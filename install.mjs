@@ -5,7 +5,14 @@ import { access, copyFile, mkdir, readFile, readdir } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, relative } from "node:path";
 
-const MODULES = ["team.ts", "team-web", "homewiki.ts", "homewiki-web"];
+const MODULES = [
+    "team.ts",
+    "team-web",
+    "homewiki.ts",
+    "homewiki-web",
+    "night-shift.ts",
+    "night-shift-web",
+];
 const check = process.argv.includes("--check");
 const source = import.meta.dirname;
 const target = join(process.env.PI_POCKET_DIR ?? join(homedir(), ".pi-pocket"), "extensions");
