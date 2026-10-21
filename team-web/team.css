@@ -74,3 +74,63 @@
 .named-team summary {
     cursor: pointer;
 }
+.named-team-count {
+    align-self: start;
+    padding: 1px 8px;
+    border-radius: 999px;
+    color: var(--bg);
+    background: var(--accent);
+    font-size: 12px;
+}
+.named-team-memory {
+    margin-top: 20px;
+}
+.named-team-lessons {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    margin: 12px 0;
+    padding: 0;
+    list-style: none;
+}
+.named-team-lesson {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 12px;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    overflow-wrap: anywhere;
+}
+.named-team-lesson.waiting {
+    border-color: var(--accent);
+}
+.named-team-lesson textarea {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 10px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    color: var(--text);
+    background: var(--bg);
+    font: inherit;
+}
+.named-team-tag {
+    margin-right: 6px;
+    color: var(--accent);
+    font-size: 12px;
+    font-weight: 600;
+    text-transform: uppercase;
+}
+.named-team-old {
+    color: var(--muted);
+}
+.named-team-link {
+    padding: 0;
+    border: 0;
+    color: var(--accent);
+    background: none;
+    font: inherit;
+    text-decoration: underline;
+    cursor: pointer;
+}

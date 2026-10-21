@@ -7,10 +7,179 @@ export function newTaskKey(random = globalThis.crypto) {
     return [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
+/** Lessons waiting for the owner: new ones, and proposed changes of ones in force. */
+export const waitingCount = (lessons = []) =>
+    lessons.filter((lesson) => lesson.pending || lesson.proposal).length;
+
+/** What the owner saw, for an approval to hold only for it. */
+export function expectedOf(lesson) {
+    if (!lesson.pending && lesson.proposal?.forget) {
+        return { forget: true };
+    }
+
+    return {
+        text:
+            !lesson.pending && lesson.proposal?.text !== undefined
+                ? lesson.proposal.text
+                : lesson.text,
+    };
+}
+
+const MEMORY_LABELS = {
+    add: "save agent lesson",
+    update: "change agent lesson",
+    remove: "forget agent lesson",
+    list: "list agent lessons",
+};
+
 export default function setup(pocket) {
     const { html, useEffect, useState } = pocket;
 
     pocket.style("team.css");
+
+    function Lessons({ agent, lessons, limits, onChanged }) {
+        const [draft, setDraft] = useState("");
+        const [editing, setEditing] = useState(null);
+        const [edit, setEdit] = useState("");
+        const [busy, setBusy] = useState(false);
+        const [error, setError] = useState("");
+        const inForce = lessons.filter((lesson) => !lesson.pending).length;
+
+        const act = async (path, body) => {
+            setBusy(true);
+            setError("");
+
+            try {
+                await pocket.api(path, body);
+                await onChanged();
+
+                return true;
+            } catch (e) {
+                setError(e.message);
+                await onChanged();
+
+                return false;
+            } finally {
+                setBusy(false);
+            }
+        };
+        const change = (lesson, body) => act(`memory/${agent.id}/${lesson.id}`, body);
+        const origin = (lesson) =>
+            lesson.from
+                ? html` from <button class="named-team-link" onClick=${() => pocket.openConversation(lesson.from)}>its session</button>`
+                : null;
+
+        return html`<section class="named-team-memory">
+            <h3>Lessons for ${agent.name}</h3>
+            <p class="small muted">
+                ${inForce} of ${limits?.approved ?? 40} in force. They apply in every session with this identity, in any folder. Pi's lessons and changes wait for you here.
+            </p>
+            ${error && html`<div class="error-box" role="alert">${error}</div>`}
+            ${lessons.length === 0 && html`<p class="small muted">No lessons yet.</p>`}
+            <ul class="named-team-lessons">
+                ${lessons.map((lesson) => {
+                    const proposal = !lesson.pending && lesson.proposal;
+                    const who = lesson.byPi ? "Pi" : lesson.byYou ? "you" : "someone";
+
+                    if (editing === lesson.id) {
+                        return html`<li class="named-team-lesson">
+                            <textarea
+                                rows="3"
+                                maxlength=${limits?.text ?? 300}
+                                value=${edit}
+                                disabled=${busy}
+                                aria-label="Lesson text"
+                                onInput=${(e) => setEdit(e.currentTarget.value)}
+                            />
+                            <div class="named-team-actions">
+                                <button
+                                    class="button primary"
+                                    disabled=${busy || !edit.trim()}
+                                    onClick=${async () => {
+                                        if (await change(lesson, { action: "edit", text: edit })) {
+                                            setEditing(null);
+                                        }
+                                    }}
+                                >
+                                    Save
+                                </button>
+                                <button class="button" disabled=${busy} onClick=${() => setEditing(null)}>Cancel</button>
+                            </div>
+                        </li>`;
+                    }
+
+                    return html`<li class=${`named-team-lesson ${lesson.pending || proposal ? "waiting" : ""}`}>
+                        ${lesson.pending && html`<span class="named-team-tag">Waiting</span>`}
+                        <span class=${proposal ? "named-team-old" : ""}>${lesson.text}</span>
+                        ${
+                            proposal &&
+                            html`<span class="named-team-proposal"
+                                ><span class="named-team-tag">Proposed</span>
+                                ${proposal.forget ? "Forget this lesson" : proposal.text}</span
+                            >`
+                        }
+                        <span class="small muted"
+                            >${lesson.pending ? "Proposed" : "Saved"} by ${who}${origin(lesson)}${proposal ? ` · change proposed by ${proposal.byPi ? "Pi" : "someone"}` : ""} · ${lesson.id}</span
+                        >
+                        <div class="named-team-actions">
+                            ${
+                                lesson.pending || proposal
+                                    ? html`<button
+                                              class="button primary"
+                                              disabled=${busy}
+                                              onClick=${() => change(lesson, { action: "approve", expected: expectedOf(lesson) })}
+                                          >
+                                              ${proposal?.forget ? "Approve forgetting" : proposal ? "Approve change" : "Approve"}
+                                          </button>
+                                          <button class="button" disabled=${busy} onClick=${() => change(lesson, { action: "discard" })}>
+                                              ${proposal ? "Keep as is" : "Discard"}
+                                          </button>`
+                                    : null
+                            }
+                            <button
+                                class="button"
+                                disabled=${busy}
+                                onClick=${() => {
+                                    setEditing(lesson.id);
+                                    setEdit(lesson.text);
+                                }}
+                            >
+                                Edit
+                            </button>
+                            ${
+                                !lesson.pending &&
+                                html`<button class="button" disabled=${busy} onClick=${() => change(lesson, { action: "forget" })}>
+                                    Forget
+                                </button>`
+                            }
+                        </div>
+                    </li>`;
+                })}
+            </ul>
+            <label class="named-team-task"
+                >Add a lesson for ${agent.name} (counts at once)
+                <textarea
+                    rows="2"
+                    maxlength=${limits?.text ?? 300}
+                    value=${draft}
+                    disabled=${busy}
+                    placeholder="One or two specific sentences…"
+                    onInput=${(e) => setDraft(e.currentTarget.value)}
+                />
+            </label>
+            <button
+                class="button"
+                disabled=${busy || !draft.trim()}
+                onClick=${async () => {
+                    if (await act(`memory/${agent.id}`, { text: draft })) {
+                        setDraft("");
+                    }
+                }}
+            >
+                Add lesson
+            </button>
+        </section>`;
+    }
 
     function Team() {
         const source = pocket.conversationId();
@@ -24,6 +193,15 @@ export default function setup(pocket) {
         const [error, setError] = useState("");
         const [notice, setNotice] = useState("");
         const [requestKey, setRequestKey] = useState(null);
+        const [memory, setMemory] = useState(null);
+
+        const loadMemory = () => pocket.api("memory").then(setMemory, (e) => setError(e.message));
+
+        useEffect(() => {
+            void loadMemory();
+
+            return pocket.on("memory", () => void loadMemory());
+        }, []);
 
         const refresh = async () => {
             const result = await pocket.api("agents");
@@ -140,6 +318,12 @@ export default function setup(pocket) {
                             }}
                         >
                             <strong>${a.name}</strong><span class="small muted">${a.role}</span>
+                            ${
+                                waitingCount(memory?.agents?.[a.id]) > 0 &&
+                                html`<span class="named-team-count" title="Lessons waiting for you"
+                                    >${waitingCount(memory.agents[a.id])} waiting</span
+                                >`
+                            }
                         </button>`,
                 )}
             </div>
@@ -185,6 +369,7 @@ export default function setup(pocket) {
                         <summary>Soul and responsibilities</summary>
                         <${pocket.Markdown} text=${agent.instructions} />
                     </details>
+
                     ${
                         repositories.length > 0 &&
                         html`
@@ -236,6 +421,15 @@ export default function setup(pocket) {
                     <p class="small muted">
                         The task opens in the folder shown above with ${preferred ? "the preferred model" : "this session's model"}, plus the agent's identity and your brief. Start linked tasks from the original conversation; a linked task cannot start another.
                     </p>
+                    ${
+                        memory &&
+                        html`<${Lessons}
+                            agent=${agent}
+                            lessons=${memory.agents?.[agent.id] ?? []}
+                            limits=${memory.limits}
+                            onChanged=${loadMemory}
+                        />`
+                    }
                 </section>`
             }
             ${
@@ -257,7 +451,27 @@ export default function setup(pocket) {
     }
 
     pocket.page({ id: "team", title: "Your team", component: Team });
-    pocket.rail({ id: "team", title: "Your team", icon: "chat", page: "team" });
+    const rail = pocket.rail({ id: "team", title: "Your team", icon: "chat", page: "team" });
+    // The rail shows how many lessons wait for the owner, across every agent.
+    const badge = () =>
+        pocket.api("memory").then(
+            (memory) => rail.update({ badge: memory.pending || null }),
+            () => {},
+        );
+
+    void badge();
+    pocket.onDispose(pocket.on("memory", () => void badge()));
+    pocket.toolCall({
+        tool: "team_memory",
+        icon: "key",
+        label: (args) => MEMORY_LABELS[args.action] ?? "agent lessons",
+        subject: (args) =>
+            [args.agent, args.id && `[${args.id}]`, args.text].filter(Boolean).join(" "),
+        summary: (args) =>
+            args.action === "list"
+                ? { verb: "checked agent lessons" }
+                : { verb: "proposed", noun: "agent lesson" },
+    });
     pocket.launcher({
         id: "team",
         label: "Your named agents",
