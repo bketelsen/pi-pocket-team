@@ -4,8 +4,9 @@
     "private": true,
     "type": "module",
     "scripts": {
-        "test": "node --test team.test.ts team-web.test.js homewiki.test.ts && node --check team-web/index.js && node --check homewiki-web/index.js",
+        "test": "node --test team.test.ts team-memory.test.ts team-web.test.js homewiki.test.ts && node --check team-web/index.js && node --check homewiki-web/index.js",
         "install-extension": "node install.mjs",
-        "install-check": "node install.mjs --check"
+        "install-check": "node install.mjs --check",
+        "preview": "node preview.ts"
     }
 }
