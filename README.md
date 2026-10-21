@@ -1,33 +1,46 @@
-# Brian's Pi Pocket extensions
+# pi-pocket-team
 
-Drop-in extensions for Brian's Pi Pocket server. Each module is a `.ts` file plus a browser folder; installed, they live in `~/.pi-pocket/extensions/`.
+Drop-in extensions for [Pi Pocket](https://github.com/TannerMidd/pi-pocket), written for Brian Ketelsen's own server and shared as they are. MIT license ([LICENSE](LICENSE)).
 
-| Module          | Files                                | What it is                                                                                                                                                                                                   |
-| --------------- | ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| **Team**        | `team.ts`, `team-web/`               | Named agents (Odrade and the specialists) in ordinary Pi Pocket sessions, Odrade's delegation into their repositories, and each agent's own memory.                                                          |
-| **Homewiki**    | `homewiki.ts`, `homewiki-web/`       | The "Wiki" rail page: renders Bellonda's homewiki checkout (`/var/home/bjk/projects/homewiki`) live from disk, read-only and owner-only.                                                                     |
-| **Night shift** | `night-shift.ts`, `night-shift-web/` | `/night-shift`: Pi works on an objective in rounds while you sleep, until a stop condition in words (and an optional check command), a round limit, or a deadline; then it writes a summary for the morning. |
+| Module          | Files                                | What it is                                                                                                                                                                                                             |
+| --------------- | ------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Team**        | `team.ts`, `team-web/`               | Named agents in ordinary Pi Pocket sessions, a supervisor's delegation into their repositories, and each agent's own memory.                                                                                           |
+| **Homewiki**    | `homewiki.ts`, `homewiki-web/`       | The "Wiki" rail page: renders a Markdown wiki checkout (`README.md` and `docs/**/*.md`) live from disk, read-only and owner-only. Default folder `~/projects/homewiki`; set `PI_POCKET_HOMEWIKI_ROOT` for another one. |
+| **Night shift** | `night-shift.ts`, `night-shift-web/` | `/night-shift`: Pi works on an objective in rounds while you sleep, until a stop condition in words (and an optional check command), a round limit, or a deadline; then it writes a summary for the morning.           |
 
-## Test
+## Requirements
+
+- Pi Pocket v0.19.0 or later. It includes the linked-session working directory (PR #112) that Team delegation needs.
+- The modules declare `pocketApi = 2` (Pocket's extension API version). A Pocket with another API version may refuse them or break them.
+- Node.js 24, the one Pocket runs on.
+- A Pi Pocket checkout for the tests (`../pi-pocket` by default).
+
+## Setup and test
+
+Clone this repository next to a Pi Pocket checkout, or set `PI_POCKET_CHECKOUT` to the checkout's path.
 
 ```sh
-cd ~/projects/pi-pocket-team
-npm test                                  # node --test, plus node --check of the browser modules
-./node_modules/.bin/tsc -p tsconfig.json  # types of team.ts, homewiki.ts, and night-shift.ts
+npm run link       # make node_modules, _pocket.d.ts, and _pocket point into the checkout
+npm test           # node --test, plus node --check of the browser modules
+npm run typecheck  # types of team.ts, homewiki.ts, and night-shift.ts
 ```
+
+`npm run link` also runs before `npm test`, `npm run typecheck`, and `npm run preview`. It creates or repairs 3 symlinks in the repository root: `node_modules` to the checkout's `node_modules`, `_pocket.d.ts` to its `types/pocket.d.ts`, and `_pocket` to the checkout itself, which the tests and `preview.ts` import through. It never deletes a real file or folder.
 
 The tests run each module inside a real Pi Pocket app built by the checkout's test harness: temporary data, test credentials, a fake model. `homewiki.test.ts` points the module at a fixture wiki with `PI_POCKET_HOMEWIKI_ROOT`; the server never sets it, so production reads the real checkout. `team-memory.test.ts` checks agent memory's rules directly and through the app, with fixture agent profiles. `night-shift.test.ts` runs night shifts against a scripted model, restarts included. `npm run preview` (`preview.ts`) opens an isolated app with sample lessons, to look at the panel.
 
-## Install
+## Install into your Pi Pocket
 
 ```sh
 npm run install-check      # list what an install would write; writes nothing
 npm run install-extension  # copy changed files into ~/.pi-pocket/extensions/
 ```
 
-The installer compares every file byte for byte and writes only those that differ, so installing unchanged source touches nothing. It never deletes: installed files the project doesn't have are listed and left alone. `PI_POCKET_DIR` selects another installation.
+The installer compares every file byte for byte and writes only those that differ, so installing unchanged source touches nothing. It never deletes: installed files the project doesn't have are listed and left alone. `install-extension` copies into `~/.pi-pocket/extensions/`, or `$PI_POCKET_DIR/extensions` when `PI_POCKET_DIR` (Pocket's data folder) selects another installation.
 
-An install writes into the running server: a saved module reloads at once, and open tabs pick up browser changes. Installing never turns a module on or off and never restarts the server; Brian does both, in **Menu → Extensions**. Run `npm test` before every install.
+The server must already have `node_modules` in its extensions folder. Pocket's drop-in setup does this; see Pocket's `docs/extensions.md`.
+
+An install writes into the running server: a saved module reloads at once, and open tabs pick up browser changes. Installing never turns a module on or off and never restarts the server; the owner does both, in **Menu → Extensions**. Run `npm test` before every install.
 
 # Team
 
@@ -41,13 +54,55 @@ An install writes into the running server: a saved module reloads at once, and o
 
 The owner must enable the drop-in: Pi Pocket's extension policy explicitly reserves this action for the owner. Installing the files does not enable it or restart the server.
 
-## What is preserved
+## Writing an agent profile
 
-Eight plain Markdown profiles live in `~/.config/pi-pocket-team/agents`: Odrade, Duncan Idaho, Moneo, Murbella, Sheeana, Miles Teg, Lucilla, and Bellonda. They contain each soul, responsibilities, role, preferred primary model, and repository-to-folder map. They are independent copies, so this extension does not need stomp or its VM.
+Profiles are Markdown files in `~/.config/pi-pocket-team/agents/` (override with `PI_POCKET_TEAM_AGENTS`). The file name is the agent id: lowercase, and it must match `[a-z0-9][a-z0-9_-]*.md`. The body is the identity text; its first `# Heading` is the display name.
 
-Selecting a person stores their identity in that conversation. It persists across restart and follows a native conversation fork. Other sessions keep their own identities. Editing a profile affects subsequent selections; reselect it to update an existing session.
+Frontmatter fields:
 
-The import excludes notebooks, conversation histories, credentials, VM paths, MCP configuration, schedules, and stomp's house rules. The old workspace-tool and VM-only instructions in Murbella's and Sheeana's imported souls have been updated for local repositories. Pi Pocket supplies its own tools and provider configuration. Identities describe people; they do not configure providers.
+| Field          | Meaning                                               |
+| -------------- | ----------------------------------------------------- |
+| `model`        | `provider/model`. A list uses only the first model.   |
+| `role`         | `supervisor` or `agent`. Default: `agent`.            |
+| `repositories` | Map of repository name to an absolute or `~/` folder. |
+| `workspace`    | One folder, for non-repository work.                  |
+
+A supervisor, `lead.md`, named "Lead", with no repositories:
+
+```markdown
+---
+role: supervisor
+---
+
+# Lead
+
+Lead keeps the team pointed at the goal.
+
+## Responsibilities
+
+- Break work into self-contained tasks.
+- Delegate to one agent at a time.
+```
+
+An agent, `alice.md`, named "Alice":
+
+```markdown
+---
+model: anthropic/claude-sonnet-4-5
+role: agent
+repositories:
+    example/web: ~/projects/web
+---
+
+# Alice
+
+Alice makes the web front end small and fast.
+
+## Responsibilities
+
+- Keep the web build green.
+- Report back with what changed.
+```
 
 ## Repository ownership
 
@@ -84,6 +139,12 @@ The tool takes an optional `night_shift` object, `{ objective?, stop_when, start
 }
 ```
 
+## Brian's team (an example)
+
+Brian's own setup has 8 profiles: Odrade the supervisor and 7 specialists, with Dune names. They are only an example; write your own profiles as above.
+
+Selecting a person stores their identity in that conversation. It persists across restart and follows a native conversation fork. Other sessions keep their own identities. Editing a profile affects subsequent selections; reselect it to update an existing session.
+
 Current ownership:
 
 | Agent     | Repositories / workspace                                                       |
@@ -103,7 +164,7 @@ Pi Pocket sets the child's actual working directory before the first request: pr
 
 - Direct identity selection keeps the existing model, folder, and history. Use a fresh session for a fresh task; select the model in Pi Pocket's native picker.
 - Automatic delegation (`team_delegate`) runs the specialist on the model in its profile when Pi Pocket allows that model under **Providers → Models for subagents**; otherwise it runs on the supervisor's model, and the tool result says so. Odrade's roster shows each agent's model. Thinking stays at the supervisor's level or lower. If core refuses the start (the model can't be used now), the tool fails and tells Pi to stop and tell the user, not to try another model. Delegation selects the specialist's repository folder. The Team panel's start can also opt into a person's preferred model. Only the first model in an old fallback list is imported; there is no automatic fallback.
-- This uses Pi Pocket's linked-session rules, including its limits. A specialist reports back through `team_message`; that report is model-driven, not an automatic completion hook. Odrade can do work directly or delegate one level.
+- This uses Pi Pocket's linked-session rules, including its limits. A specialist reports back through `team_message`; that report is model-driven, not an automatic completion hook. The supervisor can do work directly or delegate one level.
 - There is no automatic review workflow, scheduled duties, imported MCP setup, or shared notebook. This is a test of whether named people and task delegation are enough, before deciding what else is worth carrying over.
 - Moving the app locally does not change a provider's content policies.
 
@@ -124,23 +185,21 @@ Runtime copies: `~/.pi-pocket/extensions/team.ts` and `team-web/`. The extension
 
 Runtime imports use Pi Pocket's public extension API and installed Pi packages. Test and preview scripts (`team.test.ts`, `team-memory.test.ts`, `preview.ts`) use the checkout's internal test harness, isolated temporary data, and a fake model. They are not installed.
 
-Use the patched local Pi Pocket checkout. A server started before the working-directory change must be restarted before using repository delegation; the original API ignores `cwd`. Updating an upstream checkout without this patch, before #112 ships, removes cross-folder support.
-
-The dependency and declaration links point to `~/projects/pi-pocket`; update those links if moving the checkout. `PI_POCKET_DIR` selects another installation destination.
-
-For a one-time import from another stomp configuration, run `node import-stomp.mjs /path/to/stomp/config [extra-agent.md ...]`. Existing profiles are kept. The importer resolves model aliases but copies only the soul, role, and primary model. It does not copy credentials.
+Pi Pocket v0.19.0 or later has the working-directory support that repository delegation needs. The links to the checkout come from `npm run link`. `PI_POCKET_DIR` selects another installation destination.
 
 Disable **Team** in Extensions to remove the UI, tools, and prompt section. Stored identities remain available if it is re-enabled; ordinary conversations remain Pi Pocket conversations.
 
 # Homewiki
 
-The "Wiki" rail page shows `bketelsen/homewiki`, Bellonda's checkout, as it is on disk, uncommitted edits included. The page notes the checkout's commit and whether it has uncommitted edits.
+The "Wiki" rail page shows a Markdown wiki checkout as it is on disk, uncommitted edits included. Brian's is `bketelsen/homewiki`, kept by his agent Bellonda. The page notes the checkout's commit and whether it has uncommitted edits.
+
+The folder comes from `PI_POCKET_HOMEWIKI_ROOT`, default `~/projects/homewiki`. The server process environment must have the variable when you want another folder, and a change needs a server restart.
 
 - **Pages:** `README.md` and every `.md` file under `docs/`, skipping hidden files and folders. `README.md` comes first; the rest sort by their `order` frontmatter (none sorts last), then by path. The title is the frontmatter `title`, else the first `#` heading, else the path. A subfolder of `docs/` becomes a section.
 - **Read-only, list-only:** `GET /api/x/homewiki/pages` returns the list; `GET /api/x/homewiki/page?path=…` serves a page only when `path` is exactly one in that list, with its frontmatter stripped. Anything else (`../`, absolute paths, `.git/config`, files outside `docs/`) is a 404. Both routes are owner-only.
-- **Live:** a watcher on the checkout tells open tabs when a Markdown file changes, at most once a second, so Bellonda's edits show without a reload.
+- **Live:** a watcher on the checkout tells open tabs when a Markdown file changes, at most once a second, so edits show without a reload.
 
-The wiki's content belongs to Bellonda; this module only renders it.
+The wiki's content belongs to its owner; this module only renders it.
 
 # Night shift
 
@@ -236,4 +295,11 @@ A supervisor identity (Odrade) can start a night shift in the linked session tha
 
 ## Night shift files
 
-`night-shift.ts` (server: command, prompt section, driver task, one route), `night-shift-web/index.js` (the status-line item and its sheet; route `GET /api/x/night-shift/goal/:conversation`, for people who see every session). A new module starts off: Brian turns it on in **Menu → Extensions**.
+`night-shift.ts` (server: command, prompt section, driver task, one route), `night-shift-web/index.js` (the status-line item and its sheet; route `GET /api/x/night-shift/goal/:conversation`, for people who see every session). A new module starts off: the owner turns it on in **Menu → Extensions**.
+
+## Caveats
+
+- Night shift reads 2 Pi Pocket internals that are not public API, so a Pocket upgrade can break it:
+    - the `pocket.plan` document, to see plan mode. If it changes, the read fails safe: the goal relies on Pi to answer BLOCKED in plan mode, as its prompt section asks, and BLOCKED ends the goal.
+    - the request-id format `p:<person>:…`, which marks a message that Pocket sends for a person (`src/server/requests.ts`). If it changes, Pocket can refuse a round or count its spend differently. A round with no answer ends the goal with the error; it does not run on.
+- The modules are tested against the Pocket version in Requirements only. Team and Homewiki are owner-oriented and tuned to one person's server.

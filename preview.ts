@@ -6,15 +6,15 @@ import {
     owner,
     root,
     scriptedModel,
-} from "/var/home/bjk/projects/pi-pocket/test/helpers.ts";
-import { context } from "/var/home/bjk/projects/pi-pocket/test/helpers.ts";
+} from "./_pocket/test/helpers.ts";
+import { context } from "./_pocket/test/helpers.ts";
 import { cpSync, mkdirSync } from "node:fs";
 import { addLesson, AgentMemory, changeLesson } from "./team.ts";
 import { createServer } from "node:http";
 import { join } from "node:path";
 import { homedir } from "node:os";
-import { createHandler } from "/var/home/bjk/projects/pi-pocket/src/server/http.ts";
-import { setAuthCookie } from "/var/home/bjk/projects/pi-pocket/src/server/auth.ts";
+import { createHandler } from "./_pocket/src/server/http.ts";
+import { setAuthCookie } from "./_pocket/src/server/auth.ts";
 
 process.env.PI_POCKET_TEAM_AGENTS = join(homedir(), ".config", "pi-pocket-team", "agents");
 const extensions = join(root, "data", "extensions");

@@ -12,7 +12,7 @@ import {
     say,
     scriptedModel,
     work,
-} from "/var/home/bjk/projects/pi-pocket/test/helpers.ts";
+} from "./_pocket/test/helpers.ts";
 import assert from "node:assert/strict";
 import { cpSync, mkdirSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
@@ -20,7 +20,7 @@ import { join } from "node:path";
 import { after, test } from "node:test";
 import type { ConversationId } from "@earendil-works/pi-durable";
 import { fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
-import { createHandler } from "/var/home/bjk/projects/pi-pocket/src/server/http.ts";
+import { createHandler } from "./_pocket/src/server/http.ts";
 import createTeam, {
     addLesson,
     AgentMemory,
