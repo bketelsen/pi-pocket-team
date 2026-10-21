@@ -1,0 +1,109 @@
+.homewiki {
+    display: flex;
+    gap: 1.5rem;
+    align-items: flex-start;
+}
+
+.homewiki-nav {
+    position: sticky;
+    top: 0;
+    flex: 0 0 13rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.1rem;
+    max-height: calc(100vh - 6rem);
+    overflow-y: auto;
+}
+
+.homewiki-section {
+    margin: 0.8rem 0 0.2rem;
+    padding: 0 0.6rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+
+.homewiki-link {
+    text-align: left;
+    padding: 0.35rem 0.6rem;
+    border: 0;
+    border-radius: 6px;
+    background: none;
+    color: var(--text);
+    font: inherit;
+    cursor: pointer;
+}
+
+.homewiki-link:hover {
+    background: var(--card);
+}
+
+.homewiki-link.on {
+    background: var(--card);
+    color: var(--accent);
+    font-weight: 600;
+}
+
+.homewiki-main {
+    flex: 1;
+    min-width: 0;
+}
+
+.homewiki-bar {
+    display: flex;
+    gap: 0.5rem;
+    align-items: center;
+    margin-bottom: 0.75rem;
+    scroll-margin-top: 1rem;
+}
+
+.homewiki-bar .grow {
+    flex: 1;
+}
+
+.homewiki-select {
+    display: none;
+    min-width: 0;
+    flex: 1;
+    padding: 0.4rem;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    background: var(--bg);
+    color: var(--text);
+    font: inherit;
+}
+
+.homewiki-page {
+    max-width: 52rem;
+}
+
+.homewiki-page h1,
+.homewiki-page h2,
+.homewiki-page h3 {
+    scroll-margin-top: 1rem;
+}
+
+/* Wide tables (the estate table) scroll sideways instead of squeezing. */
+.homewiki-page table {
+    display: block;
+    overflow-x: auto;
+}
+
+.homewiki-foot {
+    margin-top: 2rem;
+    padding-top: 0.5rem;
+    border-top: 1px solid var(--line);
+}
+
+@media (max-width: 760px) {
+    .homewiki-nav {
+        display: none;
+    }
+
+    .homewiki-select {
+        display: block;
+    }
+
+    .homewiki-bar .grow {
+        display: none;
+    }
+}
