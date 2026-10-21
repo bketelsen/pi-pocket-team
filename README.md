@@ -2,10 +2,10 @@
 
 Drop-in extensions for Brian's Pi Pocket server. Each module is a `.ts` file plus a browser folder; installed, they live in `~/.pi-pocket/extensions/`.
 
-| Module       | Files                          | What it is                                                                                                                               |
-| ------------ | ------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------- |
-| **Team**     | `team.ts`, `team-web/`         | Named agents (Odrade and the specialists) in ordinary Pi Pocket sessions, and Odrade's delegation into their repositories.               |
-| **Homewiki** | `homewiki.ts`, `homewiki-web/` | The "Wiki" rail page: renders Bellonda's homewiki checkout (`/var/home/bjk/projects/homewiki`) live from disk, read-only and owner-only. |
+| Module       | Files                          | What it is                                                                                                                                          |
+| ------------ | ------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Team**     | `team.ts`, `team-web/`         | Named agents (Odrade and the specialists) in ordinary Pi Pocket sessions, Odrade's delegation into their repositories, and each agent's own memory. |
+| **Homewiki** | `homewiki.ts`, `homewiki-web/` | The "Wiki" rail page: renders Bellonda's homewiki checkout (`/var/home/bjk/projects/homewiki`) live from disk, read-only and owner-only.            |
 
 ## Test
 
@@ -15,7 +15,7 @@ npm test                                  # node --test, plus node --check of bo
 ./node_modules/.bin/tsc -p tsconfig.json  # types of team.ts and homewiki.ts
 ```
 
-The tests run each module inside a real Pi Pocket app built by the checkout's test harness: temporary data, test credentials, a fake model. `homewiki.test.ts` points the module at a fixture wiki with `PI_POCKET_HOMEWIKI_ROOT`; the server never sets it, so production reads the real checkout.
+The tests run each module inside a real Pi Pocket app built by the checkout's test harness: temporary data, test credentials, a fake model. `homewiki.test.ts` points the module at a fixture wiki with `PI_POCKET_HOMEWIKI_ROOT`; the server never sets it, so production reads the real checkout. `team-memory.test.ts` checks agent memory's rules directly and through the app, with fixture agent profiles. `npm run preview` (`preview.ts`) opens an isolated app with sample lessons, to look at the panel.
 
 ## Install
 
@@ -88,11 +88,22 @@ Pi Pocket sets the child's actual working directory before the first request: pr
 - There is no automatic review workflow, scheduled duties, imported MCP setup, or shared notebook. This is a test of whether named people and task delegation are enough, before deciding what else is worth carrying over.
 - Moving the app locally does not change a provider's content policies.
 
+## Agent memory
+
+Pi Pocket's memory has two scopes: a project (one repository or folder) and everywhere. An agent that owns several repositories gets its lessons split between them, and everywhere reaches every session. Team adds a third layer: lessons for one named agent. They apply in every session that carries that identity, linked tasks included, in whatever folder.
+
+- **Pi proposes, Brian approves.** The `team_memory` tool (add, update, remove, list) acts on the session's identity. Everything Pi writes waits for the owner. A proposed change or forget leaves the lesson in force until it's approved, and an approval holds only if the text is still what the owner saw. Odrade, the supervisor, can also give `agent: <id>` to add or list lessons for a named agent.
+- **The identity gate.** A drop-in's tool list is the same in every session, so `team_memory` is listed everywhere, but it refuses to work without a named identity. The guide for using it appears only in the `named_team` prompt section, and that section appears only with an identity.
+- **The prompt.** The `named_team` section lists the approved lessons as "Lessons for <Name>, across all <Name>'s repositories", with a short guide. Repository facts go to the built-in `memory` tool with scope project. The agent's role, the owner's preferences for its work, and anything spanning its repositories go to `team_memory`. The section's text stays the same while the lessons do.
+- **Review.** In the Team panel, each agent lists its lessons, waiting ones first, with Approve/Discard, Edit, and Forget. A lesson the owner adds there counts at once. The rail button's badge counts what waits, across all agents. All memory routes (`/api/x/team/memory…`) are owner-only.
+- **Rules, as Pi Pocket's own memory:** a lesson is one line with invisible characters stripped, at most 300 characters. An agent keeps at most 40 approved lessons, and one writer may have at most 20 waiting for each agent. The pending cap is per agent: Brian is the one requester, so a single global cap would let one busy agent block the rest. A tool call that runs again after a restart finds the lesson it saved (keyed by task and call), so it never adds one twice.
+- **Storage:** one app-wide document, `x.team.memory`: `{ agents: { <agentId>: { <lessonId>: lesson } } }`. Each lesson has its id, agent, text, who wrote it and whether Pi did, the source session, created and updated times, `pending`, and any `proposal`. It is stored data: never rename the kind or change what a field means.
+
 ## Team files
 
 Runtime copies: `~/.pi-pocket/extensions/team.ts` and `team-web/`. The extension reads only its independent profile directory (override with `PI_POCKET_TEAM_AGENTS`). Its durable document is `x.team.identity`; UI routes are in the owner-only `/api/x/team/` namespace.
 
-Runtime imports use Pi Pocket's public extension API and installed Pi packages. Test and preview scripts (`team.test.ts`, `preview.ts`) use the checkout's internal test harness, isolated temporary data, and a fake model. They are not installed.
+Runtime imports use Pi Pocket's public extension API and installed Pi packages. Test and preview scripts (`team.test.ts`, `team-memory.test.ts`, `preview.ts`) use the checkout's internal test harness, isolated temporary data, and a fake model. They are not installed.
 
 Use the patched local Pi Pocket checkout. A server started before the working-directory change must be restarted before using repository delegation; the original API ignores `cwd`. Updating an upstream checkout without this patch, before #112 ships, removes cross-folder support.
 

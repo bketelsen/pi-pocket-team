@@ -9,4 +9,6 @@ This is Brian's extension project: drop-in modules for his running Pi Pocket ser
 - **Brian turns modules on and off, and restarts the server.** Never enable or disable an extension or restart the server; finish, test, and tell him what needs doing.
 - **Tests stay isolated.** They use the Pi Pocket checkout's test harness (temporary data, test credentials, a fake model). Point modules at fixtures with environment variables (`PI_POCKET_TEAM_AGENTS`, `PI_POCKET_HOMEWIKI_ROOT`), never at Brian's real data.
 - **Nothing secret in git.** `node_modules` and `_pocket.d.ts` are links into the Pi Pocket checkout and stay ignored. Never commit anything from `~/.pi-pocket` or `~/.config/pi-pocket-team`, tokens, or credentials.
+- **Stored data is forever.** Document kinds (`x.team.identity`, `x.team.memory`) and their fields are stored in Brian's sessions: never rename a kind or change what a field means; add new ones beside them.
+- **Agent memory follows Pi Pocket's memory rules** (`src/server/memory.ts` in the checkout): Pi proposes, the owner approves, approvals check what the owner saw, and a replayed tool call never adds twice. Keep `team-memory.test.ts` covering each rule you touch.
 - The homewiki's content belongs to Bellonda; this module only renders it.
