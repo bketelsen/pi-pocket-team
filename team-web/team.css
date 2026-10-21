@@ -1,0 +1,76 @@
+.named-team {
+    max-width: 850px;
+    margin: 0 auto;
+    padding: 20px;
+    color: var(--text);
+}
+.named-team-context {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 14px;
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    overflow-wrap: anywhere;
+}
+.named-team-roster {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 10px;
+    margin: 18px 0;
+}
+.named-team-agent {
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+    text-align: left;
+    min-height: 64px;
+    padding: 12px;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    color: var(--text);
+    background: var(--card);
+    cursor: pointer;
+}
+.named-team-agent.selected {
+    border-color: var(--accent);
+    box-shadow: inset 0 0 0 1px var(--accent);
+}
+.named-team-actions {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+.named-team-task {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin-top: 20px;
+}
+.named-team-task textarea,
+.named-team-task select {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 12px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    color: var(--text);
+    background: var(--bg);
+    font: inherit;
+}
+.named-team-option {
+    display: flex;
+    align-items: start;
+    gap: 8px;
+    margin: 14px 0;
+}
+.named-team .button {
+    min-height: 42px;
+    white-space: normal;
+}
+.named-team details {
+    padding: 12px 0;
+}
+.named-team summary {
+    cursor: pointer;
+}

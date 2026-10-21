@@ -1,0 +1,10 @@
+{
+    "name": "pi-pocket-team",
+    "version": "0.1.0",
+    "private": true,
+    "type": "module",
+    "scripts": {
+        "test": "node --test team.test.ts team-web.test.js",
+        "install-extension": "node install.mjs"
+    }
+}
