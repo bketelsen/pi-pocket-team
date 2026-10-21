@@ -66,6 +66,24 @@ Odrade calls `team_delegate` with `agent: "duncan"` and `repository: "frostyard/
 
 For non-repository work, `workspace: ~/projects/moneo` supplies a working folder. An agent with neither repositories nor a workspace inherits the source folder. All mapped paths are absolute or begin with `~/` and must exist when a task starts; delegation does not silently clone or create folders.
 
+The tool takes an optional `night_shift` object, `{ objective?, stop_when, start?, until?, for?, max?, worker? }`: the linked session then runs a night-shift goal in rounds and reports back to Odrade's session when it stops. A night shift from the tool cannot have a check command. `worker` is the provider/model for subagents, such as `github-copilot/claude-sonnet-5.5`; it must be in the owner's allowed list for subagents. See [Delegated night shifts](#delegated-night-shifts).
+
+```json
+{
+    "agent": "duncan",
+    "repository": "frostyard/nsl",
+    "task": "Tend the release branch",
+    "night_shift": {
+        "objective": "Fix the flaky login tests",
+        "stop_when": "the suite passes 3 times in a row",
+        "start": "06:00",
+        "for": "8h",
+        "max": 30,
+        "worker": "github-copilot/claude-sonnet-5.5"
+    }
+}
+```
+
 Current ownership:
 
 | Agent     | Repositories / workspace                                                       |
@@ -131,7 +149,7 @@ The wiki's content belongs to Bellonda; this module only renders it.
 ## Commands
 
 ```text
-/night-shift [start 06:00] [until 07:00 | for 8h] [max 30] [check `npm test`]: <objective>; stop when <condition>
+/night-shift [start 06:00] [until 07:00 | for 8h] [max 30] [with provider/model] [check `npm test`]: <objective>; stop when <condition>
 /night-shift status | stop | resume
 ```
 
@@ -139,6 +157,7 @@ The wiki's content belongs to Bellonda; this module only renders it.
 - `start 06:00` (also `6am`): round 1 waits until the next time the server's clock (America/New_York) shows it. At most 24 hours away. Without it, round 1 starts at once.
 - `until 07:00` (also `7am`, `11:45pm`) is the next time the server's clock shows it, so at most 24 hours away. `for 8h`, `for 90m`, `for 7h30m`: from `start` when it is given, else from now, up to 24 hours. Give one or neither; `until` must be after `start`.
 - `max N`: rounds, 1 to 100. Default 20.
+- `with provider/model`: runs the work in subagents on that model, for example `github-copilot/claude-sonnet-5.5`. The model must be in **Providers → Models for subagents**; the command refuses another model, and it never substitutes one. With a `deepseek/…` worker and no `start`, round 1 waits for the end of DeepSeek's peak hours. The status, the set card, and the summary say which worker ran.
 - `` check `cmd` ``: runs in the session's folder after Pi says DONE; it must pass too. Owner only (see Lancet Guard below).
 - `status` shows the goal and its last rounds as a card. `stop` ends it after the round that runs (Stop ends that round now). `resume` goes on with a paused or stopped goal while rounds and time are left.
 
@@ -147,12 +166,15 @@ Examples:
 ```text
 /night-shift until 07:00 max 30: migrate the API client to v2; stop when all tests pass and the PR is open
 /night-shift start 06:00 until 17:00 max 40: <objective>; stop when <condition>
+/night-shift with github-copilot/claude-sonnet-5.5 until 07:00 max 25: migrate the API client; stop when all tests pass
 /night-shift for 6h check `npm test`: fix the flaky login tests; stop only when the suite passes 3 times in a row
 ```
 
 ## A start time
 
 `start 06:00` holds round 1 until the next 06:00 on the server's clock, so a goal set before bed can begin after the DeepSeek Flash peak hours (01:00–04:00 and 06:00–10:00 UTC). The start must be within 24 hours; `until` must be after it; `for` and the 24-hour limit count from it. The status line says "waiting until 06:00 EDT", and `/night-shift stop` cancels it.
+
+With `with deepseek/…` and no `start`, round 1 waits until the end of DeepSeek's peak hours (01:00–04:00 and 06:00–10:00 UTC): 04:00 UTC or 10:00 UTC on the same day. The label shows the server's clock, such as "05:00 EST". `for` counts from that start, `until` must be after it, and the status says "waiting until 05:00 EST (after DeepSeek's peak hours …)". An explicit `start` always wins.
 
 A person's message during the wait does not cancel the goal: messages written then do not pause it at start. Plan mode at start pauses it, as before a round. The prompt section is off before round 1, because a person can talk to Pi during the wait. The wait is a durable sleep in the driver task's `wait` phase, so a restart neither starts round 1 early nor twice, and a server that was down past the start time starts round 1 at once.
 
@@ -197,8 +219,20 @@ State is one document per conversation, `x.night-shift.goal` (`{ goal?: Goal }`;
 
 - **Lancet Guard:** every tool call of every round goes through the guard as usual. If the guard asks a person, the round waits for that person; the deadline does not cut it short. The check command runs unasked, with the owner's rights, and the guard does not see it (a drop-in cannot ask the guard): like the owner's own `!` commands. So only the owner can set or resume a goal with a check.
 - **Plan mode:** a goal does not start in plan mode, and pauses before a round when plan mode is on. Reading plan mode uses Pocket's own `pocket.plan` document, which is not public API: if it changes, the read fails and the goal relies on Pi saying BLOCKED, as the prompt asks.
+- **Worker:** the model must be in the owner's allowed list for subagents. The command and `team_delegate` refuse another model; `resume` checks the list again, because it can change. No other model is ever used in its place.
 - **Who:** anyone who can steer the session runs `/night-shift`; a check needs the owner. One goal per session. Any session works, linked sessions included.
 - Objective and condition together: 3000 characters. Check: 2000 characters, 10 minutes, the last 3000 characters of its output.
+
+## Delegated night shifts
+
+A supervisor identity (Odrade) can start a night shift in the linked session that `team_delegate` makes, with its `night_shift` argument. It works for the person behind Odrade's session (Brian), and the goal's spend is his. The goal is set in one commit with the specialist's identity, so a restart leaves either both or neither.
+
+- **No check.** A check command runs unasked with the owner's rights, and Lancet Guard does not see it, so only the owner sets one, with `/night-shift` in the session. `team_delegate` refuses a `night_shift` that has `check`.
+- **The first message is the message before round 1.** It says that round 1 comes as a separate `[night-shift]` message, to answer it with one short line, and not to send a report with `team_message`.
+- **The report comes back by itself.** When the goal stops, the driver sends one report to Odrade's session, with the reason and Pi's summary answer (in ASD-STE100). With a worker, the report adds `Rounds: N, worker: <worker>.`, so rounds can be counted per provider. A restart reruns the report phase, and its key makes the send happen once. `/night-shift stop` sends the same kind of report, best effort.
+- **Two modules, no import.** `team.ts` finds the night-shift module through `globalThis[Symbol.for("pi-pocket-team.night-shift")]`. An import would keep a stale copy after a reload. Both modules must be on in **Menu → Extensions**; without night-shift the tool says so.
+- **The worker.** `night_shift.worker` goes through the same allowed-list rule as `/night-shift with`, and the tool refuses a model outside the list before it starts the linked session.
+- **Replay.** The goal's id comes from the tool call's key, so the same call run again finds its goal and its driver: one goal, one driver.
 
 ## Night shift files
 

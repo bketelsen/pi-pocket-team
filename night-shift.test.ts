@@ -21,6 +21,7 @@ import type { FauxResponseStep } from "@earendil-works/pi-ai";
 import { fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import type { ConversationId } from "@earendil-works/pi-durable";
 import {
+    deepseekStart,
     DEFAULT_ROUNDS,
     type Goal,
     GoalDoc,
@@ -194,6 +195,96 @@ describe("parsing", () => {
         assert.match(far.message, /at most 24 hours/);
     });
 
+    test("a worker, and `with` twice", () => {
+        const worker = parseArgs(
+            "with github-copilot/claude-sonnet-5.5 until 07:00 max 25: a; stop when b",
+            now,
+            ZONE,
+        );
+
+        assert(worker.kind === "set");
+        assert.equal(worker.goal.worker, "github-copilot/claude-sonnet-5.5");
+        assert.equal(worker.goal.maxRounds, 25);
+        assert.equal(worker.goal.deadline, Date.UTC(2026, 9, 22, 11, 0));
+        assert.equal(worker.goal.start, undefined);
+
+        const anyOrder = parseArgs(
+            "max 25 with openai/gpt-6-astra until 07:00: a; stop when b",
+            now,
+            ZONE,
+        );
+
+        assert(anyOrder.kind === "set");
+        assert.equal(anyOrder.goal.worker, "openai/gpt-6-astra");
+        assert.deepEqual(
+            { ...anyOrder.goal, worker: undefined },
+            { ...worker.goal, worker: undefined },
+        );
+
+        const twice = parseArgs("with a/b with c/d: a; stop when b", now, ZONE);
+
+        assert(twice.kind === "error");
+        assert.match(twice.message, /Give one worker/);
+
+        // No slash: not a worker option, so it stays in the objective.
+        const plain = parseArgs("with nomodel: a; stop when b", now, ZONE);
+
+        assert(plain.kind === "set");
+        assert.equal(plain.goal.worker, undefined);
+        assert.match(plain.goal.objective, /^with nomodel/);
+    });
+
+    test("DeepSeek's peak hours move round 1, unless a start is given", () => {
+        assert.equal(deepseekStart(Date.UTC(2026, 9, 21, 2, 30)), Date.UTC(2026, 9, 21, 4, 0));
+        assert.equal(deepseekStart(Date.UTC(2026, 9, 21, 7, 0)), Date.UTC(2026, 9, 21, 10, 0));
+        assert.equal(deepseekStart(Date.UTC(2026, 9, 21, 5, 0)), undefined);
+        assert.equal(deepseekStart(Date.UTC(2026, 9, 21, 12, 0)), undefined);
+
+        // 2026-11-01 06:30 UTC is 01:30 EST, after the change.
+        const after = parseArgs(
+            "with deepseek/deepseek-flash: a; stop when b",
+            Date.UTC(2026, 10, 1, 6, 30),
+            ZONE,
+        );
+
+        assert(after.kind === "set");
+        assert.equal(after.goal.start, Date.UTC(2026, 10, 1, 10, 0));
+        assert.equal(after.goal.startLabel, "05:00 EST");
+        assert.equal(after.goal.startWhy, "deepseek-peak");
+
+        // 2026-10-31 06:30 UTC is 02:30 EDT.
+        const before = parseArgs(
+            "with deepseek/deepseek-flash: a; stop when b",
+            Date.UTC(2026, 9, 31, 6, 30),
+            ZONE,
+        );
+
+        assert(before.kind === "set");
+        assert.equal(before.goal.startLabel, "06:00 EDT");
+
+        // `for` counts from the end of the peak window.
+        const peak = parseArgs(
+            "with deepseek/deepseek-flash for 2h: a; stop when b",
+            Date.UTC(2026, 9, 21, 7, 0),
+            ZONE,
+        );
+
+        assert(peak.kind === "set");
+        assert.equal(peak.goal.start, Date.UTC(2026, 9, 21, 10, 0));
+        assert.equal(peak.goal.deadline, Date.UTC(2026, 9, 21, 12, 0));
+
+        // An explicit start always wins.
+        const explicit = parseArgs(
+            "with deepseek/deepseek-flash start 08:00: a; stop when b",
+            Date.UTC(2026, 9, 21, 7, 0),
+            ZONE,
+        );
+
+        assert(explicit.kind === "set");
+        assert.equal(explicit.goal.start, Date.UTC(2026, 9, 21, 12, 0));
+        assert.equal(explicit.goal.startWhy, undefined);
+    });
+
     test("a waiting goal's words", () => {
         const goal: Goal = {
             id: "wait",
@@ -214,10 +305,7 @@ describe("parsing", () => {
         };
 
         assert.equal(waiting(goal, now), true);
-        assert.equal(
-            standing(goal, now),
-            "waiting until 06:00 EDT (6h 30m), then until 17:00 EDT",
-        );
+        assert.equal(standing(goal, now), "waiting until 06:00 EDT (6h 30m), then until 17:00 EDT");
         assert.match(standing(goal, now), /waiting until 06:00 EDT/);
         assert.match(statusCard(goal, now), /waiting until 06:00 EDT/);
         assert.match(statusCard(goal, now), /stop cancels it/);
@@ -231,6 +319,32 @@ describe("parsing", () => {
             }).text,
             "Night shift waiting until 06:00 EDT",
         );
+    });
+
+    test("a DeepSeek waiting goal says why, and a worker shows", () => {
+        const goal: Goal = {
+            id: "peak",
+            objective: "a",
+            stop: "b",
+            maxRounds: 40,
+            start: Date.UTC(2026, 9, 22, 10, 0),
+            startLabel: "06:00 EDT",
+            startWhy: "deepseek-peak",
+            worker: "deepseek/deepseek-flash",
+            by: "u1",
+            byName: "Brian",
+            setAt: now,
+            status: "running",
+            round: 0,
+            seen: 0,
+            rounds: [],
+        };
+
+        assert.equal(
+            standing(goal, now),
+            "waiting until 06:00 EDT (after DeepSeek's peak hours; 6h 30m left)",
+        );
+        assert.match(statusCard(goal, now), /Worker: deepseek\/deepseek-flash/);
     });
 
     test("Pi's status line, and whose a message is", () => {
@@ -283,6 +397,8 @@ const gates = new Map<string, () => void>();
 const sectioned = new Set<string>();
 /** Whether a request that is not a round carried the prompt section: it must not, before round 1. */
 let sectionBeforeRound = false;
+/** The last round request that carried the prompt section, as JSON. */
+let sectionRequest = "";
 
 function gate(name: string): Promise<void> {
     return new Promise((resolve) => gates.set(name, resolve));
@@ -325,6 +441,7 @@ const route: FauxResponseStep = async (request, options) => {
 
     if (JSON.stringify(request).includes("This session runs a night shift")) {
         sectioned.add(`${scenario} ${n}`);
+        sectionRequest = JSON.stringify(request);
     }
     const wait = async (name: string) => {
         await new Promise<void>((resolve) => {
@@ -340,6 +457,8 @@ const route: FauxResponseStep = async (request, options) => {
             );
         case "scenario-blocked":
             return say("STATUS: BLOCKED: the token is missing");
+        case "scenario-worker":
+            return say("STATUS: DONE: it works");
         case "scenario-deadline":
             shift = 3600_000;
 
@@ -663,6 +782,56 @@ describe("stop reasons", () => {
     });
 });
 
+describe("workers", () => {
+    test("the owner's allowed list holds the worker", async () => {
+        const id = await session("worker-rules");
+
+        refused(
+            await command(id, "with nobody/nothing: a; stop when b"),
+            /nobody\/nothing is not in the owner's allowed list for subagents\. Allowed: /,
+        );
+        assert.equal(await goalOf(id), undefined);
+    });
+
+    test("a worker goes in the prompt and the status, and only with one", async () => {
+        await app.setSubagentModels(owner(app), ["faux/faux-2"]);
+        const id = await session("worker");
+
+        await command(id, "max 1 with faux/faux-2: scenario-worker; stop when never");
+        const goal = await settled(id);
+
+        assert.equal(goal.worker, "faux/faux-2");
+        assert.equal(goal.rounds[0]?.worker, "faux/faux-2");
+        assert.match(sectionRequest, /give execution to subagents on `faux\/faux-2`/);
+        assert.match(statusCard(goal, Date.now()), /Worker: faux\/faux-2/);
+
+        const plain = await session("worker-plain");
+
+        await command(plain, "max 1: scenario-worker; stop when never");
+        await settled(plain);
+        assert.doesNotMatch(sectionRequest, /give execution to subagents on/);
+    });
+
+    test("resume checks the allowed list again", async () => {
+        await app.setSubagentModels(owner(app), ["faux/faux-2"]);
+        const id = await session("worker-resume");
+
+        await command(id, "max 2 with faux/faux-2: scenario-blocked; stop when never");
+        const goal = await settled(id);
+
+        assert.equal(goal.worker, "faux/faux-2");
+        assert.equal(goal.reason, "blocked");
+
+        await app.setSubagentModels(owner(app), []);
+        refused(
+            await command(id, "resume"),
+            /faux\/faux-2 is not in the owner's allowed list for subagents\. Allowed: none\./,
+        );
+
+        await app.setSubagentModels(owner(app), ["faux/faux-2"]);
+    });
+});
+
 describe("check command and status together", () => {
     test("DONE ends it only when the check passes; the check runs only after DONE", async () => {
         const id = await session("check");
@@ -832,11 +1001,7 @@ describe("start", () => {
 
             assert.equal(goal.reason, "max-rounds");
             assert.equal(goal.round, 2);
-            assert.deepEqual(await sent(id), [
-                "Round 1",
-                "Round 2",
-                "The night shift has stopped",
-            ]);
+            assert.deepEqual(await sent(id), ["Round 1", "Round 2", "The night shift has stopped"]);
         } finally {
             shift = 0;
         }

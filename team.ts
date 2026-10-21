@@ -14,6 +14,7 @@ import {
     defineTool,
     section,
     type ConversationId,
+    type Tx,
 } from "@earendil-works/pi-durable";
 import type { Host, Web } from "./_pocket.d.ts";
 
@@ -512,6 +513,106 @@ export default function createTeam(host: Host, web: Web) {
     const taskText = (persona: Persona, message: string) =>
         `${identityText(persona)}\n\nTask from the source session:\n${message}`;
 
+    type DelegatedFields = {
+        objective: string;
+        stop_when: string;
+        start?: string;
+        until?: string;
+        for?: string;
+        max?: number;
+        worker?: string;
+    };
+
+    /** The `night_shift` argument: a goal for the linked session. It has no check command. */
+    type NightShiftArg = Omit<DelegatedFields, "objective"> & { objective?: string };
+
+    /** A night-shift goal as team.ts sets it and reads it back. */
+    type DelegatedGoal = {
+        objective: string;
+        stop: string;
+        maxRounds: number;
+        start?: number;
+        startLabel?: string;
+        startWhy?: "deepseek-peak";
+        deadline?: number;
+        deadlineLabel?: string;
+        worker?: string;
+    };
+
+    /**
+     * The night-shift module's API, from a global: team.ts must not import night-shift.ts. A static import would keep a
+     * stale copy after a reload, and a second copy of the driver task definition.
+     */
+    type NightShiftApi = {
+        version: number;
+        delegatedRequest: (
+            fields: DelegatedFields,
+            now: number,
+            zone: string,
+        ) => DelegatedGoal | { error: string };
+        setDelegated: (
+            tx: Tx,
+            conversationId: ConversationId,
+            request: DelegatedGoal,
+            who: { by: string; byName: string; supervisor: string },
+            key: string,
+        ) => Promise<DelegatedGoal>;
+        notifyChanged: (conversationId: ConversationId) => void;
+        standing: (goal: DelegatedGoal, now: number) => string;
+        zone: () => string;
+    };
+
+    const nightShiftApi = (): NightShiftApi | undefined =>
+        (globalThis as unknown as Record<symbol, NightShiftApi | undefined>)[
+            Symbol.for("pi-pocket-team.night-shift")
+        ];
+
+    /** The fields of a delegated night shift, checked: its options go through the night-shift parser. */
+    const shiftFor = (
+        fields: NightShiftArg,
+        task: string,
+        source: ConversationId,
+    ): { ns: NightShiftApi; request: DelegatedGoal; by: string } => {
+        const ns = nightShiftApi();
+
+        if (ns === undefined) {
+            throw new Error(
+                "The night-shift module is off. Brian turns it on in Menu → Extensions.",
+            );
+        }
+
+        const request = ns.delegatedRequest(
+            { ...fields, objective: fields.objective ?? task },
+            Date.now(),
+            ns.zone(),
+        );
+
+        if ("error" in request) {
+            throw new Error(request.error);
+        }
+
+        // Checked here, before the linked session starts, and again in the night-shift module's commit.
+        const allowed = host.subagentModels();
+
+        if (request.worker !== undefined && !allowed.includes(request.worker)) {
+            throw new Error(
+                `${request.worker} is not in the owner's allowed list for subagents. Allowed: ${allowed.join(", ") || "none"}.`,
+            );
+        }
+
+        const by = host.requesterOf(source);
+
+        if (by === undefined) {
+            throw new Error("A night shift needs the person it works for, and this call has none.");
+        }
+
+        return { ns, request, by };
+    };
+
+    /** The first message of a linked session that runs a night shift. */
+    const delegatedText = (persona: Persona, task: string, request: DelegatedGoal) =>
+        `${taskText(persona, task)}\n\nThis task runs as a night shift. Round 1 comes as a separate message that starts with [night-shift], ${request.startLabel === undefined ? "now" : `at ${request.startLabel}`}. Answer this message with one short line only, and do the work in the rounds. The night shift reports to the source session by itself when it stops: do not send a report with team_message.`;
+
     web.client("team-web");
     web.route("GET", "agents", async () => ({
         agents: await roster(directory),
@@ -761,7 +862,7 @@ export default function createTeam(host: Host, web: Web) {
     const delegate = defineTool({
         name: "team_delegate",
         description:
-            "Supervisor only: give a self-contained task to a named agent in their repository folder. Choose a repository from the roster if the agent owns more than one. Runs on the agent's profile model when the owner allows it for subagents, otherwise on your model (the roster shows each agent's model); thinking no higher than yours. Returns an address without waiting for completion.",
+            "Supervisor only: give a self-contained task to a named agent in their repository folder. Choose a repository from the roster if the agent owns more than one. Runs on the agent's profile model when the owner allows it for subagents, otherwise on your model (the roster shows each agent's model); thinking no higher than yours. Returns an address without waiting for completion. With night_shift, the linked session runs a night-shift goal in rounds, and its report comes back here by itself when it stops; a night shift has no check command.",
         parameters: Type.Object({
             agent: Type.String(),
             task: Type.String({ minLength: 1, maxLength: 6000 }),
@@ -771,13 +872,52 @@ export default function createTeam(host: Host, web: Web) {
                         "Owned repository name from the roster, e.g. frostyard/nsl. Omit when the agent has only one repository or a non-repository workspace.",
                 }),
             ),
+            night_shift: Type.Optional(
+                Type.Object({
+                    objective: Type.Optional(
+                        Type.String({
+                            maxLength: 3000,
+                            description:
+                                "What to work on; the task when omitted. Say the stop condition in stop_when, not here.",
+                        }),
+                    ),
+                    stop_when: Type.String({ minLength: 1, maxLength: 3000 }),
+                    start: Type.Optional(
+                        Type.String({
+                            description:
+                                "06:00 or 6am: round 1 waits until the next such time on the server clock, at most 24 hours ahead",
+                        }),
+                    ),
+                    until: Type.Optional(Type.String()),
+                    for: Type.Optional(
+                        Type.String({ description: "8h, 90m, 7h30m; counts from start" }),
+                    ),
+                    max: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
+                    worker: Type.Optional(
+                        Type.String({
+                            description:
+                                "provider/model for subagents, from the owner's allowed list for subagents, e.g. github-copilot/claude-sonnet-5.5",
+                        }),
+                    ),
+                }),
+            ),
         }),
         replay: "safe",
-        execute: async ({ agent, task, repository }, api, context) => {
+        execute: async (args, api, context) => {
+            const { agent, task, repository, night_shift } = args;
             const identity = await api.snapshot(Identity, api.conversationId, context);
+            const supervisor = identity?.persona?.name;
 
-            if (identity?.persona?.role !== "supervisor") {
+            if (identity?.persona?.role !== "supervisor" || supervisor === undefined) {
                 throw new Error("Only a session assigned a supervisor identity can delegate.");
+            }
+
+            // The check runs unasked, with the owner's rights, and Lancet Guard does not see it: only the owner sets one,
+            // with /night-shift in the session itself.
+            if (night_shift !== undefined && Object.hasOwn(night_shift, "check")) {
+                throw new Error(
+                    "A night shift from team_delegate cannot have a check command: the check does not go through Lancet Guard. Only Brian can set one, with /night-shift in the session.",
+                );
             }
 
             const persona = await find(agent);
@@ -786,6 +926,11 @@ export default function createTeam(host: Host, web: Web) {
             if (persona.role === "supervisor") {
                 throw new Error("Choose a specialist from the roster.");
             }
+
+            const shift =
+                night_shift === undefined
+                    ? undefined
+                    : shiftFor(night_shift, task, api.conversationId);
 
             // The owner's profile names the model, and the owner's allowed list permits it: neither is Pi's choice.
             // Not allowed: the source's model, as before, said in the result. Allowed but unusable now: core refuses
@@ -798,7 +943,10 @@ export default function createTeam(host: Host, web: Web) {
                     api.conversationId,
                     {
                         title: `${persona.name}: ${task.split("\n")[0]}`.slice(0, 120),
-                        message: taskText(persona, task),
+                        message:
+                            shift === undefined
+                                ? taskText(persona, task)
+                                : delegatedText(persona, task, shift.request),
                         ...(cwd === undefined ? {} : { cwd }),
                         ...(preferred === undefined ? {} : { model: preferred }),
                     },
@@ -810,12 +958,44 @@ export default function createTeam(host: Host, web: Web) {
                 );
             }
 
-            await api.commit(async (tx) => {
+            // The identity and the goal land in one durable step.
+            const goal = await api.commit(async (tx) => {
                 (await tx.doc(Identity, started.session as ConversationId)).persona ??= persona;
+
+                return shift === undefined
+                    ? undefined
+                    : shift.ns.setDelegated(
+                          tx,
+                          started.session as ConversationId,
+                          shift.request,
+                          {
+                              by: shift.by,
+                              byName: supervisor,
+                              supervisor,
+                          },
+                          `x.team.delegate:${api.taskId}:${api.callId}`,
+                      );
             }, context);
 
+            if (shift !== undefined) {
+                shift.ns.notifyChanged(started.session as ConversationId);
+            }
+
+            if (shift === undefined || goal === undefined) {
+                return reply(
+                    `Assigned to ${persona.name} at ${started.address}, on ${modelText(persona)}. Reports arrive when they send them; do not poll or acknowledge reports.`,
+                );
+            }
+
+            const begins =
+                goal.startLabel === undefined
+                    ? "round 1 starts now"
+                    : `round 1 starts at ${goal.startLabel}${goal.startWhy === "deepseek-peak" ? ", after DeepSeek's peak hours" : ""}`;
+            const ends =
+                goal.deadlineLabel === undefined ? "no deadline" : `until ${goal.deadlineLabel}`;
+
             return reply(
-                `Assigned to ${persona.name} at ${started.address}, on ${modelText(persona)}. Reports arrive when they send them; do not poll or acknowledge reports.`,
+                `Assigned to ${persona.name} at ${started.address}, on ${modelText(persona)}. Night shift set there: at most ${goal.maxRounds} rounds, ${begins}, ${ends}. Its report arrives here when it stops; do not poll. /night-shift status in that session shows it.`,
             );
         },
     });

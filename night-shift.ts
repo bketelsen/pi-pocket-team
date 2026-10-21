@@ -19,7 +19,7 @@
  * State is one document per conversation, `x.night-shift.goal`. It is stored data: never rename it or change what a
  * field means.
  */
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { Context } from "@earendil-works/chord";
 import { withAbortSignal } from "@earendil-works/chord/context";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
@@ -57,8 +57,12 @@ const KEPT_ROUNDS = 30;
 const MAX_ATTEMPTS = 3;
 /** How long an ended goal still shows in the status line. */
 const SHOW_ENDED_MS = 12 * 3600_000;
+/** How long the report to a delegated goal's supervisor session may be. */
+const MAX_REPORT = 8000;
 
 const PREFIX = "[night-shift]";
+/** Where another module finds this one's live API: a global, never an import. */
+const API = Symbol.for("pi-pocket-team.night-shift");
 
 // ─── Stored state ────────────────────────────────────────────────────────────
 
@@ -84,6 +88,8 @@ export type RoundRecord = {
     reason: string;
     at: number;
     check?: CheckResult;
+    /** The provider/model that executed this round's subagents, when the goal set one. */
+    worker?: string;
 };
 
 export type Goal = {
@@ -100,6 +106,10 @@ export type Goal = {
     start?: number;
     /** The start as the person reads it, such as "06:00 EDT". */
     startLabel?: string;
+    /** Why round 1 waits: DeepSeek's peak hours, unless the person gave a start. */
+    startWhy?: "deepseek-peak";
+    /** The provider/model that executes the work in subagents. */
+    worker?: string;
     by: string;
     byName: string;
     setAt: number;
@@ -116,6 +126,11 @@ export type Goal = {
     /** The task that drives the goal now; another task that finds this changed stops. */
     driver?: string;
     endedAt?: number;
+    /**
+     * Set by `team_delegate`: the goal belongs to a linked session, and when it stops the driver reports to the
+     * source session of that linked session.
+     */
+    delegated?: { supervisor: string };
 };
 
 export const GoalDoc = defineDoc<{ goal?: Goal }>({
@@ -154,6 +169,10 @@ export type GoalRequest = {
     start?: number;
     /** The start as the person reads it, such as "06:00 EDT". */
     startLabel?: string;
+    /** Why round 1 waits: DeepSeek's peak hours, unless the person gave a start. */
+    startWhy?: "deepseek-peak";
+    /** The provider/model that executes the work in subagents. */
+    worker?: string;
 };
 
 export type Parsed =
@@ -162,7 +181,7 @@ export type Parsed =
     | { kind: "error"; message: string };
 
 export const USAGE =
-    "/night-shift [start 06:00] [until 07:00 | for 8h] [max 30] [check `npm test`]: <objective>; stop when <condition>\n" +
+    "/night-shift [start 06:00] [until 07:00 | for 8h] [max 30] [with provider/model] [check `npm test`]: <objective>; stop when <condition>\n" +
     "/night-shift status | stop | resume";
 
 /** The wall-clock parts of `ms` in `zone`. */
@@ -236,6 +255,23 @@ export function nextClockTime(hour: number, minute: number, now: number, zone: s
     );
 }
 
+/** DeepSeek's peak hours in UTC: 01:00-04:00 and 06:00-10:00. The end of the window holding `now`, or undefined. */
+export function deepseekStart(now: number): number | undefined {
+    const at = new Date(now);
+    const hour = at.getUTCHours();
+    const day = Date.UTC(at.getUTCFullYear(), at.getUTCMonth(), at.getUTCDate());
+
+    if (hour >= 1 && hour < 4) {
+        return day + 4 * 3600_000;
+    }
+
+    if (hour >= 6 && hour < 10) {
+        return day + 10 * 3600_000;
+    }
+
+    return undefined;
+}
+
 /** A deadline as people read it: "07:00 EDT". */
 export function clockLabel(ms: number, zone: string): string {
     return new Intl.DateTimeFormat("en-US", {
@@ -273,31 +309,41 @@ const START = /^start\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?(?=[\s:]|$)/i;
 const FOR = /^for\s+(?:(\d+)\s*h(?:ours?)?)?\s*(?:(\d+)\s*m(?:in(?:utes?)?)?)?(?=[\s:]|$)/i;
 const MAX = /^max\s+(\d+)(?:\s+rounds?)?(?=[\s:]|$)/i;
 const CHECK = /^check\s+`([^`]*)`/i;
+// The model part may hold a colon, but not at its end: that colon is the separator before the objective.
+const WITH = /^with\s+([A-Za-z0-9._-]+\/[A-Za-z0-9._:-]*[A-Za-z0-9._-])(?=[\s:]|$)/i;
 const STOP_WHEN = /\bstop\s+(?:only\s+)?when\b/gi;
 
+/** What the options of `/night-shift` set, and the text after them. */
+export type GoalOptions = {
+    maxRounds?: number;
+    check?: string;
+    start?: number;
+    startLabel?: string;
+    startWhy?: "deepseek-peak";
+    deadline?: number;
+    deadlineLabel?: string;
+    worker?: string;
+    /** The text after the options: the objective and the stop condition, or the rest of a delegated field. */
+    rest: string;
+};
+
 /**
- * Parse what follows `/night-shift`. Options come first, in any order; then an optional `:`, then the objective and
- * the stop condition, split at the last "stop when" (or "stop only when").
+ * Parse the options before the objective: `start`, `until`, `for`, `max`, and `check`. Times resolve after the loop,
+ * so that the options can come in any order. `rest` is the text after them, unread here.
  */
-export function parseArgs(input: string, now: number, zone: string): Parsed {
-    const args = input.trim();
-    const word = args.toLowerCase();
-
-    if (word === "" || word === "help") {
-        return { kind: "help" };
-    }
-
-    if (word === "status" || word === "stop" || word === "resume") {
-        return { kind: word };
-    }
-
-    let rest = args;
+export function parseOptions(
+    input: string,
+    now: number,
+    zone: string,
+): GoalOptions | { error: string } {
+    let rest = input.trim();
     let maxRounds: number | undefined;
     let start: { hour: number; minute: number } | undefined;
     let until: { hour: number; minute: number } | undefined;
     let forMinutes: number | undefined;
     let check: string | undefined;
-    const error = (message: string): Parsed => ({ kind: "error", message });
+    let worker: string | undefined;
+    const error = (message: string): { error: string } => ({ error: message });
     const deadlineGiven = () => until !== undefined || forMinutes !== undefined;
 
     for (;;) {
@@ -356,6 +402,12 @@ export function parseArgs(input: string, now: number, zone: string): Parsed {
             if (check.length > MAX_COMMAND) {
                 return error(`A check command is limited to ${MAX_COMMAND} characters.`);
             }
+        } else if ((match = WITH.exec(rest)) !== null) {
+            if (worker !== undefined) {
+                return error("Give one worker.");
+            }
+
+            worker = match[1]!;
         } else {
             break;
         }
@@ -364,8 +416,18 @@ export function parseArgs(input: string, now: number, zone: string): Parsed {
     }
 
     // Times resolve here, after the loop, so that the options can come in any order.
-    const startAt =
+    let startAt =
         start === undefined ? undefined : nextClockTime(start.hour, start.minute, now, zone);
+    let startWhy: "deepseek-peak" | undefined;
+
+    // DeepSeek's peak hours delay round 1, unless a person gave a start. `for` and `until` count from it.
+    if (startAt === undefined && worker?.startsWith("deepseek/") === true) {
+        startAt = deepseekStart(now);
+
+        if (startAt !== undefined) {
+            startWhy = "deepseek-peak";
+        }
+    }
 
     // Across a daylight saving change a day has 25 hours: only then can this happen.
     if (startAt !== undefined && startAt - now > MAX_HOURS * 3600_000) {
@@ -386,12 +448,53 @@ export function parseArgs(input: string, now: number, zone: string): Parsed {
         );
     }
 
-    rest = rest.replace(/^\s*:/, "").trim();
+    return {
+        ...(maxRounds === undefined ? {} : { maxRounds }),
+        ...(check === undefined ? {} : { check }),
+        ...(worker === undefined ? {} : { worker }),
+        ...(startAt === undefined
+            ? {}
+            : {
+                  start: startAt,
+                  startLabel: clockLabel(startAt, zone),
+                  ...(startWhy === undefined ? {} : { startWhy }),
+              }),
+        ...(deadline === undefined ? {} : { deadline, deadlineLabel: clockLabel(deadline, zone) }),
+        rest,
+    };
+}
+
+/**
+ * Parse what follows `/night-shift`. Options come first, in any order; then an optional `:`, then the objective and
+ * the stop condition, split at the last "stop when" (or "stop only when").
+ */
+export function parseArgs(input: string, now: number, zone: string): Parsed {
+    const args = input.trim();
+    const word = args.toLowerCase();
+
+    if (word === "" || word === "help") {
+        return { kind: "help" };
+    }
+
+    if (word === "status" || word === "stop" || word === "resume") {
+        return { kind: word };
+    }
+
+    const options = parseOptions(args, now, zone);
+
+    if ("error" in options) {
+        return { kind: "error", message: options.error };
+    }
+
+    const rest = options.rest.replace(/^\s*:/, "").trim();
     const stops = [...rest.matchAll(STOP_WHEN)];
     const last = stops.at(-1);
 
     if (last === undefined) {
-        return error(`Say when to stop: "…; stop when <condition>".\n${USAGE}`);
+        return {
+            kind: "error",
+            message: `Say when to stop: "…; stop when <condition>".\n${USAGE}`,
+        };
     }
 
     const objective = rest
@@ -406,15 +509,18 @@ export function parseArgs(input: string, now: number, zone: string): Parsed {
         .trim();
 
     if (objective === "") {
-        return error(`Say what to do before "stop when".\n${USAGE}`);
+        return { kind: "error", message: `Say what to do before "stop when".\n${USAGE}` };
     }
 
     if (stop === "") {
-        return error(`Say the stop condition after "stop when".\n${USAGE}`);
+        return { kind: "error", message: `Say the stop condition after "stop when".\n${USAGE}` };
     }
 
     if (objective.length + stop.length > MAX_TEXT) {
-        return error(`The objective and the stop condition are limited to ${MAX_TEXT} characters.`);
+        return {
+            kind: "error",
+            message: `The objective and the stop condition are limited to ${MAX_TEXT} characters.`,
+        };
     }
 
     return {
@@ -422,15 +528,159 @@ export function parseArgs(input: string, now: number, zone: string): Parsed {
         goal: {
             objective,
             stop,
-            maxRounds: maxRounds ?? DEFAULT_ROUNDS,
-            ...(check === undefined ? {} : { check }),
-            ...(startAt === undefined
+            maxRounds: options.maxRounds ?? DEFAULT_ROUNDS,
+            ...(options.check === undefined ? {} : { check: options.check }),
+            ...(options.start === undefined
                 ? {}
-                : { start: startAt, startLabel: clockLabel(startAt, zone) }),
-            ...(deadline === undefined
+                : {
+                      start: options.start,
+                      startLabel: options.startLabel,
+                      ...(options.startWhy === undefined ? {} : { startWhy: options.startWhy }),
+                  }),
+            ...(options.deadline === undefined
                 ? {}
-                : { deadline, deadlineLabel: clockLabel(deadline, zone) }),
+                : { deadline: options.deadline, deadlineLabel: options.deadlineLabel }),
+            ...(options.worker === undefined ? {} : { worker: options.worker }),
         },
+    };
+}
+
+/** The fields of `night_shift` in the `team_delegate` tool. */
+export type DelegatedFields = {
+    objective: string;
+    stop_when: string;
+    start?: string;
+    until?: string;
+    for?: string;
+    max?: number;
+    worker?: string;
+};
+
+/** What one option alone accepts: its word, and the fields that only it can set. */
+const OPTION_ALONE = {
+    start: {
+        word: "a time, such as 06:00",
+        only: (options: GoalOptions) =>
+            options.start !== undefined &&
+            options.deadline === undefined &&
+            options.maxRounds === undefined,
+    },
+    until: {
+        word: "a time, such as 07:00",
+        only: (options: GoalOptions) =>
+            options.deadline !== undefined &&
+            options.start === undefined &&
+            options.maxRounds === undefined,
+    },
+    for: {
+        word: "a length of time, such as 8h",
+        only: (options: GoalOptions) =>
+            options.deadline !== undefined &&
+            options.start === undefined &&
+            options.maxRounds === undefined,
+    },
+} as const;
+
+/**
+ * The goal request for a night shift that `team_delegate` starts. Each option comes from its own field, so a field
+ * cannot carry a second option: the check never comes from this path (only the owner sets one, with `/night-shift`).
+ * The options combine here, so `until` after `start`, `for` from `start`, and one of `until`/`for` hold as usual.
+ */
+export function delegatedRequest(
+    fields: DelegatedFields,
+    now: number,
+    zone: string,
+): GoalRequest | { error: string } {
+    const objective = fields.objective.trim();
+    const stop = fields.stop_when.trim();
+
+    if (objective === "") {
+        return { error: `Say what to do before "stop when".\n${USAGE}` };
+    }
+
+    if (stop === "") {
+        return { error: `Say the stop condition after "stop when".\n${USAGE}` };
+    }
+
+    if (objective.length + stop.length > MAX_TEXT) {
+        return {
+            error: `The objective and the stop condition are limited to ${MAX_TEXT} characters.`,
+        };
+    }
+
+    const parts: string[] = [];
+
+    // The worker is one option too: no other option may travel in its field.
+    if (fields.worker !== undefined) {
+        const options = parseOptions(`with ${fields.worker}`, now, zone);
+
+        if (
+            "error" in options ||
+            options.rest !== "" ||
+            options.check !== undefined ||
+            options.deadline !== undefined ||
+            options.maxRounds !== undefined ||
+            options.worker !== fields.worker.trim()
+        ) {
+            return {
+                error: "night_shift.worker must be only a provider/model, such as github-copilot/claude-sonnet-5.5.",
+            };
+        }
+
+        parts.push(`with ${fields.worker.trim()}`);
+    }
+
+    for (const name of ["start", "until", "for"] as const) {
+        const text = fields[name];
+
+        if (text === undefined) {
+            continue;
+        }
+
+        const options = parseOptions(`${name} ${text}`, now, zone);
+
+        if (
+            "error" in options ||
+            options.rest !== "" ||
+            options.check !== undefined ||
+            !OPTION_ALONE[name].only(options)
+        ) {
+            return {
+                error: `night_shift.${name} must be only ${OPTION_ALONE[name].word}.`,
+            };
+        }
+
+        parts.push(`${name} ${text.trim()}`);
+    }
+
+    if (fields.max !== undefined) {
+        parts.push(`max ${fields.max}`);
+    }
+
+    const options = parseOptions(parts.join(" "), now, zone);
+
+    if ("error" in options || options.rest !== "" || options.check !== undefined) {
+        return {
+            error:
+                "error" in options ? options.error : "night_shift must not carry another option.",
+        };
+    }
+
+    return {
+        objective,
+        stop,
+        maxRounds: options.maxRounds ?? DEFAULT_ROUNDS,
+        ...(options.start === undefined
+            ? {}
+            : {
+                  start: options.start,
+                  startLabel: options.startLabel,
+                  ...(options.startWhy === undefined ? {} : { startWhy: options.startWhy }),
+              }),
+        ...(options.deadline === undefined
+            ? {}
+            : { deadline: options.deadline, deadlineLabel: options.deadlineLabel }),
+        ...(options.worker === undefined ? {} : { worker: options.worker }),
     };
 }
 
@@ -529,6 +779,35 @@ async function newestEntry(tx: Tx, id: ConversationId): Promise<number> {
     return Number(page.items[0]?.id ?? 0);
 }
 
+const LINKED_ADDRESS = /Message from linked session (session-[0-9a-f-]+)/;
+/**
+ * The source session's address in a linked session: the first `pi.user` entry is the message that started it, and it
+ * names the address to reply to. Undefined in a session that a person started.
+ */
+async function returnAddress(tx: Tx, id: ConversationId): Promise<string | undefined> {
+    let cursor: Parameters<Tx["scanEntries"]>[2];
+
+    do {
+        const page = await tx.scanEntries({ conversationId: id, order: "ascending" }, 200, cursor);
+
+        for (const entry of page.items) {
+            if (entry.kind !== "pi.user") {
+                continue;
+            }
+
+            const message = entry.model?.find((each) => each.role === "user");
+
+            return message === undefined
+                ? undefined
+                : LINKED_ADDRESS.exec(textOf(message.content))?.[1];
+        }
+
+        cursor = page.next;
+    } while (cursor !== undefined);
+
+    return undefined;
+}
+
 // ─── Words ───────────────────────────────────────────────────────────────────
 
 function left(ms: number): string {
@@ -588,11 +867,29 @@ export function roundMessage(goal: Goal, n: number, now: number): string {
 }
 
 export function summaryMessage(goal: Goal): string {
+    const rounds =
+        goal.worker === undefined
+            ? `It took ${goal.round} of ${goal.maxRounds} rounds.`
+            : `It took ${goal.round} of ${goal.maxRounds} rounds, with subagents on ${goal.worker}.`;
+
     return [
-        `${PREFIX} The night shift has stopped: ${goal.why}. It took ${goal.round} of ${goal.maxRounds} rounds.`,
+        `${PREFIX} The night shift has stopped: ${goal.why}. ${rounds}`,
         "Do not start new work. Write the summary for the morning, in three short parts: what you did, what is left, and why the work stopped.",
+        ...(goal.delegated === undefined
+            ? []
+            : [
+                  `Write it in ASD-STE100 (Simplified Technical English): it goes to ${goal.delegated.supervisor}.`,
+              ]),
         "Do not end with a STATUS line.",
     ].join("\n");
+}
+
+/** What a delegated goal sends back to the supervisor session of its linked session when it stops. */
+function reportMessage(goal: Goal, text: string): string {
+    const progress =
+        goal.worker === undefined ? "" : `\nRounds: ${goal.round}, worker: ${goal.worker}.`;
+
+    return `Night shift report from this linked session: stopped at round ${goal.round} of ${goal.maxRounds}: ${goal.why ?? "it stopped"}.${progress}\n\n${text}`;
 }
 
 const VERDICT_WORD: Record<Verdict, string> = {
@@ -647,6 +944,10 @@ export function standing(goal: Goal, now: number): string {
     if (waiting(goal, now)) {
         const then = goal.deadline === undefined ? "" : `, then until ${goal.deadlineLabel}`;
 
+        if (goal.startWhy === "deepseek-peak") {
+            return `waiting until ${goal.startLabel} (after DeepSeek's peak hours; ${left(goal.start! - now)} left)${then}`;
+        }
+
         return `waiting until ${goal.startLabel} (${left(goal.start! - now)})${then}`;
     }
 
@@ -672,6 +973,7 @@ export function statusCard(goal: Goal | undefined, now: number): string {
         `Objective: ${goal.objective}`,
         `Stop when: ${goal.stop}`,
         ...(goal.check === undefined ? [] : [`Check: ${goal.check}`]),
+        ...(goal.worker === undefined ? [] : [`Worker: ${goal.worker}`]),
         `Set by ${goal.byName}.`,
     ];
 
@@ -725,6 +1027,8 @@ export function goalView(goal: Goal | undefined, now: number) {
         objective: goal.objective,
         stop: goal.stop,
         check: goal.check ?? null,
+        worker: goal.worker ?? null,
+        startWhy: goal.startWhy ?? null,
         standing: standing(goal, now),
         card: statusCard(goal, now),
     };
@@ -738,7 +1042,8 @@ type DriverState =
     | { phase: "decide" }
     | { phase: "round"; n: number; attempt: number }
     | { phase: "check"; n: number }
-    | { phase: "summary"; attempt: number };
+    | { phase: "summary"; attempt: number }
+    | { phase: "report"; text: string };
 type Runtime = TaskRuntime<DriverInput, DriverState, null, object>;
 
 const finished = { status: "terminal", outcome: { status: "completed", result: null } } as const;
@@ -764,6 +1069,10 @@ const copy = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
 /** Keep the round records short: the newest ones. */
 function keep(goal: Goal, round: RoundRecord): void {
     const rounds = goal.rounds.filter((each) => each.n !== round.n);
+
+    if (goal.worker !== undefined) {
+        round.worker = goal.worker;
+    }
 
     rounds.push(round);
     goal.rounds = rounds.slice(-KEPT_ROUNDS);
@@ -797,8 +1106,26 @@ function stopWords(reason: StopReason, goal: Goal, detail = ""): string {
 /** Reasons that get a summary round: nobody is there to see why it stopped. */
 const SUMMARIZED = new Set<StopReason>(["done", "max-rounds", "deadline", "blocked"]);
 
+/** What `team.ts` uses: on `globalThis[Symbol.for("pi-pocket-team.night-shift")]`, so it finds the live version. */
+export type NightShiftApi = {
+    version: 1;
+    delegatedRequest: typeof delegatedRequest;
+    setDelegated: (
+        tx: Tx,
+        conversationId: ConversationId,
+        request: GoalRequest,
+        who: { by: string; byName: string; supervisor: string },
+        key: string,
+    ) => Promise<Goal>;
+    notifyChanged: (conversationId: ConversationId) => void;
+    standing: typeof standing;
+    zone: () => string;
+};
+
 export default function createNightShift(host: Host, web: Web) {
     const changed = (id: ConversationId) => web.send("changed", { conversation: Number(id) });
+    /** Tell a session's tabs that its goal changed: for another module that set the goal, after its commit. */
+    const notifyChanged = (id: ConversationId) => changed(id);
 
     /** Stop a goal in a commit's draft: with a summary round when nobody may be there, otherwise at once. */
     function stopIn(goal: Goal, reason: StopReason, detail: string, now: number) {
@@ -814,6 +1141,11 @@ export default function createNightShift(host: Host, web: Web) {
         goal.status = reason === "person" || reason === "plan" ? "paused" : "ended";
         goal.endedAt = now;
         delete goal.driver;
+
+        // A delegated goal has nobody in its session to read why it stopped: report to the supervisor session.
+        if (goal.delegated !== undefined) {
+            return next({ phase: "report", text: (goal.why ?? "").slice(0, MAX_REPORT) });
+        }
 
         return finished;
     }
@@ -1297,6 +1629,17 @@ export default function createNightShift(host: Host, web: Web) {
                         return next({ phase: "summary", attempt: attempt + 1 });
                     }
 
+                    // A delegated goal's report carries Pi's summary answer, or the reason in words.
+                    const answered =
+                        delivered !== undefined &&
+                        delivered.settled.status === "done" &&
+                        delivered.settled.type === "input"
+                            ? ((await tx.entry(AssistantEntry, delivered.settled.answer))
+                                  ?.model?.[0] as AssistantMessage | undefined)
+                            : undefined;
+                    const spoken = answered === undefined ? "" : textOf(answered.content).trim();
+                    const why = goal.why ?? "it stopped";
+
                     goal.status = "ended";
                     goal.endedAt = runtime.now();
                     delete goal.driver;
@@ -1305,9 +1648,57 @@ export default function createNightShift(host: Host, web: Web) {
                         goal.why = `${goal.why}; no summary: ${skip}`;
                     }
 
+                    if (goal.delegated !== undefined) {
+                        return next({
+                            phase: "report",
+                            text: (spoken === "" ? why : spoken).slice(0, MAX_REPORT),
+                        });
+                    }
+
                     return finished;
                 }, context);
                 changed(id);
+            },
+
+            /**
+             * Tell the supervisor session of a delegated goal that it stopped. The goal's driver is gone, so this does
+             * not use mine(). The send's key is the task's: a restart reruns the phase and sends only once.
+             */
+            report: async (task, runtime, context) => {
+                const id = runtime.conversationId;
+                const text = task.state.checkpoint.text;
+                const goal = (await runtime.snapshot(GoalDoc, id, context))?.goal;
+                const found: { address?: string } = {};
+
+                await runtime.commit(async (tx) => {
+                    found.address = await returnAddress(tx, id);
+
+                    return undefined;
+                }, context);
+
+                if (found.address === undefined) {
+                    host.notice(
+                        "warning",
+                        "The night shift could not report: this session has no source session.",
+                        id,
+                    );
+                } else if (goal !== undefined) {
+                    try {
+                        await host.linkedSessions.send(
+                            id,
+                            { to: found.address, message: reportMessage(goal, text) },
+                            `x.night-shift.report:${runtime.taskId}`,
+                        );
+                    } catch (error) {
+                        host.notice(
+                            "warning",
+                            `The night shift report did not go: ${(error as Error).message}`,
+                            id,
+                        );
+                    }
+                }
+
+                await runtime.commit(() => finished, context);
             },
         },
         abort: (_task, runtime, context) =>
@@ -1342,15 +1733,28 @@ export default function createNightShift(host: Host, web: Web) {
         return (await ctx.snapshot(GoalDoc, ctx.conversationId, ctx.context))?.goal;
     }
 
+    /** Why a worker may not be used, or undefined when the owner's allowed list for subagents holds it. */
+    function workerProblem(worker: string | undefined): string | undefined {
+        if (worker === undefined) {
+            return undefined;
+        }
+
+        const allowed = host.subagentModels();
+
+        return allowed.includes(worker)
+            ? undefined
+            : `${worker} is not in the owner's allowed list for subagents. Allowed: ${allowed.join(", ") || "none"}.`;
+    }
+
     /** Start (or go on with) a goal's driver, in a commit. */
-    async function drive(tx: Tx, ctx: CommandContext, goal: Goal): Promise<void> {
-        goal.seen = await newestEntry(tx, ctx.conversationId);
+    async function drive(tx: Tx, id: ConversationId, goal: Goal): Promise<void> {
+        goal.seen = await newestEntry(tx, id);
         const task = await tx.createTask(
             Driver,
             { goalId: goal.id },
             {
                 ownership: { kind: "conversation" },
-                conversationId: ctx.conversationId,
+                conversationId: id,
                 background: true,
             },
         );
@@ -1358,7 +1762,81 @@ export default function createNightShift(host: Host, web: Web) {
         goal.driver = String(task);
     }
 
+    /**
+     * Set a goal for a session that `team_delegate` started, in the caller's commit: the identity and the goal land in
+     * one durable step. The key names the goal, so a call that runs again finds it instead of setting a second one.
+     */
+    async function setDelegated(
+        tx: Tx,
+        id: ConversationId,
+        request: GoalRequest,
+        who: { by: string; byName: string; supervisor: string },
+        key: string,
+    ): Promise<Goal> {
+        const doc = await tx.doc(GoalDoc, id);
+        const goalId = createHash("sha256").update(key).digest("hex").slice(0, 8);
+
+        // The same key is the same goal: a replay adds no second goal and no second driver.
+        if (doc.goal?.id === goalId) {
+            return copy(doc.goal);
+        }
+
+        if (doc.goal?.status === "running" || doc.goal?.status === "summary") {
+            throw new Error("A night shift runs here. /night-shift stop ends it first.");
+        }
+
+        const unallowed = workerProblem(request.worker);
+
+        if (unallowed !== undefined) {
+            throw new Error(unallowed);
+        }
+
+        let plan = false;
+
+        try {
+            plan = (await tx.doc(PlanMode, id)).on === true;
+        } catch {
+            plan = false;
+        }
+
+        if (plan) {
+            throw new Error(
+                "Plan mode is on. Turn it off first: a night shift works, it does not plan.",
+            );
+        }
+
+        const held = host.heldBack(id);
+
+        if (held !== undefined) {
+            throw new Error(`Pi cannot start: ${held}.`);
+        }
+
+        const goal: Goal = {
+            id: goalId,
+            ...request,
+            by: who.by,
+            byName: who.byName,
+            setAt: Date.now(),
+            status: "running",
+            round: 0,
+            seen: 0,
+            rounds: [],
+            delegated: { supervisor: who.supervisor },
+        };
+
+        await drive(tx, id, goal);
+        doc.goal = goal;
+
+        return copy(goal);
+    }
+
     async function set(request: GoalRequest, ctx: CommandContext) {
+        const unallowed = workerProblem(request.worker);
+
+        if (unallowed !== undefined) {
+            throw web.error(409, unallowed);
+        }
+
         if (request.check !== undefined && ctx.user.role !== "owner") {
             // The check runs unasked after Pi's DONE, with the owner's rights; Lancet Guard does not see it, as it does
             // not see the owner's own `!` commands. So only the owner may set one.
@@ -1400,7 +1878,7 @@ export default function createNightShift(host: Host, web: Web) {
                 rounds: [],
             };
 
-            await drive(tx, ctx, goal);
+            await drive(tx, ctx.conversationId, goal);
             doc.goal = goal;
 
             return copy(goal);
@@ -1411,12 +1889,61 @@ export default function createNightShift(host: Host, web: Web) {
         const begins =
             goal.start === undefined
                 ? "Round 1 starts now."
-                : `Round 1 starts at ${goal.startLabel}.`;
+                : `Round 1 starts at ${goal.startLabel}${goal.startWhy === "deepseek-peak" ? ", after DeepSeek's peak hours" : ""}.`;
 
         return {
             type: "card" as const,
             output: `Night shift set. ${begins}\n${statusCard(goal, Date.now())}`,
         };
+    }
+
+    /**
+     * Tell the supervisor session that a person stopped its delegated goal: best effort, once for this goal and round.
+     */
+    async function reportFromCommand(ctx: CommandContext, goal: Goal): Promise<void> {
+        let address: string | undefined;
+
+        try {
+            address = await ctx.commit(async (tx) => returnAddress(tx, ctx.conversationId));
+        } catch (error) {
+            host.notice(
+                "warning",
+                `The night shift report did not go: ${(error as Error).message}`,
+                ctx.conversationId,
+            );
+
+            return;
+        }
+
+        if (address === undefined) {
+            host.notice(
+                "warning",
+                "The night shift could not report: this session has no source session.",
+                ctx.conversationId,
+            );
+
+            return;
+        }
+
+        try {
+            await host.linkedSessions.send(
+                ctx.conversationId,
+                {
+                    to: address,
+                    message: reportMessage(
+                        goal,
+                        `${ctx.user.name} stopped it with /night-shift stop.`,
+                    ),
+                },
+                `x.night-shift.report:stop:${goal.id}:${goal.round}`,
+            );
+        } catch (error) {
+            host.notice(
+                "warning",
+                `The night shift report did not go: ${(error as Error).message}`,
+                ctx.conversationId,
+            );
+        }
     }
 
     async function stop(ctx: CommandContext) {
@@ -1447,6 +1974,10 @@ export default function createNightShift(host: Host, web: Web) {
 
         changed(ctx.conversationId);
 
+        if (goal.delegated !== undefined) {
+            await reportFromCommand(ctx, goal);
+        }
+
         if (goal.round === 0) {
             return {
                 type: "card" as const,
@@ -1462,6 +1993,11 @@ export default function createNightShift(host: Host, web: Web) {
 
     async function resume(ctx: CommandContext) {
         const before = await current(ctx);
+        const unallowed = workerProblem(before?.worker);
+
+        if (unallowed !== undefined) {
+            throw web.error(409, unallowed);
+        }
 
         if (before?.check !== undefined && ctx.user.role !== "owner") {
             throw web.error(403, "Only the owner can resume a night shift with a check command.");
@@ -1505,7 +2041,7 @@ export default function createNightShift(host: Host, web: Web) {
             }
 
             // Reads before writes: a commit reads its tables before it writes one.
-            await drive(tx, ctx, goal);
+            await drive(tx, ctx.conversationId, goal);
             goal.status = "running";
             delete goal.reason;
             delete goal.why;
@@ -1525,7 +2061,7 @@ export default function createNightShift(host: Host, web: Web) {
     web.command("night-shift", {
         description:
             "Pi works on an objective in rounds until a stop condition, a round limit, or a deadline",
-        args: "[start 06:00] [until 07:00] [max 30] [check `cmd`]: <objective>; stop when <condition> | status | stop | resume",
+        args: "[start 06:00] [until 07:00] [max 30] [with provider/model] [check `cmd`]: <objective>; stop when <condition> | status | stop | resume",
         scope: "conversation",
         handler: async (args, ctx) => {
             const parsed = parseArgs(args, Date.now(), zone());
@@ -1540,7 +2076,9 @@ export default function createNightShift(host: Host, web: Web) {
                             USAGE,
                             "Example: /night-shift until 07:00 max 30: migrate the API to v2; stop when all tests pass and the PR is open",
                             "Example: /night-shift start 06:00 until 17:00 max 40: <objective>; stop when <condition>",
+                            "Example: /night-shift with github-copilot/claude-sonnet-5.5 until 07:00 max 25: <objective>; stop when <condition>",
                             "`for` counts from `start` when it is given, else from now.",
+                            "`with provider/model`: run the work in subagents on that model. It must be in Providers → Models for subagents. With `with deepseek/…` and no start, round 1 waits for the end of DeepSeek's peak hours (01:00–04:00 and 06:00–10:00 UTC).",
                         ].join("\n"),
                     };
                 case "status":
@@ -1573,6 +2111,24 @@ export default function createNightShift(host: Host, web: Web) {
 
     // ─── The extension: the prompt section and the driver ───────────────────
 
+    // Another module finds this version here. A new version sets its own before the old one's cleanup runs.
+    const api: NightShiftApi = {
+        version: 1,
+        delegatedRequest,
+        setDelegated,
+        notifyChanged,
+        standing,
+        zone,
+    };
+    const shared = globalThis as unknown as Record<symbol, NightShiftApi | undefined>;
+
+    shared[API] = api;
+    web.onDispose(() => {
+        if (shared[API] === api) {
+            delete shared[API];
+        }
+    });
+
     return defineExtension({
         name: "night-shift",
         sections: [
@@ -1596,6 +2152,11 @@ export default function createNightShift(host: Host, web: Web) {
                     `<objective>\n${host.text.defang(goal.objective)}\n</objective>`,
                     `<stop-condition>\n${host.text.defang(goal.stop)}\n</stop-condition>`,
                     `Limits: ${limits}.`,
+                    ...(goal.worker === undefined
+                        ? []
+                        : [
+                              `For this goal, give execution to subagents on \`${goal.worker}\`. This replaces the DeepSeek Flash rule for this goal. If \`${goal.worker}\` cannot be used, end with STATUS: BLOCKED. Do not pick another model.`,
+                          ]),
                     "End every answer in a round with one status line, the last line of the answer:",
                     "STATUS: DONE: <why the stop condition holds>",
                     "STATUS: CONTINUE: <what is left>",
