@@ -55,8 +55,12 @@ test("drop-in identities, named delegation, HTTP permissions, replay and restart
     cpSync(join(import.meta.dirname, "team.ts"), join(dropIns, "team.ts"));
     cpSync(join(import.meta.dirname, "team-web"), join(dropIns, "team-web"), { recursive: true });
     let requestContext = "";
+    let rosterContext = "";
     const model = scriptedModel((ctx) => {
         requestContext = JSON.stringify(ctx);
+        if (requestContext.includes("Named teammates:")) {
+            rosterContext = requestContext;
+        }
         const { text, role } = lastText(ctx as never);
 
         if (role === "user" && text.endsWith("delegate test")) {
@@ -210,20 +214,50 @@ test("drop-in identities, named delegation, HTTP permissions, replay and restart
             "specialist report delivered to supervisor",
         );
         await until(() => !app.isBusy(id), "supervisor received the report");
-        const before = (await call(`session/${id}`)).data.linked.length;
+        type Linked = { conversationId: string; title?: string; cwd?: string };
+        // Delegate once, and return the new session with the model it runs on.
+        async function delegateOnce() {
+            const seen = new Set(
+                (await call(`session/${id}`)).data.linked.map((s: Linked) => s.conversationId),
+            );
 
-        await say(app, id, "delegate test");
-        await until(
-            async () => (await call(`session/${id}`)).data.linked.length > before,
-            "named delegation",
+            await say(app, id, "delegate test");
+            await until(
+                async () =>
+                    (await call(`session/${id}`)).data.linked.some(
+                        (s: Linked) => !seen.has(s.conversationId),
+                    ),
+                "named delegation",
+            );
+            const delegated = (await call(`session/${id}`)).data.linked.find(
+                (s: Linked) => !seen.has(s.conversationId),
+            ) as Linked;
+
+            assert(delegated.title?.startsWith("Duncan Idaho:"));
+            assert.equal(delegated.cwd, repoB, "Odrade's tool uses Duncan's selected repository.");
+            await until(() => !app.isBusy(delegated.conversationId), "delegated task settled");
+            await until(() => !app.isBusy(id), "supervisor settled");
+            const runs = (await app.agentState(delegated.conversationId))?.model;
+
+            return `${runs?.provider}/${runs?.modelId}`;
+        }
+
+        // Duncan's profile model is not in the owner's allowed list: he runs on Odrade's model, and the result says so.
+        assert.match(
+            rosterContext,
+            /Model: your model \(faux\/faux-2 is not allowed for subagents\)/,
         );
-        const linked = (await call(`session/${id}`)).data.linked;
+        assert.equal(await delegateOnce(), "faux/faux-1");
+        assert.match(
+            (await modelTexts(app, id)).join("\n"),
+            /on your model \(faux\/faux-2 is not allowed for subagents\)/,
+        );
 
-        assert(linked.some((s: { title?: string }) => s.title?.startsWith("Duncan Idaho:")));
-        const delegated = linked.find((s: { cwd?: string }) => s.cwd === repoB);
-
-        assert(delegated, "Odrade's tool creates the task in Duncan's selected repository.");
-        await until(() => !app.isBusy(delegated.conversationId), "delegated task settled");
+        // The owner allows it: delegation runs Duncan on his profile model, and the roster says so.
+        await app.setSubagentModels(owner(app), ["faux/faux-2"]);
+        assert.equal(await delegateOnce(), "faux/faux-2");
+        assert.match((await modelTexts(app, id)).join("\n"), /, on faux\/faux-2\./);
+        assert.match(rosterContext, /Model: faux\/faux-2\\n/);
         assert.equal(app.cwdOf(id), work);
         // A specialist can't create a second layer of agents.
         await say(app, child, "delegate test");

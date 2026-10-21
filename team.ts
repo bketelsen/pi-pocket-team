@@ -750,10 +750,18 @@ export default function createTeam(host: Host, web: Web) {
         },
     });
 
+    // The profile model, only when the owner's allowed list for subagents has it.
+    const allowedModel = (persona: Persona) =>
+        persona.model && host.subagentModels().includes(persona.model) ? persona.model : undefined;
+    const modelText = (persona: Persona) =>
+        allowedModel(persona) ??
+        (persona.model
+            ? `your model (${persona.model} is not allowed for subagents)`
+            : "your model (no profile model)");
     const delegate = defineTool({
         name: "team_delegate",
         description:
-            "Supervisor only: give a self-contained task to a named agent in their repository folder. Choose a repository from the roster if the agent owns more than one. Inherits your model and thinking. Returns an address without waiting for completion.",
+            "Supervisor only: give a self-contained task to a named agent in their repository folder. Choose a repository from the roster if the agent owns more than one. Runs on the agent's profile model when the owner allows it for subagents, otherwise on your model (the roster shows each agent's model); thinking no higher than yours. Returns an address without waiting for completion.",
         parameters: Type.Object({
             agent: Type.String(),
             task: Type.String({ minLength: 1, maxLength: 6000 }),
@@ -779,22 +787,35 @@ export default function createTeam(host: Host, web: Web) {
                 throw new Error("Choose a specialist from the roster.");
             }
 
-            const started = await host.linkedSessions.start(
-                api.conversationId,
-                {
-                    title: `${persona.name}: ${task.split("\n")[0]}`.slice(0, 120),
-                    message: taskText(persona, task),
-                    ...(cwd === undefined ? {} : { cwd }),
-                },
-                `x.team.delegate:${api.taskId}:${api.callId}`,
-            );
+            // The owner's profile names the model, and the owner's allowed list permits it: neither is Pi's choice.
+            // Not allowed: the source's model, as before, said in the result. Allowed but unusable now: core refuses
+            // the start, and Pi is told not to try another model.
+            const preferred = allowedModel(persona);
+            let started: Awaited<ReturnType<typeof host.linkedSessions.start>>;
+
+            try {
+                started = await host.linkedSessions.start(
+                    api.conversationId,
+                    {
+                        title: `${persona.name}: ${task.split("\n")[0]}`.slice(0, 120),
+                        message: taskText(persona, task),
+                        ...(cwd === undefined ? {} : { cwd }),
+                        ...(preferred === undefined ? {} : { model: preferred }),
+                    },
+                    `x.team.delegate:${api.taskId}:${api.callId}`,
+                );
+            } catch (error) {
+                throw new Error(
+                    `${(error as Error).message} Do not delegate on another model: stop and tell the user.`,
+                );
+            }
 
             await api.commit(async (tx) => {
                 (await tx.doc(Identity, started.session as ConversationId)).persona ??= persona;
             }, context);
 
             return reply(
-                `Assigned to ${persona.name} at ${started.address}. Reports arrive when they send them; do not poll or acknowledge reports.`,
+                `Assigned to ${persona.name} at ${started.address}, on ${modelText(persona)}. Reports arrive when they send them; do not poll or acknowledge reports.`,
             );
         },
     });
@@ -1020,7 +1041,7 @@ export default function createTeam(host: Host, web: Web) {
                             .map(([name, folder]) => `  ${name}: ${folder}`)
                             .join("\n");
 
-                        return `${a.id}: ${a.name}\n${folders || `  Workspace: ${a.workspace ?? "source session folder"}`}${responsibilities ? `\n${responsibilities}` : ""}`;
+                        return `${a.id}: ${a.name}\n${folders || `  Workspace: ${a.workspace ?? "source session folder"}`}\n  Model: ${modelText(a)}${responsibilities ? `\n${responsibilities}` : ""}`;
                     });
 
                 const lessons = lessonsOf(
@@ -1031,7 +1052,7 @@ export default function createTeam(host: Host, web: Web) {
                 return (
                     identityText(identity.persona) +
                     (members.length
-                        ? `\n\nNamed teammates:\n${members.join("\n")}\nDelegation inherits your model; agent preferences are shown in the Team panel.`
+                        ? `\n\nNamed teammates:\n${members.join("\n")}\nDelegation runs each agent on its profile model when the owner allows that model for subagents, otherwise on your model.`
                         : "") +
                     `\n\n${lessonsText(identity.persona, lessons, (text) => host.text.defang(text))}`
                 );
