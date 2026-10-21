@@ -121,7 +121,7 @@ ${
         : "Do your assigned work directly. For a linked task, report the result once with team_message to the return address in its initial message."
 }`;
 
-const reply = (text: string) => ({ content: [{ type: "text" as const, text }] });
+const reply = (text: string) => ({ output: [{ type: "text" as const, text }] });
 
 // ─── Agent memory ────────────────────────────────────────────────────────────
 //
@@ -487,6 +487,9 @@ function lessonsText(
 const listed = (lesson: Lesson) =>
     `[${lesson.id}] ${flat(lesson.text)}${lesson.pending === true ? " (waiting for the owner's approval)" : lesson.proposal?.forget === true ? " (forgetting it waits for the owner's approval)" : lesson.proposal?.text !== undefined ? " (new text waits for the owner's approval)" : ""}`;
 const WAITS = "it waits for the owner's approval in the Team panel";
+
+// Its tools return `output`, so it needs version 2 of the extension API (Pi Pocket 0.19.0).
+export const pocketApi = 2;
 
 export default function createTeam(host: Host, web: Web) {
     if (typeof web.conversationRoute !== "function") {
