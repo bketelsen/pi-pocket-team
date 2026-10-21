@@ -28,6 +28,9 @@ import {
     parseArgs,
     parseVerdict,
     personOf,
+    standing,
+    statusCard,
+    waiting,
 } from "./night-shift.ts";
 import { statusItem } from "./night-shift-web/index.js";
 
@@ -130,6 +133,106 @@ describe("parsing", () => {
         );
     });
 
+    test("start: round 1 waits for a clock time, and the options come in any order", () => {
+        const parsed = parseArgs("start 06:00 until 17:00 max 40: a; stop when b", now, ZONE);
+
+        assert(parsed.kind === "set");
+        assert.equal(parsed.goal.start, Date.UTC(2026, 9, 22, 10, 0));
+        assert.equal(parsed.goal.startLabel, "06:00 EDT");
+        assert.equal(parsed.goal.deadline, Date.UTC(2026, 9, 22, 21, 0));
+        assert.equal(parsed.goal.maxRounds, 40);
+
+        const anyOrder = parseArgs("max 40 until 17:00 start 6am: a; stop when b", now, ZONE);
+
+        assert(anyOrder.kind === "set");
+        assert.deepEqual(anyOrder.goal, parsed.goal);
+    });
+
+    test("start: `for` counts from start, and the mistakes", () => {
+        const start = Date.UTC(2026, 9, 22, 10, 0);
+        const eight = parseArgs("start 06:00 for 8h: a; stop when b", now, ZONE);
+
+        assert(eight.kind === "set");
+        assert.equal(eight.goal.start, start);
+        assert.equal(eight.goal.deadline, start + 8 * 3600_000);
+        assert.equal(parseArgs("start 06:00 for 24h: a; stop when b", now, ZONE).kind, "set");
+
+        const mistakes: [string, RegExp][] = [
+            ["start 06:00 until 05:00: a; stop when b", /not after start 06:00 EDT/],
+            ["start 06:00 start 07:00: a; stop when b", /one start time/],
+            ["start 25:00: a; stop when b", /not a time/],
+            ["start 13pm: a; stop when b", /not a time/],
+            ["start 06:00 for 25h: a; stop when b", /1 minute to 24 hours/],
+        ];
+
+        for (const [args, message] of mistakes) {
+            const parsed = parseArgs(args, now, ZONE);
+
+            assert.equal(parsed.kind, "error", args);
+            assert(parsed.kind === "error");
+            assert.match(parsed.message, message, args);
+        }
+    });
+
+    test("start: a daylight saving change, and the 24-hour limit", () => {
+        // 2026-10-31 23:00 EDT; 2026-11-01 06:00 is EST (UTC-5).
+        const dst = parseArgs(
+            "start 06:00 for 2h: a; stop when b",
+            Date.UTC(2026, 10, 1, 3, 0),
+            ZONE,
+        );
+
+        assert(dst.kind === "set");
+        assert.equal(dst.goal.start, Date.UTC(2026, 10, 1, 11, 0));
+        assert.equal(dst.goal.startLabel, "06:00 EST");
+        assert.equal(dst.goal.deadline, Date.UTC(2026, 10, 1, 13, 0));
+
+        // 2026-11-01 00:30 EDT: the next 00:15 is 24h45m away.
+        const far = parseArgs("start 00:15: a; stop when b", Date.UTC(2026, 10, 1, 4, 30), ZONE);
+
+        assert(far.kind === "error");
+        assert.match(far.message, /at most 24 hours/);
+    });
+
+    test("a waiting goal's words", () => {
+        const goal: Goal = {
+            id: "wait",
+            objective: "a",
+            stop: "b",
+            maxRounds: 40,
+            start: Date.UTC(2026, 9, 22, 10, 0),
+            startLabel: "06:00 EDT",
+            deadline: Date.UTC(2026, 9, 22, 21, 0),
+            deadlineLabel: "17:00 EDT",
+            by: "u1",
+            byName: "Brian",
+            setAt: now,
+            status: "running",
+            round: 0,
+            seen: 0,
+            rounds: [],
+        };
+
+        assert.equal(waiting(goal, now), true);
+        assert.equal(
+            standing(goal, now),
+            "waiting until 06:00 EDT (6h 30m), then until 17:00 EDT",
+        );
+        assert.match(standing(goal, now), /waiting until 06:00 EDT/);
+        assert.match(statusCard(goal, now), /waiting until 06:00 EDT/);
+        assert.match(statusCard(goal, now), /stop cancels it/);
+        assert.equal(
+            statusItem({
+                status: "running",
+                waiting: true,
+                startLabel: "06:00 EDT",
+                round: 0,
+                maxRounds: 40,
+            }).text,
+            "Night shift waiting until 06:00 EDT",
+        );
+    });
+
     test("Pi's status line, and whose a message is", () => {
         assert.deepEqual(parseVerdict("Did it.\n\nSTATUS: DONE: tests pass"), {
             verdict: "done",
@@ -178,6 +281,8 @@ let shift = 0;
 const gates = new Map<string, () => void>();
 /** The rounds whose requests carried the night-shift prompt section, as "scenario n". */
 const sectioned = new Set<string>();
+/** Whether a request that is not a round carried the prompt section: it must not, before round 1. */
+let sectionBeforeRound = false;
 
 function gate(name: string): Promise<void> {
     return new Promise((resolve) => gates.set(name, resolve));
@@ -207,6 +312,10 @@ const route: FauxResponseStep = async (request, options) => {
 
     const round = /^\[night-shift\] Round (\d+) of/.exec(text);
     const scenario = /Objective: (scenario-[a-z-]+)/.exec(text)?.[1];
+
+    if (round === null && JSON.stringify(request).includes("This session runs a night shift")) {
+        sectionBeforeRound = true;
+    }
 
     if (round === null || scenario === undefined) {
         return say(`echo: ${text.slice(0, 40)}`);
@@ -373,6 +482,25 @@ async function sent(id: ConversationId): Promise<string[]> {
         .filter((text) => text.includes("[night-shift]"))
         .map((text) => /\[night-shift\] (Round \d+|The night shift has stopped)/.exec(text)![1]!)
         .reverse();
+}
+
+/** The server's clock in ZONE, 3 hours from now, as "HH:MM"; and that time as epoch ms. */
+function soon(): { hhmm: string; start: number } {
+    const at = Date.now() + 3 * 3600_000;
+    const parts = new Intl.DateTimeFormat("en-US", {
+        timeZone: ZONE,
+        hourCycle: "h23",
+        hour: "2-digit",
+        minute: "2-digit",
+    }).formatToParts(at);
+    const get = (type: string) => Number(parts.find((part) => part.type === type)?.value);
+    const hour = get("hour");
+    const minute = get("minute");
+
+    return {
+        hhmm: `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`,
+        start: nextClockTime(hour, minute, Date.now(), ZONE),
+    };
 }
 
 describe("stop reasons", () => {
@@ -637,5 +765,98 @@ describe("restarts", () => {
         const view = await (await app.harness.conversation(id, context))!.context(context);
 
         assert.match(JSON.stringify(view.messages), /was cut off by a server restart/);
+    });
+});
+
+describe("start", () => {
+    test("a restart during the wait starts round 1 once, at start", async () => {
+        const id = await session("waits");
+        const { hhmm, start } = soon();
+        const card = await command(id, `start ${hhmm} max 2: scenario-wait; stop when never`);
+
+        try {
+            assert.match(JSON.stringify(card), /Round 1 starts at/);
+
+            let goal = (await goalOf(id))!;
+
+            assert.equal(goal.status, "running");
+            assert.equal(goal.round, 0);
+            assert.deepEqual(await sent(id), []);
+            assert.equal(await drivers(id), 1);
+            assert.match(JSON.stringify(await command(id, "status")), /waiting until/);
+
+            // A person writes during the wait: no pause, and no round.
+            sectionBeforeRound = false;
+            await app.commands.submit(id, owner(app), {
+                text: "still up",
+                requestId: crypto.randomUUID(),
+            });
+            await until(
+                async () => {
+                    const page = await (await app.harness.conversation(id, context))!.entries(
+                        {},
+                        500,
+                        undefined,
+                        context,
+                    );
+
+                    return page.items.some(
+                        (entry) =>
+                            entry.kind === "pi.assistant" &&
+                            JSON.stringify(entry.model ?? "").includes("still up"),
+                    );
+                },
+                "Pi's answer",
+                20_000,
+            );
+
+            assert.equal(sectionBeforeRound, false);
+            goal = (await goalOf(id))!;
+            assert.equal(goal.status, "running");
+            assert.equal(goal.round, 0);
+
+            // A restart before start sleeps again: no round.
+            await app.close();
+            app = await openApp(model, dataDir, () => Date.now() + shift);
+            await until(async () => (await drivers(id)) === 1, "the driver to come back", 20_000);
+            await new Promise((resolve) => setTimeout(resolve, 1500));
+            assert.deepEqual(await sent(id), []);
+            assert.equal(await drivers(id), 1);
+            assert.equal((await goalOf(id))!.round, 0);
+
+            // A restart past start: round 1 at once, and no pause for the message written during the wait.
+            await app.close();
+            shift = start - Date.now() + 60_000;
+            app = await openApp(model, dataDir, () => Date.now() + shift);
+            goal = await settled(id);
+
+            assert.equal(goal.reason, "max-rounds");
+            assert.equal(goal.round, 2);
+            assert.deepEqual(await sent(id), [
+                "Round 1",
+                "Round 2",
+                "The night shift has stopped",
+            ]);
+        } finally {
+            shift = 0;
+        }
+    });
+
+    test("/night-shift stop cancels a waiting goal", async () => {
+        const id = await session("cancel-wait");
+        const { hhmm } = soon();
+
+        await command(id, `start ${hhmm} max 2: scenario-wait; stop when never`);
+        // Let the driver reach its sleep and its watch.
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        const card = await command(id, "stop");
+
+        assert.match(JSON.stringify(card), /cancelled/);
+        await until(async () => (await drivers(id)) === 0, "the waiting driver to end", 10_000);
+        const goal = (await goalOf(id))!;
+
+        assert.equal(goal.status, "ended");
+        assert.equal(goal.reason, "stopped");
+        assert.deepEqual(await sent(id), []);
     });
 });

@@ -131,12 +131,13 @@ The wiki's content belongs to Bellonda; this module only renders it.
 ## Commands
 
 ```text
-/night-shift [until 07:00 | for 8h] [max 30] [check `npm test`]: <objective>; stop when <condition>
+/night-shift [start 06:00] [until 07:00 | for 8h] [max 30] [check `npm test`]: <objective>; stop when <condition>
 /night-shift status | stop | resume
 ```
 
 - Options come first, in any order, then an optional `:`, then the objective. The text splits at the last "stop when" (or "stop only when").
-- `until 07:00` (also `7am`, `11:45pm`) is the next time the server's clock (America/New_York) shows it, so at most 24 hours away. `for 8h`, `for 90m`, `for 7h30m`: from now, up to 24 hours. Give one or neither.
+- `start 06:00` (also `6am`): round 1 waits until the next time the server's clock (America/New_York) shows it. At most 24 hours away. Without it, round 1 starts at once.
+- `until 07:00` (also `7am`, `11:45pm`) is the next time the server's clock shows it, so at most 24 hours away. `for 8h`, `for 90m`, `for 7h30m`: from `start` when it is given, else from now, up to 24 hours. Give one or neither; `until` must be after `start`.
 - `max N`: rounds, 1 to 100. Default 20.
 - `` check `cmd` ``: runs in the session's folder after Pi says DONE; it must pass too. Owner only (see Lancet Guard below).
 - `status` shows the goal and its last rounds as a card. `stop` ends it after the round that runs (Stop ends that round now). `resume` goes on with a paused or stopped goal while rounds and time are left.
@@ -145,13 +146,20 @@ Examples:
 
 ```text
 /night-shift until 07:00 max 30: migrate the API client to v2; stop when all tests pass and the PR is open
+/night-shift start 06:00 until 17:00 max 40: <objective>; stop when <condition>
 /night-shift for 6h check `npm test`: fix the flaky login tests; stop only when the suite passes 3 times in a row
 ```
+
+## A start time
+
+`start 06:00` holds round 1 until the next 06:00 on the server's clock, so a goal set before bed can begin after the DeepSeek Flash peak hours (01:00–04:00 and 06:00–10:00 UTC). The start must be within 24 hours; `until` must be after it; `for` and the 24-hour limit count from it. The status line says "waiting until 06:00 EDT", and `/night-shift stop` cancels it.
+
+A person's message during the wait does not cancel the goal: messages written then do not pause it at start. Plan mode at start pauses it, as before a round. The prompt section is off before round 1, because a person can talk to Pi during the wait. The wait is a durable sleep in the driver task's `wait` phase, so a restart neither starts round 1 early nor twice, and a server that was down past the start time starts round 1 at once.
 
 ## How a round goes
 
 1. The module sends a message, `[night-shift] Round N of M…`, with the objective, the stop condition, the deadline, and what happened last round (Pi's reason, or the check's failing output).
-2. A prompt section (`night-shift`, only while a goal runs) tells Pi to end every answer with `STATUS: DONE|CONTINUE|BLOCKED: <reason>`, to say DONE only when the condition holds, to say BLOCKED when only a person can help, and never to work around Lancet Guard or plan mode.
+2. A prompt section (`night-shift`, from round 1 while a goal runs) tells Pi to end every answer with `STATUS: DONE|CONTINUE|BLOCKED: <reason>`, to say DONE only when the condition holds, to say BLOCKED when only a person can help, and never to work around Lancet Guard or plan mode.
 3. Pi's answer decides: DONE ends the goal (after the check passes, when there is one); BLOCKED ends it; CONTINUE, or no status line, goes on. Pi judges the condition itself: no other model is asked, and the module never picks a model.
 
 ## When it stops
@@ -170,7 +178,7 @@ Examples:
 
 The summary is one more message after the last round: what Pi did, what is left, and why it stopped. A round that runs at the deadline finishes; no round starts after it. A person's message is any `pi.user` message that is not one of the module's own and not known as automated (`[via …]` from linked sessions, PiP, webhooks and watches; `[scheduled]`; subagent reports; Done when's `[goal]`): when unsure, it pauses.
 
-The status line under the message box shows the goal (`Night shift 3/30 · until 07:00 EDT`, paused, or how it ended, for 12 hours); tap it for the rounds.
+The status line under the message box shows the goal (`Night shift 3/30 · until 07:00 EDT`, `Night shift waiting until 06:00 EDT`, paused, or how it ended, for 12 hours); tap it for the rounds.
 
 ## Durability
 
@@ -178,6 +186,7 @@ Pocket's own "Done when" (`src/server/goals.ts`) drives its rounds from an `onYi
 
 - A round's message has a request id made of the goal, the round, and the attempt (`p:<person>:x-night-shift-<goal>-<round>-<attempt>`), so a restart that sends it again finds the first: one answer never starts two rounds.
 - The round count goes up in the same commit that moves the task on to send that round.
+- A `start` time is a durable sleep in the task's `wait` phase, before round 1: a restart sleeps again until the stored start, and a server that was down past it starts round 1 at once. Round 1 starts only in `decide`, which moves the round count in its commit: never twice.
 - The check is behind two memos, as in goals.ts: one set before it runs, one with its result. A restart that finds the first without the second does not run it again; the next round tells Pi it was cut off.
 - The `p:<person>:` request id is how Pocket marks a message it sends for a person: Pi works for whoever set the goal, and the spend is theirs.
 - A run before a round that fails would leave the round queued for ever: the module takes it back and sends it again, 3 times at most.

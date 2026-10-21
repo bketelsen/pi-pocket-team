@@ -8,6 +8,10 @@ export const pocketApi = 1;
 export function statusItem(goal) {
     const rounds = `${goal.round}/${goal.maxRounds}`;
 
+    if (goal.status === "running" && goal.waiting) {
+        return { text: `Night shift waiting until ${goal.startLabel}`, short: "Night: waits" };
+    }
+
     switch (goal.status) {
         case "running":
             return {

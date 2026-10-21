@@ -13,12 +13,15 @@
  * - The round count goes up in the same commit that moves the task on to send that round.
  * - A check is behind two memos, as in goals.ts: one set before it runs, one with its result. A restart that finds the
  *   first without the second does not run it again; the round says it was cut off.
+ * - A `start` time is a durable sleep in the task's `wait` phase, before round 1: a restart sleeps again until the
+ *   stored start, and a server that was down past it starts round 1 at once. Round 1 starts only in `decide`.
  *
  * State is one document per conversation, `x.night-shift.goal`. It is stored data: never rename it or change what a
  * field means.
  */
 import { randomUUID } from "node:crypto";
 import type { Context } from "@earendil-works/chord";
+import { withAbortSignal } from "@earendil-works/chord/context";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import {
     AssistantEntry,
@@ -93,6 +96,10 @@ export type Goal = {
     deadline?: number;
     /** The deadline as the person reads it, such as "07:00 EDT". */
     deadlineLabel?: string;
+    /** Epoch ms: round 1 waits until then. Without it, round 1 starts at once. */
+    start?: number;
+    /** The start as the person reads it, such as "06:00 EDT". */
+    startLabel?: string;
     by: string;
     byName: string;
     setAt: number;
@@ -143,6 +150,10 @@ export type GoalRequest = {
     maxRounds: number;
     deadline?: number;
     deadlineLabel?: string;
+    /** Epoch ms: round 1 waits until then. */
+    start?: number;
+    /** The start as the person reads it, such as "06:00 EDT". */
+    startLabel?: string;
 };
 
 export type Parsed =
@@ -151,7 +162,7 @@ export type Parsed =
     | { kind: "error"; message: string };
 
 export const USAGE =
-    "/night-shift [until 07:00 | for 8h] [max 30] [check `npm test`]: <objective>; stop when <condition>\n" +
+    "/night-shift [start 06:00] [until 07:00 | for 8h] [max 30] [check `npm test`]: <objective>; stop when <condition>\n" +
     "/night-shift status | stop | resume";
 
 /** The wall-clock parts of `ms` in `zone`. */
@@ -236,7 +247,29 @@ export function clockLabel(ms: number, zone: string): string {
     }).format(ms);
 }
 
+/** The hour and minute of a match of UNTIL or START; or a message that it is not a time. */
+function clockParts(match: RegExpExecArray): { hour: number; minute: number } | { error: string } {
+    let hour = Number(match[1]);
+    const minute = match[2] === undefined ? 0 : Number(match[2]);
+    const half = match[3]?.toLowerCase();
+
+    if (half !== undefined) {
+        if (hour < 1 || hour > 12) {
+            return { error: `"${match[0]}" is not a time.` };
+        }
+
+        hour = (hour % 12) + (half === "pm" ? 12 : 0);
+    }
+
+    if (hour > 23 || minute > 59) {
+        return { error: `"${match[0]}" is not a time.` };
+    }
+
+    return { hour, minute };
+}
+
 const UNTIL = /^until\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?(?=[\s:]|$)/i;
+const START = /^start\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?(?=[\s:]|$)/i;
 const FOR = /^for\s+(?:(\d+)\s*h(?:ours?)?)?\s*(?:(\d+)\s*m(?:in(?:utes?)?)?)?(?=[\s:]|$)/i;
 const MAX = /^max\s+(\d+)(?:\s+rounds?)?(?=[\s:]|$)/i;
 const CHECK = /^check\s+`([^`]*)`/i;
@@ -260,38 +293,43 @@ export function parseArgs(input: string, now: number, zone: string): Parsed {
 
     let rest = args;
     let maxRounds: number | undefined;
-    let deadline: number | undefined;
+    let start: { hour: number; minute: number } | undefined;
+    let until: { hour: number; minute: number } | undefined;
+    let forMinutes: number | undefined;
     let check: string | undefined;
     const error = (message: string): Parsed => ({ kind: "error", message });
+    const deadlineGiven = () => until !== undefined || forMinutes !== undefined;
 
     for (;;) {
         rest = rest.trimStart();
         let match: RegExpExecArray | null;
 
-        if ((match = UNTIL.exec(rest)) !== null) {
-            if (deadline !== undefined) {
+        if ((match = START.exec(rest)) !== null) {
+            if (start !== undefined) {
+                return error("Give one start time.");
+            }
+
+            const parts = clockParts(match);
+
+            if ("error" in parts) {
+                return error(parts.error);
+            }
+
+            start = parts;
+        } else if ((match = UNTIL.exec(rest)) !== null) {
+            if (deadlineGiven()) {
                 return error("Give one deadline: until or for.");
             }
 
-            let hour = Number(match[1]);
-            const minute = match[2] === undefined ? 0 : Number(match[2]);
-            const half = match[3]?.toLowerCase();
+            const parts = clockParts(match);
 
-            if (half !== undefined) {
-                if (hour < 1 || hour > 12) {
-                    return error(`"${match[0]}" is not a time.`);
-                }
-
-                hour = (hour % 12) + (half === "pm" ? 12 : 0);
+            if ("error" in parts) {
+                return error(parts.error);
             }
 
-            if (hour > 23 || minute > 59) {
-                return error(`"${match[0]}" is not a time.`);
-            }
-
-            deadline = nextClockTime(hour, minute, now, zone);
+            until = parts;
         } else if ((match = FOR.exec(rest)) !== null && (match[1] ?? match[2]) !== undefined) {
-            if (deadline !== undefined) {
+            if (deadlineGiven()) {
                 return error("Give one deadline: until or for.");
             }
 
@@ -301,7 +339,7 @@ export function parseArgs(input: string, now: number, zone: string): Parsed {
                 return error(`A deadline must be 1 minute to ${MAX_HOURS} hours away.`);
             }
 
-            deadline = now + minutes * 60_000;
+            forMinutes = minutes;
         } else if ((match = MAX.exec(rest)) !== null) {
             maxRounds = Number(match[1]);
 
@@ -323,6 +361,29 @@ export function parseArgs(input: string, now: number, zone: string): Parsed {
         }
 
         rest = rest.slice(match[0].length);
+    }
+
+    // Times resolve here, after the loop, so that the options can come in any order.
+    const startAt =
+        start === undefined ? undefined : nextClockTime(start.hour, start.minute, now, zone);
+
+    // Across a daylight saving change a day has 25 hours: only then can this happen.
+    if (startAt !== undefined && startAt - now > MAX_HOURS * 3600_000) {
+        return error("start must be at most 24 hours away.");
+    }
+
+    const deadline =
+        until !== undefined
+            ? nextClockTime(until.hour, until.minute, now, zone)
+            : forMinutes === undefined
+              ? undefined
+              : // `for` counts from `start` when it is given.
+                (startAt ?? now) + forMinutes * 60_000;
+
+    if (startAt !== undefined && deadline !== undefined && deadline <= startAt) {
+        return error(
+            `until ${clockLabel(deadline, zone)} is not after start ${clockLabel(startAt, zone)}.`,
+        );
     }
 
     rest = rest.replace(/^\s*:/, "").trim();
@@ -363,6 +424,9 @@ export function parseArgs(input: string, now: number, zone: string): Parsed {
             stop,
             maxRounds: maxRounds ?? DEFAULT_ROUNDS,
             ...(check === undefined ? {} : { check }),
+            ...(startAt === undefined
+                ? {}
+                : { start: startAt, startLabel: clockLabel(startAt, zone) }),
             ...(deadline === undefined
                 ? {}
                 : { deadline, deadlineLabel: clockLabel(deadline, zone) }),
@@ -560,6 +624,16 @@ export function resumable(goal: Goal, now: number): boolean {
     );
 }
 
+/** Whether a goal waits for its start time: round 1 has not started, and the start is still ahead. */
+export function waiting(goal: Goal, now: number): boolean {
+    return (
+        goal.status === "running" &&
+        goal.round === 0 &&
+        goal.start !== undefined &&
+        now < goal.start
+    );
+}
+
 /** One line on where a goal stands. */
 export function standing(goal: Goal, now: number): string {
     const rounds = goal.round === 0 ? "starting" : `round ${goal.round} of ${goal.maxRounds}`;
@@ -569,6 +643,12 @@ export function standing(goal: Goal, now: number): string {
             : goal.deadline > now
               ? `, until ${goal.deadlineLabel} (${left(goal.deadline - now)} left)`
               : `, deadline ${goal.deadlineLabel} passed`;
+
+    if (waiting(goal, now)) {
+        const then = goal.deadline === undefined ? "" : `, then until ${goal.deadlineLabel}`;
+
+        return `waiting until ${goal.startLabel} (${left(goal.start! - now)})${then}`;
+    }
 
     switch (goal.status) {
         case "running":
@@ -612,7 +692,9 @@ export function statusCard(goal: Goal | undefined, now: number): string {
         }
     }
 
-    if (goal.status === "running" || goal.status === "summary") {
+    if (waiting(goal, now)) {
+        lines.push("/night-shift stop cancels it.");
+    } else if (goal.status === "running" || goal.status === "summary") {
         lines.push(
             "/night-shift stop ends it after the current round. Stop ends the current round now.",
         );
@@ -635,6 +717,9 @@ export function goalView(goal: Goal | undefined, now: number) {
         reasonWord: goal.reason === undefined ? null : REASON_WORD[goal.reason],
         round: goal.round,
         maxRounds: goal.maxRounds,
+        waiting: waiting(goal, now),
+        start: goal.start ?? null,
+        startLabel: goal.startLabel ?? null,
         deadline: goal.deadline ?? null,
         deadlineLabel: goal.deadlineLabel ?? null,
         objective: goal.objective,
@@ -649,6 +734,7 @@ export function goalView(goal: Goal | undefined, now: number) {
 
 type DriverInput = { goalId: string };
 type DriverState =
+    | { phase: "wait" }
     | { phase: "decide" }
     | { phase: "round"; n: number; attempt: number }
     | { phase: "check"; n: number }
@@ -894,8 +980,79 @@ export default function createNightShift(host: Host, web: Web) {
     const Driver = defineTask<DriverInput, DriverState, null>({
         name: "x.night-shift.driver",
         version: 1,
-        initial: () => ({ phase: "decide" }),
+        initial: () => ({ phase: "wait" }),
         phases: {
+            /**
+             * Before round 1: a durable sleep until the goal's start time, if it has one. A restart sleeps again until
+             * the stored start; a server that was down past it goes to decide at once. Round 1 starts only in decide,
+             * which moves the round count in its commit, so it never starts twice.
+             */
+            wait: async (_task, runtime, context) => {
+                const id = runtime.conversationId;
+                const goal = await mine(runtime, context);
+
+                if (goal === undefined || goal.status !== "running") {
+                    return runtime.commit(() => finished, context);
+                }
+
+                if (goal.round === 0 && goal.start !== undefined && runtime.now() < goal.start) {
+                    const controller = new AbortController();
+                    const watch = await runtime.watchDoc(GoalDoc, id, context);
+                    let cancelled = false;
+
+                    try {
+                        if (watch !== undefined) {
+                            const look = async (value: Readonly<{ goal?: Goal }> | null) => {
+                                if (
+                                    value?.goal?.driver !== String(runtime.taskId) ||
+                                    value.goal.status !== "running"
+                                ) {
+                                    controller.abort();
+                                }
+                            };
+
+                            await look(watch.value);
+                            watch.start(look);
+                        }
+
+                        await runtime.sleep(
+                            goal.start,
+                            withAbortSignal(controller.signal, context),
+                        );
+                    } catch (failure) {
+                        // Stop or another task wakes the sleep. Any other rejection is not ours to swallow.
+                        if (!controller.signal.aborted) {
+                            throw failure;
+                        }
+
+                        cancelled = true;
+                    } finally {
+                        await watch?.stop();
+                    }
+
+                    if (cancelled) {
+                        return runtime.commit(() => finished, context);
+                    }
+                }
+
+                await runtime.commit(async (tx) => {
+                    const goal = (await tx.doc(GoalDoc, id)).goal;
+
+                    if (goal?.driver !== String(runtime.taskId) || goal.status !== "running") {
+                        return finished;
+                    }
+
+                    // Messages that people wrote during the wait must not pause the goal at start.
+                    if (goal.round === 0 && goal.start !== undefined) {
+                        goal.seen = await newestEntry(tx, id);
+                    }
+
+                    return next({ phase: "decide" });
+                }, context);
+
+                changed(id);
+            },
+
             /** Before each round: a person's message, plan mode, a spend limit, the rounds, and the deadline. */
             decide: async (_task, runtime, context) => {
                 const id = runtime.conversationId;
@@ -1251,9 +1408,14 @@ export default function createNightShift(host: Host, web: Web) {
 
         changed(ctx.conversationId);
 
+        const begins =
+            goal.start === undefined
+                ? "Round 1 starts now."
+                : `Round 1 starts at ${goal.startLabel}.`;
+
         return {
             type: "card" as const,
-            output: `Night shift set. Round 1 starts now.\n${statusCard(goal, Date.now())}`,
+            output: `Night shift set. ${begins}\n${statusCard(goal, Date.now())}`,
         };
     }
 
@@ -1284,6 +1446,13 @@ export default function createNightShift(host: Host, web: Web) {
         }
 
         changed(ctx.conversationId);
+
+        if (goal.round === 0) {
+            return {
+                type: "card" as const,
+                output: `Night shift cancelled by ${ctx.user.name} before round 1.`,
+            };
+        }
 
         return {
             type: "card" as const,
@@ -1356,7 +1525,7 @@ export default function createNightShift(host: Host, web: Web) {
     web.command("night-shift", {
         description:
             "Pi works on an objective in rounds until a stop condition, a round limit, or a deadline",
-        args: "[until 07:00] [max 30] [check `cmd`]: <objective>; stop when <condition> | status | stop | resume",
+        args: "[start 06:00] [until 07:00] [max 30] [check `cmd`]: <objective>; stop when <condition> | status | stop | resume",
         scope: "conversation",
         handler: async (args, ctx) => {
             const parsed = parseArgs(args, Date.now(), zone());
@@ -1367,7 +1536,12 @@ export default function createNightShift(host: Host, web: Web) {
                 case "help":
                     return {
                         type: "card",
-                        output: `${USAGE}\nExample: /night-shift until 07:00 max 30: migrate the API to v2; stop when all tests pass and the PR is open`,
+                        output: [
+                            USAGE,
+                            "Example: /night-shift until 07:00 max 30: migrate the API to v2; stop when all tests pass and the PR is open",
+                            "Example: /night-shift start 06:00 until 17:00 max 40: <objective>; stop when <condition>",
+                            "`for` counts from `start` when it is given, else from now.",
+                        ].join("\n"),
                     };
                 case "status":
                     return { type: "card", output: statusCard(await current(ctx), Date.now()) };
@@ -1406,7 +1580,9 @@ export default function createNightShift(host: Host, web: Web) {
                 const goal = (await input.read.snapshot(GoalDoc, input.conversationId, context))
                     ?.goal;
 
-                if (goal?.status !== "running") {
+                if (goal?.status !== "running" || goal.round === 0) {
+                    // Not before round 1: a person can talk to Pi during the wait, and the STATUS-line rules are for
+                    // rounds only.
                     return undefined;
                 }
 
