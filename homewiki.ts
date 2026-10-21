@@ -8,12 +8,13 @@
 import { execFile } from "node:child_process";
 import { watch, type FSWatcher } from "node:fs";
 import { readdir, readFile, stat } from "node:fs/promises";
+import { homedir } from "node:os";
 import { join, relative, sep } from "node:path";
 import { promisify } from "node:util";
 import type { Web } from "./_pocket.d.ts";
 
-// Tests point this at a fixture with PI_POCKET_HOMEWIKI_ROOT; the server leaves it unset.
-const ROOT = process.env.PI_POCKET_HOMEWIKI_ROOT || "/var/home/bjk/projects/homewiki";
+// Tests set PI_POCKET_HOMEWIKI_ROOT to a fixture; a server without it reads ~/projects/homewiki.
+const ROOT = process.env.PI_POCKET_HOMEWIKI_ROOT || join(homedir(), "projects", "homewiki");
 const run = promisify(execFile);
 
 interface Page {
@@ -53,7 +54,11 @@ async function files(): Promise<string[]> {
         const full = join(entry.parentPath, entry.name);
         const rel = relative(ROOT, full).split(sep).join("/");
 
-        if (entry.isFile() && rel.endsWith(".md") && !rel.split("/").some((part) => part.startsWith("."))) {
+        if (
+            entry.isFile() &&
+            rel.endsWith(".md") &&
+            !rel.split("/").some((part) => part.startsWith("."))
+        ) {
             found.push(rel);
         }
     }
@@ -75,7 +80,9 @@ async function pages(): Promise<Page[]> {
 
         const { meta, body } = split(text);
         const heading = /^#\s+(.+)$/m.exec(body)?.[1]?.trim();
-        const folder = path.startsWith("docs/") ? path.slice(5).split("/").slice(0, -1).join("/") : "";
+        const folder = path.startsWith("docs/")
+            ? path.slice(5).split("/").slice(0, -1).join("/")
+            : "";
         const order = Number(meta.order);
 
         list.push({
@@ -138,7 +145,10 @@ export default function createHomewiki(_host: unknown, web: Web) {
             }
 
             clearTimeout(pending);
-            pending = setTimeout(() => web.send("changed", { path: file.split(sep).join("/") }), 1000);
+            pending = setTimeout(
+                () => web.send("changed", { path: file.split(sep).join("/") }),
+                1000,
+            );
             pending.unref();
         });
         watcher.on("error", () => watcher?.close());

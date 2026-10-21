@@ -14,7 +14,7 @@ import {
     say,
     scriptedModel,
     until,
-} from "/var/home/bjk/projects/pi-pocket/test/helpers.ts";
+} from "./_pocket/test/helpers.ts";
 import assert from "node:assert/strict";
 import { cpSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
