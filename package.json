@@ -5,6 +5,7 @@
     "type": "module",
     "scripts": {
         "test": "node --test team.test.ts team-web.test.js",
-        "install-extension": "node install.mjs"
+        "install-extension": "node install.mjs",
+        "install-check": "node install.mjs --check"
     }
 }
