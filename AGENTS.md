@@ -2,13 +2,14 @@
 
 This is Brian's extension project: drop-in modules for his running Pi Pocket server. See README.md for what each module does.
 
-- **Modules:** Team (`team.ts`, `team-web/`) and Homewiki (`homewiki.ts`, `homewiki-web/`). A new module also goes in `MODULES` in `install.mjs`.
+- **Modules:** Team (`team.ts`, `team-web/`), Homewiki (`homewiki.ts`, `homewiki-web/`), and Night shift (`night-shift.ts`, `night-shift-web/`). A new module also goes in `MODULES` in `install.mjs`, the `test` script in `package.json`, and `files` in `tsconfig.json`.
 - **Docs:** Pi Pocket's extension docs start at `/var/home/bjk/projects/pi-pocket/docs/extensions.md`; the exact types are `_pocket.d.ts` (a link into the checkout). Read the guide your change needs before writing it.
 - **Test before install, every time.** Run `npm test` (node --test, plus `node --check` of the browser modules) and `./node_modules/.bin/tsc -p tsconfig.json` before every commit and every install.
 - **Installs are live.** `npm run install-extension` writes into `~/.pi-pocket/extensions/`, and a saved module reloads into the running server the whole team works in. Run `npm run install-check` first and make sure every file it lists is one you meant to change. If an installed file differs from the project's and you don't know why, stop and ask: someone may have edited the live copy.
 - **Brian turns modules on and off, and restarts the server.** Never enable or disable an extension or restart the server; finish, test, and tell him what needs doing.
 - **Tests stay isolated.** They use the Pi Pocket checkout's test harness (temporary data, test credentials, a fake model). Point modules at fixtures with environment variables (`PI_POCKET_TEAM_AGENTS`, `PI_POCKET_HOMEWIKI_ROOT`), never at Brian's real data.
 - **Nothing secret in git.** `node_modules` and `_pocket.d.ts` are links into the Pi Pocket checkout and stay ignored. Never commit anything from `~/.pi-pocket` or `~/.config/pi-pocket-team`, tokens, or credentials.
-- **Stored data is forever.** Document kinds (`x.team.identity`, `x.team.memory`) and their fields are stored in Brian's sessions: never rename a kind or change what a field means; add new ones beside them.
+- **Stored data is forever.** Document kinds (`x.team.identity`, `x.team.memory`, `x.night-shift.goal`), task names (`x.night-shift.driver`), and their fields are stored in Brian's sessions: never rename a kind or change what a field means; add new ones beside them.
+- **Night shift is restart-safe by design.** Round messages use stable request ids, the round count moves in the commit that starts the round, and the check sits behind a started memo. `night-shift.test.ts` covers each rule (and each stop reason): keep it so when you touch the driver. Never make it pick a model or call a judge model.
 - **Agent memory follows Pi Pocket's memory rules** (`src/server/memory.ts` in the checkout): Pi proposes, the owner approves, approvals check what the owner saw, and a replayed tool call never adds twice. Keep `team-memory.test.ts` covering each rule you touch.
 - The homewiki's content belongs to Bellonda; this module only renders it.

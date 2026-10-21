@@ -2,20 +2,21 @@
 
 Drop-in extensions for Brian's Pi Pocket server. Each module is a `.ts` file plus a browser folder; installed, they live in `~/.pi-pocket/extensions/`.
 
-| Module       | Files                          | What it is                                                                                                                                          |
-| ------------ | ------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Team**     | `team.ts`, `team-web/`         | Named agents (Odrade and the specialists) in ordinary Pi Pocket sessions, Odrade's delegation into their repositories, and each agent's own memory. |
-| **Homewiki** | `homewiki.ts`, `homewiki-web/` | The "Wiki" rail page: renders Bellonda's homewiki checkout (`/var/home/bjk/projects/homewiki`) live from disk, read-only and owner-only.            |
+| Module          | Files                                | What it is                                                                                                                                                                                                   |
+| --------------- | ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **Team**        | `team.ts`, `team-web/`               | Named agents (Odrade and the specialists) in ordinary Pi Pocket sessions, Odrade's delegation into their repositories, and each agent's own memory.                                                          |
+| **Homewiki**    | `homewiki.ts`, `homewiki-web/`       | The "Wiki" rail page: renders Bellonda's homewiki checkout (`/var/home/bjk/projects/homewiki`) live from disk, read-only and owner-only.                                                                     |
+| **Night shift** | `night-shift.ts`, `night-shift-web/` | `/night-shift`: Pi works on an objective in rounds while you sleep, until a stop condition in words (and an optional check command), a round limit, or a deadline; then it writes a summary for the morning. |
 
 ## Test
 
 ```sh
 cd ~/projects/pi-pocket-team
-npm test                                  # node --test, plus node --check of both browser modules
-./node_modules/.bin/tsc -p tsconfig.json  # types of team.ts and homewiki.ts
+npm test                                  # node --test, plus node --check of the browser modules
+./node_modules/.bin/tsc -p tsconfig.json  # types of team.ts, homewiki.ts, and night-shift.ts
 ```
 
-The tests run each module inside a real Pi Pocket app built by the checkout's test harness: temporary data, test credentials, a fake model. `homewiki.test.ts` points the module at a fixture wiki with `PI_POCKET_HOMEWIKI_ROOT`; the server never sets it, so production reads the real checkout. `team-memory.test.ts` checks agent memory's rules directly and through the app, with fixture agent profiles. `npm run preview` (`preview.ts`) opens an isolated app with sample lessons, to look at the panel.
+The tests run each module inside a real Pi Pocket app built by the checkout's test harness: temporary data, test credentials, a fake model. `homewiki.test.ts` points the module at a fixture wiki with `PI_POCKET_HOMEWIKI_ROOT`; the server never sets it, so production reads the real checkout. `team-memory.test.ts` checks agent memory's rules directly and through the app, with fixture agent profiles. `night-shift.test.ts` runs night shifts against a scripted model, restarts included. `npm run preview` (`preview.ts`) opens an isolated app with sample lessons, to look at the panel.
 
 ## Install
 
@@ -122,3 +123,74 @@ The "Wiki" rail page shows `bketelsen/homewiki`, Bellonda's checkout, as it is o
 - **Live:** a watcher on the checkout tells open tabs when a Markdown file changes, at most once a second, so Bellonda's edits show without a reload.
 
 The wiki's content belongs to Bellonda; this module only renders it.
+
+# Night shift
+
+"Do X overnight while I sleep. Stop only when Y." Pi works in rounds; after each round's answer the module decides whether to go on.
+
+## Commands
+
+```text
+/night-shift [until 07:00 | for 8h] [max 30] [check `npm test`]: <objective>; stop when <condition>
+/night-shift status | stop | resume
+```
+
+- Options come first, in any order, then an optional `:`, then the objective. The text splits at the last "stop when" (or "stop only when").
+- `until 07:00` (also `7am`, `11:45pm`) is the next time the server's clock (America/New_York) shows it, so at most 24 hours away. `for 8h`, `for 90m`, `for 7h30m`: from now, up to 24 hours. Give one or neither.
+- `max N`: rounds, 1 to 100. Default 20.
+- `` check `cmd` ``: runs in the session's folder after Pi says DONE; it must pass too. Owner only (see Lancet Guard below).
+- `status` shows the goal and its last rounds as a card. `stop` ends it after the round that runs (Stop ends that round now). `resume` goes on with a paused or stopped goal while rounds and time are left.
+
+Examples:
+
+```text
+/night-shift until 07:00 max 30: migrate the API client to v2; stop when all tests pass and the PR is open
+/night-shift for 6h check `npm test`: fix the flaky login tests; stop only when the suite passes 3 times in a row
+```
+
+## How a round goes
+
+1. The module sends a message, `[night-shift] Round N of M…`, with the objective, the stop condition, the deadline, and what happened last round (Pi's reason, or the check's failing output).
+2. A prompt section (`night-shift`, only while a goal runs) tells Pi to end every answer with `STATUS: DONE|CONTINUE|BLOCKED: <reason>`, to say DONE only when the condition holds, to say BLOCKED when only a person can help, and never to work around Lancet Guard or plan mode.
+3. Pi's answer decides: DONE ends the goal (after the check passes, when there is one); BLOCKED ends it; CONTINUE, or no status line, goes on. Pi judges the condition itself: no other model is asked, and the module never picks a model.
+
+## When it stops
+
+| Stops when                                      | Then                                                                  |
+| ----------------------------------------------- | --------------------------------------------------------------------- |
+| Pi says DONE (and the check passes)             | ended; Pi writes the summary for the morning                          |
+| all rounds used                                 | ended; summary                                                        |
+| the deadline passed (checked before each round) | ended; summary                                                        |
+| Pi says BLOCKED                                 | ended; summary                                                        |
+| a person writes in the session                  | **paused**, with a notice; no summary (the person is there); `resume` |
+| plan mode is on                                 | paused; `resume` after plan mode is off                               |
+| Stop, or `/night-shift stop`                    | ended; no summary                                                     |
+| a spend limit (Pocket's `heldBack`)             | ended; no summary (Pi may not start)                                  |
+| a round gets no answer (a model error)          | ended, with the error                                                 |
+
+The summary is one more message after the last round: what Pi did, what is left, and why it stopped. A round that runs at the deadline finishes; no round starts after it. A person's message is any `pi.user` message that is not one of the module's own and not known as automated (`[via …]` from linked sessions, PiP, webhooks and watches; `[scheduled]`; subagent reports; Done when's `[goal]`): when unsure, it pauses.
+
+The status line under the message box shows the goal (`Night shift 3/30 · until 07:00 EDT`, paused, or how it ended, for 12 hours); tap it for the rounds.
+
+## Durability
+
+Pocket's own "Done when" (`src/server/goals.ts`) drives its rounds from an `onYield` hook. A drop-in's hook can read and keep memos but cannot commit, and a command cannot start Pi, so this module drives its rounds from a durable task, `x.night-shift.driver`, as Pocket's schedules and subagent reporters do. Each step is a checkpoint:
+
+- A round's message has a request id made of the goal, the round, and the attempt (`p:<person>:x-night-shift-<goal>-<round>-<attempt>`), so a restart that sends it again finds the first: one answer never starts two rounds.
+- The round count goes up in the same commit that moves the task on to send that round.
+- The check is behind two memos, as in goals.ts: one set before it runs, one with its result. A restart that finds the first without the second does not run it again; the next round tells Pi it was cut off.
+- The `p:<person>:` request id is how Pocket marks a message it sends for a person: Pi works for whoever set the goal, and the spend is theirs.
+- A run before a round that fails would leave the round queued for ever: the module takes it back and sends it again, 3 times at most.
+
+State is one document per conversation, `x.night-shift.goal` (`{ goal?: Goal }`; a fork starts without it). It is stored data: never rename the kind or the task, or change what a field means.
+
+## Limits and rules
+
+- **Lancet Guard:** every tool call of every round goes through the guard as usual. If the guard asks a person, the round waits for that person; the deadline does not cut it short. The check command runs unasked, with the owner's rights, and the guard does not see it (a drop-in cannot ask the guard): like the owner's own `!` commands. So only the owner can set or resume a goal with a check.
+- **Plan mode:** a goal does not start in plan mode, and pauses before a round when plan mode is on. Reading plan mode uses Pocket's own `pocket.plan` document, which is not public API: if it changes, the read fails and the goal relies on Pi saying BLOCKED, as the prompt asks.
+- **Who:** anyone who can steer the session runs `/night-shift`; a check needs the owner. One goal per session. Any session works, linked sessions included.
+- Objective and condition together: 3000 characters. Check: 2000 characters, 10 minutes, the last 3000 characters of its output.
+
+## Night shift files
+
+`night-shift.ts` (server: command, prompt section, driver task, one route), `night-shift-web/index.js` (the status-line item and its sheet; route `GET /api/x/night-shift/goal/:conversation`, for people who see every session). A new module starts off: Brian turns it on in **Menu → Extensions**.
