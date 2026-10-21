@@ -12,7 +12,8 @@ import { join, relative, sep } from "node:path";
 import { promisify } from "node:util";
 import type { Web } from "./_pocket.d.ts";
 
-const ROOT = "/var/home/bjk/projects/homewiki";
+// Tests point this at a fixture with PI_POCKET_HOMEWIKI_ROOT; the server leaves it unset.
+const ROOT = process.env.PI_POCKET_HOMEWIKI_ROOT || "/var/home/bjk/projects/homewiki";
 const run = promisify(execFile);
 
 interface Page {
