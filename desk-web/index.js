@@ -169,6 +169,19 @@ export default function setup(pocket) {
                                         )}
                                     </ul>`
                           }
+                          ${
+                              (thread.answered ?? []).length === 0
+                                  ? null
+                                  : html`<h3>Answered</h3>
+                                        <ul class="desk-list">
+                                            ${thread.answered.map(
+                                                (ask) => html`<li>
+                                                    <span class="desk-id">${ask.id}</span> ${ask.text}
+                                                    <div class="small">${ask.by}: “${ask.words}”</div>
+                                                </li>`,
+                                            )}
+                                        </ul>`
+                          }
                           <h3>Events</h3>
                           ${
                               thread.events.length === 0
