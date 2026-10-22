@@ -295,7 +295,15 @@ export default function setup(pocket) {
         const answer = async (id) => {
             const words = (answers[id] ?? "").trim();
 
-            await act(`asks/${id}/answer`, words === "" ? {} : { words });
+            // The page never sends an empty answer: the button waits for Brian's words.
+            if (words !== "") {
+                await act(`asks/${id}/answer`, { words });
+            }
+        };
+
+        /** A pick-one ask: the option itself is the answer. */
+        const answerWith = async (id, words) => {
+            await act(`asks/${id}/answer`, { words });
         };
 
         if (openId !== null) {
@@ -625,13 +633,36 @@ export default function setup(pocket) {
             html`<div class="desk-need">
                 ${thread.asks.map(
                     (ask) => html`<div class="desk-ask">
-                        <p class="small">${ask.id} · ${ask.text}</p>
+                        <p class="small">
+                            ${ask.id} · ${ask.text}${
+                                ask.options && ask.options.length > 0
+                                    ? ` [${ask.options.join(" | ")}]`
+                                    : ""
+                            }
+                        </p>
+                        ${
+                            ask.options && ask.options.length > 0
+                                ? html`<div class="desk-actions">
+                                  ${ask.options.map(
+                                      (option) =>
+                                          html`<button
+                                              class="button"
+                                              disabled=${busy}
+                                              aria-label=${`Answer ${ask.id}: ${option}`}
+                                              onClick=${() => void answerWith(ask.id, option)}
+                                          >
+                                              ${option}
+                                          </button>`,
+                                  )}
+                              </div>`
+                                : null
+                        }
                         <div class="desk-actions">
                             <input
                                 class="desk-reason"
                                 type="text"
                                 maxlength="1000"
-                                placeholder="His words (optional)"
+                                placeholder="Your answer"
                                 value=${answers[ask.id] ?? ""}
                                 disabled=${busy}
                                 onInput=${(event) =>
@@ -639,7 +670,7 @@ export default function setup(pocket) {
                             />
                             <button
                                 class="button"
-                                disabled=${busy}
+                                disabled=${busy || (answers[ask.id] ?? "").trim() === ""}
                                 aria-label=${`Answered ${ask.id}`}
                                 onClick=${() => void answer(ask.id)}
                             >

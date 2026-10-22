@@ -2081,6 +2081,82 @@ describe("asks", () => {
         );
     });
 
+    test("options are stored, and bad options are refused", () => {
+        const state = deskOf();
+        const thread = placed(state, 100);
+
+        assert.deepEqual(
+            addAsk(state, {
+                thread: thread.id,
+                text: "Keep, move or delete the old repo?",
+                options: [" keep ", "move", "delete"],
+                key: "k1",
+                by: "Odrade",
+                supervisor: 1,
+                at: 200,
+            }),
+            { threadId: "T1", askId: "T1a" },
+        );
+        assert.deepEqual(thread.asks[0]?.options, ["keep", "move", "delete"]);
+        assert.match(
+            thread.events.at(-1)?.text ?? "",
+            /ask T1a: Keep, move or delete the old repo\? \[keep \| move \| delete\]/,
+        );
+
+        // A replay adds nothing.
+        assert.deepEqual(
+            addAsk(state, {
+                thread: thread.id,
+                text: "Other",
+                options: ["a", "b"],
+                key: "k1",
+                by: "Odrade",
+                supervisor: 1,
+                at: 300,
+            }),
+            { threadId: "T1", askId: "T1a" },
+        );
+        assert.equal(thread.asks.length, 1);
+
+        for (const options of [
+            ["one"],
+            ["a", "b", "c", "d", "e", "f", "g"],
+            ["a", ""],
+            ["a", "x".repeat(41)],
+        ]) {
+            const result = addAsk(state, {
+                thread: thread.id,
+                text: "Pick",
+                options,
+                key: `bad:${options.join(":")}`,
+                by: "Odrade",
+                supervisor: 1,
+                at: 400,
+            });
+
+            assert("error" in result, JSON.stringify(options));
+        }
+
+        assert.equal(thread.asks.length, 1, "a bad option adds nothing");
+    });
+
+    test("readText shows the options", () => {
+        const state = deskOf();
+        const thread = placed(state, 100);
+
+        addAsk(state, {
+            thread: thread.id,
+            text: "Which one?",
+            options: ["a", "b"],
+            key: "k1",
+            by: "Odrade",
+            supervisor: 1,
+            at: 200,
+        });
+
+        assert.match(readText(state, thread.id) ?? "", /T1a · open · Which one\? \[a \| b\]/);
+    });
+
     test("ask new makes an ask thread with its first ask", () => {
         const state = deskOf();
         const made = addAsk(state, {
@@ -2421,6 +2497,15 @@ const model = scriptedModel((request) => {
             action: "ask",
             thread: askThreadId,
             text: "Should I merge #106?",
+        });
+    }
+
+    if (text.endsWith("desk ask options test")) {
+        return call("desk", {
+            action: "ask",
+            thread: askThreadId,
+            text: "Keep, move or delete the old repo?",
+            options: ["keep", "move", "delete"],
         });
     }
 
@@ -3318,6 +3403,13 @@ describe("the desk in a Pi Pocket", () => {
         assert.equal(asked.asks[0]?.text, "Merge it?");
         assert.equal(asked.state, "open");
 
+        // Options for a pick-one ask, through the tool.
+        await say(app, source, "desk ask options test");
+        const withOptions = (await deskState())?.threads[thread.id]?.asks.at(-1);
+
+        assert.equal(withOptions?.text, "Keep, move or delete the old repo?");
+        assert.deepEqual(withOptions?.options, ["keep", "move", "delete"]);
+
         answerAskId = asked.asks[0]?.id ?? "";
         await say(app, source, "desk answer test");
         await say(app, source, "desk sync test");
@@ -4007,6 +4099,67 @@ describe("the desk in a Pi Pocket", () => {
             assert.match(
                 state?.threads[targetId]?.events.map((event) => event.text).join("; ") ?? "",
                 /reopened: T[0-9]+ attached by /,
+            );
+        });
+
+        test("POST asks/:id/answer stores an option, or free words", async () => {
+            const source = await supervisor("page-ask-options");
+            let threadId = "";
+            let chosenId = "";
+            let freeId = "";
+
+            await app.harness.commit(async (tx) => {
+                const state = await tx.doc(DeskThreads);
+                const opened = openThread(state, {
+                    key: "x.test.page-ask-options",
+                    supervisor: Number(source),
+                    agents: ["duncan"],
+                    repo: "frostyard/test",
+                    title: "A choice",
+                    at: Date.now(),
+                });
+
+                threadId = opened.thread.id;
+
+                const chosen = addAsk(state, {
+                    thread: threadId,
+                    text: "Keep, move or delete?",
+                    options: ["keep", "move", "delete"],
+                    key: "x.test.page-ask-options:1",
+                    by: "Odrade",
+                    supervisor: Number(source),
+                    at: Date.now(),
+                });
+
+                chosenId = "askId" in chosen ? chosen.askId : "";
+
+                const free = addAsk(state, {
+                    thread: threadId,
+                    text: "How many?",
+                    key: "x.test.page-ask-options:2",
+                    by: "Odrade",
+                    supervisor: Number(source),
+                    at: Date.now(),
+                });
+
+                freeId = "askId" in free ? free.askId : "";
+            }, context);
+
+            assert.equal((await call(`asks/${chosenId}/answer`, { words: "move" })).status, 200);
+            assert.equal(
+                (await deskState())?.threads[threadId]?.asks.find((ask) => ask.id === chosenId)
+                    ?.answer?.words,
+                "move",
+            );
+
+            assert.equal(
+                (await call(`asks/${freeId}/answer`, { words: "three of them" })).status,
+                200,
+            );
+            assert.equal(
+                (await deskState())?.threads[threadId]?.asks.find((ask) => ask.id === freeId)
+                    ?.answer?.words,
+                "three of them",
             );
         });
 
