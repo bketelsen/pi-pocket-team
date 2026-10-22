@@ -5639,6 +5639,7 @@ describe("the desk in a Pi Pocket", () => {
             (await modelTexts(app, linked)).filter((each) => each.includes(message)).length;
 
         try {
+            await quiet([thread.id]);
             await restartApp(SWEEP_SLEEP_MS + 60_000);
             await sweptAfter(thread, first);
 
@@ -5662,6 +5663,7 @@ describe("the desk in a Pi Pocket", () => {
             assert.equal((await deskState())?.threads[thread.id]?.closed?.why, "done");
             assert.equal(await sent(), 1);
         } finally {
+            await quiet([]);
             shift = 0;
         }
     });
