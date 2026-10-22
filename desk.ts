@@ -84,6 +84,8 @@ export type Ask = {
     key?: string;
     /** Who filed it: the supervisor's name. */
     by?: string;
+    /** The session that filed it: the reminder hook counts it even on a thread of another supervisor. */
+    session?: number;
 };
 
 /** One attached PR: how it was attached, and what GitHub said about it. */
@@ -1851,6 +1853,7 @@ export function attachTo(
     ref: string,
     targetId: string,
     now: number,
+    by = "the desk",
 ): { text: string } | { error: string } {
     const target = threadById(state, targetId);
 
@@ -1859,7 +1862,14 @@ export function attachTo(
     }
 
     if (target.state === "closed") {
-        return { error: `Thread ${target.id} is closed: choose an open thread.` };
+        // A thread that closed as done in the last 7 days comes back for the work attached to it, as a sweep would.
+        if (!reopenable(target, now)) {
+            return { error: `Thread ${target.id} is closed: choose an open thread.` };
+        }
+
+        target.state = "open";
+        delete target.closed;
+        addEvent(target, `reopened:${ref}:${String(now)}`, `reopened: ${ref} attached by ${by}`, now);
     }
 
     if (PR_REF.test(ref)) {
@@ -2170,6 +2180,8 @@ export type AskRequest = {
     by: string;
     supervisor: number;
     at: number;
+    /** The session that filed it; stored on the ask. */
+    session?: number;
 };
 
 /** File an ask on a thread, or on a new "ask" thread. Pure over the state: the caller commits it. */
@@ -2214,7 +2226,16 @@ export function addAsk(
             lastEventAt: request.at,
             prs: {},
             branches: [],
-            asks: [{ id: askId, text, at: request.at, key: request.key, by: request.by }],
+            asks: [
+                {
+                    id: askId,
+                    text,
+                    at: request.at,
+                    key: request.key,
+                    by: request.by,
+                    ...(request.session === undefined ? {} : { session: request.session }),
+                },
+            ],
             run: {},
             events: [],
         };
@@ -2239,7 +2260,14 @@ export function addAsk(
 
     const askId = `${thread.id}${letters(thread.asks.length)}`;
 
-    thread.asks.push({ id: askId, text, at: request.at, key: request.key, by: request.by });
+    thread.asks.push({
+        id: askId,
+        text,
+        at: request.at,
+        key: request.key,
+        by: request.by,
+        ...(request.session === undefined ? {} : { session: request.session }),
+    });
     addEvent(thread, `ask:${askId}:${String(request.at)}`, `ask ${askId}: ${text}`, request.at);
 
     return { threadId: thread.id, askId };
@@ -2282,7 +2310,14 @@ export function answerAsk(
 const ASK_WORDS =
     /can you|could you|would you|your call|do you want|should i|which (one|option)|please (tap|merge|confirm|check|decide|approve|create|delete|set)|needs you|your ok/i;
 
-/** Whether the last paragraph asks Brian something. Code blocks and inline code never count. */
+/** A sentence that says there is no ask: it never counts, with or without a question mark. */
+const NEGATED =
+    /nothing needs you|no ask|nothing for you|does(?: not|n't) need you|no action|not needed|nothing to decide/i;
+
+/**
+ * Whether the last paragraph asks Brian something. Code blocks and inline code never count, a sentence that says
+ * there is no ask never counts, and a "?" counts in every other sentence.
+ */
 export function asksBrian(text: string): boolean {
     const plain = text.replace(/```[\s\S]*?```/g, " ").replace(/`[^`\n]*`/g, " ");
     const last =
@@ -2291,8 +2326,18 @@ export function asksBrian(text: string): boolean {
             .split(/\n\s*\n/)
             .at(-1)
             ?.trim() ?? "";
+    const sentences = last
+        .split(/(?<=[.!?])\s+|;\s*/)
+        .map((sentence) => sentence.trim())
+        .filter((sentence) => sentence !== "");
 
-    return last.includes("?") || ASK_WORDS.test(last);
+    return sentences.some((sentence) => {
+        if (NEGATED.test(sentence)) {
+            return false;
+        }
+
+        return sentence.includes("?") || ASK_WORDS.test(sentence);
+    });
 }
 
 /** The last GitHub read, as the page reads it. */
@@ -4818,7 +4863,7 @@ export default function createDesk(host: Host, web: Web) {
             }
 
             return answer(request, (state, now) => {
-                const result = attachTo(state, id, into, now);
+                const result = attachTo(state, id, into, now, request.user.name);
 
                 if ("error" in result) {
                     throw web.error(/closed/.test(result.error) ? 409 : 404, result.error);
@@ -5017,10 +5062,15 @@ export default function createDesk(host: Host, web: Web) {
 
                 const turnStart = (await api.memo<number>("desk.turnStart", context)) ?? Date.now();
                 const state = await api.snapshot(DeskThreads, context);
-                const filed = Object.values(state?.threads ?? {}).some(
-                    (thread) =>
-                        thread.supervisor === Number(api.conversationId) &&
-                        thread.asks.some((ask) => ask.at >= turnStart),
+                const session = Number(api.conversationId);
+                const filed = Object.values(state?.threads ?? {}).some((thread) =>
+                    thread.asks.some(
+                        (ask) =>
+                            ask.at >= turnStart &&
+                            (ask.session !== undefined
+                                ? ask.session === session
+                                : thread.supervisor === session),
+                    ),
                 );
 
                 if (filed) {
@@ -5219,6 +5269,7 @@ export default function createDesk(host: Host, web: Web) {
                         key,
                         by: persona.name,
                         supervisor: Number(api.conversationId),
+                        session: Number(api.conversationId),
                         at,
                     });
 
@@ -5377,7 +5428,8 @@ export default function createDesk(host: Host, web: Web) {
                 }
 
                 const result = await api.commit(
-                    async (tx) => attachTo(await tx.doc(DeskThreads), ref, targetId, Date.now()),
+                    async (tx) =>
+                        attachTo(await tx.doc(DeskThreads), ref, targetId, Date.now(), persona.name),
                     context,
                 );
 

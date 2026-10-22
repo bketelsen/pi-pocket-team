@@ -1853,6 +1853,72 @@ describe("attachTo", () => {
         assert.match(second.text, /closed/);
         assert.equal(target.events.length, events, "the replay adds no event");
     });
+
+    test("a recently closed done target reopens for the PR, once", () => {
+        const state = deskOf();
+        const target = placed(state, 100);
+
+        target.state = "closed";
+        target.closed = { at: 200, why: "done", by: "sweep" };
+
+        const result = attachTo(state, "frostyard/test#7", target.id, 300, "Odrade");
+
+        assert("text" in result);
+        assert.equal(target.state, "open");
+        assert.equal(target.closed, undefined);
+        assert.equal(target.prs["frostyard/test#7"]?.via, "attached");
+        assert.match(
+            target.events.map((event) => event.text).join("; "),
+            /reopened: frostyard\/test#7 attached by Odrade/,
+        );
+
+        const events = target.events.length;
+        const again = attachTo(state, "frostyard/test#7", target.id, 400, "Odrade");
+
+        assert("text" in again);
+        assert.equal(target.events.length, events, "the replay adds nothing");
+    });
+
+    test("a recently closed done target reopens for a merged thread", () => {
+        const state = deskOf();
+        const target = placed(state, 100);
+        const source = placed(state, 200);
+
+        target.state = "closed";
+        target.closed = { at: 300, why: "done", by: "sweep" };
+
+        const result = attachTo(state, source.id, target.id, 400, "Odrade");
+
+        assert("text" in result);
+        assert.equal(target.state, "open");
+        assert.equal(source.state, "closed");
+        assert.match(
+            target.events.map((event) => event.text).join("; "),
+            new RegExp(`reopened: ${source.id} attached by Odrade`),
+        );
+    });
+
+    test("a target dropped, failed, or closed long ago is still refused", () => {
+        const now = 10 * DAY;
+
+        for (const [why, at] of [
+            ["dropped", now - DAY],
+            ["failed", now - DAY],
+            ["done", now - 8 * DAY],
+        ] as const) {
+            const state = deskOf();
+            const target = placed(state, 100);
+
+            target.state = "closed";
+            target.closed = { at, why, by: "brian" };
+
+            const result = attachTo(state, "frostyard/test#7", target.id, now, "Odrade");
+
+            assert("error" in result, why);
+            assert.equal(target.state, "closed");
+            assert.equal(target.prs["frostyard/test#7"], undefined);
+        }
+    });
 });
 
 describe("exportFiles", () => {
@@ -1938,6 +2004,26 @@ describe("exportFiles", () => {
 });
 
 describe("asksBrian", () => {
+    test("a sentence that says there is no ask never counts", () => {
+        for (const text of [
+            "Nothing needs you; Lucilla's publish check is running.",
+            "Nothing needs you.",
+            "No ask for you.",
+            "Nothing for you.",
+            "It does not need you.",
+            "It doesn't need you.",
+            "No action needed.",
+            "Not needed.",
+            "Nothing to decide.",
+            "Nothing needs you, right?",
+        ]) {
+            assert.equal(asksBrian(text), false, text);
+        }
+
+        assert.equal(asksBrian("Should I merge #106?"), true);
+        assert.equal(asksBrian("T3 needs you: keep the guard?"), true);
+    });
+
     test("a question, or a request, in the last paragraph only", () => {
         assert.equal(asksBrian("Should I merge #106?"), true);
         assert.equal(asksBrian("Your call: A or B."), true);
@@ -2227,6 +2313,7 @@ let askThreadId = "";
 let answerAskId = "";
 /** The threads the scripted model watches and records results on. */
 let attachThreadId = "";
+let otherAskThreadId = "";
 let watchThreadId = "";
 let otherThreadId = "";
 let resultThreadId = "";
@@ -2290,6 +2377,10 @@ const model = scriptedModel((request) => {
 
     if (text.endsWith("desk reminder test")) {
         return answer("Should I merge #106?");
+    }
+
+    if (text.endsWith("ask other thread test")) {
+        return call("desk", { action: "ask", thread: otherAskThreadId, text: "Should I keep it?" });
     }
 
     if (text.endsWith("ask then question test")) {
@@ -3252,6 +3343,43 @@ describe("the desk in a Pi Pocket", () => {
         assert.match(texts.join("\n"), /Desk check: your reply asks Brian something/);
     });
 
+    test("the reminder does not fire after an ask on another supervisor's thread", async () => {
+        const folder = join(root, "other-ask");
+
+        mkdirSync(folder, { recursive: true });
+        const other = await newSession(app, folder);
+        let threadId = "";
+
+        await app.harness.commit(async (tx) => {
+            const state = await tx.doc(DeskThreads);
+            const opened = openThread(state, {
+                key: "x.test.other-ask",
+                supervisor: Number(other),
+                agents: ["duncan"],
+                repo: "frostyard/test",
+                title: "Another supervisor's",
+                at: Date.now(),
+            });
+
+            threadId = opened.thread.id;
+            state.threads[threadId]!.state = "open";
+            state.threads[threadId]!.address = "session-other-ask";
+            state.threads[threadId]!.run.busy = true;
+        }, context);
+
+        otherAskThreadId = threadId;
+
+        const source = await supervisor("reminder-other-thread");
+
+        await say(app, source, "ask other thread test");
+        assert.doesNotMatch((await modelTexts(app, source)).join("\n"), /Desk check:/);
+
+        const ask = (await deskState())?.threads[threadId]?.asks[0];
+
+        assert.equal(ask?.session, Number(source));
+        assert.equal(ask?.by, "Odrade");
+    });
+
     test("a turn that filed an ask gets no reminder, and a session without a supervisor identity gets none", async () => {
         const filed = await supervisor("reminder-filed");
 
@@ -3828,6 +3956,57 @@ describe("the desk in a Pi Pocket", () => {
                 (await deskState())?.threads[first.id]?.events.length,
                 events,
                 "the replay adds no event",
+            );
+        });
+
+        test("the page's attach reopens a recently closed done thread", async () => {
+            const source = await supervisor("page-attach-closed");
+            let targetId = "";
+            let otherId = "";
+
+            await app.harness.commit(async (tx) => {
+                const state = await tx.doc(DeskThreads);
+                const target = openThread(state, {
+                    key: "x.test.closed-target",
+                    supervisor: Number(source),
+                    agents: ["duncan"],
+                    repo: "frostyard/test",
+                    title: "A closed target",
+                    at: Date.now(),
+                });
+
+                targetId = target.thread.id;
+                state.threads[targetId]!.state = "closed";
+                state.threads[targetId]!.closed = {
+                    at: Date.now(),
+                    why: "done",
+                    by: "sweep",
+                };
+
+                const other = openThread(state, {
+                    key: "x.test.closed-other",
+                    supervisor: Number(source),
+                    agents: ["duncan"],
+                    repo: "frostyard/test",
+                    title: "The other",
+                    at: Date.now(),
+                });
+
+                otherId = other.thread.id;
+            }, context);
+
+            const moved = await call(`threads/${otherId}/attach`, { into: targetId });
+
+            assert.equal(moved.status, 200);
+
+            const state = await deskState();
+
+            assert.equal(state?.threads[targetId]?.state, "open");
+            assert.equal(state?.threads[targetId]?.closed, undefined);
+            assert.equal(state?.threads[otherId]?.state, "closed");
+            assert.match(
+                state?.threads[targetId]?.events.map((event) => event.text).join("; ") ?? "",
+                /reopened: T[0-9]+ attached by /,
             );
         });
 
