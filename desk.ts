@@ -27,6 +27,7 @@ import {
     defineExtension,
     defineTask,
     defineTool,
+    GenerationTask,
     hook,
     section,
     ToolTask,
@@ -73,6 +74,18 @@ const BRANCH_NAME = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,200}$/;
 
 // ─── Stored state ────────────────────────────────────────────────────────────
 
+/** A question for Brian. Stored data: never rename a field. */
+export type Ask = {
+    id: string;
+    text: string;
+    at: number;
+    answer?: { at: number; by: string; words: string };
+    /** The tool call that filed it: a replay finds it, and adds nothing. */
+    key?: string;
+    /** Who filed it: the supervisor's name. */
+    by?: string;
+};
+
 /** One attached PR: how it was attached, and what GitHub said about it. */
 export type PrLink = {
     via: "seen" | "branch" | "window" | "attached";
@@ -115,12 +128,7 @@ export type Thread = {
     prs: Record<string, PrLink>;
     branches: string[];
     /** Ask ids "T13a", "T13b", ... */
-    asks: {
-        id: string;
-        text: string;
-        at: number;
-        answer?: { at: number; by: string; words: string };
-    }[];
+    asks: Ask[];
     /**
      * Facts the sweep keeps: `returnAddress`, `reportedAt`, `reportedUserEntry`, `scanCursor`, `lastUserEntry`,
      * `seenPrs`, `busy`, `archived`, `shift`, `dirty`, `ahead`, `folder`, `next`, `sweptAt`.
@@ -200,6 +208,22 @@ export const DeskReports = defineDoc<DeskReportsState>({
 });
 
 // ─── Small helpers ───────────────────────────────────────────────────────────
+
+/** One line, no double spaces, any length. */
+const flatLine = (text: string) => text.replace(/\s+/g, " ").trim();
+
+/** The next thread id, T13, and it moves the counter past it. */
+function nextThreadId(state: DeskState): string {
+    let number = state.next.T;
+
+    while (Object.hasOwn(state.threads, `T${String(number)}`)) {
+        number += 1;
+    }
+
+    state.next.T = number + 1;
+
+    return `T${String(number)}`;
+}
 
 /** One line, no double spaces, at most `MAX_TITLE` characters. */
 const oneLine = (text: string) => text.replace(/\s+/g, " ").trim().slice(0, MAX_TITLE).trimEnd();
@@ -286,15 +310,7 @@ export function openThread(
         return { thread: existing, reused: true };
     }
 
-    let number = state.next.T;
-
-    while (Object.hasOwn(state.threads, `T${String(number)}`)) {
-        number += 1;
-    }
-
-    state.next.T = number + 1;
-
-    const id = `T${String(number)}`;
+    const id = nextThreadId(state);
     const thread: Thread = {
         id,
         key: request.key,
@@ -1595,6 +1611,177 @@ export async function scanChatGrants(
     return added;
 }
 
+// ─── Asks to Brian ──────────────────────────────────────────────────────────
+
+/** The ask with an id, and its thread. */
+export function askById(
+    state: Readonly<DeskState> | undefined,
+    id: string,
+): { thread: Thread; ask: Ask } | undefined {
+    const key = id.trim().replace(/^#/, "").toLowerCase();
+
+    for (const thread of Object.values(state?.threads ?? {})) {
+        const ask = thread.asks.find((each) => each.id.toLowerCase() === key);
+
+        if (ask !== undefined) {
+            return { thread, ask };
+        }
+    }
+
+    return undefined;
+}
+
+/** The ask a tool call filed, by its key: a replay finds it. */
+function findAsk(
+    state: Readonly<DeskState>,
+    key: string,
+): { thread: Thread; ask: Ask } | undefined {
+    for (const thread of Object.values(state.threads)) {
+        const ask = thread.asks.find((each) => each.key === key);
+
+        if (ask !== undefined) {
+            return { thread, ask };
+        }
+    }
+
+    return undefined;
+}
+
+export type AskRequest = {
+    /** A thread id, or "new". */
+    thread?: string;
+    text: string;
+    /** Required when `thread` is "new". */
+    title?: string;
+    key: string;
+    by: string;
+    supervisor: number;
+    at: number;
+};
+
+/** File an ask on a thread, or on a new "ask" thread. Pure over the state: the caller commits it. */
+export function addAsk(
+    state: DeskState,
+    request: AskRequest,
+): { threadId: string; askId: string } | { error: string } {
+    const known = findAsk(state, request.key);
+
+    if (known !== undefined) {
+        return { threadId: known.thread.id, askId: known.ask.id };
+    }
+
+    const text = flatLine(request.text);
+
+    if (text === "" || text.length > 500) {
+        return { error: "An ask is 1 to 500 characters, on one line." };
+    }
+
+    if (request.thread === undefined) {
+        return { error: "ask needs thread: a thread id, or new." };
+    }
+
+    if (request.thread === "new") {
+        const title = flatLine(request.title ?? "");
+
+        if (title === "" || title.length > 120) {
+            return { error: "A new ask thread needs a title of 1 to 120 characters." };
+        }
+
+        const id = nextThreadId(state);
+        const askId = `${id}a`;
+        const thread: Thread = {
+            id,
+            key: request.key,
+            origin: "ask",
+            title: oneLine(title),
+            agents: [],
+            supervisor: request.supervisor,
+            state: "open",
+            startedAt: request.at,
+            lastEventAt: request.at,
+            prs: {},
+            branches: [],
+            asks: [{ id: askId, text, at: request.at, key: request.key, by: request.by }],
+            run: {},
+            events: [],
+        };
+
+        addEvent(thread, "opened", "opened by an ask", request.at);
+        state.threads[id] = thread;
+
+        return { threadId: id, askId };
+    }
+
+    const thread = threadById(state, request.thread);
+
+    if (thread === undefined) {
+        return { error: `There is no thread ${request.thread.toUpperCase()}.` };
+    }
+
+    if (thread.state === "closed") {
+        return {
+            error: `Thread ${thread.id} is closed: file the ask on an open thread, or with new.`,
+        };
+    }
+
+    const askId = `${thread.id}${letters(thread.asks.length)}`;
+
+    thread.asks.push({ id: askId, text, at: request.at, key: request.key, by: request.by });
+    addEvent(thread, `ask:${askId}:${String(request.at)}`, `ask ${askId}: ${text}`, request.at);
+
+    return { threadId: thread.id, askId };
+}
+
+/** Record Brian's answer to an ask. An ask that is answered already changes nothing. */
+export function answerAsk(
+    state: DeskState,
+    id: string,
+    answer: { at: number; by: string; words: string },
+): { id: string; already: boolean } | { error: string } {
+    const found = askById(state, id);
+
+    if (found === undefined) {
+        return { error: `There is no ask ${id.toUpperCase()}.` };
+    }
+
+    if (found.ask.answer !== undefined) {
+        return { id: found.ask.id, already: true };
+    }
+
+    const words = flatLine(answer.words);
+
+    if (words === "" || words.length > 1000) {
+        return { error: "An answer is 1 to 1000 characters." };
+    }
+
+    found.ask.answer = { at: answer.at, by: answer.by, words };
+    addEvent(
+        found.thread,
+        `answered:${found.ask.id}:${String(answer.at)}`,
+        `answered ${found.ask.id}`,
+        answer.at,
+    );
+
+    return { id: found.ask.id, already: false };
+}
+
+/** The words that ask Brian for something: a question, or one of these phrases. */
+const ASK_WORDS =
+    /can you|could you|would you|your call|do you want|should i|which (one|option)|please (tap|merge|confirm|check|decide|approve|create|delete|set)|needs you|your ok/i;
+
+/** Whether the last paragraph asks Brian something. Code blocks and inline code never count. */
+export function asksBrian(text: string): boolean {
+    const plain = text.replace(/```[\s\S]*?```/g, " ").replace(/`[^`\n]*`/g, " ");
+    const last =
+        plain
+            .trim()
+            .split(/\n\s*\n/)
+            .at(-1)
+            ?.trim() ?? "";
+
+    return last.includes("?") || ASK_WORDS.test(last);
+}
+
 // ─── The page's view ────────────────────────────────────────────────────────
 
 /** How many closed threads the page shows. */
@@ -1801,7 +1988,7 @@ export function listText(state: Readonly<DeskState> | undefined, now = Date.now(
     return threads
         .map((thread) => {
             const prs = Object.keys(thread.prs).length;
-            const asks = thread.asks.filter((ask) => ask.answer === undefined).length;
+            const asks = thread.asks.filter((ask) => ask.answer === undefined).map((ask) => ask.id);
 
             return [
                 thread.id,
@@ -1811,7 +1998,7 @@ export function listText(state: Readonly<DeskState> | undefined, now = Date.now(
                 thread.repo ?? "no repo",
                 thread.agents.join(", ") || "nobody",
                 ...(prs === 0 ? [] : [counted(prs, "PR")]),
-                ...(asks === 0 ? [] : [counted(asks, "ask")]),
+                ...(asks.length === 0 ? [] : [asks.join(", ")]),
                 thread.title,
             ].join(" · ");
         })
@@ -3323,6 +3510,37 @@ export default function createDesk(host: Host, web: Web) {
 
     web.route(
         "POST",
+        "asks/:id/answer",
+        async (request) => {
+            const answerId = (request.params.id ?? "").trim();
+            const { cap } = await deskConfig();
+            const now = Date.now();
+            const view = await request.commit(async (tx) => {
+                const state = await tx.doc(DeskThreads);
+                const words =
+                    flatLine(String(request.body.words ?? "")) || "answered on the Desk page";
+                const result = answerAsk(state, answerId, {
+                    at: now,
+                    by: request.user.name,
+                    words,
+                });
+
+                if ("error" in result) {
+                    throw web.error(/no ask/.test(result.error) ? 404 : 400, result.error);
+                }
+
+                return threadsView(state, now, cap);
+            });
+
+            web.send("changed", {});
+
+            return view;
+        },
+        { access: "owner" },
+    );
+
+    web.route(
+        "POST",
         "grant",
         async (request) => {
             const asked = request.body.count ?? 1;
@@ -3408,6 +3626,97 @@ export default function createDesk(host: Host, web: Web) {
      * The side door: a linked session's built-in `team` tool must not send a report to its supervisor; `team_message`
      * files it on the thread. A hook that throws must not block a call by accident, so every error lets the call run.
      */
+    /** Pocket's plan mode, read only (as night-shift.ts does): Pi proposes and does not ask for decisions yet. */
+    const PlanMode = defineDoc<{ on: boolean }>({
+        kind: "pocket.plan",
+        version: 1,
+        scope: "conversation",
+        history: "latest",
+        fork: "current",
+        initial: () => ({ on: false }),
+    });
+
+    /**
+     * The reminder: when a supervisor's reply asks Brian something and the turn filed no ask, continue once with the
+     * instruction to file it. It never changes the messages and never blocks a turn: every error lets the turn end.
+     */
+    const reminder = hook(GenerationTask, {
+        beforeRequest: async (request, api, context) => {
+            try {
+                // A new generation, or a continued one? A continue starts a new task, and its memos start empty, so
+                // the request itself says that the reminder was just sent. Then no second one comes.
+                const last = [...request.messages].reverse().find((each) => each.role === "user");
+                const said = last === undefined ? "" : textOf(last.content).trimStart();
+
+                if (said.startsWith("Desk check:")) {
+                    await api.memo("desk.reminded", true, context);
+                } else {
+                    // The turn starts when the person wrote its message: a tool call in the same turn is later, and
+                    // this attempt's memos hold that time for onYield (a new attempt starts with new memos).
+                    const made = (last as { timestamp?: unknown } | undefined)?.timestamp;
+
+                    await api.memo(
+                        "desk.turnStart",
+                        typeof made === "number" && made > 0 ? made : Date.now(),
+                        context,
+                    );
+                }
+            } catch {
+                // The turn goes on; without a start time, only the filed-ask check is skipped.
+            }
+
+            return undefined;
+        },
+        onYield: async (answer, api, context) => {
+            try {
+                const team = teamApi();
+
+                if (team === undefined) {
+                    return undefined;
+                }
+
+                const persona = await team.persona(api, api.conversationId, context);
+
+                if (persona?.role !== "supervisor") {
+                    return undefined;
+                }
+
+                if ((await api.snapshot(PlanMode, api.conversationId, context))?.on === true) {
+                    return undefined;
+                }
+
+                if ((await api.memo("desk.reminded", context)) === true) {
+                    return undefined;
+                }
+
+                if (!asksBrian(textOf(answer.content))) {
+                    return undefined;
+                }
+
+                const turnStart = (await api.memo<number>("desk.turnStart", context)) ?? Date.now();
+                const state = await api.snapshot(DeskThreads, context);
+                const filed = Object.values(state?.threads ?? {}).some(
+                    (thread) =>
+                        thread.supervisor === Number(api.conversationId) &&
+                        thread.asks.some((ask) => ask.at >= turnStart),
+                );
+
+                if (filed) {
+                    return undefined;
+                }
+
+                await api.memo("desk.reminded", true, context);
+
+                return {
+                    continue:
+                        "Desk check: your reply asks Brian something, and this turn filed no ask. If it is a decision, a host action, or a device check, file it now with desk ask (a thread id, or new). If it is not an ask to Brian, do nothing. Do not write more text to Brian.",
+                };
+            } catch {
+                return undefined;
+            }
+        },
+    });
+
     const noTeamReport = hook(ToolTask, {
         beforeTool: async (call, api, context) => {
             try {
@@ -3441,7 +3750,7 @@ export default function createDesk(host: Host, web: Web) {
     const tool = defineTool({
         name: "desk",
         description:
-            "Supervisor only: the desk of threads for work the team runs in the background. Actions: list (one line per open thread), read (one thread in full), sync (observe the threads now, with linked sessions, Night shift, git, and GitHub), seed (import a seed.json file one time), attach (put a PR, or all of another thread's work, on one thread).",
+            "Supervisor only: the desk of threads for work the team runs in the background. Actions: list (one line per open thread), read (one thread in full), sync (observe the threads now, with linked sessions, Night shift, git, and GitHub), seed (import a seed.json file one time), attach (put a PR, or all of another thread's work, on one thread), ask (file a question for Brian on a thread, or on a new one), answer (record Brian's words for an ask).",
         parameters: Type.Object({
             action: Type.Union([
                 Type.Literal("list"),
@@ -3449,6 +3758,8 @@ export default function createDesk(host: Host, web: Web) {
                 Type.Literal("sync"),
                 Type.Literal("seed"),
                 Type.Literal("attach"),
+                Type.Literal("ask"),
+                Type.Literal("answer"),
             ]),
             thread: Type.Optional(
                 Type.String({
@@ -3459,6 +3770,22 @@ export default function createDesk(host: Host, web: Web) {
                 Type.String({
                     description:
                         "attach: a PR ref (owner/name#12), or a thread id such as F2 to merge into the target",
+                }),
+            ),
+            text: Type.Optional(
+                Type.String({
+                    description: "ask: the question for Brian, 1 to 500 characters, on one line",
+                }),
+            ),
+            title: Type.Optional(
+                Type.String({
+                    description: "ask new: a short title for the thread, 1 to 120 characters",
+                }),
+            ),
+            ask: Type.Optional(Type.String({ description: "answer: the ask's id, such as T13c" })),
+            words: Type.Optional(
+                Type.String({
+                    description: "answer: Brian's words as he wrote them, 1 to 1000 characters",
                 }),
             ),
             path: Type.Optional(
@@ -3530,6 +3857,66 @@ export default function createDesk(host: Host, web: Web) {
                         : await api.snapshot(DeskReports, found.session as ConversationId, context);
 
                 return reply(found.text + reportsText(reports, (value) => host.text.defang(value)));
+            }
+
+            if (args.action === "ask") {
+                const key = `x.desk.ask:${api.taskId}:${api.callId}`;
+                const at = Date.now();
+                const result = await api.commit(async (tx) => {
+                    const state = await tx.doc(DeskThreads);
+                    const added = addAsk(state, {
+                        ...(args.thread === undefined ? {} : { thread: args.thread }),
+                        text: args.text ?? "",
+                        ...(args.title === undefined ? {} : { title: args.title }),
+                        key,
+                        by: persona.name,
+                        supervisor: Number(api.conversationId),
+                        at,
+                    });
+
+                    if ("error" in added) {
+                        return added;
+                    }
+
+                    if (state.threads[added.threadId]?.origin === "ask") {
+                        await startSweeper(tx, Number(api.conversationId));
+                    }
+
+                    return added;
+                }, context);
+
+                if ("error" in result) {
+                    throw new Error(result.error);
+                }
+
+                return reply(`Filed ${result.askId}.`);
+            }
+
+            if (args.action === "answer") {
+                const asked = args.ask?.trim() ?? "";
+
+                if (asked === "") {
+                    throw new Error("answer needs ask: an ask id such as T13c.");
+                }
+
+                const at = Date.now();
+                const result = await api.commit(async (tx) => {
+                    const state = await tx.doc(DeskThreads);
+
+                    return answerAsk(state, asked, {
+                        at,
+                        by: persona.name,
+                        words: args.words ?? "",
+                    });
+                }, context);
+
+                if ("error" in result) {
+                    throw new Error(result.error);
+                }
+
+                return reply(
+                    result.already ? `${result.id} is answered already.` : `Answered ${result.id}.`,
+                );
             }
 
             if (args.action === "attach") {
@@ -3645,7 +4032,7 @@ export default function createDesk(host: Host, web: Web) {
     return defineExtension({
         name: "desk",
         tools: [tool],
-        hooks: [noTeamReport],
+        hooks: [noTeamReport, reminder],
         tasks: [Sweeper],
         sections: [
             // Only a supervisor's session gets it. No clock text: the section changes when the desk changes.
@@ -3717,6 +4104,7 @@ export default function createDesk(host: Host, web: Web) {
                         : []),
                     `Stale: ${stale.length === 0 ? "none" : stale.join(", ")}.`,
                     ...(events.length === 0 ? [] : ["New since your last look:", ...events]),
+                    "File each ask to Brian (a decision, a host action, a device check) with desk ask. Record his answer with desk answer.",
                     "Reports arrive as 1 line that starts with [desk]. Read the full report with desk read <id> before you act.",
                     "Keep each reply to Brian to 1 or 2 lines: the project and the urgency. The Desk holds the rest.",
                 ].join("\n");

@@ -190,6 +190,7 @@ export default function setup(pocket) {
         const [reason, setReason] = useState("");
         const [into, setInto] = useState({});
         const [closedOpen, setClosedOpen] = useState(false);
+        const [answers, setAnswers] = useState({});
 
         useEffect(() => {
             const update = () => setTick((tick) => tick + 1);
@@ -255,6 +256,12 @@ export default function setup(pocket) {
         };
 
         const drop = (id) => act(`threads/${id}/drop`, { reason });
+
+        const answer = async (id) => {
+            const words = (answers[id] ?? "").trim();
+
+            await act(`asks/${id}/answer`, words === "" ? {} : { words });
+        };
 
         if (openId !== null) {
             return html`<${Detail} id=${openId} onBack=${() => setOpenId(null)} />`;
@@ -448,7 +455,31 @@ export default function setup(pocket) {
 
         const needDetail = (thread) =>
             html`<div class="desk-need">
-                ${thread.asks.map((ask) => html`<p class="small">${ask.id} · ${ask.text}</p>`)}
+                ${thread.asks.map(
+                    (ask) => html`<div class="desk-ask">
+                        <p class="small">${ask.id} · ${ask.text}</p>
+                        <div class="desk-actions">
+                            <input
+                                class="desk-reason"
+                                type="text"
+                                maxlength="1000"
+                                placeholder="His words (optional)"
+                                value=${answers[ask.id] ?? ""}
+                                disabled=${busy}
+                                onInput=${(event) =>
+                                    setAnswers({ ...answers, [ask.id]: event.currentTarget.value })}
+                            />
+                            <button
+                                class="button"
+                                disabled=${busy}
+                                aria-label=${`Answered ${ask.id}`}
+                                onClick=${() => void answer(ask.id)}
+                            >
+                                Answered
+                            </button>
+                        </div>
+                    </div>`,
+                )}
                 ${thread.prs
                     .filter((pr) => pr.next === "brian")
                     .map((pr) =>

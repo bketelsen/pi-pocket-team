@@ -23,7 +23,7 @@ import { createServer } from "node:http";
 import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
 import { fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
-import type { ConversationId } from "@earendil-works/pi-durable";
+import { defineDoc, type ConversationId } from "@earendil-works/pi-durable";
 import {
     bindThread,
     DeskReports,
@@ -40,6 +40,9 @@ import {
     isStale,
     nextActor,
     parseStatus,
+    addAsk,
+    answerAsk,
+    asksBrian,
     attachTo,
     attribute,
     buildQuery,
@@ -179,7 +182,7 @@ describe("threads", () => {
         assert.deepEqual(seeded, { added: ["T1"], reused: false });
         assert.equal(
             listText(state, 10),
-            "T1 · open · next: brian · frostyard/frostmail · irulan · 1 PR · 1 ask · frostmail fixes",
+            "T1 · open · next: brian · frostyard/frostmail · irulan · 1 PR · T1a · frostmail fixes",
         );
 
         const text = readText(state, "t1");
@@ -1039,6 +1042,143 @@ describe("attachTo", () => {
     });
 });
 
+describe("asksBrian", () => {
+    test("a question, or a request, in the last paragraph only", () => {
+        assert.equal(asksBrian("Should I merge #106?"), true);
+        assert.equal(asksBrian("Your call: A or B."), true);
+        assert.equal(asksBrian("Please tap Done when the DNS record is gone."), true);
+        assert.equal(asksBrian("Merged #106. Tests pass."), false);
+        assert.equal(asksBrian("The check:\n\n```\nIs it done?\n```"), false);
+        assert.equal(asksBrian("Should I merge #106?\n\nMerged and tested."), false);
+        assert.equal(asksBrian("Use `desk ok?` in chat.\n\nAll set."), false);
+        assert.equal(asksBrian(""), false);
+    });
+});
+
+describe("asks", () => {
+    test("an ask on a thread gets the next letter, and a replay adds nothing", () => {
+        const state = deskOf();
+        const thread = placed(state, 100);
+
+        assert.deepEqual(
+            addAsk(state, {
+                thread: thread.id,
+                text: "  Should I merge\n#106? ",
+                key: "k1",
+                by: "Odrade",
+                supervisor: 1,
+                at: 200,
+            }),
+            { threadId: "T1", askId: "T1a" },
+        );
+        assert.equal(thread.asks[0]?.text, "Should I merge #106?");
+        assert.match(thread.events.at(-1)?.text ?? "", /ask T1a: Should I merge #106\?/);
+
+        assert.deepEqual(
+            addAsk(state, {
+                thread: thread.id,
+                text: "Other",
+                key: "k1",
+                by: "Odrade",
+                supervisor: 1,
+                at: 300,
+            }),
+            { threadId: "T1", askId: "T1a" },
+        );
+        assert.equal(thread.asks.length, 1, "the replay adds nothing");
+
+        assert.deepEqual(
+            addAsk(state, {
+                thread: thread.id,
+                text: "And #107?",
+                key: "k2",
+                by: "Odrade",
+                supervisor: 1,
+                at: 400,
+            }),
+            { threadId: "T1", askId: "T1b" },
+        );
+    });
+
+    test("ask new makes an ask thread with its first ask", () => {
+        const state = deskOf();
+        const made = addAsk(state, {
+            thread: "new",
+            title: "A decision",
+            text: "Merge it?",
+            key: "k1",
+            by: "Odrade",
+            supervisor: 7,
+            at: 200,
+        });
+
+        assert.deepEqual(made, { threadId: "T1", askId: "T1a" });
+
+        const thread = state.threads.T1!;
+
+        assert.equal(thread.origin, "ask");
+        assert.deepEqual(thread.agents, []);
+        assert.equal(thread.supervisor, 7);
+        assert.equal(thread.state, "open");
+        assert.equal(thread.asks[0]?.id, "T1a");
+        assert.equal(thread.asks[0]?.by, "Odrade");
+    });
+
+    test("a closed thread is refused", () => {
+        const state = deskOf();
+        const thread = placed(state, 100);
+
+        thread.state = "closed";
+
+        const result = addAsk(state, {
+            thread: thread.id,
+            text: "Merge it?",
+            key: "k1",
+            by: "Odrade",
+            supervisor: 1,
+            at: 200,
+        });
+
+        assert.match("error" in result ? result.error : "", /is closed/);
+    });
+
+    test("an answer is recorded once, and an ask thread closes when every ask is answered", () => {
+        const state = deskOf();
+
+        addAsk(state, {
+            thread: "new",
+            title: "A decision",
+            text: "Merge it?",
+            key: "k1",
+            by: "Odrade",
+            supervisor: 1,
+            at: 100,
+        });
+
+        const thread = state.threads.T1!;
+
+        assert.equal(closeCheck(thread, facts(200)).close, false, "the open ask holds it");
+
+        assert.deepEqual(
+            answerAsk(state, "T1a", { at: 200, by: "Brian", words: " Yes, merge it. " }),
+            {
+                id: "T1a",
+                already: false,
+            },
+        );
+        assert.equal(thread.asks[0]?.answer?.words, "Yes, merge it.");
+        assert.equal(thread.asks[0]?.answer?.by, "Brian");
+        assert.match(thread.events.at(-1)?.text ?? "", /answered T1a/);
+
+        assert.deepEqual(answerAsk(state, "T1a", { at: 300, by: "Brian", words: "No." }), {
+            id: "T1a",
+            already: true,
+        });
+        assert.equal(thread.asks[0]?.answer?.words, "Yes, merge it.");
+        assert.equal(closeCheck(thread, facts(400)).close, true);
+    });
+});
+
 describe("the cap", () => {
     test("a thread counts unless it is parked, closed, or waits on a reviewer", () => {
         assert.equal(isCounted(thread({ run: { next: "agent" } })), true);
@@ -1185,6 +1325,19 @@ const OTHER_REPORT = `OTHER-START ${"o".repeat(1200)} OTHER-END`;
 const LONG_SUMMARY = `NIGHT-REPORT-START ${"n".repeat(1200)} NIGHT-REPORT-END`;
 /** The seed file the scripted model hands to the tool. */
 let seedPath = "";
+/** The thread and ask the scripted model uses in the ask tests. */
+let askThreadId = "";
+let answerAskId = "";
+
+/** Pi Pocket's plan mode, to turn it on for one session in a test. */
+const PlanDoc = defineDoc<{ on: boolean }>({
+    kind: "pocket.plan",
+    version: 1,
+    scope: "conversation",
+    history: "latest",
+    fork: "current",
+    initial: () => ({ on: false }),
+});
 /** The address the linked session sends a message to, in the tests that need one. */
 let otherAddress = "";
 /** The supervisor's address for the linked session, for the built-in team tool's guard. */
@@ -1204,7 +1357,11 @@ const model = scriptedModel((request) => {
     const { role, text } = lastText(request as never);
 
     if (role === "toolResult") {
-        return answer("ok");
+        return answer(text.includes("Filed T") ? "Should I merge #106?" : "ok");
+    }
+
+    if (text.startsWith("Desk check:")) {
+        return answer("Should I merge #107?");
     }
 
     if (text.startsWith("[night-shift] The night shift has stopped")) {
@@ -1227,6 +1384,44 @@ const model = scriptedModel((request) => {
 
     if (text.endsWith("desk sync test")) {
         return call("desk", { action: "sync" });
+    }
+
+    if (text.endsWith("desk reminder test")) {
+        return answer("Should I merge #106?");
+    }
+
+    if (text.endsWith("ask then question test")) {
+        return call("desk", {
+            action: "ask",
+            thread: "new",
+            title: "A decision",
+            text: "Should I merge #106?",
+        });
+    }
+
+    if (text.endsWith("desk ask thread test")) {
+        return call("desk", {
+            action: "ask",
+            thread: askThreadId,
+            text: "Should I merge #106?",
+        });
+    }
+
+    if (text.endsWith("desk ask new test")) {
+        return call("desk", {
+            action: "ask",
+            thread: "new",
+            title: "A decision",
+            text: "Merge it?",
+        });
+    }
+
+    if (text.endsWith("desk answer test")) {
+        return call("desk", {
+            action: "answer",
+            ask: answerAskId,
+            words: "Yes, merge it.",
+        });
     }
 
     if (text.endsWith("start linked test")) {
@@ -1972,6 +2167,89 @@ describe("the desk in a Pi Pocket", () => {
         assert.equal(plain.title, "Duncan Idaho: 2 items that Brian decided on 2026-10-22.");
     });
 
+    test("desk ask and answer work through the tool, and an ask thread closes at a sweep", async () => {
+        const { source, thread } = await delegated("asks");
+
+        askThreadId = thread.id;
+        await say(app, source, "desk ask thread test");
+
+        let stored = (await deskState())?.threads[thread.id];
+        const askId = stored?.asks.at(-1)?.id ?? "";
+
+        assert.equal(askId, `${thread.id}a`);
+        assert.equal(stored?.asks.at(-1)?.text, "Should I merge #106?");
+        assert.equal(stored?.asks.at(-1)?.by, "Odrade");
+        assert.match((await modelTexts(app, source)).join("\n"), new RegExp(`Filed ${askId}\\.`));
+
+        answerAskId = askId;
+        await say(app, source, "desk answer test");
+        stored = (await deskState())?.threads[thread.id];
+        assert.equal(stored?.asks.find((ask) => ask.id === askId)?.answer?.words, "Yes, merge it.");
+        assert.equal(stored?.asks.find((ask) => ask.id === askId)?.answer?.by, "Odrade");
+
+        // A new ask thread: its answer, then a sweep closes it.
+        await say(app, source, "desk ask new test");
+        const asked = Object.values((await deskState())?.threads ?? {}).find(
+            (each) => each.origin === "ask" && each.supervisor === Number(source),
+        );
+
+        assert(asked, "the new ask thread");
+        assert.equal(asked.asks[0]?.text, "Merge it?");
+        assert.equal(asked.state, "open");
+
+        answerAskId = asked.asks[0]?.id ?? "";
+        await say(app, source, "desk answer test");
+        await say(app, source, "desk sync test");
+
+        const closed = (await deskState())?.threads[asked.id];
+
+        assert.equal(closed?.state, "closed");
+        assert.equal(closed?.closed?.why, "done");
+    });
+
+    test("the reminder continues once when a reply asks Brian something and filed no ask", async () => {
+        const source = await supervisor("reminder");
+
+        await say(app, source, "desk reminder test");
+
+        const texts = await modelTexts(app, source);
+
+        assert.equal(
+            texts.filter((each) => each.includes("Desk check:")).length,
+            1,
+            "one reminder, and no second one after the next answer",
+        );
+        assert.match(texts.join("\n"), /Desk check: your reply asks Brian something/);
+    });
+
+    test("a turn that filed an ask gets no reminder, and a session without a supervisor identity gets none", async () => {
+        const filed = await supervisor("reminder-filed");
+
+        await say(app, filed, "ask then question test");
+        assert.match((await modelTexts(app, filed)).join("\n"), /Filed T[0-9]+a\./);
+
+        assert.doesNotMatch((await modelTexts(app, filed)).join("\n"), /Desk check:/);
+
+        const folder = join(root, "plain-reminder");
+
+        mkdirSync(folder, { recursive: true });
+        const plain = await newSession(app, folder);
+
+        await say(app, plain, "desk reminder test");
+        assert.doesNotMatch((await modelTexts(app, plain)).join("\n"), /Desk check:/);
+    });
+
+    test("plan mode turns the reminder off", async () => {
+        const source = await supervisor("reminder-plan");
+
+        await app.harness.commit(async (tx) => {
+            (await tx.doc(PlanDoc, source)).on = true;
+        }, context);
+
+        await say(app, source, "desk reminder test");
+        assert.doesNotMatch((await modelTexts(app, source)).join("\n"), /Desk check:/);
+    });
+
     describe("the desk page's routes", () => {
         let server: ReturnType<typeof createServer> | undefined;
         let call: (
@@ -2260,6 +2538,86 @@ describe("the desk in a Pi Pocket", () => {
 
             assert.equal((await call("grant", { count: 1 }, guest.token)).status, 404);
             assert.equal((await call("grant", { count: 9 })).status, 400);
+        });
+
+        test("POST asks/:id/answer records Brian's words, and a second POST changes nothing", async () => {
+            const source = await supervisor("page-ask");
+            let threadId = "";
+            let askId = "";
+            let secondAsk = "";
+
+            await app.harness.commit(async (tx) => {
+                const state = await tx.doc(DeskThreads);
+                const opened = openThread(state, {
+                    key: "x.test.page-ask",
+                    supervisor: Number(source),
+                    agents: ["duncan"],
+                    repo: "frostyard/test",
+                    title: "A decision",
+                    at: Date.now(),
+                });
+
+                threadId = opened.thread.id;
+
+                const first = addAsk(state, {
+                    thread: threadId,
+                    text: "Merge it?",
+                    key: "x.test.page-ask:1",
+                    by: "Odrade",
+                    supervisor: Number(source),
+                    at: Date.now(),
+                });
+
+                askId = "askId" in first ? first.askId : "";
+
+                const next = addAsk(state, {
+                    thread: threadId,
+                    text: "And then?",
+                    key: "x.test.page-ask:2",
+                    by: "Odrade",
+                    supervisor: Number(source),
+                    at: Date.now(),
+                });
+
+                secondAsk = "askId" in next ? next.askId : "";
+            }, context);
+
+            const answered = await call(`asks/${askId}/answer`, { words: "Yes, merge it." });
+
+            assert.equal(answered.status, 200);
+
+            const stored = (await deskState())?.threads[threadId]?.asks.find(
+                (ask) => ask.id === askId,
+            );
+
+            assert.equal(stored?.answer?.words, "Yes, merge it.");
+            assert.equal(stored?.answer?.by, owner(app).name);
+
+            const events = (await deskState())?.threads[threadId]?.events.length;
+
+            assert.equal((await call(`asks/${askId}/answer`, { words: "No." })).status, 200);
+            assert.equal(
+                (await deskState())?.threads[threadId]?.asks.find((ask) => ask.id === askId)?.answer
+                    ?.words,
+                "Yes, merge it.",
+            );
+            assert.equal(
+                (await deskState())?.threads[threadId]?.events.length,
+                events,
+                "a second POST changes nothing",
+            );
+
+            // No words: the page's default.
+            assert.equal((await call(`asks/${secondAsk}/answer`, {})).status, 200);
+            assert.equal(
+                (await deskState())?.threads[threadId]?.asks.find((ask) => ask.id === secondAsk)
+                    ?.answer?.words,
+                "answered on the Desk page",
+            );
+
+            const guest = app.config.addUser("An ask guest", "guest");
+
+            assert.equal((await call(`asks/${secondAsk}/answer`, {}, guest.token)).status, 404);
         });
     });
 
