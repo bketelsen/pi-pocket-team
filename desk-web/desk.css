@@ -227,3 +227,19 @@
 .desk-full p {
     margin: 0 0 8px;
 }
+
+.desk-ask {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 8px 0;
+    border-top: 1px solid var(--line);
+}
+
+.desk-ask:first-child {
+    border-top: 0;
+}
+
+.desk-ask p {
+    margin: 0;
+}
