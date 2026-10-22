@@ -17,7 +17,8 @@ import {
     until,
 } from "./_pocket/test/helpers.ts";
 import assert from "node:assert/strict";
-import { cpSync, mkdirSync, writeFileSync } from "node:fs";
+import { appendFileSync, cpSync, mkdirSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
 import { fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
@@ -33,6 +34,13 @@ import {
     readText,
     seedThreads,
     shortLine,
+    closeCheck,
+    isStale,
+    nextActor,
+    parseStatus,
+    FOUND_FOLDER_DELAY_MS,
+    scanText,
+    SWEEP_SLEEP_MS,
     threadOfSession,
     type DeskState,
     type SeedRow,
@@ -153,8 +161,8 @@ describe("threads", () => {
 
         assert.deepEqual(seeded, { added: ["T1"], reused: false });
         assert.equal(
-            listText(state),
-            "T1 · open · frostyard/frostmail · irulan · 1 PR · 1 ask · frostmail fixes",
+            listText(state, 10),
+            "T1 · open · next: brian · frostyard/frostmail · irulan · 1 PR · 1 ask · frostmail fixes",
         );
 
         const text = readText(state, "t1");
@@ -297,6 +305,237 @@ describe("seedThreads", () => {
     });
 });
 
+// ─── The sweep's rules ────────────────────────────────────────────────────────
+
+const DAY = 24 * 3600_000;
+
+/** A thread with every part closed, unless `patch` opens one; its `run` is merged with the closed facts. */
+const thread = (patch: Partial<Thread> = {}): Thread => ({
+    id: "T1",
+    key: "k",
+    origin: "delegate",
+    title: "A task",
+    agents: ["duncan"],
+    repo: "frostyard/test",
+    cwd: "/work/test",
+    session: 7,
+    address: "session-abc",
+    state: "open",
+    startedAt: 1,
+    lastEventAt: 1,
+    prs: {},
+    branches: [],
+    asks: [],
+    ...patch,
+    run: { busy: false, reportedUserEntry: 5, lastUserEntry: 5, ...(patch.run ?? {}) },
+    events: [],
+});
+
+const facts = (now = 1000, folders: string[] = []) => ({ now, folders: new Set(folders) });
+
+describe("closeCheck", () => {
+    test("a thread with every part closed closes", () => {
+        assert.deepEqual(closeCheck(thread(), facts()), { close: true, open: [] });
+    });
+
+    test("a PR holds it open until it is merged, closed or frozen", () => {
+        const open = closeCheck(
+            thread({ prs: { "frostyard/test#2": { via: "attached" } } }),
+            facts(),
+        );
+
+        assert.equal(open.close, false);
+        assert.match(open.open.join("; "), /PR frostyard\/test#2 is not read/);
+
+        for (const state of ["MERGED", "CLOSED", "FROZEN"]) {
+            const pr = thread({ prs: { "frostyard/test#2": { via: "attached", state } } });
+
+            assert.equal(closeCheck(pr, facts()).close, true, state);
+        }
+    });
+
+    test("an unanswered ask holds it open", () => {
+        const asks = [{ id: "T1a", text: "Which one?", at: 1 }];
+        const open = closeCheck(thread({ asks }), facts());
+
+        assert.equal(open.close, false);
+        assert.match(open.open.join("; "), /ask T1a has no answer/);
+
+        const answered = thread({
+            asks: [
+                {
+                    id: "T1a",
+                    text: "Which one?",
+                    at: 1,
+                    answer: { at: 2, by: "brian", words: "that one" },
+                },
+            ],
+        });
+
+        assert.equal(closeCheck(answered, facts()).close, true);
+    });
+
+    test("the session part: none, archived, idle with a report, idle without, working", () => {
+        assert.equal(
+            closeCheck(thread({ session: undefined, address: undefined, run: {} }), facts()).close,
+            true,
+        );
+        assert.equal(closeCheck(thread({ run: { archived: true } }), facts()).close, true);
+        assert.equal(
+            closeCheck(
+                thread({ run: { busy: false, reportedUserEntry: 5, lastUserEntry: 5 } }),
+                facts(),
+            ).close,
+            true,
+        );
+
+        const silent = closeCheck(
+            thread({ run: { busy: false, reportedUserEntry: 4, lastUserEntry: 5 } }),
+            facts(),
+        );
+
+        assert.equal(silent.close, false);
+        assert.match(silent.open.join("; "), /did not report in its last turn/);
+
+        const working = closeCheck(thread({ run: { busy: true } }), facts());
+
+        assert.equal(working.close, false);
+        assert.match(working.open.join("; "), /its session is working/);
+
+        assert.equal(
+            closeCheck(thread({ run: { busy: undefined } }), facts()).close,
+            false,
+            "not seen idle yet",
+        );
+    });
+
+    test("a seeded thread with only an address is closed when it is idle", () => {
+        assert.equal(
+            closeCheck(thread({ session: undefined, run: { busy: false } }), facts()).close,
+            true,
+        );
+        assert.equal(
+            closeCheck(thread({ session: undefined, run: { busy: true } }), facts()).close,
+            false,
+        );
+    });
+
+    test("a night shift holds it open until it ends", () => {
+        assert.equal(closeCheck(thread({ run: { shift: "running" } }), facts()).close, false);
+        assert.equal(closeCheck(thread({ run: { shift: "summary" } }), facts()).close, false);
+        assert.equal(closeCheck(thread({ run: { shift: "ended" } }), facts()).close, true);
+    });
+
+    test("a dirty folder or unpushed commits hold it open, unless another thread works there", () => {
+        const dirty = closeCheck(thread({ run: { dirty: 2 } }), facts());
+
+        assert.equal(dirty.close, false);
+        assert.match(dirty.open.join("; "), /2 changed files in \/work\/test/);
+        assert.match(
+            closeCheck(thread({ run: { ahead: 1 } }), facts()).open.join("; "),
+            /1 unpushed commit/,
+        );
+        assert.equal(
+            closeCheck(thread({ run: { dirty: 2 } }), facts(1000, ["/work/test"])).close,
+            true,
+        );
+        assert.equal(closeCheck(thread({ run: { dirty: 0, ahead: 0 } }), facts()).close, true);
+        assert.equal(
+            closeCheck(
+                thread({ cwd: undefined, run: { folder: "/work/found", dirty: 1 } }),
+                facts(),
+            ).close,
+            false,
+        );
+    });
+
+    test("a thread still starting closes as failed after an hour", () => {
+        const starting = thread({ state: "starting", startedAt: 0 });
+
+        assert.equal(closeCheck(starting, facts(3599_000)).close, false);
+        assert.deepEqual(closeCheck(starting, facts(3600_001)), {
+            close: true,
+            open: ["the session never started"],
+        });
+    });
+});
+
+describe("nextActor", () => {
+    test("brian comes before agent, and agent before odrade", () => {
+        const asks = [{ id: "T1a", text: "Which one?", at: 1 }];
+
+        assert.equal(nextActor(thread({ asks, run: { busy: true } })), "brian");
+        assert.equal(nextActor(thread({ run: { busy: true } })), "agent");
+        assert.equal(nextActor(thread({ run: { dirty: 2 } })), "agent");
+        assert.equal(nextActor(thread({ run: { ahead: 1 } })), "agent");
+        assert.equal(nextActor(thread({ run: { shift: "running" } })), "agent");
+        assert.equal(nextActor(thread({ run: { shift: "summary" } })), "agent");
+        assert.equal(nextActor(thread({ run: { busy: false, lastUserEntry: 6 } })), "odrade");
+        assert.equal(nextActor(thread({ origin: "found", run: {} })), "odrade");
+        assert.equal(nextActor(thread({ run: { busy: false, archived: true } })), "none");
+        assert.equal(
+            nextActor(thread({ run: { busy: false, reportedUserEntry: 5, lastUserEntry: 5 } })),
+            "none",
+        );
+        assert.equal(nextActor(thread({ state: "closed" })), "none");
+    });
+});
+
+describe("isStale", () => {
+    test("3 days, 7 for a reviewer wait, and keptAt resets the clock", () => {
+        assert.equal(isStale(thread({ lastEventAt: 0 }), 3 * DAY - 1), false);
+        assert.equal(isStale(thread({ lastEventAt: 0 }), 3 * DAY + 1), true);
+        assert.equal(
+            isStale(thread({ lastEventAt: 0, run: { next: "reviewer" } }), 6 * DAY),
+            false,
+        );
+        assert.equal(
+            isStale(thread({ lastEventAt: 0, run: { next: "reviewer" } }), 7 * DAY + 1),
+            true,
+        );
+        assert.equal(isStale(thread({ lastEventAt: 0, keptAt: 2 * DAY }), 4 * DAY), false);
+        assert.equal(isStale(thread({ lastEventAt: 0, keptAt: 2 * DAY }), 5 * DAY + 1), true);
+        assert.equal(isStale(thread({ state: "closed", lastEventAt: 0 }), 100 * DAY), false);
+    });
+});
+
+describe("scanText", () => {
+    test("finds PR refs and the remote branch in a push", () => {
+        const found = scanText(
+            [
+                "Opened https://github.com/frostyard/frostmail/pull/106 and saw it twice: https://github.com/frostyard/frostmail/pull/106",
+                " * [new branch]      fix-x -> fix-x",
+                "   abc123..def456  fix-y -> fix-y",
+                " + abc1234...def5678 fix-z -> fix-z (forced update)",
+                "nothing else",
+            ].join("\n"),
+        );
+
+        assert.deepEqual(found.prs, ["frostyard/frostmail#106"]);
+        assert.deepEqual(found.branches, ["fix-x", "fix-y", "fix-z"]);
+    });
+
+    test("nothing in plain text", () => {
+        assert.deepEqual(scanText("all tests pass"), { prs: [], branches: [] });
+    });
+});
+
+describe("parseStatus", () => {
+    test("counts changed files and commits ahead", () => {
+        const text = [
+            "# branch.oid 1234",
+            "# branch.head main",
+            "# branch.upstream origin/main",
+            "# branch.ab +2 -3",
+            "1 .M N... 100644 100644 100644 a b file.txt",
+            "? new.txt",
+        ].join("\n");
+
+        assert.deepEqual(parseStatus(text), { dirty: 2, ahead: 2, branch: "main" });
+        assert.deepEqual(parseStatus(""), { dirty: 0, ahead: 0 });
+    });
+});
+
 // ─── The short line ───────────────────────────────────────────────────────────
 
 describe("shortLine", () => {
@@ -319,6 +558,15 @@ describe("shortLine", () => {
             line,
             "[desk] T1 frostyard/frostmail · irulan reported (2,340 chars) · desk read T1 · “Opened #106; tests pass.”",
         );
+    });
+
+    test("adds needs Brian when Brian acts next", () => {
+        const line = shortLine(
+            { ...seeded(), run: { next: "brian" } },
+            { from: "team_message", text: "x", quote: "“done”" },
+        );
+
+        assert.match(line, / · needs Brian · desk read T1/);
     });
 
     test("says night shift report for a night shift", () => {
@@ -409,6 +657,10 @@ const model = scriptedModel((request) => {
         return call("desk", { action: "list" });
     }
 
+    if (text.endsWith("desk sync test")) {
+        return call("desk", { action: "sync" });
+    }
+
     if (text.endsWith("desk seed test")) {
         return call("desk", { action: "seed", path: seedPath });
     }
@@ -442,6 +694,14 @@ const model = scriptedModel((request) => {
         });
     }
 
+    if (text.endsWith("desk delegate gurney test")) {
+        return call("team_delegate", {
+            agent: "gurney",
+            repository: "frostyard/old",
+            task: TASK,
+        });
+    }
+
     if (text.endsWith("desk delegate test")) {
         return call("team_delegate", { agent: "duncan", repository: "frostyard/test", task: TASK });
     }
@@ -452,11 +712,49 @@ const model = scriptedModel((request) => {
 const dataDir = join(root, "data");
 const definitions = join(root, "agents");
 const repo = join(root, "repo");
+/** A roster folder that is dirty at the first sweep. */
+const old = join(root, "old");
+/** A roster folder that is clean at the first sweep, and dirty later. */
+const fresh = join(root, "new");
+/** A roster folder that is dirty for one sweep only. */
+const brief = join(root, "brief");
+/** The app's clock is this far ahead: the sweeper test moves it past its sleep. */
+let shift = 0;
+
+const gitEnv = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" };
+
+/** One git command in a test folder. */
+function git(folder: string, ...args: string[]): void {
+    execFileSync("git", args, { cwd: folder, env: gitEnv, stdio: "ignore" });
+}
+
+/** A folder with one commit. */
+function repository(folder: string): void {
+    mkdirSync(folder, { recursive: true });
+    git(folder, "init", "-q");
+    writeFileSync(join(folder, "file.txt"), "one\n");
+    git(folder, "add", ".");
+    git(
+        folder,
+        "-c",
+        "user.email=test@example.com",
+        "-c",
+        "user.name=Test",
+        "commit",
+        "-qm",
+        "one",
+    );
+}
 
 before(async () => {
     process.env.PI_POCKET_TEAM_AGENTS = definitions;
     mkdirSync(definitions, { recursive: true });
-    mkdirSync(repo, { recursive: true });
+    repository(repo);
+    repository(old);
+    repository(fresh);
+    repository(brief);
+    // Old work: a folder that is dirty at every supervisor's first sweep.
+    appendFileSync(join(old, "file.txt"), "two\n");
     writeFileSync(
         join(definitions, "odrade.md"),
         "---\nmodel: faux/faux-2\nrole: supervisor\n---\n# Odrade\nYou are Odrade. Coordinate the team.",
@@ -469,6 +767,18 @@ before(async () => {
         join(definitions, "paul.md"),
         `---\nmodel: faux/faux-2\nrepositories:\n  frostyard/missing: ${join(root, "missing")}\n---\n# Paul Atreides\nYou are Paul Atreides. Own a folder that is not there.`,
     );
+    writeFileSync(
+        join(definitions, "gurney.md"),
+        `---\nmodel: faux/faux-2\nrepositories:\n  frostyard/old: ${old}\n---\n# Gurney Halleck\nYou are Gurney Halleck. Own a folder with uncommitted work.`,
+    );
+    writeFileSync(
+        join(definitions, "irina.md"),
+        `---\nmodel: faux/faux-2\nrepositories:\n  frostyard/new: ${fresh}\n---\n# Irina\nYou are Irina. Own a folder that is clean now.`,
+    );
+    writeFileSync(
+        join(definitions, "shaddam.md"),
+        `---\nmodel: faux/faux-2\nrepositories:\n  frostyard/brief: ${brief}\n---\n# Shaddam\nYou are Shaddam. Own a folder that is dirty for a moment.`,
+    );
 
     const dropIns = join(dataDir, "extensions");
 
@@ -480,7 +790,7 @@ before(async () => {
     cpSync(join(import.meta.dirname, "night-shift-web"), join(dropIns, "night-shift-web"), {
         recursive: true,
     });
-    app = await openApp(model, dataDir);
+    app = await openApp(model, dataDir, () => Date.now() + shift);
     await app.setExtensionEnabled(owner(app), "team.ts", true);
     await app.setExtensionEnabled(owner(app), "desk.ts", true);
     await app.setExtensionEnabled(owner(app), "night-shift.ts", true);
@@ -525,10 +835,11 @@ const deskState = () => app.harness.snapshot(DeskThreads, context);
 /** Delegate once, and give back the supervisor session, the linked session, and the thread. */
 async function delegated(
     name: string,
+    words = "desk delegate test",
 ): Promise<{ source: ConversationId; linked: ConversationId; thread: Thread }> {
     const source = await supervisor(name);
 
-    await say(app, source, "desk delegate test");
+    await say(app, source, words);
     const linked = app.sessions().find((session) => session.linkedFrom?.id === Number(source));
 
     assert(linked, "the delegation started a linked session");
@@ -537,6 +848,53 @@ async function delegated(
     assert(thread, "the linked session has a thread");
 
     return { source, linked: linked.id as ConversationId, thread };
+}
+
+/** Stop every live sweeper: a test that moves the clock must not wake the sweepers of earlier tests. */
+async function stopSweepers(): Promise<void> {
+    const live = await app.harness.inspect(context);
+
+    for (const task of live.tasks) {
+        if (task.record.kind === "x.desk.sweeper") {
+            await app.harness.abortTask(task.record.id, context);
+        }
+    }
+}
+
+/** Restart the app with its clock moved forward by `by` milliseconds. */
+async function restartApp(by: number): Promise<void> {
+    await app.close();
+    shift = by;
+    app = await openApp(model, dataDir, () => Date.now() + shift);
+}
+
+/** The found threads of a supervisor. */
+async function foundFor(source: ConversationId): Promise<Thread[]> {
+    return Object.values((await deskState())?.threads ?? {}).filter(
+        (thread) => thread.origin === "found" && thread.supervisor === Number(source),
+    );
+}
+
+/** Wait for a thread's next sweep. */
+async function sweptAfter(thread: Thread, after: unknown): Promise<void> {
+    await until(
+        async () =>
+            ((await deskState())?.threads[thread.id]?.run.sweptAt as number | undefined) !==
+                undefined &&
+            ((await deskState())?.threads[thread.id]?.run.sweptAt as number) > Number(after),
+        "the next sweep",
+        20_000,
+    );
+}
+
+/** The live sweeper tasks of a supervisor session. */
+async function sweepers(id: ConversationId): Promise<number> {
+    const live = await app.harness.inspect(context);
+
+    return live.tasks.filter(
+        (task) =>
+            task.record.kind === "x.desk.sweeper" && task.record.conversationId === Number(id),
+    ).length;
 }
 
 describe("the desk in a Pi Pocket", () => {
@@ -565,7 +923,12 @@ describe("the desk in a Pi Pocket", () => {
         await say(app, source, "desk list test");
         assert.match(
             (await modelTexts(app, source)).join("\n"),
-            /T1 · open · frostyard\/test · duncan · Tend the test repository/,
+            /T1 · open · next: [a-z]+ · frostyard\/test · duncan · Tend the test repository/,
+        );
+        assert.equal(
+            typeof (await deskState())?.seen[`supervisor:${String(Number(source))}`],
+            "number",
+            "the list marks Odrade's last look",
         );
     });
 
@@ -777,5 +1140,237 @@ describe("the desk in a Pi Pocket", () => {
         assert.match(read, /NIGHT-REPORT-END/);
         assert.match(read, /<report/);
         assert.match(read, /Night shift report from this linked session/);
+    });
+
+    test("sync sees an idle session that did not report: open, and Odrade is next", async () => {
+        const { source, linked, thread } = await delegated("syncing");
+
+        await until(() => !app.isBusy(linked), "the linked session to settle", 20_000);
+        await say(app, source, "desk sync test");
+
+        const after = (await deskState())?.threads[thread.id];
+
+        assert.equal(after?.state, "open");
+        assert.equal(after?.run.busy, false);
+        assert.equal(after?.run.next, "odrade");
+        assert.equal(typeof after?.run.sweptAt, "number");
+        assert.match(
+            (await modelTexts(app, source)).join("\n"),
+            new RegExp(`${thread.id} · open · next: odrade`),
+        );
+    });
+
+    test("a report in the session's last turn closes the thread at the next sync", async () => {
+        const { source, linked, thread } = await delegated("closing");
+
+        await until(() => !app.isBusy(linked), "the linked session to settle", 20_000);
+        await say(app, linked, "report to supervisor test");
+        await until(() => !app.isBusy(linked), "the report's turn to settle", 20_000);
+        await say(app, source, "desk sync test");
+
+        const after = (await deskState())?.threads[thread.id];
+
+        assert.equal(after?.state, "closed");
+        assert.deepEqual(after?.closed && { why: after.closed.why, by: after.closed.by }, {
+            why: "done",
+            by: "sweep",
+        });
+        assert.equal(after?.run.next, "none");
+    });
+
+    test("a dirty folder keeps its thread open, and the agent is next", async () => {
+        const { source, linked, thread } = await delegated("dirty", "desk delegate gurney test");
+
+        await until(() => !app.isBusy(linked), "the linked session to settle", 20_000);
+        await say(app, source, "desk sync test");
+
+        const after = (await deskState())?.threads[thread.id];
+
+        assert.equal(after?.cwd, old);
+        assert.equal(after?.state, "open");
+        assert.equal(after?.run.dirty, 1);
+        assert.equal(after?.run.next, "agent");
+        assert.equal(
+            Object.values((await deskState())?.threads ?? {}).some(
+                (each) => each.origin === "found" && each.run.folder === old,
+            ),
+            false,
+            "a folder that was dirty at the first sweep is not found",
+        );
+    });
+
+    test("a folder that becomes dirty later is found after 5 minutes, once", async () => {
+        // The app's clock moves here: no sweeper of an earlier test may wake and see the folder too.
+        await stopSweepers();
+        const { source, thread } = await delegated("finding");
+
+        await until(
+            async () => typeof (await deskState())?.threads[thread.id]?.run.sweptAt === "number",
+            "the first sweep",
+            20_000,
+        );
+        const first = (await deskState())?.threads[thread.id]?.run.sweptAt;
+
+        appendFileSync(join(fresh, "file.txt"), "two\n");
+
+        // The next sweep sees the folder dirty for the first time: pending, and no thread yet.
+        try {
+            await restartApp(SWEEP_SLEEP_MS + 60_000);
+            await sweptAfter(thread, first);
+
+            assert.equal((await foundFor(source)).length, 0, "one dirty moment is not work");
+            assert.equal(
+                typeof (await deskState())?.baseline?.[String(Number(source))]?.pending?.[fresh],
+                "number",
+            );
+
+            // A sweep 11 minutes later, still dirty: the found thread appears.
+            await restartApp(SWEEP_SLEEP_MS + FOUND_FOLDER_DELAY_MS + 7 * 60_000);
+
+            await until(
+                async () => (await foundFor(source)).length === 1,
+                "the found thread",
+                20_000,
+            );
+
+            const found = await foundFor(source);
+
+            assert.equal(found[0]?.run.folder, fresh);
+            assert.equal(found[0]?.id, "F1");
+            assert.equal(found[0]?.run.next, "odrade");
+            assert.equal(
+                (await deskState())?.baseline?.[String(Number(source))]?.pending?.[fresh],
+                undefined,
+            );
+            assert.equal(
+                (await foundFor(source)).some((each) => each.run.folder === old),
+                false,
+                "old work never becomes a found thread",
+            );
+
+            // A later sweep writes no second thread for the same folder.
+            const seen = (await deskState())?.threads[thread.id]?.run.sweptAt;
+
+            await restartApp(SWEEP_SLEEP_MS * 2 + FOUND_FOLDER_DELAY_MS + 8 * 60_000);
+            await sweptAfter(thread, seen);
+            assert.equal((await foundFor(source)).length, 1);
+        } finally {
+            shift = 0;
+        }
+    });
+
+    test("a folder that is dirty for one sweep only makes no found thread", async () => {
+        await stopSweepers();
+        const { source, thread } = await delegated("briefly");
+
+        await until(
+            async () => typeof (await deskState())?.threads[thread.id]?.run.sweptAt === "number",
+            "the first sweep",
+            20_000,
+        );
+        const first = (await deskState())?.threads[thread.id]?.run.sweptAt;
+
+        appendFileSync(join(brief, "file.txt"), "two\n");
+
+        try {
+            await restartApp(SWEEP_SLEEP_MS + 60_000);
+            await sweptAfter(thread, first);
+
+            assert.equal(
+                typeof (await deskState())?.baseline?.[String(Number(source))]?.pending?.[brief],
+                "number",
+                "the first sight of the dirt is recorded",
+            );
+
+            // Clean before the next sweep.
+            git(brief, "checkout", "--", "file.txt");
+            const seen = (await deskState())?.threads[thread.id]?.run.sweptAt;
+
+            await restartApp(SWEEP_SLEEP_MS + FOUND_FOLDER_DELAY_MS + 7 * 60_000);
+            await sweptAfter(thread, seen);
+
+            assert.equal((await foundFor(source)).length, 0, "the dirt was gone at the next sweep");
+            assert.equal(
+                (await deskState())?.baseline?.[String(Number(source))]?.pending?.[brief],
+                undefined,
+            );
+        } finally {
+            shift = 0;
+        }
+    });
+
+    test("one sweeper per supervisor, also after a second delegation", async () => {
+        const source = await supervisor("sweep-tasks");
+
+        await say(app, source, "desk delegate test");
+        assert.equal(await sweepers(source), 1);
+        assert.equal(typeof (await deskState())?.sweepers?.[String(Number(source))], "string");
+
+        await say(app, source, "desk delegate test");
+        assert.equal(await sweepers(source), 1);
+    });
+
+    test("a look starts the sweeper for a desk that already has threads", async () => {
+        const source = await supervisor("pre-desk");
+
+        // A desk from before this part: a thread, and no sweeper record.
+        await app.harness.commit(async (tx) => {
+            openThread(await tx.doc(DeskThreads), {
+                key: "x.test.pre-desk",
+                supervisor: Number(source),
+                agents: ["duncan"],
+                repo: "frostyard/test",
+                title: "Before the sweeper",
+                at: Date.now(),
+            });
+        }, context);
+
+        assert.equal((await deskState())?.sweepers?.[String(Number(source))], undefined);
+
+        await say(app, source, "desk list test");
+
+        assert.equal(typeof (await deskState())?.sweepers?.[String(Number(source))], "string");
+        assert.equal(await sweepers(source), 1);
+    });
+
+    test("the sweeper sweeps again after 10 minutes, and ends when no thread is open", async () => {
+        const { source, linked, thread } = await delegated("sweeper-clock");
+
+        await until(
+            async () => typeof (await deskState())?.threads[thread.id]?.run.sweptAt === "number",
+            "the sweeper's first sweep",
+            20_000,
+        );
+
+        const first = (await deskState())?.threads[thread.id]?.run.sweptAt;
+
+        assert.equal(typeof first, "number");
+        assert.equal(await sweepers(source), 1);
+
+        await until(() => !app.isBusy(linked), "the linked session to settle", 20_000);
+        await say(app, linked, "report to supervisor test");
+        await until(() => !app.isBusy(linked), "the report's turn to settle", 20_000);
+
+        // A restart past the sleep: the sweeper wakes, closes the thread, and ends.
+        await app.close();
+        shift = SWEEP_SLEEP_MS + 60_000;
+        app = await openApp(model, dataDir, () => Date.now() + shift);
+
+        try {
+            await until(
+                async () => (await deskState())?.threads[thread.id]?.state === "closed",
+                "the sweeper to close the thread",
+                20_000,
+            );
+
+            const after = (await deskState())?.threads[thread.id];
+
+            assert.equal(after?.closed?.why, "done");
+            assert((after?.run.sweptAt as number) > (first as number));
+            assert.equal((await deskState())?.sweepers?.[String(Number(source))], undefined);
+            await until(async () => (await sweepers(source)) === 0, "the sweeper to end", 20_000);
+        } finally {
+            shift = 0;
+        }
     });
 });
