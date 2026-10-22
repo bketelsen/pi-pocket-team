@@ -44,6 +44,7 @@ import {
     reopenReason,
     wakeParked,
     closeCheck,
+    closeoutHold,
     closeoutKey,
     isStale,
     nextActor,
@@ -428,11 +429,87 @@ describe("closeCheck", () => {
         assert.equal(open.close, false);
         assert.match(open.open.join("; "), /PR frostyard\/test#2 is not read/);
 
+        // Closed PRs, and the close-out wake-up sent and reported after: the thread closes.
         for (const state of ["MERGED", "CLOSED", "FROZEN"]) {
-            const pr = thread({ prs: { "frostyard/test#2": { via: "attached", state } } });
+            const pr = thread({
+                prs: { "frostyard/test#2": { via: "attached", state } },
+                run: { closeout: "closeout:k:frostyard/test#2", closeoutEntry: 4 },
+            });
 
             assert.equal(closeCheck(pr, facts()).close, true, state);
         }
+    });
+
+    test("the close-out wake-up holds a thread open until it went and the agent reported after it", () => {
+        const prs = { "frostyard/test#2": { via: "attached" as const, state: "MERGED" as const } };
+        const key = "closeout:k:frostyard/test#2";
+
+        // The last PR merged while the session was idle and reported: the wake-up has not gone yet.
+        const merged = closeCheck(thread({ prs }), facts());
+
+        assert.equal(merged.close, false);
+        assert.deepEqual(merged.open, ["the close-out wake-up has not gone"]);
+        assert.equal(closeoutHold(thread({ prs })), "the close-out wake-up has not gone");
+
+        // Sent, and the last report is not past the wake-up.
+        const sent = thread({ prs, run: { closeout: key, closeoutEntry: 5 } });
+
+        assert.deepEqual(closeCheck(sent, facts()).open, [
+            "it has not reported after the close-out wake-up",
+        ]);
+        assert.equal(
+            closeCheck(
+                thread({
+                    prs,
+                    run: { closeout: key, closeoutEntry: 5, reportedUserEntry: undefined },
+                }),
+                facts(),
+            ).close,
+            false,
+            "no report at all",
+        );
+
+        // A report past the wake-up lets it close.
+        assert.equal(
+            closeCheck(
+                thread({
+                    prs,
+                    run: {
+                        closeout: key,
+                        closeoutEntry: 5,
+                        reportedUserEntry: 6,
+                        lastUserEntry: 6,
+                    },
+                }),
+                facts(),
+            ).close,
+            true,
+        );
+
+        // An archived session, a parked thread, no address, or a key sent before closeoutEntry existed: no hold.
+        assert.equal(closeoutHold(thread({ prs, run: { archived: true } })), undefined);
+        assert.equal(closeoutHold(thread({ prs, state: "parked" })), undefined);
+        assert.equal(closeoutHold(thread({ prs, address: undefined })), undefined);
+        assert.equal(closeoutHold(thread({ prs, run: { closeout: key } })), undefined);
+
+        // A thread with only an address cannot report: the wake-up alone is enough.
+        assert.equal(
+            closeoutHold(
+                thread({ prs, session: undefined, run: { closeout: key, closeoutEntry: 5 } }),
+            ),
+            undefined,
+        );
+
+        // A new PR on the thread, merged: a new key, so the hold comes back.
+        const more = {
+            ...prs,
+            "frostyard/test#3": { via: "attached" as const, state: "MERGED" as const },
+        };
+
+        assert.equal(
+            closeoutHold(thread({ prs: more, run: { closeout: key, closeoutEntry: 4 } })),
+            "the close-out wake-up has not gone",
+        );
     });
 
     test("an unanswered ask holds it open", () => {
@@ -2419,7 +2496,11 @@ describe("asks", () => {
         assert.equal(thread.events.at(-1)?.text, "answered T1a (Brian): Yes, merge it.");
         assert.match(readText(state, "T1") ?? "", /T1a · answered by Brian: "Yes, merge it\."/);
         assert.deepEqual(
-            threadView(state.threads, thread, 250).answered.map((ask) => [ask.id, ask.by, ask.words]),
+            threadView(state.threads, thread, 250).answered.map((ask) => [
+                ask.id,
+                ask.by,
+                ask.words,
+            ]),
             [["T1a", "Brian", "Yes, merge it."]],
         );
 
@@ -3630,6 +3711,23 @@ describe("the desk in a Pi Pocket", () => {
                     ]),
                 ),
             );
+            await say(app, source, "desk sync test");
+
+            // Every PR merged: the close-out wake-up holds the thread open until the agent reports after it.
+            const held = (await deskState())?.threads[thread.id];
+
+            assert.equal(held?.state, "open");
+            assert.equal(held?.prs["frostyard/pilothouse#212"]?.state, "MERGED");
+
+            // As the sweeper does after its send; then the agent reports, and the next sync closes the thread.
+            await app.harness.commit(async (tx) => {
+                const run = (await tx.doc(DeskThreads)).threads[thread.id]!.run;
+
+                run.closeout = `closeout:${thread.key}:frostyard/pilothouse#212,frostyard/pilothouse#213`;
+                run.closeoutEntry = run.lastUserEntry ?? 0;
+            }, context);
+            await say(app, linked, "report to supervisor test");
+            await until(() => !app.isBusy(linked), "the report's turn", 20_000);
             await say(app, source, "desk sync test");
 
             const closed = (await deskState())?.threads[thread.id];
@@ -5507,6 +5605,63 @@ describe("the desk in a Pi Pocket", () => {
             assert.equal((await deskState())?.threads[thread.id]?.run.closeout, key);
         } finally {
             await quiet([]);
+            shift = 0;
+        }
+    });
+
+    test("1 PR that merges while the session is idle and reported: the wake-up goes, and the thread waits for a report", async () => {
+        await stopSweepers();
+        const { linked, thread } = await delegated("closeout-idle");
+
+        await until(
+            async () => typeof (await deskState())?.threads[thread.id]?.run.sweptAt === "number",
+            "the first sweep",
+            20_000,
+        );
+        await until(() => !app.isBusy(linked), "the linked session to settle", 20_000);
+
+        // The agent reported in its last turn: before the hold, the merge closed the thread in the same sweep.
+        await say(app, linked, "report to supervisor test");
+        await until(() => !app.isBusy(linked), "the report's turn", 20_000);
+
+        const first = (await deskState())?.threads[thread.id]?.run.sweptAt;
+
+        await app.harness.commit(async (tx) => {
+            (await tx.doc(DeskThreads)).threads[thread.id]!.prs["frostyard/test#8"] = {
+                via: "seen",
+                state: "MERGED",
+            };
+        }, context);
+
+        const key = `closeout:${thread.key}:frostyard/test#8`;
+        const message = `All PRs on ${thread.id} are merged or closed.`;
+        const sent = async () =>
+            (await modelTexts(app, linked)).filter((each) => each.includes(message)).length;
+
+        try {
+            await restartApp(SWEEP_SLEEP_MS + 60_000);
+            await sweptAfter(thread, first);
+
+            const held = (await deskState())?.threads[thread.id];
+
+            assert.equal(held?.state, "open", "the merge does not close the thread");
+            assert.equal(held?.run.closeout, key);
+            assert.equal(typeof held?.run.closeoutEntry, "number");
+            await until(async () => (await sent()) === 1, "the agent's wake-up", 20_000);
+            await until(() => !app.isBusy(linked), "the wake-up's turn", 20_000);
+
+            // The agent reports after the wake-up: the next sweep closes the thread as done.
+            await say(app, linked, "report to supervisor test");
+            await until(() => !app.isBusy(linked), "the report's turn", 20_000);
+            await restartApp(SWEEP_SLEEP_MS * 2 + 120_000);
+            await until(
+                async () => (await deskState())?.threads[thread.id]?.state === "closed",
+                "the close after the report",
+                20_000,
+            );
+            assert.equal((await deskState())?.threads[thread.id]?.closed?.why, "done");
+            assert.equal(await sent(), 1);
+        } finally {
             shift = 0;
         }
     });
