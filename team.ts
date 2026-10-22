@@ -129,6 +129,17 @@ ${
 
 const reply = (text: string) => ({ output: [{ type: "text" as const, text }] });
 
+/** A short title for a task: its first non-empty line, without a leading "Task:", "Goal:", or "Title:". */
+export function taskTitle(task: string): string {
+    const line =
+        task
+            .split("\n")
+            .map((part) => part.trim())
+            .find((part) => part !== "") ?? "";
+
+    return line.replace(/^(task|goal|title):\s*/i, "").slice(0, 120);
+}
+
 // ─── Agent memory ────────────────────────────────────────────────────────────
 //
 // A third layer beside Pi Pocket's project and everywhere memory: lessons for one named agent, in every session that
@@ -964,6 +975,13 @@ export default function createTeam(host: Host, web: Web) {
         parameters: Type.Object({
             agent: Type.String(),
             task: Type.String({ minLength: 1, maxLength: 6000 }),
+            title: Type.Optional(
+                Type.String({
+                    maxLength: 120,
+                    description:
+                        "A short title for the desk thread and the session, for example 'pilothouse: CI fixes'",
+                }),
+            ),
             repository: Type.Optional(
                 Type.String({
                     description:
@@ -1003,6 +1021,8 @@ export default function createTeam(host: Host, web: Web) {
         replay: "safe",
         execute: async (args, api, context) => {
             const { agent, task, repository, night_shift } = args;
+            const given = args.title === undefined ? undefined : flat(args.title);
+            const title = given === undefined || given === "" ? taskTitle(task) : given.slice(0, 120);
             const identity = await api.snapshot(Identity, api.conversationId, context);
             const supervisor = identity?.persona?.name;
 
@@ -1050,7 +1070,7 @@ export default function createTeam(host: Host, web: Web) {
                                   agents: [persona.id],
                                   ...(repo === undefined ? {} : { repo }),
                                   ...(cwd === undefined ? {} : { cwd }),
-                                  title: task.split("\n")[0] ?? task,
+                                  title,
                                   at: Date.now(),
                               }),
                           context,
@@ -1067,7 +1087,7 @@ export default function createTeam(host: Host, web: Web) {
                 started = await host.linkedSessions.start(
                     api.conversationId,
                     {
-                        title: `${persona.name}: ${task.split("\n")[0]}`.slice(0, 120),
+                        title: `${persona.name}: ${title}`.slice(0, 120),
                         message:
                             shift === undefined
                                 ? taskText(persona, task)
