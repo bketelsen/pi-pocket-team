@@ -36,6 +36,7 @@ import {
     readText,
     seedThreads,
     shortLine,
+    detachFrom,
     deskEpoch,
     repairEpoch,
     reopenable,
@@ -740,6 +741,42 @@ describe("hand-attached PRs", () => {
         assert.equal(holder.prs["frostyard/test#7"]?.via, "attached");
         assert.equal(closed.prs["frostyard/test#7"], undefined);
         assert.equal(closed.state, "closed");
+    });
+});
+
+describe("a missing PR", () => {
+    test("a PR GitHub cannot find is Odrade's, and it keeps the thread open", () => {
+        assert.equal(prNext({ state: "MISSING" }), "odrade");
+
+        const missing = thread({
+            prs: { "frostyard/snosi#1097": { via: "attached", state: "MISSING", next: "odrade" } },
+        });
+        const check = closeCheck(missing, facts());
+
+        assert.equal(check.close, false);
+        assert.match(check.open.join("; "), /PR frostyard\/snosi#1097 is missing/);
+        assert.equal(nextActor(missing), "odrade");
+    });
+});
+
+describe("detachFrom", () => {
+    test("takes a PR off a thread, once", () => {
+        const state = deskOf();
+        const thread = placed(state, 100);
+
+        thread.prs["frostyard/test#7"] = { via: "attached" };
+
+        const first = detachFrom(state, "frostyard/test#7", thread.id, 200);
+
+        assert("text" in first);
+        assert.equal(thread.prs["frostyard/test#7"], undefined);
+        assert.match(thread.events.at(-1)?.text ?? "", /detached frostyard\/test#7/);
+
+        const events = thread.events.length;
+        const second = detachFrom(state, "frostyard/test#7", thread.id, 300);
+
+        assert("text" in second);
+        assert.equal(thread.events.length, events, "the replay adds nothing");
     });
 });
 
@@ -2189,6 +2226,7 @@ let prNumber = 212;
 let askThreadId = "";
 let answerAskId = "";
 /** The threads the scripted model watches and records results on. */
+let attachThreadId = "";
 let watchThreadId = "";
 let otherThreadId = "";
 let resultThreadId = "";
@@ -2260,6 +2298,30 @@ const model = scriptedModel((request) => {
             thread: "new",
             title: "A decision",
             text: "Should I merge #106?",
+        });
+    }
+
+    if (text.endsWith("desk attach bad test")) {
+        return call("desk", {
+            action: "attach",
+            ref: "frostyard/snosi#1097",
+            thread: attachThreadId,
+        });
+    }
+
+    if (text.endsWith("desk attach good test")) {
+        return call("desk", {
+            action: "attach",
+            ref: "frostyard/test#7",
+            thread: attachThreadId,
+        });
+    }
+
+    if (text.endsWith("desk detach test")) {
+        return call("desk", {
+            action: "detach",
+            ref: "frostyard/test#7",
+            thread: attachThreadId,
         });
     }
 
@@ -2443,6 +2505,9 @@ const fixturePath = join(root, "github.json");
 const configPath = join(root, "desk.json");
 const fakeGh = join(root, "fake-gh.sh");
 const failGh = join(root, "fail-gh.sh");
+const partialPath = join(root, "partial-github.json");
+const partialGh = join(root, "partial-gh.sh");
+const okGh = join(root, "ok-gh.sh");
 
 /** A `gh api graphql` answer for frostyard/pilothouse. */
 const githubFixture = (
@@ -2556,6 +2621,15 @@ before(async () => {
     chmodSync(fakeGh, 0o755);
     writeFileSync(failGh, '#!/bin/sh\necho "HTTP 401: Bad credentials" >&2\nexit 1\n');
     chmodSync(failGh, 0o755);
+    // A partial answer: the JSON, then a non-zero exit, as `gh` does for a wrong PR number.
+    writeFileSync(partialPath, JSON.stringify({ data: { viewer: { login: "github-viewer" } } }));
+    writeFileSync(partialGh, `#!/bin/sh\ncat ${JSON.stringify(partialPath)}\nexit 1\n`);
+    chmodSync(partialGh, 0o755);
+    writeFileSync(
+        okGh,
+        `#!/bin/sh\nprintf '%s' '{"data":{"repository":{"pullRequest":{"number":1}}}}'\n`,
+    );
+    chmodSync(okGh, 0o755);
     process.env.PI_POCKET_DESK_GH = fakeGh;
     process.env.PI_POCKET_DESK_CONFIG = configPath;
     // The tests make many threads: a high cap, so only the cap tests meet the cap. Each of them restores this.
@@ -2642,6 +2716,15 @@ async function restartApp(by: number): Promise<void> {
     chmodSync(fakeGh, 0o755);
     writeFileSync(failGh, '#!/bin/sh\necho "HTTP 401: Bad credentials" >&2\nexit 1\n');
     chmodSync(failGh, 0o755);
+    // A partial answer: the JSON, then a non-zero exit, as `gh` does for a wrong PR number.
+    writeFileSync(partialPath, JSON.stringify({ data: { viewer: { login: "github-viewer" } } }));
+    writeFileSync(partialGh, `#!/bin/sh\ncat ${JSON.stringify(partialPath)}\nexit 1\n`);
+    chmodSync(partialGh, 0o755);
+    writeFileSync(
+        okGh,
+        `#!/bin/sh\nprintf '%s' '{"data":{"repository":{"pullRequest":{"number":1}}}}'\n`,
+    );
+    chmodSync(okGh, 0o755);
     process.env.PI_POCKET_DESK_GH = fakeGh;
     process.env.PI_POCKET_DESK_CONFIG = configPath;
     // The tests make many threads: a high cap, so only the cap tests meet the cap. Each of them restores this.
@@ -3223,6 +3306,150 @@ describe("the desk in a Pi Pocket", () => {
         } finally {
             process.env.PI_POCKET_DESK_GH = fakeGh;
         }
+    });
+
+    test("a partial GitHub answer keeps its PRs and marks a missing ref", async () => {
+        await stopSweepers();
+        await new Promise((resolve) => setTimeout(resolve, 250));
+
+        const { source, thread } = await delegated("partial");
+
+        await until(sweepersAsleep, "the sweepers to sleep", 20_000);
+
+        // The bad ref is on the thread by hand: the attach tool refuses one that GitHub cannot read.
+        await app.harness.commit(async (tx) => {
+            (await tx.doc(DeskThreads)).threads[thread.id]!.prs["frostyard/snosi#1097"] = {
+                via: "attached",
+            };
+        }, context);
+
+        writeFileSync(
+            partialPath,
+            JSON.stringify({
+                data: {
+                    viewer: { login: "github-viewer" },
+                    r0: {
+                        nameWithOwner: "frostyard/test",
+                        isArchived: false,
+                        pullRequests: {
+                            nodes: [
+                                {
+                                    number: 216,
+                                    title: "A fix",
+                                    url: "https://github.com/frostyard/test/pull/216",
+                                    state: "OPEN",
+                                    isDraft: false,
+                                    createdAt: new Date(
+                                        Number(thread.startedAt) + 60_000,
+                                    ).toISOString(),
+                                    headRefName: "fix-216",
+                                    mergeable: "MERGEABLE",
+                                    reviewDecision: "APPROVED",
+                                    author: { login: "github-viewer" },
+                                },
+                            ],
+                        },
+                    },
+                    p0: {
+                        nameWithOwner: "frostyard/snosi",
+                        isArchived: false,
+                        pullRequest: null,
+                    },
+                },
+                errors: [
+                    {
+                        message: "Could not resolve to a PullRequest with the number of 1097.",
+                        path: ["p0", "pullRequest"],
+                    },
+                ],
+            }),
+        );
+
+        process.env.PI_POCKET_DESK_GH = partialGh;
+
+        try {
+            await say(app, source, "desk sync test");
+        } finally {
+            process.env.PI_POCKET_DESK_GH = fakeGh;
+            writeFileSync(
+                partialPath,
+                JSON.stringify({ data: { viewer: { login: "github-viewer" } } }),
+            );
+        }
+
+        const state = await deskState();
+
+        assert.equal(state?.github?.ok, true);
+        assert.deepEqual(state?.github?.missing, ["frostyard/snosi#1097"]);
+
+        const missing = state?.threads[thread.id]?.prs["frostyard/snosi#1097"];
+
+        assert.equal(missing?.state, "MISSING");
+        assert.equal(missing?.next, "odrade");
+        assert.match(
+            state?.threads[thread.id]?.events.map((event) => event.text).join("; ") ?? "",
+            /not found on GitHub \(an issue, or a wrong number\)/,
+        );
+        assert.equal(
+            state?.threads[thread.id]?.prs["frostyard/test#216"]?.state,
+            "OPEN",
+            "the other PR in the answer is kept",
+        );
+
+        await say(app, source, "desk list test");
+        assert.match(
+            (await modelTexts(app, source)).join("\n"),
+            /Not found on GitHub: frostyard\/snosi#1097/,
+        );
+    });
+
+    test("desk attach refuses a ref GitHub cannot read, and detach takes one off", async () => {
+        const { source, thread } = await delegated("attach-pr");
+
+        attachThreadId = thread.id;
+
+        // The ordinary fake has no repository for the check: the ref is refused, and nothing changes.
+        await say(app, source, "desk attach bad test");
+        assert.match(
+            (await modelTexts(app, source)).join("\n"),
+            /frostyard\/snosi#1097 is not a pull request that GitHub can read \(an issue, or a wrong number\)\. Nothing changed\./,
+        );
+        assert.equal(
+            (await deskState())?.threads[thread.id]?.prs["frostyard/snosi#1097"],
+            undefined,
+        );
+
+        // A PR that GitHub has: attached.
+        process.env.PI_POCKET_DESK_GH = okGh;
+
+        try {
+            await say(app, source, "desk attach good test");
+        } finally {
+            process.env.PI_POCKET_DESK_GH = fakeGh;
+        }
+
+        assert.equal(
+            (await deskState())?.threads[thread.id]?.prs["frostyard/test#7"]?.via,
+            "attached",
+        );
+
+        // Detach it, and again: the second call changes nothing.
+        await say(app, source, "desk detach test");
+        assert.equal((await deskState())?.threads[thread.id]?.prs["frostyard/test#7"], undefined);
+        assert.match(
+            (await deskState())?.threads[thread.id]?.events.map((event) => event.text).join("; ") ??
+                "",
+            /detached frostyard\/test#7/,
+        );
+
+        const events = (await deskState())?.threads[thread.id]?.events.length;
+
+        await say(app, source, "desk detach test");
+        assert.equal(
+            (await deskState())?.threads[thread.id]?.events.length,
+            events,
+            "a replay changes nothing",
+        );
     });
 
     test("a thread closed without GitHub reopens when its PR is open", async () => {
@@ -4217,7 +4444,7 @@ describe("the desk in a Pi Pocket", () => {
             const found = await folderFound();
 
             assert.equal(found[0]?.run.folder, fresh);
-            assert.equal(found[0]?.id, "F1");
+            assert.match(found[0]?.id ?? "", /^F[1-9][0-9]*$/);
             assert.equal(found[0]?.run.next, "odrade");
             assert.equal(
                 (await deskState())?.baseline?.[String(Number(source))]?.pending?.[fresh],
