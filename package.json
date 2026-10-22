@@ -7,7 +7,7 @@
     "scripts": {
         "link": "node link.mjs",
         "pretest": "node link.mjs",
-        "test": "node --test team.test.ts team-memory.test.ts team-web.test.js homewiki.test.ts night-shift.test.ts team-night-shift.test.ts && node --check team-web/index.js && node --check homewiki-web/index.js && node --check night-shift-web/index.js",
+        "test": "node --test team.test.ts team-memory.test.ts team-web.test.js homewiki.test.ts night-shift.test.ts team-night-shift.test.ts desk.test.ts && node --check team-web/index.js && node --check homewiki-web/index.js && node --check night-shift-web/index.js",
         "typecheck": "node link.mjs && tsc -p tsconfig.json",
         "install-extension": "node install.mjs",
         "install-check": "node install.mjs --check",

@@ -7,6 +7,7 @@ Drop-in extensions for [Pi Pocket](https://github.com/TannerMidd/pi-pocket), wri
 | **Team**        | `team.ts`, `team-web/`               | Named agents in ordinary Pi Pocket sessions, a supervisor's delegation into their repositories, and each agent's own memory.                                                                                           |
 | **Homewiki**    | `homewiki.ts`, `homewiki-web/`       | The "Wiki" rail page: renders a Markdown wiki checkout (`README.md` and `docs/**/*.md`) live from disk, read-only and owner-only. Default folder `~/projects/homewiki`; set `PI_POCKET_HOMEWIKI_ROOT` for another one. |
 | **Night shift** | `night-shift.ts`, `night-shift-web/` | `/night-shift`: Pi works on an objective in rounds while you sleep, until a stop condition in words (and an optional check command), a round limit, or a deadline; then it writes a summary for the morning.           |
+| **Desk**        | `desk.ts`                            | One thread for each piece of work the team runs in the background: opened by `team_delegate`, listed and read by a supervisor session, and seeded once from a `seed.json` triage file (part 1 of 8).                   |
 
 ## Requirements
 
@@ -303,3 +304,57 @@ A supervisor identity (Odrade) can start a night shift in the linked session tha
     - the `pocket.plan` document, to see plan mode. If it changes, the read fails safe: the goal relies on Pi to answer BLOCKED in plan mode, as its prompt section asks, and BLOCKED ends the goal.
     - the request-id format `p:<person>:…`, which marks a message that Pocket sends for a person (`src/server/requests.ts`). If it changes, Pocket can refuse a round or count its spend differently. A round with no answer ends the goal with the error; it does not run on.
 - The modules are tested against the Pocket version in Requirements only. Team and Homewiki are owner-oriented and tuned to one person's server.
+
+# Desk
+
+One thread for each piece of work the team runs in the background: T13, T14, … A thread holds the work, its agents, its repository, its PRs, its asks, and its events. This is part 1 of 8; reports, the sweep, the page, the cap, asks, and the git export come in later parts.
+
+## What part 1 does
+
+- **`team_delegate` opens a thread.** Before the linked session starts, the thread is made with state `starting`, keyed by the tool call (`x.team.delegate:<task>:<call>`). After the session starts, the same durable step binds its session id and address, and the state becomes `open`. A replay finds the same thread: one delegation makes one thread. If the start fails, the thread closes as `failed`. The reply names the thread: "Thread T1."
+- **The tool `desk`.** A session with a supervisor identity can use it; another session is refused.
+    - `list`: one line per thread that is not closed, newest last: `T13 · open · frostyard/frostmail · irulan · 2 PRs · 1 ask · <title>`.
+    - `read T13`: the thread in full: agents, repository, folder, sessions, PRs with how each was attached, branches, asks, and the last 10 events.
+    - `seed`: import a `seed.json` file once, from an absolute path. It refuses a second seed file, a thread id that is taken, and an agent id that is not in the roster.
+- **The document.** One app-wide document, `x.desk.threads`: `next` (the id counters T and F), `threads`, `grants` (later), and `seen` (later). It is stored data: never rename the kind or change what a field means.
+- **No import between modules.** `team.ts` finds the desk through `globalThis[Symbol.for("pi-pocket-team.desk")]`, and the desk finds Team through `globalThis[Symbol.for("pi-pocket-team.team")]`. With the desk off, Team and Night shift work exactly as before.
+
+## seed.json
+
+Odrade writes one file beside the triage notes, and Brian marks each row keep or park. Rows for closed, dropped, or done threads are left out.
+
+```json
+{
+    "threads": [
+        {
+            "id": "T1",
+            "title": "frostmail fixes",
+            "agents": ["irulan"],
+            "repo": "frostyard/frostmail",
+            "prs": ["frostyard/frostmail#106", "frostyard/frostmail#108"],
+            "session": "session-…",
+            "asks": ["Keep the 'stop Coder first' guard?"],
+            "mark": "keep"
+        }
+    ]
+}
+```
+
+| Field     | Rule                                                                        |
+| --------- | --------------------------------------------------------------------------- |
+| `id`      | `T<n>`, unique in the file. New ids go on from the highest one.             |
+| `title`   | A non-empty string; it is cut to one line of 120 characters.                |
+| `agents`  | A non-empty array of roster ids.                                            |
+| `repo`    | Optional: a repository name, `owner/name`.                                  |
+| `prs`     | Optional: `owner/name#n` refs, attached to the thread as they are.          |
+| `session` | Optional: Odrade's address for the session; stored as the thread's address. |
+| `asks`    | Optional: questions; they get the ids `T1a`, `T1b`, …                       |
+| `mark`    | `keep` (the thread starts open) or `park` (it starts parked).               |
+
+Any other key in a row is an error. An error names the row and the field.
+
+## Turn it on
+
+The module starts off, as every drop-in does. Install it (`npm run install-check`, then `npm run install-extension`), then turn on **Desk** in **Menu → Extensions**. Team must be on too: the `desk` tool reads identities and the roster through Team's API, and refuses with "The Team module is off." when Team is not loaded. Both modules reload into the running server; no restart is needed.
+
+`desk.test.ts` covers the rules directly and in a Pi Pocket: a delegation opens and binds one thread, the desk lists and reads it, a session without a supervisor identity is refused, and a seed is imported once.
