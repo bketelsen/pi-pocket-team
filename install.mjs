@@ -12,6 +12,7 @@ const MODULES = [
     "homewiki-web",
     "night-shift.ts",
     "night-shift-web",
+    "desk.ts",
 ];
 const check = process.argv.includes("--check");
 const source = import.meta.dirname;

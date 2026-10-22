@@ -6,6 +6,7 @@ import { randomUUID } from "node:crypto";
 import { readdir, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
+import type { Context } from "@earendil-works/chord";
 import { Type } from "@earendil-works/pi-ai";
 import { parseFrontmatter } from "@earendil-works/pi-coding-agent";
 import {
@@ -14,6 +15,7 @@ import {
     defineTool,
     section,
     type ConversationId,
+    type DocumentReader,
     type Tx,
 } from "@earendil-works/pi-durable";
 import type { Host, Web } from "./_pocket.d.ts";
@@ -27,6 +29,9 @@ type Persona = {
     repositories: Record<string, string>;
     workspace?: string;
 };
+
+/** Where another module finds this one's live API. */
+const TEAM_API = Symbol.for("pi-pocket-team.team");
 
 const localFolder = (path: unknown): string => {
     if (typeof path !== "string" || (!isAbsolute(path) && !path.startsWith("~/"))) {
@@ -140,6 +145,28 @@ export const MAX_AGENT_LESSONS = 40;
  * requester, so one cap across agents would let a busy agent's queue block every other agent's.
  */
 export const MAX_PENDING = 20;
+
+/**
+ * What other modules use: on `globalThis[Symbol.for("pi-pocket-team.team")]`, so they find the live version. The desk
+ * reads who a session is and which agents exist; it never imports this file, which would keep a stale copy after a
+ * reload.
+ */
+export type TeamApi = {
+    version: 1;
+    persona: (
+        read: DocumentReader,
+        conversationId: ConversationId,
+        context: Context,
+    ) => Promise<{ id: string; name: string; role: "supervisor" | "agent" } | undefined>;
+    roster: () => Promise<
+        {
+            id: string;
+            name: string;
+            role: "supervisor" | "agent";
+            repositories: Record<string, string>;
+        }[]
+    >;
+};
 
 export type Lesson = {
     /** Short and stable: what Pi and the owner use to change or remove it. */
@@ -567,6 +594,66 @@ export default function createTeam(host: Host, web: Web) {
             Symbol.for("pi-pocket-team.night-shift")
         ];
 
+    /**
+     * The desk module's API, from a global: team.ts must not import desk.ts. A static import would keep a stale copy
+     * after a reload.
+     */
+    type DeskThread = { id: string };
+    type DeskApi = {
+        version: number;
+        open: (
+            tx: Tx,
+            request: {
+                key: string;
+                supervisor: number;
+                agents: string[];
+                repo?: string;
+                cwd?: string;
+                title: string;
+                at: number;
+            },
+        ) => Promise<{ thread: DeskThread; reused: boolean }>;
+        bind: (
+            tx: Tx,
+            key: string,
+            binding: { session: number; address: string; at: number },
+        ) => Promise<DeskThread | undefined>;
+        fail: (tx: Tx, key: string, why: string, at: number) => Promise<void>;
+    };
+
+    const deskApi = (): DeskApi | undefined =>
+        (globalThis as unknown as Record<symbol, DeskApi | undefined>)[
+            Symbol.for("pi-pocket-team.desk")
+        ];
+
+    /** This module's API, for other modules. */
+    const published: TeamApi = {
+        version: 1,
+        persona: async (read, conversationId, context) => {
+            const found = (await read.snapshot(Identity, conversationId, context))?.persona;
+
+            return found === undefined
+                ? undefined
+                : { id: found.id, name: found.name, role: found.role };
+        },
+        roster: async () =>
+            (await roster(directory)).map((agent) => ({
+                id: agent.id,
+                name: agent.name,
+                role: agent.role,
+                repositories: agent.repositories,
+            })),
+    };
+    const sharedTeam = globalThis as unknown as Record<symbol, TeamApi | undefined>;
+
+    // Another module finds this version here. A new version sets its own before the old one's cleanup runs.
+    sharedTeam[TEAM_API] = published;
+    web.onDispose(() => {
+        if (sharedTeam[TEAM_API] === published) {
+            delete sharedTeam[TEAM_API];
+        }
+    });
+
     /** The fields of a delegated night shift, checked: its options go through the night-shift parser. */
     const shiftFor = (
         fields: NightShiftArg,
@@ -932,6 +1019,33 @@ export default function createTeam(host: Host, web: Web) {
                     ? undefined
                     : shiftFor(night_shift, task, api.conversationId);
 
+            // The desk, when it is on: the thread opens in the same durable step's key as the start, so a replay finds
+            // it. With the desk off, delegation works as before.
+            const key = `x.team.delegate:${api.taskId}:${api.callId}`;
+            const desk = deskApi();
+            const repo =
+                repository ??
+                (Object.keys(persona.repositories).length === 1
+                    ? Object.keys(persona.repositories)[0]
+                    : undefined);
+            const opened =
+                desk === undefined
+                    ? undefined
+                    : await api.commit(
+                          async (tx) =>
+                              desk.open(tx, {
+                                  key,
+                                  supervisor: Number(api.conversationId),
+                                  agents: [persona.id],
+                                  ...(repo === undefined ? {} : { repo }),
+                                  ...(cwd === undefined ? {} : { cwd }),
+                                  title: task.split("\n")[0] ?? task,
+                                  at: Date.now(),
+                              }),
+                          context,
+                      );
+            const thread = opened === undefined ? "" : ` Thread ${opened.thread.id}.`;
+
             // The owner's profile names the model, and the owner's allowed list permits it: neither is Pi's choice.
             // Not allowed: the source's model, as before, said in the result. Allowed but unusable now: core refuses
             // the start, and Pi is told not to try another model.
@@ -950,17 +1064,36 @@ export default function createTeam(host: Host, web: Web) {
                         ...(cwd === undefined ? {} : { cwd }),
                         ...(preferred === undefined ? {} : { model: preferred }),
                     },
-                    `x.team.delegate:${api.taskId}:${api.callId}`,
+                    key,
                 );
             } catch (error) {
+                if (desk !== undefined) {
+                    try {
+                        await api.commit(
+                            async (tx) => desk.fail(tx, key, (error as Error).message, Date.now()),
+                            context,
+                        );
+                    } catch {
+                        // The start's refusal is what the model must see: the desk can mark the thread later.
+                    }
+                }
+
                 throw new Error(
                     `${(error as Error).message} Do not delegate on another model: stop and tell the user.`,
                 );
             }
 
-            // The identity and the goal land in one durable step.
+            // The identity, the thread's binding, and the goal land in one durable step.
             const goal = await api.commit(async (tx) => {
                 (await tx.doc(Identity, started.session as ConversationId)).persona ??= persona;
+
+                if (desk !== undefined) {
+                    await desk.bind(tx, key, {
+                        session: Number(started.session),
+                        address: started.address,
+                        at: Date.now(),
+                    });
+                }
 
                 return shift === undefined
                     ? undefined
@@ -973,7 +1106,7 @@ export default function createTeam(host: Host, web: Web) {
                               byName: supervisor,
                               supervisor,
                           },
-                          `x.team.delegate:${api.taskId}:${api.callId}`,
+                          key,
                       );
             }, context);
 
@@ -983,7 +1116,7 @@ export default function createTeam(host: Host, web: Web) {
 
             if (shift === undefined || goal === undefined) {
                 return reply(
-                    `Assigned to ${persona.name} at ${started.address}, on ${modelText(persona)}. Reports arrive when they send them; do not poll or acknowledge reports.`,
+                    `Assigned to ${persona.name} at ${started.address}, on ${modelText(persona)}.${thread} Reports arrive when they send them; do not poll or acknowledge reports.`,
                 );
             }
 
@@ -995,7 +1128,7 @@ export default function createTeam(host: Host, web: Web) {
                 goal.deadlineLabel === undefined ? "no deadline" : `until ${goal.deadlineLabel}`;
 
             return reply(
-                `Assigned to ${persona.name} at ${started.address}, on ${modelText(persona)}. Night shift set there: at most ${goal.maxRounds} rounds, ${begins}, ${ends}. Its report arrives here when it stops; do not poll. /night-shift status in that session shows it.`,
+                `Assigned to ${persona.name} at ${started.address}, on ${modelText(persona)}.${thread} Night shift set there: at most ${goal.maxRounds} rounds, ${begins}, ${ends}. Its report arrives here when it stops; do not poll. /night-shift status in that session shows it.`,
             );
         },
     });
