@@ -36,6 +36,8 @@ import {
 import { statusItem } from "./night-shift-web/index.js";
 
 const ZONE = "America/New_York";
+// These tests compute server clock times in ZONE, so the process runs in ZONE.
+process.env.TZ = ZONE;
 
 // ─── Parsing ─────────────────────────────────────────────────────────────────
 

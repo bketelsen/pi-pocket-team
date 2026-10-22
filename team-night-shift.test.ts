@@ -24,6 +24,8 @@ import type { ConversationId } from "@earendil-works/pi-durable";
 import { delegatedRequest, type Goal, GoalDoc } from "./night-shift.ts";
 
 const ZONE = "America/New_York";
+// These tests compute server clock times in ZONE, so the process runs in ZONE.
+process.env.TZ = ZONE;
 const TASK = "Tend the test repository";
 const SUMMARY = "SUMMARY-TEXT";
 
