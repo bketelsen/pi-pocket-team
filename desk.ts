@@ -153,8 +153,9 @@ export type Thread = {
     asks: Ask[];
     /**
      * Facts the sweep keeps: `returnAddress`, `reportedAt`, `reportedUserEntry`, `scanCursor`, `lastUserEntry`,
-     * `seenPrs`, `busy`, `archived`, `shift`, `dirty`, `ahead`, `folder`, `next`, `sweptAt`, and `closeout` (the
-     * wake-up key that went, so a sweep does not send it again).
+     * `seenPrs`, `busy`, `archived`, `shift`, `dirty`, `ahead`, `folder`, `next`, `sweptAt`, `closeout` (the
+     * wake-up key that went, so a sweep does not send it again), and `closeoutEntry` (the session's newest user entry
+     * before it went: a report past it lets the thread close).
      */
     run: Record<string, JsonValue>;
     /** The last 50; `key` makes an event unique. */
@@ -1082,6 +1083,13 @@ export function closeCheck(thread: Thread, facts: CloseFacts): { close: boolean;
         open.push(session);
     }
 
+    // A thread whose last PR merged is not done until its agent did the after-merge steps.
+    const held = closeoutHold(thread);
+
+    if (held !== undefined) {
+        open.push(held);
+    }
+
     const shift = thread.run.shift;
 
     if (typeof shift === "string" && shift !== "ended") {
@@ -1112,6 +1120,13 @@ export function closeCheck(thread: Thread, facts: CloseFacts): { close: boolean;
  * is archived, or already sent this key. A new PR gives a new key, so the agent hears about it.
  */
 export function closeoutKey(thread: Thread): string | undefined {
+    const key = closeoutDue(thread);
+
+    return key === undefined || thread.run.closeout === key ? undefined : key;
+}
+
+/** The close-out key of an open thread with a bound, non-archived agent and every PR closed, sent or not. */
+function closeoutDue(thread: Thread): string | undefined {
     if (thread.state !== "open" || thread.address === undefined) {
         return undefined;
     }
@@ -1126,9 +1141,37 @@ export function closeoutKey(thread: Thread): string | undefined {
         return undefined;
     }
 
-    const key = `closeout:${thread.key}:${refs.join(",")}`;
+    return `closeout:${thread.key}:${refs.join(",")}`;
+}
 
-    return thread.run.closeout === key ? undefined : key;
+/**
+ * What the close-out wake-up still holds open, in words: the wake-up has not gone, or the agent has not reported after
+ * it: a report whose newest user entry is past `closeoutEntry`, the session's newest user entry before the send (entry
+ * ids, not clocks). A thread with only an address cannot report (its reports have no session to file from), so the
+ * wake-up alone is enough there. A key sent before `closeoutEntry` existed holds nothing. Undefined when nothing is held.
+ */
+export function closeoutHold(thread: Thread): string | undefined {
+    const key = closeoutDue(thread);
+
+    if (key === undefined) {
+        return undefined;
+    }
+
+    if (thread.run.closeout !== key) {
+        return "the close-out wake-up has not gone";
+    }
+
+    const before = numberOr(thread.run.closeoutEntry);
+
+    if (thread.session === undefined || before === undefined) {
+        return undefined;
+    }
+
+    const reported = numberOr(thread.run.reportedUserEntry);
+
+    return reported !== undefined && reported > before
+        ? undefined
+        : "it has not reported after the close-out wake-up";
 }
 
 /** The close-out wake-up's 1 message to a thread's agent: the after-merge steps, and a report back. */
@@ -1953,7 +1996,12 @@ export function attachTo(
 
         target.state = "open";
         delete target.closed;
-        addEvent(target, `reopened:${ref}:${String(now)}`, `reopened: ${ref} attached by ${by}`, now);
+        addEvent(
+            target,
+            `reopened:${ref}:${String(now)}`,
+            `reopened: ${ref} attached by ${by}`,
+            now,
+        );
     }
 
     if (PR_REF.test(ref)) {
@@ -4518,7 +4566,7 @@ export default function createDesk(host: Host, web: Web) {
                 // The threads that closed out in the commit below: their agents hear about it after the commit, so a
                 // restart before the send loses nothing (the next sweep finds them again, because `run.closeout` is
                 // unset). The key makes a repeated send act once.
-                const closedOut: { id: string; address: string; key: string }[] = [];
+                const closedOut: { id: string; address: string; key: string; entry: number }[] = [];
 
                 await runtime.commit(async (tx) => {
                     const state = await tx.doc(DeskThreads);
@@ -4534,7 +4582,13 @@ export default function createDesk(host: Host, web: Web) {
                         const key = closeoutKey(thread);
 
                         if (key !== undefined && thread.address !== undefined) {
-                            closedOut.push({ id: thread.id, address: thread.address, key });
+                            closedOut.push({
+                                id: thread.id,
+                                address: thread.address,
+                                key,
+                                // The sweep scanned the session in this commit: the wake-up comes after this entry.
+                                entry: numberOr(thread.run.lastUserEntry) ?? 0,
+                            });
                         }
                     }
 
@@ -4606,6 +4660,7 @@ export default function createDesk(host: Host, web: Web) {
 
                             if (thread !== undefined) {
                                 thread.run.closeout = wake.key;
+                                thread.run.closeoutEntry = wake.entry;
                                 addEvent(
                                     thread,
                                     `closeout:${wake.key}`,
@@ -5822,7 +5877,13 @@ export default function createDesk(host: Host, web: Web) {
 
                 const result = await api.commit(
                     async (tx) =>
-                        attachTo(await tx.doc(DeskThreads), ref, targetId, Date.now(), persona.name),
+                        attachTo(
+                            await tx.doc(DeskThreads),
+                            ref,
+                            targetId,
+                            Date.now(),
+                            persona.name,
+                        ),
                     context,
                 );
 
