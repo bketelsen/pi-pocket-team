@@ -44,8 +44,12 @@ import {
     reopenReason,
     wakeParked,
     closeCheck,
+    closeoutKey,
     isStale,
     nextActor,
+    odradeReason,
+    waitsText,
+    answeredText,
     parseStatus,
     addAsk,
     answerAsk,
@@ -535,6 +539,147 @@ describe("nextActor", () => {
             "none",
         );
         assert.equal(nextActor(thread({ state: "closed" })), "none");
+    });
+});
+
+/** Attached PRs with the state GitHub gave them. */
+const prs = (...states: ("MERGED" | "CLOSED" | "FROZEN" | "OPEN" | "MISSING")[]) =>
+    Object.fromEntries(
+        states.map((state, index) => [
+            `frostyard/test#${String(index + 1)}`,
+            { via: "seen" as const, state },
+        ]),
+    );
+
+describe("closeoutKey", () => {
+    test("every PR merged or closed gives the key, with its refs sorted", () => {
+        const merged = thread({ prs: prs("MERGED", "CLOSED") });
+
+        assert.equal(closeoutKey(merged), "closeout:k:frostyard/test#1,frostyard/test#2");
+        assert.equal(
+            closeoutKey(thread({ prs: prs("FROZEN") })),
+            "closeout:k:frostyard/test#1",
+            "a frozen PR counts as closed",
+        );
+    });
+
+    test("one open PR, no PR, a PR not read yet, parked, starting, archived, no address, or sent: no key", () => {
+        assert.equal(closeoutKey(thread({ prs: prs("MERGED", "OPEN") })), undefined);
+        assert.equal(closeoutKey(thread({ prs: prs("MERGED", "MISSING") })), undefined);
+        assert.equal(closeoutKey(thread()), undefined, "no PRs: nothing to close out");
+        assert.equal(
+            closeoutKey(thread({ prs: { "frostyard/test#1": { via: "seen" } } })),
+            undefined,
+            "a PR with no state yet does not count as closed",
+        );
+        assert.equal(closeoutKey(thread({ state: "parked", prs: prs("MERGED") })), undefined);
+        assert.equal(closeoutKey(thread({ state: "starting", prs: prs("MERGED") })), undefined);
+        assert.equal(closeoutKey(thread({ state: "closed", prs: prs("MERGED") })), undefined);
+        assert.equal(
+            closeoutKey(thread({ prs: prs("MERGED"), run: { archived: true } })),
+            undefined,
+        );
+        assert.equal(closeoutKey(thread({ prs: prs("MERGED"), address: undefined })), undefined);
+        assert.equal(
+            closeoutKey(
+                thread({
+                    prs: prs("MERGED"),
+                    run: { closeout: "closeout:k:frostyard/test#1" },
+                }),
+            ),
+            undefined,
+            "already sent for these PRs",
+        );
+    });
+
+    test("a new PR on the thread gives a new key", () => {
+        const one = thread({ prs: prs("MERGED") });
+        const two = thread({ prs: prs("MERGED", "MERGED") });
+
+        assert.notEqual(closeoutKey(two), closeoutKey(one));
+
+        // The one that went is still sent for its refs: only the new set is a new wake-up.
+        one.run.closeout = "closeout:k:frostyard/test#1";
+
+        assert.equal(closeoutKey(one), undefined);
+        assert.equal(closeoutKey(two), "closeout:k:frostyard/test#1,frostyard/test#2");
+    });
+});
+
+describe("odradeReason", () => {
+    const due = thread({
+        watch: {
+            checkOn: "2026-10-01",
+            check: "the blob sweep",
+            setAt: 1,
+            setBy: "brian",
+            key: "watch:1",
+            dueAt: 2,
+        },
+    });
+
+    test("a due watch, a found thread, a missing PR, else a silent session", () => {
+        assert.equal(odradeReason(due), "watch is due: the blob sweep");
+        assert.equal(
+            odradeReason(thread({ origin: "found", key: "found:pr:frostyard/test#1" })),
+            "found PR, attach or drop",
+        );
+        assert.equal(
+            odradeReason(thread({ origin: "found", key: "found:session:session-abc" })),
+            "found session, attach or drop",
+        );
+        assert.equal(
+            odradeReason(thread({ origin: "found", key: "found:folder:/work/test:1" })),
+            "found folder work, attach or drop",
+        );
+        assert.equal(
+            odradeReason(thread({ prs: prs("MISSING") })),
+            "PR frostyard/test#1 is missing on GitHub",
+        );
+        assert.equal(odradeReason(thread({ run: { lastUserEntry: 6 } })), "silent session");
+    });
+
+    test("a parked thread, and a thread whose next actor is not Odrade: no reason", () => {
+        assert.equal(
+            odradeReason(thread({ state: "parked", run: { lastUserEntry: 6 } })),
+            undefined,
+        );
+        assert.equal(odradeReason(thread({ run: { busy: true } })), undefined);
+        assert.equal(
+            odradeReason(thread({ asks: [{ id: "T1a", text: "Which?", at: 1 }] })),
+            undefined,
+        );
+        assert.equal(odradeReason(thread({ state: "closed" })), undefined);
+    });
+});
+
+describe("waitsText", () => {
+    test("lists the ids by number with their reasons, and none is an empty line", () => {
+        const found = thread({ id: "F2", origin: "found", key: "found:pr:frostyard/test#1" });
+        const silent = thread({ id: "T35", key: "k35", run: { lastUserEntry: 6 } });
+        const agent = thread({ id: "T36", key: "k36", run: { busy: true } });
+
+        assert.equal(
+            waitsText([found, silent, agent]),
+            "F2: found PR, attach or drop; T35: silent session",
+        );
+        assert.equal(
+            waitsText([thread({ id: "T5", key: "k5", run: { lastUserEntry: 6 } })]),
+            "T5: silent session",
+        );
+        assert.equal(waitsText([]), "");
+        assert.equal(waitsText([agent]), "");
+    });
+});
+
+describe("answeredText", () => {
+    test("names the ask, the person and his words, cut to 300 characters", () => {
+        assert.equal(answeredText("T39a", "Brian", "yes"), "[desk] T39a answered by Brian: yes");
+
+        const long = answeredText("T39a", "Brian", "y".repeat(400));
+
+        assert.equal(long, `[desk] T39a answered by Brian: ${"y".repeat(299)}…`);
+        assert.equal(answeredText("T39a", "Brian", "y".repeat(300)).endsWith("…"), false);
     });
 });
 
@@ -2405,6 +2550,8 @@ let otherAskThreadId = "";
 let watchThreadId = "";
 let otherThreadId = "";
 let resultThreadId = "";
+/** The thread the queue tests name in an answer: a thread the turn touched is not in the queue. */
+let queueThreadId = "";
 
 /** Pi Pocket's plan mode, to turn it on for one session in a test. */
 const PlanDoc = defineDoc<{ on: boolean }>({
@@ -2429,9 +2576,18 @@ const call = (name: string, args: object) =>
 const linkedAddressOf = (request: unknown): string =>
     /Message from linked session (session-[0-9a-f-]+)/.exec(JSON.stringify(request))?.[1] ?? "";
 
+/** The desk's prompt section, from the newest model request: a system message carries it. */
+let lastDeskSection = "";
+
 /** Pi, scripted: the supervisor delegates, and the desk is used by the words of each test. */
 const model = scriptedModel((request) => {
     const { role, text } = lastText(request as never);
+    const sectioned = (
+        request as { messages: readonly { sections?: Record<string, string> }[] }
+    ).messages.filter((each) => each.sections?.desk !== undefined);
+
+    // The newest system message that carries the desk section: a continued turn adds one.
+    lastDeskSection = sectioned.at(-1)?.sections?.desk ?? lastDeskSection;
 
     if (role === "toolResult") {
         return answer(text.includes("Filed T") ? "Should I merge #106?" : "ok");
@@ -2447,6 +2603,10 @@ const model = scriptedModel((request) => {
 
     if (text.startsWith("[night-shift] Round")) {
         return answer("STATUS: DONE: it works");
+    }
+
+    if (text.endsWith("desk queue named test")) {
+        return answer(`${queueThreadId} is done: I read it.`);
     }
 
     const read = /desk read (T[0-9]+) test$/.exec(text);
@@ -3512,6 +3672,86 @@ describe("the desk in a Pi Pocket", () => {
         assert.doesNotMatch((await modelTexts(app, source)).join("\n"), /Desk check:/);
     });
 
+    test("the queue continues once for a thread that waits on Odrade", async () => {
+        const { source, linked, thread } = await delegated("queue");
+
+        await until(() => !app.isBusy(linked), "the linked session to settle", 20_000);
+
+        // As the first sweep sees it: idle, and silent, so Odrade is next.
+        await app.harness.commit(async (tx) => {
+            (await tx.doc(DeskThreads)).threads[thread.id]!.run.busy = false;
+        }, context);
+        queueThreadId = thread.id;
+
+        await say(app, source, "desk queue test");
+
+        const expected = `Desk queue: these threads wait on you: ${thread.id}: silent session. Act on each now with desk, team_message or team_delegate. If one must wait, leave it. Keep any text to Brian to 1 line.`;
+        // The continue's user message, and not the model's echo of it.
+        const queued = async () =>
+            (await modelTexts(app, source)).filter((each) =>
+                each.includes(JSON.stringify(expected)),
+            ).length;
+
+        assert.equal(await queued(), 1, "one continue, and no second one after the next answer");
+
+        // The section says the same thing, with the instruction beside it.
+        assert.match(lastDeskSection, new RegExp(`Waits on you: ${thread.id}: silent session\\.`));
+        assert.match(
+            lastDeskSection,
+            /Threads that wait on you are yours to act on now: do not wait for a message\./,
+        );
+
+        // A turn that names the thread touched it: no queue.
+        await say(app, source, "desk queue named test");
+        assert.equal(await queued(), 1);
+
+        await until(() => !app.isBusy(linked), "the linked session to settle", 20_000);
+    });
+
+    test("the queue is off in plan mode, and off for another supervisor's thread", async () => {
+        const { source, linked, thread } = await delegated("queue-plan");
+
+        await until(() => !app.isBusy(linked), "the linked session to settle", 20_000);
+
+        await app.harness.commit(async (tx) => {
+            (await tx.doc(DeskThreads)).threads[thread.id]!.run.busy = false;
+        }, context);
+
+        await app.harness.commit(async (tx) => {
+            (await tx.doc(PlanDoc, source)).on = true;
+        }, context);
+
+        await say(app, source, "desk queue test");
+        assert.doesNotMatch((await modelTexts(app, source)).join("\n"), /Desk queue:/);
+
+        // Another supervisor's thread is not this session's to queue.
+        const folder = join(root, "queue-other");
+
+        mkdirSync(folder, { recursive: true });
+        const other = await newSession(app, folder);
+
+        await app.harness.commit(async (tx) => {
+            const state = await tx.doc(DeskThreads);
+            const opened = openThread(state, {
+                key: "x.test.queue-other",
+                supervisor: Number(other),
+                agents: ["duncan"],
+                repo: "frostyard/test",
+                title: "Another supervisor's",
+                at: Date.now(),
+            });
+
+            opened.thread.state = "open";
+            opened.thread.address = "session-queue-other";
+            opened.thread.run.busy = false;
+        }, context);
+
+        const own = await supervisor("queue-own");
+
+        await say(app, own, "desk queue test");
+        assert.doesNotMatch((await modelTexts(app, own)).join("\n"), /Desk queue:/);
+    });
+
     test("a failed GitHub read is shown in the desk and by desk list", async () => {
         const source = await supervisor("github-fail");
 
@@ -4307,6 +4547,77 @@ describe("the desk in a Pi Pocket", () => {
             assert.equal((await call(`asks/${secondAsk}/answer`, {}, guest.token)).status, 404);
         });
 
+        test("a page answer tells the supervisor once; a second answer and the tool tell nothing", async () => {
+            const source = await supervisor("page-notify");
+            let threadId = "";
+            let toldId = "";
+            let toolAskId = "";
+
+            await app.harness.commit(async (tx) => {
+                const state = await tx.doc(DeskThreads);
+                const opened = openThread(state, {
+                    key: "x.test.page-notify",
+                    supervisor: Number(source),
+                    agents: ["duncan"],
+                    repo: "frostyard/test",
+                    title: "A decision",
+                    at: Date.now(),
+                });
+
+                threadId = opened.thread.id;
+
+                const told = addAsk(state, {
+                    thread: threadId,
+                    text: "Merge it?",
+                    key: "x.test.page-notify:1",
+                    by: "Odrade",
+                    supervisor: Number(source),
+                    at: Date.now(),
+                });
+
+                toldId = "askId" in told ? told.askId : "";
+
+                const tool = addAsk(state, {
+                    thread: threadId,
+                    text: "And then?",
+                    key: "x.test.page-notify:2",
+                    by: "Odrade",
+                    supervisor: Number(source),
+                    at: Date.now(),
+                });
+
+                toolAskId = "askId" in tool ? tool.askId : "";
+            }, context);
+
+            const text = `[desk] ${toldId} answered by ${owner(app).name}: yes`;
+            // The message itself, and not the model's echo of it.
+            const told = async () =>
+                (await modelTexts(app, source)).filter((each) =>
+                    each.startsWith(JSON.stringify(text)),
+                ).length;
+
+            assert.equal((await call(`asks/${toldId}/answer`, { words: "yes" })).status, 200);
+            await until(async () => (await told()) === 1, "the supervisor's message", 20_000);
+
+            // The words are recorded, and the message names the ask, the person and the words.
+            assert.equal(await told(), 1);
+
+            // A second answer to the same ask changes nothing, and sends nothing.
+            assert.equal((await call(`asks/${toldId}/answer`, { words: "no" })).status, 200);
+            await until(() => !app.isBusy(source), "the supervisor to settle", 20_000);
+            assert.equal(await told(), 1);
+
+            // An answer recorded by the tool sends nothing: Odrade records it herself.
+            answerAskId = toolAskId;
+            await say(app, source, "desk answer test");
+            assert.equal(
+                (await modelTexts(app, source)).filter((each) =>
+                    each.includes(`[desk] ${toolAskId} answered by`),
+                ).length,
+                0,
+            );
+        });
+
         test("watch, unwatch and result change the thread; a second POST changes nothing", async () => {
             const { thread } = await delegated("page-watch");
 
@@ -4967,6 +5278,54 @@ describe("the desk in a Pi Pocket", () => {
             assert((after?.run.sweptAt as number) > (first as number));
             assert.equal((await deskState())?.sweepers?.[String(Number(source))], undefined);
             await until(async () => (await sweepers(source)) === 0, "the sweeper to end", 20_000);
+        } finally {
+            shift = 0;
+        }
+    });
+
+    test("the sweeper wakes the agent once when every PR on its thread is merged", async () => {
+        // The clock moves here: no sweeper of an earlier test may wake and send.
+        await stopSweepers();
+        const { linked, thread } = await delegated("closeout");
+
+        await until(
+            async () => typeof (await deskState())?.threads[thread.id]?.run.sweptAt === "number",
+            "the first sweep",
+            20_000,
+        );
+        const first = (await deskState())?.threads[thread.id]?.run.sweptAt;
+
+        await until(() => !app.isBusy(linked), "the linked session to settle", 20_000);
+
+        // A merged PR on the thread: the next sweep closes it out.
+        await app.harness.commit(async (tx) => {
+            (await tx.doc(DeskThreads)).threads[thread.id]!.prs["frostyard/test#7"] = {
+                via: "seen",
+                state: "MERGED",
+            };
+        }, context);
+
+        const key = `closeout:${thread.key}:frostyard/test#7`;
+        const message = `All PRs on ${thread.id} are merged or closed. Do the after-merge steps from your task (verify releases, deploys or publishes; delete local branches of merged PRs; leave the folder clean). Then report: done, or what remains.`;
+        // The wake-up itself: the model's echo of the message's first 40 characters does not carry it.
+        const sent = async () =>
+            (await modelTexts(app, linked)).filter((each) => each.includes(message)).length;
+
+        try {
+            await restartApp(SWEEP_SLEEP_MS + 60_000);
+            await sweptAfter(thread, first);
+
+            const after = (await deskState())?.threads[thread.id];
+
+            assert.equal(after?.run.closeout, key);
+            assert.equal(after?.events.at(-1)?.text, "close-out wake-up sent");
+            await until(async () => (await sent()) === 1, "the agent's wake-up", 20_000);
+
+            // The next sweep finds the key sent: no second message.
+            await restartApp(SWEEP_SLEEP_MS * 2 + 120_000);
+            await sweptAfter(thread, after?.run.sweptAt);
+            assert.equal(await sent(), 1);
+            assert.equal((await deskState())?.threads[thread.id]?.run.closeout, key);
         } finally {
             shift = 0;
         }
