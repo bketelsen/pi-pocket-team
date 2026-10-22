@@ -153,7 +153,8 @@ export type Thread = {
     asks: Ask[];
     /**
      * Facts the sweep keeps: `returnAddress`, `reportedAt`, `reportedUserEntry`, `scanCursor`, `lastUserEntry`,
-     * `seenPrs`, `busy`, `archived`, `shift`, `dirty`, `ahead`, `folder`, `next`, `sweptAt`.
+     * `seenPrs`, `busy`, `archived`, `shift`, `dirty`, `ahead`, `folder`, `next`, `sweptAt`, and `closeout` (the
+     * wake-up key that went, so a sweep does not send it again).
      */
     run: Record<string, JsonValue>;
     /** The last 50; `key` makes an event unique. */
@@ -1105,6 +1106,35 @@ export function closeCheck(thread: Thread, facts: CloseFacts): { close: boolean;
     return { close: open.length === 0, open };
 }
 
+/**
+ * The wake-up key of a thread whose PRs are all merged or closed: `closeout:<thread.key>:<refs>`. Undefined when the
+ * thread is not open (parked, starting, closed), has no PR, has a PR that is still open, has no address for its agent,
+ * is archived, or already sent this key. A new PR gives a new key, so the agent hears about it.
+ */
+export function closeoutKey(thread: Thread): string | undefined {
+    if (thread.state !== "open" || thread.address === undefined) {
+        return undefined;
+    }
+
+    if (thread.run.archived === true) {
+        return undefined;
+    }
+
+    const refs = Object.keys(thread.prs).sort();
+
+    if (refs.length === 0 || !refs.every((ref) => CLOSED_PR.has(thread.prs[ref]?.state ?? ""))) {
+        return undefined;
+    }
+
+    const key = `closeout:${thread.key}:${refs.join(",")}`;
+
+    return thread.run.closeout === key ? undefined : key;
+}
+
+/** The close-out wake-up's 1 message to a thread's agent: the after-merge steps, and a report back. */
+const closeoutMessage = (id: string): string =>
+    `All PRs on ${id} are merged or closed. Do the after-merge steps from your task (verify releases, deploys or publishes; delete local branches of merged PRs; leave the folder clean). Then report: done, or what remains.`;
+
 export type NextActor = "brian" | "agent" | "odrade" | "reviewer" | "none";
 
 /** Who acts next on a thread. First match: brian, odrade (a due watch), agent (a failed watch), agent, odrade. */
@@ -1174,6 +1204,58 @@ export function nextActor(thread: Thread): NextActor {
     }
 
     return "none";
+}
+
+/**
+ * Why a thread waits on Odrade now, in `nextActor`'s order, in words: a due watch, a found thread, a PR GitHub cannot
+ * find, else a silent session. Undefined when Odrade is not next, or the thread is parked: a parked thread waits on
+ * Brian, not on her.
+ */
+export function odradeReason(thread: Thread): string | undefined {
+    if (thread.state === "parked" || nextActor(thread) !== "odrade") {
+        return undefined;
+    }
+
+    const watch = thread.watch;
+
+    if (watch !== undefined && watch.result === undefined && watch.dueAt !== undefined) {
+        return `watch is due: ${watch.check}`;
+    }
+
+    if (thread.origin === "found") {
+        if (thread.key.startsWith("found:pr:")) {
+            return "found PR, attach or drop";
+        }
+
+        if (thread.key.startsWith("found:session:")) {
+            return "found session, attach or drop";
+        }
+
+        if (thread.key.startsWith("found:folder:")) {
+            return "found folder work, attach or drop";
+        }
+    }
+
+    const missing = Object.keys(thread.prs).find((ref) => thread.prs[ref]?.state === "MISSING");
+
+    if (missing !== undefined) {
+        return `PR ${missing} is missing on GitHub`;
+    }
+
+    return "silent session";
+}
+
+/**
+ * The threads that wait on Odrade, in `nextActor`'s order, in words: `T35: silent session; F5: found PR, attach or
+ * drop`. The section and the queue say the same thing, so they say it the same way.
+ */
+export function waitsText(threads: Thread[]): string {
+    return threads
+        .map((thread) => ({ thread, reason: odradeReason(thread) }))
+        .filter((each): each is { thread: Thread; reason: string } => each.reason !== undefined)
+        .sort((a, b) => byId(a.thread, b.thread))
+        .map((each) => `${each.thread.id}: ${each.reason}`)
+        .join("; ");
 }
 
 /** The desk's start: the oldest seed thread's start, else the stored epoch. A seed sets the truth. */
@@ -2033,7 +2115,7 @@ export function deskFullText(
 
 // Copied from night-shift.ts: a message written by a person, not by a linked session, a schedule, or a task.
 const FROM = /^\[from: ([^\]\n]{1,60})\] /;
-const AUTOMATED = /^\[(?:night-shift\]|via |scheduled\]|subagent |goal\] )/;
+const AUTOMATED = /^\[(?:night-shift\]|via |scheduled\]|subagent |goal\] |desk\] )/;
 
 /** A message's writer and its words without the `[from: …]` prefix; no writer when nobody typed it. */
 export function personAndBody(content: unknown): { person?: string; body: string } {
@@ -2333,6 +2415,14 @@ export function answerAsk(
     return { id: found.ask.id, already: false };
 }
 
+/**
+ * A page answer as 1 message to the supervisor: `[desk] T39a answered by Brian: yes`. The words are cut to 300
+ * characters, with `…` at the end when they are longer.
+ */
+export function answeredText(id: string, by: string, words: string): string {
+    return `[desk] ${id} answered by ${by}: ${words.length > 300 ? `${words.slice(0, 299)}…` : words}`;
+}
+
 /** The words that ask Brian for something: a question, or one of these phrases. */
 const ASK_WORDS =
     /can you|could you|would you|your call|do you want|should i|which (one|option)|please (tap|merge|confirm|check|decide|approve|create|delete|set)|needs you|your ok/i;
@@ -2365,6 +2455,46 @@ export function asksBrian(text: string): boolean {
 
         return sentence.includes("?") || ASK_WORDS.test(sentence);
     });
+}
+
+/** A thread id in a text: T13, F2, or the thread of an ask id (T13 in T13a). */
+const THREAD_IDS = /\b([TF][1-9][0-9]*)[a-z]?\b/g;
+
+/** The thread ids in one text, each once. */
+function idsIn(text: string): string[] {
+    return [...new Set([...text.matchAll(THREAD_IDS)].map((match) => match[1]!))];
+}
+
+/**
+ * The thread ids an assistant message names: in its text parts, and in the JSON of its tool calls' arguments. The queue
+ * reads the messages after the real user message, so a thread the turn touched does not wait on Odrade.
+ */
+function touchedIn(messages: readonly { role: string; content: unknown }[]): string[] {
+    const touched = new Set<string>();
+
+    for (const message of messages) {
+        if (message.role !== "assistant") {
+            continue;
+        }
+
+        for (const id of idsIn(textOf(message.content))) {
+            touched.add(id);
+        }
+
+        if (!Array.isArray(message.content)) {
+            continue;
+        }
+
+        for (const part of message.content as { type?: string; arguments?: unknown }[]) {
+            if (part?.type === "toolCall" && part.arguments !== undefined) {
+                for (const id of idsIn(JSON.stringify(part.arguments))) {
+                    touched.add(id);
+                }
+            }
+        }
+    }
+
+    return [...touched];
 }
 
 /** The last GitHub read, as the page reads it. */
@@ -4385,12 +4515,28 @@ export default function createDesk(host: Host, web: Web) {
             sweep: async (task, runtime, context) => {
                 const supervisor = task.input.supervisor as ConversationId;
                 const facts = await gather(supervisor, runtime, runtime.now(), context);
+                // The threads that closed out in the commit below: their agents hear about it after the commit, so a
+                // restart before the send loses nothing (the next sweep finds them again, because `run.closeout` is
+                // unset). The key makes a repeated send act once.
+                const closedOut: { id: string; address: string; key: string }[] = [];
 
                 await runtime.commit(async (tx) => {
                     const state = await tx.doc(DeskThreads);
 
                     await applySweep(tx, state, Number(supervisor), facts);
                     await startMissingSweepers(tx);
+
+                    for (const thread of Object.values(state.threads)) {
+                        if (thread.supervisor !== Number(supervisor)) {
+                            continue;
+                        }
+
+                        const key = closeoutKey(thread);
+
+                        if (key !== undefined && thread.address !== undefined) {
+                            closedOut.push({ id: thread.id, address: thread.address, key });
+                        }
+                    }
 
                     const open = Object.values(state.threads).some(
                         (thread) =>
@@ -4415,6 +4561,65 @@ export default function createDesk(host: Host, web: Web) {
                         checkpoint: { phase: "sleep", until: runtime.now() + SWEEP_SLEEP_MS },
                     };
                 }, context);
+
+                for (const wake of closedOut) {
+                    let failure: string | undefined;
+
+                    try {
+                        await host.linkedSessions.send(
+                            supervisor,
+                            { to: wake.address, message: closeoutMessage(wake.id) },
+                            `x.desk.closeout:${wake.key}`,
+                        );
+                    } catch (error) {
+                        failure = (error as Error).message;
+                    }
+
+                    if (failure !== undefined) {
+                        // 1 event, and no `run.closeout`: the next sweep tries again with the same key.
+                        try {
+                            await runtime.commit(async (tx) => {
+                                const thread = threadById(await tx.doc(DeskThreads), wake.id);
+
+                                if (thread !== undefined) {
+                                    addEvent(
+                                        thread,
+                                        `closeout-failed:${wake.key}`,
+                                        `close-out wake-up failed: ${failure}`,
+                                        runtime.now(),
+                                    );
+                                }
+
+                                return undefined;
+                            }, context);
+                        } catch {
+                            // The sweep goes on: the next one finds the thread again.
+                        }
+
+                        continue;
+                    }
+
+                    try {
+                        // A document change only: the send has its own record, and the mark needs its own commit.
+                        await runtime.commit(async (tx) => {
+                            const thread = threadById(await tx.doc(DeskThreads), wake.id);
+
+                            if (thread !== undefined) {
+                                thread.run.closeout = wake.key;
+                                addEvent(
+                                    thread,
+                                    `closeout:${wake.key}`,
+                                    "close-out wake-up sent",
+                                    runtime.now(),
+                                );
+                            }
+
+                            return undefined;
+                        }, context);
+                    } catch {
+                        // The send went: the next sweep sends again with the same key, which acts once.
+                    }
+                }
 
                 web.send("changed", {});
                 await exportNow(runtime, context);
@@ -4499,6 +4704,63 @@ export default function createDesk(host: Host, web: Web) {
             await startSweeper(tx, supervisor);
         }
     };
+
+    type NotifyInput = { supervisor: number; text: string; requestId: string };
+    type NotifyState = { phase: "send" };
+
+    /**
+     * A message to a supervisor's session, from a page answer: 1 message, and the task ends at once. The request id makes
+     * a rerun after a restart act once. It never waits for the answer, and it never retries for ever: an error is 1 notice.
+     */
+    const Notify = defineTask<NotifyInput, NotifyState, null>({
+        name: "x.desk.notify",
+        version: 1,
+        initial: () => ({ phase: "send" }),
+        phases: {
+            send: async (task, runtime, context) => {
+                const supervisor = task.input.supervisor as ConversationId;
+                const conversation = await runtime.conversation(supervisor, context);
+                let warning: string | undefined;
+
+                if (conversation !== undefined) {
+                    const held = host.heldBack(supervisor);
+
+                    if (held !== undefined) {
+                        warning = `The desk answer did not reach the supervisor: ${held}.`;
+                    } else {
+                        try {
+                            await conversation.submit(
+                                {
+                                    type: "input",
+                                    content: task.input.text,
+                                    whenBusy: "followUp",
+                                    requestId: task.input.requestId,
+                                },
+                                context,
+                            );
+                        } catch (error) {
+                            warning = `The desk answer did not reach the supervisor: ${(error as Error).message}`;
+                        }
+                    }
+                }
+
+                if (warning !== undefined) {
+                    host.notice("warning", warning, supervisor);
+                }
+
+                // The message is in, or it never will be: no wait for the answer, and no retry for ever.
+                await runtime.commit(
+                    () => ({
+                        status: "terminal",
+                        outcome: { status: "completed", result: null },
+                    }),
+                    context,
+                );
+            },
+        },
+        abort: (_task, runtime, context) =>
+            runtime.commit(() => ({ status: "terminal", outcome: { status: "aborted" } }), context),
+    });
 
     // ─── The page ────────────────────────────────────────────────────────────
 
@@ -4939,6 +5201,28 @@ export default function createDesk(host: Host, web: Web) {
                     throw web.error(/no ask/.test(result.error) ? 404 : 400, result.error);
                 }
 
+                // A page answer goes to the supervisor's session: the ask, the person, and his words. The task and the
+                // answer are in 1 commit, so a restart can lose neither and double neither. A second answer (already)
+                // sends nothing, and the tool action records the words for Odrade herself: it sends nothing either.
+                const found = result.already ? undefined : askById(state, result.id);
+
+                if (found?.thread.supervisor !== undefined) {
+                    await tx.createTask(
+                        Notify,
+                        {
+                            supervisor: found.thread.supervisor,
+                            text: answeredText(result.id, request.user.name, words),
+                            requestId: `x.desk.answered:${result.id}`,
+                        },
+                        {
+                            ownership: { kind: "conversation" },
+                            conversationId: found.thread.supervisor as ConversationId,
+                            background: true,
+                            abandonOnRestart: false,
+                        },
+                    );
+                }
+
                 return threadsView(state, now, cap);
             });
 
@@ -5056,23 +5340,49 @@ export default function createDesk(host: Host, web: Web) {
         beforeRequest: async (request, api, context) => {
             try {
                 // A new generation, or a continued one? A continue starts a new task, and its memos start empty, so
-                // the request itself says that the reminder was just sent. Then no second one comes.
-                const last = [...request.messages].reverse().find((each) => each.role === "user");
-                const said = last === undefined ? "" : textOf(last.content).trimStart();
+                // the messages themselves say which continues ran in this turn: `Desk check:` is the ask reminder,
+                // `Desk queue:` is the queue. The first user message that is neither began the turn.
+                const messages = request.messages;
+                let start = -1;
 
-                if (said.startsWith("Desk check:")) {
-                    await api.memo("desk.reminded", true, context);
-                } else {
+                for (let index = messages.length - 1; index >= 0; index -= 1) {
+                    const message = messages[index];
+
+                    if (message === undefined || message.role !== "user") {
+                        continue;
+                    }
+
+                    const said = textOf(message.content).trimStart();
+
+                    if (said.startsWith("Desk check:")) {
+                        await api.memo("desk.reminded", true, context);
+                        continue;
+                    }
+
+                    if (said.startsWith("Desk queue:")) {
+                        // Both: the ask reminder must not come back after the queue either.
+                        await api.memo("desk.queued", true, context);
+                        await api.memo("desk.reminded", true, context);
+                        continue;
+                    }
+
+                    start = index;
+
                     // The turn starts when the person wrote its message: a tool call in the same turn is later, and
                     // this attempt's memos hold that time for onYield (a new attempt starts with new memos).
-                    const made = (last as { timestamp?: unknown } | undefined)?.timestamp;
+                    const made = (message as { timestamp?: unknown }).timestamp;
 
                     await api.memo(
                         "desk.turnStart",
                         typeof made === "number" && made > 0 ? made : Date.now(),
                         context,
                     );
+                    break;
                 }
+
+                // The threads this turn touched: named in a text, or in a tool call's arguments, after the turn
+                // began. A thread the turn touched does not wait on Odrade in the queue.
+                await api.memo("desk.touched", touchedIn(messages.slice(start + 1)), context);
             } catch {
                 // The turn goes on; without a start time, only the filed-ask check is skipped.
             }
@@ -5097,36 +5407,65 @@ export default function createDesk(host: Host, web: Web) {
                     return undefined;
                 }
 
+                // 1 continue per turn: this memo is set by a `Desk check:` or a `Desk queue:` message, so neither
+                // reminder comes back after the other one.
                 if ((await api.memo("desk.reminded", context)) === true) {
                     return undefined;
                 }
 
-                if (!asksBrian(textOf(answer.content))) {
+                const said = textOf(answer.content);
+                const state = await api.snapshot(DeskThreads, context);
+                const session = Number(api.conversationId);
+
+                if (asksBrian(said)) {
+                    const turnStart =
+                        (await api.memo<number>("desk.turnStart", context)) ?? Date.now();
+                    const filed = Object.values(state?.threads ?? {}).some((thread) =>
+                        thread.asks.some(
+                            (ask) =>
+                                ask.at >= turnStart &&
+                                (ask.session !== undefined
+                                    ? ask.session === session
+                                    : thread.supervisor === session),
+                        ),
+                    );
+
+                    if (!filed) {
+                        await api.memo("desk.reminded", true, context);
+
+                        return {
+                            continue:
+                                "Desk check: your reply asks Brian something, and this turn filed no ask. If it is a decision, a host action, or a device check, file it now with desk ask (a thread id, or new). If it is not an ask to Brian, do nothing. Do not write more text to Brian.",
+                        };
+                    }
+                }
+
+                // The queue: the threads that wait on Odrade now, and that this turn did not touch. She acts on them
+                // without waiting for a message; the memo keeps it to 1 continue per turn.
+                if ((await api.memo("desk.queued", context)) === true) {
                     return undefined;
                 }
 
-                const turnStart = (await api.memo<number>("desk.turnStart", context)) ?? Date.now();
-                const state = await api.snapshot(DeskThreads, context);
-                const session = Number(api.conversationId);
-                const filed = Object.values(state?.threads ?? {}).some((thread) =>
-                    thread.asks.some(
-                        (ask) =>
-                            ask.at >= turnStart &&
-                            (ask.session !== undefined
-                                ? ask.session === session
-                                : thread.supervisor === session),
+                const touched = new Set([
+                    ...((await api.memo<string[]>("desk.touched", context)) ?? []),
+                    ...idsIn(said),
+                ]);
+                const waits = waitsText(
+                    Object.values(state?.threads ?? {}).filter(
+                        (thread) => thread.supervisor === session && !touched.has(thread.id),
                     ),
                 );
 
-                if (filed) {
+                if (waits === "") {
                     return undefined;
                 }
 
+                // Also `desk.reminded`: the ask reminder must not come back after a `Desk queue:` continue.
+                await api.memo("desk.queued", true, context);
                 await api.memo("desk.reminded", true, context);
 
                 return {
-                    continue:
-                        "Desk check: your reply asks Brian something, and this turn filed no ask. If it is a decision, a host action, or a device check, file it now with desk ask (a thread id, or new). If it is not an ask to Brian, do nothing. Do not write more text to Brian.",
+                    continue: `Desk queue: these threads wait on you: ${waits}. Act on each now with desk, team_message or team_delegate. If one must wait, leave it. Keep any text to Brian to 1 line.`,
                 };
             } catch {
                 return undefined;
@@ -5619,7 +5958,7 @@ export default function createDesk(host: Host, web: Web) {
         name: "desk",
         tools: [tool],
         hooks: [noTeamReport, reminder],
-        tasks: [Sweeper],
+        tasks: [Sweeper, Notify],
         sections: [
             // Only a supervisor's session gets it. No clock text: the section changes when the desk changes.
             section("desk", async (input, context) => {
@@ -5672,6 +6011,7 @@ export default function createDesk(host: Host, web: Web) {
                     )
                     .map((thread) => `due: ${thread.id} ${thread.watch?.check ?? ""}`);
                 const watching = open.filter((thread) => asleep(thread, now)).length;
+                const waits = waitsText(open);
                 const { cap } = await deskConfig();
                 const capped = capView(state, cap, now);
                 const events = mine
@@ -5701,7 +6041,9 @@ export default function createDesk(host: Host, web: Web) {
                           ]
                         : []),
                     `Stale: ${stale.length === 0 ? "none" : stale.join(", ")}.`,
+                    ...(waits === "" ? [] : [`Waits on you: ${waits}.`]),
                     ...(events.length === 0 ? [] : ["New since your last look:", ...events]),
+                    "Threads that wait on you are yours to act on now: do not wait for a message.",
                     "File each ask to Brian (a decision, a host action, a device check) with desk ask. Record his answer with desk answer. Give choices with options when an ask is a pick-one decision.",
                     "A due watch (due: T13 <check>) is yours to send: send the check to the thread's agent, then record its result with desk result.",
                     "Reports arrive as 1 line that starts with [desk]. Read the full report with desk read <id> before you act.",
