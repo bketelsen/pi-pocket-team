@@ -2,12 +2,12 @@
 
 Drop-in extensions for [Pi Pocket](https://github.com/TannerMidd/pi-pocket), written for Brian Ketelsen's own server and shared as they are. MIT license ([LICENSE](LICENSE)).
 
-| Module          | Files                                | What it is                                                                                                                                                                                                                                                                                                                                                                                                  |
-| --------------- | ------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Team**        | `team.ts`, `team-web/`               | Named agents in ordinary Pi Pocket sessions, a supervisor's delegation into their repositories, and each agent's own memory.                                                                                                                                                                                                                                                                                |
-| **Homewiki**    | `homewiki.ts`, `homewiki-web/`       | The "Wiki" rail page: renders a Markdown wiki checkout (`README.md` and `docs/**/*.md`) live from disk, read-only and owner-only. Default folder `~/projects/homewiki`; set `PI_POCKET_HOMEWIKI_ROOT` for another one.                                                                                                                                                                                      |
-| **Night shift** | `night-shift.ts`, `night-shift-web/` | `/night-shift`: Pi works on an objective in rounds while you sleep, until a stop condition in words (and an optional check command), a round limit, or a deadline; then it writes a summary for the morning.                                                                                                                                                                                                |
-| **Desk**        | `desk.ts`                            | One thread for each piece of work the team runs in the background: opened by `team_delegate`, listed and read by a supervisor session, seeded once from a `seed.json` triage file, given its agents' reports, observed by a sweep that closes it when every part is closed, tied to the PRs in its repository, held to a cap, carrying the asks to Brian, and shown on an owner-only page (parts 1–7 of 8). |
+| Module          | Files                                | What it is                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| --------------- | ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **Team**        | `team.ts`, `team-web/`               | Named agents in ordinary Pi Pocket sessions, a supervisor's delegation into their repositories, and each agent's own memory.                                                                                                                                                                                                                                                                                                   |
+| **Homewiki**    | `homewiki.ts`, `homewiki-web/`       | The "Wiki" rail page: renders a Markdown wiki checkout (`README.md` and `docs/**/*.md`) live from disk, read-only and owner-only. Default folder `~/projects/homewiki`; set `PI_POCKET_HOMEWIKI_ROOT` for another one.                                                                                                                                                                                                         |
+| **Night shift** | `night-shift.ts`, `night-shift-web/` | `/night-shift`: Pi works on an objective in rounds while you sleep, until a stop condition in words (and an optional check command), a round limit, or a deadline; then it writes a summary for the morning.                                                                                                                                                                                                                   |
+| **Desk**        | `desk.ts`                            | One thread for each piece of work the team runs in the background: opened by `team_delegate`, listed and read by a supervisor session, seeded once from a `seed.json` triage file, given its agents' reports, observed by a sweep that closes it when every part is closed, tied to the PRs in its repository, held to a cap, carrying the asks to Brian, shown on an owner-only page, and copied to a git folder (parts 1–8). |
 
 ## Requirements
 
@@ -307,7 +307,7 @@ A supervisor identity (Odrade) can start a night shift in the linked session tha
 
 # Desk
 
-One thread for each piece of work the team runs in the background: T13, T14, … A thread holds the work, its agents, its repository, its PRs, its asks, its events, and its reports. These are parts 1–7 of 8; the git export comes in the last part.
+One thread for each piece of work the team runs in the background: T13, T14, … A thread holds the work, its agents, its repository, its PRs, its asks, its events, and its reports. The module is complete in these 8 parts.
 
 ## What these parts do
 
@@ -333,13 +333,15 @@ One thread for each piece of work the team runs in the background: T13, T14, …
     - **PR states:** each attached PR gets `OPEN`, `MERGED`, `CLOSED`, or `FROZEN` (its repository is archived), with its title, URL, review, checks, and mergeable state. Its next actor is `none`, `agent` (draft, conflict, failing checks, changes requested), `reviewer` (review required), or `brian` (ready to merge). A change of state or next actor is an event.
     - **Attribution:** a PR is ours when its author is the viewer or a login in the desk's config file. All agents act as one account, so the author never says which thread made a PR. The sweep tries 3 rules, in order. **Seen:** the PR's URL was in the thread's session (it must be made while the thread ran; an older PR counts only when the thread pushed its branch). **Branch:** exactly 1 thread in that repository has or made the PR's branch (`git reflog`). **Window:** exactly 1 thread in that repository was open when the PR was made. A PR that no rule claims becomes a found thread `F1`, `F2`, …, unless it is older than the desk's epoch (set at the seed, else at the first sweep). A newer thread that pushed an older thread's PR branch takes the PR from it. Other authors' PRs are never attached: their count per repository goes to `others`.
     - **Archived repositories are frozen:** an attached PR there is `FROZEN`, which counts as closed, and no PR there is a candidate.
-- **The desk's config file.** `PI_POCKET_DESK_CONFIG` names it (default `~/.config/pi-pocket-team/desk.json`). It holds the extra logins that count as ours, beside the viewer's, for example a machine account:
+- **The desk's config file.** `PI_POCKET_DESK_CONFIG` names it (default `~/.config/pi-pocket-team/desk.json`). Every part reads it each time, so Brian can change it without a restart. A missing or bad file means the defaults.
 
-```json
-{ "authors": ["ci-machine", "release-bot"], "cap": 12 }
-```
+| Key       | Meaning                                                                                                                                     |
+| --------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| `authors` | Logins that count as ours beside the viewer's, for example a machine account: `["ci-machine", "release-bot"]`.                              |
+| `cap`     | How many threads count before the desk is full: 1 to 100. Default 12.                                                                       |
+| `export`  | A folder for the git copy, absolute or starting with `~/`. No `export` means no export. The folder must exist; the module never creates it. |
 
-`authors` adds the machine accounts that count as ours. `cap` is 1 to 100, default 12. A missing or bad file means no extra authors and the default cap. The sweep and `team_delegate` read it each time.
+- **The git export.** After each sweep, seed, `desk sync`, `attach`, `ask`, `answer`, and each page POST except `seen`, the module writes a readable copy of the desk into `export`: `threads.md` with the page's sections, and one `T13.md` for every thread, with its PRs, asks and answers, events, and the full reports. The Pocket document stays the truth; the export is written, never read back. It is deterministic (no "generated at" line), and a file is written only when its bytes change (a temp file, then a rename); no file is ever deleted. A missing folder or a write error skips the export and adds 1 warning an hour at most; it never fails a sweep, a route, or a tool.
 
 - **The Desk page: Brian's inbox.** `desk-web/` adds a rail button, "Desk", with a badge: the count of threads that are not parked and that need Brian or are stale. The page and its routes are owner-only.
     - **Sections, phone first:** Needs you (each ask with an **Answered** button and an optional field for Brian's words, and PRs ready to merge as links), Found (attach to a thread, or drop; a found thread stays here whatever its next actor), Stale (Keep / Park / Drop, with a reason for a drop), Working and Waiting on review (Park / Drop), Parked (Wake / Drop), and Closed in the last 7 days.
@@ -395,5 +397,15 @@ Any other key in a row is an error. An error names the row and the field.
 ## Turn it on
 
 The module starts off, as every drop-in does. Install it (`npm run install-check`, then `npm run install-extension`), then turn on **Desk** in **Menu → Extensions**. Team must be on too: the `desk` tool reads identities and the roster through Team's API, and refuses with "The Team module is off." when Team is not loaded. Both modules reload into the running server; no restart is needed. Open **Desk** in the rail (or the launcher on a phone) for the page.
+
+## The module, complete
+
+One module, `desk.ts` with `desk-web/`, over 2 Pocket documents: `x.desk.threads` (the app-wide desk) and `x.desk.reports` (one thread session's full reports). Team and Night shift reach it through `globalThis[Symbol.for("pi-pocket-team.desk")]`.
+
+- **The tools:** `desk` (list, read, sync, seed, attach, ask, answer), all for a supervisor session.
+- **The task:** `x.desk.sweeper`, one per supervisor, every 10 minutes.
+- **The page:** "Desk" on the rail with a badge, and the routes behind it, all owner-only.
+- **The export:** a git copy in the folder the config file names.
+- **What stays with Brian:** he turns the module on, sets the cap and the extra authors in the config file, gives the OKs (the page's **Allow 1**, or `desk ok` in the chat), keeps, parks, wakes and drops threads on the page, and commits the export. The desk observes the work and closes a thread when every part is closed.
 
 `desk.test.ts` covers the rules directly and in a Pi Pocket: a delegation opens and binds one thread, the desk lists and reads it, a session without a supervisor identity is refused, a seed is imported once, a report is filed with 1 line in the chat, a message to another address keeps its full text, the built-in `team` tool is blocked, a night shift's report is filed, a parked thread wakes on an event, and the page's routes answer the owner, refuse a guest, and change nothing on a second POST.
