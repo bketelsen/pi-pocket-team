@@ -507,6 +507,17 @@ export default function setup(pocket) {
                     ${counts.brian ?? 0} need you · ${counts.open ?? 0} open · ${counts.stale ?? 0} stale · ${counts.parked ?? 0} parked · ${capInfo.counted} of ${capInfo.cap} count
                 </p>
                 ${
+                    view.github && view.github.ok === false
+                        ? html`<p class="small desk-warn">
+                              GitHub: read failed at
+                              ${new Date(view.github.at).toLocaleTimeString([], {
+                                  hour: "2-digit",
+                                  minute: "2-digit",
+                              })}: ${view.github.error ?? "unknown error"}
+                          </p>`
+                        : null
+                }
+                ${
                     capInfo.full
                         ? html`<div class="desk-full" role="status">
                               <p>The desk is full. New delegations wait for your OK.</p>

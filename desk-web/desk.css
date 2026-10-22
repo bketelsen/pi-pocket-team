@@ -243,3 +243,8 @@
 .desk-ask p {
     margin: 0;
 }
+
+.desk-warn {
+    color: var(--warn);
+    margin: 6px 0 0;
+}

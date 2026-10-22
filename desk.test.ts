@@ -35,6 +35,10 @@ import {
     readText,
     seedThreads,
     shortLine,
+    deskEpoch,
+    repairEpoch,
+    reopenable,
+    reopenReason,
     wakeParked,
     closeCheck,
     isStale,
@@ -533,6 +537,201 @@ describe("isStale", () => {
     });
 });
 
+describe("the epoch", () => {
+    test("the oldest seed sets it, and a repair moves it back", () => {
+        const state = deskOf();
+
+        state.epoch = 500;
+        const seed = placed(state, 100);
+
+        seed.origin = "seed";
+
+        assert.equal(deskEpoch(state), 100);
+
+        repairEpoch(state, 900);
+        assert.equal(state.epoch, 100);
+
+        const none = deskOf();
+
+        none.epoch = 42;
+        assert.equal(deskEpoch(none), 42);
+
+        repairEpoch(none, 50);
+        assert.equal(none.epoch, 42);
+    });
+});
+
+describe("reopening", () => {
+    test("only a thread closed as done in the last 7 days can come back", () => {
+        const now = 10 * DAY;
+
+        for (const [why, at] of [
+            ["dropped", now - DAY],
+            ["failed", now - DAY],
+            ["done", now - 8 * DAY],
+        ] as const) {
+            const closed = thread({ state: "closed", closed: { at, why, by: "sweep" } });
+
+            assert.equal(reopenable(closed, now), false, why);
+            assert.equal(reopenReason(closed, { busy: true }, now), undefined, why);
+        }
+
+        const done = thread({
+            state: "closed",
+            closed: { at: now - DAY, why: "done", by: "sweep" },
+            run: { lastUserEntry: 5 },
+        });
+
+        assert.equal(reopenable(done, now), true);
+        assert.equal(reopenReason(done, { busy: true }, now), "its session is busy");
+        assert.equal(reopenReason(done, { busy: false }, now), undefined);
+        assert.equal(
+            reopenReason(done, { busy: false, userBefore: 4 }, now),
+            "new work in its session",
+        );
+        assert.equal(reopenReason(done, { busy: false, userBefore: 5 }, now), undefined);
+    });
+
+    test("a PR seen in the closed thread reopens it", () => {
+        const state = deskOf();
+
+        state.epoch = 0;
+        const closed = placed(state, 100);
+
+        closed.state = "closed";
+        closed.closed = { at: 300, why: "done", by: "sweep" };
+        closed.run.seenPrs = ["frostyard/test#7"];
+
+        const result = attribute(
+            state,
+            githubOf([prFact({ createdAt: 150 })]),
+            gitOf({ recentlyClosed: [closed.id] }),
+            400,
+        );
+
+        assert.deepEqual(result.reopened, [closed.id]);
+        assert.equal(closed.prs["frostyard/test#7"]?.via, "seen");
+    });
+
+    test("a PR whose branch the closed thread made reopens it", () => {
+        const state = deskOf();
+
+        state.epoch = 0;
+        const closed = placed(state, 100);
+
+        closed.state = "closed";
+        closed.closed = { at: 300, why: "done", by: "sweep" };
+        closed.branches = ["fix-7"];
+
+        const result = attribute(
+            state,
+            githubOf([prFact({ createdAt: 250 })]),
+            gitOf({ recentlyClosed: [closed.id] }),
+            400,
+        );
+
+        assert.deepEqual(result.reopened, [closed.id]);
+        assert.equal(closed.prs["frostyard/test#7"]?.via, "branch");
+    });
+
+    test("the window rule never targets a closed thread; a merged PR does not reopen one", () => {
+        const state = deskOf();
+
+        state.epoch = 0;
+        const closed = placed(state, 100);
+
+        closed.state = "closed";
+        closed.closed = { at: 200, why: "done", by: "sweep" };
+
+        const pr = prFact({ createdAt: 150 });
+        const result = attribute(
+            state,
+            githubOf([pr]),
+            gitOf({ recentlyClosed: [closed.id] }),
+            300,
+        );
+
+        assert.deepEqual(result.reopened, []);
+        assert.equal(closed.prs[pr.ref], undefined);
+        assert.equal(
+            Object.values(state.threads).some(
+                (each) => each.origin === "found" && each.prs[pr.ref] !== undefined,
+            ),
+            true,
+            "the PR becomes a found thread instead",
+        );
+
+        // A merged PR is not an open candidate: nothing reopens.
+        const mergedState = deskOf();
+
+        mergedState.epoch = 0;
+        const mergedClosed = placed(mergedState, 100);
+
+        mergedClosed.state = "closed";
+        mergedClosed.closed = { at: 200, why: "done", by: "sweep" };
+        mergedClosed.run.seenPrs = ["frostyard/test#7"];
+
+        const merged = attribute(
+            mergedState,
+            {
+                viewer: "github-viewer",
+                repos: { "frostyard/test": { archived: false, open: [] } },
+                prs: { "frostyard/test#7": prFact({ state: "MERGED", createdAt: 150 }) },
+            },
+            gitOf({ recentlyClosed: [mergedClosed.id] }),
+            300,
+        );
+
+        assert.deepEqual(merged.reopened, []);
+        assert.equal(mergedClosed.state, "closed");
+    });
+});
+
+describe("hand-attached PRs", () => {
+    test("a PR attached by hand does not move when a newer thread pushes its branch", () => {
+        const state = deskOf();
+        const older = placed(state, 100);
+        const newer = placed(state, 300);
+
+        older.prs["frostyard/test#7"] = { via: "attached" };
+        newer.run.seenPrs = ["frostyard/test#7"];
+        newer.branches = ["fix-7"];
+
+        const result = attribute(state, githubOf([prFact({ createdAt: 200 })]), gitOf(), 400);
+
+        assert.equal(older.prs["frostyard/test#7"]?.via, "attached");
+        assert.equal(newer.prs["frostyard/test#7"], undefined);
+        assert.deepEqual(result.reopened, []);
+    });
+
+    test("a PR attached by hand elsewhere does not reopen a closed thread that saw it", () => {
+        const state = deskOf();
+
+        state.epoch = 0;
+        const closed = placed(state, 100);
+
+        closed.state = "closed";
+        closed.closed = { at: 300, why: "done", by: "sweep" };
+        closed.run.seenPrs = ["frostyard/test#7"];
+
+        const holder = placed(state, 200);
+
+        holder.prs["frostyard/test#7"] = { via: "attached" };
+
+        const result = attribute(
+            state,
+            githubOf([prFact({ createdAt: 250 })]),
+            gitOf({ recentlyClosed: [closed.id] }),
+            400,
+        );
+
+        assert.deepEqual(result.reopened, []);
+        assert.equal(holder.prs["frostyard/test#7"]?.via, "attached");
+        assert.equal(closed.prs["frostyard/test#7"], undefined);
+        assert.equal(closed.state, "closed");
+    });
+});
+
 describe("wakeParked", () => {
     test("a parked thread goes back to open when the sweep gave it an event", () => {
         const thread = placed(deskOf(), 100);
@@ -825,7 +1024,7 @@ describe("attribute", () => {
         const older = placed(state, 100);
         const newer = placed(state, 300);
 
-        older.prs["frostyard/test#7"] = { via: "attached" };
+        older.prs["frostyard/test#7"] = { via: "seen" };
         newer.run.seenPrs = ["frostyard/test#7"];
         newer.branches = ["fix-7"];
 
@@ -1325,6 +1524,8 @@ const OTHER_REPORT = `OTHER-START ${"o".repeat(1200)} OTHER-END`;
 const LONG_SUMMARY = `NIGHT-REPORT-START ${"n".repeat(1200)} NIGHT-REPORT-END`;
 /** The seed file the scripted model hands to the tool. */
 let seedPath = "";
+/** The PR number the "desk pr test" answer mentions: each test that uses it takes its own. */
+let prNumber = 212;
 /** The thread and ask the scripted model uses in the ask tests. */
 let askThreadId = "";
 let answerAskId = "";
@@ -1434,7 +1635,7 @@ const model = scriptedModel((request) => {
 
     if (text.endsWith("desk pr test")) {
         return answer(
-            "Opened https://github.com/frostyard/pilothouse/pull/212 — the CI fix is in.",
+            `Opened https://github.com/frostyard/pilothouse/pull/${String(prNumber)} — the CI fix is in.`,
         );
     }
 
@@ -1524,6 +1725,7 @@ const brief = join(root, "brief");
 const fixturePath = join(root, "github.json");
 const configPath = join(root, "desk.json");
 const fakeGh = join(root, "fake-gh.sh");
+const failGh = join(root, "fail-gh.sh");
 
 /** A `gh api graphql` answer for frostyard/pilothouse. */
 const githubFixture = (
@@ -1601,7 +1803,7 @@ before(async () => {
     );
     writeFileSync(
         join(definitions, "duncan.md"),
-        `---\nmodel: faux/faux-2\nrepositories:\n  frostyard/test: ${repo}\n  frostyard/pilothouse: ${repo}\n---\n# Duncan Idaho\nYou are Duncan Idaho. Own the test repository.`,
+        `---\nmodel: faux/faux-2\nrepositories:\n  frostyard/test: ${repo}\n  frostyard/pilothouse: ${repo}\n  pi-pocket-team: ${repo}\n---\n# Duncan Idaho\nYou are Duncan Idaho. Own the test repository.`,
     );
     writeFileSync(
         join(definitions, "paul.md"),
@@ -1635,6 +1837,8 @@ before(async () => {
     writeFileSync(fixturePath, JSON.stringify({ data: { viewer: { login: "github-viewer" } } }));
     writeFileSync(fakeGh, `#!/bin/sh\ncat ${JSON.stringify(fixturePath)}\n`);
     chmodSync(fakeGh, 0o755);
+    writeFileSync(failGh, '#!/bin/sh\necho "HTTP 401: Bad credentials" >&2\nexit 1\n');
+    chmodSync(failGh, 0o755);
     process.env.PI_POCKET_DESK_GH = fakeGh;
     process.env.PI_POCKET_DESK_CONFIG = configPath;
     // The tests make many threads: a high cap, so only the cap tests meet the cap. Each of them restores this.
@@ -1719,6 +1923,8 @@ async function restartApp(by: number): Promise<void> {
     writeFileSync(fixturePath, JSON.stringify({ data: { viewer: { login: "github-viewer" } } }));
     writeFileSync(fakeGh, `#!/bin/sh\ncat ${JSON.stringify(fixturePath)}\n`);
     chmodSync(fakeGh, 0o755);
+    writeFileSync(failGh, '#!/bin/sh\necho "HTTP 401: Bad credentials" >&2\nexit 1\n');
+    chmodSync(failGh, 0o755);
     process.env.PI_POCKET_DESK_GH = fakeGh;
     process.env.PI_POCKET_DESK_CONFIG = configPath;
     // The tests make many threads: a high cap, so only the cap tests meet the cap. Each of them restores this.
@@ -1756,6 +1962,22 @@ async function clearGrants(): Promise<void> {
             (grant) => grant.usedBy !== undefined || grant.expires <= now,
         );
     }, context);
+}
+
+/** True when every live sweeper sleeps: no first sweep is still reading the world. */
+async function sweepersAsleep(): Promise<boolean> {
+    const live = await app.harness.inspect(context);
+
+    return live.tasks
+        .filter((task) => task.record.kind === "x.desk.sweeper")
+        .every((task) => {
+            const state = task.record.state as {
+                status?: string;
+                checkpoint?: { phase?: string };
+            };
+
+            return state.status === "running" && state.checkpoint?.phase === "sleep";
+        });
 }
 
 /** The live sweeper tasks of a supervisor session. */
@@ -2072,12 +2294,18 @@ describe("the desk in a Pi Pocket", () => {
 
     test("a PR URL in the session's answer is attached by seen; merged, it closes the thread", async () => {
         await stopSweepers();
+        // An aborted sweeper may still finish its commit: let it, so no other supervisor sees this fixture.
+        await new Promise((resolve) => setTimeout(resolve, 250));
+
         const { source, linked, thread } = await delegated(
             "github",
             "desk delegate pilothouse test",
         );
 
         try {
+            // Every other supervisor's first sweep must finish, so no other sweep makes a found thread for this PR.
+            await until(sweepersAsleep, "the sweepers to sleep", 20_000);
+
             // The session's answer holds the PR's URL; the next sweep reads it.
             await say(app, linked, "desk pr test");
 
@@ -2130,6 +2358,8 @@ describe("the desk in a Pi Pocket", () => {
             assert.equal(closed?.prs["frostyard/pilothouse#212"]?.state, "MERGED");
             assert.equal((await deskState())?.others?.["frostyard/pilothouse"], 1);
             assert.equal(closed?.prs["frostyard/pilothouse#214"], undefined);
+            assert.equal((await deskState())?.github?.ok, true);
+            assert.deepEqual((await deskState())?.github?.skipped, ["pi-pocket-team"]);
         } finally {
             writeFileSync(
                 fixturePath,
@@ -2248,6 +2478,90 @@ describe("the desk in a Pi Pocket", () => {
 
         await say(app, source, "desk reminder test");
         assert.doesNotMatch((await modelTexts(app, source)).join("\n"), /Desk check:/);
+    });
+
+    test("a failed GitHub read is shown in the desk and by desk list", async () => {
+        const source = await supervisor("github-fail");
+
+        process.env.PI_POCKET_DESK_GH = failGh;
+
+        try {
+            await say(app, source, "desk sync test");
+
+            const github = (await deskState())?.github;
+
+            assert.equal(github?.ok, false);
+            assert.match(github?.error ?? "", /exit code 1: HTTP 401/);
+            assert.deepEqual(github?.skipped, ["pi-pocket-team"]);
+
+            await say(app, source, "desk list test");
+            assert.match(
+                (await modelTexts(app, source)).join("\n"),
+                /GitHub: read failed at \d\d:\d\d: exit code 1: HTTP 401: Bad credentials/,
+            );
+            assert.match(
+                (await modelTexts(app, source)).join("\n"),
+                /Skipped roster names: pi-pocket-team/,
+            );
+        } finally {
+            process.env.PI_POCKET_DESK_GH = fakeGh;
+        }
+    });
+
+    test("a thread closed without GitHub reopens when its PR is open", async () => {
+        await stopSweepers();
+        await new Promise((resolve) => setTimeout(resolve, 250));
+
+        const { source, linked, thread } = await delegated("reopen");
+
+        prNumber = 215;
+        await until(sweepersAsleep, "the sweepers to sleep", 20_000);
+        await say(app, linked, "desk pr test");
+        await say(app, linked, "report to supervisor test");
+        await until(() => !app.isBusy(linked), "the report's turn", 20_000);
+
+        process.env.PI_POCKET_DESK_GH = failGh;
+
+        try {
+            await say(app, source, "desk sync test");
+        } finally {
+            process.env.PI_POCKET_DESK_GH = fakeGh;
+        }
+
+        assert.equal((await deskState())?.threads[thread.id]?.state, "closed");
+        assert.equal((await deskState())?.threads[thread.id]?.closed?.why, "done");
+
+        writeFileSync(
+            fixturePath,
+            JSON.stringify(
+                githubFixture([
+                    {
+                        number: 215,
+                        createdAt: new Date(Number(thread.startedAt) + 60_000).toISOString(),
+                    },
+                ]),
+            ),
+        );
+
+        try {
+            await say(app, source, "desk sync test");
+
+            const back = (await deskState())?.threads[thread.id];
+
+            assert.equal(back?.state, "open");
+            assert.equal(back?.closed, undefined);
+            assert.equal(back?.prs["frostyard/pilothouse#215"]?.via, "seen");
+            assert.match(
+                back?.events.map((event) => event.text).join("; ") ?? "",
+                /reopened: a PR it made is open/,
+            );
+        } finally {
+            writeFileSync(
+                fixturePath,
+                JSON.stringify({ data: { viewer: { login: "github-viewer" } } }),
+            );
+            prNumber = 212;
+        }
     });
 
     describe("the desk page's routes", () => {
@@ -2646,16 +2960,18 @@ describe("the desk in a Pi Pocket", () => {
                 "number",
             );
 
-            // A sweep 11 minutes later, still dirty: the found thread appears.
+            // A sweep 11 minutes later, still dirty: the found thread appears. Any supervisor may make it: the
+            // folder is one thread for the whole desk.
             await restartApp(SWEEP_SLEEP_MS + FOUND_FOLDER_DELAY_MS + 7 * 60_000);
 
-            await until(
-                async () => (await foundFor(source)).length === 1,
-                "the found thread",
-                20_000,
-            );
+            const folderFound = async () =>
+                Object.values((await deskState())?.threads ?? {}).filter(
+                    (each) => each.origin === "found" && each.run.folder === fresh,
+                );
 
-            const found = await foundFor(source);
+            await until(async () => (await folderFound()).length === 1, "the found thread", 20_000);
+
+            const found = await folderFound();
 
             assert.equal(found[0]?.run.folder, fresh);
             assert.equal(found[0]?.id, "F1");
@@ -2665,7 +2981,9 @@ describe("the desk in a Pi Pocket", () => {
                 undefined,
             );
             assert.equal(
-                (await foundFor(source)).some((each) => each.run.folder === old),
+                Object.values((await deskState())?.threads ?? {}).some(
+                    (each) => each.origin === "found" && each.run.folder === old,
+                ),
                 false,
                 "old work never becomes a found thread",
             );
@@ -2675,7 +2993,7 @@ describe("the desk in a Pi Pocket", () => {
 
             await restartApp(SWEEP_SLEEP_MS * 2 + FOUND_FOLDER_DELAY_MS + 8 * 60_000);
             await sweptAfter(thread, seen);
-            assert.equal((await foundFor(source)).length, 1);
+            assert.equal((await folderFound()).length, 1);
         } finally {
             shift = 0;
         }
@@ -2753,6 +3071,40 @@ describe("the desk in a Pi Pocket", () => {
 
         assert.equal(typeof (await deskState())?.sweepers?.[String(Number(source))], "string");
         assert.equal(await sweepers(source), 1);
+    });
+
+    test("a sweep starts a sweeper for every supervisor with open work", async () => {
+        const folder = join(root, "sweep-all");
+
+        mkdirSync(folder, { recursive: true });
+        const lonely = await newSession(app, folder);
+        let threadId = "";
+
+        await app.harness.commit(async (tx) => {
+            const state = await tx.doc(DeskThreads);
+            const opened = openThread(state, {
+                key: "x.test.sweep-all",
+                supervisor: Number(lonely),
+                agents: ["duncan"],
+                repo: "frostyard/test",
+                title: "No sweeper",
+                at: Date.now(),
+            });
+
+            threadId = opened.thread.id;
+            state.threads[threadId]!.state = "open";
+            state.threads[threadId]!.address = "session-sweep-all";
+            state.threads[threadId]!.run.busy = true;
+        }, context);
+
+        assert.equal((await deskState())?.sweepers?.[String(Number(lonely))], undefined);
+
+        const other = await supervisor("sweep-other");
+
+        await say(app, other, "desk sync test");
+
+        assert.equal(typeof (await deskState())?.sweepers?.[String(Number(lonely))], "string");
+        assert.equal(await sweepers(lonely), 1);
     });
 
     test("the sweeper sweeps again after 10 minutes, and ends when no thread is open", async () => {

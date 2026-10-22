@@ -166,6 +166,8 @@ export type DeskState = {
     epoch?: number;
     /** Open PRs per repository that are not ours: dependabot, and other people. */
     others?: Record<string, number>;
+    /** The last GitHub read: when, whether it worked, why not, and the roster names it skipped. */
+    github?: { at: number; ok: boolean; error?: string; skipped?: string[] };
     /**
      * What a supervisor's first sweep saw. Old work never becomes a found thread: only the seed brings it in. A folder
      * leaves `folders` when it is clean. `pending` holds the folders that have been dirty since a sweep first saw them,
@@ -803,6 +805,64 @@ export function nextActor(thread: Thread): NextActor {
     return "none";
 }
 
+/** The desk's start: the oldest seed thread's start, else the stored epoch. A seed sets the truth. */
+export function deskEpoch(state: Readonly<DeskState> | undefined): number | undefined {
+    let oldest: number | undefined;
+
+    for (const thread of Object.values(state?.threads ?? {})) {
+        if (thread.origin === "seed" && (oldest === undefined || thread.startedAt < oldest)) {
+            oldest = thread.startedAt;
+        }
+    }
+
+    return oldest ?? state?.epoch;
+}
+
+/** A desk seeded before the epoch existed: move the epoch back to the seed's start. */
+export function repairEpoch(state: DeskState, now: number): void {
+    state.epoch ??= now;
+
+    const epoch = deskEpoch(state);
+
+    if (epoch !== undefined && state.epoch > epoch) {
+        state.epoch = epoch;
+    }
+}
+
+/** How long after it closed a "done" thread can come back. */
+const REOPEN_MS = 7 * 24 * 3600_000;
+
+/** A thread that closed as done in the last 7 days may reopen: new work came back to it. */
+export function reopenable(thread: Thread, now: number): boolean {
+    return (
+        thread.state === "closed" &&
+        thread.closed?.why === "done" &&
+        now - thread.closed.at <= REOPEN_MS
+    );
+}
+
+/** Why a closed done thread reopens from its session: busy, or a person wrote in it again. */
+export function reopenReason(
+    thread: Thread,
+    facts: { busy?: boolean; userBefore?: number },
+    now: number,
+): string | undefined {
+    if (!reopenable(thread, now)) {
+        return undefined;
+    }
+
+    if (facts.busy === true) {
+        return "its session is busy";
+    }
+
+    const after =
+        typeof thread.run.lastUserEntry === "number" ? thread.run.lastUserEntry : undefined;
+
+    return typeof facts.userBefore === "number" && after !== undefined && after > facts.userBefore
+        ? "new work in its session"
+        : undefined;
+}
+
 /**
  * A parked thread that this sweep gave an event goes back to open, with the event "woke: <that event>". `before` is
  * its event count when the sweep began: the park event is older, so it never wakes a thread by itself.
@@ -916,6 +976,13 @@ export type GitHubFacts = {
 };
 
 const OWNER_NAME = /^[A-Za-z0-9][A-Za-z0-9_.-]*$/;
+
+/** A roster name that may go into a query: exactly "owner/name". Anything else is skipped, never fatal. */
+export function isRepoName(name: string): boolean {
+    const parts = name.split("/");
+
+    return parts.length === 2 && OWNER_NAME.test(parts[0] ?? "") && OWNER_NAME.test(parts[1] ?? "");
+}
 const REF = /^([A-Za-z0-9][A-Za-z0-9_.-]*\/[A-Za-z0-9][A-Za-z0-9_.-]*)#([1-9][0-9]*)$/;
 
 function splitRepo(repo: string): { owner: string; name: string } {
@@ -1159,6 +1226,8 @@ export type GitFacts = {
     authors: string[];
     /** folder → branch → the oldest reflog time, in ms. */
     branches: Record<string, Record<string, number>>;
+    /** Threads closed as done in the last 7 days: rules 1 and 2 may reopen them. */
+    recentlyClosed?: string[];
 };
 
 const seenRef = (thread: Thread, ref: string): boolean =>
@@ -1182,9 +1251,9 @@ export function attribute(
     github: GitHubFacts | undefined,
     gitFacts: GitFacts,
     now: number,
-): { events: number } {
+): { events: number; reopened: string[] } {
     if (github === undefined) {
-        return { events: 0 };
+        return { events: 0, reopened: [] };
     }
 
     const supervisor = gitFacts.supervisor;
@@ -1194,8 +1263,16 @@ export function attribute(
         Object.values(state.threads).filter(
             (thread) => thread.supervisor === supervisor && thread.state !== "closed",
         );
+    const recent = new Set(gitFacts.recentlyClosed ?? []);
+    const targetsFor = () =>
+        Object.values(state.threads).filter(
+            (thread) =>
+                thread.supervisor === supervisor &&
+                (thread.state !== "closed" || recent.has(thread.id)),
+        );
     const holderOf = (ref: string) =>
         Object.values(state.threads).find((thread) => thread.prs[ref] !== undefined);
+    const reopened = new Set<string>();
     let events = 0;
 
     state.others ??= {};
@@ -1215,6 +1292,11 @@ export function attribute(
             }
 
             const holder = holderOf(pr.ref);
+
+            // A PR attached by hand (the tool, the page, or the seed) stays on its thread: never a candidate.
+            if (holder?.prs[pr.ref]?.via === "attached") {
+                continue;
+            }
 
             if (holder !== undefined) {
                 // The "touched" move: a newer thread of this supervisor pushed the branch of an older thread's PR.
@@ -1263,7 +1345,8 @@ export function attribute(
                 continue;
             }
 
-            const threads = mine();
+            // Rules 1 and 2 may also give a PR back to a thread that closed as done in the last 7 days.
+            const threads = targetsFor();
 
             // 1. seen: it was in the thread's context. An older PR counts only when the thread pushed its branch.
             let target = threads
@@ -1295,9 +1378,9 @@ export function attribute(
                 }
             }
 
-            // 3. window: exactly one thread in that repository was open when the PR was made.
+            // 3. window: exactly one open thread in that repository was open when the PR was made. Never a closed one.
             if (target === undefined) {
-                const matches = threads.filter(
+                const matches = mine().filter(
                     (thread) =>
                         threadRepos(thread).includes(pr.repo) && thread.startedAt <= pr.createdAt,
                 );
@@ -1322,11 +1405,17 @@ export function attribute(
                     events += 1;
                 }
 
+                if (recent.has(target.id)) {
+                    reopened.add(target.id);
+                }
+
                 continue;
             }
 
             // 4. found: new work, not older than the desk's epoch.
-            if (state.epoch === undefined || pr.createdAt < state.epoch) {
+            const epoch = deskEpoch(state);
+
+            if (epoch === undefined || pr.createdAt < epoch) {
                 continue;
             }
 
@@ -1359,7 +1448,7 @@ export function attribute(
         }
     }
 
-    return { events };
+    return { events, reopened: [...reopened] };
 }
 
 /** Put a PR, or all of another thread's work, on one thread. Pure over the state: the caller commits it. */
@@ -1782,6 +1871,56 @@ export function asksBrian(text: string): boolean {
     return last.includes("?") || ASK_WORDS.test(last);
 }
 
+/** The last GitHub read, as the page reads it. */
+export type GitHubView = {
+    at: number;
+    ok: boolean;
+    error?: string;
+    skipped?: string[];
+};
+
+/** The last GitHub read as a plain value; null when no read happened yet. */
+export function githubView(state: Readonly<DeskState> | undefined): GitHubView | null {
+    const github = state?.github;
+
+    if (github === undefined) {
+        return null;
+    }
+
+    return {
+        at: github.at,
+        ok: github.ok,
+        ...(github.error === undefined ? {} : { error: github.error }),
+        ...(github.skipped === undefined ? {} : { skipped: [...github.skipped] }),
+    };
+}
+
+/** A read time as the list and the section show it: 01:47, the server's clock. */
+const clock = (at: number) => new Date(at).toTimeString().slice(0, 5);
+
+/** The GitHub status lines for `desk list` and the section: a failure, and the skipped roster names. */
+export function githubLines(state: Readonly<DeskState> | undefined): string[] {
+    const github = state?.github;
+
+    if (github === undefined) {
+        return [];
+    }
+
+    const lines: string[] = [];
+
+    if (!github.ok) {
+        lines.push(
+            `GitHub: read failed at ${clock(github.at)}: ${github.error ?? "unknown error"}`,
+        );
+    }
+
+    if (github.skipped !== undefined && github.skipped.length > 0) {
+        lines.push(`Skipped roster names: ${github.skipped.join(", ")}`);
+    }
+
+    return lines;
+}
+
 // ─── The page's view ────────────────────────────────────────────────────────
 
 /** How many closed threads the page shows. */
@@ -1893,6 +2032,8 @@ export type ThreadsView = {
     threads: ThreadView[];
     seen: number;
     others: Record<string, number>;
+    /** The last GitHub read: the page shows a warning when it failed. */
+    github: GitHubView | null;
     /** The cap: how many threads count, and how many OKs wait. */
     cap: { counted: number; cap: number; full: boolean; grants: number };
     counts: {
@@ -1956,6 +2097,7 @@ export function threadsView(
             .sort((a, b) => b.lastEventAt - a.lastEventAt),
         seen: state?.seen.brian ?? 0,
         others: { ...(state?.others ?? {}) },
+        github: githubView(state),
         cap: (() => {
             const view = capView(state, cap, now);
 
@@ -2438,6 +2580,10 @@ export default function createDesk(host: Host, web: Web) {
         /** By folder: its counts, or null when it is not a git repository. */
         folders: Record<string, FolderFact | null>;
         github?: GitHubFacts;
+        /** Why the GitHub read failed, in one line; absent when it worked. */
+        githubError?: string;
+        /** Roster repository names that are not "owner/name": skipped, never queried. */
+        githubSkipped?: string[];
         /** The logins that count as ours, from the desk's config file. */
         authors: string[];
         /** folder → branch → the oldest reflog time, in ms. */
@@ -2495,25 +2641,59 @@ export default function createDesk(host: Host, web: Web) {
         }
     }
 
-    /** The one GitHub read of a sweep: nothing this time when it fails. */
-    async function readGitHub(repos: string[], prs: string[]): Promise<GitHubFacts | undefined> {
+    /** Why a GitHub read failed, in one line of 200 characters at most. */
+    function githubError(error: unknown): string {
+        const failure = error as {
+            killed?: boolean;
+            code?: unknown;
+            stderr?: unknown;
+            message?: unknown;
+        } | null;
+        let said: string;
+
+        if (failure?.killed === true) {
+            said = "the read took longer than 60 seconds";
+        } else {
+            const stderr =
+                typeof failure?.stderr === "string"
+                    ? failure.stderr
+                          .split("\n")
+                          .map((line) => line.trim())
+                          .find((line) => line !== "")
+                    : undefined;
+
+            said =
+                stderr !== undefined && stderr !== ""
+                    ? `exit code ${String(failure?.code ?? "?")}: ${stderr}`
+                    : typeof failure?.message === "string"
+                      ? (failure.message.split("\n")[0] ?? "")
+                      : String(error);
+        }
+
+        return flatLine(said).slice(0, 200) || "the GitHub read failed";
+    }
+
+    /** The one GitHub read of a sweep: its facts, or why it failed. A failure keeps every thread's state. */
+    async function readGitHub(
+        repos: string[],
+        prs: string[],
+    ): Promise<{ facts?: GitHubFacts; error?: string }> {
         if (repos.length === 0 && prs.length === 0) {
-            return undefined;
+            return {};
         }
 
         try {
             const query = buildQuery(repos, prs);
             const gh = process.env.PI_POCKET_DESK_GH ?? "gh";
             const { stdout } = await run(gh, ["api", "graphql", "-f", `query=${query}`], {
-                timeout: 30_000,
+                timeout: 60_000,
                 maxBuffer: 8 * 1024 * 1024,
                 encoding: "utf8",
             });
 
-            return parseGitHub(JSON.parse(stdout));
-        } catch {
-            // No GitHub facts this sweep: the threads keep the states they had.
-            return undefined;
+            return { facts: parseGitHub(JSON.parse(stdout)) };
+        } catch (error) {
+            return { error: githubError(error) };
         }
     }
 
@@ -2652,6 +2832,7 @@ export default function createDesk(host: Host, web: Web) {
 
         const team = teamApi();
         const repositories = new Set<string>();
+        const skipped = new Set<string>();
 
         if (team !== undefined) {
             try {
@@ -2662,7 +2843,13 @@ export default function createDesk(host: Host, web: Web) {
 
                     for (const [repo, folder] of Object.entries(member.repositories ?? {})) {
                         folders.add(folder);
-                        repositories.add(repo);
+
+                        // A real profile may name a repository without an owner. Skip it: never a query name.
+                        if (isRepoName(repo)) {
+                            repositories.add(repo);
+                        } else {
+                            skipped.add(repo);
+                        }
                     }
                 }
             } catch {
@@ -2674,14 +2861,24 @@ export default function createDesk(host: Host, web: Web) {
 
         for (const thread of open) {
             for (const ref of Object.keys(thread.prs)) {
+                if (!REF.test(ref) || !isRepoName(repoOf(ref))) {
+                    continue;
+                }
+
                 pinned.add(ref);
                 repositories.add(repoOf(ref));
             }
         }
 
-        const github = await readGitHub([...repositories], [...pinned]);
+        const githubRead = await readGitHub([...repositories], [...pinned]);
         const { authors } = await deskConfig();
-        const branches = github === undefined ? {} : await branchFacts(open, github);
+        const recent = Object.values(state?.threads ?? {}).filter(
+            (thread) => thread.supervisor === Number(supervisor) && reopenable(thread, now),
+        );
+        const branches =
+            githubRead.facts === undefined
+                ? {}
+                : await branchFacts([...open, ...recent], githubRead.facts);
 
         const facts: Record<string, FolderFact | null> = {};
 
@@ -2694,7 +2891,9 @@ export default function createDesk(host: Host, web: Web) {
             ...(sessions === undefined ? {} : { sessions }),
             shifts,
             folders: facts,
-            ...(github === undefined ? {} : { github }),
+            ...(githubRead.facts === undefined ? {} : { github: githubRead.facts }),
+            ...(githubRead.error === undefined ? {} : { githubError: githubRead.error }),
+            ...(skipped.size === 0 ? {} : { githubSkipped: [...skipped].sort() }),
             authors,
             branches,
         };
@@ -2775,7 +2974,13 @@ export default function createDesk(host: Host, web: Web) {
 
         state.sweepers ??= {};
         state.baseline ??= {};
-        state.epoch ??= now;
+        repairEpoch(state, now);
+        state.github = {
+            at: now,
+            ok: facts.githubError === undefined,
+            ...(facts.githubError === undefined ? {} : { error: facts.githubError }),
+            ...(facts.githubSkipped === undefined ? {} : { skipped: [...facts.githubSkipped] }),
+        };
 
         await scanChatGrants(tx, state, supervisor, now);
 
@@ -2794,7 +2999,16 @@ export default function createDesk(host: Host, web: Web) {
         const open = Object.values(state.threads).filter(
             (thread) => thread.supervisor === supervisor && thread.state !== "closed",
         );
-        const eventsBefore = new Map(open.map((thread) => [thread.id, thread.events.length]));
+        // Threads that closed as done in the last 7 days: new work may bring them back.
+        const closedDone = Object.values(state.threads).filter(
+            (thread) => thread.supervisor === supervisor && reopenable(thread, now),
+        );
+        const usersBefore = new Map(
+            closedDone.map((thread) => [thread.id, thread.run.lastUserEntry]),
+        );
+        const eventsBefore = new Map(
+            [...open, ...closedDone].map((thread) => [thread.id, thread.events.length]),
+        );
 
         for (const thread of open) {
             await scanEntries(tx, thread);
@@ -2920,17 +3134,78 @@ export default function createDesk(host: Host, web: Web) {
             thread.run.sweptAt = now;
         }
 
+        // A closed done thread: scan its session too, and its session's facts, so new work shows.
+        for (const thread of closedDone) {
+            await scanEntries(tx, thread);
+
+            const session =
+                thread.address === undefined
+                    ? undefined
+                    : facts.sessions?.find((each) => each.address === thread.address);
+
+            if (session !== undefined) {
+                thread.run.busy = session.busy;
+                thread.run.archived = session.archived;
+            }
+        }
+
+        const reopen = new Map<string, string>();
+
+        for (const thread of closedDone) {
+            const reason = reopenReason(
+                thread,
+                {
+                    busy: thread.run.busy === true,
+                    userBefore: usersBefore.get(thread.id) as number | undefined,
+                },
+                now,
+            );
+
+            if (reason !== undefined) {
+                reopen.set(thread.id, reason);
+            }
+        }
+
         if (facts.github !== undefined) {
             for (const thread of open) {
                 events += updatePrs(thread, facts.github, now);
             }
 
-            events += attribute(
+            const attributed = attribute(
                 state,
                 facts.github,
-                { supervisor, authors: facts.authors, branches: facts.branches },
+                {
+                    supervisor,
+                    authors: facts.authors,
+                    branches: facts.branches,
+                    recentlyClosed: closedDone.map((thread) => thread.id),
+                },
                 now,
-            ).events;
+            );
+
+            events += attributed.events;
+
+            for (const id of attributed.reopened) {
+                if (!reopen.has(id)) {
+                    reopen.set(id, "a PR it made is open");
+                }
+            }
+        }
+
+        for (const thread of closedDone) {
+            const reason = reopen.get(thread.id);
+
+            if (reason === undefined) {
+                continue;
+            }
+
+            thread.state = "open";
+            delete thread.closed;
+            thread.run.next = nextActor(thread);
+
+            if (addEvent(thread, `reopened:${String(now)}`, `reopened: ${reason}`, now)) {
+                events += 1;
+            }
         }
 
         // A parked thread that got an event from this sweep goes back to open: something changed on it.
@@ -3132,6 +3407,7 @@ export default function createDesk(host: Host, web: Web) {
                     const state = await tx.doc(DeskThreads);
 
                     await applySweep(tx, state, Number(supervisor), facts);
+                    await startMissingSweepers(tx);
 
                     const open = Object.values(state.threads).some(
                         (thread) =>
@@ -3223,6 +3499,23 @@ export default function createDesk(host: Host, web: Web) {
         state.sweepers[key] = String(task);
     };
 
+    /**
+     * A sweeper for every supervisor that has a thread that is not closed: a thread made before this part, or by another
+     * supervisor's sweep, must not wait for its own session to look. `startSweeper` does nothing when one is recorded.
+     */
+    const startMissingSweepers = async (tx: Tx): Promise<void> => {
+        const state = await tx.doc(DeskThreads);
+        const supervisors = new Set(
+            Object.values(state.threads)
+                .filter((thread) => thread.state !== "closed" && thread.supervisor !== undefined)
+                .map((thread) => thread.supervisor as number),
+        );
+
+        for (const supervisor of supervisors) {
+            await startSweeper(tx, supervisor);
+        }
+    };
+
     // ─── The page ────────────────────────────────────────────────────────────
 
     if (typeof web.conversationRoute !== "function") {
@@ -3304,6 +3597,11 @@ export default function createDesk(host: Host, web: Web) {
         async (request) => {
             await sweepForView(request);
 
+            // Also the sweepers that no sweep started yet: every supervisor with open work gets one.
+            await request.commit(async (tx) => {
+                await startMissingSweepers(tx);
+            });
+
             const { cap } = await deskConfig();
 
             return threadsView(
@@ -3338,6 +3636,7 @@ export default function createDesk(host: Host, web: Web) {
 
             return {
                 thread: threadView(state?.threads ?? {}, thread, Date.now()),
+                github: githubView(state),
                 reports: (reports?.reports ?? []).map((report) => ({
                     at: report.at,
                     from: report.from,
@@ -3819,11 +4118,12 @@ export default function createDesk(host: Host, web: Web) {
                     return listText(state, Date.now());
                 }, context);
                 const { cap } = await deskConfig();
-                const view = capView(await api.snapshot(DeskThreads, context), cap, Date.now());
+                const snapshot = await api.snapshot(DeskThreads, context);
+                const view = capView(snapshot, cap, Date.now());
                 const waiting = view.grants.length;
                 const first = `Counted: ${String(view.counted)} of ${String(view.cap)}${waiting === 0 ? "" : ` (${String(waiting)} OK${waiting === 1 ? "" : "s"} waiting)`}`;
 
-                return reply(`${first}\n${text}`);
+                return reply([first, ...githubLines(snapshot), text].join("\n"));
             }
 
             if (args.action === "read") {
@@ -3952,7 +4252,7 @@ export default function createDesk(host: Host, web: Web) {
                         facts,
                     );
 
-                    await startSweeper(tx, Number(supervisor));
+                    await startMissingSweepers(tx);
 
                     return swept;
                 }, context);
@@ -4097,6 +4397,7 @@ export default function createDesk(host: Host, web: Web) {
                         ? "Desk: no open threads."
                         : `Desk: ${String(open.length)} open · ${byActor.join(" · ")}.`,
                     `Counted: ${String(capped.counted)} of ${String(capped.cap)}.`,
+                    ...githubLines(state),
                     ...(capped.full
                         ? [
                               'The desk is full: team_delegate refuses new work until Brian gives an OK (a tap on the Desk page, or "desk ok" in this chat).',
