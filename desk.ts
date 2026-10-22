@@ -2326,7 +2326,7 @@ export function answerAsk(
     addEvent(
         found.thread,
         `answered:${found.ask.id}:${String(answer.at)}`,
-        `answered ${found.ask.id}`,
+        `answered ${found.ask.id} (${answer.by}): ${words.length > 120 ? `${words.slice(0, 119)}…` : words}`,
         answer.at,
     );
 
@@ -2681,6 +2681,8 @@ export type ThreadView = {
         guessed: boolean;
     }[];
     asks: { id: string; text: string; at: number }[];
+    /** Answered asks, with the words that were recorded. */
+    answered: { id: string; text: string; by: string; at: number; words: string }[];
     lastEventAt: number;
     events: { at: number; text: string }[];
     supervisor?: number;
@@ -2756,6 +2758,15 @@ export function threadView(
                 text: ask.text,
                 at: ask.at,
                 ...(ask.options === undefined ? {} : { options: [...ask.options] }),
+            })),
+        answered: thread.asks
+            .filter((ask) => ask.answer !== undefined)
+            .map((ask) => ({
+                id: ask.id,
+                text: ask.text,
+                by: ask.answer!.by,
+                at: ask.answer!.at,
+                words: ask.answer!.words,
             })),
         lastEventAt: thread.lastEventAt,
         events: thread.events.slice(-SHOWN_EVENTS).map((event) => ({
@@ -2979,7 +2990,7 @@ export function readText(state: Readonly<DeskState> | undefined, id: string): st
             : `Asks:\n${thread.asks
                   .map(
                       (ask) =>
-                          `  ${ask.id} · ${ask.answer === undefined ? "open" : `answered by ${ask.answer.by}`} · ${ask.text}${ask.options === undefined ? "" : ` [${ask.options.join(" | ")}]`}`,
+                          `  ${ask.id} · ${ask.answer === undefined ? "open" : `answered by ${ask.answer.by}: "${ask.answer.words}"`} · ${ask.text}${ask.options === undefined ? "" : ` [${ask.options.join(" | ")}]`}`,
                   )
                   .join("\n")}`,
         events.length === 0

@@ -34,6 +34,7 @@ import {
     openThread,
     parseSeed,
     readText,
+    threadView,
     seedThreads,
     shortLine,
     detachFrom,
@@ -358,6 +359,12 @@ describe("seedThreads", () => {
 // ─── The sweep's rules ────────────────────────────────────────────────────────
 
 const DAY = 24 * 3600_000;
+/** The local day `days` calendar days from today, as the desk counts a span (not 24-hour steps: DST moves those). */
+const daysFromToday = (days: number) => {
+    const today = new Date();
+
+    return dayOf(new Date(today.getFullYear(), today.getMonth(), today.getDate() + days).getTime());
+};
 
 /** A thread with every part closed, unless `patch` opens one; its `run` is merged with the closed facts. */
 const thread = (patch: Partial<Thread> = {}): Thread => ({
@@ -2225,7 +2232,12 @@ describe("asks", () => {
         );
         assert.equal(thread.asks[0]?.answer?.words, "Yes, merge it.");
         assert.equal(thread.asks[0]?.answer?.by, "Brian");
-        assert.match(thread.events.at(-1)?.text ?? "", /answered T1a/);
+        assert.equal(thread.events.at(-1)?.text, "answered T1a (Brian): Yes, merge it.");
+        assert.match(readText(state, "T1") ?? "", /T1a · answered by Brian: "Yes, merge it\."/);
+        assert.deepEqual(
+            threadView(state.threads, thread, 250).answered.map((ask) => [ask.id, ask.by, ask.words]),
+            [["T1a", "Brian", "Yes, merge it."]],
+        );
 
         assert.deepEqual(answerAsk(state, "T1a", { at: 300, by: "Brian", words: "No." }), {
             id: "T1a",
@@ -4305,7 +4317,7 @@ describe("the desk in a Pi Pocket", () => {
                 20_000,
             );
 
-            const checkOn = dayOf(Date.now() + 7 * DAY);
+            const checkOn = daysFromToday(7);
             const watched = await call(`threads/${thread.id}/watch`, {
                 checkOn,
                 check: "the blob sweep",
@@ -4441,7 +4453,7 @@ describe("the desk in a Pi Pocket", () => {
 
             let stored = (await deskState())?.threads[thread.id];
 
-            assert.equal(stored?.watch?.checkOn, dayOf(Date.now() + 7 * DAY));
+            assert.equal(stored?.watch?.checkOn, daysFromToday(7));
             assert.equal(stored?.watch?.check, "the blob sweep");
             assert.equal(stored?.watch?.setBy, "odrade", "the roster id of the agent who set it");
             assert.match(stored?.watch?.key ?? "", /^x\.desk\.watch:/);
@@ -4560,7 +4572,7 @@ describe("the desk in a Pi Pocket", () => {
                 );
                 const stored = (await deskState())?.threads[id]?.watch;
 
-                assert.equal(stored?.checkOn, dayOf(Date.now() + 7 * DAY));
+                assert.equal(stored?.checkOn, daysFromToday(7));
                 assert.match(first, /Watching/);
 
                 // The same call again, as a restart replays it: another span would move the date, and it does not.
@@ -4703,7 +4715,7 @@ describe("the desk in a Pi Pocket", () => {
             const thread = threadOfSession(await deskState(), Number(linked.id));
 
             assert(thread, "the thread");
-            assert.equal(thread.watch?.checkOn, dayOf(Date.now() + 14 * DAY));
+            assert.equal(thread.watch?.checkOn, daysFromToday(14));
             assert.equal(thread.watch?.check, "the blob sweep");
             assert.equal(thread.watch?.setBy, "odrade");
             assert.equal(thread.watch?.key.startsWith("x.team.delegate:"), true);
