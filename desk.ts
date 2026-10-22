@@ -86,6 +86,8 @@ export type Ask = {
     by?: string;
     /** The session that filed it: the reminder hook counts it even on a thread of another supervisor. */
     session?: number;
+    /** 2 to 6 choices, when the ask is a pick-one decision. */
+    options?: string[];
 };
 
 /** One attached PR: how it was attached, and what GitHub said about it. */
@@ -2182,6 +2184,8 @@ export type AskRequest = {
     at: number;
     /** The session that filed it; stored on the ask. */
     session?: number;
+    /** 2 to 6 choices, each 1 to 40 characters on one line. */
+    options?: string[];
 };
 
 /** File an ask on a thread, or on a new "ask" thread. Pure over the state: the caller commits it. */
@@ -2199,6 +2203,22 @@ export function addAsk(
 
     if (text === "" || text.length > 500) {
         return { error: "An ask is 1 to 500 characters, on one line." };
+    }
+
+    let options: string[] | undefined;
+
+    if (request.options !== undefined) {
+        const cleaned = request.options.map((option) => flatLine(option));
+
+        if (cleaned.length < 2 || cleaned.length > 6) {
+            return { error: "An ask has 2 to 6 options." };
+        }
+
+        if (cleaned.some((option) => option === "" || option.length > 40)) {
+            return { error: "Each option is 1 to 40 characters, on one line." };
+        }
+
+        options = cleaned;
     }
 
     if (request.thread === undefined) {
@@ -2234,6 +2254,7 @@ export function addAsk(
                     key: request.key,
                     by: request.by,
                     ...(request.session === undefined ? {} : { session: request.session }),
+                    ...(options === undefined ? {} : { options }),
                 },
             ],
             run: {},
@@ -2267,8 +2288,14 @@ export function addAsk(
         key: request.key,
         by: request.by,
         ...(request.session === undefined ? {} : { session: request.session }),
+        ...(options === undefined ? {} : { options }),
     });
-    addEvent(thread, `ask:${askId}:${String(request.at)}`, `ask ${askId}: ${text}`, request.at);
+    addEvent(
+        thread,
+        `ask:${askId}:${String(request.at)}`,
+        `ask ${askId}: ${text}${options === undefined ? "" : ` [${options.join(" | ")}]`}`,
+        request.at,
+    );
 
     return { threadId: thread.id, askId };
 }
@@ -2513,7 +2540,7 @@ function threadFile(
         for (const ask of thread.asks) {
             lines.push(
                 ask.answer === undefined
-                    ? `- ${ask.id} · open · ${md(ask.text)}`
+                    ? `- ${ask.id} · open · ${md(ask.text)}${ask.options === undefined ? "" : ` [${ask.options.map(md).join(" | ")}]`}`
                     : `- ${ask.id} · answered by ${md(ask.answer.by)} · ${iso(ask.answer.at)} · ${md(ask.answer.words)}`,
             );
         }
@@ -2608,7 +2635,9 @@ export function exportFiles(
             }
 
             for (const ask of thread.asks.filter((each) => each.answer === undefined)) {
-                lines.push(`  - ${ask.id}: ${md(ask.text)}`);
+                lines.push(
+                    `  - ${ask.id}: ${md(ask.text)}${ask.options === undefined ? "" : ` [${ask.options.map(md).join(" | ")}]`}`,
+                );
             }
         }
     }
@@ -2722,7 +2751,12 @@ export function threadView(
         })),
         asks: thread.asks
             .filter((ask) => ask.answer === undefined)
-            .map((ask) => ({ id: ask.id, text: ask.text, at: ask.at })),
+            .map((ask) => ({
+                id: ask.id,
+                text: ask.text,
+                at: ask.at,
+                ...(ask.options === undefined ? {} : { options: [...ask.options] }),
+            })),
         lastEventAt: thread.lastEventAt,
         events: thread.events.slice(-SHOWN_EVENTS).map((event) => ({
             at: event.at,
@@ -2945,7 +2979,7 @@ export function readText(state: Readonly<DeskState> | undefined, id: string): st
             : `Asks:\n${thread.asks
                   .map(
                       (ask) =>
-                          `  ${ask.id} · ${ask.answer === undefined ? "open" : `answered by ${ask.answer.by}`} · ${ask.text}`,
+                          `  ${ask.id} · ${ask.answer === undefined ? "open" : `answered by ${ask.answer.by}`} · ${ask.text}${ask.options === undefined ? "" : ` [${ask.options.join(" | ")}]`}`,
                   )
                   .join("\n")}`,
         events.length === 0
@@ -5159,6 +5193,14 @@ export default function createDesk(host: Host, web: Web) {
                     description: "ask new: a short title for the thread, 1 to 120 characters",
                 }),
             ),
+            options: Type.Optional(
+                Type.Array(Type.String(), {
+                    minItems: 2,
+                    maxItems: 6,
+                    description:
+                        "ask: 2 to 6 choices for a pick-one decision, each 1 to 40 characters",
+                }),
+            ),
             ask: Type.Optional(Type.String({ description: "answer: the ask's id, such as T13c" })),
             words: Type.Optional(
                 Type.String({
@@ -5266,6 +5308,7 @@ export default function createDesk(host: Host, web: Web) {
                         ...(args.thread === undefined ? {} : { thread: args.thread }),
                         text: args.text ?? "",
                         ...(args.title === undefined ? {} : { title: args.title }),
+                        ...(args.options === undefined ? {} : { options: args.options }),
                         key,
                         by: persona.name,
                         supervisor: Number(api.conversationId),
@@ -5648,7 +5691,7 @@ export default function createDesk(host: Host, web: Web) {
                         : []),
                     `Stale: ${stale.length === 0 ? "none" : stale.join(", ")}.`,
                     ...(events.length === 0 ? [] : ["New since your last look:", ...events]),
-                    "File each ask to Brian (a decision, a host action, a device check) with desk ask. Record his answer with desk answer.",
+                    "File each ask to Brian (a decision, a host action, a device check) with desk ask. Record his answer with desk answer. Give choices with options when an ask is a pick-one decision.",
                     "A due watch (due: T13 <check>) is yours to send: send the check to the thread's agent, then record its result with desk result.",
                     "Reports arrive as 1 line that starts with [desk]. Read the full report with desk read <id> before you act.",
                     "Keep each reply to Brian to 1 or 2 lines: the project and the urgency. The Desk holds the rest.",
