@@ -13,6 +13,7 @@ const MODULES = [
     "night-shift.ts",
     "night-shift-web",
     "desk.ts",
+    "desk-web",
 ];
 const check = process.argv.includes("--check");
 const source = import.meta.dirname;

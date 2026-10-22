@@ -19,6 +19,7 @@ import {
 import assert from "node:assert/strict";
 import { appendFileSync, chmodSync, cpSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
+import { createServer } from "node:http";
 import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
 import { fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
@@ -34,6 +35,7 @@ import {
     readText,
     seedThreads,
     shortLine,
+    wakeParked,
     closeCheck,
     isStale,
     nextActor,
@@ -56,6 +58,7 @@ import {
     type Thread,
 } from "./desk.ts";
 import { taskTitle } from "./team.ts";
+import { createHandler } from "./_pocket/src/server/http.ts";
 
 // ─── The rules ───────────────────────────────────────────────────────────────
 
@@ -520,6 +523,24 @@ describe("isStale", () => {
         assert.equal(isStale(thread({ lastEventAt: 0, keptAt: 2 * DAY }), 4 * DAY), false);
         assert.equal(isStale(thread({ lastEventAt: 0, keptAt: 2 * DAY }), 5 * DAY + 1), true);
         assert.equal(isStale(thread({ state: "closed", lastEventAt: 0 }), 100 * DAY), false);
+    });
+});
+
+describe("wakeParked", () => {
+    test("a parked thread goes back to open when the sweep gave it an event", () => {
+        const thread = placed(deskOf(), 100);
+
+        thread.state = "parked";
+        thread.events = [{ at: 1, key: "old", text: "parked by Brian" }];
+
+        assert.equal(wakeParked(thread, 1, 200), false, "no new event: still parked");
+        assert.equal(thread.state, "parked");
+
+        thread.events.push({ at: 150, key: "busy:false:150", text: "the session is idle" });
+
+        assert.equal(wakeParked(thread, 1, 200), true);
+        assert.equal(thread.state, "open");
+        assert.equal(thread.events.at(-1)?.text, "woke: the session is idle");
     });
 });
 
@@ -1344,6 +1365,7 @@ before(async () => {
     cpSync(join(import.meta.dirname, "team.ts"), join(dropIns, "team.ts"));
     cpSync(join(import.meta.dirname, "team-web"), join(dropIns, "team-web"), { recursive: true });
     cpSync(join(import.meta.dirname, "desk.ts"), join(dropIns, "desk.ts"));
+    cpSync(join(import.meta.dirname, "desk-web"), join(dropIns, "desk-web"), { recursive: true });
     cpSync(join(import.meta.dirname, "night-shift.ts"), join(dropIns, "night-shift.ts"));
     cpSync(join(import.meta.dirname, "night-shift-web"), join(dropIns, "night-shift-web"), {
         recursive: true,
@@ -1866,6 +1888,269 @@ describe("the desk in a Pi Pocket", () => {
 
         assert.equal(other?.title, "2 items that Brian decided on 2026-10-22.");
         assert.equal(plain.title, "Duncan Idaho: 2 items that Brian decided on 2026-10-22.");
+    });
+
+    describe("the desk page's routes", () => {
+        let server: ReturnType<typeof createServer> | undefined;
+        let call: (
+            path: string,
+            body?: object,
+            token?: string,
+        ) => Promise<{ status: number; data: any }>;
+
+        before(async () => {
+            server = createServer(
+                createHandler({ app, listen: { host: "127.0.0.1", port: 0 }, restart: () => {} }),
+            );
+            await new Promise<void>((resolve) => server!.listen(0, "127.0.0.1", resolve));
+
+            const base = `http://127.0.0.1:${(server.address() as { port: number }).port}/api/x/desk/`;
+
+            call = async (path, body, token = app.config.ownerToken) => {
+                const response = await fetch(base + path, {
+                    method: body === undefined ? "GET" : "POST",
+                    headers: {
+                        authorization: `Bearer ${token}`,
+                        "x-pocket": "1",
+                        "content-type": "application/json",
+                    },
+                    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+                });
+
+                return { status: response.status, data: await response.json() };
+            };
+        });
+
+        after(async () => {
+            await new Promise<void>((resolve) => server?.close(() => resolve()));
+        });
+
+        test("GET threads gives the page its view, and POST seen moves the look", async () => {
+            const { linked, thread } = await delegated("page-view");
+
+            await until(() => !app.isBusy(linked), "the linked session to settle", 20_000);
+
+            const first = await call("threads");
+
+            assert.equal(first.status, 200);
+            assert.equal(typeof first.data.seen, "number");
+            assert.equal(typeof first.data.others, "object");
+            assert(Object.values(first.data.others).every((count) => typeof count === "number"));
+            assert.equal(typeof first.data.counts.open, "number");
+
+            const item = first.data.threads.find((each: { id: string }) => each.id === thread.id);
+
+            assert(item, "the thread is in the view");
+            assert.equal(item.title, "Tend the test repository");
+            assert.equal(item.repo, "frostyard/test");
+            assert.equal(item.state, "open");
+            assert.equal(item.hasSession, true);
+            assert.equal(item.supervisor, thread.supervisor);
+            assert.equal(Array.isArray(item.open), true);
+            assert.equal(Array.isArray(item.prs), true);
+            assert.equal(Array.isArray(item.events), true);
+            assert.equal(item.stale, false);
+
+            // A thread from five days ago, with nothing since: stale.
+            let oldId = "";
+
+            await app.harness.commit(async (tx) => {
+                const state = await tx.doc(DeskThreads);
+                const opened = openThread(state, {
+                    key: "x.test.stale",
+                    supervisor: Number(thread.supervisor),
+                    agents: ["duncan"],
+                    repo: "frostyard/test",
+                    title: "Old work",
+                    at: Date.now() - 5 * 24 * 3600_000,
+                });
+
+                oldId = opened.thread.id;
+                state.threads[oldId]!.state = "open";
+                state.threads[oldId]!.address = "session-old";
+            }, context);
+
+            const list = await call("threads");
+            const old = list.data.threads.find((each: { id: string }) => each.id === oldId);
+
+            assert.equal(old?.stale, true);
+            assert(list.data.counts.stale >= 1);
+
+            const seen = await call("seen", {});
+
+            assert.equal(seen.status, 200);
+            assert(seen.data.seen > 0);
+
+            const after = await call("threads");
+
+            assert(after.data.seen >= seen.data.seen);
+        });
+
+        test("keep, park and drop change the thread; a second POST changes nothing", async () => {
+            const { thread } = await delegated("page-actions");
+
+            const kept = await call(`threads/${thread.id}/keep`, {});
+
+            assert.equal(kept.status, 200);
+
+            const afterKeep = (await deskState())?.threads[thread.id];
+            const events = afterKeep?.events.length ?? 0;
+
+            assert.equal(typeof afterKeep?.keptAt, "number");
+            assert.equal(afterKeep?.events.at(-1)?.text, "kept by Brian");
+
+            const again = await call(`threads/${thread.id}/keep`, {});
+
+            assert.equal(again.status, 200);
+            assert.equal(
+                (await deskState())?.threads[thread.id]?.events.length,
+                events,
+                "no second event",
+            );
+
+            const parked = await call(`threads/${thread.id}/park`, {});
+
+            assert.equal(parked.status, 200);
+            assert.equal((await deskState())?.threads[thread.id]?.state, "parked");
+
+            assert.equal((await call(`threads/${thread.id}/drop`, {})).status, 400);
+            assert.equal(
+                (await call(`threads/${thread.id}/drop`, { reason: "x".repeat(201) })).status,
+                400,
+            );
+
+            const dropped = await call(`threads/${thread.id}/drop`, { reason: "not needed" });
+
+            assert.equal(dropped.status, 200);
+
+            const closed = (await deskState())?.threads[thread.id];
+
+            assert.equal(closed?.state, "closed");
+            assert.deepEqual(closed?.closed && { why: closed.closed.why, by: closed.closed.by }, {
+                why: "dropped",
+                by: "brian",
+            });
+            assert.match(
+                closed?.events.at(-1)?.text ?? "",
+                /dropped by Brian: not needed; still open: /,
+            );
+
+            // A guest cannot use the routes at all.
+            const guest = app.config.addUser("A guest", "guest");
+
+            assert.equal((await call("threads", undefined, guest.token)).status, 404);
+            assert.equal(
+                (await call(`threads/${thread.id}/drop`, { reason: "x" }, guest.token)).status,
+                404,
+            );
+        });
+
+        test("wake opens a parked thread, and a second call changes nothing", async () => {
+            const { thread } = await delegated("page-wake");
+
+            assert.equal((await call(`threads/${thread.id}/park`, {})).status, 200);
+            assert.equal((await deskState())?.threads[thread.id]?.state, "parked");
+
+            const woken = await call(`threads/${thread.id}/wake`, {});
+
+            assert.equal(woken.status, 200);
+            assert.equal((await deskState())?.threads[thread.id]?.state, "open");
+            assert.equal(
+                (await deskState())?.threads[thread.id]?.events.at(-1)?.text,
+                "woken by Brian",
+            );
+
+            const events = (await deskState())?.threads[thread.id]?.events.length;
+
+            assert.equal((await call(`threads/${thread.id}/wake`, {})).status, 200);
+            assert.equal(
+                (await deskState())?.threads[thread.id]?.events.length,
+                events,
+                "a second call changes nothing",
+            );
+
+            // Only a parked thread can be woken.
+            assert.equal(
+                (await call(`threads/${thread.id}/drop`, { reason: "done here" })).status,
+                200,
+            );
+            assert.equal((await call(`threads/${thread.id}/wake`, {})).status, 409);
+        });
+
+        test("attach puts one thread on another, and a second call changes nothing", async () => {
+            const source = await supervisor("page-attach");
+
+            await say(app, source, "desk delegate test");
+            await say(app, source, "desk delegate test");
+
+            const linked = app
+                .sessions()
+                .filter((session) => session.linkedFrom?.id === Number(source))
+                .map((session) => session.id as ConversationId);
+
+            assert.equal(linked.length, 2);
+
+            const first = threadOfSession(await deskState(), Number(linked[0]))!;
+            const second = threadOfSession(await deskState(), Number(linked[1]))!;
+
+            assert(first && second);
+
+            const moved = await call(`threads/${second.id}/attach`, { into: first.id });
+
+            assert.equal(moved.status, 200);
+            assert.equal((await deskState())?.threads[second.id]?.state, "closed");
+            assert.equal((await deskState())?.threads[second.id]?.closed?.why, "dropped");
+
+            const events = (await deskState())?.threads[first.id]?.events.length;
+
+            const replay = await call(`threads/${second.id}/attach`, { into: first.id });
+
+            assert.equal(replay.status, 200);
+            assert.equal(
+                (await deskState())?.threads[first.id]?.events.length,
+                events,
+                "the replay adds no event",
+            );
+        });
+
+        test("resolve gives an address-only thread its session id", async () => {
+            const { source, linked } = await delegated("page-resolve");
+
+            await until(() => !app.isBusy(linked), "the linked session to settle", 20_000);
+
+            const delegatedThread = threadOfSession(await deskState(), Number(linked));
+            const address = delegatedThread?.address;
+
+            assert(address);
+
+            let threadId = "";
+
+            await app.harness.commit(async (tx) => {
+                const state = await tx.doc(DeskThreads);
+                const opened = openThread(state, {
+                    key: "x.test.resolve",
+                    supervisor: Number(source),
+                    agents: ["duncan"],
+                    repo: "frostyard/test",
+                    title: "By its address",
+                    at: Date.now(),
+                });
+
+                threadId = opened.thread.id;
+                state.threads[threadId]!.state = "open";
+                state.threads[threadId]!.address = address;
+            }, context);
+
+            const resolved = await call(`resolve/${String(Number(source))}`, {});
+
+            assert.equal(resolved.status, 200);
+            assert.equal(resolved.data.resolved, 1);
+            assert.equal((await deskState())?.threads[threadId]?.session, Number(linked));
+
+            const again = await call(`resolve/${String(Number(source))}`, {});
+
+            assert.equal(again.data.resolved, 0, "nothing left to resolve");
+        });
     });
 
     test("a folder that becomes dirty later is found after 5 minutes, once", async () => {

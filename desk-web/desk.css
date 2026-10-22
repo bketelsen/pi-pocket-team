@@ -1,0 +1,217 @@
+/* The Desk page: phone first, one column. Only the app's theme tokens, so every theme works. */
+
+.desk {
+    max-width: 760px;
+    margin: 0 auto;
+    padding: 16px;
+    color: var(--text);
+}
+
+.desk-head h1 {
+    margin: 0 0 4px;
+    font-size: 22px;
+}
+
+.desk-head p {
+    margin: 2px 0;
+}
+
+.desk-section {
+    margin: 22px 0;
+}
+
+.desk-section h2 {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    margin: 0 0 6px;
+    font-size: 13px;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--muted);
+}
+
+.desk-count {
+    padding: 0 6px;
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    font-size: 11px;
+    color: var(--muted);
+}
+
+.desk-rows {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin: 8px 0 0;
+    padding: 0;
+    list-style: none;
+}
+
+.desk-row {
+    padding: 10px;
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    background: var(--card);
+}
+
+.desk-open {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    width: 100%;
+    padding: 0;
+    border: 0;
+    background: none;
+    color: inherit;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+}
+
+.desk-line {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: center;
+}
+
+.desk-id {
+    font-family: monospace;
+    font-size: 12px;
+    color: var(--muted);
+}
+
+.desk-title {
+    font-weight: 600;
+}
+
+.desk-new {
+    padding: 1px 7px;
+    border-radius: 999px;
+    background: var(--accent);
+    color: var(--bg);
+    font-size: 11px;
+}
+
+.desk-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+}
+
+.desk-chip {
+    padding: 1px 7px;
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    color: var(--muted);
+    font-size: 11px;
+}
+
+.desk-chip.done {
+    border-color: var(--ok);
+    color: var(--ok);
+}
+
+.desk-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: center;
+    margin-top: 10px;
+}
+
+.desk-into {
+    max-width: 100%;
+    padding: 8px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: var(--bg);
+    color: var(--text);
+    font: inherit;
+}
+
+.desk-drop {
+    display: flex;
+    gap: 8px;
+    margin-top: 8px;
+}
+
+.desk-reason {
+    flex: 1;
+    min-width: 0;
+    padding: 8px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: var(--bg);
+    color: var(--text);
+    font: inherit;
+}
+
+.desk-need {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-top: 10px;
+}
+
+.desk-need p {
+    margin: 0;
+}
+
+.desk-link {
+    color: var(--accent);
+}
+
+.desk-bar {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    margin-bottom: 12px;
+}
+
+.desk-thread h2 {
+    margin: 14px 0 4px;
+}
+
+.desk-thread h3 {
+    margin: 18px 0 6px;
+    font-size: 13px;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--muted);
+}
+
+.desk-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin: 0;
+    padding-left: 18px;
+}
+
+.desk-report {
+    padding: 10px;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    background: var(--card);
+    font: inherit;
+    font-size: 13px;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+}
+
+.desk-closed {
+    margin-top: 22px;
+}
+
+.desk-closed summary {
+    color: var(--muted);
+    cursor: pointer;
+}
+
+@media (min-width: 700px) {
+    .desk {
+        padding: 24px;
+    }
+}

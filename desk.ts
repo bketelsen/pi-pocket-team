@@ -37,7 +37,7 @@ import {
     type TaskRuntime,
     type Tx,
 } from "@earendil-works/pi-durable";
-import type { Host, Web } from "./_pocket.d.ts";
+import type { Host, Web, WebRequest } from "./_pocket.d.ts";
 
 /** Where another module finds this one's live API. */
 const API = Symbol.for("pi-pocket-team.desk");
@@ -781,6 +781,31 @@ export function nextActor(thread: Thread): NextActor {
     return "none";
 }
 
+/**
+ * A parked thread that this sweep gave an event goes back to open, with the event "woke: <that event>". `before` is
+ * its event count when the sweep began: the park event is older, so it never wakes a thread by itself.
+ */
+export function wakeParked(thread: Thread, before: number, now: number): boolean {
+    if (thread.state !== "parked") {
+        return false;
+    }
+
+    const added = thread.events.slice(before);
+
+    if (added.length === 0) {
+        return false;
+    }
+
+    thread.state = "open";
+
+    return addEvent(
+        thread,
+        `woke:${String(now)}`,
+        `woke: ${added.at(-1)?.text ?? "an event"}`,
+        now,
+    );
+}
+
 /** No event for 3 days (7 for a reviewer wait); closed threads are never stale. */
 export function isStale(thread: Thread, now: number): boolean {
     if (thread.state === "closed") {
@@ -1400,6 +1425,172 @@ export function attachTo(
     return { text: `${source.id} is merged into ${target.id}.` };
 }
 
+// ─── The page's view ────────────────────────────────────────────────────────
+
+/** How many closed threads the page shows. */
+const CLOSED_SHOWN_MS = 7 * 24 * 3600_000;
+
+/** One thread as the page reads it. No draft objects: this goes to the browser as JSON. */
+export type ThreadView = {
+    id: string;
+    title: string;
+    origin: Thread["origin"];
+    agents: string[];
+    repo?: string;
+    state: Thread["state"];
+    next: NextActor;
+    stale: boolean;
+    open: string[];
+    prs: {
+        ref: string;
+        url?: string;
+        title?: string;
+        state?: string;
+        next?: string;
+        via: string;
+        guessed: boolean;
+    }[];
+    asks: { id: string; text: string; at: number }[];
+    lastEventAt: number;
+    events: { at: number; text: string }[];
+    supervisor?: number;
+    hasSession: boolean;
+    /** Whether it has an address: the page resolves the session id for it. */
+    hasAddress: boolean;
+    closed?: { at: number; why: string; by: string };
+};
+
+/** The folders that threads other than `thread` work in. */
+function otherFolders(
+    threads: Readonly<Record<string, Thread>>,
+    thread: Thread,
+): Set<string> {
+    const folders = new Set<string>();
+
+    for (const other of Object.values(threads)) {
+        if (other === thread || other.state === "closed") {
+            continue;
+        }
+
+        const folder = folderOf(other);
+
+        if (folder !== undefined) {
+            folders.add(folder);
+        }
+    }
+
+    return folders;
+}
+
+/** One thread, for the page. */
+export function threadView(
+    threads: Readonly<Record<string, Thread>>,
+    thread: Thread,
+    now: number,
+): ThreadView {
+    const next = nextActor(thread);
+    const check = closeCheck(thread, { now, folders: otherFolders(threads, thread) });
+
+    return {
+        id: thread.id,
+        title: thread.title,
+        origin: thread.origin,
+        agents: [...thread.agents],
+        ...(thread.repo === undefined ? {} : { repo: thread.repo }),
+        state: thread.state,
+        next,
+        stale: isStale(thread, now),
+        open: check.open,
+        prs: Object.entries(thread.prs).map(([ref, pr]) => ({
+            ref,
+            ...(pr.url === undefined ? {} : { url: pr.url }),
+            ...(pr.title === undefined ? {} : { title: pr.title }),
+            ...(pr.state === undefined ? {} : { state: pr.state }),
+            ...(pr.next === undefined && pr.state === undefined
+                ? {}
+                : { next: pr.next ?? prNext(pr) }),
+            via: pr.via,
+            guessed: pr.via === "window",
+        })),
+        asks: thread.asks
+            .filter((ask) => ask.answer === undefined)
+            .map((ask) => ({ id: ask.id, text: ask.text, at: ask.at })),
+        lastEventAt: thread.lastEventAt,
+        events: thread.events.slice(-SHOWN_EVENTS).map((event) => ({
+            at: event.at,
+            text: event.text,
+        })),
+        ...(thread.supervisor === undefined ? {} : { supervisor: thread.supervisor }),
+        hasSession: thread.session !== undefined,
+        hasAddress: thread.address !== undefined,
+        ...(thread.closed === undefined
+            ? {}
+            : {
+                  closed: {
+                      at: thread.closed.at,
+                      why: thread.closed.why,
+                      by: thread.closed.by,
+                  },
+              }),
+    };
+}
+
+export type ThreadsView = {
+    threads: ThreadView[];
+    seen: number;
+    others: Record<string, number>;
+    counts: {
+        open: number;
+        brian: number;
+        agent: number;
+        odrade: number;
+        reviewer: number;
+        none: number;
+        stale: number;
+        parked: number;
+    };
+};
+
+/** The page's whole view: every open thread, and those closed in the last 7 days. */
+export function threadsView(state: Readonly<DeskState> | undefined, now: number): ThreadsView {
+    const threads: Record<string, Thread> = state?.threads ?? {};
+    const all = Object.values(threads);
+    const counts = { open: 0, brian: 0, agent: 0, odrade: 0, reviewer: 0, none: 0, stale: 0, parked: 0 };
+
+    for (const thread of all) {
+        if (thread.state === "parked") {
+            counts.parked += 1;
+            continue;
+        }
+
+        if (thread.state === "closed") {
+            continue;
+        }
+
+        counts.open += 1;
+        counts[nextActor(thread)] += 1;
+
+        if (isStale(thread, now)) {
+            counts.stale += 1;
+        }
+    }
+
+    const shown = all.filter(
+        (thread) =>
+            thread.state !== "closed" ||
+            (thread.closed !== undefined && now - thread.closed.at <= CLOSED_SHOWN_MS),
+    );
+
+    return {
+        threads: shown
+            .map((thread) => threadView(threads, thread, now))
+            .sort((a, b) => b.lastEventAt - a.lastEventAt),
+        seen: state?.seen.brian ?? 0,
+        others: { ...(state?.others ?? {}) },
+        counts,
+    };
+}
+
 // ─── Words for the tool ──────────────────────────────────────────────────────
 
 const counted = (count: number, noun: string) =>
@@ -1795,7 +1986,7 @@ export default function createDesk(host: Host, web: Web) {
     type NightShiftApi = {
         version: number;
         goal: (
-            read: DocumentReader,
+            read: Reader,
             conversationId: ConversationId,
             context: Context,
         ) => Promise<{ status: string } | undefined>;
@@ -1803,6 +1994,9 @@ export default function createDesk(host: Host, web: Web) {
 
     const nightShiftApi = (): NightShiftApi | undefined =>
         (globalThis as unknown as Record<symbol, NightShiftApi | undefined>)[NIGHT_SHIFT_API];
+
+    /** The read that `gather` and Night shift's goal need: enough of a DocumentReader. */
+    type Reader = Pick<DocumentReader, "snapshot">;
 
     type SessionFact = { address: string; busy: boolean; archived: boolean; title?: string };
     type FolderFact = { dirty: number; ahead: number };
@@ -1965,7 +2159,7 @@ export default function createDesk(host: Host, web: Web) {
     /** Read the world for one supervisor's sweep: its threads, their sessions, their Night shifts, and the folders. */
     const gather = async (
         supervisor: ConversationId,
-        read: DocumentReader,
+        read: Reader,
         now: number,
         context: Context,
     ): Promise<SweepFacts> => {
@@ -2162,6 +2356,7 @@ export default function createDesk(host: Host, web: Web) {
         const open = Object.values(state.threads).filter(
             (thread) => thread.supervisor === supervisor && thread.state !== "closed",
         );
+        const eventsBefore = new Map(open.map((thread) => [thread.id, thread.events.length]));
 
         for (const thread of open) {
             await scanEntries(tx, thread);
@@ -2298,6 +2493,13 @@ export default function createDesk(host: Host, web: Web) {
                 { supervisor, authors: facts.authors, branches: facts.branches },
                 now,
             ).events;
+        }
+
+        // A parked thread that got an event from this sweep goes back to open: something changed on it.
+        for (const thread of open) {
+            if (wakeParked(thread, eventsBefore.get(thread.id) ?? thread.events.length, now)) {
+                events += 1;
+            }
         }
 
         for (const thread of open) {
@@ -2582,6 +2784,328 @@ export default function createDesk(host: Host, web: Web) {
 
         state.sweepers[key] = String(task);
     };
+
+    // ─── The page ────────────────────────────────────────────────────────────
+
+    if (typeof web.conversationRoute !== "function") {
+        throw new Error("The desk needs Pi Pocket 0.16.0 or newer.");
+    }
+
+    web.client("desk-web", { access: "owner" });
+
+    /** A sweep when nobody looked for 5 minutes, for each supervisor that has open threads. A failure never fails the page. */
+    const SWEEP_VIEW_MS = 5 * 60_000;
+
+    const sweepForView = async (request: WebRequest): Promise<void> => {
+        try {
+            const state = await request.snapshot(DeskThreads, request.context);
+            const now = Date.now();
+            const open = Object.values(state?.threads ?? {}).filter(
+                (thread) => thread.state !== "closed" && thread.supervisor !== undefined,
+            );
+
+            for (const supervisor of new Set(open.map((thread) => thread.supervisor as number))) {
+                const mine = open.filter((thread) => thread.supervisor === supervisor);
+                const fresh = mine.some(
+                    (thread) =>
+                        typeof thread.run.sweptAt === "number" &&
+                        now - (thread.run.sweptAt as number) < SWEEP_VIEW_MS,
+                );
+
+                if (fresh) {
+                    continue;
+                }
+
+                try {
+                    const facts = await gather(
+                        supervisor as ConversationId,
+                        { snapshot: request.snapshot },
+                        now,
+                        request.context,
+                    );
+
+                    await request.commit(async (tx) => {
+                        await applySweep(tx, await tx.doc(DeskThreads), supervisor, facts);
+                    });
+                    web.send("changed", {});
+                } catch {
+                    // A failed sweep must not fail the page.
+                }
+            }
+        } catch {
+            // No sweep now: the page still shows what the document has.
+        }
+    };
+
+    const threadIdOf = (request: { params: Readonly<Record<string, string>> }) =>
+        (request.params.id ?? "").toUpperCase();
+
+    /** Run one change in a commit, then answer with the new view and tell the tabs. */
+    const answer = async (
+        request: WebRequest,
+        change: (state: DeskState, now: number) => void,
+    ): Promise<ThreadsView> => {
+        const view = await request.commit(async (tx) => {
+            const state = await tx.doc(DeskThreads);
+            const now = Date.now();
+
+            change(state, now);
+
+            return threadsView(state, now);
+        });
+
+        web.send("changed", {});
+
+        return view;
+    };
+
+    web.route(
+        "GET",
+        "threads",
+        async (request) => {
+            await sweepForView(request);
+
+            return threadsView(await request.snapshot(DeskThreads, request.context), Date.now());
+        },
+        { access: "owner" },
+    );
+
+    web.route(
+        "GET",
+        "threads/:id",
+        async (request) => {
+            const state = await request.snapshot(DeskThreads, request.context);
+            const id = threadIdOf(request);
+            const thread = threadById(state, id);
+
+            if (thread === undefined) {
+                throw web.error(404, `There is no thread ${id}.`);
+            }
+
+            const reports =
+                thread.session === undefined
+                    ? undefined
+                    : await request.snapshot(
+                          DeskReports,
+                          thread.session as ConversationId,
+                          request.context,
+                      );
+
+            return {
+                thread: threadView(state?.threads ?? {}, thread, Date.now()),
+                reports: (reports?.reports ?? []).map((report) => ({
+                    at: report.at,
+                    from: report.from,
+                    text: report.text,
+                })),
+            };
+        },
+        { access: "owner" },
+    );
+
+    web.route(
+        "POST",
+        "seen",
+        async (request) =>
+            answer(request, (state, now) => {
+                state.seen.brian = now;
+            }),
+        { access: "owner" },
+    );
+
+    web.route(
+        "POST",
+        "threads/:id/keep",
+        async (request) => {
+            const id = threadIdOf(request);
+
+            return answer(request, (state, now) => {
+                const thread = threadById(state, id);
+
+                if (thread === undefined) {
+                    throw web.error(404, `There is no thread ${id}.`);
+                }
+
+                // Already kept since anything happened: a second tap changes nothing.
+                if (thread.keptAt !== undefined && thread.keptAt >= thread.lastEventAt) {
+                    return;
+                }
+
+                thread.keptAt = now;
+                addEvent(thread, `kept:${String(now)}`, "kept by Brian", now);
+            });
+        },
+        { access: "owner" },
+    );
+
+    web.route(
+        "POST",
+        "threads/:id/park",
+        async (request) => {
+            const id = threadIdOf(request);
+
+            return answer(request, (state, now) => {
+                const thread = threadById(state, id);
+
+                if (thread === undefined) {
+                    throw web.error(404, `There is no thread ${id}.`);
+                }
+
+                if (thread.state === "parked") {
+                    return;
+                }
+
+                if (thread.state !== "open") {
+                    throw web.error(409, `Thread ${thread.id} is not open.`);
+                }
+
+                thread.state = "parked";
+                addEvent(thread, `parked:${String(now)}`, "parked by Brian", now);
+            });
+        },
+        { access: "owner" },
+    );
+
+    web.route(
+        "POST",
+        "threads/:id/wake",
+        async (request) => {
+            const id = threadIdOf(request);
+
+            return answer(request, (state, now) => {
+                const thread = threadById(state, id);
+
+                if (thread === undefined) {
+                    throw web.error(404, `There is no thread ${id}.`);
+                }
+
+                // Already open: a second tap changes nothing.
+                if (thread.state === "open") {
+                    return;
+                }
+
+                if (thread.state !== "parked") {
+                    throw web.error(409, `Thread ${thread.id} is not parked.`);
+                }
+
+                thread.state = "open";
+                addEvent(thread, `woken:${String(now)}`, "woken by Brian", now);
+            });
+        },
+        { access: "owner" },
+    );
+
+    web.route(
+        "POST",
+        "threads/:id/drop",
+        async (request) => {
+            const id = threadIdOf(request);
+            const reason = String(request.body.reason ?? "")
+                .replace(/\s+/g, " ")
+                .trim();
+
+            if (reason === "") {
+                throw web.error(400, "Give a reason for the drop.");
+            }
+
+            if (reason.length > 200) {
+                throw web.error(400, "The reason is 200 characters at most.");
+            }
+
+            return answer(request, (state, now) => {
+                const thread = threadById(state, id);
+
+                if (thread === undefined) {
+                    throw web.error(404, `There is no thread ${id}.`);
+                }
+
+                if (thread.state === "closed") {
+                    return;
+                }
+
+                const check = closeCheck(thread, {
+                    now,
+                    folders: otherFolders(state.threads, thread),
+                });
+
+                thread.state = "closed";
+                thread.closed = { at: now, why: "dropped", by: "brian" };
+                addEvent(
+                    thread,
+                    `dropped:${String(now)}`,
+                    `dropped by Brian: ${reason}; still open: ${check.open.join("; ") || "nothing"}`,
+                    now,
+                );
+            });
+        },
+        { access: "owner" },
+    );
+
+    web.route(
+        "POST",
+        "threads/:id/attach",
+        async (request) => {
+            const id = threadIdOf(request);
+            const into = String(request.body.into ?? "").trim();
+
+            if (into === "") {
+                throw web.error(400, "attach needs into: the thread to put this one on.");
+            }
+
+            return answer(request, (state, now) => {
+                const result = attachTo(state, id, into, now);
+
+                if ("error" in result) {
+                    throw web.error(/closed/.test(result.error) ? 409 : 404, result.error);
+                }
+            });
+        },
+        { access: "owner" },
+    );
+
+    // The page learns a seeded or found thread's session id here, from its address. Never in a model's text.
+    web.conversationRoute(
+        "POST",
+        "resolve/:conversation",
+        async (request) => {
+            const supervisor = Number(request.conversation.id);
+            const sessions = await request.linkedSessions.list();
+            const byAddress = new Map(
+                sessions.map((session) => [session.address, Number(session.conversationId)]),
+            );
+            let resolved = 0;
+
+            await request.commit(async (tx) => {
+                const state = await tx.doc(DeskThreads);
+
+                for (const thread of Object.values(state.threads)) {
+                    if (
+                        thread.supervisor !== supervisor ||
+                        thread.session !== undefined ||
+                        thread.address === undefined
+                    ) {
+                        continue;
+                    }
+
+                    const id = byAddress.get(thread.address);
+
+                    if (id === undefined) {
+                        continue;
+                    }
+
+                    thread.session = id;
+                    resolved += 1;
+                }
+            });
+
+            if (resolved > 0) {
+                web.send("changed", {});
+            }
+
+            return { resolved };
+        },
+        { conversation: "conversation", access: "owner" },
+    );
 
     /**
      * The side door: a linked session's built-in `team` tool must not send a report to its supervisor; `team_message`
