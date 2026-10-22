@@ -138,6 +138,9 @@ const errorOf = (result: { error: string } | object): string => {
     return (result as { error: string }).error;
 };
 
+/** A thread id as a literal in a RegExp: the id depends on the tests that ran before. */
+const rx = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
 describe("threads", () => {
     test("the same key opens one thread, and a second open reuses it", () => {
         const state = empty();
@@ -370,6 +373,23 @@ const daysFromToday = (days: number) => {
 
     return dayOf(new Date(today.getFullYear(), today.getMonth(), today.getDate() + days).getTime());
 };
+
+/**
+ * The day a date has when an action runs: the desk reads the clock, and the test reads it again after. When the two
+ * readings are on different days (midnight), both are accepted: the test must not depend on the hour it runs.
+ */
+async function dayAround(
+    act: () => Promise<unknown> | unknown,
+    expected: () => string,
+): Promise<string[]> {
+    const before = expected();
+
+    await act();
+
+    const after = expected();
+
+    return before === after ? [before] : [before, after];
+}
 
 /** A thread with every part closed, unless `patch` opens one; its `run` is merged with the closed facts. */
 const thread = (patch: Partial<Thread> = {}): Thread => ({
@@ -1555,9 +1575,14 @@ describe("the watch's rules", () => {
             at: on("2026-12-02"),
             closedBy: "desk",
         });
+        // The due time is a UTC stamp: its date is not the check date east or west of UTC.
+        const due = new Date(on("2026-12-01")).toISOString();
+
         assert.match(
             readText(state, one.id) ?? "",
-            /Watch: 2026-12-01 · the blob sweep · set by odrade · due 2026-12-01T[0-9:]+.* · passed \(duncan\) .*the blobs are gone/,
+            new RegExp(
+                `Watch: 2026-12-01 · the blob sweep · set by odrade · due ${rx(due)}.* · passed \\(duncan\\) .*the blobs are gone`,
+            ),
         );
     });
 
@@ -1694,6 +1719,14 @@ const placed = (state: DeskState, at: number): Thread => {
 
     return opened.thread;
 };
+
+/**
+ * The found thread of a state: a fixed number is wrong when earlier tests made threads first, so find it by its key,
+ * else by its origin.
+ */
+const foundIn = (state: DeskState, key = "found:pr:frostyard/test#7"): Thread | undefined =>
+    Object.values(state.threads).find((each) => each.key === key) ??
+    Object.values(state.threads).find((each) => each.origin === "found");
 
 describe("buildQuery", () => {
     test("one query with repositories and pinned PRs, and nothing else", () => {
@@ -1877,11 +1910,11 @@ describe("attribute", () => {
         assert.equal(newer.prs["frostyard/test#7"]?.via, "seen");
         assert.match(
             older.events.map((event) => event.text).join("; "),
-            /frostyard\/test#7 moved to T2/,
+            new RegExp(`frostyard\\/test#7 moved to ${rx(newer.id)}`),
         );
         assert.match(
             newer.events.map((event) => event.text).join("; "),
-            /frostyard\/test#7 moved from T1/,
+            new RegExp(`frostyard\\/test#7 moved from ${rx(older.id)}`),
         );
     });
 
@@ -1904,7 +1937,7 @@ describe("attribute", () => {
 
         assert.equal(Object.keys(first.prs).length, 0);
         assert.equal(Object.keys(second.prs).length, 0);
-        assert.equal(state2.threads.F1?.origin, "found");
+        assert.equal(foundIn(state2)?.origin, "found");
     });
 
     test("the branch rule reads the reflog too", () => {
@@ -1932,14 +1965,14 @@ describe("attribute", () => {
 
     test("2 threads in 1 repo, no seen and no branch: no window attach, a found thread", () => {
         const state = deskOf();
+        const first = placed(state, 100);
+        const second = placed(state, 200);
 
-        placed(state, 100);
-        placed(state, 200);
         attribute(state, githubOf([prFact({ createdAt: 300 })]), gitOf(), 400);
 
-        assert.equal(Object.keys(state.threads.T1?.prs ?? {}).length, 0);
-        assert.equal(Object.keys(state.threads.T2?.prs ?? {}).length, 0);
-        const found = state.threads.F1;
+        assert.equal(Object.keys(first.prs).length, 0);
+        assert.equal(Object.keys(second.prs).length, 0);
+        const found = foundIn(state);
 
         assert.equal(found?.origin, "found");
         assert.equal(found?.key, "found:pr:frostyard/test#7");
@@ -1986,7 +2019,7 @@ describe("attribute", () => {
 
         attribute(state, githubOf([prFact()], { archived: true }), gitOf(), 400);
         assert.equal(Object.keys(thread.prs).length, 0);
-        assert.equal(state.threads.F1, undefined);
+        assert.equal(foundIn(state), undefined);
 
         thread.prs["frostyard/test#7"] = {
             via: "attached",
@@ -2005,13 +2038,13 @@ describe("attribute", () => {
 
         state.epoch = 300;
         attribute(state, githubOf([prFact({ createdAt: 200 })]), gitOf(), 400);
-        assert.equal(state.threads.F1, undefined);
+        assert.equal(foundIn(state), undefined);
 
         const state2 = deskOf();
 
         state2.epoch = 100;
         attribute(state2, githubOf([prFact({ createdAt: 200 })]), gitOf(), 400);
-        assert.equal(state2.threads.F1?.origin, "found");
+        assert.equal(foundIn(state2)?.origin, "found");
     });
 });
 
@@ -2028,7 +2061,10 @@ describe("attachTo", () => {
         assert.equal(older.prs["frostyard/test#7"], undefined);
         assert.equal(target.prs["frostyard/test#7"]?.via, "attached");
         assert.equal(target.prs["frostyard/test#7"]?.state, "OPEN");
-        assert.match(older.events.map((event) => event.text).join("; "), /moved to T2/);
+        assert.match(
+            older.events.map((event) => event.text).join("; "),
+            new RegExp(`moved to ${rx(target.id)}`),
+        );
         assert.match(
             target.events.map((event) => event.text).join("; "),
             /frostyard\/test#7 attached/,
@@ -2055,7 +2091,10 @@ describe("attachTo", () => {
             why: "dropped",
             by: "desk",
         });
-        assert.match(source.events.map((event) => event.text).join("; "), /merged into T2/);
+        assert.match(
+            source.events.map((event) => event.text).join("; "),
+            new RegExp(`merged into ${rx(target.id)}`),
+        );
     });
 
     test("a closed target is refused, and a second call changes nothing", () => {
@@ -3124,15 +3163,87 @@ async function delegated(
     return { source, linked: linked.id as ConversationId, thread };
 }
 
+/**
+ * Stop one sweeper, and wait for it to be terminal. An abort that is only marked resumes after a restart, which is not
+ * what a test that closes the app wants.
+ */
+async function stopSweeper(taskId: Parameters<typeof app.harness.abortTask>[0]): Promise<void> {
+    await app.harness.abortTask(taskId, context);
+    await app.harness.waitForTask(taskId, context).catch(() => undefined);
+}
+
 /** Stop every live sweeper: a test that moves the clock must not wake the sweepers of earlier tests. */
 async function stopSweepers(): Promise<void> {
     const live = await app.harness.inspect(context);
 
     for (const task of live.tasks) {
         if (task.record.kind === "x.desk.sweeper") {
-            await app.harness.abortTask(task.record.id, context);
+            await stopSweeper(task.record.id);
         }
     }
+}
+
+/**
+ * Close every thread this test did not make, and stop the sweepers that then have no open work left. A test that moves
+ * the clock calls this before it moves, so no sweeper of an earlier test wakes on the moved clock and works.
+ *
+ * The sweepers of the kept threads stay: a restart resumes them, and a stopped one is not resumed. The loop is for a
+ * sweep that was already running: its commit lands after the close, writes a found thread of its own supervisor, and
+ * starts that supervisor's sweeper again. Each round closes what the last round's sweeps made, and stops their
+ * sweepers; a round with no sweeper to stop is the last.
+ */
+async function quiet(keep: string[]): Promise<void> {
+    const kept = new Set(keep);
+
+    for (let round = 0; round < 8; round += 1) {
+        await app.harness.commit(async (tx) => {
+            const state = await tx.doc(DeskThreads);
+            const now = Date.now();
+
+            for (const thread of Object.values(state.threads)) {
+                if (!kept.has(thread.id) && thread.state !== "closed") {
+                    thread.state = "closed";
+                    thread.closed = { at: now, why: "dropped", by: "desk" };
+                }
+            }
+
+            // One record per supervisor with open work: a supervisor with none gets no sweeper, so a later sweep must
+            // not find a record that points at a task that is not live.
+            const busy = new Set(
+                Object.values(state.threads)
+                    .filter((thread) => thread.state !== "closed")
+                    .map((thread) => String(thread.supervisor)),
+            );
+
+            for (const key of Object.keys(state.sweepers ?? {})) {
+                if (!busy.has(key)) {
+                    delete state.sweepers?.[key];
+                }
+            }
+        }, context);
+
+        const busy = new Set(
+            Object.values((await deskState())?.threads ?? {})
+                .filter((thread) => thread.state !== "closed")
+                .map((thread) => String(thread.supervisor)),
+        );
+        const live = await app.harness.inspect(context);
+        const stale = live.tasks.filter(
+            (task) =>
+                task.record.kind === "x.desk.sweeper" &&
+                !busy.has(String(task.record.conversationId)),
+        );
+
+        if (stale.length === 0) {
+            return;
+        }
+
+        for (const task of stale) {
+            await stopSweeper(task.record.id);
+        }
+    }
+
+    throw new Error("quiet: sweepers of earlier tests keep waking");
 }
 
 /** Restart the app with its clock moved forward by `by` milliseconds. */
@@ -3225,9 +3336,13 @@ describe("the desk in a Pi Pocket", () => {
 
         await say(app, source, "desk delegate test");
 
-        const thread = (await deskState())?.threads.T1;
+        // The id depends on the tests that ran before: find the thread by its linked session, as `delegated` does.
+        const linked = app.sessions().find((session) => session.linkedFrom?.id === Number(source));
 
-        assert(thread, "the delegation opened T1");
+        assert(linked, "the delegation started a linked session");
+        const thread = threadOfSession(await deskState(), Number(linked.id));
+
+        assert(thread, "the delegation opened a thread");
         assert.equal(thread.state, "open");
         assert.equal(thread.origin, "delegate");
         assert.equal(thread.repo, "frostyard/test");
@@ -3239,13 +3354,15 @@ describe("the desk in a Pi Pocket", () => {
 
         const texts = (await modelTexts(app, source)).join("\n");
 
-        assert.match(texts, /Thread T1\./);
+        assert.match(texts, new RegExp(`Thread ${rx(thread.id)}\\.`));
         assert.match(texts, /Assigned to Duncan Idaho at session-/);
 
         await say(app, source, "desk list test");
         assert.match(
             (await modelTexts(app, source)).join("\n"),
-            /T1 · open · next: [a-z]+ · frostyard\/test · duncan · Tend the test repository/,
+            new RegExp(
+                `${rx(thread.id)} · open · next: [a-z]+ · frostyard\\/test · duncan · Tend the test repository`,
+            ),
         );
         assert.equal(
             typeof (await deskState())?.seen[`supervisor:${String(Number(source))}`],
@@ -3313,28 +3430,44 @@ describe("the desk in a Pi Pocket", () => {
     test("seed refuses an unknown agent, then imports once and replays", async () => {
         const source = await supervisor("seeder");
 
+        // A free id: the fixed T20 is taken when 20 threads exist before this test.
+        const seededState = await deskState();
+        let seedNumber = (seededState?.next.T ?? 1) + 50;
+
+        while (seededState?.threads[`T${String(seedNumber)}`] !== undefined) {
+            seedNumber += 1;
+        }
+
+        const seedId = `T${String(seedNumber)}`;
+
         seedPath = join(root, "seed.json");
         writeFileSync(
             seedPath,
             JSON.stringify({
-                threads: [{ id: "T20", title: "seeded work", agents: ["nobody"], mark: "keep" }],
+                threads: [{ id: seedId, title: "seeded work", agents: ["nobody"], mark: "keep" }],
             }),
         );
         await say(app, source, "desk seed test");
-        assert.match((await modelTexts(app, source)).join("\n"), /Unknown agent ids: T20: nobody/);
-        assert.equal((await deskState())?.threads.T20, undefined);
+        assert.match(
+            (await modelTexts(app, source)).join("\n"),
+            new RegExp(`Unknown agent ids: ${rx(seedId)}: nobody`),
+        );
+        assert.equal((await deskState())?.threads[seedId], undefined);
 
-        writeFileSync(seedPath, seedFile({ id: "T20", title: "seeded work", agents: ["duncan"] }));
+        writeFileSync(seedPath, seedFile({ id: seedId, title: "seeded work", agents: ["duncan"] }));
         await say(app, source, "desk seed test");
-        assert.match((await modelTexts(app, source)).join("\n"), /Seeded T20\./);
+        assert.match(
+            (await modelTexts(app, source)).join("\n"),
+            new RegExp(`Seeded ${rx(seedId)}\\.`),
+        );
 
-        const thread = (await deskState())?.threads.T20;
+        const thread = (await deskState())?.threads[seedId];
 
         assert.equal(thread?.origin, "seed");
         assert.equal(thread?.state, "open");
         assert.deepEqual(Object.keys(thread.prs), ["frostyard/frostmail#106"]);
         assert.equal(thread.prs["frostyard/frostmail#106"]?.via, "attached");
-        assert.equal(thread.asks[0]?.id, "T20a");
+        assert.equal(thread.asks[0]?.id, `${seedId}a`);
 
         await say(app, source, "desk seed test");
         assert.match(
@@ -4858,11 +4991,17 @@ describe("the desk in a Pi Pocket", () => {
 
             watchThreadId = thread.id;
             resultThreadId = thread.id;
-            await say(app, source, "desk watch test");
+            const dates = await dayAround(
+                () => say(app, source, "desk watch test"),
+                () => daysFromToday(7),
+            );
 
             let stored = (await deskState())?.threads[thread.id];
 
-            assert.equal(stored?.watch?.checkOn, daysFromToday(7));
+            assert(
+                dates.includes(stored?.watch?.checkOn ?? ""),
+                `the check date is ${stored?.watch?.checkOn}, and the day is ${dates.join(" or ")}`,
+            );
             assert.equal(stored?.watch?.check, "the blob sweep");
             assert.equal(stored?.watch?.setBy, "odrade", "the roster id of the agent who set it");
             assert.match(stored?.watch?.key ?? "", /^x\.desk\.watch:/);
@@ -4972,16 +5111,30 @@ describe("the desk in a Pi Pocket", () => {
             };
 
             try {
-                const first = JSON.stringify(
-                    await tool.execute(
-                        { action: "watch", thread: id, check_on: "7d", text: "the blob sweep" },
-                        api,
-                        context,
-                    ),
+                let first = "";
+                const dates = await dayAround(
+                    async () => {
+                        first = JSON.stringify(
+                            await tool.execute(
+                                {
+                                    action: "watch",
+                                    thread: id,
+                                    check_on: "7d",
+                                    text: "the blob sweep",
+                                },
+                                api,
+                                context,
+                            ),
+                        );
+                    },
+                    () => daysFromToday(7),
                 );
                 const stored = (await deskState())?.threads[id]?.watch;
 
-                assert.equal(stored?.checkOn, daysFromToday(7));
+                assert(
+                    dates.includes(stored?.checkOn ?? ""),
+                    `the check date is ${stored?.checkOn}, and the day is ${dates.join(" or ")}`,
+                );
                 assert.match(first, /Watching/);
 
                 // The same call again, as a restart replays it: another span would move the date, and it does not.
@@ -5016,8 +5169,12 @@ describe("the desk in a Pi Pocket", () => {
             assert.match(checkOn, /^\d{4}-\d{2}-\d{2}$/);
 
             try {
-                // 8 days later: past the 7-day check date.
-                await restartApp(8 * DAY);
+                // The desk counts a watch date in calendar days: go to noon of the day after it, not 8 times 24 hours.
+                await quiet([thread.id]);
+                const target = new Date(`${checkOn}T12:00:00`);
+
+                target.setDate(target.getDate() + 1);
+                await restartApp(target.getTime() - Date.now());
 
                 assert.equal(
                     (await deskState())?.threads[thread.id]?.watch?.checkOn,
@@ -5055,6 +5212,7 @@ describe("the desk in a Pi Pocket", () => {
                     1,
                 );
             } finally {
+                await quiet([]);
                 shift = 0;
             }
         });
@@ -5075,11 +5233,17 @@ describe("the desk in a Pi Pocket", () => {
             assert(other, "a second thread");
 
             watchThreadId = thread.id;
-            await say(app, linked, "watch own thread test");
+            const dates = await dayAround(
+                () => say(app, linked, "watch own thread test"),
+                () => parseCheckOn("1m", Date.now()) as string,
+            );
 
             const stored = (await deskState())?.threads[thread.id];
 
-            assert.equal(stored?.watch?.checkOn, parseCheckOn("1m", Date.now()));
+            assert(
+                dates.includes(stored?.watch?.checkOn ?? ""),
+                `the check date is ${stored?.watch?.checkOn}, and the day is ${dates.join(" or ")}`,
+            );
             assert.equal(stored?.watch?.setBy, "duncan");
             assert.equal(stored?.watch?.key.startsWith("x.desk.watch:"), true);
             assert.match(
@@ -5115,7 +5279,10 @@ describe("the desk in a Pi Pocket", () => {
             await stopSweepers();
             const source = await supervisor("delegate-watch");
 
-            await say(app, source, "desk delegate watch test");
+            const dates = await dayAround(
+                () => say(app, source, "desk delegate watch test"),
+                () => daysFromToday(14),
+            );
 
             const linked = app.sessions().find((each) => each.linkedFrom?.id === Number(source));
 
@@ -5124,7 +5291,10 @@ describe("the desk in a Pi Pocket", () => {
             const thread = threadOfSession(await deskState(), Number(linked.id));
 
             assert(thread, "the thread");
-            assert.equal(thread.watch?.checkOn, daysFromToday(14));
+            assert(
+                dates.includes(thread.watch?.checkOn ?? ""),
+                `the check date is ${thread.watch?.checkOn}, and the day is ${dates.join(" or ")}`,
+            );
             assert.equal(thread.watch?.check, "the blob sweep");
             assert.equal(thread.watch?.setBy, "odrade");
             assert.equal(thread.watch?.key.startsWith("x.team.delegate:"), true);
@@ -5174,6 +5344,7 @@ describe("the desk in a Pi Pocket", () => {
 
         // The next sweep sees the folder dirty for the first time: pending, and no thread yet.
         try {
+            await quiet([thread.id]);
             await restartApp(SWEEP_SLEEP_MS + 60_000);
             await sweptAfter(thread, first);
 
@@ -5218,6 +5389,7 @@ describe("the desk in a Pi Pocket", () => {
             await sweptAfter(thread, seen);
             assert.equal((await folderFound()).length, 1);
         } finally {
+            await quiet([]);
             shift = 0;
         }
     });
@@ -5236,6 +5408,7 @@ describe("the desk in a Pi Pocket", () => {
         appendFileSync(join(brief, "file.txt"), "two\n");
 
         try {
+            await quiet([thread.id]);
             await restartApp(SWEEP_SLEEP_MS + 60_000);
             await sweptAfter(thread, first);
 
@@ -5258,6 +5431,7 @@ describe("the desk in a Pi Pocket", () => {
                 undefined,
             );
         } finally {
+            await quiet([]);
             shift = 0;
         }
     });
@@ -5348,6 +5522,9 @@ describe("the desk in a Pi Pocket", () => {
         await say(app, linked, "report to supervisor test");
         await until(() => !app.isBusy(linked), "the report's turn to settle", 20_000);
 
+        // The clock moves here: no sweeper of an earlier test may wake on it.
+        await quiet([thread.id]);
+
         // A restart past the sleep: the sweeper wakes, closes the thread, and ends.
         await app.close();
         shift = SWEEP_SLEEP_MS + 60_000;
@@ -5377,6 +5554,7 @@ describe("the desk in a Pi Pocket", () => {
             assert.equal((await deskState())?.sweepers?.[String(Number(source))], undefined);
             await until(async () => (await sweepers(source)) === 0, "the sweeper to end", 20_000);
         } finally {
+            await quiet([]);
             shift = 0;
         }
     });
@@ -5410,6 +5588,7 @@ describe("the desk in a Pi Pocket", () => {
             (await modelTexts(app, linked)).filter((each) => each.includes(message)).length;
 
         try {
+            await quiet([thread.id]);
             await restartApp(SWEEP_SLEEP_MS + 60_000);
             await sweptAfter(thread, first);
 
@@ -5425,6 +5604,7 @@ describe("the desk in a Pi Pocket", () => {
             assert.equal(await sent(), 1);
             assert.equal((await deskState())?.threads[thread.id]?.run.closeout, key);
         } finally {
+            await quiet([]);
             shift = 0;
         }
     });
@@ -5459,6 +5639,7 @@ describe("the desk in a Pi Pocket", () => {
             (await modelTexts(app, linked)).filter((each) => each.includes(message)).length;
 
         try {
+            await quiet([thread.id]);
             await restartApp(SWEEP_SLEEP_MS + 60_000);
             await sweptAfter(thread, first);
 
@@ -5482,6 +5663,7 @@ describe("the desk in a Pi Pocket", () => {
             assert.equal((await deskState())?.threads[thread.id]?.closed?.why, "done");
             assert.equal(await sent(), 1);
         } finally {
+            await quiet([]);
             shift = 0;
         }
     });
