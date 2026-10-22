@@ -29,6 +29,7 @@ import {
     defineDoc,
     defineExtension,
     defineTask,
+    type DocumentReader,
     type EntryId,
     InboxDoc,
     LiveDoc,
@@ -63,6 +64,8 @@ const MAX_REPORT = 8000;
 const PREFIX = "[night-shift]";
 /** Where another module finds this one's live API: a global, never an import. */
 const API = Symbol.for("pi-pocket-team.night-shift");
+/** Where this module finds the desk's live API: a global, never an import. */
+const DESK_API = Symbol.for("pi-pocket-team.desk");
 
 // ─── Stored state ────────────────────────────────────────────────────────────
 
@@ -1120,12 +1123,42 @@ export type NightShiftApi = {
     notifyChanged: (conversationId: ConversationId) => void;
     standing: typeof standing;
     zone: () => string;
+    /** A goal as the desk's sweep reads it. */
+    goal: (
+        read: DocumentReader,
+        conversationId: ConversationId,
+        context: Context,
+    ) => Promise<
+        { status: Goal["status"]; round: number; maxRounds: number; why?: string } | undefined
+    >;
 };
 
 export default function createNightShift(host: Host, web: Web) {
     const changed = (id: ConversationId) => web.send("changed", { conversation: Number(id) });
     /** Tell a session's tabs that its goal changed: for another module that set the goal, after its commit. */
     const notifyChanged = (id: ConversationId) => changed(id);
+
+    /**
+     * The desk's API, from a global: night-shift.ts must not import desk.ts. A static import would keep a stale copy
+     * after a reload.
+     */
+    type DeskApi = {
+        version: number;
+        file: (
+            tx: Tx,
+            session: ConversationId,
+            request: {
+                to: string;
+                key: string;
+                from: "team_message" | "night-shift";
+                text: string;
+                at: number;
+            },
+        ) => Promise<{ line: string } | undefined>;
+    };
+
+    const deskApi = (): DeskApi | undefined =>
+        (globalThis as unknown as Record<symbol, DeskApi | undefined>)[DESK_API];
 
     /** Stop a goal in a commit's draft: with a summary round when nobody may be there, otherwise at once. */
     function stopIn(goal: Goal, reason: StopReason, detail: string, now: number) {
@@ -1662,16 +1695,30 @@ export default function createNightShift(host: Host, web: Web) {
 
             /**
              * Tell the supervisor session of a delegated goal that it stopped. The goal's driver is gone, so this does
-             * not use mine(). The send's key is the task's: a restart reruns the phase and sends only once.
+             * not use mine(). The send's key is the task's: a restart reruns the phase and sends only once. With the
+             * desk on, the report is filed on the thread in the same commit, and the supervisor gets its one line.
              */
             report: async (task, runtime, context) => {
                 const id = runtime.conversationId;
                 const text = task.state.checkpoint.text;
                 const goal = (await runtime.snapshot(GoalDoc, id, context))?.goal;
-                const found: { address?: string } = {};
+                const report = goal === undefined ? undefined : reportMessage(goal, text);
+                const found: { address?: string; filed?: { line: string } } = {};
 
                 await runtime.commit(async (tx) => {
                     found.address = await returnAddress(tx, id);
+
+                    const desk = deskApi();
+
+                    if (desk !== undefined && found.address !== undefined && report !== undefined) {
+                        found.filed = await desk.file(tx, id, {
+                            to: found.address,
+                            key: `x.night-shift.report:${runtime.taskId}`,
+                            from: "night-shift",
+                            text: report,
+                            at: runtime.now(),
+                        });
+                    }
 
                     return undefined;
                 }, context);
@@ -1682,11 +1729,11 @@ export default function createNightShift(host: Host, web: Web) {
                         "The night shift could not report: this session has no source session.",
                         id,
                     );
-                } else if (goal !== undefined) {
+                } else if (report !== undefined) {
                     try {
                         await host.linkedSessions.send(
                             id,
-                            { to: found.address, message: reportMessage(goal, text) },
+                            { to: found.address, message: found.filed?.line ?? report },
                             `x.night-shift.report:${runtime.taskId}`,
                         );
                     } catch (error) {
@@ -2119,6 +2166,18 @@ export default function createNightShift(host: Host, web: Web) {
         notifyChanged,
         standing,
         zone,
+        goal: async (read, conversationId, context) => {
+            const goal = (await read.snapshot(GoalDoc, conversationId, context))?.goal;
+
+            return goal === undefined
+                ? undefined
+                : {
+                      status: goal.status,
+                      round: goal.round,
+                      maxRounds: goal.maxRounds,
+                      ...(goal.why === undefined ? {} : { why: goal.why }),
+                  };
+        },
     };
     const shared = globalThis as unknown as Record<symbol, NightShiftApi | undefined>;
 
