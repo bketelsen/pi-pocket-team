@@ -89,8 +89,8 @@ export type Ask = {
 /** One attached PR: how it was attached, and what GitHub said about it. */
 export type PrLink = {
     via: "seen" | "branch" | "window" | "attached";
-    /** FROZEN: its repository is archived. */
-    state?: "OPEN" | "MERGED" | "CLOSED" | "FROZEN";
+    /** FROZEN: its repository is archived. MISSING: GitHub has no such PR (an issue, or a wrong number). */
+    state?: "OPEN" | "MERGED" | "CLOSED" | "FROZEN" | "MISSING";
     next?: string;
     title?: string;
     url?: string;
@@ -184,8 +184,8 @@ export type DeskState = {
     epoch?: number;
     /** Open PRs per repository that are not ours: dependabot, and other people. */
     others?: Record<string, number>;
-    /** The last GitHub read: when, whether it worked, why not, and the roster names it skipped. */
-    github?: { at: number; ok: boolean; error?: string; skipped?: string[] };
+    /** The last GitHub read: when, whether it worked, why not, the roster names it skipped, and the refs it lacks. */
+    github?: { at: number; ok: boolean; error?: string; skipped?: string[]; missing?: string[] };
     /**
      * What a supervisor's first sweep saw. Old work never becomes a found thread: only the seed brings it in. A folder
      * leaves `folders` when it is clean. `pending` holds the folders that have been dirty since a sweep first saw them,
@@ -1144,7 +1144,7 @@ export function nextActor(thread: Thread): NextActor {
         return "agent";
     }
 
-    if (thread.origin === "found") {
+    if (thread.origin === "found" || openPrs.includes("odrade")) {
         return "odrade";
     }
 
@@ -1287,7 +1287,7 @@ export function threadRepos(thread: Thread): string[] {
 }
 
 /** What a PR needs next: nobody, the agent, a reviewer, or Brian. */
-export type PrNext = "none" | "agent" | "reviewer" | "brian";
+export type PrNext = "none" | "agent" | "reviewer" | "brian" | "odrade";
 
 /** One PR's next actor. A draft PR waits on its agent; a merged, closed or frozen one is done. */
 export function prNext(pr: {
@@ -1299,6 +1299,11 @@ export function prNext(pr: {
 }): PrNext {
     if (pr.state === "MERGED" || pr.state === "CLOSED" || pr.state === "FROZEN") {
         return "none";
+    }
+
+    // A PR that GitHub cannot find is Odrade's to fix: an issue, or a wrong number.
+    if (pr.state === "MISSING") {
+        return "odrade";
     }
 
     if (pr.isDraft === true) {
@@ -1340,6 +1345,8 @@ export type GitHubFacts = {
     viewer: string;
     repos: Record<string, { archived: boolean; open: PrFact[] }>;
     prs: Record<string, PrFact>;
+    /** Attached refs that GitHub does not have: an issue, or a wrong number. */
+    missing?: string[];
 };
 
 const OWNER_NAME = /^[A-Za-z0-9][A-Za-z0-9_.-]*$/;
@@ -1549,6 +1556,26 @@ export function updatePrs(thread: Thread, github: GitHubFacts, now: number): num
     let events = 0;
 
     for (const [ref, link] of Object.entries(thread.prs)) {
+        if (github.missing !== undefined && github.missing.includes(ref)) {
+            if (link.state !== "MISSING") {
+                link.state = "MISSING";
+                link.next = "odrade";
+
+                if (
+                    addEvent(
+                        thread,
+                        `${ref}:state:MISSING`,
+                        `${ref} not found on GitHub (an issue, or a wrong number)`,
+                        now,
+                    )
+                ) {
+                    events += 1;
+                }
+            }
+
+            continue;
+        }
+
         const fact =
             github.prs[ref] ?? github.repos[repoOf(ref)]?.open.find((pr) => pr.ref === ref);
 
@@ -1903,6 +1930,29 @@ export function attachTo(
     return { text: `${source.id} is merged into ${target.id}.` };
 }
 
+/** Take a PR off a thread. Pure over the state: the caller commits it. A second call changes nothing. */
+export function detachFrom(
+    state: DeskState,
+    ref: string,
+    threadId: string,
+    now: number,
+): { text: string } | { error: string } {
+    const thread = threadById(state, threadId);
+
+    if (thread === undefined) {
+        return { error: `There is no thread ${threadId.toUpperCase()}.` };
+    }
+
+    if (thread.prs[ref] === undefined) {
+        return { text: `${ref} is not on ${thread.id}.` };
+    }
+
+    delete thread.prs[ref];
+    addEvent(thread, `detached:${ref}:${String(now)}`, `detached ${ref}`, now);
+
+    return { text: `${ref} is off ${thread.id}.` };
+}
+
 // ─── The cap and Brian's OKs ────────────────────────────────────────────────
 
 /** How many threads count before the desk is full, unless the config file says less or more. */
@@ -2251,6 +2301,7 @@ export type GitHubView = {
     ok: boolean;
     error?: string;
     skipped?: string[];
+    missing?: string[];
 };
 
 /** The last GitHub read as a plain value; null when no read happened yet. */
@@ -2266,6 +2317,7 @@ export function githubView(state: Readonly<DeskState> | undefined): GitHubView |
         ok: github.ok,
         ...(github.error === undefined ? {} : { error: github.error }),
         ...(github.skipped === undefined ? {} : { skipped: [...github.skipped] }),
+        ...(github.missing === undefined ? {} : { missing: [...github.missing] }),
     };
 }
 
@@ -2290,6 +2342,10 @@ export function githubLines(state: Readonly<DeskState> | undefined): string[] {
 
     if (github.skipped !== undefined && github.skipped.length > 0) {
         lines.push(`Skipped roster names: ${github.skipped.join(", ")}`);
+    }
+
+    if (github.missing !== undefined && github.missing.length > 0) {
+        lines.push(`Not found on GitHub: ${github.missing.join(", ")}`);
     }
 
     return lines;
@@ -3412,7 +3468,11 @@ export default function createDesk(host: Host, web: Web) {
         return flatLine(said).slice(0, 200) || "the GitHub read failed";
     }
 
-    /** The one GitHub read of a sweep: its facts, or why it failed. A failure keeps every thread's state. */
+    /**
+     * The one GitHub read of a sweep: its facts, or why it failed. `gh api graphql` exits non-zero when the answer has
+     * an error, but it still prints the data it has: a wrong PR ref must not hide every other PR. An alias with an
+     * error is a missing ref (`pN`) or a skipped repository (`rN`); only no data at all is a failure.
+     */
     async function readGitHub(
         repos: string[],
         prs: string[],
@@ -3421,8 +3481,11 @@ export default function createDesk(host: Host, web: Web) {
             return {};
         }
 
+        const wanted = [...new Set(repos)];
+        const pinned = [...new Set(prs)];
+
         try {
-            const query = buildQuery(repos, prs);
+            const query = buildQuery(wanted, pinned);
             const gh = process.env.PI_POCKET_DESK_GH ?? "gh";
             const { stdout } = await run(gh, ["api", "graphql", "-f", `query=${query}`], {
                 timeout: 60_000,
@@ -3432,7 +3495,92 @@ export default function createDesk(host: Host, web: Web) {
 
             return { facts: parseGitHub(JSON.parse(stdout)) };
         } catch (error) {
-            return { error: githubError(error) };
+            const failure = error as { stdout?: unknown } | null;
+            const raw =
+                typeof failure?.stdout === "string"
+                    ? failure.stdout
+                    : Buffer.isBuffer(failure?.stdout)
+                      ? failure.stdout.toString("utf8")
+                      : "";
+            let answer: unknown;
+
+            try {
+                answer = raw.trim() === "" ? undefined : JSON.parse(raw);
+            } catch {
+                answer = undefined;
+            }
+
+            const data = (answer as { data?: unknown } | undefined)?.data;
+
+            if (data === undefined || data === null || typeof data !== "object") {
+                return { error: githubError(error) };
+            }
+
+            const facts = parseGitHub(answer);
+            const missing: string[] = [];
+            const errors = (answer as { errors?: unknown }).errors;
+
+            if (Array.isArray(errors)) {
+                for (const entry of errors) {
+                    const path = (entry as { path?: unknown } | null)?.path;
+                    const alias =
+                        Array.isArray(path) && typeof path[0] === "string" ? path[0] : undefined;
+
+                    if (alias === undefined) {
+                        continue;
+                    }
+
+                    if (/^p[0-9]+$/.test(alias)) {
+                        const ref = pinned[Number(alias.slice(1))];
+
+                        if (ref !== undefined && !missing.includes(ref)) {
+                            missing.push(ref);
+                        }
+                    } else if (/^r[0-9]+$/.test(alias)) {
+                        // That repository could not be read: skip it, and keep the others.
+                        const repo = wanted[Number(alias.slice(1))];
+
+                        if (repo !== undefined) {
+                            delete facts.repos[repo];
+                        }
+                    }
+                }
+            }
+
+            if (missing.length > 0) {
+                facts.missing = missing;
+            }
+
+            return { facts };
+        }
+    }
+
+    /** Whether GitHub has this PR: 1 GraphQL call. An issue's number, or a wrong one, is not a PR. */
+    async function pullRequestExists(ref: string): Promise<boolean> {
+        const match = REF.exec(ref);
+
+        if (match === null) {
+            return false;
+        }
+
+        try {
+            const { owner, name } = splitRepo(match[1]!);
+            const query = `query { repository(owner: ${JSON.stringify(owner)}, name: ${JSON.stringify(name)}) { pullRequest(number: ${match[2]!}) { number } } }`;
+            const gh = process.env.PI_POCKET_DESK_GH ?? "gh";
+            const { stdout } = await run(gh, ["api", "graphql", "-f", `query=${query}`], {
+                timeout: 60_000,
+                encoding: "utf8",
+            });
+            const answer = JSON.parse(stdout) as {
+                data?: { repository?: { pullRequest?: unknown } | null } | null;
+            };
+
+            return (
+                answer.data?.repository?.pullRequest !== null &&
+                answer.data?.repository?.pullRequest !== undefined
+            );
+        } catch {
+            return false;
         }
     }
 
@@ -3719,6 +3867,7 @@ export default function createDesk(host: Host, web: Web) {
             ok: facts.githubError === undefined,
             ...(facts.githubError === undefined ? {} : { error: facts.githubError }),
             ...(facts.githubSkipped === undefined ? {} : { skipped: [...facts.githubSkipped] }),
+            ...(facts.github?.missing === undefined ? {} : { missing: [...facts.github.missing] }),
         };
 
         await scanChatGrants(tx, state, supervisor, now);
@@ -4923,7 +5072,7 @@ export default function createDesk(host: Host, web: Web) {
     const tool = defineTool({
         name: "desk",
         description:
-            "The desk of threads for work the team runs in the background. A supervisor session can use every action; an agent session can use watch and result on its own thread only. Actions: list (one line per open thread), read (one thread in full), sync (observe the threads now, with linked sessions, Night shift, git, and GitHub), seed (import a seed.json file one time), attach (put a PR, or all of another thread's work, on one thread), ask (file a question for Brian on a thread, or on a new one), answer (record Brian's words for an ask), watch (set a dated check on a thread: it sleeps until that date, and does not count toward the cap), result (record that check's pass, which closes the thread, or its fail, which opens it again).",
+            "The desk of threads for work the team runs in the background. A supervisor session can use every action; an agent session can use watch and result on its own thread only. Actions: list (one line per open thread), read (one thread in full), sync (observe the threads now, with linked sessions, Night shift, git, and GitHub), seed (import a seed.json file one time), attach (put a PR, or all of another thread's work, on one thread), detach (take a PR off a thread), ask (file a question for Brian on a thread, or on a new one), answer (record Brian's words for an ask), watch (set a dated check on a thread: it sleeps until that date, and does not count toward the cap), result (record that check's pass, which closes the thread, or its fail, which opens it again).",
         parameters: Type.Object({
             action: Type.Union([
                 Type.Literal("list"),
@@ -4931,6 +5080,7 @@ export default function createDesk(host: Host, web: Web) {
                 Type.Literal("sync"),
                 Type.Literal("seed"),
                 Type.Literal("attach"),
+                Type.Literal("detach"),
                 Type.Literal("ask"),
                 Type.Literal("answer"),
                 Type.Literal("watch"),
@@ -5219,8 +5369,43 @@ export default function createDesk(host: Host, web: Web) {
                     );
                 }
 
+                // A ref must be a PR: an issue's number, or a wrong one, goes no further.
+                if (PR_REF.test(ref) && !(await pullRequestExists(ref))) {
+                    throw new Error(
+                        `${ref} is not a pull request that GitHub can read (an issue, or a wrong number). Nothing changed.`,
+                    );
+                }
+
                 const result = await api.commit(
                     async (tx) => attachTo(await tx.doc(DeskThreads), ref, targetId, Date.now()),
+                    context,
+                );
+
+                if ("error" in result) {
+                    throw new Error(result.error);
+                }
+
+                await exportNow(api, context);
+
+                return reply(result.text);
+            }
+
+            if (args.action === "detach") {
+                const ref = args.ref?.trim();
+                const targetId = args.thread?.trim();
+
+                if (ref === undefined || ref === "" || targetId === undefined || targetId === "") {
+                    throw new Error(
+                        "detach needs ref (a PR ref) and thread (the thread it is on).",
+                    );
+                }
+
+                if (!PR_REF.test(ref)) {
+                    throw new Error(`${ref} is not a PR ref such as owner/name#12.`);
+                }
+
+                const result = await api.commit(
+                    async (tx) => detachFrom(await tx.doc(DeskThreads), ref, targetId, Date.now()),
                     context,
                 );
 
