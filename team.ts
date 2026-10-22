@@ -619,6 +619,17 @@ export default function createTeam(host: Host, web: Web) {
             binding: { session: number; address: string; at: number },
         ) => Promise<DeskThread | undefined>;
         fail: (tx: Tx, key: string, why: string, at: number) => Promise<void>;
+        file: (
+            tx: Tx,
+            session: ConversationId,
+            request: {
+                to: string;
+                key: string;
+                from: "team_message" | "night-shift";
+                text: string;
+                at: number;
+            },
+        ) => Promise<{ thread: DeskThread; line: string } | undefined>;
     };
 
     const deskApi = (): DeskApi | undefined =>
@@ -1141,14 +1152,38 @@ export default function createTeam(host: Host, web: Web) {
             message: Type.String({ minLength: 1, maxLength: 6000 }),
         }),
         replay: "safe",
-        execute: async (args, api) => {
+        execute: async (args, api, context) => {
+            const key = `x.team.message:${api.taskId}:${api.callId}`;
+            const desk = deskApi();
+
+            // A report to the thread's supervisor is filed on the thread in one commit with the send's key, so a replay
+            // finds it and sends the same line once. A message to anyone else goes as before.
+            const filed =
+                desk === undefined
+                    ? undefined
+                    : await api.commit(
+                          async (tx) =>
+                              desk.file(tx, api.conversationId, {
+                                  to: args.to,
+                                  key,
+                                  from: "team_message",
+                                  text: args.message,
+                                  at: Date.now(),
+                              }),
+                          context,
+                      );
+
             await host.linkedSessions.send(
                 api.conversationId,
-                args,
-                `x.team.message:${api.taskId}:${api.callId}`,
+                { to: args.to, message: filed?.line ?? args.message },
+                key,
             );
 
-            return reply("Message sent. Do not send an acknowledgement or wait for a reply.");
+            return reply(
+                filed === undefined
+                    ? "Message sent. Do not send an acknowledgement or wait for a reply."
+                    : `Filed on ${filed.thread.id}. Your supervisor got 1 line. Do not send an acknowledgement or wait for a reply.`,
+            );
         },
     });
     const teamMemory = defineTool({
