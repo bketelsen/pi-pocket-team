@@ -17,7 +17,7 @@ import {
     until,
 } from "./_pocket/test/helpers.ts";
 import assert from "node:assert/strict";
-import { appendFileSync, cpSync, mkdirSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, cpSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
@@ -38,14 +38,24 @@ import {
     isStale,
     nextActor,
     parseStatus,
+    attachTo,
+    attribute,
+    buildQuery,
     FOUND_FOLDER_DELAY_MS,
+    parseGitHub,
+    prNext,
     scanText,
+    updatePrs,
+    type GitFacts,
+    type GitHubFacts,
+    type PrFact,
     SWEEP_SLEEP_MS,
     threadOfSession,
     type DeskState,
     type SeedRow,
     type Thread,
 } from "./desk.ts";
+import { taskTitle } from "./team.ts";
 
 // ─── The rules ───────────────────────────────────────────────────────────────
 
@@ -250,6 +260,20 @@ describe("seedThreads", () => {
         });
         assert.equal(Object.keys(state.threads).length, 1);
         assert.equal(state.threads.T1?.startedAt, 10);
+    });
+
+    test("a row gets its folder from the roster, and the seed sets the epoch", () => {
+        const state = empty();
+
+        seedThreads(state, rows(), {
+            hash: "abc",
+            supervisor: 9,
+            at: 10,
+            folders: { "frostyard/frostmail": "/work/frostmail" },
+        });
+
+        assert.equal(state.threads.T1?.cwd, "/work/frostmail");
+        assert.equal(state.epoch, 10);
     });
 
     test("another seed file is refused", () => {
@@ -536,6 +560,471 @@ describe("parseStatus", () => {
     });
 });
 
+// ─── GitHub ───────────────────────────────────────────────────────────────────
+
+const prFact = (patch: Partial<PrFact> = {}): PrFact => ({
+    ref: "frostyard/test#7",
+    repo: "frostyard/test",
+    number: 7,
+    title: "A fix",
+    url: "https://github.com/frostyard/test/pull/7",
+    state: "OPEN",
+    author: "github-viewer",
+    createdAt: 200,
+    headRefName: "fix-7",
+    isDraft: false,
+    mergeable: "MERGEABLE",
+    review: "APPROVED",
+    checks: "SUCCESS",
+    archived: false,
+    ...patch,
+});
+
+const githubOf = (
+    prs: PrFact[],
+    patch: { viewer?: string; archived?: boolean } = {},
+): GitHubFacts => ({
+    viewer: patch.viewer ?? "github-viewer",
+    repos: { "frostyard/test": { archived: patch.archived ?? false, open: prs } },
+    prs: {},
+});
+
+const deskOf = (): DeskState => ({
+    next: { T: 1, F: 1 },
+    threads: {},
+    grants: [],
+    seen: {},
+    epoch: 0,
+});
+
+const gitOf = (patch: Partial<GitFacts> = {}): GitFacts => ({
+    supervisor: 1,
+    authors: [],
+    branches: {},
+    ...patch,
+});
+
+/** A thread of supervisor 1, open at `at`, with its session bound. */
+const placed = (state: DeskState, at: number): Thread => {
+    const opened = openThread(state, {
+        key: `k-${String(at)}`,
+        supervisor: 1,
+        agents: ["duncan"],
+        repo: "frostyard/test",
+        cwd: "/work/test",
+        title: `At ${String(at)}`,
+        at,
+    });
+
+    bindThread(state, opened.thread.key, {
+        session: 50 + at,
+        address: `session-${String(at)}`,
+        at,
+    });
+
+    return opened.thread;
+};
+
+describe("buildQuery", () => {
+    test("one query with repositories and pinned PRs, and nothing else", () => {
+        const query = buildQuery(["frostyard/test"], ["frostyard/test#7"]);
+
+        assert.match(query, /^query \{/);
+        assert.match(query, /viewer \{ login \}/);
+        assert.match(query, /r0: repository\(owner: "frostyard", name: "test"\)/);
+        assert.match(query, /p0: repository\(owner: "frostyard", name: "test"\)/);
+        assert.match(query, /pullRequest\(number: 7\)/);
+        assert.match(query, /pullRequests\(states: OPEN, first: 50/);
+    });
+
+    test("refuses a name or a number that is not strict", () => {
+        for (const repo of ["frostyard", "own er/repo", "a/b/c", "", "o/r#1", "o/r)\n}", "-o/r"]) {
+            assert.throws(() => buildQuery([repo], []), /Not a repository name/, repo);
+        }
+
+        for (const ref of ["o/r#0", "o/r#x", "o/r#-1", "o/r#1x", "o/r", "o/r#", "a/b/c#1"]) {
+            assert.throws(() => buildQuery([], [ref]), /Not a PR ref/, ref);
+        }
+    });
+});
+
+describe("parseGitHub", () => {
+    const fixture = {
+        data: {
+            viewer: { login: "github-viewer" },
+            r0: {
+                nameWithOwner: "frostyard/test",
+                isArchived: false,
+                pullRequests: {
+                    nodes: [
+                        {
+                            number: 7,
+                            title: "Fix it",
+                            url: "https://github.com/frostyard/test/pull/7",
+                            state: "OPEN",
+                            isDraft: false,
+                            createdAt: "2026-10-20T10:00:00Z",
+                            headRefName: "fix-7",
+                            mergeable: "MERGEABLE",
+                            reviewDecision: "APPROVED",
+                            author: { login: "github-viewer" },
+                            commits: {
+                                nodes: [{ commit: { statusCheckRollup: { state: "SUCCESS" } } }],
+                            },
+                        },
+                        {
+                            number: 8,
+                            title: "Draft",
+                            state: "OPEN",
+                            isDraft: true,
+                            author: { login: "github-viewer" },
+                        },
+                        {
+                            number: 9,
+                            title: "Bump it",
+                            state: "OPEN",
+                            author: { login: "dependabot[bot]" },
+                        },
+                    ],
+                },
+            },
+            r1: null,
+            r2: {
+                nameWithOwner: "frostyard/old",
+                isArchived: true,
+                pullRequests: { nodes: [] },
+            },
+            p0: {
+                nameWithOwner: "frostyard/test",
+                isArchived: false,
+                pullRequest: {
+                    number: 6,
+                    title: "Merged one",
+                    state: "MERGED",
+                    createdAt: "2026-10-19T10:00:00Z",
+                },
+            },
+        },
+    };
+
+    test("reads the viewer, each repository, and each pinned PR; a null repo is skipped", () => {
+        const facts = parseGitHub(fixture);
+
+        assert.equal(facts.viewer, "github-viewer");
+        assert.equal(facts.repos["frostyard/test"]?.open.length, 3);
+        assert.equal(facts.repos["frostyard/old"]?.archived, true);
+        assert.equal(facts.repos["frostyard/old"]?.open.length, 0);
+        assert.equal(Object.keys(facts.repos).length, 2, "a null repository is skipped");
+
+        const fix = facts.repos["frostyard/test"]?.open[0];
+
+        assert.equal(fix?.ref, "frostyard/test#7");
+        assert.equal(fix?.review, "APPROVED");
+        assert.equal(fix?.checks, "SUCCESS");
+        assert.equal(fix?.createdAt, Date.parse("2026-10-20T10:00:00Z"));
+        assert.equal(facts.repos["frostyard/test"]?.open[1]?.isDraft, true);
+        assert.equal(
+            facts.repos["frostyard/test"]?.open[2]?.author,
+            "dependabot[bot]",
+            "another author is kept, not dropped",
+        );
+        assert.equal(facts.prs["frostyard/test#6"]?.state, "MERGED");
+    });
+
+    test("tolerates missing nodes and a missing viewer", () => {
+        const facts = parseGitHub({ data: { r0: { nameWithOwner: "o/r", isArchived: false } } });
+
+        assert.deepEqual(facts.repos["o/r"], { archived: false, open: [] });
+        assert.equal(facts.viewer, "");
+    });
+});
+
+describe("prNext", () => {
+    test("each state and review", () => {
+        for (const [patch, next] of [
+            [{ state: "MERGED" }, "none"],
+            [{ state: "CLOSED" }, "none"],
+            [{ state: "FROZEN" }, "none"],
+            [{ isDraft: true }, "agent"],
+            [{ mergeable: "CONFLICTING" }, "agent"],
+            [{ checks: "FAILURE" }, "agent"],
+            [{ checks: "ERROR" }, "agent"],
+            [{ review: "CHANGES_REQUESTED" }, "agent"],
+            [{ review: "REVIEW_REQUIRED" }, "reviewer"],
+            [{}, "brian"],
+            [{ review: "APPROVED" }, "brian"],
+        ] as [object, string][]) {
+            assert.equal(prNext(patch), next, JSON.stringify(patch));
+        }
+    });
+});
+
+describe("attribute", () => {
+    test("a PR the thread read, made while it ran, is attached by seen", () => {
+        const state = deskOf();
+        const thread = placed(state, 100);
+
+        thread.run.seenPrs = ["frostyard/test#7"];
+
+        const events = attribute(state, githubOf([prFact()]), gitOf(), 300).events;
+        const link = thread.prs["frostyard/test#7"];
+
+        assert.equal(link?.via, "seen");
+        assert.equal(link?.state, "OPEN");
+        assert.equal(link?.next, "brian");
+        assert(events > 0);
+        assert.equal(state.others?.["frostyard/test"], 0);
+    });
+
+    test("an older PR the thread read needs its branch; else nothing", () => {
+        const state = deskOf();
+
+        state.epoch = 100_000;
+        const thread = placed(state, 300);
+
+        thread.run.seenPrs = ["frostyard/test#7"];
+        attribute(state, githubOf([prFact()]), gitOf(), 400);
+        assert.equal(Object.keys(thread.prs).length, 0);
+
+        thread.branches = ["fix-7"];
+        attribute(state, githubOf([prFact()]), gitOf(), 500);
+
+        assert.equal(thread.prs["frostyard/test#7"]?.via, "seen");
+    });
+
+    test("a newer thread that pushed the branch takes the PR from an older thread", () => {
+        const state = deskOf();
+        const older = placed(state, 100);
+        const newer = placed(state, 300);
+
+        older.prs["frostyard/test#7"] = { via: "attached" };
+        newer.run.seenPrs = ["frostyard/test#7"];
+        newer.branches = ["fix-7"];
+
+        attribute(state, githubOf([prFact()]), gitOf(), 400);
+
+        assert.equal(older.prs["frostyard/test#7"], undefined);
+        assert.equal(newer.prs["frostyard/test#7"]?.via, "seen");
+        assert.match(
+            older.events.map((event) => event.text).join("; "),
+            /frostyard\/test#7 moved to T2/,
+        );
+        assert.match(
+            newer.events.map((event) => event.text).join("; "),
+            /frostyard\/test#7 moved from T1/,
+        );
+    });
+
+    test("the branch rule: a local branch the thread made, and exactly one thread", () => {
+        const state = deskOf();
+        const thread = placed(state, 100);
+
+        thread.branches = ["fix-7"];
+        attribute(state, githubOf([prFact({ createdAt: 50 })]), gitOf(), 400);
+        assert.equal(thread.prs["frostyard/test#7"]?.via, "branch");
+
+        // More than one thread matches: no attach by this rule, and the window has two too.
+        const state2 = deskOf();
+        const first = placed(state2, 100);
+        const second = placed(state2, 200);
+
+        first.branches = ["fix-7"];
+        second.branches = ["fix-7"];
+        attribute(state2, githubOf([prFact({ createdAt: 300 })]), gitOf(), 400);
+
+        assert.equal(Object.keys(first.prs).length, 0);
+        assert.equal(Object.keys(second.prs).length, 0);
+        assert.equal(state2.threads.F1?.origin, "found");
+    });
+
+    test("the branch rule reads the reflog too", () => {
+        const state = deskOf();
+        const thread = placed(state, 100);
+
+        attribute(
+            state,
+            githubOf([prFact({ createdAt: 50 })]),
+            gitOf({ branches: { "/work/test": { "fix-7": 150 } } }),
+            400,
+        );
+
+        assert.equal(thread.prs["frostyard/test#7"]?.via, "branch");
+    });
+
+    test("the window rule: exactly one thread in that repository was open", () => {
+        const state = deskOf();
+        const thread = placed(state, 100);
+
+        attribute(state, githubOf([prFact({ createdAt: 200 })]), gitOf(), 400);
+
+        assert.equal(thread.prs["frostyard/test#7"]?.via, "window");
+    });
+
+    test("2 threads in 1 repo, no seen and no branch: no window attach, a found thread", () => {
+        const state = deskOf();
+
+        placed(state, 100);
+        placed(state, 200);
+        attribute(state, githubOf([prFact({ createdAt: 300 })]), gitOf(), 400);
+
+        assert.equal(Object.keys(state.threads.T1?.prs ?? {}).length, 0);
+        assert.equal(Object.keys(state.threads.T2?.prs ?? {}).length, 0);
+        const found = state.threads.F1;
+
+        assert.equal(found?.origin, "found");
+        assert.equal(found?.key, "found:pr:frostyard/test#7");
+        assert.equal(found?.prs["frostyard/test#7"]?.via, "attached");
+        assert.equal(found?.run.next, "odrade");
+        assert.equal(found?.title, "A fix");
+    });
+
+    test("a dependabot PR is counted, never a candidate; the config file's authors are ours", () => {
+        const state = deskOf();
+        const thread = placed(state, 100);
+
+        attribute(
+            state,
+            githubOf([
+                prFact({ author: "dependabot[bot]", number: 9, ref: "frostyard/test#9" }),
+                prFact({ author: "github-viewer" }),
+            ]),
+            gitOf(),
+            400,
+        );
+
+        assert.equal(thread.prs["frostyard/test#9"], undefined);
+        assert.equal(state.others?.["frostyard/test"], 1);
+        assert.equal(thread.prs["frostyard/test#7"]?.via, "window");
+
+        const state2 = deskOf();
+        const thread2 = placed(state2, 100);
+
+        attribute(
+            state2,
+            githubOf([prFact({ author: "machine-user" })]),
+            gitOf({ authors: ["machine-user"] }),
+            400,
+        );
+
+        assert.equal(thread2.prs["frostyard/test#7"]?.via, "window");
+        assert.equal(state2.others?.["frostyard/test"], 0);
+    });
+
+    test("an archived repository attaches nothing; an attached PR becomes FROZEN", () => {
+        const state = deskOf();
+        const thread = placed(state, 100);
+
+        attribute(state, githubOf([prFact()], { archived: true }), gitOf(), 400);
+        assert.equal(Object.keys(thread.prs).length, 0);
+        assert.equal(state.threads.F1, undefined);
+
+        thread.prs["frostyard/test#7"] = {
+            via: "attached",
+            state: "OPEN",
+            next: "brian",
+        };
+        const events = updatePrs(thread, githubOf([prFact()], { archived: true }), 500);
+
+        assert.equal(thread.prs["frostyard/test#7"]?.state, "FROZEN");
+        assert.equal(thread.prs["frostyard/test#7"]?.next, "none");
+        assert(events > 0);
+    });
+
+    test("a PR older than the epoch makes no found thread", () => {
+        const state = deskOf();
+
+        state.epoch = 300;
+        attribute(state, githubOf([prFact({ createdAt: 200 })]), gitOf(), 400);
+        assert.equal(state.threads.F1, undefined);
+
+        const state2 = deskOf();
+
+        state2.epoch = 100;
+        attribute(state2, githubOf([prFact({ createdAt: 200 })]), gitOf(), 400);
+        assert.equal(state2.threads.F1?.origin, "found");
+    });
+});
+
+describe("attachTo", () => {
+    test("a PR ref moves to the target, with an event on both threads", () => {
+        const state = deskOf();
+        const older = placed(state, 100);
+        const target = placed(state, 200);
+
+        older.prs["frostyard/test#7"] = { via: "seen", state: "OPEN" };
+        const result = attachTo(state, "frostyard/test#7", target.id, 300);
+
+        assert("text" in result);
+        assert.equal(older.prs["frostyard/test#7"], undefined);
+        assert.equal(target.prs["frostyard/test#7"]?.via, "attached");
+        assert.equal(target.prs["frostyard/test#7"]?.state, "OPEN");
+        assert.match(older.events.map((event) => event.text).join("; "), /moved to T2/);
+        assert.match(
+            target.events.map((event) => event.text).join("; "),
+            /frostyard\/test#7 attached/,
+        );
+    });
+
+    test("a thread id moves its work and its address, and closes it as dropped", () => {
+        const state = deskOf();
+        const source = placed(state, 100);
+        const target = placed(state, 200);
+
+        source.prs["frostyard/test#7"] = { via: "seen" };
+        source.run.folder = "/work/found";
+        target.address = "session-target";
+        const result = attachTo(state, source.id, target.id, 300);
+
+        assert("text" in result);
+        assert.equal(target.prs["frostyard/test#7"]?.via, "seen");
+        assert.deepEqual(source.prs, {});
+        assert.equal(target.address, "session-target", "the target keeps its own address");
+        assert.equal(target.run.folder, "/work/found");
+        assert.equal(source.state, "closed");
+        assert.deepEqual(source.closed && { why: source.closed.why, by: source.closed.by }, {
+            why: "dropped",
+            by: "desk",
+        });
+        assert.match(source.events.map((event) => event.text).join("; "), /merged into T2/);
+    });
+
+    test("a closed target is refused, and a second call changes nothing", () => {
+        const state = deskOf();
+        const source = placed(state, 100);
+        const target = placed(state, 200);
+
+        target.state = "closed";
+
+        const refused = attachTo(state, source.id, target.id, 300);
+
+        assert("error" in refused);
+
+        target.state = "open";
+
+        const first = attachTo(state, source.id, target.id, 300);
+
+        assert("text" in first);
+
+        const events = target.events.length;
+        const second = attachTo(state, source.id, target.id, 400);
+
+        assert("text" in second);
+        assert.match(second.text, /closed/);
+        assert.equal(target.events.length, events, "the replay adds no event");
+    });
+});
+
+describe("taskTitle", () => {
+    test("first non-empty line, without a leading Task, Goal, or Title", () => {
+        assert.equal(taskTitle("Task: pilothouse: CI fixes"), "pilothouse: CI fixes");
+        assert.equal(taskTitle("\n  Goal: ship it  \nmore"), "ship it");
+        assert.equal(taskTitle("title: A thing"), "A thing");
+        assert.equal(taskTitle("Plain line\nsecond"), "Plain line");
+        assert.equal(taskTitle("   "), "");
+        assert.equal(taskTitle("x".repeat(200)).length, 120);
+    });
+});
+
 // ─── The short line ───────────────────────────────────────────────────────────
 
 describe("shortLine", () => {
@@ -661,6 +1150,12 @@ const model = scriptedModel((request) => {
         return call("desk", { action: "sync" });
     }
 
+    if (text.endsWith("desk pr test")) {
+        return answer(
+            "Opened https://github.com/frostyard/pilothouse/pull/212 — the CI fix is in.",
+        );
+    }
+
     if (text.endsWith("desk seed test")) {
         return call("desk", { action: "seed", path: seedPath });
     }
@@ -694,6 +1189,31 @@ const model = scriptedModel((request) => {
         });
     }
 
+    if (text.endsWith("desk titled delegate test")) {
+        return call("team_delegate", {
+            agent: "duncan",
+            repository: "frostyard/test",
+            task: TASK,
+            title: "pilothouse: CI fixes",
+        });
+    }
+
+    if (text.endsWith("desk plain title test")) {
+        return call("team_delegate", {
+            agent: "duncan",
+            repository: "frostyard/test",
+            task: "Task: 2 items that Brian decided on 2026-10-22.",
+        });
+    }
+
+    if (text.endsWith("desk delegate pilothouse test")) {
+        return call("team_delegate", {
+            agent: "duncan",
+            repository: "frostyard/pilothouse",
+            task: TASK,
+        });
+    }
+
     if (text.endsWith("desk delegate gurney test")) {
         return call("team_delegate", {
             agent: "gurney",
@@ -718,6 +1238,44 @@ const old = join(root, "old");
 const fresh = join(root, "new");
 /** A roster folder that is dirty for one sweep only. */
 const brief = join(root, "brief");
+/** Where the fake `gh` reads its JSON, and the desk's config file: both in the test folder. */
+const fixturePath = join(root, "github.json");
+const configPath = join(root, "desk.json");
+const fakeGh = join(root, "fake-gh.sh");
+
+/** A `gh api graphql` answer for frostyard/pilothouse. */
+const githubFixture = (
+    prs: {
+        number: number;
+        author?: string;
+        state?: string;
+        createdAt?: string;
+        title?: string;
+    }[],
+) => ({
+    data: {
+        viewer: { login: "github-viewer" },
+        r0: {
+            nameWithOwner: "frostyard/pilothouse",
+            isArchived: false,
+            pullRequests: {
+                nodes: prs.map((pr) => ({
+                    number: pr.number,
+                    title: pr.title ?? `PR ${String(pr.number)}`,
+                    url: `https://github.com/frostyard/pilothouse/pull/${String(pr.number)}`,
+                    state: pr.state ?? "OPEN",
+                    isDraft: false,
+                    createdAt: pr.createdAt ?? new Date().toISOString(),
+                    headRefName: `pr-${String(pr.number)}`,
+                    mergeable: "MERGEABLE",
+                    reviewDecision: "APPROVED",
+                    author: { login: pr.author ?? "github-viewer" },
+                    commits: { nodes: [{ commit: { statusCheckRollup: { state: "SUCCESS" } } }] },
+                })),
+            },
+        },
+    },
+});
 /** The app's clock is this far ahead: the sweeper test moves it past its sleep. */
 let shift = 0;
 
@@ -761,7 +1319,7 @@ before(async () => {
     );
     writeFileSync(
         join(definitions, "duncan.md"),
-        `---\nmodel: faux/faux-2\nrepositories:\n  frostyard/test: ${repo}\n---\n# Duncan Idaho\nYou are Duncan Idaho. Own the test repository.`,
+        `---\nmodel: faux/faux-2\nrepositories:\n  frostyard/test: ${repo}\n  frostyard/pilothouse: ${repo}\n---\n# Duncan Idaho\nYou are Duncan Idaho. Own the test repository.`,
     );
     writeFileSync(
         join(definitions, "paul.md"),
@@ -790,6 +1348,13 @@ before(async () => {
     cpSync(join(import.meta.dirname, "night-shift-web"), join(dropIns, "night-shift-web"), {
         recursive: true,
     });
+    // A fake `gh`: every sweep reads this fixture, and nothing goes to GitHub. The config file starts absent.
+    writeFileSync(fixturePath, JSON.stringify({ data: { viewer: { login: "github-viewer" } } }));
+    writeFileSync(fakeGh, `#!/bin/sh\ncat ${JSON.stringify(fixturePath)}\n`);
+    chmodSync(fakeGh, 0o755);
+    process.env.PI_POCKET_DESK_GH = fakeGh;
+    process.env.PI_POCKET_DESK_CONFIG = configPath;
+
     app = await openApp(model, dataDir, () => Date.now() + shift);
     await app.setExtensionEnabled(owner(app), "team.ts", true);
     await app.setExtensionEnabled(owner(app), "desk.ts", true);
@@ -865,6 +1430,13 @@ async function stopSweepers(): Promise<void> {
 async function restartApp(by: number): Promise<void> {
     await app.close();
     shift = by;
+    // A fake `gh`: every sweep reads this fixture, and nothing goes to GitHub. The config file starts absent.
+    writeFileSync(fixturePath, JSON.stringify({ data: { viewer: { login: "github-viewer" } } }));
+    writeFileSync(fakeGh, `#!/bin/sh\ncat ${JSON.stringify(fixturePath)}\n`);
+    chmodSync(fakeGh, 0o755);
+    process.env.PI_POCKET_DESK_GH = fakeGh;
+    process.env.PI_POCKET_DESK_CONFIG = configPath;
+
     app = await openApp(model, dataDir, () => Date.now() + shift);
 }
 
@@ -1199,6 +1771,103 @@ describe("the desk in a Pi Pocket", () => {
         );
     });
 
+    test("a PR URL in the session's answer is attached by seen; merged, it closes the thread", async () => {
+        await stopSweepers();
+        const { source, linked, thread } = await delegated(
+            "github",
+            "desk delegate pilothouse test",
+        );
+
+        try {
+            // The session's answer holds the PR's URL; the next sweep reads it.
+            await say(app, linked, "desk pr test");
+
+            // A machine account counts as ours: its PR is a candidate too.
+            writeFileSync(configPath, JSON.stringify({ authors: ["machine-user"] }));
+            writeFileSync(
+                fixturePath,
+                JSON.stringify(
+                    githubFixture([
+                        {
+                            number: 212,
+                            createdAt: new Date(Number(thread.startedAt) + 60_000).toISOString(),
+                        },
+                        {
+                            number: 213,
+                            author: "machine-user",
+                            createdAt: new Date(Number(thread.startedAt) + 120_000).toISOString(),
+                        },
+                    ]),
+                ),
+            );
+
+            await say(app, source, "desk sync test");
+
+            const attached = (await deskState())?.threads[thread.id];
+
+            assert.equal(attached?.prs["frostyard/pilothouse#212"]?.via, "seen");
+            assert.equal(attached?.prs["frostyard/pilothouse#212"]?.state, "OPEN");
+            assert.equal(attached?.prs["frostyard/pilothouse#213"]?.via, "window");
+            assert.equal((await deskState())?.others?.["frostyard/pilothouse"], 0);
+
+            await say(app, linked, "report to supervisor test");
+            await until(() => !app.isBusy(linked), "the report's turn", 20_000);
+            writeFileSync(
+                fixturePath,
+                JSON.stringify(
+                    githubFixture([
+                        { number: 212, state: "MERGED" },
+                        { number: 213, author: "machine-user", state: "MERGED" },
+                        { number: 214, author: "dependabot[bot]" },
+                    ]),
+                ),
+            );
+            await say(app, source, "desk sync test");
+
+            const closed = (await deskState())?.threads[thread.id];
+
+            assert.equal(closed?.state, "closed");
+            assert.equal(closed?.closed?.why, "done");
+            assert.equal(closed?.prs["frostyard/pilothouse#212"]?.state, "MERGED");
+            assert.equal((await deskState())?.others?.["frostyard/pilothouse"], 1);
+            assert.equal(closed?.prs["frostyard/pilothouse#214"], undefined);
+        } finally {
+            writeFileSync(
+                fixturePath,
+                JSON.stringify({ data: { viewer: { login: "github-viewer" } } }),
+            );
+            rmSync(configPath, { force: true });
+        }
+    });
+
+    test("team_delegate titles the thread and the session, given or from the task", async () => {
+        const source = await supervisor("titles");
+
+        await say(app, source, "desk titled delegate test");
+        const titled = app.sessions().find((each) => each.linkedFrom?.id === Number(source));
+
+        assert(titled);
+        const thread = threadOfSession(await deskState(), Number(titled.id));
+
+        assert.equal(thread?.title, "pilothouse: CI fixes");
+        assert.equal(titled.title, "Duncan Idaho: pilothouse: CI fixes");
+
+        await say(app, source, "desk plain title test");
+        const plain = app
+            .sessions()
+            .find(
+                (each) =>
+                    each.linkedFrom?.id === Number(source) &&
+                    each.title === "Duncan Idaho: 2 items that Brian decided on 2026-10-22.",
+            );
+
+        assert(plain);
+        const other = threadOfSession(await deskState(), Number(plain.id));
+
+        assert.equal(other?.title, "2 items that Brian decided on 2026-10-22.");
+        assert.equal(plain.title, "Duncan Idaho: 2 items that Brian decided on 2026-10-22.");
+    });
+
     test("a folder that becomes dirty later is found after 5 minutes, once", async () => {
         // The app's clock moves here: no sweeper of an earlier test may wake and see the folder too.
         await stopSweepers();
@@ -1354,6 +2023,16 @@ describe("the desk in a Pi Pocket", () => {
         // A restart past the sleep: the sweeper wakes, closes the thread, and ends.
         await app.close();
         shift = SWEEP_SLEEP_MS + 60_000;
+        // A fake `gh`: every sweep reads this fixture, and nothing goes to GitHub. The config file starts absent.
+        writeFileSync(
+            fixturePath,
+            JSON.stringify({ data: { viewer: { login: "github-viewer" } } }),
+        );
+        writeFileSync(fakeGh, `#!/bin/sh\ncat ${JSON.stringify(fixturePath)}\n`);
+        chmodSync(fakeGh, 0o755);
+        process.env.PI_POCKET_DESK_GH = fakeGh;
+        process.env.PI_POCKET_DESK_CONFIG = configPath;
+
         app = await openApp(model, dataDir, () => Date.now() + shift);
 
         try {

@@ -17,7 +17,8 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
-import { isAbsolute } from "node:path";
+import { homedir } from "node:os";
+import { isAbsolute, join } from "node:path";
 import { promisify } from "node:util";
 import type { Context, JsonValue } from "@earendil-works/chord";
 import { Type } from "@earendil-works/pi-ai";
@@ -67,8 +68,23 @@ const REVIEWER_STALE_MS = 7 * 24 * 3600_000;
 export const SWEEP_SLEEP_MS = 10 * 60_000;
 /** How long a roster folder must stay dirty or ahead before the sweep makes a found thread: a short dirty moment is not work. */
 export const FOUND_FOLDER_DELAY_MS = 5 * 60_000;
+/** A branch name that may go into a git command. */
+const BRANCH_NAME = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,200}$/;
 
 // ─── Stored state ────────────────────────────────────────────────────────────
+
+/** One attached PR: how it was attached, and what GitHub said about it. */
+export type PrLink = {
+    via: "seen" | "branch" | "window" | "attached";
+    /** FROZEN: its repository is archived. */
+    state?: "OPEN" | "MERGED" | "CLOSED" | "FROZEN";
+    next?: string;
+    title?: string;
+    url?: string;
+    review?: string;
+    checks?: string;
+    mergeable?: string;
+};
 
 /** One piece of work the team runs. Stored data: never rename a field or change what it means. */
 export type Thread = {
@@ -96,10 +112,7 @@ export type Thread = {
     keptAt?: number;
     closed?: { at: number; why: "done" | "dropped" | "failed"; by: "sweep" | "brian" | "desk" };
     /** Key "owner/name#n". */
-    prs: Record<
-        string,
-        { via: "seen" | "branch" | "window" | "attached"; state?: string; next?: string }
-    >;
+    prs: Record<string, PrLink>;
     branches: string[];
     /** Ask ids "T13a", "T13b", ... */
     asks: {
@@ -135,6 +148,10 @@ export type DeskState = {
     seen: Record<string, number>;
     /** Each supervisor's live sweeper task id, by conversation id. */
     sweepers?: Record<string, string>;
+    /** When the desk began: a PR older than this enters only through the seed. Set at the seed, else at the first sweep. */
+    epoch?: number;
+    /** Open PRs per repository that are not ours: dependabot, and other people. */
+    others?: Record<string, number>;
     /**
      * What a supervisor's first sweep saw. Old work never becomes a found thread: only the seed brings it in. A folder
      * leaves `folders` when it is clean. `pending` holds the folders that have been dirty since a sweep first saw them,
@@ -466,7 +483,13 @@ export function parseSeed(text: string): { threads: SeedRow[] } | { error: strin
     return { threads };
 }
 
-export type SeedOptions = { hash: string; supervisor: number; at: number };
+export type SeedOptions = {
+    hash: string;
+    supervisor: number;
+    at: number;
+    /** Repository names from the roster, with their folders: a seeded thread gets its folder from here. */
+    folders?: Record<string, string>;
+};
 
 /**
  * Import the rows once, keyed by the seed file's hash. A second import of the same file changes nothing; another seed
@@ -493,6 +516,9 @@ export function seedThreads(
         return { error: `These thread ids are taken: ${taken.join(", ")}.` };
     }
 
+    // The desk begins at the seed: an older PR enters only through a row.
+    state.epoch ??= options.at;
+
     let highest = 0;
 
     for (const row of rows) {
@@ -503,6 +529,9 @@ export function seedThreads(
             title: row.title,
             agents: [...row.agents],
             ...(row.repo === undefined ? {} : { repo: row.repo }),
+            ...(row.repo === undefined || options.folders?.[row.repo] === undefined
+                ? {}
+                : { cwd: options.folders[row.repo] }),
             supervisor: options.supervisor,
             ...(row.session === undefined ? {} : { address: row.session }),
             state: row.mark === "park" ? "parked" : "open",
@@ -706,12 +735,21 @@ export function nextActor(thread: Thread): NextActor {
         return "brian";
     }
 
+    const openPrs = Object.values(thread.prs)
+        .map((pr) => prNext(pr))
+        .filter((next) => next !== "none");
+
+    if (openPrs.includes("brian")) {
+        return "brian";
+    }
+
     const busy = thread.run.busy === true;
     const dirty = (numberOr(thread.run.dirty) ?? 0) > 0;
     const ahead = (numberOr(thread.run.ahead) ?? 0) > 0;
     const shift = thread.run.shift;
+    const shiftOpen = typeof shift === "string" && shift !== "ended";
 
-    if (busy || dirty || ahead || shift === "running" || shift === "summary") {
+    if (busy || dirty || ahead || shiftOpen || openPrs.includes("agent")) {
         return "agent";
     }
 
@@ -724,7 +762,23 @@ export function nextActor(thread: Thread): NextActor {
     const last = numberOr(thread.run.lastUserEntry);
     const silent = reported === undefined || reported !== last;
 
-    return thread.run.busy === false && !archived && silent ? "odrade" : "none";
+    if (thread.run.busy === false && !archived && silent) {
+        return "odrade";
+    }
+
+    // Every open part is a PR that waits on a reviewer: the session, the folder, and the night shift are closed.
+    if (
+        openPrs.length > 0 &&
+        openPrs.every((next) => next === "reviewer") &&
+        openSession(thread) === undefined &&
+        !shiftOpen &&
+        !dirty &&
+        !ahead
+    ) {
+        return "reviewer";
+    }
+
+    return "none";
 }
 
 /** No event for 3 days (7 for a reviewer wait); closed threads are never stale. */
@@ -736,6 +790,614 @@ export function isStale(thread: Thread, now: number): boolean {
     const then = Math.max(thread.lastEventAt, thread.keptAt ?? 0);
 
     return now - then > (thread.run.next === "reviewer" ? REVIEWER_STALE_MS : STALE_MS);
+}
+
+// ─── GitHub ─────────────────────────────────────────────────────────────────
+
+/** The repository of a PR ref: "owner/name#12" → "owner/name". */
+export const repoOf = (ref: string): string => ref.slice(0, Math.max(0, ref.lastIndexOf("#")));
+
+/** The repositories a thread works in: its own, and those of its PRs. */
+export function threadRepos(thread: Thread): string[] {
+    const repos = new Set<string>();
+
+    if (thread.repo !== undefined) {
+        repos.add(thread.repo);
+    }
+
+    for (const ref of Object.keys(thread.prs)) {
+        repos.add(repoOf(ref));
+    }
+
+    return [...repos];
+}
+
+/** What a PR needs next: nobody, the agent, a reviewer, or Brian. */
+export type PrNext = "none" | "agent" | "reviewer" | "brian";
+
+/** One PR's next actor. A draft PR waits on its agent; a merged, closed or frozen one is done. */
+export function prNext(pr: {
+    state?: string;
+    mergeable?: string;
+    checks?: string;
+    review?: string;
+    isDraft?: boolean;
+}): PrNext {
+    if (pr.state === "MERGED" || pr.state === "CLOSED" || pr.state === "FROZEN") {
+        return "none";
+    }
+
+    if (pr.isDraft === true) {
+        return "agent";
+    }
+
+    if (
+        pr.mergeable === "CONFLICTING" ||
+        pr.checks === "FAILURE" ||
+        pr.checks === "ERROR" ||
+        pr.review === "CHANGES_REQUESTED"
+    ) {
+        return "agent";
+    }
+
+    return pr.review === "REVIEW_REQUIRED" ? "reviewer" : "brian";
+}
+
+/** One PR as a sweep read it. Stored only through a thread's `prs`, never as itself. */
+export type PrFact = {
+    ref: string;
+    repo: string;
+    number: number;
+    title: string;
+    url: string;
+    state: "OPEN" | "MERGED" | "CLOSED";
+    author: string;
+    createdAt: number;
+    headRefName: string;
+    isDraft: boolean;
+    mergeable: string;
+    review: string;
+    checks: string;
+    archived: boolean;
+};
+
+/** What one GitHub read says. */
+export type GitHubFacts = {
+    viewer: string;
+    repos: Record<string, { archived: boolean; open: PrFact[] }>;
+    prs: Record<string, PrFact>;
+};
+
+const OWNER_NAME = /^[A-Za-z0-9][A-Za-z0-9_.-]*$/;
+const REF = /^([A-Za-z0-9][A-Za-z0-9_.-]*\/[A-Za-z0-9][A-Za-z0-9_.-]*)#([1-9][0-9]*)$/;
+
+function splitRepo(repo: string): { owner: string; name: string } {
+    const parts = repo.split("/");
+
+    if (
+        parts.length !== 2 ||
+        !OWNER_NAME.test(parts[0] ?? "") ||
+        !OWNER_NAME.test(parts[1] ?? "")
+    ) {
+        throw new Error(`Not a repository name: ${repo}. It must be "owner/name".`);
+    }
+
+    return { owner: parts[0]!, name: parts[1]! };
+}
+
+function splitRef(ref: string): { repo: string; number: number } {
+    const match = REF.exec(ref);
+
+    if (match === null) {
+        throw new Error(`Not a PR ref: ${ref}. It must be "owner/name#12".`);
+    }
+
+    return { repo: match[1]!, number: Number(match[2]) };
+}
+
+const PR_FIELDS =
+    "number title url state isDraft createdAt mergedAt closedAt headRefName mergeable reviewDecision author { login } commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }";
+
+/**
+ * The one GraphQL query of a sweep: the viewer, each repository's open PRs, and each attached PR by number. Every
+ * owner, name, and number is checked first: nothing else goes into the query.
+ */
+export function buildQuery(repos: string[], prs: string[]): string {
+    const lines = ["query {", "  viewer { login }"];
+
+    for (const [index, repo] of [...new Set(repos)].entries()) {
+        const { owner, name } = splitRepo(repo);
+
+        lines.push(
+            `  r${String(index)}: repository(owner: ${JSON.stringify(owner)}, name: ${JSON.stringify(name)}) {`,
+            "    nameWithOwner",
+            "    isArchived",
+            "    pullRequests(states: OPEN, first: 50, orderBy: {field: CREATED_AT, direction: DESC}) {",
+            `      nodes { ${PR_FIELDS} }`,
+            "    }",
+            "  }",
+        );
+    }
+
+    for (const [index, ref] of [...new Set(prs)].entries()) {
+        const { repo, number } = splitRef(ref);
+        const { owner, name } = splitRepo(repo);
+
+        lines.push(
+            `  p${String(index)}: repository(owner: ${JSON.stringify(owner)}, name: ${JSON.stringify(name)}) {`,
+            "    nameWithOwner",
+            "    isArchived",
+            `    pullRequest(number: ${String(number)}) { ${PR_FIELDS} }`,
+            "  }",
+        );
+    }
+
+    lines.push("}");
+
+    return lines.join("\n");
+}
+
+const text = (value: unknown): string => (typeof value === "string" ? value : "");
+
+const milliseconds = (value: unknown): number => {
+    const at = typeof value === "string" ? Date.parse(value) : Number.NaN;
+
+    return Number.isFinite(at) ? at : 0;
+};
+
+function prFact(
+    node: Record<string, unknown>,
+    repo: string,
+    archived: boolean,
+): PrFact | undefined {
+    const number = typeof node.number === "number" ? node.number : undefined;
+
+    if (number === undefined) {
+        return undefined;
+    }
+
+    const commits = (node.commits as { nodes?: unknown } | undefined)?.nodes;
+    const first = Array.isArray(commits)
+        ? (commits[0] as
+              { commit?: { statusCheckRollup?: { state?: unknown } } | undefined } | undefined)
+        : undefined;
+    const state = text(node.state).toUpperCase();
+
+    return {
+        ref: `${repo}#${String(number)}`,
+        repo,
+        number,
+        title: text(node.title),
+        url: text(node.url),
+        state: state === "MERGED" || state === "CLOSED" ? state : "OPEN",
+        author: text((node.author as { login?: unknown } | null | undefined)?.login),
+        createdAt: milliseconds(node.createdAt),
+        headRefName: text(node.headRefName),
+        isDraft: node.isDraft === true,
+        mergeable: text(node.mergeable),
+        review: text(node.reviewDecision),
+        checks: text(first?.commit?.statusCheckRollup?.state),
+        archived,
+    };
+}
+
+/** `gh api graphql`'s JSON as facts. A null repository, or a PR that is gone, is skipped. */
+export function parseGitHub(json: unknown): GitHubFacts {
+    const data = (json as { data?: unknown } | null | undefined)?.data;
+    const root = (data ?? json) as Record<string, unknown> | undefined;
+    const viewer = text((root?.viewer as { login?: unknown } | undefined)?.login);
+    const repos: GitHubFacts["repos"] = {};
+    const prs: GitHubFacts["prs"] = {};
+
+    for (const [alias, value] of Object.entries(root ?? {})) {
+        if (!/^[rp][0-9]+$/.test(alias)) {
+            continue;
+        }
+
+        const node = value as
+            | {
+                  nameWithOwner?: unknown;
+                  isArchived?: unknown;
+                  pullRequests?: { nodes?: unknown };
+                  pullRequest?: unknown;
+              }
+            | null
+            | undefined;
+
+        if (node === null || typeof node !== "object") {
+            continue;
+        }
+
+        const repo = text(node.nameWithOwner);
+
+        if (repo === "") {
+            continue;
+        }
+
+        const archived = node.isArchived === true;
+
+        if (alias.startsWith("r")) {
+            const nodes = node.pullRequests?.nodes;
+            const open: PrFact[] = [];
+
+            if (Array.isArray(nodes)) {
+                for (const one of nodes) {
+                    const fact =
+                        one === null || typeof one !== "object"
+                            ? undefined
+                            : prFact(one as Record<string, unknown>, repo, archived);
+
+                    if (fact !== undefined) {
+                        open.push(fact);
+                    }
+                }
+            }
+
+            repos[repo] = { archived, open };
+        } else {
+            const one = node.pullRequest;
+
+            if (one === null || typeof one !== "object") {
+                continue;
+            }
+
+            const fact = prFact(one as Record<string, unknown>, repo, archived);
+
+            if (fact !== undefined) {
+                prs[fact.ref] = fact;
+            }
+        }
+    }
+
+    return { viewer, repos, prs };
+}
+
+const linkFor = (pr: PrFact, via: PrLink["via"]): PrLink => ({
+    via,
+    state: pr.state,
+    next: prNext(pr),
+    title: pr.title,
+    url: pr.url,
+    review: pr.review,
+    checks: pr.checks,
+    mergeable: pr.mergeable,
+});
+
+/** One attached PR's facts from a read: its state, its next actor, and what GitHub says. */
+export function updatePrs(thread: Thread, github: GitHubFacts, now: number): number {
+    let events = 0;
+
+    for (const [ref, link] of Object.entries(thread.prs)) {
+        const fact =
+            github.prs[ref] ?? github.repos[repoOf(ref)]?.open.find((pr) => pr.ref === ref);
+
+        if (fact === undefined) {
+            continue;
+        }
+
+        const archived = fact.archived || github.repos[fact.repo]?.archived === true;
+        const state = archived ? "FROZEN" : fact.state;
+        const next = archived ? "none" : prNext(fact);
+
+        if (link.state !== state) {
+            link.state = state;
+
+            if (addEvent(thread, `${ref}:state:${state}:${String(now)}`, `${ref}: ${state}`, now)) {
+                events += 1;
+            }
+        }
+
+        if (link.next !== next) {
+            link.next = next;
+
+            if (addEvent(thread, `${ref}:next:${next}:${String(now)}`, `${ref}: ${next}`, now)) {
+                events += 1;
+            }
+        }
+
+        link.title = fact.title;
+        link.url = fact.url;
+        link.review = fact.review;
+        link.checks = fact.checks;
+        link.mergeable = fact.mergeable;
+    }
+
+    return events;
+}
+
+/** What attribution reads besides GitHub: the supervisor, the logins that count as ours, and local branch times. */
+export type GitFacts = {
+    supervisor: number;
+    /** Logins from the desk's config file, beside the viewer's. */
+    authors: string[];
+    /** folder → branch → the oldest reflog time, in ms. */
+    branches: Record<string, Record<string, number>>;
+};
+
+const seenRef = (thread: Thread, ref: string): boolean =>
+    Array.isArray(thread.run.seenPrs) && thread.run.seenPrs.includes(ref);
+
+/** Whether the thread made the branch in its folder, by the reflog's oldest time. */
+function madeBranch(gitFacts: GitFacts, thread: Thread, branch: string): boolean {
+    const folder = folderOf(thread);
+    const at = folder === undefined ? undefined : gitFacts.branches[folder]?.[branch];
+
+    return at !== undefined && at >= thread.startedAt;
+}
+
+/**
+ * Attach the viewer's open PRs to threads of one supervisor, by the 3 rules in order (seen, branch, window), or make a
+ * found thread for a PR that none of them claims. Work by other authors is counted, never attached. Pure over the
+ * state: the caller commits it.
+ */
+export function attribute(
+    state: DeskState,
+    github: GitHubFacts | undefined,
+    gitFacts: GitFacts,
+    now: number,
+): { events: number } {
+    if (github === undefined) {
+        return { events: 0 };
+    }
+
+    const supervisor = gitFacts.supervisor;
+    const ours = (login: string) =>
+        login !== "" && (login === github.viewer || gitFacts.authors.includes(login));
+    const mine = () =>
+        Object.values(state.threads).filter(
+            (thread) => thread.supervisor === supervisor && thread.state !== "closed",
+        );
+    const holderOf = (ref: string) =>
+        Object.values(state.threads).find((thread) => thread.prs[ref] !== undefined);
+    let events = 0;
+
+    state.others ??= {};
+
+    for (const [repo, facts] of Object.entries(github.repos)) {
+        state.others[repo] = facts.open.filter((pr) => !ours(pr.author)).length;
+    }
+
+    for (const [repo, facts] of Object.entries(github.repos)) {
+        if (facts.archived) {
+            continue;
+        }
+
+        for (const pr of facts.open) {
+            if (!ours(pr.author)) {
+                continue;
+            }
+
+            const holder = holderOf(pr.ref);
+
+            if (holder !== undefined) {
+                // The "touched" move: a newer thread of this supervisor pushed the branch of an older thread's PR.
+                if (holder.state === "closed" || holder.supervisor !== supervisor) {
+                    continue;
+                }
+
+                const newer = mine()
+                    .filter(
+                        (thread) =>
+                            thread !== holder &&
+                            thread.startedAt > holder.startedAt &&
+                            threadRepos(thread).includes(pr.repo) &&
+                            seenRef(thread, pr.ref) &&
+                            thread.branches.includes(pr.headRefName),
+                    )
+                    .sort((a, b) => b.startedAt - a.startedAt)[0];
+
+                if (newer !== undefined) {
+                    delete holder.prs[pr.ref];
+                    newer.prs[pr.ref] = linkFor(pr, "seen");
+
+                    if (
+                        addEvent(
+                            holder,
+                            `moved:${pr.ref}:to:${newer.id}:${String(now)}`,
+                            `${pr.ref} moved to ${newer.id}`,
+                            now,
+                        )
+                    ) {
+                        events += 1;
+                    }
+
+                    if (
+                        addEvent(
+                            newer,
+                            `moved:${pr.ref}:from:${holder.id}:${String(now)}`,
+                            `${pr.ref} moved from ${holder.id}`,
+                            now,
+                        )
+                    ) {
+                        events += 1;
+                    }
+                }
+
+                continue;
+            }
+
+            const threads = mine();
+
+            // 1. seen: it was in the thread's context. An older PR counts only when the thread pushed its branch.
+            let target = threads
+                .filter((thread) => seenRef(thread, pr.ref) && pr.createdAt >= thread.startedAt)
+                .sort((a, b) => b.startedAt - a.startedAt)[0];
+            let via: "seen" | "branch" | "window" = "seen";
+
+            if (target === undefined) {
+                target = threads
+                    .filter(
+                        (thread) =>
+                            seenRef(thread, pr.ref) && thread.branches.includes(pr.headRefName),
+                    )
+                    .sort((a, b) => b.startedAt - a.startedAt)[0];
+            }
+
+            // 2. branch: a thread in that repository that made or has the branch, and exactly one.
+            if (target === undefined) {
+                const matches = threads.filter(
+                    (thread) =>
+                        threadRepos(thread).includes(pr.repo) &&
+                        (thread.branches.includes(pr.headRefName) ||
+                            madeBranch(gitFacts, thread, pr.headRefName)),
+                );
+
+                if (matches.length === 1) {
+                    target = matches[0];
+                    via = "branch";
+                }
+            }
+
+            // 3. window: exactly one thread in that repository was open when the PR was made.
+            if (target === undefined) {
+                const matches = threads.filter(
+                    (thread) =>
+                        threadRepos(thread).includes(pr.repo) && thread.startedAt <= pr.createdAt,
+                );
+
+                if (matches.length === 1) {
+                    target = matches[0];
+                    via = "window";
+                }
+            }
+
+            if (target !== undefined) {
+                target.prs[pr.ref] = linkFor(pr, via);
+
+                if (
+                    addEvent(
+                        target,
+                        `pr:${pr.ref}:${via}:${String(now)}`,
+                        `${pr.ref} attached (${via})`,
+                        now,
+                    )
+                ) {
+                    events += 1;
+                }
+
+                continue;
+            }
+
+            // 4. found: new work, not older than the desk's epoch.
+            if (state.epoch === undefined || pr.createdAt < state.epoch) {
+                continue;
+            }
+
+            const id = `F${String(state.next.F)}`;
+
+            state.next.F += 1;
+            const found: Thread = {
+                id,
+                key: `found:pr:${pr.ref}`,
+                origin: "found",
+                title: oneLine(pr.title) || pr.ref,
+                agents: [],
+                repo: pr.repo,
+                supervisor,
+                state: "open",
+                startedAt: now,
+                lastEventAt: now,
+                prs: { [pr.ref]: linkFor(pr, "attached") },
+                branches: [],
+                asks: [],
+                run: { next: "odrade", sweptAt: now },
+                events: [],
+            };
+
+            state.threads[id] = found;
+
+            if (addEvent(found, "found", "found: a PR with no thread", now)) {
+                events += 1;
+            }
+        }
+    }
+
+    return { events };
+}
+
+/** Put a PR, or all of another thread's work, on one thread. Pure over the state: the caller commits it. */
+export function attachTo(
+    state: DeskState,
+    ref: string,
+    targetId: string,
+    now: number,
+): { text: string } | { error: string } {
+    const target = threadById(state, targetId);
+
+    if (target === undefined) {
+        return { error: `There is no thread ${targetId.toUpperCase()}.` };
+    }
+
+    if (target.state === "closed") {
+        return { error: `Thread ${target.id} is closed: choose an open thread.` };
+    }
+
+    if (PR_REF.test(ref)) {
+        const holder = Object.values(state.threads).find((thread) => thread.prs[ref] !== undefined);
+
+        if (holder === target) {
+            return { text: `${ref} is on ${target.id} already.` };
+        }
+
+        const link = holder?.prs[ref];
+
+        if (holder !== undefined) {
+            delete holder.prs[ref];
+            addEvent(
+                holder,
+                `moved:${ref}:to:${target.id}:${String(now)}`,
+                `${ref} moved to ${target.id}`,
+                now,
+            );
+        }
+
+        target.prs[ref] = { ...(link ?? {}), via: "attached" };
+        addEvent(target, `attached:${ref}:${String(now)}`, `${ref} attached`, now);
+
+        return { text: `${ref} is on ${target.id}.` };
+    }
+
+    const source = threadById(state, ref);
+
+    if (source === undefined) {
+        return {
+            error: `There is no thread ${ref.toUpperCase()}, and no PR ref like owner/name#12.`,
+        };
+    }
+
+    if (source === target) {
+        return { text: `${source.id} is the target.` };
+    }
+
+    if (source.state === "closed") {
+        return { text: `${source.id} is closed: nothing moved.` };
+    }
+
+    for (const [prRef, link] of Object.entries(source.prs)) {
+        target.prs[prRef] = { ...link };
+    }
+
+    source.prs = {};
+
+    if (target.address === undefined && source.address !== undefined) {
+        target.address = source.address;
+    }
+
+    if (target.run.folder === undefined && source.run.folder !== undefined) {
+        target.run.folder = source.run.folder;
+    }
+
+    source.state = "closed";
+    source.closed = { at: now, why: "dropped", by: "desk" };
+    addEvent(source, `merged:${target.id}:${String(now)}`, `merged into ${target.id}`, now);
+    addEvent(
+        target,
+        `merged:${source.id}:${String(now)}`,
+        `${source.id} merged into this thread`,
+        now,
+    );
+
+    return { text: `${source.id} is merged into ${target.id}.` };
 }
 
 // ─── Words for the tool ──────────────────────────────────────────────────────
@@ -800,7 +1462,7 @@ export function readText(state: Readonly<DeskState> | undefined, id: string): st
             : [`Closed: ${iso(thread.closed.at)} · ${thread.closed.why} · by ${thread.closed.by}`]),
         prs.length === 0
             ? "PRs: none"
-            : `PRs:\n${prs.map(([ref, pr]) => `  ${ref} · ${pr.via}${pr.state === undefined ? "" : ` · ${pr.state}`}${pr.next === undefined ? "" : ` · next: ${pr.next}`}`).join("\n")}`,
+            : `PRs:\n${prs.map(([ref, pr]) => `  ${ref} · ${pr.via}${pr.state === undefined ? "" : ` · ${pr.state}`}${pr.next === undefined ? "" : ` · next: ${pr.next}`}${pr.title === undefined || pr.title === "" ? "" : ` · ${pr.title}`}`).join("\n")}`,
         `Branches: ${thread.branches.length === 0 ? "none" : thread.branches.join(", ")}`,
         thread.asks.length === 0
             ? "Asks: none"
@@ -1153,6 +1815,11 @@ export default function createDesk(host: Host, web: Web) {
         shifts: Record<string, string | null>;
         /** By folder: its counts, or null when it is not a git repository. */
         folders: Record<string, FolderFact | null>;
+        github?: GitHubFacts;
+        /** The logins that count as ours, from the desk's config file. */
+        authors: string[];
+        /** folder → branch → the oldest reflog time, in ms. */
+        branches: Record<string, Record<string, number>>;
     };
 
     const run = promisify(execFile);
@@ -1171,6 +1838,128 @@ export default function createDesk(host: Host, web: Web) {
         } catch {
             return null;
         }
+    }
+
+    const LOGIN = /^[A-Za-z0-9][A-Za-z0-9-]{0,38}(\[bot\])?$/;
+
+    /** The desk's config file: `PI_POCKET_DESK_CONFIG`, else ~/.config/pi-pocket-team/desk.json. */
+    const configFile = () =>
+        process.env.PI_POCKET_DESK_CONFIG ??
+        join(homedir(), ".config", "pi-pocket-team", "desk.json");
+
+    /** The logins that count as ours beside the viewer's: a missing or bad file means none. */
+    async function extraAuthors(): Promise<string[]> {
+        try {
+            const value = JSON.parse(await readFile(configFile(), "utf8")) as {
+                authors?: unknown;
+            } | null;
+            const authors = value?.authors;
+
+            return Array.isArray(authors)
+                ? authors.filter(
+                      (login): login is string => typeof login === "string" && LOGIN.test(login),
+                  )
+                : [];
+        } catch {
+            return [];
+        }
+    }
+
+    /** The one GitHub read of a sweep: nothing this time when it fails. */
+    async function readGitHub(repos: string[], prs: string[]): Promise<GitHubFacts | undefined> {
+        if (repos.length === 0 && prs.length === 0) {
+            return undefined;
+        }
+
+        try {
+            const query = buildQuery(repos, prs);
+            const gh = process.env.PI_POCKET_DESK_GH ?? "gh";
+            const { stdout } = await run(gh, ["api", "graphql", "-f", `query=${query}`], {
+                timeout: 30_000,
+                maxBuffer: 8 * 1024 * 1024,
+                encoding: "utf8",
+            });
+
+            return parseGitHub(JSON.parse(stdout));
+        } catch {
+            // No GitHub facts this sweep: the threads keep the states they had.
+            return undefined;
+        }
+    }
+
+    /** The oldest reflog time of a local branch, in ms; undefined when the folder has no such branch. */
+    async function branchTime(folder: string, branch: string): Promise<number | undefined> {
+        try {
+            const { stdout } = await run(
+                "git",
+                ["-C", folder, "reflog", "show", "--format=%ct", `refs/heads/${branch}`],
+                { timeout: 10_000, encoding: "utf8" },
+            );
+            let oldest: number | undefined;
+
+            for (const line of stdout.split("\n")) {
+                const seconds = Number(line.trim());
+
+                if (Number.isFinite(seconds) && seconds > 0) {
+                    oldest = oldest === undefined ? seconds : Math.min(oldest, seconds);
+                }
+            }
+
+            return oldest === undefined ? undefined : oldest * 1000;
+        } catch {
+            return undefined;
+        }
+    }
+
+    /** For each open thread, the branches of candidate PRs in its folder: did this thread make one? */
+    async function branchFacts(
+        threads: Thread[],
+        github: GitHubFacts,
+    ): Promise<Record<string, Record<string, number>>> {
+        const facts: Record<string, Record<string, number>> = {};
+        const cache = new Map<string, number | undefined>();
+        const openPrs = Object.values(github.repos)
+            .filter((repo) => !repo.archived)
+            .flatMap((repo) => repo.open);
+
+        for (const thread of threads) {
+            const folder = folderOf(thread);
+
+            if (folder === undefined) {
+                continue;
+            }
+
+            const repos = threadRepos(thread);
+
+            for (const pr of openPrs) {
+                if (
+                    !repos.includes(pr.repo) ||
+                    !BRANCH_NAME.test(pr.headRefName) ||
+                    pr.headRefName.includes("..")
+                ) {
+                    continue;
+                }
+
+                const key = `${folder}\u0000${pr.headRefName}`;
+                let at = cache.get(key);
+
+                if (at === undefined && !cache.has(key)) {
+                    at = await branchTime(folder, pr.headRefName);
+                    cache.set(key, at);
+                }
+
+                if (at === undefined) {
+                    continue;
+                }
+
+                const row = (facts[folder] ??= {});
+
+                row[pr.headRefName] =
+                    row[pr.headRefName] === undefined ? at : Math.min(row[pr.headRefName]!, at);
+            }
+        }
+
+        return facts;
     }
 
     /** Read the world for one supervisor's sweep: its threads, their sessions, their Night shifts, and the folders. */
@@ -1232,6 +2021,7 @@ export default function createDesk(host: Host, web: Web) {
         }
 
         const team = teamApi();
+        const repositories = new Set<string>();
 
         if (team !== undefined) {
             try {
@@ -1240,8 +2030,9 @@ export default function createDesk(host: Host, web: Web) {
                         continue;
                     }
 
-                    for (const folder of Object.values(member.repositories ?? {})) {
+                    for (const [repo, folder] of Object.entries(member.repositories ?? {})) {
                         folders.add(folder);
+                        repositories.add(repo);
                     }
                 }
             } catch {
@@ -1249,13 +2040,34 @@ export default function createDesk(host: Host, web: Web) {
             }
         }
 
+        const pinned = new Set<string>();
+
+        for (const thread of open) {
+            for (const ref of Object.keys(thread.prs)) {
+                pinned.add(ref);
+                repositories.add(repoOf(ref));
+            }
+        }
+
+        const github = await readGitHub([...repositories], [...pinned]);
+        const authors = await extraAuthors();
+        const branches = github === undefined ? {} : await branchFacts(open, github);
+
         const facts: Record<string, FolderFact | null> = {};
 
         for (const folder of folders) {
             facts[folder] = await statusOf(folder);
         }
 
-        return { now, ...(sessions === undefined ? {} : { sessions }), shifts, folders: facts };
+        return {
+            now,
+            ...(sessions === undefined ? {} : { sessions }),
+            shifts,
+            folders: facts,
+            ...(github === undefined ? {} : { github }),
+            authors,
+            branches,
+        };
     };
 
     /** Scan a thread session's new entries for PR refs and branches. */
@@ -1333,6 +2145,7 @@ export default function createDesk(host: Host, web: Web) {
 
         state.sweepers ??= {};
         state.baseline ??= {};
+        state.epoch ??= now;
 
         const dirtyFolders = Object.entries(facts.folders)
             .filter(([, counts]) => counts !== null && (counts.dirty > 0 || counts.ahead > 0))
@@ -1472,6 +2285,19 @@ export default function createDesk(host: Host, web: Web) {
             }
 
             thread.run.sweptAt = now;
+        }
+
+        if (facts.github !== undefined) {
+            for (const thread of open) {
+                events += updatePrs(thread, facts.github, now);
+            }
+
+            events += attribute(
+                state,
+                facts.github,
+                { supervisor, authors: facts.authors, branches: facts.branches },
+                now,
+            ).events;
         }
 
         for (const thread of open) {
@@ -1794,15 +2620,26 @@ export default function createDesk(host: Host, web: Web) {
     const tool = defineTool({
         name: "desk",
         description:
-            "Supervisor only: the desk of threads for work the team runs in the background. Actions: list (one line per open thread), read (one thread in full), sync (observe the threads now, with linked sessions, Night shift, and git), seed (import a seed.json file one time).",
+            "Supervisor only: the desk of threads for work the team runs in the background. Actions: list (one line per open thread), read (one thread in full), sync (observe the threads now, with linked sessions, Night shift, git, and GitHub), seed (import a seed.json file one time), attach (put a PR, or all of another thread's work, on one thread).",
         parameters: Type.Object({
             action: Type.Union([
                 Type.Literal("list"),
                 Type.Literal("read"),
                 Type.Literal("sync"),
                 Type.Literal("seed"),
+                Type.Literal("attach"),
             ]),
-            thread: Type.Optional(Type.String({ description: "read: a thread id, such as T13" })),
+            thread: Type.Optional(
+                Type.String({
+                    description: "read: a thread id, such as T13; attach: the target thread",
+                }),
+            ),
+            ref: Type.Optional(
+                Type.String({
+                    description:
+                        "attach: a PR ref (owner/name#12), or a thread id such as F2 to merge into the target",
+                }),
+            ),
             path: Type.Optional(
                 Type.String({ description: "seed: the absolute path of a seed.json file" }),
             ),
@@ -1870,6 +2707,28 @@ export default function createDesk(host: Host, web: Web) {
                 return reply(found.text + reportsText(reports, (value) => host.text.defang(value)));
             }
 
+            if (args.action === "attach") {
+                const ref = args.ref?.trim();
+                const targetId = args.thread?.trim();
+
+                if (ref === undefined || ref === "" || targetId === undefined || targetId === "") {
+                    throw new Error(
+                        "attach needs ref (a PR ref such as owner/name#12, or a thread id) and thread (the target).",
+                    );
+                }
+
+                const result = await api.commit(
+                    async (tx) => attachTo(await tx.doc(DeskThreads), ref, targetId, Date.now()),
+                    context,
+                );
+
+                if ("error" in result) {
+                    throw new Error(result.error);
+                }
+
+                return reply(result.text);
+            }
+
             if (args.action === "sync") {
                 const supervisor = api.conversationId;
                 const facts = await gather(supervisor, api, Date.now(), context);
@@ -1928,11 +2787,15 @@ export default function createDesk(host: Host, web: Web) {
             }
 
             const hash = createHash("sha256").update(bytes).digest("hex");
+            const folders = Object.fromEntries(
+                members.flatMap((member) => Object.entries(member.repositories ?? {})),
+            );
             const result = await api.commit(async (tx) => {
                 const seeded = seedThreads(await tx.doc(DeskThreads), parsed.threads, {
                     hash,
                     supervisor: Number(api.conversationId),
                     at: Date.now(),
+                    folders,
                 });
 
                 if ("error" in seeded) {
