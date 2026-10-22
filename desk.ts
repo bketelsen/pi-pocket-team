@@ -130,22 +130,28 @@ export type Thread = {
     events: { at: number; key: string; text: string }[];
 };
 
+/** One OK over the cap: it allows 1 delegation, for 24 hours. Stored data: never rename a field. */
+export type Grant = {
+    at: number;
+    by: string;
+    via: "tap" | "chat";
+    key: string;
+    /** The delegation key that used it: absent again when that start failed. */
+    usedBy?: string;
+    expires: number;
+};
+
 /** The desk's one document. Stored data: never rename the kind or change what a field means. */
 export type DeskState = {
     /** The next id of each kind: T13, F2. */
     next: { T: number; F: number };
     threads: Record<string, Thread>;
     /** Delegation grants, used from the cap part. */
-    grants: {
-        at: number;
-        by: string;
-        via: "tap" | "chat";
-        key: string;
-        usedBy?: string;
-        expires: number;
-    }[];
+    grants: Grant[];
     /** "brian", or "supervisor:<id>": the time of the last look. */
     seen: Record<string, number>;
+    /** Each supervisor's newest `pi.user` entry looked at for "desk ok", by conversation id. */
+    grantCursor?: Record<string, number>;
     /** Each supervisor's live sweeper task id, by conversation id. */
     sweepers?: Record<string, string>;
     /** When the desk began: a PR older than this enters only through the seed. Set at the seed, else at the first sweep. */
@@ -1425,6 +1431,170 @@ export function attachTo(
     return { text: `${source.id} is merged into ${target.id}.` };
 }
 
+// ─── The cap and Brian's OKs ────────────────────────────────────────────────
+
+/** How many threads count before the desk is full, unless the config file says less or more. */
+export const DEFAULT_CAP = 12;
+/** An OK lasts this long. */
+const GRANT_MS = 24 * 3600_000;
+
+/** A message that gives an OK: "desk ok", "desk ok 3", "desk ok." */
+const DESK_OK = /^\s*desk ok(?:\s+([1-5]))?\s*[.!]?\s*$/i;
+
+/** How many OKs a person's message gives: 0 when it is not one. */
+export function chatGrants(text: string): number {
+    const match = DESK_OK.exec(text);
+
+    return match === null ? 0 : match[1] === undefined ? 1 : Number(match[1]);
+}
+
+/** Whether a thread counts toward the cap. A reviewer wait and a parked thread do not; a found thread does. */
+export function isCounted(thread: Thread): boolean {
+    return (
+        (thread.state === "open" || thread.state === "starting") && thread.run.next !== "reviewer"
+    );
+}
+
+export type CapView = {
+    counted: number;
+    cap: number;
+    full: boolean;
+    /** The usable OKs: not used, and not expired. */
+    grants: Grant[];
+};
+
+/** The cap's view: how many threads count, and which OKs are usable now. */
+export function capView(state: Readonly<DeskState> | undefined, cap: number, now: number): CapView {
+    const counted = Object.values(state?.threads ?? {}).filter(isCounted).length;
+    const grants = (state?.grants ?? []).filter(
+        (grant) => grant.usedBy === undefined && grant.expires > now,
+    );
+
+    return { counted, cap, full: counted >= cap, grants };
+}
+
+/** The refusal: no thread is made, and the model reads the words as the tool's error. */
+export function deskFullText(
+    state: Readonly<DeskState> | undefined,
+    view: CapView,
+    now: number,
+): string {
+    const stale = Object.values(state?.threads ?? {})
+        .filter(isCounted)
+        .filter((thread) => isStale(thread, now))
+        .map((thread) => thread.id)
+        .sort((a, b) => idNumber(a) - idNumber(b));
+
+    return `The desk is full: ${String(view.counted)} of ${String(view.cap)} threads count. Stale: ${stale.join(", ") || "none"}. Ask Brian for an OK: he taps "Allow 1" on the Desk page, or writes "desk ok" in this chat. Then delegate again.`;
+}
+
+// ─── The chat's "desk ok" ───────────────────────────────────────────────────
+
+// Copied from night-shift.ts: a message written by a person, not by a linked session, a schedule, or a task.
+const FROM = /^\[from: ([^\]\n]{1,60})\] /;
+const AUTOMATED = /^\[(?:night-shift\]|via |scheduled\]|subagent |goal\] )/;
+
+/** A message's writer and its words without the `[from: …]` prefix; no writer when nobody typed it. */
+export function personAndBody(content: unknown): { person?: string; body: string } {
+    const text = textOf(content).trimStart();
+    const from = FROM.exec(text);
+    const body = from === null ? text : text.slice(from[0].length);
+
+    return { person: AUTOMATED.test(body) ? undefined : (from?.[1] ?? "A person"), body };
+}
+
+/** Add an OK once per key: a scan of the same entry adds nothing. */
+function addGrant(state: DeskState, grant: Grant): boolean {
+    if (state.grants.some((each) => each.key === grant.key)) {
+        return false;
+    }
+
+    state.grants.push(grant);
+
+    return true;
+}
+
+/**
+ * Read Brian's "desk ok" messages in a supervisor's session, after the stored cursor. A message counts only when a
+ * person wrote it, and only from the last 24 hours; its key is the entry's id, so a second scan adds nothing.
+ */
+export async function scanChatGrants(
+    tx: Tx,
+    state: DeskState,
+    supervisor: number,
+    now: number,
+): Promise<number> {
+    const key = String(supervisor);
+
+    state.grantCursor ??= {};
+
+    const cursor = state.grantCursor[key] ?? 0;
+    let after = cursor;
+    let page: Cursor | undefined;
+    let added = 0;
+
+    do {
+        const entries = await tx.scanEntries(
+            {
+                conversationId: supervisor as ConversationId,
+                order: "ascending",
+                minEntryId: (cursor + 1) as EntryId,
+            },
+            200,
+            page,
+        );
+
+        for (const entry of entries.items) {
+            after = Math.max(after, Number(entry.id));
+
+            if (entry.kind !== "pi.user") {
+                continue;
+            }
+
+            const message = entry.model?.find((each) => each.role === "user");
+
+            if (message === undefined) {
+                continue;
+            }
+
+            const made = (message as { timestamp?: unknown }).timestamp;
+            const at = typeof made === "number" && Number.isFinite(made) && made > 0 ? made : now;
+
+            if (now - at > GRANT_MS) {
+                continue;
+            }
+
+            const { person, body } = personAndBody(message.content);
+
+            if (person === undefined) {
+                continue;
+            }
+
+            const count = chatGrants(body);
+
+            for (let index = 1; index <= count; index += 1) {
+                if (
+                    addGrant(state, {
+                        at,
+                        by: person,
+                        via: "chat",
+                        key: `chat:${String(entry.id)}:${String(index)}`,
+                        expires: at + GRANT_MS,
+                    })
+                ) {
+                    added += 1;
+                }
+            }
+        }
+
+        page = entries.next;
+    } while (page !== undefined);
+
+    state.grantCursor[key] = after;
+
+    return added;
+}
+
 // ─── The page's view ────────────────────────────────────────────────────────
 
 /** How many closed threads the page shows. */
@@ -1461,10 +1631,7 @@ export type ThreadView = {
 };
 
 /** The folders that threads other than `thread` work in. */
-function otherFolders(
-    threads: Readonly<Record<string, Thread>>,
-    thread: Thread,
-): Set<string> {
+function otherFolders(threads: Readonly<Record<string, Thread>>, thread: Thread): Set<string> {
     const folders = new Set<string>();
 
     for (const other of Object.values(threads)) {
@@ -1539,6 +1706,8 @@ export type ThreadsView = {
     threads: ThreadView[];
     seen: number;
     others: Record<string, number>;
+    /** The cap: how many threads count, and how many OKs wait. */
+    cap: { counted: number; cap: number; full: boolean; grants: number };
     counts: {
         open: number;
         brian: number;
@@ -1552,10 +1721,23 @@ export type ThreadsView = {
 };
 
 /** The page's whole view: every open thread, and those closed in the last 7 days. */
-export function threadsView(state: Readonly<DeskState> | undefined, now: number): ThreadsView {
+export function threadsView(
+    state: Readonly<DeskState> | undefined,
+    now: number,
+    cap = DEFAULT_CAP,
+): ThreadsView {
     const threads: Record<string, Thread> = state?.threads ?? {};
     const all = Object.values(threads);
-    const counts = { open: 0, brian: 0, agent: 0, odrade: 0, reviewer: 0, none: 0, stale: 0, parked: 0 };
+    const counts = {
+        open: 0,
+        brian: 0,
+        agent: 0,
+        odrade: 0,
+        reviewer: 0,
+        none: 0,
+        stale: 0,
+        parked: 0,
+    };
 
     for (const thread of all) {
         if (thread.state === "parked") {
@@ -1587,6 +1769,16 @@ export function threadsView(state: Readonly<DeskState> | undefined, now: number)
             .sort((a, b) => b.lastEventAt - a.lastEventAt),
         seen: state?.seen.brian ?? 0,
         others: { ...(state?.others ?? {}) },
+        cap: (() => {
+            const view = capView(state, cap, now);
+
+            return {
+                counted: view.counted,
+                cap: view.cap,
+                full: view.full,
+                grants: view.grants.length,
+            };
+        })(),
         counts,
     };
 }
@@ -1891,7 +2083,47 @@ export default function createDesk(host: Host, web: Web) {
     const published: DeskApi = {
         version: 1,
         open: async (tx, request) => {
-            const opened = openThread(await tx.doc(DeskThreads), request);
+            const state = await tx.doc(DeskThreads);
+            const existing = findThread(state, request.key);
+
+            // A replay: the same thread, no cap check, and no second OK.
+            if (existing !== undefined) {
+                await startSweeper(tx, request.supervisor);
+
+                return { thread: copyThread(existing), reused: true };
+            }
+
+            const { cap } = await deskConfig();
+
+            await scanChatGrants(tx, state, request.supervisor, request.at);
+
+            const view = capView(state, cap, request.at);
+            let grant: Grant | undefined;
+
+            if (view.full) {
+                grant = [...view.grants].sort(
+                    (a, b) => a.at - b.at || a.key.localeCompare(b.key),
+                )[0];
+
+                if (grant === undefined) {
+                    throw new Error(deskFullText(state, view, request.at));
+                }
+
+                grant.usedBy = request.key;
+            }
+
+            const opened = openThread(state, request);
+            // The stored thread, not the plain object `openThread` returned: the draft holds its own copy.
+            const thread = state.threads[opened.thread.id] ?? opened.thread;
+
+            if (grant !== undefined) {
+                addEvent(
+                    thread,
+                    `over:${grant.via}:${String(request.at)}`,
+                    `opened over the cap with Brian's OK (${grant.via})`,
+                    request.at,
+                );
+            }
 
             // The sweeper starts in the same commit that makes the thread: a restart finds it, and adds no other.
             await startSweeper(tx, request.supervisor);
@@ -1911,7 +2143,16 @@ export default function createDesk(host: Host, web: Web) {
             return copyThread(thread);
         },
         fail: async (tx, key, why, at) => {
-            failThread(await tx.doc(DeskThreads), key, why, at);
+            const state = await tx.doc(DeskThreads);
+
+            failThread(state, key, why, at);
+
+            // A start that did not happen gives its OK back.
+            for (const grant of state.grants) {
+                if (grant.usedBy === key) {
+                    delete grant.usedBy;
+                }
+            }
         },
         file: async (tx, session, request) => {
             const thread = threadOfSession(await tx.doc(DeskThreads), Number(session));
@@ -2041,21 +2282,29 @@ export default function createDesk(host: Host, web: Web) {
         process.env.PI_POCKET_DESK_CONFIG ??
         join(homedir(), ".config", "pi-pocket-team", "desk.json");
 
-    /** The logins that count as ours beside the viewer's: a missing or bad file means none. */
-    async function extraAuthors(): Promise<string[]> {
+    /** The config file: the extra logins that count as ours, and the cap. A missing or bad file means the defaults. */
+    async function deskConfig(): Promise<{ authors: string[]; cap: number }> {
         try {
             const value = JSON.parse(await readFile(configFile(), "utf8")) as {
                 authors?: unknown;
+                cap?: unknown;
             } | null;
-            const authors = value?.authors;
-
-            return Array.isArray(authors)
-                ? authors.filter(
+            const authors = Array.isArray(value?.authors)
+                ? value.authors.filter(
                       (login): login is string => typeof login === "string" && LOGIN.test(login),
                   )
                 : [];
+            const cap =
+                typeof value?.cap === "number" &&
+                Number.isInteger(value.cap) &&
+                value.cap >= 1 &&
+                value.cap <= 100
+                    ? value.cap
+                    : DEFAULT_CAP;
+
+            return { authors, cap };
         } catch {
-            return [];
+            return { authors: [], cap: DEFAULT_CAP };
         }
     }
 
@@ -2244,7 +2493,7 @@ export default function createDesk(host: Host, web: Web) {
         }
 
         const github = await readGitHub([...repositories], [...pinned]);
-        const authors = await extraAuthors();
+        const { authors } = await deskConfig();
         const branches = github === undefined ? {} : await branchFacts(open, github);
 
         const facts: Record<string, FolderFact | null> = {};
@@ -2340,6 +2589,8 @@ export default function createDesk(host: Host, web: Web) {
         state.sweepers ??= {};
         state.baseline ??= {};
         state.epoch ??= now;
+
+        await scanChatGrants(tx, state, supervisor, now);
 
         const dirtyFolders = Object.entries(facts.folders)
             .filter(([, counts]) => counts !== null && (counts.dirty > 0 || counts.ahead > 0))
@@ -2845,13 +3096,14 @@ export default function createDesk(host: Host, web: Web) {
         request: WebRequest,
         change: (state: DeskState, now: number) => void,
     ): Promise<ThreadsView> => {
+        const { cap } = await deskConfig();
         const view = await request.commit(async (tx) => {
             const state = await tx.doc(DeskThreads);
             const now = Date.now();
 
             change(state, now);
 
-            return threadsView(state, now);
+            return threadsView(state, now, cap);
         });
 
         web.send("changed", {});
@@ -2865,7 +3117,13 @@ export default function createDesk(host: Host, web: Web) {
         async (request) => {
             await sweepForView(request);
 
-            return threadsView(await request.snapshot(DeskThreads, request.context), Date.now());
+            const { cap } = await deskConfig();
+
+            return threadsView(
+                await request.snapshot(DeskThreads, request.context),
+                Date.now(),
+                cap,
+            );
         },
         { access: "owner" },
     );
@@ -3063,6 +3321,45 @@ export default function createDesk(host: Host, web: Web) {
         { access: "owner" },
     );
 
+    web.route(
+        "POST",
+        "grant",
+        async (request) => {
+            const asked = request.body.count ?? 1;
+            const count =
+                typeof asked === "number" && Number.isInteger(asked) && asked >= 1 && asked <= 5
+                    ? asked
+                    : undefined;
+
+            if (count === undefined) {
+                throw web.error(400, "grant takes a count from 1 to 5.");
+            }
+
+            const { cap } = await deskConfig();
+            const view = await request.commit(async (tx) => {
+                const state = await tx.doc(DeskThreads);
+                const now = Date.now();
+
+                for (let index = 1; index <= count; index += 1) {
+                    addGrant(state, {
+                        at: now,
+                        by: request.user.name,
+                        via: "tap",
+                        key: `tap:${String(now)}:${String(index)}`,
+                        expires: now + GRANT_MS,
+                    });
+                }
+
+                return threadsView(state, now, cap);
+            });
+
+            web.send("changed", {});
+
+            return view;
+        },
+        { access: "owner" },
+    );
+
     // The page learns a seeded or found thread's session id here, from its address. Never in a model's text.
     web.conversationRoute(
         "POST",
@@ -3194,8 +3491,12 @@ export default function createDesk(host: Host, web: Web) {
 
                     return listText(state, Date.now());
                 }, context);
+                const { cap } = await deskConfig();
+                const view = capView(await api.snapshot(DeskThreads, context), cap, Date.now());
+                const waiting = view.grants.length;
+                const first = `Counted: ${String(view.counted)} of ${String(view.cap)}${waiting === 0 ? "" : ` (${String(waiting)} OK${waiting === 1 ? "" : "s"} waiting)`}`;
 
-                return reply(text);
+                return reply(`${first}\n${text}`);
             }
 
             if (args.action === "read") {
@@ -3389,6 +3690,8 @@ export default function createDesk(host: Host, web: Web) {
                     .filter((thread) => isStale(thread, now))
                     .map((thread) => thread.id)
                     .sort((a, b) => idNumber(a) - idNumber(b));
+                const { cap } = await deskConfig();
+                const capped = capView(state, cap, now);
                 const events = mine
                     .flatMap((thread) =>
                         thread.events
@@ -3406,6 +3709,12 @@ export default function createDesk(host: Host, web: Web) {
                     open.length === 0
                         ? "Desk: no open threads."
                         : `Desk: ${String(open.length)} open · ${byActor.join(" · ")}.`,
+                    `Counted: ${String(capped.counted)} of ${String(capped.cap)}.`,
+                    ...(capped.full
+                        ? [
+                              'The desk is full: team_delegate refuses new work until Brian gives an OK (a tap on the Desk page, or "desk ok" in this chat).',
+                          ]
+                        : []),
                     `Stale: ${stale.length === 0 ? "none" : stale.join(", ")}.`,
                     ...(events.length === 0 ? [] : ["New since your last look:", ...events]),
                     "Reports arrive as 1 line that starts with [desk]. Read the full report with desk read <id> before you act.",
