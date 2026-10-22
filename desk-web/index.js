@@ -295,6 +295,7 @@ export default function setup(pocket) {
 
         const others = Object.values(view?.others ?? {}).reduce((sum, count) => sum + count, 0);
         const counts = view?.counts ?? {};
+        const capInfo = view?.cap ?? { counted: 0, cap: 0, full: false, grants: 0 };
         const fresh = (thread) => thread.lastEventAt > (seenBefore ?? 0);
 
         const row = (thread, actions) =>
@@ -472,8 +473,32 @@ export default function setup(pocket) {
             <header class="desk-head">
                 <h1>Desk</h1>
                 <p class="small muted">
-                    ${counts.brian ?? 0} need you · ${counts.open ?? 0} open · ${counts.stale ?? 0} stale · ${counts.parked ?? 0} parked
+                    ${counts.brian ?? 0} need you · ${counts.open ?? 0} open · ${counts.stale ?? 0} stale · ${counts.parked ?? 0} parked · ${capInfo.counted} of ${capInfo.cap} count
                 </p>
+                ${
+                    capInfo.full
+                        ? html`<div class="desk-full" role="status">
+                              <p>The desk is full. New delegations wait for your OK.</p>
+                              <div class="desk-actions">
+                                  <button
+                                      class="button primary"
+                                      disabled=${busy}
+                                      aria-label="Allow 1 delegation"
+                                      onClick=${() => void act("grant", { count: 1 })}
+                                  >
+                                      Allow 1
+                                  </button>
+                                  ${
+                                      capInfo.grants > 0
+                                          ? html`<span class="small muted"
+                                            >${capInfo.grants} OK${capInfo.grants === 1 ? "" : "s"} waiting</span
+                                        >`
+                                          : null
+                                  }
+                              </div>
+                          </div>`
+                        : null
+                }
                 ${
                     others > 0
                         ? html`<p class="small muted">

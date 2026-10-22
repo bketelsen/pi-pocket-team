@@ -43,6 +43,10 @@ import {
     attachTo,
     attribute,
     buildQuery,
+    capView,
+    chatGrants,
+    DEFAULT_CAP,
+    isCounted,
     FOUND_FOLDER_DELAY_MS,
     parseGitHub,
     prNext,
@@ -1035,6 +1039,60 @@ describe("attachTo", () => {
     });
 });
 
+describe("the cap", () => {
+    test("a thread counts unless it is parked, closed, or waits on a reviewer", () => {
+        assert.equal(isCounted(thread({ run: { next: "agent" } })), true);
+        assert.equal(isCounted(thread({ state: "starting", run: { next: "agent" } })), true);
+        assert.equal(isCounted(thread({ origin: "found", run: { next: "odrade" } })), true);
+        assert.equal(isCounted(thread({ state: "parked", run: { next: "agent" } })), false);
+        assert.equal(isCounted(thread({ state: "closed", run: { next: "none" } })), false);
+        assert.equal(isCounted(thread({ run: { next: "reviewer" } })), false);
+    });
+
+    test("capView counts the threads and the usable OKs", () => {
+        const state = deskOf();
+        const first = placed(state, 100);
+        const second = placed(state, 200);
+
+        first.run.next = "agent";
+        second.run.next = "reviewer";
+        state.grants.push(
+            { at: 1, by: "Brian", via: "tap", key: "used", usedBy: "k", expires: 100_000 },
+            { at: 2, by: "Brian", via: "tap", key: "expired", expires: 10 },
+            { at: 3, by: "Brian", via: "chat", key: "usable", expires: 100_000 },
+        );
+
+        const view = capView(state, 2, 1000);
+
+        assert.deepEqual(
+            { counted: view.counted, cap: view.cap, full: view.full },
+            { counted: 1, cap: 2, full: false },
+        );
+        assert.deepEqual(
+            view.grants.map((grant) => grant.key),
+            ["usable"],
+        );
+        assert.equal(capView(state, 1, 1000).full, true);
+    });
+
+    test("chatGrants reads desk ok, and nothing else", () => {
+        for (const [text, count] of [
+            ["desk ok", 1],
+            ["Desk OK 3", 3],
+            ["  desk ok.  ", 1],
+            ["desk ok!", 1],
+            ["desk ok 5", 5],
+            ["desk ok 9", 0],
+            ["the desk ok?", 0],
+            ["desk okay", 0],
+            ["desk ok 3 and more", 0],
+            ["", 0],
+        ] as [string, number][]) {
+            assert.equal(chatGrants(text), count, text);
+        }
+    });
+});
+
 describe("taskTitle", () => {
     test("first non-empty line, without a leading Task, Goal, or Title", () => {
         assert.equal(taskTitle("Task: pilothouse: CI fixes"), "pilothouse: CI fixes");
@@ -1169,6 +1227,14 @@ const model = scriptedModel((request) => {
 
     if (text.endsWith("desk sync test")) {
         return call("desk", { action: "sync" });
+    }
+
+    if (text.endsWith("start linked test")) {
+        return call("team", { action: "start", title: "A linked test", message: "Say hello." });
+    }
+
+    if (text.endsWith("desk ok from linked test")) {
+        return call("team_message", { to: linkedAddressOf(request), message: "desk ok" });
     }
 
     if (text.endsWith("desk pr test")) {
@@ -1376,6 +1442,8 @@ before(async () => {
     chmodSync(fakeGh, 0o755);
     process.env.PI_POCKET_DESK_GH = fakeGh;
     process.env.PI_POCKET_DESK_CONFIG = configPath;
+    // The tests make many threads: a high cap, so only the cap tests meet the cap. Each of them restores this.
+    writeFileSync(configPath, JSON.stringify({ cap: 100 }));
 
     app = await openApp(model, dataDir, () => Date.now() + shift);
     await app.setExtensionEnabled(owner(app), "team.ts", true);
@@ -1458,6 +1526,8 @@ async function restartApp(by: number): Promise<void> {
     chmodSync(fakeGh, 0o755);
     process.env.PI_POCKET_DESK_GH = fakeGh;
     process.env.PI_POCKET_DESK_CONFIG = configPath;
+    // The tests make many threads: a high cap, so only the cap tests meet the cap. Each of them restores this.
+    writeFileSync(configPath, JSON.stringify({ cap: 100 }));
 
     app = await openApp(model, dataDir, () => Date.now() + shift);
 }
@@ -1479,6 +1549,18 @@ async function sweptAfter(thread: Thread, after: unknown): Promise<void> {
         "the next sweep",
         20_000,
     );
+}
+
+/** Remove the usable OKs: a cap test must not spend an OK that another test left. */
+async function clearGrants(): Promise<void> {
+    await app.harness.commit(async (tx) => {
+        const state = await tx.doc(DeskThreads);
+        const now = Date.now();
+
+        state.grants = state.grants.filter(
+            (grant) => grant.usedBy !== undefined || grant.expires <= now,
+        );
+    }, context);
 }
 
 /** The live sweeper tasks of a supervisor session. */
@@ -1858,7 +1940,7 @@ describe("the desk in a Pi Pocket", () => {
                 fixturePath,
                 JSON.stringify({ data: { viewer: { login: "github-viewer" } } }),
             );
-            rmSync(configPath, { force: true });
+            writeFileSync(configPath, JSON.stringify({ cap: 100 }));
         }
     });
 
@@ -1989,6 +2071,14 @@ describe("the desk in a Pi Pocket", () => {
         test("keep, park and drop change the thread; a second POST changes nothing", async () => {
             const { thread } = await delegated("page-actions");
 
+            // The sweeper's first sweep sets the facts; wait for it, so no sweep wakes the thread when it is parked.
+            await until(
+                async () =>
+                    typeof (await deskState())?.threads[thread.id]?.run.sweptAt === "number",
+                "the first sweep",
+                20_000,
+            );
+
             const kept = await call(`threads/${thread.id}/keep`, {});
 
             assert.equal(kept.status, 200);
@@ -2047,6 +2137,13 @@ describe("the desk in a Pi Pocket", () => {
 
         test("wake opens a parked thread, and a second call changes nothing", async () => {
             const { thread } = await delegated("page-wake");
+
+            await until(
+                async () =>
+                    typeof (await deskState())?.threads[thread.id]?.run.sweptAt === "number",
+                "the first sweep",
+                20_000,
+            );
 
             assert.equal((await call(`threads/${thread.id}/park`, {})).status, 200);
             assert.equal((await deskState())?.threads[thread.id]?.state, "parked");
@@ -2150,6 +2247,19 @@ describe("the desk in a Pi Pocket", () => {
             const again = await call(`resolve/${String(Number(source))}`, {});
 
             assert.equal(again.data.resolved, 0, "nothing left to resolve");
+        });
+
+        test("POST grant adds an OK, for the owner only", async () => {
+            const before = (await call("threads")).data.cap.grants;
+            const granted = await call("grant", { count: 1 });
+
+            assert.equal(granted.status, 200);
+            assert.equal(granted.data.cap.grants, before + 1);
+
+            const guest = app.config.addUser("A cap guest", "guest");
+
+            assert.equal((await call("grant", { count: 1 }, guest.token)).status, 404);
+            assert.equal((await call("grant", { count: 9 })).status, 400);
         });
     });
 
@@ -2335,6 +2445,226 @@ describe("the desk in a Pi Pocket", () => {
             await until(async () => (await sweepers(source)) === 0, "the sweeper to end", 20_000);
         } finally {
             shift = 0;
+        }
+    });
+
+    test("the cap refuses a delegation until Brian writes desk ok", async () => {
+        const source = await supervisor("cap-chat");
+        const now = Date.now();
+        const before = capView(await deskState(), DEFAULT_CAP, now).counted;
+
+        writeFileSync(configPath, JSON.stringify({ cap: DEFAULT_CAP }));
+        await clearGrants();
+
+        // Fill the desk to the cap, with threads that count.
+        if (before < DEFAULT_CAP) {
+            await app.harness.commit(async (tx) => {
+                const state = await tx.doc(DeskThreads);
+
+                for (let index = before; index < DEFAULT_CAP; index += 1) {
+                    const opened = openThread(state, {
+                        key: `x.test.fill:${String(index)}`,
+                        supervisor: Number(source),
+                        agents: ["duncan"],
+                        repo: "frostyard/test",
+                        title: `Fill ${String(index)}`,
+                        at: now,
+                    });
+
+                    state.threads[opened.thread.id]!.state = "open";
+                    state.threads[opened.thread.id]!.run.next = "agent";
+                }
+            }, context);
+        }
+
+        const sessions = app.sessions().length;
+
+        await say(app, source, "desk delegate test");
+        assert.match(
+            (await modelTexts(app, source)).join("\n"),
+            /The desk is full: \d+ of 12 threads count\./,
+        );
+        assert.equal(app.sessions().length, sessions, "no linked session started");
+
+        // A linked session's "desk ok" is not a person's message.
+        await say(app, source, "start linked test");
+        const linked = app.sessions().find((session) => session.linkedFrom?.id === Number(source));
+
+        assert(linked, "the team tool started a linked session");
+        await say(app, linked.id as ConversationId, "desk ok from linked test");
+        await until(
+            async () => (await modelTexts(app, source)).join("\n").includes("via linked session"),
+            "the linked-session message at the supervisor",
+            20_000,
+        );
+        await until(() => !app.isBusy(source), "the supervisor to settle", 20_000);
+
+        await say(app, source, "desk delegate test");
+        assert.match(
+            (await modelTexts(app, source)).join("\n"),
+            /The desk is full: \d+ of 12 threads count\./,
+        );
+
+        // Brian's own "desk ok" gives 1 OK, and the next delegation uses it.
+        await say(app, source, "desk ok");
+        await say(app, source, "desk delegate test");
+
+        const opened = Object.values((await deskState())?.threads ?? {})
+            .filter(
+                (thread) => thread.supervisor === Number(source) && thread.origin === "delegate",
+            )
+            .at(-1);
+
+        assert(opened, "the delegation opened a thread");
+        assert.equal(opened.state, "open");
+
+        const used = (await deskState())?.grants.find((grant) => grant.usedBy === opened.key);
+
+        assert(used, "the OK was used");
+        assert.equal(used.via, "chat");
+        assert.match(
+            opened.events.map((event) => event.text).join("; "),
+            /opened over the cap with Brian's OK \(chat\)/,
+        );
+
+        writeFileSync(configPath, JSON.stringify({ cap: 100 }));
+    });
+
+    test("open at the cap refuses, a grant opens it, and fail gives the grant back", async () => {
+        const folder = join(root, "cap-open");
+
+        mkdirSync(folder, { recursive: true });
+        const source = await newSession(app, folder);
+        const api = (
+            globalThis as unknown as Record<
+                symbol,
+                {
+                    open: (
+                        tx: unknown,
+                        request: object,
+                    ) => Promise<{ thread: Thread; reused: boolean }>;
+                    fail: (tx: unknown, key: string, why: string, at: number) => Promise<void>;
+                }
+            >
+        )[Symbol.for("pi-pocket-team.desk")]!;
+        const at = Date.now();
+        const key = `x.test.cap:${String(at)}`;
+        const request = {
+            key,
+            supervisor: Number(source),
+            agents: ["duncan"],
+            repo: "frostyard/test",
+            title: "Capped",
+            at,
+        };
+
+        assert(api, "the desk publishes its API");
+        writeFileSync(configPath, JSON.stringify({ cap: 1 }));
+        await clearGrants();
+
+        try {
+            // One counted thread is enough: the cap is 1.
+            await app.harness.commit(async (tx) => {
+                const state = await tx.doc(DeskThreads);
+                const filled = openThread(state, {
+                    key: `x.test.cap.fill:${String(at)}`,
+                    supervisor: Number(source),
+                    agents: ["duncan"],
+                    repo: "frostyard/test",
+                    title: "Full",
+                    at,
+                });
+
+                state.threads[filled.thread.id]!.state = "open";
+                state.threads[filled.thread.id]!.run.next = "agent";
+            }, context);
+
+            await assert.rejects(
+                app.harness.commit((tx) => api.open(tx, request), context),
+                /The desk is full: \d+ of 1 threads count\. Stale: /,
+            );
+            assert.equal(
+                Object.values((await deskState())?.threads ?? {}).some(
+                    (thread) => thread.key === key,
+                ),
+                false,
+                "no thread was made",
+            );
+
+            // An expired OK is not usable.
+            await app.harness.commit(async (tx) => {
+                const state = await tx.doc(DeskThreads);
+
+                state.grants.push({
+                    at: at - 2 * DAY,
+                    by: "Brian",
+                    via: "tap",
+                    key: `tap:expired:${String(at)}`,
+                    expires: at - DAY,
+                });
+            }, context);
+            await assert.rejects(
+                app.harness.commit((tx) => api.open(tx, request), context),
+                /The desk is full/,
+            );
+
+            // A tap OK opens it, and is marked used.
+            await app.harness.commit(async (tx) => {
+                const state = await tx.doc(DeskThreads);
+
+                state.grants.push({
+                    at,
+                    by: "Brian",
+                    via: "tap",
+                    key: `tap:test:${String(at)}`,
+                    expires: at + DAY,
+                });
+            }, context);
+
+            const opened = await app.harness.commit((tx) => api.open(tx, request), context);
+
+            assert.equal(opened.reused, false);
+
+            const stored = (await deskState())?.threads[opened.thread.id];
+
+            assert.equal(stored?.key, key);
+            assert.match(
+                stored?.events.map((event) => event.text).join("; ") ?? "",
+                /opened over the cap with Brian's OK \(tap\)/,
+            );
+            assert.equal(
+                (await deskState())?.grants.find((grant) => grant.key === `tap:test:${String(at)}`)
+                    ?.usedBy,
+                key,
+            );
+
+            // A replay reuses the thread, and uses no second OK.
+            const again = await app.harness.commit((tx) => api.open(tx, request), context);
+
+            assert.equal(again.reused, true);
+            assert.equal(
+                (await deskState())?.grants.filter((grant) => grant.usedBy === key).length,
+                1,
+            );
+
+            // A failed start gives the OK back.
+            await app.harness.commit((tx) => api.fail(tx, key, "no start", Date.now()), context);
+            assert.equal(
+                (await deskState())?.grants.find((grant) => grant.key === `tap:test:${String(at)}`)
+                    ?.usedBy,
+                undefined,
+            );
+        } finally {
+            await app.harness.commit(async (tx) => {
+                const state = await tx.doc(DeskThreads);
+
+                state.grants = state.grants.filter(
+                    (grant) =>
+                        grant.key !== `tap:test:${String(at)}` &&
+                        grant.key !== `tap:expired:${String(at)}`,
+                );
+            }, context);
+            writeFileSync(configPath, JSON.stringify({ cap: 100 }));
         }
     });
 });
