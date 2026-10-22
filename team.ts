@@ -609,7 +609,7 @@ export default function createTeam(host: Host, web: Web) {
      * The desk module's API, from a global: team.ts must not import desk.ts. A static import would keep a stale copy
      * after a reload.
      */
-    type DeskThread = { id: string };
+    type DeskThread = { id: string; watch?: { checkOn: string } };
     type DeskApi = {
         version: number;
         open: (
@@ -622,6 +622,7 @@ export default function createTeam(host: Host, web: Web) {
                 cwd?: string;
                 title: string;
                 at: number;
+                watch?: { checkOn: string; check: string; by: string };
             },
         ) => Promise<{ thread: DeskThread; reused: boolean }>;
         bind: (
@@ -971,7 +972,7 @@ export default function createTeam(host: Host, web: Web) {
     const delegate = defineTool({
         name: "team_delegate",
         description:
-            "Supervisor only: give a self-contained task to a named agent in their repository folder. Choose a repository from the roster if the agent owns more than one. Runs on the agent's profile model when the owner allows it for subagents, otherwise on your model (the roster shows each agent's model); thinking no higher than yours. Returns an address without waiting for completion. With night_shift, the linked session runs a night-shift goal in rounds, and its report comes back here by itself when it stops; a night shift has no check command.",
+            "Supervisor only: give a self-contained task to a named agent in their repository folder. Choose a repository from the roster if the agent owns more than one. Runs on the agent's profile model when the owner allows it for subagents, otherwise on your model (the roster shows each agent's model); thinking no higher than yours. Returns an address without waiting for completion. With night_shift, the linked session runs a night-shift goal in rounds, and its report comes back here by itself when it stops; a night shift has no check command. With watch, the desk thread sleeps until the check's date: it does not count toward the cap, and a check result closes it.",
         parameters: Type.Object({
             agent: Type.String(),
             task: Type.String({ minLength: 1, maxLength: 6000 }),
@@ -1017,12 +1018,28 @@ export default function createTeam(host: Host, web: Web) {
                     ),
                 }),
             ),
+            watch: Type.Optional(
+                Type.Object({
+                    check_on: Type.String({
+                        minLength: 1,
+                        description:
+                            "The check's date as 2026-10-29, or a span from today: 7d, 2w, 1m",
+                    }),
+                    check: Type.String({
+                        minLength: 1,
+                        maxLength: 200,
+                        description:
+                            "The check for the desk thread, one line: what to look at on that date",
+                    }),
+                }),
+            ),
         }),
         replay: "safe",
         execute: async (args, api, context) => {
             const { agent, task, repository, night_shift } = args;
             const given = args.title === undefined ? undefined : flat(args.title);
-            const title = given === undefined || given === "" ? taskTitle(task) : given.slice(0, 120);
+            const title =
+                given === undefined || given === "" ? taskTitle(task) : given.slice(0, 120);
             const identity = await api.snapshot(Identity, api.conversationId, context);
             const supervisor = identity?.persona?.name;
 
@@ -1072,10 +1089,31 @@ export default function createTeam(host: Host, web: Web) {
                                   ...(cwd === undefined ? {} : { cwd }),
                                   title,
                                   at: Date.now(),
+                                  ...(args.watch === undefined
+                                      ? {}
+                                      : {
+                                            watch: {
+                                                checkOn: args.watch.check_on,
+                                                check: args.watch.check,
+                                                by: identity?.persona?.id ?? supervisor,
+                                            },
+                                        }),
                               }),
                           context,
                       );
-            const thread = opened === undefined ? "" : ` Thread ${opened.thread.id}.`;
+            // The watch's date is the one the desk resolved at open: a span such as "2w" is kept as its day.
+            const checkOn = opened?.thread.watch?.checkOn;
+            const thread =
+                opened === undefined
+                    ? ""
+                    : checkOn === undefined
+                      ? ` Thread ${opened.thread.id}.`
+                      : ` Thread ${opened.thread.id}, watching until ${checkOn}.`;
+            // With the desk off, delegation works as before, and the result says the watch is not set.
+            const noDesk =
+                args.watch === undefined || desk !== undefined
+                    ? ""
+                    : " The desk is off: the watch is not set.";
 
             // The owner's profile names the model, and the owner's allowed list permits it: neither is Pi's choice.
             // Not allowed: the source's model, as before, said in the result. Allowed but unusable now: core refuses
@@ -1147,7 +1185,7 @@ export default function createTeam(host: Host, web: Web) {
 
             if (shift === undefined || goal === undefined) {
                 return reply(
-                    `Assigned to ${persona.name} at ${started.address}, on ${modelText(persona)}.${thread} Reports arrive when they send them; do not poll or acknowledge reports.`,
+                    `Assigned to ${persona.name} at ${started.address}, on ${modelText(persona)}.${thread} Reports arrive when they send them; do not poll or acknowledge reports.${noDesk}`,
                 );
             }
 
@@ -1159,7 +1197,7 @@ export default function createTeam(host: Host, web: Web) {
                 goal.deadlineLabel === undefined ? "no deadline" : `until ${goal.deadlineLabel}`;
 
             return reply(
-                `Assigned to ${persona.name} at ${started.address}, on ${modelText(persona)}.${thread} Night shift set there: at most ${goal.maxRounds} rounds, ${begins}, ${ends}. Its report arrives here when it stops; do not poll. /night-shift status in that session shows it.`,
+                `Assigned to ${persona.name} at ${started.address}, on ${modelText(persona)}.${thread} Night shift set there: at most ${goal.maxRounds} rounds, ${begins}, ${ends}. Its report arrives here when it stops; do not poll. /night-shift status in that session shows it.${noDesk}`,
             );
         },
     });

@@ -46,12 +46,20 @@ import {
     asksBrian,
     attachTo,
     attribute,
+    asleep,
     buildQuery,
     capView,
     chatGrants,
+    clearWatch,
+    dayOf,
     DEFAULT_CAP,
     exportFiles,
     isCounted,
+    isDue,
+    parseCheckOn,
+    recordResult,
+    setWatch,
+    wakeWatch,
     FOUND_FOLDER_DELAY_MS,
     parseGitHub,
     prNext,
@@ -66,6 +74,7 @@ import {
     type SeedRow,
     type Thread,
 } from "./desk.ts";
+import createDesk from "./desk.ts";
 import { taskTitle } from "./team.ts";
 import { createHandler } from "./_pocket/src/server/http.ts";
 
@@ -550,6 +559,572 @@ describe("wakeParked", () => {
         assert.equal(wakeParked(thread, 1, 200), true);
         assert.equal(thread.state, "open");
         assert.equal(thread.events.at(-1)?.text, "woke: the session is idle");
+    });
+});
+
+// ─── Watches ─────────────────────────────────────────────────────────────────
+
+/** Noon of a local day: a time in the middle of that day, far from midnight. */
+const on = (day: string) => new Date(`${day}T12:00:00`).getTime();
+
+/** A thread with a watch until `checkOn`, and every other part closed. */
+const watched = (patch: Partial<Thread> = {}, checkOn = "2026-11-01"): Thread =>
+    thread({
+        watch: { checkOn, check: "the blob sweep", setAt: 1, setBy: "odrade", key: "watch-1" },
+        ...patch,
+    });
+
+describe("watch dates", () => {
+    test("dayOf is the local day, with a leading zero", () => {
+        assert.equal(dayOf(new Date(2026, 9, 29, 0, 0, 0).getTime()), "2026-10-29");
+        assert.equal(dayOf(new Date(2026, 0, 5, 23, 59).getTime()), "2026-01-05");
+    });
+
+    test("a real date today or later, and a span from today", () => {
+        const now = on("2026-10-22");
+
+        assert.equal(parseCheckOn("2026-10-29", now), "2026-10-29");
+        assert.equal(parseCheckOn(" 2026-10-22 ", now), "2026-10-22", "today is not the past");
+        assert.equal(parseCheckOn("7d", now), "2026-10-29");
+        assert.equal(parseCheckOn("2w", now), "2026-11-05");
+        assert.equal(parseCheckOn("1m", now), "2026-11-22");
+        assert.equal(parseCheckOn("400d", now), "2027-11-26");
+        assert.equal(parseCheckOn("52w", now), "2027-10-21");
+    });
+
+    test("a month span takes that month's last day when the day is past it", () => {
+        assert.equal(parseCheckOn("1m", on("2026-01-31")), "2026-02-28");
+        assert.equal(parseCheckOn("1m", on("2028-01-31")), "2028-02-29");
+        assert.equal(parseCheckOn("12m", on("2026-10-22")), "2027-10-22");
+    });
+
+    test("a past date, a day that is not there, and a bad or long span are errors", () => {
+        const now = on("2026-10-22");
+
+        assert.match(errorOf(parseCheckOn("2026-10-21", now)), /is in the past/);
+        assert.match(errorOf(parseCheckOn("2026-02-30", now)), /not a real date/);
+        assert.match(errorOf(parseCheckOn("2026-13-01", now)), /not a real date/);
+
+        for (const bad of ["", "7", "0d", "d7", "next week", "7 days", "-7d", "1.5w"]) {
+            assert.match(errorOf(parseCheckOn(bad, now)), /A check date is a day such as/);
+        }
+
+        for (const long of ["401d", "53w", "13m"]) {
+            assert.match(errorOf(parseCheckOn(long, now)), /1 to 400 days, 1 to 52 weeks/);
+        }
+    });
+});
+
+describe("the watch's rules", () => {
+    test("a watched thread sleeps until its date: it does not count, and it is not stale", () => {
+        const sleeping = watched();
+
+        assert.equal(asleep(sleeping, on("2026-10-22")), true);
+        assert.equal(asleep(sleeping, on("2026-10-31")), true);
+        assert.equal(isDue(sleeping, on("2026-10-31")), false);
+        assert.equal(isCounted(sleeping, on("2026-10-22")), false);
+        assert.equal(
+            isStale(sleeping, on("2026-10-30")),
+            false,
+            "a sleeping thread is never stale",
+        );
+
+        // On its date it is due: it counts again, and the stale clock runs from its last event.
+        const due = watched({ lastEventAt: on("2026-11-01") });
+
+        assert.equal(asleep(due, on("2026-11-01")), false);
+        assert.equal(isDue(due, on("2026-11-01")), true);
+        assert.equal(isCounted(due, on("2026-11-01")), true);
+        assert.equal(isStale(due, on("2026-11-01")), false);
+        assert.equal(isStale(due, on("2026-11-01") + 3 * DAY + 1), true);
+
+        // Only an open or starting thread with a watch and no result sleeps.
+        assert.equal(asleep(watched({ state: "parked" }), on("2026-10-22")), false);
+        assert.equal(asleep(thread(), on("2026-10-22")), false, "no watch, no sleep");
+    });
+
+    test("wakeWatch records the wake once, on the date", () => {
+        const sleeping = watched();
+        const events = sleeping.events.length;
+
+        assert.equal(wakeWatch(sleeping, on("2026-10-31")), false, "not due yet");
+        assert.equal(sleeping.watch?.dueAt, undefined);
+        assert.equal(sleeping.events.length, events);
+
+        assert.equal(wakeWatch(sleeping, on("2026-11-01")), true);
+        assert.equal(sleeping.watch?.dueAt, on("2026-11-01"));
+        assert.equal(sleeping.events.at(-1)?.key, "watch:2026-11-01:due");
+        assert.equal(sleeping.events.at(-1)?.text, "due: the blob sweep");
+        assert.equal(sleeping.lastEventAt, on("2026-11-01"));
+
+        const after = sleeping.events.length;
+
+        assert.equal(wakeWatch(sleeping, on("2026-11-02")), false, "a second call writes nothing");
+        assert.equal(sleeping.events.length, after);
+        assert.equal(sleeping.watch?.dueAt, on("2026-11-01"));
+    });
+
+    test("setWatch adds a watch with its event, and a replay with the same key changes nothing", () => {
+        const fresh = thread();
+        const first = setWatch(fresh, {
+            checkOn: "7d",
+            check: "  the blob    sweep ",
+            by: "odrade",
+            key: "call-1",
+            at: on("2026-10-22"),
+        });
+
+        assert.deepEqual(first, { changed: true });
+        assert.deepEqual(fresh.watch, {
+            checkOn: "2026-10-29",
+            check: "the blob sweep",
+            setAt: on("2026-10-22"),
+            setBy: "odrade",
+            key: "call-1",
+        });
+        assert.equal(fresh.events.at(-1)?.key, "watch:set:call-1");
+        assert.equal(
+            fresh.events.at(-1)?.text,
+            "watch: check on 2026-10-29 by odrade: the blob sweep",
+        );
+
+        // A replay, with a span that would resolve to another date today: the first date stays.
+        const events = fresh.events.length;
+
+        assert.deepEqual(
+            setWatch(fresh, {
+                checkOn: "2w",
+                check: "another",
+                by: "odrade",
+                key: "call-1",
+                at: on("2026-10-25"),
+            }),
+            { changed: false },
+        );
+        assert.equal(fresh.watch?.checkOn, "2026-10-29");
+        assert.equal(fresh.watch?.check, "the blob sweep");
+        assert.equal(fresh.events.length, events);
+
+        // A new key replaces the watch: no wake, and no result, from the old one.
+        const due = watched();
+
+        wakeWatch(due, on("2026-11-01"));
+        recordResult(due, {
+            pass: false,
+            text: "still there",
+            by: "duncan",
+            key: "r-1",
+            at: on("2026-11-01"),
+            closedBy: "desk",
+        });
+        assert.equal(
+            setWatch(due, {
+                checkOn: "2w",
+                check: "again",
+                by: "brian",
+                key: "call-2",
+                at: on("2026-11-02"),
+            }).changed,
+            true,
+        );
+        assert.equal(due.watch?.checkOn, "2026-11-16");
+        assert.equal(due.watch?.dueAt, undefined);
+        assert.equal(due.watch?.result, undefined);
+
+        // A watch is for an open thread, the check is 1 line of 1 to 200 characters, and the date is real.
+        assert.match(
+            errorOf(
+                setWatch(thread({ state: "closed" }), {
+                    checkOn: "2w",
+                    check: "x",
+                    by: "odrade",
+                    key: "k",
+                    at: on("2026-10-22"),
+                }),
+            ),
+            /closed/,
+        );
+        assert.match(
+            errorOf(
+                setWatch(thread(), {
+                    checkOn: "2w",
+                    check: "  ",
+                    by: "odrade",
+                    key: "k",
+                    at: on("2026-10-22"),
+                }),
+            ),
+            /1 to 200 characters/,
+        );
+        assert.match(
+            errorOf(
+                setWatch(thread(), {
+                    checkOn: "2w",
+                    check: "x".repeat(201),
+                    by: "odrade",
+                    key: "k",
+                    at: on("2026-10-22"),
+                }),
+            ),
+            /1 to 200 characters/,
+        );
+        assert.match(
+            errorOf(
+                setWatch(thread(), {
+                    checkOn: "2026-01-01",
+                    check: "x",
+                    by: "odrade",
+                    key: "k",
+                    at: on("2026-10-22"),
+                }),
+            ),
+            /is in the past/,
+        );
+    });
+
+    test("clearWatch removes it once, and no watch is no change", () => {
+        const fresh = watched();
+
+        assert.equal(clearWatch(fresh, "brian", "tap-1", on("2026-10-23")), true);
+        assert.equal(fresh.watch, undefined);
+        assert.equal(fresh.events.at(-1)?.key, "watch:clear:tap-1");
+        assert.equal(fresh.events.at(-1)?.text, "watch cleared by brian");
+
+        const events = fresh.events.length;
+
+        assert.equal(clearWatch(fresh, "brian", "tap-2", on("2026-10-24")), false);
+        assert.equal(fresh.events.length, events);
+    });
+
+    test("a pass closes the thread as done, with the result and who recorded it", () => {
+        const due = watched();
+        const at = on("2026-11-01") + 1000;
+
+        wakeWatch(due, on("2026-11-01"));
+        assert.deepEqual(
+            recordResult(due, {
+                pass: true,
+                text: " the blobs are gone ",
+                by: "odrade",
+                key: "r-1",
+                at,
+                closedBy: "desk",
+            }),
+            { changed: true },
+        );
+        assert.equal(due.state, "closed");
+        assert.deepEqual(due.closed, { at, why: "done", by: "desk" });
+        assert.equal(due.run.next, "none");
+        assert.deepEqual(due.watch?.result, {
+            at,
+            by: "odrade",
+            pass: true,
+            text: "the blobs are gone",
+            key: "r-1",
+        });
+        assert.equal(due.events.at(-1)?.key, "watch:pass:r-1");
+        assert.equal(due.events.at(-1)?.text, "watch passed (odrade): the blobs are gone");
+
+        // The same call again: nothing changes. A second pass with a new key is refused.
+        const events = due.events.length;
+
+        assert.deepEqual(
+            recordResult(due, {
+                pass: true,
+                text: "x",
+                by: "odrade",
+                key: "r-1",
+                at: at + 1000,
+                closedBy: "desk",
+            }),
+            { changed: false },
+        );
+        assert.equal(due.events.length, events);
+        assert.match(
+            errorOf(
+                recordResult(due, {
+                    pass: true,
+                    text: "x",
+                    by: "brian",
+                    key: "r-2",
+                    at,
+                    closedBy: "brian",
+                }),
+            ),
+            /passed already/,
+        );
+    });
+
+    test("a fail keeps it open, counts again, and starts the stale clock at the fail", () => {
+        const failed = watched();
+        const at = on("2026-11-01");
+
+        assert.equal(isCounted(failed, at), true);
+        assert.equal(
+            recordResult(failed, {
+                pass: false,
+                text: "2 blobs remain",
+                by: "duncan",
+                key: "f-1",
+                at,
+                closedBy: "desk",
+            }).changed,
+            true,
+        );
+        assert.equal(failed.state, "open");
+        assert.equal(failed.watch?.result?.pass, false);
+        assert.equal(failed.lastEventAt, at, "the fail moves the stale clock");
+        assert.equal(isCounted(failed, at), true);
+        assert.equal(isStale(failed, at + 3 * DAY), false);
+        assert.equal(isStale(failed, at + 3 * DAY + 1), true);
+        assert.equal(failed.events.at(-1)?.key, "watch:fail:f-1");
+        assert.equal(failed.events.at(-1)?.text, "watch failed (duncan): 2 blobs remain");
+
+        // A result may come early, before the date: the thread was asleep, and the pass closes it.
+        const early = watched();
+
+        assert.equal(asleep(early, on("2026-10-22")), true);
+        assert.equal(
+            recordResult(early, {
+                pass: true,
+                text: "it went early",
+                by: "duncan",
+                key: "e-1",
+                at: on("2026-10-22"),
+                closedBy: "brian",
+            }).changed,
+            true,
+        );
+        assert.equal(early.state, "closed");
+        assert.equal(early.closed?.by, "brian");
+
+        // A later pass after a fail closes it as done.
+        recordResult(failed, {
+            pass: true,
+            text: "gone now",
+            by: "duncan",
+            key: "p-2",
+            at: at + 100,
+            closedBy: "desk",
+        });
+        assert.equal(failed.state, "closed");
+        assert.deepEqual(failed.closed, { at: at + 100, why: "done", by: "desk" });
+
+        // No watch, and a closed thread, are refused.
+        assert.match(
+            errorOf(
+                recordResult(thread(), {
+                    pass: true,
+                    text: "x",
+                    by: "odrade",
+                    key: "n-1",
+                    at,
+                    closedBy: "desk",
+                }),
+            ),
+            /has no watch/,
+        );
+        assert.match(
+            errorOf(
+                recordResult(watched({ state: "closed" }), {
+                    pass: false,
+                    text: "x",
+                    by: "odrade",
+                    key: "n-2",
+                    at,
+                    closedBy: "desk",
+                }),
+            ),
+            /is closed/,
+        );
+    });
+
+    test("closeCheck keeps a watched thread open until a pass", () => {
+        const sleeping = watched();
+        const before = closeCheck(sleeping, facts(on("2026-10-25")));
+
+        assert.equal(before.close, false);
+        assert.deepEqual(before.open, ["watch: check on 2026-11-01"]);
+
+        const due = closeCheck(watched(), facts(on("2026-11-02")));
+
+        assert.equal(due.close, false);
+        assert.deepEqual(due.open, ["watch is due: the blob sweep"]);
+
+        const failed = watched();
+
+        recordResult(failed, {
+            pass: false,
+            text: "2 blobs remain",
+            by: "duncan",
+            key: "f-1",
+            at: on("2026-11-02"),
+            closedBy: "desk",
+        });
+        assert.deepEqual(closeCheck(failed, facts(on("2026-11-02"))).open, [
+            "watch failed: 2 blobs remain",
+        ]);
+
+        // Only a pass closes it.
+        const passed = watched();
+
+        recordResult(passed, {
+            pass: true,
+            text: "gone",
+            by: "duncan",
+            key: "p-1",
+            at: on("2026-11-02"),
+            closedBy: "desk",
+        });
+        assert.equal(passed.state, "closed");
+        assert.equal(closeCheck(passed, facts(on("2026-11-02"))).close, false, "closed already");
+        assert.equal(closeCheck(thread(), facts(on("2026-11-02"))).close, true, "no watch closes");
+    });
+
+    test("nextActor gives a due watch to odrade and a failed one to the agent", () => {
+        assert.equal(nextActor(watched()), "none", "a sleeping thread keeps its normal actor");
+
+        const due = watched();
+
+        wakeWatch(due, on("2026-11-01"));
+        assert.equal(nextActor(due), "odrade");
+
+        // An open ask still comes first.
+        const asked = watched({ asks: [{ id: "T1a", text: "Which one?", at: 1 }] });
+
+        wakeWatch(asked, on("2026-11-01"));
+        assert.equal(nextActor(asked), "brian");
+
+        const failed = watched();
+
+        recordResult(failed, {
+            pass: false,
+            text: "2 blobs remain",
+            by: "duncan",
+            key: "f-1",
+            at: on("2026-11-01"),
+            closedBy: "desk",
+        });
+        assert.equal(nextActor(failed), "agent");
+    });
+
+    test("listText puts the due lines first, and lists sleeping threads under Watching", () => {
+        const state = deskOf();
+        const sleeping = placed(state, 100);
+        const due = placed(state, 200);
+
+        sleeping.watch = {
+            checkOn: "2026-12-01",
+            check: "the blob sweep",
+            setAt: 1,
+            setBy: "odrade",
+            key: "k-1",
+        };
+        due.watch = {
+            checkOn: "2026-11-01",
+            check: "the deploy",
+            setAt: 1,
+            setBy: "brian",
+            key: "k-2",
+        };
+
+        const text = listText(state, on("2026-11-02"));
+        const lines = text.split("\n");
+
+        assert.equal(lines[0], `due: ${due.id} the deploy`, "the due line is first");
+        assert.match(
+            text,
+            new RegExp(`^2026-12-01 · ${sleeping.id} · frostyard/test · the blob sweep$`, "m"),
+        );
+        assert.match(text, new RegExp(`^Watching:$`, "m"));
+        assert.match(
+            text,
+            new RegExp(`^${due.id} · open · next: `, "m"),
+            "a due thread has a line",
+        );
+        assert.doesNotMatch(
+            text,
+            new RegExp(`^${sleeping.id} · open`, "m"),
+            "a sleeping thread is not in the lines",
+        );
+
+        // Sorted by date: the earlier date comes first.
+        const other = placed(state, 300);
+
+        other.watch = {
+            checkOn: "2026-11-20",
+            check: "the second check",
+            setAt: 1,
+            setBy: "odrade",
+            key: "k-3",
+        };
+
+        const block = listText(state, on("2026-11-02")).split("Watching:\n")[1]?.split("\n");
+
+        assert.equal(block?.[0], `2026-11-20 · ${other.id} · frostyard/test · the second check`);
+        assert.equal(block?.[1], `2026-12-01 · ${sleeping.id} · frostyard/test · the blob sweep`);
+    });
+
+    test("readText has a Watch line, with its date, check, who set it, the wake and the result", () => {
+        const state = deskOf();
+        const one = placed(state, 100);
+
+        one.watch = {
+            checkOn: "2026-12-01",
+            check: "the blob sweep",
+            setAt: 1,
+            setBy: "odrade",
+            key: "k-1",
+        };
+        assert.match(
+            readText(state, one.id) ?? "",
+            /Watch: 2026-12-01 · the blob sweep · set by odrade/,
+        );
+
+        wakeWatch(one, on("2026-12-01"));
+        recordResult(one, {
+            pass: true,
+            text: "the blobs are gone",
+            by: "duncan",
+            key: "r-1",
+            at: on("2026-12-02"),
+            closedBy: "desk",
+        });
+        assert.match(
+            readText(state, one.id) ?? "",
+            /Watch: 2026-12-01 · the blob sweep · set by odrade · due 2026-12-01T[0-9:]+.* · passed \(duncan\) .*the blobs are gone/,
+        );
+    });
+
+    test("the export has a Watching section, a watch line, and the sleeping thread does not count", () => {
+        const state = deskOf();
+        const working = placed(state, 100);
+        const sleeping = placed(state, 200);
+
+        working.lastEventAt = on("2026-10-22");
+        sleeping.watch = {
+            checkOn: "2026-12-01",
+            check: "the blob sweep",
+            setAt: 1,
+            setBy: "odrade",
+            key: "k-1",
+        };
+
+        const files = exportFiles(state, {}, on("2026-10-22"), 12);
+        const readme = files["threads.md"] ?? "";
+
+        assert.match(readme, /Counted: 1 of 12\./);
+        assert.match(
+            readme,
+            new RegExp(
+                `## Watching\n\n- \\*\\*${sleeping.id}\\*\\* At 200 · frostyard/test · next: \\w+ · watch: 2026-12-01`,
+            ),
+        );
+        assert(readme.indexOf("## Watching") < readme.indexOf("## Working"));
+        assert.match(
+            files[`${sleeping.id}.md`] ?? "",
+            /- Watch: 2026-12-01 · the blob sweep · set by odrade/,
+        );
     });
 });
 
@@ -1265,12 +1840,12 @@ describe("asks", () => {
 
 describe("the cap", () => {
     test("a thread counts unless it is parked, closed, or waits on a reviewer", () => {
-        assert.equal(isCounted(thread({ run: { next: "agent" } })), true);
-        assert.equal(isCounted(thread({ state: "starting", run: { next: "agent" } })), true);
-        assert.equal(isCounted(thread({ origin: "found", run: { next: "odrade" } })), true);
-        assert.equal(isCounted(thread({ state: "parked", run: { next: "agent" } })), false);
-        assert.equal(isCounted(thread({ state: "closed", run: { next: "none" } })), false);
-        assert.equal(isCounted(thread({ run: { next: "reviewer" } })), false);
+        assert.equal(isCounted(thread({ run: { next: "agent" } }), 1000), true);
+        assert.equal(isCounted(thread({ state: "starting", run: { next: "agent" } }), 1000), true);
+        assert.equal(isCounted(thread({ origin: "found", run: { next: "odrade" } }), 1000), true);
+        assert.equal(isCounted(thread({ state: "parked", run: { next: "agent" } }), 1000), false);
+        assert.equal(isCounted(thread({ state: "closed", run: { next: "none" } }), 1000), false);
+        assert.equal(isCounted(thread({ run: { next: "reviewer" } }), 1000), false);
     });
 
     test("capView counts the threads and the usable OKs", () => {
@@ -1412,6 +1987,10 @@ let seedPath = "";
 /** The thread and ask the scripted model uses in the ask tests. */
 let askThreadId = "";
 let answerAskId = "";
+/** The threads the scripted model watches and records results on. */
+let watchThreadId = "";
+let otherThreadId = "";
+let resultThreadId = "";
 
 /** Pi Pocket's plan mode, to turn it on for one session in a test. */
 const PlanDoc = defineDoc<{ on: boolean }>({
@@ -1497,6 +2076,60 @@ const model = scriptedModel((request) => {
             thread: "new",
             title: "A decision",
             text: "Merge it?",
+        });
+    }
+
+    if (text.endsWith("desk watch test")) {
+        return call("desk", {
+            action: "watch",
+            thread: watchThreadId,
+            check_on: "7d",
+            text: "the blob sweep",
+        });
+    }
+
+    if (text.endsWith("watch own thread test")) {
+        return call("desk", {
+            action: "watch",
+            thread: watchThreadId,
+            check_on: "1m",
+            text: "the blob sweep",
+        });
+    }
+
+    if (text.endsWith("watch other thread test")) {
+        return call("desk", {
+            action: "watch",
+            thread: otherThreadId,
+            check_on: "7d",
+            text: "not mine",
+        });
+    }
+
+    if (text.endsWith("desk result fail test")) {
+        return call("desk", {
+            action: "result",
+            thread: resultThreadId,
+            pass: false,
+            text: "2 blobs remain",
+        });
+    }
+
+    if (text.endsWith("desk result test")) {
+        return call("desk", {
+            action: "result",
+            thread: resultThreadId,
+            pass: true,
+            text: "the blobs are gone",
+        });
+    }
+
+    if (text.endsWith("desk delegate watch test")) {
+        return call("team_delegate", {
+            agent: "duncan",
+            repository: "frostyard/test",
+            task: TASK,
+            watch: { check_on: "2w", check: "the blob sweep" },
         });
     }
 
@@ -2787,6 +3420,447 @@ describe("the desk in a Pi Pocket", () => {
             const guest = app.config.addUser("An ask guest", "guest");
 
             assert.equal((await call(`asks/${secondAsk}/answer`, {}, guest.token)).status, 404);
+        });
+
+        test("watch, unwatch and result change the thread; a second POST changes nothing", async () => {
+            const { thread } = await delegated("page-watch");
+
+            await until(
+                async () =>
+                    typeof (await deskState())?.threads[thread.id]?.run.sweptAt === "number",
+                "the first sweep",
+                20_000,
+            );
+
+            const checkOn = dayOf(Date.now() + 7 * DAY);
+            const watched = await call(`threads/${thread.id}/watch`, {
+                checkOn,
+                check: "the blob sweep",
+            });
+
+            assert.equal(watched.status, 200);
+
+            let stored = (await deskState())?.threads[thread.id];
+
+            assert.equal(stored?.watch?.checkOn, checkOn);
+            assert.equal(stored?.watch?.check, "the blob sweep");
+            assert.equal(stored?.watch?.setBy, "brian");
+            assert.equal(
+                watched.data.threads.find((each: { id: string }) => each.id === thread.id).asleep,
+                true,
+            );
+            assert(watched.data.counts.watching >= 1, "the header counts it");
+
+            const events = stored?.events.length ?? 0;
+            const twice = await call(`threads/${thread.id}/watch`, {
+                checkOn,
+                check: "the blob sweep",
+            });
+
+            assert.equal(twice.status, 200);
+            assert.equal(
+                (await deskState())?.threads[thread.id]?.events.length,
+                events,
+                "a double tap changes nothing",
+            );
+
+            // A past date, and no date at all, are refused.
+            assert.equal(
+                (await call(`threads/${thread.id}/watch`, { checkOn: "2020-01-01", check: "x" }))
+                    .status,
+                400,
+            );
+            assert.equal((await call(`threads/${thread.id}/watch`, { check: "x" })).status, 400);
+
+            const cleared = await call(`threads/${thread.id}/unwatch`, {});
+
+            assert.equal(cleared.status, 200);
+            assert.equal((await deskState())?.threads[thread.id]?.watch, undefined);
+            assert.equal(
+                (await call(`threads/${thread.id}/unwatch`, {})).status,
+                200,
+                "no watch: no change",
+            );
+
+            // A fail leaves it open, and its stale clock starts at the fail.
+            assert.equal(
+                (await call(`threads/${thread.id}/watch`, { checkOn, check: "the blob sweep" }))
+                    .status,
+                200,
+            );
+            assert.equal(
+                (await call(`threads/${thread.id}/result`, {})).status,
+                400,
+                "pass must be a boolean",
+            );
+
+            const failed = await call(`threads/${thread.id}/result`, {
+                pass: false,
+                text: "2 blobs remain",
+            });
+
+            assert.equal(failed.status, 200);
+            stored = (await deskState())?.threads[thread.id];
+            assert.equal(stored?.state, "open");
+            assert.equal(stored?.watch?.result?.pass, false);
+            assert.equal(stored?.watch?.result?.by, "brian");
+            assert.equal(stored?.watch?.result?.text, "2 blobs remain");
+            assert.equal(stored?.lastEventAt, stored?.watch?.result?.at);
+
+            // A pass closes it as done, by Brian.
+            const passed = await call(`threads/${thread.id}/result`, {
+                pass: true,
+                text: "the blobs are gone",
+            });
+
+            assert.equal(passed.status, 200);
+            stored = (await deskState())?.threads[thread.id];
+            assert.equal(stored?.state, "closed");
+            assert.deepEqual(stored?.closed && { why: stored.closed.why, by: stored.closed.by }, {
+                why: "done",
+                by: "brian",
+            });
+            assert.equal(stored?.watch?.result?.pass, true);
+            assert.equal(stored?.run.next, "none");
+
+            const afterPass = stored?.events.length ?? 0;
+
+            assert.equal(
+                (await call(`threads/${thread.id}/result`, { pass: true, text: "again" })).status,
+                200,
+            );
+            assert.equal(
+                (await deskState())?.threads[thread.id]?.events.length,
+                afterPass,
+                "a second pass changes nothing",
+            );
+
+            // A guest cannot use the routes.
+            const guest = app.config.addUser("A watch guest", "guest");
+
+            for (const [path, body] of [
+                [`threads/${thread.id}/watch`, { checkOn, check: "x" }],
+                [`threads/${thread.id}/unwatch`, {}],
+                [`threads/${thread.id}/result`, { pass: true, text: "x" }],
+            ] as [string, object][]) {
+                assert.equal((await call(path, body, guest.token)).status, 404, path);
+            }
+        });
+    });
+
+    describe("watches", () => {
+        test("a supervisor's watch makes the thread sleep, outside the cap, and a pass closes it", async () => {
+            await stopSweepers();
+            const { source, thread } = await delegated("watcher");
+
+            await until(
+                async () =>
+                    typeof (await deskState())?.threads[thread.id]?.run.sweptAt === "number",
+                "the first sweep",
+                20_000,
+            );
+
+            const before = capView(await deskState(), 100, Date.now()).counted;
+
+            watchThreadId = thread.id;
+            resultThreadId = thread.id;
+            await say(app, source, "desk watch test");
+
+            let stored = (await deskState())?.threads[thread.id];
+
+            assert.equal(stored?.watch?.checkOn, dayOf(Date.now() + 7 * DAY));
+            assert.equal(stored?.watch?.check, "the blob sweep");
+            assert.equal(stored?.watch?.setBy, "odrade", "the roster id of the agent who set it");
+            assert.match(stored?.watch?.key ?? "", /^x\.desk\.watch:/);
+            assert.equal(typeof stored?.watch?.setAt, "number");
+            assert.equal(asleep(stored!, Date.now()), true);
+            assert.match(
+                (await modelTexts(app, source)).join("\n"),
+                new RegExp(`Watching ${thread.id}: check on \\d{4}-\\d{2}-\\d{2}\\.`),
+            );
+
+            // A sleeping thread is outside the cap count.
+            assert.equal(capView(await deskState(), 100, Date.now()).counted, before - 1);
+
+            // desk list hides it from the lines, and lists it under Watching.
+            await say(app, source, "desk list test");
+
+            const list =
+                (await modelTexts(app, source))
+                    .filter((text) => text.includes("Counted:"))
+                    .at(-1) ?? "";
+
+            assert.match(list, new RegExp(`Counted: ${String(before - 1)} of 100`));
+            assert(list.includes("Watching:"), "the Watching block");
+            assert(
+                list.includes(`${thread.id} · frostyard/test · the blob sweep`),
+                "the sleeping thread is under Watching",
+            );
+            assert(!list.includes(`${thread.id} · open`), "no line of its own");
+
+            // A pass closes the thread, by the desk, with who recorded it.
+            await say(app, source, "desk result test");
+            stored = (await deskState())?.threads[thread.id];
+            assert.equal(stored?.state, "closed");
+            assert.deepEqual(stored?.closed && { why: stored.closed.why, by: stored.closed.by }, {
+                why: "done",
+                by: "desk",
+            });
+            assert.deepEqual(
+                stored?.watch?.result && {
+                    pass: stored.watch.result.pass,
+                    by: stored.watch.result.by,
+                    text: stored.watch.result.text,
+                },
+                { pass: true, by: "odrade", text: "the blobs are gone" },
+            );
+            assert.match(
+                (await modelTexts(app, source)).join("\n"),
+                new RegExp(`Check passed: ${thread.id} is closed\\.`),
+            );
+
+            // A second result on a passed watch is refused.
+            await say(app, source, "desk result fail test");
+            assert.match((await modelTexts(app, source)).join("\n"), /passed already/);
+        });
+
+        test("a replayed desk watch keeps the date it first resolved", async () => {
+            const source = await supervisor("watch-replay");
+            let id = "";
+
+            await app.harness.commit(async (tx) => {
+                const state = await tx.doc(DeskThreads);
+                const opened = openThread(state, {
+                    key: "x.test.watch-replay",
+                    supervisor: Number(source),
+                    agents: ["duncan"],
+                    repo: "frostyard/test",
+                    title: "A replayed watch",
+                    at: Date.now(),
+                });
+
+                id = opened.thread.id;
+                state.threads[id]!.state = "open";
+            }, context);
+
+            const stubWeb = {
+                conversationRoute() {},
+                route() {},
+                client() {},
+                command() {},
+                send() {},
+                onDispose() {},
+                error: (status: number, message: string) =>
+                    Object.assign(new Error(message), { status }),
+            };
+            const stubHost = {
+                requesterOf: () => owner(app).id,
+                text: { defang: (value: string) => value, quoted: () => "" },
+                notice() {},
+                linkedSessions: {},
+            };
+            const shared = globalThis as unknown as Record<symbol, unknown>;
+            const saved = shared[Symbol.for("pi-pocket-team.desk")];
+            const extension = createDesk(stubHost as never, stubWeb as never) as unknown as {
+                tools: {
+                    name: string;
+                    execute: (args: object, api: object, context: unknown) => Promise<unknown>;
+                }[];
+            };
+            const tool = extension.tools.find((each) => each.name === "desk")!;
+            const api = {
+                conversationId: source,
+                taskId: "task-watch",
+                callId: "call-1",
+                snapshot: (...args: unknown[]) =>
+                    Reflect.apply(app.harness.snapshot, app.harness, args),
+                commit: (change: never, ctx: never) => app.harness.commit(change, ctx),
+            };
+
+            try {
+                const first = JSON.stringify(
+                    await tool.execute(
+                        { action: "watch", thread: id, check_on: "7d", text: "the blob sweep" },
+                        api,
+                        context,
+                    ),
+                );
+                const stored = (await deskState())?.threads[id]?.watch;
+
+                assert.equal(stored?.checkOn, dayOf(Date.now() + 7 * DAY));
+                assert.match(first, /Watching/);
+
+                // The same call again, as a restart replays it: another span would move the date, and it does not.
+                const again = JSON.stringify(
+                    await tool.execute(
+                        { action: "watch", thread: id, check_on: "2w", text: "the blob sweep" },
+                        api,
+                        context,
+                    ),
+                );
+
+                assert.equal((await deskState())?.threads[id]?.watch?.checkOn, stored?.checkOn);
+                assert.equal(
+                    (await deskState())?.threads[id]?.watch?.key,
+                    "x.desk.watch:task-watch:call-1",
+                );
+                assert.match(again, /watched already/);
+            } finally {
+                shared[Symbol.for("pi-pocket-team.desk")] = saved;
+            }
+        });
+
+        test("a watch survives a restart, and the sweep records the wake on its date", async () => {
+            await stopSweepers();
+            const { source, thread } = await delegated("watch-restart");
+
+            watchThreadId = thread.id;
+            await say(app, source, "desk watch test");
+
+            const checkOn = (await deskState())?.threads[thread.id]?.watch?.checkOn ?? "";
+
+            assert.match(checkOn, /^\d{4}-\d{2}-\d{2}$/);
+
+            try {
+                // 8 days later: past the 7-day check date.
+                await restartApp(8 * DAY);
+
+                assert.equal(
+                    (await deskState())?.threads[thread.id]?.watch?.checkOn,
+                    checkOn,
+                    "the field survives the restart",
+                );
+
+                await until(
+                    async () =>
+                        typeof (await deskState())?.threads[thread.id]?.watch?.dueAt === "number",
+                    "the sweep to record the wake",
+                    20_000,
+                );
+
+                const due = (await deskState())?.threads[thread.id];
+                const key = `watch:${checkOn}:due`;
+
+                assert.equal(due?.state, "open", "a due watch keeps the thread open");
+                assert.equal(due?.run.next, "odrade");
+                assert.equal(due?.events.filter((event) => event.key === key).length, 1);
+                assert.equal(
+                    due?.events.find((event) => event.key === key)?.text,
+                    "due: the blob sweep",
+                );
+
+                // A second sweep adds no second wake.
+                const at = due?.watch?.dueAt;
+
+                await say(app, source, "desk sync test");
+                assert.equal((await deskState())?.threads[thread.id]?.watch?.dueAt, at);
+                assert.equal(
+                    (await deskState())?.threads[thread.id]?.events.filter(
+                        (event) => event.key === key,
+                    ).length,
+                    1,
+                );
+            } finally {
+                shift = 0;
+            }
+        });
+
+        test("the owning agent can watch its own thread, and not another thread", async () => {
+            const { source, linked, thread } = await delegated("agent-watch");
+
+            // A second thread of the same supervisor: it is not this agent's thread.
+            await say(app, source, "desk delegate test");
+
+            const other = Object.values((await deskState())?.threads ?? {}).find(
+                (each) =>
+                    each.supervisor === Number(source) &&
+                    each.id !== thread.id &&
+                    each.origin === "delegate",
+            );
+
+            assert(other, "a second thread");
+
+            watchThreadId = thread.id;
+            await say(app, linked, "watch own thread test");
+
+            const stored = (await deskState())?.threads[thread.id];
+
+            assert.equal(stored?.watch?.checkOn, parseCheckOn("1m", Date.now()));
+            assert.equal(stored?.watch?.setBy, "duncan");
+            assert.equal(stored?.watch?.key.startsWith("x.desk.watch:"), true);
+            assert.match(
+                (await modelTexts(app, linked)).join("\n"),
+                new RegExp(`Watching ${thread.id}: check on`),
+            );
+
+            otherThreadId = other!.id;
+            await say(app, linked, "watch other thread test");
+
+            assert.equal((await deskState())?.threads[other!.id]?.watch, undefined);
+            assert.match(
+                (await modelTexts(app, linked)).join("\n"),
+                /Only the supervisor can record a result or set a watch on/,
+            );
+
+            // A session with no identity cannot set a watch at all.
+            const folder = join(root, "plain-watch");
+
+            mkdirSync(folder, { recursive: true });
+
+            const plain = await newSession(app, folder);
+
+            watchThreadId = thread.id;
+            await say(app, plain, "desk watch test");
+            assert.match(
+                (await modelTexts(app, plain)).join("\n"),
+                /A watch needs a session with a named identity/,
+            );
+        });
+
+        test("team_delegate with a watch opens a sleeping thread, and says so when the desk is off", async () => {
+            await stopSweepers();
+            const source = await supervisor("delegate-watch");
+
+            await say(app, source, "desk delegate watch test");
+
+            const linked = app.sessions().find((each) => each.linkedFrom?.id === Number(source));
+
+            assert(linked, "the delegation started a linked session");
+
+            const thread = threadOfSession(await deskState(), Number(linked.id));
+
+            assert(thread, "the thread");
+            assert.equal(thread.watch?.checkOn, dayOf(Date.now() + 14 * DAY));
+            assert.equal(thread.watch?.check, "the blob sweep");
+            assert.equal(thread.watch?.setBy, "odrade");
+            assert.equal(thread.watch?.key.startsWith("x.team.delegate:"), true);
+            assert.equal(asleep(thread, Date.now()), true);
+            assert.match(
+                (await modelTexts(app, source)).join("\n"),
+                new RegExp(`Thread ${thread.id}, watching until ${thread.watch?.checkOn}\\.`),
+            );
+
+            // With the desk off, delegation works as before, and the result says the watch is not set.
+            const shared = globalThis as unknown as Record<symbol, unknown>;
+            const saved = shared[Symbol.for("pi-pocket-team.desk")];
+            const sessions = app.sessions().length;
+
+            try {
+                delete shared[Symbol.for("pi-pocket-team.desk")];
+                await say(app, source, "desk delegate watch test");
+
+                assert.equal(
+                    app.sessions().length,
+                    sessions + 1,
+                    "the delegation works without the desk",
+                );
+                assert.match(
+                    (await modelTexts(app, source)).join("\n"),
+                    /The desk is off: the watch is not set\./,
+                );
+            } finally {
+                shared[Symbol.for("pi-pocket-team.desk")] = saved;
+            }
         });
     });
 

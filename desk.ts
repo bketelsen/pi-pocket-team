@@ -99,6 +99,22 @@ export type PrLink = {
     mergeable?: string;
 };
 
+/** One dated check on a thread. Stored data: never rename a field or change what it means. */
+export type Watch = {
+    /** "2026-10-29": a day on the server's clock, in local time. */
+    checkOn: string;
+    /** 1 line, at most 200 characters. */
+    check: string;
+    setAt: number;
+    /** "brian", or the roster id of the agent who set it. */
+    setBy: string;
+    /** The replay key of the call or tap that set it. */
+    key: string;
+    /** When the desk recorded the wake: due, and no result yet. */
+    dueAt?: number;
+    result?: { at: number; by: string; pass: boolean; text: string; key: string };
+};
+
 /** One piece of work the team runs. Stored data: never rename a field or change what it means. */
 export type Thread = {
     /** "T13" for a delegated, seeded, or asked thread; "F2" for a found one. */
@@ -127,6 +143,8 @@ export type Thread = {
     /** Key "owner/name#n". */
     prs: Record<string, PrLink>;
     branches: string[];
+    /** A dated check: the thread sleeps until its date, and a pass closes it. */
+    watch?: Watch;
     /** Ask ids "T13a", "T13b", ... */
     asks: Ask[];
     /**
@@ -292,13 +310,16 @@ export type OpenRequest = {
     cwd?: string;
     title: string;
     at: number;
+    /** A dated check, set with the thread: `team_delegate`'s `watch`. */
+    watch?: { checkOn: string; check: string; by: string };
 };
 
 export type BindRequest = { session: number; address: string; at: number };
 
 /**
  * Open a thread for `key`, or return the thread that key made already (a replay): a restarted delegation must not make
- * a second thread.
+ * a second thread. A watch with a bad date or a bad check throws before anything is added: the caller's commit rolls
+ * back, so no thread starts.
  */
 export function openThread(
     state: DeskState,
@@ -308,6 +329,29 @@ export function openThread(
 
     if (existing !== undefined) {
         return { thread: existing, reused: true };
+    }
+
+    let watch: Watch | undefined;
+
+    if (request.watch !== undefined) {
+        const check = flatLine(request.watch.check);
+        const checkOn = parseCheckOn(request.watch.checkOn, request.at);
+
+        if (check === "" || check.length > MAX_LINE) {
+            throw new Error("A watch's check is 1 to 200 characters, on one line.");
+        }
+
+        if (typeof checkOn !== "string") {
+            throw new Error(checkOn.error);
+        }
+
+        watch = {
+            checkOn,
+            check,
+            setAt: request.at,
+            setBy: request.watch.by,
+            key: request.key,
+        };
     }
 
     const id = nextThreadId(state);
@@ -326,11 +370,22 @@ export function openThread(
         prs: {},
         branches: [],
         asks: [],
+        ...(watch === undefined ? {} : { watch }),
         run: {},
         events: [],
     };
 
     addEvent(thread, "opened", "opened by delegation", request.at);
+
+    if (watch !== undefined) {
+        addEvent(
+            thread,
+            `watch:set:${watch.key}`,
+            `watch: check on ${watch.checkOn} by ${watch.setBy}: ${watch.check}`,
+            request.at,
+        );
+    }
+
     state.threads[id] = thread;
 
     return { thread, reused: false };
@@ -583,6 +638,290 @@ export function seedThreads(
     return { added: rows.map((row) => row.id), reused: false };
 }
 
+// ─── Watches ────────────────────────────────────────────────────────────────
+
+const DATE = /^(\d{4})-(\d{2})-(\d{2})$/;
+/** A span from today: a number, then days, weeks, or months. */
+const SPAN = /^([1-9][0-9]{0,2})([dwm])$/;
+
+/** The local day of a time, on the server's clock: "2026-10-29". */
+export function dayOf(now: number): string {
+    const date = new Date(now);
+
+    return `${String(date.getFullYear())}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+}
+
+/** The local date of "YYYY-MM-DD", or undefined when no such day exists. */
+function dateOf(text: string): Date | undefined {
+    const match = DATE.exec(text);
+
+    if (match === null) {
+        return undefined;
+    }
+
+    const year = Number(match[1]);
+    const month = Number(match[2]);
+    const day = Number(match[3]);
+    const date = new Date(year, month - 1, day);
+
+    return date.getFullYear() === year && date.getMonth() === month - 1 && date.getDate() === day
+        ? date
+        : undefined;
+}
+
+/**
+ * A check date, as "YYYY-MM-DD". It takes a real day, today or later, or a span from today: "7d", "2w", "1m", 1 to
+ * 400 days, 1 to 52 weeks, or 1 to 12 months. A month span keeps the day of the month, or takes that month's last one.
+ * The span is resolved here, once: the caller stores the day, so a replay keeps the date it first got.
+ */
+export function parseCheckOn(text: string, now: number): string | { error: string } {
+    const plain = text.trim();
+
+    if (DATE.test(plain)) {
+        const date = dateOf(plain);
+
+        if (date === undefined) {
+            return {
+                error: `${plain} is not a real date. A check date is a day, such as 2026-10-29.`,
+            };
+        }
+
+        const day = dayOf(date.getTime());
+
+        return day < dayOf(now) ? { error: `The check date ${day} is in the past.` } : day;
+    }
+
+    const span = SPAN.exec(plain);
+    const count = span === null ? 0 : Number(span[1]);
+    const unit = span?.[2];
+
+    if (span === null || unit === undefined) {
+        return {
+            error: "A check date is a day such as 2026-10-29, or a span from today: 7d, 2w, 1m.",
+        };
+    }
+
+    if (
+        (unit === "d" && count > 400) ||
+        (unit === "w" && count > 52) ||
+        (unit === "m" && count > 12)
+    ) {
+        return { error: "A span from today is 1 to 400 days, 1 to 52 weeks, or 1 to 12 months." };
+    }
+
+    const today = new Date(now);
+
+    if (unit === "m") {
+        const month = today.getMonth() + count;
+        const last = new Date(today.getFullYear(), month + 1, 0).getDate();
+
+        return dayOf(
+            new Date(today.getFullYear(), month, Math.min(today.getDate(), last)).getTime(),
+        );
+    }
+
+    const days = unit === "d" ? count : count * 7;
+
+    return dayOf(new Date(today.getFullYear(), today.getMonth(), today.getDate() + days).getTime());
+}
+
+/** A watch that is still open: its thread is open or starting, and the watch has no result yet. */
+function openWatch(thread: Thread): Watch | undefined {
+    if (thread.state !== "open" && thread.state !== "starting") {
+        return undefined;
+    }
+
+    const watch = thread.watch;
+
+    return watch === undefined || watch.result !== undefined ? undefined : watch;
+}
+
+/** One line about a watch: its date, its check, who set it, the wake, and the result. */
+function watchText(watch: Watch): string {
+    return [
+        watch.checkOn,
+        watch.check,
+        `set by ${watch.setBy}`,
+        ...(watch.dueAt === undefined ? [] : [`due ${iso(watch.dueAt)}`]),
+        ...(watch.result === undefined
+            ? []
+            : [
+                  `${watch.result.pass ? "passed" : "failed"} (${watch.result.by}) ${iso(watch.result.at)}: ${watch.result.text}`,
+              ]),
+    ].join(" · ");
+}
+
+/** A watched thread before its check date: it does not count toward the cap, and it is never stale. */
+export function asleep(thread: Thread, now: number): boolean {
+    const watch = openWatch(thread);
+
+    return watch !== undefined && dayOf(now) < watch.checkOn;
+}
+
+/** A watched thread on or after its check date, with no result yet: the desk wakes it. */
+export function isDue(thread: Thread, now: number): boolean {
+    const watch = openWatch(thread);
+
+    return watch !== undefined && dayOf(now) >= watch.checkOn;
+}
+
+/**
+ * Record the wake of a due watch in the sweep's commit: `dueAt`, and 1 event. A second call writes nothing, so a
+ * sweep that runs again adds no second event. True only when it changed something.
+ */
+export function wakeWatch(thread: Thread, now: number): boolean {
+    const watch = openWatch(thread);
+
+    if (watch === undefined || watch.dueAt !== undefined || dayOf(now) < watch.checkOn) {
+        return false;
+    }
+
+    watch.dueAt = now;
+    addEvent(thread, `watch:${watch.checkOn}:due`, `due: ${watch.check}`, now);
+
+    return true;
+}
+
+export type WatchRequest = {
+    /** "2026-10-29", or a span from today: "7d", "2w", "1m". */
+    checkOn: string;
+    check: string;
+    /** "brian", or the roster id of the agent who set it. */
+    by: string;
+    /** The replay key of the call or tap: the same key changes nothing. */
+    key: string;
+    at: number;
+};
+
+/**
+ * Put a watch on an open thread, or replace the one it has. A replay, with the same key, changes nothing, so a
+ * replayed "7d" keeps the date it first resolved. The caller checks its own rules first when it must.
+ */
+export function setWatch(
+    thread: Thread,
+    request: WatchRequest,
+): { error: string } | { changed: boolean } {
+    // A replay: the date stays the one the first call resolved, whatever this text would give now.
+    if (thread.watch?.key === request.key) {
+        return { changed: false };
+    }
+
+    if (thread.state !== "open" && thread.state !== "starting") {
+        return {
+            error: `Thread ${thread.id} is ${thread.state}: a watch is set on an open thread only.`,
+        };
+    }
+
+    const check = flatLine(request.check);
+
+    if (check === "" || check.length > MAX_LINE) {
+        return { error: "A watch's check is 1 to 200 characters, on one line." };
+    }
+
+    const checkOn = parseCheckOn(request.checkOn, request.at);
+
+    if (typeof checkOn !== "string") {
+        return checkOn;
+    }
+
+    // A new watch replaces the old one: no wake, and no result, from the one it replaces.
+    thread.watch = {
+        checkOn,
+        check,
+        setAt: request.at,
+        setBy: request.by,
+        key: request.key,
+    };
+    addEvent(
+        thread,
+        `watch:set:${request.key}`,
+        `watch: check on ${checkOn} by ${request.by}: ${check}`,
+        request.at,
+    );
+
+    return { changed: true };
+}
+
+/** Remove a thread's watch. No watch: no change. True when it removed one. */
+export function clearWatch(thread: Thread, by: string, key: string, at: number): boolean {
+    if (thread.watch === undefined) {
+        return false;
+    }
+
+    delete thread.watch;
+    addEvent(thread, `watch:clear:${key}`, `watch cleared by ${by}`, at);
+
+    return true;
+}
+
+export type ResultRequest = {
+    pass: boolean;
+    text: string;
+    /** "brian", or the roster id of the agent who recorded it. */
+    by: string;
+    /** The replay key of the call or tap: the same key changes nothing. */
+    key: string;
+    at: number;
+    /** Who closed the thread on a pass: the tool is the desk, the page is Brian. */
+    closedBy: "desk" | "brian";
+};
+
+/**
+ * Record a watch's result. A pass closes the thread as done; a fail opens it again, with its event, so a counted
+ * thread's stale clock starts at the fail. A result may come early, before the date, and after a fail.
+ */
+export function recordResult(
+    thread: Thread,
+    request: ResultRequest,
+): { error: string } | { changed: boolean } {
+    const watch = thread.watch;
+
+    if (watch === undefined) {
+        return { error: `Thread ${thread.id} has no watch.` };
+    }
+
+    if (watch.result?.key === request.key) {
+        return { changed: false };
+    }
+
+    if (watch.result?.pass === true) {
+        return { error: `The watch on ${thread.id} passed already: nothing waits on it.` };
+    }
+
+    if (thread.state === "closed") {
+        return { error: `Thread ${thread.id} is closed: there is no watch to record.` };
+    }
+
+    const text = flatLine(request.text);
+
+    if (text === "" || text.length > MAX_LINE) {
+        return { error: "A watch's result is 1 to 200 characters, on one line." };
+    }
+
+    watch.result = { at: request.at, by: request.by, pass: request.pass, text, key: request.key };
+
+    if (request.pass) {
+        thread.state = "closed";
+        thread.closed = { at: request.at, why: "done", by: request.closedBy };
+        thread.run.next = "none";
+        addEvent(
+            thread,
+            `watch:pass:${request.key}`,
+            `watch passed (${request.by}): ${text}`,
+            request.at,
+        );
+    } else {
+        addEvent(
+            thread,
+            `watch:fail:${request.key}`,
+            `watch failed (${request.by}): ${text}`,
+            request.at,
+        );
+    }
+
+    return { changed: true };
+}
+
 // ─── The sweep's rules ──────────────────────────────────────────────────────
 
 /** The folder a thread works in: `run.folder` for a found folder thread, else its `cwd`. */
@@ -715,6 +1054,21 @@ export function closeCheck(thread: Thread, facts: CloseFacts): { close: boolean;
         }
     }
 
+    // A watch with no result holds the thread open: only a pass closes it.
+    if (thread.watch !== undefined) {
+        const watch = thread.watch;
+
+        if (watch.result === undefined) {
+            open.push(
+                dayOf(facts.now) >= watch.checkOn
+                    ? `watch is due: ${watch.check}`
+                    : `watch: check on ${watch.checkOn}`,
+            );
+        } else if (!watch.result.pass) {
+            open.push(`watch failed: ${watch.result.text}`);
+        }
+    }
+
     const session = openSession(thread);
 
     if (session !== undefined) {
@@ -747,7 +1101,7 @@ export function closeCheck(thread: Thread, facts: CloseFacts): { close: boolean;
 
 export type NextActor = "brian" | "agent" | "odrade" | "reviewer" | "none";
 
-/** Who acts next on a thread. First match: brian, agent, odrade. */
+/** Who acts next on a thread. First match: brian, odrade (a due watch), agent (a failed watch), agent, odrade. */
 export function nextActor(thread: Thread): NextActor {
     if (thread.state === "closed") {
         return "none";
@@ -755,6 +1109,19 @@ export function nextActor(thread: Thread): NextActor {
 
     if (thread.asks.some((ask) => ask.answer === undefined)) {
         return "brian";
+    }
+
+    // A due watch is Odrade's to send; a failed one is the agent's to work again.
+    if (thread.watch !== undefined) {
+        const watch = thread.watch;
+
+        if (watch.result === undefined && watch.dueAt !== undefined) {
+            return "odrade";
+        }
+
+        if (watch.result !== undefined && !watch.result.pass) {
+            return "agent";
+        }
     }
 
     const openPrs = Object.values(thread.prs)
@@ -828,9 +1195,9 @@ export function wakeParked(thread: Thread, before: number, now: number): boolean
     );
 }
 
-/** No event for 3 days (7 for a reviewer wait); closed threads are never stale. */
+/** No event for 3 days (7 for a reviewer wait); closed threads and sleeping ones are never stale. */
 export function isStale(thread: Thread, now: number): boolean {
-    if (thread.state === "closed") {
+    if (thread.state === "closed" || asleep(thread, now)) {
         return false;
     }
 
@@ -1464,10 +1831,15 @@ export function chatGrants(text: string): number {
     return match === null ? 0 : match[1] === undefined ? 1 : Number(match[1]);
 }
 
-/** Whether a thread counts toward the cap. A reviewer wait and a parked thread do not; a found thread does. */
-export function isCounted(thread: Thread): boolean {
+/**
+ * Whether a thread counts toward the cap. A reviewer wait, a parked thread, and a sleeping one do not; a found
+ * thread does.
+ */
+export function isCounted(thread: Thread, now: number): boolean {
     return (
-        (thread.state === "open" || thread.state === "starting") && thread.run.next !== "reviewer"
+        (thread.state === "open" || thread.state === "starting") &&
+        thread.run.next !== "reviewer" &&
+        !asleep(thread, now)
     );
 }
 
@@ -1481,7 +1853,9 @@ export type CapView = {
 
 /** The cap's view: how many threads count, and which OKs are usable now. */
 export function capView(state: Readonly<DeskState> | undefined, cap: number, now: number): CapView {
-    const counted = Object.values(state?.threads ?? {}).filter(isCounted).length;
+    const counted = Object.values(state?.threads ?? {}).filter((thread) =>
+        isCounted(thread, now),
+    ).length;
     const grants = (state?.grants ?? []).filter(
         (grant) => grant.usedBy === undefined && grant.expires > now,
     );
@@ -1496,7 +1870,7 @@ export function deskFullText(
     now: number,
 ): string {
     const stale = Object.values(state?.threads ?? {})
-        .filter(isCounted)
+        .filter((thread) => isCounted(thread, now))
         .filter((thread) => isStale(thread, now))
         .map((thread) => thread.id)
         .sort((a, b) => idNumber(a) - idNumber(b));
@@ -1820,6 +2194,10 @@ function sectionOf(thread: Thread, now: number): string {
         return "Parked";
     }
 
+    if (asleep(thread, now)) {
+        return "Watching";
+    }
+
     if (thread.origin === "found") {
         return "Found";
     }
@@ -1859,6 +2237,14 @@ function threadFile(
     if (thread.closed !== undefined) {
         lines.push(
             `- Closed: ${thread.closed.why} · by ${thread.closed.by} · ${iso(thread.closed.at)}`,
+        );
+    }
+
+    if (thread.watch !== undefined) {
+        const watch = thread.watch;
+
+        lines.push(
+            `- Watch: ${watch.checkOn} · ${md(watch.check)} · set by ${md(watch.setBy)}${watch.dueAt === undefined ? "" : ` · due ${iso(watch.dueAt)}`}${watch.result === undefined ? "" : ` · ${watch.result.pass ? "passed" : "failed"} (${md(watch.result.by)}) · ${iso(watch.result.at)} · ${md(watch.result.text)}`}`,
         );
     }
 
@@ -1931,11 +2317,12 @@ export function exportFiles(
     cap = DEFAULT_CAP,
 ): Record<string, string> {
     const threads = Object.values(state?.threads ?? {});
-    const counted = threads.filter(isCounted).length;
+    const counted = threads.filter((thread) => isCounted(thread, now)).length;
     const order = [
         "Needs Brian",
         "Found",
         "Stale",
+        "Watching",
         "Working",
         "Waiting on review",
         "Parked",
@@ -1966,7 +2353,7 @@ export function exportFiles(
 
         for (const thread of list) {
             lines.push(
-                `- **${thread.id}** ${md(thread.title)} · ${thread.repo === undefined ? "no repo" : md(thread.repo)} · next: ${nextActor(thread)}`,
+                `- **${thread.id}** ${md(thread.title)} · ${thread.repo === undefined ? "no repo" : md(thread.repo)} · next: ${nextActor(thread)}${title === "Watching" && thread.watch !== undefined ? ` · watch: ${thread.watch.checkOn}` : ""}`,
             );
 
             for (const [ref, pr] of Object.entries(thread.prs).sort(([a], [b]) =>
@@ -2031,6 +2418,16 @@ export type ThreadView = {
     hasSession: boolean;
     /** Whether it has an address: the page resolves the session id for it. */
     hasAddress: boolean;
+    /** Its dated check, and whether that date is here. */
+    watch?: {
+        checkOn: string;
+        check: string;
+        setBy: string;
+        due: boolean;
+        result?: { pass: boolean; text: string; by: string; at: number };
+    };
+    /** A watched thread before its date: it does not count, and it is not stale. */
+    asleep: boolean;
     closed?: { at: number; why: string; by: string };
 };
 
@@ -2094,6 +2491,27 @@ export function threadView(
         ...(thread.supervisor === undefined ? {} : { supervisor: thread.supervisor }),
         hasSession: thread.session !== undefined,
         hasAddress: thread.address !== undefined,
+        ...(thread.watch === undefined
+            ? {}
+            : {
+                  watch: {
+                      checkOn: thread.watch.checkOn,
+                      check: thread.watch.check,
+                      setBy: thread.watch.setBy,
+                      due: isDue(thread, now),
+                      ...(thread.watch.result === undefined
+                          ? {}
+                          : {
+                                result: {
+                                    pass: thread.watch.result.pass,
+                                    text: thread.watch.result.text,
+                                    by: thread.watch.result.by,
+                                    at: thread.watch.result.at,
+                                },
+                            }),
+                  },
+              }),
+        asleep: asleep(thread, now),
         ...(thread.closed === undefined
             ? {}
             : {
@@ -2121,6 +2539,8 @@ export type ThreadsView = {
         none: number;
         stale: number;
         parked: number;
+        /** Watched threads before their date: they do not count, and they are not stale. */
+        watching: number;
     };
 };
 
@@ -2141,6 +2561,7 @@ export function threadsView(
         none: 0,
         stale: 0,
         parked: 0,
+        watching: 0,
     };
 
     for (const thread of all) {
@@ -2156,7 +2577,9 @@ export function threadsView(
         counts.open += 1;
         counts[nextActor(thread)] += 1;
 
-        if (isStale(thread, now)) {
+        if (asleep(thread, now)) {
+            counts.watching += 1;
+        } else if (isStale(thread, now)) {
             counts.stale += 1;
         }
     }
@@ -2192,34 +2615,56 @@ export function threadsView(
 const counted = (count: number, noun: string) =>
     `${String(count)} ${noun}${count === 1 ? "" : "s"}`;
 
-/** One line for each thread that is not closed, newest last. */
+/**
+ * One line for each thread that is not closed, newest last. A due watch goes first; a sleeping thread waits under
+ * "Watching", with its date, and not in the lines below.
+ */
 export function listText(state: Readonly<DeskState> | undefined, now = Date.now()): string {
     const threads = Object.values(state?.threads ?? {})
         .filter((thread) => thread.state !== "closed")
-        .sort((a, b) => a.startedAt - b.startedAt || idNumber(a.id) - idNumber(b.id));
+        .sort((a, b) => a.startedAt - b.startedAt || byId(a, b));
 
     if (threads.length === 0) {
         return "No threads on the desk.";
     }
 
-    return threads
-        .map((thread) => {
-            const prs = Object.keys(thread.prs).length;
-            const asks = thread.asks.filter((ask) => ask.answer === undefined).map((ask) => ask.id);
+    const byCheck = (a: Thread, b: Thread) =>
+        (a.watch?.checkOn ?? "").localeCompare(b.watch?.checkOn ?? "") || byId(a, b);
+    const due = threads.filter((thread) => isDue(thread, now)).sort(byCheck);
+    const watching = threads.filter((thread) => asleep(thread, now)).sort(byCheck);
 
-            return [
-                thread.id,
-                thread.state,
-                `next: ${nextActor(thread)}`,
-                ...(isStale(thread, now) ? ["stale"] : []),
-                thread.repo ?? "no repo",
-                thread.agents.join(", ") || "nobody",
-                ...(prs === 0 ? [] : [counted(prs, "PR")]),
-                ...(asks.length === 0 ? [] : [asks.join(", ")]),
-                thread.title,
-            ].join(" · ");
-        })
-        .join("\n");
+    return [
+        ...due.map((thread) => `due: ${thread.id} ${thread.watch?.check ?? ""}`),
+        ...threads
+            .filter((thread) => !asleep(thread, now))
+            .map((thread) => {
+                const prs = Object.keys(thread.prs).length;
+                const asks = thread.asks
+                    .filter((ask) => ask.answer === undefined)
+                    .map((ask) => ask.id);
+
+                return [
+                    thread.id,
+                    thread.state,
+                    `next: ${nextActor(thread)}`,
+                    ...(isStale(thread, now) ? ["stale"] : []),
+                    thread.repo ?? "no repo",
+                    thread.agents.join(", ") || "nobody",
+                    ...(prs === 0 ? [] : [counted(prs, "PR")]),
+                    ...(asks.length === 0 ? [] : [asks.join(", ")]),
+                    thread.title,
+                ].join(" · ");
+            }),
+        ...(watching.length === 0
+            ? []
+            : [
+                  "Watching:",
+                  ...watching.map(
+                      (thread) =>
+                          `${thread.watch?.checkOn ?? ""} · ${thread.id} · ${thread.repo ?? "no repo"} · ${thread.watch?.check ?? ""}`,
+                  ),
+              ]),
+    ].join("\n");
 }
 
 /** One thread in full: what a person needs to judge it. */
@@ -2244,6 +2689,7 @@ export function readText(state: Readonly<DeskState> | undefined, id: string): st
         `Address: ${thread.address ?? "none"}`,
         `Started: ${iso(thread.startedAt)} · last event: ${iso(thread.lastEventAt)}`,
         ...(thread.keptAt === undefined ? [] : [`Kept: ${iso(thread.keptAt)}`]),
+        ...(thread.watch === undefined ? [] : [`Watch: ${watchText(thread.watch)}`]),
         ...(thread.closed === undefined
             ? []
             : [`Closed: ${iso(thread.closed.at)} · ${thread.closed.why} · by ${thread.closed.by}`]),
@@ -3234,6 +3680,11 @@ export default function createDesk(host: Host, web: Web) {
         }
 
         for (const thread of open) {
+            // A due watch records its wake here, once: a second sweep adds no second event.
+            if (wakeWatch(thread, now)) {
+                events += 1;
+            }
+
             thread.run.next = nextActor(thread);
 
             const elsewhere = new Set(
@@ -3752,6 +4203,117 @@ export default function createDesk(host: Host, web: Web) {
 
     web.route(
         "POST",
+        "threads/:id/watch",
+        async (request) => {
+            const id = threadIdOf(request);
+            const checkOn = String(request.body.checkOn ?? "").trim();
+            const check = String(request.body.check ?? "");
+
+            if (checkOn === "") {
+                throw web.error(400, "watch needs checkOn: a date such as 2026-10-29.");
+            }
+
+            return answer(request, (state, now) => {
+                const thread = threadById(state, id);
+
+                if (thread === undefined) {
+                    throw web.error(404, `There is no thread ${id}.`);
+                }
+
+                // A double tap: the same date and check change nothing.
+                const date = parseCheckOn(checkOn, now);
+
+                if (
+                    typeof date === "string" &&
+                    thread.watch !== undefined &&
+                    thread.watch.checkOn === date &&
+                    thread.watch.check === flatLine(check)
+                ) {
+                    return;
+                }
+
+                const set = setWatch(thread, {
+                    checkOn,
+                    check,
+                    by: "brian",
+                    key: `page:watch:${String(now)}`,
+                    at: now,
+                });
+
+                if ("error" in set) {
+                    throw web.error(400, set.error);
+                }
+            });
+        },
+        { access: "owner" },
+    );
+
+    web.route(
+        "POST",
+        "threads/:id/unwatch",
+        async (request) => {
+            const id = threadIdOf(request);
+
+            return answer(request, (state, now) => {
+                const thread = threadById(state, id);
+
+                if (thread === undefined) {
+                    throw web.error(404, `There is no thread ${id}.`);
+                }
+
+                clearWatch(thread, "brian", `page:unwatch:${String(now)}`, now);
+            });
+        },
+        { access: "owner" },
+    );
+
+    web.route(
+        "POST",
+        "threads/:id/result",
+        async (request) => {
+            const id = threadIdOf(request);
+            const pass = request.body.pass;
+            const words = String(request.body.text ?? "");
+
+            if (typeof pass !== "boolean") {
+                throw web.error(400, "result needs pass: true or false.");
+            }
+
+            return answer(request, (state, now) => {
+                const thread = threadById(state, id);
+
+                if (thread === undefined) {
+                    throw web.error(404, `There is no thread ${id}.`);
+                }
+
+                if (thread.watch === undefined) {
+                    throw web.error(409, `Thread ${thread.id} has no watch.`);
+                }
+
+                // A double tap: a thread whose watch passed, or one closed already, changes nothing.
+                if (thread.watch.result?.pass === true || thread.state === "closed") {
+                    return;
+                }
+
+                const recorded = recordResult(thread, {
+                    pass,
+                    text: words,
+                    by: "brian",
+                    key: `page:result:${String(now)}`,
+                    at: now,
+                    closedBy: "brian",
+                });
+
+                if ("error" in recorded) {
+                    throw web.error(400, recorded.error);
+                }
+            });
+        },
+        { access: "owner" },
+    );
+
+    web.route(
+        "POST",
         "threads/:id/drop",
         async (request) => {
             const id = threadIdOf(request);
@@ -4062,7 +4624,7 @@ export default function createDesk(host: Host, web: Web) {
     const tool = defineTool({
         name: "desk",
         description:
-            "Supervisor only: the desk of threads for work the team runs in the background. Actions: list (one line per open thread), read (one thread in full), sync (observe the threads now, with linked sessions, Night shift, git, and GitHub), seed (import a seed.json file one time), attach (put a PR, or all of another thread's work, on one thread), ask (file a question for Brian on a thread, or on a new one), answer (record Brian's words for an ask).",
+            "The desk of threads for work the team runs in the background. A supervisor session can use every action; an agent session can use watch and result on its own thread only. Actions: list (one line per open thread), read (one thread in full), sync (observe the threads now, with linked sessions, Night shift, git, and GitHub), seed (import a seed.json file one time), attach (put a PR, or all of another thread's work, on one thread), ask (file a question for Brian on a thread, or on a new one), answer (record Brian's words for an ask), watch (set a dated check on a thread: it sleeps until that date, and does not count toward the cap), result (record that check's pass, which closes the thread, or its fail, which opens it again).",
         parameters: Type.Object({
             action: Type.Union([
                 Type.Literal("list"),
@@ -4072,10 +4634,13 @@ export default function createDesk(host: Host, web: Web) {
                 Type.Literal("attach"),
                 Type.Literal("ask"),
                 Type.Literal("answer"),
+                Type.Literal("watch"),
+                Type.Literal("result"),
             ]),
             thread: Type.Optional(
                 Type.String({
-                    description: "read: a thread id, such as T13; attach: the target thread",
+                    description:
+                        "read: a thread id, such as T13; attach: the target thread; watch, result: the thread to change",
                 }),
             ),
             ref: Type.Optional(
@@ -4086,7 +4651,8 @@ export default function createDesk(host: Host, web: Web) {
             ),
             text: Type.Optional(
                 Type.String({
-                    description: "ask: the question for Brian, 1 to 500 characters, on one line",
+                    description:
+                        "ask: the question for Brian, 1 to 500 characters, on one line; watch: the check, 1 to 200 characters; result: what happened, 1 to 200 characters",
                 }),
             ),
             title: Type.Optional(
@@ -4103,6 +4669,17 @@ export default function createDesk(host: Host, web: Web) {
             path: Type.Optional(
                 Type.String({ description: "seed: the absolute path of a seed.json file" }),
             ),
+            check_on: Type.Optional(
+                Type.String({
+                    description:
+                        "watch: the check's date as 2026-10-29, or a span from today: 7d, 2w, 1m",
+                }),
+            ),
+            pass: Type.Optional(
+                Type.Boolean({
+                    description: "result: true when the check passed, false when it failed",
+                }),
+            ),
         }),
         replay: "safe",
         execute: async (args, api, context) => {
@@ -4113,8 +4690,17 @@ export default function createDesk(host: Host, web: Web) {
             }
 
             const persona = await team.persona(api, api.conversationId, context);
+            const watching = args.action === "watch" || args.action === "result";
 
-            if (persona?.role !== "supervisor") {
+            if (persona === undefined) {
+                throw new Error(
+                    watching
+                        ? "A watch needs a session with a named identity: a supervisor, or the agent whose thread it is."
+                        : "Only a session assigned a supervisor identity can use the desk.",
+                );
+            }
+
+            if (persona.role !== "supervisor" && !watching) {
                 throw new Error("Only a session assigned a supervisor identity can use the desk.");
             }
 
@@ -4233,6 +4819,94 @@ export default function createDesk(host: Host, web: Web) {
                 return reply(
                     result.already ? `${result.id} is answered already.` : `Answered ${result.id}.`,
                 );
+            }
+
+            if (args.action === "watch" || args.action === "result") {
+                const asked = args.thread?.trim() ?? "";
+
+                if (asked === "") {
+                    throw new Error(`${args.action} needs thread: a thread id such as T13.`);
+                }
+
+                if (args.action === "result" && typeof args.pass !== "boolean") {
+                    throw new Error(
+                        "result needs pass: true when the check passed, false when it failed.",
+                    );
+                }
+
+                const key = `x.desk.${args.action}:${api.taskId}:${api.callId}`;
+                const at = Date.now();
+                const result = await api.commit(async (tx) => {
+                    const state = await tx.doc(DeskThreads);
+                    const thread = threadById(state, asked);
+
+                    if (thread === undefined) {
+                        return { error: `There is no thread ${asked.toUpperCase()} on the desk.` };
+                    }
+
+                    // A supervisor changes any thread; an agent only the thread of the session it runs in.
+                    if (
+                        persona.role !== "supervisor" &&
+                        thread.session !== Number(api.conversationId)
+                    ) {
+                        return {
+                            error: `Only the supervisor can record a result or set a watch on ${thread.id}: it is not this session's thread.`,
+                        };
+                    }
+
+                    if (args.action === "watch") {
+                        const set = setWatch(thread, {
+                            checkOn: args.check_on ?? "",
+                            check: args.text ?? "",
+                            by: persona.id,
+                            key,
+                            at,
+                        });
+
+                        if ("error" in set) {
+                            return set;
+                        }
+
+                        const date = thread.watch?.checkOn ?? "";
+
+                        return {
+                            text: set.changed
+                                ? `Watching ${thread.id}: check on ${date}. It does not count toward the cap until then.`
+                                : `${thread.id} is watched already: check on ${date}. Nothing changed.`,
+                        };
+                    }
+
+                    const recorded = recordResult(thread, {
+                        pass: args.pass === true,
+                        text: args.text ?? "",
+                        by: persona.id,
+                        key,
+                        at,
+                        closedBy: "desk",
+                    });
+
+                    if ("error" in recorded) {
+                        return recorded;
+                    }
+
+                    const passed = thread.watch?.result?.pass === true;
+
+                    return {
+                        text: recorded.changed
+                            ? passed
+                                ? `Check passed: ${thread.id} is closed.`
+                                : `Check failed: ${thread.id} is open again, and counts. Send it to the agent, or set a new watch.`
+                            : `${thread.id} has this result already. Nothing changed.`,
+                    };
+                }, context);
+
+                if ("error" in result) {
+                    throw new Error(result.error);
+                }
+
+                await exportNow(api, context);
+
+                return reply(result.text);
             }
 
             if (args.action === "attach") {
@@ -4398,6 +5072,15 @@ export default function createDesk(host: Host, web: Web) {
                     .filter((thread) => isStale(thread, now))
                     .map((thread) => thread.id)
                     .sort((a, b) => idNumber(a) - idNumber(b));
+                const due = open
+                    .filter((thread) => isDue(thread, now))
+                    .sort(
+                        (a, b) =>
+                            (a.watch?.checkOn ?? "").localeCompare(b.watch?.checkOn ?? "") ||
+                            idNumber(a.id) - idNumber(b.id),
+                    )
+                    .map((thread) => `due: ${thread.id} ${thread.watch?.check ?? ""}`);
+                const watching = open.filter((thread) => asleep(thread, now)).length;
                 const { cap } = await deskConfig();
                 const capped = capView(state, cap, now);
                 const events = mine
@@ -4417,6 +5100,8 @@ export default function createDesk(host: Host, web: Web) {
                     open.length === 0
                         ? "Desk: no open threads."
                         : `Desk: ${String(open.length)} open · ${byActor.join(" · ")}.`,
+                    ...due,
+                    `Watching: ${String(watching)}.`,
                     `Counted: ${String(capped.counted)} of ${String(capped.cap)}.`,
                     ...(capped.full
                         ? [
@@ -4426,6 +5111,7 @@ export default function createDesk(host: Host, web: Web) {
                     `Stale: ${stale.length === 0 ? "none" : stale.join(", ")}.`,
                     ...(events.length === 0 ? [] : ["New since your last look:", ...events]),
                     "File each ask to Brian (a decision, a host action, a device check) with desk ask. Record his answer with desk answer.",
+                    "A due watch (due: T13 <check>) is yours to send: send the check to the thread's agent, then record its result with desk result.",
                     "Reports arrive as 1 line that starts with [desk]. Read the full report with desk read <id> before you act.",
                     "Keep each reply to Brian to 1 or 2 lines: the project and the urgency. The Desk holds the rest.",
                 ].join("\n");

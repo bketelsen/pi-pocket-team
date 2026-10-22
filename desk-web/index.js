@@ -19,6 +19,7 @@ const badgeOf = (next) =>
               (thread) =>
                   thread.state !== "parked" &&
                   thread.state !== "closed" &&
+                  !thread.asleep &&
                   (thread.next === "brian" || thread.stale),
           ).length;
 
@@ -65,6 +66,20 @@ export default function setup(pocket) {
 
     const time = (at) => new Date(at).toLocaleString();
 
+    /** One line about a thread's watch, for the detail view. */
+    const watchLine = (watch) =>
+        [
+            watch.checkOn,
+            watch.check,
+            `set by ${watch.setBy}`,
+            watch.due ? "due" : "",
+            watch.result
+                ? `${watch.result.pass ? "passed" : "failed"} by ${watch.result.by}: ${watch.result.text}`
+                : "",
+        ]
+            .filter(Boolean)
+            .join(" · ");
+
     function Detail({ id, onBack }) {
         const [thread, setThread] = useState(null);
         const [reports, setReports] = useState([]);
@@ -109,11 +124,13 @@ export default function setup(pocket) {
                                   thread.repo,
                                   thread.state,
                                   `next: ${thread.next}`,
+                                  thread.asleep ? "asleep" : "",
                                   thread.stale ? "stale" : "",
                               ]
                                   .filter(Boolean)
                                   .join(" · ")}
                           </p>
+                          ${thread.watch ? html`<p class="small">Watch: ${watchLine(thread.watch)}</p>` : null}
                           <h3>PRs</h3>
                           ${
                               thread.prs.length === 0
@@ -191,6 +208,11 @@ export default function setup(pocket) {
         const [into, setInto] = useState({});
         const [closedOpen, setClosedOpen] = useState(false);
         const [answers, setAnswers] = useState({});
+        const [watchFor, setWatchFor] = useState(null);
+        const [checkOn, setCheckOn] = useState("");
+        const [checkText, setCheckText] = useState("");
+        const [resultFor, setResultFor] = useState(null);
+        const [resultText, setResultText] = useState("");
 
         useEffect(() => {
             const update = () => setTick((tick) => tick + 1);
@@ -248,6 +270,11 @@ export default function setup(pocket) {
 
                 setDropFor(null);
                 setReason("");
+                setWatchFor(null);
+                setCheckOn("");
+                setCheckText("");
+                setResultFor(null);
+                setResultText("");
             } catch (failure) {
                 setError(failure.message);
             } finally {
@@ -256,6 +283,14 @@ export default function setup(pocket) {
         };
 
         const drop = (id) => act(`threads/${id}/drop`, { reason });
+
+        const watchOn = (id) => act(`threads/${id}/watch`, { checkOn, check: checkText.trim() });
+
+        const passCheck = (id) =>
+            act(`threads/${id}/result`, { pass: true, text: "Passed on the Desk page." });
+
+        const failCheck = (id) =>
+            act(`threads/${id}/result`, { pass: false, text: resultText.trim() });
 
         const answer = async (id) => {
             const words = (answers[id] ?? "").trim();
@@ -276,6 +311,7 @@ export default function setup(pocket) {
             need: [],
             stale: [],
             found: [],
+            watching: [],
             working: [],
             review: [],
             parked: [],
@@ -287,6 +323,8 @@ export default function setup(pocket) {
                 groups.closed.push(thread);
             } else if (thread.state === "parked") {
                 groups.parked.push(thread);
+            } else if (thread.asleep) {
+                groups.watching.push(thread);
             } else if (thread.origin === "found") {
                 groups.found.push(thread);
             } else if (thread.next === "brian") {
@@ -300,10 +338,32 @@ export default function setup(pocket) {
             }
         }
 
+        // The soonest check first.
+        groups.watching.sort(
+            (a, b) =>
+                (a.watch?.checkOn ?? "").localeCompare(b.watch?.checkOn ?? "") ||
+                a.id.localeCompare(b.id, undefined, { numeric: true }),
+        );
+
         const others = Object.values(view?.others ?? {}).reduce((sum, count) => sum + count, 0);
         const counts = view?.counts ?? {};
         const capInfo = view?.cap ?? { counted: 0, cap: 0, full: false, grants: 0 };
         const fresh = (thread) => thread.lastEventAt > (seenBefore ?? 0);
+
+        /** One line of a row's facts: its repository, its next actor, its check, and its age. */
+        const factsOf = (thread) =>
+            [
+                thread.repo,
+                `next: ${thread.next}`,
+                thread.watch && thread.watch.due
+                    ? `due: ${thread.watch.check}`
+                    : thread.asleep && thread.watch
+                      ? `check on ${thread.watch.checkOn}`
+                      : "",
+                thread.stale ? "stale" : "",
+            ]
+                .filter(Boolean)
+                .join(" · ");
 
         const row = (thread, actions) =>
             html`<li class="desk-row">
@@ -318,11 +378,7 @@ export default function setup(pocket) {
                         ${fresh(thread) ? html`<span class="desk-new">new</span>` : null}
                         <span class="desk-title">${thread.title}</span>
                     </span>
-                    <span class="small muted">
-                        ${[thread.repo, `next: ${thread.next}`, thread.stale ? "stale" : ""]
-                            .filter(Boolean)
-                            .join(" · ")}
-                    </span>
+                    <span class="small muted"> ${factsOf(thread)} </span>
                     ${
                         thread.prs.length > 0
                             ? html`<span class="desk-chips">
@@ -453,6 +509,118 @@ export default function setup(pocket) {
             ${dropField(thread)}`;
         };
 
+        /** A watch is set on an open thread: its date and its check. */
+        const watchOpen = (thread) => thread.state === "open" || thread.state === "starting";
+
+        const watchField = (thread) =>
+            watchFor === thread.id
+                ? html`<div class="desk-watch">
+                      <input
+                          class="desk-reason"
+                          type="date"
+                          aria-label=${`The check's date for ${thread.id}`}
+                          value=${checkOn}
+                          disabled=${busy}
+                          onInput=${(event) => setCheckOn(event.currentTarget.value)}
+                      />
+                      <input
+                          class="desk-reason"
+                          type="text"
+                          maxlength="200"
+                          placeholder="What to check"
+                          aria-label=${`The check for ${thread.id}`}
+                          value=${checkText}
+                          disabled=${busy}
+                          onInput=${(event) => setCheckText(event.currentTarget.value)}
+                      />
+                      <button
+                          class="button"
+                          disabled=${busy || checkOn === "" || checkText.trim() === ""}
+                          aria-label=${`Set the watch on ${thread.id}`}
+                          onClick=${() => void watchOn(thread.id)}
+                      >
+                          Set
+                      </button>
+                  </div>`
+                : null;
+
+        const resultField = (thread) =>
+            resultFor === thread.id
+                ? html`<div class="desk-watch">
+                      <input
+                          class="desk-reason"
+                          type="text"
+                          maxlength="200"
+                          placeholder="What happened?"
+                          aria-label=${`The failed check on ${thread.id}`}
+                          value=${resultText}
+                          disabled=${busy}
+                          onInput=${(event) => setResultText(event.currentTarget.value)}
+                      />
+                      <button
+                          class="button"
+                          disabled=${busy || resultText.trim() === ""}
+                          aria-label=${`Record the failed check on ${thread.id}`}
+                          onClick=${() => void failCheck(thread.id)}
+                      >
+                          Record
+                      </button>
+                  </div>`
+                : null;
+
+        /** Watch, Clear, Pass and Fail: a watch is set on an open thread, the rest on a watched one. */
+        const watchActions = (thread) => {
+            if (!watchOpen(thread)) {
+                return null;
+            }
+
+            // A failed watch is still a watch: Clear, and a later Pass that closes the thread.
+            const watched = thread.watch !== undefined;
+
+            return html`<div class="desk-actions">
+                    <button
+                        class="button"
+                        disabled=${busy}
+                        aria-label=${`Watch ${thread.id}`}
+                        onClick=${() => setWatchFor(watchFor === thread.id ? null : thread.id)}
+                    >
+                        Watch
+                    </button>
+                    ${
+                        watched
+                            ? html`<button
+                                  class="button"
+                                  disabled=${busy}
+                                  aria-label=${`Clear the watch on ${thread.id}`}
+                                  onClick=${() => void act(`threads/${thread.id}/unwatch`, {})}
+                              >
+                                  Clear
+                              </button>
+                              <button
+                                  class="button"
+                                  disabled=${busy}
+                                  aria-label=${`Pass the check on ${thread.id}`}
+                                  onClick=${() => void passCheck(thread.id)}
+                              >
+                                  Pass
+                              </button>
+                              <button
+                                  class="button"
+                                  disabled=${busy}
+                                  aria-label=${`Fail the check on ${thread.id}`}
+                                  onClick=${() =>
+                                      setResultFor(resultFor === thread.id ? null : thread.id)}
+                              >
+                                  Fail
+                              </button>`
+                            : null
+                    }
+                </div>
+                ${watchField(thread)} ${resultField(thread)}`;
+        };
+
+        const withWatch = (thread, actions) => html`${actions}${watchActions(thread)}`;
+
         const needDetail = (thread) =>
             html`<div class="desk-need">
                 ${thread.asks.map(
@@ -504,7 +672,7 @@ export default function setup(pocket) {
             <header class="desk-head">
                 <h1>Desk</h1>
                 <p class="small muted">
-                    ${counts.brian ?? 0} need you · ${counts.open ?? 0} open · ${counts.stale ?? 0} stale · ${counts.parked ?? 0} parked · ${capInfo.counted} of ${capInfo.cap} count
+                    ${counts.brian ?? 0} need you · ${counts.open ?? 0} open · ${counts.stale ?? 0} stale · ${counts.watching ?? 0} watching · ${counts.parked ?? 0} parked · ${capInfo.counted} of ${capInfo.cap} count
                 </p>
                 ${
                     capInfo.full
@@ -540,16 +708,22 @@ export default function setup(pocket) {
             </header>
             ${error ? html`<div class="error-box" role="alert">${error}</div>` : null}
             ${loadError ? html`<div class="error-box" role="alert">${loadError}</div>` : null}
-            ${section("Needs you", groups.need, (thread) => row(thread, needDetail(thread)))}
+            ${section("Needs you", groups.need, (thread) => row(thread, withWatch(thread, needDetail(thread))))}
             ${section(
                 "Found",
                 groups.found,
-                (thread) => row(thread, foundActions(thread)),
+                (thread) => row(thread, withWatch(thread, foundActions(thread))),
                 "Work with no thread of its own. Attach it to the thread that owns it.",
             )}
-            ${section("Stale", groups.stale, (thread) => row(thread, staleActions(thread)))}
-            ${section("Working", groups.working, (thread) => row(thread, parkActions(thread)))}
-            ${section("Waiting on review", groups.review, (thread) => row(thread, parkActions(thread)))}
+            ${section("Stale", groups.stale, (thread) => row(thread, withWatch(thread, staleActions(thread))))}
+            ${section(
+                "Watching",
+                groups.watching,
+                (thread) => row(thread, watchActions(thread)),
+                "A check on its date. It does not count toward the cap, and it is not stale.",
+            )}
+            ${section("Working", groups.working, (thread) => row(thread, withWatch(thread, parkActions(thread))))}
+            ${section("Waiting on review", groups.review, (thread) => row(thread, withWatch(thread, parkActions(thread))))}
             ${section("Parked", groups.parked, (thread) => row(thread, parkedActions(thread)))}
             ${
                 groups.closed.length === 0

@@ -137,6 +137,18 @@
     margin-top: 8px;
 }
 
+/* A watch's date, check or result: the inputs wrap on a phone instead of shrinking. */
+.desk-watch {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 8px;
+}
+
+.desk-watch .desk-reason {
+    flex: 1 1 140px;
+}
+
 .desk-reason {
     flex: 1;
     min-width: 0;
