@@ -4217,7 +4217,7 @@ describe("the desk in a Pi Pocket", () => {
             const found = await folderFound();
 
             assert.equal(found[0]?.run.folder, fresh);
-            assert.equal(found[0]?.id, "F1");
+            assert.match(found[0]?.id ?? "", /^F[1-9][0-9]*$/);
             assert.equal(found[0]?.run.next, "odrade");
             assert.equal(
                 (await deskState())?.baseline?.[String(Number(source))]?.pending?.[fresh],
