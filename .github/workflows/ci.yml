@@ -1,0 +1,49 @@
+# The tests need a Pi Pocket checkout: link.mjs symlinks node_modules, _pocket.d.ts and _pocket into the
+# checkout at PI_POCKET_CHECKOUT. Here we clone the public Pi Pocket repository at tag v0.19.0 into the
+# runner's temporary folder, install its dependencies, and point the links at it.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out this repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Set the Pi Pocket checkout path
+        run: echo "PI_POCKET_CHECKOUT=$RUNNER_TEMP/pi-pocket" >> "$GITHUB_ENV"
+
+      - name: Clone Pi Pocket v0.19.0
+        run: git clone --depth 1 --branch v0.19.0 https://github.com/TannerMidd/pi-pocket.git "$PI_POCKET_CHECKOUT"
+
+      - name: Install Pi Pocket dependencies
+        working-directory: ${{ runner.temp }}/pi-pocket
+        run: npm ci
+
+      - name: Link this project to the Pi Pocket checkout
+        run: npm run link
+
+      - name: Run the tests
+        run: npm test
+
+      - name: Run the type check
+        run: npm run typecheck
