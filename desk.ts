@@ -15,8 +15,8 @@
  * import would keep a stale copy after a reload. With this module off, Team and Night shift work as before.
  */
 import { execFile } from "node:child_process";
-import { createHash } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import { access, readFile, rename, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { promisify } from "node:util";
@@ -1782,6 +1782,223 @@ export function asksBrian(text: string): boolean {
     return last.includes("?") || ASK_WORDS.test(last);
 }
 
+// ─── The export ─────────────────────────────────────────────────────────────
+
+/** Markdown-safe text from an agent or GitHub: no link, emphasis, code, or heading starts in it. */
+const md = (text: string) =>
+    text.replace(/[\\`*_[\]<>|]/g, (character) => `\\${character}`).replace(/^(#)/, "\\$1");
+
+/** A link target for a PR's URL, or undefined when it is not an http(s) address. */
+function linkUrl(url: string): string | undefined {
+    if (!/^https?:\/\/\S+$/.test(url)) {
+        return undefined;
+    }
+
+    return url.replace(/\(/g, "%28").replace(/\)/g, "%29");
+}
+
+/** The longest run of backticks in a text: a fence must be longer. */
+function longestRun(text: string): number {
+    let longest = 0;
+
+    for (const match of text.matchAll(/`+/g)) {
+        longest = Math.max(longest, match[0].length);
+    }
+
+    return longest;
+}
+
+const byId = (a: Thread, b: Thread) => idNumber(a.id) - idNumber(b.id) || a.id.localeCompare(b.id);
+
+/** The export's section for a thread: the page's groups, with closed threads last. */
+function sectionOf(thread: Thread, now: number): string {
+    if (thread.state === "closed") {
+        return "Closed in the last 7 days";
+    }
+
+    if (thread.state === "parked") {
+        return "Parked";
+    }
+
+    if (thread.origin === "found") {
+        return "Found";
+    }
+
+    if (nextActor(thread) === "brian") {
+        return "Needs Brian";
+    }
+
+    if (isStale(thread, now)) {
+        return "Stale";
+    }
+
+    if (nextActor(thread) === "reviewer") {
+        return "Waiting on review";
+    }
+
+    return "Working";
+}
+
+/** One thread's file: everything the document keeps, and its session's reports. */
+function threadFile(
+    thread: Thread,
+    reports: readonly StoredReport[] | undefined,
+    now: number,
+): string {
+    const folder = folderOf(thread);
+    const lines: string[] = [`# ${thread.id} · ${md(thread.title)}`, ""];
+
+    lines.push(
+        `- State: ${thread.state}`,
+        `- Origin: ${thread.origin}`,
+        `- Agents: ${thread.agents.map(md).join(", ") || "nobody"}`,
+        `- Repo: ${thread.repo === undefined ? "none" : md(thread.repo)}`,
+        `- Folder: ${folder === undefined ? "none" : md(folder)}`,
+    );
+
+    if (thread.closed !== undefined) {
+        lines.push(
+            `- Closed: ${thread.closed.why} · by ${thread.closed.by} · ${iso(thread.closed.at)}`,
+        );
+    }
+
+    lines.push("", "## PRs", "");
+
+    const prs = Object.entries(thread.prs).sort(([a], [b]) => a.localeCompare(b));
+
+    if (prs.length === 0) {
+        lines.push("None.");
+    } else {
+        for (const [ref, pr] of prs) {
+            const url = pr.url === undefined ? undefined : linkUrl(pr.url);
+            const label = url === undefined ? ref : `[${ref}](${url})`;
+
+            lines.push(
+                `- ${label} · ${pr.state ?? "no state"} · ${pr.next ?? prNext(pr)} · ${pr.via}${pr.title === undefined ? "" : ` · ${md(pr.title)}`}`,
+            );
+        }
+    }
+
+    lines.push("", "## Asks", "");
+
+    if (thread.asks.length === 0) {
+        lines.push("None.");
+    } else {
+        for (const ask of thread.asks) {
+            lines.push(
+                ask.answer === undefined
+                    ? `- ${ask.id} · open · ${md(ask.text)}`
+                    : `- ${ask.id} · answered by ${md(ask.answer.by)} · ${iso(ask.answer.at)} · ${md(ask.answer.words)}`,
+            );
+        }
+    }
+
+    lines.push("", "## Events", "");
+
+    const events = [...thread.events].sort((a, b) => a.at - b.at || a.key.localeCompare(b.key));
+
+    if (events.length === 0) {
+        lines.push("None.");
+    } else {
+        for (const event of events) {
+            lines.push(`- ${iso(event.at)} · ${md(event.text)}`);
+        }
+    }
+
+    lines.push("", "## Reports", "");
+
+    if (reports === undefined || reports.length === 0) {
+        lines.push("None.");
+    } else {
+        for (const report of reports) {
+            const fence = "`".repeat(Math.max(3, longestRun(report.text) + 1));
+
+            lines.push(fence, report.text, fence, "");
+        }
+    }
+
+    return `${lines.join("\n").trimEnd()}\n`;
+}
+
+/**
+ * The export's files, by name: `threads.md` for the page's sections, and one file for each thread. Deterministic: the
+ * same state, reports, and time give the same bytes; no "generated at" line.
+ */
+export function exportFiles(
+    state: Readonly<DeskState> | undefined,
+    reports: Record<number, readonly StoredReport[] | undefined>,
+    now: number,
+    cap = DEFAULT_CAP,
+): Record<string, string> {
+    const threads = Object.values(state?.threads ?? {});
+    const counted = threads.filter(isCounted).length;
+    const order = [
+        "Needs Brian",
+        "Found",
+        "Stale",
+        "Working",
+        "Waiting on review",
+        "Parked",
+        "Closed in the last 7 days",
+    ];
+    const groups = new Map<string, Thread[]>(order.map((title) => [title, []]));
+
+    for (const thread of threads) {
+        groups.get(sectionOf(thread, now))?.push(thread);
+    }
+
+    const lines = [
+        "# Desk",
+        "",
+        "Generated by the Desk module. Do not edit: the next export writes over it.",
+        "",
+        `Counted: ${String(counted)} of ${String(cap)}.`,
+    ];
+
+    for (const title of order) {
+        const list = (groups.get(title) ?? []).sort(byId);
+
+        if (list.length === 0) {
+            continue;
+        }
+
+        lines.push("", `## ${title}`, "");
+
+        for (const thread of list) {
+            lines.push(
+                `- **${thread.id}** ${md(thread.title)} · ${thread.repo === undefined ? "no repo" : md(thread.repo)} · next: ${nextActor(thread)}`,
+            );
+
+            for (const [ref, pr] of Object.entries(thread.prs).sort(([a], [b]) =>
+                a.localeCompare(b),
+            )) {
+                const url = pr.url === undefined ? undefined : linkUrl(pr.url);
+                const label = url === undefined ? ref : `[${ref}](${url})`;
+
+                lines.push(
+                    `  - ${label} · ${pr.state ?? "no state"} · ${pr.next ?? prNext(pr)} · ${pr.via}`,
+                );
+            }
+
+            for (const ask of thread.asks.filter((each) => each.answer === undefined)) {
+                lines.push(`  - ${ask.id}: ${md(ask.text)}`);
+            }
+        }
+    }
+
+    const files: Record<string, string> = { "threads.md": `${lines.join("\n")}\n` };
+
+    for (const thread of threads) {
+        files[`${thread.id}.md`] = threadFile(
+            thread,
+            thread.session === undefined ? undefined : reports[thread.session],
+            now,
+        );
+    }
+
+    return files;
+}
+
 // ─── The page's view ────────────────────────────────────────────────────────
 
 /** How many closed threads the page shows. */
@@ -2470,11 +2687,12 @@ export default function createDesk(host: Host, web: Web) {
         join(homedir(), ".config", "pi-pocket-team", "desk.json");
 
     /** The config file: the extra logins that count as ours, and the cap. A missing or bad file means the defaults. */
-    async function deskConfig(): Promise<{ authors: string[]; cap: number }> {
+    async function deskConfig(): Promise<{ authors: string[]; cap: number; export?: string }> {
         try {
             const value = JSON.parse(await readFile(configFile(), "utf8")) as {
                 authors?: unknown;
                 cap?: unknown;
+                export?: unknown;
             } | null;
             const authors = Array.isArray(value?.authors)
                 ? value.authors.filter(
@@ -2488,12 +2706,87 @@ export default function createDesk(host: Host, web: Web) {
                 value.cap <= 100
                     ? value.cap
                     : DEFAULT_CAP;
+            const raw = typeof value?.export === "string" ? value.export.trim() : "";
+            const folder =
+                raw === "" ? undefined : raw.startsWith("~/") ? join(homedir(), raw.slice(2)) : raw;
+            const exported = folder !== undefined && isAbsolute(folder) ? folder : undefined;
 
-            return { authors, cap };
+            return { authors, cap, ...(exported === undefined ? {} : { export: exported }) };
         } catch {
             return { authors: [], cap: DEFAULT_CAP };
         }
     }
+
+    /** The export speaks at most once an hour: a failed export must not fill the notices. */
+    let exportNoticeAt = 0;
+    const noteExport = (message: string): void => {
+        const at = Date.now();
+
+        if (at - exportNoticeAt < 3600_000) {
+            return;
+        }
+
+        exportNoticeAt = at;
+
+        try {
+            host.notice("warning", message);
+        } catch {
+            // A notice that cannot show must not fail a sweep, a route, or a tool either.
+        }
+    };
+
+    /** Write a file only when its bytes differ: a temp file in the same folder, then a rename. */
+    const writeChanged = async (folder: string, files: Record<string, string>): Promise<void> => {
+        for (const [name, content] of Object.entries(files)) {
+            const target = join(folder, name);
+            const current = await readFile(target, "utf8").catch(() => undefined);
+
+            if (current === content) {
+                continue;
+            }
+
+            const temp = join(folder, `.${name}.${randomUUID()}.tmp`);
+
+            await writeFile(temp, content, "utf8");
+            await rename(temp, target);
+        }
+    };
+
+    /** The git export, after a commit: a readable copy, never read back, and never a reason to fail. */
+    const exportNow = async (
+        read: Pick<DocumentReader, "snapshot">,
+        context: Context,
+    ): Promise<void> => {
+        try {
+            const config = await deskConfig();
+
+            if (config.export === undefined) {
+                return;
+            }
+
+            try {
+                await access(config.export);
+            } catch {
+                noteExport(`The desk export folder is not there: ${config.export}.`);
+                return;
+            }
+
+            const state = await read.snapshot(DeskThreads, context);
+            const reports: Record<number, readonly StoredReport[] | undefined> = {};
+
+            for (const thread of Object.values(state?.threads ?? {})) {
+                if (thread.session !== undefined) {
+                    reports[thread.session] = (
+                        await read.snapshot(DeskReports, thread.session as ConversationId, context)
+                    )?.reports;
+                }
+            }
+
+            await writeChanged(config.export, exportFiles(state, reports, Date.now(), config.cap));
+        } catch (error) {
+            noteExport(`The desk export did not write: ${(error as Error).message}`);
+        }
+    };
 
     /** The one GitHub read of a sweep: nothing this time when it fails. */
     async function readGitHub(repos: string[], prs: string[]): Promise<GitHubFacts | undefined> {
@@ -3158,6 +3451,7 @@ export default function createDesk(host: Host, web: Web) {
                 }, context);
 
                 web.send("changed", {});
+                await exportNow(runtime, context);
             },
             sleep: async (task, runtime, context) => {
                 const checkpoint = task.state.checkpoint;
@@ -3242,6 +3536,8 @@ export default function createDesk(host: Host, web: Web) {
                 (thread) => thread.state !== "closed" && thread.supervisor !== undefined,
             );
 
+            let swept = false;
+
             for (const supervisor of new Set(open.map((thread) => thread.supervisor as number))) {
                 const mine = open.filter((thread) => thread.supervisor === supervisor);
                 const fresh = mine.some(
@@ -3266,9 +3562,14 @@ export default function createDesk(host: Host, web: Web) {
                         await applySweep(tx, await tx.doc(DeskThreads), supervisor, facts);
                     });
                     web.send("changed", {});
+                    swept = true;
                 } catch {
                     // A failed sweep must not fail the page.
                 }
+            }
+
+            if (swept) {
+                await exportNow({ snapshot: request.snapshot }, request.context);
             }
         } catch {
             // No sweep now: the page still shows what the document has.
@@ -3282,6 +3583,7 @@ export default function createDesk(host: Host, web: Web) {
     const answer = async (
         request: WebRequest,
         change: (state: DeskState, now: number) => void,
+        writeExport = true,
     ): Promise<ThreadsView> => {
         const { cap } = await deskConfig();
         const view = await request.commit(async (tx) => {
@@ -3294,6 +3596,10 @@ export default function createDesk(host: Host, web: Web) {
         });
 
         web.send("changed", {});
+
+        if (writeExport) {
+            await exportNow({ snapshot: request.snapshot }, request.context);
+        }
 
         return view;
     };
@@ -3352,9 +3658,13 @@ export default function createDesk(host: Host, web: Web) {
         "POST",
         "seen",
         async (request) =>
-            answer(request, (state, now) => {
-                state.seen.brian = now;
-            }),
+            answer(
+                request,
+                (state, now) => {
+                    state.seen.brian = now;
+                },
+                false,
+            ),
         { access: "owner" },
     );
 
@@ -3533,6 +3843,7 @@ export default function createDesk(host: Host, web: Web) {
             });
 
             web.send("changed", {});
+            await exportNow({ snapshot: request.snapshot }, request.context);
 
             return view;
         },
@@ -3572,6 +3883,7 @@ export default function createDesk(host: Host, web: Web) {
             });
 
             web.send("changed", {});
+            await exportNow({ snapshot: request.snapshot }, request.context);
 
             return view;
         },
@@ -3889,6 +4201,8 @@ export default function createDesk(host: Host, web: Web) {
                     throw new Error(result.error);
                 }
 
+                await exportNow(api, context);
+
                 return reply(`Filed ${result.askId}.`);
             }
 
@@ -3914,6 +4228,8 @@ export default function createDesk(host: Host, web: Web) {
                     throw new Error(result.error);
                 }
 
+                await exportNow(api, context);
+
                 return reply(
                     result.already ? `${result.id} is answered already.` : `Answered ${result.id}.`,
                 );
@@ -3938,6 +4254,8 @@ export default function createDesk(host: Host, web: Web) {
                     throw new Error(result.error);
                 }
 
+                await exportNow(api, context);
+
                 return reply(result.text);
             }
 
@@ -3958,6 +4276,7 @@ export default function createDesk(host: Host, web: Web) {
                 }, context);
 
                 web.send("changed", {});
+                await exportNow(api, context);
 
                 const state = await api.snapshot(DeskThreads, context);
                 const events =
@@ -4020,6 +4339,8 @@ export default function createDesk(host: Host, web: Web) {
 
                 return seeded;
             }, context);
+
+            await exportNow(api, context);
 
             return reply(
                 result.reused
