@@ -32,7 +32,8 @@ import { createServer } from "node:http";
 import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
 import { fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
-import { defineDoc, type ConversationId } from "@earendil-works/pi-durable";
+import { defineDoc, type ConversationId, LiveDoc, type TaskId } from "@earendil-works/pi-durable";
+import { SubagentsDoc } from "./_pocket/src/server/docs.ts";
 import {
     bindThread,
     DeskReports,
@@ -53,8 +54,11 @@ import {
     wakeParked,
     reparkRepairWoken,
     closeCheck,
+    closeOutcome,
     closeoutHold,
     closeoutKey,
+    assignWorktrees,
+    parseWorktrees,
     isStale,
     nextActor,
     odradeReason,
@@ -106,6 +110,7 @@ import {
     type DeskState,
     type SeedRow,
     type Thread,
+    type WorktreeFact,
 } from "./desk.ts";
 import createDesk from "./desk.ts";
 import { taskTitle } from "./team.ts";
@@ -646,6 +651,60 @@ describe("closeCheck", () => {
         );
     });
 
+    test("an unpushed count that is unknown holds it open", () => {
+        const unknown = closeCheck(
+            thread({ run: { ahead: 0, aheadUnknown: "detached HEAD" } }),
+            facts(),
+        );
+
+        assert.equal(unknown.close, false);
+        assert.deepEqual(unknown.open, [
+            "unpushed commits in /work/test are unknown (detached HEAD)",
+        ]);
+        assert.equal(
+            closeCheck(
+                thread({ run: { aheadUnknown: "no upstream" } }),
+                facts(1000, ["/work/test"]),
+            ).close,
+            true,
+            "another thread works in the folder",
+        );
+    });
+
+    test("a worktree that holds a thread keeps it open, even when its folder is clean", () => {
+        const holding = closeCheck(
+            thread({
+                run: { worktrees: [{ path: "/work/test-digest", dirty: 2, unpushed: 1 }] },
+            }),
+            facts(),
+        );
+
+        assert.equal(holding.close, false);
+        assert.deepEqual(holding.open, [
+            "2 changed files in /work/test-digest",
+            "1 unpushed commit in /work/test-digest",
+        ]);
+
+        // The same words as the folder lines, with 1 of each.
+        assert.deepEqual(
+            closeCheck(
+                thread({ run: { worktrees: [{ path: "/work/digest", dirty: 1, unpushed: 1 }] } }),
+                facts(),
+            ).open,
+            ["1 changed file in /work/digest", "1 unpushed commit in /work/digest"],
+        );
+
+        // A worktree with no work in it, and none recorded at all: nothing holds the thread.
+        assert.equal(
+            closeCheck(
+                thread({ run: { worktrees: [{ path: "/work/digest", dirty: 0, unpushed: 0 }] } }),
+                facts(),
+            ).close,
+            true,
+        );
+        assert.equal(closeCheck(thread({ run: { worktrees: [] } }), facts()).close, true);
+    });
+
     test("a thread still starting closes as failed after an hour", () => {
         const starting = thread({ state: "starting", startedAt: 0 });
 
@@ -665,6 +724,21 @@ describe("nextActor", () => {
         assert.equal(nextActor(thread({ run: { busy: true } })), "agent");
         assert.equal(nextActor(thread({ run: { dirty: 2 } })), "agent");
         assert.equal(nextActor(thread({ run: { ahead: 1 } })), "agent");
+        assert.equal(nextActor(thread({ run: { aheadUnknown: "no upstream" } })), "agent");
+        // A worktree of its folder that holds it is agent work, beside the folder's own counts.
+        assert.equal(
+            nextActor(
+                thread({ run: { worktrees: [{ path: "/work/digest", dirty: 0, unpushed: 2 }] } }),
+            ),
+            "agent",
+        );
+        assert.equal(
+            nextActor(
+                thread({ run: { worktrees: [{ path: "/work/digest", dirty: 0, unpushed: 0 }] } }),
+            ),
+            "none",
+            "a worktree with no work is not agent work",
+        );
         assert.equal(nextActor(thread({ run: { shift: "running" } })), "agent");
         assert.equal(nextActor(thread({ run: { shift: "summary" } })), "agent");
         assert.equal(nextActor(thread({ run: { busy: false, lastUserEntry: 6 } })), "odrade");
@@ -769,6 +843,24 @@ describe("closeoutKey", () => {
         assert.equal(closeoutKey(two), "closeout:k:frostyard/test#1,frostyard/test#2");
     });
 
+    test("a working session, or one not seen idle yet, gets no close-out wake-up", () => {
+        assert.equal(
+            closeoutKey(thread({ prs: prs("MERGED"), run: { busy: true } })),
+            undefined,
+            "the wake-up would land in the middle of a turn",
+        );
+        assert.equal(
+            closeoutKey(thread({ prs: prs("MERGED"), run: { busy: undefined } })),
+            undefined,
+            "not seen idle yet",
+        );
+        assert.equal(
+            closeoutKey(thread({ prs: prs("MERGED"), run: { busy: false } })),
+            "closeout:k:frostyard/test#1",
+            "an idle session gets the key",
+        );
+    });
+
     test("a PR detached after the wake-up gives no new key and no hold", () => {
         // The wake-up covered #1 and #2; a sweep later detached #2: what is left is a state the agent has.
         const detached = thread({
@@ -815,6 +907,75 @@ describe("closeoutKey", () => {
         });
 
         assert.equal(closeoutKey(told), undefined);
+    });
+});
+
+describe("closeOutcome", () => {
+    /** A watch whose check passed: the thread closed because someone verified the work. */
+    const passed = () => ({
+        checkOn: "2026-11-01",
+        check: "the blob sweep",
+        setAt: 1,
+        setBy: "odrade",
+        key: "watch-1",
+        result: { at: 2, by: "odrade", pass: true, text: "the blobs are gone", key: "r-1" },
+    });
+
+    test("every PR merged, or no PR at all, is completed", () => {
+        assert.equal(closeOutcome(thread()), "completed");
+        assert.equal(closeOutcome(thread({ prs: prs("MERGED") })), "completed");
+        assert.equal(closeOutcome(thread({ prs: prs("MERGED", "MERGED") })), "completed");
+    });
+
+    test("a PR closed unmerged is abandoned", () => {
+        assert.equal(closeOutcome(thread({ prs: prs("CLOSED") })), "abandoned");
+        assert.equal(closeOutcome(thread({ prs: prs("MERGED", "CLOSED") })), "abandoned");
+    });
+
+    test("a guessed window PR does not abandon or freeze a thread", () => {
+        const guessed = thread({
+            prs: {
+                "frostyard/test#1": { via: "seen" as const, state: "MERGED" as const },
+                "frostyard/test#2": { via: "window" as const, state: "CLOSED" as const },
+            },
+        });
+
+        assert.equal(closeOutcome(guessed), "completed", "the agent did not make #2");
+
+        const frozen = thread({
+            prs: {
+                "frostyard/test#1": { via: "seen" as const, state: "MERGED" as const },
+                "frostyard/test#2": { via: "window" as const, state: "FROZEN" as const },
+            },
+        });
+
+        assert.equal(closeOutcome(frozen), "completed", "a guessed frozen PR counts for nothing");
+
+        // Only a guessed PR: no PR that the agent made, so the thread completed.
+        const only = thread({
+            prs: { "frostyard/test#2": { via: "window" as const, state: "CLOSED" as const } },
+        });
+
+        assert.equal(closeOutcome(only), "completed");
+    });
+
+    test("a frozen PR, or an archived repository, is frozen", () => {
+        assert.equal(closeOutcome(thread({ prs: prs("FROZEN") })), "frozen");
+        assert.equal(closeOutcome(thread({ run: { repoArchived: true } })), "frozen");
+        assert.equal(
+            closeOutcome(thread({ prs: prs("MERGED"), run: { repoArchived: true } })),
+            "frozen",
+        );
+    });
+
+    test("a passed watch is verified, unless a PR was abandoned or frozen", () => {
+        assert.equal(closeOutcome(thread({ watch: passed() })), "verified");
+        assert.equal(closeOutcome(thread({ prs: prs("MERGED"), watch: passed() })), "verified");
+
+        // The order of the rules: abandoned first, then frozen, then verified.
+        assert.equal(closeOutcome(thread({ prs: prs("CLOSED"), watch: passed() })), "abandoned");
+        assert.equal(closeOutcome(thread({ prs: prs("FROZEN"), watch: passed() })), "frozen");
+        assert.equal(closeOutcome(thread({ prs: prs("CLOSED", "FROZEN") })), "abandoned");
     });
 });
 
@@ -1553,7 +1714,7 @@ describe("the watch's rules", () => {
             { changed: true },
         );
         assert.equal(due.state, "closed");
-        assert.deepEqual(due.closed, { at, why: "done", by: "desk" });
+        assert.deepEqual(due.closed, { at, why: "done", by: "desk", outcome: "verified" });
         assert.equal(due.run.next, "none");
         assert.deepEqual(due.watch?.result, {
             at,
@@ -1593,6 +1754,22 @@ describe("the watch's rules", () => {
             ),
             /passed already/,
         );
+    });
+
+    test("a pass on a thread with an abandoned PR closes it as done (abandoned)", () => {
+        const abandoned = watched({ prs: prs("CLOSED") });
+        const at = on("2026-11-01");
+
+        recordResult(abandoned, {
+            pass: true,
+            text: "the blobs are gone",
+            by: "odrade",
+            key: "r-9",
+            at,
+            closedBy: "brian",
+        });
+        assert.equal(abandoned.closed?.why, "done", "why stays done");
+        assert.equal(abandoned.closed?.outcome, "abandoned", "the PR was closed unmerged");
     });
 
     test("a fail keeps it open, counts again, and starts the stale clock at the fail", () => {
@@ -1648,7 +1825,12 @@ describe("the watch's rules", () => {
             closedBy: "desk",
         });
         assert.equal(failed.state, "closed");
-        assert.deepEqual(failed.closed, { at: at + 100, why: "done", by: "desk" });
+        assert.deepEqual(failed.closed, {
+            at: at + 100,
+            why: "done",
+            by: "desk",
+            outcome: "verified",
+        });
 
         // No watch, and a closed thread, are refused.
         assert.match(
@@ -1906,7 +2088,214 @@ describe("parseStatus", () => {
         ].join("\n");
 
         assert.deepEqual(parseStatus(text), { dirty: 2, ahead: 2, branch: "main" });
-        assert.deepEqual(parseStatus(""), { dirty: 0, ahead: 0 });
+    });
+
+    test("a branch with no upstream has an unknown count, not 0", () => {
+        const text = ["# branch.oid 1234", "# branch.head main"].join("\n");
+
+        assert.deepEqual(parseStatus(text), {
+            dirty: 0,
+            ahead: undefined,
+            aheadUnknown: "no upstream",
+            branch: "main",
+        });
+    });
+
+    test("a detached HEAD has an unknown count, not 0", () => {
+        const text = ["# branch.oid 1234", "# branch.head (detached)"].join("\n");
+
+        assert.deepEqual(parseStatus(text), {
+            dirty: 0,
+            ahead: undefined,
+            aheadUnknown: "detached HEAD",
+        });
+    });
+
+    test("an upstream that is gone has an unknown count, not 0", () => {
+        const text = [
+            "# branch.oid 1234",
+            "# branch.head main",
+            "# branch.upstream origin/main",
+        ].join("\n");
+
+        assert.deepEqual(parseStatus(text), {
+            dirty: 0,
+            ahead: undefined,
+            aheadUnknown: "upstream gone",
+            branch: "main",
+        });
+    });
+
+    test("no branch line at all has an unknown count, not 0", () => {
+        assert.deepEqual(parseStatus(""), {
+            dirty: 0,
+            ahead: undefined,
+            aheadUnknown: "no branch",
+        });
+    });
+});
+
+describe("parseWorktrees", () => {
+    test("the main worktree, a linked one, a detached one, and a bare one", () => {
+        const text = [
+            "worktree /work/main",
+            "HEAD aaa111",
+            "branch refs/heads/main",
+            "",
+            "worktree /work/linked",
+            "HEAD bbb222",
+            "branch refs/heads/desk-hold-open",
+            "",
+            "worktree /work/detached",
+            "HEAD ccc333",
+            "detached",
+            "",
+            "worktree /work/bare",
+            "bare",
+            "",
+        ].join("\n");
+
+        assert.deepEqual(parseWorktrees(text), [
+            { path: "/work/main", branch: "main" },
+            { path: "/work/linked", branch: "desk-hold-open" },
+            { path: "/work/detached", detached: true },
+            { path: "/work/bare", bare: true },
+        ]);
+    });
+
+    test("the last block needs no blank line after it, and empty text is no worktree", () => {
+        const text = [
+            "worktree /work/main",
+            "HEAD aaa111",
+            "branch refs/heads/main",
+            "",
+            "worktree /work/linked",
+            "HEAD bbb222",
+            "branch refs/heads/digest",
+        ].join("\n");
+
+        assert.deepEqual(
+            parseWorktrees(text).map((each) => each.path),
+            ["/work/main", "/work/linked"],
+        );
+        assert.deepEqual(parseWorktrees(""), []);
+    });
+});
+
+describe("assignWorktrees", () => {
+    const owned = (id: string, startedAt: number, patch: Partial<Thread> = {}): Thread =>
+        thread({ id, key: `k-${id}`, startedAt, ...patch });
+    const worktree = (patch: Partial<WorktreeFact> = {}): WorktreeFact => ({
+        path: "/work/linked",
+        branch: "digest",
+        created: 150,
+        dirty: 0,
+        unpushed: 0,
+        ...patch,
+    });
+
+    test("the newest thread at or before the branch's start holds it", () => {
+        const threads = [owned("T1", 100), owned("T2", 200)];
+        const held = assignWorktrees(threads, "/work/test", [worktree({ dirty: 2 })], new Set());
+
+        assert.deepEqual([...held.keys()], ["T1"]);
+        assert.equal(held.get("T1")?.[0]?.dirty, 2);
+
+        // The branch started after every thread: no thread made it.
+        assert.equal(
+            assignWorktrees(threads, "/work/test", [worktree({ created: 50, dirty: 2 })], new Set())
+                .size,
+            0,
+        );
+
+        // No known start: it holds no thread, whatever its work.
+        assert.equal(
+            assignWorktrees(
+                threads,
+                "/work/test",
+                [worktree({ created: undefined, dirty: 2 })],
+                new Set(),
+            ).size,
+            0,
+        );
+    });
+
+    test("a clean worktree, a done branch, and a thread of another folder hold nothing", () => {
+        const threads = [owned("T1", 100)];
+
+        assert.equal(
+            assignWorktrees(threads, "/work/test", [worktree()], new Set()).size,
+            0,
+            "clean and nothing unpushed: not work",
+        );
+        assert.equal(
+            assignWorktrees(threads, "/work/test", [worktree({ unpushed: 1 })], new Set()).size,
+            1,
+            "unpushed commits alone are work",
+        );
+        assert.equal(
+            assignWorktrees(threads, "/work/test", [worktree({ dirty: 1 })], new Set(["digest"]))
+                .size,
+            0,
+            "a merged or closed PR's branch holds no thread",
+        );
+        assert.equal(
+            assignWorktrees(threads, "/work/other", [worktree({ dirty: 1 })], new Set()).size,
+            0,
+            "a thread of another folder does not hold it",
+        );
+    });
+
+    test("a worktree that is a thread's own folder, or a delegation's worktree, holds no other thread", () => {
+        const main = owned("T1", 100);
+        const delegated = owned("T2", 120, {
+            cwd: "/work/linked",
+            worktree: { path: "/work/linked", branch: "digest", checkout: "/work/test" },
+        });
+
+        // The main checkout's thread does not take the delegation's worktree.
+        assert.equal(
+            assignWorktrees([main, delegated], "/work/test", [worktree({ dirty: 2 })], new Set())
+                .size,
+            0,
+        );
+
+        // The delegation's thread does not take a sibling delegation's worktree, open or closed.
+        const sibling = owned("T3", 110, {
+            state: "closed",
+            cwd: "/work/other-linked",
+            worktree: { path: "/work/other-linked", branch: "other", checkout: "/work/test" },
+        });
+
+        assert.equal(
+            assignWorktrees(
+                [main, delegated, sibling],
+                "/work/linked",
+                [worktree({ path: "/work/other-linked", branch: "other", dirty: 1 })],
+                new Set(),
+            ).size,
+            0,
+        );
+
+        // A worktree that no thread owns still holds the main checkout's thread.
+        assert.deepEqual(
+            [
+                ...assignWorktrees(
+                    [main, delegated],
+                    "/work/test",
+                    [worktree({ path: "/work/hand-made", branch: "hand", dirty: 1 })],
+                    new Set(),
+                ).keys(),
+            ],
+            ["T1"],
+        );
+    });
+
+    test("a closed thread holds nothing: the older open thread holds it", () => {
+        const threads = [owned("T1", 100), owned("T2", 200, { state: "closed" })];
+        const held = assignWorktrees(threads, "/work/test", [worktree({ dirty: 1 })], new Set());
+
+        assert.deepEqual([...held.keys()], ["T1"]);
     });
 });
 
@@ -3388,6 +3777,31 @@ describe("exportFiles", () => {
         assert.equal(files["T4.md"]?.includes("- Closed: done · by sweep · "), true);
     });
 
+    test("a closed thread says how it ended, and an old one with no outcome says no more", () => {
+        const state = deskOf();
+        const done = placed(state, 100);
+
+        done.state = "closed";
+        done.closed = { at: 500, why: "done", by: "sweep", outcome: "abandoned" };
+        done.title = "Abandoned work";
+
+        const old = placed(state, 200);
+
+        old.state = "closed";
+        old.closed = { at: 600, why: "done", by: "sweep" };
+        old.title = "Old work";
+
+        const read = readText(state, done.id) ?? "";
+
+        assert.match(read, /Closed: .* · done \(abandoned\) · by sweep/);
+
+        const files = exportFiles(state, {}, 1000, 12);
+
+        assert.match(files[`${done.id}.md`] ?? "", /- Closed: done \(abandoned\) · by sweep · /);
+        assert.match(files[`${old.id}.md`] ?? "", /- Closed: done · by sweep · /);
+        assert.doesNotMatch(files[`${old.id}.md`] ?? "", /\\(completed\\)|\\(verified\\)/);
+    });
+
     test("a report fence is longer than any backtick run, and the bytes do not change", () => {
         const state = deskOf();
         const thread = placed(state, 100);
@@ -4168,7 +4582,7 @@ function git(folder: string, ...args: string[]): void {
     execFileSync("git", args, { cwd: folder, env: gitEnv, stdio: "ignore" });
 }
 
-/** A folder with one commit. */
+/** A folder with one commit, and an upstream that has it: nothing is unpushed, as in a pushed repository. */
 function repository(folder: string): void {
     mkdirSync(folder, { recursive: true });
     git(folder, "init", "-q");
@@ -4184,6 +4598,19 @@ function repository(folder: string): void {
         "-qm",
         "one",
     );
+
+    // A remote-tracking ref at the commit, and the branch's upstream: `git status` prints `# branch.ab +0 -0`.
+    const branch = execFileSync("git", ["symbolic-ref", "--short", "HEAD"], {
+        cwd: folder,
+        env: gitEnv,
+        encoding: "utf8",
+    }).trim();
+
+    git(folder, "config", "remote.origin.url", folder);
+    git(folder, "config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*");
+    git(folder, "update-ref", `refs/remotes/origin/${branch}`, "HEAD");
+    git(folder, "config", `branch.${branch}.remote`, "origin");
+    git(folder, "config", `branch.${branch}.merge`, `refs/heads/${branch}`);
 }
 
 before(async () => {
@@ -4442,6 +4869,38 @@ async function sweptAfter(thread: Thread, after: unknown): Promise<void> {
         "the next sweep",
         20_000,
     );
+}
+
+/**
+ * A conversation that stands in for a subagent of `id`: Pocket's registry names it `helper`, as `subagent` does when Pi
+ * spawns one.
+ */
+async function spawnFakeSubagent(id: ConversationId): Promise<ConversationId> {
+    const folder = join(root, `subagent-${String(id)}`);
+
+    mkdirSync(folder, { recursive: true });
+    const child = await newSession(app, folder);
+
+    await app.harness.commit(async (tx) => {
+        const registry = await tx.doc(SubagentsDoc, id);
+
+        registry.agents.helper = { conversationId: child, reported: [] };
+    }, context);
+
+    return child;
+}
+
+/** Pocket's sign that a subagent works: a run on its conversation. */
+async function setSubagentWorking(child: ConversationId, working: boolean): Promise<void> {
+    await app.harness.commit(async (tx) => {
+        const live = await tx.doc(LiveDoc, child);
+
+        if (working) {
+            live.run = { taskId: "desk-subagent-run" as TaskId, inputs: [] };
+        } else {
+            delete live.run;
+        }
+    }, context);
 }
 
 /** Remove the usable OKs: a cap test must not spend an OK that another test left. */
@@ -4796,6 +5255,36 @@ describe("the desk in a Pi Pocket", () => {
             by: "sweep",
         });
         assert.equal(after?.run.next, "none");
+    });
+
+    test("a thread does not close while a subagent of its session works, and waits on its agent", async () => {
+        const { source, linked, thread } = await delegated("subagent-hold");
+
+        await until(() => !app.isBusy(linked), "the linked session to settle", 20_000);
+
+        const child = await spawnFakeSubagent(linked);
+
+        await setSubagentWorking(child, true);
+        // The agent reports in its last turn: without the subagent, the next sync would close the thread as done.
+        await say(app, linked, "report to supervisor test");
+        await until(() => !app.isBusy(linked), "the report's turn to settle", 20_000);
+        await say(app, source, "desk sync test");
+
+        const held = (await deskState())?.threads[thread.id];
+
+        assert.equal(held?.state, "open", "a working subagent keeps the thread open");
+        assert.equal(held?.run.busy, true, "the sweep counts the idle session as working");
+        assert.equal(held?.run.next, "agent", "the thread waits on its agent");
+
+        // The subagent stops: the next sync closes the thread as done, as it would have before.
+        await setSubagentWorking(child, false);
+        await say(app, source, "desk sync test");
+
+        const after = (await deskState())?.threads[thread.id];
+
+        assert.equal(after?.state, "closed");
+        assert.equal(after?.closed?.why, "done");
+        assert.equal(after?.run.busy, false);
     });
 
     test("a dirty folder keeps its thread open, and the agent is next", async () => {
@@ -5386,6 +5875,43 @@ describe("the desk in a Pi Pocket", () => {
             (await deskState())?.threads[thread.id]?.events.length,
             events,
             "a replay changes nothing",
+        );
+    });
+
+    test("a sweep that closes a thread with a merged PR records how it ended", async () => {
+        await stopSweepers();
+        const source = await supervisor("outcome");
+        let id = "";
+
+        // A thread with no session to wait for, and one PR that merged: the next sweep closes it.
+        await app.harness.commit(async (tx) => {
+            const state = await tx.doc(DeskThreads);
+            const opened = openThread(state, {
+                key: "x.test.outcome",
+                supervisor: Number(source),
+                agents: ["duncan"],
+                repo: "frostyard/test",
+                title: "A finished task",
+                at: Date.now(),
+            });
+
+            id = opened.thread.id;
+            const thread = state.threads[id]!;
+
+            thread.state = "open";
+            thread.prs["frostyard/test#9"] = { via: "attached", state: "MERGED" };
+        }, context);
+
+        await say(app, source, "desk sync test");
+
+        const closed = (await deskState())?.threads[id];
+
+        assert.equal(closed?.state, "closed");
+        assert.equal(closed?.closed?.why, "done");
+        assert.equal(closed?.closed?.outcome, "completed");
+        assert.match(
+            closed?.events.map((event) => event.text).join("; ") ?? "",
+            /closed: completed \(all PRs merged\)/,
         );
     });
 
@@ -6663,6 +7189,186 @@ describe("the desk in a Pi Pocket", () => {
             assert.equal(
                 (await deskState())?.baseline?.[String(Number(source))]?.pending?.[brief],
                 undefined,
+            );
+        } finally {
+            await quiet([]);
+            shift = 0;
+        }
+    });
+
+    test("a branch with no upstream never reports nothing unpushed", async () => {
+        // The app's clock moves here: no sweeper of an earlier test may wake and see the folder too.
+        await stopSweepers();
+        const folder = join(root, "no-upstream");
+
+        rmSync(folder, { recursive: true, force: true });
+        repository(folder);
+        // No upstream at all: the case this test is about.
+        git(folder, "remote", "remove", "origin");
+
+        const source = await supervisor("ahead");
+        let id = "";
+
+        await app.harness.commit(async (tx) => {
+            const state = await tx.doc(DeskThreads);
+            const opened = openThread(state, {
+                key: "x.test.no-upstream",
+                supervisor: Number(source),
+                agents: ["duncan"],
+                repo: "frostyard/no-upstream",
+                cwd: folder,
+                title: "A branch with no upstream",
+                at: Date.now(),
+            }).thread;
+
+            // The doc's copy is not the returned object: set the state on the stored thread.
+            id = opened.id;
+            state.threads[id]!.state = "open";
+        }, context);
+
+        try {
+            // `desk list` starts the supervisor's sweeper: its first sweep reads the folder.
+            await say(app, source, "desk list test");
+            await until(
+                async () => typeof (await deskState())?.threads[id]?.run.sweptAt === "number",
+                "the first sweep",
+                20_000,
+            );
+
+            const first = (await deskState())?.threads[id];
+
+            assert(first, "the thread is stored");
+
+            const firstTexts = first.events.map((event) => event.text);
+
+            assert.equal(firstTexts.includes("nothing is unpushed"), false);
+            // `git rev-list --count HEAD --not --remotes` verifies the 1 commit that no remote has.
+            assert.equal(first.run.ahead, 1);
+            assert.equal(first.run.aheadUnknown, undefined);
+            assert.deepEqual(closeCheck(first, facts()).open, [`1 unpushed commit in ${folder}`]);
+
+            // The branch's only commit goes: there is no HEAD to count, so the count is unknown again. `run.ahead`
+            // keeps its last known value, and the thread does not close.
+            const branch = execFileSync("git", ["symbolic-ref", "--short", "HEAD"], {
+                cwd: folder,
+                env: gitEnv,
+                encoding: "utf8",
+            }).trim();
+
+            git(folder, "update-ref", "-d", `refs/heads/${branch}`);
+            await quiet([id]);
+            const seen = first.run.sweptAt;
+
+            await restartApp(SWEEP_SLEEP_MS + 60_000);
+            await sweptAfter(first, seen);
+
+            const second = (await deskState())?.threads[id];
+
+            assert(second, "the thread is still stored");
+
+            const secondTexts = second.events.map((event) => event.text);
+
+            assert.equal(secondTexts.includes("nothing is unpushed"), false);
+            assert.equal(second.run.ahead, 1, "a known count is not overwritten");
+            assert.equal(second.run.aheadUnknown, "no upstream");
+            assert.equal(secondTexts.includes("unpushed commits unknown: no upstream"), true);
+            assert.equal(
+                closeCheck(second, facts()).open.includes(
+                    `unpushed commits in ${folder} are unknown (no upstream)`,
+                ),
+                true,
+            );
+
+            // A `git status` that fails in a repository is a failed read, not a clean folder: the thread still does not
+            // close, and the count stays unknown with its own reason.
+            writeFileSync(join(folder, ".git", "index"), "not an index");
+            await quiet([id]);
+            const secondSwept = second.run.sweptAt;
+
+            await restartApp(SWEEP_SLEEP_MS * 2 + 120_000);
+            await sweptAfter(second, secondSwept);
+
+            const third = (await deskState())?.threads[id];
+
+            assert(third, "the thread is still stored");
+            assert.equal(third.run.ahead, 1, "a known count is not overwritten");
+            assert.equal(third.run.aheadUnknown, "git status failed");
+            assert.equal(
+                third.events.some(
+                    (event) => event.text === "unpushed commits unknown: git status failed",
+                ),
+                true,
+            );
+            assert.equal(closeCheck(third, facts()).close, false);
+        } finally {
+            await quiet([]);
+            shift = 0;
+        }
+    });
+
+    test("a thread whose folder is gone closes, and does not say git status failed", async () => {
+        await stopSweepers();
+        const folder = join(root, "gone-worktree");
+
+        rmSync(folder, { recursive: true, force: true });
+        repository(folder);
+
+        const source = await supervisor("gone");
+        let id = "";
+
+        await app.harness.commit(async (tx) => {
+            const state = await tx.doc(DeskThreads);
+            const opened = openThread(state, {
+                key: "x.test.gone-worktree",
+                supervisor: Number(source),
+                agents: ["duncan"],
+                repo: "frostyard/gone-worktree",
+                cwd: folder,
+                title: "A worktree that goes away",
+                at: Date.now(),
+            }).thread;
+
+            // Its session is still working, so the thread stays open across both sweeps.
+            id = opened.id;
+            state.threads[id]!.state = "open";
+            state.threads[id]!.address = "session-gone";
+            state.threads[id]!.run.busy = true;
+        }, context);
+
+        try {
+            await say(app, source, "desk list test");
+            await until(
+                async () => typeof (await deskState())?.threads[id]?.run.sweptAt === "number",
+                "the first sweep",
+                20_000,
+            );
+
+            const first = (await deskState())?.threads[id];
+
+            assert(first, "the thread is stored");
+            assert.equal(first.run.dirty, 0);
+            assert.equal(first.run.ahead, 0);
+
+            // An agent removed its worktree after the merge: the folder is not on disk. That is not a failed read.
+            rmSync(folder, { recursive: true, force: true });
+            await quiet([id]);
+            const seen = first.run.sweptAt;
+
+            await restartApp(SWEEP_SLEEP_MS + 60_000);
+            await sweptAfter(first, seen);
+
+            const second = (await deskState())?.threads[id];
+
+            assert(second, "the thread is still stored");
+            assert.equal(second.run.aheadUnknown, undefined);
+            assert.equal(
+                second.events.some((event) => event.text.includes("git status failed")),
+                false,
+            );
+            assert.equal(
+                closeCheck(second, facts()).open.some((part) => part.includes("unknown")),
+                false,
+                "the missing worktree does not hold the thread",
             );
         } finally {
             await quiet([]);

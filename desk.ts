@@ -35,6 +35,7 @@ import {
     type Cursor,
     type DocumentReader,
     type EntryId,
+    LiveDoc,
     type TaskRuntime,
     type Tx,
 } from "@earendil-works/pi-durable";
@@ -130,6 +131,12 @@ export type Watch = {
     result?: { at: number; by: string; pass: boolean; text: string; key: string };
 };
 
+/**
+ * How a thread that closed as done ended: `completed` (every PR merged, or no PR), `abandoned` (a PR closed
+ * unmerged), `frozen` (a PR, or the repository, is archived), or `verified` (a watch passed).
+ */
+export type CloseOutcome = "completed" | "abandoned" | "verified" | "frozen";
+
 /** One piece of work the team runs. Stored data: never rename a field or change what it means. */
 export type Thread = {
     /** "T13" for a delegated, seeded, or asked thread; "F2" for a found one. */
@@ -161,7 +168,13 @@ export type Thread = {
     startedAt: number;
     lastEventAt: number;
     keptAt?: number;
-    closed?: { at: number; why: "done" | "dropped" | "failed"; by: "sweep" | "brian" | "desk" };
+    closed?: {
+        at: number;
+        why: "done" | "dropped" | "failed";
+        by: "sweep" | "brian" | "desk";
+        /** How it ended, when `why` is "done"; an older record has none. Stored data: never rename a field. */
+        outcome?: CloseOutcome;
+    };
     /** Key "owner/name#n". */
     prs: Record<string, PrLink>;
     branches: string[];
@@ -171,13 +184,16 @@ export type Thread = {
     asks: Ask[];
     /**
      * Facts the sweep keeps: `returnAddress`, `reportedAt`, `reportedUserEntry`, `scanCursor`, `lastUserEntry`,
-     * `seenPrs`, `busy`, `archived`, `shift`, `dirty`, `ahead`, `folder`, `next`, `sweptAt`, `closeout` (the
-     * wake-up key that went last, so a sweep does not send it again), `closeoutEntry` (the session's newest user entry
-     * before it went: a report past it lets the thread close), `closeoutRefs` (every PR ref an earlier wake-up told the
-     * agent, sorted, at most 50: a state of only told refs is no new wake-up, so a detached PR cannot send again),
-     * `repairs` (the repair wake-ups the sweep decided, by repair key: `{ at, to, why, sent }`, at most 30),
-     * `repairCounts` (PR ref → the repair wake-ups that went to the agent: never pruned), `worktreeGone` (when a sweep
-     * removed the thread's worktree), and `worktreeKeptAt` (when git refused to remove it: the next try waits a day).
+     * `seenPrs`, `busy`, `archived`, `repoArchived` (its repository is archived, as the last read saw it), `shift`, `dirty`, `ahead`, `aheadUnknown` (why the unpushed count is unknown: it
+     * is absent when the count is known, and `ahead` then keeps its last known value), `folder`, `next`, `sweptAt`,
+     * `worktrees` (the linked worktrees of its folder that hold it, `{ path, dirty, unpushed }`: a worktree of it that
+     * changed, or holds unpushed commits, keeps it open, and its work is the agent's), `closeout` (the wake-up key that
+     * went last, so a sweep does not send it again), `closeoutEntry` (the session's newest user entry before it went: a
+     * report past it lets the thread close), `closeoutRefs` (every PR ref an earlier wake-up told the agent, sorted, at
+     * most 50: a state of only told refs is no new wake-up, so a detached PR cannot send again), `repairs` (the repair
+     * wake-ups the sweep decided, by repair key: `{ at, to, why, sent }`, at most 30), `repairCounts` (PR ref → the
+     * repair wake-ups that went to the agent: never pruned), `worktreeGone` (when a sweep removed the thread's
+     * delegation worktree), and `worktreeKeptAt` (when git refused to remove it: the next try waits a day).
      */
     run: Record<string, JsonValue>;
     /** The last 50; `key` makes an event unique. */
@@ -254,6 +270,64 @@ export const DeskReports = defineDoc<DeskReportsState>({
     fork: "current",
     initial: () => ({ reports: [] }),
 });
+
+/**
+ * Pi's subagents of a conversation, read only: the ones Pi spawned, and their reports on the way to it. It is Pocket's
+ * own document, not public API: when its shape changes, reading it fails, and the sweep then counts no subagent as
+ * working (a session is idle when Pocket says so, as before). Never write it. The same definition as Night shift's.
+ */
+const SubagentsDoc = defineDoc<{
+    agents: Record<string, { conversationId: ConversationId }>;
+    /** Pocket's reporter task for each message; not read here, but part of the document's shape. */
+    reporters: Record<string, string>;
+    /** Reports not yet sent to the parent. */
+    outbox?: { name: string; text: string }[];
+    /** The batch on its way to the parent. */
+    sending?: { request: string };
+}>({
+    kind: "pocket.subagents",
+    version: 1,
+    scope: "conversation",
+    history: "latest",
+    fork: "initial",
+    // The same as Pocket's own base, `rebased` in src/server/docs.ts: not part of the stored meaning.
+    checkpointWhen: (_value, _ops, info) => info.deltasSinceBase >= 64,
+    initial: () => ({ agents: {}, reporters: {} }),
+});
+
+/**
+ * Whether a subagent of `conversationId` still works: one of them has a run, or a report of one is on its way to the
+ * session. Any failure to read Pocket's registry, or a subagent's conversation, means no subagent works.
+ */
+async function subagentsBusy(
+    read: Pick<DocumentReader, "snapshot">,
+    conversationId: ConversationId,
+    context: Context,
+): Promise<boolean> {
+    try {
+        const registry = await read.snapshot(SubagentsDoc, conversationId, context);
+
+        if (registry === undefined) {
+            return false;
+        }
+
+        if ((registry.outbox?.length ?? 0) > 0 || registry.sending !== undefined) {
+            return true;
+        }
+
+        for (const agent of Object.values(registry.agents)) {
+            const live = await read.snapshot(LiveDoc, agent.conversationId, context);
+
+            if (live?.run !== undefined) {
+                return true;
+            }
+        }
+
+        return false;
+    } catch {
+        return false;
+    }
+}
 
 // ─── Small helpers ───────────────────────────────────────────────────────────
 
@@ -935,7 +1009,12 @@ export function recordResult(
 
     if (request.pass) {
         thread.state = "closed";
-        thread.closed = { at: request.at, why: "done", by: request.closedBy };
+        thread.closed = {
+            at: request.at,
+            why: "done",
+            by: request.closedBy,
+            outcome: closeOutcome(thread),
+        };
         thread.run.next = "none";
         addEvent(
             thread,
@@ -993,19 +1072,41 @@ export function scanText(text: string): { prs: string[]; branches: string[] } {
     return { prs: [...prs], branches: [...branches] };
 }
 
-/** `git status --porcelain=v2 --branch`: the changed files, the commits ahead, and the branch name. */
-export function parseStatus(text: string): { dirty: number; ahead: number; branch?: string } {
+/**
+ * Why a folder's unpushed commit count is unknown: `git status` printed no `# branch.ab` line, the count could not be
+ * verified (`git rev-list` failed), or git could not read the folder at all.
+ */
+export type AheadUnknown =
+    "no upstream" | "detached HEAD" | "upstream gone" | "no branch" | "git status failed";
+
+/**
+ * `git status --porcelain=v2 --branch`: the changed files, the commits ahead, and the branch name. `ahead` is undefined
+ * when git printed no `# branch.ab` line, with the reason: a branch with no upstream, a detached HEAD, or an upstream
+ * that is gone is not the same as 0 unpushed commits.
+ */
+export function parseStatus(text: string): {
+    dirty: number;
+    ahead: number | undefined;
+    aheadUnknown?: AheadUnknown;
+    branch?: string;
+} {
     let dirty = 0;
-    let ahead = 0;
+    let ahead: number | undefined;
     let branch: string | undefined;
+    let detached = false;
+    let upstream = false;
 
     for (const line of text.split("\n")) {
         if (line.startsWith("# branch.head ")) {
             const name = line.slice("# branch.head ".length).trim();
 
-            if (name !== "(detached)") {
+            if (name === "(detached)") {
+                detached = true;
+            } else {
                 branch = name;
             }
+        } else if (line.startsWith("# branch.upstream ")) {
+            upstream = true;
         } else if (line.startsWith("# branch.ab ")) {
             const match = /\+(\d+) -(\d+)/.exec(line);
 
@@ -1017,10 +1118,276 @@ export function parseStatus(text: string): { dirty: number; ahead: number; branc
         }
     }
 
-    return { dirty, ahead, ...(branch === undefined ? {} : { branch }) };
+    // Git prints `# branch.upstream` without `# branch.ab` when the upstream is gone, and `# branch.head (detached)`
+    // for a detached HEAD.
+    const reason: AheadUnknown = detached
+        ? "detached HEAD"
+        : upstream
+          ? "upstream gone"
+          : branch === undefined
+            ? "no branch"
+            : "no upstream";
+
+    return {
+        dirty,
+        ahead,
+        ...(ahead === undefined ? { aheadUnknown: reason } : {}),
+        ...(branch === undefined ? {} : { branch }),
+    };
+}
+
+/**
+ * One block of `git worktree list --porcelain`: `worktree <path>`, then `HEAD`, `branch`, `detached`, or `bare`. The
+ * branch is the name after `refs/heads/`.
+ */
+export type ParsedWorktree = {
+    path: string;
+    branch?: string;
+    detached?: boolean;
+    bare?: boolean;
+};
+
+/**
+ * `git worktree list --porcelain` in blocks, in the order git gives them: the main worktree first. A block separated
+ * by a blank line, or by the next `worktree` line (the last block needs no blank line after it).
+ */
+export function parseWorktrees(text: string): ParsedWorktree[] {
+    const worktrees: ParsedWorktree[] = [];
+    let block: ParsedWorktree | undefined;
+
+    for (const line of text.split("\n")) {
+        if (line.trim() === "") {
+            block = undefined;
+            continue;
+        }
+
+        if (line.startsWith("worktree ")) {
+            block = { path: line.slice("worktree ".length).trim() };
+            worktrees.push(block);
+            continue;
+        }
+
+        if (block === undefined) {
+            continue;
+        }
+
+        if (line.startsWith("branch ")) {
+            const ref = line.slice("branch ".length).trim();
+
+            block.branch = ref.startsWith("refs/heads/") ? ref.slice("refs/heads/".length) : ref;
+        } else if (line === "detached") {
+            block.detached = true;
+        } else if (line === "bare") {
+            block.bare = true;
+        }
+    }
+
+    return worktrees.filter((each) => each.path !== "");
+}
+
+/** A worktree of a thread's folder that holds the thread, as the sweep reads it. */
+export type WorktreeFact = {
+    path: string;
+    /** The branch it holds, without `refs/heads/`. */
+    branch: string;
+    /** The branch's oldest reflog time, in ms; undefined when git did not give it. */
+    created?: number;
+    dirty: number;
+    unpushed: number;
+};
+
+/** One worktree as a thread records it: `run.worktrees`, and what `closeCheck` and `nextActor` read. */
+export type WorktreeLine = { path: string; dirty: number; unpushed: number };
+
+/**
+ * The worktrees that hold a thread of `folder`: a map of thread id to them. A worktree holds a thread only when it has
+ * changed files or unpushed commits, its `created` is known, and its branch is not in `doneBranches` (a merged or closed
+ * PR's branch keeps commits that are on no remote, and a squash-merge leaves them: it is not work). It belongs to the 1
+ * thread that is not closed, works in `folder`, and has the newest `startedAt` at or before `created`; no such thread,
+ * and it holds none. A worktree that is a thread's own folder (an open thread's `cwd`), or the delegation worktree of
+ * any thread (`thread.worktree.path`), belongs to that thread: it holds no other thread, and the sweep reads its counts
+ * as that thread's folder.
+ */
+export function assignWorktrees(
+    threads: readonly Thread[],
+    folder: string,
+    worktrees: readonly WorktreeFact[],
+    doneBranches: ReadonlySet<string>,
+): Map<string, WorktreeFact[]> {
+    const open = threads
+        .filter((thread) => thread.state !== "closed" && folderOf(thread) === folder)
+        .sort((a, b) => b.startedAt - a.startedAt);
+    const held = new Map<string, WorktreeFact[]>();
+    const owned = new Set<string>();
+
+    for (const thread of threads) {
+        const own = folderOf(thread);
+
+        if (thread.state !== "closed" && own !== undefined) {
+            owned.add(own);
+        }
+
+        if (thread.worktree !== undefined) {
+            owned.add(thread.worktree.path);
+        }
+    }
+
+    for (const worktree of worktrees) {
+        const works = worktree.dirty > 0 || worktree.unpushed > 0;
+
+        if (owned.has(worktree.path)) {
+            continue;
+        }
+
+        if (!works || worktree.created === undefined || doneBranches.has(worktree.branch)) {
+            continue;
+        }
+
+        const owner = open.find((thread) => thread.startedAt <= worktree.created!);
+
+        if (owner === undefined) {
+            continue;
+        }
+
+        held.set(owner.id, [...(held.get(owner.id) ?? []), worktree]);
+    }
+
+    return held;
+}
+
+/** The worktrees a thread records: `run.worktrees` that have work, and none when it is absent or not readable. */
+function storedWorktrees(thread: Thread): WorktreeLine[] {
+    const stored = thread.run.worktrees;
+
+    if (!Array.isArray(stored)) {
+        return [];
+    }
+
+    const lines: WorktreeLine[] = [];
+
+    for (const entry of stored) {
+        if (entry === null || typeof entry !== "object" || Array.isArray(entry)) {
+            continue;
+        }
+
+        const path = entry.path;
+        const dirty = numberOr(entry.dirty) ?? 0;
+        const unpushed = numberOr(entry.unpushed) ?? 0;
+
+        if (typeof path !== "string" || (dirty === 0 && unpushed === 0)) {
+            continue;
+        }
+
+        lines.push({ path, dirty, unpushed });
+    }
+
+    return lines;
+}
+
+/** Whether 2 lists of worktrees are the same list: the same entries, in the same order. */
+function sameWorktrees(one: readonly WorktreeLine[], two: readonly WorktreeLine[]): boolean {
+    return (
+        one.length === two.length &&
+        one.every((each, index) => {
+            const other = two[index];
+
+            return (
+                other !== undefined &&
+                each.path === other.path &&
+                each.dirty === other.dirty &&
+                each.unpushed === other.unpushed
+            );
+        })
+    );
+}
+
+/** One worktree's lines, in `closeCheck`'s words: the changed files, then the unpushed commits. */
+function worktreeLines(worktree: WorktreeLine): string[] {
+    const lines: string[] = [];
+
+    if (worktree.dirty > 0) {
+        lines.push(
+            `${String(worktree.dirty)} changed file${worktree.dirty === 1 ? "" : "s"} in ${worktree.path}`,
+        );
+    }
+
+    if (worktree.unpushed > 0) {
+        lines.push(
+            `${String(worktree.unpushed)} unpushed commit${worktree.unpushed === 1 ? "" : "s"} in ${worktree.path}`,
+        );
+    }
+
+    return lines;
+}
+
+/** The key and text of the event a thread's held worktrees get: the same work gives the same key. */
+function worktreesEvent(
+    worktrees: readonly WorktreeLine[],
+    now: number,
+): { key: string; text: string } {
+    const state = worktrees
+        .map((each) => `${each.path}:${String(each.dirty)}:${String(each.unpushed)}`)
+        .join("|");
+    const text =
+        worktrees.length === 0
+            ? "no worktree holds it"
+            : worktrees.flatMap(worktreeLines).join("; ");
+
+    return { key: `worktrees:${state}:${String(now)}`, text };
 }
 
 const CLOSED_PR = new Set(["MERGED", "CLOSED", "FROZEN"]);
+
+/**
+ * How a thread that closes as done ended, in the rules' order: a PR closed unmerged abandons it; a frozen PR, or an
+ * archived repository, freezes it; a passed watch verifies it; else every PR merged, or it had none. A guessed PR
+ * (`via: "window"`) is not the agent's work, so it counts for nothing here. Old threads keep no outcome; a new one is
+ * recorded in `thread.closed.outcome`.
+ */
+export function closeOutcome(thread: Thread): CloseOutcome {
+    const entries = ownPrs(thread);
+
+    if (entries.some(([, pr]) => pr.state === "CLOSED")) {
+        return "abandoned";
+    }
+
+    if (thread.run.repoArchived === true || entries.some(([, pr]) => pr.state === "FROZEN")) {
+        return "frozen";
+    }
+
+    if (thread.watch?.result?.pass === true) {
+        return "verified";
+    }
+
+    return "completed";
+}
+
+/** A thread's PRs that the agent made: a guessed one (`via: "window"`) is not its work. */
+function ownPrs(thread: Thread): [string, PrLink][] {
+    return Object.entries(thread.prs).filter(([, pr]) => pr.via !== "window");
+}
+
+/** The close event's text for a thread's outcome: `closeOutcome`, with the fact that gives it. */
+function closeOutcomeWords(thread: Thread): string {
+    const outcome = closeOutcome(thread);
+    const entries = ownPrs(thread);
+
+    if (outcome === "abandoned") {
+        const ref = entries.find(([, pr]) => pr.state === "CLOSED")?.[0];
+
+        return `abandoned (PR ${ref ?? "a PR"} closed unmerged)`;
+    }
+
+    if (outcome === "frozen") {
+        return "frozen (repository archived)";
+    }
+
+    if (outcome === "verified") {
+        return "verified (watch passed)";
+    }
+
+    return entries.length === 0 ? "completed (no PRs)" : "completed (all PRs merged)";
+}
 
 /** What keeps a thread's session part open, in words. Undefined when it is closed. */
 function openSession(thread: Thread): string | undefined {
@@ -1131,14 +1498,24 @@ export function closeCheck(thread: Thread, facts: CloseFacts): { close: boolean;
     if (folder !== undefined && !facts.folders.has(folder)) {
         const dirty = numberOr(thread.run.dirty) ?? 0;
         const ahead = numberOr(thread.run.ahead) ?? 0;
+        const aheadUnknown =
+            typeof thread.run.aheadUnknown === "string" ? thread.run.aheadUnknown : undefined;
 
         if (dirty > 0) {
             open.push(`${String(dirty)} changed file${dirty === 1 ? "" : "s"} in ${folder}`);
         }
 
-        if (ahead > 0) {
+        // A count the desk cannot know is not 0: the thread waits for the agent, as an unpushed commit does.
+        if (aheadUnknown !== undefined) {
+            open.push(`unpushed commits in ${folder} are unknown (${aheadUnknown})`);
+        } else if (ahead > 0) {
             open.push(`${String(ahead)} unpushed commit${ahead === 1 ? "" : "s"} in ${folder}`);
         }
+    }
+
+    // A worktree of the thread's folder that holds it: its work is not in the folder's own counts.
+    for (const worktree of storedWorktrees(thread)) {
+        open.push(...worktreeLines(worktree));
     }
 
     return { close: open.length === 0, open };
@@ -1147,11 +1524,17 @@ export function closeCheck(thread: Thread, facts: CloseFacts): { close: boolean;
 /**
  * The wake-up key of a thread that needs a close-out wake-up: `closeout:<thread.key>:<refs>`, the refs of its PRs
  * that are not guessed (`via: "window"`). Undefined when the thread is not open (parked, starting, closed), has no PR
- * that is not guessed, has such a PR still open, has no address for its agent, is archived, or when every ref in the
- * key was already told by an earlier wake-up. A new PR gives a new key, so the agent hears about it; a PR that leaves
- * the thread gives a state the agent already has, so it sends nothing.
+ * that is not guessed, has such a PR still open, has no address for its agent, is archived, when its session works or
+ * was not seen idle yet (`run.busy` is not false: the wake-up would land in the middle of a turn, and a working
+ * subagent of that session counts as the session working), or when every ref in the key was already told by an earlier
+ * wake-up. A new PR gives a new key, so the agent hears about it; a PR that leaves the thread gives a state the agent
+ * already has, so it sends nothing.
  */
 export function closeoutKey(thread: Thread): string | undefined {
+    if (thread.run.busy !== false) {
+        return undefined;
+    }
+
     const key = closeoutDue(thread);
 
     if (key === undefined) {
@@ -1620,10 +2003,21 @@ export function nextActor(thread: Thread): NextActor {
     const busy = thread.run.busy === true;
     const dirty = (numberOr(thread.run.dirty) ?? 0) > 0;
     const ahead = (numberOr(thread.run.ahead) ?? 0) > 0;
+    const aheadUnknown = typeof thread.run.aheadUnknown === "string";
+    // A worktree of the thread's folder that holds it: work of the agent, as the folder's own counts are.
+    const worktree = storedWorktrees(thread).length > 0;
     const shift = thread.run.shift;
     const shiftOpen = typeof shift === "string" && shift !== "ended";
 
-    if (busy || dirty || ahead || shiftOpen || openPrs.includes("agent")) {
+    if (
+        busy ||
+        dirty ||
+        ahead ||
+        aheadUnknown ||
+        worktree ||
+        shiftOpen ||
+        openPrs.includes("agent")
+    ) {
         return "agent";
     }
 
@@ -1648,7 +2042,9 @@ export function nextActor(thread: Thread): NextActor {
         openSession(thread) === undefined &&
         !shiftOpen &&
         !dirty &&
-        !ahead
+        !ahead &&
+        !aheadUnknown &&
+        !worktree
     ) {
         return "reviewer";
     }
@@ -2335,6 +2731,13 @@ const linkFor = (pr: PrFact, via: PrLink["via"]): PrLink => ({
 /** One attached PR's facts from a read: its state, its next actor, and what GitHub says. */
 export function updatePrs(thread: Thread, github: GitHubFacts, now: number): number {
     let events = 0;
+
+    // The thread's repository, as the read saw it: an archived one freezes the thread, even with no PR to show it.
+    const repo = thread.repo === undefined ? undefined : github.repos[thread.repo];
+
+    if (repo !== undefined) {
+        thread.run.repoArchived = repo.archived;
+    }
 
     for (const [ref, link] of Object.entries(thread.prs)) {
         if (github.missing !== undefined && github.missing.includes(ref)) {
@@ -3336,7 +3739,7 @@ function threadFile(
 
     if (thread.closed !== undefined) {
         lines.push(
-            `- Closed: ${thread.closed.why} · by ${thread.closed.by} · ${iso(thread.closed.at)}`,
+            `- Closed: ${thread.closed.why}${thread.closed.outcome === undefined ? "" : ` (${thread.closed.outcome})`} · by ${thread.closed.by} · ${iso(thread.closed.at)}`,
         );
     }
 
@@ -3532,7 +3935,7 @@ export type ThreadView = {
     };
     /** A watched thread before its date: it does not count, and it is not stale. */
     asleep: boolean;
-    closed?: { at: number; why: string; by: string };
+    closed?: { at: number; why: string; by: string; outcome?: CloseOutcome };
 };
 
 /** The folders that threads other than `thread` work in. */
@@ -3637,6 +4040,9 @@ export function threadView(
                       at: thread.closed.at,
                       why: thread.closed.why,
                       by: thread.closed.by,
+                      ...(thread.closed.outcome === undefined
+                          ? {}
+                          : { outcome: thread.closed.outcome }),
                   },
               }),
     };
@@ -3813,7 +4219,9 @@ export function readText(state: Readonly<DeskState> | undefined, id: string): st
         ...(thread.watch === undefined ? [] : [`Watch: ${watchText(thread.watch)}`]),
         ...(thread.closed === undefined
             ? []
-            : [`Closed: ${iso(thread.closed.at)} · ${thread.closed.why} · by ${thread.closed.by}`]),
+            : [
+                  `Closed: ${iso(thread.closed.at)} · ${thread.closed.why}${thread.closed.outcome === undefined ? "" : ` (${thread.closed.outcome})`} · by ${thread.closed.by}`,
+              ]),
         prs.length === 0
             ? "PRs: none"
             : `PRs:\n${prs.map(([ref, pr]) => `  ${ref} · ${pr.via}${pr.state === undefined ? "" : ` · ${pr.state}`}${pr.next === undefined ? "" : ` · next: ${pr.next}`}${pr.title === undefined || pr.title === "" ? "" : ` · ${pr.title}`}`).join("\n")}`,
@@ -4211,7 +4619,17 @@ export default function createDesk(host: Host, web: Web) {
     type Reader = Pick<DocumentReader, "snapshot">;
 
     type SessionFact = { address: string; busy: boolean; archived: boolean; title?: string };
-    type FolderFact = { dirty: number; ahead: number };
+    type FolderFact = {
+        dirty: number;
+        /** The commits that no remote-tracking ref has; undefined when git could not tell, never 0. */
+        ahead: number | undefined;
+        /** Why `ahead` is unknown. */
+        aheadUnknown?: AheadUnknown;
+        /** `git status` failed in a repository: its counts are unknown, not clean. */
+        statusFailed?: true;
+        /** The folder is not on disk, as after an agent removes its worktree: keep the last counts, and no failure. */
+        gone?: true;
+    };
 
     /** What one sweep read, before its commit. A missing key means the read failed: the thread keeps its old value. */
     type SweepFacts = {
@@ -4219,8 +4637,10 @@ export default function createDesk(host: Host, web: Web) {
         sessions?: SessionFact[];
         /** By session id: a status, or null when that session has no goal. */
         shifts: Record<string, string | null>;
-        /** By folder: its counts, or null when it is not a git repository. */
+        /** By folder: its counts, null when it is not a git repository, or a fact with `gone` when it is not on disk. */
         folders: Record<string, FolderFact | null>;
+        /** By folder: its linked worktrees, or null when git cannot list them. */
+        worktrees?: Record<string, WorktreeFact[] | null>;
         github?: GitHubFacts;
         /** Why the GitHub read failed, in one line; absent when it worked. */
         githubError?: string;
@@ -4238,7 +4658,7 @@ export default function createDesk(host: Host, web: Web) {
     const GIT_OPTIONS = { timeout: 30_000, maxBuffer: 4 * 1024 * 1024, encoding: "utf8" as const };
 
     /** One closed thread's worktree: removed, or kept with git's first line of reason. */
-    type WorktreeFact = { gone: true } | { kept: string };
+    type WorktreeCleanup = { gone: true } | { kept: string };
 
     /** The first non-empty line of git's error, on one line, at most 200 characters. */
     function gitReason(error: unknown): string {
@@ -4264,7 +4684,7 @@ export default function createDesk(host: Host, web: Web) {
         path: string;
         branch: string;
         checkout: string;
-    }): Promise<WorktreeFact> {
+    }): Promise<WorktreeCleanup> {
         if (!isAbsolute(worktree.path) || !isAbsolute(worktree.checkout)) {
             return { kept: "its folder is not an absolute path" };
         }
@@ -4325,7 +4745,7 @@ export default function createDesk(host: Host, web: Web) {
                 thread.worktree !== undefined &&
                 thread.run.worktreeGone === undefined,
         );
-        const facts: Record<string, WorktreeFact> = {};
+        const facts: Record<string, WorktreeCleanup> = {};
 
         for (const thread of closed) {
             const closedAt = thread.closed?.at;
@@ -4375,21 +4795,88 @@ export default function createDesk(host: Host, web: Web) {
         });
     };
 
-    /** `git status` of one folder: null when it is not a git repository, or git cannot read it. */
-    async function statusOf(folder: string): Promise<FolderFact | null> {
+    /** One git read of a folder: its text, or undefined when the call failed. */
+    async function gitText(folder: string, args: string[]): Promise<string | undefined> {
         try {
-            const { stdout } = await run(
-                "git",
-                ["-C", folder, "status", "--porcelain=v2", "--branch"],
-                { timeout: 10_000, maxBuffer: 4 * 1024 * 1024, encoding: "utf8" },
-            );
-            const status = parseStatus(stdout);
+            const { stdout } = await run("git", ["-C", folder, ...args], {
+                timeout: 10_000,
+                maxBuffer: 4 * 1024 * 1024,
+                encoding: "utf8",
+            });
 
-            return { dirty: status.dirty, ahead: status.ahead };
+            return stdout;
         } catch {
-            return null;
+            return undefined;
         }
     }
+
+    /** Whether a folder is on disk. */
+    const exists = (folder: string): Promise<boolean> =>
+        access(folder).then(
+            () => true,
+            () => false,
+        );
+
+    /**
+     * `git status` of one folder: null when it is not a git repository, as before. A repository whose status git cannot
+     * read is a fact with `statusFailed`: a failed read is not a clean folder. When git prints no `# branch.ab` line,
+     * `git rev-list --count HEAD --not --remotes` counts the commits that no remote-tracking ref has.
+     */
+    async function statusOf(folder: string): Promise<FolderFact | null> {
+        const text = await gitText(folder, ["status", "--porcelain=v2", "--branch"]);
+
+        if (text === undefined) {
+            // A folder that is gone (an agent removed its worktree after a merge) is no failure: its counts stay.
+            if (!(await exists(folder))) {
+                return { dirty: 0, ahead: undefined, gone: true };
+            }
+
+            return (await gitText(folder, ["rev-parse", "--git-dir"])) === undefined
+                ? null
+                : {
+                      dirty: 0,
+                      ahead: undefined,
+                      aheadUnknown: "git status failed",
+                      statusFailed: true,
+                  };
+        }
+
+        const status = parseStatus(text);
+
+        if (status.ahead !== undefined) {
+            return { dirty: status.dirty, ahead: status.ahead };
+        }
+
+        // No `# branch.ab` line: this works for a branch with no upstream and for a detached HEAD. It fails when there is
+        // no commit to count (an empty repository), and the count then stays unknown with its reason.
+        const counted = await gitText(folder, [
+            "rev-list",
+            "--count",
+            "HEAD",
+            "--not",
+            "--remotes",
+        ]);
+        const ahead = counted === undefined ? Number.NaN : Number(counted.trim());
+
+        return Number.isInteger(ahead) && ahead >= 0
+            ? { dirty: status.dirty, ahead }
+            : {
+                  dirty: status.dirty,
+                  ahead: undefined,
+                  aheadUnknown: status.aheadUnknown ?? "no branch",
+              };
+    }
+
+    /**
+     * Whether a folder's counts are work: changed files, or commits that are known to be unpushed. An unknown count is
+     * not work: a main checkout on a detached HEAD is not new work.
+     */
+    const folderWork = (counts: FolderFact | null | undefined): counts is FolderFact =>
+        counts !== undefined &&
+        counts !== null &&
+        counts.statusFailed !== true &&
+        counts.gone !== true &&
+        (counts.dirty > 0 || (counts.ahead ?? 0) > 0);
 
     const LOGIN = /^[A-Za-z0-9][A-Za-z0-9-]{0,38}(\[bot\])?$/;
 
@@ -4690,6 +5177,58 @@ export default function createDesk(host: Host, web: Web) {
         }
     }
 
+    /**
+     * The linked worktrees of a folder, as the sweep reads them; null when git cannot list them. The first block is the
+     * main worktree: its counts are the folder's own. A block with no branch holds no thread's work.
+     */
+    async function worktreeFacts(folder: string): Promise<WorktreeFact[] | null> {
+        try {
+            const { stdout } = await run("git", ["-C", folder, "worktree", "list", "--porcelain"], {
+                timeout: 10_000,
+                maxBuffer: 4 * 1024 * 1024,
+                encoding: "utf8",
+            });
+            const facts: WorktreeFact[] = [];
+
+            for (const block of parseWorktrees(stdout).slice(1)) {
+                if (block.branch === undefined || block.bare === true) {
+                    continue;
+                }
+
+                const created = await branchTime(folder, block.branch);
+                const status = await statusOf(block.path);
+
+                facts.push({
+                    path: block.path,
+                    branch: block.branch,
+                    ...(created === undefined ? {} : { created }),
+                    dirty: status?.dirty ?? 0,
+                    unpushed: await unpushedCount(block.path),
+                });
+            }
+
+            return facts;
+        } catch {
+            return null;
+        }
+    }
+
+    /** The commits on HEAD that no remote has: 0 when git cannot count them. */
+    async function unpushedCount(folder: string): Promise<number> {
+        try {
+            const { stdout } = await run(
+                "git",
+                ["-C", folder, "rev-list", "--count", "HEAD", "--not", "--remotes"],
+                { timeout: 10_000, encoding: "utf8" },
+            );
+            const count = Number(stdout.trim());
+
+            return Number.isInteger(count) && count >= 0 ? count : 0;
+        } catch {
+            return 0;
+        }
+    }
+
     /** For each open thread, the branches of candidate PRs in its folder: did this thread make one? */
     async function branchFacts(
         threads: Thread[],
@@ -4790,6 +5329,26 @@ export default function createDesk(host: Host, web: Web) {
             // The list is not readable now: no facts, and no found session threads.
         }
 
+        // A session that looks idle but has a working subagent still works: its thread must wait on its agent, as it
+        // does while the session itself runs. Any failure to read the registry leaves the session idle, as before.
+        if (sessions !== undefined) {
+            for (const thread of open) {
+                if (thread.session === undefined) {
+                    continue;
+                }
+
+                const fact = sessions.find((each) => each.address === thread.address);
+
+                if (
+                    fact !== undefined &&
+                    !fact.busy &&
+                    (await subagentsBusy(read, thread.session as ConversationId, context))
+                ) {
+                    fact.busy = true;
+                }
+            }
+        }
+
         const shifts: Record<string, string | null> = {};
         const nightShift = nightShiftApi();
 
@@ -4874,9 +5433,11 @@ export default function createDesk(host: Host, web: Web) {
                 : await branchFacts([...open, ...recent], githubRead.facts);
 
         const facts: Record<string, FolderFact | null> = {};
+        const worktrees: Record<string, WorktreeFact[] | null> = {};
 
         for (const folder of folders) {
             facts[folder] = await statusOf(folder);
+            worktrees[folder] = await worktreeFacts(folder);
         }
 
         return {
@@ -4884,6 +5445,7 @@ export default function createDesk(host: Host, web: Web) {
             ...(sessions === undefined ? {} : { sessions }),
             shifts,
             folders: facts,
+            worktrees,
             ...(githubRead.facts === undefined ? {} : { github: githubRead.facts }),
             ...(githubRead.error === undefined ? {} : { githubError: githubRead.error }),
             ...(skipped.size === 0 ? {} : { githubSkipped: [...skipped].sort() }),
@@ -4979,7 +5541,7 @@ export default function createDesk(host: Host, web: Web) {
         await scanChatGrants(tx, state, supervisor, now);
 
         const dirtyFolders = Object.entries(facts.folders)
-            .filter(([, counts]) => counts !== null && (counts.dirty > 0 || counts.ahead > 0))
+            .filter(([, counts]) => folderWork(counts))
             .map(([folder]) => folder);
 
         if (state.baseline[key] === undefined) {
@@ -5003,6 +5565,30 @@ export default function createDesk(host: Host, web: Web) {
         const eventsBefore = new Map(
             [...open, ...closedDone].map((thread) => [thread.id, thread.events.length]),
         );
+
+        // The worktrees that hold a thread: a linked worktree's work is not in its folder's own counts. A branch of a
+        // merged or closed PR keeps commits that are on no remote (a squash-merge leaves them): it holds no thread.
+        const doneBranches = new Set(
+            Object.values(facts.github?.prs ?? {})
+                .filter((pr) => pr.state === "MERGED" || pr.state === "CLOSED")
+                .map((pr) => pr.headRefName),
+        );
+        const heldWorktrees = new Map<string, WorktreeFact[]>();
+
+        for (const [folder, worktrees] of Object.entries(facts.worktrees ?? {})) {
+            if (worktrees === null) {
+                continue;
+            }
+
+            for (const [id, holding] of assignWorktrees(
+                Object.values(state.threads),
+                folder,
+                worktrees,
+                doneBranches,
+            )) {
+                heldWorktrees.set(id, holding);
+            }
+        }
 
         for (const thread of open) {
             await scanEntries(tx, thread);
@@ -5088,8 +5674,35 @@ export default function createDesk(host: Host, web: Web) {
 
             const folder = folderOf(thread);
             const counts = folder === undefined ? undefined : facts.folders[folder];
+            // A folder that the read cannot see, after the thread had counts, was a repository git could not read.
+            const knownBefore =
+                numberOr(thread.run.dirty) !== undefined ||
+                numberOr(thread.run.ahead) !== undefined;
+            const gone = counts !== undefined && counts !== null && counts.gone === true;
+            const failed =
+                counts === undefined || gone
+                    ? false
+                    : counts === null
+                      ? knownBefore
+                      : counts.statusFailed === true;
 
-            if (counts !== undefined && counts !== null) {
+            if (failed) {
+                // A failed read is not a clean folder: keep the last counts, and say the unpushed count is unknown.
+                if (thread.run.aheadUnknown !== "git status failed") {
+                    thread.run.aheadUnknown = "git status failed";
+
+                    if (
+                        addEvent(
+                            thread,
+                            `aheadUnknown:git status failed:${String(now)}`,
+                            "unpushed commits unknown: git status failed",
+                            now,
+                        )
+                    ) {
+                        events += 1;
+                    }
+                }
+            } else if (counts !== undefined && counts !== null && counts.gone !== true) {
                 if (thread.run.dirty !== counts.dirty) {
                     thread.run.dirty = counts.dirty;
 
@@ -5107,19 +5720,71 @@ export default function createDesk(host: Host, web: Web) {
                     }
                 }
 
-                if (thread.run.ahead !== counts.ahead) {
-                    thread.run.ahead = counts.ahead;
+                const wasUnknown = thread.run.aheadUnknown !== undefined;
 
-                    if (
-                        addEvent(
-                            thread,
-                            `ahead:${String(counts.ahead)}:${String(now)}`,
-                            counts.ahead === 0
-                                ? "nothing is unpushed"
-                                : `${String(counts.ahead)} unpushed commit${counts.ahead === 1 ? "" : "s"}`,
-                            now,
-                        )
-                    ) {
+                if (counts.ahead !== undefined) {
+                    delete thread.run.aheadUnknown;
+
+                    if (thread.run.ahead !== counts.ahead || wasUnknown) {
+                        thread.run.ahead = counts.ahead;
+
+                        if (
+                            addEvent(
+                                thread,
+                                `ahead:${String(counts.ahead)}:${String(now)}`,
+                                counts.ahead === 0
+                                    ? "nothing is unpushed"
+                                    : `${String(counts.ahead)} unpushed commit${counts.ahead === 1 ? "" : "s"}`,
+                                now,
+                            )
+                        ) {
+                            events += 1;
+                        }
+                    }
+                } else {
+                    // Never write 0 into `ahead`: the desk does not know the count, and says why once per change.
+                    const reason = counts.aheadUnknown ?? "no branch";
+
+                    if (thread.run.aheadUnknown !== reason) {
+                        thread.run.aheadUnknown = reason;
+
+                        if (
+                            addEvent(
+                                thread,
+                                `aheadUnknown:${reason}:${String(now)}`,
+                                `unpushed commits unknown: ${reason}`,
+                                now,
+                            )
+                        ) {
+                            events += 1;
+                        }
+                    }
+                }
+            }
+
+            // The worktrees of its folder that hold it: a failed read keeps the ones the thread has, as a failed
+            // folder read does.
+            const lists = folder === undefined ? undefined : facts.worktrees?.[folder];
+
+            if (lists !== undefined && lists !== null) {
+                const holding: WorktreeLine[] = (heldWorktrees.get(thread.id) ?? []).map(
+                    (worktree) => ({
+                        path: worktree.path,
+                        dirty: worktree.dirty,
+                        unpushed: worktree.unpushed,
+                    }),
+                );
+
+                if (!sameWorktrees(storedWorktrees(thread), holding)) {
+                    if (holding.length === 0) {
+                        delete thread.run.worktrees;
+                    } else {
+                        thread.run.worktrees = holding;
+                    }
+
+                    const event = worktreesEvent(holding, now);
+
+                    if (addEvent(thread, event.key, event.text, now)) {
                         events += 1;
                     }
                 }
@@ -5271,9 +5936,21 @@ export default function createDesk(host: Host, web: Web) {
                     events += 1;
                 }
             } else {
-                thread.closed = { at: now, why: "done", by: "sweep" };
+                thread.closed = {
+                    at: now,
+                    why: "done",
+                    by: "sweep",
+                    outcome: closeOutcome(thread),
+                };
 
-                if (addEvent(thread, `closed:${String(now)}`, "closed: all parts closed", now)) {
+                if (
+                    addEvent(
+                        thread,
+                        `closed:${String(now)}`,
+                        `closed: ${closeOutcomeWords(thread)}`,
+                        now,
+                    )
+                ) {
                     events += 1;
                 }
             }
@@ -5342,7 +6019,12 @@ export default function createDesk(host: Host, web: Web) {
         const pending = (baseline.pending ??= {});
 
         for (const [folder, counts] of Object.entries(facts.folders)) {
-            if (counts === null || (counts.dirty === 0 && counts.ahead === 0)) {
+            if (counts !== null && counts.statusFailed === true) {
+                // A failed read says nothing about the folder: the pending time it had stays.
+                continue;
+            }
+
+            if (!folderWork(counts)) {
                 delete pending[folder];
                 continue;
             }
@@ -5384,7 +6066,9 @@ export default function createDesk(host: Host, web: Web) {
                 run: {
                     folder,
                     dirty: counts.dirty,
-                    ahead: counts.ahead,
+                    ...(counts.ahead === undefined
+                        ? { aheadUnknown: counts.aheadUnknown ?? "no branch" }
+                        : { ahead: counts.ahead }),
                     next: "odrade",
                     sweptAt: now,
                 },
@@ -5410,7 +6094,14 @@ export default function createDesk(host: Host, web: Web) {
         baseline.folders = baseline.folders.filter((folder) => {
             const counts = facts.folders[folder];
 
-            return counts === undefined || counts === null || counts.dirty > 0 || counts.ahead > 0;
+            return (
+                counts === undefined ||
+                counts === null ||
+                counts.statusFailed === true ||
+                counts.gone === true ||
+                counts.dirty > 0 ||
+                (counts.ahead ?? 0) > 0
+            );
         });
 
         return { events };
