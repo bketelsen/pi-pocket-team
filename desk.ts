@@ -118,6 +118,11 @@ export type PrLink = {
     failing?: string[];
     /** A draft PR: it may conflict or fail on purpose, so it gets no repair wake-up. */
     draft?: boolean;
+    /**
+     * The label `ready-for-human` was on the PR: `at` is when GitHub says it was added (the sweep's `now` when that is
+     * unknown), and `head` is the head oid the desk saw first with the label. Absent: no label.
+     */
+    ready?: { at: number; head: string };
 };
 
 /** One dated check on a thread. Stored data: never rename a field or change what it means. */
@@ -198,7 +203,9 @@ export type Thread = {
      * most 50: a state of only told refs is no new wake-up, so a detached PR cannot send again), `repairs` (the repair
      * wake-ups the sweep decided, by repair key: `{ at, to, why, sent }`, at most 30), `repairCounts` (PR ref → the
      * repair wake-ups that went to the agent: never pruned), `worktreeGone` (when a sweep removed the thread's
-     * delegation worktree), and `worktreeKeptAt` (when git refused to remove it: the next try waits a day).
+     * delegation worktree), `worktreeKeptAt` (when git refused to remove it: the next try waits a day), and `unready`
+     * (the `ready-for-human` removals the sweep decided, by key `unready:<ref>:<label time>`:
+     * `{ at, why, to, removed, sent }`, at most 30).
      */
     run: Record<string, JsonValue>;
     /** The last 50; `key` makes an event unique. */
@@ -2077,6 +2084,215 @@ export function repairReopen(thread: Thread, github: GitHubFacts, now: number): 
     return true;
 }
 
+// ─── The label `ready-for-human` ─────────────────────────────────────────────
+
+/** The GitHub label that says a PR is ready for Brian. Only the agent adds it, and only when the PR is ready. */
+export const READY_LABEL = "ready-for-human";
+
+/** Where 1 removal of the label goes, and what it says. Stored data: never rename a value. */
+export type UnreadyEntry = {
+    at: number;
+    why: string;
+    to: "agent" | "odrade";
+    /** The label is gone from the PR: a retry sends the wake-up only, never the removal again. */
+    removed: boolean;
+    sent: boolean;
+};
+
+const KEPT_UNREADY = 30;
+
+/**
+ * The mark that starts a line of a review or a comment that is a blocking point: the word `blocking` after spaces and
+ * markdown marks, 1 optional noun, optional closing marks, an optional colon or dash, then the rest of the line.
+ */
+const BLOCKING_LINE =
+    /^[\s>*#[_`\]-]*blocking(?:\s+(?:issues?|points?|changes?|findings?|problems?))?[\s*_\]`]*(?:[:\-–—][\s*_\]`]*|\s|$)(.*)$/i;
+
+/**
+ * The rest of a blocking line that says there is nothing blocking: `none`, `nothing`, `n/a`, or `no` alone or with 1
+ * noun (`no blockers`, `no issues`). `no tests cover the restart` is a point, not an all-clear.
+ */
+const NOTHING_BLOCKING =
+    /^(?:none|nothing|n\/a|no(?:\s+(?:blocking\s+)?(?:blockers?|issues?|points?|changes?|findings?|problems?))?(?:[\s.!]*$))/i;
+
+/**
+ * Whether a review or a comment marks a blocking point: a line that starts with `blocking`, unless its rest is empty of
+ * a point (`none`, `nothing`, `n/a`, `no blockers`). `Non-blocking: x` and `Nothing blocking` are not blocking points.
+ */
+export function blockingMarked(body: string): boolean {
+    for (const line of body.split(/\r?\n/)) {
+        const match = BLOCKING_LINE.exec(line);
+
+        if (match === null) {
+            continue;
+        }
+
+        const rest = (match[1] ?? "").trim();
+
+        if (rest === "" || !NOTHING_BLOCKING.test(rest)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+const isUnreadyEntry = (value: unknown): value is UnreadyEntry => {
+    const entry = value as Partial<UnreadyEntry> | null | undefined;
+
+    return (
+        entry !== null &&
+        typeof entry === "object" &&
+        typeof entry.at === "number" &&
+        typeof entry.why === "string" &&
+        (entry.to === "agent" || entry.to === "odrade") &&
+        typeof entry.removed === "boolean" &&
+        typeof entry.sent === "boolean"
+    );
+};
+
+/** The label removals a thread has decided, by key. A value of the wrong shape is left out. */
+export function unreadyOf(thread: Thread): Record<string, UnreadyEntry> {
+    const stored = thread.run.unready;
+
+    if (stored === null || typeof stored !== "object" || Array.isArray(stored)) {
+        return {};
+    }
+
+    const entries: Record<string, UnreadyEntry> = {};
+
+    for (const [key, value] of Object.entries(stored)) {
+        if (isUnreadyEntry(value)) {
+            entries[key] = value;
+        }
+    }
+
+    return entries;
+}
+
+/**
+ * Why the label `ready-for-human` must come off 1 PR, in the order the desk checks: a new commit after the label, a
+ * failing check, a review that requests changes after the label, a comment marked blocking after the label. Undefined
+ * when the label is not on the PR, when the PR is not open, when it is a draft, and when nothing came after the label.
+ */
+export function unreadyReason(link: PrLink, fact: PrFact): string | undefined {
+    const ready = link.ready;
+
+    if (ready === undefined || fact.state !== "OPEN" || fact.isDraft) {
+        return undefined;
+    }
+
+    if (ready.head !== fact.head || fact.headAt > ready.at) {
+        return "a new commit came after the label";
+    }
+
+    if (fact.checks === "FAILURE" || fact.checks === "ERROR") {
+        const names = fact.failing.join(", ");
+
+        return names === "" ? "a check fails" : `a check fails: ${names}`;
+    }
+
+    if (fact.feedback.some((each) => each.changes && each.at > ready.at)) {
+        return "a review requested changes after the label";
+    }
+
+    if (fact.feedback.some((each) => each.blocking && each.at > ready.at)) {
+        return "a comment marked a blocking point after the label";
+    }
+
+    return undefined;
+}
+
+/** The message to the agent whose PR lost the label. */
+export const unreadyMessage = (ref: string, why: string): string =>
+    `${ref}: the desk removed the label \`${READY_LABEL}\`: ${why}. Fix it, run the checks, push, and add the label again only when the PR is ready (CI green, every blocking review point resolved, nothing pending). Then report.`;
+
+/** The notice when the thread has no agent session to wake. */
+export const unreadyNotice = (ref: string, id: string, why: string): string =>
+    `${ref} on ${id}: the desk removed the label \`${READY_LABEL}\`: ${why}. The thread has no agent session to wake: it waits on Odrade.`;
+
+/** Record 1 decided removal and its event, and keep at most 30 entries: the oldest sent ones go first. */
+function recordUnready(
+    thread: Thread,
+    key: string,
+    entry: { why: string; to: UnreadyEntry["to"] },
+    ref: string,
+    now: number,
+): boolean {
+    const unready = unreadyOf(thread);
+
+    unready[key] = { at: now, why: entry.why, to: entry.to, removed: false, sent: false };
+
+    const order = (sent: boolean) =>
+        Object.entries(unready)
+            .filter(([each, value]) => value.sent === sent && each !== key)
+            .sort((a, b) => a[1].at - b[1].at);
+
+    for (const [old] of [...order(true), ...order(false)]) {
+        if (Object.keys(unready).length <= KEPT_UNREADY) {
+            break;
+        }
+
+        delete unready[old];
+    }
+
+    thread.run.unready = unready;
+
+    return addEvent(
+        thread,
+        `unready:${key}`,
+        `${ref}: ${READY_LABEL} comes off: ${entry.why}`,
+        now,
+    );
+}
+
+/**
+ * Decide the label removals of one open thread: each PR that has the label and a reason gets 1 entry, once for its key
+ * `unready:<ref>:<label time>`. The agent takes it when the thread has a session and an address and is not archived;
+ * else Odrade. A parked thread gets none: Brian parked it. Pure over the thread: the sweeper removes and sends after the
+ * commit. Returns the events it added.
+ */
+export function planUnready(thread: Thread, github: GitHubFacts, now: number): number {
+    if (thread.state !== "open") {
+        return 0;
+    }
+
+    const to: UnreadyEntry["to"] =
+        thread.session !== undefined && thread.address !== undefined && thread.run.archived !== true
+            ? "agent"
+            : "odrade";
+    let events = 0;
+
+    for (const ref of Object.keys(thread.prs).sort()) {
+        const link = thread.prs[ref]!;
+        const at = link.ready?.at;
+
+        if (at === undefined) {
+            continue;
+        }
+
+        const fact =
+            github.prs[ref] ?? github.repos[repoOf(ref)]?.open.find((pr) => pr.ref === ref);
+        const why = fact === undefined ? undefined : unreadyReason(link, fact);
+
+        if (why === undefined) {
+            continue;
+        }
+
+        const key = `unready:${ref}:${String(at)}`;
+
+        if (unreadyOf(thread)[key] !== undefined) {
+            continue;
+        }
+
+        if (recordUnready(thread, key, { why, to }, ref, now)) {
+            events += 1;
+        }
+    }
+
+    return events;
+}
+
 export type NextActor = "brian" | "agent" | "odrade" | "reviewer" | "none";
 
 /** Who acts next on a thread. First match: brian, odrade (a due watch), agent (a failed watch), agent, odrade. */
@@ -2689,13 +2905,18 @@ export function threadRepos(thread: Thread): string[] {
 /** What a PR needs next: nobody, the agent, a reviewer, or Brian. */
 export type PrNext = "none" | "agent" | "reviewer" | "brian" | "odrade";
 
-/** One PR's next actor. A draft PR waits on its agent; a merged, closed or frozen one is done. */
+/**
+ * One PR's next actor. A merged, closed or frozen one is done; one GitHub cannot find is Odrade's. A draft, a conflict,
+ * failing checks, and changes requested wait on the agent. Brian is next only with the label `ready-for-human`: without
+ * it, the PR waits on a reviewer when a review is required, else on the agent.
+ */
 export function prNext(pr: {
     state?: string;
     mergeable?: string;
     checks?: string;
     review?: string;
     isDraft?: boolean;
+    ready?: boolean | { at: number; head: string };
 }): PrNext {
     if (pr.state === "MERGED" || pr.state === "CLOSED" || pr.state === "FROZEN") {
         return "none";
@@ -2719,7 +2940,12 @@ export function prNext(pr: {
         return "agent";
     }
 
-    return pr.review === "REVIEW_REQUIRED" ? "reviewer" : "brian";
+    // Brian takes a PR only when its agent said it is ready: the label is the gate.
+    if (Boolean(pr.ready)) {
+        return "brian";
+    }
+
+    return pr.review === "REVIEW_REQUIRED" ? "reviewer" : "agent";
 }
 
 /** One PR as a sweep read it. Stored only through a thread's `prs`, never as itself. */
@@ -2739,6 +2965,17 @@ export type PrFact = {
     checks: string;
     /** The oid of the newest commit: "" when GitHub gave none. */
     head: string;
+    /** The label `ready-for-human` is on the PR. Every read says this, from the labels list. */
+    ready: boolean;
+    /** When GitHub says the label was added: 0 when the read did not ask for the label events. */
+    readyAt: number;
+    /** When the head commit was committed: 0 when unknown. */
+    headAt: number;
+    /**
+     * 1 entry for each review and each comment the read got: when it came, whether it requests changes, and whether its
+     * body marks a blocking point. Empty when the read did not ask for them.
+     */
+    feedback: { at: number; changes: boolean; blocking: boolean }[];
     /** The names of the checks that fail now: at most 10, sorted, with no repeat. */
     failing: string[];
     archived: boolean;
@@ -2807,7 +3044,17 @@ function splitRef(ref: string): { repo: string; number: number } {
     return { repo: match[1]!, number: Number(match[2]) };
 }
 
-const PR_FIELDS = `number title url state isDraft createdAt mergedAt closedAt headRefName mergeable reviewDecision author { login } commits(last: 1) { nodes { commit { oid statusCheckRollup { state contexts(first: ${String(GITHUB_CHECKS)}) { totalCount nodes { __typename ... on CheckRun { name conclusion status startedAt } ... on StatusContext { context state } } } } } } }`;
+const PR_FIELDS = `number title url state isDraft createdAt mergedAt closedAt headRefName mergeable reviewDecision author { login } labels(first: 20) { nodes { name } } commits(last: 1) { nodes { commit { oid committedDate statusCheckRollup { state contexts(first: ${String(GITHUB_CHECKS)}) { totalCount nodes { __typename ... on CheckRun { name conclusion status startedAt } ... on StatusContext { context state } } } } } } }`;
+
+/**
+ * The fields of an attached PR: `PR_FIELDS`, the label events, the reviews, and the comments. Only the pinned parts of
+ * the query ask for them: the repository lists stay small.
+ */
+const PR_DETAIL =
+    `${PR_FIELDS} ` +
+    "timelineItems(itemTypes: [LABELED_EVENT], last: 20) { nodes { ... on LabeledEvent { createdAt label { name } } } } " +
+    "reviews(last: 20) { nodes { state submittedAt body } } " +
+    "comments(last: 20) { nodes { createdAt body } }";
 
 /**
  * The one GraphQL query of a sweep: the viewer, each repository's open PRs, and each attached PR by number. Every
@@ -2840,7 +3087,7 @@ export function buildQuery(repos: string[], prs: string[]): string {
             `  p${String(index)}: repository(owner: ${JSON.stringify(owner)}, name: ${JSON.stringify(name)}) {`,
             "    nameWithOwner",
             "    isArchived",
-            `    pullRequest(number: ${String(number)}) { ${PR_FIELDS} }`,
+            `    pullRequest(number: ${String(number)}) { ${PR_DETAIL} }`,
             "  }",
         );
     }
@@ -2923,6 +3170,7 @@ function prFact(
                     commit?:
                         | {
                               oid?: unknown;
+                              committedDate?: unknown;
                               statusCheckRollup?: {
                                   state?: unknown;
                                   contexts?: { nodes?: unknown; totalCount?: unknown } | null;
@@ -2954,6 +3202,10 @@ function prFact(
             review: text(node.reviewDecision),
             checks: checksState(text(first?.commit?.statusCheckRollup?.state), contexts),
             head: text(first?.commit?.oid),
+            ready: labelsOf(node).includes(READY_LABEL),
+            readyAt: readyLabelAt(node),
+            headAt: milliseconds(first?.commit?.committedDate),
+            feedback: feedbackOf(node),
             failing: failingChecks(contexts?.nodes),
             archived,
         },
@@ -2961,6 +3213,88 @@ function prFact(
             ? {}
             : { incomplete: checksIncompleteLine(ref, read, total) }),
     };
+}
+
+/** The names of a PR's labels, in the order GitHub gave them. A missing list is no labels. */
+function labelsOf(node: Record<string, unknown>): string[] {
+    const list = node.labels as { nodes?: unknown } | null | undefined;
+
+    if (!Array.isArray(list?.nodes)) {
+        return [];
+    }
+
+    return list.nodes
+        .map((one) => text((one as { name?: unknown } | null | undefined)?.name))
+        .filter((name) => name !== "");
+}
+
+/** When GitHub says the label `ready-for-human` was newest added: 0 when the read did not ask, or never says. */
+function readyLabelAt(node: Record<string, unknown>): number {
+    const timeline = node.timelineItems as { nodes?: unknown } | null | undefined;
+
+    if (!Array.isArray(timeline?.nodes)) {
+        return 0;
+    }
+
+    let newest = 0;
+
+    for (const one of timeline.nodes) {
+        const event = one as { createdAt?: unknown; label?: { name?: unknown } | null } | null;
+
+        if (event === null || typeof event !== "object") {
+            continue;
+        }
+
+        if (text(event.label?.name) !== READY_LABEL) {
+            continue;
+        }
+
+        newest = Math.max(newest, milliseconds(event.createdAt));
+    }
+
+    return newest;
+}
+
+/** 1 entry for each review and each comment: when it came, whether it requests changes, and whether it is blocking. */
+function feedbackOf(node: Record<string, unknown>): PrFact["feedback"] {
+    const entries: PrFact["feedback"] = [];
+    const reviews = node.reviews as { nodes?: unknown } | null | undefined;
+    const comments = node.comments as { nodes?: unknown } | null | undefined;
+
+    if (Array.isArray(reviews?.nodes)) {
+        for (const one of reviews.nodes) {
+            const review = one as
+                { state?: unknown; submittedAt?: unknown; body?: unknown } | null | undefined;
+
+            if (review === null || typeof review !== "object") {
+                continue;
+            }
+
+            entries.push({
+                at: milliseconds(review.submittedAt),
+                changes: text(review.state).toUpperCase() === "CHANGES_REQUESTED",
+                blocking: blockingMarked(text(review.body)),
+            });
+        }
+    }
+
+    if (Array.isArray(comments?.nodes)) {
+        for (const one of comments.nodes) {
+            const comment = one as { createdAt?: unknown; body?: unknown } | null | undefined;
+
+            if (comment === null || typeof comment !== "object") {
+                continue;
+            }
+
+            entries.push({
+                at: milliseconds(comment.createdAt),
+                changes: false,
+                blocking: blockingMarked(text(comment.body)),
+            });
+        }
+    }
+
+    return entries;
 }
 
 /** The wait before the 1 retry of a GitHub read that failed for a moment. */
@@ -3226,6 +3560,8 @@ const linkFor = (pr: PrFact, via: PrLink["via"]): PrLink => ({
     head: pr.head,
     failing: [...pr.failing],
     draft: pr.isDraft,
+    // A list read says the label is there but not when: 0 is "unknown", and the next pinned read fills the time in.
+    ...(pr.ready ? { ready: { at: pr.readyAt > 0 ? pr.readyAt : 0, head: pr.head } } : {}),
 });
 
 /** One attached PR's facts from a read: its state, its next actor, and what GitHub says. */
@@ -3295,6 +3631,45 @@ export function updatePrs(thread: Thread, github: GitHubFacts, now: number): num
         link.head = fact.head;
         link.failing = [...fact.failing];
         link.draft = fact.isDraft;
+
+        // The label `ready-for-human`: seen, added again (a new label time), or gone.
+        if (fact.ready) {
+            const known = link.ready;
+
+            if (
+                known === undefined ||
+                (fact.readyAt > 0 && fact.readyAt !== known.at) ||
+                (known.at === 0 && fact.readyAt === 0)
+            ) {
+                const at = fact.readyAt > 0 ? fact.readyAt : now;
+
+                link.ready = { at, head: fact.head };
+
+                if (
+                    addEvent(
+                        thread,
+                        `${ref}:ready:${String(at)}`,
+                        `${ref}: label ${READY_LABEL}`,
+                        now,
+                    )
+                ) {
+                    events += 1;
+                }
+            }
+        } else if (link.ready !== undefined) {
+            delete link.ready;
+
+            if (
+                addEvent(
+                    thread,
+                    `${ref}:unready:${String(now)}`,
+                    `${ref}: label ${READY_LABEL} gone`,
+                    now,
+                )
+            ) {
+                events += 1;
+            }
+        }
     }
 
     return events;
@@ -4269,7 +4644,7 @@ function threadFile(
             const label = url === undefined ? ref : `[${ref}](${url})`;
 
             lines.push(
-                `- ${label} · ${pr.state ?? "no state"} · ${pr.next ?? prNext(pr)} · ${pr.via}${pr.title === undefined ? "" : ` · ${md(pr.title)}`}`,
+                `- ${label} · ${pr.state ?? "no state"}${pr.ready === undefined ? "" : ` · ${READY_LABEL}`} · ${pr.next ?? prNext(pr)} · ${pr.via}${pr.title === undefined ? "" : ` · ${md(pr.title)}`}`,
             );
         }
     }
@@ -4421,6 +4796,8 @@ export type ThreadView = {
         next?: string;
         via: string;
         guessed: boolean;
+        /** The label `ready-for-human` is on the PR. */
+        ready?: boolean;
     }[];
     asks: { id: string; text: string; at: number }[];
     /** Answered asks, with the words that were recorded. */
@@ -4492,6 +4869,7 @@ export function threadView(
                 : { next: pr.next ?? prNext(pr) }),
             via: pr.via,
             guessed: pr.via === "window",
+            ...(pr.ready === undefined ? {} : { ready: true }),
         })),
         asks: thread.asks
             .filter((ask) => ask.answer === undefined)
@@ -4730,7 +5108,7 @@ export function readText(state: Readonly<DeskState> | undefined, id: string): st
               ]),
         prs.length === 0
             ? "PRs: none"
-            : `PRs:\n${prs.map(([ref, pr]) => `  ${ref} · ${pr.via}${pr.state === undefined ? "" : ` · ${pr.state}`}${pr.next === undefined ? "" : ` · next: ${pr.next}`}${pr.title === undefined || pr.title === "" ? "" : ` · ${pr.title}`}`).join("\n")}`,
+            : `PRs:\n${prs.map(([ref, pr]) => `  ${ref} · ${pr.via}${pr.state === undefined ? "" : ` · ${pr.state}`}${pr.ready === undefined ? "" : ` · ${READY_LABEL}`}${pr.next === undefined ? "" : ` · next: ${pr.next}`}${pr.title === undefined || pr.title === "" ? "" : ` · ${pr.title}`}`).join("\n")}`,
         `Branches: ${thread.branches.length === 0 ? "none" : thread.branches.join(", ")}`,
         thread.asks.length === 0
             ? "Asks: none"
@@ -6583,6 +6961,9 @@ export default function createDesk(host: Host, web: Web) {
         if (facts.github !== undefined) {
             for (const thread of open) {
                 events += updatePrs(thread, facts.github, now);
+                // The label `ready-for-human` comes off when something came after it. The sweeper removes and sends
+                // after the commit, from what is recorded here.
+                events += planUnready(thread, facts.github, now);
             }
 
             const attributed = attribute(
@@ -7029,6 +7410,151 @@ export default function createDesk(host: Host, web: Web) {
         }
     };
 
+    /** One `ready-for-human` removal to do: the label, the wake-up, and what the commit needs. */
+    type UnreadyWork = {
+        id: string;
+        key: string;
+        ref: string;
+        why: string;
+        to: UnreadyEntry["to"];
+        /** The label is already gone from the PR: send the wake-up only. */
+        removed: boolean;
+        /** The supervisor's address for the agent. */
+        address?: string;
+    };
+
+    /**
+     * Remove the label `ready-for-human` from 1 PR with `gh` (the bot account). A `gh` that says the label is not there
+     * counts as done: the removal is the goal, not the call.
+     */
+    async function removeLabel(ref: string): Promise<{ removed: boolean; error?: string }> {
+        let path: string;
+
+        try {
+            const { repo, number } = splitRef(ref);
+            const { owner, name } = splitRepo(repo);
+
+            path = `repos/${owner}/${name}/issues/${String(number)}/labels/${READY_LABEL}`;
+        } catch (error) {
+            return { removed: false, error: (error as Error).message };
+        }
+
+        const gh = process.env.PI_POCKET_DESK_GH ?? "gh";
+
+        try {
+            await run(gh, ["api", "-X", "DELETE", path], {
+                timeout: 60_000,
+                encoding: "utf8",
+            });
+
+            return { removed: true };
+        } catch (error) {
+            const failure = error as { stderr?: unknown } | null;
+            const stderr =
+                typeof failure?.stderr === "string"
+                    ? failure.stderr
+                    : Buffer.isBuffer(failure?.stderr)
+                      ? failure.stderr.toString("utf8")
+                      : "";
+
+            return /Label does not exist/i.test(stderr)
+                ? { removed: true }
+                : { removed: false, error: githubError(error) };
+        }
+    }
+
+    /**
+     * Remove 1 `ready-for-human` label, wake the agent (or tell Odrade), then mark what went in its own commit. A failure
+     * adds 1 event and keeps the entry unsent: the next sweep tries again, and does not remove the label again when it
+     * is already gone.
+     */
+    const sendUnready = async (
+        supervisor: ConversationId,
+        work: UnreadyWork,
+        runtime: TaskRuntime<SweeperInput, SweeperState, null, object>,
+        context: Context,
+    ): Promise<void> => {
+        let removed = work.removed;
+        let sent = false;
+        let done: string;
+        let failure: string | undefined;
+
+        if (!removed) {
+            const removal = await removeLabel(work.ref);
+
+            if (!removal.removed) {
+                failure = removal.error ?? "the label removal failed";
+            } else {
+                removed = true;
+            }
+        }
+
+        if (failure === undefined) {
+            try {
+                if (work.to === "agent" && work.address !== undefined) {
+                    await host.linkedSessions.send(
+                        supervisor,
+                        {
+                            to: work.address,
+                            message: unreadyMessage(work.ref, work.why),
+                        },
+                        `x.desk.unready:${work.key}`,
+                    );
+                    sent = true;
+                    done = `ready-for-human removed, wake-up sent to the agent`;
+                } else {
+                    host.notice("warning", unreadyNotice(work.ref, work.id, work.why), supervisor);
+                    sent = true;
+                    done = "ready-for-human removed, notice sent to Odrade";
+                }
+            } catch (error) {
+                failure = (error as Error).message;
+            }
+        }
+
+        try {
+            await runtime.commit(async (tx) => {
+                const thread = threadById(await tx.doc(DeskThreads), work.id);
+
+                if (thread === undefined) {
+                    return undefined;
+                }
+
+                const entry = unreadyOf(thread)[work.key];
+
+                if (entry === undefined) {
+                    return undefined;
+                }
+
+                if (failure !== undefined) {
+                    // 1 event, and still unsent: the next sweep tries again, from where this one stopped.
+                    thread.run.unready = {
+                        ...unreadyOf(thread),
+                        [work.key]: { ...entry, removed },
+                    };
+                    addEvent(
+                        thread,
+                        `unready-failed:${work.key}`,
+                        `${work.ref}: the label ${READY_LABEL} removal failed: ${failure}`,
+                        runtime.now(),
+                    );
+
+                    return undefined;
+                }
+
+                thread.run.unready = {
+                    ...unreadyOf(thread),
+                    [work.key]: { ...entry, removed, sent: true },
+                };
+                addEvent(thread, `unready-sent:${work.key}`, done, runtime.now());
+
+                return undefined;
+            }, context);
+        } catch {
+            // The removal and the send went: the next sweep does them again with the same key, which acts once.
+        }
+    };
+
     type SweeperInput = { supervisor: number };
     type SweeperState = { phase: "sweep" } | { phase: "sleep"; until: number };
 
@@ -7051,6 +7577,9 @@ export default function createDesk(host: Host, web: Web) {
                 // The repair wake-ups still to send: the ones decided in this commit, and any an earlier sweep could not
                 // send. Each goes by its recorded route and key, so a repeat acts once.
                 const repairs: RepairWork[] = [];
+                // The `ready-for-human` removals still to do: the ones decided in this commit, and any an earlier sweep
+                // could not finish. A removal and a send act once by their key.
+                const unready: UnreadyWork[] = [];
 
                 await runtime.commit(async (tx) => {
                     const state = await tx.doc(DeskThreads);
@@ -7115,6 +7644,37 @@ export default function createDesk(host: Host, web: Web) {
                                           return back === undefined ? {} : { back };
                                       })()
                                     : {}),
+                            });
+                        }
+                    }
+
+                    for (const thread of Object.values(state.threads)) {
+                        // A parked thread sends nothing: the same rule as the repair wake-up.
+                        if (thread.supervisor !== Number(supervisor) || thread.state !== "open") {
+                            continue;
+                        }
+
+                        for (const [key, entry] of Object.entries(unreadyOf(thread))) {
+                            if (entry.sent) {
+                                continue;
+                            }
+
+                            const parts = key.split(":");
+
+                            if (parts.length < 3 || parts[0] !== "unready") {
+                                continue;
+                            }
+
+                            unready.push({
+                                id: thread.id,
+                                key,
+                                ref: parts.slice(1, -1).join(":"),
+                                why: entry.why,
+                                to: entry.to,
+                                removed: entry.removed,
+                                ...(thread.address === undefined
+                                    ? {}
+                                    : { address: thread.address }),
                             });
                         }
                     }
@@ -7206,6 +7766,10 @@ export default function createDesk(host: Host, web: Web) {
 
                 for (const work of repairs) {
                     await sendRepair(supervisor, work, runtime, context);
+                }
+
+                for (const work of unready) {
+                    await sendUnready(supervisor, work, runtime, context);
                 }
 
                 // After the commit, so a thread that closed in it has its worktree handled at once: the sweeper ends
