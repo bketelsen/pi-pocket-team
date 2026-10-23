@@ -58,9 +58,11 @@ test("drop-in identities, named delegation, HTTP permissions, replay and restart
     let rosterContext = "";
     const model = scriptedModel((ctx) => {
         requestContext = JSON.stringify(ctx);
+
         if (requestContext.includes("Named teammates:")) {
             rosterContext = requestContext;
         }
+
         const { text, role } = lastText(ctx as never);
 
         if (role === "user" && text.endsWith("delegate test")) {
@@ -215,6 +217,7 @@ test("drop-in identities, named delegation, HTTP permissions, replay and restart
         );
         await until(() => !app.isBusy(id), "supervisor received the report");
         type Linked = { conversationId: string; title?: string; cwd?: string };
+
         // Delegate once, and return the new session with the model it runs on.
         async function delegateOnce() {
             const seen = new Set(

@@ -279,6 +279,7 @@ test("agent memory: identity gate, pending vs approved in the prompt, across fol
 
         return fauxAssistantMessage([fauxText(`echo: ${text}`)]);
     });
+
     /** The named_team section as the newest request had it. */
     const section = () => {
         const start = requestContext.lastIndexOf("<named_team>");
@@ -287,6 +288,7 @@ test("agent memory: identity gate, pending vs approved in the prompt, across fol
             ? ""
             : requestContext.slice(start, requestContext.indexOf("</named_team>", start));
     };
+
     let app = await openApp(model);
     let server: ReturnType<typeof createServer> | undefined;
 
@@ -322,6 +324,7 @@ test("agent memory: identity gate, pending vs approved in the prompt, across fol
         };
         const lessons = async (agent: string): Promise<View[]> =>
             (await call("memory")).data.agents[agent] ?? [];
+
         const named = async (agent: string, cwd: string) => {
             const id = await newSession(app, cwd);
 
@@ -329,6 +332,7 @@ test("agent memory: identity gate, pending vs approved in the prompt, across fol
 
             return id;
         };
+
         const said = async (id: ConversationId, text: string) => {
             await say(app, id, text);
 

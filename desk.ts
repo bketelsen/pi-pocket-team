@@ -65,6 +65,7 @@ const STARTING_LIMIT_MS = 3600_000;
 const STALE_MS = 3 * 24 * 3600_000;
 /** A thread that waits on a reviewer is stale after this long. */
 const REVIEWER_STALE_MS = 7 * 24 * 3600_000;
+
 /** How long the sweeper sleeps between sweeps. */
 export const SWEEP_SLEEP_MS = 10 * 60_000;
 /** How long a roster folder must stay dirty or ahead before the sweep makes a found thread: a short dirty moment is not work. */
@@ -1486,6 +1487,7 @@ export function isRepoName(name: string): boolean {
 
     return parts.length === 2 && OWNER_NAME.test(parts[0] ?? "") && OWNER_NAME.test(parts[1] ?? "");
 }
+
 const REF = /^([A-Za-z0-9][A-Za-z0-9_.-]*\/[A-Za-z0-9][A-Za-z0-9_.-]*)#([1-9][0-9]*)$/;
 
 function splitRepo(repo: string): { owner: string; name: string } {
@@ -3635,6 +3637,7 @@ export default function createDesk(host: Host, web: Web) {
 
     /** The export speaks at most once an hour: a failed export must not fill the notices. */
     let exportNoticeAt = 0;
+
     const noteExport = (message: string): void => {
         const at = Date.now();
 
@@ -3684,6 +3687,7 @@ export default function createDesk(host: Host, web: Web) {
                 await access(config.export);
             } catch {
                 noteExport(`The desk export folder is not there: ${config.export}.`);
+
                 return;
             }
 

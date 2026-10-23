@@ -114,9 +114,9 @@ An agent's Markdown frontmatter can contain:
 
 ```yaml
 repositories:
-  frostyard/nsl: ~/projects/frostyard/nsl
-  frostyard/intuneme: ~/projects/frostyard/intuneme
-  frostyard/igloo: ~/projects/frostyard/igloo
+    frostyard/nsl: ~/projects/frostyard/nsl
+    frostyard/intuneme: ~/projects/frostyard/intuneme
+    frostyard/igloo: ~/projects/frostyard/igloo
 ```
 
 Odrade calls `team_delegate` with `agent: "duncan"` and `repository: "frostyard/nsl"`. A single owned repository is selected automatically; with multiple repositories the tool requires a name from the map. The Team panel has the same choices and shows the destination folder before starting. The tool's optional `title` names the desk thread and the linked session; without it, the task's first non-empty line is the title, without a leading `Task:`, `Goal:`, or `Title:`.
