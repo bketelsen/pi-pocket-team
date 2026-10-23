@@ -46,6 +46,7 @@ import {
     wakeParked,
     reparkRepairWoken,
     closeCheck,
+    closeOutcome,
     closeoutHold,
     closeoutKey,
     assignWorktrees,
@@ -915,6 +916,75 @@ describe("closeoutKey", () => {
     });
 });
 
+describe("closeOutcome", () => {
+    /** A watch whose check passed: the thread closed because someone verified the work. */
+    const passed = () => ({
+        checkOn: "2026-11-01",
+        check: "the blob sweep",
+        setAt: 1,
+        setBy: "odrade",
+        key: "watch-1",
+        result: { at: 2, by: "odrade", pass: true, text: "the blobs are gone", key: "r-1" },
+    });
+
+    test("every PR merged, or no PR at all, is completed", () => {
+        assert.equal(closeOutcome(thread()), "completed");
+        assert.equal(closeOutcome(thread({ prs: prs("MERGED") })), "completed");
+        assert.equal(closeOutcome(thread({ prs: prs("MERGED", "MERGED") })), "completed");
+    });
+
+    test("a PR closed unmerged is abandoned", () => {
+        assert.equal(closeOutcome(thread({ prs: prs("CLOSED") })), "abandoned");
+        assert.equal(closeOutcome(thread({ prs: prs("MERGED", "CLOSED") })), "abandoned");
+    });
+
+    test("a guessed window PR does not abandon or freeze a thread", () => {
+        const guessed = thread({
+            prs: {
+                "frostyard/test#1": { via: "seen" as const, state: "MERGED" as const },
+                "frostyard/test#2": { via: "window" as const, state: "CLOSED" as const },
+            },
+        });
+
+        assert.equal(closeOutcome(guessed), "completed", "the agent did not make #2");
+
+        const frozen = thread({
+            prs: {
+                "frostyard/test#1": { via: "seen" as const, state: "MERGED" as const },
+                "frostyard/test#2": { via: "window" as const, state: "FROZEN" as const },
+            },
+        });
+
+        assert.equal(closeOutcome(frozen), "completed", "a guessed frozen PR counts for nothing");
+
+        // Only a guessed PR: no PR that the agent made, so the thread completed.
+        const only = thread({
+            prs: { "frostyard/test#2": { via: "window" as const, state: "CLOSED" as const } },
+        });
+
+        assert.equal(closeOutcome(only), "completed");
+    });
+
+    test("a frozen PR, or an archived repository, is frozen", () => {
+        assert.equal(closeOutcome(thread({ prs: prs("FROZEN") })), "frozen");
+        assert.equal(closeOutcome(thread({ run: { repoArchived: true } })), "frozen");
+        assert.equal(
+            closeOutcome(thread({ prs: prs("MERGED"), run: { repoArchived: true } })),
+            "frozen",
+        );
+    });
+
+    test("a passed watch is verified, unless a PR was abandoned or frozen", () => {
+        assert.equal(closeOutcome(thread({ watch: passed() })), "verified");
+        assert.equal(closeOutcome(thread({ prs: prs("MERGED"), watch: passed() })), "verified");
+
+        // The order of the rules: abandoned first, then frozen, then verified.
+        assert.equal(closeOutcome(thread({ prs: prs("CLOSED"), watch: passed() })), "abandoned");
+        assert.equal(closeOutcome(thread({ prs: prs("FROZEN"), watch: passed() })), "frozen");
+        assert.equal(closeOutcome(thread({ prs: prs("CLOSED", "FROZEN") })), "abandoned");
+    });
+});
+
 describe("odradeReason", () => {
     const due = thread({
         watch: {
@@ -1650,7 +1720,7 @@ describe("the watch's rules", () => {
             { changed: true },
         );
         assert.equal(due.state, "closed");
-        assert.deepEqual(due.closed, { at, why: "done", by: "desk" });
+        assert.deepEqual(due.closed, { at, why: "done", by: "desk", outcome: "verified" });
         assert.equal(due.run.next, "none");
         assert.deepEqual(due.watch?.result, {
             at,
@@ -1690,6 +1760,22 @@ describe("the watch's rules", () => {
             ),
             /passed already/,
         );
+    });
+
+    test("a pass on a thread with an abandoned PR closes it as done (abandoned)", () => {
+        const abandoned = watched({ prs: prs("CLOSED") });
+        const at = on("2026-11-01");
+
+        recordResult(abandoned, {
+            pass: true,
+            text: "the blobs are gone",
+            by: "odrade",
+            key: "r-9",
+            at,
+            closedBy: "brian",
+        });
+        assert.equal(abandoned.closed?.why, "done", "why stays done");
+        assert.equal(abandoned.closed?.outcome, "abandoned", "the PR was closed unmerged");
     });
 
     test("a fail keeps it open, counts again, and starts the stale clock at the fail", () => {
@@ -1745,7 +1831,12 @@ describe("the watch's rules", () => {
             closedBy: "desk",
         });
         assert.equal(failed.state, "closed");
-        assert.deepEqual(failed.closed, { at: at + 100, why: "done", by: "desk" });
+        assert.deepEqual(failed.closed, {
+            at: at + 100,
+            why: "done",
+            by: "desk",
+            outcome: "verified",
+        });
 
         // No watch, and a closed thread, are refused.
         assert.match(
@@ -3749,6 +3840,31 @@ describe("exportFiles", () => {
         assert.match(page, /- State: open/);
         assert.match(page, /- Origin: delegate/);
         assert.equal(files["T4.md"]?.includes("- Closed: done · by sweep · "), true);
+    });
+
+    test("a closed thread says how it ended, and an old one with no outcome says no more", () => {
+        const state = deskOf();
+        const done = placed(state, 100);
+
+        done.state = "closed";
+        done.closed = { at: 500, why: "done", by: "sweep", outcome: "abandoned" };
+        done.title = "Abandoned work";
+
+        const old = placed(state, 200);
+
+        old.state = "closed";
+        old.closed = { at: 600, why: "done", by: "sweep" };
+        old.title = "Old work";
+
+        const read = readText(state, done.id) ?? "";
+
+        assert.match(read, /Closed: .* · done \(abandoned\) · by sweep/);
+
+        const files = exportFiles(state, {}, 1000, 12);
+
+        assert.match(files[`${done.id}.md`] ?? "", /- Closed: done \(abandoned\) · by sweep · /);
+        assert.match(files[`${old.id}.md`] ?? "", /- Closed: done · by sweep · /);
+        assert.doesNotMatch(files[`${old.id}.md`] ?? "", /\\(completed\\)|\\(verified\\)/);
     });
 
     test("a report fence is longer than any backtick run, and the bytes do not change", () => {
@@ -6304,6 +6420,43 @@ describe("the desk in a Pi Pocket", () => {
             (await deskState())?.threads[thread.id]?.events.length,
             events,
             "a replay changes nothing",
+        );
+    });
+
+    test("a sweep that closes a thread with a merged PR records how it ended", async () => {
+        await stopSweepers();
+        const source = await supervisor("outcome");
+        let id = "";
+
+        // A thread with no session to wait for, and one PR that merged: the next sweep closes it.
+        await app.harness.commit(async (tx) => {
+            const state = await tx.doc(DeskThreads);
+            const opened = openThread(state, {
+                key: "x.test.outcome",
+                supervisor: Number(source),
+                agents: ["duncan"],
+                repo: "frostyard/test",
+                title: "A finished task",
+                at: Date.now(),
+            });
+
+            id = opened.thread.id;
+            const thread = state.threads[id]!;
+
+            thread.state = "open";
+            thread.prs["frostyard/test#9"] = { via: "attached", state: "MERGED" };
+        }, context);
+
+        await say(app, source, "desk sync test");
+
+        const closed = (await deskState())?.threads[id];
+
+        assert.equal(closed?.state, "closed");
+        assert.equal(closed?.closed?.why, "done");
+        assert.equal(closed?.closed?.outcome, "completed");
+        assert.match(
+            closed?.events.map((event) => event.text).join("; ") ?? "",
+            /closed: completed \(all PRs merged\)/,
         );
     });
 
