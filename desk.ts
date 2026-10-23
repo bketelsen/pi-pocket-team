@@ -106,6 +106,8 @@ export type PrLink = {
     head?: string;
     /** The names of the checks that fail now: at most 10, sorted. */
     failing?: string[];
+    /** A draft PR: it may conflict or fail on purpose, so it gets no repair wake-up. */
+    draft?: boolean;
 };
 
 /** One dated check on a thread. Stored data: never rename a field or change what it means. */
@@ -1211,9 +1213,12 @@ const REPAIR_WORDS: Record<RepairEntry["why"], string> = {
     "no-session": "no session",
 };
 
-/** A PR that needs a repair: OPEN and CONFLICTING, else OPEN with failing checks. Anything else gives undefined. */
+/**
+ * A PR that needs a repair: OPEN and CONFLICTING, else OPEN with failing checks. Anything else gives undefined, and so
+ * does a draft: it may conflict or fail on purpose.
+ */
 export function repairState(link: PrLink): RepairState | undefined {
-    if (link.state !== "OPEN") {
+    if (link.state !== "OPEN" || link.draft === true) {
         return undefined;
     }
 
@@ -1402,12 +1407,13 @@ function recordRepair(
 }
 
 /**
- * Decide the repair wake-ups of one open or parked thread: each PR with a repair key that is not in `run.repairs` yet
- * gets 1 entry. The 4th change on a PR, a thread with no session, and an archived session go to Odrade, not to the agent.
- * Pure over the thread: the sweeper sends after the commit. Returns the events it added.
+ * Decide the repair wake-ups of one open thread: each PR with a repair key that is not in `run.repairs` yet gets 1
+ * entry. The 4th change on a PR, a thread with no session, and an archived session go to Odrade, not to the agent. A
+ * parked thread gets none: Brian parked it, and a repair never wakes it. Pure over the thread: the sweeper sends after
+ * the commit. Returns the events it added.
  */
 export function planRepairs(thread: Thread, now: number): number {
-    if (thread.state !== "open" && thread.state !== "parked") {
+    if (thread.state !== "open") {
         return 0;
     }
 
@@ -1697,7 +1703,10 @@ export function wakeParked(thread: Thread, before: number, now: number): boolean
         return false;
     }
 
-    const added = thread.events.slice(before);
+    // A repair event never wakes a parked thread: Brian parks drafts that conflict or fail on purpose.
+    const added = thread.events
+        .slice(before)
+        .filter((event) => !event.key.startsWith("repair") && !event.key.startsWith("reparked:"));
 
     if (added.length === 0) {
         return false;
@@ -1711,6 +1720,47 @@ export function wakeParked(thread: Thread, before: number, now: number): boolean
         `woke: ${added.at(-1)?.text ?? "an event"}`,
         now,
     );
+}
+
+/** The text of the event a repair wake-up added: `<ref> is conflicting: repair notice to Odrade (no-session)`. */
+const REPAIR_EVENT =
+    /^\S+ (is|needs) [^\n]*: repair (wake-up to the agent|message to Odrade|notice to Odrade)/;
+
+/**
+ * Park again an open thread that a repair event woke (the bug of the first repair wake-up, 2026-10-23: T11). The newest
+ * park or wake event decides: only a sweep's `woke:` whose event is a repair's parks it again. A later tap on Wake by
+ * Brian, a later park, or a later wake by another event leaves the thread as it is. True when it parked the thread.
+ */
+export function reparkRepairWoken(thread: Thread, now: number): boolean {
+    if (thread.state !== "open") {
+        return false;
+    }
+
+    const last = thread.events.findLast(
+        (event) =>
+            event.key.startsWith("woke:") ||
+            event.key.startsWith("woken:") ||
+            event.key.startsWith("parked:") ||
+            event.key.startsWith("reparked:"),
+    );
+
+    if (
+        last === undefined ||
+        !last.key.startsWith("woke:") ||
+        !REPAIR_EVENT.test(last.text.replace(/^woke: /, ""))
+    ) {
+        return false;
+    }
+
+    thread.state = "parked";
+    addEvent(
+        thread,
+        `reparked:${last.key}`,
+        "parked again: a repair wake-up had woken it, and a repair never wakes a parked thread",
+        now,
+    );
+
+    return true;
 }
 
 /** No event for 3 days (7 for a reviewer wait); closed threads and sleeping ones are never stale. */
@@ -2064,6 +2114,7 @@ const linkFor = (pr: PrFact, via: PrLink["via"]): PrLink => ({
     mergeable: pr.mergeable,
     head: pr.head,
     failing: [...pr.failing],
+    draft: pr.isDraft,
 });
 
 /** One attached PR's facts from a read: its state, its next actor, and what GitHub says. */
@@ -2125,6 +2176,7 @@ export function updatePrs(thread: Thread, github: GitHubFacts, now: number): num
         link.mergeable = fact.mergeable;
         link.head = fact.head;
         link.failing = [...fact.failing];
+        link.draft = fact.isDraft;
     }
 
     return events;
@@ -4768,12 +4820,24 @@ export default function createDesk(host: Host, web: Web) {
             }
         }
 
+        // Threads that this sweep parked again: its other events must not wake them at once.
+        const reparked = new Set<string>();
+
         for (const thread of mine) {
+            if (reparkRepairWoken(thread, now)) {
+                reparked.add(thread.id);
+                events += 1;
+            }
+
             events += planRepairs(thread, now);
         }
 
         // A parked thread that got an event from this sweep goes back to open: something changed on it.
         for (const thread of open) {
+            if (reparked.has(thread.id)) {
+                continue;
+            }
+
             if (wakeParked(thread, eventsBefore.get(thread.id) ?? thread.events.length, now)) {
                 events += 1;
             }
@@ -5123,10 +5187,8 @@ export default function createDesk(host: Host, web: Web) {
                     }
 
                     for (const thread of Object.values(state.threads)) {
-                        if (
-                            thread.supervisor !== Number(supervisor) ||
-                            (thread.state !== "open" && thread.state !== "parked")
-                        ) {
+                        // A parked thread sends nothing: an entry from before the park waits until Brian wakes it.
+                        if (thread.supervisor !== Number(supervisor) || thread.state !== "open") {
                             continue;
                         }
 
