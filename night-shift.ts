@@ -1186,8 +1186,12 @@ export default function createNightShift(host: Host, web: Web) {
                 from: "team_message" | "night-shift";
                 text: string;
                 at: number;
+                /** The desk puts the report in the supervisor's digest: `held` says it did. */
+                digest?: true;
+                /** The stop reason: `blocked` and `failed` go at once. */
+                reason?: string;
             },
-        ) => Promise<{ line: string } | undefined>;
+        ) => Promise<{ line: string; held?: boolean } | undefined>;
     };
 
     const deskApi = (): DeskApi | undefined =>
@@ -1845,14 +1849,15 @@ export default function createNightShift(host: Host, web: Web) {
             /**
              * Tell the supervisor session of a delegated goal that it stopped. The goal's driver is gone, so this does
              * not use mine(). The send's key is the task's: a restart reruns the phase and sends only once. With the
-             * desk on, the report is filed on the thread in the same commit, and the supervisor gets its one line.
+             * desk on, the report is filed on the thread in the same commit, and the supervisor gets its one line; with
+             * the digest on, the desk holds the line for the next digest, and this sends nothing.
              */
             report: async (task, runtime, context) => {
                 const id = runtime.conversationId;
                 const text = task.state.checkpoint.text;
                 const goal = (await runtime.snapshot(GoalDoc, id, context))?.goal;
                 const report = goal === undefined ? undefined : reportMessage(goal, text);
-                const found: { address?: string; filed?: { line: string } } = {};
+                const found: { address?: string; filed?: { line: string; held?: boolean } } = {};
 
                 await runtime.commit(async (tx) => {
                     found.address = await returnAddress(tx, id);
@@ -1866,6 +1871,8 @@ export default function createNightShift(host: Host, web: Web) {
                             from: "night-shift",
                             text: report,
                             at: runtime.now(),
+                            digest: true,
+                            ...(goal?.reason === undefined ? {} : { reason: goal.reason }),
                         });
                     }
 
@@ -1878,7 +1885,7 @@ export default function createNightShift(host: Host, web: Web) {
                         "The night shift could not report: this session has no source session.",
                         id,
                     );
-                } else if (report !== undefined) {
+                } else if (report !== undefined && found.filed?.held !== true) {
                     try {
                         await host.linkedSessions.send(
                             id,
