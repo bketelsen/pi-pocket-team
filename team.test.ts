@@ -14,13 +14,15 @@ import {
     work,
 } from "./_pocket/test/helpers.ts";
 import assert from "node:assert/strict";
-import { cpSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { cpSync, existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { join } from "node:path";
 import { after, test } from "node:test";
 import { fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import { createHandler } from "./_pocket/src/server/http.ts";
-import { Identity } from "./team.ts";
+import { delegationWorktree, Identity, roster } from "./team.ts";
 
 after(cleanUp);
 const definitions = join(root, "agents");
@@ -314,6 +316,197 @@ test("drop-in identities, named delegation, HTTP permissions, replay and restart
     } finally {
         server?.closeAllConnections();
         server?.close();
+        await app.close();
+    }
+});
+
+const gitEnv = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" };
+
+/** One git command in a test folder. */
+const git = (folder: string, ...args: string[]): string =>
+    execFileSync("git", args, {
+        cwd: folder,
+        env: gitEnv,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+    });
+
+/** A folder with 1 commit: nothing when it is a repository with a commit already. */
+function repository(folder: string): void {
+    mkdirSync(folder, { recursive: true });
+    git(folder, "init", "-q");
+
+    try {
+        git(folder, "rev-parse", "--verify", "HEAD");
+    } catch {
+        writeFileSync(join(folder, "file.txt"), "one\n");
+        git(folder, "add", ".");
+        git(
+            folder,
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test",
+            "commit",
+            "-qm",
+            "one",
+        );
+    }
+}
+
+test("a delegation gets a sibling worktree on a new branch, and its key reuses it", async () => {
+    const checkout = join(root, "worktree-checkout");
+
+    repository(checkout);
+
+    const key = "x.team.delegate:task-1:call-1";
+    const slug = createHash("sha256").update(key).digest("hex").slice(0, 8);
+    const first = await delegationWorktree(checkout, { agent: "duncan", key });
+
+    assert(first, "a repository gets a worktree");
+    assert.equal(first.checkout, checkout);
+    assert.equal(first.path, join(root, `worktree-checkout--duncan-${slug}`));
+    assert.equal(first.branch, `duncan/${slug}`);
+    assert.equal(existsSync(first.path!), true);
+    assert.equal(git(first.path!, "rev-parse", "--abbrev-ref", "HEAD").trim(), `duncan/${slug}`);
+
+    // A replay of the same key finds the worktree it made, and makes no second one.
+    const again = await delegationWorktree(checkout, { agent: "duncan", key });
+
+    assert.equal(again?.path, first.path);
+
+    // Another call is another worktree, so 2 jobs in 1 repository share no folder.
+    const second = await delegationWorktree(checkout, {
+        agent: "duncan",
+        key: "x.team.delegate:task-1:call-2",
+    });
+
+    assert.notEqual(second?.path, first.path);
+    assert.equal(existsSync(second!.path!), true);
+
+    // A folder that is not a git repository, and a folder inside one, keep the folder itself.
+    const plain = join(root, "worktree-plain");
+
+    mkdirSync(plain, { recursive: true });
+    assert.equal(await delegationWorktree(plain, { agent: "duncan", key }), undefined);
+
+    const inside = join(checkout, "sub");
+
+    mkdirSync(inside, { recursive: true });
+    assert.equal(await delegationWorktree(inside, { agent: "duncan", key }), undefined);
+
+    // A folder that is not this repository's worktree is no worktree: the delegation says why and uses the checkout.
+    const occupiedKey = "x.team.delegate:task-1:call-3";
+    const occupied = join(
+        root,
+        `worktree-checkout--duncan-${createHash("sha256").update(occupiedKey).digest("hex").slice(0, 8)}`,
+    );
+
+    mkdirSync(occupied);
+    const blocked = await delegationWorktree(checkout, { agent: "duncan", key: occupiedKey });
+
+    assert.equal(blocked?.path, undefined);
+    assert.match(blocked?.error ?? "", /another folder/);
+});
+
+test("2 delegations to 1 repository work in 2 worktrees, and the task says where", async () => {
+    // frostyard/nsl is Duncan's first repository: a real repository, so each delegation gets its own worktree.
+    repository(repoA);
+
+    const requests: string[] = [];
+    const model = scriptedModel((ctx) => {
+        const { text, role } = lastText(ctx as never);
+
+        requests.push(JSON.stringify(ctx));
+
+        if (role === "user" && text.endsWith("worktree test")) {
+            return fauxAssistantMessage(
+                [
+                    fauxToolCall("team_delegate", {
+                        agent: "duncan",
+                        repository: "frostyard/nsl",
+                        task: "Say hello. No tools needed.",
+                    }),
+                ],
+                { stopReason: "toolUse" },
+            );
+        }
+
+        return fauxAssistantMessage([fauxText(`echo: ${text}`)]);
+    });
+    const dropIns = join(root, "data", "extensions");
+
+    mkdirSync(dropIns, { recursive: true });
+    cpSync(join(import.meta.dirname, "team.ts"), join(dropIns, "team.ts"));
+    cpSync(join(import.meta.dirname, "team-web"), join(dropIns, "team-web"), { recursive: true });
+    const app = await openApp(model);
+
+    try {
+        await app.setExtensionEnabled(owner(app), "team.ts", true);
+        const id = await newSession(app);
+        const odrade = (await roster(definitions)).find((each) => each.id === "odrade");
+
+        assert(odrade, "the roster has Odrade");
+        await app.harness.commit(async (tx) => {
+            (await tx.doc(Identity, id)).persona = odrade;
+        }, context);
+
+        // Delegate once, and give back the folder the new linked session starts in.
+        async function delegateOnce(): Promise<string> {
+            const before = new Set(
+                app
+                    .sessions()
+                    .filter((session) => session.linkedFrom?.id === Number(id))
+                    .map((session) => session.id),
+            );
+
+            await say(app, id, "worktree test");
+            await until(
+                () =>
+                    app
+                        .sessions()
+                        .some(
+                            (session) =>
+                                session.linkedFrom?.id === Number(id) && !before.has(session.id),
+                        ),
+                "the delegation",
+                20_000,
+            );
+            const linked = app
+                .sessions()
+                .find(
+                    (session) => session.linkedFrom?.id === Number(id) && !before.has(session.id),
+                );
+
+            assert(linked);
+            await until(() => !app.isBusy(linked.id), "the delegated task settled", 20_000);
+
+            return app.cwdOf(linked.id) ?? "";
+        }
+
+        const first = await delegateOnce();
+        const second = await delegateOnce();
+        const prefix = `${repoA}--duncan-`;
+
+        for (const cwd of [first, second]) {
+            assert.equal(cwd.startsWith(prefix), true, `${cwd} is a sibling of the checkout`);
+            assert.match(cwd.slice(prefix.length), /^[0-9a-f]{8}$/);
+            assert.equal(existsSync(cwd), true);
+            assert.match(
+                git(cwd, "rev-parse", "--abbrev-ref", "HEAD").trim(),
+                /^duncan\/[0-9a-f]{8}$/,
+            );
+        }
+
+        assert.notEqual(first, second, "2 delegations to 1 repository get 2 folders");
+
+        // The task tells the agent where it works, and where it must not work.
+        const told = requests.join("\n");
+
+        assert.match(told, /You work in your own git worktree at \S+ on branch duncan\//);
+        assert.match(told, /you can rename the branch/);
+        assert.match(told, /belongs to no task: do not work there/);
+    } finally {
         await app.close();
     }
 });
