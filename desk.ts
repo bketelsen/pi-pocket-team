@@ -38,6 +38,7 @@ import {
     type Cursor,
     type DocumentReader,
     type EntryId,
+    LiveDoc,
     type TaskRuntime,
     type Tx,
 } from "@earendil-works/pi-durable";
@@ -163,7 +164,9 @@ export type Thread = {
     asks: Ask[];
     /**
      * Facts the sweep keeps: `returnAddress`, `reportedAt`, `reportedUserEntry`, `scanCursor`, `lastUserEntry`,
-     * `seenPrs`, `busy`, `archived`, `shift`, `dirty`, `ahead`, `folder`, `next`, `sweptAt`, `closeout` (the
+     * `seenPrs`, `busy`, `archived`, `shift`, `dirty`, `ahead`, `folder`, `next`, `sweptAt`, `worktrees` (the linked
+     * worktrees of its folder that hold it, `{ path, dirty, unpushed }`: a worktree of it that changed, or holds
+     * unpushed commits, keeps it open, and its work is the agent's), `closeout` (the
      * wake-up key that went last, so a sweep does not send it again), `closeoutEntry` (the session's newest user entry
      * before it went: a report past it lets the thread close), `closeoutRefs` (every PR ref an earlier wake-up told the
      * agent, sorted, at most 50: a state of only told refs is no new wake-up, so a detached PR cannot send again),
@@ -308,6 +311,64 @@ export const DeskReports = defineDoc<DeskReportsState>({
     fork: "current",
     initial: () => ({ reports: [] }),
 });
+
+/**
+ * Pi's subagents of a conversation, read only: the ones Pi spawned, and their reports on the way to it. It is Pocket's
+ * own document, not public API: when its shape changes, reading it fails, and the sweep then counts no subagent as
+ * working (a session is idle when Pocket says so, as before). Never write it. The same definition as Night shift's.
+ */
+const SubagentsDoc = defineDoc<{
+    agents: Record<string, { conversationId: ConversationId }>;
+    /** Pocket's reporter task for each message; not read here, but part of the document's shape. */
+    reporters: Record<string, string>;
+    /** Reports not yet sent to the parent. */
+    outbox?: { name: string; text: string }[];
+    /** The batch on its way to the parent. */
+    sending?: { request: string };
+}>({
+    kind: "pocket.subagents",
+    version: 1,
+    scope: "conversation",
+    history: "latest",
+    fork: "initial",
+    // The same as Pocket's own base, `rebased` in src/server/docs.ts: not part of the stored meaning.
+    checkpointWhen: (_value, _ops, info) => info.deltasSinceBase >= 64,
+    initial: () => ({ agents: {}, reporters: {} }),
+});
+
+/**
+ * Whether a subagent of `conversationId` still works: one of them has a run, or a report of one is on its way to the
+ * session. Any failure to read Pocket's registry, or a subagent's conversation, means no subagent works.
+ */
+async function subagentsBusy(
+    read: Pick<DocumentReader, "snapshot">,
+    conversationId: ConversationId,
+    context: Context,
+): Promise<boolean> {
+    try {
+        const registry = await read.snapshot(SubagentsDoc, conversationId, context);
+
+        if (registry === undefined) {
+            return false;
+        }
+
+        if ((registry.outbox?.length ?? 0) > 0 || registry.sending !== undefined) {
+            return true;
+        }
+
+        for (const agent of Object.values(registry.agents)) {
+            const live = await read.snapshot(LiveDoc, agent.conversationId, context);
+
+            if (live?.run !== undefined) {
+                return true;
+            }
+        }
+
+        return false;
+    } catch {
+        return false;
+    }
+}
 
 // ─── Small helpers ───────────────────────────────────────────────────────────
 
@@ -1071,6 +1132,187 @@ export function parseStatus(text: string): { dirty: number; ahead: number; branc
     return { dirty, ahead, ...(branch === undefined ? {} : { branch }) };
 }
 
+/**
+ * One block of `git worktree list --porcelain`: `worktree <path>`, then `HEAD`, `branch`, `detached`, or `bare`. The
+ * branch is the name after `refs/heads/`.
+ */
+export type ParsedWorktree = {
+    path: string;
+    branch?: string;
+    detached?: boolean;
+    bare?: boolean;
+};
+
+/**
+ * `git worktree list --porcelain` in blocks, in the order git gives them: the main worktree first. A block separated
+ * by a blank line, or by the next `worktree` line (the last block needs no blank line after it).
+ */
+export function parseWorktrees(text: string): ParsedWorktree[] {
+    const worktrees: ParsedWorktree[] = [];
+    let block: ParsedWorktree | undefined;
+
+    for (const line of text.split("\n")) {
+        if (line.trim() === "") {
+            block = undefined;
+            continue;
+        }
+
+        if (line.startsWith("worktree ")) {
+            block = { path: line.slice("worktree ".length).trim() };
+            worktrees.push(block);
+            continue;
+        }
+
+        if (block === undefined) {
+            continue;
+        }
+
+        if (line.startsWith("branch ")) {
+            const ref = line.slice("branch ".length).trim();
+
+            block.branch = ref.startsWith("refs/heads/") ? ref.slice("refs/heads/".length) : ref;
+        } else if (line === "detached") {
+            block.detached = true;
+        } else if (line === "bare") {
+            block.bare = true;
+        }
+    }
+
+    return worktrees.filter((each) => each.path !== "");
+}
+
+/** A worktree of a thread's folder that holds the thread, as the sweep reads it. */
+export type WorktreeFact = {
+    path: string;
+    /** The branch it holds, without `refs/heads/`. */
+    branch: string;
+    /** The branch's oldest reflog time, in ms; undefined when git did not give it. */
+    created?: number;
+    dirty: number;
+    unpushed: number;
+};
+
+/** One worktree as a thread records it: `run.worktrees`, and what `closeCheck` and `nextActor` read. */
+export type WorktreeLine = { path: string; dirty: number; unpushed: number };
+
+/**
+ * The worktrees that hold a thread of `folder`: a map of thread id to them. A worktree holds a thread only when it has
+ * changed files or unpushed commits, its `created` is known, and its branch is not in `doneBranches` (a merged or closed
+ * PR's branch keeps commits that are on no remote, and a squash-merge leaves them: it is not work). It belongs to the 1
+ * thread that is not closed, works in `folder`, and has the newest `startedAt` at or before `created`; no such thread,
+ * and it holds none.
+ */
+export function assignWorktrees(
+    threads: readonly Thread[],
+    folder: string,
+    worktrees: readonly WorktreeFact[],
+    doneBranches: ReadonlySet<string>,
+): Map<string, WorktreeFact[]> {
+    const open = threads
+        .filter((thread) => thread.state !== "closed" && folderOf(thread) === folder)
+        .sort((a, b) => b.startedAt - a.startedAt);
+    const held = new Map<string, WorktreeFact[]>();
+
+    for (const worktree of worktrees) {
+        const works = worktree.dirty > 0 || worktree.unpushed > 0;
+
+        if (!works || worktree.created === undefined || doneBranches.has(worktree.branch)) {
+            continue;
+        }
+
+        const owner = open.find((thread) => thread.startedAt <= worktree.created!);
+
+        if (owner === undefined) {
+            continue;
+        }
+
+        held.set(owner.id, [...(held.get(owner.id) ?? []), worktree]);
+    }
+
+    return held;
+}
+
+/** The worktrees a thread records: `run.worktrees` that have work, and none when it is absent or not readable. */
+function storedWorktrees(thread: Thread): WorktreeLine[] {
+    const stored = thread.run.worktrees;
+
+    if (!Array.isArray(stored)) {
+        return [];
+    }
+
+    const lines: WorktreeLine[] = [];
+
+    for (const entry of stored) {
+        if (entry === null || typeof entry !== "object" || Array.isArray(entry)) {
+            continue;
+        }
+
+        const path = entry.path;
+        const dirty = numberOr(entry.dirty) ?? 0;
+        const unpushed = numberOr(entry.unpushed) ?? 0;
+
+        if (typeof path !== "string" || (dirty === 0 && unpushed === 0)) {
+            continue;
+        }
+
+        lines.push({ path, dirty, unpushed });
+    }
+
+    return lines;
+}
+
+/** Whether 2 lists of worktrees are the same list: the same entries, in the same order. */
+function sameWorktrees(one: readonly WorktreeLine[], two: readonly WorktreeLine[]): boolean {
+    return (
+        one.length === two.length &&
+        one.every((each, index) => {
+            const other = two[index];
+
+            return (
+                other !== undefined &&
+                each.path === other.path &&
+                each.dirty === other.dirty &&
+                each.unpushed === other.unpushed
+            );
+        })
+    );
+}
+
+/** One worktree's lines, in `closeCheck`'s words: the changed files, then the unpushed commits. */
+function worktreeLines(worktree: WorktreeLine): string[] {
+    const lines: string[] = [];
+
+    if (worktree.dirty > 0) {
+        lines.push(
+            `${String(worktree.dirty)} changed file${worktree.dirty === 1 ? "" : "s"} in ${worktree.path}`,
+        );
+    }
+
+    if (worktree.unpushed > 0) {
+        lines.push(
+            `${String(worktree.unpushed)} unpushed commit${worktree.unpushed === 1 ? "" : "s"} in ${worktree.path}`,
+        );
+    }
+
+    return lines;
+}
+
+/** The key and text of the event a thread's held worktrees get: the same work gives the same key. */
+function worktreesEvent(
+    worktrees: readonly WorktreeLine[],
+    now: number,
+): { key: string; text: string } {
+    const state = worktrees
+        .map((each) => `${each.path}:${String(each.dirty)}:${String(each.unpushed)}`)
+        .join("|");
+    const text =
+        worktrees.length === 0
+            ? "no worktree holds it"
+            : worktrees.flatMap(worktreeLines).join("; ");
+
+    return { key: `worktrees:${state}:${String(now)}`, text };
+}
+
 const CLOSED_PR = new Set(["MERGED", "CLOSED", "FROZEN"]);
 
 /** What keeps a thread's session part open, in words. Undefined when it is closed. */
@@ -1192,17 +1434,28 @@ export function closeCheck(thread: Thread, facts: CloseFacts): { close: boolean;
         }
     }
 
+    // A worktree of the thread's folder that holds it: its work is not in the folder's own counts.
+    for (const worktree of storedWorktrees(thread)) {
+        open.push(...worktreeLines(worktree));
+    }
+
     return { close: open.length === 0, open };
 }
 
 /**
  * The wake-up key of a thread that needs a close-out wake-up: `closeout:<thread.key>:<refs>`, the refs of its PRs
  * that are not guessed (`via: "window"`). Undefined when the thread is not open (parked, starting, closed), has no PR
- * that is not guessed, has such a PR still open, has no address for its agent, is archived, or when every ref in the
- * key was already told by an earlier wake-up. A new PR gives a new key, so the agent hears about it; a PR that leaves
- * the thread gives a state the agent already has, so it sends nothing.
+ * that is not guessed, has such a PR still open, has no address for its agent, is archived, when its session works or
+ * was not seen idle yet (`run.busy` is not false: the wake-up would land in the middle of a turn, and a working
+ * subagent of that session counts as the session working), or when every ref in the key was already told by an earlier
+ * wake-up. A new PR gives a new key, so the agent hears about it; a PR that leaves the thread gives a state the agent
+ * already has, so it sends nothing.
  */
 export function closeoutKey(thread: Thread): string | undefined {
+    if (thread.run.busy !== false) {
+        return undefined;
+    }
+
     const key = closeoutDue(thread);
 
     if (key === undefined) {
@@ -1671,10 +1924,12 @@ export function nextActor(thread: Thread): NextActor {
     const busy = thread.run.busy === true;
     const dirty = (numberOr(thread.run.dirty) ?? 0) > 0;
     const ahead = (numberOr(thread.run.ahead) ?? 0) > 0;
+    // A worktree of the thread's folder that holds it: work of the agent, as the folder's own counts are.
+    const worktree = storedWorktrees(thread).length > 0;
     const shift = thread.run.shift;
     const shiftOpen = typeof shift === "string" && shift !== "ended";
 
-    if (busy || dirty || ahead || shiftOpen || openPrs.includes("agent")) {
+    if (busy || dirty || ahead || worktree || shiftOpen || openPrs.includes("agent")) {
         return "agent";
     }
 
@@ -1699,7 +1954,8 @@ export function nextActor(thread: Thread): NextActor {
         openSession(thread) === undefined &&
         !shiftOpen &&
         !dirty &&
-        !ahead
+        !ahead &&
+        !worktree
     ) {
         return "reviewer";
     }
@@ -4683,6 +4939,8 @@ export default function createDesk(host: Host, web: Web) {
         shifts: Record<string, string | null>;
         /** By folder: its counts, or null when it is not a git repository. */
         folders: Record<string, FolderFact | null>;
+        /** By folder: its linked worktrees, or null when git cannot list them. */
+        worktrees?: Record<string, WorktreeFact[] | null>;
         github?: GitHubFacts;
         /** Why the GitHub read failed, in one line; absent when it worked. */
         githubError?: string;
@@ -5130,6 +5388,58 @@ export default function createDesk(host: Host, web: Web) {
         }
     }
 
+    /**
+     * The linked worktrees of a folder, as the sweep reads them; null when git cannot list them. The first block is the
+     * main worktree: its counts are the folder's own. A block with no branch holds no thread's work.
+     */
+    async function worktreeFacts(folder: string): Promise<WorktreeFact[] | null> {
+        try {
+            const { stdout } = await run("git", ["-C", folder, "worktree", "list", "--porcelain"], {
+                timeout: 10_000,
+                maxBuffer: 4 * 1024 * 1024,
+                encoding: "utf8",
+            });
+            const facts: WorktreeFact[] = [];
+
+            for (const block of parseWorktrees(stdout).slice(1)) {
+                if (block.branch === undefined || block.bare === true) {
+                    continue;
+                }
+
+                const created = await branchTime(folder, block.branch);
+                const status = await statusOf(block.path);
+
+                facts.push({
+                    path: block.path,
+                    branch: block.branch,
+                    ...(created === undefined ? {} : { created }),
+                    dirty: status?.dirty ?? 0,
+                    unpushed: await unpushedCount(block.path),
+                });
+            }
+
+            return facts;
+        } catch {
+            return null;
+        }
+    }
+
+    /** The commits on HEAD that no remote has: 0 when git cannot count them. */
+    async function unpushedCount(folder: string): Promise<number> {
+        try {
+            const { stdout } = await run(
+                "git",
+                ["-C", folder, "rev-list", "--count", "HEAD", "--not", "--remotes"],
+                { timeout: 10_000, encoding: "utf8" },
+            );
+            const count = Number(stdout.trim());
+
+            return Number.isInteger(count) && count >= 0 ? count : 0;
+        } catch {
+            return 0;
+        }
+    }
+
     /** For each open thread, the branches of candidate PRs in its folder: did this thread make one? */
     async function branchFacts(
         threads: Thread[],
@@ -5230,6 +5540,26 @@ export default function createDesk(host: Host, web: Web) {
             // The list is not readable now: no facts, and no found session threads.
         }
 
+        // A session that looks idle but has a working subagent still works: its thread must wait on its agent, as it
+        // does while the session itself runs. Any failure to read the registry leaves the session idle, as before.
+        if (sessions !== undefined) {
+            for (const thread of open) {
+                if (thread.session === undefined) {
+                    continue;
+                }
+
+                const fact = sessions.find((each) => each.address === thread.address);
+
+                if (
+                    fact !== undefined &&
+                    !fact.busy &&
+                    (await subagentsBusy(read, thread.session as ConversationId, context))
+                ) {
+                    fact.busy = true;
+                }
+            }
+        }
+
         const shifts: Record<string, string | null> = {};
         const nightShift = nightShiftApi();
 
@@ -5314,9 +5644,11 @@ export default function createDesk(host: Host, web: Web) {
                 : await branchFacts([...open, ...recent], githubRead.facts);
 
         const facts: Record<string, FolderFact | null> = {};
+        const worktrees: Record<string, WorktreeFact[] | null> = {};
 
         for (const folder of folders) {
             facts[folder] = await statusOf(folder);
+            worktrees[folder] = await worktreeFacts(folder);
         }
 
         return {
@@ -5324,6 +5656,7 @@ export default function createDesk(host: Host, web: Web) {
             ...(sessions === undefined ? {} : { sessions }),
             shifts,
             folders: facts,
+            worktrees,
             ...(githubRead.facts === undefined ? {} : { github: githubRead.facts }),
             ...(githubRead.error === undefined ? {} : { githubError: githubRead.error }),
             ...(skipped.size === 0 ? {} : { githubSkipped: [...skipped].sort() }),
@@ -5451,6 +5784,30 @@ export default function createDesk(host: Host, web: Web) {
             [...open, ...closedDone].map((thread) => [thread.id, thread.events.length]),
         );
 
+        // The worktrees that hold a thread: a linked worktree's work is not in its folder's own counts. A branch of a
+        // merged or closed PR keeps commits that are on no remote (a squash-merge leaves them): it holds no thread.
+        const doneBranches = new Set(
+            Object.values(facts.github?.prs ?? {})
+                .filter((pr) => pr.state === "MERGED" || pr.state === "CLOSED")
+                .map((pr) => pr.headRefName),
+        );
+        const heldWorktrees = new Map<string, WorktreeFact[]>();
+
+        for (const [folder, worktrees] of Object.entries(facts.worktrees ?? {})) {
+            if (worktrees === null) {
+                continue;
+            }
+
+            for (const [id, holding] of assignWorktrees(
+                Object.values(state.threads),
+                folder,
+                worktrees,
+                doneBranches,
+            )) {
+                heldWorktrees.set(id, holding);
+            }
+        }
+
         for (const thread of open) {
             await scanEntries(tx, thread);
 
@@ -5567,6 +5924,34 @@ export default function createDesk(host: Host, web: Web) {
                             now,
                         )
                     ) {
+                        events += 1;
+                    }
+                }
+            }
+
+            // The worktrees of its folder that hold it: a failed read keeps the ones the thread has, as a failed
+            // folder read does.
+            const lists = folder === undefined ? undefined : facts.worktrees?.[folder];
+
+            if (lists !== undefined && lists !== null) {
+                const holding: WorktreeLine[] = (heldWorktrees.get(thread.id) ?? []).map(
+                    (worktree) => ({
+                        path: worktree.path,
+                        dirty: worktree.dirty,
+                        unpushed: worktree.unpushed,
+                    }),
+                );
+
+                if (!sameWorktrees(storedWorktrees(thread), holding)) {
+                    if (holding.length === 0) {
+                        delete thread.run.worktrees;
+                    } else {
+                        thread.run.worktrees = holding;
+                    }
+
+                    const event = worktreesEvent(holding, now);
+
+                    if (addEvent(thread, event.key, event.text, now)) {
                         events += 1;
                     }
                 }

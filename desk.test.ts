@@ -24,7 +24,8 @@ import { createServer } from "node:http";
 import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
 import { fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
-import { defineDoc, type ConversationId } from "@earendil-works/pi-durable";
+import { defineDoc, type ConversationId, LiveDoc, type TaskId } from "@earendil-works/pi-durable";
+import { SubagentsDoc } from "./_pocket/src/server/docs.ts";
 import {
     bindThread,
     DeskReports,
@@ -47,6 +48,8 @@ import {
     closeCheck,
     closeoutHold,
     closeoutKey,
+    assignWorktrees,
+    parseWorktrees,
     isStale,
     nextActor,
     odradeReason,
@@ -109,6 +112,7 @@ import {
     type DeskState,
     type SeedRow,
     type Thread,
+    type WorktreeFact,
 } from "./desk.ts";
 import createDesk from "./desk.ts";
 import { taskTitle } from "./team.ts";
@@ -649,6 +653,40 @@ describe("closeCheck", () => {
         );
     });
 
+    test("a worktree that holds a thread keeps it open, even when its folder is clean", () => {
+        const holding = closeCheck(
+            thread({
+                run: { worktrees: [{ path: "/work/test-digest", dirty: 2, unpushed: 1 }] },
+            }),
+            facts(),
+        );
+
+        assert.equal(holding.close, false);
+        assert.deepEqual(holding.open, [
+            "2 changed files in /work/test-digest",
+            "1 unpushed commit in /work/test-digest",
+        ]);
+
+        // The same words as the folder lines, with 1 of each.
+        assert.deepEqual(
+            closeCheck(
+                thread({ run: { worktrees: [{ path: "/work/digest", dirty: 1, unpushed: 1 }] } }),
+                facts(),
+            ).open,
+            ["1 changed file in /work/digest", "1 unpushed commit in /work/digest"],
+        );
+
+        // A worktree with no work in it, and none recorded at all: nothing holds the thread.
+        assert.equal(
+            closeCheck(
+                thread({ run: { worktrees: [{ path: "/work/digest", dirty: 0, unpushed: 0 }] } }),
+                facts(),
+            ).close,
+            true,
+        );
+        assert.equal(closeCheck(thread({ run: { worktrees: [] } }), facts()).close, true);
+    });
+
     test("a thread still starting closes as failed after an hour", () => {
         const starting = thread({ state: "starting", startedAt: 0 });
 
@@ -668,6 +706,20 @@ describe("nextActor", () => {
         assert.equal(nextActor(thread({ run: { busy: true } })), "agent");
         assert.equal(nextActor(thread({ run: { dirty: 2 } })), "agent");
         assert.equal(nextActor(thread({ run: { ahead: 1 } })), "agent");
+        // A worktree of its folder that holds it is agent work, beside the folder's own counts.
+        assert.equal(
+            nextActor(
+                thread({ run: { worktrees: [{ path: "/work/digest", dirty: 0, unpushed: 2 }] } }),
+            ),
+            "agent",
+        );
+        assert.equal(
+            nextActor(
+                thread({ run: { worktrees: [{ path: "/work/digest", dirty: 0, unpushed: 0 }] } }),
+            ),
+            "none",
+            "a worktree with no work is not agent work",
+        );
         assert.equal(nextActor(thread({ run: { shift: "running" } })), "agent");
         assert.equal(nextActor(thread({ run: { shift: "summary" } })), "agent");
         assert.equal(nextActor(thread({ run: { busy: false, lastUserEntry: 6 } })), "odrade");
@@ -770,6 +822,24 @@ describe("closeoutKey", () => {
 
         assert.equal(closeoutKey(one), undefined);
         assert.equal(closeoutKey(two), "closeout:k:frostyard/test#1,frostyard/test#2");
+    });
+
+    test("a working session, or one not seen idle yet, gets no close-out wake-up", () => {
+        assert.equal(
+            closeoutKey(thread({ prs: prs("MERGED"), run: { busy: true } })),
+            undefined,
+            "the wake-up would land in the middle of a turn",
+        );
+        assert.equal(
+            closeoutKey(thread({ prs: prs("MERGED"), run: { busy: undefined } })),
+            undefined,
+            "not seen idle yet",
+        );
+        assert.equal(
+            closeoutKey(thread({ prs: prs("MERGED"), run: { busy: false } })),
+            "closeout:k:frostyard/test#1",
+            "an idle session gets the key",
+        );
     });
 
     test("a PR detached after the wake-up gives no new key and no hold", () => {
@@ -1910,6 +1980,125 @@ describe("parseStatus", () => {
 
         assert.deepEqual(parseStatus(text), { dirty: 2, ahead: 2, branch: "main" });
         assert.deepEqual(parseStatus(""), { dirty: 0, ahead: 0 });
+    });
+});
+
+describe("parseWorktrees", () => {
+    test("the main worktree, a linked one, a detached one, and a bare one", () => {
+        const text = [
+            "worktree /work/main",
+            "HEAD aaa111",
+            "branch refs/heads/main",
+            "",
+            "worktree /work/linked",
+            "HEAD bbb222",
+            "branch refs/heads/desk-hold-open",
+            "",
+            "worktree /work/detached",
+            "HEAD ccc333",
+            "detached",
+            "",
+            "worktree /work/bare",
+            "bare",
+            "",
+        ].join("\n");
+
+        assert.deepEqual(parseWorktrees(text), [
+            { path: "/work/main", branch: "main" },
+            { path: "/work/linked", branch: "desk-hold-open" },
+            { path: "/work/detached", detached: true },
+            { path: "/work/bare", bare: true },
+        ]);
+    });
+
+    test("the last block needs no blank line after it, and empty text is no worktree", () => {
+        const text = [
+            "worktree /work/main",
+            "HEAD aaa111",
+            "branch refs/heads/main",
+            "",
+            "worktree /work/linked",
+            "HEAD bbb222",
+            "branch refs/heads/digest",
+        ].join("\n");
+
+        assert.deepEqual(
+            parseWorktrees(text).map((each) => each.path),
+            ["/work/main", "/work/linked"],
+        );
+        assert.deepEqual(parseWorktrees(""), []);
+    });
+});
+
+describe("assignWorktrees", () => {
+    const owned = (id: string, startedAt: number, patch: Partial<Thread> = {}): Thread =>
+        thread({ id, key: `k-${id}`, startedAt, ...patch });
+    const worktree = (patch: Partial<WorktreeFact> = {}): WorktreeFact => ({
+        path: "/work/linked",
+        branch: "digest",
+        created: 150,
+        dirty: 0,
+        unpushed: 0,
+        ...patch,
+    });
+
+    test("the newest thread at or before the branch's start holds it", () => {
+        const threads = [owned("T1", 100), owned("T2", 200)];
+        const held = assignWorktrees(threads, "/work/test", [worktree({ dirty: 2 })], new Set());
+
+        assert.deepEqual([...held.keys()], ["T1"]);
+        assert.equal(held.get("T1")?.[0]?.dirty, 2);
+
+        // The branch started after every thread: no thread made it.
+        assert.equal(
+            assignWorktrees(threads, "/work/test", [worktree({ created: 50, dirty: 2 })], new Set())
+                .size,
+            0,
+        );
+
+        // No known start: it holds no thread, whatever its work.
+        assert.equal(
+            assignWorktrees(
+                threads,
+                "/work/test",
+                [worktree({ created: undefined, dirty: 2 })],
+                new Set(),
+            ).size,
+            0,
+        );
+    });
+
+    test("a clean worktree, a done branch, and a thread of another folder hold nothing", () => {
+        const threads = [owned("T1", 100)];
+
+        assert.equal(
+            assignWorktrees(threads, "/work/test", [worktree()], new Set()).size,
+            0,
+            "clean and nothing unpushed: not work",
+        );
+        assert.equal(
+            assignWorktrees(threads, "/work/test", [worktree({ unpushed: 1 })], new Set()).size,
+            1,
+            "unpushed commits alone are work",
+        );
+        assert.equal(
+            assignWorktrees(threads, "/work/test", [worktree({ dirty: 1 })], new Set(["digest"]))
+                .size,
+            0,
+            "a merged or closed PR's branch holds no thread",
+        );
+        assert.equal(
+            assignWorktrees(threads, "/work/other", [worktree({ dirty: 1 })], new Set()).size,
+            0,
+            "a thread of another folder does not hold it",
+        );
+    });
+
+    test("a closed thread holds nothing: the older open thread holds it", () => {
+        const threads = [owned("T1", 100), owned("T2", 200, { state: "closed" })];
+        const held = assignWorktrees(threads, "/work/test", [worktree({ dirty: 1 })], new Set());
+
+        assert.deepEqual([...held.keys()], ["T1"]);
     });
 });
 
@@ -4869,6 +5058,38 @@ async function sweptAfter(thread: Thread, after: unknown): Promise<void> {
     );
 }
 
+/**
+ * A conversation that stands in for a subagent of `id`: Pocket's registry names it `helper`, as `subagent` does when Pi
+ * spawns one.
+ */
+async function spawnFakeSubagent(id: ConversationId): Promise<ConversationId> {
+    const folder = join(root, `subagent-${String(id)}`);
+
+    mkdirSync(folder, { recursive: true });
+    const child = await newSession(app, folder);
+
+    await app.harness.commit(async (tx) => {
+        const registry = await tx.doc(SubagentsDoc, id);
+
+        registry.agents.helper = { conversationId: child, reported: [] };
+    }, context);
+
+    return child;
+}
+
+/** Pocket's sign that a subagent works: a run on its conversation. */
+async function setSubagentWorking(child: ConversationId, working: boolean): Promise<void> {
+    await app.harness.commit(async (tx) => {
+        const live = await tx.doc(LiveDoc, child);
+
+        if (working) {
+            live.run = { taskId: "desk-subagent-run" as TaskId, inputs: [] };
+        } else {
+            delete live.run;
+        }
+    }, context);
+}
+
 /** Remove the usable OKs: a cap test must not spend an OK that another test left. */
 async function clearGrants(): Promise<void> {
     await app.harness.commit(async (tx) => {
@@ -5208,6 +5429,36 @@ describe("the desk in a Pi Pocket", () => {
             by: "sweep",
         });
         assert.equal(after?.run.next, "none");
+    });
+
+    test("a thread does not close while a subagent of its session works, and waits on its agent", async () => {
+        const { source, linked, thread } = await delegated("subagent-hold");
+
+        await until(() => !app.isBusy(linked), "the linked session to settle", 20_000);
+
+        const child = await spawnFakeSubagent(linked);
+
+        await setSubagentWorking(child, true);
+        // The agent reports in its last turn: without the subagent, the next sync would close the thread as done.
+        await say(app, linked, "report to supervisor test");
+        await until(() => !app.isBusy(linked), "the report's turn to settle", 20_000);
+        await say(app, source, "desk sync test");
+
+        const held = (await deskState())?.threads[thread.id];
+
+        assert.equal(held?.state, "open", "a working subagent keeps the thread open");
+        assert.equal(held?.run.busy, true, "the sweep counts the idle session as working");
+        assert.equal(held?.run.next, "agent", "the thread waits on its agent");
+
+        // The subagent stops: the next sync closes the thread as done, as it would have before.
+        await setSubagentWorking(child, false);
+        await say(app, source, "desk sync test");
+
+        const after = (await deskState())?.threads[thread.id];
+
+        assert.equal(after?.state, "closed");
+        assert.equal(after?.closed?.why, "done");
+        assert.equal(after?.run.busy, false);
     });
 
     test("a dirty folder keeps its thread open, and the agent is next", async () => {
