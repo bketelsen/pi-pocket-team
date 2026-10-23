@@ -1,6 +1,7 @@
 # Daily audit of pi-pocket-team operations: design
 
-Status: design, for Brian's review (desk thread T108). Nothing here is installed or turned on.
+Status: design, decided by Brian on 2026-10-23 (desk thread T108, asks T108a and T108b; Section 11).
+Nothing here is installed or turned on.
 
 The daily audit reads one day of the team's work and gives Brian at most 5 small proposals, each
 backed by facts. It reads, counts and compares. It never changes anything. Mechanical checks do the
@@ -53,7 +54,7 @@ The pipeline, as the audit sees it:
 | `x.desk.reports` deltas                                              | every report, not only the last 10 a session keeps                                                                                                        | Report text is read to compare, never copied out.                                                                                                       |
 | `entries` (transcripts)                                              | fixed patterns only: `Desk queue:` user entries, tool results with `isError`, `usage.cost.total`                                                          | No free reading of transcripts by the LLM.                                                                                                              |
 | `x.night-shift.goal`, `x.team.identity`, `tasks` (`pocket.schedule`) | materialized documents and task records                                                                                                                   |                                                                                                                                                         |
-| `~/projects/odrade`                                                  | `git log`, `git status --porcelain`, the file list of `reports/`, `README.md`                                                                             | Odrade's folder; read, never written.                                                                                                                   |
+| `~/projects/odrade`                                                  | `git log`, `git status --porcelain`, the file list of `reports/`, `README.md`                                                                             | Odrade's folder; read. The audit writes only its own report folder there (Section 7).                                                                   |
 | GitHub                                                               | `gh search prs --author frostyard-machines`, 1 GraphQL query per 40 PRs, check runs of each repair's commit, `repos/:r` for settings                      | About 10 to 20 calls a day.                                                                                                                             |
 | `~/.pi-pocket/extensions/*.ts`                                       | file modification time only                                                                                                                               | The install time for rule 4.                                                                                                                            |
 
@@ -194,20 +195,24 @@ The JSON keeps every finding, so the next day can say what is new, what repeats,
 
 ## 7. Where it runs, when, and on which model
 
-**Recommended: a script and a Pocket schedule.**
+**Decided: a script and a Pocket schedule.**
 
 - The script `audit/daily.mjs` in this repository (the trial script, cleaned up, with tests on
-  fixtures in the style of `PI_POCKET_TEAM_AGENTS`). It writes
-  `~/.local/state/pi-pocket-audit/YYYY-MM-DD.json`. It is not a drop-in: it adds nothing to the
-  running server, and no restart or module switch is needed.
+  fixtures in the style of `PI_POCKET_TEAM_AGENTS`). It writes the day's JSON to
+  `/var/home/bjk/projects/odrade/reports/YYYY-MM-DD-daily-audit/findings.json`, and the day before's
+  JSON is read from the same place for "new, repeating, gone". It is not a drop-in: it adds nothing
+  to the running server, and no restart or module switch is needed.
 - 1 dedicated session, "Daily audit", with 1 Pocket schedule: `every day 6:30`
-  (America/New_York; 10:30 UTC, outside DeepSeek's peak hours, and 1 hour before Odrade's 07:30
-  digest). The scheduled message tells Pi to run the script, do the LLM steps on its JSON, write
-  `YYYY-MM-DD.md` beside the JSON, and end with 1 line.
-- Model: `deepseek/deepseek-flash` (Brian's execution model), or `anthropic/claude-haiku-5-5`. The
-  session is small and new each day (Pi compacts it), so the cost stays low.
-- Odrade reads the day's report at the 07:30 digest and files what Brian should decide as desk
-  asks. The audit never files an ask itself.
+  (America/New_York: 10:30 UTC, outside DeepSeek's peak window, and 1 hour before Odrade's 07:30
+  brief). The scheduled message tells Pi to run the script, do the LLM steps on its JSON, write
+  the report to `/var/home/bjk/projects/odrade/reports/YYYY-MM-DD-daily-audit/README.md`, and end
+  with 1 line.
+- Model: `deepseek/deepseek-flash` for the LLM steps (T108b). The session is small and new each
+  day (Pi compacts it), so the cost stays low.
+- The audit writes only that folder. It does not commit it, and it does not edit Odrade's
+  `README.md` index: Odrade commits the folder with her digest.
+- Odrade reads the day's report and brings its proposals to Brian in the 07:30 brief; she files
+  what he must decide as desk asks. The audit never files an ask itself.
 
 Rejected for now:
 
@@ -232,28 +237,32 @@ that.
 - Change the server, a setting, a module, a schedule, the desk, a thread, an ask, or any data.
 - Restart Pocket, or turn a module on or off.
 - Write to GitHub: no comment, label, review, merge, branch delete or setting.
-- Write in `~/projects/odrade` or in any other repository; commit or push.
+- Write outside its day's folder `odrade/reports/YYYY-MM-DD-daily-audit/`; write in any
+  repository; commit or push.
 - Send a message to an agent or to Odrade; file a desk ask.
 - Put secrets, tokens, environment values, prompts or full report texts in its report.
 - Read a transcript with the LLM, or let the LLM pick a model, an owner or a size.
 
 ## 10. Roll-out
 
-1. Brian decides the open points (Section 11).
+1. Brian decided the open points on 2026-10-23 (Section 11).
 2. A PR turns the trial into `audit/daily.mjs` with fixture tests (`npm test`), and adds the
    missing checks (A5, B2, F3, G1 late, H3 idle, I2, J1 baseline).
 3. Brian makes the session and the schedule (or tells Odrade to). 1 week of reports, then he
    decides whether to keep it, and whether the thresholds stay.
 
-## 11. Decisions for Brian
+## 11. Brian's decisions (2026-10-23)
 
-1. **Where the report goes:** (a) `~/.local/state/pi-pocket-audit/` and Odrade reads it at 07:30
-   (recommended), (b) Odrade's `reports/` folder, or (c) a desk ask thread each day.
-2. **The model for the LLM step:** `deepseek/deepseek-flash` (recommended) or
-   `anthropic/claude-haiku-5-5`.
-3. **The time:** 06:30 America/New_York (recommended), or after the 20:00 muster.
-4. **Who owns the audit:** Sheeana (the code and the thresholds) with Odrade (the reading), as
-   proposed.
+1. **Where the report goes (T108a):** Odrade's folder,
+   `/var/home/bjk/projects/odrade/reports/YYYY-MM-DD-daily-audit/README.md`, with
+   `findings.json` beside it.
+2. **The model and the time (T108b):** the LLM steps run on `deepseek/deepseek-flash`, daily at
+   06:30 EDT (10:30 UTC, outside DeepSeek's peak window).
+3. **Owners:** Sheeana owns the code and the thresholds. Odrade reads the report and brings the
+   proposals to Brian in the 07:30 brief.
+4. **T108c (branch cleanup):** done on 2026-10-23. The bot deleted the 36 head branches of merged
+   bot PRs from the trial (check H1). The setting "Automatically delete head branches" stays
+   Brian's; his commands are in Odrade's `reports/2026-10-23-daily-audit/branch-cleanup.md`.
 
 ## Appendix A: trial run 2026-10-23 (72 hours)
 
