@@ -61,6 +61,7 @@ import {
     asleep,
     buildQuery,
     checksState,
+    transientGitHub,
     capView,
     chatGrants,
     clearWatch,
@@ -2075,6 +2076,49 @@ describe("repair wake-up: GitHub facts", () => {
         assert.deepEqual(eight?.failing, [...eight!.failing].sort());
         assert.equal(nine?.head, "", "no commit: no head");
         assert.deepEqual(nine?.failing, []);
+    });
+
+    test("transientGitHub: an empty or cut answer, or a gateway error, gets 1 more try", () => {
+        const failed = (stderr: string, more: object = {}) => ({
+            code: 1,
+            stdout: "",
+            stderr,
+            ...more,
+        });
+
+        for (const stderr of [
+            "unexpected end of JSON input",
+            "gh: unexpected EOF",
+            "HTTP 502: Bad Gateway (https://api.github.com/graphql)",
+            "HTTP 504: Gateway Timeout",
+            "read tcp: connection reset by peer",
+        ]) {
+            assert.equal(transientGitHub(failed(stderr)), true, stderr);
+        }
+
+        assert.equal(transientGitHub(failed("HTTP 401: Bad credentials")), false);
+        assert.equal(
+            transientGitHub(
+                failed("gh: Could not resolve to a PullRequest with the number of 1097."),
+            ),
+            false,
+        );
+        assert.equal(
+            transientGitHub(failed("unexpected end of JSON input", { stdout: '{"data":{}}' })),
+            false,
+            "a partial answer has data",
+        );
+        assert.equal(
+            transientGitHub(failed("unexpected end of JSON input", { killed: true })),
+            false,
+            "the 60-second limit",
+        );
+        assert.equal(
+            transientGitHub(failed("", { stderr: Buffer.from("unexpected end of JSON input") })),
+            true,
+        );
+        assert.equal(transientGitHub(null), false);
+        assert.equal(transientGitHub(new Error("spawn gh ENOENT")), false);
     });
 
     test("a cancelled run that a newer run of the same check replaced is not a failure (updex#457)", () => {
@@ -4954,6 +4998,41 @@ describe("the desk in a Pi Pocket", () => {
                 (await modelTexts(app, source)).join("\n"),
                 /Skipped roster names: pi-pocket-team/,
             );
+        } finally {
+            process.env.PI_POCKET_DESK_GH = fakeGh;
+        }
+    });
+
+    test("a GitHub read cut short is tried 1 more time, and the second answer counts", async () => {
+        const source = await supervisor("github-flaky");
+        const flakyGh = join(root, "flaky-gh.sh");
+        const calls = join(root, "flaky-calls");
+
+        rmSync(calls, { force: true });
+        // The first call fails as `gh` does when GitHub's answer is empty; the next ones answer.
+        writeFileSync(
+            flakyGh,
+            [
+                "#!/bin/sh",
+                `echo x >> ${JSON.stringify(calls)}`,
+                `if [ "$(wc -l < ${JSON.stringify(calls)})" -eq 1 ]; then`,
+                '  echo "unexpected end of JSON input" >&2',
+                "  exit 1",
+                "fi",
+                `cat ${JSON.stringify(fixturePath)}`,
+                "",
+            ].join("\n"),
+        );
+        chmodSync(flakyGh, 0o755);
+        process.env.PI_POCKET_DESK_GH = flakyGh;
+
+        try {
+            await say(app, source, "desk sync test");
+
+            const github = (await deskState())?.github;
+
+            assert.equal(github?.ok, true, github?.error);
+            assert.equal(readFileSync(calls, "utf8").split("\n").filter(Boolean).length, 2);
         } finally {
             process.env.PI_POCKET_DESK_GH = fakeGh;
         }
