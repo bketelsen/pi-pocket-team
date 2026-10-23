@@ -739,6 +739,13 @@ export default function setup(pocket) {
                         : null
                 }
                 ${
+                    view.github && (view.github.incomplete ?? []).length > 0
+                        ? html`<p class="small desk-warn">
+                              GitHub read incomplete: ${view.github.incomplete.join(", ")}
+                          </p>`
+                        : null
+                }
+                ${
                     capInfo.full
                         ? html`<div class="desk-full" role="status">
                               <p>The desk is full. New delegations wait for your OK.</p>
