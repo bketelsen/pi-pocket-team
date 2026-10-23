@@ -86,6 +86,7 @@ import {
     attribute,
     asleep,
     buildQuery,
+    buildPageQuery,
     checksState,
     transientGitHub,
     capView,
@@ -2408,6 +2409,43 @@ describe("buildQuery", () => {
             assert.throws(() => buildQuery([], [ref]), /Not a PR ref/, ref);
         }
     });
+
+    test("the open PRs say their total, and whether more pages follow", () => {
+        const query = buildQuery(["frostyard/test"], []);
+
+        assert.match(
+            query,
+            /pullRequests\(states: OPEN, first: 50[^\n]*\) \{\n\s+totalCount\n\s+pageInfo \{ hasNextPage endCursor \}\n\s+nodes \{/,
+        );
+    });
+});
+
+describe("buildPageQuery", () => {
+    test("one repository's next page of open PRs, after a cursor", () => {
+        const query = buildPageQuery("frostyard/test", "Y3Vyc29yOnYyOpK5MjAyNg==");
+
+        assert.match(query, /^query \{/);
+        assert.match(query, /r0: repository\(owner: "frostyard", name: "test"\)/);
+        assert.match(
+            query,
+            /pullRequests\(states: OPEN, first: 50, after: "Y3Vyc29yOnYyOpK5MjAyNg=="/,
+        );
+        assert.match(query, /totalCount/);
+        assert.match(query, /pageInfo \{ hasNextPage endCursor \}/);
+        assert.match(query, /contexts\(first: 100\) \{ totalCount nodes/);
+    });
+
+    test("refuses a cursor or a name that is not strict", () => {
+        for (const after of ["", "a b", 'x" } query {', "a\nb", "-x"]) {
+            assert.throws(
+                () => buildPageQuery("frostyard/test", after),
+                /Not a GitHub cursor/,
+                after,
+            );
+        }
+
+        assert.throws(() => buildPageQuery("frostyard", "abc"), /Not a repository name/);
+    });
 });
 
 describe("parseGitHub", () => {
@@ -2499,6 +2537,73 @@ describe("parseGitHub", () => {
         assert.deepEqual(facts.repos["o/r"], { archived: false, open: [] });
         assert.equal(facts.viewer, "");
     });
+
+    test("a repository that has more pages left is incomplete", () => {
+        const facts = parseGitHub({
+            data: {
+                viewer: { login: "github-viewer" },
+                r0: {
+                    nameWithOwner: "frostyard/test",
+                    isArchived: false,
+                    pullRequests: {
+                        totalCount: 60,
+                        pageInfo: { hasNextPage: true, endCursor: "Y3Vyc29y" },
+                        nodes: [
+                            { number: 7, state: "OPEN" },
+                            { number: 8, state: "OPEN" },
+                        ],
+                    },
+                },
+            },
+        });
+
+        assert.deepEqual(facts.incomplete, ["frostyard/test: 2 of 60 open PRs read"]);
+        assert.equal(facts.repos["frostyard/test"]?.page?.hasNextPage, true);
+        assert.equal(facts.repos["frostyard/test"]?.page?.endCursor, "Y3Vyc29y");
+        assert.equal(facts.repos["frostyard/test"]?.page?.totalCount, 60);
+    });
+
+    test("a PR whose checks GitHub cut is incomplete", () => {
+        const nodes = Array.from({ length: 30 }, (_, index) => ({
+            __typename: "CheckRun",
+            name: `job-${String(index).padStart(2, "0")}`,
+            conclusion: "SUCCESS",
+        }));
+        const facts = parseGitHub({
+            data: {
+                viewer: { login: "github-viewer" },
+                r0: {
+                    nameWithOwner: "frostyard/test",
+                    isArchived: false,
+                    pullRequests: {
+                        totalCount: 1,
+                        pageInfo: { hasNextPage: false, endCursor: null },
+                        nodes: [
+                            {
+                                number: 12,
+                                state: "OPEN",
+                                commits: {
+                                    nodes: [
+                                        {
+                                            commit: {
+                                                statusCheckRollup: {
+                                                    state: "FAILURE",
+                                                    contexts: { totalCount: 45, nodes },
+                                                },
+                                            },
+                                        },
+                                    ],
+                                },
+                            },
+                        ],
+                    },
+                },
+            },
+        });
+
+        assert.deepEqual(facts.incomplete, ["frostyard/test#12: 30 of 45 checks read"]);
+        assert.equal(facts.repos["frostyard/test"]?.open[0]?.checks, "FAILURE");
+    });
 });
 
 describe("prNext", () => {
@@ -2527,7 +2632,7 @@ describe("repair wake-up: GitHub facts", () => {
 
         assert.match(
             query,
-            /commit \{ oid statusCheckRollup \{ state contexts\(first: 30\) \{ totalCount nodes/,
+            /commit \{ oid statusCheckRollup \{ state contexts\(first: 100\) \{ totalCount nodes/,
         );
         assert.match(query, /\.\.\. on CheckRun \{ name conclusion status startedAt \}/);
         assert.match(query, /\.\.\. on StatusContext \{ context state \}/);
@@ -4941,6 +5046,39 @@ const githubFixture = (
         },
     },
 });
+
+/**
+ * A `gh api graphql` answer for frostyard/pilothouse's open PRs, for 1 page of them: the PRs (all dependabot's), their
+ * total, and the cursor of the page that follows. No cursor means no page follows.
+ */
+const pagedFixture = (numbers: number[], page: { total: number; cursor?: string }) => ({
+    data: {
+        viewer: { login: "github-viewer" },
+        r0: {
+            nameWithOwner: "frostyard/pilothouse",
+            isArchived: false,
+            pullRequests: {
+                totalCount: page.total,
+                pageInfo: {
+                    hasNextPage: page.cursor !== undefined,
+                    endCursor: page.cursor ?? null,
+                },
+                nodes: numbers.map((number) => ({
+                    number,
+                    title: `PR ${String(number)}`,
+                    url: `https://github.com/frostyard/pilothouse/pull/${String(number)}`,
+                    state: "OPEN",
+                    isDraft: false,
+                    createdAt: new Date().toISOString(),
+                    headRefName: `pr-${String(number)}`,
+                    mergeable: "MERGEABLE",
+                    reviewDecision: "APPROVED",
+                    author: { login: "dependabot[bot]" },
+                })),
+            },
+        },
+    },
+});
 /** The app's clock is this far ahead: the sweeper test moves it past its sleep. */
 let shift = 0;
 
@@ -6112,6 +6250,99 @@ describe("the desk in a Pi Pocket", () => {
 
             assert.equal(github?.ok, true, github?.error);
             assert.equal(readFileSync(calls, "utf8").split("\n").filter(Boolean).length, 2);
+        } finally {
+            process.env.PI_POCKET_DESK_GH = fakeGh;
+        }
+    });
+
+    test("a repository with more open PRs than one page is read to its last page", async () => {
+        const source = await supervisor("github-pages");
+        const firstPath = join(root, "pages-first.json");
+        const secondPath = join(root, "pages-second.json");
+        const pagedGh = join(root, "pages-gh.sh");
+
+        // Page 1 says a page follows; the query with `after:` in it gets page 2, which is the last.
+        writeFileSync(
+            firstPath,
+            JSON.stringify(pagedFixture([501], { total: 2, cursor: "CURSOR1" })),
+        );
+        writeFileSync(secondPath, JSON.stringify(pagedFixture([502], { total: 2 })));
+        writeFileSync(
+            pagedGh,
+            [
+                "#!/bin/sh",
+                'case "$*" in',
+                `  *after:*) cat ${JSON.stringify(secondPath)} ;;`,
+                `  *) cat ${JSON.stringify(firstPath)} ;;`,
+                "esac",
+                "",
+            ].join("\n"),
+        );
+        chmodSync(pagedGh, 0o755);
+        process.env.PI_POCKET_DESK_GH = pagedGh;
+
+        try {
+            await say(app, source, "desk sync test");
+
+            const state = await deskState();
+
+            assert.equal(
+                state?.others?.["frostyard/pilothouse"],
+                2,
+                "the PRs of both pages are read",
+            );
+            assert.equal(state?.github?.ok, true, state?.github?.error);
+            assert.equal(state?.github?.incomplete, undefined, "no page was left unread");
+        } finally {
+            process.env.PI_POCKET_DESK_GH = fakeGh;
+        }
+    });
+
+    test("a follow-up page that fails marks the repository incomplete, and the sweep keeps its facts", async () => {
+        const source = await supervisor("github-page-fail");
+        const firstPath = join(root, "page-fail-first.json");
+        const failingPageGh = join(root, "page-fail-gh.sh");
+
+        writeFileSync(
+            firstPath,
+            JSON.stringify(pagedFixture([501], { total: 2, cursor: "CURSOR1" })),
+        );
+        writeFileSync(
+            failingPageGh,
+            [
+                "#!/bin/sh",
+                'case "$*" in',
+                '  *after:*) echo "HTTP 401: Bad credentials" >&2 ; exit 1 ;;',
+                `  *) cat ${JSON.stringify(firstPath)} ;;`,
+                "esac",
+                "",
+            ].join("\n"),
+        );
+        chmodSync(failingPageGh, 0o755);
+        process.env.PI_POCKET_DESK_GH = failingPageGh;
+
+        try {
+            await say(app, source, "desk sync test");
+
+            const github = (await deskState())?.github;
+
+            assert.equal(github?.ok, true, github?.error);
+            assert.equal(github?.incomplete?.length, 1);
+            assert.match(
+                github?.incomplete?.[0] ?? "",
+                /^frostyard\/pilothouse: 1 of 2 open PRs read \(exit code 1: HTTP 401: Bad credentials\)$/,
+            );
+            assert.equal(
+                (await deskState())?.others?.["frostyard/pilothouse"],
+                1,
+                "the page that was read is kept",
+            );
+
+            await say(app, source, "desk list test");
+            assert.match(
+                (await modelTexts(app, source)).join("\n"),
+                /GitHub read incomplete: frostyard\/pilothouse: 1 of 2 open PRs read/,
+            );
         } finally {
             process.env.PI_POCKET_DESK_GH = fakeGh;
         }
