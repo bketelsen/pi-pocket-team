@@ -387,6 +387,14 @@ export default function setup(pocket) {
                 .filter(Boolean)
                 .join(" · ");
 
+        /** How a closed thread ended, as a short label; an old record has no outcome, and shows nothing extra. */
+        const outcomeOf = (thread) =>
+            thread.state === "closed" && thread.closed?.outcome
+                ? html`<span class="desk-outcome ${thread.closed.outcome}"
+                      >${thread.closed.outcome}</span
+                  >`
+                : null;
+
         const row = (thread, actions) =>
             html`<li class="desk-row">
                 <button
@@ -399,6 +407,7 @@ export default function setup(pocket) {
                         <span class="desk-id">${thread.id}</span>
                         ${fresh(thread) ? html`<span class="desk-new">new</span>` : null}
                         <span class="desk-title">${thread.title}</span>
+                        ${outcomeOf(thread)}
                     </span>
                     <span class="small muted"> ${factsOf(thread)} </span>
                     ${
@@ -728,6 +737,13 @@ export default function setup(pocket) {
                                   hour: "2-digit",
                                   minute: "2-digit",
                               })}: ${view.github.error ?? "unknown error"}
+                          </p>`
+                        : null
+                }
+                ${
+                    view.github && (view.github.incomplete ?? []).length > 0
+                        ? html`<p class="small desk-warn">
+                              GitHub read incomplete: ${view.github.incomplete.join(", ")}
                           </p>`
                         : null
                 }

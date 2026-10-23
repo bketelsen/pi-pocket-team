@@ -11,6 +11,9 @@
  * The truth is two documents. `x.desk.threads` is app-wide. `x.desk.reports` holds one thread session's reports, on
  * that session. They are stored data: never rename a kind or change what a field means; add fields beside them.
  *
+ * Desk news goes to the supervisor in a digest: 1 message at most once in each interval (`x.desk.digest`), except the
+ * kinds that go at once. An interval of 0 minutes turns it off, and every path works as it did before it.
+ *
  * Other modules find this one through `globalThis[Symbol.for("pi-pocket-team.desk")]`, never through an import: an
  * import would keep a stale copy after a reload. With this module off, Team and Night shift work as before.
  */
@@ -35,6 +38,7 @@ import {
     type Cursor,
     type DocumentReader,
     type EntryId,
+    LiveDoc,
     type TaskRuntime,
     type Tx,
 } from "@earendil-works/pi-durable";
@@ -55,6 +59,8 @@ const MAX_LINE = 200;
 const KEPT_EVENTS = 50;
 /** Events shown by `desk read`. */
 const SHOWN_EVENTS = 10;
+/** A `desk send` message's limit. */
+const MAX_SEND = 2000;
 /** Reports kept for one thread session, newest first. */
 const KEPT_REPORTS = 10;
 /** PR refs and branches kept on a thread. */
@@ -72,6 +78,10 @@ export const SWEEP_SLEEP_MS = 10 * 60_000;
 export const FOUND_FOLDER_DELAY_MS = 5 * 60_000;
 /** A branch name that may go into a git command. */
 const BRANCH_NAME = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,200}$/;
+/** A worktree that git refused to remove waits this long before the sweep tries again. */
+const WORKTREE_RETRY_MS = 24 * 3600_000;
+/** A closed thread keeps its worktree this long: a thread can reopen, and a person can send to its session later. */
+const WORKTREE_GRACE_MS = 24 * 3600_000;
 
 // ─── Stored state ────────────────────────────────────────────────────────────
 
@@ -131,6 +141,12 @@ export type Watch = {
     result?: { at: number; by: string; pass: boolean; text: string; key: string };
 };
 
+/**
+ * How a thread that closed as done ended: `completed` (every PR merged, or no PR), `abandoned` (a PR closed
+ * unmerged), `frozen` (a PR, or the repository, is archived), or `verified` (a watch passed).
+ */
+export type CloseOutcome = "completed" | "abandoned" | "verified" | "frozen";
+
 /** One piece of work the team runs. Stored data: never rename a field or change what it means. */
 export type Thread = {
     /** "T13" for a delegated, seeded, or asked thread; "F2" for a found one. */
@@ -145,6 +161,13 @@ export type Thread = {
     /** A roster repository name, such as "frostyard/frostmail". */
     repo?: string;
     cwd?: string;
+    /**
+     * The git worktree this delegation works in, when `team_delegate` made one: `path` is the folder the session starts
+     * in, `branch` its branch (the agent may rename it), and `checkout` the main checkout it came from. A sweep removes
+     * the worktree 24 hours after the thread closes (`WORKTREE_GRACE_MS`), so a thread that reopens keeps its folder, and
+     * keeps one with changes or untracked files.
+     */
+    worktree?: { path: string; branch: string; checkout: string };
     /** The supervisor session's conversation id. */
     supervisor?: number;
     /** The linked session's conversation id. */
@@ -155,7 +178,13 @@ export type Thread = {
     startedAt: number;
     lastEventAt: number;
     keptAt?: number;
-    closed?: { at: number; why: "done" | "dropped" | "failed"; by: "sweep" | "brian" | "desk" };
+    closed?: {
+        at: number;
+        why: "done" | "dropped" | "failed";
+        by: "sweep" | "brian" | "desk";
+        /** How it ended, when `why` is "done"; an older record has none. Stored data: never rename a field. */
+        outcome?: CloseOutcome;
+    };
     /** Key "owner/name#n". */
     prs: Record<string, PrLink>;
     branches: string[];
@@ -165,13 +194,17 @@ export type Thread = {
     asks: Ask[];
     /**
      * Facts the sweep keeps: `returnAddress`, `reportedAt`, `reportedUserEntry`, `scanCursor`, `lastUserEntry`,
-     * `seenPrs`, `busy`, `archived`, `shift`, `dirty`, `ahead`, `folder`, `next`, `sweptAt`, `closeout` (the
-     * wake-up key that went last, so a sweep does not send it again), `closeoutEntry` (the session's newest user entry
-     * before it went: a report past it lets the thread close), `closeoutRefs` (every PR ref an earlier wake-up told the
-     * agent, sorted, at most 50: a state of only told refs is no new wake-up, so a detached PR cannot send again),
-     * `repairs` (the repair wake-ups the sweep decided, by repair key: `{ at, to, why, sent }`, at most 30),
-     * `repairCounts` (PR ref → the repair wake-ups that went to the agent: never pruned), and `unready` (the
-     * `ready-for-human` removals the sweep decided, by key `unready:<ref>:<label time>`:
+     * `seenPrs`, `busy`, `archived`, `repoArchived` (its repository is archived, as the last read saw it), `shift`, `dirty`, `ahead`, `aheadUnknown` (why the unpushed count is unknown: it
+     * is absent when the count is known, and `ahead` then keeps its last known value), `folder`, `next`, `sweptAt`,
+     * `worktrees` (the linked worktrees of its folder that hold it, `{ path, dirty, unpushed }`: a worktree of it that
+     * changed, or holds unpushed commits, keeps it open, and its work is the agent's), `closeout` (the wake-up key that
+     * went last, so a sweep does not send it again), `closeoutEntry` (the session's newest user entry before it went: a
+     * report past it lets the thread close), `closeoutRefs` (every PR ref an earlier wake-up told the agent, sorted, at
+     * most 50: a state of only told refs is no new wake-up, so a detached PR cannot send again), `repairs` (the repair
+     * wake-ups the sweep decided, by repair key: `{ at, to, why, sent }`, at most 30), `repairCounts` (PR ref → the
+     * repair wake-ups that went to the agent: never pruned), `worktreeGone` (when a sweep removed the thread's
+     * delegation worktree), `worktreeKeptAt` (when git refused to remove it: the next try waits a day), and `unready`
+     * (the `ready-for-human` removals the sweep decided, by key `unready:<ref>:<label time>`:
      * `{ at, why, to, removed, sent }`, at most 30).
      */
     run: Record<string, JsonValue>;
@@ -188,6 +221,68 @@ export type Grant = {
     /** The delegation key that used it: absent again when that start failed. */
     usedBy?: string;
     expires: number;
+};
+
+/** One kind of desk news for the digest. Stored data: never rename a kind. */
+export type DigestKind =
+    | "report"
+    | "shift"
+    | "shift-blocked"
+    | "answer"
+    | "answer-action"
+    | "closed"
+    | "queue"
+    | "repair";
+
+/** Every digest kind, in the design's order. */
+export const DIGEST_KINDS: readonly DigestKind[] = [
+    "report",
+    "shift",
+    "shift-blocked",
+    "answer",
+    "answer-action",
+    "closed",
+    "queue",
+    "repair",
+];
+
+/** One piece of desk news for the supervisor's digest. Stored data: never rename a field. */
+export type DigestItem = {
+    /** The replay key: a second enqueue of the same news is a no-op. */
+    key: string;
+    /** The thread id the news is about. */
+    thread: string;
+    kind: DigestKind;
+    /** The one line the digest shows: `shortLine`, `answeredText`, or a line of its own. */
+    line: string;
+    at: number;
+};
+
+/** One supervisor's waiting digest news. Stored data: never rename a field. */
+export type DigestBox = {
+    /** The waiting items, oldest first: 100 at most. */
+    items: DigestItem[];
+    /** The times a digest task asked for: a scheduled time covers 1 at or after it. */
+    scheduled: number[];
+    /** Thread id → the reason a digest already carried. */
+    queued: Record<string, string>;
+    /** The digests taken: its count is the last part of a request id. */
+    seq: number;
+    /** When a digest message last went. */
+    sentAt?: number;
+};
+
+/** One registered Clerk: the supervisor's long-lived desk session. Stored data: never rename a field. */
+export type Clerk = {
+    /** The Clerk session's conversation id. */
+    session: number;
+    /** The supervisor's address for the Clerk's session. */
+    address: string;
+    /** The roster id of the Clerk's profile. */
+    agent: string;
+    at: number;
+    /** The start's replay key, so its replay finds the Clerk it made: `x.team.delegate:<task>:<call>`. */
+    key?: string;
 };
 
 /** The desk's one document. Stored data: never rename the kind or change what a field means. */
@@ -207,8 +302,18 @@ export type DeskState = {
     epoch?: number;
     /** Open PRs per repository that are not ours: dependabot, and other people. */
     others?: Record<string, number>;
-    /** The last GitHub read: when, whether it worked, why not, the roster names it skipped, and the refs it lacks. */
-    github?: { at: number; ok: boolean; error?: string; skipped?: string[]; missing?: string[] };
+    /**
+     * The last GitHub read: when, whether it worked, why not, the roster names it skipped, the refs it lacks, and the
+     * parts it cut short (a repository with PRs left unread, a PR with checks left unread).
+     */
+    github?: {
+        at: number;
+        ok: boolean;
+        error?: string;
+        skipped?: string[];
+        missing?: string[];
+        incomplete?: string[];
+    };
     /**
      * What a supervisor's first sweep saw. Old work never becomes a found thread: only the seed brings it in. A folder
      * leaves `folders` when it is clean. `pending` holds the folders that have been dirty since a sweep first saw them,
@@ -218,6 +323,10 @@ export type DeskState = {
         string,
         { sessions: string[]; folders: string[]; pending?: Record<string, number> }
     >;
+    /** Each supervisor's waiting digest news, by conversation id. */
+    digests?: Record<string, DigestBox>;
+    /** Each supervisor's Clerk, by supervisor id. */
+    clerks?: Record<string, Clerk>;
 };
 
 /** The desk's threads, app-wide as `x.team.memory` is. */
@@ -228,13 +337,15 @@ export const DeskThreads = defineDoc<DeskState>({
     initial: () => ({ next: { T: 1, F: 1 }, threads: {}, grants: [], seen: {} }),
 });
 
-/** One report, as the thread's session stores it. `line` is what the supervisor's chat got. */
+/** One report, as the thread's session stores it. `line` is what the supervisor's chat got, or the digest carries. */
 export type StoredReport = {
     key: string;
     at: number;
     from: "team_message" | "night-shift";
     text: string;
     line: string;
+    /** The report went into the digest: the caller sent nothing, and a replay of its call sends nothing again. */
+    held?: boolean;
 };
 
 /** One thread session's reports, newest first, the last 10 kept. Stored data: never rename a field. */
@@ -249,6 +360,64 @@ export const DeskReports = defineDoc<DeskReportsState>({
     fork: "current",
     initial: () => ({ reports: [] }),
 });
+
+/**
+ * Pi's subagents of a conversation, read only: the ones Pi spawned, and their reports on the way to it. It is Pocket's
+ * own document, not public API: when its shape changes, reading it fails, and the sweep then counts no subagent as
+ * working (a session is idle when Pocket says so, as before). Never write it. The same definition as Night shift's.
+ */
+const SubagentsDoc = defineDoc<{
+    agents: Record<string, { conversationId: ConversationId }>;
+    /** Pocket's reporter task for each message; not read here, but part of the document's shape. */
+    reporters: Record<string, string>;
+    /** Reports not yet sent to the parent. */
+    outbox?: { name: string; text: string }[];
+    /** The batch on its way to the parent. */
+    sending?: { request: string };
+}>({
+    kind: "pocket.subagents",
+    version: 1,
+    scope: "conversation",
+    history: "latest",
+    fork: "initial",
+    // The same as Pocket's own base, `rebased` in src/server/docs.ts: not part of the stored meaning.
+    checkpointWhen: (_value, _ops, info) => info.deltasSinceBase >= 64,
+    initial: () => ({ agents: {}, reporters: {} }),
+});
+
+/**
+ * Whether a subagent of `conversationId` still works: one of them has a run, or a report of one is on its way to the
+ * session. Any failure to read Pocket's registry, or a subagent's conversation, means no subagent works.
+ */
+async function subagentsBusy(
+    read: Pick<DocumentReader, "snapshot">,
+    conversationId: ConversationId,
+    context: Context,
+): Promise<boolean> {
+    try {
+        const registry = await read.snapshot(SubagentsDoc, conversationId, context);
+
+        if (registry === undefined) {
+            return false;
+        }
+
+        if ((registry.outbox?.length ?? 0) > 0 || registry.sending !== undefined) {
+            return true;
+        }
+
+        for (const agent of Object.values(registry.agents)) {
+            const live = await read.snapshot(LiveDoc, agent.conversationId, context);
+
+            if (live?.run !== undefined) {
+                return true;
+            }
+        }
+
+        return false;
+    } catch {
+        return false;
+    }
+}
 
 // ─── Small helpers ───────────────────────────────────────────────────────────
 
@@ -308,6 +477,28 @@ export function threadOfSession(
     return Object.values(state?.threads ?? {}).find((thread) => thread.session === session);
 }
 
+/** A supervisor's Clerk, when one is registered. */
+export function clerkOf(
+    state: Readonly<DeskState> | undefined,
+    supervisor: number,
+): Clerk | undefined {
+    return state?.clerks?.[String(supervisor)];
+}
+
+/** The supervisor whose Clerk runs in a session, when that session is registered. */
+export function supervisorOfClerk(
+    state: Readonly<DeskState> | undefined,
+    session: number,
+): number | undefined {
+    for (const [supervisor, clerk] of Object.entries(state?.clerks ?? {})) {
+        if (clerk.session === session) {
+            return Number(supervisor);
+        }
+    }
+
+    return undefined;
+}
+
 /** Add an event once per key, and keep the newest 50. True when it was added. */
 function addEvent(thread: Thread, key: string, text: string, at: number): boolean {
     if (thread.events.some((event) => event.key === key)) {
@@ -333,6 +524,8 @@ export type OpenRequest = {
     agents: string[];
     repo?: string;
     cwd?: string;
+    /** The git worktree the linked session starts in, when team.ts made one. */
+    worktree?: { path: string; branch: string; checkout: string };
     title: string;
     at: number;
     /** A dated check, set with the thread: `team_delegate`'s `watch`. */
@@ -388,6 +581,7 @@ export function openThread(
         agents: [...request.agents],
         ...(request.repo === undefined ? {} : { repo: request.repo }),
         ...(request.cwd === undefined ? {} : { cwd: request.cwd }),
+        ...(request.worktree === undefined ? {} : { worktree: { ...request.worktree } }),
         supervisor: request.supervisor,
         state: "starting",
         startedAt: request.at,
@@ -927,7 +1121,12 @@ export function recordResult(
 
     if (request.pass) {
         thread.state = "closed";
-        thread.closed = { at: request.at, why: "done", by: request.closedBy };
+        thread.closed = {
+            at: request.at,
+            why: "done",
+            by: request.closedBy,
+            outcome: closeOutcome(thread),
+        };
         thread.run.next = "none";
         addEvent(
             thread,
@@ -985,19 +1184,41 @@ export function scanText(text: string): { prs: string[]; branches: string[] } {
     return { prs: [...prs], branches: [...branches] };
 }
 
-/** `git status --porcelain=v2 --branch`: the changed files, the commits ahead, and the branch name. */
-export function parseStatus(text: string): { dirty: number; ahead: number; branch?: string } {
+/**
+ * Why a folder's unpushed commit count is unknown: `git status` printed no `# branch.ab` line, the count could not be
+ * verified (`git rev-list` failed), or git could not read the folder at all.
+ */
+export type AheadUnknown =
+    "no upstream" | "detached HEAD" | "upstream gone" | "no branch" | "git status failed";
+
+/**
+ * `git status --porcelain=v2 --branch`: the changed files, the commits ahead, and the branch name. `ahead` is undefined
+ * when git printed no `# branch.ab` line, with the reason: a branch with no upstream, a detached HEAD, or an upstream
+ * that is gone is not the same as 0 unpushed commits.
+ */
+export function parseStatus(text: string): {
+    dirty: number;
+    ahead: number | undefined;
+    aheadUnknown?: AheadUnknown;
+    branch?: string;
+} {
     let dirty = 0;
-    let ahead = 0;
+    let ahead: number | undefined;
     let branch: string | undefined;
+    let detached = false;
+    let upstream = false;
 
     for (const line of text.split("\n")) {
         if (line.startsWith("# branch.head ")) {
             const name = line.slice("# branch.head ".length).trim();
 
-            if (name !== "(detached)") {
+            if (name === "(detached)") {
+                detached = true;
+            } else {
                 branch = name;
             }
+        } else if (line.startsWith("# branch.upstream ")) {
+            upstream = true;
         } else if (line.startsWith("# branch.ab ")) {
             const match = /\+(\d+) -(\d+)/.exec(line);
 
@@ -1009,10 +1230,286 @@ export function parseStatus(text: string): { dirty: number; ahead: number; branc
         }
     }
 
-    return { dirty, ahead, ...(branch === undefined ? {} : { branch }) };
+    // Git prints `# branch.upstream` without `# branch.ab` when the upstream is gone, and `# branch.head (detached)`
+    // for a detached HEAD.
+    const reason: AheadUnknown = detached
+        ? "detached HEAD"
+        : upstream
+          ? "upstream gone"
+          : branch === undefined
+            ? "no branch"
+            : "no upstream";
+
+    return {
+        dirty,
+        ahead,
+        ...(ahead === undefined ? { aheadUnknown: reason } : {}),
+        ...(branch === undefined ? {} : { branch }),
+    };
+}
+
+/**
+ * One block of `git worktree list --porcelain`: `worktree <path>`, then `HEAD`, `branch`, `detached`, or `bare`. The
+ * branch is the name after `refs/heads/`.
+ */
+export type ParsedWorktree = {
+    path: string;
+    branch?: string;
+    detached?: boolean;
+    bare?: boolean;
+};
+
+/**
+ * `git worktree list --porcelain` in blocks, in the order git gives them: the main worktree first. A block separated
+ * by a blank line, or by the next `worktree` line (the last block needs no blank line after it).
+ */
+export function parseWorktrees(text: string): ParsedWorktree[] {
+    const worktrees: ParsedWorktree[] = [];
+    let block: ParsedWorktree | undefined;
+
+    for (const line of text.split("\n")) {
+        if (line.trim() === "") {
+            block = undefined;
+            continue;
+        }
+
+        if (line.startsWith("worktree ")) {
+            block = { path: line.slice("worktree ".length).trim() };
+            worktrees.push(block);
+            continue;
+        }
+
+        if (block === undefined) {
+            continue;
+        }
+
+        if (line.startsWith("branch ")) {
+            const ref = line.slice("branch ".length).trim();
+
+            block.branch = ref.startsWith("refs/heads/") ? ref.slice("refs/heads/".length) : ref;
+        } else if (line === "detached") {
+            block.detached = true;
+        } else if (line === "bare") {
+            block.bare = true;
+        }
+    }
+
+    return worktrees.filter((each) => each.path !== "");
+}
+
+/** A worktree of a thread's folder that holds the thread, as the sweep reads it. */
+export type WorktreeFact = {
+    path: string;
+    /** The branch it holds, without `refs/heads/`. */
+    branch: string;
+    /** The branch's oldest reflog time, in ms; undefined when git did not give it. */
+    created?: number;
+    dirty: number;
+    unpushed: number;
+};
+
+/** One worktree as a thread records it: `run.worktrees`, and what `closeCheck` and `nextActor` read. */
+export type WorktreeLine = { path: string; dirty: number; unpushed: number };
+
+/**
+ * The folders that belong to a thread as its own: each open thread's folder, and each thread's delegation worktree
+ * (open or closed). Such a folder is never another thread's linked worktree.
+ */
+export function ownedWorktrees(threads: readonly Thread[]): Set<string> {
+    const owned = new Set<string>();
+
+    for (const thread of threads) {
+        const own = folderOf(thread);
+
+        if (thread.state !== "closed" && own !== undefined) {
+            owned.add(own);
+        }
+
+        if (thread.worktree !== undefined) {
+            owned.add(thread.worktree.path);
+        }
+    }
+
+    return owned;
+}
+
+/**
+ * The worktrees that hold a thread of `folder`: a map of thread id to them. A worktree holds a thread only when it has
+ * changed files or unpushed commits, its `created` is known, and its branch is not in `doneBranches` (a merged or closed
+ * PR's branch keeps commits that are on no remote, and a squash-merge leaves them: it is not work). It belongs to the 1
+ * thread that is not closed, works in `folder`, and has the newest `startedAt` at or before `created`; no such thread,
+ * and it holds none. A worktree that is a thread's own folder (an open thread's `cwd`), or the delegation worktree of
+ * any thread (`thread.worktree.path`), belongs to that thread: it holds no other thread, and the sweep reads its counts
+ * as that thread's folder.
+ */
+export function assignWorktrees(
+    threads: readonly Thread[],
+    folder: string,
+    worktrees: readonly WorktreeFact[],
+    doneBranches: ReadonlySet<string>,
+): Map<string, WorktreeFact[]> {
+    const open = threads
+        .filter((thread) => thread.state !== "closed" && folderOf(thread) === folder)
+        .sort((a, b) => b.startedAt - a.startedAt);
+    const held = new Map<string, WorktreeFact[]>();
+    const owned = ownedWorktrees(threads);
+
+    for (const worktree of worktrees) {
+        const works = worktree.dirty > 0 || worktree.unpushed > 0;
+
+        if (owned.has(worktree.path)) {
+            continue;
+        }
+
+        if (!works || worktree.created === undefined || doneBranches.has(worktree.branch)) {
+            continue;
+        }
+
+        const owner = open.find((thread) => thread.startedAt <= worktree.created!);
+
+        if (owner === undefined) {
+            continue;
+        }
+
+        held.set(owner.id, [...(held.get(owner.id) ?? []), worktree]);
+    }
+
+    return held;
+}
+
+/** The worktrees a thread records: `run.worktrees` that have work, and none when it is absent or not readable. */
+function storedWorktrees(thread: Thread): WorktreeLine[] {
+    const stored = thread.run.worktrees;
+
+    if (!Array.isArray(stored)) {
+        return [];
+    }
+
+    const lines: WorktreeLine[] = [];
+
+    for (const entry of stored) {
+        if (entry === null || typeof entry !== "object" || Array.isArray(entry)) {
+            continue;
+        }
+
+        const path = entry.path;
+        const dirty = numberOr(entry.dirty) ?? 0;
+        const unpushed = numberOr(entry.unpushed) ?? 0;
+
+        if (typeof path !== "string" || (dirty === 0 && unpushed === 0)) {
+            continue;
+        }
+
+        lines.push({ path, dirty, unpushed });
+    }
+
+    return lines;
+}
+
+/** Whether 2 lists of worktrees are the same list: the same entries, in the same order. */
+function sameWorktrees(one: readonly WorktreeLine[], two: readonly WorktreeLine[]): boolean {
+    return (
+        one.length === two.length &&
+        one.every((each, index) => {
+            const other = two[index];
+
+            return (
+                other !== undefined &&
+                each.path === other.path &&
+                each.dirty === other.dirty &&
+                each.unpushed === other.unpushed
+            );
+        })
+    );
+}
+
+/** One worktree's lines, in `closeCheck`'s words: the changed files, then the unpushed commits. */
+function worktreeLines(worktree: WorktreeLine): string[] {
+    const lines: string[] = [];
+
+    if (worktree.dirty > 0) {
+        lines.push(
+            `${String(worktree.dirty)} changed file${worktree.dirty === 1 ? "" : "s"} in ${worktree.path}`,
+        );
+    }
+
+    if (worktree.unpushed > 0) {
+        lines.push(
+            `${String(worktree.unpushed)} unpushed commit${worktree.unpushed === 1 ? "" : "s"} in ${worktree.path}`,
+        );
+    }
+
+    return lines;
+}
+
+/** The key and text of the event a thread's held worktrees get: the same work gives the same key. */
+function worktreesEvent(
+    worktrees: readonly WorktreeLine[],
+    now: number,
+): { key: string; text: string } {
+    const state = worktrees
+        .map((each) => `${each.path}:${String(each.dirty)}:${String(each.unpushed)}`)
+        .join("|");
+    const text =
+        worktrees.length === 0
+            ? "no worktree holds it"
+            : worktrees.flatMap(worktreeLines).join("; ");
+
+    return { key: `worktrees:${state}:${String(now)}`, text };
 }
 
 const CLOSED_PR = new Set(["MERGED", "CLOSED", "FROZEN"]);
+
+/**
+ * How a thread that closes as done ended, in the rules' order: a PR closed unmerged abandons it; a frozen PR, or an
+ * archived repository, freezes it; a passed watch verifies it; else every PR merged, or it had none. A guessed PR
+ * (`via: "window"`) is not the agent's work, so it counts for nothing here. Old threads keep no outcome; a new one is
+ * recorded in `thread.closed.outcome`.
+ */
+export function closeOutcome(thread: Thread): CloseOutcome {
+    const entries = ownPrs(thread);
+
+    if (entries.some(([, pr]) => pr.state === "CLOSED")) {
+        return "abandoned";
+    }
+
+    if (thread.run.repoArchived === true || entries.some(([, pr]) => pr.state === "FROZEN")) {
+        return "frozen";
+    }
+
+    if (thread.watch?.result?.pass === true) {
+        return "verified";
+    }
+
+    return "completed";
+}
+
+/** A thread's PRs that the agent made: a guessed one (`via: "window"`) is not its work. */
+function ownPrs(thread: Thread): [string, PrLink][] {
+    return Object.entries(thread.prs).filter(([, pr]) => pr.via !== "window");
+}
+
+/** The close event's text for a thread's outcome: `closeOutcome`, with the fact that gives it. */
+function closeOutcomeWords(thread: Thread): string {
+    const outcome = closeOutcome(thread);
+    const entries = ownPrs(thread);
+
+    if (outcome === "abandoned") {
+        const ref = entries.find(([, pr]) => pr.state === "CLOSED")?.[0];
+
+        return `abandoned (PR ${ref ?? "a PR"} closed unmerged)`;
+    }
+
+    if (outcome === "frozen") {
+        return "frozen (repository archived)";
+    }
+
+    if (outcome === "verified") {
+        return "verified (watch passed)";
+    }
+
+    return entries.length === 0 ? "completed (no PRs)" : "completed (all PRs merged)";
+}
 
 /** What keeps a thread's session part open, in words. Undefined when it is closed. */
 function openSession(thread: Thread): string | undefined {
@@ -1123,14 +1620,24 @@ export function closeCheck(thread: Thread, facts: CloseFacts): { close: boolean;
     if (folder !== undefined && !facts.folders.has(folder)) {
         const dirty = numberOr(thread.run.dirty) ?? 0;
         const ahead = numberOr(thread.run.ahead) ?? 0;
+        const aheadUnknown =
+            typeof thread.run.aheadUnknown === "string" ? thread.run.aheadUnknown : undefined;
 
         if (dirty > 0) {
             open.push(`${String(dirty)} changed file${dirty === 1 ? "" : "s"} in ${folder}`);
         }
 
-        if (ahead > 0) {
+        // A count the desk cannot know is not 0: the thread waits for the agent, as an unpushed commit does.
+        if (aheadUnknown !== undefined) {
+            open.push(`unpushed commits in ${folder} are unknown (${aheadUnknown})`);
+        } else if (ahead > 0) {
             open.push(`${String(ahead)} unpushed commit${ahead === 1 ? "" : "s"} in ${folder}`);
         }
+    }
+
+    // A worktree of the thread's folder that holds it: its work is not in the folder's own counts.
+    for (const worktree of storedWorktrees(thread)) {
+        open.push(...worktreeLines(worktree));
     }
 
     return { close: open.length === 0, open };
@@ -1139,11 +1646,17 @@ export function closeCheck(thread: Thread, facts: CloseFacts): { close: boolean;
 /**
  * The wake-up key of a thread that needs a close-out wake-up: `closeout:<thread.key>:<refs>`, the refs of its PRs
  * that are not guessed (`via: "window"`). Undefined when the thread is not open (parked, starting, closed), has no PR
- * that is not guessed, has such a PR still open, has no address for its agent, is archived, or when every ref in the
- * key was already told by an earlier wake-up. A new PR gives a new key, so the agent hears about it; a PR that leaves
- * the thread gives a state the agent already has, so it sends nothing.
+ * that is not guessed, has such a PR still open, has no address for its agent, is archived, when its session works or
+ * was not seen idle yet (`run.busy` is not false: the wake-up would land in the middle of a turn, and a working
+ * subagent of that session counts as the session working), or when every ref in the key was already told by an earlier
+ * wake-up. A new PR gives a new key, so the agent hears about it; a PR that leaves the thread gives a state the agent
+ * already has, so it sends nothing.
  */
 export function closeoutKey(thread: Thread): string | undefined {
+    if (thread.run.busy !== false) {
+        return undefined;
+    }
+
     const key = closeoutDue(thread);
 
     if (key === undefined) {
@@ -1821,10 +2334,21 @@ export function nextActor(thread: Thread): NextActor {
     const busy = thread.run.busy === true;
     const dirty = (numberOr(thread.run.dirty) ?? 0) > 0;
     const ahead = (numberOr(thread.run.ahead) ?? 0) > 0;
+    const aheadUnknown = typeof thread.run.aheadUnknown === "string";
+    // A worktree of the thread's folder that holds it: work of the agent, as the folder's own counts are.
+    const worktree = storedWorktrees(thread).length > 0;
     const shift = thread.run.shift;
     const shiftOpen = typeof shift === "string" && shift !== "ended";
 
-    if (busy || dirty || ahead || shiftOpen || openPrs.includes("agent")) {
+    if (
+        busy ||
+        dirty ||
+        ahead ||
+        aheadUnknown ||
+        worktree ||
+        shiftOpen ||
+        openPrs.includes("agent")
+    ) {
         return "agent";
     }
 
@@ -1849,7 +2373,9 @@ export function nextActor(thread: Thread): NextActor {
         openSession(thread) === undefined &&
         !shiftOpen &&
         !dirty &&
-        !ahead
+        !ahead &&
+        !aheadUnknown &&
+        !worktree
     ) {
         return "reviewer";
     }
@@ -1940,6 +2466,282 @@ export function waitsNeedLive(threads: Thread[]): boolean {
     return threads.some(
         (thread) => thread.address !== undefined && odradeReason(thread) === SILENT_SESSION,
     );
+}
+
+/** The digest's default interval, in minutes. */
+export const DIGEST_MINUTES = 15;
+/** The digest's interval ceiling, in minutes. */
+export const DIGEST_MAX_MINUTES = 240;
+/** The kinds that go at once, by default. */
+export const DIGEST_NOW: readonly DigestKind[] = ["shift-blocked", "answer-action", "repair"];
+/** The kinds the Clerk gets, by default: the routine news. */
+export const DIGEST_CLERK: readonly DigestKind[] = ["report", "shift", "closed", "queue"];
+/** The most items a box keeps: the oldest go first. */
+export const DIGEST_MAX_ITEMS = 100;
+/** The most item lines 1 digest message shows. */
+export const DIGEST_MAX_LINES = 30;
+
+/**
+ * The digest's setting: an interval of 0 to 240 minutes, the kinds that go at once, and the kinds the Clerk gets. A
+ * kind in `now` always goes to the supervisor.
+ */
+export type DigestConfig = { minutes: number; now: DigestKind[]; clerk: DigestKind[] };
+
+/** The known kinds in a stored value: an unknown name is left out. */
+function digestKinds(raw: readonly unknown[]): DigestKind[] {
+    return [
+        ...new Set(
+            raw.filter(
+                (kind): kind is DigestKind =>
+                    typeof kind === "string" && (DIGEST_KINDS as readonly string[]).includes(kind),
+            ),
+        ),
+    ];
+}
+
+/** The digest's setting from its stored value: a missing or bad value gives its default. */
+export function digestConfig(raw: unknown): DigestConfig {
+    const value = (raw !== null && typeof raw === "object" ? raw : {}) as {
+        minutes?: unknown;
+        now?: unknown;
+        clerk?: unknown;
+    };
+    const minutes =
+        typeof value.minutes === "number" &&
+        Number.isInteger(value.minutes) &&
+        value.minutes >= 0 &&
+        value.minutes <= DIGEST_MAX_MINUTES
+            ? value.minutes
+            : DIGEST_MINUTES;
+    // An unknown name is left out: a setting with an array is not bad, so its known names are the list.
+    const now = Array.isArray(value.now) ? digestKinds(value.now) : [...DIGEST_NOW];
+    const clerk = Array.isArray(value.clerk) ? digestKinds(value.clerk) : [...DIGEST_CLERK];
+
+    return { minutes, now, clerk };
+}
+
+/** The words that are only an acknowledgement: they name nothing for the supervisor to do. */
+const ACK_WORDS =
+    /^(?:ok|okay|yes ok|no|nope|thanks|thank you|noted|fine|later|not now|skip|seen|got it|done|answered on the desk page)$/i;
+
+/** A Desk-page answer's kind: `answer` for an acknowledgement only, else `answer-action`. */
+export function answerKind(words: string): "answer" | "answer-action" {
+    return ACK_WORDS.test(flatLine(words).replace(/[\s.!?]+$/, "")) ? "answer" : "answer-action";
+}
+
+/** The kinds that carry a report. */
+const REPORT_KINDS: readonly DigestKind[] = ["report", "shift", "shift-blocked"];
+
+/**
+ * A supervisor's box as a plain copy, with a fresh one when it is not there yet: a change goes back through
+ * `setDigestBox`, never into the copy alone.
+ */
+function digestBox(state: DeskState, supervisor: number): DigestBox {
+    const box = state.digests?.[String(supervisor)];
+
+    return {
+        items: [...(box?.items ?? [])],
+        scheduled: [...(box?.scheduled ?? [])],
+        queued: { ...(box?.queued ?? {}) },
+        seq: box?.seq ?? 0,
+        ...(box?.sentAt === undefined ? {} : { sentAt: box.sentAt }),
+    };
+}
+
+/** Write a supervisor's box back: 1 set of the whole map, so a new box and its contents persist together. */
+function setDigestBox(state: DeskState, supervisor: number, box: DigestBox): void {
+    state.digests = { ...(state.digests ?? {}), [String(supervisor)]: box };
+}
+
+/**
+ * Add 1 item to a supervisor's box, and give the time of the digest task to create: none when an item with that key is
+ * there already, or a scheduled time at or before the item's wanted time covers it. An "at once" kind wants `now`;
+ * any other wants `now` plus the interval.
+ */
+export function enqueueDigest(
+    state: DeskState,
+    supervisor: number,
+    item: DigestItem,
+    now: number,
+    config: DigestConfig,
+): number | undefined {
+    const box = digestBox(state, supervisor);
+
+    if (box.items.some((each) => each.key === item.key)) {
+        return undefined;
+    }
+
+    box.items.push(item);
+
+    if (box.items.length > DIGEST_MAX_ITEMS) {
+        box.items.splice(0, box.items.length - DIGEST_MAX_ITEMS);
+    }
+
+    const wanted = config.now.includes(item.kind) ? now : now + config.minutes * 60_000;
+    // A task at or before the wanted time takes this item too: no second task.
+    const covered = box.scheduled.some((at) => at <= wanted);
+
+    if (!covered) {
+        box.scheduled.push(wanted);
+    }
+
+    setDigestBox(state, supervisor, box);
+
+    return covered ? undefined : wanted;
+}
+
+/**
+ * The items for the threads that newly wait on the supervisor: 1 for each thread whose reason differs from the reason
+ * a digest carried already. It records each reason in `box.queued`, and deletes the threads that stopped waiting. The
+ * caller enqueues the items it gives; nothing is added to the box here.
+ */
+export function queueNews(threads: readonly Thread[], box: DigestBox, now: number): DigestItem[] {
+    const items: DigestItem[] = [];
+    const waiting = new Set<string>();
+
+    for (const thread of threads) {
+        const reason = odradeReason(thread);
+
+        if (reason === undefined) {
+            continue;
+        }
+
+        waiting.add(thread.id);
+
+        if (box.queued[thread.id] === reason) {
+            continue;
+        }
+
+        box.queued[thread.id] = reason;
+
+        items.push({
+            key: `queue:${thread.id}:${reason}`,
+            thread: thread.id,
+            kind:
+                reason.startsWith("PR ") && reason.includes("needs a repair") ? "repair" : "queue",
+            line: `[desk] ${thread.id} · waits on you: ${reason} · desk read ${thread.id}`,
+            at: now,
+        });
+    }
+
+    for (const id of Object.keys(box.queued)) {
+        if (!waiting.has(id)) {
+            delete box.queued[id];
+        }
+    }
+
+    return items.sort((a, b) => idNumber(a.thread) - idNumber(b.thread));
+}
+
+/** Put `text` before `desk read <id>` in 1 line, else at its end. */
+function putBeforeRead(line: string, text: string): string {
+    const marker = " · desk read ";
+    const index = line.indexOf(marker);
+
+    return index < 0
+        ? `${line} · ${text}`
+        : `${line.slice(0, index)} · ${text}${line.slice(index)}`;
+}
+
+/**
+ * The digest message: 1 header line, then 1 line for each item. A thread closed in this digest gets its closed line
+ * only, with the count of its reports in the same digest. At most 30 item lines; the rest are counted.
+ */
+export function digestText(items: readonly DigestItem[]): string {
+    const closed = new Set(
+        items.filter((item) => item.kind === "closed").map((item) => item.thread),
+    );
+    const reports = new Map<string, number>();
+
+    for (const item of items) {
+        if (closed.has(item.thread) && REPORT_KINDS.includes(item.kind)) {
+            reports.set(item.thread, (reports.get(item.thread) ?? 0) + 1);
+        }
+    }
+
+    const lines: string[] = [];
+
+    for (const item of items) {
+        // A closed thread's report and queue lines are inside its closed line; an answer to Brian stays.
+        if (
+            closed.has(item.thread) &&
+            item.kind !== "closed" &&
+            item.kind !== "answer" &&
+            item.kind !== "answer-action"
+        ) {
+            continue;
+        }
+
+        if (item.kind === "closed") {
+            const count = reports.get(item.thread) ?? 0;
+
+            lines.push(
+                count === 0
+                    ? item.line
+                    : putBeforeRead(item.line, `${String(count)} report${count === 1 ? "" : "s"}`),
+            );
+            continue;
+        }
+
+        lines.push(item.line);
+    }
+
+    const shown = lines.slice(0, DIGEST_MAX_LINES);
+    const more = lines.length - shown.length;
+
+    return [
+        `[desk] digest: ${String(lines.length)} new. Read each with desk read <id> before you act.`,
+        ...shown,
+        ...(more === 0 ? [] : [`… and ${String(more)} more on the Desk page.`]),
+    ].join("\n");
+}
+
+/** One message a digest task sends: the supervisor's, or the Clerk's. */
+export type DigestMessage = { conversation: number; text: string; requestId: string };
+
+/**
+ * The messages a digest checkpoint holds: the list, or the 1 message of a task stored before the Clerk split (`text`
+ * and `requestId` on the checkpoint).
+ */
+export function digestMessages(
+    supervisor: number,
+    checkpoint: { messages?: DigestMessage[]; text?: string; requestId?: string },
+): DigestMessage[] {
+    if (checkpoint.messages !== undefined) {
+        return checkpoint.messages;
+    }
+
+    return checkpoint.text === undefined || checkpoint.requestId === undefined
+        ? []
+        : [{ conversation: supervisor, text: checkpoint.text, requestId: checkpoint.requestId }];
+}
+
+/**
+ * Take a supervisor's waiting items for the digest task due at `due`: the items, the box emptied, and its number. 1
+ * occurrence of `due` leaves `scheduled`. A supervisor with no box takes nothing, and writes nothing.
+ */
+export function takeDigest(
+    state: DeskState,
+    supervisor: number,
+    due: number,
+): { items: DigestItem[]; seq: number } {
+    if (state.digests?.[String(supervisor)] === undefined) {
+        return { items: [], seq: 0 };
+    }
+
+    const box = digestBox(state, supervisor);
+    const index = box.scheduled.indexOf(due);
+
+    if (index >= 0) {
+        box.scheduled.splice(index, 1);
+    }
+
+    const items = box.items;
+    const seq = box.seq + 1;
+
+    setDigestBox(state, supervisor, { ...box, items: [], seq });
+
+    return { items, seq };
 }
 
 /** The desk's start: the oldest seed thread's start, else the stored epoch. A seed sets the truth. */
@@ -2182,11 +2984,30 @@ export type PrFact = {
 /** What one GitHub read says. */
 export type GitHubFacts = {
     viewer: string;
-    repos: Record<string, { archived: boolean; open: PrFact[] }>;
+    repos: Record<
+        string,
+        {
+            archived: boolean;
+            open: PrFact[];
+            /** The open PRs' page: how many there are, and where the next page starts. */
+            page?: { hasNextPage: boolean; endCursor?: string; totalCount?: number };
+        }
+    >;
     prs: Record<string, PrFact>;
     /** Attached refs that GitHub does not have: an issue, or a wrong number. */
     missing?: string[];
+    /** The parts of the read that are not complete, in short lines, when the read cut something off. */
+    incomplete?: string[];
 };
+
+/** The most open PRs one page holds: GitHub's maximum for a connection. */
+export const GITHUB_PAGE = 50;
+
+/** The most pages of open PRs one sweep reads for one repository: 500 PRs. */
+export const GITHUB_MAX_PAGES = 10;
+
+/** The most check contexts of one commit one page holds: GitHub's maximum. */
+export const GITHUB_CHECKS = 100;
 
 const OWNER_NAME = /^[A-Za-z0-9][A-Za-z0-9_.-]*$/;
 
@@ -2223,8 +3044,7 @@ function splitRef(ref: string): { repo: string; number: number } {
     return { repo: match[1]!, number: Number(match[2]) };
 }
 
-const PR_FIELDS =
-    "number title url state isDraft createdAt mergedAt closedAt headRefName mergeable reviewDecision author { login } labels(first: 20) { nodes { name } } commits(last: 1) { nodes { commit { oid committedDate statusCheckRollup { state contexts(first: 30) { totalCount nodes { __typename ... on CheckRun { name conclusion status startedAt } ... on StatusContext { context state } } } } } } }";
+const PR_FIELDS = `number title url state isDraft createdAt mergedAt closedAt headRefName mergeable reviewDecision author { login } labels(first: 20) { nodes { name } } commits(last: 1) { nodes { commit { oid committedDate statusCheckRollup { state contexts(first: ${String(GITHUB_CHECKS)}) { totalCount nodes { __typename ... on CheckRun { name conclusion status startedAt } ... on StatusContext { context state } } } } } } }`;
 
 /**
  * The fields of an attached PR: `PR_FIELDS`, the label events, the reviews, and the comments. Only the pinned parts of
@@ -2250,7 +3070,9 @@ export function buildQuery(repos: string[], prs: string[]): string {
             `  r${String(index)}: repository(owner: ${JSON.stringify(owner)}, name: ${JSON.stringify(name)}) {`,
             "    nameWithOwner",
             "    isArchived",
-            "    pullRequests(states: OPEN, first: 50, orderBy: {field: CREATED_AT, direction: DESC}) {",
+            `    pullRequests(states: OPEN, first: ${String(GITHUB_PAGE)}, orderBy: {field: CREATED_AT, direction: DESC}) {`,
+            "      totalCount",
+            "      pageInfo { hasNextPage endCursor }",
             `      nodes { ${PR_FIELDS} }`,
             "    }",
             "  }",
@@ -2275,6 +3097,48 @@ export function buildQuery(repos: string[], prs: string[]): string {
     return lines.join("\n");
 }
 
+/** What a page cursor may hold: the characters of a base64 cursor, and nothing else. */
+const CURSOR = /^[A-Za-z0-9][A-Za-z0-9+/=_-]{0,511}$/;
+
+/**
+ * One repository's next page of open PRs, after a cursor from the last answer. The alias is `r0`, as in
+ * `buildQuery`, so `parseGitHub` reads the answer. The owner, the name, and the cursor are checked first: nothing else
+ * goes into the query.
+ */
+export function buildPageQuery(repo: string, after: string): string {
+    const { owner, name } = splitRepo(repo);
+
+    if (!CURSOR.test(after)) {
+        throw new Error(`Not a GitHub cursor: ${after}.`);
+    }
+
+    return [
+        "query {",
+        `  r0: repository(owner: ${JSON.stringify(owner)}, name: ${JSON.stringify(name)}) {`,
+        "    nameWithOwner",
+        "    isArchived",
+        `    pullRequests(states: OPEN, first: ${String(GITHUB_PAGE)}, after: ${JSON.stringify(after)}, orderBy: {field: CREATED_AT, direction: DESC}) {`,
+        "      totalCount",
+        "      pageInfo { hasNextPage endCursor }",
+        `      nodes { ${PR_FIELDS} }`,
+        "    }",
+        "  }",
+        "}",
+    ].join("\n");
+}
+
+/** The line that says a repository was read only in part: `owner/name: 2 of 60 open PRs read`. */
+export function openIncompleteLine(repo: string, read: number, total: number | undefined): string {
+    return total === undefined
+        ? `${repo}: ${String(read)} open PRs read, and more follow`
+        : `${repo}: ${String(read)} of ${String(total)} open PRs read`;
+}
+
+/** The line that says a PR's check list was read only in part: `owner/name#12: 30 of 45 checks read`. */
+export function checksIncompleteLine(ref: string, read: number, total: number): string {
+    return `${ref}: ${String(read)} of ${String(total)} checks read`;
+}
+
 const text = (value: unknown): string => (typeof value === "string" ? value : "");
 
 const milliseconds = (value: unknown): number => {
@@ -2283,17 +3147,22 @@ const milliseconds = (value: unknown): number => {
     return Number.isFinite(at) ? at : 0;
 };
 
+/**
+ * One PR node as facts, and the line that says its check list was cut when GitHub has more contexts than the answer
+ * holds. A node with no number is neither.
+ */
 function prFact(
     node: Record<string, unknown>,
     repo: string,
     archived: boolean,
-): PrFact | undefined {
+): { fact?: PrFact; incomplete?: string } {
     const number = typeof node.number === "number" ? node.number : undefined;
 
     if (number === undefined) {
-        return undefined;
+        return {};
     }
 
+    const ref = `${repo}#${String(number)}`;
     const commits = (node.commits as { nodes?: unknown } | undefined)?.nodes;
     const first = Array.isArray(commits)
         ? (commits[0] as
@@ -2313,31 +3182,36 @@ function prFact(
               | undefined)
         : undefined;
     const state = text(node.state).toUpperCase();
+    const contexts = first?.commit?.statusCheckRollup?.contexts;
+    const read = Array.isArray(contexts?.nodes) ? contexts.nodes.length : 0;
+    const total = typeof contexts?.totalCount === "number" ? contexts.totalCount : undefined;
 
     return {
-        ref: `${repo}#${String(number)}`,
-        repo,
-        number,
-        title: text(node.title),
-        url: text(node.url),
-        state: state === "MERGED" || state === "CLOSED" ? state : "OPEN",
-        author: text((node.author as { login?: unknown } | null | undefined)?.login),
-        createdAt: milliseconds(node.createdAt),
-        headRefName: text(node.headRefName),
-        isDraft: node.isDraft === true,
-        mergeable: text(node.mergeable),
-        review: text(node.reviewDecision),
-        checks: checksState(
-            text(first?.commit?.statusCheckRollup?.state),
-            first?.commit?.statusCheckRollup?.contexts,
-        ),
-        head: text(first?.commit?.oid),
-        ready: labelsOf(node).includes(READY_LABEL),
-        readyAt: readyLabelAt(node),
-        headAt: milliseconds(first?.commit?.committedDate),
-        feedback: feedbackOf(node),
-        failing: failingChecks(first?.commit?.statusCheckRollup?.contexts?.nodes),
-        archived,
+        fact: {
+            ref,
+            repo,
+            number,
+            title: text(node.title),
+            url: text(node.url),
+            state: state === "MERGED" || state === "CLOSED" ? state : "OPEN",
+            author: text((node.author as { login?: unknown } | null | undefined)?.login),
+            createdAt: milliseconds(node.createdAt),
+            headRefName: text(node.headRefName),
+            isDraft: node.isDraft === true,
+            mergeable: text(node.mergeable),
+            review: text(node.reviewDecision),
+            checks: checksState(text(first?.commit?.statusCheckRollup?.state), contexts),
+            head: text(first?.commit?.oid),
+            ready: labelsOf(node).includes(READY_LABEL),
+            readyAt: readyLabelAt(node),
+            headAt: milliseconds(first?.commit?.committedDate),
+            feedback: feedbackOf(node),
+            failing: failingChecks(contexts?.nodes),
+            archived,
+        },
+        ...(total === undefined || total <= read
+            ? {}
+            : { incomplete: checksIncompleteLine(ref, read, total) }),
     };
 }
 
@@ -2573,6 +3447,7 @@ export function parseGitHub(json: unknown): GitHubFacts {
     const viewer = text((root?.viewer as { login?: unknown } | undefined)?.login);
     const repos: GitHubFacts["repos"] = {};
     const prs: GitHubFacts["prs"] = {};
+    const incomplete: string[] = [];
 
     for (const [alias, value] of Object.entries(root ?? {})) {
         if (!/^[rp][0-9]+$/.test(alias)) {
@@ -2583,7 +3458,11 @@ export function parseGitHub(json: unknown): GitHubFacts {
             | {
                   nameWithOwner?: unknown;
                   isArchived?: unknown;
-                  pullRequests?: { nodes?: unknown };
+                  pullRequests?: {
+                      nodes?: unknown;
+                      totalCount?: unknown;
+                      pageInfo?: { hasNextPage?: unknown; endCursor?: unknown } | null;
+                  } | null;
                   pullRequest?: unknown;
               }
             | null
@@ -2607,18 +3486,46 @@ export function parseGitHub(json: unknown): GitHubFacts {
 
             if (Array.isArray(nodes)) {
                 for (const one of nodes) {
-                    const fact =
+                    const parsed =
                         one === null || typeof one !== "object"
-                            ? undefined
+                            ? {}
                             : prFact(one as Record<string, unknown>, repo, archived);
 
-                    if (fact !== undefined) {
-                        open.push(fact);
+                    if (parsed.fact !== undefined) {
+                        open.push(parsed.fact);
+                    }
+
+                    if (parsed.incomplete !== undefined) {
+                        incomplete.push(parsed.incomplete);
                     }
                 }
             }
 
-            repos[repo] = { archived, open };
+            const total =
+                typeof node.pullRequests?.totalCount === "number"
+                    ? node.pullRequests.totalCount
+                    : undefined;
+            const info = node.pullRequests?.pageInfo;
+            const hasNextPage = info?.hasNextPage === true;
+            const endCursor = text(info?.endCursor);
+
+            if (hasNextPage) {
+                incomplete.push(openIncompleteLine(repo, open.length, total));
+            }
+
+            repos[repo] = {
+                archived,
+                open,
+                ...(info === undefined && total === undefined
+                    ? {}
+                    : {
+                          page: {
+                              hasNextPage,
+                              ...(endCursor === "" ? {} : { endCursor }),
+                              ...(total === undefined ? {} : { totalCount: total }),
+                          },
+                      }),
+            };
         } else {
             const one = node.pullRequest;
 
@@ -2626,15 +3533,19 @@ export function parseGitHub(json: unknown): GitHubFacts {
                 continue;
             }
 
-            const fact = prFact(one as Record<string, unknown>, repo, archived);
+            const parsed = prFact(one as Record<string, unknown>, repo, archived);
 
-            if (fact !== undefined) {
-                prs[fact.ref] = fact;
+            if (parsed.fact !== undefined) {
+                prs[parsed.fact.ref] = parsed.fact;
+            }
+
+            if (parsed.incomplete !== undefined) {
+                incomplete.push(parsed.incomplete);
             }
         }
     }
 
-    return { viewer, repos, prs };
+    return { viewer, repos, prs, ...(incomplete.length === 0 ? {} : { incomplete }) };
 }
 
 const linkFor = (pr: PrFact, via: PrLink["via"]): PrLink => ({
@@ -2656,6 +3567,13 @@ const linkFor = (pr: PrFact, via: PrLink["via"]): PrLink => ({
 /** One attached PR's facts from a read: its state, its next actor, and what GitHub says. */
 export function updatePrs(thread: Thread, github: GitHubFacts, now: number): number {
     let events = 0;
+
+    // The thread's repository, as the read saw it: an archived one freezes the thread, even with no PR to show it.
+    const repo = thread.repo === undefined ? undefined : github.repos[thread.repo];
+
+    if (repo !== undefined) {
+        thread.run.repoArchived = repo.archived;
+    }
 
     for (const [ref, link] of Object.entries(thread.prs)) {
         if (github.missing !== undefined && github.missing.includes(ref)) {
@@ -3567,6 +4485,7 @@ export type GitHubView = {
     error?: string;
     skipped?: string[];
     missing?: string[];
+    incomplete?: string[];
 };
 
 /** The last GitHub read as a plain value; null when no read happened yet. */
@@ -3583,13 +4502,14 @@ export function githubView(state: Readonly<DeskState> | undefined): GitHubView |
         ...(github.error === undefined ? {} : { error: github.error }),
         ...(github.skipped === undefined ? {} : { skipped: [...github.skipped] }),
         ...(github.missing === undefined ? {} : { missing: [...github.missing] }),
+        ...(github.incomplete === undefined ? {} : { incomplete: [...github.incomplete] }),
     };
 }
 
 /** A read time as the list and the section show it: 01:47, the server's clock. */
 const clock = (at: number) => new Date(at).toTimeString().slice(0, 5);
 
-/** The GitHub status lines for `desk list` and the section: a failure, and the skipped roster names. */
+/** The GitHub status lines for `desk list` and the section: a failure, a cut read, and the skipped roster names. */
 export function githubLines(state: Readonly<DeskState> | undefined): string[] {
     const github = state?.github;
 
@@ -3603,6 +4523,10 @@ export function githubLines(state: Readonly<DeskState> | undefined): string[] {
         lines.push(
             `GitHub: read failed at ${clock(github.at)}: ${github.error ?? "unknown error"}`,
         );
+    }
+
+    if (github.incomplete !== undefined && github.incomplete.length > 0) {
+        lines.push(`GitHub read incomplete: ${github.incomplete.join(", ")}`);
     }
 
     if (github.skipped !== undefined && github.skipped.length > 0) {
@@ -3696,7 +4620,7 @@ function threadFile(
 
     if (thread.closed !== undefined) {
         lines.push(
-            `- Closed: ${thread.closed.why} · by ${thread.closed.by} · ${iso(thread.closed.at)}`,
+            `- Closed: ${thread.closed.why}${thread.closed.outcome === undefined ? "" : ` (${thread.closed.outcome})`} · by ${thread.closed.by} · ${iso(thread.closed.at)}`,
         );
     }
 
@@ -3894,7 +4818,7 @@ export type ThreadView = {
     };
     /** A watched thread before its date: it does not count, and it is not stale. */
     asleep: boolean;
-    closed?: { at: number; why: string; by: string };
+    closed?: { at: number; why: string; by: string; outcome?: CloseOutcome };
 };
 
 /** The folders that threads other than `thread` work in. */
@@ -4000,6 +4924,9 @@ export function threadView(
                       at: thread.closed.at,
                       why: thread.closed.why,
                       by: thread.closed.by,
+                      ...(thread.closed.outcome === undefined
+                          ? {}
+                          : { outcome: thread.closed.outcome }),
                   },
               }),
     };
@@ -4176,7 +5103,9 @@ export function readText(state: Readonly<DeskState> | undefined, id: string): st
         ...(thread.watch === undefined ? [] : [`Watch: ${watchText(thread.watch)}`]),
         ...(thread.closed === undefined
             ? []
-            : [`Closed: ${iso(thread.closed.at)} · ${thread.closed.why} · by ${thread.closed.by}`]),
+            : [
+                  `Closed: ${iso(thread.closed.at)} · ${thread.closed.why}${thread.closed.outcome === undefined ? "" : ` (${thread.closed.outcome})`} · by ${thread.closed.by}`,
+              ]),
         prs.length === 0
             ? "PRs: none"
             : `PRs:\n${prs.map(([ref, pr]) => `  ${ref} · ${pr.via}${pr.state === undefined ? "" : ` · ${pr.state}`}${pr.ready === undefined ? "" : ` · ${READY_LABEL}`}${pr.next === undefined ? "" : ` · next: ${pr.next}`}${pr.title === undefined || pr.title === "" ? "" : ` · ${pr.title}`}`).join("\n")}`,
@@ -4367,7 +5296,14 @@ export type FileRequest = {
     from: "team_message" | "night-shift";
     text: string;
     at: number;
+    /** Put this report in the supervisor's digest: the caller sends nothing when the desk says `held`. */
+    digest?: true;
+    /** The night shift's stop reason: `blocked` and `failed` go at once. */
+    reason?: string;
 };
+
+/** A Clerk's registration, as `team.ts` hands it over: the Clerk, and its supervisor. */
+export type ClerkRequest = Clerk & { supervisor: number };
 
 /** What `team.ts` uses: on `globalThis[Symbol.for("pi-pocket-team.desk")]`, so it finds the live version. */
 export type DeskApi = {
@@ -4379,16 +5315,23 @@ export type DeskApi = {
         tx: Tx,
         session: ConversationId,
         request: FileRequest,
-    ) => Promise<{ thread: Thread; line: string } | undefined>;
+    ) => Promise<{ thread: Thread; line: string; held?: boolean } | undefined>;
+    /** Register a supervisor's Clerk. The same values twice change nothing, and nothing else is added. */
+    clerk: (tx: Tx, request: ClerkRequest) => Promise<void>;
+    /** The supervisor's Clerk, for the check before a Clerk starts: no write. */
+    clerkOf: (tx: Tx, supervisor: number) => Promise<Clerk | undefined>;
 };
 
 // ─── The module ──────────────────────────────────────────────────────────────
+
+/** A named identity's role, as Team's roster has it. */
+type TeamRole = "supervisor" | "clerk" | "agent";
 
 /** Team's API, as this module reads it: never an import, so a reload cannot leave a stale copy. */
 type TeamMember = {
     id: string;
     name: string;
-    role: "supervisor" | "agent";
+    role: TeamRole;
     repositories?: Record<string, string>;
 };
 
@@ -4489,7 +5432,8 @@ export default function createDesk(host: Host, web: Web) {
             }
         },
         file: async (tx, session, request) => {
-            const thread = threadOfSession(await tx.doc(DeskThreads), Number(session));
+            const state = await tx.doc(DeskThreads);
+            const thread = threadOfSession(state, Number(session));
 
             if (thread === undefined) {
                 return undefined;
@@ -4505,8 +5449,13 @@ export default function createDesk(host: Host, web: Web) {
             const reports = await tx.doc(DeskReports, session);
             const same = reports.reports.find((report) => report.key === request.key);
 
+            // A replay: the stored report says whether the digest held it, so the caller sends nothing again.
             if (same !== undefined) {
-                return { thread: copyThread(thread), line: same.line };
+                return {
+                    thread: copyThread(thread),
+                    line: same.line,
+                    held: same.held === true,
+                };
             }
 
             const line = shortLine(thread, {
@@ -4515,12 +5464,53 @@ export default function createDesk(host: Host, web: Web) {
                 quote: host.text.quoted(request.text, 80),
             });
 
+            // The session's newest user entry, read before this commit writes a task: a transaction cannot read tables
+            // after its first table write.
+            const newest = await newestUserEntry(tx, session);
+
+            // With the digest on, the report goes into the box in this same commit: the caller sends nothing, and the
+            // supervisor gets it in the next digest.
+            let held = false;
+
+            if (request.digest === true && thread.supervisor !== undefined) {
+                const { digest } = await deskConfig();
+
+                if (digest.minutes > 0) {
+                    const kind: DigestKind =
+                        request.from === "team_message"
+                            ? "report"
+                            : request.reason === "blocked" || request.reason === "failed"
+                              ? "shift-blocked"
+                              : "shift";
+                    const due = enqueueDigest(
+                        state,
+                        thread.supervisor,
+                        {
+                            key: `report:${request.key}`,
+                            thread: thread.id,
+                            kind,
+                            line,
+                            at: request.at,
+                        },
+                        request.at,
+                        digest,
+                    );
+
+                    if (due !== undefined) {
+                        await startDigest(tx, thread.supervisor, due);
+                    }
+
+                    held = true;
+                }
+            }
+
             reports.reports.unshift({
                 key: request.key,
                 at: request.at,
                 from: request.from,
                 text: request.text,
                 line,
+                ...(held ? { held: true } : {}),
             });
 
             if (reports.reports.length > KEPT_REPORTS) {
@@ -4528,8 +5518,6 @@ export default function createDesk(host: Host, web: Web) {
             }
 
             thread.run.reportedAt = request.at;
-
-            const newest = await newestUserEntry(tx, session);
 
             if (newest !== undefined) {
                 thread.run.reportedUserEntry = newest;
@@ -4542,7 +5530,37 @@ export default function createDesk(host: Host, web: Web) {
                 request.at,
             );
 
-            return { thread: copyThread(thread), line };
+            return { thread: copyThread(thread), line, ...(held ? { held: true } : {}) };
+        },
+        clerk: async (tx, request) => {
+            const state = await tx.doc(DeskThreads);
+            const existing = clerkOf(state, request.supervisor);
+
+            // A replay, or the same registration again: nothing changes.
+            if (
+                existing !== undefined &&
+                existing.session === request.session &&
+                existing.address === request.address &&
+                existing.agent === request.agent
+            ) {
+                return;
+            }
+
+            state.clerks = {
+                ...(state.clerks ?? {}),
+                [String(request.supervisor)]: {
+                    session: request.session,
+                    address: request.address,
+                    agent: request.agent,
+                    at: request.at,
+                    ...(request.key === undefined ? {} : { key: request.key }),
+                },
+            };
+        },
+        clerkOf: async (tx, supervisor) => {
+            const found = clerkOf(await tx.doc(DeskThreads), supervisor);
+
+            return found === undefined ? undefined : { ...found };
         },
     };
     const shared = globalThis as unknown as Record<symbol, DeskApi | undefined>;
@@ -4574,7 +5592,17 @@ export default function createDesk(host: Host, web: Web) {
     type Reader = Pick<DocumentReader, "snapshot">;
 
     type SessionFact = { address: string; busy: boolean; archived: boolean; title?: string };
-    type FolderFact = { dirty: number; ahead: number };
+    type FolderFact = {
+        dirty: number;
+        /** The commits that no remote-tracking ref has; undefined when git could not tell, never 0. */
+        ahead: number | undefined;
+        /** Why `ahead` is unknown. */
+        aheadUnknown?: AheadUnknown;
+        /** `git status` failed in a repository: its counts are unknown, not clean. */
+        statusFailed?: true;
+        /** The folder is not on disk, as after an agent removes its worktree: keep the last counts, and no failure. */
+        gone?: true;
+    };
 
     /** What one sweep read, before its commit. A missing key means the read failed: the thread keeps its old value. */
     type SweepFacts = {
@@ -4582,8 +5610,10 @@ export default function createDesk(host: Host, web: Web) {
         sessions?: SessionFact[];
         /** By session id: a status, or null when that session has no goal. */
         shifts: Record<string, string | null>;
-        /** By folder: its counts, or null when it is not a git repository. */
+        /** By folder: its counts, null when it is not a git repository, or a fact with `gone` when it is not on disk. */
         folders: Record<string, FolderFact | null>;
+        /** By folder: its linked worktrees, or null when git cannot list them. */
+        worktrees?: Record<string, WorktreeFact[] | null>;
         github?: GitHubFacts;
         /** Why the GitHub read failed, in one line; absent when it worked. */
         githubError?: string;
@@ -4597,21 +5627,229 @@ export default function createDesk(host: Host, web: Web) {
 
     const run = promisify(execFile);
 
-    /** `git status` of one folder: null when it is not a git repository, or git cannot read it. */
-    async function statusOf(folder: string): Promise<FolderFact | null> {
-        try {
-            const { stdout } = await run(
-                "git",
-                ["-C", folder, "status", "--porcelain=v2", "--branch"],
-                { timeout: 10_000, maxBuffer: 4 * 1024 * 1024, encoding: "utf8" },
-            );
-            const status = parseStatus(stdout);
+    /** A git read or write for a worktree: at most 30 seconds, so a hung git cannot hold a sweep. */
+    const GIT_OPTIONS = { timeout: 30_000, maxBuffer: 4 * 1024 * 1024, encoding: "utf8" as const };
 
-            return { dirty: status.dirty, ahead: status.ahead };
+    /** One closed thread's worktree: removed, or kept with git's first line of reason. */
+    type WorktreeCleanup = { gone: true } | { kept: string };
+
+    /** The first non-empty line of git's error, on one line, at most 200 characters. */
+    function gitReason(error: unknown): string {
+        const stderr = (error as { stderr?: unknown }).stderr;
+        const text =
+            typeof stderr === "string" && stderr.trim() !== ""
+                ? stderr
+                : String((error as Error).message ?? error);
+        const line = text
+            .split("\n")
+            .map((each) => flatLine(each))
+            .find((each) => each !== "");
+
+        return (line ?? "git failed").slice(0, MAX_LINE);
+    }
+
+    /**
+     * Remove one closed thread's worktree, then its branch. No `--force`: git refuses a worktree with changes or
+     * untracked files, and that work stays for a person. A folder that is gone needs no removal: its record in the main
+     * checkout is pruned, so git does not keep it.
+     */
+    async function removeWorktree(worktree: {
+        path: string;
+        branch: string;
+        checkout: string;
+    }): Promise<WorktreeCleanup> {
+        if (!isAbsolute(worktree.path) || !isAbsolute(worktree.checkout)) {
+            return { kept: "its folder is not an absolute path" };
+        }
+
+        const exists = await access(worktree.path).then(
+            () => true,
+            () => false,
+        );
+
+        if (!exists) {
+            await run("git", ["-C", worktree.checkout, "worktree", "prune"], GIT_OPTIONS).catch(
+                () => undefined,
+            );
+
+            return { gone: true };
+        }
+
+        try {
+            await run(
+                "git",
+                ["-C", worktree.checkout, "worktree", "remove", worktree.path],
+                GIT_OPTIONS,
+            );
+        } catch (error) {
+            return { kept: gitReason(error) };
+        }
+
+        if (BRANCH_NAME.test(worktree.branch) && !worktree.branch.includes("..")) {
+            // Not merged: git refuses, and the branch stays for a person.
+            await run(
+                "git",
+                ["-C", worktree.checkout, "branch", "-d", worktree.branch],
+                GIT_OPTIONS,
+            ).catch(() => undefined);
+        }
+
+        return { gone: true };
+    }
+
+    /**
+     * Remove the worktrees of the closed threads that still have one, 24 hours after the thread closed: a thread can
+     * reopen, and a person can send to its session later, so its folder must stay while that can happen. Git runs here,
+     * before any commit; the commit records what happened, so a restart between the two loses nothing but tries again.
+     * A worktree that git refused waits a day, and its 1 event stays.
+     */
+    const sweepWorktrees = async (
+        supervisor: number,
+        read: Reader,
+        now: number,
+        context: Context,
+        commit: (change: (tx: Tx) => Promise<undefined>) => Promise<unknown>,
+    ): Promise<void> => {
+        const state = await read.snapshot(DeskThreads, context);
+        const closed = Object.values(state?.threads ?? {}).filter(
+            (thread) =>
+                thread.supervisor === supervisor &&
+                thread.state === "closed" &&
+                thread.worktree !== undefined &&
+                thread.run.worktreeGone === undefined,
+        );
+        const facts: Record<string, WorktreeCleanup> = {};
+
+        for (const thread of closed) {
+            const closedAt = thread.closed?.at;
+            const keptAt = numberOr(thread.run.worktreeKeptAt);
+
+            // The grace period, and the wait after a refusal: a second sweep adds no event and makes no second try.
+            if (
+                closedAt === undefined ||
+                now - closedAt < WORKTREE_GRACE_MS ||
+                (keptAt !== undefined && now - keptAt < WORKTREE_RETRY_MS)
+            ) {
+                continue;
+            }
+
+            facts[thread.id] = await removeWorktree(thread.worktree!);
+        }
+
+        if (Object.keys(facts).length === 0) {
+            return;
+        }
+
+        await commit(async (tx) => {
+            const doc = await tx.doc(DeskThreads);
+
+            for (const [id, fact] of Object.entries(facts)) {
+                const thread = threadById(doc, id);
+
+                if (thread === undefined || thread.worktree === undefined) {
+                    continue;
+                }
+
+                if ("gone" in fact) {
+                    thread.run.worktreeGone = now;
+                    addEvent(
+                        thread,
+                        `worktree-removed:${id}`,
+                        `worktree removed: ${thread.worktree.path}`,
+                        now,
+                    );
+                } else {
+                    thread.run.worktreeKeptAt = now;
+                    addEvent(thread, `worktree-kept:${id}`, `worktree kept: ${fact.kept}`, now);
+                }
+            }
+
+            return undefined;
+        });
+    };
+
+    /** One git read of a folder: its text, or undefined when the call failed. */
+    async function gitText(folder: string, args: string[]): Promise<string | undefined> {
+        try {
+            const { stdout } = await run("git", ["-C", folder, ...args], {
+                timeout: 10_000,
+                maxBuffer: 4 * 1024 * 1024,
+                encoding: "utf8",
+            });
+
+            return stdout;
         } catch {
-            return null;
+            return undefined;
         }
     }
+
+    /** Whether a folder is on disk. */
+    const exists = (folder: string): Promise<boolean> =>
+        access(folder).then(
+            () => true,
+            () => false,
+        );
+
+    /**
+     * `git status` of one folder: null when it is not a git repository, as before. A repository whose status git cannot
+     * read is a fact with `statusFailed`: a failed read is not a clean folder. When git prints no `# branch.ab` line,
+     * `git rev-list --count HEAD --not --remotes` counts the commits that no remote-tracking ref has.
+     */
+    async function statusOf(folder: string): Promise<FolderFact | null> {
+        const text = await gitText(folder, ["status", "--porcelain=v2", "--branch"]);
+
+        if (text === undefined) {
+            // A folder that is gone (an agent removed its worktree after a merge) is no failure: its counts stay.
+            if (!(await exists(folder))) {
+                return { dirty: 0, ahead: undefined, gone: true };
+            }
+
+            return (await gitText(folder, ["rev-parse", "--git-dir"])) === undefined
+                ? null
+                : {
+                      dirty: 0,
+                      ahead: undefined,
+                      aheadUnknown: "git status failed",
+                      statusFailed: true,
+                  };
+        }
+
+        const status = parseStatus(text);
+
+        if (status.ahead !== undefined) {
+            return { dirty: status.dirty, ahead: status.ahead };
+        }
+
+        // No `# branch.ab` line: this works for a branch with no upstream and for a detached HEAD. It fails when there is
+        // no commit to count (an empty repository), and the count then stays unknown with its reason.
+        const counted = await gitText(folder, [
+            "rev-list",
+            "--count",
+            "HEAD",
+            "--not",
+            "--remotes",
+        ]);
+        const ahead = counted === undefined ? Number.NaN : Number(counted.trim());
+
+        return Number.isInteger(ahead) && ahead >= 0
+            ? { dirty: status.dirty, ahead }
+            : {
+                  dirty: status.dirty,
+                  ahead: undefined,
+                  aheadUnknown: status.aheadUnknown ?? "no branch",
+              };
+    }
+
+    /**
+     * Whether a folder's counts are work: changed files, or commits that are known to be unpushed. An unknown count is
+     * not work: a main checkout on a detached HEAD is not new work.
+     */
+    const folderWork = (counts: FolderFact | null | undefined): counts is FolderFact =>
+        counts !== undefined &&
+        counts !== null &&
+        counts.statusFailed !== true &&
+        counts.gone !== true &&
+        (counts.dirty > 0 || (counts.ahead ?? 0) > 0);
 
     const LOGIN = /^[A-Za-z0-9][A-Za-z0-9-]{0,38}(\[bot\])?$/;
 
@@ -4620,13 +5858,22 @@ export default function createDesk(host: Host, web: Web) {
         process.env.PI_POCKET_DESK_CONFIG ??
         join(homedir(), ".config", "pi-pocket-team", "desk.json");
 
-    /** The config file: the extra logins that count as ours, and the cap. A missing or bad file means the defaults. */
-    async function deskConfig(): Promise<{ authors: string[]; cap: number; export?: string }> {
+    /**
+     * The config file: the extra logins that count as ours, the cap, and the digest. A missing or bad file means the
+     * defaults.
+     */
+    async function deskConfig(): Promise<{
+        authors: string[];
+        cap: number;
+        export?: string;
+        digest: DigestConfig;
+    }> {
         try {
             const value = JSON.parse(await readFile(configFile(), "utf8")) as {
                 authors?: unknown;
                 cap?: unknown;
                 export?: unknown;
+                digest?: unknown;
             } | null;
             const authors = Array.isArray(value?.authors)
                 ? value.authors.filter(
@@ -4645,9 +5892,17 @@ export default function createDesk(host: Host, web: Web) {
                 raw === "" ? undefined : raw.startsWith("~/") ? join(homedir(), raw.slice(2)) : raw;
             const exported = folder !== undefined && isAbsolute(folder) ? folder : undefined;
 
-            return { authors, cap, ...(exported === undefined ? {} : { export: exported }) };
+            // An empty or a bad value of the digest gives its default too, so the setting works without a reload.
+            const digest = digestConfig(value?.digest);
+
+            return {
+                authors,
+                cap,
+                digest,
+                ...(exported === undefined ? {} : { export: exported }),
+            };
         } catch {
-            return { authors: [], cap: DEFAULT_CAP };
+            return { authors: [], cap: DEFAULT_CAP, digest: digestConfig(undefined) };
         }
     }
 
@@ -4756,11 +6011,100 @@ export default function createDesk(host: Host, web: Web) {
         return flatLine(said).slice(0, 200) || "the GitHub read failed";
     }
 
+    /** The lines without a repository's own "open PRs read" line: a PR's line (`owner/name#12:`) stays. */
+    const withoutOpenLine = (lines: string[], repo: string): string[] =>
+        lines.filter((line) => !line.startsWith(`${repo}: `));
+
+    /**
+     * Follow each repository's cursor to its last page of open PRs, at most `GITHUB_MAX_PAGES` pages: 500 PRs. A page
+     * that fails keeps the PRs that were read: the repository is incomplete, with the reason, and the sweep works. A
+     * repository with pages left after the cap is incomplete too.
+     */
+    async function pageOpen(
+        facts: GitHubFacts,
+        ask: (text: string) => Promise<{ stdout: string }>,
+    ): Promise<GitHubFacts> {
+        let incomplete = [...(facts.incomplete ?? [])];
+
+        for (const [repo, entry] of Object.entries(facts.repos)) {
+            let page = entry.page;
+            let pages = 1;
+            let failure: string | undefined;
+
+            // `parseGitHub` records a repository with more pages as incomplete: paging fixes that line here.
+            incomplete = withoutOpenLine(incomplete, repo);
+
+            while (page?.hasNextPage === true && pages < GITHUB_MAX_PAGES) {
+                if (page.endCursor === undefined) {
+                    failure = "GitHub gave no cursor for the next page";
+                    break;
+                }
+
+                let next: GitHubFacts;
+
+                try {
+                    const { stdout } = await ask(buildPageQuery(repo, page.endCursor));
+
+                    next = parseGitHub(JSON.parse(stdout));
+                } catch (error) {
+                    failure = githubError(error);
+                    break;
+                }
+
+                const more = next.repos[repo];
+
+                if (more === undefined) {
+                    failure = "the next page had no repository";
+                    break;
+                }
+
+                for (const pr of more.open) {
+                    if (!entry.open.some((one) => one.ref === pr.ref)) {
+                        entry.open.push(pr);
+                    }
+                }
+
+                // A PR of this page may have its own cut check list.
+                incomplete.push(
+                    ...(next.incomplete ?? []).filter((line) => line.startsWith(`${repo}#`)),
+                );
+                pages += 1;
+                page = more.page;
+            }
+
+            const total = page?.totalCount;
+
+            if (failure !== undefined) {
+                incomplete.push(
+                    `${openIncompleteLine(repo, entry.open.length, total)} (${failure})`,
+                );
+            } else if (
+                page?.hasNextPage === true ||
+                (total !== undefined && total > entry.open.length)
+            ) {
+                incomplete.push(openIncompleteLine(repo, entry.open.length, total));
+            }
+
+            delete entry.page;
+        }
+
+        const result: GitHubFacts = { ...facts };
+
+        if (incomplete.length === 0) {
+            delete result.incomplete;
+        } else {
+            result.incomplete = incomplete;
+        }
+
+        return result;
+    }
+
     /**
      * The one GitHub read of a sweep: its facts, or why it failed. A transient failure (`transientGitHub`) gets 1 more
      * try after `GITHUB_RETRY_MS`; a second failure is the sweep's error, as before. `gh api graphql` exits non-zero when the answer has
      * an error, but it still prints the data it has: a wrong PR ref must not hide every other PR. An alias with an
-     * error is a missing ref (`pN`) or a skipped repository (`rN`); only no data at all is a failure.
+     * error is a missing ref (`pN`) or a skipped repository (`rN`); only no data at all is a failure. Each repository
+     * with more than 1 page of open PRs is read to its last page.
      */
     async function readGitHub(
         repos: string[],
@@ -4772,21 +6116,17 @@ export default function createDesk(host: Host, web: Web) {
 
         const wanted = [...new Set(repos)];
         const pinned = [...new Set(prs)];
-
-        const query = buildQuery(wanted, pinned);
         const gh = process.env.PI_POCKET_DESK_GH ?? "gh";
-        const call = () =>
-            run(gh, ["api", "graphql", "-f", `query=${query}`], {
+        const call = (text: string) =>
+            run(gh, ["api", "graphql", "-f", `query=${text}`], {
                 timeout: 60_000,
                 maxBuffer: 8 * 1024 * 1024,
                 encoding: "utf8",
             });
 
-        try {
-            let stdout: string;
-
+        const ask = async (text: string): Promise<{ stdout: string }> => {
             try {
-                ({ stdout } = await call());
+                return await call(text);
             } catch (error) {
                 // GitHub's answer was cut or empty (a gateway timeout on a big query): 1 more try.
                 if (!transientGitHub(error)) {
@@ -4794,10 +6134,17 @@ export default function createDesk(host: Host, web: Web) {
                 }
 
                 await new Promise((resolve) => setTimeout(resolve, GITHUB_RETRY_MS));
-                ({ stdout } = await call());
-            }
 
-            return { facts: parseGitHub(JSON.parse(stdout)) };
+                return await call(text);
+            }
+        };
+
+        let facts: GitHubFacts;
+
+        try {
+            const { stdout } = await ask(buildQuery(wanted, pinned));
+
+            facts = parseGitHub(JSON.parse(stdout));
         } catch (error) {
             const failure = error as { stdout?: unknown } | null;
             const raw =
@@ -4820,7 +6167,8 @@ export default function createDesk(host: Host, web: Web) {
                 return { error: githubError(error) };
             }
 
-            const facts = parseGitHub(answer);
+            facts = parseGitHub(answer);
+
             const missing: string[] = [];
             const errors = (answer as { errors?: unknown }).errors;
 
@@ -4846,6 +6194,15 @@ export default function createDesk(host: Host, web: Web) {
 
                         if (repo !== undefined) {
                             delete facts.repos[repo];
+
+                            // Its "open PRs read" line would name a repository that the facts do not hold.
+                            const kept = withoutOpenLine(facts.incomplete ?? [], repo);
+
+                            if (kept.length === 0) {
+                                delete facts.incomplete;
+                            } else {
+                                facts.incomplete = kept;
+                            }
                         }
                     }
                 }
@@ -4854,9 +6211,9 @@ export default function createDesk(host: Host, web: Web) {
             if (missing.length > 0) {
                 facts.missing = missing;
             }
-
-            return { facts };
         }
+
+        return { facts: await pageOpen(facts, ask) };
     }
 
     /** Whether GitHub has this PR: 1 GraphQL call. An issue's number, or a wrong one, is not a PR. */
@@ -4909,6 +6266,61 @@ export default function createDesk(host: Host, web: Web) {
             return oldest === undefined ? undefined : oldest * 1000;
         } catch {
             return undefined;
+        }
+    }
+
+    /**
+     * The linked worktrees of a folder, as the sweep reads them; null when git cannot list them. The first block is the
+     * main worktree: its counts are the folder's own. A block with no branch holds no thread's work.
+     */
+    async function worktreeFacts(
+        folder: string,
+        owned: ReadonlySet<string> = new Set(),
+    ): Promise<WorktreeFact[] | null> {
+        try {
+            const { stdout } = await run("git", ["-C", folder, "worktree", "list", "--porcelain"], {
+                timeout: 10_000,
+                maxBuffer: 4 * 1024 * 1024,
+                encoding: "utf8",
+            });
+            const facts: WorktreeFact[] = [];
+
+            for (const block of parseWorktrees(stdout).slice(1)) {
+                if (block.branch === undefined || block.bare === true || owned.has(block.path)) {
+                    continue;
+                }
+
+                const created = await branchTime(folder, block.branch);
+                const status = await statusOf(block.path);
+
+                facts.push({
+                    path: block.path,
+                    branch: block.branch,
+                    ...(created === undefined ? {} : { created }),
+                    dirty: status?.dirty ?? 0,
+                    unpushed: await unpushedCount(block.path),
+                });
+            }
+
+            return facts;
+        } catch {
+            return null;
+        }
+    }
+
+    /** The commits on HEAD that no remote has: 0 when git cannot count them. */
+    async function unpushedCount(folder: string): Promise<number> {
+        try {
+            const { stdout } = await run(
+                "git",
+                ["-C", folder, "rev-list", "--count", "HEAD", "--not", "--remotes"],
+                { timeout: 10_000, encoding: "utf8" },
+            );
+            const count = Number(stdout.trim());
+
+            return Number.isInteger(count) && count >= 0 ? count : 0;
+        } catch {
+            return 0;
         }
     }
 
@@ -5012,6 +6424,26 @@ export default function createDesk(host: Host, web: Web) {
             // The list is not readable now: no facts, and no found session threads.
         }
 
+        // A session that looks idle but has a working subagent still works: its thread must wait on its agent, as it
+        // does while the session itself runs. Any failure to read the registry leaves the session idle, as before.
+        if (sessions !== undefined) {
+            for (const thread of open) {
+                if (thread.session === undefined) {
+                    continue;
+                }
+
+                const fact = sessions.find((each) => each.address === thread.address);
+
+                if (
+                    fact !== undefined &&
+                    !fact.busy &&
+                    (await subagentsBusy(read, thread.session as ConversationId, context))
+                ) {
+                    fact.busy = true;
+                }
+            }
+        }
+
         const shifts: Record<string, string | null> = {};
         const nightShift = nightShiftApi();
 
@@ -5096,9 +6528,22 @@ export default function createDesk(host: Host, web: Web) {
                 : await branchFacts([...open, ...recent], githubRead.facts);
 
         const facts: Record<string, FolderFact | null> = {};
+        const worktrees: Record<string, WorktreeFact[] | null> = {};
+
+        // A delegation's worktree is its thread's own folder: its counts come from `statusOf`, it lists no linked
+        // worktrees of its own, and no other folder's list reads it again. Without this, every folder of a repository
+        // with many delegation worktrees reads every one of them, on each sweep.
+        const all = Object.values(state?.threads ?? {});
+        const owned = ownedWorktrees(all);
+        const delegations = new Set(
+            all
+                .map((thread) => thread.worktree?.path)
+                .filter((path): path is string => path !== undefined),
+        );
 
         for (const folder of folders) {
             facts[folder] = await statusOf(folder);
+            worktrees[folder] = delegations.has(folder) ? [] : await worktreeFacts(folder, owned);
         }
 
         return {
@@ -5106,6 +6551,7 @@ export default function createDesk(host: Host, web: Web) {
             ...(sessions === undefined ? {} : { sessions }),
             shifts,
             folders: facts,
+            worktrees,
             ...(githubRead.facts === undefined ? {} : { github: githubRead.facts }),
             ...(githubRead.error === undefined ? {} : { githubError: githubRead.error }),
             ...(skipped.size === 0 ? {} : { githubSkipped: [...skipped].sort() }),
@@ -5190,18 +6636,45 @@ export default function createDesk(host: Host, web: Web) {
         state.sweepers ??= {};
         state.baseline ??= {};
         repairEpoch(state, now);
+        // The digest's setting, read at each sweep: a change works without a reload.
+        const { digest } = await deskConfig();
+        const digestOn = digest.minutes > 0;
+
+        // A Clerk whose session is archived leaves the desk: desk news goes to the supervisor again. A failed session
+        // read never unregisters one.
+        const archivedClerks = Object.entries(state.clerks ?? {})
+            .filter(
+                ([, clerk]) =>
+                    (facts.sessions ?? []).find((each) => each.address === clerk.address)
+                        ?.archived === true,
+            )
+            .map(([supervisorId]) => supervisorId);
+
+        if (archivedClerks.length > 0) {
+            const left = { ...(state.clerks ?? {}) };
+
+            for (const supervisorId of archivedClerks) {
+                delete left[supervisorId];
+            }
+
+            state.clerks = left;
+        }
+
         state.github = {
             at: now,
             ok: facts.githubError === undefined,
             ...(facts.githubError === undefined ? {} : { error: facts.githubError }),
             ...(facts.githubSkipped === undefined ? {} : { skipped: [...facts.githubSkipped] }),
             ...(facts.github?.missing === undefined ? {} : { missing: [...facts.github.missing] }),
+            ...(facts.github?.incomplete === undefined || facts.github.incomplete.length === 0
+                ? {}
+                : { incomplete: [...facts.github.incomplete] }),
         };
 
         await scanChatGrants(tx, state, supervisor, now);
 
         const dirtyFolders = Object.entries(facts.folders)
-            .filter(([, counts]) => counts !== null && (counts.dirty > 0 || counts.ahead > 0))
+            .filter(([, counts]) => folderWork(counts))
             .map(([folder]) => folder);
 
         if (state.baseline[key] === undefined) {
@@ -5225,6 +6698,30 @@ export default function createDesk(host: Host, web: Web) {
         const eventsBefore = new Map(
             [...open, ...closedDone].map((thread) => [thread.id, thread.events.length]),
         );
+
+        // The worktrees that hold a thread: a linked worktree's work is not in its folder's own counts. A branch of a
+        // merged or closed PR keeps commits that are on no remote (a squash-merge leaves them): it holds no thread.
+        const doneBranches = new Set(
+            Object.values(facts.github?.prs ?? {})
+                .filter((pr) => pr.state === "MERGED" || pr.state === "CLOSED")
+                .map((pr) => pr.headRefName),
+        );
+        const heldWorktrees = new Map<string, WorktreeFact[]>();
+
+        for (const [folder, worktrees] of Object.entries(facts.worktrees ?? {})) {
+            if (worktrees === null) {
+                continue;
+            }
+
+            for (const [id, holding] of assignWorktrees(
+                Object.values(state.threads),
+                folder,
+                worktrees,
+                doneBranches,
+            )) {
+                heldWorktrees.set(id, holding);
+            }
+        }
 
         for (const thread of open) {
             await scanEntries(tx, thread);
@@ -5310,8 +6807,35 @@ export default function createDesk(host: Host, web: Web) {
 
             const folder = folderOf(thread);
             const counts = folder === undefined ? undefined : facts.folders[folder];
+            // A folder that the read cannot see, after the thread had counts, was a repository git could not read.
+            const knownBefore =
+                numberOr(thread.run.dirty) !== undefined ||
+                numberOr(thread.run.ahead) !== undefined;
+            const gone = counts !== undefined && counts !== null && counts.gone === true;
+            const failed =
+                counts === undefined || gone
+                    ? false
+                    : counts === null
+                      ? knownBefore
+                      : counts.statusFailed === true;
 
-            if (counts !== undefined && counts !== null) {
+            if (failed) {
+                // A failed read is not a clean folder: keep the last counts, and say the unpushed count is unknown.
+                if (thread.run.aheadUnknown !== "git status failed") {
+                    thread.run.aheadUnknown = "git status failed";
+
+                    if (
+                        addEvent(
+                            thread,
+                            `aheadUnknown:git status failed:${String(now)}`,
+                            "unpushed commits unknown: git status failed",
+                            now,
+                        )
+                    ) {
+                        events += 1;
+                    }
+                }
+            } else if (counts !== undefined && counts !== null && counts.gone !== true) {
                 if (thread.run.dirty !== counts.dirty) {
                     thread.run.dirty = counts.dirty;
 
@@ -5329,19 +6853,71 @@ export default function createDesk(host: Host, web: Web) {
                     }
                 }
 
-                if (thread.run.ahead !== counts.ahead) {
-                    thread.run.ahead = counts.ahead;
+                const wasUnknown = thread.run.aheadUnknown !== undefined;
 
-                    if (
-                        addEvent(
-                            thread,
-                            `ahead:${String(counts.ahead)}:${String(now)}`,
-                            counts.ahead === 0
-                                ? "nothing is unpushed"
-                                : `${String(counts.ahead)} unpushed commit${counts.ahead === 1 ? "" : "s"}`,
-                            now,
-                        )
-                    ) {
+                if (counts.ahead !== undefined) {
+                    delete thread.run.aheadUnknown;
+
+                    if (thread.run.ahead !== counts.ahead || wasUnknown) {
+                        thread.run.ahead = counts.ahead;
+
+                        if (
+                            addEvent(
+                                thread,
+                                `ahead:${String(counts.ahead)}:${String(now)}`,
+                                counts.ahead === 0
+                                    ? "nothing is unpushed"
+                                    : `${String(counts.ahead)} unpushed commit${counts.ahead === 1 ? "" : "s"}`,
+                                now,
+                            )
+                        ) {
+                            events += 1;
+                        }
+                    }
+                } else {
+                    // Never write 0 into `ahead`: the desk does not know the count, and says why once per change.
+                    const reason = counts.aheadUnknown ?? "no branch";
+
+                    if (thread.run.aheadUnknown !== reason) {
+                        thread.run.aheadUnknown = reason;
+
+                        if (
+                            addEvent(
+                                thread,
+                                `aheadUnknown:${reason}:${String(now)}`,
+                                `unpushed commits unknown: ${reason}`,
+                                now,
+                            )
+                        ) {
+                            events += 1;
+                        }
+                    }
+                }
+            }
+
+            // The worktrees of its folder that hold it: a failed read keeps the ones the thread has, as a failed
+            // folder read does.
+            const lists = folder === undefined ? undefined : facts.worktrees?.[folder];
+
+            if (lists !== undefined && lists !== null) {
+                const holding: WorktreeLine[] = (heldWorktrees.get(thread.id) ?? []).map(
+                    (worktree) => ({
+                        path: worktree.path,
+                        dirty: worktree.dirty,
+                        unpushed: worktree.unpushed,
+                    }),
+                );
+
+                if (!sameWorktrees(storedWorktrees(thread), holding)) {
+                    if (holding.length === 0) {
+                        delete thread.run.worktrees;
+                    } else {
+                        thread.run.worktrees = holding;
+                    }
+
+                    const event = worktreesEvent(holding, now);
+
+                    if (addEvent(thread, event.key, event.text, now)) {
                         events += 1;
                     }
                 }
@@ -5496,10 +7072,44 @@ export default function createDesk(host: Host, web: Web) {
                     events += 1;
                 }
             } else {
-                thread.closed = { at: now, why: "done", by: "sweep" };
+                thread.closed = {
+                    at: now,
+                    why: "done",
+                    by: "sweep",
+                    outcome: closeOutcome(thread),
+                };
 
-                if (addEvent(thread, `closed:${String(now)}`, "closed: all parts closed", now)) {
+                if (
+                    addEvent(
+                        thread,
+                        `closed:${String(now)}`,
+                        `closed: ${closeOutcomeWords(thread)}`,
+                        now,
+                    )
+                ) {
                     events += 1;
+                }
+
+                // A thread that closes as done is news for the supervisor: 1 line in the digest, in this commit.
+                if (digestOn) {
+                    const repo = thread.repo === undefined ? "" : ` ${thread.repo}`;
+                    const due = enqueueDigest(
+                        state,
+                        supervisor,
+                        {
+                            key: `closed:${thread.id}`,
+                            thread: thread.id,
+                            kind: "closed",
+                            line: `[desk] ${thread.id}${repo} · closed: done, nothing remains · desk read ${thread.id}`,
+                            at: now,
+                        },
+                        now,
+                        digest,
+                    );
+
+                    if (due !== undefined) {
+                        await startDigest(tx, supervisor, due);
+                    }
                 }
             }
         }
@@ -5510,6 +7120,11 @@ export default function createDesk(host: Host, web: Web) {
                 .map((thread) => thread.address)
                 .filter((address): address is string => typeof address === "string"),
         );
+
+        // A Clerk's session is known work: it never becomes a found thread.
+        for (const clerk of Object.values(state.clerks ?? {})) {
+            addresses.add(clerk.address);
+        }
 
         // A delegation in flight has a thread, but not its address yet: do not mistake its session for hidden work.
         const inFlight = open.some((thread) => thread.state === "starting");
@@ -5567,7 +7182,12 @@ export default function createDesk(host: Host, web: Web) {
         const pending = (baseline.pending ??= {});
 
         for (const [folder, counts] of Object.entries(facts.folders)) {
-            if (counts === null || (counts.dirty === 0 && counts.ahead === 0)) {
+            if (counts !== null && counts.statusFailed === true) {
+                // A failed read says nothing about the folder: the pending time it had stays.
+                continue;
+            }
+
+            if (!folderWork(counts)) {
                 delete pending[folder];
                 continue;
             }
@@ -5609,7 +7229,9 @@ export default function createDesk(host: Host, web: Web) {
                 run: {
                     folder,
                     dirty: counts.dirty,
-                    ahead: counts.ahead,
+                    ...(counts.ahead === undefined
+                        ? { aheadUnknown: counts.aheadUnknown ?? "no branch" }
+                        : { ahead: counts.ahead }),
                     next: "odrade",
                     sweptAt: now,
                 },
@@ -5635,8 +7257,36 @@ export default function createDesk(host: Host, web: Web) {
         baseline.folders = baseline.folders.filter((folder) => {
             const counts = facts.folders[folder];
 
-            return counts === undefined || counts === null || counts.dirty > 0 || counts.ahead > 0;
+            return (
+                counts === undefined ||
+                counts === null ||
+                counts.statusFailed === true ||
+                counts.gone === true ||
+                counts.dirty > 0 ||
+                (counts.ahead ?? 0) > 0
+            );
         });
+
+        // The threads of this supervisor that newly wait on it: 1 item each, in the digest, in this commit. With the
+        // digest off, nothing is recorded: every wait goes as it did before.
+        if (digestOn) {
+            const box = digestBox(state, supervisor);
+            const mine = Object.values(state.threads).filter(
+                (thread) => thread.supervisor === supervisor,
+            );
+            const news = queueNews(mine, box, now);
+
+            // The reasons a digest carried go in before the items: a box's contents persist in 1 set.
+            setDigestBox(state, supervisor, box);
+
+            for (const item of news) {
+                const due = enqueueDigest(state, supervisor, item, now, digest);
+
+                if (due !== undefined) {
+                    await startDigest(tx, supervisor, due);
+                }
+            }
+        }
 
         return { events };
     };
@@ -6122,6 +7772,20 @@ export default function createDesk(host: Host, web: Web) {
                     await sendUnready(supervisor, work, runtime, context);
                 }
 
+                // After the commit, so a thread that closed in it has its worktree handled at once: the sweeper ends
+                // when its last thread closes, and the next sweep may never come.
+                try {
+                    await sweepWorktrees(
+                        Number(supervisor),
+                        runtime,
+                        runtime.now(),
+                        context,
+                        (change) => runtime.commit(change, context),
+                    );
+                } catch {
+                    // The next sweep tries again: `run.worktreeGone` is unset.
+                }
+
                 web.send("changed", {});
                 await exportNow(runtime, context);
             },
@@ -6262,6 +7926,204 @@ export default function createDesk(host: Host, web: Web) {
         abort: (_task, runtime, context) =>
             runtime.commit(() => ({ status: "terminal", outcome: { status: "aborted" } }), context),
     });
+
+    type DigestInput = { supervisor: number; due: number };
+    type DigestState =
+        | { phase: "wait"; due: number }
+        | { phase: "take" }
+        | { phase: "deliver"; messages: DigestMessage[] }
+        /** A digest task stored before the split: 1 message to the supervisor. */
+        | { phase: "deliver"; text: string; requestId: string };
+
+    /**
+     * 1 digest message per requested time: wait until `due`, take every waiting item in 1 commit, then submit 1 message
+     * to the supervisor's session as `x.desk.notify` does, and 1 to the Clerk's session for the routine kinds. No
+     * items: no message, and the task ends. A restart in `deliver` submits again with the same request id, which acts
+     * once.
+     */
+    const Digest = defineTask<DigestInput, DigestState, null>({
+        name: "x.desk.digest",
+        version: 1,
+        initial: (input) => ({ phase: "wait", due: input.due }),
+        phases: {
+            wait: async (task, runtime, context) => {
+                if (runtime.now() < task.state.checkpoint.due) {
+                    await runtime.sleep(task.state.checkpoint.due, context);
+                }
+
+                await runtime.commit(
+                    () => ({ status: "running", checkpoint: { phase: "take" } }),
+                    context,
+                );
+            },
+            take: async (task, runtime, context) => {
+                const supervisor = task.input.supervisor;
+
+                await runtime.commit(async (tx) => {
+                    const state = await tx.doc(DeskThreads);
+                    const taken = takeDigest(state, supervisor, task.input.due);
+
+                    // Nothing waits: no message, and the task ends.
+                    if (taken.items.length === 0) {
+                        return {
+                            status: "terminal",
+                            outcome: { status: "completed", result: null },
+                        };
+                    }
+
+                    const { digest } = await deskConfig();
+                    const clerk = clerkOf(state, supervisor);
+                    // The Clerk takes the routine kinds; a kind that goes at once always stays with the supervisor.
+                    const theirs =
+                        clerk === undefined
+                            ? []
+                            : taken.items.filter(
+                                  (item) =>
+                                      digest.clerk.includes(item.kind) &&
+                                      !digest.now.includes(item.kind),
+                              );
+                    const ours = taken.items.filter((item) => !theirs.includes(item));
+                    const base = `x.desk.digest:${String(supervisor)}:${String(taken.seq)}`;
+                    const messages: DigestMessage[] = [];
+
+                    if (theirs.length > 0 && clerk !== undefined) {
+                        messages.push({
+                            conversation: clerk.session,
+                            text: digestText(theirs),
+                            requestId: `${base}:clerk`,
+                        });
+                    }
+
+                    if (ours.length > 0) {
+                        messages.push({
+                            conversation: supervisor,
+                            text: digestText(ours),
+                            requestId: base,
+                        });
+                    }
+
+                    return {
+                        status: "running",
+                        checkpoint: { phase: "deliver", messages },
+                    };
+                }, context);
+            },
+            deliver: async (task, runtime, context) => {
+                const supervisor = task.input.supervisor as ConversationId;
+                // A task stored before the split has 1 message: `text` and `requestId` on the checkpoint.
+                const messages = digestMessages(task.input.supervisor, task.state.checkpoint);
+
+                /** Submit 1 message; give back why it did not go, or nothing. */
+                const send = async (
+                    to: number,
+                    text: string,
+                    requestId: string,
+                ): Promise<string | undefined> => {
+                    const conversation = await runtime.conversation(to as ConversationId, context);
+
+                    if (conversation === undefined) {
+                        return "its session is not here";
+                    }
+
+                    const held = host.heldBack(to as ConversationId);
+
+                    if (held !== undefined) {
+                        return held;
+                    }
+
+                    try {
+                        await conversation.submit(
+                            { type: "input", content: text, whenBusy: "followUp", requestId },
+                            context,
+                        );
+
+                        return undefined;
+                    } catch (error) {
+                        return (error as Error).message;
+                    }
+                };
+
+                for (const message of messages) {
+                    const toClerk = message.conversation !== task.input.supervisor;
+                    let reason = await send(message.conversation, message.text, message.requestId);
+
+                    // A Clerk that cannot take its news: the supervisor gets it in this same digest, with 1 notice.
+                    if (toClerk && reason !== undefined) {
+                        host.notice(
+                            "warning",
+                            `The Clerk did not get the desk digest: ${reason}. The supervisor got it instead.`,
+                            supervisor,
+                        );
+                        reason = await send(
+                            task.input.supervisor,
+                            message.text,
+                            `${message.requestId}:fallback`,
+                        );
+                    }
+
+                    if (reason !== undefined) {
+                        host.notice(
+                            "warning",
+                            `The desk digest did not reach its session: ${reason}.`,
+                            supervisor,
+                        );
+                    }
+                }
+
+                // The messages are in, or they never will be: no wait for the answer, and no retry for ever.
+                await runtime.commit(async (tx) => {
+                    const state = await tx.doc(DeskThreads);
+                    const supervisorId = String(task.input.supervisor);
+
+                    if (state.digests?.[supervisorId] !== undefined) {
+                        const box = digestBox(state, task.input.supervisor);
+
+                        setDigestBox(state, task.input.supervisor, {
+                            ...box,
+                            sentAt: runtime.now(),
+                        });
+                    }
+
+                    return {
+                        status: "terminal",
+                        outcome: { status: "completed", result: null },
+                    };
+                }, context);
+            },
+        },
+        abort: (task, runtime, context) =>
+            runtime.commit(async (tx) => {
+                const state = await tx.doc(DeskThreads);
+                const supervisorId = String(task.input.supervisor);
+
+                // A stopped task frees its time: the next item can ask for it again.
+                if (state.digests?.[supervisorId] !== undefined) {
+                    const box = digestBox(state, task.input.supervisor);
+                    const index = box.scheduled.indexOf(task.input.due);
+
+                    if (index >= 0) {
+                        box.scheduled.splice(index, 1);
+                        setDigestBox(state, task.input.supervisor, box);
+                    }
+                }
+
+                return { status: "terminal", outcome: { status: "aborted" } };
+            }, context),
+    });
+
+    /** Create 1 digest task at `due`, in the caller's commit. 1 task for each requested time. */
+    const startDigest = async (tx: Tx, supervisor: number, due: number): Promise<void> => {
+        await tx.createTask(
+            Digest,
+            { supervisor, due },
+            {
+                ownership: { kind: "conversation" },
+                conversationId: supervisor as ConversationId,
+                background: true,
+                abandonOnRestart: false,
+            },
+        );
+    };
 
     // ─── The page ────────────────────────────────────────────────────────────
 
@@ -6686,7 +8548,7 @@ export default function createDesk(host: Host, web: Web) {
         "asks/:id/answer",
         async (request) => {
             const answerId = (request.params.id ?? "").trim();
-            const { cap } = await deskConfig();
+            const { cap, digest } = await deskConfig();
             const now = Date.now();
             const view = await request.commit(async (tx) => {
                 const state = await tx.doc(DeskThreads);
@@ -6705,23 +8567,47 @@ export default function createDesk(host: Host, web: Web) {
                 // A page answer goes to the supervisor's session: the ask, the person, and his words. The task and the
                 // answer are in 1 commit, so a restart can lose neither and double neither. A second answer (already)
                 // sends nothing, and the tool action records the words for Odrade herself: it sends nothing either.
+                // With the digest on, the answer is 1 item in the digest, and no task of its own.
                 const found = result.already ? undefined : askById(state, result.id);
 
                 if (found?.thread.supervisor !== undefined) {
-                    await tx.createTask(
-                        Notify,
-                        {
-                            supervisor: found.thread.supervisor,
-                            text: answeredText(result.id, request.user.name, words),
-                            requestId: `x.desk.answered:${result.id}`,
-                        },
-                        {
-                            ownership: { kind: "conversation" },
-                            conversationId: found.thread.supervisor as ConversationId,
-                            background: true,
-                            abandonOnRestart: false,
-                        },
-                    );
+                    const supervisor = found.thread.supervisor;
+                    const line = answeredText(result.id, request.user.name, words);
+
+                    if (digest.minutes > 0) {
+                        const due = enqueueDigest(
+                            state,
+                            supervisor,
+                            {
+                                key: `answer:${result.id}`,
+                                thread: found.thread.id,
+                                kind: answerKind(words),
+                                line,
+                                at: now,
+                            },
+                            now,
+                            digest,
+                        );
+
+                        if (due !== undefined) {
+                            await startDigest(tx, supervisor, due);
+                        }
+                    } else {
+                        await tx.createTask(
+                            Notify,
+                            {
+                                supervisor,
+                                text: line,
+                                requestId: `x.desk.answered:${result.id}`,
+                            },
+                            {
+                                ownership: { kind: "conversation" },
+                                conversationId: supervisor as ConversationId,
+                                background: true,
+                                abandonOnRestart: false,
+                            },
+                        );
+                    }
                 }
 
                 return threadsView(state, now, cap);
@@ -6942,8 +8828,15 @@ export default function createDesk(host: Host, web: Web) {
                 }
 
                 // The queue: the threads that wait on Odrade now, and that this turn did not touch. She acts on them
-                // without waiting for a message; the memo keeps it to 1 continue per turn.
+                // without waiting for a message; the memo keeps it to 1 continue per turn. With the digest on, the
+                // digest carries the new waits, and this continue does not run.
                 if ((await api.memo("desk.queued", context)) === true) {
+                    return undefined;
+                }
+
+                const { digest } = await deskConfig();
+
+                if (digest.minutes > 0) {
                     return undefined;
                 }
 
@@ -7006,10 +8899,52 @@ export default function createDesk(host: Host, web: Web) {
         },
     });
 
+    /** The commands a Clerk never runs: a merge, an approval, a review, a tag, a release, or a force-push. */
+    const CLERK_FORBIDDEN =
+        /\bgh\s+pr\s+(?:merge|review)\b|\bgh\s+release\b|\bgit\s+tag\b|\bgit\s+push\b[^\n]*(?:--force-with-lease|--force|-f)\b/;
+
+    /**
+     * The Clerk never merges, approves, reviews, tags, releases, or force-pushes. A hook that throws must not block a
+     * call by accident, so every error lets the call run.
+     */
+    const noClerkMerge = hook(ToolTask, {
+        beforeTool: async (call, api, context) => {
+            try {
+                if (call.name !== "bash") {
+                    return undefined;
+                }
+
+                const team = teamApi();
+
+                if (team === undefined) {
+                    return undefined;
+                }
+
+                const persona = await team.persona(api, api.conversationId, context);
+
+                if (persona?.role !== "clerk") {
+                    return undefined;
+                }
+
+                const args = call.arguments as { command?: unknown };
+
+                if (typeof args.command !== "string" || !CLERK_FORBIDDEN.test(args.command)) {
+                    return undefined;
+                }
+
+                return {
+                    block: "The Clerk never merges, approves, reviews, tags, releases, or force-pushes. Escalate to your supervisor.",
+                };
+            } catch {
+                return undefined;
+            }
+        },
+    });
+
     const tool = defineTool({
         name: "desk",
         description:
-            "The desk of threads for work the team runs in the background. A supervisor session can use every action; an agent session can use watch and result on its own thread only. Actions: list (one line per open thread), read (one thread in full), sync (observe the threads now, with linked sessions, Night shift, git, and GitHub), seed (import a seed.json file one time), attach (put a PR, or all of another thread's work, on one thread), detach (take a PR off a thread), ask (file a question for Brian on a thread, or on a new one), answer (record Brian's words for an ask), watch (set a dated check on a thread: it sleeps until that date, and does not count toward the cap), result (record that check's pass, which closes the thread, or its fail, which opens it again).",
+            "The desk of threads for work the team runs in the background. A supervisor session can use every action; a Clerk can use list, read, sync, attach, detach, watch, result, and send for its supervisor's threads; an agent session can use watch and result on its own thread only. Actions: list (one line per open thread), read (one thread in full), sync (observe the threads now, with linked sessions, Night shift, git, and GitHub), seed (import a seed.json file one time), attach (put a PR, or all of another thread's work, on one thread), detach (take a PR off a thread), ask (file a question for Brian on a thread, or on a new one), answer (record Brian's words for an ask), watch (set a dated check on a thread: it sleeps until that date, and does not count toward the cap), result (record that check's pass, which closes the thread, or its fail, which opens it again), send (send 1 message from the supervisor's session to a thread's agent).",
         parameters: Type.Object({
             action: Type.Union([
                 Type.Literal("list"),
@@ -7022,11 +8957,12 @@ export default function createDesk(host: Host, web: Web) {
                 Type.Literal("answer"),
                 Type.Literal("watch"),
                 Type.Literal("result"),
+                Type.Literal("send"),
             ]),
             thread: Type.Optional(
                 Type.String({
                     description:
-                        "read: a thread id, such as T13; attach: the target thread; watch, result: the thread to change",
+                        "read: a thread id, such as T13; attach: the target thread; watch, result: the thread to change; send: the thread whose agent gets the message",
                 }),
             ),
             ref: Type.Optional(
@@ -7038,7 +8974,7 @@ export default function createDesk(host: Host, web: Web) {
             text: Type.Optional(
                 Type.String({
                     description:
-                        "ask: the question for Brian, 1 to 500 characters, on one line; watch: the check, 1 to 200 characters; result: what happened, 1 to 200 characters",
+                        "ask: the question for Brian, 1 to 500 characters, on one line; watch: the check, 1 to 200 characters; result: what happened, 1 to 200 characters; send: the message to the thread's agent, 1 to 2000 characters",
                 }),
             ),
             title: Type.Optional(
@@ -7094,11 +9030,40 @@ export default function createDesk(host: Host, web: Web) {
                 );
             }
 
-            if (persona.role !== "supervisor" && !watching) {
+            const session = Number(api.conversationId);
+            // A registered Clerk acts for its supervisor: the look, the sweeps, and every thread check use that id.
+            let supervisor = session;
+
+            if (persona.role === "clerk") {
+                const registered = supervisorOfClerk(
+                    await api.snapshot(DeskThreads, context),
+                    session,
+                );
+
+                if (registered === undefined) {
+                    throw new Error(
+                        "This Clerk is not registered on the desk. Odrade starts it with team_delegate.",
+                    );
+                }
+
+                if (args.action === "ask" || args.action === "answer" || args.action === "seed") {
+                    throw new Error(
+                        "Only the supervisor files asks, records Brian's answers, and seeds the desk. Escalate to your supervisor.",
+                    );
+                }
+
+                supervisor = registered;
+            } else if (persona.role !== "supervisor" && !watching) {
                 throw new Error("Only a session assigned a supervisor identity can use the desk.");
             }
 
-            const looked = `supervisor:${String(Number(api.conversationId))}`;
+            /** The threads this session changes: a supervisor any, a Clerk its supervisor's, an agent its own. */
+            const changes = (thread: Thread): boolean =>
+                persona.role === "supervisor" ||
+                (persona.role === "clerk" && thread.supervisor === supervisor) ||
+                thread.session === session;
+
+            const looked = `supervisor:${String(supervisor)}`;
 
             if (args.action === "list") {
                 // The look moves in the same commit: a section cannot write, so Odrade's last look is marked here.
@@ -7106,7 +9071,7 @@ export default function createDesk(host: Host, web: Web) {
                     const state = await tx.doc(DeskThreads);
 
                     state.seen[looked] = Date.now();
-                    await startSweeper(tx, Number(api.conversationId));
+                    await startSweeper(tx, supervisor);
 
                     return listText(state, Date.now());
                 }, context);
@@ -7135,7 +9100,7 @@ export default function createDesk(host: Host, web: Web) {
                     }
 
                     state.seen[looked] = Date.now();
-                    await startSweeper(tx, Number(api.conversationId));
+                    await startSweeper(tx, supervisor);
 
                     return { text: readText(state, id) ?? "", session: thread.session };
                 }, context);
@@ -7164,8 +9129,8 @@ export default function createDesk(host: Host, web: Web) {
                         ...(args.options === undefined ? {} : { options: args.options }),
                         key,
                         by: persona.name,
-                        supervisor: Number(api.conversationId),
-                        session: Number(api.conversationId),
+                        supervisor,
+                        session,
                         at,
                     });
 
@@ -7174,7 +9139,7 @@ export default function createDesk(host: Host, web: Web) {
                     }
 
                     if (state.threads[added.threadId]?.origin === "ask") {
-                        await startSweeper(tx, Number(api.conversationId));
+                        await startSweeper(tx, supervisor);
                     }
 
                     return added;
@@ -7241,11 +9206,8 @@ export default function createDesk(host: Host, web: Web) {
                         return { error: `There is no thread ${asked.toUpperCase()} on the desk.` };
                     }
 
-                    // A supervisor changes any thread; an agent only the thread of the session it runs in.
-                    if (
-                        persona.role !== "supervisor" &&
-                        thread.session !== Number(api.conversationId)
-                    ) {
+                    // A supervisor changes any thread, a Clerk any thread of its supervisor, an agent only its own.
+                    if (!changes(thread)) {
                         return {
                             error: `Only the supervisor can record a result or set a watch on ${thread.id}: it is not this session's thread.`,
                         };
@@ -7323,17 +9285,22 @@ export default function createDesk(host: Host, web: Web) {
                     );
                 }
 
-                const result = await api.commit(
-                    async (tx) =>
-                        attachTo(
-                            await tx.doc(DeskThreads),
-                            ref,
-                            targetId,
-                            Date.now(),
-                            persona.name,
-                        ),
-                    context,
-                );
+                const result = await api.commit(async (tx) => {
+                    const state = await tx.doc(DeskThreads);
+                    const target = threadById(state, targetId);
+                    const source = PR_REF.test(ref) ? undefined : threadById(state, ref);
+
+                    // A Clerk works only on its supervisor's threads.
+                    for (const thread of [target, source]) {
+                        if (thread !== undefined && !changes(thread)) {
+                            return {
+                                error: `Only the supervisor can change ${thread.id}: it is another supervisor's thread.`,
+                            };
+                        }
+                    }
+
+                    return attachTo(state, ref, targetId, Date.now(), persona.name);
+                }, context);
 
                 if ("error" in result) {
                     throw new Error(result.error);
@@ -7358,10 +9325,18 @@ export default function createDesk(host: Host, web: Web) {
                     throw new Error(`${ref} is not a PR ref such as owner/name#12.`);
                 }
 
-                const result = await api.commit(
-                    async (tx) => detachFrom(await tx.doc(DeskThreads), ref, targetId, Date.now()),
-                    context,
-                );
+                const result = await api.commit(async (tx) => {
+                    const state = await tx.doc(DeskThreads);
+                    const target = threadById(state, targetId);
+
+                    if (target !== undefined && !changes(target)) {
+                        return {
+                            error: `Only the supervisor can change ${target.id}: it is another supervisor's thread.`,
+                        };
+                    }
+
+                    return detachFrom(state, ref, targetId, Date.now());
+                }, context);
 
                 if ("error" in result) {
                     throw new Error(result.error);
@@ -7372,14 +9347,89 @@ export default function createDesk(host: Host, web: Web) {
                 return reply(result.text);
             }
 
+            if (args.action === "send") {
+                const id = args.thread?.trim() ?? "";
+                const text = (args.text ?? "").trim();
+
+                if (id === "") {
+                    throw new Error("send needs thread: a thread id such as T13.");
+                }
+
+                if (text === "" || text.length > MAX_SEND) {
+                    throw new Error(
+                        `send needs text: 1 to ${String(MAX_SEND)} characters for the thread's agent.`,
+                    );
+                }
+
+                const key = `x.desk.send:${api.taskId}:${api.callId}`;
+                const found = await api.commit(async (tx) => {
+                    const state = await tx.doc(DeskThreads);
+                    const thread = threadById(state, id);
+
+                    if (thread === undefined) {
+                        return { error: `There is no thread ${id.toUpperCase()} on the desk.` };
+                    }
+
+                    // From the supervisor's session only: an agent's own address for another session is not this one.
+                    if (!changes(thread)) {
+                        return {
+                            error: `Only the supervisor can message ${thread.id}: it is not this session's thread.`,
+                        };
+                    }
+
+                    if (thread.state === "closed") {
+                        return { error: `${thread.id} is closed: there is no agent to message.` };
+                    }
+
+                    if (thread.address === undefined) {
+                        return {
+                            error: `${thread.id} has no address for its agent: no message can go to it.`,
+                        };
+                    }
+
+                    return { id: thread.id, address: thread.address, text };
+                }, context);
+
+                if ("error" in found) {
+                    throw new Error(found.error);
+                }
+
+                // From the supervisor's session, and the send's key makes a replay act once, as a close-out does.
+                try {
+                    await host.linkedSessions.send(
+                        supervisor as ConversationId,
+                        { to: found.address, message: found.text },
+                        key,
+                    );
+                } catch (error) {
+                    throw new Error(
+                        `The message to ${found.id}'s agent did not go: ${(error as Error).message}`,
+                    );
+                }
+
+                // A document change only, in its own commit: the send has its own record.
+                try {
+                    await api.commit(async (tx) => {
+                        const thread = threadById(await tx.doc(DeskThreads), found.id);
+
+                        if (thread !== undefined) {
+                            addEvent(thread, key, `message from ${persona.name} sent`, Date.now());
+                        }
+                    }, context);
+                } catch {
+                    // The send went: a replay adds the event with the same key, which acts once.
+                }
+
+                return reply(`Sent 1 message to the agent of ${found.id}.`);
+            }
+
             if (args.action === "sync") {
-                const supervisor = api.conversationId;
-                const facts = await gather(supervisor, api, Date.now(), context);
+                const facts = await gather(supervisor as ConversationId, api, Date.now(), context);
                 const result = await api.commit(async (tx) => {
                     const swept = await applySweep(
                         tx,
                         await tx.doc(DeskThreads),
-                        Number(supervisor),
+                        supervisor,
                         facts,
                     );
 
@@ -7387,6 +9437,11 @@ export default function createDesk(host: Host, web: Web) {
 
                     return swept;
                 }, context);
+
+                // The worktrees of this supervisor's closed threads: git runs outside the commit above.
+                await sweepWorktrees(Number(supervisor), api, Date.now(), context, (change) =>
+                    api.commit(change, context),
+                );
 
                 web.send("changed", {});
                 await exportNow(api, context);
@@ -7437,7 +9492,7 @@ export default function createDesk(host: Host, web: Web) {
             const result = await api.commit(async (tx) => {
                 const seeded = seedThreads(await tx.doc(DeskThreads), parsed.threads, {
                     hash,
-                    supervisor: Number(api.conversationId),
+                    supervisor,
                     at: Date.now(),
                     folders,
                 });
@@ -7447,7 +9502,7 @@ export default function createDesk(host: Host, web: Web) {
                 }
 
                 if (!seeded.reused) {
-                    await startSweeper(tx, Number(api.conversationId));
+                    await startSweeper(tx, supervisor);
                 }
 
                 return seeded;
@@ -7466,8 +9521,8 @@ export default function createDesk(host: Host, web: Web) {
     return defineExtension({
         name: "desk",
         tools: [tool],
-        hooks: [noTeamReport, reminder],
-        tasks: [Sweeper, Notify],
+        hooks: [noTeamReport, noClerkMerge, reminder],
+        tasks: [Sweeper, Notify, Digest],
         sections: [
             // Only a supervisor's session gets it. No clock text: the section changes when the desk changes.
             section("desk", async (input, context) => {
@@ -7524,8 +9579,9 @@ export default function createDesk(host: Host, web: Web) {
                 const waits = waitsText(open, {
                     busy: await busyNow(open, input.conversationId),
                 });
-                const { cap } = await deskConfig();
+                const { cap, digest } = await deskConfig();
                 const capped = capView(state, cap, now);
+                const clerk = clerkOf(state, supervisor);
                 const events = mine
                     .flatMap((thread) =>
                         thread.events
@@ -7554,11 +9610,18 @@ export default function createDesk(host: Host, web: Web) {
                         : []),
                     `Stale: ${stale.length === 0 ? "none" : stale.join(", ")}.`,
                     ...(waits === "" ? [] : [`Waits on you: ${waits}.`]),
+                    ...(clerk === undefined
+                        ? []
+                        : [
+                              `Clerk: ${clerk.address} gets routine desk news. Send it work with team_message.`,
+                          ]),
                     ...(events.length === 0 ? [] : ["New since your last look:", ...events]),
                     "Threads that wait on you are yours to act on now: do not wait for a message.",
                     "File each ask to Brian (a decision, a host action, a device check) with desk ask. Record his answer with desk answer. Give choices with options when an ask is a pick-one decision.",
                     "A due watch (due: T13 <check>) is yours to send: send the check to the thread's agent, then record its result with desk result.",
-                    "Reports arrive as 1 line that starts with [desk]. Read the full report with desk read <id> before you act.",
+                    digest.minutes > 0
+                        ? `Desk news arrives as 1 digest message every ${String(digest.minutes)} minutes (at once for urgent kinds): each line starts with [desk]. Read the full report with desk read <id> before you act.`
+                        : "Reports arrive as 1 line that starts with [desk]. Read the full report with desk read <id> before you act.",
                     "Keep each reply to Brian to 1 or 2 lines: the project and the urgency. The Desk holds the rest.",
                 ].join("\n");
             }),
