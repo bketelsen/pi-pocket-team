@@ -11,6 +11,9 @@
  * The truth is two documents. `x.desk.threads` is app-wide. `x.desk.reports` holds one thread session's reports, on
  * that session. They are stored data: never rename a kind or change what a field means; add fields beside them.
  *
+ * Desk news goes to the supervisor in a digest: 1 message at most once in each interval (`x.desk.digest`), except the
+ * kinds that go at once. An interval of 0 minutes turns it off, and every path works as it did before it.
+ *
  * Other modules find this one through `globalThis[Symbol.for("pi-pocket-team.desk")]`, never through an import: an
  * import would keep a stale copy after a reload. With this module off, Team and Night shift work as before.
  */
@@ -56,6 +59,8 @@ const MAX_LINE = 200;
 const KEPT_EVENTS = 50;
 /** Events shown by `desk read`. */
 const SHOWN_EVENTS = 10;
+/** A `desk send` message's limit. */
+const MAX_SEND = 2000;
 /** Reports kept for one thread session, newest first. */
 const KEPT_REPORTS = 10;
 /** PR refs and branches kept on a thread. */
@@ -199,6 +204,68 @@ export type Grant = {
     expires: number;
 };
 
+/** One kind of desk news for the digest. Stored data: never rename a kind. */
+export type DigestKind =
+    | "report"
+    | "shift"
+    | "shift-blocked"
+    | "answer"
+    | "answer-action"
+    | "closed"
+    | "queue"
+    | "repair";
+
+/** Every digest kind, in the design's order. */
+export const DIGEST_KINDS: readonly DigestKind[] = [
+    "report",
+    "shift",
+    "shift-blocked",
+    "answer",
+    "answer-action",
+    "closed",
+    "queue",
+    "repair",
+];
+
+/** One piece of desk news for the supervisor's digest. Stored data: never rename a field. */
+export type DigestItem = {
+    /** The replay key: a second enqueue of the same news is a no-op. */
+    key: string;
+    /** The thread id the news is about. */
+    thread: string;
+    kind: DigestKind;
+    /** The one line the digest shows: `shortLine`, `answeredText`, or a line of its own. */
+    line: string;
+    at: number;
+};
+
+/** One supervisor's waiting digest news. Stored data: never rename a field. */
+export type DigestBox = {
+    /** The waiting items, oldest first: 100 at most. */
+    items: DigestItem[];
+    /** The times a digest task asked for: a scheduled time covers 1 at or after it. */
+    scheduled: number[];
+    /** Thread id → the reason a digest already carried. */
+    queued: Record<string, string>;
+    /** The digests taken: its count is the last part of a request id. */
+    seq: number;
+    /** When a digest message last went. */
+    sentAt?: number;
+};
+
+/** One registered Clerk: the supervisor's long-lived desk session. Stored data: never rename a field. */
+export type Clerk = {
+    /** The Clerk session's conversation id. */
+    session: number;
+    /** The supervisor's address for the Clerk's session. */
+    address: string;
+    /** The roster id of the Clerk's profile. */
+    agent: string;
+    at: number;
+    /** The start's replay key, so its replay finds the Clerk it made: `x.team.delegate:<task>:<call>`. */
+    key?: string;
+};
+
 /** The desk's one document. Stored data: never rename the kind or change what a field means. */
 export type DeskState = {
     /** The next id of each kind: T13, F2. */
@@ -227,6 +294,10 @@ export type DeskState = {
         string,
         { sessions: string[]; folders: string[]; pending?: Record<string, number> }
     >;
+    /** Each supervisor's waiting digest news, by conversation id. */
+    digests?: Record<string, DigestBox>;
+    /** Each supervisor's Clerk, by supervisor id. */
+    clerks?: Record<string, Clerk>;
 };
 
 /** The desk's threads, app-wide as `x.team.memory` is. */
@@ -237,13 +308,15 @@ export const DeskThreads = defineDoc<DeskState>({
     initial: () => ({ next: { T: 1, F: 1 }, threads: {}, grants: [], seen: {} }),
 });
 
-/** One report, as the thread's session stores it. `line` is what the supervisor's chat got. */
+/** One report, as the thread's session stores it. `line` is what the supervisor's chat got, or the digest carries. */
 export type StoredReport = {
     key: string;
     at: number;
     from: "team_message" | "night-shift";
     text: string;
     line: string;
+    /** The report went into the digest: the caller sent nothing, and a replay of its call sends nothing again. */
+    held?: boolean;
 };
 
 /** One thread session's reports, newest first, the last 10 kept. Stored data: never rename a field. */
@@ -373,6 +446,28 @@ export function threadOfSession(
     session: number,
 ): Thread | undefined {
     return Object.values(state?.threads ?? {}).find((thread) => thread.session === session);
+}
+
+/** A supervisor's Clerk, when one is registered. */
+export function clerkOf(
+    state: Readonly<DeskState> | undefined,
+    supervisor: number,
+): Clerk | undefined {
+    return state?.clerks?.[String(supervisor)];
+}
+
+/** The supervisor whose Clerk runs in a session, when that session is registered. */
+export function supervisorOfClerk(
+    state: Readonly<DeskState> | undefined,
+    session: number,
+): number | undefined {
+    for (const [supervisor, clerk] of Object.entries(state?.clerks ?? {})) {
+        if (clerk.session === session) {
+            return Number(supervisor);
+        }
+    }
+
+    return undefined;
 }
 
 /** Add an event once per key, and keep the newest 50. True when it was added. */
@@ -2101,6 +2196,282 @@ export function waitsNeedLive(threads: Thread[]): boolean {
     return threads.some(
         (thread) => thread.address !== undefined && odradeReason(thread) === SILENT_SESSION,
     );
+}
+
+/** The digest's default interval, in minutes. */
+export const DIGEST_MINUTES = 15;
+/** The digest's interval ceiling, in minutes. */
+export const DIGEST_MAX_MINUTES = 240;
+/** The kinds that go at once, by default. */
+export const DIGEST_NOW: readonly DigestKind[] = ["shift-blocked", "answer-action", "repair"];
+/** The kinds the Clerk gets, by default: the routine news. */
+export const DIGEST_CLERK: readonly DigestKind[] = ["report", "shift", "closed", "queue"];
+/** The most items a box keeps: the oldest go first. */
+export const DIGEST_MAX_ITEMS = 100;
+/** The most item lines 1 digest message shows. */
+export const DIGEST_MAX_LINES = 30;
+
+/**
+ * The digest's setting: an interval of 0 to 240 minutes, the kinds that go at once, and the kinds the Clerk gets. A
+ * kind in `now` always goes to the supervisor.
+ */
+export type DigestConfig = { minutes: number; now: DigestKind[]; clerk: DigestKind[] };
+
+/** The known kinds in a stored value: an unknown name is left out. */
+function digestKinds(raw: readonly unknown[]): DigestKind[] {
+    return [
+        ...new Set(
+            raw.filter(
+                (kind): kind is DigestKind =>
+                    typeof kind === "string" && (DIGEST_KINDS as readonly string[]).includes(kind),
+            ),
+        ),
+    ];
+}
+
+/** The digest's setting from its stored value: a missing or bad value gives its default. */
+export function digestConfig(raw: unknown): DigestConfig {
+    const value = (raw !== null && typeof raw === "object" ? raw : {}) as {
+        minutes?: unknown;
+        now?: unknown;
+        clerk?: unknown;
+    };
+    const minutes =
+        typeof value.minutes === "number" &&
+        Number.isInteger(value.minutes) &&
+        value.minutes >= 0 &&
+        value.minutes <= DIGEST_MAX_MINUTES
+            ? value.minutes
+            : DIGEST_MINUTES;
+    // An unknown name is left out: a setting with an array is not bad, so its known names are the list.
+    const now = Array.isArray(value.now) ? digestKinds(value.now) : [...DIGEST_NOW];
+    const clerk = Array.isArray(value.clerk) ? digestKinds(value.clerk) : [...DIGEST_CLERK];
+
+    return { minutes, now, clerk };
+}
+
+/** The words that are only an acknowledgement: they name nothing for the supervisor to do. */
+const ACK_WORDS =
+    /^(?:ok|okay|yes ok|no|nope|thanks|thank you|noted|fine|later|not now|skip|seen|got it|done|answered on the desk page)$/i;
+
+/** A Desk-page answer's kind: `answer` for an acknowledgement only, else `answer-action`. */
+export function answerKind(words: string): "answer" | "answer-action" {
+    return ACK_WORDS.test(flatLine(words).replace(/[\s.!?]+$/, "")) ? "answer" : "answer-action";
+}
+
+/** The kinds that carry a report. */
+const REPORT_KINDS: readonly DigestKind[] = ["report", "shift", "shift-blocked"];
+
+/**
+ * A supervisor's box as a plain copy, with a fresh one when it is not there yet: a change goes back through
+ * `setDigestBox`, never into the copy alone.
+ */
+function digestBox(state: DeskState, supervisor: number): DigestBox {
+    const box = state.digests?.[String(supervisor)];
+
+    return {
+        items: [...(box?.items ?? [])],
+        scheduled: [...(box?.scheduled ?? [])],
+        queued: { ...(box?.queued ?? {}) },
+        seq: box?.seq ?? 0,
+        ...(box?.sentAt === undefined ? {} : { sentAt: box.sentAt }),
+    };
+}
+
+/** Write a supervisor's box back: 1 set of the whole map, so a new box and its contents persist together. */
+function setDigestBox(state: DeskState, supervisor: number, box: DigestBox): void {
+    state.digests = { ...(state.digests ?? {}), [String(supervisor)]: box };
+}
+
+/**
+ * Add 1 item to a supervisor's box, and give the time of the digest task to create: none when an item with that key is
+ * there already, or a scheduled time at or before the item's wanted time covers it. An "at once" kind wants `now`;
+ * any other wants `now` plus the interval.
+ */
+export function enqueueDigest(
+    state: DeskState,
+    supervisor: number,
+    item: DigestItem,
+    now: number,
+    config: DigestConfig,
+): number | undefined {
+    const box = digestBox(state, supervisor);
+
+    if (box.items.some((each) => each.key === item.key)) {
+        return undefined;
+    }
+
+    box.items.push(item);
+
+    if (box.items.length > DIGEST_MAX_ITEMS) {
+        box.items.splice(0, box.items.length - DIGEST_MAX_ITEMS);
+    }
+
+    const wanted = config.now.includes(item.kind) ? now : now + config.minutes * 60_000;
+    // A task at or before the wanted time takes this item too: no second task.
+    const covered = box.scheduled.some((at) => at <= wanted);
+
+    if (!covered) {
+        box.scheduled.push(wanted);
+    }
+
+    setDigestBox(state, supervisor, box);
+
+    return covered ? undefined : wanted;
+}
+
+/**
+ * The items for the threads that newly wait on the supervisor: 1 for each thread whose reason differs from the reason
+ * a digest carried already. It records each reason in `box.queued`, and deletes the threads that stopped waiting. The
+ * caller enqueues the items it gives; nothing is added to the box here.
+ */
+export function queueNews(threads: readonly Thread[], box: DigestBox, now: number): DigestItem[] {
+    const items: DigestItem[] = [];
+    const waiting = new Set<string>();
+
+    for (const thread of threads) {
+        const reason = odradeReason(thread);
+
+        if (reason === undefined) {
+            continue;
+        }
+
+        waiting.add(thread.id);
+
+        if (box.queued[thread.id] === reason) {
+            continue;
+        }
+
+        box.queued[thread.id] = reason;
+
+        items.push({
+            key: `queue:${thread.id}:${reason}`,
+            thread: thread.id,
+            kind:
+                reason.startsWith("PR ") && reason.includes("needs a repair") ? "repair" : "queue",
+            line: `[desk] ${thread.id} · waits on you: ${reason} · desk read ${thread.id}`,
+            at: now,
+        });
+    }
+
+    for (const id of Object.keys(box.queued)) {
+        if (!waiting.has(id)) {
+            delete box.queued[id];
+        }
+    }
+
+    return items.sort((a, b) => idNumber(a.thread) - idNumber(b.thread));
+}
+
+/** Put `text` before `desk read <id>` in 1 line, else at its end. */
+function putBeforeRead(line: string, text: string): string {
+    const marker = " · desk read ";
+    const index = line.indexOf(marker);
+
+    return index < 0
+        ? `${line} · ${text}`
+        : `${line.slice(0, index)} · ${text}${line.slice(index)}`;
+}
+
+/**
+ * The digest message: 1 header line, then 1 line for each item. A thread closed in this digest gets its closed line
+ * only, with the count of its reports in the same digest. At most 30 item lines; the rest are counted.
+ */
+export function digestText(items: readonly DigestItem[]): string {
+    const closed = new Set(
+        items.filter((item) => item.kind === "closed").map((item) => item.thread),
+    );
+    const reports = new Map<string, number>();
+
+    for (const item of items) {
+        if (closed.has(item.thread) && REPORT_KINDS.includes(item.kind)) {
+            reports.set(item.thread, (reports.get(item.thread) ?? 0) + 1);
+        }
+    }
+
+    const lines: string[] = [];
+
+    for (const item of items) {
+        // A closed thread's report and queue lines are inside its closed line; an answer to Brian stays.
+        if (
+            closed.has(item.thread) &&
+            item.kind !== "closed" &&
+            item.kind !== "answer" &&
+            item.kind !== "answer-action"
+        ) {
+            continue;
+        }
+
+        if (item.kind === "closed") {
+            const count = reports.get(item.thread) ?? 0;
+
+            lines.push(
+                count === 0
+                    ? item.line
+                    : putBeforeRead(item.line, `${String(count)} report${count === 1 ? "" : "s"}`),
+            );
+            continue;
+        }
+
+        lines.push(item.line);
+    }
+
+    const shown = lines.slice(0, DIGEST_MAX_LINES);
+    const more = lines.length - shown.length;
+
+    return [
+        `[desk] digest: ${String(lines.length)} new. Read each with desk read <id> before you act.`,
+        ...shown,
+        ...(more === 0 ? [] : [`… and ${String(more)} more on the Desk page.`]),
+    ].join("\n");
+}
+
+/** One message a digest task sends: the supervisor's, or the Clerk's. */
+export type DigestMessage = { conversation: number; text: string; requestId: string };
+
+/**
+ * The messages a digest checkpoint holds: the list, or the 1 message of a task stored before the Clerk split (`text`
+ * and `requestId` on the checkpoint).
+ */
+export function digestMessages(
+    supervisor: number,
+    checkpoint: { messages?: DigestMessage[]; text?: string; requestId?: string },
+): DigestMessage[] {
+    if (checkpoint.messages !== undefined) {
+        return checkpoint.messages;
+    }
+
+    return checkpoint.text === undefined || checkpoint.requestId === undefined
+        ? []
+        : [{ conversation: supervisor, text: checkpoint.text, requestId: checkpoint.requestId }];
+}
+
+/**
+ * Take a supervisor's waiting items for the digest task due at `due`: the items, the box emptied, and its number. 1
+ * occurrence of `due` leaves `scheduled`. A supervisor with no box takes nothing, and writes nothing.
+ */
+export function takeDigest(
+    state: DeskState,
+    supervisor: number,
+    due: number,
+): { items: DigestItem[]; seq: number } {
+    if (state.digests?.[String(supervisor)] === undefined) {
+        return { items: [], seq: 0 };
+    }
+
+    const box = digestBox(state, supervisor);
+    const index = box.scheduled.indexOf(due);
+
+    if (index >= 0) {
+        box.scheduled.splice(index, 1);
+    }
+
+    const items = box.items;
+    const seq = box.seq + 1;
+
+    setDigestBox(state, supervisor, { ...box, items: [], seq });
+
+    return { items, seq };
 }
 
 /** The desk's start: the oldest seed thread's start, else the stored epoch. A seed sets the truth. */
@@ -4378,7 +4749,14 @@ export type FileRequest = {
     from: "team_message" | "night-shift";
     text: string;
     at: number;
+    /** Put this report in the supervisor's digest: the caller sends nothing when the desk says `held`. */
+    digest?: true;
+    /** The night shift's stop reason: `blocked` and `failed` go at once. */
+    reason?: string;
 };
+
+/** A Clerk's registration, as `team.ts` hands it over: the Clerk, and its supervisor. */
+export type ClerkRequest = Clerk & { supervisor: number };
 
 /** What `team.ts` uses: on `globalThis[Symbol.for("pi-pocket-team.desk")]`, so it finds the live version. */
 export type DeskApi = {
@@ -4390,16 +4768,23 @@ export type DeskApi = {
         tx: Tx,
         session: ConversationId,
         request: FileRequest,
-    ) => Promise<{ thread: Thread; line: string } | undefined>;
+    ) => Promise<{ thread: Thread; line: string; held?: boolean } | undefined>;
+    /** Register a supervisor's Clerk. The same values twice change nothing, and nothing else is added. */
+    clerk: (tx: Tx, request: ClerkRequest) => Promise<void>;
+    /** The supervisor's Clerk, for the check before a Clerk starts: no write. */
+    clerkOf: (tx: Tx, supervisor: number) => Promise<Clerk | undefined>;
 };
 
 // ─── The module ──────────────────────────────────────────────────────────────
+
+/** A named identity's role, as Team's roster has it. */
+type TeamRole = "supervisor" | "clerk" | "agent";
 
 /** Team's API, as this module reads it: never an import, so a reload cannot leave a stale copy. */
 type TeamMember = {
     id: string;
     name: string;
-    role: "supervisor" | "agent";
+    role: TeamRole;
     repositories?: Record<string, string>;
 };
 
@@ -4500,7 +4885,8 @@ export default function createDesk(host: Host, web: Web) {
             }
         },
         file: async (tx, session, request) => {
-            const thread = threadOfSession(await tx.doc(DeskThreads), Number(session));
+            const state = await tx.doc(DeskThreads);
+            const thread = threadOfSession(state, Number(session));
 
             if (thread === undefined) {
                 return undefined;
@@ -4516,8 +4902,13 @@ export default function createDesk(host: Host, web: Web) {
             const reports = await tx.doc(DeskReports, session);
             const same = reports.reports.find((report) => report.key === request.key);
 
+            // A replay: the stored report says whether the digest held it, so the caller sends nothing again.
             if (same !== undefined) {
-                return { thread: copyThread(thread), line: same.line };
+                return {
+                    thread: copyThread(thread),
+                    line: same.line,
+                    held: same.held === true,
+                };
             }
 
             const line = shortLine(thread, {
@@ -4526,12 +4917,53 @@ export default function createDesk(host: Host, web: Web) {
                 quote: host.text.quoted(request.text, 80),
             });
 
+            // The session's newest user entry, read before this commit writes a task: a transaction cannot read tables
+            // after its first table write.
+            const newest = await newestUserEntry(tx, session);
+
+            // With the digest on, the report goes into the box in this same commit: the caller sends nothing, and the
+            // supervisor gets it in the next digest.
+            let held = false;
+
+            if (request.digest === true && thread.supervisor !== undefined) {
+                const { digest } = await deskConfig();
+
+                if (digest.minutes > 0) {
+                    const kind: DigestKind =
+                        request.from === "team_message"
+                            ? "report"
+                            : request.reason === "blocked" || request.reason === "failed"
+                              ? "shift-blocked"
+                              : "shift";
+                    const due = enqueueDigest(
+                        state,
+                        thread.supervisor,
+                        {
+                            key: `report:${request.key}`,
+                            thread: thread.id,
+                            kind,
+                            line,
+                            at: request.at,
+                        },
+                        request.at,
+                        digest,
+                    );
+
+                    if (due !== undefined) {
+                        await startDigest(tx, thread.supervisor, due);
+                    }
+
+                    held = true;
+                }
+            }
+
             reports.reports.unshift({
                 key: request.key,
                 at: request.at,
                 from: request.from,
                 text: request.text,
                 line,
+                ...(held ? { held: true } : {}),
             });
 
             if (reports.reports.length > KEPT_REPORTS) {
@@ -4539,8 +4971,6 @@ export default function createDesk(host: Host, web: Web) {
             }
 
             thread.run.reportedAt = request.at;
-
-            const newest = await newestUserEntry(tx, session);
 
             if (newest !== undefined) {
                 thread.run.reportedUserEntry = newest;
@@ -4553,7 +4983,37 @@ export default function createDesk(host: Host, web: Web) {
                 request.at,
             );
 
-            return { thread: copyThread(thread), line };
+            return { thread: copyThread(thread), line, ...(held ? { held: true } : {}) };
+        },
+        clerk: async (tx, request) => {
+            const state = await tx.doc(DeskThreads);
+            const existing = clerkOf(state, request.supervisor);
+
+            // A replay, or the same registration again: nothing changes.
+            if (
+                existing !== undefined &&
+                existing.session === request.session &&
+                existing.address === request.address &&
+                existing.agent === request.agent
+            ) {
+                return;
+            }
+
+            state.clerks = {
+                ...(state.clerks ?? {}),
+                [String(request.supervisor)]: {
+                    session: request.session,
+                    address: request.address,
+                    agent: request.agent,
+                    at: request.at,
+                    ...(request.key === undefined ? {} : { key: request.key }),
+                },
+            };
+        },
+        clerkOf: async (tx, supervisor) => {
+            const found = clerkOf(await tx.doc(DeskThreads), supervisor);
+
+            return found === undefined ? undefined : { ...found };
         },
     };
     const shared = globalThis as unknown as Record<symbol, DeskApi | undefined>;
@@ -4710,13 +5170,22 @@ export default function createDesk(host: Host, web: Web) {
         process.env.PI_POCKET_DESK_CONFIG ??
         join(homedir(), ".config", "pi-pocket-team", "desk.json");
 
-    /** The config file: the extra logins that count as ours, and the cap. A missing or bad file means the defaults. */
-    async function deskConfig(): Promise<{ authors: string[]; cap: number; export?: string }> {
+    /**
+     * The config file: the extra logins that count as ours, the cap, and the digest. A missing or bad file means the
+     * defaults.
+     */
+    async function deskConfig(): Promise<{
+        authors: string[];
+        cap: number;
+        export?: string;
+        digest: DigestConfig;
+    }> {
         try {
             const value = JSON.parse(await readFile(configFile(), "utf8")) as {
                 authors?: unknown;
                 cap?: unknown;
                 export?: unknown;
+                digest?: unknown;
             } | null;
             const authors = Array.isArray(value?.authors)
                 ? value.authors.filter(
@@ -4735,9 +5204,17 @@ export default function createDesk(host: Host, web: Web) {
                 raw === "" ? undefined : raw.startsWith("~/") ? join(homedir(), raw.slice(2)) : raw;
             const exported = folder !== undefined && isAbsolute(folder) ? folder : undefined;
 
-            return { authors, cap, ...(exported === undefined ? {} : { export: exported }) };
+            // An empty or a bad value of the digest gives its default too, so the setting works without a reload.
+            const digest = digestConfig(value?.digest);
+
+            return {
+                authors,
+                cap,
+                digest,
+                ...(exported === undefined ? {} : { export: exported }),
+            };
         } catch {
-            return { authors: [], cap: DEFAULT_CAP };
+            return { authors: [], cap: DEFAULT_CAP, digest: digestConfig(undefined) };
         }
     }
 
@@ -5355,6 +5832,30 @@ export default function createDesk(host: Host, web: Web) {
         state.sweepers ??= {};
         state.baseline ??= {};
         repairEpoch(state, now);
+        // The digest's setting, read at each sweep: a change works without a reload.
+        const { digest } = await deskConfig();
+        const digestOn = digest.minutes > 0;
+
+        // A Clerk whose session is archived leaves the desk: desk news goes to the supervisor again. A failed session
+        // read never unregisters one.
+        const archivedClerks = Object.entries(state.clerks ?? {})
+            .filter(
+                ([, clerk]) =>
+                    (facts.sessions ?? []).find((each) => each.address === clerk.address)
+                        ?.archived === true,
+            )
+            .map(([supervisorId]) => supervisorId);
+
+        if (archivedClerks.length > 0) {
+            const left = { ...(state.clerks ?? {}) };
+
+            for (const supervisorId of archivedClerks) {
+                delete left[supervisorId];
+            }
+
+            state.clerks = left;
+        }
+
         state.github = {
             at: now,
             ok: facts.githubError === undefined,
@@ -5778,6 +6279,28 @@ export default function createDesk(host: Host, web: Web) {
                 ) {
                     events += 1;
                 }
+
+                // A thread that closes as done is news for the supervisor: 1 line in the digest, in this commit.
+                if (digestOn) {
+                    const repo = thread.repo === undefined ? "" : ` ${thread.repo}`;
+                    const due = enqueueDigest(
+                        state,
+                        supervisor,
+                        {
+                            key: `closed:${thread.id}`,
+                            thread: thread.id,
+                            kind: "closed",
+                            line: `[desk] ${thread.id}${repo} · closed: done, nothing remains · desk read ${thread.id}`,
+                            at: now,
+                        },
+                        now,
+                        digest,
+                    );
+
+                    if (due !== undefined) {
+                        await startDigest(tx, supervisor, due);
+                    }
+                }
             }
         }
 
@@ -5787,6 +6310,11 @@ export default function createDesk(host: Host, web: Web) {
                 .map((thread) => thread.address)
                 .filter((address): address is string => typeof address === "string"),
         );
+
+        // A Clerk's session is known work: it never becomes a found thread.
+        for (const clerk of Object.values(state.clerks ?? {})) {
+            addresses.add(clerk.address);
+        }
 
         // A delegation in flight has a thread, but not its address yet: do not mistake its session for hidden work.
         const inFlight = open.some((thread) => thread.state === "starting");
@@ -5928,6 +6456,27 @@ export default function createDesk(host: Host, web: Web) {
                 (counts.ahead ?? 0) > 0
             );
         });
+
+        // The threads of this supervisor that newly wait on it: 1 item each, in the digest, in this commit. With the
+        // digest off, nothing is recorded: every wait goes as it did before.
+        if (digestOn) {
+            const box = digestBox(state, supervisor);
+            const mine = Object.values(state.threads).filter(
+                (thread) => thread.supervisor === supervisor,
+            );
+            const news = queueNews(mine, box, now);
+
+            // The reasons a digest carried go in before the items: a box's contents persist in 1 set.
+            setDigestBox(state, supervisor, box);
+
+            for (const item of news) {
+                const due = enqueueDigest(state, supervisor, item, now, digest);
+
+                if (due !== undefined) {
+                    await startDigest(tx, supervisor, due);
+                }
+            }
+        }
 
         return { events };
     };
@@ -6371,6 +6920,204 @@ export default function createDesk(host: Host, web: Web) {
             runtime.commit(() => ({ status: "terminal", outcome: { status: "aborted" } }), context),
     });
 
+    type DigestInput = { supervisor: number; due: number };
+    type DigestState =
+        | { phase: "wait"; due: number }
+        | { phase: "take" }
+        | { phase: "deliver"; messages: DigestMessage[] }
+        /** A digest task stored before the split: 1 message to the supervisor. */
+        | { phase: "deliver"; text: string; requestId: string };
+
+    /**
+     * 1 digest message per requested time: wait until `due`, take every waiting item in 1 commit, then submit 1 message
+     * to the supervisor's session as `x.desk.notify` does, and 1 to the Clerk's session for the routine kinds. No
+     * items: no message, and the task ends. A restart in `deliver` submits again with the same request id, which acts
+     * once.
+     */
+    const Digest = defineTask<DigestInput, DigestState, null>({
+        name: "x.desk.digest",
+        version: 1,
+        initial: (input) => ({ phase: "wait", due: input.due }),
+        phases: {
+            wait: async (task, runtime, context) => {
+                if (runtime.now() < task.state.checkpoint.due) {
+                    await runtime.sleep(task.state.checkpoint.due, context);
+                }
+
+                await runtime.commit(
+                    () => ({ status: "running", checkpoint: { phase: "take" } }),
+                    context,
+                );
+            },
+            take: async (task, runtime, context) => {
+                const supervisor = task.input.supervisor;
+
+                await runtime.commit(async (tx) => {
+                    const state = await tx.doc(DeskThreads);
+                    const taken = takeDigest(state, supervisor, task.input.due);
+
+                    // Nothing waits: no message, and the task ends.
+                    if (taken.items.length === 0) {
+                        return {
+                            status: "terminal",
+                            outcome: { status: "completed", result: null },
+                        };
+                    }
+
+                    const { digest } = await deskConfig();
+                    const clerk = clerkOf(state, supervisor);
+                    // The Clerk takes the routine kinds; a kind that goes at once always stays with the supervisor.
+                    const theirs =
+                        clerk === undefined
+                            ? []
+                            : taken.items.filter(
+                                  (item) =>
+                                      digest.clerk.includes(item.kind) &&
+                                      !digest.now.includes(item.kind),
+                              );
+                    const ours = taken.items.filter((item) => !theirs.includes(item));
+                    const base = `x.desk.digest:${String(supervisor)}:${String(taken.seq)}`;
+                    const messages: DigestMessage[] = [];
+
+                    if (theirs.length > 0 && clerk !== undefined) {
+                        messages.push({
+                            conversation: clerk.session,
+                            text: digestText(theirs),
+                            requestId: `${base}:clerk`,
+                        });
+                    }
+
+                    if (ours.length > 0) {
+                        messages.push({
+                            conversation: supervisor,
+                            text: digestText(ours),
+                            requestId: base,
+                        });
+                    }
+
+                    return {
+                        status: "running",
+                        checkpoint: { phase: "deliver", messages },
+                    };
+                }, context);
+            },
+            deliver: async (task, runtime, context) => {
+                const supervisor = task.input.supervisor as ConversationId;
+                // A task stored before the split has 1 message: `text` and `requestId` on the checkpoint.
+                const messages = digestMessages(task.input.supervisor, task.state.checkpoint);
+
+                /** Submit 1 message; give back why it did not go, or nothing. */
+                const send = async (
+                    to: number,
+                    text: string,
+                    requestId: string,
+                ): Promise<string | undefined> => {
+                    const conversation = await runtime.conversation(to as ConversationId, context);
+
+                    if (conversation === undefined) {
+                        return "its session is not here";
+                    }
+
+                    const held = host.heldBack(to as ConversationId);
+
+                    if (held !== undefined) {
+                        return held;
+                    }
+
+                    try {
+                        await conversation.submit(
+                            { type: "input", content: text, whenBusy: "followUp", requestId },
+                            context,
+                        );
+
+                        return undefined;
+                    } catch (error) {
+                        return (error as Error).message;
+                    }
+                };
+
+                for (const message of messages) {
+                    const toClerk = message.conversation !== task.input.supervisor;
+                    let reason = await send(message.conversation, message.text, message.requestId);
+
+                    // A Clerk that cannot take its news: the supervisor gets it in this same digest, with 1 notice.
+                    if (toClerk && reason !== undefined) {
+                        host.notice(
+                            "warning",
+                            `The Clerk did not get the desk digest: ${reason}. The supervisor got it instead.`,
+                            supervisor,
+                        );
+                        reason = await send(
+                            task.input.supervisor,
+                            message.text,
+                            `${message.requestId}:fallback`,
+                        );
+                    }
+
+                    if (reason !== undefined) {
+                        host.notice(
+                            "warning",
+                            `The desk digest did not reach its session: ${reason}.`,
+                            supervisor,
+                        );
+                    }
+                }
+
+                // The messages are in, or they never will be: no wait for the answer, and no retry for ever.
+                await runtime.commit(async (tx) => {
+                    const state = await tx.doc(DeskThreads);
+                    const supervisorId = String(task.input.supervisor);
+
+                    if (state.digests?.[supervisorId] !== undefined) {
+                        const box = digestBox(state, task.input.supervisor);
+
+                        setDigestBox(state, task.input.supervisor, {
+                            ...box,
+                            sentAt: runtime.now(),
+                        });
+                    }
+
+                    return {
+                        status: "terminal",
+                        outcome: { status: "completed", result: null },
+                    };
+                }, context);
+            },
+        },
+        abort: (task, runtime, context) =>
+            runtime.commit(async (tx) => {
+                const state = await tx.doc(DeskThreads);
+                const supervisorId = String(task.input.supervisor);
+
+                // A stopped task frees its time: the next item can ask for it again.
+                if (state.digests?.[supervisorId] !== undefined) {
+                    const box = digestBox(state, task.input.supervisor);
+                    const index = box.scheduled.indexOf(task.input.due);
+
+                    if (index >= 0) {
+                        box.scheduled.splice(index, 1);
+                        setDigestBox(state, task.input.supervisor, box);
+                    }
+                }
+
+                return { status: "terminal", outcome: { status: "aborted" } };
+            }, context),
+    });
+
+    /** Create 1 digest task at `due`, in the caller's commit. 1 task for each requested time. */
+    const startDigest = async (tx: Tx, supervisor: number, due: number): Promise<void> => {
+        await tx.createTask(
+            Digest,
+            { supervisor, due },
+            {
+                ownership: { kind: "conversation" },
+                conversationId: supervisor as ConversationId,
+                background: true,
+                abandonOnRestart: false,
+            },
+        );
+    };
+
     // ─── The page ────────────────────────────────────────────────────────────
 
     if (typeof web.conversationRoute !== "function") {
@@ -6794,7 +7541,7 @@ export default function createDesk(host: Host, web: Web) {
         "asks/:id/answer",
         async (request) => {
             const answerId = (request.params.id ?? "").trim();
-            const { cap } = await deskConfig();
+            const { cap, digest } = await deskConfig();
             const now = Date.now();
             const view = await request.commit(async (tx) => {
                 const state = await tx.doc(DeskThreads);
@@ -6813,23 +7560,47 @@ export default function createDesk(host: Host, web: Web) {
                 // A page answer goes to the supervisor's session: the ask, the person, and his words. The task and the
                 // answer are in 1 commit, so a restart can lose neither and double neither. A second answer (already)
                 // sends nothing, and the tool action records the words for Odrade herself: it sends nothing either.
+                // With the digest on, the answer is 1 item in the digest, and no task of its own.
                 const found = result.already ? undefined : askById(state, result.id);
 
                 if (found?.thread.supervisor !== undefined) {
-                    await tx.createTask(
-                        Notify,
-                        {
-                            supervisor: found.thread.supervisor,
-                            text: answeredText(result.id, request.user.name, words),
-                            requestId: `x.desk.answered:${result.id}`,
-                        },
-                        {
-                            ownership: { kind: "conversation" },
-                            conversationId: found.thread.supervisor as ConversationId,
-                            background: true,
-                            abandonOnRestart: false,
-                        },
-                    );
+                    const supervisor = found.thread.supervisor;
+                    const line = answeredText(result.id, request.user.name, words);
+
+                    if (digest.minutes > 0) {
+                        const due = enqueueDigest(
+                            state,
+                            supervisor,
+                            {
+                                key: `answer:${result.id}`,
+                                thread: found.thread.id,
+                                kind: answerKind(words),
+                                line,
+                                at: now,
+                            },
+                            now,
+                            digest,
+                        );
+
+                        if (due !== undefined) {
+                            await startDigest(tx, supervisor, due);
+                        }
+                    } else {
+                        await tx.createTask(
+                            Notify,
+                            {
+                                supervisor,
+                                text: line,
+                                requestId: `x.desk.answered:${result.id}`,
+                            },
+                            {
+                                ownership: { kind: "conversation" },
+                                conversationId: supervisor as ConversationId,
+                                background: true,
+                                abandonOnRestart: false,
+                            },
+                        );
+                    }
                 }
 
                 return threadsView(state, now, cap);
@@ -7050,8 +7821,15 @@ export default function createDesk(host: Host, web: Web) {
                 }
 
                 // The queue: the threads that wait on Odrade now, and that this turn did not touch. She acts on them
-                // without waiting for a message; the memo keeps it to 1 continue per turn.
+                // without waiting for a message; the memo keeps it to 1 continue per turn. With the digest on, the
+                // digest carries the new waits, and this continue does not run.
                 if ((await api.memo("desk.queued", context)) === true) {
+                    return undefined;
+                }
+
+                const { digest } = await deskConfig();
+
+                if (digest.minutes > 0) {
                     return undefined;
                 }
 
@@ -7114,10 +7892,52 @@ export default function createDesk(host: Host, web: Web) {
         },
     });
 
+    /** The commands a Clerk never runs: a merge, an approval, a review, a tag, a release, or a force-push. */
+    const CLERK_FORBIDDEN =
+        /\bgh\s+pr\s+(?:merge|review)\b|\bgh\s+release\b|\bgit\s+tag\b|\bgit\s+push\b[^\n]*(?:--force-with-lease|--force|-f)\b/;
+
+    /**
+     * The Clerk never merges, approves, reviews, tags, releases, or force-pushes. A hook that throws must not block a
+     * call by accident, so every error lets the call run.
+     */
+    const noClerkMerge = hook(ToolTask, {
+        beforeTool: async (call, api, context) => {
+            try {
+                if (call.name !== "bash") {
+                    return undefined;
+                }
+
+                const team = teamApi();
+
+                if (team === undefined) {
+                    return undefined;
+                }
+
+                const persona = await team.persona(api, api.conversationId, context);
+
+                if (persona?.role !== "clerk") {
+                    return undefined;
+                }
+
+                const args = call.arguments as { command?: unknown };
+
+                if (typeof args.command !== "string" || !CLERK_FORBIDDEN.test(args.command)) {
+                    return undefined;
+                }
+
+                return {
+                    block: "The Clerk never merges, approves, reviews, tags, releases, or force-pushes. Escalate to your supervisor.",
+                };
+            } catch {
+                return undefined;
+            }
+        },
+    });
+
     const tool = defineTool({
         name: "desk",
         description:
-            "The desk of threads for work the team runs in the background. A supervisor session can use every action; an agent session can use watch and result on its own thread only. Actions: list (one line per open thread), read (one thread in full), sync (observe the threads now, with linked sessions, Night shift, git, and GitHub), seed (import a seed.json file one time), attach (put a PR, or all of another thread's work, on one thread), detach (take a PR off a thread), ask (file a question for Brian on a thread, or on a new one), answer (record Brian's words for an ask), watch (set a dated check on a thread: it sleeps until that date, and does not count toward the cap), result (record that check's pass, which closes the thread, or its fail, which opens it again).",
+            "The desk of threads for work the team runs in the background. A supervisor session can use every action; a Clerk can use list, read, sync, attach, detach, watch, result, and send for its supervisor's threads; an agent session can use watch and result on its own thread only. Actions: list (one line per open thread), read (one thread in full), sync (observe the threads now, with linked sessions, Night shift, git, and GitHub), seed (import a seed.json file one time), attach (put a PR, or all of another thread's work, on one thread), detach (take a PR off a thread), ask (file a question for Brian on a thread, or on a new one), answer (record Brian's words for an ask), watch (set a dated check on a thread: it sleeps until that date, and does not count toward the cap), result (record that check's pass, which closes the thread, or its fail, which opens it again), send (send 1 message from the supervisor's session to a thread's agent).",
         parameters: Type.Object({
             action: Type.Union([
                 Type.Literal("list"),
@@ -7130,11 +7950,12 @@ export default function createDesk(host: Host, web: Web) {
                 Type.Literal("answer"),
                 Type.Literal("watch"),
                 Type.Literal("result"),
+                Type.Literal("send"),
             ]),
             thread: Type.Optional(
                 Type.String({
                     description:
-                        "read: a thread id, such as T13; attach: the target thread; watch, result: the thread to change",
+                        "read: a thread id, such as T13; attach: the target thread; watch, result: the thread to change; send: the thread whose agent gets the message",
                 }),
             ),
             ref: Type.Optional(
@@ -7146,7 +7967,7 @@ export default function createDesk(host: Host, web: Web) {
             text: Type.Optional(
                 Type.String({
                     description:
-                        "ask: the question for Brian, 1 to 500 characters, on one line; watch: the check, 1 to 200 characters; result: what happened, 1 to 200 characters",
+                        "ask: the question for Brian, 1 to 500 characters, on one line; watch: the check, 1 to 200 characters; result: what happened, 1 to 200 characters; send: the message to the thread's agent, 1 to 2000 characters",
                 }),
             ),
             title: Type.Optional(
@@ -7202,11 +8023,40 @@ export default function createDesk(host: Host, web: Web) {
                 );
             }
 
-            if (persona.role !== "supervisor" && !watching) {
+            const session = Number(api.conversationId);
+            // A registered Clerk acts for its supervisor: the look, the sweeps, and every thread check use that id.
+            let supervisor = session;
+
+            if (persona.role === "clerk") {
+                const registered = supervisorOfClerk(
+                    await api.snapshot(DeskThreads, context),
+                    session,
+                );
+
+                if (registered === undefined) {
+                    throw new Error(
+                        "This Clerk is not registered on the desk. Odrade starts it with team_delegate.",
+                    );
+                }
+
+                if (args.action === "ask" || args.action === "answer" || args.action === "seed") {
+                    throw new Error(
+                        "Only the supervisor files asks, records Brian's answers, and seeds the desk. Escalate to your supervisor.",
+                    );
+                }
+
+                supervisor = registered;
+            } else if (persona.role !== "supervisor" && !watching) {
                 throw new Error("Only a session assigned a supervisor identity can use the desk.");
             }
 
-            const looked = `supervisor:${String(Number(api.conversationId))}`;
+            /** The threads this session changes: a supervisor any, a Clerk its supervisor's, an agent its own. */
+            const changes = (thread: Thread): boolean =>
+                persona.role === "supervisor" ||
+                (persona.role === "clerk" && thread.supervisor === supervisor) ||
+                thread.session === session;
+
+            const looked = `supervisor:${String(supervisor)}`;
 
             if (args.action === "list") {
                 // The look moves in the same commit: a section cannot write, so Odrade's last look is marked here.
@@ -7214,7 +8064,7 @@ export default function createDesk(host: Host, web: Web) {
                     const state = await tx.doc(DeskThreads);
 
                     state.seen[looked] = Date.now();
-                    await startSweeper(tx, Number(api.conversationId));
+                    await startSweeper(tx, supervisor);
 
                     return listText(state, Date.now());
                 }, context);
@@ -7243,7 +8093,7 @@ export default function createDesk(host: Host, web: Web) {
                     }
 
                     state.seen[looked] = Date.now();
-                    await startSweeper(tx, Number(api.conversationId));
+                    await startSweeper(tx, supervisor);
 
                     return { text: readText(state, id) ?? "", session: thread.session };
                 }, context);
@@ -7272,8 +8122,8 @@ export default function createDesk(host: Host, web: Web) {
                         ...(args.options === undefined ? {} : { options: args.options }),
                         key,
                         by: persona.name,
-                        supervisor: Number(api.conversationId),
-                        session: Number(api.conversationId),
+                        supervisor,
+                        session,
                         at,
                     });
 
@@ -7282,7 +8132,7 @@ export default function createDesk(host: Host, web: Web) {
                     }
 
                     if (state.threads[added.threadId]?.origin === "ask") {
-                        await startSweeper(tx, Number(api.conversationId));
+                        await startSweeper(tx, supervisor);
                     }
 
                     return added;
@@ -7349,11 +8199,8 @@ export default function createDesk(host: Host, web: Web) {
                         return { error: `There is no thread ${asked.toUpperCase()} on the desk.` };
                     }
 
-                    // A supervisor changes any thread; an agent only the thread of the session it runs in.
-                    if (
-                        persona.role !== "supervisor" &&
-                        thread.session !== Number(api.conversationId)
-                    ) {
+                    // A supervisor changes any thread, a Clerk any thread of its supervisor, an agent only its own.
+                    if (!changes(thread)) {
                         return {
                             error: `Only the supervisor can record a result or set a watch on ${thread.id}: it is not this session's thread.`,
                         };
@@ -7431,17 +8278,22 @@ export default function createDesk(host: Host, web: Web) {
                     );
                 }
 
-                const result = await api.commit(
-                    async (tx) =>
-                        attachTo(
-                            await tx.doc(DeskThreads),
-                            ref,
-                            targetId,
-                            Date.now(),
-                            persona.name,
-                        ),
-                    context,
-                );
+                const result = await api.commit(async (tx) => {
+                    const state = await tx.doc(DeskThreads);
+                    const target = threadById(state, targetId);
+                    const source = PR_REF.test(ref) ? undefined : threadById(state, ref);
+
+                    // A Clerk works only on its supervisor's threads.
+                    for (const thread of [target, source]) {
+                        if (thread !== undefined && !changes(thread)) {
+                            return {
+                                error: `Only the supervisor can change ${thread.id}: it is another supervisor's thread.`,
+                            };
+                        }
+                    }
+
+                    return attachTo(state, ref, targetId, Date.now(), persona.name);
+                }, context);
 
                 if ("error" in result) {
                     throw new Error(result.error);
@@ -7466,10 +8318,18 @@ export default function createDesk(host: Host, web: Web) {
                     throw new Error(`${ref} is not a PR ref such as owner/name#12.`);
                 }
 
-                const result = await api.commit(
-                    async (tx) => detachFrom(await tx.doc(DeskThreads), ref, targetId, Date.now()),
-                    context,
-                );
+                const result = await api.commit(async (tx) => {
+                    const state = await tx.doc(DeskThreads);
+                    const target = threadById(state, targetId);
+
+                    if (target !== undefined && !changes(target)) {
+                        return {
+                            error: `Only the supervisor can change ${target.id}: it is another supervisor's thread.`,
+                        };
+                    }
+
+                    return detachFrom(state, ref, targetId, Date.now());
+                }, context);
 
                 if ("error" in result) {
                     throw new Error(result.error);
@@ -7480,14 +8340,89 @@ export default function createDesk(host: Host, web: Web) {
                 return reply(result.text);
             }
 
+            if (args.action === "send") {
+                const id = args.thread?.trim() ?? "";
+                const text = (args.text ?? "").trim();
+
+                if (id === "") {
+                    throw new Error("send needs thread: a thread id such as T13.");
+                }
+
+                if (text === "" || text.length > MAX_SEND) {
+                    throw new Error(
+                        `send needs text: 1 to ${String(MAX_SEND)} characters for the thread's agent.`,
+                    );
+                }
+
+                const key = `x.desk.send:${api.taskId}:${api.callId}`;
+                const found = await api.commit(async (tx) => {
+                    const state = await tx.doc(DeskThreads);
+                    const thread = threadById(state, id);
+
+                    if (thread === undefined) {
+                        return { error: `There is no thread ${id.toUpperCase()} on the desk.` };
+                    }
+
+                    // From the supervisor's session only: an agent's own address for another session is not this one.
+                    if (!changes(thread)) {
+                        return {
+                            error: `Only the supervisor can message ${thread.id}: it is not this session's thread.`,
+                        };
+                    }
+
+                    if (thread.state === "closed") {
+                        return { error: `${thread.id} is closed: there is no agent to message.` };
+                    }
+
+                    if (thread.address === undefined) {
+                        return {
+                            error: `${thread.id} has no address for its agent: no message can go to it.`,
+                        };
+                    }
+
+                    return { id: thread.id, address: thread.address, text };
+                }, context);
+
+                if ("error" in found) {
+                    throw new Error(found.error);
+                }
+
+                // From the supervisor's session, and the send's key makes a replay act once, as a close-out does.
+                try {
+                    await host.linkedSessions.send(
+                        supervisor as ConversationId,
+                        { to: found.address, message: found.text },
+                        key,
+                    );
+                } catch (error) {
+                    throw new Error(
+                        `The message to ${found.id}'s agent did not go: ${(error as Error).message}`,
+                    );
+                }
+
+                // A document change only, in its own commit: the send has its own record.
+                try {
+                    await api.commit(async (tx) => {
+                        const thread = threadById(await tx.doc(DeskThreads), found.id);
+
+                        if (thread !== undefined) {
+                            addEvent(thread, key, `message from ${persona.name} sent`, Date.now());
+                        }
+                    }, context);
+                } catch {
+                    // The send went: a replay adds the event with the same key, which acts once.
+                }
+
+                return reply(`Sent 1 message to the agent of ${found.id}.`);
+            }
+
             if (args.action === "sync") {
-                const supervisor = api.conversationId;
-                const facts = await gather(supervisor, api, Date.now(), context);
+                const facts = await gather(supervisor as ConversationId, api, Date.now(), context);
                 const result = await api.commit(async (tx) => {
                     const swept = await applySweep(
                         tx,
                         await tx.doc(DeskThreads),
-                        Number(supervisor),
+                        supervisor,
                         facts,
                     );
 
@@ -7545,7 +8480,7 @@ export default function createDesk(host: Host, web: Web) {
             const result = await api.commit(async (tx) => {
                 const seeded = seedThreads(await tx.doc(DeskThreads), parsed.threads, {
                     hash,
-                    supervisor: Number(api.conversationId),
+                    supervisor,
                     at: Date.now(),
                     folders,
                 });
@@ -7555,7 +8490,7 @@ export default function createDesk(host: Host, web: Web) {
                 }
 
                 if (!seeded.reused) {
-                    await startSweeper(tx, Number(api.conversationId));
+                    await startSweeper(tx, supervisor);
                 }
 
                 return seeded;
@@ -7574,8 +8509,8 @@ export default function createDesk(host: Host, web: Web) {
     return defineExtension({
         name: "desk",
         tools: [tool],
-        hooks: [noTeamReport, reminder],
-        tasks: [Sweeper, Notify],
+        hooks: [noTeamReport, noClerkMerge, reminder],
+        tasks: [Sweeper, Notify, Digest],
         sections: [
             // Only a supervisor's session gets it. No clock text: the section changes when the desk changes.
             section("desk", async (input, context) => {
@@ -7632,8 +8567,9 @@ export default function createDesk(host: Host, web: Web) {
                 const waits = waitsText(open, {
                     busy: await busyNow(open, input.conversationId),
                 });
-                const { cap } = await deskConfig();
+                const { cap, digest } = await deskConfig();
                 const capped = capView(state, cap, now);
+                const clerk = clerkOf(state, supervisor);
                 const events = mine
                     .flatMap((thread) =>
                         thread.events
@@ -7662,11 +8598,18 @@ export default function createDesk(host: Host, web: Web) {
                         : []),
                     `Stale: ${stale.length === 0 ? "none" : stale.join(", ")}.`,
                     ...(waits === "" ? [] : [`Waits on you: ${waits}.`]),
+                    ...(clerk === undefined
+                        ? []
+                        : [
+                              `Clerk: ${clerk.address} gets routine desk news. Send it work with team_message.`,
+                          ]),
                     ...(events.length === 0 ? [] : ["New since your last look:", ...events]),
                     "Threads that wait on you are yours to act on now: do not wait for a message.",
                     "File each ask to Brian (a decision, a host action, a device check) with desk ask. Record his answer with desk answer. Give choices with options when an ask is a pick-one decision.",
                     "A due watch (due: T13 <check>) is yours to send: send the check to the thread's agent, then record its result with desk result.",
-                    "Reports arrive as 1 line that starts with [desk]. Read the full report with desk read <id> before you act.",
+                    digest.minutes > 0
+                        ? `Desk news arrives as 1 digest message every ${String(digest.minutes)} minutes (at once for urgent kinds): each line starts with [desk]. Read the full report with desk read <id> before you act.`
+                        : "Reports arrive as 1 line that starts with [desk]. Read the full report with desk read <id> before you act.",
                     "Keep each reply to Brian to 1 or 2 lines: the project and the urgency. The Desk holds the rest.",
                 ].join("\n");
             }),
