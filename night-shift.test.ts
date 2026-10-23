@@ -19,7 +19,8 @@ import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
 import type { FauxResponseStep } from "@earendil-works/pi-ai";
 import { fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
-import type { ConversationId } from "@earendil-works/pi-durable";
+import { type ConversationId, LiveDoc, type TaskId } from "@earendil-works/pi-durable";
+import { SubagentsDoc } from "./_pocket/src/server/docs.ts";
 import {
     deepseekStart,
     DEFAULT_ROUNDS,
@@ -31,6 +32,7 @@ import {
     personOf,
     standing,
     statusCard,
+    SUBAGENT_WAIT_MS,
     waiting,
 } from "./night-shift.ts";
 import { statusItem } from "./night-shift-web/index.js";
@@ -463,6 +465,13 @@ const route: FauxResponseStep = async (request, options) => {
             return say("STATUS: BLOCKED: the token is missing");
         case "scenario-worker":
             return say("STATUS: DONE: it works");
+        case "scenario-subagent":
+            // Round 1 ends while its subagent works: the driver must wait for it before round 2.
+            return say(
+                n === 1
+                    ? "STATUS: CONTINUE: waiting for the subagent"
+                    : "STATUS: DONE: the subagent finished",
+            );
         case "scenario-deadline":
             shift = 3600_000;
 
@@ -605,6 +614,53 @@ async function sent(id: ConversationId): Promise<string[]> {
         .filter((text) => text.includes("[night-shift]"))
         .map((text) => /\[night-shift\] (Round \d+|The night shift has stopped)/.exec(text)![1]!)
         .reverse();
+}
+
+/**
+ * A conversation that stands in for a subagent of `id`: Pocket's registry names it `helper`, as `subagent` does when Pi
+ * spawns one.
+ */
+async function spawnFakeSubagent(id: ConversationId): Promise<ConversationId> {
+    const folder = join(root, `subagent-${id}`);
+
+    mkdirSync(folder, { recursive: true });
+    const child = await newSession(app, folder);
+
+    await app.harness.commit(async (tx) => {
+        const registry = await tx.doc(SubagentsDoc, id);
+
+        registry.agents.helper = { conversationId: child, reported: [] };
+    }, context);
+
+    return child;
+}
+
+/** Pocket's sign that a subagent works: a run on its conversation. */
+async function setWorking(child: ConversationId, working: boolean): Promise<void> {
+    await app.harness.commit(async (tx) => {
+        const live = await tx.doc(LiveDoc, child);
+
+        if (working) {
+            live.run = { taskId: "subagent-test-run" as TaskId, inputs: [] };
+        } else {
+            delete live.run;
+        }
+    }, context);
+}
+
+/**
+ * Whether the driver has taken the start time of its wait for `round`, `subagents-<round>`, and so sleeps instead of
+ * counting the round.
+ */
+async function waitingForSubagents(id: ConversationId, round: number): Promise<boolean> {
+    const live = await app.harness.inspect(context);
+
+    return live.tasks.some(
+        (task) =>
+            task.record.kind === "x.night-shift.driver" &&
+            task.record.conversationId === id &&
+            task.record.memos?.[`subagents-${round}`] !== undefined,
+    );
 }
 
 /** The server's clock in ZONE, 3 hours from now, as "HH:MM"; and that time as epoch ms. */
@@ -938,6 +994,131 @@ describe("restarts", () => {
         const view = await (await app.harness.conversation(id, context))!.context(context);
 
         assert.match(JSON.stringify(view.messages), /was cut off by a server restart/);
+    });
+});
+
+describe("Pi's own subagents", () => {
+    test("a working subagent holds the next round until it stops", async () => {
+        const id = await session("subagent-wait");
+        const child = await spawnFakeSubagent(id);
+
+        await setWorking(child, true);
+
+        try {
+            await command(id, "max 5: scenario-subagent; stop when never");
+            await until(async () => (await goalOf(id))?.round === 1, "round 1 to start");
+            // Long enough for a round 2 that nothing holds back.
+            await new Promise((resolve) => setTimeout(resolve, 1500));
+            const held = (await goalOf(id))!;
+
+            assert.equal(held.round, 1, "no round 2 while the subagent works");
+            assert.deepEqual(await sent(id), ["Round 1"]);
+            assert.equal(await waitingForSubagents(id, 1), true, "the driver waits for it");
+        } finally {
+            await setWorking(child, false);
+        }
+
+        await until(
+            async () => (await sent(id)).includes("Round 2"),
+            "round 2 after the subagent stops",
+            30_000,
+        );
+        const goal = await settled(id);
+
+        assert.equal(goal.reason, "done");
+        assert.deepEqual(await sent(id), ["Round 1", "Round 2", "The night shift has stopped"]);
+    });
+
+    test("the cap: after an hour of waiting, the round goes even while it works", async () => {
+        const id = await session("subagent-cap");
+        const child = await spawnFakeSubagent(id);
+
+        await setWorking(child, true);
+
+        try {
+            await command(id, "max 5: scenario-subagent; stop when never");
+            await until(() => waitingForSubagents(id, 1), "the wait to start", 20_000);
+            // The server stays down past the cap, and the subagent still works.
+            await app.close();
+            shift = SUBAGENT_WAIT_MS + 60_000;
+            app = await openApp(model, dataDir, () => Date.now() + shift);
+            await until(
+                async () => (await sent(id)).includes("Round 2"),
+                "round 2 after the cap",
+                20_000,
+            );
+            const goal = await settled(id);
+
+            assert.equal(goal.reason, "done");
+            assert.equal(goal.round, 2);
+            assert.deepEqual(await sent(id), ["Round 1", "Round 2", "The night shift has stopped"]);
+        } finally {
+            shift = 0;
+        }
+    });
+
+    test("a restart during the wait counts no round and sends nothing twice", async () => {
+        const id = await session("subagent-restart");
+        const child = await spawnFakeSubagent(id);
+
+        await setWorking(child, true);
+
+        try {
+            await command(id, "max 5: scenario-subagent; stop when never");
+            await until(() => waitingForSubagents(id, 1), "the wait to start", 20_000);
+            // The server stops during the wait, before the cap.
+            await app.close();
+            app = await openApp(model, dataDir, () => Date.now() + shift);
+            await until(async () => (await drivers(id)) === 1, "the driver to come back", 20_000);
+            await new Promise((resolve) => setTimeout(resolve, 1500));
+            const held = (await goalOf(id))!;
+
+            assert.equal(held.round, 1, "the restart counted no round");
+            assert.deepEqual(await sent(id), ["Round 1"], "no round was sent twice");
+            assert.equal(await waitingForSubagents(id, 1), true, "the same wait goes on");
+        } finally {
+            await setWorking(child, false);
+        }
+
+        await until(
+            async () => (await sent(id)).includes("Round 2"),
+            "round 2 after the subagent stops",
+            30_000,
+        );
+        const goal = await settled(id);
+
+        assert.deepEqual(
+            goal.rounds.map((round) => round.n),
+            [1, 2],
+        );
+        assert.deepEqual(await sent(id), ["Round 1", "Round 2", "The night shift has stopped"]);
+    });
+
+    test("a person's message during the wait pauses the shift", async () => {
+        const id = await session("subagent-person");
+        const child = await spawnFakeSubagent(id);
+
+        await setWorking(child, true);
+
+        try {
+            await command(id, "max 5: scenario-subagent; stop when never");
+            await until(() => waitingForSubagents(id, 1), "the wait to start", 20_000);
+            await app.commands.submit(id, owner(app), {
+                text: "I am awake, hold on",
+                requestId: crypto.randomUUID(),
+            });
+            await until(
+                async () => (await goalOf(id))?.status === "paused",
+                "the person's message to pause the shift",
+                30_000,
+            );
+            const goal = (await goalOf(id))!;
+
+            assert.equal(goal.reason, "person");
+            assert.deepEqual(await sent(id), ["Round 1"], "no round 2");
+        } finally {
+            await setWorking(child, false);
+        }
     });
 });
 

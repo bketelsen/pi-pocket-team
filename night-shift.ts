@@ -15,6 +15,9 @@
  *   first without the second does not run it again; the round says it was cut off.
  * - A `start` time is a durable sleep in the task's `wait` phase, before round 1: a restart sleeps again until the
  *   stored start, and a server that was down past it starts round 1 at once. Round 1 starts only in `decide`.
+ * - After round 1, `decide` waits while Pi's own subagents still work (`pocket.subagents`): a round sent then would only
+ *   hear "still waiting". One poll is a durable sleep, and a memo keyed by the round holds the wait's start, so a
+ *   restart waits for the rest of the same hour and no round is counted meanwhile.
  *
  * State is one document per conversation, `x.night-shift.goal`. It is stored data: never rename it or change what a
  * field means.
@@ -60,6 +63,11 @@ const MAX_ATTEMPTS = 3;
 const SHOW_ENDED_MS = 12 * 3600_000;
 /** How long the report to a delegated goal's supervisor session may be. */
 const MAX_REPORT = 8000;
+
+/** How often `decide` looks again while Pi's own subagents work. */
+export const SUBAGENT_POLL_MS = 15_000;
+/** The longest `decide` waits for them before one round: after it, the round goes anyway. */
+export const SUBAGENT_WAIT_MS = 60 * 60_000;
 
 const PREFIX = "[night-shift]";
 /** Where another module finds this one's live API: a global, never an import. */
@@ -157,6 +165,30 @@ const PlanMode = defineDoc<{ on: boolean }>({
     history: "latest",
     fork: "current",
     initial: () => ({ on: false }),
+});
+
+/**
+ * Pocket's subagents of this conversation, read only: the ones Pi spawned, and their reports on the way to it. It is
+ * Pocket's own document, not public API: when its shape changes, reading it fails, and the driver then does not wait
+ * for the subagents (a round goes at once, as before). Never write it.
+ */
+const SubagentsDoc = defineDoc<{
+    agents: Record<string, { conversationId: ConversationId }>;
+    /** Pocket's reporter task for each message; not read here, but part of the document's shape. */
+    reporters: Record<string, string>;
+    /** Reports not yet sent to the parent. */
+    outbox?: { name: string; text: string }[];
+    /** The batch on its way to the parent. */
+    sending?: { request: string };
+}>({
+    kind: "pocket.subagents",
+    version: 1,
+    scope: "conversation",
+    history: "latest",
+    fork: "initial",
+    // The same as Pocket's own base, `rebased` in src/server/docs.ts: not part of the stored meaning.
+    checkpointWhen: (_value, _ops, info) => info.deltasSinceBase >= 64,
+    initial: () => ({ agents: {}, reporters: {} }),
 });
 
 // ─── Parsing what people type ────────────────────────────────────────────────
@@ -1224,6 +1256,98 @@ export default function createNightShift(host: Host, web: Web) {
         }
     }
 
+    /**
+     * Whether Pi's own subagents still work: one whose conversation runs, or a report on its way to this session. Any
+     * failure to read Pocket's registry, or a subagent's conversation, means no wait.
+     */
+    async function subagentsBusy(runtime: Runtime, context: Context): Promise<boolean> {
+        try {
+            const registry = await runtime.snapshot(SubagentsDoc, runtime.conversationId, context);
+
+            if (registry === undefined) {
+                return false;
+            }
+
+            if ((registry.outbox?.length ?? 0) > 0 || registry.sending !== undefined) {
+                return true;
+            }
+
+            for (const agent of Object.values(registry.agents)) {
+                const live = await runtime.snapshot(LiveDoc, agent.conversationId, context);
+
+                if (live?.run !== undefined) {
+                    return true;
+                }
+            }
+
+            return false;
+        } catch {
+            return false;
+        }
+    }
+
+    /**
+     * Sleep until the next look at the subagents, or until the end of this round's wait. A goal that stops or another
+     * driver that takes over ends the sleep, as in `wait`.
+     */
+    async function sleepBeforeLook(
+        runtime: Runtime,
+        startedAt: number,
+        context: Context,
+    ): Promise<void> {
+        const id = runtime.conversationId;
+        const until = Math.min(runtime.now() + SUBAGENT_POLL_MS, startedAt + SUBAGENT_WAIT_MS);
+        const controller = new AbortController();
+        const watch = await runtime.watchDoc(GoalDoc, id, context);
+
+        try {
+            if (watch !== undefined) {
+                const look = async (value: Readonly<{ goal?: Goal }> | null) => {
+                    if (
+                        value?.goal?.driver !== String(runtime.taskId) ||
+                        value.goal.status !== "running"
+                    ) {
+                        controller.abort();
+                    }
+                };
+
+                await look(watch.value);
+                watch.start(look);
+            }
+
+            await runtime.sleep(until, withAbortSignal(controller.signal, context));
+        } catch (failure) {
+            // The goal stopped, or another driver took over. Any other rejection is not ours to swallow.
+            if (!controller.signal.aborted) {
+                throw failure;
+            }
+        } finally {
+            await watch?.stop();
+        }
+    }
+
+    /**
+     * While Pi's own subagents work after round 1: the start of this round's wait, from a memo keyed by the round, or
+     * undefined when they are done (or before round 2). The memo makes the wait restart-safe: a restart goes on with the
+     * same hour, and no round is counted meanwhile. `decide` gives up the wait after `SUBAGENT_WAIT_MS`.
+     */
+    async function subagentWaitStart(
+        runtime: Runtime,
+        context: Context,
+    ): Promise<number | undefined> {
+        const goal = await mine(runtime, context);
+
+        if (goal === undefined || goal.status !== "running" || goal.round === 0) {
+            return undefined;
+        }
+
+        if (!(await subagentsBusy(runtime, context))) {
+            return undefined;
+        }
+
+        return runtime.memo<number>(`subagents-${goal.round}`, runtime.now(), context);
+    }
+
     /** A person's message waiting in the session's queue. */
     async function queuedPerson(runtime: Runtime, context: Context): Promise<string | undefined> {
         const inbox = await runtime.snapshot(InboxDoc, runtime.conversationId, context);
@@ -1419,59 +1543,81 @@ export default function createNightShift(host: Host, web: Web) {
                 changed(id);
             },
 
-            /** Before each round: a person's message, plan mode, a spend limit, the rounds, and the deadline. */
+            /**
+             * Before each round: a person's message, plan mode, a spend limit, the rounds, the deadline, and, after round
+             * 1, Pi's own subagents. While they work, a poll sleeps and looks again; every poll runs the stop checks.
+             */
             decide: async (_task, runtime, context) => {
                 const id = runtime.conversationId;
-                const queued = await queuedPerson(runtime, context);
-                const plan = await planOn(runtime, context);
-                const held = host.heldBack(id);
                 const seen: { goal?: Goal } = {};
 
-                await runtime.commit(async (tx) => {
-                    const goal = (await tx.doc(GoalDoc, id)).goal;
+                for (;;) {
+                    const queued = await queuedPerson(runtime, context);
+                    const plan = await planOn(runtime, context);
+                    const held = host.heldBack(id);
+                    // Read before the commit, which reads documents only through `tx`.
+                    const startedAt = await subagentWaitStart(runtime, context);
+                    const waiting: { start?: number } = {};
 
-                    if (goal?.driver !== String(runtime.taskId) || goal.status !== "running") {
-                        return finished;
+                    await runtime.commit(async (tx) => {
+                        const goal = (await tx.doc(GoalDoc, id)).goal;
+
+                        if (goal?.driver !== String(runtime.taskId) || goal.status !== "running") {
+                            return finished;
+                        }
+
+                        const now = runtime.now();
+                        const people = await peopleSince(tx, id, goal.seen);
+                        const person = people.person ?? queued;
+
+                        const stopped = (reason: StopReason, detail = "") => {
+                            const state = stopIn(goal, reason, detail, now);
+
+                            seen.goal = copy(goal);
+
+                            return state;
+                        };
+
+                        goal.seen = people.seen;
+
+                        if (person !== undefined) {
+                            return stopped("person", person);
+                        }
+
+                        if (plan) {
+                            return stopped("plan");
+                        }
+
+                        if (held !== undefined) {
+                            return stopped("spend", held);
+                        }
+
+                        if (goal.round >= goal.maxRounds) {
+                            return stopped("max-rounds");
+                        }
+
+                        if (goal.deadline !== undefined && now >= goal.deadline) {
+                            return stopped("deadline");
+                        }
+
+                        // Pi's own subagents still work: no round is counted or sent until they stop, or the cap.
+                        if (startedAt !== undefined && now - startedAt < SUBAGENT_WAIT_MS) {
+                            waiting.start = startedAt;
+
+                            return undefined;
+                        }
+
+                        goal.round += 1;
+
+                        return next({ phase: "round", n: goal.round, attempt: 0 });
+                    }, context);
+
+                    if (waiting.start === undefined) {
+                        break;
                     }
 
-                    const now = runtime.now();
-                    const people = await peopleSince(tx, id, goal.seen);
-                    const person = people.person ?? queued;
-
-                    const stopped = (reason: StopReason, detail = "") => {
-                        const state = stopIn(goal, reason, detail, now);
-
-                        seen.goal = copy(goal);
-
-                        return state;
-                    };
-
-                    goal.seen = people.seen;
-
-                    if (person !== undefined) {
-                        return stopped("person", person);
-                    }
-
-                    if (plan) {
-                        return stopped("plan");
-                    }
-
-                    if (held !== undefined) {
-                        return stopped("spend", held);
-                    }
-
-                    if (goal.round >= goal.maxRounds) {
-                        return stopped("max-rounds");
-                    }
-
-                    if (goal.deadline !== undefined && now >= goal.deadline) {
-                        return stopped("deadline");
-                    }
-
-                    goal.round += 1;
-
-                    return next({ phase: "round", n: goal.round, attempt: 0 });
-                }, context);
+                    await sleepBeforeLook(runtime, waiting.start, context);
+                }
 
                 announce(id, seen.goal);
             },
