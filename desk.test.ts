@@ -2211,14 +2211,15 @@ describe("planRepairs", () => {
             "no-session",
         );
 
-        // A return address alone is enough: the thread has a session.
+        // A return address alone is not enough: the agent route needs the supervisor's address for the session.
         const back = repairing({}, { address: undefined, run: { returnAddress: "session-back" } });
 
         planRepairs(back, 100);
         assert.equal(
-            (back.run.repairs as Record<string, { to: string }>)[keyOf("h1")]?.to,
-            "agent",
+            (back.run.repairs as Record<string, { why: string }>)[keyOf("h1")]?.why,
+            "no-session",
         );
+        assert.equal(back.run.repairCounts, undefined, "no wake-up went to the agent");
 
         // The cap comes before the other reasons.
         const capped = repairing(

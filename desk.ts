@@ -1424,10 +1424,8 @@ export function planRepairs(thread: Thread, now: number): number {
 
         if (repairCount(thread, ref) >= REPAIR_CAP) {
             entry = { to: "odrade", why: "cap" };
-        } else if (
-            thread.session === undefined ||
-            (typeof thread.run.returnAddress !== "string" && thread.address === undefined)
-        ) {
+        } else if (thread.session === undefined || thread.address === undefined) {
+            // The agent route needs the supervisor's address for the session.
             entry = { to: "odrade", why: "no-session" };
         } else if (thread.run.archived === true) {
             entry = { to: "odrade", why: "archived" };
