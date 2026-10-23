@@ -43,6 +43,7 @@ import {
     reopenable,
     reopenReason,
     wakeParked,
+    reparkRepairWoken,
     closeCheck,
     closeoutHold,
     closeoutKey,
@@ -1056,6 +1057,97 @@ describe("wakeParked", () => {
         assert.equal(thread.state, "open");
         assert.equal(thread.events.at(-1)?.text, "woke: the session is idle");
     });
+
+    test("a repair event, or a park again, never wakes a parked thread", () => {
+        const thread = placed(deskOf(), 100);
+
+        thread.state = "parked";
+        thread.events = [
+            { at: 1, key: "parked:1", text: "parked by Brian" },
+            {
+                at: 150,
+                key: "repair:repair:frostyard/test#7:h1:CONFLICTING",
+                text: "frostyard/test#7 is conflicting: repair notice to Odrade (no-session)",
+            },
+            { at: 150, key: "repair-sent:x", text: "repair notice sent to Odrade" },
+            { at: 150, key: "reparked:woke:1", text: "parked again" },
+        ];
+
+        assert.equal(wakeParked(thread, 1, 200), false);
+        assert.equal(thread.state, "parked");
+    });
+});
+
+describe("reparkRepairWoken", () => {
+    /** T11 as the first repair wake-up left it: parked by Brian, then woken by a repair event. */
+    const woken = (after: Thread["events"] = []): Thread => {
+        const thread = placed(deskOf(), 100);
+
+        thread.state = "open";
+        thread.events = [
+            { at: 1, key: "parked:1", text: "parked by Brian" },
+            {
+                at: 2,
+                key: "repair:repair:frostyard/snosi#924:h1:CONFLICTING",
+                text: "frostyard/snosi#924 is conflicting: repair notice to Odrade (no-session)",
+            },
+            {
+                at: 2,
+                key: "woke:2",
+                text: "woke: frostyard/snosi#924 is conflicting: repair notice to Odrade (no-session)",
+            },
+            ...after,
+        ];
+
+        return thread;
+    };
+
+    test("a thread that a repair woke is parked again, once", () => {
+        const thread = woken();
+
+        assert.equal(reparkRepairWoken(thread, 300), true);
+        assert.equal(thread.state, "parked");
+        assert.equal(thread.events.at(-1)?.key, "reparked:woke:2");
+
+        // Parked now: a second sweep changes nothing.
+        assert.equal(reparkRepairWoken(thread, 400), false);
+        assert.equal(thread.events.filter((event) => event.key.startsWith("reparked:")).length, 1);
+    });
+
+    test("each repair route's text counts: the agent, a message to Odrade, and failing checks", () => {
+        for (const text of [
+            "woke: frostyard/test#7 is conflicting: repair wake-up to the agent",
+            "woke: frostyard/test#7 is failing: lint, unit tests: repair message to Odrade (archived)",
+            "woke: frostyard/test#7 needs a repair: repair notice to Odrade (cap)",
+        ]) {
+            const thread = woken();
+
+            thread.events[2] = { at: 2, key: "woke:2", text };
+            assert.equal(reparkRepairWoken(thread, 300), true, text);
+        }
+    });
+
+    test("Brian's wake, a later park, another wake, or no park at all leaves it as it is", () => {
+        const brian = woken([{ at: 3, key: "woken:3", text: "woken by Brian" }]);
+
+        assert.equal(reparkRepairWoken(brian, 300), false);
+        assert.equal(brian.state, "open");
+
+        const other = woken([{ at: 3, key: "woke:3", text: "woke: the session is working" }]);
+
+        assert.equal(reparkRepairWoken(other, 300), false);
+
+        const parkedAgain = woken([{ at: 3, key: "parked:3", text: "parked by Brian" }]);
+
+        parkedAgain.state = "parked";
+        assert.equal(reparkRepairWoken(parkedAgain, 300), false);
+
+        const plain = placed(deskOf(), 100);
+
+        plain.state = "open";
+        assert.equal(reparkRepairWoken(plain, 300), false);
+        assert.equal(plain.state, "open");
+    });
 });
 
 // ─── Watches ─────────────────────────────────────────────────────────────────
@@ -1992,6 +2084,9 @@ describe("repair wake-up: GitHub facts", () => {
         updatePrs(thread, githubOf([prFact({ head: "h2", failing: [] })]), 200);
         assert.equal(thread.prs["frostyard/test#7"]?.head, "h2");
         assert.deepEqual(thread.prs["frostyard/test#7"]?.failing, []);
+        assert.equal(thread.prs["frostyard/test#7"]?.draft, false);
+        updatePrs(thread, githubOf([prFact({ head: "h2", isDraft: true })]), 300);
+        assert.equal(thread.prs["frostyard/test#7"]?.draft, true, "a draft is kept on the link");
     });
 });
 
@@ -2249,10 +2344,51 @@ describe("planRepairs", () => {
             assert.equal(other.run.repairs, undefined, state);
         }
 
-        // A parked thread is planned: the repair is an event on it.
+        // A parked thread gets nothing: Brian parked it, and a repair never wakes it.
         const parked = repairing({}, { state: "parked" });
 
-        assert.equal(planRepairs(parked, 100), 1);
+        assert.equal(planRepairs(parked, 100), 0);
+        assert.equal(parked.run.repairs, undefined);
+        assert.equal(parked.events.length, 0);
+    });
+
+    test("a draft PR gets nothing: it may conflict or fail on purpose", () => {
+        const draft = repairing({ draft: true });
+
+        assert.equal(repairState(draft.prs[REPAIR_REF]!), undefined);
+        assert.equal(repairKey(REPAIR_REF, draft.prs[REPAIR_REF]!), undefined);
+        assert.equal(planRepairs(draft, 100), 0);
+        assert.equal(draft.run.repairs, undefined);
+        assert.equal(
+            planRepairs(repairing({ draft: true, mergeable: "MERGEABLE", checks: "FAILURE" }), 100),
+            0,
+        );
+
+        // Ready for review: the same PR now gets its wake-up.
+        assert.equal(planRepairs(repairing({ draft: false }), 100), 1);
+    });
+
+    test("T11: a parked thread with a conflicting draft stays parked through plan and wake", () => {
+        const t11 = repairing(
+            { draft: true },
+            {
+                state: "parked",
+                session: undefined,
+                events: [{ at: 1, key: "parked:1", text: "parked by Brian" }],
+            },
+        );
+        const before = t11.events.length;
+
+        assert.equal(planRepairs(t11, 100), 0);
+        assert.equal(wakeParked(t11, before, 100), false);
+        assert.equal(t11.state, "parked");
+
+        // Not a draft, and still parked: no wake-up, and no wake.
+        const ready = repairing({}, { state: "parked", events: [] });
+
+        assert.equal(planRepairs(ready, 100), 0);
+        assert.equal(wakeParked(ready, 0, 100), false);
+        assert.equal(ready.state, "parked");
     });
 
     test("at most 30 entries: sent ones go first, oldest first", () => {
@@ -2366,7 +2502,7 @@ describe("repairReopen", () => {
         assert.equal(one.state, "open");
     });
 
-    test("a dropped thread, a good PR, a closed PR, an archived repository, and a PR GitHub did not read do not reopen it", () => {
+    test("a dropped thread, a good PR, a closed PR, an archived repository, a draft, and a PR GitHub did not read do not reopen it", () => {
         const dropped = closedThread("dropped");
 
         assert.equal(repairReopen(dropped, conflicting(), 100), false);
@@ -2379,6 +2515,7 @@ describe("repairReopen", () => {
             githubOf([prFact({ ref: REPAIR_REF, mergeable: "CONFLICTING" })], { archived: true }),
             githubOf([prFact({ ref: "frostyard/test#9", mergeable: "CONFLICTING" })]),
             githubOf([prFact({ ref: REPAIR_REF, mergeable: "CONFLICTING", head: "" })]),
+            githubOf([prFact({ ref: REPAIR_REF, mergeable: "CONFLICTING", isDraft: true })]),
             githubOf([]),
         ]) {
             const one = closedThread();
@@ -6290,6 +6427,7 @@ describe("the desk in a Pi Pocket", () => {
         mergeable?: string;
         checks?: string;
         failing?: string[];
+        draft?: boolean;
     }) => ({
         data: {
             viewer: { login: "github-viewer" },
@@ -6301,7 +6439,7 @@ describe("the desk in a Pi Pocket", () => {
                     title: "A fix",
                     url: "https://github.com/frostyard/test/pull/7",
                     state: "OPEN",
-                    isDraft: false,
+                    isDraft: patch.draft ?? false,
                     createdAt: new Date().toISOString(),
                     headRefName: "fix-7",
                     mergeable: patch.mergeable ?? "MERGEABLE",
@@ -6524,6 +6662,65 @@ describe("the desk in a Pi Pocket", () => {
             );
             await sweptAfter(thread, after?.run.sweptAt);
             assert.equal(await texts(source, message), 1);
+        } finally {
+            await quiet([]);
+            shift = 0;
+        }
+    });
+
+    test("T11: the sweep parks again a thread that a repair woke, and a parked thread gets no repair", async () => {
+        const { source, linked, thread, first, texts } = await withOpenPr("repair-parked");
+        const ref = "frostyard/test#7";
+        const state = async () => (await deskState())?.threads[thread.id];
+
+        try {
+            // As the first repair wake-up left T11: parked by Brian, then woken by a repair event on a draft.
+            await app.harness.commit(async (tx) => {
+                const found = (await tx.doc(DeskThreads)).threads[thread.id]!;
+
+                found.state = "open";
+                found.events.push(
+                    { at: 1, key: "parked:1", text: "parked by Brian" },
+                    {
+                        at: 2,
+                        key: `repair:repair:${ref}:aaa111:CONFLICTING`,
+                        text: `${ref} is conflicting: repair notice to Odrade (no-session)`,
+                    },
+                    {
+                        at: 2,
+                        key: "woke:2",
+                        text: `woke: ${ref} is conflicting: repair notice to Odrade (no-session)`,
+                    },
+                );
+            }, context);
+            await quiet([thread.id]);
+            await restartApp(
+                SWEEP_SLEEP_MS + 60_000,
+                repairFixture({ head: "aaa111", mergeable: "CONFLICTING", draft: true }),
+            );
+            await sweptAfter(thread, first);
+
+            const after = await state();
+
+            assert.equal(after?.state, "parked");
+            assert.equal(after?.prs[ref]?.draft, true);
+            assert(after?.events.some((event) => event.key === "reparked:woke:2"));
+            assert.equal(after?.run.repairs, undefined, "a draft gets no repair");
+
+            // Ready for review, still conflicting, and still parked: no wake-up, and no wake.
+            await restartApp(
+                SWEEP_SLEEP_MS * 2 + 120_000,
+                repairFixture({ head: "bbb222", mergeable: "CONFLICTING" }),
+            );
+            await sweptAfter(thread, after?.run.sweptAt);
+
+            const later = await state();
+
+            assert.equal(later?.state, "parked");
+            assert.equal(later?.prs[ref]?.draft, false);
+            assert.equal(later?.run.repairs, undefined, "a parked thread gets no repair");
+            assert.equal(await texts(linked, "is now conflicting"), 0);
+            assert.equal(await texts(source, "is now conflicting"), 0);
         } finally {
             await quiet([]);
             shift = 0;
