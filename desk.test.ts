@@ -53,6 +53,16 @@ import {
     waitsText,
     waitsNeedLive,
     answeredText,
+    answerKind,
+    digestConfig,
+    digestText,
+    enqueueDigest,
+    queueNews,
+    takeDigest,
+    type DigestBox,
+    type DigestConfig,
+    type DigestItem,
+    type DigestKind,
     parseStatus,
     addAsk,
     answerAsk,
@@ -3781,6 +3791,280 @@ describe("shortLine", () => {
     });
 });
 
+// ─── The digest ─────────────────────────────────────────────────────────────
+
+describe("the digest's rules", () => {
+    /** A supervisor's box, as a fresh one looks. */
+    const newBox = (): DigestBox => ({ items: [], scheduled: [], queued: {}, seq: 0 });
+    const config = (
+        minutes = 15,
+        now: DigestKind[] = ["shift-blocked", "answer-action", "repair"],
+    ): DigestConfig => ({ minutes, now });
+    const made = (
+        key: string,
+        kind: DigestKind,
+        thread = "T1",
+        at = 1000,
+        line = `[desk] ${thread} · ${kind}`,
+    ): DigestItem => ({ key, thread, kind, line, at });
+    const lines = (text: string) => text.split("\n");
+
+    test("an acknowledgement is `answer`; words that name a thing to do are `answer-action`", () => {
+        for (const words of [
+            "ok",
+            "OK",
+            "Okay.",
+            "yes ok",
+            "no",
+            "nope!",
+            "thanks",
+            "Thank you",
+            "noted",
+            "fine",
+            "later",
+            "not now",
+            "skip",
+            "seen",
+            "got it",
+            "done",
+            "answered on the Desk page",
+        ]) {
+            assert.equal(answerKind(words), "answer", words);
+        }
+
+        for (const words of ["merge it", "yes, merge it", "ok but wait for CI", ""]) {
+            assert.equal(answerKind(words), "answer-action", words);
+        }
+    });
+
+    test("the setting: 0 to 240 minutes, known kinds only, and a default for a bad value", () => {
+        const fallback = ["shift-blocked", "answer-action", "repair"];
+
+        assert.deepEqual(digestConfig(undefined), { minutes: 15, now: fallback });
+        assert.deepEqual(digestConfig(null), { minutes: 15, now: fallback });
+        assert.deepEqual(digestConfig({ minutes: 0, now: ["queue", "nope", "queue", 3] }), {
+            minutes: 0,
+            now: ["queue"],
+        });
+        assert.equal(digestConfig({ minutes: 240 }).minutes, 240);
+        assert.deepEqual(digestConfig({ now: [] }).now, [], "an empty list is not a bad value");
+
+        for (const minutes of [-1, 241, 1.5, "10", null]) {
+            assert.equal(digestConfig({ minutes }).minutes, 15, JSON.stringify(minutes));
+        }
+
+        assert.deepEqual(digestConfig({ now: "queue" }).now, fallback);
+    });
+
+    test("enqueue: an at-once kind asks for now, another for now plus the interval", () => {
+        const state = empty();
+        const soon = config(15);
+
+        assert.equal(enqueueDigest(state, 5, made("a", "report"), 1000, soon), 1000 + 15 * 60_000);
+        assert.equal(
+            enqueueDigest(state, 5, made("b", "queue", "T2"), 1000, soon),
+            undefined,
+            "the task at 15 minutes covers it",
+        );
+        assert.equal(
+            enqueueDigest(state, 5, made("c", "repair", "T3"), 1000, soon),
+            1000,
+            "at once: a task at this moment",
+        );
+
+        const box = state.digests?.["5"];
+
+        assert.deepEqual(
+            box?.items.map((each) => each.key),
+            ["a", "b", "c"],
+        );
+        assert.deepEqual(box?.scheduled, [1000 + 15 * 60_000, 1000]);
+    });
+
+    test("enqueue: 1 item per key, 100 items at most, the oldest gone", () => {
+        const state = empty();
+        const soon = config(15);
+
+        for (let index = 0; index < 120; index += 1) {
+            const at = 1000 + index * 60_000;
+
+            enqueueDigest(state, 5, made(`k${String(index)}`, "report", "T1", at), at, soon);
+        }
+
+        const box = state.digests?.["5"];
+
+        assert.equal(box?.items.length, 100);
+        assert.equal(box?.items[0]?.key, "k20");
+        assert.equal(
+            enqueueDigest(state, 5, made("k119", "report"), 9999, soon),
+            undefined,
+            "the key is in the box already",
+        );
+        assert.equal(box?.items.filter((each) => each.key === "k119").length, 1);
+    });
+
+    test("queue: 1 item for a new wait, none for the same reason, and a leave when it stops", () => {
+        const state = empty();
+        const thread = open(state, "x.test.news").thread;
+        const box = newBox();
+
+        thread.origin = "found";
+        thread.key = "found:pr:frostyard/test#7";
+
+        const first = queueNews([thread], box, 1000);
+
+        assert.equal(first.length, 1);
+        assert.equal(first[0]?.kind, "queue");
+        assert.equal(first[0]?.key, `queue:${thread.id}:found PR, attach or drop`);
+        assert.equal(
+            first[0]?.line,
+            `[desk] ${thread.id} · waits on you: found PR, attach or drop · desk read ${thread.id}`,
+        );
+        assert.equal(box.queued[thread.id], "found PR, attach or drop");
+        assert.deepEqual(queueNews([thread], box, 2000), [], "the same reason again");
+
+        // Another reason: 1 new item.
+        thread.key = "found:folder:/work/x";
+        assert.deepEqual(
+            queueNews([thread], box, 3000).map((each) => each.key),
+            [`queue:${thread.id}:found folder work, attach or drop`],
+        );
+
+        // It stops waiting: its entry leaves, and it comes back when it waits again.
+        thread.state = "closed";
+        assert.deepEqual(queueNews([thread], box, 4000), []);
+        assert.equal(box.queued[thread.id], undefined);
+        thread.state = "open";
+        assert.equal(queueNews([thread], box, 5000).length, 1);
+    });
+
+    test("queue: a repair the agent cannot take is an at-once `repair` item", () => {
+        const state = empty();
+        const thread = open(state, "x.test.repair-news").thread;
+
+        thread.prs["frostyard/test#7"] = {
+            via: "seen",
+            state: "OPEN",
+            mergeable: "CONFLICTING",
+            head: "abc",
+        };
+        thread.run.repairs = {
+            "repair:frostyard/test#7:abc:CONFLICTING": {
+                at: 1,
+                to: "odrade",
+                why: "change",
+                sent: true,
+            },
+        };
+
+        const items = queueNews([thread], newBox(), 1000);
+
+        assert.equal(items.length, 1);
+        assert.equal(items[0]?.kind, "repair");
+        assert.match(
+            items[0]?.line ?? "",
+            /waits on you: PR frostyard\/test#7 needs a repair: agent/,
+        );
+    });
+
+    test("the message: a header, 1 line each, and a closed thread's reports in its closed line", () => {
+        const text = digestText([
+            made(
+                "report:a",
+                "report",
+                "T12",
+                1,
+                "[desk] T12 frostyard/x · lucilla reported (420 chars) · desk read T12",
+            ),
+            made(
+                "report:b",
+                "report",
+                "T36",
+                2,
+                "[desk] T36 frostyard/y · duncan reported (5 chars) · desk read T36",
+            ),
+            made(
+                "queue:T36:silent session",
+                "queue",
+                "T36",
+                3,
+                "[desk] T36 · waits on you: silent session · desk read T36",
+            ),
+            made(
+                "closed:T36",
+                "closed",
+                "T36",
+                4,
+                "[desk] T36 frostyard/y · closed: done, nothing remains · desk read T36",
+            ),
+            made("answer:T39a", "answer", "T39", 5, "[desk] T39a answered by Brian: yes"),
+        ]);
+
+        assert.deepEqual(lines(text), [
+            "[desk] digest: 3 new. Read each with desk read <id> before you act.",
+            "[desk] T12 frostyard/x · lucilla reported (420 chars) · desk read T12",
+            "[desk] T36 frostyard/y · closed: done, nothing remains · 1 report · desk read T36",
+            "[desk] T39a answered by Brian: yes",
+        ]);
+
+        // 2 reports: plural. An answer on the closed thread stays.
+        assert.deepEqual(
+            lines(
+                digestText([
+                    made("r1", "report", "T1", 1, "[desk] T1 · a"),
+                    made("r2", "report", "T1", 2, "[desk] T1 · b"),
+                    made("c1", "closed", "T1", 3, "[desk] T1 · closed: done · desk read T1"),
+                    made("ans", "answer", "T1", 4, "[desk] T1a answered by Brian: ok"),
+                ]),
+            ),
+            [
+                "[desk] digest: 2 new. Read each with desk read <id> before you act.",
+                "[desk] T1 · closed: done · 2 reports · desk read T1",
+                "[desk] T1a answered by Brian: ok",
+            ],
+        );
+    });
+
+    test("the message keeps 30 item lines, and counts the rest", () => {
+        const items = Array.from({ length: 35 }, (_, index) =>
+            made(
+                `k${String(index)}`,
+                "report",
+                `T${String(index + 1)}`,
+                index,
+                `[desk] line ${String(index)}`,
+            ),
+        );
+        const shown = lines(digestText(items));
+
+        assert.equal(shown.length, 32);
+        assert.equal(shown[1], "[desk] line 0");
+        assert.equal(shown[30], "[desk] line 29");
+        assert.equal(shown[31], "… and 5 more on the Desk page.");
+    });
+
+    test("take: the items, an empty box, the number, and 1 scheduled time gone", () => {
+        const state = empty();
+        const due = enqueueDigest(state, 5, made("a", "closed"), 5000, config(15));
+
+        assert.equal(typeof due, "number");
+
+        const first = takeDigest(state, 5, due as number);
+
+        assert.equal(first.items.length, 1);
+        assert.equal(first.seq, 1);
+        assert.deepEqual(state.digests?.["5"]?.items, []);
+        assert.deepEqual(state.digests?.["5"]?.scheduled, []);
+
+        const second = takeDigest(state, 5, due as number);
+
+        assert.deepEqual(second.items, []);
+        assert.equal(second.seq, 2);
+        assert.deepEqual(takeDigest(state, 6, 1), { items: [], seq: 0 }, "no box: no write");
+        assert.equal(state.digests?.["6"], undefined);
+    });
+});
+
 // ─── In a Pi Pocket ──────────────────────────────────────────────────────────
 
 const TASK = "Tend the test repository";
@@ -4241,7 +4525,7 @@ before(async () => {
     process.env.PI_POCKET_DESK_GH = fakeGh;
     process.env.PI_POCKET_DESK_CONFIG = configPath;
     // The tests make many threads: a high cap, so only the cap tests meet the cap. Each of them restores this.
-    writeFileSync(configPath, JSON.stringify({ cap: 100 }));
+    writeFileSync(configPath, JSON.stringify({ digest: { minutes: 0 }, cap: 100 }));
 
     app = await openApp(model, dataDir, () => Date.now() + shift);
     await app.setExtensionEnabled(owner(app), "team.ts", true);
@@ -4318,6 +4602,17 @@ async function stopSweepers(): Promise<void> {
 
     for (const task of live.tasks) {
         if (task.record.kind === "x.desk.sweeper") {
+            await stopSweeper(task.record.id);
+        }
+    }
+}
+
+/** Stop every live digest task: a test that moves the clock must not wake the digests of earlier tests. */
+async function stopDigests(): Promise<void> {
+    const live = await app.harness.inspect(context);
+
+    for (const task of live.tasks) {
+        if (task.record.kind === "x.desk.digest") {
             await stopSweeper(task.record.id);
         }
     }
@@ -4412,7 +4707,7 @@ async function restartApp(by: number, github?: unknown): Promise<void> {
     process.env.PI_POCKET_DESK_GH = fakeGh;
     process.env.PI_POCKET_DESK_CONFIG = configPath;
     // The tests make many threads: a high cap, so only the cap tests meet the cap. Each of them restores this.
-    writeFileSync(configPath, JSON.stringify({ cap: 100 }));
+    writeFileSync(configPath, JSON.stringify({ digest: { minutes: 0 }, cap: 100 }));
 
     app = await openApp(model, dataDir, () => Date.now() + shift);
 }
@@ -4816,7 +5111,10 @@ describe("the desk in a Pi Pocket", () => {
             await say(app, linked, "desk pr test");
 
             // A machine account counts as ours: its PR is a candidate too.
-            writeFileSync(configPath, JSON.stringify({ authors: ["machine-user"] }));
+            writeFileSync(
+                configPath,
+                JSON.stringify({ digest: { minutes: 0 }, authors: ["machine-user"] }),
+            );
             writeFileSync(
                 fixturePath,
                 JSON.stringify(
@@ -4888,7 +5186,7 @@ describe("the desk in a Pi Pocket", () => {
                 fixturePath,
                 JSON.stringify({ data: { viewer: { login: "github-viewer" } } }),
             );
-            writeFileSync(configPath, JSON.stringify({ cap: 100 }));
+            writeFileSync(configPath, JSON.stringify({ digest: { minutes: 0 }, cap: 100 }));
         }
     });
 
@@ -5425,7 +5723,10 @@ describe("the desk in a Pi Pocket", () => {
         const folder = join(root, "export");
 
         mkdirSync(folder, { recursive: true });
-        writeFileSync(configPath, JSON.stringify({ cap: 100, export: folder }));
+        writeFileSync(
+            configPath,
+            JSON.stringify({ digest: { minutes: 0 }, cap: 100, export: folder }),
+        );
 
         try {
             const { source, thread } = await delegated("export");
@@ -5476,7 +5777,7 @@ describe("the desk in a Pi Pocket", () => {
             assert.equal(statSync(otherFile).mtimeMs, second, "the other file stays");
             assert.match(readFileSync(threadsFile, "utf8"), /A changed title/);
         } finally {
-            writeFileSync(configPath, JSON.stringify({ cap: 100 }));
+            writeFileSync(configPath, JSON.stringify({ digest: { minutes: 0 }, cap: 100 }));
             rmSync(folder, { recursive: true, force: true });
         }
     });
@@ -5485,7 +5786,7 @@ describe("the desk in a Pi Pocket", () => {
         const folder = join(root, "export-none");
 
         mkdirSync(folder, { recursive: true });
-        writeFileSync(configPath, JSON.stringify({ cap: 100 }));
+        writeFileSync(configPath, JSON.stringify({ digest: { minutes: 0 }, cap: 100 }));
 
         try {
             const { source } = await delegated("export-none");
@@ -5496,12 +5797,16 @@ describe("the desk in a Pi Pocket", () => {
             // A folder that is not there: the tool answers as usual.
             writeFileSync(
                 configPath,
-                JSON.stringify({ cap: 100, export: join(root, "export-missing") }),
+                JSON.stringify({
+                    digest: { minutes: 0 },
+                    cap: 100,
+                    export: join(root, "export-missing"),
+                }),
             );
             await say(app, source, "desk sync test");
             assert.match((await modelTexts(app, source)).join("\n"), /· open · next: /);
         } finally {
-            writeFileSync(configPath, JSON.stringify({ cap: 100 }));
+            writeFileSync(configPath, JSON.stringify({ digest: { minutes: 0 }, cap: 100 }));
             rmSync(folder, { recursive: true, force: true });
         }
     });
@@ -6057,6 +6362,95 @@ describe("the desk in a Pi Pocket", () => {
                 ).length,
                 0,
             );
+        });
+
+        test("with the digest on, a page answer is 1 item, and its kind sends it at once or not", async () => {
+            writeFileSync(configPath, JSON.stringify({ digest: { minutes: 15 }, cap: 100 }));
+
+            const source = await supervisor("digest-page");
+            let threadId = "";
+            let actionId = "";
+            let ackId = "";
+
+            await app.harness.commit(async (tx) => {
+                const state = await tx.doc(DeskThreads);
+                const opened = openThread(state, {
+                    key: "x.test.digest-page",
+                    supervisor: Number(source),
+                    agents: ["duncan"],
+                    repo: "frostyard/test",
+                    title: "A decision",
+                    at: Date.now(),
+                });
+
+                threadId = opened.thread.id;
+
+                for (const [index, text] of ["Merge it?", "And then?"].entries()) {
+                    const made = addAsk(state, {
+                        thread: threadId,
+                        text,
+                        key: `x.test.digest-page:${String(index + 1)}`,
+                        by: "Odrade",
+                        supervisor: Number(source),
+                        at: Date.now(),
+                    });
+
+                    if (index === 0) {
+                        actionId = "askId" in made ? made.askId : "";
+                    } else {
+                        ackId = "askId" in made ? made.askId : "";
+                    }
+                }
+            }, context);
+
+            const notifyTasks = async () =>
+                (await app.harness.inspect(context)).tasks.filter(
+                    (task) =>
+                        task.record.kind === "x.desk.notify" &&
+                        Number(task.record.conversationId) === Number(source),
+                ).length;
+            const itemOf = async (id: string) =>
+                (await deskState())?.digests?.[String(Number(source))]?.items.find(
+                    (each) => each.key === `answer:${id}`,
+                );
+
+            try {
+                assert.equal(await notifyTasks(), 0);
+
+                // Words that name a thing to do: an at-once item, and no task of its own.
+                assert.equal(
+                    (await call(`asks/${actionId}/answer`, { words: "merge it" })).status,
+                    200,
+                );
+
+                assert.equal(await notifyTasks(), 0, "no notify task");
+
+                // At once: the digest goes with no clock move, and carries the line.
+                await until(
+                    async () =>
+                        (await modelTexts(app, source))
+                            .join("\n")
+                            .includes(`[desk] ${actionId} answered by`),
+                    "the digest message",
+                    20_000,
+                );
+
+                const texts = (await modelTexts(app, source)).join("\n");
+
+                assert.match(texts, /\[desk\] digest: 1 new\./);
+                assert.match(
+                    texts,
+                    new RegExp(`\\[desk\\] ${actionId} answered by ${owner(app).name}: merge it`),
+                );
+
+                // An acknowledgement waits for the interval.
+                assert.equal((await call(`asks/${ackId}/answer`, { words: "ok" })).status, 200);
+                assert.equal((await itemOf(ackId))?.kind, "answer");
+                assert.equal(await notifyTasks(), 0);
+            } finally {
+                await stopDigests();
+                writeFileSync(configPath, JSON.stringify({ digest: { minutes: 0 }, cap: 100 }));
+            }
         });
 
         test("watch, unwatch and result change the thread; a second POST changes nothing", async () => {
@@ -7297,7 +7691,7 @@ describe("the desk in a Pi Pocket", () => {
         const now = Date.now();
         const before = capView(await deskState(), DEFAULT_CAP, now).counted;
 
-        writeFileSync(configPath, JSON.stringify({ cap: DEFAULT_CAP }));
+        writeFileSync(configPath, JSON.stringify({ digest: { minutes: 0 }, cap: DEFAULT_CAP }));
         await clearGrants();
 
         // Fill the desk to the cap, with threads that count.
@@ -7371,7 +7765,7 @@ describe("the desk in a Pi Pocket", () => {
             /opened over the cap with Brian's OK \(chat\)/,
         );
 
-        writeFileSync(configPath, JSON.stringify({ cap: 100 }));
+        writeFileSync(configPath, JSON.stringify({ digest: { minutes: 0 }, cap: 100 }));
     });
 
     test("open at the cap refuses, a grant opens it, and fail gives the grant back", async () => {
@@ -7403,7 +7797,7 @@ describe("the desk in a Pi Pocket", () => {
         };
 
         assert(api, "the desk publishes its API");
-        writeFileSync(configPath, JSON.stringify({ cap: 1 }));
+        writeFileSync(configPath, JSON.stringify({ digest: { minutes: 0 }, cap: 1 }));
         await clearGrants();
 
         try {
@@ -7508,7 +7902,276 @@ describe("the desk in a Pi Pocket", () => {
                         grant.key !== `tap:expired:${String(at)}`,
                 );
             }, context);
-            writeFileSync(configPath, JSON.stringify({ cap: 100 }));
+            writeFileSync(configPath, JSON.stringify({ digest: { minutes: 0 }, cap: 100 }));
         }
+    });
+
+    describe("the digest", () => {
+        /** The desk's config file, with the digest on for this test. */
+        const digestOn = (minutes = 15) =>
+            writeFileSync(configPath, JSON.stringify({ digest: { minutes }, cap: 100 }));
+        /** The config the other tests expect: the digest off. */
+        const digestOff = () =>
+            writeFileSync(configPath, JSON.stringify({ digest: { minutes: 0 }, cap: 100 }));
+        const boxOf = async (source: ConversationId) =>
+            (await deskState())?.digests?.[String(Number(source))];
+        /** The digest tasks of 1 supervisor: other tests' supervisors may have their own. */
+        const digestTasks = async (source: ConversationId) =>
+            (await app.harness.inspect(context)).tasks.filter(
+                (task) =>
+                    task.record.kind === "x.desk.digest" &&
+                    Number(task.record.conversationId) === Number(source),
+            );
+
+        test("a filed report is held, and 1 digest message arrives at its time", async () => {
+            digestOn();
+
+            try {
+                const { source, linked, thread } = await delegated("digest-report");
+
+                await until(
+                    async () =>
+                        typeof (await deskState())?.threads[thread.id]?.run.sweptAt === "number",
+                    "the first sweep",
+                    20_000,
+                );
+                await until(() => !app.isBusy(linked), "the linked session to settle", 20_000);
+                // The first sweep's queue item is not this test's news.
+                await app.harness.commit(async (tx) => {
+                    delete (await tx.doc(DeskThreads)).digests;
+                }, context);
+
+                await say(app, linked, "report to supervisor test");
+                await until(() => !app.isBusy(linked), "the report's turn to settle", 20_000);
+
+                const box = await boxOf(source);
+
+                assert.equal(box?.items.length, 1);
+                assert.equal(box?.items[0]?.kind, "report");
+                assert.equal(box?.items[0]?.thread, thread.id);
+                assert.match(box?.items[0]?.line ?? "", /duncan reported/);
+                assert.equal(
+                    (await app.harness.snapshot(DeskReports, linked, context))?.reports[0]?.held,
+                    true,
+                    "the stored report says the digest has it",
+                );
+                assert.match(
+                    (await modelTexts(app, linked)).join("\n"),
+                    new RegExp(
+                        `Filed on ${thread.id}\\. Your supervisor gets it in the next desk digest`,
+                    ),
+                );
+                assert.equal(
+                    (await modelTexts(app, source)).filter((each) =>
+                        each.includes("· duncan reported ("),
+                    ).length,
+                    0,
+                    "no line at the supervisor yet",
+                );
+                assert.equal((await digestTasks(source)).length, 1, "1 digest task waits");
+
+                await quiet([thread.id]);
+                await restartApp(16 * 60_000, undefined);
+                digestOff();
+
+                await until(
+                    async () =>
+                        (await modelTexts(app, source)).join("\n").includes("[desk] digest:"),
+                    "the digest message",
+                    20_000,
+                );
+
+                const texts = (await modelTexts(app, source)).join("\n");
+
+                assert.match(texts, /\[desk\] digest: 1 new\./);
+                assert.match(
+                    texts,
+                    new RegExp(`\\[desk\\] ${thread.id} frostyard/test · duncan reported`),
+                );
+
+                const after = await boxOf(source);
+
+                assert.deepEqual(after?.items, [], "the box is empty after the digest");
+                assert.equal(typeof after?.sentAt, "number");
+            } finally {
+                await stopDigests();
+                await quiet([]);
+                shift = 0;
+                digestOff();
+            }
+        });
+
+        test("a replay of the same report adds no second item, and says held again", async () => {
+            digestOn();
+
+            try {
+                const { source, linked, thread } = await delegated("digest-replay");
+
+                await until(
+                    async () =>
+                        typeof (await deskState())?.threads[thread.id]?.run.sweptAt === "number",
+                    "the first sweep",
+                    20_000,
+                );
+                await until(() => !app.isBusy(linked), "the linked session to settle", 20_000);
+                await app.harness.commit(async (tx) => {
+                    delete (await tx.doc(DeskThreads)).digests;
+                }, context);
+
+                // The report the call filed, and the same request again: a replay sends nothing and adds no item.
+                await say(app, linked, "report to supervisor test");
+                await until(() => !app.isBusy(linked), "the report's turn to settle", 20_000);
+
+                const stored = (await app.harness.snapshot(DeskReports, linked, context))
+                    ?.reports[0];
+
+                assert(stored, "the report is stored");
+                assert.equal((await boxOf(source))?.items.length, 1);
+
+                const address = String((await deskState())?.threads[thread.id]?.run.returnAddress);
+                const api = (
+                    globalThis as unknown as Record<
+                        symbol,
+                        {
+                            file: (
+                                tx: unknown,
+                                session: ConversationId,
+                                request: object,
+                            ) => Promise<{ line: string; held?: boolean } | undefined>;
+                        }
+                    >
+                )[Symbol.for("pi-pocket-team.desk")]!;
+                const replay = await app.harness.commit(
+                    (tx) =>
+                        api.file(tx, linked, {
+                            to: address,
+                            key: stored.key,
+                            from: stored.from,
+                            text: stored.text,
+                            at: stored.at,
+                            digest: true as const,
+                        }),
+                    context,
+                );
+
+                assert.equal(replay?.held, true, "the stored report holds it too");
+                assert.equal(replay?.line, stored.line);
+                assert.equal((await boxOf(source))?.items.length, 1, "1 item, not 2");
+            } finally {
+                await stopDigests();
+                digestOff();
+            }
+        });
+
+        test("a night shift report waits for the digest too, and sends nothing itself", async () => {
+            digestOn();
+
+            try {
+                const source = await supervisor("digest-night");
+
+                await say(app, source, "desk night shift test");
+                const linked = app
+                    .sessions()
+                    .find((session) => session.linkedFrom?.id === Number(source));
+
+                assert(linked, "the night shift started a linked session");
+
+                const thread = threadOfSession(await deskState(), Number(linked.id));
+
+                assert(thread);
+                await until(
+                    async () =>
+                        typeof (await deskState())?.threads[thread.id]?.run.reportedAt === "number",
+                    "the night shift's report",
+                    30_000,
+                );
+
+                const box = await boxOf(source);
+                const item = box?.items.find((each) => each.thread === thread.id);
+
+                assert.equal(item?.kind, "shift", "a report that stopped as done");
+                assert.equal(
+                    (await app.harness.snapshot(DeskReports, linked.id, context))?.reports[0]?.held,
+                    true,
+                );
+                assert.equal(
+                    (await modelTexts(app, source)).filter((each) =>
+                        each.includes("· night shift report ("),
+                    ).length,
+                    0,
+                    "no line at the supervisor yet",
+                );
+            } finally {
+                await stopDigests();
+                digestOff();
+            }
+        });
+
+        test("an interval of 0 sends the line at once, as before", async () => {
+            digestOff();
+
+            const { source, linked, thread } = await delegated("digest-off");
+
+            await say(app, linked, "report to supervisor test");
+            await until(
+                async () =>
+                    (await modelTexts(app, source))
+                        .join("\n")
+                        .includes(`[desk] ${thread.id} frostyard/test · duncan reported`),
+                "the line at the supervisor",
+                20_000,
+            );
+
+            assert.match((await modelTexts(app, linked)).join("\n"), /Your supervisor got 1 line/);
+            assert.equal(
+                (await app.harness.snapshot(DeskReports, linked, context))?.reports[0]?.held,
+                undefined,
+                "nothing holds it",
+            );
+            assert.equal(await boxOf(source), undefined, "no box for this supervisor");
+            assert.equal((await digestTasks(source)).length, 0);
+        });
+
+        test("the sweep puts a new wait and a close in the digest, and the close folds them", async () => {
+            digestOn();
+
+            try {
+                const { source, linked, thread } = await delegated("digest-sweep");
+
+                await until(() => !app.isBusy(linked), "the linked session to settle", 20_000);
+                await say(app, linked, "report to supervisor test");
+                await until(() => !app.isBusy(linked), "the report's turn to settle", 20_000);
+                await say(app, source, "desk sync test");
+
+                const after = (await deskState())?.threads[thread.id];
+
+                assert.equal(after?.state, "closed", "the report closed the thread");
+
+                const box = await boxOf(source);
+                const closed = box?.items.find(
+                    (each) => each.kind === "closed" && each.thread === thread.id,
+                );
+
+                assert(closed, "the close is 1 item");
+                assert.equal(
+                    closed.line,
+                    `[desk] ${thread.id} frostyard/test · closed: done, nothing remains · desk read ${thread.id}`,
+                );
+                // The message folds the report into the closed line, and leaves out the wait.
+                const text = digestText(box?.items ?? []);
+
+                assert.match(
+                    text,
+                    new RegExp(
+                        `\\[desk\\] ${thread.id} frostyard/test · closed: done, nothing remains · 1 report · desk read ${thread.id}`,
+                    ),
+                );
+                assert.doesNotMatch(text, /duncan reported/, "the report line is folded away");
+                assert.doesNotMatch(text, /waits on you/, "the wait is inside the closed line");
+            } finally {
+                await stopDigests();
+                digestOff();
+            }
+        });
     });
 });

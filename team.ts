@@ -640,8 +640,10 @@ export default function createTeam(host: Host, web: Web) {
                 from: "team_message" | "night-shift";
                 text: string;
                 at: number;
+                /** The desk puts the report in the supervisor's digest: `held` says it did. */
+                digest?: true;
             },
-        ) => Promise<{ thread: DeskThread; line: string } | undefined>;
+        ) => Promise<{ thread: DeskThread; line: string; held?: boolean } | undefined>;
     };
 
     const deskApi = (): DeskApi | undefined =>
@@ -1223,7 +1225,8 @@ export default function createTeam(host: Host, web: Web) {
             const desk = deskApi();
 
             // A report to the thread's supervisor is filed on the thread in one commit with the send's key, so a replay
-            // finds it and sends the same line once. A message to anyone else goes as before.
+            // finds it and sends the same line once. A message to anyone else goes as before. With the desk's digest on,
+            // the report waits for the next digest, and this session sends nothing now.
             const filed =
                 desk === undefined
                     ? undefined
@@ -1235,20 +1238,25 @@ export default function createTeam(host: Host, web: Web) {
                                   from: "team_message",
                                   text: args.message,
                                   at: Date.now(),
+                                  digest: true,
                               }),
                           context,
                       );
 
-            await host.linkedSessions.send(
-                api.conversationId,
-                { to: args.to, message: filed?.line ?? args.message },
-                key,
-            );
+            if (filed?.held !== true) {
+                await host.linkedSessions.send(
+                    api.conversationId,
+                    { to: args.to, message: filed?.line ?? args.message },
+                    key,
+                );
+            }
 
             return reply(
                 filed === undefined
                     ? "Message sent. Do not send an acknowledgement or wait for a reply."
-                    : `Filed on ${filed.thread.id}. Your supervisor got 1 line. Do not send an acknowledgement or wait for a reply.`,
+                    : filed.held === true
+                      ? `Filed on ${filed.thread.id}. Your supervisor gets it in the next desk digest. Do not send an acknowledgement or wait for a reply.`
+                      : `Filed on ${filed.thread.id}. Your supervisor got 1 line. Do not send an acknowledgement or wait for a reply.`,
             );
         },
     });
