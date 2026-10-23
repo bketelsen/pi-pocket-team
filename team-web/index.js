@@ -1,6 +1,20 @@
 export const pocketApi = 1;
 
 // getRandomValues also works on plain-HTTP LAN pages, where randomUUID is absent.
+/** The status item for a session: the identity's name, which opens the Team page; null when it has none. */
+export const identityStatus = (session) => {
+    const name = session?.identity?.name;
+
+    return name
+        ? {
+              id: "identity",
+              text: name,
+              title: `Team identity: ${name}. Tap to change it.`,
+              page: "team",
+          }
+        : null;
+};
+
 export function newTaskKey(random = globalThis.crypto) {
     const bytes = random.getRandomValues(new Uint8Array(16));
 
@@ -461,6 +475,67 @@ export default function setup(pocket) {
 
     void badge();
     pocket.onDispose(pocket.on("memory", () => void badge()));
+
+    // The shown session's identity in the status line (new in 0.19.0: an older app has none). Pocket sends no event when
+    // the tab changes session, so a timer watches the id; the server's "identity" event says when the choice changes.
+    if (typeof pocket.status === "function") {
+        let shown = null;
+        let item = null;
+
+        const show = (spec) => {
+            if (!spec) {
+                item?.remove();
+                item = null;
+            } else if (item) {
+                item.update(spec);
+            } else {
+                item = pocket.status(spec);
+            }
+        };
+
+        const load = async () => {
+            const id = shown;
+            let spec = null;
+
+            if (id !== null) {
+                try {
+                    spec = identityStatus(await pocket.api(`session/${id}`));
+                } catch {
+                    spec = null;
+                }
+            }
+
+            // A reply for a session that is no longer shown must not win.
+            if (shown === id) {
+                show(spec);
+            }
+        };
+
+        const watch = () => {
+            const id = pocket.conversationId() ?? null;
+
+            if (id !== shown) {
+                shown = id;
+                void load();
+            }
+        };
+
+        watch();
+        const timer = setInterval(watch, 1500);
+        const stop = pocket.on("identity", ({ conversationId }) => {
+            if (shown !== null && Number(conversationId) === Number(shown)) {
+                void load();
+            }
+        });
+
+        pocket.onDispose(() => {
+            clearInterval(timer);
+            stop();
+            item?.remove();
+            item = null;
+        });
+    }
+
     pocket.toolCall({
         tool: "team_memory",
         icon: "key",

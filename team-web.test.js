@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { webcrypto } from "node:crypto";
 import { test } from "node:test";
-import { expectedOf, newTaskKey, waitingCount } from "./team-web/index.js";
+import { expectedOf, identityStatus, newTaskKey, waitingCount } from "./team-web/index.js";
 
 test("task keys work with the crypto API available on plain-HTTP LAN pages", () => {
     const lanCrypto = { getRandomValues: webcrypto.getRandomValues.bind(webcrypto) };
@@ -26,4 +26,15 @@ test("the owner's approval carries what they saw, and waiting lessons count", ()
     assert.deepEqual(expectedOf(inForce), { text: "Kept." });
     assert.equal(waitingCount([pending, change, forget, inForce]), 3);
     assert.equal(waitingCount(undefined), 0);
+});
+
+test("the status line shows the session's identity, and nothing without one", () => {
+    assert.equal(identityStatus(null), null);
+    assert.equal(identityStatus({ identity: null, linked: [] }), null);
+    assert.deepEqual(identityStatus({ identity: { id: "murbella", name: "Murbella" } }), {
+        id: "identity",
+        text: "Murbella",
+        title: "Team identity: Murbella. Tap to change it.",
+        page: "team",
+    });
 });

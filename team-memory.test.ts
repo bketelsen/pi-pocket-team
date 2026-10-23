@@ -546,3 +546,59 @@ test("agent memory: identity gate, pending vs approved in the prompt, across fol
         await app.close();
     }
 });
+
+test("a change of identity sends one event with the conversation id, and no name", async () => {
+    type Handler = (...args: never[]) => Promise<unknown>;
+    const routes = new Map<string, Handler>();
+    const commands = new Map<string, Handler>();
+    const sent: unknown[][] = [];
+    const web = {
+        conversationRoute: (method: string, path: string, handler: Handler) =>
+            void routes.set(`${method} ${path}`, handler),
+        route() {},
+        client() {},
+        command: (name: string, spec: { handler: Handler }) =>
+            void commands.set(name, spec.handler),
+        send: (...args: unknown[]) => void sent.push(args),
+        onDispose() {},
+        error: (status: number, message: string) => Object.assign(new Error(message), { status }),
+    };
+
+    createTeam({ text: { defang: (t: string) => t }, linkedSessions: {} } as never, web as never);
+
+    const docs: { persona?: { id: string } }[] = [];
+
+    const commit = async (change: (tx: unknown) => Promise<void>) => {
+        const doc: { persona?: { id: string } } = {};
+
+        docs.push(doc);
+        await change({ doc: async () => doc });
+    };
+
+    const route = routes.get("POST session/:source/identity")!;
+    const command = commands.get("team-agent")!;
+
+    await route({ body: { agent: "teg" }, conversation: { id: 7 }, commit } as never);
+    assert.deepEqual(sent, [["identity", { conversationId: 7 }]]);
+    assert.equal(docs[0]?.persona?.id, "teg");
+
+    sent.length = 0;
+    await route({ body: { agent: null }, conversation: { id: 8 }, commit } as never);
+    assert.deepEqual(sent, [["identity", { conversationId: 8 }]]);
+
+    sent.length = 0;
+    await command("duncan" as never, { conversationId: 9, commit } as never);
+    assert.deepEqual(sent, [["identity", { conversationId: 9 }]]);
+    assert.equal(docs[2]?.persona?.id, "duncan");
+
+    sent.length = 0;
+    await command("clear" as never, { conversationId: 10, commit } as never);
+    assert.deepEqual(sent, [["identity", { conversationId: 10 }]]);
+
+    // A refused choice changes nothing and sends nothing.
+    sent.length = 0;
+    await assert.rejects(
+        route({ body: { agent: "../missing" }, conversation: { id: 11 }, commit } as never),
+    );
+    assert.equal(sent.length, 0);
+});
