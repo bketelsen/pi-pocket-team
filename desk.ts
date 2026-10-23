@@ -5144,7 +5144,8 @@ export default function createDesk(host: Host, web: Web) {
                                 key,
                                 ref: parsed.ref,
                                 state: parsed.state,
-                                failing: thread.prs[parsed.ref]?.failing ?? [],
+                                // A copy: the document's own array is not readable after the commit.
+                                failing: [...(thread.prs[parsed.ref]?.failing ?? [])],
                                 to: entry.to,
                                 why: entry.why,
                                 ...(thread.address === undefined

@@ -79,6 +79,7 @@ import {
     repairState,
     repairKey,
     repairHeld,
+    repairsOf,
     repairReopen,
     planRepairs,
     repairMessage,
@@ -2149,14 +2150,19 @@ describe("planRepairs", () => {
         one.prs[REPAIR_REF]!.head = "h4";
         assert.equal(planRepairs(one, 200), 1);
 
-        const repairs = one.run.repairs as Record<string, { to: string; why: string }>;
+        const repairs = () => one.run.repairs as Record<string, { to: string; why: string }>;
 
-        assert.deepEqual(repairs[keyOf("h4")], { at: 200, to: "odrade", why: "cap", sent: false });
+        assert.deepEqual(repairs()[keyOf("h4")], {
+            at: 200,
+            to: "odrade",
+            why: "cap",
+            sent: false,
+        });
         assert.deepEqual(one.run.repairCounts, { [REPAIR_REF]: 3 });
 
         one.prs[REPAIR_REF]!.head = "h5";
         planRepairs(one, 300);
-        assert.equal(repairs[keyOf("h5")]?.why, "cap");
+        assert.equal(repairs()[keyOf("h5")]?.why, "cap");
         assert.deepEqual(one.run.repairCounts, { [REPAIR_REF]: 3 });
     });
 
@@ -2248,7 +2254,7 @@ describe("planRepairs", () => {
         assert.equal(planRepairs(parked, 100), 1);
     });
 
-    test("at most 30 entries: sent ones go first, oldest first; a current key stays", () => {
+    test("at most 30 entries: sent ones go first, oldest first", () => {
         const one = repairing();
         const old: Record<string, object> = {};
 
@@ -2261,7 +2267,7 @@ describe("planRepairs", () => {
             };
         }
 
-        // An entry for the current key of the PR, the oldest of all and sent: it must stay.
+        // An entry for a key that is not current, the oldest of all and sent: it goes first.
         old[keyOf("h1")] = { at: -1, to: "agent", why: "change", sent: true };
         one.run.repairs = old as never;
         one.prs[REPAIR_REF]!.head = "h9";
@@ -2273,13 +2279,11 @@ describe("planRepairs", () => {
         assert.equal(Object.keys(repairs).length, 30);
         assert(repairs[keyOf("h9")], "the new entry stays");
 
-        // The 2 oldest of the sent ones went: at 0 and at 2; the unsent ones stay.
-        assert.equal(repairs["repair:o/r#0:x:CONFLICTING"], undefined);
-        assert.equal(repairs["repair:o/r#2:x:CONFLICTING"], undefined);
-        assert(repairs["repair:o/r#1:x:CONFLICTING"], "an unsent one stays");
-
-        // The current key of the PR is the new one now, so the old h1 entry was a free one: the oldest sent entry.
+        // The 2 oldest of the sent ones went: the old current key of h1 (at -1: h9 is the key now), and at 0.
         assert.equal(repairs[keyOf("h1")], undefined);
+        assert.equal(repairs["repair:o/r#0:x:CONFLICTING"], undefined);
+        assert(repairs["repair:o/r#2:x:CONFLICTING"], "a newer sent one stays");
+        assert(repairs["repair:o/r#1:x:CONFLICTING"], "an unsent one stays");
     });
 
     test("an unsent entry goes only when no sent one is left, and a current key never goes", () => {
@@ -3913,11 +3917,15 @@ async function quiet(keep: string[]): Promise<void> {
 }
 
 /** Restart the app with its clock moved forward by `by` milliseconds. */
-async function restartApp(by: number): Promise<void> {
+async function restartApp(by: number, github?: unknown): Promise<void> {
     await app.close();
     shift = by;
-    // A fake `gh`: every sweep reads this fixture, and nothing goes to GitHub. The config file starts absent.
-    writeFileSync(fixturePath, JSON.stringify({ data: { viewer: { login: "github-viewer" } } }));
+    // A fake `gh`: every sweep reads this fixture, and nothing goes to GitHub. The config file starts absent. A caller
+    // that needs the first sweep after the restart to see a PR gives the answer here: it is in place before the sweep.
+    writeFileSync(
+        fixturePath,
+        JSON.stringify(github ?? { data: { viewer: { login: "github-viewer" } } }),
+    );
     writeFileSync(fakeGh, `#!/bin/sh\ncat ${JSON.stringify(fixturePath)}\n`);
     chmodSync(fakeGh, 0o755);
     writeFileSync(failGh, '#!/bin/sh\necho "HTTP 401: Bad credentials" >&2\nexit 1\n');
@@ -6269,6 +6277,359 @@ describe("the desk in a Pi Pocket", () => {
             await sweptAfter(thread, after?.run.sweptAt);
             assert.equal(await sent(), 1);
             assert.equal((await deskState())?.threads[thread.id]?.run.closeout, key);
+        } finally {
+            await quiet([]);
+            shift = 0;
+        }
+    });
+
+    /** A `gh` answer with 1 open PR on frostyard/test, read by number. */
+    const repairFixture = (patch: {
+        head: string;
+        mergeable?: string;
+        checks?: string;
+        failing?: string[];
+    }) => ({
+        data: {
+            viewer: { login: "github-viewer" },
+            p0: {
+                nameWithOwner: "frostyard/test",
+                isArchived: false,
+                pullRequest: {
+                    number: 7,
+                    title: "A fix",
+                    url: "https://github.com/frostyard/test/pull/7",
+                    state: "OPEN",
+                    isDraft: false,
+                    createdAt: new Date().toISOString(),
+                    headRefName: "fix-7",
+                    mergeable: patch.mergeable ?? "MERGEABLE",
+                    reviewDecision: "REVIEW_REQUIRED",
+                    author: { login: "github-viewer" },
+                    commits: {
+                        nodes: [
+                            {
+                                commit: {
+                                    oid: patch.head,
+                                    statusCheckRollup: {
+                                        state: patch.checks ?? "SUCCESS",
+                                        contexts: {
+                                            nodes: (patch.failing ?? []).map((name) => ({
+                                                __typename: "CheckRun",
+                                                name,
+                                                conclusion: "FAILURE",
+                                            })),
+                                        },
+                                    },
+                                },
+                            },
+                        ],
+                    },
+                },
+            },
+        },
+    });
+
+    /** A delegated thread with 1 open PR that GitHub has not read yet. */
+    const withOpenPr = async (name: string) => {
+        // The clock moves in these tests: no sweeper of an earlier test may wake and send.
+        await stopSweepers();
+        const made = await delegated(name);
+
+        await until(
+            async () =>
+                typeof (await deskState())?.threads[made.thread.id]?.run.sweptAt === "number",
+            "the first sweep",
+            20_000,
+        );
+        await until(() => !app.isBusy(made.linked), "the linked session to settle", 20_000);
+        await app.harness.commit(async (tx) => {
+            (await tx.doc(DeskThreads)).threads[made.thread.id]!.prs["frostyard/test#7"] = {
+                via: "seen",
+                state: "OPEN",
+            };
+        }, context);
+
+        return {
+            ...made,
+            first: (await deskState())?.threads[made.thread.id]?.run.sweptAt,
+            // The wake-up itself, counted by its text in the session that got it.
+            texts: async (at: ConversationId, text: string) =>
+                (await modelTexts(app, at)).filter((each) => each.includes(text)).length,
+        };
+    };
+
+    test("the sweeper tells the agent once for each change of a conflicting or failing PR", async () => {
+        const { source, linked, thread, first, texts } = await withOpenPr("repair-agent");
+        const ref = "frostyard/test#7";
+        const conflicting = repairMessage(ref, "CONFLICTING", []);
+        const failing = repairMessage(ref, "FAILURE", ["lint", "unit tests"]);
+        const entries = async () =>
+            repairsOf((await deskState())!.threads[thread.id]!) as Record<
+                string,
+                { to: string; why: string; sent: boolean }
+            >;
+        const key = (head: string, state: string) => `repair:${ref}:${head}:${state}`;
+
+        try {
+            await quiet([thread.id]);
+            await restartApp(
+                SWEEP_SLEEP_MS + 60_000,
+                repairFixture({ head: "aaa111", mergeable: "CONFLICTING" }),
+            );
+            await sweptAfter(thread, first);
+            await until(
+                async () => (await texts(linked, conflicting)) === 1,
+                "the wake-up",
+                20_000,
+            );
+            await until(
+                async () => (await entries())[key("aaa111", "CONFLICTING")]?.sent === true,
+                "the wake-up marked sent",
+                20_000,
+            );
+
+            const after = (await deskState())?.threads[thread.id];
+
+            assert.deepEqual(
+                Object.keys(await entries()),
+                [key("aaa111", "CONFLICTING")],
+                "1 key, for this head",
+            );
+            assert.equal((await entries())[key("aaa111", "CONFLICTING")]?.to, "agent");
+            assert.deepEqual(after?.run.repairCounts, { [ref]: 1 });
+            assert.equal(after?.prs[ref]?.head, "aaa111");
+            assert(
+                after?.events.some((event) => event.text === "repair wake-up sent to the agent"),
+                "the wake-up is an event",
+            );
+            await until(() => !app.isBusy(linked), "the wake-up's turn", 20_000);
+
+            // The same change at the next sweep: no second message.
+            await restartApp(
+                SWEEP_SLEEP_MS * 2 + 120_000,
+                repairFixture({ head: "aaa111", mergeable: "CONFLICTING" }),
+            );
+            await sweptAfter(thread, after?.run.sweptAt);
+            assert.equal(await texts(linked, conflicting), 1);
+            assert.deepEqual((await deskState())?.threads[thread.id]?.run.repairCounts, {
+                [ref]: 1,
+            });
+
+            // A new push that still conflicts is a new change: 1 new message.
+            const again = (await deskState())?.threads[thread.id];
+
+            await restartApp(
+                SWEEP_SLEEP_MS * 3 + 180_000,
+                repairFixture({ head: "bbb222", mergeable: "CONFLICTING" }),
+            );
+            await sweptAfter(thread, again?.run.sweptAt);
+            await until(
+                async () => (await texts(linked, conflicting)) === 2,
+                "the second wake-up",
+                20_000,
+            );
+            await until(
+                async () => (await entries())[key("bbb222", "CONFLICTING")]?.sent === true,
+                "the second wake-up marked sent",
+                20_000,
+            );
+            await until(() => !app.isBusy(linked), "the second wake-up's turn", 20_000);
+
+            // The conflict is gone, but the checks fail: a new state is a new change, and it names the checks.
+            const third = (await deskState())?.threads[thread.id];
+
+            await restartApp(
+                SWEEP_SLEEP_MS * 4 + 240_000,
+                repairFixture({
+                    head: "ccc333",
+                    checks: "FAILURE",
+                    failing: ["unit tests", "lint", "lint"],
+                }),
+            );
+            await sweptAfter(thread, third?.run.sweptAt);
+            await until(
+                async () => (await texts(linked, failing)) === 1,
+                "the failing wake-up",
+                20_000,
+            );
+            await until(
+                async () => (await entries())[key("ccc333", "FAILURE")]?.sent === true,
+                "the failing wake-up marked sent",
+                20_000,
+            );
+            assert.equal(await texts(linked, conflicting), 2);
+            assert.deepEqual((await deskState())?.threads[thread.id]?.run.repairCounts, {
+                [ref]: 3,
+            });
+            assert.equal(
+                await texts(source, "needs a repair"),
+                0,
+                "Odrade hears of nothing: the agent took all 3",
+            );
+        } finally {
+            await quiet([]);
+            shift = 0;
+        }
+    });
+
+    test("an archived agent session cannot take it: Odrade gets the message, and the agent none", async () => {
+        const { source, linked, thread, first, texts } = await withOpenPr("repair-archived");
+        const ref = "frostyard/test#7";
+        const key = `repair:${ref}:aaa111:CONFLICTING`;
+        const message = odradeRepairMessage(ref, thread.id, "CONFLICTING", [], "archived");
+
+        try {
+            // The sweep reads the supervisor's address, as the agent knows it, from the agent's first message.
+            await app.commands.updateSession(linked, owner(app), { archived: true });
+            await quiet([thread.id]);
+            await restartApp(
+                SWEEP_SLEEP_MS + 60_000,
+                repairFixture({ head: "aaa111", mergeable: "CONFLICTING" }),
+            );
+            await sweptAfter(thread, first);
+            await until(
+                async () => (await texts(source, message)) === 1,
+                "the message to Odrade",
+                20_000,
+            );
+            await until(
+                async () =>
+                    (
+                        (await deskState())?.threads[thread.id]?.run.repairs as
+                            Record<string, { sent: boolean }> | undefined
+                    )?.[key]?.sent === true,
+                "the message marked sent",
+                20_000,
+            );
+
+            const after = (await deskState())?.threads[thread.id];
+
+            assert.deepEqual((after?.run.repairs as Record<string, unknown>)[key], {
+                at: (after?.run.repairs as Record<string, { at: number }>)[key]?.at,
+                to: "odrade",
+                why: "archived",
+                sent: true,
+            });
+            assert.equal(after?.run.repairCounts, undefined, "an Odrade route counts nothing");
+            assert.equal(after?.run.next, "odrade");
+            assert.equal(odradeReason(after!), `PR ${ref} needs a repair: archived`);
+            assert.equal(await texts(linked, "is now conflicting"), 0, "the agent hears nothing");
+
+            // The next sweep sends no second message.
+            await restartApp(
+                SWEEP_SLEEP_MS * 2 + 120_000,
+                repairFixture({ head: "aaa111", mergeable: "CONFLICTING" }),
+            );
+            await sweptAfter(thread, after?.run.sweptAt);
+            assert.equal(await texts(source, message), 1);
+        } finally {
+            await quiet([]);
+            shift = 0;
+        }
+    });
+
+    test("a failed send stays unsent with 1 event, and the next sweep sends it with the same key", async () => {
+        const { linked, thread, first, texts } = await withOpenPr("repair-retry");
+        const ref = "frostyard/test#7";
+        const key = `repair:${ref}:aaa111:CONFLICTING`;
+        const message = repairMessage(ref, "CONFLICTING", []);
+        const entry = async () =>
+            (
+                (await deskState())?.threads[thread.id]?.run.repairs as
+                    Record<string, { sent: boolean; to: string }> | undefined
+            )?.[key];
+        let address = "";
+
+        try {
+            // An address that no session has: the send is refused.
+            await app.harness.commit(async (tx) => {
+                const found = (await tx.doc(DeskThreads)).threads[thread.id]!;
+
+                address = found.address!;
+                found.address = "session-nobody";
+            }, context);
+            await quiet([thread.id]);
+            await restartApp(
+                SWEEP_SLEEP_MS + 60_000,
+                repairFixture({ head: "aaa111", mergeable: "CONFLICTING" }),
+            );
+            await sweptAfter(thread, first);
+            await until(
+                async () =>
+                    (await deskState())?.threads[thread.id]?.events.some(
+                        (event) => event.key === `repair-failed:${key}`,
+                    ) === true,
+                "the failure event",
+                20_000,
+            );
+            assert.equal((await entry())?.sent, false);
+            assert.equal((await entry())?.to, "agent");
+            assert.equal(await texts(linked, message), 0);
+
+            // The address is right again: the next sweep sends once, and marks it.
+            const failed = (await deskState())?.threads[thread.id];
+
+            await app.harness.commit(async (tx) => {
+                (await tx.doc(DeskThreads)).threads[thread.id]!.address = address;
+            }, context);
+            await restartApp(
+                SWEEP_SLEEP_MS * 2 + 120_000,
+                repairFixture({ head: "aaa111", mergeable: "CONFLICTING" }),
+            );
+            await sweptAfter(thread, failed?.run.sweptAt);
+            await until(async () => (await texts(linked, message)) === 1, "the wake-up", 20_000);
+            await until(async () => (await entry())?.sent === true, "the mark", 20_000);
+            assert.deepEqual((await deskState())?.threads[thread.id]?.run.repairCounts, {
+                [ref]: 1,
+            });
+            assert.equal(
+                (await deskState())?.threads[thread.id]?.events.filter((event) =>
+                    event.key.startsWith("repair-failed:"),
+                ).length,
+                1,
+            );
+        } finally {
+            await quiet([]);
+            shift = 0;
+        }
+    });
+
+    test("a thread with no session gets a notice for Odrade, never a message, and marks it sent", async () => {
+        const { linked, thread, first, texts } = await withOpenPr("repair-no-session");
+        const ref = "frostyard/test#7";
+        const key = `repair:${ref}:aaa111:CONFLICTING`;
+
+        try {
+            await app.harness.commit(async (tx) => {
+                delete (await tx.doc(DeskThreads)).threads[thread.id]!.session;
+            }, context);
+            await quiet([thread.id]);
+            await restartApp(
+                SWEEP_SLEEP_MS + 60_000,
+                repairFixture({ head: "aaa111", mergeable: "CONFLICTING" }),
+            );
+            await sweptAfter(thread, first);
+            await until(
+                async () =>
+                    (
+                        (await deskState())?.threads[thread.id]?.run.repairs as
+                            Record<string, { sent: boolean }> | undefined
+                    )?.[key]?.sent === true,
+                "the notice marked sent",
+                20_000,
+            );
+
+            const after = (await deskState())?.threads[thread.id];
+
+            assert.deepEqual(
+                (after?.run.repairs as Record<string, { to: string; why: string }>)[key]?.why,
+                "no-session",
+            );
+            assert(after?.events.some((event) => event.text === "repair notice sent to Odrade"));
+            assert.equal(after?.run.next, "odrade");
+            assert.equal(odradeReason(after!), `PR ${ref} needs a repair: no session`);
+            assert.equal(await texts(linked, "is now conflicting"), 0);
         } finally {
             await quiet([]);
             shift = 0;
