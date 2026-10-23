@@ -72,6 +72,10 @@ export const SWEEP_SLEEP_MS = 10 * 60_000;
 export const FOUND_FOLDER_DELAY_MS = 5 * 60_000;
 /** A branch name that may go into a git command. */
 const BRANCH_NAME = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,200}$/;
+/** A worktree that git refused to remove waits this long before the sweep tries again. */
+const WORKTREE_RETRY_MS = 24 * 3600_000;
+/** A closed thread keeps its worktree this long: a thread can reopen, and a person can send to its session later. */
+const WORKTREE_GRACE_MS = 24 * 3600_000;
 
 // ─── Stored state ────────────────────────────────────────────────────────────
 
@@ -140,6 +144,13 @@ export type Thread = {
     /** A roster repository name, such as "frostyard/frostmail". */
     repo?: string;
     cwd?: string;
+    /**
+     * The git worktree this delegation works in, when `team_delegate` made one: `path` is the folder the session starts
+     * in, `branch` its branch (the agent may rename it), and `checkout` the main checkout it came from. A sweep removes
+     * the worktree 24 hours after the thread closes (`WORKTREE_GRACE_MS`), so a thread that reopens keeps its folder, and
+     * keeps one with changes or untracked files.
+     */
+    worktree?: { path: string; branch: string; checkout: string };
     /** The supervisor session's conversation id. */
     supervisor?: number;
     /** The linked session's conversation id. */
@@ -164,8 +175,9 @@ export type Thread = {
      * wake-up key that went last, so a sweep does not send it again), `closeoutEntry` (the session's newest user entry
      * before it went: a report past it lets the thread close), `closeoutRefs` (every PR ref an earlier wake-up told the
      * agent, sorted, at most 50: a state of only told refs is no new wake-up, so a detached PR cannot send again),
-     * `repairs` (the repair wake-ups the sweep decided, by repair key: `{ at, to, why, sent }`, at most 30), and
-     * `repairCounts` (PR ref → the repair wake-ups that went to the agent: never pruned).
+     * `repairs` (the repair wake-ups the sweep decided, by repair key: `{ at, to, why, sent }`, at most 30),
+     * `repairCounts` (PR ref → the repair wake-ups that went to the agent: never pruned), `worktreeGone` (when a sweep
+     * removed the thread's worktree), and `worktreeKeptAt` (when git refused to remove it: the next try waits a day).
      */
     run: Record<string, JsonValue>;
     /** The last 50; `key` makes an event unique. */
@@ -326,6 +338,8 @@ export type OpenRequest = {
     agents: string[];
     repo?: string;
     cwd?: string;
+    /** The git worktree the linked session starts in, when team.ts made one. */
+    worktree?: { path: string; branch: string; checkout: string };
     title: string;
     at: number;
     /** A dated check, set with the thread: `team_delegate`'s `watch`. */
@@ -381,6 +395,7 @@ export function openThread(
         agents: [...request.agents],
         ...(request.repo === undefined ? {} : { repo: request.repo }),
         ...(request.cwd === undefined ? {} : { cwd: request.cwd }),
+        ...(request.worktree === undefined ? {} : { worktree: { ...request.worktree } }),
         supervisor: request.supervisor,
         state: "starting",
         startedAt: request.at,
@@ -4219,6 +4234,147 @@ export default function createDesk(host: Host, web: Web) {
 
     const run = promisify(execFile);
 
+    /** A git read or write for a worktree: at most 30 seconds, so a hung git cannot hold a sweep. */
+    const GIT_OPTIONS = { timeout: 30_000, maxBuffer: 4 * 1024 * 1024, encoding: "utf8" as const };
+
+    /** One closed thread's worktree: removed, or kept with git's first line of reason. */
+    type WorktreeFact = { gone: true } | { kept: string };
+
+    /** The first non-empty line of git's error, on one line, at most 200 characters. */
+    function gitReason(error: unknown): string {
+        const stderr = (error as { stderr?: unknown }).stderr;
+        const text =
+            typeof stderr === "string" && stderr.trim() !== ""
+                ? stderr
+                : String((error as Error).message ?? error);
+        const line = text
+            .split("\n")
+            .map((each) => flatLine(each))
+            .find((each) => each !== "");
+
+        return (line ?? "git failed").slice(0, MAX_LINE);
+    }
+
+    /**
+     * Remove one closed thread's worktree, then its branch. No `--force`: git refuses a worktree with changes or
+     * untracked files, and that work stays for a person. A folder that is gone needs no removal: its record in the main
+     * checkout is pruned, so git does not keep it.
+     */
+    async function removeWorktree(worktree: {
+        path: string;
+        branch: string;
+        checkout: string;
+    }): Promise<WorktreeFact> {
+        if (!isAbsolute(worktree.path) || !isAbsolute(worktree.checkout)) {
+            return { kept: "its folder is not an absolute path" };
+        }
+
+        const exists = await access(worktree.path).then(
+            () => true,
+            () => false,
+        );
+
+        if (!exists) {
+            await run("git", ["-C", worktree.checkout, "worktree", "prune"], GIT_OPTIONS).catch(
+                () => undefined,
+            );
+
+            return { gone: true };
+        }
+
+        try {
+            await run(
+                "git",
+                ["-C", worktree.checkout, "worktree", "remove", worktree.path],
+                GIT_OPTIONS,
+            );
+        } catch (error) {
+            return { kept: gitReason(error) };
+        }
+
+        if (BRANCH_NAME.test(worktree.branch) && !worktree.branch.includes("..")) {
+            // Not merged: git refuses, and the branch stays for a person.
+            await run(
+                "git",
+                ["-C", worktree.checkout, "branch", "-d", worktree.branch],
+                GIT_OPTIONS,
+            ).catch(() => undefined);
+        }
+
+        return { gone: true };
+    }
+
+    /**
+     * Remove the worktrees of the closed threads that still have one, 24 hours after the thread closed: a thread can
+     * reopen, and a person can send to its session later, so its folder must stay while that can happen. Git runs here,
+     * before any commit; the commit records what happened, so a restart between the two loses nothing but tries again.
+     * A worktree that git refused waits a day, and its 1 event stays.
+     */
+    const sweepWorktrees = async (
+        supervisor: number,
+        read: Reader,
+        now: number,
+        context: Context,
+        commit: (change: (tx: Tx) => Promise<undefined>) => Promise<unknown>,
+    ): Promise<void> => {
+        const state = await read.snapshot(DeskThreads, context);
+        const closed = Object.values(state?.threads ?? {}).filter(
+            (thread) =>
+                thread.supervisor === supervisor &&
+                thread.state === "closed" &&
+                thread.worktree !== undefined &&
+                thread.run.worktreeGone === undefined,
+        );
+        const facts: Record<string, WorktreeFact> = {};
+
+        for (const thread of closed) {
+            const closedAt = thread.closed?.at;
+            const keptAt = numberOr(thread.run.worktreeKeptAt);
+
+            // The grace period, and the wait after a refusal: a second sweep adds no event and makes no second try.
+            if (
+                closedAt === undefined ||
+                now - closedAt < WORKTREE_GRACE_MS ||
+                (keptAt !== undefined && now - keptAt < WORKTREE_RETRY_MS)
+            ) {
+                continue;
+            }
+
+            facts[thread.id] = await removeWorktree(thread.worktree!);
+        }
+
+        if (Object.keys(facts).length === 0) {
+            return;
+        }
+
+        await commit(async (tx) => {
+            const doc = await tx.doc(DeskThreads);
+
+            for (const [id, fact] of Object.entries(facts)) {
+                const thread = threadById(doc, id);
+
+                if (thread === undefined || thread.worktree === undefined) {
+                    continue;
+                }
+
+                if ("gone" in fact) {
+                    thread.run.worktreeGone = now;
+                    addEvent(
+                        thread,
+                        `worktree-removed:${id}`,
+                        `worktree removed: ${thread.worktree.path}`,
+                        now,
+                    );
+                } else {
+                    thread.run.worktreeKeptAt = now;
+                    addEvent(thread, `worktree-kept:${id}`, `worktree kept: ${fact.kept}`, now);
+                }
+            }
+
+            return undefined;
+        });
+    };
+
     /** `git status` of one folder: null when it is not a git repository, or git cannot read it. */
     async function statusOf(folder: string): Promise<FolderFact | null> {
         try {
@@ -5558,6 +5714,20 @@ export default function createDesk(host: Host, web: Web) {
                     await sendRepair(supervisor, work, runtime, context);
                 }
 
+                // After the commit, so a thread that closed in it has its worktree handled at once: the sweeper ends
+                // when its last thread closes, and the next sweep may never come.
+                try {
+                    await sweepWorktrees(
+                        Number(supervisor),
+                        runtime,
+                        runtime.now(),
+                        context,
+                        (change) => runtime.commit(change, context),
+                    );
+                } catch {
+                    // The next sweep tries again: `run.worktreeGone` is unset.
+                }
+
                 web.send("changed", {});
                 await exportNow(runtime, context);
             },
@@ -6823,6 +6993,11 @@ export default function createDesk(host: Host, web: Web) {
 
                     return swept;
                 }, context);
+
+                // The worktrees of this supervisor's closed threads: git runs outside the commit above.
+                await sweepWorktrees(Number(supervisor), api, Date.now(), context, (change) =>
+                    api.commit(change, context),
+                );
 
                 web.send("changed", {});
                 await exportNow(api, context);

@@ -17,7 +17,15 @@ import {
     until,
 } from "./_pocket/test/helpers.ts";
 import assert from "node:assert/strict";
-import { appendFileSync, chmodSync, cpSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import {
+    appendFileSync,
+    chmodSync,
+    cpSync,
+    existsSync,
+    mkdirSync,
+    rmSync,
+    writeFileSync,
+} from "node:fs";
 import { execFileSync } from "node:child_process";
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { createServer } from "node:http";
@@ -4464,6 +4472,19 @@ async function sweepersAsleep(): Promise<boolean> {
         });
 }
 
+/** Close a thread as the sweep would, this long ago, so a later sweep may clean up its worktree. */
+async function closeThreadNow(id: string, ageMs = 0): Promise<void> {
+    await app.harness.commit(async (tx) => {
+        const state = await tx.doc(DeskThreads);
+        const thread = state.threads[id];
+
+        if (thread !== undefined) {
+            thread.state = "closed";
+            thread.closed = { at: Date.now() - ageMs, why: "done", by: "sweep" };
+        }
+    }, context);
+}
+
 /** The live sweeper tasks of a supervisor session. */
 async function sweepers(id: ConversationId): Promise<number> {
     const live = await app.harness.inspect(context);
@@ -4780,12 +4801,15 @@ describe("the desk in a Pi Pocket", () => {
     test("a dirty folder keeps its thread open, and the agent is next", async () => {
         const { source, linked, thread } = await delegated("dirty", "desk delegate gurney test");
 
+        assert(thread.worktree, "the delegation made a worktree");
+        // The session works in its own worktree: a change there is what keeps the thread open.
+        appendFileSync(join(thread.worktree.path, "file.txt"), "two\n");
         await until(() => !app.isBusy(linked), "the linked session to settle", 20_000);
         await say(app, source, "desk sync test");
 
         const after = (await deskState())?.threads[thread.id];
 
-        assert.equal(after?.cwd, old);
+        assert.equal(after?.cwd, thread.worktree.path);
         assert.equal(after?.state, "open");
         assert.equal(after?.run.dirty, 1);
         assert.equal(after?.run.next, "agent");
@@ -7510,5 +7534,104 @@ describe("the desk in a Pi Pocket", () => {
             }, context);
             writeFileSync(configPath, JSON.stringify({ cap: 100 }));
         }
+    });
+
+    test("a closed thread's clean worktree is removed once, and its branch with it", async () => {
+        const { source, linked, thread } = await delegated("worktree-clean");
+
+        assert(thread.worktree, "the delegation made a worktree");
+        assert.equal(thread.worktree?.checkout, repo);
+
+        const worktree = thread.worktree!;
+
+        assert.equal(existsSync(worktree.path), true, "the worktree is there");
+        await until(() => !app.isBusy(linked), "the linked session to settle", 20_000);
+        // 25 hours closed: the grace period is over.
+        await closeThreadNow(thread.id, 25 * 3600_000);
+        await say(app, source, "desk sync test");
+
+        const after = (await deskState())?.threads[thread.id];
+
+        assert.equal(existsSync(worktree.path), false, "the worktree is gone");
+        assert.equal(typeof after?.run.worktreeGone, "number");
+        assert.equal(
+            (after?.events ?? []).filter((event) => event.text.startsWith("worktree removed:"))
+                .length,
+            1,
+        );
+        assert.equal(
+            execFileSync("git", ["-C", repo, "branch", "--list", worktree.branch], {
+                env: gitEnv,
+                encoding: "utf8",
+            }).trim(),
+            "",
+            "the merged branch is gone too",
+        );
+
+        // A second sweep records no second event.
+        await say(app, source, "desk sync test");
+        assert.equal(
+            ((await deskState())?.threads[thread.id]?.events ?? []).filter((event) =>
+                event.text.startsWith("worktree removed:"),
+            ).length,
+            1,
+        );
+    });
+
+    test("a thread closed 1 hour ago keeps its worktree, with no event", async () => {
+        const { source, linked, thread } = await delegated("worktree-grace");
+
+        assert(thread.worktree, "the delegation made a worktree");
+
+        const worktree = thread.worktree!;
+
+        await until(() => !app.isBusy(linked), "the linked session to settle", 20_000);
+        await closeThreadNow(thread.id, 3600_000);
+        await say(app, source, "desk sync test");
+
+        const after = (await deskState())?.threads[thread.id];
+        const events = (after?.events ?? []).filter(
+            (event) =>
+                event.text.startsWith("worktree removed:") ||
+                event.text.startsWith("worktree kept:"),
+        );
+
+        assert.equal(existsSync(worktree.path), true, "the worktree stays in the grace period");
+        assert.equal(after?.run.worktreeGone, undefined);
+        assert.equal(after?.run.worktreeKeptAt, undefined);
+        assert.equal(events.length, 0, "the desk records nothing about a worktree it keeps");
+    });
+
+    test("a closed thread's dirty worktree is kept once, with git's reason", async () => {
+        const { source, linked, thread } = await delegated("worktree-dirty");
+
+        assert(thread.worktree, "the delegation made a worktree");
+
+        const worktree = thread.worktree!;
+
+        writeFileSync(join(worktree.path, "scratch.txt"), "not committed\n");
+        await until(() => !app.isBusy(linked), "the linked session to settle", 20_000);
+        // 25 hours closed: the grace period is over, and git is asked.
+        await closeThreadNow(thread.id, 25 * 3600_000);
+        await say(app, source, "desk sync test");
+
+        const after = (await deskState())?.threads[thread.id];
+        const kept = (after?.events ?? []).filter((event) =>
+            event.text.startsWith("worktree kept:"),
+        );
+
+        assert.equal(existsSync(worktree.path), true, "the worktree stays");
+        assert.equal(after?.run.worktreeGone, undefined);
+        assert.equal(kept.length, 1);
+        assert.match(kept[0]?.text ?? "", /untracked files|modified/);
+
+        // The next sweep, within a day, adds no second event.
+        await say(app, source, "desk sync test");
+        assert.equal(
+            ((await deskState())?.threads[thread.id]?.events ?? []).filter((event) =>
+                event.text.startsWith("worktree kept:"),
+            ).length,
+            1,
+        );
     });
 });
