@@ -60,6 +60,7 @@ import {
     attribute,
     asleep,
     buildQuery,
+    checksState,
     capView,
     chatGrants,
     clearWatch,
@@ -1971,8 +1972,11 @@ describe("repair wake-up: GitHub facts", () => {
     test("the query asks for the head oid and the check contexts", () => {
         const query = buildQuery(["frostyard/test"], ["frostyard/test#7"]);
 
-        assert.match(query, /commit \{ oid statusCheckRollup \{ state contexts\(first: 30\)/);
-        assert.match(query, /\.\.\. on CheckRun \{ name conclusion \}/);
+        assert.match(
+            query,
+            /commit \{ oid statusCheckRollup \{ state contexts\(first: 30\) \{ totalCount nodes/,
+        );
+        assert.match(query, /\.\.\. on CheckRun \{ name conclusion status startedAt \}/);
         assert.match(query, /\.\.\. on StatusContext \{ context state \}/);
     });
 
@@ -2071,6 +2075,138 @@ describe("repair wake-up: GitHub facts", () => {
         assert.deepEqual(eight?.failing, [...eight!.failing].sort());
         assert.equal(nine?.head, "", "no commit: no head");
         assert.deepEqual(nine?.failing, []);
+    });
+
+    test("a cancelled run that a newer run of the same check replaced is not a failure (updex#457)", () => {
+        const run = (
+            name: string,
+            conclusion: string,
+            startedAt?: string,
+            status = "COMPLETED",
+        ) => ({
+            __typename: "CheckRun",
+            name,
+            conclusion,
+            status,
+            ...(startedAt === undefined ? {} : { startedAt }),
+        });
+        const contexts = (...nodes: object[]) => ({ totalCount: nodes.length, nodes });
+        const pr = (rollup: string, list: unknown) =>
+            parseGitHub({
+                data: {
+                    viewer: { login: "github-viewer" },
+                    r0: {
+                        nameWithOwner: "frostyard/test",
+                        isArchived: false,
+                        pullRequests: {
+                            nodes: [
+                                {
+                                    number: 7,
+                                    state: "OPEN",
+                                    commits: {
+                                        nodes: [
+                                            {
+                                                commit: {
+                                                    oid: "abc123",
+                                                    statusCheckRollup: {
+                                                        state: rollup,
+                                                        contexts: list,
+                                                    },
+                                                },
+                                            },
+                                        ],
+                                    },
+                                },
+                            ],
+                        },
+                    },
+                },
+            }).repos["frostyard/test"]!.open[0]!;
+        const early = "2026-10-23T13:25:55Z";
+        const late = "2026-10-23T13:26:03Z";
+
+        // updex#457: 1 title run was cancelled 4 s before a newer one passed; all else passed.
+        const replaced = pr(
+            "FAILURE",
+            contexts(
+                run("Conventional PR title", "CANCELLED", early),
+                run("Conventional PR title", "SUCCESS", late),
+                run("Unit Tests", "SUCCESS", early),
+            ),
+        );
+
+        assert.equal(replaced.checks, "SUCCESS");
+        assert.deepEqual(replaced.failing, []);
+        assert.equal(repairState({ state: "OPEN", checks: replaced.checks }), undefined);
+        assert.equal(prNext({ state: "OPEN", checks: replaced.checks }), "brian");
+
+        // The newer run still runs: pending, not failing.
+        const running = pr(
+            "FAILURE",
+            contexts(
+                run("Conventional PR title", "CANCELLED", early),
+                run("Conventional PR title", "", late, "IN_PROGRESS"),
+            ),
+        );
+
+        assert.equal(running.checks, "PENDING");
+        assert.deepEqual(running.failing, []);
+
+        // The newer run failed: the check fails.
+        const failed = pr(
+            "FAILURE",
+            contexts(
+                run("Conventional PR title", "CANCELLED", early),
+                run("Conventional PR title", "FAILURE", late),
+            ),
+        );
+
+        assert.equal(failed.checks, "FAILURE");
+        assert.deepEqual(failed.failing, ["Conventional PR title"]);
+
+        // A cancelled run with no newer run of its name, or with no start time, still fails.
+        for (const nodes of [
+            [run("lint", "CANCELLED", late), run("Unit Tests", "SUCCESS", early)],
+            [run("lint", "CANCELLED"), run("lint", "SUCCESS")],
+            [run("lint", "CANCELLED", late), run("lint", "SUCCESS", early)],
+        ]) {
+            const one = pr("FAILURE", contexts(...nodes));
+
+            assert.equal(one.checks, "FAILURE", JSON.stringify(nodes));
+            assert.deepEqual(one.failing, ["lint"]);
+        }
+
+        // A replaced run beside a real failure: still FAILURE, with only the real name.
+        const both = pr(
+            "FAILURE",
+            contexts(
+                run("Conventional PR title", "CANCELLED", early),
+                run("Conventional PR title", "SUCCESS", late),
+                run("Unit Tests", "FAILURE", early),
+            ),
+        );
+
+        assert.equal(both.checks, "FAILURE");
+        assert.deepEqual(both.failing, ["Unit Tests"]);
+
+        // GitHub cut the list (more contexts than it gave): the state stays as GitHub says.
+        const cut = {
+            totalCount: 40,
+            nodes: [
+                run("Conventional PR title", "CANCELLED", early),
+                run("Conventional PR title", "SUCCESS", late),
+            ],
+        };
+
+        assert.equal(pr("FAILURE", cut).checks, "FAILURE");
+        assert.equal(checksState("FAILURE", { nodes: cut.nodes }), "FAILURE", "no totalCount");
+        assert.equal(checksState("SUCCESS", cut), "SUCCESS");
+        assert.equal(checksState("PENDING", cut), "PENDING");
+        assert.equal(
+            checksState("ERROR", contexts(...cut.nodes)),
+            "SUCCESS",
+            "ERROR with only a replaced run",
+        );
     });
 
     test("updatePrs keeps head and failing on the link, and a new push changes them", () => {
