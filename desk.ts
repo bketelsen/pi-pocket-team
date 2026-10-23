@@ -102,6 +102,10 @@ export type PrLink = {
     review?: string;
     checks?: string;
     mergeable?: string;
+    /** The oid of the PR's newest commit: a new push is a new repair key. */
+    head?: string;
+    /** The names of the checks that fail now: at most 10, sorted. */
+    failing?: string[];
 };
 
 /** One dated check on a thread. Stored data: never rename a field or change what it means. */
@@ -156,7 +160,9 @@ export type Thread = {
      * Facts the sweep keeps: `returnAddress`, `reportedAt`, `reportedUserEntry`, `scanCursor`, `lastUserEntry`,
      * `seenPrs`, `busy`, `archived`, `shift`, `dirty`, `ahead`, `folder`, `next`, `sweptAt`, `closeout` (the
      * wake-up key that went, so a sweep does not send it again), and `closeoutEntry` (the session's newest user entry
-     * before it went: a report past it lets the thread close).
+     * before it went: a report past it lets the thread close), `repairs` (the repair wake-ups the sweep decided, by
+     * repair key: `{ at, to, why, sent }`, at most 30), and `repairCounts` (PR ref → the repair wake-ups that went to
+     * the agent: never pruned).
      */
     run: Record<string, JsonValue>;
     /** The last 50; `key` makes an event unique. */
@@ -1179,6 +1185,319 @@ export function closeoutHold(thread: Thread): string | undefined {
 const closeoutMessage = (id: string): string =>
     `All PRs on ${id} are merged or closed. Do the after-merge steps from your task (verify releases, deploys or publishes; delete local branches of merged PRs; leave the folder clean). Then report: done, or what remains.`;
 
+// ─── The repair wake-up ──────────────────────────────────────────────────────
+
+/** What is wrong with 1 open PR: it conflicts with its base, or its checks fail. */
+export type RepairState = "CONFLICTING" | "FAILURE";
+
+/** Where 1 repair wake-up goes, and why: an agent, or Odrade. Stored data: never rename a value. */
+export type RepairEntry = {
+    at: number;
+    to: "agent" | "odrade";
+    why: "change" | "archived" | "closed" | "cap" | "no-session";
+    sent: boolean;
+};
+
+/** The wake-ups 1 PR gets for its agent, at most. The next change waits on Odrade. */
+export const REPAIR_CAP = 3;
+const KEPT_REPAIRS = 30;
+
+/** Short words for `odradeReason`. */
+const REPAIR_WORDS: Record<RepairEntry["why"], string> = {
+    change: "agent",
+    cap: "cap",
+    archived: "archived",
+    closed: "closed",
+    "no-session": "no session",
+};
+
+/** A PR that needs a repair: OPEN and CONFLICTING, else OPEN with failing checks. Anything else gives undefined. */
+export function repairState(link: PrLink): RepairState | undefined {
+    if (link.state !== "OPEN") {
+        return undefined;
+    }
+
+    if (link.mergeable === "CONFLICTING") {
+        return "CONFLICTING";
+    }
+
+    return link.checks === "FAILURE" || link.checks === "ERROR" ? "FAILURE" : undefined;
+}
+
+/** The key of 1 change on 1 PR: `repair:<ref>:<head>:<state>`. Undefined when nothing needs a repair, or the head is unknown. */
+export function repairKey(ref: string, link: PrLink): string | undefined {
+    const state = repairState(link);
+
+    return state === undefined || link.head === undefined || link.head === ""
+        ? undefined
+        : `repair:${ref}:${link.head}:${state}`;
+}
+
+/** The ref and the state inside a key from `repairKey`. */
+function parseRepairKey(key: string): { ref: string; state: RepairState } | undefined {
+    const parts = key.split(":");
+    const state = parts.at(-1);
+
+    return parts.length === 4 &&
+        parts[0] === "repair" &&
+        (state === "CONFLICTING" || state === "FAILURE")
+        ? { ref: parts[1]!, state }
+        : undefined;
+}
+
+const isRepairEntry = (value: unknown): value is RepairEntry => {
+    const entry = value as Partial<RepairEntry> | null | undefined;
+
+    return (
+        entry !== null &&
+        typeof entry === "object" &&
+        typeof entry.at === "number" &&
+        (entry.to === "agent" || entry.to === "odrade") &&
+        typeof entry.why === "string" &&
+        typeof entry.sent === "boolean"
+    );
+};
+
+/** The repair wake-ups a thread has decided, by key. A value of the wrong shape is left out. */
+export function repairsOf(thread: Thread): Record<string, RepairEntry> {
+    const stored = thread.run.repairs;
+
+    if (stored === null || typeof stored !== "object" || Array.isArray(stored)) {
+        return {};
+    }
+
+    const entries: Record<string, RepairEntry> = {};
+
+    for (const [key, value] of Object.entries(stored)) {
+        if (isRepairEntry(value)) {
+            entries[key] = value;
+        }
+    }
+
+    return entries;
+}
+
+/** The wake-ups that went to a PR's agent. */
+const repairCount = (thread: Thread, ref: string): number => {
+    const counts = thread.run.repairCounts;
+    const count =
+        counts !== null && typeof counts === "object" && !Array.isArray(counts)
+            ? counts[ref]
+            : undefined;
+
+    return typeof count === "number" ? count : 0;
+};
+
+/**
+ * The PR of a thread that waits on Odrade for a repair: its current repair key has an entry that went to Odrade. Once
+ * the PR is fixed, or a new key goes to the agent, there is none.
+ */
+export function repairHeld(thread: Thread): { ref: string; why: RepairEntry["why"] } | undefined {
+    const repairs = repairsOf(thread);
+
+    for (const ref of Object.keys(thread.prs).sort()) {
+        const key = repairKey(ref, thread.prs[ref]!);
+        const entry = key === undefined ? undefined : repairs[key];
+
+        if (entry?.to === "odrade") {
+            return { ref, why: entry.why };
+        }
+    }
+
+    return undefined;
+}
+
+const repairWhat = (state: RepairState, failing: string[]): string =>
+    state === "CONFLICTING"
+        ? "conflicting"
+        : failing.length === 0
+          ? "failing"
+          : `failing: ${failing.join(", ")}`;
+
+/** The repair wake-up's 1 message to a thread's agent. */
+export const repairMessage = (ref: string, state: RepairState, failing: string[]): string =>
+    `${ref} is now ${repairWhat(state, failing)}. Merge \`main\` in (no force-push) or fix the check, run the checks, push, report.`;
+
+/** The message from the agent's session to the supervisor, when the agent cannot take the repair. */
+export const odradeRepairMessage = (
+    ref: string,
+    id: string,
+    state: RepairState,
+    failing: string[],
+    why: "archived" | "closed",
+): string =>
+    `${ref} on ${id} is now ${repairWhat(state, failing)}. Its agent cannot take it: ${
+        why === "archived"
+            ? "the agent session is archived"
+            : "the thread was closed, and the desk reopened it"
+    }. Choose who fixes it.`;
+
+/** The notice when no message can go: the cap is reached, or the thread has no agent session. */
+export const repairNotice = (
+    ref: string,
+    id: string,
+    state: RepairState,
+    failing: string[],
+    why: "cap" | "no-session",
+): string =>
+    `${ref} on ${id} is now ${repairWhat(state, failing)}. ${
+        why === "cap"
+            ? `It had ${String(REPAIR_CAP)} repair wake-ups already`
+            : "The thread has no agent session"
+    }: it waits on Odrade.`;
+
+/** Record 1 decided wake-up and its event, and keep at most 30 entries: the oldest sent ones go first. */
+function recordRepair(
+    thread: Thread,
+    key: string,
+    entry: Omit<RepairEntry, "sent" | "at">,
+    now: number,
+): boolean {
+    const repairs = repairsOf(thread);
+    const parsed = parseRepairKey(key);
+    const link = parsed === undefined ? undefined : thread.prs[parsed.ref];
+    const failing = link?.failing ?? [];
+    const what =
+        parsed === undefined ? "needs a repair" : `is ${repairWhat(parsed.state, failing)}`;
+
+    repairs[key] = { at: now, ...entry, sent: false };
+
+    if (entry.to === "agent" && parsed !== undefined) {
+        const counts = { ...(thread.run.repairCounts as Record<string, number> | undefined) };
+
+        counts[parsed.ref] = repairCount(thread, parsed.ref) + 1;
+        thread.run.repairCounts = counts;
+    }
+
+    // A key that is still current stays: dropping it would make the same change a new one.
+    const current = new Set(Object.entries(thread.prs).map(([ref, each]) => repairKey(ref, each)));
+    const order = (sent: boolean) =>
+        Object.entries(repairs)
+            .filter(([each, value]) => value.sent === sent && each !== key && !current.has(each))
+            .sort((a, b) => a[1].at - b[1].at);
+
+    for (const [old] of [...order(true), ...order(false)]) {
+        if (Object.keys(repairs).length <= KEPT_REPAIRS) {
+            break;
+        }
+
+        delete repairs[old];
+    }
+
+    thread.run.repairs = repairs;
+
+    const where =
+        entry.to === "agent"
+            ? "wake-up to the agent"
+            : entry.why === "archived" || entry.why === "closed"
+              ? "message to Odrade"
+              : "notice to Odrade";
+
+    return addEvent(
+        thread,
+        `repair:${key}`,
+        `${parsed?.ref ?? "a PR"} ${what}: repair ${where}${entry.to === "odrade" ? ` (${entry.why})` : ""}`,
+        now,
+    );
+}
+
+/**
+ * Decide the repair wake-ups of one open or parked thread: each PR with a repair key that is not in `run.repairs` yet
+ * gets 1 entry. The 4th change on a PR, a thread with no session, and an archived session go to Odrade, not to the agent.
+ * Pure over the thread: the sweeper sends after the commit. Returns the events it added.
+ */
+export function planRepairs(thread: Thread, now: number): number {
+    if (thread.state !== "open" && thread.state !== "parked") {
+        return 0;
+    }
+
+    let events = 0;
+
+    for (const ref of Object.keys(thread.prs).sort()) {
+        const key = repairKey(ref, thread.prs[ref]!);
+
+        if (key === undefined || repairsOf(thread)[key] !== undefined) {
+            continue;
+        }
+
+        let entry: Omit<RepairEntry, "sent" | "at">;
+
+        if (repairCount(thread, ref) >= REPAIR_CAP) {
+            entry = { to: "odrade", why: "cap" };
+        } else if (
+            thread.session === undefined ||
+            (typeof thread.run.returnAddress !== "string" && thread.address === undefined)
+        ) {
+            entry = { to: "odrade", why: "no-session" };
+        } else if (thread.run.archived === true) {
+            entry = { to: "odrade", why: "archived" };
+        } else {
+            entry = { to: "agent", why: "change" };
+        }
+
+        if (recordRepair(thread, key, entry, now)) {
+            events += 1;
+        }
+    }
+
+    return events;
+}
+
+/**
+ * A closed thread (not a dropped one) with an OPEN PR that needs a repair, on a key it has not met: the thread opens
+ * again, its links are read again, and the wake-up goes to Odrade, not to an agent whose thread was closed. True when
+ * it reopened.
+ */
+export function repairReopen(thread: Thread, github: GitHubFacts, now: number): boolean {
+    if (thread.state !== "closed" || thread.closed?.why === "dropped") {
+        return false;
+    }
+
+    const repairs = repairsOf(thread);
+    let found: { ref: string; key: string; state: RepairState } | undefined;
+
+    for (const ref of Object.keys(thread.prs).sort()) {
+        const fact =
+            github.prs[ref] ?? github.repos[repoOf(ref)]?.open.find((pr) => pr.ref === ref);
+
+        if (
+            fact === undefined ||
+            fact.state !== "OPEN" ||
+            fact.archived ||
+            github.repos[fact.repo]?.archived === true
+        ) {
+            continue;
+        }
+
+        const link = linkFor(fact, thread.prs[ref]?.via ?? "seen");
+        const key = repairKey(ref, link);
+        const state = repairState(link);
+
+        if (key !== undefined && state !== undefined && repairs[key] === undefined) {
+            found = { ref, key, state };
+            break;
+        }
+    }
+
+    if (found === undefined) {
+        return false;
+    }
+
+    updatePrs(thread, github, now);
+    thread.state = "open";
+    delete thread.closed;
+    recordRepair(thread, found.key, { to: "odrade", why: "closed" }, now);
+    thread.run.next = nextActor(thread);
+    addEvent(
+        thread,
+        `reopened:${String(now)}`,
+        `reopened: ${found.ref} is ${found.state === "CONFLICTING" ? "conflicting" : "failing"}`,
+        now,
+    );
+
+    return true;
+}
+
 export type NextActor = "brian" | "agent" | "odrade" | "reviewer" | "none";
 
 /** Who acts next on a thread. First match: brian, odrade (a due watch), agent (a failed watch), agent, odrade. */
@@ -1210,6 +1529,11 @@ export function nextActor(thread: Thread): NextActor {
 
     if (openPrs.includes("brian")) {
         return "brian";
+    }
+
+    // A PR that needs a repair, and whose agent cannot take it, waits on Odrade: it stops by itself when the PR is fixed.
+    if (repairHeld(thread) !== undefined) {
+        return "odrade";
     }
 
     const busy = thread.run.busy === true;
@@ -1284,6 +1608,12 @@ export function odradeReason(thread: Thread): string | undefined {
 
     if (missing !== undefined) {
         return `PR ${missing} is missing on GitHub`;
+    }
+
+    const held = repairHeld(thread);
+
+    if (held !== undefined) {
+        return `PR ${held.ref} needs a repair: ${REPAIR_WORDS[held.why]}`;
     }
 
     return "silent session";
@@ -1467,6 +1797,10 @@ export type PrFact = {
     mergeable: string;
     review: string;
     checks: string;
+    /** The oid of the newest commit: "" when GitHub gave none. */
+    head: string;
+    /** The names of the checks that fail now: at most 10, sorted, with no repeat. */
+    failing: string[];
     archived: boolean;
 };
 
@@ -1515,7 +1849,7 @@ function splitRef(ref: string): { repo: string; number: number } {
 }
 
 const PR_FIELDS =
-    "number title url state isDraft createdAt mergedAt closedAt headRefName mergeable reviewDecision author { login } commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }";
+    "number title url state isDraft createdAt mergedAt closedAt headRefName mergeable reviewDecision author { login } commits(last: 1) { nodes { commit { oid statusCheckRollup { state contexts(first: 30) { nodes { __typename ... on CheckRun { name conclusion } ... on StatusContext { context state } } } } } } }";
 
 /**
  * The one GraphQL query of a sweep: the viewer, each repository's open PRs, and each attached PR by number. Every
@@ -1578,7 +1912,19 @@ function prFact(
     const commits = (node.commits as { nodes?: unknown } | undefined)?.nodes;
     const first = Array.isArray(commits)
         ? (commits[0] as
-              { commit?: { statusCheckRollup?: { state?: unknown } } | undefined } | undefined)
+              | {
+                    commit?:
+                        | {
+                              oid?: unknown;
+                              statusCheckRollup?: {
+                                  state?: unknown;
+                                  contexts?: { nodes?: unknown } | null;
+                              } | null;
+                          }
+                        | null
+                        | undefined;
+                }
+              | undefined)
         : undefined;
     const state = text(node.state).toUpperCase();
 
@@ -1596,8 +1942,46 @@ function prFact(
         mergeable: text(node.mergeable),
         review: text(node.reviewDecision),
         checks: text(first?.commit?.statusCheckRollup?.state),
+        head: text(first?.commit?.oid),
+        failing: failingChecks(first?.commit?.statusCheckRollup?.contexts?.nodes),
         archived,
     };
+}
+
+const FAILED_RUN = new Set([
+    "FAILURE",
+    "TIMED_OUT",
+    "CANCELLED",
+    "ACTION_REQUIRED",
+    "STARTUP_FAILURE",
+]);
+const FAILED_STATUS = new Set(["FAILURE", "ERROR"]);
+const KEPT_FAILING = 10;
+
+/** The names of the checks that fail, from a rollup's context nodes: no repeat, sorted, at most 10. */
+function failingChecks(nodes: unknown): string[] {
+    const names = new Set<string>();
+
+    for (const node of Array.isArray(nodes) ? nodes : []) {
+        const one = node as Record<string, unknown> | null | undefined;
+
+        if (one === null || typeof one !== "object") {
+            continue;
+        }
+
+        const name =
+            one.__typename === "CheckRun" && FAILED_RUN.has(text(one.conclusion))
+                ? text(one.name)
+                : one.__typename === "StatusContext" && FAILED_STATUS.has(text(one.state))
+                  ? text(one.context)
+                  : "";
+
+        if (name !== "") {
+            names.add(name);
+        }
+    }
+
+    return [...names].sort().slice(0, KEPT_FAILING);
 }
 
 /** `gh api graphql`'s JSON as facts. A null repository, or a PR that is gone, is skipped. */
@@ -1680,6 +2064,8 @@ const linkFor = (pr: PrFact, via: PrLink["via"]): PrLink => ({
     review: pr.review,
     checks: pr.checks,
     mergeable: pr.mergeable,
+    head: pr.head,
+    failing: [...pr.failing],
 });
 
 /** One attached PR's facts from a read: its state, its next actor, and what GitHub says. */
@@ -1739,6 +2125,8 @@ export function updatePrs(thread: Thread, github: GitHubFacts, now: number): num
         link.review = fact.review;
         link.checks = fact.checks;
         link.mergeable = fact.mergeable;
+        link.head = fact.head;
+        link.failing = [...fact.failing];
     }
 
     return events;
@@ -4368,6 +4756,24 @@ export default function createDesk(host: Host, web: Web) {
             }
         }
 
+        // Repair wake-ups: a closed thread whose PR needs a repair opens again for Odrade; each open or parked thread
+        // records its new repair keys. The sweeper sends after the commit, from what is recorded here.
+        const mine = Object.values(state.threads).filter(
+            (thread) => thread.supervisor === supervisor,
+        );
+
+        if (facts.github !== undefined) {
+            for (const thread of mine) {
+                if (repairReopen(thread, facts.github, now)) {
+                    events += 1;
+                }
+            }
+        }
+
+        for (const thread of mine) {
+            events += planRepairs(thread, now);
+        }
+
         // A parked thread that got an event from this sweep goes back to open: something changed on it.
         for (const thread of open) {
             if (wakeParked(thread, eventsBefore.get(thread.id) ?? thread.events.length, now)) {
@@ -4552,6 +4958,125 @@ export default function createDesk(host: Host, web: Web) {
         return { events };
     };
 
+    /** One repair wake-up to send: where it goes, and what the message needs. */
+    type RepairWork = {
+        id: string;
+        key: string;
+        ref: string;
+        state: RepairState;
+        failing: string[];
+        to: RepairEntry["to"];
+        why: RepairEntry["why"];
+        /** The supervisor's address for the agent. */
+        address?: string;
+        session?: ConversationId;
+        /** The agent session's address for the supervisor. */
+        back?: string;
+    };
+
+    /**
+     * Send 1 repair wake-up, then mark it sent in its own commit. A failed send adds 1 event and stays unsent: the next
+     * sweep tries again with the same route and key. A route with no address, and the cap and no-session routes,
+     * give a notice to the supervisor's chat, never a message.
+     */
+    const sendRepair = async (
+        supervisor: ConversationId,
+        work: RepairWork,
+        runtime: TaskRuntime<SweeperInput, SweeperState, null, object>,
+        context: Context,
+    ): Promise<void> => {
+        // A route with no address can only tell the chat: what it says follows the reason.
+        const notice = (): string =>
+            work.to === "odrade" && (work.why === "archived" || work.why === "closed")
+                ? odradeRepairMessage(work.ref, work.id, work.state, work.failing, work.why)
+                : repairNotice(
+                      work.ref,
+                      work.id,
+                      work.state,
+                      work.failing,
+                      work.why === "cap" ? "cap" : "no-session",
+                  );
+        let done: string;
+        let failure: string | undefined;
+
+        try {
+            if (work.to === "agent" && work.address !== undefined) {
+                await host.linkedSessions.send(
+                    supervisor,
+                    {
+                        to: work.address,
+                        message: repairMessage(work.ref, work.state, work.failing),
+                    },
+                    `x.desk.repair:${work.key}`,
+                );
+                done = "repair wake-up sent to the agent";
+            } else if (
+                work.to === "odrade" &&
+                (work.why === "archived" || work.why === "closed") &&
+                work.session !== undefined &&
+                work.back !== undefined
+            ) {
+                await host.linkedSessions.send(
+                    work.session,
+                    {
+                        to: work.back,
+                        message: odradeRepairMessage(
+                            work.ref,
+                            work.id,
+                            work.state,
+                            work.failing,
+                            work.why,
+                        ),
+                    },
+                    `x.desk.repair:${work.key}`,
+                );
+                done = "repair wake-up sent to Odrade";
+            } else {
+                host.notice("warning", notice(), supervisor);
+                done = "repair notice sent to Odrade";
+            }
+        } catch (error) {
+            failure = (error as Error).message;
+            done = "";
+        }
+
+        try {
+            await runtime.commit(async (tx) => {
+                const thread = threadById(await tx.doc(DeskThreads), work.id);
+
+                if (thread === undefined) {
+                    return undefined;
+                }
+
+                if (failure !== undefined) {
+                    // 1 event, and still unsent: the next sweep tries again with the same route and key.
+                    addEvent(
+                        thread,
+                        `repair-failed:${work.key}`,
+                        `repair wake-up failed: ${failure}`,
+                        runtime.now(),
+                    );
+
+                    return undefined;
+                }
+
+                const entry = repairsOf(thread)[work.key];
+
+                if (entry !== undefined) {
+                    thread.run.repairs = {
+                        ...repairsOf(thread),
+                        [work.key]: { ...entry, sent: true },
+                    };
+                    addEvent(thread, `repair-sent:${work.key}`, done, runtime.now());
+                }
+
+                return undefined;
+            }, context);
+        } catch {
+            // The send went: the next sweep sends again with the same key, which acts once.
+        }
+    };
+
     type SweeperInput = { supervisor: number };
     type SweeperState = { phase: "sweep" } | { phase: "sleep"; until: number };
 
@@ -4571,6 +5096,9 @@ export default function createDesk(host: Host, web: Web) {
                 // restart before the send loses nothing (the next sweep finds them again, because `run.closeout` is
                 // unset). The key makes a repeated send act once.
                 const closedOut: { id: string; address: string; key: string; entry: number }[] = [];
+                // The repair wake-ups still to send: the ones decided in this commit, and any an earlier sweep could not
+                // send. Each goes by its recorded route and key, so a repeat acts once.
+                const repairs: RepairWork[] = [];
 
                 await runtime.commit(async (tx) => {
                     const state = await tx.doc(DeskThreads);
@@ -4592,6 +5120,50 @@ export default function createDesk(host: Host, web: Web) {
                                 key,
                                 // The sweep scanned the session in this commit: the wake-up comes after this entry.
                                 entry: numberOr(thread.run.lastUserEntry) ?? 0,
+                            });
+                        }
+                    }
+
+                    for (const thread of Object.values(state.threads)) {
+                        if (
+                            thread.supervisor !== Number(supervisor) ||
+                            (thread.state !== "open" && thread.state !== "parked")
+                        ) {
+                            continue;
+                        }
+
+                        for (const [key, entry] of Object.entries(repairsOf(thread))) {
+                            const parsed = parseRepairKey(key);
+
+                            if (entry.sent || parsed === undefined) {
+                                continue;
+                            }
+
+                            repairs.push({
+                                id: thread.id,
+                                key,
+                                ref: parsed.ref,
+                                state: parsed.state,
+                                failing: thread.prs[parsed.ref]?.failing ?? [],
+                                to: entry.to,
+                                why: entry.why,
+                                ...(thread.address === undefined
+                                    ? {}
+                                    : { address: thread.address }),
+                                ...(thread.session === undefined
+                                    ? {}
+                                    : { session: thread.session as ConversationId }),
+                                ...(entry.to === "odrade" && thread.session !== undefined
+                                    ? await (async () => {
+                                          const back = await addressOf(
+                                              tx,
+                                              thread,
+                                              thread.session as ConversationId,
+                                          );
+
+                                          return back === undefined ? {} : { back };
+                                      })()
+                                    : {}),
                             });
                         }
                     }
@@ -4678,6 +5250,10 @@ export default function createDesk(host: Host, web: Web) {
                     } catch {
                         // The send went: the next sweep sends again with the same key, which acts once.
                     }
+                }
+
+                for (const work of repairs) {
+                    await sendRepair(supervisor, work, runtime, context);
                 }
 
                 web.send("changed", {});

@@ -76,6 +76,15 @@ import {
     prNext,
     scanText,
     updatePrs,
+    repairState,
+    repairKey,
+    repairHeld,
+    repairReopen,
+    planRepairs,
+    repairMessage,
+    odradeRepairMessage,
+    repairNotice,
+    type PrLink,
     type GitFacts,
     type GitHubFacts,
     type PrFact,
@@ -1672,6 +1681,8 @@ const prFact = (patch: Partial<PrFact> = {}): PrFact => ({
     mergeable: "MERGEABLE",
     review: "APPROVED",
     checks: "SUCCESS",
+    head: "a1b2c3",
+    failing: [],
     archived: false,
     ...patch,
 });
@@ -1860,6 +1871,660 @@ describe("prNext", () => {
         ] as [object, string][]) {
             assert.equal(prNext(patch), next, JSON.stringify(patch));
         }
+    });
+});
+
+describe("repair wake-up: GitHub facts", () => {
+    test("the query asks for the head oid and the check contexts", () => {
+        const query = buildQuery(["frostyard/test"], ["frostyard/test#7"]);
+
+        assert.match(query, /commit \{ oid statusCheckRollup \{ state contexts\(first: 30\)/);
+        assert.match(query, /\.\.\. on CheckRun \{ name conclusion \}/);
+        assert.match(query, /\.\.\. on StatusContext \{ context state \}/);
+    });
+
+    test("parseGitHub reads head, and the failing names: sorted, once each, at most 10", () => {
+        const run = (name: string, conclusion: string) => ({
+            __typename: "CheckRun",
+            name,
+            conclusion,
+        });
+        const status = (context: string, state: string) => ({
+            __typename: "StatusContext",
+            context,
+            state,
+        });
+        const many = Array.from({ length: 12 }, (_, index) =>
+            run(`job-${String(index).padStart(2, "0")}`, "FAILURE"),
+        );
+        const facts = parseGitHub({
+            data: {
+                viewer: { login: "github-viewer" },
+                r0: {
+                    nameWithOwner: "frostyard/test",
+                    isArchived: false,
+                    pullRequests: {
+                        nodes: [
+                            {
+                                number: 7,
+                                state: "OPEN",
+                                commits: {
+                                    nodes: [
+                                        {
+                                            commit: {
+                                                oid: "abc123",
+                                                statusCheckRollup: {
+                                                    state: "FAILURE",
+                                                    contexts: {
+                                                        nodes: [
+                                                            run("lint", "FAILURE"),
+                                                            run("build", "TIMED_OUT"),
+                                                            run("lint", "CANCELLED"),
+                                                            run("deploy", "ACTION_REQUIRED"),
+                                                            run("boot", "STARTUP_FAILURE"),
+                                                            run("tests", "SUCCESS"),
+                                                            run("skipped", "SKIPPED"),
+                                                            run("neutral", "NEUTRAL"),
+                                                            status("ci/legacy", "FAILURE"),
+                                                            status("ci/broken", "ERROR"),
+                                                            status("ci/slow", "PENDING"),
+                                                            status("ci/ok", "SUCCESS"),
+                                                            { __typename: "Other", name: "x" },
+                                                            null,
+                                                        ],
+                                                    },
+                                                },
+                                            },
+                                        },
+                                    ],
+                                },
+                            },
+                            {
+                                number: 8,
+                                state: "OPEN",
+                                commits: {
+                                    nodes: [
+                                        {
+                                            commit: {
+                                                oid: "def456",
+                                                statusCheckRollup: {
+                                                    state: "FAILURE",
+                                                    contexts: { nodes: many },
+                                                },
+                                            },
+                                        },
+                                    ],
+                                },
+                            },
+                            { number: 9, state: "OPEN" },
+                        ],
+                    },
+                },
+            },
+        });
+        const [seven, eight, nine] = facts.repos["frostyard/test"]!.open;
+
+        assert.equal(seven?.head, "abc123");
+        assert.deepEqual(seven?.failing, [
+            "boot",
+            "build",
+            "ci/broken",
+            "ci/legacy",
+            "deploy",
+            "lint",
+        ]);
+        assert.equal(eight?.head, "def456");
+        assert.equal(eight?.failing.length, 10);
+        assert.deepEqual(eight?.failing, [...eight!.failing].sort());
+        assert.equal(nine?.head, "", "no commit: no head");
+        assert.deepEqual(nine?.failing, []);
+    });
+
+    test("updatePrs keeps head and failing on the link, and a new push changes them", () => {
+        const state = deskOf();
+        const thread = open(state, "k").thread;
+
+        thread.prs["frostyard/test#7"] = { via: "attached" };
+        updatePrs(thread, githubOf([prFact({ head: "h1", failing: ["lint"] })]), 100);
+        assert.equal(thread.prs["frostyard/test#7"]?.head, "h1");
+        assert.deepEqual(thread.prs["frostyard/test#7"]?.failing, ["lint"]);
+        updatePrs(thread, githubOf([prFact({ head: "h2", failing: [] })]), 200);
+        assert.equal(thread.prs["frostyard/test#7"]?.head, "h2");
+        assert.deepEqual(thread.prs["frostyard/test#7"]?.failing, []);
+    });
+});
+
+/** A thread with 1 open PR that GitHub said needs a repair, unless the patch says otherwise. */
+const REPAIR_REF = "frostyard/test#7";
+const repairing = (link: PrLink = {}, patch: Partial<Thread> = {}): Thread =>
+    thread({
+        prs: {
+            [REPAIR_REF]: {
+                via: "seen",
+                state: "OPEN",
+                mergeable: "CONFLICTING",
+                head: "h1",
+                ...link,
+            },
+        },
+        ...patch,
+    });
+
+describe("repairState and repairKey", () => {
+    test("CONFLICTING, FAILURE, and ERROR need a repair; conflicts come first", () => {
+        const base: PrLink = { via: "seen", state: "OPEN", head: "h1" };
+
+        assert.equal(repairState({ ...base, mergeable: "CONFLICTING" }), "CONFLICTING");
+        assert.equal(repairState({ ...base, checks: "FAILURE" }), "FAILURE");
+        assert.equal(repairState({ ...base, checks: "ERROR" }), "FAILURE");
+        assert.equal(
+            repairState({ ...base, mergeable: "CONFLICTING", checks: "FAILURE" }),
+            "CONFLICTING",
+        );
+        assert.equal(
+            repairKey(REPAIR_REF, { ...base, mergeable: "CONFLICTING" }),
+            `repair:${REPAIR_REF}:h1:CONFLICTING`,
+        );
+        assert.equal(
+            repairKey(REPAIR_REF, { ...base, checks: "FAILURE" }),
+            `repair:${REPAIR_REF}:h1:FAILURE`,
+        );
+        assert.equal(
+            repairKey(REPAIR_REF, { ...base, checks: "ERROR" }),
+            `repair:${REPAIR_REF}:h1:FAILURE`,
+        );
+    });
+
+    test("PENDING, SUCCESS, no value, MERGED, CLOSED, FROZEN, MISSING, and no head give nothing", () => {
+        const base: PrLink = { via: "seen", state: "OPEN", head: "h1" };
+
+        for (const checks of ["PENDING", "SUCCESS", "EXPECTED", ""]) {
+            assert.equal(repairState({ ...base, checks }), undefined, checks);
+            assert.equal(repairKey(REPAIR_REF, { ...base, checks }), undefined, checks);
+        }
+
+        assert.equal(repairState(base), undefined);
+        assert.equal(repairState({ ...base, mergeable: "MERGEABLE" }), undefined);
+        assert.equal(repairState({ ...base, mergeable: "UNKNOWN" }), undefined);
+
+        for (const state of ["MERGED", "CLOSED", "FROZEN", "MISSING", undefined] as const) {
+            const link: PrLink = {
+                via: "seen",
+                head: "h1",
+                mergeable: "CONFLICTING",
+                checks: "FAILURE",
+            };
+
+            if (state !== undefined) {
+                link.state = state;
+            }
+
+            assert.equal(repairState(link), undefined, String(state));
+            assert.equal(repairKey(REPAIR_REF, link), undefined, String(state));
+        }
+
+        // A state with no head still has a state, but no key.
+        assert.equal(
+            repairState({ via: "seen", state: "OPEN", mergeable: "CONFLICTING" }),
+            "CONFLICTING",
+        );
+        assert.equal(
+            repairKey(REPAIR_REF, { via: "seen", state: "OPEN", mergeable: "CONFLICTING" }),
+            undefined,
+        );
+        assert.equal(
+            repairKey(REPAIR_REF, {
+                via: "seen",
+                state: "OPEN",
+                mergeable: "CONFLICTING",
+                head: "",
+            }),
+            undefined,
+        );
+    });
+});
+
+describe("planRepairs", () => {
+    const keyOf = (head: string, state = "CONFLICTING") => `repair:${REPAIR_REF}:${head}:${state}`;
+
+    test("a new key goes to the agent and counts 1; the same key again adds nothing", () => {
+        const one = repairing();
+
+        assert.equal(planRepairs(one, 100), 1);
+        assert.deepEqual(one.run.repairs, {
+            [keyOf("h1")]: { at: 100, to: "agent", why: "change", sent: false },
+        });
+        assert.deepEqual(one.run.repairCounts, { [REPAIR_REF]: 1 });
+        assert.equal(one.events.at(-1)?.key, `repair:${keyOf("h1")}`);
+
+        assert.equal(planRepairs(one, 200), 0);
+        assert.equal(Object.keys(one.run.repairs as object).length, 1);
+        assert.deepEqual(one.run.repairCounts, { [REPAIR_REF]: 1 });
+        assert.equal(one.events.length, 1);
+    });
+
+    test("a sent entry stays sent, and its key is not decided again", () => {
+        const one = repairing();
+
+        planRepairs(one, 100);
+        (one.run.repairs as Record<string, { sent: boolean }>)[keyOf("h1")]!.sent = true;
+        assert.equal(planRepairs(one, 200), 0);
+        assert.equal(
+            (one.run.repairs as Record<string, { sent: boolean }>)[keyOf("h1")]?.sent,
+            true,
+        );
+    });
+
+    test("a new head is a new key; a new state on the same head is a new key too", () => {
+        const one = repairing();
+
+        planRepairs(one, 100);
+        one.prs[REPAIR_REF]!.head = "h2";
+        assert.equal(planRepairs(one, 200), 1);
+        one.prs[REPAIR_REF] = {
+            via: "seen",
+            state: "OPEN",
+            checks: "FAILURE",
+            head: "h2",
+            failing: ["lint"],
+        };
+        assert.equal(planRepairs(one, 300), 1);
+        assert.deepEqual(Object.keys(one.run.repairs as object).sort(), [
+            keyOf("h1"),
+            keyOf("h2"),
+            keyOf("h2", "FAILURE"),
+        ]);
+        assert.deepEqual(one.run.repairCounts, { [REPAIR_REF]: 3 });
+        assert.match(one.events.at(-1)?.text ?? "", /failing: lint/);
+    });
+
+    test("the 4th change goes to Odrade with cap, and the count stays 3", () => {
+        const one = repairing();
+
+        for (const [index, head] of ["h1", "h2", "h3"].entries()) {
+            one.prs[REPAIR_REF]!.head = head;
+            planRepairs(one, 100 + index);
+        }
+
+        one.prs[REPAIR_REF]!.head = "h4";
+        assert.equal(planRepairs(one, 200), 1);
+
+        const repairs = one.run.repairs as Record<string, { to: string; why: string }>;
+
+        assert.deepEqual(repairs[keyOf("h4")], { at: 200, to: "odrade", why: "cap", sent: false });
+        assert.deepEqual(one.run.repairCounts, { [REPAIR_REF]: 3 });
+
+        one.prs[REPAIR_REF]!.head = "h5";
+        planRepairs(one, 300);
+        assert.equal(repairs[keyOf("h5")]?.why, "cap");
+        assert.deepEqual(one.run.repairCounts, { [REPAIR_REF]: 3 });
+    });
+
+    test("the count belongs to the PR: another PR still has its 3", () => {
+        const one = repairing({}, { run: { repairCounts: { [REPAIR_REF]: 3 } } });
+
+        one.prs["frostyard/test#8"] = {
+            via: "seen",
+            state: "OPEN",
+            mergeable: "CONFLICTING",
+            head: "x1",
+        };
+        planRepairs(one, 100);
+
+        const repairs = one.run.repairs as Record<string, { to: string; why: string }>;
+
+        assert.equal(repairs[keyOf("h1")]?.why, "cap");
+        assert.equal(repairs["repair:frostyard/test#8:x1:CONFLICTING"]?.to, "agent");
+    });
+
+    test("an archived session goes to Odrade; no session, or no address at all, is no-session", () => {
+        const archived = repairing({}, { run: { archived: true } });
+
+        planRepairs(archived, 100);
+        assert.deepEqual((archived.run.repairs as object)[keyOf("h1") as never], {
+            at: 100,
+            to: "odrade",
+            why: "archived",
+            sent: false,
+        });
+        assert.equal(archived.run.repairCounts, undefined, "an Odrade route counts nothing");
+
+        const none = repairing({}, { session: undefined });
+
+        planRepairs(none, 100);
+        assert.equal(
+            (none.run.repairs as Record<string, { why: string }>)[keyOf("h1")]?.why,
+            "no-session",
+        );
+
+        const lost = repairing({}, { address: undefined });
+
+        planRepairs(lost, 100);
+        assert.equal(
+            (lost.run.repairs as Record<string, { why: string }>)[keyOf("h1")]?.why,
+            "no-session",
+        );
+
+        // A return address alone is enough: the thread has a session.
+        const back = repairing({}, { address: undefined, run: { returnAddress: "session-back" } });
+
+        planRepairs(back, 100);
+        assert.equal(
+            (back.run.repairs as Record<string, { to: string }>)[keyOf("h1")]?.to,
+            "agent",
+        );
+
+        // The cap comes before the other reasons.
+        const capped = repairing(
+            {},
+            { session: undefined, run: { repairCounts: { [REPAIR_REF]: 3 } } },
+        );
+
+        planRepairs(capped, 100);
+        assert.equal(
+            (capped.run.repairs as Record<string, { why: string }>)[keyOf("h1")]?.why,
+            "cap",
+        );
+    });
+
+    test("PENDING checks, a good PR, a closed PR, and a starting or closed thread give nothing", () => {
+        const pending = repairing({ mergeable: "MERGEABLE", checks: "PENDING" });
+
+        assert.equal(planRepairs(pending, 100), 0);
+        assert.equal(pending.run.repairs, undefined);
+        assert.equal(pending.events.length, 0);
+        assert.equal(planRepairs(repairing({ state: "MERGED" }), 100), 0);
+
+        for (const state of ["starting", "closed"] as const) {
+            const other = repairing({}, { state });
+
+            assert.equal(planRepairs(other, 100), 0, state);
+            assert.equal(other.run.repairs, undefined, state);
+        }
+
+        // A parked thread is planned: the repair is an event on it.
+        const parked = repairing({}, { state: "parked" });
+
+        assert.equal(planRepairs(parked, 100), 1);
+    });
+
+    test("at most 30 entries: sent ones go first, oldest first; a current key stays", () => {
+        const one = repairing();
+        const old: Record<string, object> = {};
+
+        for (let index = 0; index < 30; index += 1) {
+            old[`repair:o/r#${String(index)}:x:CONFLICTING`] = {
+                at: index,
+                to: "agent",
+                why: "change",
+                sent: index % 2 === 0,
+            };
+        }
+
+        // An entry for the current key of the PR, the oldest of all and sent: it must stay.
+        old[keyOf("h1")] = { at: -1, to: "agent", why: "change", sent: true };
+        one.run.repairs = old as never;
+        one.prs[REPAIR_REF]!.head = "h9";
+
+        planRepairs(one, 500);
+
+        const repairs = one.run.repairs as Record<string, { sent: boolean; at: number }>;
+
+        assert.equal(Object.keys(repairs).length, 30);
+        assert(repairs[keyOf("h9")], "the new entry stays");
+
+        // The 2 oldest of the sent ones went: at 0 and at 2; the unsent ones stay.
+        assert.equal(repairs["repair:o/r#0:x:CONFLICTING"], undefined);
+        assert.equal(repairs["repair:o/r#2:x:CONFLICTING"], undefined);
+        assert(repairs["repair:o/r#1:x:CONFLICTING"], "an unsent one stays");
+
+        // The current key of the PR is the new one now, so the old h1 entry was a free one: the oldest sent entry.
+        assert.equal(repairs[keyOf("h1")], undefined);
+    });
+
+    test("an unsent entry goes only when no sent one is left, and a current key never goes", () => {
+        const one = repairing();
+        const old: Record<string, object> = {};
+
+        for (let index = 0; index < 30; index += 1) {
+            old[`repair:o/r#${String(index)}:x:CONFLICTING`] = {
+                at: index + 10,
+                to: "agent",
+                why: "change",
+                sent: false,
+            };
+        }
+
+        old[keyOf("h1")] = { at: 1, to: "agent", why: "change", sent: false };
+        one.run.repairs = old as never;
+        one.prs[REPAIR_REF]!.head = "h1";
+        // A second PR with a new key.
+        one.prs["frostyard/test#8"] = {
+            via: "seen",
+            state: "OPEN",
+            mergeable: "CONFLICTING",
+            head: "n1",
+        };
+        planRepairs(one, 500);
+
+        const repairs = one.run.repairs as Record<string, unknown>;
+
+        assert.equal(Object.keys(repairs).length, 30);
+        assert(repairs[keyOf("h1")], "a current key stays, though it is the oldest");
+        assert(repairs["repair:frostyard/test#8:n1:CONFLICTING"]);
+        assert.equal(repairs["repair:o/r#0:x:CONFLICTING"], undefined, "the oldest other one went");
+    });
+});
+
+describe("repairReopen", () => {
+    const closedThread = (why: "done" | "dropped" | "failed" = "done", link: PrLink = {}) =>
+        repairing(link, { state: "closed", closed: { at: 50, why, by: "sweep" } });
+    const conflicting = (patch: Partial<PrFact> = {}) =>
+        githubOf([prFact({ ref: REPAIR_REF, mergeable: "CONFLICTING", head: "h1", ...patch })]);
+
+    test("a closed thread reopens, and the repair goes to Odrade with closed", () => {
+        const one = closedThread();
+
+        assert.equal(repairReopen(one, conflicting(), 100), true);
+        assert.equal(one.state, "open");
+        assert.equal(one.closed, undefined);
+        assert.deepEqual(
+            (one.run.repairs as object)[`repair:${REPAIR_REF}:h1:CONFLICTING` as never],
+            {
+                at: 100,
+                to: "odrade",
+                why: "closed",
+                sent: false,
+            },
+        );
+        assert.equal(one.run.repairCounts, undefined);
+        assert.equal(one.run.next, "odrade");
+        assert.equal(one.events.at(-1)?.text, `reopened: ${REPAIR_REF} is conflicting`);
+
+        // The same key again: nothing, and the plan adds nothing either.
+        assert.equal(planRepairs(one, 200), 0);
+        assert.equal(repairReopen(one, conflicting(), 200), false);
+    });
+
+    test("failing checks reopen it too, and the event says failing", () => {
+        const one = closedThread("failed");
+
+        assert.equal(
+            repairReopen(
+                one,
+                githubOf([prFact({ ref: REPAIR_REF, checks: "FAILURE", failing: ["lint"] })]),
+                100,
+            ),
+            true,
+        );
+        assert.equal(one.events.at(-1)?.text, `reopened: ${REPAIR_REF} is failing`);
+        assert.equal(one.state, "open");
+    });
+
+    test("a dropped thread, a good PR, a closed PR, an archived repository, and a PR GitHub did not read do not reopen it", () => {
+        const dropped = closedThread("dropped");
+
+        assert.equal(repairReopen(dropped, conflicting(), 100), false);
+        assert.equal(dropped.state, "closed");
+        assert.equal(dropped.run.repairs, undefined);
+
+        for (const github of [
+            githubOf([prFact({ ref: REPAIR_REF })]),
+            githubOf([prFact({ ref: REPAIR_REF, mergeable: "CONFLICTING", state: "MERGED" })]),
+            githubOf([prFact({ ref: REPAIR_REF, mergeable: "CONFLICTING" })], { archived: true }),
+            githubOf([prFact({ ref: "frostyard/test#9", mergeable: "CONFLICTING" })]),
+            githubOf([prFact({ ref: REPAIR_REF, mergeable: "CONFLICTING", head: "" })]),
+            githubOf([]),
+        ]) {
+            const one = closedThread();
+
+            assert.equal(repairReopen(one, github, 100), false);
+            assert.equal(one.state, "closed");
+        }
+
+        // An open thread is not its concern.
+        assert.equal(repairReopen(repairing(), conflicting(), 100), false);
+    });
+
+    test("a PR read by number reopens it too", () => {
+        const one = closedThread();
+        const github = githubOf([]);
+
+        github.prs[REPAIR_REF] = prFact({ ref: REPAIR_REF, mergeable: "CONFLICTING" });
+        assert.equal(repairReopen(one, github, 100), true);
+    });
+
+    test("a key it has already decided does not reopen it again", () => {
+        const one = closedThread();
+
+        one.run.repairs = {
+            [`repair:${REPAIR_REF}:h1:CONFLICTING`]: {
+                at: 5,
+                to: "agent",
+                why: "change",
+                sent: true,
+            },
+        };
+        assert.equal(repairReopen(one, conflicting(), 100), false);
+        assert.equal(one.state, "closed");
+    });
+});
+
+describe("a PR that waits on Odrade for a repair", () => {
+    const capped = () =>
+        repairing(
+            {},
+            {
+                run: {
+                    busy: true,
+                    repairs: {
+                        [`repair:${REPAIR_REF}:h1:CONFLICTING`]: {
+                            at: 1,
+                            to: "odrade",
+                            why: "cap",
+                            sent: false,
+                        },
+                    },
+                },
+            },
+        );
+
+    test("nextActor is odrade, though the session works; odradeReason says why", () => {
+        assert.equal(nextActor(repairing({}, { run: { busy: true } })), "agent");
+        assert.equal(nextActor(capped()), "odrade");
+        assert.equal(odradeReason(capped()), `PR ${REPAIR_REF} needs a repair: cap`);
+
+        for (const [why, words] of [
+            ["archived", "archived"],
+            ["closed", "closed"],
+            ["no-session", "no session"],
+        ] as const) {
+            const one = capped();
+
+            (one.run.repairs as Record<string, { why: string }>)[
+                `repair:${REPAIR_REF}:h1:CONFLICTING`
+            ]!.why = why;
+            assert.equal(odradeReason(one), `PR ${REPAIR_REF} needs a repair: ${words}`);
+        }
+    });
+
+    test("it comes after Brian, and before a silent session", () => {
+        const asked = capped();
+
+        asked.asks = [{ id: "T1a", text: "Which one?", at: 1 }];
+        assert.equal(nextActor(asked), "brian");
+
+        const silent = capped();
+
+        silent.run.busy = false;
+        silent.run.lastUserEntry = 6;
+        assert.equal(odradeReason(silent), `PR ${REPAIR_REF} needs a repair: cap`);
+    });
+
+    test("it stops when the PR is fixed, or a new key goes to the agent", () => {
+        const fixed = capped();
+
+        fixed.prs[REPAIR_REF]!.mergeable = "MERGEABLE";
+        assert.equal(nextActor(fixed), "brian", "a PR with no repair is Brian's to review");
+        assert.equal(odradeReason(fixed), undefined);
+
+        const pushed = capped();
+
+        pushed.prs[REPAIR_REF]!.head = "h2";
+        planRepairs(pushed, 300);
+        assert.equal(nextActor(pushed), "agent");
+
+        const merged = capped();
+
+        merged.prs[REPAIR_REF]!.state = "MERGED";
+        assert.notEqual(nextActor(merged), "odrade");
+    });
+
+    test("an entry that went to the agent holds nothing", () => {
+        const one = repairing({}, { run: { busy: true } });
+
+        planRepairs(one, 100);
+        assert.equal(nextActor(one), "agent");
+        assert.equal(repairHeld(one), undefined);
+    });
+});
+
+describe("the repair messages", () => {
+    test("the agent's message, for a conflict, named checks, and unnamed checks", () => {
+        const tail =
+            " Merge `main` in (no force-push) or fix the check, run the checks, push, report.";
+
+        assert.equal(
+            repairMessage("frostyard/test#7", "CONFLICTING", []),
+            `frostyard/test#7 is now conflicting.${tail}`,
+        );
+        assert.equal(
+            repairMessage("frostyard/test#7", "FAILURE", ["build", "lint"]),
+            `frostyard/test#7 is now failing: build, lint.${tail}`,
+        );
+        assert.equal(
+            repairMessage("frostyard/test#7", "FAILURE", []),
+            `frostyard/test#7 is now failing.${tail}`,
+        );
+    });
+
+    test("the message to Odrade, and the notice", () => {
+        assert.equal(
+            odradeRepairMessage("frostyard/test#7", "T9", "CONFLICTING", [], "archived"),
+            "frostyard/test#7 on T9 is now conflicting. Its agent cannot take it: the agent session is archived. Choose who fixes it.",
+        );
+        assert.equal(
+            odradeRepairMessage("frostyard/test#7", "T9", "FAILURE", ["lint"], "closed"),
+            "frostyard/test#7 on T9 is now failing: lint. Its agent cannot take it: the thread was closed, and the desk reopened it. Choose who fixes it.",
+        );
+        assert.equal(
+            repairNotice("frostyard/test#7", "T9", "CONFLICTING", [], "cap"),
+            "frostyard/test#7 on T9 is now conflicting. It had 3 repair wake-ups already: it waits on Odrade.",
+        );
+        assert.equal(
+            repairNotice("frostyard/test#7", "T9", "FAILURE", [], "no-session"),
+            "frostyard/test#7 on T9 is now failing. The thread has no agent session: it waits on Odrade.",
+        );
     });
 });
 
