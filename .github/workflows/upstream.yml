@@ -1,0 +1,76 @@
+# Tests this project against upstream Pi Pocket, not the pinned tag that ci.yml uses. The purpose is to see
+# a break before the next upstream release. It runs each Monday, and by hand. A red run only warns: this is
+# a separate workflow, not a required check, so it never blocks a merge.
+#
+# To test the next release's draft PR, run it by hand with `ref` set to the draft PR's branch (for example
+# release/0.21.0) or to pull/<number>/head:
+#   gh workflow run upstream.yml -f ref=pull/125/head
+name: Upstream
+
+on:
+    schedule:
+        - cron: "17 6 * * 1"
+    workflow_dispatch:
+        inputs:
+            ref:
+                description: A branch, a tag, or pull/<number>/head of TannerMidd/pi-pocket
+                type: string
+                default: main
+    pull_request:
+        paths: [.github/workflows/upstream.yml]
+
+permissions:
+    contents: read
+
+concurrency:
+    group: ci-${{ github.workflow }}-${{ github.ref }}
+    cancel-in-progress: true
+
+jobs:
+    test:
+        name: Test against upstream
+        runs-on: ubuntu-latest
+        timeout-minutes: 20
+        steps:
+            - name: Check out this repository
+              uses: actions/checkout@v4
+
+            - name: Set up Node.js 24
+              uses: actions/setup-node@v4
+              with:
+                  node-version: 24
+
+            - name: Set the Pi Pocket checkout path
+              run: echo "PI_POCKET_CHECKOUT=$RUNNER_TEMP/pi-pocket" >> "$GITHUB_ENV"
+
+            - name: Get Pi Pocket at the ref
+              env:
+                  REF: ${{ inputs.ref || 'main' }}
+              run: |
+                  git init "$PI_POCKET_CHECKOUT"
+                  git -C "$PI_POCKET_CHECKOUT" fetch --depth 1 https://github.com/TannerMidd/pi-pocket.git "$REF"
+                  git -C "$PI_POCKET_CHECKOUT" checkout --detach FETCH_HEAD
+                  commit=$(git -C "$PI_POCKET_CHECKOUT" log -1 --oneline)
+                  echo "Testing Pi Pocket $REF at $commit"
+                  echo "Tested Pi Pocket \`$REF\` at \`$commit\`" >> "$GITHUB_STEP_SUMMARY"
+
+            - name: Install Pi Pocket dependencies
+              working-directory: ${{ runner.temp }}/pi-pocket
+              run: npm ci
+
+            - name: Link this project to the Pi Pocket checkout
+              run: npm run link
+
+            - name: Run the tests
+              run: npm test
+
+            - name: Run the type check
+              run: npm run typecheck
+
+            - name: Warn that upstream breaks this project
+              if: failure()
+              env:
+                  REF: ${{ inputs.ref || 'main' }}
+              run: |
+                  echo "::warning::Upstream Pi Pocket at $REF breaks this project. This does not block anything."
+                  echo "Upstream Pi Pocket at \`$REF\` breaks this project. This does not block anything." >> "$GITHUB_STEP_SUMMARY"
