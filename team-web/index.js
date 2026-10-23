@@ -1,6 +1,12 @@
 export const pocketApi = 1;
 
 // getRandomValues also works on plain-HTTP LAN pages, where randomUUID is absent.
+export function newTaskKey(random = globalThis.crypto) {
+    const bytes = random.getRandomValues(new Uint8Array(16));
+
+    return [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
 /** The status item for a session: the identity's name, which opens the Team page; null when it has none. */
 export const identityStatus = (session) => {
     const name = session?.identity?.name;
@@ -14,12 +20,6 @@ export const identityStatus = (session) => {
           }
         : null;
 };
-
-export function newTaskKey(random = globalThis.crypto) {
-    const bytes = random.getRandomValues(new Uint8Array(16));
-
-    return [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
-}
 
 /** Lessons waiting for the owner: new ones, and proposed changes of ones in force. */
 export const waitingCount = (lessons = []) =>
