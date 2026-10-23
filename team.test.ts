@@ -137,6 +137,10 @@ test("drop-in identities, named delegation, HTTP permissions, replay and restart
         assert.equal((await call(`session/${id}/identity`, { agent: "../missing" })).status, 400);
         assert.equal((await call(`session/${id}/identity`, { agent: "odrade" })).status, 200);
         assert.equal((await app.harness.snapshot(Identity, id, context))?.persona?.id, "odrade");
+        assert.equal((await call(`session/${id}`)).data.identity.name, "Odrade");
+        assert.equal((await call(`session/${id}/identity`, { agent: null })).status, 200);
+        assert.equal((await call(`session/${id}`)).data.identity, null);
+        assert.equal((await call(`session/${id}/identity`, { agent: "odrade" })).status, 200);
         await say(app, id, "Hello");
         const transcript = requestContext;
 

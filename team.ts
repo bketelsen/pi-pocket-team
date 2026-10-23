@@ -723,6 +723,10 @@ export default function createTeam(host: Host, web: Web) {
     const delegatedText = (persona: Persona, task: string, request: DelegatedGoal) =>
         `${taskText(persona, task)}\n\nThis task runs as a night shift. Round 1 comes as a separate message that starts with [night-shift], ${request.startLabel === undefined ? "now" : `at ${request.startLabel}`}. Answer this message with one short line only, and do the work in the rounds. The night shift reports to the source session by itself when it stops: do not send a report with team_message.`;
 
+    /** Tell the tabs that a session's identity changed: the id only, so each tab asks the route (which checks access). */
+    const identityChanged = (conversationId: ConversationId) =>
+        web.send("identity", { conversationId });
+
     web.client("team-web");
     web.route("GET", "agents", async () => ({
         agents: await roster(directory),
@@ -753,6 +757,8 @@ export default function createTeam(host: Host, web: Web) {
                     delete doc.persona;
                 }
             });
+
+            identityChanged(req.conversation.id);
 
             return { identity: persona ?? null };
         },
@@ -950,6 +956,8 @@ export default function createTeam(host: Host, web: Web) {
                     delete doc.persona;
                 }
             });
+
+            identityChanged(ctx.conversationId);
 
             return {
                 type: "toast",
