@@ -200,8 +200,18 @@ export type DeskState = {
     epoch?: number;
     /** Open PRs per repository that are not ours: dependabot, and other people. */
     others?: Record<string, number>;
-    /** The last GitHub read: when, whether it worked, why not, the roster names it skipped, and the refs it lacks. */
-    github?: { at: number; ok: boolean; error?: string; skipped?: string[]; missing?: string[] };
+    /**
+     * The last GitHub read: when, whether it worked, why not, the roster names it skipped, the refs it lacks, and the
+     * parts it cut short (a repository with PRs left unread, a PR with checks left unread).
+     */
+    github?: {
+        at: number;
+        ok: boolean;
+        error?: string;
+        skipped?: string[];
+        missing?: string[];
+        incomplete?: string[];
+    };
     /**
      * What a supervisor's first sweep saw. Old work never becomes a found thread: only the seed brings it in. A folder
      * leaves `folders` when it is clean. `pending` holds the folders that have been dirty since a sweep first saw them,
@@ -1945,11 +1955,30 @@ export type PrFact = {
 /** What one GitHub read says. */
 export type GitHubFacts = {
     viewer: string;
-    repos: Record<string, { archived: boolean; open: PrFact[] }>;
+    repos: Record<
+        string,
+        {
+            archived: boolean;
+            open: PrFact[];
+            /** The open PRs' page: how many there are, and where the next page starts. */
+            page?: { hasNextPage: boolean; endCursor?: string; totalCount?: number };
+        }
+    >;
     prs: Record<string, PrFact>;
     /** Attached refs that GitHub does not have: an issue, or a wrong number. */
     missing?: string[];
+    /** The parts of the read that are not complete, in short lines, when the read cut something off. */
+    incomplete?: string[];
 };
+
+/** The most open PRs one page holds: GitHub's maximum for a connection. */
+export const GITHUB_PAGE = 50;
+
+/** The most pages of open PRs one sweep reads for one repository: 500 PRs. */
+export const GITHUB_MAX_PAGES = 10;
+
+/** The most check contexts of one commit one page holds: GitHub's maximum. */
+export const GITHUB_CHECKS = 100;
 
 const OWNER_NAME = /^[A-Za-z0-9][A-Za-z0-9_.-]*$/;
 
@@ -1986,8 +2015,7 @@ function splitRef(ref: string): { repo: string; number: number } {
     return { repo: match[1]!, number: Number(match[2]) };
 }
 
-const PR_FIELDS =
-    "number title url state isDraft createdAt mergedAt closedAt headRefName mergeable reviewDecision author { login } commits(last: 1) { nodes { commit { oid statusCheckRollup { state contexts(first: 30) { totalCount nodes { __typename ... on CheckRun { name conclusion status startedAt } ... on StatusContext { context state } } } } } } }";
+const PR_FIELDS = `number title url state isDraft createdAt mergedAt closedAt headRefName mergeable reviewDecision author { login } commits(last: 1) { nodes { commit { oid statusCheckRollup { state contexts(first: ${String(GITHUB_CHECKS)}) { totalCount nodes { __typename ... on CheckRun { name conclusion status startedAt } ... on StatusContext { context state } } } } } } }`;
 
 /**
  * The one GraphQL query of a sweep: the viewer, each repository's open PRs, and each attached PR by number. Every
@@ -2003,7 +2031,9 @@ export function buildQuery(repos: string[], prs: string[]): string {
             `  r${String(index)}: repository(owner: ${JSON.stringify(owner)}, name: ${JSON.stringify(name)}) {`,
             "    nameWithOwner",
             "    isArchived",
-            "    pullRequests(states: OPEN, first: 50, orderBy: {field: CREATED_AT, direction: DESC}) {",
+            `    pullRequests(states: OPEN, first: ${String(GITHUB_PAGE)}, orderBy: {field: CREATED_AT, direction: DESC}) {`,
+            "      totalCount",
+            "      pageInfo { hasNextPage endCursor }",
             `      nodes { ${PR_FIELDS} }`,
             "    }",
             "  }",
@@ -2028,6 +2058,48 @@ export function buildQuery(repos: string[], prs: string[]): string {
     return lines.join("\n");
 }
 
+/** What a page cursor may hold: the characters of a base64 cursor, and nothing else. */
+const CURSOR = /^[A-Za-z0-9][A-Za-z0-9+/=_-]{0,511}$/;
+
+/**
+ * One repository's next page of open PRs, after a cursor from the last answer. The alias is `r0`, as in
+ * `buildQuery`, so `parseGitHub` reads the answer. The owner, the name, and the cursor are checked first: nothing else
+ * goes into the query.
+ */
+export function buildPageQuery(repo: string, after: string): string {
+    const { owner, name } = splitRepo(repo);
+
+    if (!CURSOR.test(after)) {
+        throw new Error(`Not a GitHub cursor: ${after}.`);
+    }
+
+    return [
+        "query {",
+        `  r0: repository(owner: ${JSON.stringify(owner)}, name: ${JSON.stringify(name)}) {`,
+        "    nameWithOwner",
+        "    isArchived",
+        `    pullRequests(states: OPEN, first: ${String(GITHUB_PAGE)}, after: ${JSON.stringify(after)}, orderBy: {field: CREATED_AT, direction: DESC}) {`,
+        "      totalCount",
+        "      pageInfo { hasNextPage endCursor }",
+        `      nodes { ${PR_FIELDS} }`,
+        "    }",
+        "  }",
+        "}",
+    ].join("\n");
+}
+
+/** The line that says a repository was read only in part: `owner/name: 2 of 60 open PRs read`. */
+export function openIncompleteLine(repo: string, read: number, total: number | undefined): string {
+    return total === undefined
+        ? `${repo}: ${String(read)} open PRs read, and more follow`
+        : `${repo}: ${String(read)} of ${String(total)} open PRs read`;
+}
+
+/** The line that says a PR's check list was read only in part: `owner/name#12: 30 of 45 checks read`. */
+export function checksIncompleteLine(ref: string, read: number, total: number): string {
+    return `${ref}: ${String(read)} of ${String(total)} checks read`;
+}
+
 const text = (value: unknown): string => (typeof value === "string" ? value : "");
 
 const milliseconds = (value: unknown): number => {
@@ -2036,17 +2108,22 @@ const milliseconds = (value: unknown): number => {
     return Number.isFinite(at) ? at : 0;
 };
 
+/**
+ * One PR node as facts, and the line that says its check list was cut when GitHub has more contexts than the answer
+ * holds. A node with no number is neither.
+ */
 function prFact(
     node: Record<string, unknown>,
     repo: string,
     archived: boolean,
-): PrFact | undefined {
+): { fact?: PrFact; incomplete?: string } {
     const number = typeof node.number === "number" ? node.number : undefined;
 
     if (number === undefined) {
-        return undefined;
+        return {};
     }
 
+    const ref = `${repo}#${String(number)}`;
     const commits = (node.commits as { nodes?: unknown } | undefined)?.nodes;
     const first = Array.isArray(commits)
         ? (commits[0] as
@@ -2065,27 +2142,32 @@ function prFact(
               | undefined)
         : undefined;
     const state = text(node.state).toUpperCase();
+    const contexts = first?.commit?.statusCheckRollup?.contexts;
+    const read = Array.isArray(contexts?.nodes) ? contexts.nodes.length : 0;
+    const total = typeof contexts?.totalCount === "number" ? contexts.totalCount : undefined;
 
     return {
-        ref: `${repo}#${String(number)}`,
-        repo,
-        number,
-        title: text(node.title),
-        url: text(node.url),
-        state: state === "MERGED" || state === "CLOSED" ? state : "OPEN",
-        author: text((node.author as { login?: unknown } | null | undefined)?.login),
-        createdAt: milliseconds(node.createdAt),
-        headRefName: text(node.headRefName),
-        isDraft: node.isDraft === true,
-        mergeable: text(node.mergeable),
-        review: text(node.reviewDecision),
-        checks: checksState(
-            text(first?.commit?.statusCheckRollup?.state),
-            first?.commit?.statusCheckRollup?.contexts,
-        ),
-        head: text(first?.commit?.oid),
-        failing: failingChecks(first?.commit?.statusCheckRollup?.contexts?.nodes),
-        archived,
+        fact: {
+            ref,
+            repo,
+            number,
+            title: text(node.title),
+            url: text(node.url),
+            state: state === "MERGED" || state === "CLOSED" ? state : "OPEN",
+            author: text((node.author as { login?: unknown } | null | undefined)?.login),
+            createdAt: milliseconds(node.createdAt),
+            headRefName: text(node.headRefName),
+            isDraft: node.isDraft === true,
+            mergeable: text(node.mergeable),
+            review: text(node.reviewDecision),
+            checks: checksState(text(first?.commit?.statusCheckRollup?.state), contexts),
+            head: text(first?.commit?.oid),
+            failing: failingChecks(contexts?.nodes),
+            archived,
+        },
+        ...(total === undefined || total <= read
+            ? {}
+            : { incomplete: checksIncompleteLine(ref, read, total) }),
     };
 }
 
@@ -2239,6 +2321,7 @@ export function parseGitHub(json: unknown): GitHubFacts {
     const viewer = text((root?.viewer as { login?: unknown } | undefined)?.login);
     const repos: GitHubFacts["repos"] = {};
     const prs: GitHubFacts["prs"] = {};
+    const incomplete: string[] = [];
 
     for (const [alias, value] of Object.entries(root ?? {})) {
         if (!/^[rp][0-9]+$/.test(alias)) {
@@ -2249,7 +2332,11 @@ export function parseGitHub(json: unknown): GitHubFacts {
             | {
                   nameWithOwner?: unknown;
                   isArchived?: unknown;
-                  pullRequests?: { nodes?: unknown };
+                  pullRequests?: {
+                      nodes?: unknown;
+                      totalCount?: unknown;
+                      pageInfo?: { hasNextPage?: unknown; endCursor?: unknown } | null;
+                  } | null;
                   pullRequest?: unknown;
               }
             | null
@@ -2273,18 +2360,46 @@ export function parseGitHub(json: unknown): GitHubFacts {
 
             if (Array.isArray(nodes)) {
                 for (const one of nodes) {
-                    const fact =
+                    const parsed =
                         one === null || typeof one !== "object"
-                            ? undefined
+                            ? {}
                             : prFact(one as Record<string, unknown>, repo, archived);
 
-                    if (fact !== undefined) {
-                        open.push(fact);
+                    if (parsed.fact !== undefined) {
+                        open.push(parsed.fact);
+                    }
+
+                    if (parsed.incomplete !== undefined) {
+                        incomplete.push(parsed.incomplete);
                     }
                 }
             }
 
-            repos[repo] = { archived, open };
+            const total =
+                typeof node.pullRequests?.totalCount === "number"
+                    ? node.pullRequests.totalCount
+                    : undefined;
+            const info = node.pullRequests?.pageInfo;
+            const hasNextPage = info?.hasNextPage === true;
+            const endCursor = text(info?.endCursor);
+
+            if (hasNextPage) {
+                incomplete.push(openIncompleteLine(repo, open.length, total));
+            }
+
+            repos[repo] = {
+                archived,
+                open,
+                ...(info === undefined && total === undefined
+                    ? {}
+                    : {
+                          page: {
+                              hasNextPage,
+                              ...(endCursor === "" ? {} : { endCursor }),
+                              ...(total === undefined ? {} : { totalCount: total }),
+                          },
+                      }),
+            };
         } else {
             const one = node.pullRequest;
 
@@ -2292,15 +2407,19 @@ export function parseGitHub(json: unknown): GitHubFacts {
                 continue;
             }
 
-            const fact = prFact(one as Record<string, unknown>, repo, archived);
+            const parsed = prFact(one as Record<string, unknown>, repo, archived);
 
-            if (fact !== undefined) {
-                prs[fact.ref] = fact;
+            if (parsed.fact !== undefined) {
+                prs[parsed.fact.ref] = parsed.fact;
+            }
+
+            if (parsed.incomplete !== undefined) {
+                incomplete.push(parsed.incomplete);
             }
         }
     }
 
-    return { viewer, repos, prs };
+    return { viewer, repos, prs, ...(incomplete.length === 0 ? {} : { incomplete }) };
 }
 
 const linkFor = (pr: PrFact, via: PrLink["via"]): PrLink => ({
@@ -3192,6 +3311,7 @@ export type GitHubView = {
     error?: string;
     skipped?: string[];
     missing?: string[];
+    incomplete?: string[];
 };
 
 /** The last GitHub read as a plain value; null when no read happened yet. */
@@ -3208,13 +3328,14 @@ export function githubView(state: Readonly<DeskState> | undefined): GitHubView |
         ...(github.error === undefined ? {} : { error: github.error }),
         ...(github.skipped === undefined ? {} : { skipped: [...github.skipped] }),
         ...(github.missing === undefined ? {} : { missing: [...github.missing] }),
+        ...(github.incomplete === undefined ? {} : { incomplete: [...github.incomplete] }),
     };
 }
 
 /** A read time as the list and the section show it: 01:47, the server's clock. */
 const clock = (at: number) => new Date(at).toTimeString().slice(0, 5);
 
-/** The GitHub status lines for `desk list` and the section: a failure, and the skipped roster names. */
+/** The GitHub status lines for `desk list` and the section: a failure, a cut read, and the skipped roster names. */
 export function githubLines(state: Readonly<DeskState> | undefined): string[] {
     const github = state?.github;
 
@@ -3228,6 +3349,10 @@ export function githubLines(state: Readonly<DeskState> | undefined): string[] {
         lines.push(
             `GitHub: read failed at ${clock(github.at)}: ${github.error ?? "unknown error"}`,
         );
+    }
+
+    if (github.incomplete !== undefined && github.incomplete.length > 0) {
+        lines.push(`GitHub read incomplete: ${github.incomplete.join(", ")}`);
     }
 
     if (github.skipped !== undefined && github.skipped.length > 0) {
@@ -4378,11 +4503,100 @@ export default function createDesk(host: Host, web: Web) {
         return flatLine(said).slice(0, 200) || "the GitHub read failed";
     }
 
+    /** The lines without a repository's own "open PRs read" line: a PR's line (`owner/name#12:`) stays. */
+    const withoutOpenLine = (lines: string[], repo: string): string[] =>
+        lines.filter((line) => !line.startsWith(`${repo}: `));
+
+    /**
+     * Follow each repository's cursor to its last page of open PRs, at most `GITHUB_MAX_PAGES` pages: 500 PRs. A page
+     * that fails keeps the PRs that were read: the repository is incomplete, with the reason, and the sweep works. A
+     * repository with pages left after the cap is incomplete too.
+     */
+    async function pageOpen(
+        facts: GitHubFacts,
+        ask: (text: string) => Promise<{ stdout: string }>,
+    ): Promise<GitHubFacts> {
+        let incomplete = [...(facts.incomplete ?? [])];
+
+        for (const [repo, entry] of Object.entries(facts.repos)) {
+            let page = entry.page;
+            let pages = 1;
+            let failure: string | undefined;
+
+            // `parseGitHub` records a repository with more pages as incomplete: paging fixes that line here.
+            incomplete = withoutOpenLine(incomplete, repo);
+
+            while (page?.hasNextPage === true && pages < GITHUB_MAX_PAGES) {
+                if (page.endCursor === undefined) {
+                    failure = "GitHub gave no cursor for the next page";
+                    break;
+                }
+
+                let next: GitHubFacts;
+
+                try {
+                    const { stdout } = await ask(buildPageQuery(repo, page.endCursor));
+
+                    next = parseGitHub(JSON.parse(stdout));
+                } catch (error) {
+                    failure = githubError(error);
+                    break;
+                }
+
+                const more = next.repos[repo];
+
+                if (more === undefined) {
+                    failure = "the next page had no repository";
+                    break;
+                }
+
+                for (const pr of more.open) {
+                    if (!entry.open.some((one) => one.ref === pr.ref)) {
+                        entry.open.push(pr);
+                    }
+                }
+
+                // A PR of this page may have its own cut check list.
+                incomplete.push(
+                    ...(next.incomplete ?? []).filter((line) => line.startsWith(`${repo}#`)),
+                );
+                pages += 1;
+                page = more.page;
+            }
+
+            const total = page?.totalCount;
+
+            if (failure !== undefined) {
+                incomplete.push(
+                    `${openIncompleteLine(repo, entry.open.length, total)} (${failure})`,
+                );
+            } else if (
+                page?.hasNextPage === true ||
+                (total !== undefined && total > entry.open.length)
+            ) {
+                incomplete.push(openIncompleteLine(repo, entry.open.length, total));
+            }
+
+            delete entry.page;
+        }
+
+        const result: GitHubFacts = { ...facts };
+
+        if (incomplete.length === 0) {
+            delete result.incomplete;
+        } else {
+            result.incomplete = incomplete;
+        }
+
+        return result;
+    }
+
     /**
      * The one GitHub read of a sweep: its facts, or why it failed. A transient failure (`transientGitHub`) gets 1 more
      * try after `GITHUB_RETRY_MS`; a second failure is the sweep's error, as before. `gh api graphql` exits non-zero when the answer has
      * an error, but it still prints the data it has: a wrong PR ref must not hide every other PR. An alias with an
-     * error is a missing ref (`pN`) or a skipped repository (`rN`); only no data at all is a failure.
+     * error is a missing ref (`pN`) or a skipped repository (`rN`); only no data at all is a failure. Each repository
+     * with more than 1 page of open PRs is read to its last page.
      */
     async function readGitHub(
         repos: string[],
@@ -4394,21 +4608,17 @@ export default function createDesk(host: Host, web: Web) {
 
         const wanted = [...new Set(repos)];
         const pinned = [...new Set(prs)];
-
-        const query = buildQuery(wanted, pinned);
         const gh = process.env.PI_POCKET_DESK_GH ?? "gh";
-        const call = () =>
-            run(gh, ["api", "graphql", "-f", `query=${query}`], {
+        const call = (text: string) =>
+            run(gh, ["api", "graphql", "-f", `query=${text}`], {
                 timeout: 60_000,
                 maxBuffer: 8 * 1024 * 1024,
                 encoding: "utf8",
             });
 
-        try {
-            let stdout: string;
-
+        const ask = async (text: string): Promise<{ stdout: string }> => {
             try {
-                ({ stdout } = await call());
+                return await call(text);
             } catch (error) {
                 // GitHub's answer was cut or empty (a gateway timeout on a big query): 1 more try.
                 if (!transientGitHub(error)) {
@@ -4416,10 +4626,17 @@ export default function createDesk(host: Host, web: Web) {
                 }
 
                 await new Promise((resolve) => setTimeout(resolve, GITHUB_RETRY_MS));
-                ({ stdout } = await call());
-            }
 
-            return { facts: parseGitHub(JSON.parse(stdout)) };
+                return await call(text);
+            }
+        };
+
+        let facts: GitHubFacts;
+
+        try {
+            const { stdout } = await ask(buildQuery(wanted, pinned));
+
+            facts = parseGitHub(JSON.parse(stdout));
         } catch (error) {
             const failure = error as { stdout?: unknown } | null;
             const raw =
@@ -4442,7 +4659,8 @@ export default function createDesk(host: Host, web: Web) {
                 return { error: githubError(error) };
             }
 
-            const facts = parseGitHub(answer);
+            facts = parseGitHub(answer);
+
             const missing: string[] = [];
             const errors = (answer as { errors?: unknown }).errors;
 
@@ -4468,6 +4686,15 @@ export default function createDesk(host: Host, web: Web) {
 
                         if (repo !== undefined) {
                             delete facts.repos[repo];
+
+                            // Its "open PRs read" line would name a repository that the facts do not hold.
+                            const kept = withoutOpenLine(facts.incomplete ?? [], repo);
+
+                            if (kept.length === 0) {
+                                delete facts.incomplete;
+                            } else {
+                                facts.incomplete = kept;
+                            }
                         }
                     }
                 }
@@ -4476,9 +4703,9 @@ export default function createDesk(host: Host, web: Web) {
             if (missing.length > 0) {
                 facts.missing = missing;
             }
-
-            return { facts };
         }
+
+        return { facts: await pageOpen(facts, ask) };
     }
 
     /** Whether GitHub has this PR: 1 GraphQL call. An issue's number, or a wrong one, is not a PR. */
@@ -4818,6 +5045,9 @@ export default function createDesk(host: Host, web: Web) {
             ...(facts.githubError === undefined ? {} : { error: facts.githubError }),
             ...(facts.githubSkipped === undefined ? {} : { skipped: [...facts.githubSkipped] }),
             ...(facts.github?.missing === undefined ? {} : { missing: [...facts.github.missing] }),
+            ...(facts.github?.incomplete === undefined || facts.github.incomplete.length === 0
+                ? {}
+                : { incomplete: [...facts.github.incomplete] }),
         };
 
         await scanChatGrants(tx, state, supervisor, now);
