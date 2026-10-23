@@ -424,3 +424,22 @@ One module, `desk.ts` with `desk-web/`, over 2 Pocket documents: `x.desk.threads
 - **What stays with Brian:** he turns the module on, sets the cap and the extra authors in the config file, gives the OKs (the page's **Allow 1**, or `desk ok` in the chat), keeps, parks, wakes and drops threads on the page, and commits the export. The desk observes the work and closes a thread when every part is closed.
 
 `desk.test.ts` covers the rules directly and in a Pi Pocket: a delegation opens and binds one thread, the desk lists and reads it, a session without a supervisor identity is refused, a seed is imported once, a report is filed with 1 line in the chat, a message to another address keeps its full text, the built-in `team` tool is blocked, a night shift's report is filed, a parked thread wakes on an event, a watch puts a thread to sleep outside the cap and a pass closes it, the sweeper wakes an agent once when every PR on its thread is merged, the queue continues once for a thread that waits on Odrade, a page answer tells the supervisor once, and the page's routes answer the owner, refuse a guest, and change nothing on a second POST.
+
+# Daily audit
+
+`audit/daily.mjs` reads 1 day of the team's work and writes 1 short report with at most 5 proposals, each backed by facts. It is a script, not a drop-in: it adds nothing to the running server, and it needs no install, no module switch and no restart. The design, with every check and threshold, is [docs/plans/daily-audit.md](docs/plans/daily-audit.md).
+
+```sh
+npm run audit                                   # the day's report, in Odrade's reports folder
+node audit/daily.mjs --no-llm --out-dir /tmp/audit-dry-run/$(date +%F)-daily-audit
+```
+
+- **It reads only.** Pocket's database opens with `readOnly: true`. `gh` gets only `gh api` GET requests, GraphQL queries (a `mutation` is refused) and `gh search prs`, at most 40 calls a run. `git` gets only `log`, `status` and `show`.
+- **It writes 2 files:** `README.md` and `findings.json` in `$ODRADE_DIR/reports/YYYY-MM-DD-daily-audit/` (default `~/projects/odrade`), or in `--out-dir`. Other files in that folder stay as they are. Earlier days come from the sibling `*-daily-audit/findings.json` files, for "new, repeating, gone".
+- **The checks come first.** `audit/checks.mjs` has 1 function for each check of the design (A1 to J1). A check whose source fails is listed under "Skipped checks"; the run goes on.
+- **1 model call, with its limits in code** (`audit/llm.mjs`): `deepseek/deepseek-flash` through Pi's model runtime and Pi's stored sign-in; at most 30,000 input tokens, 2,000 output tokens and $0.50 a day; no call after 2 days over $0.50. The model sees only finding texts, metrics and, for up to 10 pairs, 2 report texts of at most 1,500 characters. Code checks its answer (at most 5 proposals, cited ids that exist, numbers from the cited findings). An answer that fails, or `--no-llm`, gives the plain ranked list.
+- **No secrets.** A line that matches the redaction filter is dropped, not masked; a quote is at most 80 characters; report texts never go into the report or the JSON.
+- **Options:** `--hours N` (default 24), `--date YYYY-MM-DD` (the label and the folder name; default today in America/New_York), `--out-dir DIR`, `--no-llm`, `--no-github`, `--json`. Environment: `PI_POCKET_DIR`, `ODRADE_DIR`.
+- **Tests:** `audit/*.test.ts`, on invented fixtures (a temporary SQLite file, a fake `gh` and `git`, a fake model). They never read Brian's data or call a model.
+
+Brian runs it each day at 06:30 America/New_York with a Pocket schedule in a "Daily audit" session; Odrade reads the report for the 07:30 brief.

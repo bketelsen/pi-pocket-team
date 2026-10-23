@@ -204,11 +204,12 @@ The JSON keeps every finding, so the next day can say what is new, what repeats,
   to the running server, and no restart or module switch is needed.
 - 1 dedicated session, "Daily audit", with 1 Pocket schedule: `every day 6:30`
   (America/New_York: 10:30 UTC, outside DeepSeek's peak window, and 1 hour before Odrade's 07:30
-  brief). The scheduled message tells Pi to run the script, do the LLM steps on its JSON, write
-  the report to `/var/home/bjk/projects/odrade/reports/YYYY-MM-DD-daily-audit/README.md`, and end
-  with 1 line.
-- Model: `deepseek/deepseek-flash` for the LLM steps (T108b). The session is small and new each
-  day (Pi compacts it), so the cost stays low.
+  brief). The scheduled message tells Pi to run `npm run audit` and end with 1 line. The script
+  writes the report to `/var/home/bjk/projects/odrade/reports/YYYY-MM-DD-daily-audit/README.md`.
+- Model: `deepseek/deepseek-flash` for the LLM steps (T108b). The script makes the 1 model call
+  itself, through Pi's model runtime and Pi's stored DeepSeek sign-in, so the limits of Section 8
+  are in code (`audit/llm.mjs`), not in a prompt. The session itself only runs the script; it can
+  run on any model, and DeepSeek Flash keeps it cheap.
 - The audit writes only that folder. It does not commit it, and it does not edit Odrade's
   `README.md` index: Odrade commits the folder with her digest.
 - Odrade reads the day's report and brings its proposals to Brian in the 07:30 brief; she files
@@ -226,7 +227,7 @@ Rejected for now:
 | Part          | Limit                                                                                                                             |
 | ------------- | --------------------------------------------------------------------------------------------------------------------------------- |
 | Deterministic | 0 model tokens; at most 40 GitHub calls (the trial used about 15); under 2 minutes (the trial took about 25 s)                    |
-| LLM           | 1 turn a day; input at most 30,000 tokens (the script cuts the findings to fit); output at most 2,000 tokens; at most $0.50 a day |
+| LLM           | 1 call a day; input at most 30,000 tokens (the script cuts the findings to fit); output at most 2,000 tokens; at most $0.50 a day |
 | Over a limit  | The script sends less (fewer findings, no pair checks). After 2 days over $0.50, the run is deterministic only.                   |
 
 For scale: the team spent about $1,162 in the trial's 72 hours. The audit's limit is under 0.2% of
