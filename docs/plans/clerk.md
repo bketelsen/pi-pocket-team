@@ -146,9 +146,12 @@ never send Brian a message. Write to Odrade in ASD-STE100.
 
 ## 8. Restart safety and stored data
 
-- `DeskState.clerks?: Record<supervisor id, { session: number; address: string; agent: string; at: number }>`:
-  new and optional. The registration lands in the same commit as the Clerk's identity, under the start's
-  replay key, so a replay registers once.
+- `DeskState.clerks?: Record<supervisor id, { session: number; address: string; agent: string; at: number; key?: string }>`:
+  new and optional. The registration lands in the same commit as the Clerk's identity, and stores the
+  start's replay key (`key`): a replay of the same `team_delegate` call registers once and gives the same
+  reply, while a new call is refused when a live Clerk is there.
+- `team_delegate` refuses a `night_shift` or a `watch` for the Clerk: it has no desk thread.
+- The desk API has 2 new members: `clerk` (register) and `clerkOf` (the read before a start).
 - `desk send` uses the key `x.desk.send:<task>:<call>`: a replay sends once.
 - The digest's split happens in the `take` commit: each target gets its own request id
   (`x.desk.digest:<supervisor>:<seq>` and `…:<seq>:clerk`), so a restart in `deliver` sends each once.
