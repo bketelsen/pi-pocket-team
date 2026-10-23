@@ -161,10 +161,11 @@ export type Thread = {
     /**
      * Facts the sweep keeps: `returnAddress`, `reportedAt`, `reportedUserEntry`, `scanCursor`, `lastUserEntry`,
      * `seenPrs`, `busy`, `archived`, `shift`, `dirty`, `ahead`, `folder`, `next`, `sweptAt`, `closeout` (the
-     * wake-up key that went, so a sweep does not send it again), and `closeoutEntry` (the session's newest user entry
-     * before it went: a report past it lets the thread close), `repairs` (the repair wake-ups the sweep decided, by
-     * repair key: `{ at, to, why, sent }`, at most 30), and `repairCounts` (PR ref → the repair wake-ups that went to
-     * the agent: never pruned).
+     * wake-up key that went last, so a sweep does not send it again), `closeoutEntry` (the session's newest user entry
+     * before it went: a report past it lets the thread close), `closeoutRefs` (every PR ref an earlier wake-up told the
+     * agent, sorted, at most 50: a state of only told refs is no new wake-up, so a detached PR cannot send again),
+     * `repairs` (the repair wake-ups the sweep decided, by repair key: `{ at, to, why, sent }`, at most 30), and
+     * `repairCounts` (PR ref → the repair wake-ups that went to the agent: never pruned).
      */
     run: Record<string, JsonValue>;
     /** The last 50; `key` makes an event unique. */
@@ -1124,17 +1125,29 @@ export function closeCheck(thread: Thread, facts: CloseFacts): { close: boolean;
 }
 
 /**
- * The wake-up key of a thread whose PRs are all merged or closed: `closeout:<thread.key>:<refs>`. Undefined when the
- * thread is not open (parked, starting, closed), has no PR, has a PR that is still open, has no address for its agent,
- * is archived, or already sent this key. A new PR gives a new key, so the agent hears about it.
+ * The wake-up key of a thread that needs a close-out wake-up: `closeout:<thread.key>:<refs>`, the refs of its PRs
+ * that are not guessed (`via: "window"`). Undefined when the thread is not open (parked, starting, closed), has no PR
+ * that is not guessed, has such a PR still open, has no address for its agent, is archived, or when every ref in the
+ * key was already told by an earlier wake-up. A new PR gives a new key, so the agent hears about it; a PR that leaves
+ * the thread gives a state the agent already has, so it sends nothing.
  */
 export function closeoutKey(thread: Thread): string | undefined {
     const key = closeoutDue(thread);
 
-    return key === undefined || thread.run.closeout === key ? undefined : key;
+    if (key === undefined) {
+        return undefined;
+    }
+
+    const told = new Set(closeoutTold(thread));
+
+    return closeoutKeyRefs(thread, key).every((ref) => told.has(ref)) ? undefined : key;
 }
 
-/** The close-out key of an open thread with a bound, non-archived agent and every PR closed, sent or not. */
+/**
+ * The close-out key of an open thread with a bound, non-archived agent and every counted PR closed, sent or not. A
+ * guessed PR (`via: "window"`) counts for nothing: the agent did not make it, so it must not make a wake-up, and its
+ * state must not keep one away.
+ */
 function closeoutDue(thread: Thread): string | undefined {
     if (thread.state !== "open" || thread.address === undefined) {
         return undefined;
@@ -1144,7 +1157,9 @@ function closeoutDue(thread: Thread): string | undefined {
         return undefined;
     }
 
-    const refs = Object.keys(thread.prs).sort();
+    const refs = Object.keys(thread.prs)
+        .filter((ref) => thread.prs[ref]?.via !== "window")
+        .sort();
 
     if (refs.length === 0 || !refs.every((ref) => CLOSED_PR.has(thread.prs[ref]?.state ?? ""))) {
         return undefined;
@@ -1153,11 +1168,51 @@ function closeoutDue(thread: Thread): string | undefined {
     return `closeout:${thread.key}:${refs.join(",")}`;
 }
 
+/** The PR refs a close-out key covers: the part after `closeout:<thread.key>:`, split on `,`. None for another key. */
+function closeoutKeyRefs(thread: Thread, key: string): string[] {
+    const prefix = `closeout:${thread.key}:`;
+
+    return key.startsWith(prefix)
+        ? key
+              .slice(prefix.length)
+              .split(",")
+              .filter((ref) => ref !== "")
+        : [];
+}
+
+/**
+ * The refs that earlier close-out wake-ups told the agent: `run.closeoutRefs`, or, for older data, the refs in
+ * `run.closeout`. None when there is neither, or when `run.closeout` is another thread's key.
+ */
+function closeoutTold(thread: Thread): string[] {
+    const stored = thread.run.closeoutRefs;
+
+    if (Array.isArray(stored)) {
+        return stored.filter((ref): ref is string => typeof ref === "string");
+    }
+
+    const sent = thread.run.closeout;
+
+    return typeof sent === "string" ? closeoutKeyRefs(thread, sent) : [];
+}
+
+/** The most PR refs `run.closeoutRefs` keeps: the newest, by sort order. */
+const CLOSEOUT_REFS_MAX = 50;
+
+/** The refs told after a wake-up for `key`: the told refs and the key's refs, sorted, at most the newest 50. */
+function closeoutRefsAfter(thread: Thread, key: string): string[] {
+    const refs = [...new Set([...closeoutTold(thread), ...closeoutKeyRefs(thread, key)])].sort();
+
+    return refs.slice(-CLOSEOUT_REFS_MAX);
+}
+
 /**
  * What the close-out wake-up still holds open, in words: the wake-up has not gone, or the agent has not reported after
  * it: a report whose newest user entry is past `closeoutEntry`, the session's newest user entry before the send (entry
  * ids, not clocks). A thread with only an address cannot report (its reports have no session to file from), so the
- * wake-up alone is enough there. A key sent before `closeoutEntry` existed holds nothing. Undefined when nothing is held.
+ * wake-up alone is enough there. A wake-up sent before `closeoutEntry` existed holds nothing. Undefined when nothing is
+ * held, and when every ref of the due state was told before. It follows `closeoutKey`: a due ref that no wake-up told
+ * is the wake-up that has not gone.
  */
 export function closeoutHold(thread: Thread): string | undefined {
     const key = closeoutDue(thread);
@@ -1166,7 +1221,9 @@ export function closeoutHold(thread: Thread): string | undefined {
         return undefined;
     }
 
-    if (thread.run.closeout !== key) {
+    const told = new Set(closeoutTold(thread));
+
+    if (!closeoutKeyRefs(thread, key).every((ref) => told.has(ref))) {
         return "the close-out wake-up has not gone";
     }
 
@@ -5424,6 +5481,7 @@ export default function createDesk(host: Host, web: Web) {
                             if (thread !== undefined) {
                                 thread.run.closeout = wake.key;
                                 thread.run.closeoutEntry = wake.entry;
+                                thread.run.closeoutRefs = closeoutRefsAfter(thread, wake.key);
                                 addEvent(
                                     thread,
                                     `closeout:${wake.key}`,

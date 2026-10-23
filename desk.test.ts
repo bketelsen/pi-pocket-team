@@ -715,6 +715,54 @@ describe("closeoutKey", () => {
         assert.equal(closeoutKey(one), undefined);
         assert.equal(closeoutKey(two), "closeout:k:frostyard/test#1,frostyard/test#2");
     });
+
+    test("a PR detached after the wake-up gives no new key and no hold", () => {
+        // The wake-up covered #1 and #2; a sweep later detached #2: what is left is a state the agent has.
+        const detached = thread({
+            prs: prs("MERGED"),
+            run: {
+                closeout: "closeout:k:frostyard/test#1,frostyard/test#2",
+                closeoutEntry: 5,
+                reportedUserEntry: 6,
+            },
+        });
+
+        assert.equal(closeoutKey(detached), undefined);
+        assert.equal(closeoutHold(detached), undefined);
+    });
+
+    test("a PR attached through the window guess makes no new state", () => {
+        // #1 is the thread's own PR and #2 came from the guess: only #1 was told, and #1 alone is not new.
+        const guessed = thread({
+            prs: {
+                "frostyard/test#1": { via: "seen" as const, state: "MERGED" as const },
+                "frostyard/test#2": { via: "window" as const, state: "MERGED" as const },
+            },
+            run: { closeout: "closeout:k:frostyard/test#1" },
+        });
+
+        assert.equal(closeoutKey(guessed), undefined);
+
+        // Only a guessed PR, and no wake-up yet: nothing to close out, and nothing holds the thread open.
+        const only = thread({
+            prs: { "frostyard/test#2": { via: "window" as const, state: "MERGED" as const } },
+        });
+
+        assert.equal(closeoutKey(only), undefined);
+        assert.equal(closeoutHold(only), undefined);
+    });
+
+    test("the refs in run.closeoutRefs are the refs told, past the older run.closeout", () => {
+        const told = thread({
+            prs: prs("MERGED", "MERGED"),
+            run: {
+                closeout: "closeout:k:frostyard/test#2",
+                closeoutRefs: ["frostyard/test#1", "frostyard/test#2"],
+            },
+        });
+
+        assert.equal(closeoutKey(told), undefined);
+    });
 });
 
 describe("odradeReason", () => {
@@ -6622,6 +6670,7 @@ describe("the desk in a Pi Pocket", () => {
             const after = (await deskState())?.threads[thread.id];
 
             assert.equal(after?.run.closeout, key);
+            assert.deepEqual(after?.run.closeoutRefs, ["frostyard/test#7"]);
             assert.equal(after?.events.at(-1)?.text, "close-out wake-up sent");
             await until(async () => (await sent()) === 1, "the agent's wake-up", 20_000);
 
