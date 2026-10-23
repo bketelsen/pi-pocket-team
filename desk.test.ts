@@ -58,6 +58,7 @@ import {
     closeoutHold,
     closeoutKey,
     assignWorktrees,
+    ownedWorktrees,
     parseWorktrees,
     isStale,
     nextActor,
@@ -2303,6 +2304,31 @@ describe("assignWorktrees", () => {
             ],
             ["T1"],
         );
+    });
+
+    test("ownedWorktrees: open threads' folders, and every delegation worktree", () => {
+        const paths = ownedWorktrees([
+            owned("T1", 100, { cwd: "/work/test" }),
+            owned("T2", 120, {
+                cwd: "/work/test--duncan-aaaa1111",
+                worktree: {
+                    path: "/work/test--duncan-aaaa1111",
+                    branch: "duncan/aaaa1111",
+                    checkout: "/work/test",
+                },
+            }),
+            owned("T3", 130, {
+                state: "closed",
+                cwd: "/work/closed",
+                worktree: { path: "/work/closed-wt", branch: "x", checkout: "/work/closed" },
+            }),
+        ]);
+
+        assert.deepEqual([...paths].sort(), [
+            "/work/closed-wt",
+            "/work/test",
+            "/work/test--duncan-aaaa1111",
+        ]);
     });
 
     test("a closed thread holds nothing: the older open thread holds it", () => {

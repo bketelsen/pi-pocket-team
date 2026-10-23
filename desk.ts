@@ -1305,6 +1305,28 @@ export type WorktreeFact = {
 export type WorktreeLine = { path: string; dirty: number; unpushed: number };
 
 /**
+ * The folders that belong to a thread as its own: each open thread's folder, and each thread's delegation worktree
+ * (open or closed). Such a folder is never another thread's linked worktree.
+ */
+export function ownedWorktrees(threads: readonly Thread[]): Set<string> {
+    const owned = new Set<string>();
+
+    for (const thread of threads) {
+        const own = folderOf(thread);
+
+        if (thread.state !== "closed" && own !== undefined) {
+            owned.add(own);
+        }
+
+        if (thread.worktree !== undefined) {
+            owned.add(thread.worktree.path);
+        }
+    }
+
+    return owned;
+}
+
+/**
  * The worktrees that hold a thread of `folder`: a map of thread id to them. A worktree holds a thread only when it has
  * changed files or unpushed commits, its `created` is known, and its branch is not in `doneBranches` (a merged or closed
  * PR's branch keeps commits that are on no remote, and a squash-merge leaves them: it is not work). It belongs to the 1
@@ -1323,19 +1345,7 @@ export function assignWorktrees(
         .filter((thread) => thread.state !== "closed" && folderOf(thread) === folder)
         .sort((a, b) => b.startedAt - a.startedAt);
     const held = new Map<string, WorktreeFact[]>();
-    const owned = new Set<string>();
-
-    for (const thread of threads) {
-        const own = folderOf(thread);
-
-        if (thread.state !== "closed" && own !== undefined) {
-            owned.add(own);
-        }
-
-        if (thread.worktree !== undefined) {
-            owned.add(thread.worktree.path);
-        }
-    }
+    const owned = ownedWorktrees(threads);
 
     for (const worktree of worktrees) {
         const works = worktree.dirty > 0 || worktree.unpushed > 0;
@@ -5885,7 +5895,10 @@ export default function createDesk(host: Host, web: Web) {
      * The linked worktrees of a folder, as the sweep reads them; null when git cannot list them. The first block is the
      * main worktree: its counts are the folder's own. A block with no branch holds no thread's work.
      */
-    async function worktreeFacts(folder: string): Promise<WorktreeFact[] | null> {
+    async function worktreeFacts(
+        folder: string,
+        owned: ReadonlySet<string> = new Set(),
+    ): Promise<WorktreeFact[] | null> {
         try {
             const { stdout } = await run("git", ["-C", folder, "worktree", "list", "--porcelain"], {
                 timeout: 10_000,
@@ -5895,7 +5908,7 @@ export default function createDesk(host: Host, web: Web) {
             const facts: WorktreeFact[] = [];
 
             for (const block of parseWorktrees(stdout).slice(1)) {
-                if (block.branch === undefined || block.bare === true) {
+                if (block.branch === undefined || block.bare === true || owned.has(block.path)) {
                     continue;
                 }
 
@@ -6139,9 +6152,20 @@ export default function createDesk(host: Host, web: Web) {
         const facts: Record<string, FolderFact | null> = {};
         const worktrees: Record<string, WorktreeFact[] | null> = {};
 
+        // A delegation's worktree is its thread's own folder: its counts come from `statusOf`, it lists no linked
+        // worktrees of its own, and no other folder's list reads it again. Without this, every folder of a repository
+        // with many delegation worktrees reads every one of them, on each sweep.
+        const all = Object.values(state?.threads ?? {});
+        const owned = ownedWorktrees(all);
+        const delegations = new Set(
+            all
+                .map((thread) => thread.worktree?.path)
+                .filter((path): path is string => path !== undefined),
+        );
+
         for (const folder of folders) {
             facts[folder] = await statusOf(folder);
-            worktrees[folder] = await worktreeFacts(folder);
+            worktrees[folder] = delegations.has(folder) ? [] : await worktreeFacts(folder, owned);
         }
 
         return {
