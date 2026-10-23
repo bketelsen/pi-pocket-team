@@ -160,12 +160,13 @@ export type Thread = {
     asks: Ask[];
     /**
      * Facts the sweep keeps: `returnAddress`, `reportedAt`, `reportedUserEntry`, `scanCursor`, `lastUserEntry`,
-     * `seenPrs`, `busy`, `archived`, `shift`, `dirty`, `ahead`, `folder`, `next`, `sweptAt`, `closeout` (the
-     * wake-up key that went last, so a sweep does not send it again), `closeoutEntry` (the session's newest user entry
-     * before it went: a report past it lets the thread close), `closeoutRefs` (every PR ref an earlier wake-up told the
-     * agent, sorted, at most 50: a state of only told refs is no new wake-up, so a detached PR cannot send again),
-     * `repairs` (the repair wake-ups the sweep decided, by repair key: `{ at, to, why, sent }`, at most 30), and
-     * `repairCounts` (PR ref → the repair wake-ups that went to the agent: never pruned).
+     * `seenPrs`, `busy`, `archived`, `shift`, `dirty`, `ahead`, `aheadUnknown` (why the unpushed count is unknown: it
+     * is absent when the count is known, and `ahead` then keeps its last known value), `folder`, `next`, `sweptAt`,
+     * `closeout` (the wake-up key that went last, so a sweep does not send it again), `closeoutEntry` (the session's
+     * newest user entry before it went: a report past it lets the thread close), `closeoutRefs` (every PR ref an
+     * earlier wake-up told the agent, sorted, at most 50: a state of only told refs is no new wake-up, so a detached PR
+     * cannot send again), `repairs` (the repair wake-ups the sweep decided, by repair key: `{ at, to, why, sent }`, at
+     * most 30), and `repairCounts` (PR ref → the repair wake-ups that went to the agent: never pruned).
      */
     run: Record<string, JsonValue>;
     /** The last 50; `key` makes an event unique. */
@@ -978,19 +979,41 @@ export function scanText(text: string): { prs: string[]; branches: string[] } {
     return { prs: [...prs], branches: [...branches] };
 }
 
-/** `git status --porcelain=v2 --branch`: the changed files, the commits ahead, and the branch name. */
-export function parseStatus(text: string): { dirty: number; ahead: number; branch?: string } {
+/**
+ * Why a folder's unpushed commit count is unknown: `git status` printed no `# branch.ab` line, the count could not be
+ * verified (`git rev-list` failed), or git could not read the folder at all.
+ */
+export type AheadUnknown =
+    "no upstream" | "detached HEAD" | "upstream gone" | "no branch" | "git status failed";
+
+/**
+ * `git status --porcelain=v2 --branch`: the changed files, the commits ahead, and the branch name. `ahead` is undefined
+ * when git printed no `# branch.ab` line, with the reason: a branch with no upstream, a detached HEAD, or an upstream
+ * that is gone is not the same as 0 unpushed commits.
+ */
+export function parseStatus(text: string): {
+    dirty: number;
+    ahead: number | undefined;
+    aheadUnknown?: AheadUnknown;
+    branch?: string;
+} {
     let dirty = 0;
-    let ahead = 0;
+    let ahead: number | undefined;
     let branch: string | undefined;
+    let detached = false;
+    let upstream = false;
 
     for (const line of text.split("\n")) {
         if (line.startsWith("# branch.head ")) {
             const name = line.slice("# branch.head ".length).trim();
 
-            if (name !== "(detached)") {
+            if (name === "(detached)") {
+                detached = true;
+            } else {
                 branch = name;
             }
+        } else if (line.startsWith("# branch.upstream ")) {
+            upstream = true;
         } else if (line.startsWith("# branch.ab ")) {
             const match = /\+(\d+) -(\d+)/.exec(line);
 
@@ -1002,7 +1025,22 @@ export function parseStatus(text: string): { dirty: number; ahead: number; branc
         }
     }
 
-    return { dirty, ahead, ...(branch === undefined ? {} : { branch }) };
+    // Git prints `# branch.upstream` without `# branch.ab` when the upstream is gone, and `# branch.head (detached)`
+    // for a detached HEAD.
+    const reason: AheadUnknown = detached
+        ? "detached HEAD"
+        : upstream
+          ? "upstream gone"
+          : branch === undefined
+            ? "no branch"
+            : "no upstream";
+
+    return {
+        dirty,
+        ahead,
+        ...(ahead === undefined ? { aheadUnknown: reason } : {}),
+        ...(branch === undefined ? {} : { branch }),
+    };
 }
 
 const CLOSED_PR = new Set(["MERGED", "CLOSED", "FROZEN"]);
@@ -1116,12 +1154,17 @@ export function closeCheck(thread: Thread, facts: CloseFacts): { close: boolean;
     if (folder !== undefined && !facts.folders.has(folder)) {
         const dirty = numberOr(thread.run.dirty) ?? 0;
         const ahead = numberOr(thread.run.ahead) ?? 0;
+        const aheadUnknown =
+            typeof thread.run.aheadUnknown === "string" ? thread.run.aheadUnknown : undefined;
 
         if (dirty > 0) {
             open.push(`${String(dirty)} changed file${dirty === 1 ? "" : "s"} in ${folder}`);
         }
 
-        if (ahead > 0) {
+        // A count the desk cannot know is not 0: the thread waits for the agent, as an unpushed commit does.
+        if (aheadUnknown !== undefined) {
+            open.push(`unpushed commits in ${folder} are unknown (${aheadUnknown})`);
+        } else if (ahead > 0) {
             open.push(`${String(ahead)} unpushed commit${ahead === 1 ? "" : "s"} in ${folder}`);
         }
     }
@@ -1605,10 +1648,11 @@ export function nextActor(thread: Thread): NextActor {
     const busy = thread.run.busy === true;
     const dirty = (numberOr(thread.run.dirty) ?? 0) > 0;
     const ahead = (numberOr(thread.run.ahead) ?? 0) > 0;
+    const aheadUnknown = typeof thread.run.aheadUnknown === "string";
     const shift = thread.run.shift;
     const shiftOpen = typeof shift === "string" && shift !== "ended";
 
-    if (busy || dirty || ahead || shiftOpen || openPrs.includes("agent")) {
+    if (busy || dirty || ahead || aheadUnknown || shiftOpen || openPrs.includes("agent")) {
         return "agent";
     }
 
@@ -1633,7 +1677,8 @@ export function nextActor(thread: Thread): NextActor {
         openSession(thread) === undefined &&
         !shiftOpen &&
         !dirty &&
-        !ahead
+        !ahead &&
+        !aheadUnknown
     ) {
         return "reviewer";
     }
@@ -4196,7 +4241,17 @@ export default function createDesk(host: Host, web: Web) {
     type Reader = Pick<DocumentReader, "snapshot">;
 
     type SessionFact = { address: string; busy: boolean; archived: boolean; title?: string };
-    type FolderFact = { dirty: number; ahead: number };
+    type FolderFact = {
+        dirty: number;
+        /** The commits that no remote-tracking ref has; undefined when git could not tell, never 0. */
+        ahead: number | undefined;
+        /** Why `ahead` is unknown. */
+        aheadUnknown?: AheadUnknown;
+        /** `git status` failed in a repository: its counts are unknown, not clean. */
+        statusFailed?: true;
+        /** The folder is not on disk, as after an agent removes its worktree: keep the last counts, and no failure. */
+        gone?: true;
+    };
 
     /** What one sweep read, before its commit. A missing key means the read failed: the thread keeps its old value. */
     type SweepFacts = {
@@ -4204,7 +4259,7 @@ export default function createDesk(host: Host, web: Web) {
         sessions?: SessionFact[];
         /** By session id: a status, or null when that session has no goal. */
         shifts: Record<string, string | null>;
-        /** By folder: its counts, or null when it is not a git repository. */
+        /** By folder: its counts, null when it is not a git repository, or a fact with `gone` when it is not on disk. */
         folders: Record<string, FolderFact | null>;
         github?: GitHubFacts;
         /** Why the GitHub read failed, in one line; absent when it worked. */
@@ -4219,21 +4274,88 @@ export default function createDesk(host: Host, web: Web) {
 
     const run = promisify(execFile);
 
-    /** `git status` of one folder: null when it is not a git repository, or git cannot read it. */
-    async function statusOf(folder: string): Promise<FolderFact | null> {
+    /** One git read of a folder: its text, or undefined when the call failed. */
+    async function gitText(folder: string, args: string[]): Promise<string | undefined> {
         try {
-            const { stdout } = await run(
-                "git",
-                ["-C", folder, "status", "--porcelain=v2", "--branch"],
-                { timeout: 10_000, maxBuffer: 4 * 1024 * 1024, encoding: "utf8" },
-            );
-            const status = parseStatus(stdout);
+            const { stdout } = await run("git", ["-C", folder, ...args], {
+                timeout: 10_000,
+                maxBuffer: 4 * 1024 * 1024,
+                encoding: "utf8",
+            });
 
-            return { dirty: status.dirty, ahead: status.ahead };
+            return stdout;
         } catch {
-            return null;
+            return undefined;
         }
     }
+
+    /** Whether a folder is on disk. */
+    const exists = (folder: string): Promise<boolean> =>
+        access(folder).then(
+            () => true,
+            () => false,
+        );
+
+    /**
+     * `git status` of one folder: null when it is not a git repository, as before. A repository whose status git cannot
+     * read is a fact with `statusFailed`: a failed read is not a clean folder. When git prints no `# branch.ab` line,
+     * `git rev-list --count HEAD --not --remotes` counts the commits that no remote-tracking ref has.
+     */
+    async function statusOf(folder: string): Promise<FolderFact | null> {
+        const text = await gitText(folder, ["status", "--porcelain=v2", "--branch"]);
+
+        if (text === undefined) {
+            // A folder that is gone (an agent removed its worktree after a merge) is no failure: its counts stay.
+            if (!(await exists(folder))) {
+                return { dirty: 0, ahead: undefined, gone: true };
+            }
+
+            return (await gitText(folder, ["rev-parse", "--git-dir"])) === undefined
+                ? null
+                : {
+                      dirty: 0,
+                      ahead: undefined,
+                      aheadUnknown: "git status failed",
+                      statusFailed: true,
+                  };
+        }
+
+        const status = parseStatus(text);
+
+        if (status.ahead !== undefined) {
+            return { dirty: status.dirty, ahead: status.ahead };
+        }
+
+        // No `# branch.ab` line: this works for a branch with no upstream and for a detached HEAD. It fails when there is
+        // no commit to count (an empty repository), and the count then stays unknown with its reason.
+        const counted = await gitText(folder, [
+            "rev-list",
+            "--count",
+            "HEAD",
+            "--not",
+            "--remotes",
+        ]);
+        const ahead = counted === undefined ? Number.NaN : Number(counted.trim());
+
+        return Number.isInteger(ahead) && ahead >= 0
+            ? { dirty: status.dirty, ahead }
+            : {
+                  dirty: status.dirty,
+                  ahead: undefined,
+                  aheadUnknown: status.aheadUnknown ?? "no branch",
+              };
+    }
+
+    /**
+     * Whether a folder's counts are work: changed files, or commits that are known to be unpushed. An unknown count is
+     * not work: a main checkout on a detached HEAD is not new work.
+     */
+    const folderWork = (counts: FolderFact | null | undefined): counts is FolderFact =>
+        counts !== undefined &&
+        counts !== null &&
+        counts.statusFailed !== true &&
+        counts.gone !== true &&
+        (counts.dirty > 0 || (counts.ahead ?? 0) > 0);
 
     const LOGIN = /^[A-Za-z0-9][A-Za-z0-9-]{0,38}(\[bot\])?$/;
 
@@ -4823,7 +4945,7 @@ export default function createDesk(host: Host, web: Web) {
         await scanChatGrants(tx, state, supervisor, now);
 
         const dirtyFolders = Object.entries(facts.folders)
-            .filter(([, counts]) => counts !== null && (counts.dirty > 0 || counts.ahead > 0))
+            .filter(([, counts]) => folderWork(counts))
             .map(([folder]) => folder);
 
         if (state.baseline[key] === undefined) {
@@ -4932,8 +5054,35 @@ export default function createDesk(host: Host, web: Web) {
 
             const folder = folderOf(thread);
             const counts = folder === undefined ? undefined : facts.folders[folder];
+            // A folder that the read cannot see, after the thread had counts, was a repository git could not read.
+            const knownBefore =
+                numberOr(thread.run.dirty) !== undefined ||
+                numberOr(thread.run.ahead) !== undefined;
+            const gone = counts !== undefined && counts !== null && counts.gone === true;
+            const failed =
+                counts === undefined || gone
+                    ? false
+                    : counts === null
+                      ? knownBefore
+                      : counts.statusFailed === true;
 
-            if (counts !== undefined && counts !== null) {
+            if (failed) {
+                // A failed read is not a clean folder: keep the last counts, and say the unpushed count is unknown.
+                if (thread.run.aheadUnknown !== "git status failed") {
+                    thread.run.aheadUnknown = "git status failed";
+
+                    if (
+                        addEvent(
+                            thread,
+                            `aheadUnknown:git status failed:${String(now)}`,
+                            "unpushed commits unknown: git status failed",
+                            now,
+                        )
+                    ) {
+                        events += 1;
+                    }
+                }
+            } else if (counts !== undefined && counts !== null && counts.gone !== true) {
                 if (thread.run.dirty !== counts.dirty) {
                     thread.run.dirty = counts.dirty;
 
@@ -4951,20 +5100,44 @@ export default function createDesk(host: Host, web: Web) {
                     }
                 }
 
-                if (thread.run.ahead !== counts.ahead) {
-                    thread.run.ahead = counts.ahead;
+                const wasUnknown = thread.run.aheadUnknown !== undefined;
 
-                    if (
-                        addEvent(
-                            thread,
-                            `ahead:${String(counts.ahead)}:${String(now)}`,
-                            counts.ahead === 0
-                                ? "nothing is unpushed"
-                                : `${String(counts.ahead)} unpushed commit${counts.ahead === 1 ? "" : "s"}`,
-                            now,
-                        )
-                    ) {
-                        events += 1;
+                if (counts.ahead !== undefined) {
+                    delete thread.run.aheadUnknown;
+
+                    if (thread.run.ahead !== counts.ahead || wasUnknown) {
+                        thread.run.ahead = counts.ahead;
+
+                        if (
+                            addEvent(
+                                thread,
+                                `ahead:${String(counts.ahead)}:${String(now)}`,
+                                counts.ahead === 0
+                                    ? "nothing is unpushed"
+                                    : `${String(counts.ahead)} unpushed commit${counts.ahead === 1 ? "" : "s"}`,
+                                now,
+                            )
+                        ) {
+                            events += 1;
+                        }
+                    }
+                } else {
+                    // Never write 0 into `ahead`: the desk does not know the count, and says why once per change.
+                    const reason = counts.aheadUnknown ?? "no branch";
+
+                    if (thread.run.aheadUnknown !== reason) {
+                        thread.run.aheadUnknown = reason;
+
+                        if (
+                            addEvent(
+                                thread,
+                                `aheadUnknown:${reason}:${String(now)}`,
+                                `unpushed commits unknown: ${reason}`,
+                                now,
+                            )
+                        ) {
+                            events += 1;
+                        }
                     }
                 }
             }
@@ -5186,7 +5359,12 @@ export default function createDesk(host: Host, web: Web) {
         const pending = (baseline.pending ??= {});
 
         for (const [folder, counts] of Object.entries(facts.folders)) {
-            if (counts === null || (counts.dirty === 0 && counts.ahead === 0)) {
+            if (counts !== null && counts.statusFailed === true) {
+                // A failed read says nothing about the folder: the pending time it had stays.
+                continue;
+            }
+
+            if (!folderWork(counts)) {
                 delete pending[folder];
                 continue;
             }
@@ -5228,7 +5406,9 @@ export default function createDesk(host: Host, web: Web) {
                 run: {
                     folder,
                     dirty: counts.dirty,
-                    ahead: counts.ahead,
+                    ...(counts.ahead === undefined
+                        ? { aheadUnknown: counts.aheadUnknown ?? "no branch" }
+                        : { ahead: counts.ahead }),
                     next: "odrade",
                     sweptAt: now,
                 },
@@ -5254,7 +5434,14 @@ export default function createDesk(host: Host, web: Web) {
         baseline.folders = baseline.folders.filter((folder) => {
             const counts = facts.folders[folder];
 
-            return counts === undefined || counts === null || counts.dirty > 0 || counts.ahead > 0;
+            return (
+                counts === undefined ||
+                counts === null ||
+                counts.statusFailed === true ||
+                counts.gone === true ||
+                counts.dirty > 0 ||
+                (counts.ahead ?? 0) > 0
+            );
         });
 
         return { events };

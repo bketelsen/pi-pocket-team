@@ -638,6 +638,26 @@ describe("closeCheck", () => {
         );
     });
 
+    test("an unpushed count that is unknown holds it open", () => {
+        const unknown = closeCheck(
+            thread({ run: { ahead: 0, aheadUnknown: "detached HEAD" } }),
+            facts(),
+        );
+
+        assert.equal(unknown.close, false);
+        assert.deepEqual(unknown.open, [
+            "unpushed commits in /work/test are unknown (detached HEAD)",
+        ]);
+        assert.equal(
+            closeCheck(
+                thread({ run: { aheadUnknown: "no upstream" } }),
+                facts(1000, ["/work/test"]),
+            ).close,
+            true,
+            "another thread works in the folder",
+        );
+    });
+
     test("a thread still starting closes as failed after an hour", () => {
         const starting = thread({ state: "starting", startedAt: 0 });
 
@@ -657,6 +677,7 @@ describe("nextActor", () => {
         assert.equal(nextActor(thread({ run: { busy: true } })), "agent");
         assert.equal(nextActor(thread({ run: { dirty: 2 } })), "agent");
         assert.equal(nextActor(thread({ run: { ahead: 1 } })), "agent");
+        assert.equal(nextActor(thread({ run: { aheadUnknown: "no upstream" } })), "agent");
         assert.equal(nextActor(thread({ run: { shift: "running" } })), "agent");
         assert.equal(nextActor(thread({ run: { shift: "summary" } })), "agent");
         assert.equal(nextActor(thread({ run: { busy: false, lastUserEntry: 6 } })), "odrade");
@@ -1898,7 +1919,50 @@ describe("parseStatus", () => {
         ].join("\n");
 
         assert.deepEqual(parseStatus(text), { dirty: 2, ahead: 2, branch: "main" });
-        assert.deepEqual(parseStatus(""), { dirty: 0, ahead: 0 });
+    });
+
+    test("a branch with no upstream has an unknown count, not 0", () => {
+        const text = ["# branch.oid 1234", "# branch.head main"].join("\n");
+
+        assert.deepEqual(parseStatus(text), {
+            dirty: 0,
+            ahead: undefined,
+            aheadUnknown: "no upstream",
+            branch: "main",
+        });
+    });
+
+    test("a detached HEAD has an unknown count, not 0", () => {
+        const text = ["# branch.oid 1234", "# branch.head (detached)"].join("\n");
+
+        assert.deepEqual(parseStatus(text), {
+            dirty: 0,
+            ahead: undefined,
+            aheadUnknown: "detached HEAD",
+        });
+    });
+
+    test("an upstream that is gone has an unknown count, not 0", () => {
+        const text = [
+            "# branch.oid 1234",
+            "# branch.head main",
+            "# branch.upstream origin/main",
+        ].join("\n");
+
+        assert.deepEqual(parseStatus(text), {
+            dirty: 0,
+            ahead: undefined,
+            aheadUnknown: "upstream gone",
+            branch: "main",
+        });
+    });
+
+    test("no branch line at all has an unknown count, not 0", () => {
+        assert.deepEqual(parseStatus(""), {
+            dirty: 0,
+            ahead: undefined,
+            aheadUnknown: "no branch",
+        });
     });
 });
 
@@ -4160,7 +4224,7 @@ function git(folder: string, ...args: string[]): void {
     execFileSync("git", args, { cwd: folder, env: gitEnv, stdio: "ignore" });
 }
 
-/** A folder with one commit. */
+/** A folder with one commit, and an upstream that has it: nothing is unpushed, as in a pushed repository. */
 function repository(folder: string): void {
     mkdirSync(folder, { recursive: true });
     git(folder, "init", "-q");
@@ -4176,6 +4240,19 @@ function repository(folder: string): void {
         "-qm",
         "one",
     );
+
+    // A remote-tracking ref at the commit, and the branch's upstream: `git status` prints `# branch.ab +0 -0`.
+    const branch = execFileSync("git", ["symbolic-ref", "--short", "HEAD"], {
+        cwd: folder,
+        env: gitEnv,
+        encoding: "utf8",
+    }).trim();
+
+    git(folder, "config", "remote.origin.url", folder);
+    git(folder, "config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*");
+    git(folder, "update-ref", `refs/remotes/origin/${branch}`, "HEAD");
+    git(folder, "config", `branch.${branch}.remote`, "origin");
+    git(folder, "config", `branch.${branch}.merge`, `refs/heads/${branch}`);
 }
 
 before(async () => {
@@ -6639,6 +6716,186 @@ describe("the desk in a Pi Pocket", () => {
             assert.equal(
                 (await deskState())?.baseline?.[String(Number(source))]?.pending?.[brief],
                 undefined,
+            );
+        } finally {
+            await quiet([]);
+            shift = 0;
+        }
+    });
+
+    test("a branch with no upstream never reports nothing unpushed", async () => {
+        // The app's clock moves here: no sweeper of an earlier test may wake and see the folder too.
+        await stopSweepers();
+        const folder = join(root, "no-upstream");
+
+        rmSync(folder, { recursive: true, force: true });
+        repository(folder);
+        // No upstream at all: the case this test is about.
+        git(folder, "remote", "remove", "origin");
+
+        const source = await supervisor("ahead");
+        let id = "";
+
+        await app.harness.commit(async (tx) => {
+            const state = await tx.doc(DeskThreads);
+            const opened = openThread(state, {
+                key: "x.test.no-upstream",
+                supervisor: Number(source),
+                agents: ["duncan"],
+                repo: "frostyard/no-upstream",
+                cwd: folder,
+                title: "A branch with no upstream",
+                at: Date.now(),
+            }).thread;
+
+            // The doc's copy is not the returned object: set the state on the stored thread.
+            id = opened.id;
+            state.threads[id]!.state = "open";
+        }, context);
+
+        try {
+            // `desk list` starts the supervisor's sweeper: its first sweep reads the folder.
+            await say(app, source, "desk list test");
+            await until(
+                async () => typeof (await deskState())?.threads[id]?.run.sweptAt === "number",
+                "the first sweep",
+                20_000,
+            );
+
+            const first = (await deskState())?.threads[id];
+
+            assert(first, "the thread is stored");
+
+            const firstTexts = first.events.map((event) => event.text);
+
+            assert.equal(firstTexts.includes("nothing is unpushed"), false);
+            // `git rev-list --count HEAD --not --remotes` verifies the 1 commit that no remote has.
+            assert.equal(first.run.ahead, 1);
+            assert.equal(first.run.aheadUnknown, undefined);
+            assert.deepEqual(closeCheck(first, facts()).open, [`1 unpushed commit in ${folder}`]);
+
+            // The branch's only commit goes: there is no HEAD to count, so the count is unknown again. `run.ahead`
+            // keeps its last known value, and the thread does not close.
+            const branch = execFileSync("git", ["symbolic-ref", "--short", "HEAD"], {
+                cwd: folder,
+                env: gitEnv,
+                encoding: "utf8",
+            }).trim();
+
+            git(folder, "update-ref", "-d", `refs/heads/${branch}`);
+            await quiet([id]);
+            const seen = first.run.sweptAt;
+
+            await restartApp(SWEEP_SLEEP_MS + 60_000);
+            await sweptAfter(first, seen);
+
+            const second = (await deskState())?.threads[id];
+
+            assert(second, "the thread is still stored");
+
+            const secondTexts = second.events.map((event) => event.text);
+
+            assert.equal(secondTexts.includes("nothing is unpushed"), false);
+            assert.equal(second.run.ahead, 1, "a known count is not overwritten");
+            assert.equal(second.run.aheadUnknown, "no upstream");
+            assert.equal(secondTexts.includes("unpushed commits unknown: no upstream"), true);
+            assert.equal(
+                closeCheck(second, facts()).open.includes(
+                    `unpushed commits in ${folder} are unknown (no upstream)`,
+                ),
+                true,
+            );
+
+            // A `git status` that fails in a repository is a failed read, not a clean folder: the thread still does not
+            // close, and the count stays unknown with its own reason.
+            writeFileSync(join(folder, ".git", "index"), "not an index");
+            await quiet([id]);
+            const secondSwept = second.run.sweptAt;
+
+            await restartApp(SWEEP_SLEEP_MS * 2 + 120_000);
+            await sweptAfter(second, secondSwept);
+
+            const third = (await deskState())?.threads[id];
+
+            assert(third, "the thread is still stored");
+            assert.equal(third.run.ahead, 1, "a known count is not overwritten");
+            assert.equal(third.run.aheadUnknown, "git status failed");
+            assert.equal(
+                third.events.some(
+                    (event) => event.text === "unpushed commits unknown: git status failed",
+                ),
+                true,
+            );
+            assert.equal(closeCheck(third, facts()).close, false);
+        } finally {
+            await quiet([]);
+            shift = 0;
+        }
+    });
+
+    test("a thread whose folder is gone closes, and does not say git status failed", async () => {
+        await stopSweepers();
+        const folder = join(root, "gone-worktree");
+
+        rmSync(folder, { recursive: true, force: true });
+        repository(folder);
+
+        const source = await supervisor("gone");
+        let id = "";
+
+        await app.harness.commit(async (tx) => {
+            const state = await tx.doc(DeskThreads);
+            const opened = openThread(state, {
+                key: "x.test.gone-worktree",
+                supervisor: Number(source),
+                agents: ["duncan"],
+                repo: "frostyard/gone-worktree",
+                cwd: folder,
+                title: "A worktree that goes away",
+                at: Date.now(),
+            }).thread;
+
+            // Its session is still working, so the thread stays open across both sweeps.
+            id = opened.id;
+            state.threads[id]!.state = "open";
+            state.threads[id]!.address = "session-gone";
+            state.threads[id]!.run.busy = true;
+        }, context);
+
+        try {
+            await say(app, source, "desk list test");
+            await until(
+                async () => typeof (await deskState())?.threads[id]?.run.sweptAt === "number",
+                "the first sweep",
+                20_000,
+            );
+
+            const first = (await deskState())?.threads[id];
+
+            assert(first, "the thread is stored");
+            assert.equal(first.run.dirty, 0);
+            assert.equal(first.run.ahead, 0);
+
+            // An agent removed its worktree after the merge: the folder is not on disk. That is not a failed read.
+            rmSync(folder, { recursive: true, force: true });
+            await quiet([id]);
+            const seen = first.run.sweptAt;
+
+            await restartApp(SWEEP_SLEEP_MS + 60_000);
+            await sweptAfter(first, seen);
+
+            const second = (await deskState())?.threads[id];
+
+            assert(second, "the thread is still stored");
+            assert.equal(second.run.aheadUnknown, undefined);
+            assert.equal(
+                second.events.some((event) => event.text.includes("git status failed")),
+                false,
+            );
+            assert.equal(
+                closeCheck(second, facts()).open.some((part) => part.includes("unknown")),
+                false,
+                "the missing worktree does not hold the thread",
             );
         } finally {
             await quiet([]);
