@@ -1897,7 +1897,7 @@ function splitRef(ref: string): { repo: string; number: number } {
 }
 
 const PR_FIELDS =
-    "number title url state isDraft createdAt mergedAt closedAt headRefName mergeable reviewDecision author { login } commits(last: 1) { nodes { commit { oid statusCheckRollup { state contexts(first: 30) { nodes { __typename ... on CheckRun { name conclusion } ... on StatusContext { context state } } } } } } }";
+    "number title url state isDraft createdAt mergedAt closedAt headRefName mergeable reviewDecision author { login } commits(last: 1) { nodes { commit { oid statusCheckRollup { state contexts(first: 30) { totalCount nodes { __typename ... on CheckRun { name conclusion status startedAt } ... on StatusContext { context state } } } } } } }";
 
 /**
  * The one GraphQL query of a sweep: the viewer, each repository's open PRs, and each attached PR by number. Every
@@ -1966,7 +1966,7 @@ function prFact(
                               oid?: unknown;
                               statusCheckRollup?: {
                                   state?: unknown;
-                                  contexts?: { nodes?: unknown } | null;
+                                  contexts?: { nodes?: unknown; totalCount?: unknown } | null;
                               } | null;
                           }
                         | null
@@ -1989,7 +1989,10 @@ function prFact(
         isDraft: node.isDraft === true,
         mergeable: text(node.mergeable),
         review: text(node.reviewDecision),
-        checks: text(first?.commit?.statusCheckRollup?.state),
+        checks: checksState(
+            text(first?.commit?.statusCheckRollup?.state),
+            first?.commit?.statusCheckRollup?.contexts,
+        ),
         head: text(first?.commit?.oid),
         failing: failingChecks(first?.commit?.statusCheckRollup?.contexts?.nodes),
         archived,
@@ -2006,14 +2009,85 @@ const FAILED_RUN = new Set([
 const FAILED_STATUS = new Set(["FAILURE", "ERROR"]);
 const KEPT_FAILING = 10;
 
-/** The names of the checks that fail, from a rollup's context nodes: no repeat, sorted, at most 10. */
+/** The context nodes that are objects. */
+const contextNodes = (nodes: unknown): Record<string, unknown>[] =>
+    (Array.isArray(nodes) ? nodes : []).filter(
+        (node): node is Record<string, unknown> => node !== null && typeof node === "object",
+    );
+
+/**
+ * The cancelled check runs that a newer run of the same name replaced. GitHub cancels a run when a new one starts
+ * (a concurrency group, an edited title): that is not a fault. A cancelled run with no start time, or with no newer
+ * run of its name, still counts as failed.
+ */
+function supersededRuns(nodes: unknown): Set<Record<string, unknown>> {
+    const runs = contextNodes(nodes).filter((one) => one.__typename === "CheckRun");
+    const newest = new Map<string, number>();
+
+    for (const run of runs) {
+        const started = milliseconds(run.startedAt);
+
+        if (started > (newest.get(text(run.name)) ?? 0)) {
+            newest.set(text(run.name), started);
+        }
+    }
+
+    return new Set(
+        runs.filter((run) => {
+            const started = milliseconds(run.startedAt);
+
+            return (
+                text(run.conclusion) === "CANCELLED" &&
+                started > 0 &&
+                (newest.get(text(run.name)) ?? 0) > started
+            );
+        }),
+    );
+}
+
+/**
+ * The checks' state of a PR's head commit. GitHub's rollup says FAILURE when 1 run was cancelled, also when a newer
+ * run of the same check passed (frostyard/updex#457). When every context was read, and the only failed runs are
+ * cancelled runs that a newer run replaced, the state is PENDING while a context still runs, else SUCCESS. Any other
+ * state, or a list of contexts that GitHub cut, stays as GitHub says.
+ */
+export function checksState(state: string, contexts: unknown): string {
+    if (state !== "FAILURE" && state !== "ERROR") {
+        return state;
+    }
+
+    const list = contexts as { nodes?: unknown; totalCount?: unknown } | null | undefined;
+    const nodes = contextNodes(list?.nodes);
+
+    if (
+        typeof list?.totalCount !== "number" ||
+        list.totalCount > (Array.isArray(list.nodes) ? list.nodes.length : 0) ||
+        supersededRuns(list.nodes).size === 0 ||
+        failingChecks(list.nodes).length > 0
+    ) {
+        return state;
+    }
+
+    const running = nodes.some((one) =>
+        one.__typename === "CheckRun"
+            ? one.status !== undefined && text(one.status) !== "COMPLETED"
+            : one.__typename === "StatusContext" &&
+              (text(one.state) === "PENDING" || text(one.state) === "EXPECTED"),
+    );
+
+    return running ? "PENDING" : "SUCCESS";
+}
+
+/**
+ * The names of the checks that fail, from a rollup's context nodes: no repeat, sorted, at most 10. A cancelled run
+ * that a newer run of the same name replaced does not fail.
+ */
 function failingChecks(nodes: unknown): string[] {
     const names = new Set<string>();
+    const superseded = supersededRuns(nodes);
 
-    for (const node of Array.isArray(nodes) ? nodes : []) {
-        const one = node as Record<string, unknown> | null | undefined;
-
-        if (one === null || typeof one !== "object") {
+    for (const one of contextNodes(nodes)) {
+        if (superseded.has(one)) {
             continue;
         }
 
