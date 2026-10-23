@@ -126,6 +126,12 @@ export type Watch = {
     result?: { at: number; by: string; pass: boolean; text: string; key: string };
 };
 
+/**
+ * How a thread that closed as done ended: `completed` (every PR merged, or no PR), `abandoned` (a PR closed
+ * unmerged), `frozen` (a PR, or the repository, is archived), or `verified` (a watch passed).
+ */
+export type CloseOutcome = "completed" | "abandoned" | "verified" | "frozen";
+
 /** One piece of work the team runs. Stored data: never rename a field or change what it means. */
 export type Thread = {
     /** "T13" for a delegated, seeded, or asked thread; "F2" for a found one. */
@@ -150,7 +156,13 @@ export type Thread = {
     startedAt: number;
     lastEventAt: number;
     keptAt?: number;
-    closed?: { at: number; why: "done" | "dropped" | "failed"; by: "sweep" | "brian" | "desk" };
+    closed?: {
+        at: number;
+        why: "done" | "dropped" | "failed";
+        by: "sweep" | "brian" | "desk";
+        /** How it ended, when `why` is "done"; an older record has none. Stored data: never rename a field. */
+        outcome?: CloseOutcome;
+    };
     /** Key "owner/name#n". */
     prs: Record<string, PrLink>;
     branches: string[];
@@ -160,7 +172,8 @@ export type Thread = {
     asks: Ask[];
     /**
      * Facts the sweep keeps: `returnAddress`, `reportedAt`, `reportedUserEntry`, `scanCursor`, `lastUserEntry`,
-     * `seenPrs`, `busy`, `archived`, `shift`, `dirty`, `ahead`, `folder`, `next`, `sweptAt`, `closeout` (the
+     * `seenPrs`, `busy`, `archived`, `repoArchived` (its repository is archived, as the last read saw it), `shift`,
+     * `dirty`, `ahead`, `folder`, `next`, `sweptAt`, `closeout` (the
      * wake-up key that went last, so a sweep does not send it again), `closeoutEntry` (the session's newest user entry
      * before it went: a report past it lets the thread close), `closeoutRefs` (every PR ref an earlier wake-up told the
      * agent, sorted, at most 50: a state of only told refs is no new wake-up, so a detached PR cannot send again),
@@ -920,7 +933,12 @@ export function recordResult(
 
     if (request.pass) {
         thread.state = "closed";
-        thread.closed = { at: request.at, why: "done", by: request.closedBy };
+        thread.closed = {
+            at: request.at,
+            why: "done",
+            by: request.closedBy,
+            outcome: closeOutcome(thread),
+        };
         thread.run.next = "none";
         addEvent(
             thread,
@@ -1006,6 +1024,57 @@ export function parseStatus(text: string): { dirty: number; ahead: number; branc
 }
 
 const CLOSED_PR = new Set(["MERGED", "CLOSED", "FROZEN"]);
+
+/**
+ * How a thread that closes as done ended, in the rules' order: a PR closed unmerged abandons it; a frozen PR, or an
+ * archived repository, freezes it; a passed watch verifies it; else every PR merged, or it had none. A guessed PR
+ * (`via: "window"`) is not the agent's work, so it counts for nothing here. Old threads keep no outcome; a new one is
+ * recorded in `thread.closed.outcome`.
+ */
+export function closeOutcome(thread: Thread): CloseOutcome {
+    const entries = ownPrs(thread);
+
+    if (entries.some(([, pr]) => pr.state === "CLOSED")) {
+        return "abandoned";
+    }
+
+    if (thread.run.repoArchived === true || entries.some(([, pr]) => pr.state === "FROZEN")) {
+        return "frozen";
+    }
+
+    if (thread.watch?.result?.pass === true) {
+        return "verified";
+    }
+
+    return "completed";
+}
+
+/** A thread's PRs that the agent made: a guessed one (`via: "window"`) is not its work. */
+function ownPrs(thread: Thread): [string, PrLink][] {
+    return Object.entries(thread.prs).filter(([, pr]) => pr.via !== "window");
+}
+
+/** The close event's text for a thread's outcome: `closeOutcome`, with the fact that gives it. */
+function closeOutcomeWords(thread: Thread): string {
+    const outcome = closeOutcome(thread);
+    const entries = ownPrs(thread);
+
+    if (outcome === "abandoned") {
+        const ref = entries.find(([, pr]) => pr.state === "CLOSED")?.[0];
+
+        return `abandoned (PR ${ref ?? "a PR"} closed unmerged)`;
+    }
+
+    if (outcome === "frozen") {
+        return "frozen (repository archived)";
+    }
+
+    if (outcome === "verified") {
+        return "verified (watch passed)";
+    }
+
+    return entries.length === 0 ? "completed (no PRs)" : "completed (all PRs merged)";
+}
 
 /** What keeps a thread's session part open, in words. Undefined when it is closed. */
 function openSession(thread: Thread): string | undefined {
@@ -2321,6 +2390,13 @@ const linkFor = (pr: PrFact, via: PrLink["via"]): PrLink => ({
 export function updatePrs(thread: Thread, github: GitHubFacts, now: number): number {
     let events = 0;
 
+    // The thread's repository, as the read saw it: an archived one freezes the thread, even with no PR to show it.
+    const repo = thread.repo === undefined ? undefined : github.repos[thread.repo];
+
+    if (repo !== undefined) {
+        thread.run.repoArchived = repo.archived;
+    }
+
     for (const [ref, link] of Object.entries(thread.prs)) {
         if (github.missing !== undefined && github.missing.includes(ref)) {
             if (link.state !== "MISSING") {
@@ -3321,7 +3397,7 @@ function threadFile(
 
     if (thread.closed !== undefined) {
         lines.push(
-            `- Closed: ${thread.closed.why} · by ${thread.closed.by} · ${iso(thread.closed.at)}`,
+            `- Closed: ${thread.closed.why}${thread.closed.outcome === undefined ? "" : ` (${thread.closed.outcome})`} · by ${thread.closed.by} · ${iso(thread.closed.at)}`,
         );
     }
 
@@ -3517,7 +3593,7 @@ export type ThreadView = {
     };
     /** A watched thread before its date: it does not count, and it is not stale. */
     asleep: boolean;
-    closed?: { at: number; why: string; by: string };
+    closed?: { at: number; why: string; by: string; outcome?: CloseOutcome };
 };
 
 /** The folders that threads other than `thread` work in. */
@@ -3622,6 +3698,9 @@ export function threadView(
                       at: thread.closed.at,
                       why: thread.closed.why,
                       by: thread.closed.by,
+                      ...(thread.closed.outcome === undefined
+                          ? {}
+                          : { outcome: thread.closed.outcome }),
                   },
               }),
     };
@@ -3798,7 +3877,9 @@ export function readText(state: Readonly<DeskState> | undefined, id: string): st
         ...(thread.watch === undefined ? [] : [`Watch: ${watchText(thread.watch)}`]),
         ...(thread.closed === undefined
             ? []
-            : [`Closed: ${iso(thread.closed.at)} · ${thread.closed.why} · by ${thread.closed.by}`]),
+            : [
+                  `Closed: ${iso(thread.closed.at)} · ${thread.closed.why}${thread.closed.outcome === undefined ? "" : ` (${thread.closed.outcome})`} · by ${thread.closed.by}`,
+              ]),
         prs.length === 0
             ? "PRs: none"
             : `PRs:\n${prs.map(([ref, pr]) => `  ${ref} · ${pr.via}${pr.state === undefined ? "" : ` · ${pr.state}`}${pr.next === undefined ? "" : ` · next: ${pr.next}`}${pr.title === undefined || pr.title === "" ? "" : ` · ${pr.title}`}`).join("\n")}`,
@@ -5115,9 +5196,21 @@ export default function createDesk(host: Host, web: Web) {
                     events += 1;
                 }
             } else {
-                thread.closed = { at: now, why: "done", by: "sweep" };
+                thread.closed = {
+                    at: now,
+                    why: "done",
+                    by: "sweep",
+                    outcome: closeOutcome(thread),
+                };
 
-                if (addEvent(thread, `closed:${String(now)}`, "closed: all parts closed", now)) {
+                if (
+                    addEvent(
+                        thread,
+                        `closed:${String(now)}`,
+                        `closed: ${closeOutcomeWords(thread)}`,
+                        now,
+                    )
+                ) {
                     events += 1;
                 }
             }
