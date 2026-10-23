@@ -18,14 +18,18 @@ import {
     section,
     type ConversationId,
     type DocumentReader,
+    type ToolExecutionApi,
     type Tx,
 } from "@earendil-works/pi-durable";
 import type { Host, Web } from "./_pocket.d.ts";
 
+/** A named identity's role: the supervisor, its desk Clerk, or an agent. */
+type Role = "supervisor" | "clerk" | "agent";
+
 type Persona = {
     id: string;
     name: string;
-    role: "supervisor" | "agent";
+    role: Role;
     model: string;
     instructions: string;
     repositories: Record<string, string>;
@@ -238,7 +242,12 @@ export async function roster(directory: string): Promise<Persona[]> {
         agents.push({
             id: file.slice(0, -3),
             name: /^#\s+(.+)$/m.exec(body)?.[1]?.trim() ?? file.slice(0, -3),
-            role: frontmatter.role === "supervisor" ? "supervisor" : "agent",
+            role:
+                frontmatter.role === "supervisor"
+                    ? "supervisor"
+                    : frontmatter.role === "clerk"
+                      ? "clerk"
+                      : "agent",
             model: typeof model === "string" ? model : "",
             instructions: body.trim(),
             repositories,
@@ -263,7 +272,9 @@ Your name and responsibilities do not change the tools, permissions, or model se
 ${
     persona.role === "supervisor"
         ? "You own the team, not this conversation's repository. Do work directly when helpful. Use team_delegate for a specialist; select their repository by its roster name and give a self-contained task. Their task starts in that repository regardless of your folder. A greeting needs no audit of old work."
-        : "Do your assigned work directly. For a linked task, report the result once with team_message to the return address in its initial message."
+        : persona.role === "clerk"
+          ? "You are the desk clerk of your supervisor. Desk digests arrive as messages whose lines start with [desk]. Escalate to your supervisor with team_message to the return address in your first message."
+          : "Do your assigned work directly. For a linked task, report the result once with team_message to the return address in its initial message."
 }`;
 
 const reply = (text: string) => ({ output: [{ type: "text" as const, text }] });
@@ -307,12 +318,12 @@ export type TeamApi = {
         read: DocumentReader,
         conversationId: ConversationId,
         context: Context,
-    ) => Promise<{ id: string; name: string; role: "supervisor" | "agent" } | undefined>;
+    ) => Promise<{ id: string; name: string; role: Role } | undefined>;
     roster: () => Promise<
         {
             id: string;
             name: string;
-            role: "supervisor" | "agent";
+            role: Role;
             repositories: Record<string, string>;
         }[]
     >;
@@ -705,6 +716,97 @@ export default function createTeam(host: Host, web: Web) {
         return `${identityText(persona)}\n\n${where === "" ? "" : `${where}\n\n`}Task from the source session:\n${message}`;
     };
 
+    /**
+     * The Clerk's model: the profile's own, from the owner's allowed list for subagents. The Clerk never falls back to
+     * the supervisor's model, so a missing or refused model stops the start and names what Brian must set.
+     */
+    const clerkModel = (persona: Persona): string => {
+        const allowed = host.subagentModels();
+
+        if (persona.model === "") {
+            throw new Error(
+                `The Clerk has no model in its profile (${persona.id}.md). Brian sets one there, from the owner's allowed list for subagents. The Clerk never uses your model.`,
+            );
+        }
+
+        if (!allowed.includes(persona.model)) {
+            throw new Error(
+                `${persona.model} is not in the owner's allowed list for subagents. Brian sets the Clerk's model in its profile (${persona.id}.md), from the list: ${allowed.join(", ") || "none"}. The Clerk never uses your model.`,
+            );
+        }
+
+        return persona.model;
+    };
+
+    /**
+     * Start the supervisor's Clerk: 1 long-lived linked session, registered on the desk in the same commit as its
+     * identity, under the start's replay key. It opens no desk thread, so it does not count toward the cap. 1 Clerk for
+     * each supervisor: a second start while the first one's session is there is refused with its address.
+     */
+    const startClerk = async (
+        persona: Persona,
+        task: string,
+        title: string,
+        cwd: string | undefined,
+        api: ToolExecutionApi,
+        context: Context,
+    ): Promise<{ output: { type: "text"; text: string }[] }> => {
+        const model = clerkModel(persona);
+        const desk = deskApi();
+        const supervisor = Number(api.conversationId);
+        const key = `x.team.delegate:${api.taskId}:${api.callId}`;
+        const here =
+            desk === undefined
+                ? undefined
+                : await api.commit((tx) => desk.clerkOf(tx, supervisor), context);
+
+        // A replay of the start that made this Clerk: its session is the same one, and nothing changes.
+        const replay = here !== undefined && here.key !== undefined && here.key === key;
+
+        if (here !== undefined && desk !== undefined && !replay) {
+            const sessions = await host.linkedSessions.list(api.conversationId);
+            const live = sessions.find((session) => session.address === here.address);
+
+            // Gone is not there: a new Clerk may start. Archived is not there either; the sweep removes it too.
+            if (live !== undefined && live.archived !== true) {
+                throw new Error(
+                    `This supervisor has a Clerk already, at ${here.address}. There is 1 Clerk for each supervisor: send it work with team_message.`,
+                );
+            }
+        }
+
+        const started = await host.linkedSessions.start(
+            api.conversationId,
+            {
+                title: `${persona.name}: ${title}`.slice(0, 120),
+                message: taskText(persona, task),
+                model,
+                ...(cwd === undefined ? {} : { cwd }),
+            },
+            key,
+        );
+
+        // The identity and the registration land in one durable step, under the start's replay key.
+        await api.commit(async (tx) => {
+            (await tx.doc(Identity, started.session as ConversationId)).persona ??= persona;
+
+            if (desk !== undefined) {
+                await desk.clerk(tx, {
+                    supervisor,
+                    session: Number(started.session),
+                    address: started.address,
+                    agent: persona.id,
+                    at: Date.now(),
+                    key,
+                });
+            }
+        }, context);
+
+        return reply(
+            `Assigned to ${persona.name} at ${started.address}, on ${model}. Routine desk news goes to the Clerk now. Send it work with team_message.${desk === undefined ? " The desk is off: the Clerk is not registered." : ""}`,
+        );
+    };
+
     type DelegatedFields = {
         objective: string;
         stop_when: string;
@@ -794,8 +896,28 @@ export default function createTeam(host: Host, web: Web) {
                 from: "team_message" | "night-shift";
                 text: string;
                 at: number;
+                /** The desk puts the report in the supervisor's digest: `held` says it did. */
+                digest?: true;
             },
-        ) => Promise<{ thread: DeskThread; line: string } | undefined>;
+        ) => Promise<{ thread: DeskThread; line: string; held?: boolean } | undefined>;
+        /** Register a supervisor's Clerk. The same values twice change nothing. */
+        clerk: (
+            tx: Tx,
+            request: {
+                supervisor: number;
+                session: number;
+                address: string;
+                agent: string;
+                at: number;
+                /** The start's replay key. */
+                key?: string;
+            },
+        ) => Promise<void>;
+        /** The supervisor's Clerk, for the check before a Clerk starts: no write. */
+        clerkOf: (
+            tx: Tx,
+            supervisor: number,
+        ) => Promise<{ address: string; key?: string } | undefined>;
     };
 
     const deskApi = (): DeskApi | undefined =>
@@ -1229,6 +1351,19 @@ export default function createTeam(host: Host, web: Web) {
                 throw new Error("Choose a specialist from the roster.");
             }
 
+            if (persona.role === "clerk") {
+                // A Clerk is 1 long-lived session with no desk thread: neither option has anything to attach to.
+                if (night_shift !== undefined) {
+                    throw new Error("A Clerk runs until it is archived: it takes no night shift.");
+                }
+
+                if (args.watch !== undefined) {
+                    throw new Error("A Clerk opens no desk thread: it takes no watch.");
+                }
+
+                return await startClerk(persona, task, title, cwd, api, context);
+            }
+
             const shift =
                 night_shift === undefined
                     ? undefined
@@ -1396,7 +1531,8 @@ export default function createTeam(host: Host, web: Web) {
             const desk = deskApi();
 
             // A report to the thread's supervisor is filed on the thread in one commit with the send's key, so a replay
-            // finds it and sends the same line once. A message to anyone else goes as before.
+            // finds it and sends the same line once. A message to anyone else goes as before. With the desk's digest on,
+            // the report waits for the next digest, and this session sends nothing now.
             const filed =
                 desk === undefined
                     ? undefined
@@ -1408,20 +1544,25 @@ export default function createTeam(host: Host, web: Web) {
                                   from: "team_message",
                                   text: args.message,
                                   at: Date.now(),
+                                  digest: true,
                               }),
                           context,
                       );
 
-            await host.linkedSessions.send(
-                api.conversationId,
-                { to: args.to, message: filed?.line ?? args.message },
-                key,
-            );
+            if (filed?.held !== true) {
+                await host.linkedSessions.send(
+                    api.conversationId,
+                    { to: args.to, message: filed?.line ?? args.message },
+                    key,
+                );
+            }
 
             return reply(
                 filed === undefined
                     ? "Message sent. Do not send an acknowledgement or wait for a reply."
-                    : `Filed on ${filed.thread.id}. Your supervisor got 1 line. Do not send an acknowledgement or wait for a reply.`,
+                    : filed.held === true
+                      ? `Filed on ${filed.thread.id}. Your supervisor gets it in the next desk digest. Do not send an acknowledgement or wait for a reply.`
+                      : `Filed on ${filed.thread.id}. Your supervisor got 1 line. Do not send an acknowledgement or wait for a reply.`,
             );
         },
     });

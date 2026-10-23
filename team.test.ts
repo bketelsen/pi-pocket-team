@@ -16,7 +16,7 @@ import {
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { cpSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { join } from "node:path";
 import { after, test } from "node:test";
@@ -274,6 +274,35 @@ test("drop-in identities, named delegation, HTTP permissions, replay and restart
             (await modelTexts(app, child)).join("\n"),
             /Only a session assigned a supervisor/,
         );
+
+        // The third role: `role: clerk`. It sorts with the others by name, and the supervisor stays first.
+        writeFileSync(
+            join(definitions, "clerk.md"),
+            `---\nrole: clerk\nmodel: faux/faux-2\nworkspace: ${repoA}\n---\n# Clerk\nYou are the desk clerk.`,
+        );
+
+        try {
+            const listed = (await call("agents")).data.agents as { id: string; role: string }[];
+
+            assert.equal(listed.find((each) => each.id === "clerk")?.role, "clerk");
+            assert.equal(listed[0]?.role, "supervisor", "the supervisor goes first");
+
+            const clerkSession = await newSession(app);
+
+            assert.equal(
+                (await call(`session/${clerkSession}/identity`, { agent: "clerk" })).status,
+                200,
+            );
+            await say(app, clerkSession, "Hello");
+            assert.match(
+                requestContext,
+                /You are the desk clerk of your supervisor\. Desk digests arrive as messages whose lines start with \[desk\]\./,
+            );
+            assert.doesNotMatch(requestContext, /Named teammates:/, "a Clerk gets no roster");
+        } finally {
+            rmSync(join(definitions, "clerk.md"), { force: true });
+        }
+
         server.closeAllConnections();
         await new Promise<void>((resolve) => server!.close(() => resolve()));
         server = undefined;
