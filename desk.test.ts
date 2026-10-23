@@ -6206,7 +6206,22 @@ describe("the desk in a Pi Pocket", () => {
             assert.match(github?.error ?? "", /exit code 1: HTTP 401/);
             assert.deepEqual(github?.skipped, ["pi-pocket-team"]);
 
-            await say(app, source, "desk list test");
+            // A sweep of an earlier test's thread can still be in flight with the old `gh`: its commit lands after
+            // this sync and records a good read. The next sync reads with the failing `gh` again.
+            for (let attempt = 0; attempt < 3; attempt += 1) {
+                await say(app, source, "desk list test");
+
+                const texts = (await modelTexts(app, source)).join("\n");
+
+                if (
+                    /GitHub: read failed at/.test(texts.slice(texts.lastIndexOf("desk list test")))
+                ) {
+                    break;
+                }
+
+                await say(app, source, "desk sync test");
+            }
+
             assert.match(
                 (await modelTexts(app, source)).join("\n"),
                 /GitHub: read failed at \d\d:\d\d: exit code 1: HTTP 401: Bad credentials/,
