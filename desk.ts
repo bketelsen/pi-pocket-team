@@ -1897,7 +1897,7 @@ function splitRef(ref: string): { repo: string; number: number } {
 }
 
 const PR_FIELDS =
-    "number title url state isDraft createdAt mergedAt closedAt headRefName mergeable reviewDecision author { login } commits(last: 1) { nodes { commit { oid statusCheckRollup { state contexts(first: 30) { nodes { __typename ... on CheckRun { name conclusion } ... on StatusContext { context state } } } } } } }";
+    "number title url state isDraft createdAt mergedAt closedAt headRefName mergeable reviewDecision author { login } commits(last: 1) { nodes { commit { oid statusCheckRollup { state contexts(first: 30) { totalCount nodes { __typename ... on CheckRun { name conclusion status startedAt } ... on StatusContext { context state } } } } } } }";
 
 /**
  * The one GraphQL query of a sweep: the viewer, each repository's open PRs, and each attached PR by number. Every
@@ -1966,7 +1966,7 @@ function prFact(
                               oid?: unknown;
                               statusCheckRollup?: {
                                   state?: unknown;
-                                  contexts?: { nodes?: unknown } | null;
+                                  contexts?: { nodes?: unknown; totalCount?: unknown } | null;
                               } | null;
                           }
                         | null
@@ -1989,11 +1989,50 @@ function prFact(
         isDraft: node.isDraft === true,
         mergeable: text(node.mergeable),
         review: text(node.reviewDecision),
-        checks: text(first?.commit?.statusCheckRollup?.state),
+        checks: checksState(
+            text(first?.commit?.statusCheckRollup?.state),
+            first?.commit?.statusCheckRollup?.contexts,
+        ),
         head: text(first?.commit?.oid),
         failing: failingChecks(first?.commit?.statusCheckRollup?.contexts?.nodes),
         archived,
     };
+}
+
+/** The wait before the 1 retry of a GitHub read that failed for a moment. */
+export const GITHUB_RETRY_MS = 1_000;
+
+/**
+ * A `gh api graphql` failure that a second try can fix: no data on stdout, and `gh` says the answer was cut or empty
+ * ("unexpected end of JSON input"), or GitHub's gateway failed (HTTP 502, 503, 504), or the connection broke. A
+ * failure with data (a partial answer), an auth error, or a read that hit the 60-second limit is not transient.
+ */
+export function transientGitHub(error: unknown): boolean {
+    const failure = error as { killed?: unknown; stdout?: unknown; stderr?: unknown } | null;
+
+    if (failure === null || typeof failure !== "object" || failure.killed === true) {
+        return false;
+    }
+
+    const out =
+        typeof failure.stdout === "string"
+            ? failure.stdout
+            : Buffer.isBuffer(failure.stdout)
+              ? failure.stdout.toString("utf8")
+              : "";
+    const err =
+        typeof failure.stderr === "string"
+            ? failure.stderr
+            : Buffer.isBuffer(failure.stderr)
+              ? failure.stderr.toString("utf8")
+              : "";
+
+    return (
+        out.trim() === "" &&
+        /unexpected end of JSON input|unexpected EOF|HTTP 50[234]\b|connection reset|i\/o timeout/i.test(
+            err,
+        )
+    );
 }
 
 const FAILED_RUN = new Set([
@@ -2006,14 +2045,85 @@ const FAILED_RUN = new Set([
 const FAILED_STATUS = new Set(["FAILURE", "ERROR"]);
 const KEPT_FAILING = 10;
 
-/** The names of the checks that fail, from a rollup's context nodes: no repeat, sorted, at most 10. */
+/** The context nodes that are objects. */
+const contextNodes = (nodes: unknown): Record<string, unknown>[] =>
+    (Array.isArray(nodes) ? nodes : []).filter(
+        (node): node is Record<string, unknown> => node !== null && typeof node === "object",
+    );
+
+/**
+ * The cancelled check runs that a newer run of the same name replaced. GitHub cancels a run when a new one starts
+ * (a concurrency group, an edited title): that is not a fault. A cancelled run with no start time, or with no newer
+ * run of its name, still counts as failed.
+ */
+function supersededRuns(nodes: unknown): Set<Record<string, unknown>> {
+    const runs = contextNodes(nodes).filter((one) => one.__typename === "CheckRun");
+    const newest = new Map<string, number>();
+
+    for (const run of runs) {
+        const started = milliseconds(run.startedAt);
+
+        if (started > (newest.get(text(run.name)) ?? 0)) {
+            newest.set(text(run.name), started);
+        }
+    }
+
+    return new Set(
+        runs.filter((run) => {
+            const started = milliseconds(run.startedAt);
+
+            return (
+                text(run.conclusion) === "CANCELLED" &&
+                started > 0 &&
+                (newest.get(text(run.name)) ?? 0) > started
+            );
+        }),
+    );
+}
+
+/**
+ * The checks' state of a PR's head commit. GitHub's rollup says FAILURE when 1 run was cancelled, also when a newer
+ * run of the same check passed (frostyard/updex#457). When every context was read, and the only failed runs are
+ * cancelled runs that a newer run replaced, the state is PENDING while a context still runs, else SUCCESS. Any other
+ * state, or a list of contexts that GitHub cut, stays as GitHub says.
+ */
+export function checksState(state: string, contexts: unknown): string {
+    if (state !== "FAILURE" && state !== "ERROR") {
+        return state;
+    }
+
+    const list = contexts as { nodes?: unknown; totalCount?: unknown } | null | undefined;
+    const nodes = contextNodes(list?.nodes);
+
+    if (
+        typeof list?.totalCount !== "number" ||
+        list.totalCount > (Array.isArray(list.nodes) ? list.nodes.length : 0) ||
+        supersededRuns(list.nodes).size === 0 ||
+        failingChecks(list.nodes).length > 0
+    ) {
+        return state;
+    }
+
+    const running = nodes.some((one) =>
+        one.__typename === "CheckRun"
+            ? one.status !== undefined && text(one.status) !== "COMPLETED"
+            : one.__typename === "StatusContext" &&
+              (text(one.state) === "PENDING" || text(one.state) === "EXPECTED"),
+    );
+
+    return running ? "PENDING" : "SUCCESS";
+}
+
+/**
+ * The names of the checks that fail, from a rollup's context nodes: no repeat, sorted, at most 10. A cancelled run
+ * that a newer run of the same name replaced does not fail.
+ */
 function failingChecks(nodes: unknown): string[] {
     const names = new Set<string>();
+    const superseded = supersededRuns(nodes);
 
-    for (const node of Array.isArray(nodes) ? nodes : []) {
-        const one = node as Record<string, unknown> | null | undefined;
-
-        if (one === null || typeof one !== "object") {
+    for (const one of contextNodes(nodes)) {
+        if (superseded.has(one)) {
             continue;
         }
 
@@ -4179,7 +4289,8 @@ export default function createDesk(host: Host, web: Web) {
     }
 
     /**
-     * The one GitHub read of a sweep: its facts, or why it failed. `gh api graphql` exits non-zero when the answer has
+     * The one GitHub read of a sweep: its facts, or why it failed. A transient failure (`transientGitHub`) gets 1 more
+     * try after `GITHUB_RETRY_MS`; a second failure is the sweep's error, as before. `gh api graphql` exits non-zero when the answer has
      * an error, but it still prints the data it has: a wrong PR ref must not hide every other PR. An alias with an
      * error is a missing ref (`pN`) or a skipped repository (`rN`); only no data at all is a failure.
      */
@@ -4194,14 +4305,29 @@ export default function createDesk(host: Host, web: Web) {
         const wanted = [...new Set(repos)];
         const pinned = [...new Set(prs)];
 
-        try {
-            const query = buildQuery(wanted, pinned);
-            const gh = process.env.PI_POCKET_DESK_GH ?? "gh";
-            const { stdout } = await run(gh, ["api", "graphql", "-f", `query=${query}`], {
+        const query = buildQuery(wanted, pinned);
+        const gh = process.env.PI_POCKET_DESK_GH ?? "gh";
+        const call = () =>
+            run(gh, ["api", "graphql", "-f", `query=${query}`], {
                 timeout: 60_000,
                 maxBuffer: 8 * 1024 * 1024,
                 encoding: "utf8",
             });
+
+        try {
+            let stdout: string;
+
+            try {
+                ({ stdout } = await call());
+            } catch (error) {
+                // GitHub's answer was cut or empty (a gateway timeout on a big query): 1 more try.
+                if (!transientGitHub(error)) {
+                    throw error;
+                }
+
+                await new Promise((resolve) => setTimeout(resolve, GITHUB_RETRY_MS));
+                ({ stdout } = await call());
+            }
 
             return { facts: parseGitHub(JSON.parse(stdout)) };
         } catch (error) {

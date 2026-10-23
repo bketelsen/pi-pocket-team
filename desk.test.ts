@@ -60,6 +60,8 @@ import {
     attribute,
     asleep,
     buildQuery,
+    checksState,
+    transientGitHub,
     capView,
     chatGrants,
     clearWatch,
@@ -1971,8 +1973,11 @@ describe("repair wake-up: GitHub facts", () => {
     test("the query asks for the head oid and the check contexts", () => {
         const query = buildQuery(["frostyard/test"], ["frostyard/test#7"]);
 
-        assert.match(query, /commit \{ oid statusCheckRollup \{ state contexts\(first: 30\)/);
-        assert.match(query, /\.\.\. on CheckRun \{ name conclusion \}/);
+        assert.match(
+            query,
+            /commit \{ oid statusCheckRollup \{ state contexts\(first: 30\) \{ totalCount nodes/,
+        );
+        assert.match(query, /\.\.\. on CheckRun \{ name conclusion status startedAt \}/);
         assert.match(query, /\.\.\. on StatusContext \{ context state \}/);
     });
 
@@ -2071,6 +2076,181 @@ describe("repair wake-up: GitHub facts", () => {
         assert.deepEqual(eight?.failing, [...eight!.failing].sort());
         assert.equal(nine?.head, "", "no commit: no head");
         assert.deepEqual(nine?.failing, []);
+    });
+
+    test("transientGitHub: an empty or cut answer, or a gateway error, gets 1 more try", () => {
+        const failed = (stderr: string, more: object = {}) => ({
+            code: 1,
+            stdout: "",
+            stderr,
+            ...more,
+        });
+
+        for (const stderr of [
+            "unexpected end of JSON input",
+            "gh: unexpected EOF",
+            "HTTP 502: Bad Gateway (https://api.github.com/graphql)",
+            "HTTP 504: Gateway Timeout",
+            "read tcp: connection reset by peer",
+        ]) {
+            assert.equal(transientGitHub(failed(stderr)), true, stderr);
+        }
+
+        assert.equal(transientGitHub(failed("HTTP 401: Bad credentials")), false);
+        assert.equal(
+            transientGitHub(
+                failed("gh: Could not resolve to a PullRequest with the number of 1097."),
+            ),
+            false,
+        );
+        assert.equal(
+            transientGitHub(failed("unexpected end of JSON input", { stdout: '{"data":{}}' })),
+            false,
+            "a partial answer has data",
+        );
+        assert.equal(
+            transientGitHub(failed("unexpected end of JSON input", { killed: true })),
+            false,
+            "the 60-second limit",
+        );
+        assert.equal(
+            transientGitHub(failed("", { stderr: Buffer.from("unexpected end of JSON input") })),
+            true,
+        );
+        assert.equal(transientGitHub(null), false);
+        assert.equal(transientGitHub(new Error("spawn gh ENOENT")), false);
+    });
+
+    test("a cancelled run that a newer run of the same check replaced is not a failure (updex#457)", () => {
+        const run = (
+            name: string,
+            conclusion: string,
+            startedAt?: string,
+            status = "COMPLETED",
+        ) => ({
+            __typename: "CheckRun",
+            name,
+            conclusion,
+            status,
+            ...(startedAt === undefined ? {} : { startedAt }),
+        });
+        const contexts = (...nodes: object[]) => ({ totalCount: nodes.length, nodes });
+        const pr = (rollup: string, list: unknown) =>
+            parseGitHub({
+                data: {
+                    viewer: { login: "github-viewer" },
+                    r0: {
+                        nameWithOwner: "frostyard/test",
+                        isArchived: false,
+                        pullRequests: {
+                            nodes: [
+                                {
+                                    number: 7,
+                                    state: "OPEN",
+                                    commits: {
+                                        nodes: [
+                                            {
+                                                commit: {
+                                                    oid: "abc123",
+                                                    statusCheckRollup: {
+                                                        state: rollup,
+                                                        contexts: list,
+                                                    },
+                                                },
+                                            },
+                                        ],
+                                    },
+                                },
+                            ],
+                        },
+                    },
+                },
+            }).repos["frostyard/test"]!.open[0]!;
+        const early = "2026-10-23T13:25:55Z";
+        const late = "2026-10-23T13:26:03Z";
+
+        // updex#457: 1 title run was cancelled 4 s before a newer one passed; all else passed.
+        const replaced = pr(
+            "FAILURE",
+            contexts(
+                run("Conventional PR title", "CANCELLED", early),
+                run("Conventional PR title", "SUCCESS", late),
+                run("Unit Tests", "SUCCESS", early),
+            ),
+        );
+
+        assert.equal(replaced.checks, "SUCCESS");
+        assert.deepEqual(replaced.failing, []);
+        assert.equal(repairState({ state: "OPEN", checks: replaced.checks }), undefined);
+        assert.equal(prNext({ state: "OPEN", checks: replaced.checks }), "brian");
+
+        // The newer run still runs: pending, not failing.
+        const running = pr(
+            "FAILURE",
+            contexts(
+                run("Conventional PR title", "CANCELLED", early),
+                run("Conventional PR title", "", late, "IN_PROGRESS"),
+            ),
+        );
+
+        assert.equal(running.checks, "PENDING");
+        assert.deepEqual(running.failing, []);
+
+        // The newer run failed: the check fails.
+        const failed = pr(
+            "FAILURE",
+            contexts(
+                run("Conventional PR title", "CANCELLED", early),
+                run("Conventional PR title", "FAILURE", late),
+            ),
+        );
+
+        assert.equal(failed.checks, "FAILURE");
+        assert.deepEqual(failed.failing, ["Conventional PR title"]);
+
+        // A cancelled run with no newer run of its name, or with no start time, still fails.
+        for (const nodes of [
+            [run("lint", "CANCELLED", late), run("Unit Tests", "SUCCESS", early)],
+            [run("lint", "CANCELLED"), run("lint", "SUCCESS")],
+            [run("lint", "CANCELLED", late), run("lint", "SUCCESS", early)],
+        ]) {
+            const one = pr("FAILURE", contexts(...nodes));
+
+            assert.equal(one.checks, "FAILURE", JSON.stringify(nodes));
+            assert.deepEqual(one.failing, ["lint"]);
+        }
+
+        // A replaced run beside a real failure: still FAILURE, with only the real name.
+        const both = pr(
+            "FAILURE",
+            contexts(
+                run("Conventional PR title", "CANCELLED", early),
+                run("Conventional PR title", "SUCCESS", late),
+                run("Unit Tests", "FAILURE", early),
+            ),
+        );
+
+        assert.equal(both.checks, "FAILURE");
+        assert.deepEqual(both.failing, ["Unit Tests"]);
+
+        // GitHub cut the list (more contexts than it gave): the state stays as GitHub says.
+        const cut = {
+            totalCount: 40,
+            nodes: [
+                run("Conventional PR title", "CANCELLED", early),
+                run("Conventional PR title", "SUCCESS", late),
+            ],
+        };
+
+        assert.equal(pr("FAILURE", cut).checks, "FAILURE");
+        assert.equal(checksState("FAILURE", { nodes: cut.nodes }), "FAILURE", "no totalCount");
+        assert.equal(checksState("SUCCESS", cut), "SUCCESS");
+        assert.equal(checksState("PENDING", cut), "PENDING");
+        assert.equal(
+            checksState("ERROR", contexts(...cut.nodes)),
+            "SUCCESS",
+            "ERROR with only a replaced run",
+        );
     });
 
     test("updatePrs keeps head and failing on the link, and a new push changes them", () => {
@@ -4818,6 +4998,41 @@ describe("the desk in a Pi Pocket", () => {
                 (await modelTexts(app, source)).join("\n"),
                 /Skipped roster names: pi-pocket-team/,
             );
+        } finally {
+            process.env.PI_POCKET_DESK_GH = fakeGh;
+        }
+    });
+
+    test("a GitHub read cut short is tried 1 more time, and the second answer counts", async () => {
+        const source = await supervisor("github-flaky");
+        const flakyGh = join(root, "flaky-gh.sh");
+        const calls = join(root, "flaky-calls");
+
+        rmSync(calls, { force: true });
+        // The first call fails as `gh` does when GitHub's answer is empty; the next ones answer.
+        writeFileSync(
+            flakyGh,
+            [
+                "#!/bin/sh",
+                `echo x >> ${JSON.stringify(calls)}`,
+                `if [ "$(wc -l < ${JSON.stringify(calls)})" -eq 1 ]; then`,
+                '  echo "unexpected end of JSON input" >&2',
+                "  exit 1",
+                "fi",
+                `cat ${JSON.stringify(fixturePath)}`,
+                "",
+            ].join("\n"),
+        );
+        chmodSync(flakyGh, 0o755);
+        process.env.PI_POCKET_DESK_GH = flakyGh;
+
+        try {
+            await say(app, source, "desk sync test");
+
+            const github = (await deskState())?.github;
+
+            assert.equal(github?.ok, true, github?.error);
+            assert.equal(readFileSync(calls, "utf8").split("\n").filter(Boolean).length, 2);
         } finally {
             process.env.PI_POCKET_DESK_GH = fakeGh;
         }
