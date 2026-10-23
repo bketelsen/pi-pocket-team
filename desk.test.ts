@@ -367,6 +367,7 @@ describe("seedThreads", () => {
 // ─── The sweep's rules ────────────────────────────────────────────────────────
 
 const DAY = 24 * 3600_000;
+
 /** The local day `days` calendar days from today, as the desk counts a span (not 24-hour steps: DST moves those). */
 const daysFromToday = (days: number) => {
     const today = new Date();

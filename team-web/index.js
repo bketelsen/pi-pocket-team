@@ -77,6 +77,7 @@ export default function setup(pocket) {
                 setBusy(false);
             }
         };
+
         const change = (lesson, body) => act(`memory/${agent.id}/${lesson.id}`, body);
         const origin = (lesson) =>
             lesson.from

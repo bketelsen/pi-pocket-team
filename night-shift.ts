@@ -783,6 +783,7 @@ async function newestEntry(tx: Tx, id: ConversationId): Promise<number> {
 }
 
 const LINKED_ADDRESS = /Message from linked session (session-[0-9a-f-]+)/;
+
 /**
  * The source session's address in a linked session: the first `pi.user` entry is the message that started it, and it
  * names the address to reply to. Undefined in a session that a person started.
@@ -1436,6 +1437,7 @@ export default function createNightShift(host: Host, web: Web) {
                     const now = runtime.now();
                     const people = await peopleSince(tx, id, goal.seen);
                     const person = people.person ?? queued;
+
                     const stopped = (reason: StopReason, detail = "") => {
                         const state = stopIn(goal, reason, detail, now);
 
@@ -1507,6 +1509,7 @@ export default function createNightShift(host: Host, web: Web) {
 
                     const now = runtime.now();
                     const { settled, withdrawn } = delivered;
+
                     const stopped = (reason: StopReason, detail = "") => {
                         const state = stopIn(goal, reason, detail, now);
 

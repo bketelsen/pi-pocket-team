@@ -36,6 +36,7 @@ import {
 import { statusItem } from "./night-shift-web/index.js";
 
 const ZONE = "America/New_York";
+
 // These tests compute server clock times in ZONE, so the process runs in ZONE.
 process.env.TZ = ZONE;
 
@@ -445,6 +446,7 @@ const route: FauxResponseStep = async (request, options) => {
         sectioned.add(`${scenario} ${n}`);
         sectionRequest = JSON.stringify(request);
     }
+
     const wait = async (name: string) => {
         await new Promise<void>((resolve) => {
             gates.set(name, resolve);
