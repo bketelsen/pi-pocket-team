@@ -1031,7 +1031,12 @@ function openSession(thread: Thread): string | undefined {
     const reported = numberOr(thread.run.reportedUserEntry);
     const last = numberOr(thread.run.lastUserEntry);
 
-    return reported !== undefined && reported === last
+    // A report at or past the newest user entry the sweep saw counts: the close-out wake-up's entry may come after the
+    // sweep, and the agent's report is then newer than `lastUserEntry` still is.
+    const reportedAfter =
+        reported !== undefined && last !== undefined ? reported >= last : reported !== undefined;
+
+    return reportedAfter
         ? undefined
         : reported === undefined
           ? "it has not reported"
@@ -1614,7 +1619,8 @@ export function nextActor(thread: Thread): NextActor {
     const archived = thread.run.archived === true;
     const reported = numberOr(thread.run.reportedUserEntry);
     const last = numberOr(thread.run.lastUserEntry);
-    const silent = reported === undefined || reported !== last;
+    // A report at or past `lastUserEntry` counts: a report after the last scan is newer than the scan's newest entry.
+    const silent = reported === undefined || (last !== undefined && reported < last);
 
     if (thread.run.busy === false && !archived && silent) {
         return "odrade";
@@ -1634,6 +1640,9 @@ export function nextActor(thread: Thread): NextActor {
 
     return "none";
 }
+
+/** The words `odradeReason` gives a session whose agent did not report in its last turn. */
+const SILENT_SESSION = "silent session";
 
 /**
  * Why a thread waits on Odrade now, in `nextActor`'s order, in words: a due watch, a found thread, a PR GitHub cannot
@@ -1677,20 +1686,44 @@ export function odradeReason(thread: Thread): string | undefined {
         return `PR ${held.ref} needs a repair: ${REPAIR_WORDS[held.why]}`;
     }
 
-    return "silent session";
+    return SILENT_SESSION;
 }
+
+export type WaitsFacts = {
+    /**
+     * The addresses of the linked sessions that work now: a silent session of them will report, so it is not listed.
+     * Absent when the live list was not read: the text is then the one the stored facts give.
+     */
+    busy?: ReadonlySet<string>;
+};
 
 /**
  * The threads that wait on Odrade, in `nextActor`'s order, in words: `T35: silent session; F5: found PR, attach or
- * drop`. The section and the queue say the same thing, so they say it the same way.
+ * drop`. The section and the queue say the same thing, so they say it the same way. `facts.busy` leaves out a silent
+ * session whose agent works now: its report comes, so it does not wait on Odrade. The other reasons stay.
  */
-export function waitsText(threads: Thread[]): string {
+export function waitsText(threads: Thread[], facts: WaitsFacts = {}): string {
     return threads
         .map((thread) => ({ thread, reason: odradeReason(thread) }))
         .filter((each): each is { thread: Thread; reason: string } => each.reason !== undefined)
+        .filter(
+            (each) =>
+                !(
+                    each.reason === SILENT_SESSION &&
+                    each.thread.address !== undefined &&
+                    facts.busy?.has(each.thread.address) === true
+                ),
+        )
         .sort((a, b) => byId(a.thread, b.thread))
         .map((each) => `${each.thread.id}: ${each.reason}`)
         .join("; ");
+}
+
+/** Whether `waitsText` needs the live session list for `threads`: 1 of them is a silent session with an address. */
+export function waitsNeedLive(threads: Thread[]): boolean {
+    return threads.some(
+        (thread) => thread.address !== undefined && odradeReason(thread) === SILENT_SESSION,
+    );
 }
 
 /** The desk's start: the oldest seed thread's start, else the stored epoch. A seed sets the truth. */
@@ -4552,6 +4585,30 @@ export default function createDesk(host: Host, web: Web) {
         return facts;
     }
 
+    /**
+     * The addresses of `threads` whose linked session works now, for `waitsText`. The live list is read once, and only
+     * when a silent session makes it matter; undefined when it is not read, or not readable: the stored facts stand.
+     */
+    const busyNow = async (
+        threads: Thread[],
+        supervisor: ConversationId,
+    ): Promise<ReadonlySet<string> | undefined> => {
+        if (!waitsNeedLive(threads)) {
+            return undefined;
+        }
+
+        try {
+            const sessions = await host.linkedSessions.list(supervisor);
+
+            return new Set(
+                sessions.filter((each) => each.busy === true).map((each) => each.address),
+            );
+        } catch {
+            // Not readable now: the text from the stored facts, as before.
+            return undefined;
+        }
+    };
+
     /** Read the world for one supervisor's sweep: its threads, their sessions, their Night shifts, and the folders. */
     const gather = async (
         supervisor: ConversationId,
@@ -6330,11 +6387,13 @@ export default function createDesk(host: Host, web: Web) {
                     ...((await api.memo<string[]>("desk.touched", context)) ?? []),
                     ...idsIn(said),
                 ]);
-                const waits = waitsText(
-                    Object.values(state?.threads ?? {}).filter(
-                        (thread) => thread.supervisor === session && !touched.has(thread.id),
-                    ),
+                const candidates = Object.values(state?.threads ?? {}).filter(
+                    (thread) => thread.supervisor === session && !touched.has(thread.id),
                 );
+                // A silent session whose agent works now reports soon: it is not in the queue.
+                const waits = waitsText(candidates, {
+                    busy: await busyNow(candidates, api.conversationId),
+                });
 
                 if (waits === "") {
                     return undefined;
@@ -6897,7 +6956,10 @@ export default function createDesk(host: Host, web: Web) {
                     )
                     .map((thread) => `due: ${thread.id} ${thread.watch?.check ?? ""}`);
                 const watching = open.filter((thread) => asleep(thread, now)).length;
-                const waits = waitsText(open);
+                // The section and the queue say the same thing: a silent session that works now is left out of both.
+                const waits = waitsText(open, {
+                    busy: await busyNow(open, input.conversationId),
+                });
                 const { cap } = await deskConfig();
                 const capped = capView(state, cap, now);
                 const events = mine

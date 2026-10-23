@@ -51,6 +51,7 @@ import {
     nextActor,
     odradeReason,
     waitsText,
+    waitsNeedLive,
     answeredText,
     parseStatus,
     addAsk,
@@ -434,6 +435,22 @@ describe("closeCheck", () => {
         assert.deepEqual(closeCheck(thread(), facts()), { close: true, open: [] });
     });
 
+    test("a report past the last scan closes the session part", () => {
+        // The agent reported at entry 6, after the sweep's newest user entry 5: the session part is closed.
+        const late = thread({
+            prs: { "frostyard/test#1": { via: "attached" as const, state: "MERGED" as const } },
+            run: {
+                busy: false,
+                closeout: "closeout:k:frostyard/test#1",
+                closeoutEntry: 5,
+                reportedUserEntry: 6,
+                lastUserEntry: 5,
+            },
+        });
+
+        assert.deepEqual(closeCheck(late, facts()), { close: true, open: [] });
+    });
+
     test("a PR holds it open until it is merged, closed or frozen", () => {
         const open = closeCheck(
             thread({ prs: { "frostyard/test#2": { via: "attached" } } }),
@@ -651,6 +668,34 @@ describe("nextActor", () => {
         );
         assert.equal(nextActor(thread({ state: "closed" })), "none");
     });
+
+    test("a report after the last scan is not a silent session", () => {
+        const reported = (lastUserEntry: number) =>
+            thread({
+                prs: { "frostyard/test#1": { via: "attached" as const, state: "MERGED" as const } },
+                run: {
+                    busy: false,
+                    closeout: "closeout:k:frostyard/test#1",
+                    closeoutEntry: 5,
+                    reportedUserEntry: 6,
+                    lastUserEntry,
+                },
+            });
+
+        // The close-out wake-up came after the sweep's scan: the agent reported after it, and `lastUserEntry` is older.
+        const after = reported(5);
+
+        assert.notEqual(nextActor(after), "odrade");
+        assert.equal(odradeReason(after), undefined);
+        assert.equal(waitsText([after]), "");
+
+        // A newer message, and no report after it: a silent session again.
+        const newer = reported(7);
+
+        assert.equal(nextActor(newer), "odrade");
+        assert.equal(odradeReason(newer), "silent session");
+        assert.equal(waitsText([newer]), "T1: silent session");
+    });
 });
 
 /** Attached PRs with the state GitHub gave them. */
@@ -828,6 +873,55 @@ describe("waitsText", () => {
         );
         assert.equal(waitsText([]), "");
         assert.equal(waitsText([agent]), "");
+    });
+
+    test("a silent session that works now is left out, and another reason stays", () => {
+        const silent = thread({
+            id: "T36",
+            key: "k36",
+            address: "session-busy",
+            run: { lastUserEntry: 6 },
+        });
+        const idle = thread({
+            id: "T37",
+            key: "k37",
+            address: "session-idle",
+            run: { lastUserEntry: 6 },
+        });
+        const found = thread({
+            id: "F2",
+            origin: "found",
+            key: "found:pr:frostyard/test#1",
+            address: "session-busy",
+        });
+        const busy = new Set(["session-busy"]);
+
+        assert.equal(waitsText([silent], { busy }), "");
+        assert.equal(waitsText([silent, idle], { busy }), "T37: silent session");
+        assert.equal(waitsText([found], { busy }), "F2: found PR, attach or drop");
+        assert.equal(
+            waitsText([silent], { busy: new Set(["session-else"]) }),
+            "T36: silent session",
+            "a busy set that does not match leaves the thread in",
+        );
+        assert.equal(
+            waitsText([silent]),
+            "T36: silent session",
+            "no live list: the stored facts stand",
+        );
+
+        assert.equal(waitsNeedLive([silent]), true);
+        assert.equal(
+            waitsNeedLive([thread({ key: "k38", address: undefined, run: { lastUserEntry: 6 } })]),
+            false,
+            "no address to look up",
+        );
+        assert.equal(waitsNeedLive([idle]), true);
+        assert.equal(
+            waitsNeedLive([thread({ key: "k39", run: { busy: true } })]),
+            false,
+            "no silent session",
+        );
     });
 });
 
@@ -3708,6 +3802,11 @@ let otherThreadId = "";
 let resultThreadId = "";
 /** The thread the queue tests name in an answer: a thread the turn touched is not in the queue. */
 let queueThreadId = "";
+/**
+ * A gate that holds the linked session's first answer, in the queue test that keeps its session working: unset for
+ * every other test, so the answer goes at once.
+ */
+let heldAnswer: Promise<void> | undefined;
 
 /** Pi Pocket's plan mode, to turn it on for one session in a test. */
 const PlanDoc = defineDoc<{ on: boolean }>({
@@ -3747,6 +3846,11 @@ const model = scriptedModel((request) => {
 
     if (role === "toolResult") {
         return answer(text.includes("Filed T") ? "Should I merge #106?" : "ok");
+    }
+
+    // The delegation's first message to the linked session: the queue test holds this answer, so the session works.
+    if (heldAnswer !== undefined && text.includes("Task from the source session:")) {
+        return heldAnswer.then(() => answer("ok"));
     }
 
     if (text.startsWith("Desk check:")) {
@@ -4975,6 +5079,37 @@ describe("the desk in a Pi Pocket", () => {
         // A turn that names the thread touched it: no queue.
         await say(app, source, "desk queue named test");
         assert.equal(await queued(), 1);
+
+        await until(() => !app.isBusy(linked), "the linked session to settle", 20_000);
+    });
+
+    test("a silent thread whose session works now is not in the queue", async () => {
+        let release = () => {};
+
+        const gate = new Promise<void>((resolve) => {
+            release = resolve;
+        });
+
+        // The linked session's first answer waits on the gate: it works now, and its report comes later.
+        heldAnswer = gate;
+        const { source, linked, thread } = await delegated("queue-working");
+
+        try {
+            await until(() => app.isBusy(linked), "the linked session to work", 20_000);
+
+            // The stored facts say idle and silent, as the last sweep saw them: only the live list knows it works.
+            await app.harness.commit(async (tx) => {
+                (await tx.doc(DeskThreads)).threads[thread.id]!.run.busy = false;
+            }, context);
+
+            await say(app, source, "desk queue test");
+
+            assert.doesNotMatch((await modelTexts(app, source)).join("\n"), /Desk queue:/);
+            assert.doesNotMatch(lastDeskSection, /Waits on you:/, "the section leaves it out too");
+        } finally {
+            heldAnswer = undefined;
+            release();
+        }
 
         await until(() => !app.isBusy(linked), "the linked session to settle", 20_000);
     });
