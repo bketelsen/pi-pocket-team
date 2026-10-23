@@ -31,11 +31,11 @@ wakes Odrade only for judgement.
 The digest (`desk-digest.md`) decides **when** news goes. The Clerk changes **where** it goes. At each
 digest, the desk splits the items:
 
-| Kind                                         | With a Clerk           | Without a Clerk |
-| -------------------------------------------- | ---------------------- | --------------- |
-| `report`, `shift`, `closed`, `queue`         | the Clerk's digest     | the supervisor  |
-| `answer` (an acknowledgement from Brian)     | the supervisor's digest | the supervisor |
-| `shift-blocked`, `answer-action`, `repair`   | the supervisor, at once | the supervisor |
+| Kind                                       | With a Clerk            | Without a Clerk |
+| ------------------------------------------ | ----------------------- | --------------- |
+| `report`, `shift`, `closed`, `queue`       | the Clerk's digest      | the supervisor  |
+| `answer` (an acknowledgement from Brian)   | the supervisor's digest | the supervisor  |
+| `shift-blocked`, `answer-action`, `repair` | the supervisor, at once | the supervisor  |
 
 - The split is a setting: `digest.clerk` in `desk.json` lists the kinds the Clerk gets. Default
   `["report", "shift", "closed", "queue"]`. A kind in `digest.now` always goes to the supervisor.
@@ -73,16 +73,16 @@ It escalates to Odrade (1 `team_message`, 1 line for each item, with the thread 
 
 ## 5. Tools and limits
 
-| Tool                                  | The Clerk                                                                 |
-| ------------------------------------- | ------------------------------------------------------------------------- |
-| `desk` list, read, sync               | yes, for its supervisor's threads                                          |
-| `desk` attach, detach, watch, result  | yes, on its supervisor's threads                                           |
-| `desk send` (new)                     | yes: 1 message to a thread's agent, from the supervisor's session          |
-| `desk` ask, answer, seed              | **refused**: asks and Brian's words are Odrade's                           |
-| `team_delegate`                       | **refused** (supervisor only, as today)                                    |
-| `team_message`                        | yes: to its return address (Odrade), for escalations                        |
-| `bash`, `read`, `edit`, `write`       | yes, in its workspace                                                      |
-| `gh pr merge`, `gh pr review`, `gh release`, `git tag`, `git push --force` | **blocked** by a hook in the Clerk's session |
+| Tool                                                                       | The Clerk                                                         |
+| -------------------------------------------------------------------------- | ----------------------------------------------------------------- |
+| `desk` list, read, sync                                                    | yes, for its supervisor's threads                                 |
+| `desk` attach, detach, watch, result                                       | yes, on its supervisor's threads                                  |
+| `desk send` (new)                                                          | yes: 1 message to a thread's agent, from the supervisor's session |
+| `desk` ask, answer, seed                                                   | **refused**: asks and Brian's words are Odrade's                  |
+| `team_delegate`                                                            | **refused** (supervisor only, as today)                           |
+| `team_message`                                                             | yes: to its return address (Odrade), for escalations              |
+| `bash`, `read`, `edit`, `write`                                            | yes, in its workspace                                             |
+| `gh pr merge`, `gh pr review`, `gh release`, `git tag`, `git push --force` | **blocked** by a hook in the Clerk's session                      |
 
 The Clerk never approves, merges, tags, releases, files an ask, records an answer for Brian, or writes a
 decision that Brian did not make. A decision line in `decided.md` copies Brian's words from the desk

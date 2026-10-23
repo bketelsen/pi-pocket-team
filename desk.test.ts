@@ -54,10 +54,13 @@ import {
     waitsNeedLive,
     answeredText,
     answerKind,
+    clerkOf,
     digestConfig,
+    digestMessages,
     digestText,
     enqueueDigest,
     queueNews,
+    supervisorOfClerk,
     takeDigest,
     type DigestBox,
     type DigestConfig,
@@ -110,7 +113,7 @@ import {
     type Thread,
 } from "./desk.ts";
 import createDesk from "./desk.ts";
-import { taskTitle } from "./team.ts";
+import createTeam, { Identity, taskTitle } from "./team.ts";
 import { createHandler } from "./_pocket/src/server/http.ts";
 
 // ─── The rules ───────────────────────────────────────────────────────────────
@@ -3839,12 +3842,18 @@ describe("the digest's rules", () => {
 
     test("the setting: 0 to 240 minutes, known kinds only, and a default for a bad value", () => {
         const fallback = ["shift-blocked", "answer-action", "repair"];
+        const routine = ["report", "shift", "closed", "queue"];
 
-        assert.deepEqual(digestConfig(undefined), { minutes: 15, now: fallback });
-        assert.deepEqual(digestConfig(null), { minutes: 15, now: fallback });
+        assert.deepEqual(digestConfig(undefined), {
+            minutes: 15,
+            now: fallback,
+            clerk: routine,
+        });
+        assert.deepEqual(digestConfig(null), { minutes: 15, now: fallback, clerk: routine });
         assert.deepEqual(digestConfig({ minutes: 0, now: ["queue", "nope", "queue", 3] }), {
             minutes: 0,
             now: ["queue"],
+            clerk: routine,
         });
         assert.equal(digestConfig({ minutes: 240 }).minutes, 240);
         assert.deepEqual(digestConfig({ now: [] }).now, [], "an empty list is not a bad value");
@@ -3854,6 +3863,27 @@ describe("the digest's rules", () => {
         }
 
         assert.deepEqual(digestConfig({ now: "queue" }).now, fallback);
+        // The Clerk's kinds: known names only, and its default when the value is not a list.
+        assert.deepEqual(digestConfig({ clerk: ["queue", "nope", "answer"] }).clerk, [
+            "queue",
+            "answer",
+        ]);
+        assert.deepEqual(digestConfig({ clerk: [] }).clerk, []);
+        assert.deepEqual(digestConfig({ clerk: "queue" }).clerk, routine);
+    });
+
+    test("a Clerk is found by its supervisor, and a session by its supervisor's Clerk", () => {
+        const state = empty();
+        const clerk = { session: 77, address: "session-a", agent: "clerk", at: 5 };
+
+        state.clerks = { "5": clerk };
+
+        assert.deepEqual(clerkOf(state, 5), clerk);
+        assert.equal(clerkOf(state, 6), undefined);
+        assert.equal(clerkOf(undefined, 5), undefined);
+        assert.equal(supervisorOfClerk(state, 77), 5);
+        assert.equal(supervisorOfClerk(state, 78), undefined);
+        assert.equal(supervisorOfClerk(undefined, 77), undefined);
     });
 
     test("enqueue: an at-once kind asks for now, another for now plus the interval", () => {
@@ -4043,6 +4073,16 @@ describe("the digest's rules", () => {
         assert.equal(shown[31], "… and 5 more on the Desk page.");
     });
 
+    test("a checkpoint: the message list, or the 1 message of a task stored before the split", () => {
+        const messages = [{ conversation: 7, text: "a", requestId: "x.desk.digest:5:2:clerk" }];
+
+        assert.deepEqual(digestMessages(5, { messages }), messages);
+        assert.deepEqual(digestMessages(5, { text: "old news", requestId: "x.desk.digest:5:1" }), [
+            { conversation: 5, text: "old news", requestId: "x.desk.digest:5:1" },
+        ]);
+        assert.deepEqual(digestMessages(5, {}), []);
+    });
+
     test("take: the items, an empty box, the number, and 1 scheduled time gone", () => {
         const state = empty();
         const due = enqueueDigest(state, 5, made("a", "closed"), 5000, config(15));
@@ -4086,6 +4126,8 @@ let otherThreadId = "";
 let resultThreadId = "";
 /** The thread the queue tests name in an answer: a thread the turn touched is not in the queue. */
 let queueThreadId = "";
+/** The thread the Clerk tests send a message to with `desk send`. */
+let sendThreadId = "";
 /**
  * A gate that holds the linked session's first answer, in the queue test that keeps its session working: unset for
  * every other test, so the answer goes at once.
@@ -4324,6 +4366,49 @@ const model = scriptedModel((request) => {
 
     if (text.endsWith("team guard test")) {
         return call("team", { action: "send", to: guardAddress, message: "a report" });
+    }
+
+    if (text.endsWith("desk clerk delegate test")) {
+        return call("team_delegate", { agent: "clerk", task: "Run the desk." });
+    }
+
+    if (text.endsWith("clerk ask test")) {
+        return call("desk", { action: "ask", thread: askThreadId, text: "Should I merge #106?" });
+    }
+
+    if (text.endsWith("clerk answer test")) {
+        return call("desk", { action: "answer", ask: answerAskId, words: "yes" });
+    }
+
+    if (text.endsWith("clerk seed test")) {
+        return call("desk", { action: "seed", path: seedPath });
+    }
+
+    if (text.endsWith("clerk list test")) {
+        return call("desk", { action: "list" });
+    }
+
+    if (text.endsWith("clerk result test")) {
+        return call("desk", {
+            action: "result",
+            thread: resultThreadId,
+            pass: true,
+            text: "the checks pass",
+        });
+    }
+
+    if (text.endsWith("clerk send test")) {
+        return call("desk", {
+            action: "send",
+            thread: sendThreadId,
+            text: "Send the after-merge check to your agent.",
+        });
+    }
+
+    if (text.endsWith("clerk merge test")) {
+        return fauxAssistantMessage([fauxToolCall("bash", { command: "gh pr merge 7" })], {
+            stopReason: "toolUse",
+        });
     }
 
     if (text.endsWith("desk night shift test")) {
@@ -6453,6 +6538,79 @@ describe("the desk in a Pi Pocket", () => {
             }
         });
 
+        test("with a Clerk, an at-once answer goes to the supervisor, not the Clerk", async () => {
+            writeFileSync(configPath, JSON.stringify({ digest: { minutes: 15 }, cap: 100 }));
+
+            const source = await supervisor("digest-clerk-action");
+            const folder = join(root, "clerk-action");
+
+            mkdirSync(folder, { recursive: true });
+            const clerkSession = await newSession(app, folder);
+            let askId = "";
+
+            await app.harness.commit(async (tx) => {
+                const state = await tx.doc(DeskThreads);
+                const opened = openThread(state, {
+                    key: "x.test.digest-clerk-action",
+                    supervisor: Number(source),
+                    agents: ["duncan"],
+                    repo: "frostyard/test",
+                    title: "A decision",
+                    at: Date.now(),
+                });
+
+                // A Clerk's session, registered for this supervisor.
+                state.clerks = {
+                    [String(Number(source))]: {
+                        session: Number(clerkSession),
+                        address: "session-clerk",
+                        agent: "clerk",
+                        at: Date.now(),
+                    },
+                };
+
+                const made = addAsk(state, {
+                    thread: opened.thread.id,
+                    text: "Merge it?",
+                    key: "x.test.digest-clerk-action:1",
+                    by: "Odrade",
+                    supervisor: Number(source),
+                    at: Date.now(),
+                });
+
+                askId = "askId" in made ? made.askId : "";
+            }, context);
+
+            try {
+                assert.equal(
+                    (await call(`asks/${askId}/answer`, { words: "merge it" })).status,
+                    200,
+                );
+                await until(
+                    async () =>
+                        (await modelTexts(app, source))
+                            .join("\n")
+                            .includes(`[desk] ${askId} answered by`),
+                    "the supervisor's digest",
+                    20_000,
+                );
+                assert.match(
+                    (await modelTexts(app, source)).join("\n"),
+                    /\[desk\] digest: 1 new\./,
+                );
+                assert.equal(
+                    (await modelTexts(app, clerkSession)).filter((each) =>
+                        each.includes("[desk] digest:"),
+                    ).length,
+                    0,
+                    "an at-once kind never goes to the Clerk",
+                );
+            } finally {
+                await stopDigests();
+                writeFileSync(configPath, JSON.stringify({ digest: { minutes: 0 }, cap: 100 }));
+            }
+        });
+
         test("watch, unwatch and result change the thread; a second POST changes nothing", async () => {
             const { thread } = await delegated("page-watch");
 
@@ -8171,6 +8329,736 @@ describe("the desk in a Pi Pocket", () => {
             } finally {
                 await stopDigests();
                 digestOff();
+            }
+        });
+    });
+
+    describe("the Clerk", () => {
+        /** The Clerk's profile: the shared fixture has none, so each test writes and removes it. */
+        const clerkFile = join(definitions, "clerk.md");
+        const clerkFolder = join(root, "clerk-folder");
+
+        const writeClerk = (model?: string) => {
+            mkdirSync(clerkFolder, { recursive: true });
+            writeFileSync(
+                clerkFile,
+                `---\nrole: clerk\n${model === undefined ? "" : `model: ${model}\n`}workspace: ${clerkFolder}\n---\n# Clerk\nYou are the desk clerk.`,
+            );
+        };
+
+        const removeClerk = () => rmSync(clerkFile, { force: true });
+        const clerksOf = async (source: ConversationId) =>
+            (await deskState())?.clerks?.[String(Number(source))];
+        /** The desk's config file, with the digest on or off. */
+        const digestMinutes = (minutes: number) =>
+            writeFileSync(configPath, JSON.stringify({ digest: { minutes }, cap: 100 }));
+
+        /** Delegate the Clerk from a supervisor session, and give back its registration. */
+        const startClerk = async (source: ConversationId) => {
+            await say(app, source, "desk clerk delegate test");
+            await until(
+                async () => (await clerksOf(source)) !== undefined,
+                "the Clerk's registration",
+                20_000,
+            );
+
+            const clerk = await clerksOf(source);
+
+            assert(clerk, "the Clerk is registered");
+
+            return clerk;
+        };
+
+        const newFolder = (name: string) => {
+            const folder = join(root, name);
+
+            mkdirSync(folder, { recursive: true });
+
+            return folder;
+        };
+
+        /** Wait for a message, then take the news out of the box: a first sweep's item is not this test's news. */
+        const clearDigests = async () => {
+            await app.harness.commit(async (tx) => {
+                delete (await tx.doc(DeskThreads)).digests;
+            }, context);
+        };
+
+        /** The desk module alone, with a host that records its sends: the rules a real turn is slow to reach. */
+        const stubDesk = () => {
+            const sent: { source: number; to: string; message: string; key: string }[] = [];
+            const keys = new Set<string>();
+            const stubWeb = {
+                conversationRoute() {},
+                route() {},
+                client() {},
+                command() {},
+                send() {},
+                onDispose() {},
+                error: (status: number, message: string) =>
+                    Object.assign(new Error(message), { status }),
+            };
+            const stubHost = {
+                requesterOf: () => owner(app).id,
+                text: { defang: (value: string) => value, quoted: () => "" },
+                notice() {},
+                linkedSessions: {
+                    send: async (
+                        source: number,
+                        request: { to: string; message: string },
+                        key: string,
+                    ) => {
+                        // As Pi Pocket's own send: the same key acts once.
+                        if (keys.has(key)) {
+                            return;
+                        }
+
+                        keys.add(key);
+                        sent.push({
+                            source: Number(source),
+                            to: request.to,
+                            message: request.message,
+                            key,
+                        });
+                    },
+                },
+            };
+            const shared = globalThis as unknown as Record<symbol, unknown>;
+            const saved = shared[Symbol.for("pi-pocket-team.desk")];
+            const extension = createDesk(stubHost as never, stubWeb as never) as unknown as {
+                tools: {
+                    name: string;
+                    execute: (args: object, api: object, context: unknown) => Promise<unknown>;
+                }[];
+                hooks: {
+                    task: string;
+                    handlers: {
+                        beforeTool?: (
+                            call: object,
+                            api: object,
+                            context: unknown,
+                        ) => Promise<unknown>;
+                    };
+                }[];
+            };
+            const api = (conversationId: number, taskId: string, callId: string) => ({
+                conversationId,
+                taskId,
+                callId,
+                snapshot: (...args: unknown[]) =>
+                    Reflect.apply(app.harness.snapshot, app.harness, args),
+                commit: (change: never, ctx: never) => app.harness.commit(change, ctx),
+            });
+            const tool = (
+                args: object,
+                conversationId: number,
+                taskId = "task-1",
+                callId = "call-1",
+            ) =>
+                extension.tools
+                    .find((each) => each.name === "desk")!
+                    .execute(args, api(conversationId, taskId, callId), context);
+            const hooks = extension.hooks
+                .map((each) => each.handlers.beforeTool)
+                .filter((each): each is NonNullable<typeof each> => each !== undefined);
+
+            /** The block text of a bash command in a session, or undefined when it may run. */
+            const blocked = async (command: string, conversationId: number) => {
+                for (const hook of hooks) {
+                    const result = (await hook(
+                        { name: "bash", arguments: { command } },
+                        api(conversationId, "task-hook", "call-hook"),
+                        context,
+                    )) as { block?: string } | undefined;
+
+                    if (result?.block !== undefined) {
+                        return result.block;
+                    }
+                }
+
+                return undefined;
+            };
+
+            return {
+                sent,
+                tool,
+                blocked,
+                restore: () => {
+                    shared[Symbol.for("pi-pocket-team.desk")] = saved;
+                },
+            };
+        };
+
+        test("a Clerk start registers it, opens no thread, and refuses a second one", async () => {
+            await app.setSubagentModels(owner(app), ["faux/faux-2"]);
+            writeClerk("faux/faux-2");
+
+            try {
+                const source = await supervisor("clerk-start");
+                const before = Object.keys((await deskState())?.threads ?? {}).length;
+
+                const clerk = await startClerk(source);
+
+                assert.equal(clerk.agent, "clerk");
+                assert.match(clerk.address, /^session-/);
+                assert.equal(
+                    Object.keys((await deskState())?.threads ?? {}).length,
+                    before,
+                    "a Clerk opens no thread",
+                );
+
+                const texts = (await modelTexts(app, source)).join("\n");
+
+                assert.match(texts, new RegExp(`at ${clerk.address}, on faux/faux-2`));
+                assert.match(
+                    texts,
+                    /Routine desk news goes to the Clerk now\. Send it work with team_message\./,
+                );
+                assert.equal(
+                    (await app.harness.snapshot(Identity, clerk.session as ConversationId, context))
+                        ?.persona?.id,
+                    "clerk",
+                    "the session carries the Clerk's identity",
+                );
+                assert.equal(app.cwdOf(clerk.session as ConversationId), clerkFolder);
+
+                // A second start: refused, with the address of the one that is there.
+                const sessions = app.sessions().length;
+
+                await say(app, source, "desk clerk delegate test");
+                assert.match(
+                    (await modelTexts(app, source)).join("\n"),
+                    new RegExp(
+                        `This supervisor has a Clerk already, at ${clerk.address}\\. There is 1 Clerk for each supervisor`,
+                    ),
+                );
+                assert.equal(app.sessions().length, sessions, "nothing started");
+            } finally {
+                await app.setSubagentModels(owner(app), []);
+                removeClerk();
+            }
+        });
+
+        test("a replayed Clerk start gives the same reply, 1 session, and 1 registration", async () => {
+            writeClerk("faux/faux-2");
+
+            const starts = new Map<string, { session: ConversationId; address: string }>();
+            const made: ConversationId[] = [];
+            const stubWeb = {
+                conversationRoute() {},
+                route() {},
+                client() {},
+                command() {},
+                send() {},
+                onDispose() {},
+                error: (status: number, message: string) =>
+                    Object.assign(new Error(message), { status }),
+            };
+            // A start that returns the same session for the same key, as Pi Pocket's own does.
+            const stubHost = {
+                requesterOf: () => owner(app).id,
+                subagentModels: () => ["faux/faux-2"],
+                text: { defang: (value: string) => value, quoted: () => "" },
+                notice() {},
+                linkedSessions: {
+                    start: async (_source: ConversationId, _request: object, key: string) => {
+                        const had = starts.get(key);
+
+                        if (had !== undefined) {
+                            return had;
+                        }
+
+                        const session = (
+                            await app.harness.commit(
+                                (tx) => tx.createConversation({ ownership: { kind: "ownerless" } }),
+                                context,
+                            )
+                        ).id;
+                        const here = {
+                            session,
+                            address: `session-replay-${String(made.length)}`,
+                        };
+
+                        made.push(session);
+                        starts.set(key, here);
+
+                        return here;
+                    },
+                    list: async () =>
+                        [...starts.values()].map((each) => ({
+                            address: each.address,
+                            archived: false,
+                        })),
+                },
+            };
+            const shared = globalThis as unknown as Record<symbol, unknown>;
+            const saved = shared[Symbol.for("pi-pocket-team.team")];
+            const extension = createTeam(stubHost as never, stubWeb as never) as unknown as {
+                tools: {
+                    name: string;
+                    execute: (args: object, api: object, context: unknown) => Promise<unknown>;
+                }[];
+            };
+            const tool = extension.tools.find((each) => each.name === "team_delegate")!;
+            const api = {
+                conversationId: 0,
+                taskId: "task-clerk-replay",
+                callId: "call-1",
+                snapshot: (...args: unknown[]) =>
+                    Reflect.apply(app.harness.snapshot, app.harness, args),
+                commit: (change: never, ctx: never) => app.harness.commit(change, ctx),
+            };
+
+            try {
+                const source = await supervisor("clerk-replay");
+
+                api.conversationId = Number(source);
+
+                const first = JSON.stringify(
+                    await tool.execute({ agent: "clerk", task: "Run the desk." }, api, context),
+                );
+                const second = JSON.stringify(
+                    await tool.execute({ agent: "clerk", task: "Run the desk." }, api, context),
+                );
+
+                assert.match(first, /Routine desk news goes to the Clerk now/);
+                assert.equal(second, first, "the replay gives the same reply");
+                assert.equal(made.length, 1, "1 session");
+
+                const clerk = await clerksOf(source);
+
+                assert.equal(clerk?.session, Number(made[0]), "1 registration");
+                assert.equal(clerk?.key, "x.team.delegate:task-clerk-replay:call-1");
+            } finally {
+                shared[Symbol.for("pi-pocket-team.team")] = saved;
+                removeClerk();
+            }
+        });
+
+        test("a Clerk needs its own model, in the owner's allowed list", async () => {
+            await app.setSubagentModels(owner(app), ["faux/faux-2"]);
+
+            try {
+                const source = await supervisor("clerk-model");
+                const sessions = app.sessions().length;
+
+                // No model in the profile.
+                writeClerk();
+                await say(app, source, "desk clerk delegate test");
+                assert.match(
+                    (await modelTexts(app, source)).join("\n"),
+                    /The Clerk has no model in its profile \(clerk\.md\)\. Brian sets one there, from the owner's allowed list for subagents\. The Clerk never uses your model\./,
+                );
+
+                // A model that the owner does not allow for subagents.
+                writeClerk("nobody/nothing");
+                await say(app, source, "desk clerk delegate test");
+                assert.match(
+                    (await modelTexts(app, source)).join("\n"),
+                    /nobody\/nothing is not in the owner's allowed list for subagents\. Brian sets the Clerk's model in its profile \(clerk\.md\)/,
+                );
+                assert.equal(app.sessions().length, sessions, "nothing started");
+                assert.equal(await clerksOf(source), undefined, "nothing registered");
+            } finally {
+                await app.setSubagentModels(owner(app), []);
+                removeClerk();
+            }
+        });
+
+        test("a report goes to the Clerk's digest, and the supervisor's session gets none", async () => {
+            await app.setSubagentModels(owner(app), ["faux/faux-2"]);
+            writeClerk("faux/faux-2");
+            digestMinutes(15);
+
+            try {
+                const { source, linked, thread } = await delegated("clerk-split");
+                const clerk = await startClerk(source);
+
+                await until(() => !app.isBusy(linked), "the linked session to settle", 20_000);
+                await until(
+                    async () =>
+                        typeof (await deskState())?.threads[thread.id]?.run.sweptAt === "number",
+                    "the first sweep",
+                    20_000,
+                );
+                await clearDigests();
+
+                await say(app, linked, "report to supervisor test");
+                await until(() => !app.isBusy(linked), "the report's turn to settle", 20_000);
+
+                const box = (await deskState())?.digests?.[String(Number(source))];
+
+                assert.equal(box?.items.find((each) => each.thread === thread.id)?.kind, "report");
+
+                await quiet([thread.id]);
+                await restartApp(16 * 60_000);
+
+                await until(
+                    async () =>
+                        (await modelTexts(app, clerk.session as ConversationId))
+                            .join("\n")
+                            .includes("[desk] digest:"),
+                    "the Clerk's digest",
+                    20_000,
+                );
+
+                const clerkTexts = (await modelTexts(app, clerk.session as ConversationId)).join(
+                    "\n",
+                );
+
+                assert.match(clerkTexts, /\[desk\] digest: 1 new\./);
+                assert.match(
+                    clerkTexts,
+                    new RegExp(`\\[desk\\] ${thread.id} frostyard/test · duncan reported`),
+                );
+                assert.equal(
+                    (await modelTexts(app, source)).filter((each) =>
+                        each.includes("[desk] digest:"),
+                    ).length,
+                    0,
+                    "the supervisor's session gets no routine news",
+                );
+            } finally {
+                await stopDigests();
+                await quiet([]);
+                shift = 0;
+                digestMinutes(0);
+                await app.setSubagentModels(owner(app), []);
+                removeClerk();
+            }
+        });
+
+        test("a Clerk that cannot take its news: the supervisor gets it instead", async () => {
+            digestMinutes(15);
+
+            try {
+                const { source, linked, thread } = await delegated("clerk-gone");
+
+                // A registration whose session is not there: the fallback must carry its text to the supervisor.
+                await app.harness.commit(async (tx) => {
+                    (await tx.doc(DeskThreads)).clerks = {
+                        [String(Number(source))]: {
+                            session: 999_999_999,
+                            address: "session-gone",
+                            agent: "clerk",
+                            at: Date.now(),
+                        },
+                    };
+                }, context);
+
+                await until(() => !app.isBusy(linked), "the linked session to settle", 20_000);
+                await until(
+                    async () =>
+                        typeof (await deskState())?.threads[thread.id]?.run.sweptAt === "number",
+                    "the first sweep",
+                    20_000,
+                );
+                await clearDigests();
+
+                await say(app, linked, "report to supervisor test");
+                await until(() => !app.isBusy(linked), "the report's turn to settle", 20_000);
+
+                await quiet([thread.id]);
+                await restartApp(16 * 60_000);
+
+                await until(
+                    async () =>
+                        (await modelTexts(app, source)).join("\n").includes("[desk] digest:"),
+                    "the supervisor's digest",
+                    20_000,
+                );
+
+                const texts = (await modelTexts(app, source)).join("\n");
+
+                assert.match(texts, /\[desk\] digest: 1 new\./);
+                assert.match(
+                    texts,
+                    new RegExp(`\\[desk\\] ${thread.id} frostyard/test · duncan reported`),
+                );
+            } finally {
+                await stopDigests();
+                await quiet([]);
+                shift = 0;
+                digestMinutes(0);
+                removeClerk();
+            }
+        });
+
+        test("desk send sends 1 message to the thread's agent, from the supervisor's session", async () => {
+            const { source, linked, thread } = await delegated("clerk-send");
+
+            sendThreadId = thread.id;
+
+            try {
+                await say(app, source, "clerk send test");
+                await until(
+                    async () =>
+                        (await modelTexts(app, linked))
+                            .join("\n")
+                            .includes("Send the after-merge check to your agent."),
+                    "the message at the agent",
+                    20_000,
+                );
+
+                const after = (await deskState())?.threads[thread.id];
+
+                assert(
+                    after?.events.some(
+                        (event) =>
+                            event.key.startsWith("x.desk.send:") &&
+                            event.text === "message from Odrade sent",
+                    ),
+                    "1 event with the call's key",
+                );
+                assert.match(
+                    (await modelTexts(app, source)).join("\n"),
+                    new RegExp(`Sent 1 message to the agent of ${thread.id}\\.`),
+                );
+            } finally {
+                sendThreadId = "";
+            }
+        });
+
+        test("desk send acts once on a replay, and refuses a closed thread and an agent session", async () => {
+            const stub = stubDesk();
+
+            try {
+                const { source, linked, thread } = await delegated("clerk-send-replay");
+                const args = { action: "send", thread: thread.id, text: "a check" };
+
+                assert(thread.address, "the thread has its agent's address");
+
+                await stub.tool(args, Number(source), "task-send", "call-1");
+                await stub.tool(args, Number(source), "task-send", "call-1");
+
+                assert.equal(stub.sent.length, 1, "the same call sends once");
+                assert.equal(stub.sent[0]?.source, Number(source), "from the supervisor's session");
+                assert.equal(stub.sent[0]?.to, thread.address);
+                assert.equal(stub.sent[0]?.message, "a check");
+                assert.equal(
+                    (await deskState())?.threads[thread.id]?.events.filter((event) =>
+                        event.key.startsWith("x.desk.send:"),
+                    ).length,
+                    1,
+                );
+
+                // A closed thread, and a session that is an agent: refused.
+                await app.harness.commit(async (tx) => {
+                    (await tx.doc(DeskThreads)).threads[thread.id]!.state = "closed";
+                }, context);
+                await assert.rejects(
+                    () => stub.tool(args, Number(source), "task-send", "call-2"),
+                    new RegExp(`${thread.id} is closed`),
+                );
+                await assert.rejects(
+                    () => stub.tool(args, Number(linked), "task-send", "call-3"),
+                    /Only a session assigned a supervisor identity can use the desk\./,
+                );
+
+                // A thread with no address for its agent: refused.
+                let bare = "";
+
+                await app.harness.commit(async (tx) => {
+                    bare = openThread(await tx.doc(DeskThreads), {
+                        key: "x.test.send-no-address",
+                        supervisor: Number(source),
+                        agents: ["duncan"],
+                        title: "No address",
+                        at: Date.now(),
+                    }).thread.id;
+                }, context);
+                await assert.rejects(
+                    () =>
+                        stub.tool(
+                            { action: "send", thread: bare, text: "a check" },
+                            Number(source),
+                            "task-send",
+                            "call-4",
+                        ),
+                    /has no address for its agent/,
+                );
+            } finally {
+                stub.restore();
+            }
+        });
+
+        test("a Clerk lists and records results for its supervisor, and never asks, answers, or seeds", async () => {
+            await app.setSubagentModels(owner(app), ["faux/faux-2"]);
+            writeClerk("faux/faux-2");
+
+            try {
+                const { source, linked, thread } = await delegated("clerk-tools");
+                const clerk = await startClerk(source);
+                const clerkSession = clerk.session as ConversationId;
+
+                await until(() => !app.isBusy(linked), "the linked session to settle", 20_000);
+
+                // The supervisor files the ask, then the Clerk tries the actions it may not take.
+                askThreadId = thread.id;
+                answerAskId = "";
+                await say(app, source, "desk ask thread test");
+
+                for (const words of ["clerk ask test", "clerk answer test", "clerk seed test"]) {
+                    await say(app, clerkSession, words);
+                    assert.match(
+                        (await modelTexts(app, clerkSession)).join("\n"),
+                        /Only the supervisor files asks, records Brian's answers, and seeds the desk\. Escalate to your supervisor\./,
+                        words,
+                    );
+                }
+
+                const askId = (await deskState())?.threads[thread.id]?.asks[0]?.id ?? "";
+
+                assert.match(askId, /^T\d+[a-z]+$/);
+                assert.equal(
+                    (await deskState())?.threads[thread.id]?.asks[0]?.answer,
+                    undefined,
+                    "no answer recorded",
+                );
+
+                // list, for its supervisor's threads, and the look on its supervisor's key.
+                await say(app, clerkSession, "clerk list test");
+                const listed =
+                    (await modelTexts(app, clerkSession))
+                        .filter((each) => each.includes("Counted:"))
+                        .at(-1) ?? "";
+
+                assert.match(listed, new RegExp(`${thread.id} · open · .* · frostyard/test`));
+                assert(
+                    ((await deskState())?.seen[`supervisor:${String(Number(source))}`] ?? 0) > 0,
+                    "the Clerk's look is the supervisor's",
+                );
+
+                // send, from the supervisor's session.
+                sendThreadId = thread.id;
+                await say(app, clerkSession, "clerk send test");
+                assert.match(
+                    (await modelTexts(app, clerkSession)).join("\n"),
+                    new RegExp(`Sent 1 message to the agent of ${thread.id}`),
+                );
+
+                // watch and result: any thread of its supervisor. A pass closes it.
+                watchThreadId = thread.id;
+                await say(app, source, "desk watch test");
+                resultThreadId = thread.id;
+                await say(app, clerkSession, "clerk result test");
+
+                const after = (await deskState())?.threads[thread.id];
+
+                assert.equal(after?.state, "closed");
+                assert.deepEqual(
+                    after?.watch?.result && {
+                        by: after.watch.result.by,
+                        pass: after.watch.result.pass,
+                    },
+                    { by: "clerk", pass: true },
+                );
+
+                // The bash hook blocks a merge in the Clerk's session.
+                await say(app, clerkSession, "clerk merge test");
+                assert.match(
+                    (await modelTexts(app, clerkSession)).join("\n"),
+                    /The Clerk never merges, approves, reviews, tags, releases, or force-pushes\. Escalate to your supervisor\./,
+                );
+
+                // A Clerk identity that no supervisor registered: refused by name.
+                const stray = await newSession(app, newFolder("clerk-stray"));
+
+                await command(stray, "team-agent", "clerk");
+                await say(app, stray, "clerk list test");
+                assert.match(
+                    (await modelTexts(app, stray)).join("\n"),
+                    /This Clerk is not registered on the desk\. Odrade starts it with team_delegate\./,
+                );
+            } finally {
+                await app.setSubagentModels(owner(app), []);
+                sendThreadId = "";
+                resultThreadId = "";
+                watchThreadId = "";
+                removeClerk();
+            }
+        });
+
+        test("the Clerk's session makes no found thread, and an archived Clerk leaves the desk", async () => {
+            await app.setSubagentModels(owner(app), ["faux/faux-2"]);
+            writeClerk("faux/faux-2");
+
+            try {
+                const { source, thread } = await delegated("clerk-sweep");
+                const clerk = await startClerk(source);
+
+                await until(
+                    () => !app.isBusy(clerk.session as ConversationId),
+                    "the Clerk to rest",
+                    20_000,
+                );
+                await say(app, source, "desk sync test");
+
+                const found = Object.values((await deskState())?.threads ?? {}).find(
+                    (each) => each.address === clerk.address,
+                );
+
+                assert.equal(found, undefined, "the Clerk's session is known work");
+
+                // Archived: the sweep removes the registration, and adds nothing.
+                const before = Object.keys((await deskState())?.threads ?? {}).length;
+                const events = (await deskState())?.threads[thread.id]?.events.length ?? 0;
+
+                await app.commands.updateSession(clerk.session as ConversationId, owner(app), {
+                    archived: true,
+                });
+                await say(app, source, "desk sync test");
+
+                assert.equal(await clerksOf(source), undefined, "the Clerk left the desk");
+                assert.equal(Object.keys((await deskState())?.threads ?? {}).length, before);
+                assert.equal((await deskState())?.threads[thread.id]?.events.length, events);
+            } finally {
+                await app.setSubagentModels(owner(app), []);
+                removeClerk();
+            }
+        });
+
+        test("the Clerk's bash calls: a merge, a review, a tag, a release, and a force-push are blocked", async () => {
+            await app.setSubagentModels(owner(app), ["faux/faux-2"]);
+            writeClerk("faux/faux-2");
+
+            const stub = stubDesk();
+
+            try {
+                const source = await supervisor("clerk-hook");
+                const clerk = await startClerk(source);
+                const block =
+                    "The Clerk never merges, approves, reviews, tags, releases, or force-pushes. Escalate to your supervisor.";
+
+                for (const command of [
+                    "gh pr merge 41 --squash",
+                    "gh pr review 41 --approve",
+                    "gh pr review 41 --comment 'looks fine'",
+                    "gh release create v1.2.0",
+                    "git tag -a v1.2.0 -m 'release'",
+                    "git push --force origin main",
+                    "git push origin main -f",
+                    "git push --force-with-lease origin main",
+                ]) {
+                    assert.equal(await stub.blocked(command, clerk.session), block, command);
+                }
+
+                // A push without force is allowed, and only a Clerk's session is blocked.
+                assert.equal(await stub.blocked("git push origin main", clerk.session), undefined);
+                assert.equal(
+                    await stub.blocked("git push -u origin main", clerk.session),
+                    undefined,
+                );
+                assert.equal(await stub.blocked("git status", clerk.session), undefined);
+                assert.equal(
+                    await stub.blocked("gh pr merge 41 --squash", Number(source)),
+                    undefined,
+                    "the supervisor is not blocked",
+                );
+            } finally {
+                stub.restore();
+                await app.setSubagentModels(owner(app), []);
+                removeClerk();
             }
         });
     });
