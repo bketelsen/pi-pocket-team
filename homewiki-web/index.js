@@ -116,6 +116,7 @@ export default function setup(pocket) {
 
             if (target === path) {
                 setPage((same) => (same ? { ...same } : same));
+
                 return;
             }
 
@@ -170,6 +171,7 @@ export default function setup(pocket) {
             if (file === "") {
                 setAnchor(fragment);
                 setPage((same) => (same ? { ...same } : same));
+
                 return;
             }
 
@@ -208,9 +210,11 @@ export default function setup(pocket) {
             <nav class="homewiki-nav">${nav}</nav>
             <div class="homewiki-main">
                 <div class="homewiki-bar" ref=${top}>
-                    ${back.length > 0
-                        ? html`<button class="button" onClick=${goBack}>← Back</button>`
-                        : null}
+                    ${
+                        back.length > 0
+                            ? html`<button class="button" onClick=${goBack}>← Back</button>`
+                            : null
+                    }
                     <select
                         class="homewiki-select"
                         value=${path}
@@ -226,21 +230,27 @@ export default function setup(pocket) {
                     <span class="grow"></span>
                     <button class="button" onClick=${refresh}>Refresh</button>
                 </div>
-                ${missing
-                    ? html`<div class="error-box">No wiki page at <span class="mono">${missing}</span>.</div>`
-                    : null}
+                ${
+                    missing
+                        ? html`<div class="error-box">No wiki page at <span class="mono">${missing}</span>.</div>`
+                        : null
+                }
                 ${error ? html`<div class="error-box">${error}</div>` : null}
-                ${page
-                    ? html`<article class="homewiki-page" ref=${body} onClick=${onClick}>
+                ${
+                    page
+                        ? html`<article class="homewiki-page" ref=${body} onClick=${onClick}>
                           <${Markdown} text=${page.body} breaks=${false} />
                       </article>`
-                    : html`<${Loader} label="Opening the page" />`}
+                        : html`<${Loader} label="Opening the page" />`
+                }
                 <p class="homewiki-foot small muted">
                     <span class="mono">${page?.path ?? ""}</span>
                     ${page?.updated ? ` · updated ${page.updated}` : ""}
-                    ${head.commit
-                        ? ` · checkout at ${head.commit} (${head.date})${head.dirty ? ", with uncommitted edits" : ""}`
-                        : ""}
+                    ${
+                        head.commit
+                            ? ` · checkout at ${head.commit} (${head.date})${head.dirty ? ", with uncommitted edits" : ""}`
+                            : ""
+                    }
                 </p>
             </div>
         </div>`;
