@@ -89,6 +89,13 @@ import {
     repairMessage,
     odradeRepairMessage,
     repairNotice,
+    blockingMarked,
+    unreadyReason,
+    planUnready,
+    unreadyOf,
+    unreadyMessage,
+    unreadyNotice,
+    READY_LABEL,
     type PrLink,
     type GitFacts,
     type GitHubFacts,
@@ -1919,6 +1926,10 @@ const prFact = (patch: Partial<PrFact> = {}): PrFact => ({
     review: "APPROVED",
     checks: "SUCCESS",
     head: "a1b2c3",
+    ready: false,
+    readyAt: 0,
+    headAt: 0,
+    feedback: [],
     failing: [],
     archived: false,
     ...patch,
@@ -2102,9 +2113,20 @@ describe("prNext", () => {
             [{ checks: "FAILURE" }, "agent"],
             [{ checks: "ERROR" }, "agent"],
             [{ review: "CHANGES_REQUESTED" }, "agent"],
+            // Without the label `ready-for-human`, no PR waits on Brian.
             [{ review: "REVIEW_REQUIRED" }, "reviewer"],
-            [{}, "brian"],
-            [{ review: "APPROVED" }, "brian"],
+            [{}, "agent"],
+            [{ review: "APPROVED" }, "agent"],
+            [{ ready: false, review: "APPROVED" }, "agent"],
+            [{ ready: true }, "brian"],
+            [{ ready: true, review: "REVIEW_REQUIRED" }, "brian"],
+            [{ ready: { at: 5, head: "h1" } }, "brian"],
+            // The faults come first: a labeled PR that fails still waits on its agent.
+            [{ ready: true, checks: "FAILURE" }, "agent"],
+            [{ ready: true, mergeable: "CONFLICTING" }, "agent"],
+            [{ ready: true, review: "CHANGES_REQUESTED" }, "agent"],
+            [{ ready: true, isDraft: true }, "agent"],
+            [{ ready: true, state: "MERGED" }, "none"],
         ] as [object, string][]) {
             assert.equal(prNext(patch), next, JSON.stringify(patch));
         }
@@ -2117,7 +2139,7 @@ describe("repair wake-up: GitHub facts", () => {
 
         assert.match(
             query,
-            /commit \{ oid statusCheckRollup \{ state contexts\(first: 30\) \{ totalCount nodes/,
+            /commit \{ oid committedDate statusCheckRollup \{ state contexts\(first: 30\) \{ totalCount nodes/,
         );
         assert.match(query, /\.\.\. on CheckRun \{ name conclusion status startedAt \}/);
         assert.match(query, /\.\.\. on StatusContext \{ context state \}/);
@@ -2324,7 +2346,7 @@ describe("repair wake-up: GitHub facts", () => {
         assert.equal(replaced.checks, "SUCCESS");
         assert.deepEqual(replaced.failing, []);
         assert.equal(repairState({ state: "OPEN", checks: replaced.checks }), undefined);
-        assert.equal(prNext({ state: "OPEN", checks: replaced.checks }), "brian");
+        assert.equal(prNext({ state: "OPEN", checks: replaced.checks, ready: true }), "brian");
 
         // The newer run still runs: pending, not failing.
         const running = pr(
@@ -2409,6 +2431,418 @@ describe("repair wake-up: GitHub facts", () => {
         assert.equal(thread.prs["frostyard/test#7"]?.draft, false);
         updatePrs(thread, githubOf([prFact({ head: "h2", isDraft: true })]), 300);
         assert.equal(thread.prs["frostyard/test#7"]?.draft, true, "a draft is kept on the link");
+    });
+});
+
+describe("blockingMarked", () => {
+    test("a line that starts with blocking is a blocking point", () => {
+        for (const body of [
+            "Blocking: the cache is stale",
+            "Blocking issues: the cache is stale",
+            "**Blocking**: the cache is stale",
+            "**Blocking issues:** the cache is stale",
+            "### Blocking",
+            "**Blocking**",
+            "Blocking:",
+            "- Blocking point: the guard is gone",
+            "> Blocking — the guard is gone",
+            "`Blocking`: the guard is gone",
+            "[Blocking] the guard is gone",
+            "Blocking: no test covers the restart",
+            "Fine.\n\nBlocking findings:\n- one",
+        ]) {
+            assert.equal(blockingMarked(body), true, body);
+        }
+    });
+
+    test("none, nothing, n/a and no give no blocking point", () => {
+        for (const body of [
+            "Blocking: none",
+            "**Blocking issues:** none",
+            "Blocking: nothing",
+            "Blocking: n/a",
+            "Blocking: no blockers",
+            "Blocking: no",
+            "Blocking: None found.",
+            "## Blocking points: None",
+        ]) {
+            assert.equal(blockingMarked(body), false, body);
+        }
+    });
+
+    test("a blocking word inside a line, non-blocking, and nothing blocking are not points", () => {
+        for (const body of [
+            "Non-blocking: x",
+            "Nothing blocking",
+            "This is not blocking",
+            "No blocking issues found",
+            "",
+        ]) {
+            assert.equal(blockingMarked(body), false, body);
+        }
+    });
+});
+
+describe("the label ready-for-human: the read", () => {
+    const detail = {
+        number: 7,
+        state: "OPEN",
+        labels: { nodes: [{ name: "bug" }, { name: READY_LABEL }] },
+        commits: { nodes: [{ commit: { oid: "h1", committedDate: "2026-10-20T10:00:00Z" } }] },
+        timelineItems: {
+            nodes: [
+                { createdAt: "2026-10-21T10:00:00Z", label: { name: READY_LABEL } },
+                { createdAt: "2026-10-22T10:00:00Z", label: { name: READY_LABEL } },
+                { createdAt: "2026-10-23T10:00:00Z", label: { name: "bug" } },
+            ],
+        },
+        reviews: {
+            nodes: [
+                {
+                    state: "CHANGES_REQUESTED",
+                    submittedAt: "2026-10-22T11:00:00Z",
+                    body: "Blocking: the guard is gone",
+                },
+                { state: "APPROVED", submittedAt: "2026-10-22T12:00:00Z", body: "Good." },
+            ],
+        },
+        comments: {
+            nodes: [{ createdAt: "2026-10-22T13:00:00Z", body: "**Blocking issues:** none" }],
+        },
+    };
+    const one = (pullRequest: object) => ({
+        data: {
+            p0: { nameWithOwner: "o/r", isArchived: false, pullRequest },
+        },
+    });
+
+    test("the label, the newest label time, the head's commit time, the reviews and the comments", () => {
+        const fact = parseGitHub(one(detail)).prs["o/r#7"]!;
+
+        assert.equal(fact.ready, true);
+        assert.equal(fact.readyAt, Date.parse("2026-10-22T10:00:00Z"));
+        assert.equal(fact.headAt, Date.parse("2026-10-20T10:00:00Z"));
+        assert.deepEqual(fact.feedback, [
+            {
+                at: Date.parse("2026-10-22T11:00:00Z"),
+                changes: true,
+                blocking: true,
+            },
+            {
+                at: Date.parse("2026-10-22T12:00:00Z"),
+                changes: false,
+                blocking: false,
+            },
+            {
+                at: Date.parse("2026-10-22T13:00:00Z"),
+                changes: false,
+                blocking: false,
+            },
+        ]);
+    });
+
+    test("a list read says the label, and not when it went on: no time and no feedback", () => {
+        const fact = parseGitHub(
+            one({
+                ...detail,
+                timelineItems: undefined,
+                reviews: undefined,
+                comments: undefined,
+            }),
+        ).prs["o/r#7"]!;
+
+        assert.equal(fact.ready, true, "the labels list is in every part of the query");
+        assert.equal(fact.readyAt, 0);
+        assert.equal(fact.headAt, Date.parse("2026-10-20T10:00:00Z"), "the commit time is asked");
+        assert.deepEqual(fact.feedback, []);
+    });
+
+    test("a node of the wrong shape gives no label, no time, and no feedback", () => {
+        const fact = parseGitHub({
+            data: {
+                p0: {
+                    nameWithOwner: "o/r",
+                    pullRequest: {
+                        number: 7,
+                        labels: null,
+                        timelineItems: { nodes: [null, 5, { label: null }] },
+                        reviews: "no",
+                        comments: { nodes: [null, { body: 5 }] },
+                    },
+                },
+            },
+        }).prs["o/r#7"]!;
+
+        assert.equal(fact.ready, false);
+        assert.equal(fact.readyAt, 0);
+        assert.equal(fact.headAt, 0);
+        assert.deepEqual(fact.feedback, [{ at: 0, changes: false, blocking: false }]);
+    });
+
+    test("the pinned part of the query has the detail fields, and a repository list does not", () => {
+        const query = buildQuery(["frostyard/test"], ["frostyard/test#7"]);
+        const repoPart = query.slice(query.indexOf("r0:"), query.indexOf("p0:"));
+        const pinnedPart = query.slice(query.indexOf("p0:"));
+
+        assert.match(query, /labels\(first: 20\) \{ nodes \{ name \} \}/);
+        assert.match(query, /commits\(last: 1\) \{ nodes \{ commit \{ oid committedDate/);
+        assert.match(repoPart, /labels\(first: 20\)/, "every PR says its labels");
+        assert.doesNotMatch(repoPart, /timelineItems|reviews\(last|comments\(last/);
+        assert.match(pinnedPart, /timelineItems\(itemTypes: \[LABELED_EVENT\], last: 20\)/);
+        assert.match(pinnedPart, /reviews\(last: 20\) \{ nodes \{ state submittedAt body \} \}/);
+        assert.match(pinnedPart, /comments\(last: 20\) \{ nodes \{ createdAt body \} \}/);
+    });
+});
+
+describe("the label ready-for-human: the link", () => {
+    const ref = "frostyard/test#7";
+    const onLink = (thread: Thread) => thread.prs[ref]?.ready;
+
+    test("updatePrs records the label, the same label once, a re-added label, and a label gone", () => {
+        const thread = open(deskOf(), "k").thread;
+
+        thread.prs[ref] = { via: "attached", state: "OPEN" };
+        updatePrs(thread, githubOf([prFact({ head: "h1", ready: true, readyAt: 50 })]), 100);
+        assert.deepEqual(onLink(thread), { at: 50, head: "h1" });
+        assert.equal(thread.prs[ref]?.next, "brian");
+        assert(
+            thread.events.some((event) => event.text === `${ref}: label ready-for-human`),
+            "the label is an event",
+        );
+
+        // The same label at the next sweep: no second event, no new time.
+        const before = thread.events.length;
+
+        updatePrs(thread, githubOf([prFact({ head: "h1", ready: true, readyAt: 50 })]), 200);
+        assert.equal(thread.events.length, before);
+        assert.deepEqual(onLink(thread), { at: 50, head: "h1" });
+
+        // Added again after it came off, on a new push: a new label time and head.
+        updatePrs(thread, githubOf([prFact({ head: "h2", ready: true, readyAt: 300 })]), 400);
+        assert.deepEqual(onLink(thread), { at: 300, head: "h2" });
+
+        // Gone: the link's label goes, and the next actor is no longer Brian.
+        updatePrs(thread, githubOf([prFact({ head: "h2" })]), 500);
+        assert.equal(onLink(thread), undefined);
+        assert.equal(thread.prs[ref]?.next, "agent");
+        assert(
+            thread.events.some((event) => event.text === `${ref}: label ready-for-human gone`),
+            "the label's removal is an event",
+        );
+    });
+
+    test("a list read says the label but not when: the sweep's time fills it in", () => {
+        const thread = open(deskOf(), "k").thread;
+
+        thread.prs[ref] = { via: "seen", state: "OPEN", ready: { at: 0, head: "h1" } };
+        updatePrs(thread, githubOf([prFact({ head: "h1", ready: true, readyAt: 0 })]), 700);
+        assert.deepEqual(onLink(thread), { at: 700, head: "h1" });
+    });
+});
+
+describe("unreadyReason", () => {
+    const labeled = (at = 1000, head = "h1"): PrLink => ({
+        via: "attached",
+        state: "OPEN",
+        ready: { at, head },
+    });
+    const factOf = (patch: Partial<PrFact> = {}): PrFact =>
+        prFact({ head: "h1", headAt: 500, ...patch });
+
+    test("a new commit after the label comes first", () => {
+        assert.equal(
+            unreadyReason(labeled(), factOf({ head: "h2", headAt: 2000 })),
+            "a new commit came after the label",
+        );
+        assert.equal(
+            unreadyReason(labeled(), factOf({ headAt: 2000 })),
+            "a new commit came after the label",
+        );
+    });
+
+    test("a failing check, with the names when GitHub gives them", () => {
+        assert.equal(
+            unreadyReason(
+                labeled(),
+                factOf({ checks: "FAILURE", failing: ["lint", "unit tests"] }),
+            ),
+            "a check fails: lint, unit tests",
+        );
+        assert.equal(unreadyReason(labeled(), factOf({ checks: "ERROR" })), "a check fails");
+    });
+
+    test("a review that requests changes, or a comment marked blocking, after the label", () => {
+        assert.equal(
+            unreadyReason(
+                labeled(),
+                factOf({ feedback: [{ at: 2000, changes: true, blocking: false }] }),
+            ),
+            "a review requested changes after the label",
+        );
+        assert.equal(
+            unreadyReason(
+                labeled(),
+                factOf({ feedback: [{ at: 2000, changes: false, blocking: true }] }),
+            ),
+            "a comment marked a blocking point after the label",
+        );
+    });
+
+    test("a clean PR gives nothing, and so does a review from before the label", () => {
+        assert.equal(unreadyReason(labeled(), factOf()), undefined);
+        assert.equal(
+            unreadyReason(
+                labeled(),
+                factOf({ feedback: [{ at: 500, changes: true, blocking: true }] }),
+            ),
+            undefined,
+            "an old review does not count",
+        );
+    });
+
+    test("no label, a closed PR, and a draft PR give nothing", () => {
+        assert.equal(
+            unreadyReason({ via: "attached", state: "OPEN" }, factOf({ head: "h2", headAt: 2000 })),
+            undefined,
+        );
+        assert.equal(
+            unreadyReason(labeled(), factOf({ state: "MERGED", head: "h2", headAt: 2000 })),
+            undefined,
+        );
+        assert.equal(
+            unreadyReason(labeled(), factOf({ isDraft: true, head: "h2", headAt: 2000 })),
+            undefined,
+        );
+    });
+
+    test("the order: a commit, then a check, then a review, then a comment", () => {
+        assert.equal(
+            unreadyReason(
+                labeled(),
+                factOf({
+                    head: "h2",
+                    headAt: 2000,
+                    checks: "FAILURE",
+                    failing: ["lint"],
+                    feedback: [{ at: 2500, changes: true, blocking: true }],
+                }),
+            ),
+            "a new commit came after the label",
+        );
+        assert.equal(
+            unreadyReason(
+                labeled(),
+                factOf({
+                    checks: "FAILURE",
+                    failing: ["lint"],
+                    feedback: [{ at: 2500, changes: true, blocking: false }],
+                }),
+            ),
+            "a check fails: lint",
+        );
+    });
+});
+
+describe("planUnready", () => {
+    const ref = "frostyard/test#7";
+    const labeled = (patch: Partial<Thread> = {}): Thread =>
+        thread({
+            prs: {
+                [ref]: { via: "seen", state: "OPEN", head: "h1", ready: { at: 1000, head: "h1" } },
+            },
+            ...patch,
+        });
+    const pushed = () => githubOf([prFact({ head: "h2", headAt: 2000 })]);
+    const key = `unready:${ref}:1000`;
+
+    test("1 entry per key, for the agent, with its event", () => {
+        const one = labeled();
+
+        assert.equal(planUnready(one, pushed(), 100), 1);
+        assert.deepEqual(unreadyOf(one)[key], {
+            at: 100,
+            why: "a new commit came after the label",
+            to: "agent",
+            removed: false,
+            sent: false,
+        });
+        assert.equal(
+            one.events.at(-1)?.text,
+            `${ref}: ready-for-human comes off: a new commit came after the label`,
+        );
+
+        // The same key again: nothing.
+        assert.equal(planUnready(one, pushed(), 200), 0);
+        assert.deepEqual(Object.keys(unreadyOf(one)), [key]);
+    });
+
+    test("a thread with no session, and an archived one, go to Odrade", () => {
+        const quiet = labeled({ session: undefined, address: undefined });
+
+        assert.equal(planUnready(quiet, pushed(), 100), 1);
+        assert.equal(unreadyOf(quiet)[key]?.to, "odrade");
+
+        const archived = labeled({ run: { archived: true } });
+
+        assert.equal(planUnready(archived, pushed(), 100), 1);
+        assert.equal(unreadyOf(archived)[key]?.to, "odrade");
+    });
+
+    test("a parked thread gets nothing", () => {
+        const parked = labeled({ state: "parked" });
+
+        assert.equal(planUnready(parked, pushed(), 100), 0);
+        assert.deepEqual(unreadyOf(parked), {});
+        assert.equal(parked.events.length, 0);
+    });
+
+    test("a clean PR, a PR GitHub does not give, and a PR with no label get nothing", () => {
+        assert.equal(planUnready(labeled(), githubOf([prFact({ head: "h1" })]), 100), 0);
+        assert.equal(planUnready(labeled(), githubOf([]), 100), 0);
+        assert.equal(
+            planUnready(
+                thread({ prs: { [ref]: { via: "seen", state: "OPEN", head: "h1" } } }),
+                pushed(),
+                100,
+            ),
+            0,
+        );
+    });
+
+    test("it keeps 30 entries, and drops the oldest sent ones first", () => {
+        const stored: Record<string, object> = {};
+
+        for (let index = 0; index < 30; index += 1) {
+            stored[`unready:old/r#${String(index)}:${String(index)}`] = {
+                at: index,
+                why: "a new commit came after the label",
+                to: "agent",
+                removed: true,
+                sent: index > 0,
+            };
+        }
+
+        const one = labeled({ run: { unready: stored } });
+
+        assert.equal(planUnready(one, pushed(), 100), 1);
+
+        const entries = unreadyOf(one);
+
+        assert.equal(Object.keys(entries).length, 30);
+        assert.equal(entries[key]?.sent, false, "the key just added stays");
+        assert.equal(entries["unready:old/r#1:1"], undefined, "the oldest sent entry went first");
+        assert.notEqual(entries["unready:old/r#0:0"], undefined, "an unsent entry stays");
+    });
+
+    test("the agent's message and Odrade's notice", () => {
+        assert.equal(
+            unreadyMessage("frostyard/test#7", "a new commit came after the label"),
+            "frostyard/test#7: the desk removed the label `ready-for-human`: a new commit came after the label. Fix it, run the checks, push, and add the label again only when the PR is ready (CI green, every blocking review point resolved, nothing pending). Then report.",
+        );
+        assert.equal(
+            unreadyNotice("frostyard/test#7", "T9", "a check fails: lint"),
+            "frostyard/test#7 on T9: the desk removed the label `ready-for-human`: a check fails: lint. The thread has no agent session to wake: it waits on Odrade.",
+        );
     });
 });
 
@@ -2929,7 +3363,13 @@ describe("a PR that waits on Odrade for a repair", () => {
         const fixed = capped();
 
         fixed.prs[REPAIR_REF]!.mergeable = "MERGEABLE";
-        assert.equal(nextActor(fixed), "brian", "a PR with no repair is Brian's to review");
+        assert.equal(
+            nextActor(fixed),
+            "agent",
+            "a PR with no repair and no label waits on the agent",
+        );
+        fixed.prs[REPAIR_REF]!.ready = { at: 1, head: "h1" };
+        assert.equal(nextActor(fixed), "brian", "a PR with no repair and the label is Brian's");
         assert.equal(odradeReason(fixed), undefined);
 
         const pushed = capped();
@@ -3004,7 +3444,7 @@ describe("attribute", () => {
 
         assert.equal(link?.via, "seen");
         assert.equal(link?.state, "OPEN");
-        assert.equal(link?.next, "brian");
+        assert.equal(link?.next, "agent", "no label: the agent is next");
         assert(events > 0);
         assert.equal(state.others?.["frostyard/test"], 0);
     });
@@ -3625,6 +4065,7 @@ describe("asks", () => {
         assert.equal(thread.asks[0]?.answer?.by, "Brian");
         assert.equal(thread.events.at(-1)?.text, "answered T1a (Brian): Yes, merge it.");
         assert.match(readText(state, "T1") ?? "", /T1a · answered by Brian: "Yes, merge it\."/);
+
         assert.deepEqual(
             threadView(state.threads, thread, 250).answered.map((ask) => [
                 ask.id,
@@ -3640,6 +4081,22 @@ describe("asks", () => {
         });
         assert.equal(thread.asks[0]?.answer?.words, "Yes, merge it.");
         assert.equal(closeCheck(thread, facts(400)).close, true);
+
+        // The label `ready-for-human` shows on the PR line of the thread view, of `desk read`, and of the export.
+        thread.prs["frostyard/test#7"] = {
+            via: "seen",
+            state: "OPEN",
+            ready: { at: 100, head: "h1" },
+        };
+        assert.equal(threadView(state.threads, thread, 250).prs[0]?.ready, true);
+        assert.match(
+            readText(state, "T1") ?? "",
+            /frostyard\/test#7 · seen · OPEN · ready-for-human/,
+        );
+        assert.match(
+            exportFiles(state, {}, 250, 12)["T1.md"] ?? "",
+            /frostyard\/test#7 · OPEN · ready-for-human · brian · seen/,
+        );
     });
 });
 
@@ -7227,6 +7684,187 @@ describe("the desk in a Pi Pocket", () => {
             assert.equal(after?.run.next, "odrade");
             assert.equal(odradeReason(after!), `PR ${ref} needs a repair: no session`);
             assert.equal(await texts(linked, "is now conflicting"), 0);
+        } finally {
+            await quiet([]);
+            shift = 0;
+        }
+    });
+
+    /** A `gh` answer with 1 open PR on frostyard/test, read by number, with its label `ready-for-human`. */
+    const readyFixture = (patch: {
+        head: string;
+        committed: string;
+        labels: string[];
+        readyAt?: string;
+    }) => ({
+        data: {
+            viewer: { login: "github-viewer" },
+            p0: {
+                nameWithOwner: "frostyard/test",
+                isArchived: false,
+                pullRequest: {
+                    number: 7,
+                    title: "A fix",
+                    url: "https://github.com/frostyard/test/pull/7",
+                    state: "OPEN",
+                    isDraft: false,
+                    createdAt: "2026-10-01T00:00:00Z",
+                    headRefName: "fix-7",
+                    mergeable: "MERGEABLE",
+                    reviewDecision: "REVIEW_REQUIRED",
+                    author: { login: "github-viewer" },
+                    labels: { nodes: patch.labels.map((name) => ({ name })) },
+                    commits: {
+                        nodes: [
+                            {
+                                commit: {
+                                    oid: patch.head,
+                                    committedDate: patch.committed,
+                                    statusCheckRollup: {
+                                        state: "SUCCESS",
+                                        contexts: { nodes: [] },
+                                    },
+                                },
+                            },
+                        ],
+                    },
+                    timelineItems: {
+                        nodes:
+                            patch.readyAt === undefined
+                                ? []
+                                : [
+                                      {
+                                          createdAt: patch.readyAt,
+                                          label: { name: "ready-for-human" },
+                                      },
+                                  ],
+                    },
+                    reviews: { nodes: [] },
+                    comments: { nodes: [] },
+                },
+            },
+        },
+    });
+
+    test("a labeled PR that gets a new commit loses the label, and its agent hears why once", async () => {
+        const { linked, thread, first, texts } = await withOpenPr("ready-label");
+        const ref = "frostyard/test#7";
+        const log = join(root, "ready-label.log");
+        const labelAt = "2026-10-20T10:00:00Z";
+        const key = `unready:${ref}:${String(Date.parse(labelAt))}`;
+        const why = "a new commit came after the label";
+        const message = unreadyMessage(ref, why);
+
+        const deletes = () => {
+            try {
+                return readFileSync(log, "utf8")
+                    .split("\n")
+                    .filter((line) => line.includes("DELETE"));
+            } catch {
+                return [];
+            }
+        };
+
+        // A `gh` that keeps its arguments in a log file, and prints the fixture for a GraphQL read.
+        const restartWithLog = async (by: number, github: unknown) => {
+            await app.close();
+            shift = by;
+            writeFileSync(fixturePath, JSON.stringify(github));
+            writeFileSync(
+                fakeGh,
+                `#!/bin/sh\nprintf '%s\\n' "$*" >> ${JSON.stringify(log)}\nif [ "$2" = "graphql" ]; then cat ${JSON.stringify(fixturePath)}; else printf '{}'; fi\n`,
+            );
+            chmodSync(fakeGh, 0o755);
+            process.env.PI_POCKET_DESK_GH = fakeGh;
+            process.env.PI_POCKET_DESK_CONFIG = configPath;
+            app = await openApp(model, dataDir, () => Date.now() + shift);
+        };
+
+        try {
+            rmSync(log, { force: true });
+            await quiet([thread.id]);
+
+            // The label goes on the head the desk has: Brian is next, and nothing comes off.
+            await restartWithLog(
+                SWEEP_SLEEP_MS + 60_000,
+                readyFixture({
+                    head: "aaa111",
+                    committed: "2026-10-19T10:00:00Z",
+                    labels: [READY_LABEL],
+                    readyAt: labelAt,
+                }),
+            );
+            await sweptAfter(thread, first);
+
+            const labeled = (await deskState())?.threads[thread.id];
+
+            assert.deepEqual(labeled?.prs[ref]?.ready, {
+                at: Date.parse(labelAt),
+                head: "aaa111",
+            });
+            assert.equal(labeled?.prs[ref]?.next, "brian");
+            assert.equal(labeled?.run.next, "brian");
+            assert.equal(deletes().length, 0, "a clean labeled PR keeps its label");
+            assert.equal(await texts(linked, "ready-for-human"), 0);
+
+            // A new commit after the label: the label comes off, and the agent hears why.
+            await restartWithLog(
+                SWEEP_SLEEP_MS * 2 + 120_000,
+                readyFixture({
+                    head: "bbb222",
+                    committed: "2026-10-21T10:00:00Z",
+                    labels: [READY_LABEL],
+                    readyAt: labelAt,
+                }),
+            );
+            await sweptAfter(thread, labeled?.run.sweptAt);
+            await until(async () => (await texts(linked, message)) === 1, "the wake-up", 20_000);
+            await until(
+                async () => unreadyOf((await deskState())!.threads[thread.id]!)[key]?.sent === true,
+                "the removal marked sent",
+                20_000,
+            );
+
+            const after = (await deskState())?.threads[thread.id];
+
+            assert.deepEqual(deletes(), [
+                "api -X DELETE repos/frostyard/test/issues/7/labels/ready-for-human",
+            ]);
+            assert.deepEqual(unreadyOf(after!)[key], {
+                at: unreadyOf(after!)[key]?.at,
+                why,
+                to: "agent",
+                removed: true,
+                sent: true,
+            });
+            assert(
+                after?.events.some(
+                    (event) => event.text === "ready-for-human removed, wake-up sent to the agent",
+                ),
+                "the removal is an event",
+            );
+            await until(() => !app.isBusy(linked), "the wake-up's turn", 20_000);
+
+            // The label is off now: the next sweep removes nothing, and sends nothing.
+            await quiet([thread.id]);
+
+            const removed = (await deskState())?.threads[thread.id];
+
+            await restartWithLog(
+                SWEEP_SLEEP_MS * 3 + 180_000,
+                readyFixture({ head: "bbb222", committed: "2026-10-21T10:00:00Z", labels: [] }),
+            );
+            await sweptAfter(thread, removed?.run.sweptAt);
+            const unlabeled = (await deskState())?.threads[thread.id];
+
+            assert.equal(unlabeled?.prs[ref]?.ready, undefined);
+            assert.equal(
+                unlabeled?.prs[ref]?.next,
+                "reviewer",
+                "without the label it waits on the reviewer the review needs",
+            );
+            assert.equal(deletes().length, 1, "the label is removed once");
+            assert.equal(await texts(linked, message), 1, "the agent hears it once");
         } finally {
             await quiet([]);
             shift = 0;

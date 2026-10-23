@@ -146,6 +146,7 @@ export default function setup(pocket) {
                                                 <span class="small muted">
                                                     ${[
                                                         pr.state,
+                                                        pr.ready ? "ready-for-human" : "",
                                                         pr.next ? `next: ${pr.next}` : "",
                                                         pr.via === "window" ? "guessed" : pr.via,
                                                     ]
@@ -409,6 +410,7 @@ export default function setup(pocket) {
                                           >${[
                                               pr.ref,
                                               pr.state,
+                                              pr.ready ? "ready-for-human" : "",
                                               pr.next,
                                               pr.via === "window" ? "guessed" : "",
                                           ]
