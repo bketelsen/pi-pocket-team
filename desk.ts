@@ -1999,6 +1999,42 @@ function prFact(
     };
 }
 
+/** The wait before the 1 retry of a GitHub read that failed for a moment. */
+export const GITHUB_RETRY_MS = 1_000;
+
+/**
+ * A `gh api graphql` failure that a second try can fix: no data on stdout, and `gh` says the answer was cut or empty
+ * ("unexpected end of JSON input"), or GitHub's gateway failed (HTTP 502, 503, 504), or the connection broke. A
+ * failure with data (a partial answer), an auth error, or a read that hit the 60-second limit is not transient.
+ */
+export function transientGitHub(error: unknown): boolean {
+    const failure = error as { killed?: unknown; stdout?: unknown; stderr?: unknown } | null;
+
+    if (failure === null || typeof failure !== "object" || failure.killed === true) {
+        return false;
+    }
+
+    const out =
+        typeof failure.stdout === "string"
+            ? failure.stdout
+            : Buffer.isBuffer(failure.stdout)
+              ? failure.stdout.toString("utf8")
+              : "";
+    const err =
+        typeof failure.stderr === "string"
+            ? failure.stderr
+            : Buffer.isBuffer(failure.stderr)
+              ? failure.stderr.toString("utf8")
+              : "";
+
+    return (
+        out.trim() === "" &&
+        /unexpected end of JSON input|unexpected EOF|HTTP 50[234]\b|connection reset|i\/o timeout/i.test(
+            err,
+        )
+    );
+}
+
 const FAILED_RUN = new Set([
     "FAILURE",
     "TIMED_OUT",
@@ -4253,7 +4289,8 @@ export default function createDesk(host: Host, web: Web) {
     }
 
     /**
-     * The one GitHub read of a sweep: its facts, or why it failed. `gh api graphql` exits non-zero when the answer has
+     * The one GitHub read of a sweep: its facts, or why it failed. A transient failure (`transientGitHub`) gets 1 more
+     * try after `GITHUB_RETRY_MS`; a second failure is the sweep's error, as before. `gh api graphql` exits non-zero when the answer has
      * an error, but it still prints the data it has: a wrong PR ref must not hide every other PR. An alias with an
      * error is a missing ref (`pN`) or a skipped repository (`rN`); only no data at all is a failure.
      */
@@ -4268,14 +4305,29 @@ export default function createDesk(host: Host, web: Web) {
         const wanted = [...new Set(repos)];
         const pinned = [...new Set(prs)];
 
-        try {
-            const query = buildQuery(wanted, pinned);
-            const gh = process.env.PI_POCKET_DESK_GH ?? "gh";
-            const { stdout } = await run(gh, ["api", "graphql", "-f", `query=${query}`], {
+        const query = buildQuery(wanted, pinned);
+        const gh = process.env.PI_POCKET_DESK_GH ?? "gh";
+        const call = () =>
+            run(gh, ["api", "graphql", "-f", `query=${query}`], {
                 timeout: 60_000,
                 maxBuffer: 8 * 1024 * 1024,
                 encoding: "utf8",
             });
+
+        try {
+            let stdout: string;
+
+            try {
+                ({ stdout } = await call());
+            } catch (error) {
+                // GitHub's answer was cut or empty (a gateway timeout on a big query): 1 more try.
+                if (!transientGitHub(error)) {
+                    throw error;
+                }
+
+                await new Promise((resolve) => setTimeout(resolve, GITHUB_RETRY_MS));
+                ({ stdout } = await call());
+            }
 
             return { facts: parseGitHub(JSON.parse(stdout)) };
         } catch (error) {
