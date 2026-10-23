@@ -42,6 +42,9 @@ jobs:
       - name: Link this project to the Pi Pocket checkout
         run: npm run link
 
+      - name: Run the lint
+        run: npm run lint
+
       - name: Run the tests
         run: npm test
 

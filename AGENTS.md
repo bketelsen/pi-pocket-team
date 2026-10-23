@@ -4,7 +4,7 @@ This is Brian's extension project: drop-in modules for his running Pi Pocket ser
 
 - **Modules:** Team (`team.ts`, `team-web/`), Homewiki (`homewiki.ts`, `homewiki-web/`), and Night shift (`night-shift.ts`, `night-shift-web/`). A new module also goes in `MODULES` in `install.mjs`, the `test` script in `package.json`, and `files` in `tsconfig.json`.
 - **Docs:** Pi Pocket's extension docs start at `_pocket/docs/extensions.md`; the exact types are `_pocket.d.ts` (a link into the checkout). Read the guide your change needs before writing it.
-- **Test before install, every time.** Run `npm test` (node --test, plus `node --check` of the browser modules) and `npm run typecheck` before every commit and every install.
+- **Test before install, every time.** Run `npm test` (node --test, plus `node --check` of the browser modules), `npm run typecheck`, and `npm run lint` (`npm run format` fixes it) before every commit and every install.
 - **Installs are live.** `npm run install-extension` writes into `~/.pi-pocket/extensions/`, and a saved module reloads into the running server the whole team works in. Run `npm run install-check` first and make sure every file it lists is one you meant to change. If an installed file differs from the project's and you don't know why, stop and ask: someone may have edited the live copy.
 - **Brian turns modules on and off, and restarts the server.** Never enable or disable an extension or restart the server; finish, test, and tell him what needs doing.
 - **Tests stay isolated.** They use the Pi Pocket checkout's test harness (temporary data, test credentials, a fake model). Point modules at fixtures with environment variables (`PI_POCKET_TEAM_AGENTS`, `PI_POCKET_HOMEWIKI_ROOT`), never at Brian's real data.

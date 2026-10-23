@@ -24,6 +24,7 @@ Clone this repository next to a Pi Pocket checkout, or set `PI_POCKET_CHECKOUT` 
 npm run link       # make node_modules, _pocket.d.ts, and _pocket point into the checkout
 npm test           # node --test, plus node --check of the browser modules
 npm run typecheck  # types of team.ts, homewiki.ts, and night-shift.ts
+npm run lint       # Prettier and ESLint, Pi Pocket's config (npm run format fixes)
 ```
 
 `npm run link` also runs before `npm test`, `npm run typecheck`, and `npm run preview`. It creates or repairs 3 symlinks in the repository root: `node_modules` to the checkout's `node_modules`, `_pocket.d.ts` to its `types/pocket.d.ts`, and `_pocket` to the checkout itself, which the tests and `preview.ts` import through. It never deletes a real file or folder.
