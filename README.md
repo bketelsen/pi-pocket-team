@@ -11,7 +11,7 @@ Drop-in extensions for [Pi Pocket](https://github.com/TannerMidd/pi-pocket), wri
 
 ## Requirements
 
-- Pi Pocket v0.19.0 or later. It includes the linked-session working directory (PR #112) that Team delegation needs.
+- Pi Pocket v0.21.0 or later (Pi Durable 1.4: `runtime.sleepUntil` and `checkpointWhen`). It includes the linked-session working directory (PR #112) that Team delegation needs.
 - The modules declare `pocketApi = 2` (Pocket's extension API version). A Pocket with another API version may refuse them or break them.
 - Node.js 24, the one Pocket runs on.
 - A Pi Pocket checkout for the tests (`../pi-pocket` by default).
@@ -188,7 +188,7 @@ Runtime copies: `~/.pi-pocket/extensions/team.ts` and `team-web/`. The extension
 
 Runtime imports use Pi Pocket's public extension API and installed Pi packages. Test and preview scripts (`team.test.ts`, `team-memory.test.ts`, `preview.ts`) use the checkout's internal test harness, isolated temporary data, and a fake model. They are not installed.
 
-Pi Pocket v0.19.0 or later has the working-directory support that repository delegation needs. The links to the checkout come from `npm run link`. `PI_POCKET_DIR` selects another installation destination.
+Pi Pocket v0.21.0 or later (Pi Durable 1.4) has the working-directory support (PR #112) that repository delegation needs. The links to the checkout come from `npm run link`. `PI_POCKET_DIR` selects another installation destination.
 
 Disable **Team** in Extensions to remove the UI, tools, and prompt section. Stored identities remain available if it is re-enabled; ordinary conversations remain Pi Pocket conversations.
 
@@ -238,7 +238,7 @@ Examples:
 
 With `with deepseek/…` and no `start`, round 1 waits until the end of DeepSeek's peak hours (01:00–04:00 and 06:00–10:00 UTC): 04:00 UTC or 10:00 UTC on the same day. The label shows the server's clock, such as "05:00 EST". `for` counts from that start, `until` must be after it, and the status says "waiting until 05:00 EST (after DeepSeek's peak hours …)". An explicit `start` always wins.
 
-A person's message during the wait does not cancel the goal: messages written then do not pause it at start. Plan mode at start pauses it, as before a round. The prompt section is off before round 1, because a person can talk to Pi during the wait. The wait is a durable sleep in the driver task's `wait` phase, so a restart neither starts round 1 early nor twice, and a server that was down past the start time starts round 1 at once.
+A person's message during the wait does not cancel the goal: messages written then do not pause it at start. Plan mode at start pauses it, as before a round. The prompt section is off before round 1, because a person can talk to Pi during the wait. The wait is a restart-safe wait in the driver task's `wait` phase, so a restart neither starts round 1 early nor twice, and a server that was down past the start time starts round 1 at once.
 
 ## How a round goes
 
@@ -270,7 +270,7 @@ Pocket's own "Done when" (`src/server/goals.ts`) drives its rounds from an `onYi
 
 - A round's message has a request id made of the goal, the round, and the attempt (`p:<person>:x-night-shift-<goal>-<round>-<attempt>`), so a restart that sends it again finds the first: one answer never starts two rounds.
 - The round count goes up in the same commit that moves the task on to send that round.
-- A `start` time is a durable sleep in the task's `wait` phase, before round 1: a restart sleeps again until the stored start, and a server that was down past it starts round 1 at once. Round 1 starts only in `decide`, which moves the round count in its commit: never twice.
+- A `start` time is a restart-safe wait in the task's `wait` phase, before round 1: a restart sleeps again until the stored start, and a server that was down past it starts round 1 at once. Round 1 starts only in `decide`, which moves the round count in its commit: never twice.
 - The check is behind two memos, as in goals.ts: one set before it runs, one with its result. A restart that finds the first without the second does not run it again; the next round tells Pi it was cut off.
 - The `p:<person>:` request id is how Pocket marks a message it sends for a person: Pi works for whoever set the goal, and the spend is theirs.
 - A run before a round that fails would leave the round queued for ever: the module takes it back and sends it again, 3 times at most.

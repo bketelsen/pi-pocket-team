@@ -1,5 +1,5 @@
 # The tests need a Pi Pocket checkout: link.mjs symlinks node_modules, _pocket.d.ts and _pocket into the
-# checkout at PI_POCKET_CHECKOUT. Here we clone the public Pi Pocket repository at tag v0.19.0 into the
+# checkout at PI_POCKET_CHECKOUT. Here we clone the public Pi Pocket repository at tag v0.21.0 into the
 # runner's temporary folder, install its dependencies, and point the links at it.
 name: CI
 
@@ -32,8 +32,8 @@ jobs:
             - name: Set the Pi Pocket checkout path
               run: echo "PI_POCKET_CHECKOUT=$RUNNER_TEMP/pi-pocket" >> "$GITHUB_ENV"
 
-            - name: Clone Pi Pocket v0.19.0
-              run: git clone --depth 1 --branch v0.19.0 https://github.com/TannerMidd/pi-pocket.git "$PI_POCKET_CHECKOUT"
+            - name: Clone Pi Pocket v0.21.0
+              run: git clone --depth 1 --branch v0.21.0 https://github.com/TannerMidd/pi-pocket.git "$PI_POCKET_CHECKOUT"
 
             - name: Install Pi Pocket dependencies
               working-directory: ${{ runner.temp }}/pi-pocket
