@@ -39,7 +39,8 @@ The pipeline, as the audit sees it:
    decide (Section 5), and its answer is checked by code before anyone sees it.
 4. **Already fixed is not a proposal.** When the last case of a finding is older than the live
    module's install time plus 1 sweep (10 minutes), the report lists it under "maybe fixed", not as
-   a proposal (the trial marks this `afterInstall: false`).
+   a proposal (the trial marks this `afterInstall: false`). An install less than 1 h before the
+   run proves nothing yet: the finding keeps its rank, marked "installed recently".
 5. **No secrets.** The report never holds report bodies, prompts, tokens, environment values or
    file contents. A quote is at most 80 characters, and passes a redaction filter (`ghp_`,
    `github_pat_`, `sk-`, `AKIA`, `-----BEGIN`, `password=`, `token=`); a quote that matches is
@@ -76,10 +77,10 @@ positives (marked †).
 
 ### B. Repair wake-ups
 
-| Id  | Check                                                                                                                                                                                                                                                    | Kind | A finding when                             |
-| --- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---- | ------------------------------------------ |
-| B1  | For each `run.repairs` key `repair:<ref>:<oid>:FAILURE`, read the check runs of `<oid>`. A check name fails only when no run of that name succeeded and one ended `failure`, `timed_out` or `action_required`. `cancelled` and `skipped` are not faults. | D    | a repair went out and no check name failed |
-| B2  | Agent replies to a repair that say the PR does not fail (regex: `does not fail`, `not failing`, `only "?cancelled`).                                                                                                                                     | D    | 1 or more                                  |
+| Id  | Check                                                                                                                                                                                                                                                                                                                           | Kind | A finding when                             |
+| --- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---- | ------------------------------------------ |
+| B1  | For each `run.repairs` key `repair:<ref>:<oid>:FAILURE`, read every check run of `<oid>` (`filter=all`). Only the runs that completed by the wake-up count: a check name fails when one of them ended `failure`, `timed_out` or `action_required`, and no success completed after it. `cancelled` and `skipped` are not faults. | D    | a repair went out and no check name failed |
+| B2  | Agent replies to a repair that say the PR does not fail (regex: `does not fail`, `not failing`, `only "?cancelled`).                                                                                                                                                                                                            | D    | 1 or more                                  |
 
 ### C. Attribution
 
@@ -105,11 +106,11 @@ positives (marked †).
 
 ### F. Night and day shifts
 
-| Id  | Check                                                                                                                                | Kind | A finding when                                        |
-| --- | ------------------------------------------------------------------------------------------------------------------------------------ | ---- | ----------------------------------------------------- |
-| F1  | Shift endings by reason (`done`, `blocked`, `error`, `max rounds`, `deadline`, `person`) and the `why`.                              | D    | any `error` or `max rounds`; each `blocked` is listed |
-| F2  | Rounds that follow a `continue` verdict in under 60 s (the agent waits on a subagent and burns a round).                             | D    | 2 or more shifts with 2 or more such rounds           |
-| F3  | A worker that is not the one the brief named, and a DeepSeek worker that starts in its peak (01:00 to 04:00 and 06:00 to 10:00 UTC). | D    | any                                                   |
+| Id  | Check                                                                                                                                                                                                                                                    | Kind | A finding when                                        |
+| --- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---- | ----------------------------------------------------- |
+| F1  | Shift endings by reason (`done`, `blocked`, `error`, `max rounds`, `deadline`, `person`) and the `why`.                                                                                                                                                  | D    | any `error` or `max rounds`; each `blocked` is listed |
+| F2  | Rounds that follow a `continue` verdict in under 60 s (the agent waits on a subagent and burns a round).                                                                                                                                                 | D    | 2 or more shifts with 2 or more such rounds           |
+| F3  | A worker that is not the one the brief named (the cross-review reviewer, with exactly the tools `read` and `bash` and "review" in its name or brief, is not one), and a DeepSeek worker that starts in its peak (01:00 to 04:00 and 06:00 to 10:00 UTC). | D    | any                                                   |
 
 ### G. Schedules
 
