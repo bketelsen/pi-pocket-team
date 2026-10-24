@@ -22,6 +22,7 @@ import {
     checkF1,
     checkF2,
     checkF3,
+    isCrossReviewSpawn,
     checkG1,
     checkH1,
     checkH2,
@@ -472,6 +473,52 @@ test("B1: a name with only failures is a real fault; a name with a success is no
     assert.deepEqual(ids(checkB1(healed, ctx)), ["B1:acme/widgets#7"]);
 });
 
+test("B1: a failure before the wake-up is real, even when a rerun succeeded after it (updex#461)", () => {
+    const wake = ago(HOUR);
+    const timed = (name: string, conclusion: string, at: number) => ({
+        name,
+        conclusion,
+        completed_at: new Date(at).toISOString(),
+    });
+    const data = (checks: unknown[]) =>
+        emptyData({
+            threads: threadMap(repairThread("abc1234")),
+            github: {
+                botPrs: [],
+                prs: {},
+                autoDelete: {},
+                checkRuns: { "acme/widgets@abc1234": checks },
+            },
+        });
+
+    // The rerun succeeded after the wake-up: it was not known then.
+    assert.deepEqual(
+        ids(
+            checkB1(
+                data([
+                    timed("Unit Tests", "failure", wake - 60_000),
+                    timed("Unit Tests", "success", wake + 3 * 60_000),
+                ]),
+                ctx,
+            ),
+        ),
+        [],
+    );
+    // Both ended before the wake-up and the success was later: the failure healed.
+    assert.deepEqual(
+        ids(
+            checkB1(
+                data([
+                    timed("Unit Tests", "failure", wake - 120_000),
+                    timed("Unit Tests", "success", wake - 60_000),
+                ]),
+                ctx,
+            ),
+        ),
+        ["B1:acme/widgets#7"],
+    );
+});
+
 test("B1: a repair with no check data from GitHub is left out; a CONFLICTING one is not read", () => {
     const missing = emptyData({ threads: threadMap(repairThread("abc1234")) });
     const conflict = emptyData({
@@ -899,6 +946,43 @@ test("F3: a subagent on another model than the worker is a finding; the same mod
         [],
     );
     assert.deepEqual(ids(checkF3(data(undefined, "anything"), ctx)), []);
+});
+
+test("F3: a cross-review reviewer is left out; other spawns on another model stay findings", () => {
+    const worker = "deepseek/deepseek-flash";
+    const data = (extra: Record<string, unknown>) =>
+        emptyData({
+            goals: [{ session: 5, goal: goal({ worker }) }],
+            spawns: [
+                {
+                    id: 9,
+                    c: 5,
+                    at: ago(3 * HOUR),
+                    model: "openai/gpt-6.1-sol",
+                    brief: "",
+                    ...extra,
+                },
+            ],
+        });
+    const reviewer = {
+        name: "xreview-43",
+        tools: ["bash", "read"],
+        brief: "You are a read-only cross-reviewer.",
+    };
+    const left = checkF3(data(reviewer), ctx);
+
+    assert.deepEqual(ids(left), []);
+    assert.equal(left.metrics.reviewerSpawns, 1);
+    assert.equal(isCrossReviewSpawn(reviewer), true);
+    assert.deepEqual(
+        ids(checkF3(data({ name: "fix462", tools: null, brief: "You fix review findings" }), ctx)),
+        ["F3:model:g1"],
+    );
+    assert.deepEqual(
+        ids(checkF3(data({ ...reviewer, name: "xreview", tools: ["read", "bash", "edit"] }), ctx)),
+        ["F3:model:g1"],
+    );
+    assert.equal(checkF3(data({ name: "fix462", tools: null }), ctx).metrics.reviewerSpawns, 0);
 });
 
 test("F3: a spawn in another session, or before the shift, is not counted", () => {

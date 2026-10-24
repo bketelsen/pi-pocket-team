@@ -186,6 +186,32 @@ test("annotate: a maybe-fixed finding has no rank and goes after the ranked ones
     assert.equal(rows[1].installedAt, iso(install));
 });
 
+test("annotate: a module installed less than 1 h before the run keeps the rank", () => {
+    const now = Date.UTC(2026, 9, 24, 10, 30);
+    const old = { ...finding("A2", "T11", { severity: "high" }), lastSeen: iso(now - 3 * HOUR) };
+    const recent = annotate([old], [], { "desk.ts": now - 7 * MINUTE }, now)[0];
+    const older = annotate([old], [], { "desk.ts": now - 2 * HOUR }, now)[0];
+
+    assert.equal(recent.maybeFixed, false);
+    assert.equal(recent.installedRecently, true);
+    assert.equal(recent.installedAt, iso(now - 7 * MINUTE));
+    assert.equal(typeof recent.rank, "number");
+    assert.equal(older.maybeFixed, true);
+    assert.equal(older.installedRecently, undefined);
+    // With no run time, the old behavior stays.
+    assert.equal(annotate([old], [], { "desk.ts": now - 7 * MINUTE })[0].maybeFixed, true);
+    // A case after the recent install is a plain finding: no mark.
+    const after = { ...old, lastSeen: iso(now - 2 * MINUTE) };
+    const plain = annotate([after], [], { "desk.ts": now - 30 * MINUTE }, now)[0];
+
+    assert.equal(plain.maybeFixed, false);
+    assert.equal(plain.installedRecently, undefined);
+    assert.match(
+        renderReport(baseReport({ findings: [recent] })),
+        /\(installed recently: desk\.ts at 2026-10-24T10:23Z\)/,
+    );
+});
+
 // ---------- The days before ----------
 
 function writeDay(parent: string, date: string, ids: string[], extra: object = {}) {

@@ -409,7 +409,7 @@ function loadCosts(db, since) {
         .map((row) => ({ c: row.c, at: row.at, cost: row.cost }));
 }
 
-/** `subagent` spawn calls: the model each one named (null when it named none). */
+/** `subagent` spawn calls: the model each one named (null when it named none), its name, its tools and the start of its brief. */
 function loadSpawns(db, since) {
     const out = [];
 
@@ -432,6 +432,14 @@ function loadSpawns(db, since) {
                     c: row.c,
                     at: entry.model[0].timestamp,
                     model: typeof part.arguments.model === "string" ? part.arguments.model : null,
+                    name: typeof part.arguments.name === "string" ? part.arguments.name : null,
+                    tools: Array.isArray(part.arguments.tools)
+                        ? part.arguments.tools.filter((tool) => typeof tool === "string")
+                        : null,
+                    brief:
+                        typeof part.arguments.message === "string"
+                            ? part.arguments.message.slice(0, 300)
+                            : "",
                 });
             }
         }
@@ -561,8 +569,10 @@ export function loadGithub(data, { gh, now, since }) {
                 const repo = ref.split("#")[0];
 
                 checkRuns[`${repo}@${oid}`] =
-                    json(gh.api(`repos/${repo}/commits/${oid}/check-runs?per_page=100`), {})
-                        .check_runs ?? null;
+                    json(
+                        gh.api(`repos/${repo}/commits/${oid}/check-runs?per_page=100&filter=all`),
+                        {},
+                    ).check_runs ?? null;
             }
         }
     }

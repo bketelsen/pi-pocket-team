@@ -101,7 +101,7 @@ export async function main(
     });
     const result = runChecks(data, ctx);
     const earlier = loadEarlier(outDir, date);
-    const findings = annotate(result.findings, earlier, data.installed);
+    const findings = annotate(result.findings, earlier, data.installed, ctx.now);
     const llm = await runLlm({
         ranked: findings.filter((finding) => !finding.maybeFixed),
         metrics: result.metrics,

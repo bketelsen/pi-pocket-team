@@ -154,6 +154,10 @@ test("loadData reads every source into one plain object", () => {
         data.spawns.map((spawn: { c: number; model: string }) => [spawn.c, spawn.model]),
         [[SUPERVISOR, "other/model"]],
     );
+    // The name, tools and the start of the brief are read too.
+    assert.equal(data.spawns[0].name, "w");
+    assert.deepEqual(data.spawns[0].tools, ["read", "bash"]);
+    assert.equal(data.spawns[0].brief, "do");
 
     // No extensions folder: no install times.
     assert.deepEqual(data.installed, { "desk.ts": null, "team.ts": null, "night-shift.ts": null });
@@ -435,6 +439,11 @@ test("loadGithub: 1 search, 1 query per 40 PRs, check runs of each repair, 1 set
     };
     const result = loadGithub({ threads: { T1: t1 } }, { gh, now: NOW, since: NOW - 24 * HOUR });
 
+    assert.ok(
+        fake.seen.some(
+            (args) => args[1] === "repos/acme/w0/commits/abc123/check-runs?per_page=100&filter=all",
+        ),
+    );
     assert.equal(result.botPrs.length, 45);
     // 45 bot PRs + 1 attached PR = 46 refs: 2 GraphQL queries.
     assert.equal(Object.keys(result.prs).length, 46);

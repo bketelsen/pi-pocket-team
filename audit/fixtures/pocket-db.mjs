@@ -262,7 +262,13 @@ export function createFixtureDb(file, now) {
             type: "toolCall",
             id: "c1",
             name: "subagent",
-            arguments: { action: "spawn", name: "w", model: "other/model", message: "do" },
+            arguments: {
+                action: "spawn",
+                name: "w",
+                model: "other/model",
+                tools: ["read", "bash"],
+                message: "do",
+            },
         },
     ]);
     assistant(SUPERVISOR, now - 40 * 24 * HOUR, 99);
