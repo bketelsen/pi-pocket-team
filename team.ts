@@ -207,6 +207,7 @@ function taskFolder(persona: Persona, repository?: unknown): string | undefined 
 export const Identity = defineDoc<{ persona?: Persona }>({
     kind: "x.team.identity",
     version: 1,
+    checkpointWhen: () => false,
     scope: "conversation",
     history: "latest",
     fork: "current",
@@ -356,6 +357,7 @@ export type MemoryState = { agents: Record<string, Record<string, Lesson>> };
 export const AgentMemory = defineDoc<MemoryState>({
     kind: "x.team.memory",
     version: 1,
+    checkpointWhen: () => false,
     scope: "session",
     initial: () => ({ agents: {} }),
 });

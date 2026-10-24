@@ -5151,6 +5151,8 @@ const PlanDoc = defineDoc<{ on: boolean }>({
     scope: "conversation",
     history: "latest",
     fork: "current",
+    // The same as Pocket's own base, `rebased` in src/server/docs.ts: not part of the stored meaning.
+    checkpointWhen: (_value, _ops, info) => info.deltasSinceBase >= 64,
     initial: () => ({ on: false }),
 });
 /** The address the linked session sends a message to, in the tests that need one. */
