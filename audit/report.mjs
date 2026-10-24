@@ -4,7 +4,7 @@
 // source: the functions take the findings, the earlier days and the LLM result, and return plain values.
 import fs from "node:fs";
 import path from "node:path";
-import { MINUTE, SECRET, iso, money, moneyFine, newYorkClock } from "./common.mjs";
+import { HOUR, MINUTE, SECRET, iso, money, moneyFine, newYorkClock } from "./common.mjs";
 
 /** Weight of a severity in the rank. */
 export const WEIGHT = { high: 3, medium: 2, low: 1 };
@@ -156,11 +156,15 @@ export function repeatDays(id, earlier) {
 }
 
 /** Findings with their rank, owner, size and `maybeFixed`; the ranked ones first (highest rank first). */
-export function annotate(findings, earlier, installed) {
+export function annotate(findings, earlier, installed, now = null) {
     const rows = findings.map((finding) => {
         const days = repeatDays(finding.id, earlier);
-        const maybeFixed = isMaybeFixed(finding, installed);
         const file = moduleOf(finding.check);
+        // A module installed less than 1 h before the run has had no time to show its effect: the finding keeps its
+        // rank, and is marked "installed recently" in place of "maybe fixed".
+        const older = isMaybeFixed(finding, installed);
+        const recent = older && now !== null && now - installed[file] < HOUR;
+        const maybeFixed = older && !recent;
 
         return {
             ...finding,
@@ -170,6 +174,7 @@ export function annotate(findings, earlier, installed) {
             ...(maybeFixed
                 ? { installedAt: iso(installed[file]) }
                 : { rank: rankOf(finding, days) }),
+            ...(recent ? { installedRecently: true, installedAt: iso(installed[file]) } : {}),
         };
     });
 
@@ -366,7 +371,7 @@ const metricLines = (metrics, github) => {
 };
 
 const findingLine = (finding) =>
-    `- \`${finding.id}\` ${finding.severity}, ${finding.cases} case${finding.cases === 1 ? "" : "s"}${finding.rank === undefined ? "" : `, rank ${finding.rank}`}: ${oneLine(finding.text)}`;
+    `- \`${finding.id}\` ${finding.severity}, ${finding.cases} case${finding.cases === 1 ? "" : "s"}${finding.rank === undefined ? "" : `, rank ${finding.rank}`}: ${oneLine(finding.text)}${finding.installedRecently ? ` (installed recently: ${moduleOf(finding.check)} at ${finding.installedAt})` : ""}`;
 
 /** The LLM line at the end of the report. */
 export function llmLine(llm) {

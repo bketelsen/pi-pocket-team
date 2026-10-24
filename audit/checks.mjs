@@ -520,24 +520,44 @@ export function checkB1(data, ctx) {
             continue;
         }
 
-        // A check name fails only when no run of that name succeeded, and a run of it ended in failure,
-        // timed_out or action_required (cancelled and skipped are not faults).
+        // Only the runs known at the wake-up count: a run with no `completed_at`, or one that completed by then.
+        // A check name fails when these runs hold a failure (failure, timed_out or action_required; cancelled and
+        // skipped are not faults) and no success completed later than the newest failure. Runs with no times: any
+        // success counts as later.
         const names = new Map();
 
         for (const run of runs) {
-            names.set(run.name, [...(names.get(run.name) ?? []), run.conclusion]);
+            const done = run.completed_at ? Date.parse(run.completed_at) : null;
+
+            if (done === null || Number.isNaN(done) || done <= repair.at) {
+                names.set(run.name, [...(names.get(run.name) ?? []), { ...run, done }]);
+            }
         }
 
-        const failing = [...names].filter(
-            ([, conclusions]) =>
-                !conclusions.includes("success") &&
-                conclusions.some((c) => ["failure", "timed_out", "action_required"].includes(c)),
-        );
+        const failing = [...names].filter(([, known]) => {
+            const failures = known.filter((run) =>
+                ["failure", "timed_out", "action_required"].includes(run.conclusion),
+            );
+
+            if (failures.length === 0) {
+                return false;
+            }
+
+            const lastFailure = Math.max(...failures.map((run) => run.done ?? 0));
+
+            return !known.some(
+                (run) =>
+                    run.conclusion === "success" &&
+                    (run.done === null || run.done === undefined || run.done > lastFailure),
+            );
+        });
 
         if (failing.length === 0) {
             const cancelled = [...names]
-                .filter(([, c]) => c.includes("cancelled"))
-                .map(([name, c]) => `${name} (${c.join(", ")})`);
+                .filter(([, known]) => known.some((run) => run.conclusion === "cancelled"))
+                .map(
+                    ([name, known]) => `${name} (${known.map((run) => run.conclusion).join(", ")})`,
+                );
 
             falseCount += 1;
             perRef.set(ref, [...(perRef.get(ref) ?? []), { repair, repo, oid, cancelled }]);
@@ -1145,10 +1165,27 @@ export const inDeepseekPeak = (ms) => {
     return (hour >= 1 && hour < 4) || (hour >= 6 && hour < 10);
 };
 
+/**
+ * A cross-review reviewer (Brian's cross-review policy): a read-only subagent with exactly the tools `read` and
+ * `bash`, whose name or brief says "review". It runs on another model family by design.
+ */
+export function isCrossReviewSpawn(spawn) {
+    const tools = spawn.tools;
+
+    return (
+        Array.isArray(tools) &&
+        tools.length === 2 &&
+        tools.includes("read") &&
+        tools.includes("bash") &&
+        (spawn.review === true || /review/i.test(`${spawn.name ?? ""} ${spawn.brief ?? ""}`))
+    );
+}
+
 /** F3: a subagent on a model other than the brief's worker, and a DeepSeek worker that starts in its peak. */
 export function checkF3(data, ctx) {
     const findings = [];
     let wrongSpawns = 0;
+    let reviewerSpawns = 0;
     let peakRounds = 0;
 
     for (const { session, goal } of activeGoals(data, ctx)) {
@@ -1158,13 +1195,16 @@ export function checkF3(data, ctx) {
 
         const from = goal.setAt ?? 0;
         const to = goal.endedAt ?? ctx.now;
-        const wrong = data.spawns.filter(
+        const other = data.spawns.filter(
             (spawn) =>
                 spawn.c === session &&
                 spawn.at >= from &&
                 spawn.at <= to + HOUR &&
                 spawn.model !== goal.worker,
         );
+        const wrong = other.filter((spawn) => !isCrossReviewSpawn(spawn));
+
+        reviewerSpawns += other.length - wrong.length;
 
         if (wrong.length > 0) {
             wrongSpawns += wrong.length;
@@ -1214,7 +1254,7 @@ export function checkF3(data, ctx) {
         }
     }
 
-    return { findings, metrics: { wrongModelSpawns: wrongSpawns, peakRounds } };
+    return { findings, metrics: { wrongModelSpawns: wrongSpawns, reviewerSpawns, peakRounds } };
 }
 
 // ---------- G. Schedules ----------
