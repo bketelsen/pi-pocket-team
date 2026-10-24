@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
+import { isCrossReviewSpawn } from "./checks.mjs";
 import { HOUR } from "./common.mjs";
 import { NOW } from "./fixtures/builders.mjs";
 import { SESSION_T1, SUPERVISOR, createFixtureDb } from "./fixtures/pocket-db.mjs";
@@ -152,12 +153,20 @@ test("loadData reads every source into one plain object", () => {
     // Spawn calls with the model each one named.
     assert.deepEqual(
         data.spawns.map((spawn: { c: number; model: string }) => [spawn.c, spawn.model]),
-        [[SUPERVISOR, "other/model"]],
+        [
+            [SUPERVISOR, "other/model"],
+            [SUPERVISOR, "other/model"],
+        ],
     );
     // The name, tools and the start of the brief are read too.
     assert.equal(data.spawns[0].name, "w");
     assert.deepEqual(data.spawns[0].tools, ["read", "bash"]);
     assert.equal(data.spawns[0].brief, "do");
+    assert.equal(data.spawns[0].review, false);
+    // "review" after character 300 is not in the brief, but the flag has it.
+    assert.equal(data.spawns[1].brief.length, 300);
+    assert.equal(data.spawns[1].review, true);
+    assert.equal(isCrossReviewSpawn(data.spawns[1]), true);
 
     // No extensions folder: no install times.
     assert.deepEqual(data.installed, { "desk.ts": null, "team.ts": null, "night-shift.ts": null });
@@ -441,7 +450,9 @@ test("loadGithub: 1 search, 1 query per 40 PRs, check runs of each repair, 1 set
 
     assert.ok(
         fake.seen.some(
-            (args) => args[1] === "repos/acme/w0/commits/abc123/check-runs?per_page=100&filter=all",
+            (args) =>
+                args[1] ===
+                "repos/acme/w0/commits/abc123/check-runs?per_page=100&filter=all&page=1",
         ),
     );
     assert.equal(result.botPrs.length, 45);
@@ -456,6 +467,73 @@ test("loadGithub: 1 search, 1 query per 40 PRs, check runs of each repair, 1 set
     // 1 search + 2 graphql + 1 check run + 3 settings.
     assert.equal(gh.state.calls, 7);
     assert.ok(fake.seen.every((args) => !args.includes("-X") && !args.includes("--method")));
+});
+
+/** A `gh` fake that serves the check runs of 1 commit in pages; `total` is what `total_count` says. */
+function pagedRuns(count: number, total = count) {
+    const pages: string[] = [];
+
+    const run = (_: string, args: string[]) => {
+        const url = args[1] ?? "";
+
+        if (url.includes("check-runs")) {
+            const page = Number(/[&?]page=(\d+)/.exec(url)?.[1]);
+
+            pages.push(url);
+
+            const from = (page - 1) * 100;
+            const runs = Array.from(
+                { length: Math.max(0, Math.min(100, count - from)) },
+                (_, i) => ({
+                    name: `n${from + i}`,
+                    conclusion: from + i === 100 ? "failure" : "success",
+                }),
+            );
+
+            return JSON.stringify({ total_count: total, check_runs: runs });
+        }
+
+        return args[0] === "search" ? "[]" : "{}";
+    };
+
+    return { pages, run };
+}
+
+const repairOf = {
+    T1: {
+        id: "T1",
+        state: "open",
+        prs: {},
+        asks: [],
+        run: {
+            repairs: { "repair:acme/w0#900:abc123:FAILURE": { at: NOW - HOUR, to: "agent" } },
+        },
+    },
+};
+
+test("loadGithub: check runs are read page by page; the run on page 2 is kept", () => {
+    const fake = pagedRuns(101);
+    const result = loadGithub(
+        { threads: repairOf },
+        { gh: makeGh(fake.run), now: NOW, since: NOW - 24 * HOUR },
+    );
+    const runs = result.checkRuns["acme/w0@abc123"];
+
+    assert.equal(fake.pages.length, 2);
+    assert.match(fake.pages[1]!, /per_page=100&filter=all&page=2$/);
+    assert.equal(runs.length, 101);
+    assert.equal(runs[100].conclusion, "failure");
+});
+
+test("loadGithub: with more runs than 5 pages hold, the commit's check runs are null", () => {
+    const fake = pagedRuns(600);
+    const result = loadGithub(
+        { threads: repairOf },
+        { gh: makeGh(fake.run), now: NOW, since: NOW - 24 * HOUR },
+    );
+
+    assert.equal(fake.pages.length, 5);
+    assert.equal(result.checkRuns["acme/w0@abc123"], null);
 });
 
 test("loadGithub: when gh gives nothing, the load fails and the source is reported", () => {

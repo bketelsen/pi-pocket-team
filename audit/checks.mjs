@@ -1177,7 +1177,7 @@ export function isCrossReviewSpawn(spawn) {
         tools.length === 2 &&
         tools.includes("read") &&
         tools.includes("bash") &&
-        /review/i.test(`${spawn.name ?? ""} ${spawn.brief ?? ""}`)
+        (spawn.review === true || /review/i.test(`${spawn.name ?? ""} ${spawn.brief ?? ""}`))
     );
 }
 

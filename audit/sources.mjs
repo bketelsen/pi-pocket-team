@@ -436,6 +436,9 @@ function loadSpawns(db, since) {
                     tools: Array.isArray(part.arguments.tools)
                         ? part.arguments.tools.filter((tool) => typeof tool === "string")
                         : null,
+                    review:
+                        typeof part.arguments.message === "string" &&
+                        /review/i.test(part.arguments.message),
                     brief:
                         typeof part.arguments.message === "string"
                             ? part.arguments.message.slice(0, 300)
@@ -521,6 +524,38 @@ function graphqlPrs(gh, refs) {
     return result;
 }
 
+/** At most this many pages of 100 check runs for 1 commit. */
+const CHECK_PAGES = 5;
+
+/**
+ * Every check run of a commit, 100 a page, at most 5 pages. `null` when a page cannot be read, or when fewer runs
+ * came than `total_count` says: partial data is never judged.
+ */
+function loadCheckRuns(gh, repo, oid) {
+    const runs = [];
+    let total = null;
+
+    for (let page = 1; page <= CHECK_PAGES; page += 1) {
+        const body = json(
+            gh.api(`repos/${repo}/commits/${oid}/check-runs?per_page=100&filter=all&page=${page}`),
+            {},
+        );
+
+        if (!Array.isArray(body.check_runs)) {
+            return null;
+        }
+
+        total = typeof body.total_count === "number" ? body.total_count : total;
+        runs.push(...body.check_runs);
+
+        if (body.check_runs.length < 100 || (total !== null && runs.length >= total)) {
+            break;
+        }
+    }
+
+    return total !== null && runs.length < total ? null : runs;
+}
+
 /** The PRs and check runs the checks of groups B, C, D and H read. At most 40 `gh` calls. */
 export function loadGithub(data, { gh, now, since }) {
     const day = new Date(since).toISOString().slice(0, 10);
@@ -568,11 +603,7 @@ export function loadGithub(data, { gh, now, since }) {
             if (kind === "FAILURE" && value.at >= since && value.at <= now) {
                 const repo = ref.split("#")[0];
 
-                checkRuns[`${repo}@${oid}`] =
-                    json(
-                        gh.api(`repos/${repo}/commits/${oid}/check-runs?per_page=100&filter=all`),
-                        {},
-                    ).check_runs ?? null;
+                checkRuns[`${repo}@${oid}`] = loadCheckRuns(gh, repo, oid);
             }
         }
     }

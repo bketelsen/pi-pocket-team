@@ -270,6 +270,18 @@ export function createFixtureDb(file, now) {
                 message: "do",
             },
         },
+        {
+            type: "toolCall",
+            id: "c2",
+            name: "subagent",
+            arguments: {
+                action: "spawn",
+                name: "audit",
+                model: "other/model",
+                tools: ["read", "bash"],
+                message: `${"x".repeat(320)} This is a cross-review.`,
+            },
+        },
     ]);
     assistant(SUPERVISOR, now - 40 * 24 * HOUR, 99);
     toolResult(

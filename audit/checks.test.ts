@@ -519,6 +519,46 @@ test("B1: a failure before the wake-up is real, even when a rerun succeeded afte
     );
 });
 
+test("B1: runs with times are judged by what was known at the wake-up", () => {
+    const wake = ago(HOUR);
+    const done = (conclusion: string, at: number) => ({
+        name: "Build",
+        conclusion,
+        completed_at: new Date(wake + at).toISOString(),
+    });
+    const cases: [string, unknown[], boolean][] = [
+        [
+            "an older success, then a newer failure: real failure",
+            [done("success", -120_000), done("failure", -60_000)],
+            false,
+        ],
+        [
+            "a success and a cancelled run: no failure",
+            [done("success", -120_000), done("cancelled", -60_000)],
+            true,
+        ],
+        [
+            "a failure and a rerun in progress: real failure",
+            [done("failure", -60_000), { name: "Build", status: "in_progress", conclusion: null }],
+            false,
+        ],
+    ];
+
+    for (const [label, checks, finding] of cases) {
+        const data = emptyData({
+            threads: threadMap(repairThread("abc1234")),
+            github: {
+                botPrs: [],
+                prs: {},
+                autoDelete: {},
+                checkRuns: { "acme/widgets@abc1234": checks },
+            },
+        });
+
+        assert.deepEqual(ids(checkB1(data, ctx)), finding ? ["B1:acme/widgets#7"] : [], label);
+    }
+});
+
 test("B1: a repair with no check data from GitHub is left out; a CONFLICTING one is not read", () => {
     const missing = emptyData({ threads: threadMap(repairThread("abc1234")) });
     const conflict = emptyData({
@@ -974,6 +1014,12 @@ test("F3: a cross-review reviewer is left out; other spawns on another model sta
     assert.deepEqual(ids(left), []);
     assert.equal(left.metrics.reviewerSpawns, 1);
     assert.equal(isCrossReviewSpawn(reviewer), true);
+    // "review" only past the 300 characters of the brief: the loader's flag has it.
+    assert.equal(
+        isCrossReviewSpawn({ name: "audit", tools: ["read", "bash"], brief: "x", review: true }),
+        true,
+    );
+    assert.equal(isCrossReviewSpawn({ name: "audit", tools: ["read", "bash"], brief: "x" }), false);
     assert.deepEqual(
         ids(checkF3(data({ name: "fix462", tools: null, brief: "You fix review findings" }), ctx)),
         ["F3:model:g1"],
