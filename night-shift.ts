@@ -13,10 +13,10 @@
  * - The round count goes up in the same commit that moves the task on to send that round.
  * - A check is behind two memos, as in goals.ts: one set before it runs, one with its result. A restart that finds the
  *   first without the second does not run it again; the round says it was cut off.
- * - A `start` time is a durable sleep in the task's `wait` phase, before round 1: a restart sleeps again until the
+ * - A `start` time is a restart-safe wait in the task's `wait` phase, before round 1: a restart sleeps again until the
  *   stored start, and a server that was down past it starts round 1 at once. Round 1 starts only in `decide`.
  * - After round 1, `decide` waits while Pi's own subagents still work (`pocket.subagents`): a round sent then would only
- *   hear "still waiting". One poll is a durable sleep, and a memo keyed by the round holds the wait's start, so a
+ *   hear "still waiting". One poll is a restart-safe wait, and a memo keyed by the round holds the wait's start, so a
  *   restart waits for the rest of the same hour and no round is counted meanwhile.
  *
  * State is one document per conversation, `x.night-shift.goal`. It is stored data: never rename it or change what a
@@ -1085,24 +1085,17 @@ type DriverState =
     | { phase: "report"; text: string };
 type Runtime = TaskRuntime<DriverInput, DriverState, null, object>;
 
-/** The part of a task runtime that `sleepInPhase` uses: `sleep` exists on Pi Durable 1.3, `setTimer` on 1.4. */
-type SleepRuntime = {
-    now(): number;
-    sleep?: (until: number, context: Context) => Promise<void>;
-    setTimer?: (callback: () => void, delayMs: number) => () => void;
-};
-
 /**
- * Wait inside a phase until the Harness clock reaches `until`. Pi Durable 1.4 removed `runtime.sleep`, so this calls it
- * where it exists (1.3) and otherwise waits the same way: rechecking the clock after every timer, and rejecting with
- * the abort reason when the context's signal aborts. It keeps 1.3's in-phase semantics, so stored task states stay the
- * same. A later change can move to `runtime.sleepUntil` once Pi Pocket 0.21 is the oldest supported version.
+ * Wait inside a phase until the Harness clock reaches `until`: recheck the clock after every timer, and reject with the
+ * abort reason when the context's signal aborts. This stays in-phase and does not use `runtime.sleepUntil` on purpose:
+ * the wait must end at once when the goal stops or another driver takes over. A stop is a document change from a
+ * command, and an extension cannot wake or abort a durably sleeping task early.
  */
-function sleepInPhase(runtime: SleepRuntime, until: number, context: Context): Promise<void> {
-    if (typeof runtime.sleep === "function") {
-        return runtime.sleep(until, context);
-    }
-
+function sleepInPhase(
+    runtime: Pick<Runtime, "now" | "setTimer">,
+    until: number,
+    context: Context,
+): Promise<void> {
     return (async () => {
         const signal = context.abortSignal;
 
@@ -1132,13 +1125,7 @@ function sleepInPhase(runtime: SleepRuntime, until: number, context: Context): P
                     resolve();
                 };
 
-                if (typeof runtime.setTimer === "function") {
-                    disarm = runtime.setTimer(onTimer, delayMs);
-                } else {
-                    const timer = setTimeout(onTimer, delayMs);
-
-                    disarm = () => clearTimeout(timer);
-                }
+                disarm = runtime.setTimer(onTimer, delayMs);
 
                 signal?.addEventListener("abort", onAbort, { once: true });
             });
@@ -1541,7 +1528,7 @@ export default function createNightShift(host: Host, web: Web) {
         initial: () => ({ phase: "wait" }),
         phases: {
             /**
-             * Before round 1: a durable sleep until the goal's start time, if it has one. A restart sleeps again until
+             * Before round 1: a restart-safe wait until the goal's start time, if it has one. A restart sleeps again until
              * the stored start; a server that was down past it goes to decide at once. Round 1 starts only in decide,
              * which moves the round count in its commit, so it never starts twice.
              */

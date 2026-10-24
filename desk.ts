@@ -72,67 +72,6 @@ const STALE_MS = 3 * 24 * 3600_000;
 /** A thread that waits on a reviewer is stale after this long. */
 const REVIEWER_STALE_MS = 7 * 24 * 3600_000;
 
-/** The part of a task runtime that `sleepInPhase` uses: `sleep` exists on Pi Durable 1.3, `setTimer` on 1.4. */
-type SleepRuntime = {
-    now(): number;
-    sleep?: (until: number, context: Context) => Promise<void>;
-    setTimer?: (callback: () => void, delayMs: number) => () => void;
-};
-
-/**
- * Wait inside a phase until the Harness clock reaches `until`. Pi Durable 1.4 removed `runtime.sleep`, so this calls it
- * where it exists (1.3) and otherwise waits the same way: rechecking the clock after every timer, and rejecting with
- * the abort reason when the context's signal aborts. It keeps 1.3's in-phase semantics, so stored task states stay the
- * same. A later change can move to `runtime.sleepUntil` once Pi Pocket 0.21 is the oldest supported version.
- */
-function sleepInPhase(runtime: SleepRuntime, until: number, context: Context): Promise<void> {
-    if (typeof runtime.sleep === "function") {
-        return runtime.sleep(until, context);
-    }
-
-    return (async () => {
-        const signal = context.abortSignal;
-
-        for (;;) {
-            signal?.throwIfAborted();
-
-            const remaining = until - runtime.now();
-
-            if (remaining <= 0) {
-                return;
-            }
-
-            const delayMs = Math.min(remaining, 2_147_483_647);
-
-            await new Promise<void>((resolve, reject) => {
-                let disarm = (): void => {};
-
-                const onAbort = (): void => {
-                    disarm();
-
-                    reject(signal?.reason);
-                };
-
-                const onTimer = (): void => {
-                    signal?.removeEventListener("abort", onAbort);
-
-                    resolve();
-                };
-
-                if (typeof runtime.setTimer === "function") {
-                    disarm = runtime.setTimer(onTimer, delayMs);
-                } else {
-                    const timer = setTimeout(onTimer, delayMs);
-
-                    disarm = () => clearTimeout(timer);
-                }
-
-                signal?.addEventListener("abort", onAbort, { once: true });
-            });
-        }
-    })();
-}
-
 /** How long the sweeper sleeps between sweeps. */
 export const SWEEP_SLEEP_MS = 10 * 60_000;
 /** How long a roster folder must stay dirty or ahead before the sweep makes a found thread: a short dirty moment is not work. */
@@ -5766,7 +5705,7 @@ export default function createDesk(host: Host, web: Web) {
      * before any commit; the commit records what happened, so a restart between the two loses nothing but tries again.
      * A worktree that git refused waits a day, and its 1 event stays.
      */
-    const sweepWorktrees = async (
+    const sweepWorktreesNow = async (
         supervisor: number,
         read: Reader,
         now: number,
@@ -5829,6 +5768,33 @@ export default function createDesk(host: Host, web: Web) {
 
             return undefined;
         });
+    };
+
+    /** The end of the last `sweepWorktrees` call: the lock's tail. It never rejects. */
+    let worktreeSweepTail: Promise<unknown> = Promise.resolve();
+
+    /**
+     * `sweepWorktreesNow`, 1 call at a time in this process. The sweeper task and the `desk sync` tool can run it together:
+     * both would read the snapshot before the other commits, both would run `git worktree remove`, and one could record
+     * a false "worktree kept" event while `run.worktreeGone` is not committed yet. Each call waits for the previous call
+     * to end, also when it failed, then reads, runs git and commits; a failure does not break the chain.
+     */
+    const sweepWorktrees = async (...args: Parameters<typeof sweepWorktreesNow>): Promise<void> => {
+        const previous = worktreeSweepTail;
+
+        let release: () => void = () => {};
+
+        worktreeSweepTail = new Promise<void>((resolve) => {
+            release = resolve;
+        });
+
+        await previous;
+
+        try {
+            await sweepWorktreesNow(...args);
+        } finally {
+            release();
+        }
     };
 
     /** One git read of a folder: its text, or undefined when the call failed. */
@@ -7623,7 +7589,10 @@ export default function createDesk(host: Host, web: Web) {
 
     /**
      * One sweeper per supervisor: sweep, sleep 10 minutes, sweep again. It ends when that supervisor has no thread that
-     * is not closed. A restart during the sleep sleeps again until the same time; `sweepers` keeps it to one task.
+     * is not closed. The sleep is a durable sleep (`runtime.sleepUntil`): the task has status `sleeping` until the time, and
+     * a restart keeps it. The `sweep` phase commits `{ phase: "sleep", until }` and does its sends and `sweepWorktrees`
+     * afterwards, which needs the running invocation; the `sleep` phase then starts the durable sleep. `sweepers` keeps
+     * it to one task.
      */
     const Sweeper = defineTask<SweeperInput, SweeperState, null>({
         name: "x.desk.sweeper",
@@ -7856,7 +7825,7 @@ export default function createDesk(host: Host, web: Web) {
                 const checkpoint = task.state.checkpoint;
 
                 if (checkpoint.phase === "sleep" && runtime.now() < checkpoint.until) {
-                    await sleepInPhase(runtime, checkpoint.until, context);
+                    return runtime.sleepUntil(checkpoint.until, { phase: "sweep" }, context);
                 }
 
                 await runtime.commit(
@@ -8010,8 +7979,10 @@ export default function createDesk(host: Host, web: Web) {
         initial: (input) => ({ phase: "wait", due: input.due }),
         phases: {
             wait: async (task, runtime, context) => {
-                if (runtime.now() < task.state.checkpoint.due) {
-                    await sleepInPhase(runtime, task.state.checkpoint.due, context);
+                const due = task.state.checkpoint.due;
+
+                if (runtime.now() < due) {
+                    return runtime.sleepUntil(due, { phase: "take" }, context);
                 }
 
                 await runtime.commit(

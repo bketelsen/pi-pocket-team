@@ -5918,19 +5918,16 @@ async function clearGrants(): Promise<void> {
     }, context);
 }
 
-/** True when every live sweeper sleeps: no first sweep is still reading the world. */
+/** True when every live sweeper is in a durable sleep (task status `sleeping`): no first sweep is still reading the world. */
 async function sweepersAsleep(): Promise<boolean> {
     const live = await app.harness.inspect(context);
 
     return live.tasks
         .filter((task) => task.record.kind === "x.desk.sweeper")
         .every((task) => {
-            const state = task.record.state as {
-                status?: string;
-                checkpoint?: { phase?: string };
-            };
+            const state = task.record.state as { status?: string };
 
-            return state.status === "running" && state.checkpoint?.phase === "sleep";
+            return state.status === "sleeping";
         });
 }
 
@@ -9718,12 +9715,19 @@ describe("the desk in a Pi Pocket", () => {
         await until(() => !app.isBusy(linked), "the linked session to settle", 20_000);
         // 25 hours closed: the grace period is over.
         await closeThreadNow(thread.id, 25 * 3600_000);
+        // The sweeper's own `sweepWorktrees` and the tool's run one at a time: the lock makes this read safe.
         await say(app, source, "desk sync test");
 
         const after = (await deskState())?.threads[thread.id];
 
         assert.equal(existsSync(worktree.path), false, "the worktree is gone");
         assert.equal(typeof after?.run.worktreeGone, "number");
+        assert.equal(
+            (after?.events ?? []).some((event) => event.text.startsWith("worktree kept:")),
+            false,
+            "no false kept event",
+        );
+        assert.equal(after?.run.worktreeKeptAt, undefined);
         assert.equal(
             (after?.events ?? []).filter((event) => event.text.startsWith("worktree removed:"))
                 .length,
