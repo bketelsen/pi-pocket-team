@@ -147,6 +147,7 @@ export type Goal = {
 export const GoalDoc = defineDoc<{ goal?: Goal }>({
     kind: "x.night-shift.goal",
     version: 1,
+    checkpointWhen: () => false,
     scope: "conversation",
     history: "latest",
     // A fork is a new start: it does not take the goal.
@@ -164,6 +165,8 @@ const PlanMode = defineDoc<{ on: boolean }>({
     scope: "conversation",
     history: "latest",
     fork: "current",
+    // The same as Pocket's own base, `rebased` in src/server/docs.ts: not part of the stored meaning.
+    checkpointWhen: (_value, _ops, info) => info.deltasSinceBase >= 64,
     initial: () => ({ on: false }),
 });
 
@@ -1082,6 +1085,67 @@ type DriverState =
     | { phase: "report"; text: string };
 type Runtime = TaskRuntime<DriverInput, DriverState, null, object>;
 
+/** The part of a task runtime that `sleepInPhase` uses: `sleep` exists on Pi Durable 1.3, `setTimer` on 1.4. */
+type SleepRuntime = {
+    now(): number;
+    sleep?: (until: number, context: Context) => Promise<void>;
+    setTimer?: (callback: () => void, delayMs: number) => () => void;
+};
+
+/**
+ * Wait inside a phase until the Harness clock reaches `until`. Pi Durable 1.4 removed `runtime.sleep`, so this calls it
+ * where it exists (1.3) and otherwise waits the same way: rechecking the clock after every timer, and rejecting with
+ * the abort reason when the context's signal aborts. It keeps 1.3's in-phase semantics, so stored task states stay the
+ * same. A later change can move to `runtime.sleepUntil` once Pi Pocket 0.21 is the oldest supported version.
+ */
+function sleepInPhase(runtime: SleepRuntime, until: number, context: Context): Promise<void> {
+    if (typeof runtime.sleep === "function") {
+        return runtime.sleep(until, context);
+    }
+
+    return (async () => {
+        const signal = context.abortSignal;
+
+        for (;;) {
+            signal?.throwIfAborted();
+
+            const remaining = until - runtime.now();
+
+            if (remaining <= 0) {
+                return;
+            }
+
+            const delayMs = Math.min(remaining, 2_147_483_647);
+
+            await new Promise<void>((resolve, reject) => {
+                let disarm = (): void => {};
+
+                const onAbort = (): void => {
+                    disarm();
+
+                    reject(signal?.reason);
+                };
+
+                const onTimer = (): void => {
+                    signal?.removeEventListener("abort", onAbort);
+
+                    resolve();
+                };
+
+                if (typeof runtime.setTimer === "function") {
+                    disarm = runtime.setTimer(onTimer, delayMs);
+                } else {
+                    const timer = setTimeout(onTimer, delayMs);
+
+                    disarm = () => clearTimeout(timer);
+                }
+
+                signal?.addEventListener("abort", onAbort, { once: true });
+            });
+        }
+    })();
+}
+
 const finished = { status: "terminal", outcome: { status: "completed", result: null } } as const;
 const next = (checkpoint: DriverState) => ({ status: "running", checkpoint }) as const;
 
@@ -1319,7 +1383,7 @@ export default function createNightShift(host: Host, web: Web) {
                 watch.start(look);
             }
 
-            await runtime.sleep(until, withAbortSignal(controller.signal, context));
+            await sleepInPhase(runtime, until, withAbortSignal(controller.signal, context));
         } catch (failure) {
             // The goal stopped, or another driver took over. Any other rejection is not ours to swallow.
             if (!controller.signal.aborted) {
@@ -1509,7 +1573,8 @@ export default function createNightShift(host: Host, web: Web) {
                             watch.start(look);
                         }
 
-                        await runtime.sleep(
+                        await sleepInPhase(
+                            runtime,
                             goal.start,
                             withAbortSignal(controller.signal, context),
                         );

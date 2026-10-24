@@ -72,6 +72,67 @@ const STALE_MS = 3 * 24 * 3600_000;
 /** A thread that waits on a reviewer is stale after this long. */
 const REVIEWER_STALE_MS = 7 * 24 * 3600_000;
 
+/** The part of a task runtime that `sleepInPhase` uses: `sleep` exists on Pi Durable 1.3, `setTimer` on 1.4. */
+type SleepRuntime = {
+    now(): number;
+    sleep?: (until: number, context: Context) => Promise<void>;
+    setTimer?: (callback: () => void, delayMs: number) => () => void;
+};
+
+/**
+ * Wait inside a phase until the Harness clock reaches `until`. Pi Durable 1.4 removed `runtime.sleep`, so this calls it
+ * where it exists (1.3) and otherwise waits the same way: rechecking the clock after every timer, and rejecting with
+ * the abort reason when the context's signal aborts. It keeps 1.3's in-phase semantics, so stored task states stay the
+ * same. A later change can move to `runtime.sleepUntil` once Pi Pocket 0.21 is the oldest supported version.
+ */
+function sleepInPhase(runtime: SleepRuntime, until: number, context: Context): Promise<void> {
+    if (typeof runtime.sleep === "function") {
+        return runtime.sleep(until, context);
+    }
+
+    return (async () => {
+        const signal = context.abortSignal;
+
+        for (;;) {
+            signal?.throwIfAborted();
+
+            const remaining = until - runtime.now();
+
+            if (remaining <= 0) {
+                return;
+            }
+
+            const delayMs = Math.min(remaining, 2_147_483_647);
+
+            await new Promise<void>((resolve, reject) => {
+                let disarm = (): void => {};
+
+                const onAbort = (): void => {
+                    disarm();
+
+                    reject(signal?.reason);
+                };
+
+                const onTimer = (): void => {
+                    signal?.removeEventListener("abort", onAbort);
+
+                    resolve();
+                };
+
+                if (typeof runtime.setTimer === "function") {
+                    disarm = runtime.setTimer(onTimer, delayMs);
+                } else {
+                    const timer = setTimeout(onTimer, delayMs);
+
+                    disarm = () => clearTimeout(timer);
+                }
+
+                signal?.addEventListener("abort", onAbort, { once: true });
+            });
+        }
+    })();
+}
+
 /** How long the sweeper sleeps between sweeps. */
 export const SWEEP_SLEEP_MS = 10 * 60_000;
 /** How long a roster folder must stay dirty or ahead before the sweep makes a found thread: a short dirty moment is not work. */
@@ -333,6 +394,7 @@ export type DeskState = {
 export const DeskThreads = defineDoc<DeskState>({
     kind: "x.desk.threads",
     version: 1,
+    checkpointWhen: () => false,
     scope: "session",
     initial: () => ({ next: { T: 1, F: 1 }, threads: {}, grants: [], seen: {} }),
 });
@@ -355,6 +417,7 @@ export type DeskReportsState = { reports: StoredReport[] };
 export const DeskReports = defineDoc<DeskReportsState>({
     kind: "x.desk.reports",
     version: 1,
+    checkpointWhen: () => false,
     scope: "conversation",
     history: "latest",
     fork: "current",
@@ -7793,7 +7856,7 @@ export default function createDesk(host: Host, web: Web) {
                 const checkpoint = task.state.checkpoint;
 
                 if (checkpoint.phase === "sleep" && runtime.now() < checkpoint.until) {
-                    await runtime.sleep(checkpoint.until, context);
+                    await sleepInPhase(runtime, checkpoint.until, context);
                 }
 
                 await runtime.commit(
@@ -7948,7 +8011,7 @@ export default function createDesk(host: Host, web: Web) {
         phases: {
             wait: async (task, runtime, context) => {
                 if (runtime.now() < task.state.checkpoint.due) {
-                    await runtime.sleep(task.state.checkpoint.due, context);
+                    await sleepInPhase(runtime, task.state.checkpoint.due, context);
                 }
 
                 await runtime.commit(
@@ -8716,6 +8779,8 @@ export default function createDesk(host: Host, web: Web) {
         scope: "conversation",
         history: "latest",
         fork: "current",
+        // The same as Pocket's own base, `rebased` in src/server/docs.ts: not part of the stored meaning.
+        checkpointWhen: (_value, _ops, info) => info.deltasSinceBase >= 64,
         initial: () => ({ on: false }),
     });
 
