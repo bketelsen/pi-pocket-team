@@ -210,7 +210,7 @@ New optional fields only (stored data is forever). No existing kind or field cha
   and made urgent later gets its `issue-urgent` item then. A ref leaves `urgentSeen` when its last
   counted urgent signal goes (with proof), and leaves both when it leaves the queue (with proof), so a
   second queueing or a second urgent label tells Odrade again.
-- `partial` holds the merged PR refs that are "part of" the issue (section 4.3).
+- `partial` holds the merged PR refs that are verified partial work on the issue (section 4.3).
 - `Thread.issues?: string[]`: the issue refs of a thread.
 
 ### 3.5 On the Desk page
@@ -308,13 +308,23 @@ file and applies them; this PR does not change it.
   also after it leaves the search: state, `stateReason`, and `closedByPullRequestsReferences`.
 - **The close**: GitHub closes the issue when the PR with `Fixes #N` merges into the default branch.
   The thread then gets 1 event, "issue closed by PR #1130". When a thread's PR merges and its linked
-  issue stays open:
-    - the PR was in the issue's `closedByPullRequestsReferences` before the merge: the close failed
-      (for example a merge into another branch). The thread waits on Odrade: "frostyard/snosi#1123
-      still open after #1130 merged". She asks the agent for a follow-up, or asks Brian.
-    - the PR was not (a `Part of #N` PR): the open issue is expected. The PR goes into the item's
-      `partial`, the row shows "1 part merged", and the issue stays queued for the next step. The
-      thread closes by its own rules; the next step gets a new thread.
+  issue stays open, the desk reads that merged PR by number, after the merge, in the pinned part of the
+  query (`body`, and `closingIssuesReferences(first: 10) { totalCount nodes { number repository {
+nameWithOwner } } }`, which GitHub keeps on a merged PR). The PR is **verified partial** only when
+  all 3 hold:
+    - the read worked;
+    - the PR's `closingIssuesReferences` is complete (`totalCount` equals the nodes read) and does not
+      hold the issue;
+    - the PR's body has a line `Part of #N` (or `Part of owner/name#N`) that names the issue.
+
+    A verified partial PR goes into the item's `partial`: the row shows "1 part merged", the issue stays
+    queued for the next step, and the thread closes by its own rules (the next step gets a new thread).
+    **Every other case is unknown, and the warning stays**: a failed read, a cut list, no `Part of` line,
+    or the issue in the closing list. The thread waits on Odrade: "frostyard/snosi#1123 still open after
+    #1130 merged", and it does not close. She asks the agent for a follow-up, or asks Brian; when Brian
+    says the open issue is right, she records it with `desk result`. Nothing that the desk saw before the
+    merge decides the class: a PR can merge between 2 sweeps.
+
 - The desk never closes the issue.
 
 ## 5. Guard rails
@@ -422,7 +432,9 @@ done
    removal only after a by-number read; each digest kind once, and again after a dequeue; the
    promotion from queued to urgent; `issue-left` goes to the supervisor with a Clerk; a replayed
    sweep; a `Part of #N` merge keeps the issue queued; the link from the task text and
-   from `attach`; "still open after merge". All against `PI_POCKET_DESK_GH` fixtures, never GitHub.
+   from `attach`; "still open after merge"; the partial class: a PR that merged before any sweep saw
+   it, a failed read after the merge, a cut closing list, a body with no `Part of` line, and a verified
+   partial PR. All against `PI_POCKET_DESK_GH` fixtures, never GitHub.
 
 Size: about 600 to 900 lines with tests. Per Brian's rules, a `deepseek/deepseek-flash` worker writes
 it from this plan, and the PR gets a cross-review before `ready-for-human`.
