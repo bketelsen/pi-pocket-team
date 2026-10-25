@@ -950,6 +950,35 @@ test("E3: a person's message between the shift report and the team_message makes
     assert.equal(checkE3(data, ctx).metrics.answeredAfterShift, 3);
 });
 
+test("E3: 1 answering message with 2 shift reports near it counts 1 time", () => {
+    const data = emptyData({
+        threads: threadMap(thread("T1", { session: 101 })),
+        reports: {
+            101: [
+                report("n1", ago(3 * HOUR), "night shift summary", "night-shift"),
+                report("n2", ago(3 * HOUR) + 10 * MINUTE, "second shift summary", "night-shift"),
+                report("m1", ago(3 * HOUR) + 20 * MINUTE, "the answer to the new request"),
+            ],
+        },
+        userEntries: {
+            101: [
+                {
+                    id: "u1",
+                    at: ago(3 * HOUR) + 15 * MINUTE,
+                    text: "[via linked session session-x] Do the after-merge steps, then report.",
+                },
+            ],
+        },
+    });
+    const result = checkE3(data, ctx);
+
+    assert.deepEqual(ids(result), []);
+    assert.equal(result.pairs.length, 0);
+    assert.equal(result.metrics.answeredAfterShift, 1);
+    assert.equal(result.metrics.shiftPlusMessage, 0);
+    assert.equal(result.metrics.shiftReports, 2);
+});
+
 // ---------- F. Night and day shifts ----------
 
 const goal = (over: object = {}) => ({
@@ -1549,6 +1578,14 @@ test("runChecks: a check that throws is skipped and the run goes on", () => {
     assert.match(result.skipped.I1!, /^check failed:/);
     assert.match(result.skipped.I2!, /^check failed:/);
     assert.ok(result.metrics.A1);
+});
+
+test("runChecks: a failed entries source skips E3, so it cannot make false twins", () => {
+    const data = emptyData({ sourceErrors: { entries: "no such table" } });
+    const result = runChecks(data, ctx);
+
+    assert.match(result.skipped.E3!, /source unavailable: entries: no such table/);
+    assert.equal(result.metrics.E3, undefined);
 });
 
 test("runChecks: a database that cannot be read skips the checks that need it", () => {

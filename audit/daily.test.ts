@@ -249,6 +249,59 @@ test("main: the report holds the LLM proposal, the owner from the table, and the
     assert.ok(!model.calls[0]!.includes("First report text"));
 });
 
+/** A `run` like `setup`'s, but with its own answer to the lookup of the audit's own commit. */
+const codeRun = (codeLog: () => string) => (command: string, args: string[]) => {
+    if (command === "git" && args.includes("log")) {
+        return args.some((arg) => arg.includes("%h%x09%cI"))
+            ? codeLog()
+            : new Date(NOW - 2 * HOUR).toISOString();
+    }
+
+    if (command === "git" && args.includes("status")) {
+        return "?? reports/2026-10-23-daily-audit/\n";
+    }
+
+    throw new Error(`the audit ran ${command} ${args.join(" ")}`);
+};
+
+test("main: a lookup of the audit's own commit that throws says unknown, and the run goes on", async () => {
+    const t = setup();
+
+    await main(["--no-github", "--no-llm", "--out-dir", t.outDir], {
+        env: t.env,
+        now: NOW,
+        run: codeRun(() => {
+            throw new Error("not a git repository");
+        }),
+        log: () => undefined,
+    });
+
+    const readme = fs.readFileSync(path.join(t.outDir, "README.md"), "utf8");
+    const json = JSON.parse(fs.readFileSync(path.join(t.outDir, "findings.json"), "utf8"));
+
+    assert.equal(json.code, null);
+    assert.match(readme, /Audit code: unknown\./);
+    assert.match(readme, /LLM: not used \(--no-llm\)\./);
+});
+
+test("main: a lookup of the audit's own commit with empty output says unknown", async () => {
+    const t = setup();
+
+    await main(["--no-github", "--no-llm", "--out-dir", t.outDir], {
+        env: t.env,
+        now: NOW,
+        run: codeRun(() => ""),
+        log: () => undefined,
+    });
+
+    const readme = fs.readFileSync(path.join(t.outDir, "README.md"), "utf8");
+    const json = JSON.parse(fs.readFileSync(path.join(t.outDir, "findings.json"), "utf8"));
+
+    assert.equal(json.code, null);
+    assert.match(readme, /Audit code: unknown\./);
+    assert.ok(!readme.includes("Audit code: ("), "no half line");
+});
+
 test("main: the report and the JSON hold no report body, no secret and no pair text", async () => {
     const t = setup();
 

@@ -1021,6 +1021,7 @@ export function checkE3(data, ctx) {
     for (const { session, thread, reports } of reportsInWindow(data, ctx)) {
         const label = thread?.id ?? `session-${session}`;
         const requests = data.userEntries[thread?.session ?? session] ?? [];
+        const answered = new Set();
 
         const askedBetween = (shift, message) => {
             const from = Math.min(shift.at, message.at);
@@ -1044,12 +1045,15 @@ export function checkE3(data, ctx) {
                     !askedBetween(shift, report),
             );
 
-            answeredAfterShift += reports.filter(
-                (report) =>
+            for (const report of reports) {
+                if (
                     report.from === "team_message" &&
                     Math.abs(report.at - shift.at) <= 30 * MINUTE &&
-                    askedBetween(shift, report),
-            ).length;
+                    askedBetween(shift, report)
+                ) {
+                    answered.add(report.key);
+                }
+            }
 
             if (twin) {
                 twins.push({
@@ -1060,6 +1064,9 @@ export function checkE3(data, ctx) {
                 pairs.push({ finding: "E3", check: "E3", thread: label, a: shift, b: twin });
             }
         }
+
+        // One answering message counts 1 time for the session, however many shift reports are near it.
+        answeredAfterShift += answered.size;
     }
 
     return {
@@ -1655,7 +1662,7 @@ export const CHECKS = [
     ["D2", checkD2, ["desk", "github"]],
     ["E1", checkE1, ["desk", "reports"]],
     ["E2", checkE2, ["desk", "entries"]],
-    ["E3", checkE3, ["desk", "reports"]],
+    ["E3", checkE3, ["desk", "reports", "entries"]],
     ["F1", checkF1, ["goals"]],
     ["F2", checkF2, ["goals"]],
     ["F3", checkF3, ["goals", "entries"]],
