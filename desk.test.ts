@@ -51,6 +51,7 @@ import {
     seedThreads,
     shortLine,
     detachFrom,
+    ownThread,
     deskEpoch,
     repairEpoch,
     reopenable,
@@ -1414,6 +1415,247 @@ describe("detachFrom", () => {
 
         assert("text" in second);
         assert.equal(thread.events.length, events, "the replay adds nothing");
+    });
+});
+
+/** A found PR thread in `state`, with 1 PR on it, as `attribute`'s rule 4 makes it. */
+const foundPrThread = (state: DeskState, ref = "frostyard/test#7", at = 100): Thread => {
+    const id = `F${String(state.next.F)}`;
+    const found: Thread = {
+        id,
+        key: `found:pr:${ref}`,
+        origin: "found",
+        title: "A fix",
+        agents: [],
+        repo: "frostyard/test",
+        supervisor: 1,
+        state: "open",
+        startedAt: at,
+        lastEventAt: at,
+        prs: { [ref]: { via: "attached" } },
+        branches: [],
+        asks: [],
+        run: { next: "odrade" },
+        events: [],
+    };
+
+    state.next.F += 1;
+    state.threads[id] = found;
+
+    return found;
+};
+
+describe("ownThread", () => {
+    test("queue news that waits in the digest goes; other news stays", () => {
+        const state = deskOf();
+        const found = foundPrThread(state);
+        const other = foundPrThread(state, "frostyard/test#8");
+        const config = digestConfig({ minutes: 15 });
+        const reason = "found PR, attach or drop";
+
+        // As a sweep's queue news would put them in the box.
+        for (const thread of [found, other]) {
+            enqueueDigest(
+                state,
+                1,
+                {
+                    key: `queue:${thread.id}:${reason}`,
+                    thread: thread.id,
+                    kind: "queue",
+                    line: `[desk] ${thread.id} · waits on you: ${reason}`,
+                    at: 100,
+                },
+                100,
+                config,
+            );
+        }
+
+        enqueueDigest(
+            state,
+            1,
+            { key: "report:x", thread: found.id, kind: "report", line: "a report", at: 100 },
+            100,
+            config,
+        );
+        state.digests!["1"]!.queued = { [found.id]: reason, [other.id]: reason };
+
+        ownThread(state, found.id, 200, "Odrade");
+
+        const taken = takeDigest(state, 1, 0);
+
+        assert.deepEqual(
+            taken.items.map((item) => `${item.thread}:${item.kind}`),
+            [`${other.id}:queue`, `${found.id}:report`],
+        );
+        assert.equal(state.digests?.["1"]?.queued[found.id], undefined);
+        assert.equal(state.digests?.["1"]?.queued[other.id], reason);
+    });
+
+    test("closes a found PR thread as dropped by the desk, keeps its PR, and adds 1 event", () => {
+        const state = deskOf();
+        const found = foundPrThread(state);
+        const result = ownThread(state, found.id, 200, "Odrade");
+
+        assert("text" in result);
+        assert.match(result.text, /is Brian's own: it is closed/);
+        assert.equal(found.state, "closed");
+        assert.equal(found.closed?.at, 200);
+        assert.equal(found.closed?.why, "dropped");
+        assert.equal(found.closed?.by, "desk");
+        assert.equal(found.prs["frostyard/test#7"]?.via, "attached", "the PR stays on it");
+        assert.equal(found.events.at(-1)?.key, "own:200");
+        assert.match(
+            found.events.at(-1)?.text ?? "",
+            /Brian's own, marked by Odrade: the desk does not track frostyard\/test#7/,
+        );
+    });
+
+    test("a second call says already, and adds no event", () => {
+        const state = deskOf();
+        const found = foundPrThread(state);
+
+        ownThread(state, found.id, 200, "Odrade");
+
+        const events = found.events.length;
+        const again = ownThread(state, found.id, 300, "Odrade");
+
+        assert("text" in again);
+        assert.match(again.text, /is Brian's own already\. Nothing changed\./);
+        assert.equal(found.events.length, events);
+    });
+
+    test("a delegated thread and a found session thread are refused", () => {
+        const state = deskOf();
+        const delegated = placed(state, 100);
+        const session = foundPrThread(state);
+
+        session.key = "found:session:session-abc";
+
+        for (const thread of [delegated, session]) {
+            const events = thread.events.length;
+            const refused = ownThread(state, thread.id, 200, "Odrade");
+
+            assert("error" in refused);
+            assert.match(
+                refused.error,
+                /is not a found PR thread: only a found PR can be Brian's own\. To take 1 PR off a thread, use detach\./,
+            );
+            assert.equal(thread.state, "open");
+            assert.equal(thread.events.length, events);
+        }
+    });
+
+    test("an unknown id is refused", () => {
+        const refused = ownThread(deskOf(), "F9", 200, "Odrade");
+
+        assert("error" in refused);
+        assert.equal(refused.error, "There is no thread F9.");
+    });
+
+    test("after it, attribute makes no found thread for the PR, and reopens nothing", () => {
+        const state = deskOf();
+        const found = foundPrThread(state);
+
+        ownThread(state, found.id, 200, "Odrade");
+
+        const count = Object.keys(state.threads).length;
+        const attributed = attribute(state, githubOf([prFact()]), gitOf(), 300);
+
+        assert.equal(Object.keys(state.threads).length, count, "no new found thread");
+        assert.deepEqual(attributed.reopened, []);
+        assert.equal(state.threads[found.id]?.state, "closed");
+    });
+});
+
+describe("the dropped list", () => {
+    test("detachFrom records the ref, and the no-op path changes nothing", () => {
+        const state = deskOf();
+        const thread = placed(state, 100);
+
+        thread.prs["frostyard/test#7"] = { via: "attached" };
+        detachFrom(state, "frostyard/test#7", thread.id, 200);
+
+        assert.deepEqual(state.dropped?.["frostyard/test#7"], { at: 200, from: thread.id });
+
+        detachFrom(state, "frostyard/test#7", thread.id, 300);
+        assert.deepEqual(state.dropped?.["frostyard/test#7"], { at: 200, from: thread.id });
+    });
+
+    test("attribute neither attaches nor finds a dropped PR", () => {
+        const state = deskOf();
+        const found = foundPrThread(state);
+
+        detachFrom(state, "frostyard/test#7", found.id, 200);
+        found.state = "closed";
+
+        const count = Object.keys(state.threads).length;
+
+        attribute(state, githubOf([prFact()]), gitOf(), 300);
+
+        assert.equal(Object.keys(state.threads).length, count, "no new found thread");
+        assert.equal(Object.keys(found.prs).length, 0);
+
+        // A thread that read the PR, and has its branch, does not get it either.
+        const other = deskOf();
+        const thread = placed(other, 100);
+
+        other.dropped = { "frostyard/test#7": { at: 50, from: "F9" } };
+        thread.run.seenPrs = ["frostyard/test#7"];
+        thread.branches = ["fix-7"];
+
+        attribute(other, githubOf([prFact()]), gitOf(), 300);
+
+        assert.equal(thread.prs["frostyard/test#7"], undefined);
+        assert.equal(foundIn(other), undefined);
+    });
+
+    test("attachTo puts the PR on the target, and deletes its entry", () => {
+        const state = deskOf();
+        const thread = placed(state, 100);
+
+        state.dropped = { "frostyard/test#7": { at: 200, from: "F1" } };
+
+        const result = attachTo(state, "frostyard/test#7", thread.id, 300);
+
+        assert("text" in result);
+        assert.equal(thread.prs["frostyard/test#7"]?.via, "attached");
+        assert.equal(state.dropped["frostyard/test#7"], undefined);
+    });
+
+    test("a complete read that no longer lists the PR deletes the entry; a cut read keeps it", () => {
+        const state = deskOf();
+
+        state.dropped = { "frostyard/test#7": { at: 100, from: "F1" } };
+
+        // The repository read is complete, and the PR is not open: its entry goes.
+        attribute(state, githubOf([]), gitOf(), 200);
+        assert.equal(state.dropped["frostyard/test#7"], undefined);
+
+        // A read that cut the repository short keeps every entry of it.
+        state.dropped = { "frostyard/test#7": { at: 100, from: "F1" } };
+        attribute(
+            state,
+            { ...githubOf([]), incomplete: ["frostyard/test: 50 of 300 open PRs read"] },
+            gitOf(),
+            300,
+        );
+        assert.deepEqual(state.dropped["frostyard/test#7"], { at: 100, from: "F1" });
+    });
+
+    test("detachFrom keeps at most 200 entries, the newest", () => {
+        const state = deskOf();
+        const thread = placed(state, 100);
+
+        for (let index = 0; index < 201; index += 1) {
+            const ref = `frostyard/test#${String(index + 1)}`;
+
+            thread.prs[ref] = { via: "attached" };
+            detachFrom(state, ref, thread.id, 1000 + index);
+        }
+
+        assert.equal(Object.keys(state.dropped ?? {}).length, 200);
+        assert.equal(state.dropped?.["frostyard/test#1"], undefined, "the oldest goes");
+        assert.deepEqual(state.dropped?.["frostyard/test#201"], { at: 1200, from: thread.id });
     });
 });
 
@@ -4198,6 +4440,64 @@ describe("attribute", () => {
         attribute(state2, githubOf([prFact({ createdAt: 200 })]), gitOf(), 400);
         assert.equal(foundIn(state2)?.origin, "found");
     });
+
+    test("an owner's PR takes no window, and makes no found thread", () => {
+        const state = deskOf();
+        const thread = placed(state, 100);
+
+        attribute(
+            state,
+            githubOf([prFact({ author: "bketelsen" })]),
+            gitOf({ ownAuthors: ["bketelsen"] }),
+            400,
+        );
+
+        assert.equal(thread.prs["frostyard/test#7"], undefined, "no window attach");
+        assert.equal(foundIn(state), undefined, "no found thread");
+        assert.equal(state.others?.["frostyard/test"], 0, "an owner's PR is not another's");
+    });
+
+    test("an owner's PR attaches by seen, and by branch", () => {
+        const seen = deskOf();
+        const seenThread = placed(seen, 100);
+
+        seenThread.run.seenPrs = ["frostyard/test#7"];
+        attribute(
+            seen,
+            githubOf([prFact({ author: "bketelsen" })]),
+            gitOf({ ownAuthors: ["bketelsen"] }),
+            400,
+        );
+        assert.equal(seenThread.prs["frostyard/test#7"]?.via, "seen");
+
+        const branch = deskOf();
+        const branchThread = placed(branch, 100);
+
+        branchThread.branches = ["fix-7"];
+        attribute(
+            branch,
+            githubOf([prFact({ author: "bketelsen", createdAt: 50 })]),
+            gitOf({ ownAuthors: ["bketelsen"] }),
+            400,
+        );
+        assert.equal(branchThread.prs["frostyard/test#7"]?.via, "branch");
+    });
+
+    test("a login in both authors and ownAuthors is Brian's own", () => {
+        const state = deskOf();
+        const thread = placed(state, 100);
+
+        attribute(
+            state,
+            githubOf([prFact({ author: "bketelsen" })]),
+            gitOf({ authors: ["bketelsen"], ownAuthors: ["bketelsen"] }),
+            400,
+        );
+
+        assert.equal(thread.prs["frostyard/test#7"], undefined);
+        assert.equal(foundIn(state), undefined);
+        assert.equal(state.others?.["frostyard/test"], 0);
+    });
 });
 
 describe("attachTo", () => {
@@ -5177,6 +5477,8 @@ let askThreadId = "";
 let answerAskId = "";
 /** The threads the scripted model watches and records results on. */
 let attachThreadId = "";
+/** The found PR thread the scripted model marks as Brian's own. */
+let ownThreadId = "";
 let otherAskThreadId = "";
 let watchThreadId = "";
 let otherThreadId = "";
@@ -5307,6 +5609,14 @@ const model = scriptedModel((request) => {
             ref: "frostyard/test#7",
             thread: attachThreadId,
         });
+    }
+
+    if (text.endsWith("desk own test")) {
+        return call("desk", { action: "own", thread: ownThreadId });
+    }
+
+    if (text.endsWith("clerk own test")) {
+        return call("desk", { action: "own", thread: ownThreadId });
     }
 
     if (text.endsWith("desk ask thread test")) {
@@ -9118,10 +9428,14 @@ describe("the desk in a Pi Pocket", () => {
             // The session's answer holds the PR's URL; the next sweep reads it.
             await say(app, linked, "desk pr test");
 
-            // A machine account counts as ours: its PR is a candidate too.
+            // A machine account counts as ours: its PR is a candidate too. Brian's own login is not a candidate.
             writeFileSync(
                 configPath,
-                JSON.stringify({ digest: { minutes: 0 }, authors: ["machine-user"] }),
+                JSON.stringify({
+                    digest: { minutes: 0 },
+                    authors: ["machine-user"],
+                    ownAuthors: ["brian-user"],
+                }),
             );
             writeFileSync(
                 fixturePath,
@@ -9136,6 +9450,11 @@ describe("the desk in a Pi Pocket", () => {
                             author: "machine-user",
                             createdAt: new Date(Number(thread.startedAt) + 120_000).toISOString(),
                         },
+                        {
+                            number: 215,
+                            author: "brian-user",
+                            createdAt: new Date(Number(thread.startedAt) + 180_000).toISOString(),
+                        },
                     ]),
                 ),
             );
@@ -9147,6 +9466,14 @@ describe("the desk in a Pi Pocket", () => {
             assert.equal(attached?.prs["frostyard/pilothouse#212"]?.via, "seen");
             assert.equal(attached?.prs["frostyard/pilothouse#212"]?.state, "OPEN");
             assert.equal(attached?.prs["frostyard/pilothouse#213"]?.via, "window");
+            assert.equal(attached?.prs["frostyard/pilothouse#215"], undefined, "no window");
+            assert.equal(
+                Object.values((await deskState())?.threads ?? {}).some(
+                    (each) => each.prs["frostyard/pilothouse#215"] !== undefined,
+                ),
+                false,
+                "Brian's own PR makes no found thread",
+            );
             assert.equal((await deskState())?.others?.["frostyard/pilothouse"], 0);
 
             await say(app, linked, "report to supervisor test");
@@ -9777,6 +10104,51 @@ describe("the desk in a Pi Pocket", () => {
             (await deskState())?.threads[thread.id]?.events.length,
             events,
             "a replay changes nothing",
+        );
+    });
+
+    test("desk own closes a found PR thread, and keeps its PR on it", async () => {
+        const source = await supervisor("own-pr");
+        let id = "";
+
+        await app.harness.commit(async (tx) => {
+            const state = await tx.doc(DeskThreads);
+            const opened = openThread(state, {
+                key: "found:pr:frostyard/test#7",
+                supervisor: Number(source),
+                agents: [],
+                repo: "frostyard/test",
+                title: "A fix",
+                at: Date.now(),
+            });
+
+            id = opened.thread.id;
+            const thread = state.threads[id]!;
+
+            thread.origin = "found";
+            thread.prs["frostyard/test#7"] = { via: "attached" };
+        }, context);
+
+        ownThreadId = id;
+        await say(app, source, "desk own test");
+
+        assert.match(
+            (await modelTexts(app, source)).join("\n"),
+            new RegExp(`${id} is Brian's own: it is closed`),
+        );
+
+        const after = (await deskState())?.threads[id];
+
+        assert.equal(after?.state, "closed");
+        assert.equal(after?.closed?.why, "dropped");
+        assert.equal(after?.closed?.by, "desk");
+        assert.equal(after?.prs["frostyard/test#7"]?.via, "attached", "the PR stays on it");
+        assert(
+            after?.events.some(
+                (event) =>
+                    event.key.startsWith("own:") && /Brian's own, marked by/.test(event.text),
+            ),
+            "the own event is there",
         );
     });
 
@@ -15022,7 +15394,7 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
             }
         });
 
-        test("a Clerk lists and records results for its supervisor, and never asks, answers, or seeds", async () => {
+        test("a Clerk lists and records results for its supervisor, and never asks, answers, seeds, or marks Brian's own", async () => {
             await app.setSubagentModels(owner(app), ["faux/faux-2"]);
             writeClerk("faux/faux-2");
 
@@ -15054,6 +15426,23 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
                     (await deskState())?.threads[thread.id]?.asks[0]?.answer,
                     undefined,
                     "no answer recorded",
+                );
+
+                // own: refused, and the thread does not change.
+                ownThreadId = thread.id;
+                await say(app, clerkSession, "clerk own test");
+                assert.match(
+                    (await modelTexts(app, clerkSession)).join("\n"),
+                    /Only the supervisor marks a thread as Brian's own\. Escalate to your supervisor\./,
+                );
+
+                const afterOwn = (await deskState())?.threads[thread.id];
+
+                assert.equal(afterOwn?.state, "open");
+                assert.equal(
+                    afterOwn?.events.filter((event) => event.key.startsWith("own:")).length,
+                    0,
+                    "no own event",
                 );
 
                 // list, for its supervisor's threads, and the look on its supervisor's key.

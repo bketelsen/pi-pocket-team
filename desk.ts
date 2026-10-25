@@ -373,6 +373,12 @@ export type DeskState = {
     /** Open PRs per repository that are not ours: dependabot, and other people. */
     others?: Record<string, number>;
     /**
+     * The PR refs that `desk detach` took off a thread: the sweep never attaches or finds them again, and only an
+     * attach by hand brings one back. An entry goes when a complete read of its repository no longer lists the PR
+     * open. At most `DROPPED_MAX` (200), the oldest go first.
+     */
+    dropped?: Record<string, { at: number; from: string }>;
+    /**
      * The last GitHub read: when, whether it worked, why not, the roster names it skipped, the refs it lacks, and the
      * parts it cut short (a repository with PRs left unread, a PR with checks left unread).
      */
@@ -3965,11 +3971,40 @@ export type GitFacts = {
     supervisor: number;
     /** Logins from the desk's config file, beside the viewer's. */
     authors: string[];
+    /**
+     * The GitHub logins of Brian's own PRs, from the desk's config file. Rules 1 (seen) and 2 (branch) apply to one,
+     * because they are evidence that an agent made it; rules 3 (window) and 4 (found) do not, because they guess.
+     */
+    ownAuthors?: string[];
     /** folder → branch → the oldest reflog time, in ms. */
     branches: Record<string, Record<string, number>>;
     /** Threads closed as done in the last 7 days: rules 1 and 2 may reopen them. */
     recentlyClosed?: string[];
 };
+
+/** The most refs the dropped list keeps: the oldest go first. */
+const DROPPED_MAX = 200;
+
+/** Keep the newest `DROPPED_MAX` refs of the dropped list, and forget the rest. */
+function pruneDroppedList(state: DeskState): void {
+    const dropped = state.dropped;
+
+    if (dropped === undefined) {
+        return;
+    }
+
+    const refs = Object.keys(dropped);
+
+    if (refs.length <= DROPPED_MAX) {
+        return;
+    }
+
+    refs.sort((a, b) => (dropped[a]?.at ?? 0) - (dropped[b]?.at ?? 0));
+
+    for (const ref of refs.slice(0, refs.length - DROPPED_MAX)) {
+        delete dropped[ref];
+    }
+}
 
 const seenRef = (thread: Thread, ref: string): boolean =>
     Array.isArray(thread.run.seenPrs) && thread.run.seenPrs.includes(ref);
@@ -3984,8 +4019,8 @@ function madeBranch(gitFacts: GitFacts, thread: Thread, branch: string): boolean
 
 /**
  * Attach the viewer's open PRs to threads of one supervisor, by the 3 rules in order (seen, branch, window), or make a
- * found thread for a PR that none of them claims. Work by other authors is counted, never attached. Pure over the
- * state: the caller commits it.
+ * found thread for a PR that none of them claims. Work by other authors is counted, never attached. A PR a person took
+ * off by hand is skipped. Pure over the state: the caller commits it.
  */
 export function attribute(
     state: DeskState,
@@ -3998,8 +4033,10 @@ export function attribute(
     }
 
     const supervisor = gitFacts.supervisor;
+    const owned = (login: string) => login !== "" && (gitFacts.ownAuthors ?? []).includes(login);
     const ours = (login: string) =>
-        login !== "" && (login === github.viewer || gitFacts.authors.includes(login));
+        login !== "" &&
+        (login === github.viewer || gitFacts.authors.includes(login) || owned(login));
     const mine = () =>
         Object.values(state.threads).filter(
             (thread) => thread.supervisor === supervisor && thread.state !== "closed",
@@ -4018,6 +4055,26 @@ export function attribute(
 
     state.others ??= {};
 
+    // A dropped PR that a complete read of its repository no longer lists open has ended: its entry goes, so the list
+    // stays small. A read that cut the repository short keeps every entry of it.
+    const dropped = state.dropped;
+
+    if (dropped !== undefined) {
+        for (const [repo, facts] of Object.entries(github.repos)) {
+            if ((github.incomplete ?? []).some((line) => line.startsWith(`${repo}: `))) {
+                continue;
+            }
+
+            const open = new Set(facts.open.map((pr) => pr.ref));
+
+            for (const ref of Object.keys(dropped)) {
+                if (repoOf(ref) === repo && !open.has(ref)) {
+                    delete dropped[ref];
+                }
+            }
+        }
+    }
+
     for (const [repo, facts] of Object.entries(github.repos)) {
         state.others[repo] = facts.open.filter((pr) => !ours(pr.author)).length;
     }
@@ -4031,6 +4088,14 @@ export function attribute(
             if (!ours(pr.author)) {
                 continue;
             }
+
+            // A PR a person took off by hand stays off: no sweep attaches it, and none finds it again.
+            if (state.dropped?.[pr.ref] !== undefined) {
+                continue;
+            }
+
+            // Brian's own PR: only the evidence rules apply to it.
+            const ownPr = owned(pr.author);
 
             const holder = holderOf(pr.ref);
 
@@ -4120,7 +4185,8 @@ export function attribute(
             }
 
             // 3. window: exactly one open thread in that repository was open when the PR was made. Never a closed one.
-            if (target === undefined) {
+            // A window is a guess, so it never claims Brian's own PR.
+            if (target === undefined && !ownPr) {
                 const matches = mine().filter(
                     (thread) =>
                         threadRepos(thread).includes(pr.repo) && thread.startedAt <= pr.createdAt,
@@ -4153,7 +4219,11 @@ export function attribute(
                 continue;
             }
 
-            // 4. found: new work, not older than the desk's epoch.
+            // 4. found: new work, not older than the desk's epoch. Brian's own PR is his, so it makes no found thread.
+            if (ownPr) {
+                continue;
+            }
+
             const epoch = deskEpoch(state);
 
             if (epoch === undefined || pr.createdAt < epoch) {
@@ -4242,6 +4312,8 @@ export function attachTo(
         }
 
         target.prs[ref] = { ...(link ?? {}), via: "attached" };
+        // A PR put on by hand comes back: the dropped list no longer holds it.
+        delete state.dropped?.[ref];
         addEvent(target, `attached:${ref}:${String(now)}`, `${ref} attached`, now);
 
         return { text: `${ref} is on ${target.id}.` };
@@ -4342,7 +4414,10 @@ export function attachTo(
     return { text: `${source.id} is merged into ${target.id}.` };
 }
 
-/** Take a PR off a thread. Pure over the state: the caller commits it. A second call changes nothing. */
+/**
+ * Take a PR off a thread. Pure over the state: the caller commits it. A second call changes nothing. The PR goes on the
+ * dropped list, so no later sweep attaches it, or finds it again; only an attach by hand brings it back.
+ */
 export function detachFrom(
     state: DeskState,
     ref: string,
@@ -4360,9 +4435,73 @@ export function detachFrom(
     }
 
     delete thread.prs[ref];
+    state.dropped ??= {};
+    state.dropped[ref] = { at: now, from: thread.id };
+    pruneDroppedList(state);
     addEvent(thread, `detached:${ref}:${String(now)}`, `detached ${ref}`, now);
 
     return { text: `${ref} is off ${thread.id}.` };
+}
+
+/**
+ * Mark a found PR thread as Brian's own. It closes as dropped by the desk, and its PRs stay on it: a closed thread
+ * that holds a PR stops every later sweep from finding it again. Pure over the state: the caller commits it.
+ */
+export function ownThread(
+    state: DeskState,
+    id: string,
+    now: number,
+    by: string,
+): { text: string } | { error: string } {
+    const thread = threadById(state, id);
+
+    if (thread === undefined) {
+        return { error: `There is no thread ${id.toUpperCase()}.` };
+    }
+
+    if (thread.origin !== "found" || !thread.key.startsWith("found:pr:")) {
+        return {
+            error: `${thread.id} is not a found PR thread: only a found PR can be Brian's own. To take 1 PR off a thread, use detach.`,
+        };
+    }
+
+    if (thread.state === "closed") {
+        return {
+            text: thread.events.some((event) => event.key.startsWith("own:"))
+                ? `${thread.id} is Brian's own already. Nothing changed.`
+                : `${thread.id} is closed already. Nothing changed.`,
+        };
+    }
+
+    const refs = Object.keys(thread.prs);
+
+    thread.state = "closed";
+    thread.closed = { at: now, why: "dropped", by: "desk" };
+
+    // Queue news that waits in the digest would still say the thread waits on the supervisor: it goes, with its reason.
+    if (
+        thread.supervisor !== undefined &&
+        state.digests?.[String(thread.supervisor)] !== undefined
+    ) {
+        const box = digestBox(state, thread.supervisor);
+
+        box.items = box.items.filter(
+            (item) => !(item.thread === thread.id && item.kind === "queue"),
+        );
+        delete box.queued[thread.id];
+        setDigestBox(state, thread.supervisor, box);
+    }
+
+    addEvent(
+        thread,
+        `own:${String(now)}`,
+        `Brian's own, marked by ${by}: the desk does not track ${refs.join(", ")}`,
+        now,
+    );
+
+    return {
+        text: `${thread.id} is Brian's own: it is closed, and its PRs stay on it, so no sweep finds them again.`,
+    };
 }
 
 // ─── The issue queue ─────────────────────────────────────────────────────────
@@ -7645,6 +7784,8 @@ export default function createDesk(host: Host, web: Web) {
         queue?: QueueRead;
         /** The logins that count as ours, from the desk's config file. */
         authors: string[];
+        /** The logins of Brian's own PRs, from the desk's config file. */
+        ownAuthors: string[];
         /** folder → branch → the oldest reflog time, in ms. */
         branches: Record<string, Record<string, number>>;
     };
@@ -7910,11 +8051,12 @@ export default function createDesk(host: Host, web: Web) {
         join(homedir(), ".config", "pi-pocket-team", "desk.json");
 
     /**
-     * The config file: the extra logins that count as ours, the cap, and the digest. A missing or bad file means the
-     * defaults.
+     * The config file: the extra logins that count as ours, the logins of Brian's own PRs, the cap, and the digest. A
+     * missing or bad file means the defaults.
      */
     async function deskConfig(): Promise<{
         authors: string[];
+        ownAuthors: string[];
         cap: number;
         export?: string;
         digest: DigestConfig;
@@ -7924,6 +8066,7 @@ export default function createDesk(host: Host, web: Web) {
         try {
             const value = JSON.parse(await readFile(configFile(), "utf8")) as {
                 authors?: unknown;
+                ownAuthors?: unknown;
                 cap?: unknown;
                 export?: unknown;
                 digest?: unknown;
@@ -7931,6 +8074,11 @@ export default function createDesk(host: Host, web: Web) {
             } | null;
             const authors = Array.isArray(value?.authors)
                 ? value.authors.filter(
+                      (login): login is string => typeof login === "string" && LOGIN.test(login),
+                  )
+                : [];
+            const ownAuthors = Array.isArray(value?.ownAuthors)
+                ? value.ownAuthors.filter(
                       (login): login is string => typeof login === "string" && LOGIN.test(login),
                   )
                 : [];
@@ -7951,6 +8099,7 @@ export default function createDesk(host: Host, web: Web) {
 
             return {
                 authors,
+                ownAuthors,
                 cap,
                 digest,
                 queue: value?.queue,
@@ -7959,6 +8108,7 @@ export default function createDesk(host: Host, web: Web) {
         } catch {
             return {
                 authors: [],
+                ownAuthors: [],
                 cap: DEFAULT_CAP,
                 digest: digestConfig(undefined),
                 queue: undefined,
@@ -8885,7 +9035,7 @@ export default function createDesk(host: Host, web: Web) {
             [...pinnedIssues],
             [...detail],
         );
-        const { authors, queue: queueRaw } = await deskConfig();
+        const { authors, ownAuthors, queue: queueRaw } = await deskConfig();
         // The issue queue: its own read, after the PR read. A failure of one never touches the other.
         const queueSetting = queueConfig(queueRaw, ownersOfRepos(rosterRepos));
         let queue: QueueRead | undefined;
@@ -8938,6 +9088,7 @@ export default function createDesk(host: Host, web: Web) {
             ...(skipped.size === 0 ? {} : { githubSkipped: [...skipped].sort() }),
             ...(queue === undefined ? {} : { queue }),
             authors,
+            ownAuthors,
             branches,
         };
     };
@@ -9478,6 +9629,7 @@ export default function createDesk(host: Host, web: Web) {
                 {
                     supervisor,
                     authors: facts.authors,
+                    ownAuthors: facts.ownAuthors ?? [],
                     branches: facts.branches,
                     recentlyClosed: closedDone.map((thread) => thread.id),
                 },
@@ -11453,7 +11605,7 @@ export default function createDesk(host: Host, web: Web) {
     const tool = defineTool({
         name: "desk",
         description:
-            "The desk of threads for work the team runs in the background. A supervisor session can use every action; a Clerk can use list, read, sync, attach, detach, watch, result, send, and issues for its supervisor's threads; an agent session can use watch and result on its own thread only. Actions: list (one line per open thread), read (one thread in full), sync (observe the threads now, with linked sessions, Night shift, git, and GitHub), seed (import a seed.json file one time), attach (put a PR, a queued issue, or all of another thread's work, on one thread), detach (take a PR off a thread), ask (file a question for Brian on a thread, or on a new one), answer (record Brian's words for an ask), watch (set a dated check on a thread: it sleeps until that date, and does not count toward the cap), result (record that check's pass, which closes the thread, or its fail, which opens it again), send (send 1 message from the supervisor's session to a thread's agent), issues (read the issues Brian queued on GitHub: read only).",
+            "The desk of threads for work the team runs in the background. A supervisor session can use every action; a Clerk can use list, read, sync, attach, detach, watch, result, send, and issues for its supervisor's threads; an agent session can use watch and result on its own thread only. Actions: list (one line per open thread), read (one thread in full), sync (observe the threads now, with linked sessions, Night shift, git, and GitHub), seed (import a seed.json file one time), attach (put a PR, a queued issue, or all of another thread's work, on one thread), detach (take a PR off a thread for good: the sweep does not attach or find it again; only attach brings it back), own (mark a found PR thread as Brian's own: it closes, and no sweep finds its PR again), ask (file a question for Brian on a thread, or on a new one), answer (record Brian's words for an ask), watch (set a dated check on a thread: it sleeps until that date, and does not count toward the cap), result (record that check's pass, which closes the thread, or its fail, which opens it again), send (send 1 message from the supervisor's session to a thread's agent), issues (read the issues Brian queued on GitHub: read only).",
         parameters: Type.Object({
             action: Type.Union([
                 Type.Literal("list"),
@@ -11462,6 +11614,7 @@ export default function createDesk(host: Host, web: Web) {
                 Type.Literal("seed"),
                 Type.Literal("attach"),
                 Type.Literal("detach"),
+                Type.Literal("own"),
                 Type.Literal("ask"),
                 Type.Literal("answer"),
                 Type.Literal("watch"),
@@ -11472,7 +11625,7 @@ export default function createDesk(host: Host, web: Web) {
             thread: Type.Optional(
                 Type.String({
                     description:
-                        "read: a thread id, such as T13; attach: the target thread; watch, result: the thread to change; send: the thread whose agent gets the message",
+                        "read: a thread id, such as T13; attach: the target thread; watch, result: the thread to change; send: the thread whose agent gets the message; own: the found thread",
                 }),
             ),
             ref: Type.Optional(
@@ -11559,6 +11712,12 @@ export default function createDesk(host: Host, web: Web) {
                 if (args.action === "ask" || args.action === "answer" || args.action === "seed") {
                     throw new Error(
                         "Only the supervisor files asks, records Brian's answers, and seeds the desk. Escalate to your supervisor.",
+                    );
+                }
+
+                if (args.action === "own") {
+                    throw new Error(
+                        "Only the supervisor marks a thread as Brian's own. Escalate to your supervisor.",
                     );
                 }
 
@@ -11891,6 +12050,35 @@ export default function createDesk(host: Host, web: Web) {
                 return reply(result.text);
             }
 
+            if (args.action === "own") {
+                const id = args.thread?.trim() ?? "";
+
+                if (id === "") {
+                    throw new Error("own needs thread: a found thread such as F2.");
+                }
+
+                const result = await api.commit(async (tx) => {
+                    const state = await tx.doc(DeskThreads);
+                    const target = threadById(state, id);
+
+                    if (target !== undefined && !changes(target)) {
+                        return {
+                            error: `Only the supervisor can change ${target.id}: it is another supervisor's thread.`,
+                        };
+                    }
+
+                    return ownThread(state, id, Date.now(), persona.name);
+                }, context);
+
+                if ("error" in result) {
+                    throw new Error(result.error);
+                }
+
+                await exportNow(api, context);
+
+                return reply(result.text);
+            }
+
             if (args.action === "send") {
                 const id = args.thread?.trim() ?? "";
                 const text = (args.text ?? "").trim();
@@ -12154,6 +12342,16 @@ export default function createDesk(host: Host, web: Web) {
                         : []),
                     `Stale: ${stale.length === 0 ? "none" : stale.join(", ")}.`,
                     ...(waits === "" ? [] : [`Waits on you: ${waits}.`]),
+                    ...(open.some(
+                        (thread) =>
+                            thread.origin === "found" &&
+                            thread.key.startsWith("found:pr:") &&
+                            odradeReason(thread) !== undefined,
+                    )
+                        ? [
+                              "A found PR that Brian opened himself is his own: mark it with desk own <id>. A PR you take off with desk detach stays off.",
+                          ]
+                        : []),
                     ...(clerk === undefined
                         ? []
                         : [
