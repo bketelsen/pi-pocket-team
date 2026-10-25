@@ -98,11 +98,11 @@ positives (marked †).
 
 ### E. Reports and messaging
 
-| Id  | Check                                                                                                                                | Kind | A finding when                                                                             |
-| --- | ------------------------------------------------------------------------------------------------------------------------------------ | ---- | ------------------------------------------------------------------------------------------ |
-| E1† | 2 reports on one thread within 30 min: word-set overlap (Jaccard on words of 3 or more characters) and the set of `#n` refs in each. | D+L  | sure: 80% or more and the same refs. 50 to 80%, or different refs: a candidate for the LLM |
-| E2  | `team_message` or `team` calls that failed (`No linked session has that address here`, the side-door block).                         | D    | any address failure (medium); 2 or more blocks (low)                                       |
-| E3  | A night shift's report and a `team_message` from the same session within 30 min.                                                     | D+L  | 3 or more pairs in the window; the LLM samples up to 5 pairs: same result or not           |
+| Id  | Check                                                                                                                                                                                                                           | Kind | A finding when                                                                             |
+| --- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---- | ------------------------------------------------------------------------------------------ |
+| E1† | 2 reports on one thread within 30 min: word-set overlap (Jaccard on words of 3 or more characters) and the set of `#n` refs in each.                                                                                            | D+L  | sure: 80% or more and the same refs. 50 to 80%, or different refs: a candidate for the LLM |
+| E2  | `team_message` or `team` calls that failed (`No linked session has that address here`, the side-door block).                                                                                                                    | D    | any address failure (medium); 2 or more blocks (low)                                       |
+| E3  | A night shift's report and a `team_message` from the same session within 30 min, with no new request from a person or another agent to that session between the 2 (a `team_message` that answers such a request is not a twin). | D+L  | 3 or more pairs in the window; the LLM samples up to 5 pairs: same result or not           |
 
 ### F. Night and day shifts
 
@@ -193,6 +193,9 @@ Spend $391 · 23 threads · 41 PRs (38 merged) · 0 failed shifts
 ```
 
 The JSON keeps every finding, so the next day can say what is new, what repeats, and what is gone.
+
+The report also names the audit's own code version, in the line `Audit code: <commit> (<date>).`
+(or `Audit code: unknown.`), so a finding can be traced to the code that made it.
 
 ## 7. Where it runs, when, and on which model
 

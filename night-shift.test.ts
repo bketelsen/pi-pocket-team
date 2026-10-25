@@ -30,9 +30,11 @@ import {
     parseArgs,
     parseVerdict,
     personOf,
+    roundMessage,
     standing,
     statusCard,
     SUBAGENT_WAIT_MS,
+    summaryMessage,
     waiting,
 } from "./night-shift.ts";
 import { statusItem } from "./night-shift-web/index.js";
@@ -350,6 +352,38 @@ describe("parsing", () => {
             "waiting until 06:00 EDT (after DeepSeek's peak hours; 6h 30m left)",
         );
         assert.match(statusCard(goal, now), /Worker: deepseek\/deepseek-flash/);
+    });
+
+    test("a delegated goal is told its report goes to the supervisor by itself", () => {
+        const goal = (over: Partial<Goal> = {}): Goal => ({
+            id: "delegated",
+            objective: "a",
+            stop: "b",
+            maxRounds: 4,
+            by: "u1",
+            byName: "Brian",
+            setAt: now,
+            status: "running",
+            round: 0,
+            seen: 0,
+            rounds: [],
+            ...over,
+        });
+        const delegated = goal({ delegated: { supervisor: "Sheeana" } });
+
+        assert.match(
+            roundMessage(delegated, 1, now),
+            /Your shift report goes to Sheeana by itself when the shift stops\. Do not send a separate team_message report\./,
+        );
+        assert.match(
+            summaryMessage(delegated),
+            /Write it in ASD-STE100 .*\nThis summary is your shift report\. It goes to Sheeana by itself: do not send a separate team_message report\. Answer a later message from Sheeana as usual\./,
+        );
+
+        const plain = goal();
+
+        assert.ok(!roundMessage(plain, 1, now).includes("team_message report"));
+        assert.ok(!summaryMessage(plain).includes("team_message report"));
     });
 
     test("Pi's status line, and whose a message is", () => {

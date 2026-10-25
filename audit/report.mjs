@@ -237,6 +237,7 @@ export function buildJson({
     date,
     ctx,
     installed,
+    code,
     findings,
     metrics,
     skipped,
@@ -247,6 +248,7 @@ export function buildJson({
     return {
         version: 1,
         date,
+        code: code ?? null,
         window: { since: iso(ctx.since), until: iso(ctx.now), hours: ctx.hours },
         installed: Object.fromEntries(
             Object.entries(installed).map(([file, ms]) => [file, ms ? iso(ms) : null]),
@@ -336,6 +338,12 @@ const metricLines = (metrics, github) => {
         );
     }
 
+    if (metrics.F3) {
+        lines.push(
+            `- Subagents on another model than the worker: ${metrics.F3.wrongModelSpawns} flagged, cross-reviews: ${metrics.F3.reviewerSpawns} (another family by design, not flagged).`,
+        );
+    }
+
     if (metrics.G1) {
         lines.push(
             `- Schedules: ${
@@ -386,6 +394,7 @@ export function llmLine(llm) {
 export function renderReport({
     date,
     ctx,
+    code,
     findings,
     comparison,
     metrics,
@@ -501,6 +510,7 @@ export function renderReport({
             ? ["- None."]
             : Object.entries(skipped).map(([id, why]) => `- ${id}: ${oneLine(why, 140)}`)),
         "",
+        ...(code ? [`Audit code: ${code.commit} (${code.date}).`] : ["Audit code: unknown."]),
         llmLine(llm),
         "",
     );

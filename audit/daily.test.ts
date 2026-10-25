@@ -64,6 +64,11 @@ function setup() {
         calls.push({ command, args });
 
         if (command === "git" && args.includes("log")) {
+            // The audit's own commit, as `--format=%h%x09%cI` prints it.
+            if (args.some((arg) => arg.includes("%h%x09%cI"))) {
+                return "abc1234\t2026-10-23T13:11:11-04:00\n";
+            }
+
             return new Date(NOW - 2 * HOUR).toISOString();
         }
 
@@ -220,6 +225,7 @@ test("main: the report holds the LLM proposal, the owner from the table, and the
     assert.match(readme, /\[A1:T1\]/);
     assert.match(readme, /- Repeating 3\+ days: `A1:T1`/);
     assert.match(readme, /- Gone since 2026-10-22: `X9`/);
+    assert.match(readme, /Audit code: abc1234 \(2026-10-23T13:11:11-04:00\)\./);
     assert.match(readme, /LLM: deepseek\/deepseek-flash, 900 in, 120 out, \$0\.0004/);
 
     // The JSON: findings with rank, owner and repeat days; the LLM use; the skipped GitHub checks.
@@ -227,6 +233,7 @@ test("main: the report holds the LLM proposal, the owner from the table, and the
 
     assert.equal(json.version, 1);
     assert.equal(json.date, "2026-10-23");
+    assert.deepEqual(json.code, { commit: "abc1234", date: "2026-10-23T13:11:11-04:00" });
     assert.equal(a1.repeatDays, 2);
     // medium 2 × (1 + log2(2 cases)) + 2 days it repeats + $1.25 of empty reopen / 5.
     assert.equal(a1.rank, 6.25);
@@ -240,6 +247,59 @@ test("main: the report holds the LLM proposal, the owner from the table, and the
     // The model got the finding text, and never a report body.
     assert.equal(model.calls.length, 1);
     assert.ok(!model.calls[0]!.includes("First report text"));
+});
+
+/** A `run` like `setup`'s, but with its own answer to the lookup of the audit's own commit. */
+const codeRun = (codeLog: () => string) => (command: string, args: string[]) => {
+    if (command === "git" && args.includes("log")) {
+        return args.some((arg) => arg.includes("%h%x09%cI"))
+            ? codeLog()
+            : new Date(NOW - 2 * HOUR).toISOString();
+    }
+
+    if (command === "git" && args.includes("status")) {
+        return "?? reports/2026-10-23-daily-audit/\n";
+    }
+
+    throw new Error(`the audit ran ${command} ${args.join(" ")}`);
+};
+
+test("main: a lookup of the audit's own commit that throws says unknown, and the run goes on", async () => {
+    const t = setup();
+
+    await main(["--no-github", "--no-llm", "--out-dir", t.outDir], {
+        env: t.env,
+        now: NOW,
+        run: codeRun(() => {
+            throw new Error("not a git repository");
+        }),
+        log: () => undefined,
+    });
+
+    const readme = fs.readFileSync(path.join(t.outDir, "README.md"), "utf8");
+    const json = JSON.parse(fs.readFileSync(path.join(t.outDir, "findings.json"), "utf8"));
+
+    assert.equal(json.code, null);
+    assert.match(readme, /Audit code: unknown\./);
+    assert.match(readme, /LLM: not used \(--no-llm\)\./);
+});
+
+test("main: a lookup of the audit's own commit with empty output says unknown", async () => {
+    const t = setup();
+
+    await main(["--no-github", "--no-llm", "--out-dir", t.outDir], {
+        env: t.env,
+        now: NOW,
+        run: codeRun(() => ""),
+        log: () => undefined,
+    });
+
+    const readme = fs.readFileSync(path.join(t.outDir, "README.md"), "utf8");
+    const json = JSON.parse(fs.readFileSync(path.join(t.outDir, "findings.json"), "utf8"));
+
+    assert.equal(json.code, null);
+    assert.match(readme, /Audit code: unknown\./);
+    assert.ok(!readme.includes("Audit code: ("), "no half line");
 });
 
 test("main: the report and the JSON hold no report body, no secret and no pair text", async () => {

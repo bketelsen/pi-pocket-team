@@ -901,6 +901,11 @@ export function roundMessage(goal: Goal, n: number, now: number): string {
             ? []
             : [`Check: \`${goal.check}\` must pass too. It runs after you say DONE.`]),
         lastRoundWords(goal),
+        ...(goal.delegated === undefined
+            ? []
+            : [
+                  `Your shift report goes to ${goal.delegated.supervisor} by itself when the shift stops. Do not send a separate team_message report.`,
+              ]),
         "Work toward the objective now. End your answer with one status line: STATUS: DONE, STATUS: CONTINUE, or STATUS: BLOCKED, then the reason.",
     ].join("\n");
 }
@@ -918,6 +923,7 @@ export function summaryMessage(goal: Goal): string {
             ? []
             : [
                   `Write it in ASD-STE100 (Simplified Technical English): it goes to ${goal.delegated.supervisor}.`,
+                  `This summary is your shift report. It goes to ${goal.delegated.supervisor} by itself: do not send a separate team_message report. Answer a later message from ${goal.delegated.supervisor} as usual.`,
               ]),
         "Do not end with a STATUS line.",
     ].join("\n");

@@ -10,7 +10,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { pathToFileURL } from "node:url";
+import { pathToFileURL, fileURLToPath } from "node:url";
 import { HOUR, newYorkDate } from "./common.mjs";
 import { runChecks } from "./checks.mjs";
 import { runLlm } from "./llm.mjs";
@@ -24,7 +24,7 @@ import {
     scrubMarkdown,
     totalsOf,
 } from "./report.mjs";
-import { loadData } from "./sources.mjs";
+import { defaultRun, loadData, makeGit } from "./sources.mjs";
 
 const USAGE =
     "usage: node audit/daily.mjs [--hours N] [--date YYYY-MM-DD] [--out-dir DIR] [--no-llm] [--no-github] [--json]";
@@ -74,6 +74,21 @@ export function parseArgs(argv) {
     return options;
 }
 
+/** The audit's own last commit and its date, or null. The repo root is the parent folder of `audit/`. */
+function codeVersion(run) {
+    try {
+        const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+        const [commit, date] = makeGit(run ?? defaultRun)
+            .call(root, ["log", "-1", "--format=%h%x09%cI"])
+            .trim()
+            .split("\t");
+
+        return commit && date ? { commit, date } : null;
+    } catch {
+        return null;
+    }
+}
+
 /**
  * Run the audit. Everything outside the process is injectable: `env`, `now`, `run` (the process runner of `gh` and
  * `git`), `getModel` (the LLM) and `log`. Returns `{ readme, json, outDir, line }`.
@@ -112,11 +127,13 @@ export async function main(
     });
     const totals = totalsOf(data, ctx, result.metrics);
     const github = { ...data.githubCalls };
+    const code = codeVersion(run);
     const json = scrubJson(
         buildJson({
             date,
             ctx,
             installed: data.installed,
+            code,
             findings,
             metrics: result.metrics,
             skipped: result.skipped,
@@ -129,6 +146,7 @@ export async function main(
         renderReport({
             date,
             ctx,
+            code,
             findings,
             comparison: compareDays(findings, earlier),
             metrics: result.metrics,
