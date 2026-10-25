@@ -881,6 +881,8 @@ export default function createTeam(host: Host, web: Web) {
                 title: string;
                 at: number;
                 watch?: { checkOn: string; check: string; by: string };
+                /** The delegation's task text: the desk links the queued issues named in it. */
+                task?: string;
             },
         ) => Promise<{ thread: DeskThread; reused: boolean }>;
         bind: (
@@ -1406,6 +1408,8 @@ export default function createTeam(host: Host, web: Web) {
                                   ...(where === undefined ? {} : { cwd: where }),
                                   ...(made === undefined ? {} : { worktree: made }),
                                   title,
+                                  // Every queued issue named in the task text links to the thread.
+                                  task,
                                   at: Date.now(),
                                   ...(args.watch === undefined
                                       ? {}

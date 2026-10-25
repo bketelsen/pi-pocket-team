@@ -58,6 +58,31 @@ const load = async () => {
     }
 };
 
+/**
+ * The queue's read status, for the page: its words, and whether it is a warning. A queue that is turned off is a short
+ * muted line, not a failure. Null when a good read has nothing to say.
+ */
+export const queueStatus = (queue, clock) => {
+    if (queue === null || queue === undefined) {
+        return null;
+    }
+
+    if (queue.off) {
+        return { text: "queue read is off", warn: false };
+    }
+
+    if (!queue.ok) {
+        return {
+            text: `queue read failed at ${clock(queue.at)}${queue.error ? `: ${queue.error}` : ""}`,
+            warn: true,
+        };
+    }
+
+    return (queue.incomplete ?? []).length > 0
+        ? { text: `queue read incomplete: ${queue.incomplete.join(", ")}`, warn: true }
+        : null;
+};
+
 export default function setup(pocket) {
     const { html, useEffect, useState, Loader } = pocket;
 
@@ -65,6 +90,26 @@ export default function setup(pocket) {
     pocket.style("desk.css");
 
     const time = (at) => new Date(at).toLocaleString();
+
+    /** A clock time, as the queue's "read 19:02" shows it. */
+    const clock = (at) =>
+        new Date(at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+
+    /** How long ago, in 1 short word group: "5 h ago". */
+    const ago = (at) => {
+        const minutes = Math.max(0, Math.round((Date.now() - at) / 60000));
+
+        if (minutes < 60) {
+            return `${minutes} min ago`;
+        }
+
+        return minutes < 2880
+            ? `${Math.round(minutes / 60)} h ago`
+            : `${Math.round(minutes / 1440)} d ago`;
+    };
+
+    /** A GitHub link that is safe to open: http(s) only. */
+    const webUrl = (url) => (/^https?:\/\/\S+$/.test(url ?? "") ? url : undefined);
 
     /** One line about a thread's watch, for the detail view. */
     const watchLine = (watch) =>
@@ -131,6 +176,11 @@ export default function setup(pocket) {
                                   .join(" · ")}
                           </p>
                           ${thread.watch ? html`<p class="small">Watch: ${watchLine(thread.watch)}</p>` : null}
+                          ${
+                              (thread.issues ?? []).length > 0
+                                  ? html`<p class="small">Issues: ${thread.issues.join(", ")}</p>`
+                                  : null
+                          }
                           <h3>PRs</h3>
                           ${
                               thread.prs.length === 0
@@ -169,6 +219,19 @@ export default function setup(pocket) {
                                             </li>`,
                                         )}
                                     </ul>`
+                          }
+                          ${
+                              (thread.resolved ?? []).length === 0
+                                  ? null
+                                  : html`<h3>Resolved by the desk</h3>
+                                        <ul class="desk-list">
+                                            ${thread.resolved.map(
+                                                (ask) => html`<li>
+                                                    <span class="desk-id">${ask.id}</span> ${ask.text}
+                                                    <div class="small">${ask.why}</div>
+                                                </li>`,
+                                            )}
+                                        </ul>`
                           }
                           ${
                               (thread.answered ?? []).length === 0
@@ -714,6 +777,101 @@ export default function setup(pocket) {
                     )}
             </div>`;
 
+        const queue = view?.issues ?? null;
+
+        /** One queued issue: its link, its owner, its threads, and what Brian did. Read only: Brian changes it on GitHub. */
+        const issueRow = (item) => {
+            const url = webUrl(item.url);
+            const owner = item.agent
+                ? item.owners && item.owners.length > 1
+                    ? `${item.agent} (owned by ${item.owners.length} agents)`
+                    : item.agent
+                : "no owner";
+
+            return html`<li class="desk-row desk-issue">
+                <span class="desk-line">
+                    ${item.urgent ? html`<span class="desk-urgent">URGENT</span>` : null}
+                    ${
+                        url
+                            ? html`<a class="desk-link mono" href=${url} target="_blank" rel="noopener"
+                                  >${item.ref}</a
+                              >`
+                            : html`<span class="mono">${item.ref}</span>`
+                    }
+                    <span class="desk-title">${item.title}</span>
+                </span>
+                <span class="small muted">
+                    ${owner} · ${item.threads.length === 0 ? "not started" : null}
+                    ${item.threads.map(
+                        (thread) =>
+                            html`<button
+                                type="button"
+                                class="desk-thread-link"
+                                aria-label=${`Open ${thread.id}`}
+                                onClick=${() => setOpenId(thread.id)}
+                            >
+                                ${thread.id} ${thread.word}</button
+                            > `,
+                    )}
+                    · ${(item.names ?? [item.signal]).join(", ")} · ${item.by}, ${ago(item.at)}
+                    ${item.fixedBy.length > 0 ? ` · PR ${item.fixedBy.join(", ")} fixes it` : ""}
+                </span>
+                ${
+                    item.parts > 0 || item.unverified
+                        ? html`<span class="desk-chips">
+                              ${
+                                  item.parts > 0
+                                      ? html`<span class="desk-chip done"
+                                            >${item.parts} part${item.parts === 1 ? "" : "s"} merged</span
+                                        >`
+                                      : null
+                              }
+                              ${
+                                  item.unverified
+                                      ? html`<span class="desk-chip" title="The last read could not prove it: it stays until a read does."
+                                            >unverified</span
+                                        >`
+                                      : null
+                              }
+                          </span>`
+                        : null
+                }
+            </li>`;
+        };
+
+        const status = queueStatus(queue, clock);
+        const queueSection =
+            queue !== null && (queue.items.length > 0 || queue.ignored.length > 0)
+                ? html`<section class="desk-section desk-queue">
+                      <h2>
+                          Brian queued <span class="desk-count">${queue.items.length}</span>
+                          <span class=${`desk-read ${status !== null && status.warn ? "desk-warn" : ""}`}>
+                              ${queue.ok ? `read ${clock(queue.at)}` : queue.off ? "queue read is off" : `queue read failed at ${clock(queue.at)}`}
+                          </span>
+                      </h2>
+                      ${
+                          status !== null
+                              ? html`<p class=${`small ${status.warn ? "desk-warn" : "muted"}`}>${status.text}</p>`
+                              : null
+                      }
+                      <ul class="desk-rows">
+                          ${queue.items.map(issueRow)}
+                      </ul>
+                      ${
+                          queue.ignored.length > 0
+                              ? html`<p class="small muted">
+                                    Not counted:
+                                    ${queue.ignored
+                                        .map((one) => `${one.ref} ${one.signal} by ${one.actor}`)
+                                        .join(", ")}
+                                </p>`
+                              : null
+                      }
+                  </section>`
+                : status !== null
+                  ? html`<p class=${`small ${status.warn ? "desk-warn" : "muted"}`}>${status.text}</p>`
+                  : null;
+
         const section = (title, items, render, hint) =>
             items.length === 0
                 ? null
@@ -781,6 +939,7 @@ export default function setup(pocket) {
             </header>
             ${error ? html`<div class="error-box" role="alert">${error}</div>` : null}
             ${loadError ? html`<div class="error-box" role="alert">${loadError}</div>` : null}
+            ${queueSection}
             ${section("Needs you", groups.need, (thread) => row(thread, withWatch(thread, needDetail(thread))))}
             ${section(
                 "Found",

@@ -3,8 +3,8 @@
 # a separate workflow, not a required check, so it never blocks a merge.
 #
 # To test the next release's draft PR, run it by hand with `ref` set to the draft PR's branch (for example
-# release/0.21.0) or to pull/<number>/head:
-#   gh workflow run upstream.yml -f ref=pull/125/head
+# release/0.22.0) or to pull/<number>/head:
+#   gh workflow run upstream.yml -f ref=pull/150/head
 name: Upstream
 
 on:
