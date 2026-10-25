@@ -1006,22 +1006,50 @@ export function checkE2(data, ctx) {
     };
 }
 
-/** E3: a night shift's report and a `team_message` from the same session within 30 min: 3 or more pairs. */
+/**
+ * E3: a night shift's report and a `team_message` from the same session within 30 min: 3 or more pairs. A
+ * `team_message` is a twin only when no new request came to the shift session between the shift report and it: a
+ * person's message, or another agent's message (for example `[via linked session …]`), makes it an answer to that
+ * request. Those answers are the metric `answeredAfterShift`.
+ */
 export function checkE3(data, ctx) {
     const twins = [];
     const pairs = [];
     let shiftReports = 0;
+    let answeredAfterShift = 0;
 
     for (const { session, thread, reports } of reportsInWindow(data, ctx)) {
         const label = thread?.id ?? `session-${session}`;
+        const requests = data.userEntries[thread?.session ?? session] ?? [];
+
+        const askedBetween = (shift, message) => {
+            const from = Math.min(shift.at, message.at);
+            const to = Math.max(shift.at, message.at);
+
+            return requests.some(
+                (entry) =>
+                    entry.at > from &&
+                    entry.at < to &&
+                    !/^\[night-shift\]|^\[subagent |^\[scheduled\]/.test(entry.text),
+            );
+        };
 
         for (const shift of reports.filter((report) => report.from === "night-shift")) {
             shiftReports += 1;
 
             const twin = reports.find(
                 (report) =>
-                    report.from === "team_message" && Math.abs(report.at - shift.at) <= 30 * MINUTE,
+                    report.from === "team_message" &&
+                    Math.abs(report.at - shift.at) <= 30 * MINUTE &&
+                    !askedBetween(shift, report),
             );
+
+            answeredAfterShift += reports.filter(
+                (report) =>
+                    report.from === "team_message" &&
+                    Math.abs(report.at - shift.at) <= 30 * MINUTE &&
+                    askedBetween(shift, report),
+            ).length;
 
             if (twin) {
                 twins.push({
@@ -1050,7 +1078,7 @@ export function checkE3(data, ctx) {
                       }),
                   ]
                 : [],
-        metrics: { shiftReports, shiftPlusMessage: twins.length },
+        metrics: { shiftReports, shiftPlusMessage: twins.length, answeredAfterShift },
         pairs: twins.length >= 3 ? pairs : [],
     };
 }

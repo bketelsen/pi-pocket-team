@@ -891,6 +891,65 @@ test("E3: a team_message 31 min away is not a twin", () => {
     assert.deepEqual(ids(checkE3(emptyData({ threads: threadMap(...threads), reports }), ctx)), []);
 });
 
+/** 3 threads, each with a night shift report and a team_message 29 min later. */
+const e3Pairs = (userEntries: (i: number) => object[] = () => []) => {
+    const threads = [1, 2, 3].map((n) => thread(`T${n}`, { session: 100 + n }));
+    const reports = Object.fromEntries(
+        threads.map((t, i) => [
+            t.session!,
+            [
+                report(`n${i}`, ago(3 * HOUR), "night shift summary", "night-shift"),
+                report(`m${i}`, ago(3 * HOUR) + 29 * MINUTE, "the same result by message"),
+            ],
+        ]),
+    );
+    const entries = Object.fromEntries(threads.map((t, i) => [t.session!, userEntries(i)]));
+
+    return emptyData({ threads: threadMap(...threads), reports, userEntries: entries });
+};
+
+test("E3: a team_message that answers a new request after the shift report is not a twin", () => {
+    const data = e3Pairs((i) => [
+        {
+            id: `u${i}`,
+            at: ago(3 * HOUR) + 5 * MINUTE,
+            text: `[via linked session session-x] All PRs on T${i + 1} are merged. Do the after-merge steps, then report.`,
+        },
+    ]);
+    const result = checkE3(data, ctx);
+
+    assert.deepEqual(ids(result), []);
+    assert.equal(result.pairs.length, 0);
+    assert.equal(result.metrics.answeredAfterShift, 3);
+    assert.equal(result.metrics.shiftPlusMessage, 0);
+    assert.equal(result.metrics.shiftReports, 3);
+});
+
+test("E3: the shift's own entries between the report and the message do not make it an answer", () => {
+    const data = e3Pairs((i) => [
+        { id: `u${i}a`, at: ago(3 * HOUR) + 5 * MINUTE, text: "[night-shift] Round 2 of 4." },
+        {
+            id: `u${i}b`,
+            at: ago(3 * HOUR) + 15 * MINUTE,
+            text: "[subagent x answered, no reply needed] ok",
+        },
+    ]);
+    const result = checkE3(data, ctx);
+
+    assert.deepEqual(ids(result), ["E3"]);
+    assert.equal(result.pairs.length, 3);
+    assert.equal(result.metrics.answeredAfterShift, 0);
+});
+
+test("E3: a person's message between the shift report and the team_message makes it an answer", () => {
+    const data = e3Pairs((i) => [
+        { id: `u${i}`, at: ago(3 * HOUR) + 5 * MINUTE, text: "Also check the changelog." },
+    ]);
+
+    assert.deepEqual(ids(checkE3(data, ctx)), []);
+    assert.equal(checkE3(data, ctx).metrics.answeredAfterShift, 3);
+});
+
 // ---------- F. Night and day shifts ----------
 
 const goal = (over: object = {}) => ({
@@ -1029,6 +1088,50 @@ test("F3: a cross-review reviewer is left out; other spawns on another model sta
         ["F3:model:g1"],
     );
     assert.equal(checkF3(data({ name: "fix462", tools: null }), ctx).metrics.reviewerSpawns, 0);
+});
+
+test("F3: today's cross-review spawns are reviewers, not wrong models", () => {
+    const worker = "deepseek/deepseek-flash";
+    const spawn = (over: object) => ({
+        id: 1,
+        c: 5,
+        at: ago(3 * HOUR),
+        model: "openai/gpt-6.1-sol",
+        ...over,
+    });
+    const reviewers = [
+        spawn({
+            id: 1,
+            name: "xr-core-164",
+            tools: ["read", "bash"],
+            brief: "You are a cross-family reviewer. Review 1 PR. The review is read-only.",
+        }),
+        spawn({
+            id: 2,
+            name: "xreview",
+            tools: ["read", "bash"],
+            brief: "You do a read-only cross-review of 1 pull request, in batches.",
+        }),
+    ];
+    const data = (spawns: object[]) =>
+        emptyData({ goals: [{ session: 5, goal: goal({ worker }) }], spawns });
+    const only = checkF3(data(reviewers), ctx);
+
+    assert.deepEqual(ids(only), []);
+    assert.equal(only.metrics.reviewerSpawns, 2);
+    assert.equal(only.metrics.wrongModelSpawns, 0);
+
+    const coder = spawn({
+        id: 3,
+        name: "fix-162",
+        tools: null,
+        brief: "Fix the 2 findings in core#162.",
+    });
+    const mixed = checkF3(data([...reviewers, coder]), ctx);
+
+    assert.deepEqual(ids(mixed), ["F3:model:g1"]);
+    assert.equal(mixed.metrics.wrongModelSpawns, 1);
+    assert.equal(mixed.metrics.reviewerSpawns, 2);
 });
 
 test("F3: a spawn in another session, or before the shift, is not counted", () => {

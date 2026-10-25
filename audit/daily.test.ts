@@ -64,6 +64,11 @@ function setup() {
         calls.push({ command, args });
 
         if (command === "git" && args.includes("log")) {
+            // The audit's own commit, as `--format=%h%x09%cI` prints it.
+            if (args.some((arg) => arg.includes("%h%x09%cI"))) {
+                return "abc1234\t2026-10-23T13:11:11-04:00\n";
+            }
+
             return new Date(NOW - 2 * HOUR).toISOString();
         }
 
@@ -220,6 +225,7 @@ test("main: the report holds the LLM proposal, the owner from the table, and the
     assert.match(readme, /\[A1:T1\]/);
     assert.match(readme, /- Repeating 3\+ days: `A1:T1`/);
     assert.match(readme, /- Gone since 2026-10-22: `X9`/);
+    assert.match(readme, /Audit code: abc1234 \(2026-10-23T13:11:11-04:00\)\./);
     assert.match(readme, /LLM: deepseek\/deepseek-flash, 900 in, 120 out, \$0\.0004/);
 
     // The JSON: findings with rank, owner and repeat days; the LLM use; the skipped GitHub checks.
@@ -227,6 +233,7 @@ test("main: the report holds the LLM proposal, the owner from the table, and the
 
     assert.equal(json.version, 1);
     assert.equal(json.date, "2026-10-23");
+    assert.deepEqual(json.code, { commit: "abc1234", date: "2026-10-23T13:11:11-04:00" });
     assert.equal(a1.repeatDays, 2);
     // medium 2 × (1 + log2(2 cases)) + 2 days it repeats + $1.25 of empty reopen / 5.
     assert.equal(a1.rank, 6.25);

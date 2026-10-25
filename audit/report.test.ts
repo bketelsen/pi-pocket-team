@@ -537,6 +537,31 @@ test("maybe fixed findings, the day compare, metrics and skipped checks are in t
     assert.match(renderReport(baseReport()), /No earlier day to compare\./);
 });
 
+test("the metrics note the subagents on another model, and the cross-reviews that are not flagged", () => {
+    const markdown = renderReport(
+        baseReport({
+            metrics: {
+                F1: { endings: { "ended: done": 2 } },
+                F3: { wrongModelSpawns: 1, reviewerSpawns: 2, peakRounds: 0 },
+            },
+        }),
+    );
+
+    assert.match(markdown, /- Shift endings: ended: done 2\./);
+    assert.match(
+        markdown,
+        /- Subagents on another model than the worker: 1 flagged, cross-reviews: 2 \(another family by design, not flagged\)\./,
+    );
+    // Without a code version: the line says so.
+    assert.match(markdown, /Audit code: unknown\./);
+    assert.match(
+        renderReport(
+            baseReport({ code: { commit: "abc1234", date: "2026-10-23T13:11:11-04:00" } }),
+        ),
+        /Audit code: abc1234 \(2026-10-23T13:11:11-04:00\)\./,
+    );
+});
+
 test("buildJson keeps the findings and the metrics, and never the report texts", () => {
     const data = emptyData();
     const json = buildJson({
@@ -556,7 +581,9 @@ test("buildJson keeps the findings and the metrics, and never the report texts",
     assert.deepEqual(json.window, { since: iso(ctx.since), until: iso(ctx.now), hours: 24 });
     assert.deepEqual(json.installed, { "desk.ts": iso(NOW), "team.ts": null });
     assert.equal(json.findings.length, 1);
+    assert.equal(json.code, null);
     assert.deepEqual(Object.keys(json).sort(), [
+        "code",
         "date",
         "findings",
         "github",
