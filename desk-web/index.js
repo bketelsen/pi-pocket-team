@@ -872,6 +872,81 @@ export default function setup(pocket) {
                   ? html`<p class=${`small ${status.warn ? "desk-warn" : "muted"}`}>${status.text}</p>`
                   : null;
 
+        /** The top count's button: open the "Other PRs" section and bring it into view. */
+        const showOthers = (event) => {
+            const box = event.currentTarget.closest(".desk")?.querySelector(".desk-others");
+
+            if (box) {
+                box.open = true;
+                box.scrollIntoView({ behavior: "smooth", block: "start" });
+            }
+        };
+
+        /** One other author's PR: a link to it, its author and age, and its draft and check marks. */
+        const otherRow = (pr) => {
+            const url = webUrl(pr.url);
+            const label = html`<span class="mono">${pr.ref}</span> <span class="desk-title">${pr.title}</span>`;
+
+            return html`<li class="desk-other">
+                ${
+                    url
+                        ? html`<a class="desk-link" href=${url} target="_blank" rel="noopener">${label}</a>`
+                        : label
+                }
+                <span class="small muted">
+                    (${pr.author || "unknown"}${pr.createdAt > 0 ? `, ${ago(pr.createdAt)}` : ""})</span
+                >
+                ${pr.draft ? html`<span class="desk-chip">draft</span>` : null}
+                ${
+                    pr.checks === "FAILURE" || pr.checks === "ERROR"
+                        ? html`<span class="desk-chip desk-chip-fail">checks fail</span>`
+                        : null
+                }
+            </li>`;
+        };
+
+        const otherRepos = Object.keys(view?.others ?? {})
+            .filter((repo) => (view.others[repo] ?? 0) > 0)
+            .sort((a, b) => a.localeCompare(b));
+        const othersSection =
+            others === 0
+                ? null
+                : html`<details id="desk-others" class="desk-closed desk-others">
+                      <summary>Other PRs (${others})</summary>
+                      <p class="small muted">
+                          Open PRs by other authors, from the last read of each repository. Your own PRs are not here.
+                      </p>
+                      ${otherRepos.map((repo) => {
+                          const count = view.others[repo] ?? 0;
+                          const list = view.otherPrs?.[repo] ?? [];
+                          const more = count - list.length;
+
+                          return html`<div class="desk-others-repo">
+                              <h3>${repo} <span class="desk-count">${count}</span></h3>
+                              <ul class="desk-others-list">
+                                  ${list.map(otherRow)}
+                              </ul>
+                              ${
+                                  more > 0
+                                      ? html`<p class="small muted">
+                                            ${
+                                                list.length === 0
+                                                    ? "The list comes with the next sweep."
+                                                    : html`… and ${more} more:${" "}<a
+                                                              class="desk-link"
+                                                              href=${`https://github.com/${repo}/pulls`}
+                                                              target="_blank"
+                                                              rel="noopener"
+                                                              >all open PRs</a
+                                                          >`
+                                            }
+                                        </p>`
+                                      : null
+                              }
+                          </div>`;
+                      })}
+                  </details>`;
+
         const section = (title, items, render, hint) =>
             items.length === 0
                 ? null
@@ -932,7 +1007,14 @@ export default function setup(pocket) {
                 ${
                     others > 0
                         ? html`<p class="small muted">
-                          ${others} other PR${others === 1 ? "" : "s"} (dependabot and others)
+                          <button
+                              type="button"
+                              class="desk-thread-link desk-others-link"
+                              aria-controls="desk-others"
+                              onClick=${showOthers}
+                          >
+                              ${others} other PR${others === 1 ? "" : "s"} (dependabot and others)
+                          </button>
                       </p>`
                         : null
                 }
@@ -957,6 +1039,7 @@ export default function setup(pocket) {
             ${section("Working", groups.working, (thread) => row(thread, withWatch(thread, parkActions(thread))))}
             ${section("Waiting on review", groups.review, (thread) => row(thread, withWatch(thread, parkActions(thread))))}
             ${section("Parked", groups.parked, (thread) => row(thread, parkedActions(thread)))}
+            ${othersSection}
             ${
                 groups.closed.length === 0
                     ? null
