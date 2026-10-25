@@ -201,7 +201,7 @@ New optional fields only (stored data is forever). No existing kind or field cha
 
 - `DeskState.issues?: IssueQueue`
 - `IssueQueue = { at: number; ok: boolean; error?: string; incomplete?: string[]; items: QueuedIssue[]; ignored: IgnoredIssue[]; seen: Record<ref, number>; urgentSeen: Record<ref, number> }`
-- `QueuedIssue = { ref: string; title: string; url: string; urgent: boolean; signals: ("queue" | "urgent" | "assigned")[]; by: string; at: number; agent?: string; owners?: string[]; threads: string[]; fixedBy: string[]; partial?: string[]; unverified?: true }`
+- `QueuedIssue = { ref: string; title: string; url: string; urgent: boolean; signals: ("queue" | "urgent" | "assigned")[]; by: string; at: number; agent?: string; owners?: string[]; threads: string[]; fixedBy: string[]; partial?: { pr: string; how: "verified" | "brian" }[]; unverified?: true }`
     - `ref` is `owner/name#N`. `at` is the time of the newest counted signal. `threads` are the desk
       threads linked to the issue (section 4.3). `fixedBy` are the open PR refs that close it.
 - `IgnoredIssue = { ref: string; signal: string; actor: string; at: number }`: a signal that does not count.
@@ -210,7 +210,8 @@ New optional fields only (stored data is forever). No existing kind or field cha
   and made urgent later gets its `issue-urgent` item then. A ref leaves `urgentSeen` when its last
   counted urgent signal goes (with proof), and leaves both when it leaves the queue (with proof), so a
   second queueing or a second urgent label tells Odrade again.
-- `partial` holds the merged PR refs that are verified partial work on the issue (section 4.3).
+- `partial` holds the merged PRs that are partial work on the issue (section 4.3), as
+  `{ pr: string; how: "verified" | "brian" }`: verified from the PR, or accepted by Brian's answer.
 - `Thread.issues?: string[]`: the issue refs of a thread.
 
 ### 3.5 On the Desk page
@@ -321,9 +322,22 @@ nameWithOwner } } }`, which GitHub keeps on a merged PR). The PR is **verified p
     queued for the next step, and the thread closes by its own rules (the next step gets a new thread).
     **Every other case is unknown, and the warning stays**: a failed read, a cut list, no `Part of` line,
     or the issue in the closing list. The thread waits on Odrade: "frostyard/snosi#1123 still open after
-    #1130 merged", and it does not close. She asks the agent for a follow-up, or asks Brian; when Brian
-    says the open issue is right, she records it with `desk result`. Nothing that the desk saw before the
-    merge decides the class: a PR can merge between 2 sweeps.
+    #1130 merged", and it does not close.
+
+    **Brian's acceptance.** In the same commit as the warning, the desk files 1 ask for Brian on the
+    thread with the existing `addAsk` (by `desk`, key `issue-open:<issue ref>:<PR ref>`, so a replayed
+    sweep files nothing more): "frostyard/snosi#1123 is still open after #1130 merged. Is that right?",
+    with the options `Open is right` and `Needs a fix`. Brian answers on the Desk page, or Odrade
+    records his chat words with `desk answer`, as for every ask today.
+    - The answer `Open is right` (the exact option): the pair goes into `partial` with
+      `how: "brian"`, the warning ends, the issue stays queued, and the thread closes by its own
+      rules. The pair never warns again: the ask's key and its stored answer hold it, also after a
+      restart.
+    - Any other answer: an `answer-action` digest item, as today. Odrade asks the agent for a
+      follow-up PR, or does what Brian says. The warning stays until the issue closes.
+    - `desk result` and the watches do not change: this flow uses no watch.
+
+    Nothing that the desk saw before the merge decides the class: a PR can merge between 2 sweeps.
 
 - The desk never closes the issue.
 
@@ -434,7 +448,9 @@ done
    sweep; a `Part of #N` merge keeps the issue queued; the link from the task text and
    from `attach`; "still open after merge"; the partial class: a PR that merged before any sweep saw
    it, a failed read after the merge, a cut closing list, a body with no `Part of` line, and a verified
-   partial PR. All against `PI_POCKET_DESK_GH` fixtures, never GitHub.
+   partial PR; the acceptance flow from a thread with no watch: the ask is filed once, `Open is right`
+   ends the warning, and the acceptance holds after another sweep and after a restart; another answer
+   keeps the warning. All against `PI_POCKET_DESK_GH` fixtures, never GitHub.
 
 Size: about 600 to 900 lines with tests. Per Brian's rules, a `deepseek/deepseek-flash` worker writes
 it from this plan, and the PR gets a cross-review before `ready-for-human`.
