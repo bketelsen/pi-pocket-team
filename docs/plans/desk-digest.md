@@ -28,8 +28,14 @@ Each piece of news is 1 digest item of 1 kind. Stored data: never rename a kind.
 | `closed`        | the sweep closed the thread: done, nothing remains                                              | digest      |
 | `queue`         | a thread newly waits on the supervisor: a due watch, found work, a missing PR, a silent session | digest      |
 | `repair`        | a thread newly waits on the supervisor for a repair that its agent cannot take (after the cap)  | **at once** |
+| `issue`         | an issue that Brian queued on GitHub, newly (`issue-queue.md`)                                  | digest      |
+| `issue-urgent`  | an issue newly urgent: the label `agent-urgent` by Brian                                        | **at once** |
+| `issue-left`    | an issue with a thread left the queue while open, with proof                                    | digest      |
 
 An "at once" item is not sent alone: it makes the next digest go now, with every item that waits.
+
+The 3 issue kinds were added after the first 8: they go to the supervisor also with a Clerk (they are in no
+default Clerk list), because only the supervisor plans shifts. The default `now` list gets `issue-urgent`.
 
 ## 3. Settings
 

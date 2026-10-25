@@ -66,6 +66,26 @@ export default function setup(pocket) {
 
     const time = (at) => new Date(at).toLocaleString();
 
+    /** A clock time, as the queue's "read 19:02" shows it. */
+    const clock = (at) =>
+        new Date(at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+
+    /** How long ago, in 1 short word group: "5 h ago". */
+    const ago = (at) => {
+        const minutes = Math.max(0, Math.round((Date.now() - at) / 60000));
+
+        if (minutes < 60) {
+            return `${minutes} min ago`;
+        }
+
+        return minutes < 2880
+            ? `${Math.round(minutes / 60)} h ago`
+            : `${Math.round(minutes / 1440)} d ago`;
+    };
+
+    /** A GitHub link that is safe to open: http(s) only. */
+    const webUrl = (url) => (/^https?:\/\/\S+$/.test(url ?? "") ? url : undefined);
+
     /** One line about a thread's watch, for the detail view. */
     const watchLine = (watch) =>
         [
@@ -131,6 +151,11 @@ export default function setup(pocket) {
                                   .join(" · ")}
                           </p>
                           ${thread.watch ? html`<p class="small">Watch: ${watchLine(thread.watch)}</p>` : null}
+                          ${
+                              (thread.issues ?? []).length > 0
+                                  ? html`<p class="small">Issues: ${thread.issues.join(", ")}</p>`
+                                  : null
+                          }
                           <h3>PRs</h3>
                           ${
                               thread.prs.length === 0
@@ -714,6 +739,99 @@ export default function setup(pocket) {
                     )}
             </div>`;
 
+        const queue = view?.issues ?? null;
+
+        /** One queued issue: its link, its owner, its threads, and what Brian did. Read only: Brian changes it on GitHub. */
+        const issueRow = (item) => {
+            const url = webUrl(item.url);
+            const owner = item.agent
+                ? item.owners && item.owners.length > 1
+                    ? `${item.agent} (owned by ${item.owners.length} agents)`
+                    : item.agent
+                : "no owner";
+
+            return html`<li class="desk-row desk-issue">
+                <span class="desk-line">
+                    ${item.urgent ? html`<span class="desk-urgent">URGENT</span>` : null}
+                    ${
+                        url
+                            ? html`<a class="desk-link mono" href=${url} target="_blank" rel="noopener"
+                                  >${item.ref}</a
+                              >`
+                            : html`<span class="mono">${item.ref}</span>`
+                    }
+                    <span class="desk-title">${item.title}</span>
+                </span>
+                <span class="small muted">
+                    ${owner} · ${item.threads.length === 0 ? "not started" : null}
+                    ${item.threads.map(
+                        (thread) =>
+                            html`<button
+                                type="button"
+                                class="desk-thread-link"
+                                aria-label=${`Open ${thread.id}`}
+                                onClick=${() => setOpenId(thread.id)}
+                            >
+                                ${thread.id} ${thread.word}</button
+                            > `,
+                    )}
+                    · ${item.signal === "assigned" ? "assigned" : "label"}, ${ago(item.at)}
+                    ${item.fixedBy.length > 0 ? ` · PR ${item.fixedBy.join(", ")} fixes it` : ""}
+                </span>
+                ${
+                    item.parts > 0 || item.unverified
+                        ? html`<span class="desk-chips">
+                              ${
+                                  item.parts > 0
+                                      ? html`<span class="desk-chip done"
+                                            >${item.parts} part${item.parts === 1 ? "" : "s"} merged</span
+                                        >`
+                                      : null
+                              }
+                              ${
+                                  item.unverified
+                                      ? html`<span class="desk-chip" title="The last read could not prove it: it stays until a read does."
+                                            >unverified</span
+                                        >`
+                                      : null
+                              }
+                          </span>`
+                        : null
+                }
+            </li>`;
+        };
+
+        const queueSection =
+            queue !== null && (queue.items.length > 0 || queue.ignored.length > 0)
+                ? html`<section class="desk-section desk-queue">
+                      <h2>
+                          Brian queued <span class="desk-count">${queue.items.length}</span>
+                          <span class=${`desk-read ${queue.ok ? "" : "desk-warn"}`}>
+                              ${queue.ok ? `read ${clock(queue.at)}` : `queue read failed at ${clock(queue.at)}`}
+                          </span>
+                      </h2>
+                      ${!queue.ok && queue.error ? html`<p class="small desk-warn">${queue.error}</p>` : null}
+                      ${
+                          (queue.incomplete ?? []).length > 0
+                              ? html`<p class="small desk-warn">${queue.incomplete.join(", ")}</p>`
+                              : null
+                      }
+                      <ul class="desk-rows">
+                          ${queue.items.map(issueRow)}
+                      </ul>
+                      ${
+                          queue.ignored.length > 0
+                              ? html`<p class="small muted">
+                                    Not counted:
+                                    ${queue.ignored
+                                        .map((one) => `${one.ref} ${one.signal} by ${one.actor}`)
+                                        .join(", ")}
+                                </p>`
+                              : null
+                      }
+                  </section>`
+                : null;
+
         const section = (title, items, render, hint) =>
             items.length === 0
                 ? null
@@ -781,6 +899,7 @@ export default function setup(pocket) {
             </header>
             ${error ? html`<div class="error-box" role="alert">${error}</div>` : null}
             ${loadError ? html`<div class="error-box" role="alert">${loadError}</div>` : null}
+            ${queueSection}
             ${section("Needs you", groups.need, (thread) => row(thread, withWatch(thread, needDetail(thread))))}
             ${section(
                 "Found",

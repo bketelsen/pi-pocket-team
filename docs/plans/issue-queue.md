@@ -1,8 +1,10 @@
 # Issue queue: Brian puts a GitHub issue in the team's queue
 
-Status: design, decided by Brian on 2026-10-25 (Odrade's request of the same day; his decisions are in
-section 10). No code yet. The implementation (section 9) is not small: it adds a GitHub read, stored
-state, a tool action, digest kinds and a page section to `desk.ts`. It follows in its own PR.
+Status: implemented in `desk.ts` (the read, the stored queue, the `issues` action, the digest kinds, the
+link and the "still open after merge" rule), `desk-web/` (the page section) and `team.ts` (the task text
+goes to `desk.open`). The design was decided by Brian on 2026-10-25 (Odrade's request of the same day; his
+decisions are in section 10). Odrade's runbook (section 4.1) and the agents' comments (section 4.4) are not
+code in this repository. The choices that the design left open are in section 11.
 
 ## 1. What changes
 
@@ -495,3 +497,40 @@ it from this plan, and the PR gets a cross-review before `ready-for-human`.
 4. The bot runs the label command (section 6). Done.
 5. The agents comment on the issue (section 4.4). A comment does not mean a commitment or a
    completion.
+
+## 11. Implementation notes
+
+Choices that the design left open:
+
+- **Settings.** `queueConfig(raw, rosterOwners)` checks each name: labels `^[A-Za-z0-9][A-Za-z0-9_.-]{0,49}$`
+  (no space, no quote, no colon), the assignee and the `by` logins `^[A-Za-z0-9][A-Za-z0-9-]{0,38}$` (no
+  `[bot]` suffix), owners as `isRepoName` does. A bad name is left out; a list with no good name gives the
+  default. `buildIssueQuery` checks again, so a hand-made config cannot put a name in a query. With no owner
+  to search (no roster, no `queue.owners`), the queue is not read and nothing is written.
+- **Query.** The fragment also reads `pageInfo` of `labels` and `assignees` (for the by-number paging),
+  `state` of the issue, and `state` of each closing PR (`fixedBy` holds the open ones). The pinned read of a
+  linked issue uses `includeClosedPrs: true`, so a closed issue names the PR that closed it. The stored
+  items that the search did not return are read by number, 20 in each query. A by-number read that gets a
+  `NOT_FOUND` error for an issue (deleted, or moved) counts as proof that it is gone.
+- **Stored fields added beside the design's.** `QueuedIssue.latest` (the newest counted signal: `queue`,
+  `urgent` or `assigned`, for "label by" or "assigned by" in the row). `seen` and `urgentSeen` hold the
+  item's `at`. An urgent item sets both, so no `issue` item follows an `issue-urgent` item. On a thread:
+  `run.issueOpen` (the warnings) and `run.issuePartial` (the partial PRs, with `how`). The threads are the
+  truth; `QueuedIssue.threads` and `partial` are rebuilt from them in each sweep (`relinkIssues`).
+- **Warning.** `nextActor` returns `odrade` for a stored warning (after the repair rule), `odradeReason` says
+  `<issue> still open after <PR> merged`, and `closeCheck` lists it. While the ask for Brian is open, the
+  thread waits on Brian, as for every ask; when he answers something other than `Open is right`, it waits
+  on Odrade. The issue's state is the pinned read's, else "open" when the queue's own read has it; when
+  neither says, the warnings it had stay.
+- **Pinned PRs.** Every pinned PR of a thread with a linked issue also reads `body` and
+  `closingIssuesReferences` in each sweep (not only after a merge): a merge between 2 sweeps is then read in
+  the same sweep that sees it.
+- **Digest.** The first linked thread (by id) is `DigestItem.thread`; else the empty string. An issue item
+  stays in the digest text even when its thread closed in the same digest. The Clerk split is
+  `splitDigest`. The title in a line is defanged and its quotes become `'`. With the digest off, no issue
+  item is recorded (the queue stays on the page and in `desk issues`).
+- **Closed issue.** The event `<ref> closed by PR #N` uses a PR of the thread when GitHub lists one, else
+  the first listed PR; with none, `<ref> closed`. The key is `issue-closed:<ref>`, so it comes once.
+- **Several supervisors.** The queue is 1 document for the app: the first sweep that sees a ref gives the
+  digest item to its supervisor.
+- **First failure.** A failed read with no stored queue stores an empty queue with `ok: false`.
