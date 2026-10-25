@@ -278,3 +278,28 @@
     color: var(--warn);
     margin: 6px 0 0;
 }
+
+/* The issues Brian queued: a read-only section above "Needs you". */
+.desk-read {
+    margin-left: auto;
+    font-size: 11px;
+    letter-spacing: 0;
+    text-transform: none;
+}
+
+.desk-urgent {
+    padding: 1px 7px;
+    border: 1px solid var(--warn);
+    border-radius: 999px;
+    color: var(--warn);
+    font-size: 11px;
+}
+
+.desk-thread-link {
+    padding: 0;
+    border: 0;
+    background: none;
+    color: var(--accent);
+    font: inherit;
+    cursor: pointer;
+}

@@ -1,8 +1,10 @@
 # Issue queue: Brian puts a GitHub issue in the team's queue
 
-Status: design, decided by Brian on 2026-10-25 (Odrade's request of the same day; his decisions are in
-section 10). No code yet. The implementation (section 9) is not small: it adds a GitHub read, stored
-state, a tool action, digest kinds and a page section to `desk.ts`. It follows in its own PR.
+Status: implemented in `desk.ts` (the read, the stored queue, the `issues` action, the digest kinds, the
+link and the "still open after merge" rule), `desk-web/` (the page section) and `team.ts` (the task text
+goes to `desk.open`). The design was decided by Brian on 2026-10-25 (Odrade's request of the same day; his
+decisions are in section 10). Odrade's runbook (section 4.1) and the agents' comments (section 4.4) are not
+code in this repository. The choices that the design left open are in section 11.
 
 ## 1. What changes
 
@@ -495,3 +497,78 @@ it from this plan, and the PR gets a cross-review before `ready-for-human`.
 4. The bot runs the label command (section 6). Done.
 5. The agents comment on the issue (section 4.4). A comment does not mean a commitment or a
    completion.
+
+## 11. Implementation notes
+
+Choices that the design left open:
+
+- **Settings.** `queueConfig(raw, rosterOwners)` checks each name: labels `^[A-Za-z0-9][A-Za-z0-9_.-]{0,49}$`
+  (no space, no quote, no colon), the assignee and the `by` logins `^[A-Za-z0-9][A-Za-z0-9-]{0,38}$` (no
+  `[bot]` suffix), owners as `isRepoName` does. A bad name is left out; a list with no good name gives the
+  default. `buildIssueQuery` checks again, so a hand-made config cannot put a name in a query. With no owner
+  to search (no roster, no `queue.owners`), the queue is not read and nothing is written.
+- **Query.** The fragment also reads `pageInfo` of `labels` and `assignees` (for the by-number paging),
+  `state` of the issue, and `state` of each closing PR (`fixedBy` holds the open ones). The pinned read of a
+  linked issue uses `includeClosedPrs: true`, so a closed issue names the PR that closed it. The stored
+  items that the search did not return are read by number, 20 in each query. A by-number read that gets a
+  `NOT_FOUND` error for an issue (deleted, or moved) counts as proof that it is gone.
+- **Stored fields added beside the design's.** `QueuedIssue.latest` (the newest counted signal: `queue`,
+  `urgent` or `assigned`, for "label by" or "assigned by" in the row). `seen` and `urgentSeen` hold the
+  item's `at`. An urgent item sets both, so no `issue` item follows an `issue-urgent` item. On a thread:
+  `run.issueOpen` (the warnings) and `run.issuePartial` (the partial PRs, with `how`). The threads are the
+  truth; `QueuedIssue.threads` and `partial` are rebuilt from them in each sweep (`relinkIssues`).
+- **Warning.** `nextActor` returns `odrade` for a stored warning (after the repair rule), `odradeReason` says
+  `<issue> still open after <PR> merged`, and `closeCheck` lists it. While the ask for Brian is open, the
+  thread waits on Brian, as for every ask; when he answers something other than `Open is right`, it waits
+  on Odrade. The issue's state is the pinned read's, else "open" when the queue's own read has it; when
+  neither says, the warnings it had stay.
+- **Pinned PRs.** Every pinned PR of a thread with a linked issue also reads `body` and
+  `closingIssuesReferences` in each sweep (not only after a merge): a merge between 2 sweeps is then read in
+  the same sweep that sees it.
+- **Digest.** The first linked thread (by id) is `DigestItem.thread`; else the empty string. An issue item
+  stays in the digest text even when its thread closed in the same digest. The Clerk split is
+  `splitDigest`. The title in a line is defanged and its quotes become `'`. With the digest off, no issue
+  item is recorded (the queue stays on the page and in `desk issues`).
+- **Closed issue.** The event `<ref> closed by PR #N` uses a PR of the thread when GitHub lists one, else
+  the first listed PR; with none, `<ref> closed`. The key is `issue-closed:<ref>`, so it comes once.
+- **Several supervisors.** The queue is 1 document for the app: the first sweep that sees a ref gives the
+  digest item to its supervisor.
+- **First failure.** A failed read with no stored queue stores an empty queue with `ok: false`.
+- **Partial answers.** `IssueFact.partial` is set when a connection (`labels`, `assignees`, `timelineItems`) is
+  missing, null or has no `nodes`; when its `totalCount` is above the nodes read with no next page (a page
+  that continues a cursor skips this count); when the issue has no `state`; and when GraphQL has an error
+  under the issue's node (`["labeled","nodes",i,...]`, or `nN`; an error under the alias but not under a node
+  makes every issue of that alias partial). A partial fact is `cut`: it never proves a removal. A closed
+  `state` is still proof. In `mergeQueue`, a cut read keeps a stored item's counted signals (the union, and
+  `urgent`), marks it `unverified`, and keeps `seen` and `urgentSeen`.
+- **`QueuedIssue.names`.** The words of every counted signal (`label agent-queue`, `label agent-urgent`,
+  `assigned`), from the config. `desk issues` and the page show all of them; an old item shows its `signals`.
+- **`Ask.resolved`.** `{ at, why }`, set only by the desk when an `issue-open:` warning ends without Brian's
+  answer (the issue closed, or a verified partial PR). `askIsOpen` (no answer and not resolved) replaces
+  every `answer === undefined` test. The desk never sets `answer`. The page shows it under "Resolved by the
+  desk", `desk read` as `resolved by the desk: <why>`.
+- **1 acceptance rule.** `acceptsOpen(words)` is true only for the exact option `Open is right`. `planIssues`
+  and `askAnswerKind` (the page's answer POST) use it: for an ask whose key starts with `issue-open:`, the
+  exact text is digest kind `answer`, and every other answer is `answer-action`. `ACK_WORDS` has no such
+  words. The `desk answer` tool only records the words and sends nothing.
+- **Thread merge.** `attachTo` of a thread moves the source's `issues` (with `linkIssue`), its
+  `run.issuePartial`, and its `issue-open:` asks (new ids on the target, with their answer or resolution) to
+  the target, then runs `relinkIssues` in the same call.
+- **Detail errors.** In `readGitHub`, an error under a `pN` alias is a missing PR only when the alias or its
+  `pullRequest` node is null or absent, or the error is `NOT_FOUND`. An error under `body` or
+  `closingIssuesReferences` keeps the PR's facts and drops `body` and `closing`: the partial class is unknown.
+- **Page status.** A failed (`ok: false`) or incomplete read shows its warning also with no row; a queue turned
+  off (`IssuesView.off`) shows `queue read is off`; a good empty queue shows nothing.
+- **Timeline proof.** `IssueFact.timelineCut` is set (with `partial`) when the timeline is missing, has a null
+  or unreadable node, is short of its `totalCount` with no older page, or has an error under the issue.
+  `judgeIssue` then counts no signal of the fact: each shows as not counted with the actor `unknown`. A new
+  issue gets no entry and no news; a stored item keeps its signals, unverified. A null node in `labels` or
+  `assignees` makes the fact partial too.
+- **Joined connections.** The fact keeps `labelsTotal`, `assigneesTotal`, `eventsTotal` and `eventsRead`.
+  `joinIssueFact` marks the fact cut (and the timeline cut) when the paging ends with the joined count below the
+  total (the larger total of the 2 reads). A page cap leaves the cursor, which is a cut too.
+- **Thread merge, warnings.** `attachTo` moves `run.issueOpen` to the target without a repeat, so a later sweep
+  with an unknown issue state keeps the warning, and the target does not close.
+- **Missing PR by path.** An error under a `pN` alias makes the PR missing only when its path ends at the alias
+  or at `pullRequest` and that node is null or absent. Any deeper error, `NOT_FOUND` too, keeps the PR's facts
+  and drops `body` and `closing`.
