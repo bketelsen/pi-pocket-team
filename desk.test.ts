@@ -1446,6 +1446,51 @@ const foundPrThread = (state: DeskState, ref = "frostyard/test#7", at = 100): Th
 };
 
 describe("ownThread", () => {
+    test("queue news that waits in the digest goes; other news stays", () => {
+        const state = deskOf();
+        const found = foundPrThread(state);
+        const other = foundPrThread(state, "frostyard/test#8");
+        const config = digestConfig({ minutes: 15 });
+        const reason = "found PR, attach or drop";
+
+        // As a sweep's queue news would put them in the box.
+        for (const thread of [found, other]) {
+            enqueueDigest(
+                state,
+                1,
+                {
+                    key: `queue:${thread.id}:${reason}`,
+                    thread: thread.id,
+                    kind: "queue",
+                    line: `[desk] ${thread.id} · waits on you: ${reason}`,
+                    at: 100,
+                },
+                100,
+                config,
+            );
+        }
+
+        enqueueDigest(
+            state,
+            1,
+            { key: "report:x", thread: found.id, kind: "report", line: "a report", at: 100 },
+            100,
+            config,
+        );
+        state.digests!["1"]!.queued = { [found.id]: reason, [other.id]: reason };
+
+        ownThread(state, found.id, 200, "Odrade");
+
+        const taken = takeDigest(state, 1, 0);
+
+        assert.deepEqual(
+            taken.items.map((item) => `${item.thread}:${item.kind}`),
+            [`${other.id}:queue`, `${found.id}:report`],
+        );
+        assert.equal(state.digests?.["1"]?.queued[found.id], undefined);
+        assert.equal(state.digests?.["1"]?.queued[other.id], reason);
+    });
+
     test("closes a found PR thread as dropped by the desk, keeps its PR, and adds 1 event", () => {
         const state = deskOf();
         const found = foundPrThread(state);
@@ -9383,10 +9428,14 @@ describe("the desk in a Pi Pocket", () => {
             // The session's answer holds the PR's URL; the next sweep reads it.
             await say(app, linked, "desk pr test");
 
-            // A machine account counts as ours: its PR is a candidate too.
+            // A machine account counts as ours: its PR is a candidate too. Brian's own login is not a candidate.
             writeFileSync(
                 configPath,
-                JSON.stringify({ digest: { minutes: 0 }, authors: ["machine-user"] }),
+                JSON.stringify({
+                    digest: { minutes: 0 },
+                    authors: ["machine-user"],
+                    ownAuthors: ["brian-user"],
+                }),
             );
             writeFileSync(
                 fixturePath,
@@ -9401,6 +9450,11 @@ describe("the desk in a Pi Pocket", () => {
                             author: "machine-user",
                             createdAt: new Date(Number(thread.startedAt) + 120_000).toISOString(),
                         },
+                        {
+                            number: 215,
+                            author: "brian-user",
+                            createdAt: new Date(Number(thread.startedAt) + 180_000).toISOString(),
+                        },
                     ]),
                 ),
             );
@@ -9412,6 +9466,14 @@ describe("the desk in a Pi Pocket", () => {
             assert.equal(attached?.prs["frostyard/pilothouse#212"]?.via, "seen");
             assert.equal(attached?.prs["frostyard/pilothouse#212"]?.state, "OPEN");
             assert.equal(attached?.prs["frostyard/pilothouse#213"]?.via, "window");
+            assert.equal(attached?.prs["frostyard/pilothouse#215"], undefined, "no window");
+            assert.equal(
+                Object.values((await deskState())?.threads ?? {}).some(
+                    (each) => each.prs["frostyard/pilothouse#215"] !== undefined,
+                ),
+                false,
+                "Brian's own PR makes no found thread",
+            );
             assert.equal((await deskState())?.others?.["frostyard/pilothouse"], 0);
 
             await say(app, linked, "report to supervisor test");

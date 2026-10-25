@@ -4477,6 +4477,21 @@ export function ownThread(
 
     thread.state = "closed";
     thread.closed = { at: now, why: "dropped", by: "desk" };
+
+    // Queue news that waits in the digest would still say the thread waits on the supervisor: it goes, with its reason.
+    if (
+        thread.supervisor !== undefined &&
+        state.digests?.[String(thread.supervisor)] !== undefined
+    ) {
+        const box = digestBox(state, thread.supervisor);
+
+        box.items = box.items.filter(
+            (item) => !(item.thread === thread.id && item.kind === "queue"),
+        );
+        delete box.queued[thread.id];
+        setDigestBox(state, thread.supervisor, box);
+    }
+
     addEvent(
         thread,
         `own:${String(now)}`,
