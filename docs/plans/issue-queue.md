@@ -534,3 +534,28 @@ Choices that the design left open:
 - **Several supervisors.** The queue is 1 document for the app: the first sweep that sees a ref gives the
   digest item to its supervisor.
 - **First failure.** A failed read with no stored queue stores an empty queue with `ok: false`.
+- **Partial answers.** `IssueFact.partial` is set when a connection (`labels`, `assignees`, `timelineItems`) is
+  missing, null or has no `nodes`; when its `totalCount` is above the nodes read with no next page (a page
+  that continues a cursor skips this count); when the issue has no `state`; and when GraphQL has an error
+  under the issue's node (`["labeled","nodes",i,...]`, or `nN`; an error under the alias but not under a node
+  makes every issue of that alias partial). A partial fact is `cut`: it never proves a removal. A closed
+  `state` is still proof. In `mergeQueue`, a cut read keeps a stored item's counted signals (the union, and
+  `urgent`), marks it `unverified`, and keeps `seen` and `urgentSeen`.
+- **`QueuedIssue.names`.** The words of every counted signal (`label agent-queue`, `label agent-urgent`,
+  `assigned`), from the config. `desk issues` and the page show all of them; an old item shows its `signals`.
+- **`Ask.resolved`.** `{ at, why }`, set only by the desk when an `issue-open:` warning ends without Brian's
+  answer (the issue closed, or a verified partial PR). `askIsOpen` (no answer and not resolved) replaces
+  every `answer === undefined` test. The desk never sets `answer`. The page shows it under "Resolved by the
+  desk", `desk read` as `resolved by the desk: <why>`.
+- **1 acceptance rule.** `acceptsOpen(words)` is true only for the exact option `Open is right`. `planIssues`
+  and `askAnswerKind` (the page's answer POST) use it: for an ask whose key starts with `issue-open:`, the
+  exact text is digest kind `answer`, and every other answer is `answer-action`. `ACK_WORDS` has no such
+  words. The `desk answer` tool only records the words and sends nothing.
+- **Thread merge.** `attachTo` of a thread moves the source's `issues` (with `linkIssue`), its
+  `run.issuePartial`, and its `issue-open:` asks (new ids on the target, with their answer or resolution) to
+  the target, then runs `relinkIssues` in the same call.
+- **Detail errors.** In `readGitHub`, an error under a `pN` alias is a missing PR only when the alias or its
+  `pullRequest` node is null or absent, or the error is `NOT_FOUND`. An error under `body` or
+  `closingIssuesReferences` keeps the PR's facts and drops `body` and `closing`: the partial class is unknown.
+- **Page status.** A failed (`ok: false`) or incomplete read shows its warning also with no row; a queue turned
+  off (`IssuesView.off`) shows `queue read is off`; a good empty queue shows nothing.

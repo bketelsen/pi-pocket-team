@@ -58,6 +58,31 @@ const load = async () => {
     }
 };
 
+/**
+ * The queue's read status, for the page: its words, and whether it is a warning. A queue that is turned off is a short
+ * muted line, not a failure. Null when a good read has nothing to say.
+ */
+export const queueStatus = (queue, clock) => {
+    if (queue === null || queue === undefined) {
+        return null;
+    }
+
+    if (queue.off) {
+        return { text: "queue read is off", warn: false };
+    }
+
+    if (!queue.ok) {
+        return {
+            text: `queue read failed at ${clock(queue.at)}${queue.error ? `: ${queue.error}` : ""}`,
+            warn: true,
+        };
+    }
+
+    return (queue.incomplete ?? []).length > 0
+        ? { text: `queue read incomplete: ${queue.incomplete.join(", ")}`, warn: true }
+        : null;
+};
+
 export default function setup(pocket) {
     const { html, useEffect, useState, Loader } = pocket;
 
@@ -194,6 +219,19 @@ export default function setup(pocket) {
                                             </li>`,
                                         )}
                                     </ul>`
+                          }
+                          ${
+                              (thread.resolved ?? []).length === 0
+                                  ? null
+                                  : html`<h3>Resolved by the desk</h3>
+                                        <ul class="desk-list">
+                                            ${thread.resolved.map(
+                                                (ask) => html`<li>
+                                                    <span class="desk-id">${ask.id}</span> ${ask.text}
+                                                    <div class="small">${ask.why}</div>
+                                                </li>`,
+                                            )}
+                                        </ul>`
                           }
                           ${
                               (thread.answered ?? []).length === 0
@@ -775,7 +813,7 @@ export default function setup(pocket) {
                                 ${thread.id} ${thread.word}</button
                             > `,
                     )}
-                    · ${item.signal === "assigned" ? "assigned" : "label"}, ${ago(item.at)}
+                    · ${(item.names ?? [item.signal]).join(", ")} · ${item.by}, ${ago(item.at)}
                     ${item.fixedBy.length > 0 ? ` · PR ${item.fixedBy.join(", ")} fixes it` : ""}
                 </span>
                 ${
@@ -801,19 +839,19 @@ export default function setup(pocket) {
             </li>`;
         };
 
+        const status = queueStatus(queue, clock);
         const queueSection =
             queue !== null && (queue.items.length > 0 || queue.ignored.length > 0)
                 ? html`<section class="desk-section desk-queue">
                       <h2>
                           Brian queued <span class="desk-count">${queue.items.length}</span>
-                          <span class=${`desk-read ${queue.ok ? "" : "desk-warn"}`}>
-                              ${queue.ok ? `read ${clock(queue.at)}` : `queue read failed at ${clock(queue.at)}`}
+                          <span class=${`desk-read ${status !== null && status.warn ? "desk-warn" : ""}`}>
+                              ${queue.ok ? `read ${clock(queue.at)}` : queue.off ? "queue read is off" : `queue read failed at ${clock(queue.at)}`}
                           </span>
                       </h2>
-                      ${!queue.ok && queue.error ? html`<p class="small desk-warn">${queue.error}</p>` : null}
                       ${
-                          (queue.incomplete ?? []).length > 0
-                              ? html`<p class="small desk-warn">${queue.incomplete.join(", ")}</p>`
+                          status !== null
+                              ? html`<p class=${`small ${status.warn ? "desk-warn" : "muted"}`}>${status.text}</p>`
                               : null
                       }
                       <ul class="desk-rows">
@@ -830,7 +868,9 @@ export default function setup(pocket) {
                               : null
                       }
                   </section>`
-                : null;
+                : status !== null
+                  ? html`<p class=${`small ${status.warn ? "desk-warn" : "muted"}`}>${status.text}</p>`
+                  : null;
 
         const section = (title, items, render, hint) =>
             items.length === 0

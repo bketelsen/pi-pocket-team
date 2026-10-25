@@ -99,7 +99,16 @@ export type Ask = {
     session?: number;
     /** 2 to 6 choices, when the ask is a pick-one decision. */
     options?: string[];
+    /**
+     * The desk ended the question itself: its reason is gone (an issue closed, or a PR was verified partial work). Set by
+     * the desk, never by Brian, and it never sets `answer`. A resolved ask needs no answer.
+     */
+    resolved?: { at: number; why: string };
 };
+
+/** Whether an ask waits for Brian: no answer, and the desk did not resolve it. */
+export const askIsOpen = (ask: Pick<Ask, "answer" | "resolved">): boolean =>
+    ask.answer === undefined && ask.resolved === undefined;
 
 /** One attached PR: how it was attached, and what GitHub said about it. */
 export type PrLink = {
@@ -323,6 +332,8 @@ export type QueuedIssue = {
     partial?: { pr: string; how: "verified" | "brian" }[];
     /** The last read could not prove it: it stays until a read does. */
     unverified?: true;
+    /** Every counted signal, in words: `label agent-queue`, `label agent-urgent`, `assigned`. A row names all of them. */
+    names?: string[];
 };
 
 /** A signal that does not count: who did it, or "unknown". */
@@ -1651,7 +1662,7 @@ export function closeCheck(thread: Thread, facts: CloseFacts): { close: boolean;
     }
 
     for (const ask of thread.asks) {
-        if (ask.answer === undefined) {
+        if (askIsOpen(ask)) {
             open.push(`ask ${ask.id} has no answer`);
         }
     }
@@ -2381,7 +2392,7 @@ export function nextActor(thread: Thread): NextActor {
         return "none";
     }
 
-    if (thread.asks.some((ask) => ask.answer === undefined)) {
+    if (thread.asks.some((ask) => askIsOpen(ask))) {
         return "brian";
     }
 
@@ -2616,16 +2627,31 @@ export function digestConfig(raw: unknown): DigestConfig {
     return { minutes, now, clerk };
 }
 
-/**
- * The words that are only an acknowledgement: they name nothing for the supervisor to do. `Open is right` accepts a
- * still-open issue: the sweep records it, so it is no work for the supervisor either.
- */
+/** The words that are only an acknowledgement: they name nothing for the supervisor to do. */
 const ACK_WORDS =
-    /^(?:ok|okay|yes ok|no|nope|thanks|thank you|noted|fine|later|not now|skip|seen|got it|done|answered on the desk page|open is right)$/i;
+    /^(?:ok|okay|yes ok|no|nope|thanks|thank you|noted|fine|later|not now|skip|seen|got it|done|answered on the desk page)$/i;
 
 /** A Desk-page answer's kind: `answer` for an acknowledgement only, else `answer-action`. */
 export function answerKind(words: string): "answer" | "answer-action" {
     return ACK_WORDS.test(flatLine(words).replace(/[\s.!?]+$/, "")) ? "answer" : "answer-action";
+}
+
+/** Whether an answer accepts a still-open issue: only the exact option `Open is right` does, nothing near it. */
+export function acceptsOpen(words: string): boolean {
+    return flatLine(words) === OPEN_IS_RIGHT;
+}
+
+/**
+ * The digest kind of an answer to an ask. An ask about a still-open issue (key `issue-open:`) has 1 rule: the exact
+ * option `Open is right` is only an acknowledgement (`answer`), and every other answer names work (`answer-action`).
+ * Any other ask uses `answerKind`.
+ */
+export function askAnswerKind(ask: Pick<Ask, "key">, words: string): "answer" | "answer-action" {
+    return ask.key?.startsWith("issue-open:") === true
+        ? acceptsOpen(words)
+            ? "answer"
+            : "answer-action"
+        : answerKind(words);
 }
 
 /** The kinds of the issue queue: news about an issue stays in a digest even when its thread closes. */
@@ -4243,6 +4269,43 @@ export function attachTo(
 
     source.prs = {};
 
+    // The linked issues go with the work: the merged PR may leave an issue open, and the target must then warn. The
+    // partial records and the asks about a still-open issue go too, so Brian's answer and the desk's resolution stay.
+    for (const ref of [...(source.issues ?? [])]) {
+        linkIssue(state, target, ref, now);
+    }
+
+    const carried = issuePartialOf(source);
+
+    if (carried.length > 0) {
+        const kept = issuePartialOf(target);
+
+        for (const record of carried) {
+            if (!kept.some((each) => each.issue === record.issue && each.pr === record.pr)) {
+                kept.push(record);
+            }
+        }
+
+        target.run.issuePartial = kept.slice(-KEPT_REFS);
+    }
+
+    // Plain copies: the document's draft arrays are not searched by object.
+    const plainAsks = JSON.parse(JSON.stringify(source.asks)) as Ask[];
+    const aboutIssues = (ask: Ask) => ask.key?.startsWith("issue-open:") === true;
+
+    if (plainAsks.some(aboutIssues)) {
+        for (const ask of plainAsks.filter(aboutIssues)) {
+            target.asks.push({ ...ask, id: `${target.id}${letters(target.asks.length)}` });
+        }
+
+        source.asks = plainAsks.filter((ask) => !aboutIssues(ask));
+    }
+
+    delete source.issues;
+    delete source.run.issuePartial;
+    delete source.run.issueOpen;
+    relinkIssues(state);
+
     if (target.address === undefined && source.address !== undefined) {
         target.address = source.address;
     }
@@ -4564,6 +4627,11 @@ export type IssueFact = {
     eventsBefore?: string;
     /** The PRs that close it, with their state: "" when GitHub gave none. */
     closing: { ref: string; state: string }[];
+    /**
+     * Something the read needs is missing or short: a connection that is not there, a count above the nodes read with no
+     * next page, or an error under the issue. A fact like that never proves a removal.
+     */
+    partial?: true;
 };
 
 /** A cut part of an issue's read: its labels, its assignees, or its signal events. */
@@ -4596,7 +4664,11 @@ function issueUrl(url: string, repo: string, number: number): string {
 }
 
 /** One issue node as facts, or undefined when it has no number or no repository. */
-export function parseIssueNode(value: unknown): IssueFact | undefined {
+export function parseIssueNode(
+    value: unknown,
+    /** The parts that a later page continues: their `totalCount` is for the whole list, not for this page. */
+    continued: Partial<Record<"labels" | "assignees" | "timeline", boolean>> = {},
+): IssueFact | undefined {
     const node = value as Record<string, unknown> | null | undefined;
 
     if (node === null || typeof node !== "object" || typeof node.number !== "number") {
@@ -4611,33 +4683,68 @@ export function parseIssueNode(value: unknown): IssueFact | undefined {
         return undefined;
     }
 
-    const page = (list: unknown, key: "login" | "name") => {
+    // A part of the read that is missing or short: the fact is partial, and never proves a removal.
+    let partial = typeof node.state !== "string";
+
+    const page = (list: unknown, key: "login" | "name", again: boolean | undefined) => {
         const found = list as
-            | { nodes?: unknown; pageInfo?: { hasNextPage?: unknown; endCursor?: unknown } | null }
+            | {
+                  nodes?: unknown;
+                  totalCount?: unknown;
+                  pageInfo?: { hasNextPage?: unknown; endCursor?: unknown } | null;
+              }
             | null
             | undefined;
-        const names = (Array.isArray(found?.nodes) ? found.nodes : [])
+
+        if (found === null || typeof found !== "object" || !Array.isArray(found.nodes)) {
+            partial = true;
+        }
+
+        const nodes = Array.isArray(found?.nodes) ? found.nodes : [];
+        const names = nodes
             .map((one) => text((one as Record<string, unknown> | null)?.[key]))
             .filter((name) => name !== "");
         const cursor = text(found?.pageInfo?.endCursor);
+        const more = found?.pageInfo?.hasNextPage === true;
+
+        if (
+            !more &&
+            !again &&
+            typeof found?.totalCount === "number" &&
+            found.totalCount > nodes.length
+        ) {
+            partial = true;
+        }
 
         return {
             names,
             // Unread parts with no cursor cannot go on: they stay marked as cut with a cursor that never fits.
-            next: found?.pageInfo?.hasNextPage === true ? cursor || "-" : undefined,
+            next: more ? cursor || "-" : undefined,
         };
     };
 
-    const labels = page(node.labels, "name");
-    const assignees = page(node.assignees, "login");
+    const labels = page(node.labels, "name", continued.labels);
+    const assignees = page(node.assignees, "login", continued.assignees);
     const timeline = node.timelineItems as
         | {
               nodes?: unknown;
+              totalCount?: unknown;
               pageInfo?: { hasPreviousPage?: unknown; startCursor?: unknown } | null;
           }
         | null
         | undefined;
     const events: IssueEvent[] = [];
+
+    if (timeline === null || typeof timeline !== "object" || !Array.isArray(timeline.nodes)) {
+        partial = true;
+    } else if (
+        timeline.pageInfo?.hasPreviousPage !== true &&
+        continued.timeline !== true &&
+        typeof timeline.totalCount === "number" &&
+        timeline.totalCount > timeline.nodes.length
+    ) {
+        partial = true;
+    }
 
     for (const one of Array.isArray(timeline?.nodes) ? timeline.nodes : []) {
         const event = one as {
@@ -4709,6 +4816,7 @@ export function parseIssueNode(value: unknown): IssueFact | undefined {
         events,
         ...(timeline?.pageInfo?.hasPreviousPage === true ? { eventsBefore: before || "-" } : {}),
         closing,
+        ...(partial ? { partial: true as const } : {}),
     };
 }
 
@@ -4818,7 +4926,11 @@ export function judgeIssue(
         }
     }
 
-    const cut = unresolved || fact.labelsNext !== undefined || fact.assigneesNext !== undefined;
+    const cut =
+        unresolved ||
+        fact.partial === true ||
+        fact.labelsNext !== undefined ||
+        fact.assigneesNext !== undefined;
     const closing = fact.closing.map((pr) => pr.ref);
     const base = {
         ref: fact.ref,
@@ -4845,6 +4957,13 @@ export function judgeIssue(
             url: fact.url,
             urgent: counted.some((one) => one.signal === "urgent"),
             signals: SIGNAL_ORDER.filter((signal) => counted.some((one) => one.signal === signal)),
+            names: SIGNAL_ORDER.filter((signal) =>
+                counted.some((one) => one.signal === signal),
+            ).map((signal) =>
+                signal === "assigned"
+                    ? "assigned"
+                    : `label ${signal === "urgent" ? config.urgent : config.label}`,
+            ),
             by: newest.actor,
             at: newest.at,
             latest: newest.signal,
@@ -4873,6 +4992,28 @@ export function parseIssueFacts(json: unknown): Record<QueueAlias, SearchPage> {
     const data = (json as { data?: unknown } | null | undefined)?.data;
     const root = (data ?? json) as Record<string, unknown> | null | undefined;
     const pages = {} as Record<QueueAlias, SearchPage>;
+    // An error under a search node makes that issue partial: its index in `nodes`, or every issue of the alias.
+    const errored = new Map<string, Set<number> | "all">();
+
+    for (const error of Array.isArray((json as { errors?: unknown } | null)?.errors)
+        ? ((json as { errors: unknown[] }).errors as unknown[])
+        : []) {
+        const path = (error as { path?: unknown } | null)?.path;
+
+        if (!Array.isArray(path) || typeof path[0] !== "string" || path.length < 2) {
+            continue;
+        }
+
+        const known = errored.get(path[0]);
+
+        if (path[1] === "nodes" && typeof path[2] === "number") {
+            if (known !== "all") {
+                errored.set(path[0], (known ?? new Set<number>()).add(path[2]));
+            }
+        } else {
+            errored.set(path[0], "all");
+        }
+    }
 
     for (const alias of ["labeled", "assigned"] as const) {
         const search = root?.[alias] as
@@ -4894,9 +5035,18 @@ export function parseIssueFacts(json: unknown): Record<QueueAlias, SearchPage> {
         pages[alias] = {
             ok: true,
             ...(typeof search.issueCount === "number" ? { total: search.issueCount } : {}),
-            facts: search.nodes
-                .map((one) => parseIssueNode(one))
-                .filter((fact): fact is IssueFact => fact !== undefined),
+            facts: search.nodes.flatMap((one, index) => {
+                const fact = parseIssueNode(one);
+                const bad = errored.get(alias);
+
+                return fact === undefined
+                    ? []
+                    : [
+                          bad === "all" || bad?.has(index) === true
+                              ? { ...fact, partial: true as const }
+                              : fact,
+                      ];
+            }),
             ...(search.pageInfo?.hasNextPage === true ? { next: cursor || "-" } : {}),
         };
     }
@@ -4938,16 +5088,20 @@ export function parseIssueNumbers(
     const root = (data ?? json) as Record<string, unknown> | null | undefined;
     const errors = (json as { errors?: unknown } | null | undefined)?.errors;
     const notFound = new Set<string>();
+    // An alias with any other error: its issue is partial, and proves nothing.
+    const errored = new Set<string>();
 
     for (const error of Array.isArray(errors) ? errors : []) {
         const path = (error as { path?: unknown; type?: unknown } | null)?.path;
 
-        if (
-            (error as { type?: unknown } | null)?.type === "NOT_FOUND" &&
-            Array.isArray(path) &&
-            typeof path[0] === "string"
-        ) {
+        if (!Array.isArray(path) || typeof path[0] !== "string") {
+            continue;
+        }
+
+        if ((error as { type?: unknown } | null)?.type === "NOT_FOUND" && path.length <= 2) {
             notFound.add(path[0]);
+        } else {
+            errored.add(path[0]);
         }
     }
 
@@ -4956,10 +5110,14 @@ export function parseIssueNumbers(
     for (const [index, read] of reads.entries()) {
         const alias = `n${String(index)}`;
         const node = root?.[alias] as { issue?: unknown } | null | undefined;
-        const fact = parseIssueNode(node?.issue);
+        const fact = parseIssueNode(node?.issue, {
+            labels: read.labelsAfter !== undefined,
+            assignees: read.assigneesAfter !== undefined,
+            timeline: read.eventsBefore !== undefined,
+        });
 
         if (fact !== undefined) {
-            facts[read.ref] = fact;
+            facts[read.ref] = errored.has(alias) ? { ...fact, partial: true } : fact;
         } else if (
             notFound.has(alias) &&
             !(
@@ -4989,6 +5147,7 @@ export function joinIssueFact(base: IssueFact, more: IssueFact, asked: IssueGap)
             ...rest,
             labels: [...new Set([...base.labels, ...more.labels])],
             ...(more.labelsNext === undefined ? {} : { labelsNext: more.labelsNext }),
+            ...(more.partial === true ? { partial: true as const } : {}),
         };
     }
 
@@ -4999,6 +5158,7 @@ export function joinIssueFact(base: IssueFact, more: IssueFact, asked: IssueGap)
             ...rest,
             assignees: [...new Set([...base.assignees, ...more.assignees])],
             ...(more.assigneesNext === undefined ? {} : { assigneesNext: more.assigneesNext }),
+            ...(more.partial === true ? { partial: true as const } : {}),
         };
     }
 
@@ -5008,6 +5168,7 @@ export function joinIssueFact(base: IssueFact, more: IssueFact, asked: IssueGap)
         ...rest,
         events: [...more.events, ...base.events],
         ...(more.eventsBefore === undefined ? {} : { eventsBefore: more.eventsBefore }),
+        ...(more.partial === true ? { partial: true as const } : {}),
     };
 }
 
@@ -5026,6 +5187,9 @@ export type QueueRead = {
     /** The stored refs whose by-number read failed: they stay, unverified. */
     unread: string[];
 };
+
+/** The error of a queue that is turned off: the page shows it as a short line, not as a failure. */
+export const QUEUE_OFF = "the queue read is off";
 
 /** What a merge of a read into the queue decided. */
 export type QueueMerge = {
@@ -5071,8 +5235,7 @@ export function mergeQueue(
                 ...base,
                 at: now,
                 ok: false,
-                error:
-                    read.off === true ? "the queue read is off" : (read.error ?? "unknown error"),
+                error: read.off === true ? QUEUE_OFF : (read.error ?? "unknown error"),
             },
             left: [],
             news: [],
@@ -5089,13 +5252,36 @@ export function mergeQueue(
     const take = (judged: JudgedIssue): QueuedIssue | undefined => {
         const old = carried.get(refKey(judged.ref));
 
-        return judged.item === undefined
-            ? undefined
-            : {
-                  ...judged.item,
-                  threads: old?.threads ?? [],
-                  ...(old?.partial === undefined ? {} : { partial: old.partial }),
-              };
+        if (judged.item === undefined) {
+            return undefined;
+        }
+
+        const fresh: QueuedIssue = {
+            ...judged.item,
+            threads: old?.threads ?? [],
+            ...(old?.partial === undefined ? {} : { partial: old.partial }),
+        };
+
+        // A cut read can lose a signal's event: the stored item keeps its counted signals (urgent too), unverified.
+        if (judged.cut && old !== undefined) {
+            const { names: _names, ...plain } = fresh;
+            const names =
+                old.names === undefined || fresh.names === undefined
+                    ? undefined
+                    : [...new Set([...fresh.names, ...old.names])];
+
+            return {
+                ...plain,
+                ...(names === undefined ? {} : { names }),
+                urgent: fresh.urgent || old.urgent,
+                signals: SIGNAL_ORDER.filter(
+                    (signal) => fresh.signals.includes(signal) || old.signals.includes(signal),
+                ),
+                unverified: true,
+            };
+        }
+
+        return fresh;
     };
 
     for (const judged of read.found) {
@@ -5115,7 +5301,9 @@ export function mergeQueue(
 
         // The search returned it with no counted signal, or did not return it: the by-number read is the proof.
         const judged = found.get(key) ?? read.checked[item.ref] ?? read.checked[key];
-        const unproven = judged === undefined || (judged.item === undefined && judged.cut);
+        // A closed issue is proof by its state; an open one with a cut read is not.
+        const unproven =
+            judged === undefined || (judged.item === undefined && judged.open && judged.cut);
 
         if (unproven) {
             items.push({ ...item, unverified: true });
@@ -5366,6 +5554,8 @@ export function planIssues(
     const partial = issuePartialOf(thread);
     const pinned = (ref: string): PinnedIssue | undefined =>
         Object.values(github.issues ?? {}).find((each) => refKey(each.ref) === refKey(ref));
+    // Why an ask about a still-open issue is no longer needed, by its key: the desk resolves it, Brian does not.
+    const ended = new Map<string, string>();
 
     for (const ref of refs) {
         const fact = pinned(ref);
@@ -5380,6 +5570,12 @@ export function planIssues(
         }
 
         if (status === "CLOSED") {
+            for (const ask of thread.asks) {
+                if (ask.key?.startsWith(`issue-open:${ref}:`) === true) {
+                    ended.set(ask.key, `${ref} closed`);
+                }
+            }
+
             if (
                 addEvent(
                     thread,
@@ -5399,15 +5595,17 @@ export function planIssues(
                 continue;
             }
 
+            const key = issueOpenKey(ref, pr);
+
             if (partial.some((each) => refKey(each.issue) === refKey(ref) && each.pr === pr)) {
+                ended.set(key, `${prWords(pr, ref)} was part of ${ref}`);
                 continue;
             }
 
-            const key = issueOpenKey(ref, pr);
             const answer = thread.asks.find((ask) => ask.key === key)?.answer;
             const read = github.prs[pr];
             const how =
-                answer !== undefined && answer.words === OPEN_IS_RIGHT
+                answer !== undefined && acceptsOpen(answer.words)
                     ? "brian"
                     : read !== undefined && partialVerified(read, ref)
                       ? "verified"
@@ -5415,6 +5613,7 @@ export function planIssues(
 
             if (how !== undefined) {
                 partial.push({ issue: ref, pr, how });
+                ended.set(key, `${prWords(pr, ref)} was part of ${ref}`);
 
                 if (
                     addEvent(
@@ -5448,6 +5647,30 @@ export function planIssues(
                 supervisor: thread.supervisor ?? 0,
                 at: now,
             });
+        }
+    }
+
+    // An unanswered ask whose warning is gone: the desk ends it, with the reason. It never sets Brian's `answer`.
+    for (const ask of thread.asks) {
+        if (
+            ask.key?.startsWith("issue-open:") === true &&
+            askIsOpen(ask) &&
+            !warnings.some((each) => issueOpenKey(each.issue, each.pr) === ask.key)
+        ) {
+            const why = ended.get(ask.key) ?? "the warning ended";
+
+            ask.resolved = { at: now, why };
+
+            if (
+                addEvent(
+                    thread,
+                    `ask-resolved:${ask.id}`,
+                    `${ask.id} resolved by the desk: ${why}`,
+                    now,
+                )
+            ) {
+                events += 1;
+            }
         }
     }
 
@@ -5590,11 +5813,13 @@ export function issuesSummary(state: Readonly<DeskState> | undefined): string | 
     return `Brian queued ${counted(items.length, "issue")}${urgent === 0 ? "" : ` (${String(urgent)} urgent)`}: desk issues`;
 }
 
-/** The signal words of an item's last act: `label by bketelsen 2026-10-24`. */
-function signalWords(item: QueuedIssue): string {
-    const how = item.latest === "assigned" ? "assigned" : "label";
+/** Every counted signal of an item, in words. An item stored before `names` has its signal kinds. */
+export const signalNames = (item: Pick<QueuedIssue, "names" | "signals">): string[] =>
+    item.names !== undefined && item.names.length > 0 ? [...item.names] : [...item.signals];
 
-    return `${how} by ${item.by} ${iso(item.at).slice(0, 10)}`;
+/** The signal words of an item: all of its signals, and the newest act: `label agent-queue, assigned by bketelsen 2026-10-24`. */
+function signalWords(item: QueuedIssue): string {
+    return `${signalNames(item).join(", ")} by ${item.by} ${iso(item.at).slice(0, 10)}`;
 }
 
 /** The "Not counted" line, or nothing. */
@@ -5622,7 +5847,9 @@ export function issuesText(
     const urgent = items.filter((item) => item.urgent).length;
     const when = queue.ok
         ? `read ${clock(queue.at)}`
-        : `queue read failed at ${clock(queue.at)}: ${queue.error ?? "unknown error"}`;
+        : queue.error === QUEUE_OFF
+          ? "queue read is off"
+          : `queue read failed at ${clock(queue.at)}: ${queue.error ?? "unknown error"}`;
     const header =
         items.length === 0
             ? `No issues queued by Brian (${when}).`
@@ -5666,6 +5893,8 @@ export type IssuesView = {
     at: number;
     ok: boolean;
     error?: string;
+    /** The queue read is turned off: not a failure. */
+    off?: true;
     incomplete?: string[];
     items: {
         ref: string;
@@ -5675,6 +5904,8 @@ export type IssuesView = {
         agent?: string;
         owners?: string[];
         signal: "label" | "assigned";
+        /** Every counted signal in words: Brian removes all of them to take the issue out. */
+        names: string[];
         by: string;
         at: number;
         threads: { id: string; word: string }[];
@@ -5697,6 +5928,7 @@ export function issuesView(state: Readonly<DeskState> | undefined, now: number):
         at: queue.at,
         ok: queue.ok,
         ...(queue.error === undefined ? {} : { error: queue.error }),
+        ...(!queue.ok && queue.error === QUEUE_OFF ? { off: true as const } : {}),
         ...(queue.incomplete === undefined ? {} : { incomplete: [...queue.incomplete] }),
         items: queuedInOrder(state).map((item) => ({
             ref: item.ref,
@@ -5706,6 +5938,7 @@ export function issuesView(state: Readonly<DeskState> | undefined, now: number):
             ...(item.agent === undefined ? {} : { agent: item.agent }),
             ...(item.owners === undefined ? {} : { owners: [...item.owners] }),
             signal: item.latest === "assigned" ? "assigned" : "label",
+            names: signalNames(item),
             by: item.by,
             at: item.at,
             threads: item.threads
@@ -6348,9 +6581,11 @@ function threadFile(
     } else {
         for (const ask of thread.asks) {
             lines.push(
-                ask.answer === undefined
-                    ? `- ${ask.id} · open · ${md(ask.text)}${ask.options === undefined ? "" : ` [${ask.options.map(md).join(" | ")}]`}`
-                    : `- ${ask.id} · answered by ${md(ask.answer.by)} · ${iso(ask.answer.at)} · ${md(ask.answer.words)}`,
+                ask.answer === undefined && ask.resolved !== undefined
+                    ? `- ${ask.id} · resolved by the desk · ${iso(ask.resolved.at)} · ${md(ask.resolved.why)} · ${md(ask.text)}`
+                    : ask.answer === undefined
+                      ? `- ${ask.id} · open · ${md(ask.text)}${ask.options === undefined ? "" : ` [${ask.options.map(md).join(" | ")}]`}`
+                      : `- ${ask.id} · answered by ${md(ask.answer.by)} · ${iso(ask.answer.at)} · ${md(ask.answer.words)}`,
             );
         }
     }
@@ -6443,7 +6678,7 @@ export function exportFiles(
                 );
             }
 
-            for (const ask of thread.asks.filter((each) => each.answer === undefined)) {
+            for (const ask of thread.asks.filter((each) => askIsOpen(each))) {
                 lines.push(
                     `  - ${ask.id}: ${md(ask.text)}${ask.options === undefined ? "" : ` [${ask.options.map(md).join(" | ")}]`}`,
                 );
@@ -6494,6 +6729,8 @@ export type ThreadView = {
     asks: { id: string; text: string; at: number }[];
     /** Answered asks, with the words that were recorded. */
     answered: { id: string; text: string; by: string; at: number; words: string }[];
+    /** Asks that the desk resolved itself, with the reason: they need no answer. */
+    resolved: { id: string; text: string; at: number; why: string }[];
     lastEventAt: number;
     events: { at: number; text: string }[];
     supervisor?: number;
@@ -6567,7 +6804,7 @@ export function threadView(
             ...(pr.ready === undefined ? {} : { ready: true }),
         })),
         asks: thread.asks
-            .filter((ask) => ask.answer === undefined)
+            .filter((ask) => askIsOpen(ask))
             .map((ask) => ({
                 id: ask.id,
                 text: ask.text,
@@ -6582,6 +6819,14 @@ export function threadView(
                 by: ask.answer!.by,
                 at: ask.answer!.at,
                 words: ask.answer!.words,
+            })),
+        resolved: thread.asks
+            .filter((ask) => ask.answer === undefined && ask.resolved !== undefined)
+            .map((ask) => ({
+                id: ask.id,
+                text: ask.text,
+                at: ask.resolved!.at,
+                why: ask.resolved!.why,
             })),
         lastEventAt: thread.lastEventAt,
         events: thread.events.slice(-SHOWN_EVENTS).map((event) => ({
@@ -6752,9 +6997,7 @@ export function listText(state: Readonly<DeskState> | undefined, now = Date.now(
             .filter((thread) => !asleep(thread, now))
             .map((thread) => {
                 const prs = Object.keys(thread.prs).length;
-                const asks = thread.asks
-                    .filter((ask) => ask.answer === undefined)
-                    .map((ask) => ask.id);
+                const asks = thread.asks.filter((ask) => askIsOpen(ask)).map((ask) => ask.id);
 
                 return [
                     thread.id,
@@ -6820,7 +7063,7 @@ export function readText(state: Readonly<DeskState> | undefined, id: string): st
             : `Asks:\n${thread.asks
                   .map(
                       (ask) =>
-                          `  ${ask.id} · ${ask.answer === undefined ? "open" : `answered by ${ask.answer.by}: "${ask.answer.words}"`} · ${ask.text}${ask.options === undefined ? "" : ` [${ask.options.join(" | ")}]`}`,
+                          `  ${ask.id} · ${ask.answer !== undefined ? `answered by ${ask.answer.by}: "${ask.answer.words}"` : ask.resolved !== undefined ? `resolved by the desk: ${ask.resolved.why}` : "open"} · ${ask.text}${ask.options === undefined ? "" : ` [${ask.options.join(" | ")}]`}`,
                   )
                   .join("\n")}`,
         events.length === 0
@@ -7935,7 +8178,27 @@ export default function createDesk(host: Host, web: Web) {
                     if (/^p[0-9]+$/.test(alias)) {
                         const ref = pinned[Number(alias.slice(1))];
 
-                        if (ref !== undefined && !missing.includes(ref)) {
+                        if (ref === undefined) {
+                            continue;
+                        }
+
+                        // An error under the PR's own fields (`body`, `closingIssuesReferences`) is not a missing PR:
+                        // the PR keeps its facts, and its detail is left out, so a partial class is unknown.
+                        const inside = Array.isArray(path) ? path.slice(1) : [];
+                        const notFound = (entry as { type?: unknown } | null)?.type === "NOT_FOUND";
+                        const fact = Object.values(facts.prs).find(
+                            (pr) => pr.ref.toLowerCase() === ref.toLowerCase(),
+                        );
+                        const detail =
+                            !notFound &&
+                            inside[0] === "pullRequest" &&
+                            inside.length > 1 &&
+                            fact !== undefined;
+
+                        if (detail) {
+                            delete fact.body;
+                            delete fact.closing;
+                        } else if (!missing.includes(ref)) {
                             missing.push(ref);
                         }
                     } else if (/^r[0-9]+$/.test(alias)) {
@@ -10749,7 +11012,10 @@ export default function createDesk(host: Host, web: Web) {
                             {
                                 key: `answer:${result.id}`,
                                 thread: found.thread.id,
-                                kind: answerKind(words),
+                                kind:
+                                    found === undefined
+                                        ? answerKind(words)
+                                        : askAnswerKind(found.ask, words),
                                 line,
                                 at: now,
                             },
@@ -10980,6 +11246,7 @@ export default function createDesk(host: Host, web: Web) {
                     const filed = Object.values(state?.threads ?? {}).some((thread) =>
                         thread.asks.some(
                             (ask) =>
+                                ask.by !== "desk" &&
                                 ask.at >= turnStart &&
                                 (ask.session !== undefined
                                     ? ask.session === session

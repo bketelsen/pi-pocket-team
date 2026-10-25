@@ -35,6 +35,9 @@ import { fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi
 import { defineDoc, type ConversationId, LiveDoc, type TaskId } from "@earendil-works/pi-durable";
 import { SubagentsDoc } from "./_pocket/src/server/docs.ts";
 import {
+    acceptsOpen,
+    askAnswerKind,
+    askIsOpen,
     bindThread,
     DeskReports,
     DeskThreads,
@@ -157,6 +160,7 @@ import {
     planIssues,
     queueConfig,
     queuedRefsIn,
+    signalNames,
     relinkIssues,
     repoOf,
     rosterOwners,
@@ -4878,18 +4882,11 @@ describe("the digest's rules", () => {
             "got it",
             "done",
             "answered on the Desk page",
-            "Open is right",
         ]) {
             assert.equal(answerKind(words), "answer", words);
         }
 
-        for (const words of [
-            "merge it",
-            "yes, merge it",
-            "ok but wait for CI",
-            "Needs a fix",
-            "",
-        ]) {
+        for (const words of ["merge it", "yes, merge it", "ok but wait for CI", ""]) {
             assert.equal(answerKind(words), "answer-action", words);
         }
     });
@@ -6062,6 +6059,8 @@ type IssuePatch = {
     labels?: string[];
     assignees?: string[];
     events?: object[];
+    /** The true number of labels, when it is above the page's. */
+    labelsTotal?: number;
     /** More labels than the answer holds, and the cursor of the next page. */
     labelsNext?: string;
     assigneesNext?: string;
@@ -6080,7 +6079,7 @@ const issueNode = (number: number, patch: IssuePatch = {}) => ({
     state: patch.state ?? "OPEN",
     repository: { nameWithOwner: patch.repo ?? "frostyard/snosi", isArchived: false },
     labels: {
-        totalCount: (patch.labels ?? []).length,
+        totalCount: patch.labelsTotal ?? (patch.labels ?? []).length,
         pageInfo: {
             hasNextPage: patch.labelsNext !== undefined,
             endCursor: patch.labelsNext ?? null,
@@ -6554,10 +6553,11 @@ describe("the signal rules", () => {
         assert.equal(judgeIssue(still, QUEUE, ROSTER).cut, true);
     });
 
-    test("more than 100 labels: the rest are read by number, and a signal among them counts", () => {
+    test("a second page of labels joins the first, and a signal on it counts (the page join)", () => {
         const fact = parseIssueNode(
             issueNode(8, {
                 labels: ["l1", "l2"],
+                labelsTotal: 150,
                 labelsNext: "Q3Vyc29y",
                 // The newest events are in the first read: the urgent label is on the second page of labels.
                 events: [labelEvent("agent-urgent", "bketelsen", at(3))],
@@ -6567,11 +6567,14 @@ describe("the signal rules", () => {
         assert.deepEqual(issueGaps(fact, QUEUE), ["labels"]);
         assert.equal(judgeIssue(fact, QUEUE, ROSTER).cut, true);
 
+        // The next page: `totalCount` is for the whole list, and the read says it continues a cursor.
         const rest = parseIssueNode(
             issueNode(8, {
                 labels: ["agent-urgent"],
+                labelsTotal: 150,
                 events: [labelEvent("agent-urgent", "bketelsen", at(3))],
             }),
+            { labels: true },
         )!;
         const whole = joinIssueFact(fact, rest, "labels");
 
@@ -6787,13 +6790,34 @@ describe("mergeQueue", () => {
         assert.equal(calm.queue.urgentSeen["frostyard/snosi#5"], undefined);
         assert.equal(calm.queue.seen["frostyard/snosi#5"], ms(6));
 
-        // Made urgent a second time: it tells again.
-        const again = mergeQueue(calm.queue, readOf([promoted]), ms(40))!;
+        // Made urgent a second time, with a newer LabeledEvent: it tells again, with another time and another key.
+        const promotedAgain = judged(
+            issueNode(5, {
+                labels: ["agent-queue", "agent-urgent"],
+                events: [
+                    labelEvent("agent-queue", "bketelsen", at(1)),
+                    labelEvent("agent-urgent", "bketelsen", at(9)),
+                ],
+            }),
+        );
+        const again = mergeQueue(calm.queue, readOf([promotedAgain]), ms(40))!;
 
         assert.deepEqual(
             again.news.map((news) => news.kind),
             ["issue-urgent"],
         );
+
+        const keyOf = (merge: typeof next) =>
+            `issue-urgent:${merge.news[0]!.item.ref}:${String(merge.news[0]!.item.at)}`;
+
+        assert.equal(next.news[0]?.item.at, ms(6));
+        assert.equal(again.news[0]?.item.at, ms(9));
+        assert.notEqual(
+            keyOf(again),
+            keyOf(next),
+            "a replay of the first key adds nothing; this one is new",
+        );
+        assert.equal(again.queue.urgentSeen["frostyard/snosi#5"], ms(9));
     });
 
     test("a dequeue and a second queueing: each kind goes again, with a new key", () => {
@@ -6992,6 +7016,515 @@ describe("mergeQueue", () => {
 
         assert.deepEqual(next.queue.items[0]?.threads, ["T40"]);
         assert.deepEqual(next.queue.items[0]?.partial, [{ pr: "frostyard/snosi#9", how: "brian" }]);
+    });
+});
+
+describe("a partial answer never proves a removal", () => {
+    /** An issue node that GitHub answered in part: 1 connection is null, missing, or short. */
+    const without = (key: string, patch: IssuePatch = {}) => ({
+        ...queuedNode(21, { repo: "frostyard/test", ...patch }),
+        [key]: null,
+    });
+
+    const keepOf = (node: object) => {
+        const first = mergeQueue(
+            undefined,
+            readOf([judged(queuedNode(21, { repo: "frostyard/test" }))]),
+            ms(10),
+        )!;
+        const fact = parseIssueNode(node)!;
+        const next = mergeQueue(first.queue, readOf([judgeIssue(fact, QUEUE, ROSTER)]), ms(20))!;
+
+        return { first, fact, next };
+    };
+
+    test("a missing or null connection makes the fact partial, and the judge says cut", () => {
+        for (const key of ["labels", "assignees", "timelineItems"]) {
+            const fact = parseIssueNode(without(key))!;
+
+            assert.equal(fact.partial, true, key);
+            assert.equal(judgeIssue(fact, QUEUE, ROSTER).cut, true, key);
+        }
+
+        const noNodes = {
+            ...queuedNode(21),
+            labels: { totalCount: 1, pageInfo: { hasNextPage: false } },
+        };
+        const missing = { ...queuedNode(21) } as Record<string, unknown>;
+
+        delete missing.assignees;
+
+        assert.equal(parseIssueNode(noNodes)!.partial, true, "no nodes array");
+        assert.equal(parseIssueNode(missing)!.partial, true, "a missing key");
+        assert.equal(
+            parseIssueNode({ ...queuedNode(21), state: undefined })!.partial,
+            true,
+            "no state",
+        );
+        assert.equal(
+            parseIssueNode(queuedNode(21))!.partial,
+            undefined,
+            "a whole answer is not partial",
+        );
+    });
+
+    test("a count above the nodes read, with no next page, is partial; with a next page it is a gap", () => {
+        const short = parseIssueNode(issueNode(22, { labels: ["a"], labelsTotal: 3 }))!;
+
+        assert.equal(short.partial, true);
+
+        const paged = parseIssueNode(
+            issueNode(22, { labels: ["a"], labelsTotal: 3, labelsNext: "Q3Vyc29y" }),
+        )!;
+
+        assert.equal(paged.partial, undefined);
+        assert.deepEqual(issueGaps(paged, QUEUE), ["labels"]);
+
+        const events = {
+            ...issueNode(22),
+            timelineItems: { totalCount: 4, pageInfo: { hasPreviousPage: false }, nodes: [] },
+        };
+
+        assert.equal(parseIssueNode(events)!.partial, true, "4 events, 0 read, none before");
+        assert.equal(
+            parseIssueNode({
+                ...events,
+                timelineItems: {
+                    ...events.timelineItems,
+                    pageInfo: { hasPreviousPage: true, startCursor: "Q1VS" },
+                },
+            })!.partial,
+            undefined,
+        );
+    });
+
+    test("an error under a search node makes that issue partial; another node of the answer stays whole", () => {
+        const json = {
+            data: {
+                labeled: searchPage([queuedNode(31), queuedNode(32)]),
+                assigned: searchPage([]),
+            },
+            errors: [{ path: ["labeled", "nodes", 0, "labels"], message: "boom" }],
+        };
+        const pages = parseIssueFacts(json);
+
+        assert.equal(pages.labeled.facts[0]?.partial, true);
+        assert.equal(pages.labeled.facts[1]?.partial, undefined);
+
+        // A null node leaves the index where it was: the error of node 1 is for the second issue.
+        const shifted = parseIssueFacts({
+            data: {
+                labeled: searchPage([null as unknown as object, queuedNode(32)]),
+                assigned: searchPage([]),
+            },
+            errors: [{ path: ["labeled", "nodes", 1, "timelineItems"], message: "boom" }],
+        });
+
+        assert.equal(shifted.labeled.facts[0]?.partial, true);
+
+        // An error under the alias but not under a node: every issue of that alias is partial.
+        const all = parseIssueFacts({
+            data: {
+                labeled: searchPage([queuedNode(31), queuedNode(32)]),
+                assigned: searchPage([queuedNode(33)]),
+            },
+            errors: [{ path: ["labeled", "pageInfo"], message: "boom" }],
+        });
+
+        assert.deepEqual(
+            all.labeled.facts.map((fact) => fact.partial),
+            [true, true],
+        );
+        assert.equal(all.assigned.facts[0]?.partial, undefined);
+    });
+
+    test("a by-number alias with an error is partial; NOT_FOUND on it is gone; a continued page skips the count", () => {
+        const reads = [{ ref: "frostyard/snosi#41" }, { ref: "frostyard/snosi#42" }];
+        const facts = parseIssueNumbers(
+            {
+                data: {
+                    n0: { nameWithOwner: "frostyard/snosi", issue: queuedNode(41) },
+                    n1: { nameWithOwner: "frostyard/snosi", issue: null },
+                },
+                errors: [
+                    { path: ["n0", "issue", "labels"], message: "boom" },
+                    { type: "NOT_FOUND", path: ["n1", "issue"], message: "no" },
+                ],
+            },
+            reads,
+        );
+
+        assert.equal((facts["frostyard/snosi#41"] as { partial?: true }).partial, true);
+        assert.equal(facts["frostyard/snosi#42"], "gone");
+
+        const page = parseIssueNumbers(
+            {
+                data: {
+                    n0: {
+                        nameWithOwner: "frostyard/snosi",
+                        issue: issueNode(41, { labels: ["z"], labelsTotal: 150 }),
+                    },
+                },
+            },
+            [{ ref: "frostyard/snosi#41", labelsAfter: "Q3Vyc29y" }],
+        );
+
+        assert.equal((page["frostyard/snosi#41"] as { partial?: true }).partial, undefined);
+    });
+
+    test("a page join keeps the cut when the continued page lost its part", () => {
+        const base = parseIssueNode(
+            issueNode(43, { labels: ["a"], labelsTotal: 9, labelsNext: "Q3Vyc29y" }),
+        )!;
+        const lost = parseIssueNode({ ...issueNode(43), labels: null }, { labels: true })!;
+        const joined = joinIssueFact(base, lost, "labels");
+
+        assert.equal(joined.partial, true);
+        assert.equal(judgeIssue(joined, QUEUE, ROSTER).cut, true);
+    });
+
+    test("a partial answer that keeps the issue but loses its labels keeps the stored item, unverified", () => {
+        for (const key of ["labels", "assignees", "timelineItems"]) {
+            const { first, next } = keepOf(without(key));
+
+            assert.equal(next.queue.items.length, 1, key);
+            assert.equal(next.queue.items[0]?.unverified, true, key);
+            assert.deepEqual(next.left, [], `${key}: no removal`);
+            assert.deepEqual(next.news, []);
+            assert.deepEqual(next.queue.seen, first.queue.seen, "seen stays");
+        }
+    });
+
+    test("a closed issue is proof by its state even when its labels are missing", () => {
+        const { next } = keepOf({ ...without("labels"), state: "CLOSED" });
+
+        assert.equal(next.left.length, 1);
+        assert.equal(next.left[0]?.closed, true);
+    });
+
+    test("a count above the nodes read keeps the stored item too", () => {
+        const { next } = keepOf(
+            issueNode(21, { repo: "frostyard/test", labels: ["x"], labelsTotal: 4 }),
+        );
+
+        assert.equal(next.queue.items[0]?.unverified, true);
+        assert.deepEqual(next.left, []);
+    });
+});
+
+describe("a cut read keeps the counted signals of a stored item", () => {
+    const urgentRead = () =>
+        judged(
+            issueNode(51, {
+                labels: ["agent-queue", "agent-urgent"],
+                events: [
+                    labelEvent("agent-queue", "bketelsen", at(1)),
+                    labelEvent("agent-urgent", "bketelsen", at(4)),
+                ],
+            }),
+        );
+
+    test("an urgent item read again cut, with its urgent event not found, stays urgent and sends no second promotion", () => {
+        const first = mergeQueue(undefined, readOf([urgentRead()]), ms(10))!;
+
+        assert.equal(first.queue.items[0]?.urgent, true);
+        assert.equal(first.queue.urgentSeen["frostyard/snosi#51"], ms(4));
+
+        // Both labels are there, but the newest 50 events hold only the queue label: the urgent event is cut off.
+        const cut = judged(
+            issueNode(51, {
+                labels: ["agent-queue", "agent-urgent"],
+                before: "Y3Vyc29yOjUw",
+                events: [labelEvent("agent-queue", "bketelsen", at(1))],
+            }),
+        );
+
+        assert.equal(cut.item?.urgent, false, "this read alone cannot tell");
+        assert.equal(cut.cut, true);
+
+        const kept = mergeQueue(first.queue, readOf([cut]), ms(20))!;
+        const item = kept.queue.items[0]!;
+
+        assert.equal(item.urgent, true, "the stored urgent status stays");
+        assert.deepEqual(item.signals, ["queue", "urgent"], "the union of the signals");
+        assert.equal(item.unverified, true);
+        assert.deepEqual(kept.queue.urgentSeen, first.queue.urgentSeen);
+        assert.deepEqual(kept.queue.seen, first.queue.seen);
+        assert.deepEqual(kept.news, []);
+        assert.deepEqual(kept.left, []);
+
+        // A complete read: the mark goes, and no second promotion is sent.
+        const whole = mergeQueue(kept.queue, readOf([urgentRead()]), ms(30))!;
+
+        assert.equal(whole.queue.items[0]?.unverified, undefined);
+        assert.equal(whole.queue.items[0]?.urgent, true);
+        assert.deepEqual(whole.news, []);
+        assert.deepEqual(whole.queue.urgentSeen, first.queue.urgentSeen);
+    });
+
+    test("an old stored item with no names keeps its signal kinds through a cut read", () => {
+        const old = stored("frostyard/snosi#51", { urgent: true, signals: ["queue", "urgent"] });
+        const cut = judged(
+            issueNode(51, {
+                labels: ["agent-queue", "agent-urgent"],
+                before: "Y3Vyc29yOjUw",
+                events: [labelEvent("agent-queue", "bketelsen", at(1))],
+            }),
+        );
+        const kept = mergeQueue(queueOf([old]), readOf([cut]), ms(20))!.queue.items[0]!;
+
+        assert.equal(kept.urgent, true);
+        assert.equal(kept.names, undefined, "the fallback is the signal kinds");
+        assert.deepEqual(signalNames(kept), ["queue", "urgent"]);
+    });
+});
+
+describe("the names of the counted signals", () => {
+    test("every counted signal is named from the config, in a fixed order", () => {
+        const one = judged(
+            issueNode(61, {
+                labels: ["agent-queue", "agent-urgent"],
+                assignees: ["frostyard-machines"],
+                events: [
+                    assignEvent("frostyard-machines", "bketelsen", at(1)),
+                    labelEvent("agent-urgent", "bketelsen", at(2)),
+                    labelEvent("agent-queue", "bketelsen", at(3)),
+                ],
+            }),
+        );
+
+        assert.deepEqual(one.item?.names, ["label agent-queue", "label agent-urgent", "assigned"]);
+
+        const custom = judged(
+            issueNode(61, { labels: ["q"], events: [labelEvent("q", "brian", at(1))] }),
+            queueConfig({ label: "q", urgent: "u", by: ["brian"] }, ["frostyard"]),
+        );
+
+        assert.deepEqual(custom.item?.names, ["label q"]);
+    });
+
+    test("a signal that does not count is not named", () => {
+        const one = judged(
+            issueNode(62, {
+                labels: ["agent-queue", "agent-urgent"],
+                events: [
+                    labelEvent("agent-queue", "bketelsen", at(1)),
+                    labelEvent("agent-urgent", "a-stranger", at(2)),
+                ],
+            }),
+        );
+
+        assert.deepEqual(one.item?.names, ["label agent-queue"]);
+    });
+
+    test("the text and the view name all of them, and an old item falls back to its kinds", () => {
+        const desk = deskOf();
+
+        desk.issues = queueOf([
+            stored("frostyard/snosi#1", {
+                signals: ["queue", "assigned"],
+                names: ["label agent-queue", "assigned"],
+                at: ms(30),
+            }),
+            stored("frostyard/snosi#2", { signals: ["queue", "urgent"], urgent: true, at: ms(31) }),
+        ]);
+
+        const lines = issuesText(desk, ms(40)).split("\n");
+
+        assert.match(lines[2] ?? "", /label agent-queue, assigned by bketelsen 2026-10-25/);
+        assert.match(lines[1] ?? "", /queue, urgent by bketelsen/, "no names: the signal kinds");
+
+        const view = issuesView(desk, ms(40))!;
+
+        assert.deepEqual(view.items.find((item) => item.ref.endsWith("#1"))?.names, [
+            "label agent-queue",
+            "assigned",
+        ]);
+        assert.deepEqual(view.items.find((item) => item.ref.endsWith("#2"))?.names, [
+            "queue",
+            "urgent",
+        ]);
+    });
+
+    test("a queue that is turned off is not a failure in the text or the view", () => {
+        const off = mergeQueue(
+            queueOf([stored("a/b#1")]),
+            { off: true, found: [], checked: {}, unread: [] },
+            ms(5),
+        )!;
+        const desk = deskOf();
+
+        desk.issues = off.queue;
+        assert.match(issuesText(desk, 1), /\(queue read is off\)/);
+        assert.doesNotMatch(issuesText(desk, 1), /failed/);
+        assert.equal(issuesView(desk, 1)?.off, true);
+
+        desk.issues = { ...off.queue, error: "exit code 1: HTTP 502" };
+        assert.equal(issuesView(desk, 1)?.off, undefined);
+    });
+});
+
+describe("the acceptance rule", () => {
+    test("only the exact option Open is right accepts a still-open issue", () => {
+        assert.equal(acceptsOpen("Open is right"), true);
+        assert.equal(acceptsOpen("  Open   is right "), true, "the words are 1 line, trimmed");
+
+        for (const words of [
+            "open is right",
+            "open is right!",
+            "Open is right.",
+            "Open is right, I think",
+            "yes",
+            "ok",
+            "",
+            "Needs a fix",
+        ]) {
+            assert.equal(acceptsOpen(words), false, words);
+        }
+    });
+
+    test("an ask about a still-open issue has 1 rule for its digest kind; any other ask keeps answerKind", () => {
+        const ask = { key: "issue-open:frostyard/snosi#1123:frostyard/snosi#1130" };
+
+        assert.equal(askAnswerKind(ask, "Open is right"), "answer");
+
+        for (const words of [
+            "open is right!",
+            "open is right",
+            "ok",
+            "thanks",
+            "Needs a fix",
+            "merge it",
+        ]) {
+            assert.equal(askAnswerKind(ask, words), "answer-action", words);
+        }
+
+        assert.equal(askAnswerKind({}, "ok"), "answer");
+        assert.equal(askAnswerKind({ key: "x.desk.ask:1:2" }, "Open is right"), "answer-action");
+        assert.equal(
+            answerKind("open is right"),
+            "answer-action",
+            "the general list has no such words",
+        );
+    });
+
+    test("a near match keeps the warning, and only the exact text is stored as Brian's acceptance", () => {
+        const state = deskOf();
+        const target = placed(state, 100);
+
+        target.run.archived = true;
+        target.prs["frostyard/snosi#1130"] = { via: "seen", state: "MERGED" };
+        state.issues = queueOf([stored("frostyard/snosi#1123")]);
+        linkIssue(state, target, "frostyard/snosi#1123", 100);
+
+        const github: GitHubFacts = {
+            viewer: "v",
+            repos: {},
+            prs: {},
+            issues: {
+                "frostyard/snosi#1123": {
+                    ref: "frostyard/snosi#1123",
+                    state: "OPEN",
+                    closedBy: [],
+                },
+            },
+        };
+
+        planIssues(state, target, github, 500);
+        answerAsk(state, target.asks[0]!.id, { at: 600, by: "Brian", words: "open is right!" });
+        planIssues(state, target, github, 700);
+        assert.equal(issueOpenOf(target).length, 1);
+        assert.equal(issuePartialOf(target).length, 0);
+    });
+});
+
+describe("merging a thread carries its issues", () => {
+    const REF = "frostyard/snosi#1123";
+    const PR = "frostyard/snosi#1130";
+    const open: GitHubFacts = {
+        viewer: "v",
+        repos: {},
+        prs: {},
+        issues: { [REF]: { ref: REF, state: "OPEN", closedBy: [] } },
+    };
+
+    test("T1 with a queued issue and an open PR is merged into T2: the merge of the PR then warns T2, and T2 stays open", () => {
+        const state = deskOf();
+        const first = placed(state, 100);
+        const second = placed(state, 200);
+
+        state.issues = queueOf([stored(REF)]);
+        linkIssue(state, first, REF, 100);
+        first.prs[PR] = { via: "seen", state: "OPEN" };
+        first.run.issuePartial = [
+            { issue: "frostyard/snosi#9", pr: "frostyard/snosi#10", how: "brian" },
+        ];
+        // Both sessions are archived: only the issue can keep T2 open.
+        first.run.archived = true;
+        second.run.archived = true;
+
+        const result = attachTo(state, first.id, second.id, 300);
+
+        assert("text" in result);
+        assert.deepEqual(second.issues, [REF], "the issue moved");
+        assert.equal(first.issues, undefined);
+        assert.equal(first.run.issuePartial, undefined);
+        assert.deepEqual(issuePartialOf(second), [
+            { issue: "frostyard/snosi#9", pr: "frostyard/snosi#10", how: "brian" },
+        ]);
+        assert.deepEqual(state.issues?.items[0]?.threads, [second.id], "relinked in the same call");
+        assert.equal(second.prs[PR]?.via, "seen");
+
+        // The PR merges while the issue stays open: T2 warns, files 1 ask, and does not close.
+        second.prs[PR]!.state = "MERGED";
+        planIssues(state, second, open, 400);
+        planIssues(state, second, open, 500);
+
+        assert.deepEqual(issueOpenOf(second), [{ issue: REF, pr: PR }]);
+        assert.equal(second.asks.length, 1);
+        assert.equal(closeCheck(second, facts_(1000)).close, false);
+        assert.match(
+            closeCheck(second, facts_(1000)).open.join(";"),
+            /still open after #1130 merged/,
+        );
+        assert.equal(first.state, "closed");
+    });
+
+    test("the ask history moves too: Brian's answer and the desk's resolution are not lost", () => {
+        const state = deskOf();
+        const first = placed(state, 100);
+        const second = placed(state, 200);
+
+        state.issues = queueOf([stored(REF)]);
+        linkIssue(state, first, REF, 100);
+        first.prs[PR] = { via: "seen", state: "MERGED" };
+        first.run.archived = true;
+        planIssues(state, first, open, 300);
+        answerAsk(state, first.asks[0]!.id, { at: 350, by: "Brian", words: "Open is right" });
+        second.asks.push({ id: `${second.id}a`, text: "Other", at: 1, key: "other" });
+
+        attachTo(state, first.id, second.id, 400);
+
+        const moved = second.asks.find((ask) => ask.key === `issue-open:${REF}:${PR}`);
+
+        assert.equal(moved?.id, `${second.id}b`, "a new id on the target");
+        assert.equal(moved?.answer?.words, "Open is right");
+        assert.equal(first.asks.length, 0);
+        // On the target the acceptance holds, and no second ask is filed.
+        second.run.archived = true;
+        planIssues(state, second, open, 500);
+        assert.deepEqual(issueOpenOf(second), []);
+        assert.equal(second.asks.filter((ask) => ask.key?.startsWith("issue-open:")).length, 1);
+    });
+
+    test("merging a thread with no issue changes nothing about issues", () => {
+        const state = deskOf();
+        const first = placed(state, 100);
+        const second = placed(state, 200);
+
+        attachTo(state, first.id, second.id, 300);
+        assert.equal(second.issues, undefined);
+        assert.equal(second.run.issuePartial, undefined);
     });
 });
 
@@ -7343,11 +7876,12 @@ describe("still open after merge", () => {
         assert.deepEqual(issueOpenOf(target), []);
     });
 
-    test("the issue closed: 1 event, no warning, and the thread may close", () => {
+    test("the issue closed: 1 event, no warning, the ask is resolved by the desk, and the thread closes", () => {
         const { state, target } = merged();
 
         planIssues(state, target, facts(undefined), 500);
         assert.equal(issueOpenOf(target).length, 1);
+        assert.equal(nextActor(target), "brian", "the ask waits on Brian first");
 
         const closed: PinnedIssue = { ref: REF, state: "CLOSED", closedBy: [PR] };
 
@@ -7357,10 +7891,42 @@ describe("still open after merge", () => {
         assert.deepEqual(issueOpenOf(target), []);
         assert.deepEqual(
             target.events
-                .filter((event) => event.text.includes("closed"))
+                .filter((event) => event.text.includes(" closed"))
                 .map((event) => event.text),
-            ["frostyard/snosi#1123 closed by PR #1130"],
-            "1 event, however many sweeps",
+            [
+                "frostyard/snosi#1123 closed by PR #1130",
+                `${target.asks[0]!.id} resolved by the desk: frostyard/snosi#1123 closed`,
+            ],
+            "1 event for the close, and 1 for the resolved ask, however many sweeps",
+        );
+
+        // The desk resolved the ask itself: Brian never answered, and nothing waits on him.
+        const ask = target.asks[0]!;
+
+        assert.deepEqual(ask.resolved, { at: 600, why: "frostyard/snosi#1123 closed" });
+        assert.equal(ask.answer, undefined, "the desk never sets an answer");
+        assert.equal(askIsOpen(ask), false);
+        assert.equal(closeCheck(target, facts_(1000)).close, true);
+        assert.notEqual(nextActor(target), "brian");
+        assert.equal(odradeReason(target), undefined);
+        // Every reader skips it: the view, the list, and the read.
+        const desk = { ...state, threads: { [target.id]: target } };
+        const view = threadView(desk.threads, target, 1000);
+
+        assert.deepEqual(view.asks, []);
+        assert.deepEqual(
+            view.resolved.map((one) => [one.id, one.why]),
+            [[ask.id, "frostyard/snosi#1123 closed"]],
+        );
+        assert.doesNotMatch(listText(desk, 1000), new RegExp(`${ask.id}\\b`));
+        assert.match(
+            readText(desk, target.id) ?? "",
+            /resolved by the desk: frostyard\/snosi#1123 closed/,
+        );
+        assert.doesNotMatch(
+            exportFiles(desk, {}, 1000, 12)["threads.md"] ?? "",
+            /is still open after/,
+            "the export lists no open ask",
         );
 
         const bare = merged();
@@ -7374,18 +7940,78 @@ describe("still open after merge", () => {
         assert(bare.target.events.some((event) => event.text === "frostyard/snosi#1123 closed"));
     });
 
-    test("an issue whose state the read did not give keeps the warning it had", () => {
+    test("a later verified partial resolves the ask by itself, and the thread closes", () => {
+        const { state, target } = merged();
+
+        // The first read could not tell: the warning and its ask.
+        planIssues(
+            state,
+            target,
+            facts({ body: "No marker", closing: { total: 0, refs: [] } }),
+            500,
+        );
+        assert.equal(issueOpenOf(target).length, 1);
+        assert.equal(nextActor(target), "brian");
+
+        // A later sweep reads the PR whole: verified partial work.
+        planIssues(state, target, facts(partOf), 600);
+        relinkIssues(state);
+
+        const ask = target.asks[0]!;
+
+        assert.deepEqual(issueOpenOf(target), []);
+        assert.deepEqual(issuePartialOf(target), [{ issue: REF, pr: PR, how: "verified" }]);
+        assert.deepEqual(ask.resolved, {
+            at: 600,
+            why: "#1130 was part of frostyard/snosi#1123",
+        });
+        assert.equal(ask.answer, undefined);
+        assert.equal(closeCheck(target, facts_(1000)).close, true);
+        assert.notEqual(nextActor(target), "brian");
+        assert.equal(target.asks.length, 1, "no new ask");
+    });
+
+    test("Brian's own answer is never replaced by a resolution", () => {
         const { state, target } = merged();
 
         planIssues(state, target, facts(undefined), 500);
-        // The pinned issue read is missing, and the queue's own read says it is open still.
-        planIssues(state, target, facts(undefined, undefined), 600);
+        answerAsk(state, target.asks[0]!.id, { at: 550, by: "Brian", words: "Needs a fix" });
+        planIssues(
+            state,
+            target,
+            facts(undefined, { ref: REF, state: "CLOSED", closedBy: [] }),
+            600,
+        );
+        assert.equal(target.asks[0]?.resolved, undefined);
+        assert.equal(target.asks[0]?.answer?.words, "Needs a fix");
+    });
+
+    test("an issue whose state the read did not give keeps the warning it had: no new ask, no new event", () => {
+        const { state, target } = merged();
+
+        planIssues(state, target, facts(undefined), 500);
+
+        // Facts with no `issues` field at all: the pinned issue read gave nothing.
+        const { issues: _issues, ...silent } = facts(undefined);
+
+        assert.equal(silent.issues, undefined, "the pinned issue is absent");
+
+        const asks = target.asks.length;
+        const events = target.events.length;
+
+        // The queue's own read says it is open still: the warning is the same one, and nothing is added.
+        planIssues(state, target, silent, 600);
         assert.equal(issueOpenOf(target).length, 1);
+        assert.equal(target.asks.length, asks);
+        assert.equal(target.events.length, events);
 
         // Out of the queue and not read: unknown, so the old warning is kept as it was.
         state.issues = queueOf([]);
-        planIssues(state, target, facts(undefined, undefined), 700);
-        assert.equal(issueOpenOf(target).length, 1);
+        planIssues(state, target, silent, 700);
+        assert.deepEqual(issueOpenOf(target), [{ issue: REF, pr: PR }]);
+        assert.equal(target.asks.length, asks);
+        assert.equal(target.events.length, events);
+        assert.equal(target.asks[0]?.resolved, undefined, "unknown is not an end");
     });
 
     test("Brian's answer Open is right ends the warning at once; it holds after another sweep and a restart", () => {
@@ -7538,7 +8164,8 @@ describe("the queue's words", () => {
                 stored("frostyard/snosi#1123", {
                     title: 'Fix the "ISO" build',
                     urgent: true,
-                    signals: ["urgent"],
+                    signals: ["queue", "urgent"],
+                    names: ["label agent-queue", "label agent-urgent"],
                     latest: "urgent",
                     agent: "duncan",
                     owners: ["duncan", "murbella"],
@@ -7552,6 +8179,7 @@ describe("the queue's words", () => {
                     title: "Add a README",
                     latest: "assigned",
                     signals: ["assigned"],
+                    names: ["assigned"],
                     at: ms(1),
                 }),
             ],
@@ -7580,7 +8208,7 @@ describe("the queue's words", () => {
         assert.equal(lines[0], "Brian queued 3 issues, 1 urgent (read 19:02).");
         assert.equal(
             lines[1],
-            `urgent · frostyard/snosi#1123 · duncan (owned by 2 agents) · ${id} working · PR frostyard/snosi#1130 · 1 part merged · "Fix the 'ISO' build" · label by bketelsen 2026-10-25 · unverified`,
+            `urgent · frostyard/snosi#1123 · duncan (owned by 2 agents) · ${id} working · PR frostyard/snosi#1130 · 1 part merged · "Fix the 'ISO' build" · label agent-queue, label agent-urgent by bketelsen 2026-10-25 · unverified`,
         );
         assert.equal(
             lines[2],
@@ -7588,7 +8216,7 @@ describe("the queue's words", () => {
         );
         assert.equal(
             lines[3],
-            'queued · frostyard/updex#465 · lucilla · not started · "Retry the mirror fetch" · label by bketelsen 2026-10-24',
+            'queued · frostyard/updex#465 · lucilla · not started · "Retry the mirror fetch" · queue by bketelsen 2026-10-24',
         );
         assert.equal(lines[4], "Not counted: frostyard/clix#9 agent-queue by frostyard-machines.");
         assert.equal(lines.length, 5);
@@ -9068,16 +9696,147 @@ describe("the desk in a Pi Pocket", () => {
             await new Promise<void>((resolve) => server?.close(() => resolve()));
         });
 
-        test("GET threads gives the page the issue queue: null before a read, else the same plain view", async () => {
-            const first = await call("threads");
+        test("GET threads gives the page the issue queue: null before a read, then the same view as the stored state", async () => {
+            await app.harness.commit(async (tx) => {
+                delete (await tx.doc(DeskThreads)).issues;
+            }, context);
 
-            assert.equal(first.status, 200);
-            assert("issues" in first.data);
+            const before = await call("threads");
 
-            if (first.data.issues !== null) {
-                assert(Array.isArray(first.data.issues.items));
-                assert(Array.isArray(first.data.issues.ignored));
-                assert.equal(typeof first.data.issues.ok, "boolean");
+            assert.equal(before.status, 200);
+            assert.equal(before.data.issues, null, "no read yet");
+
+            // A known read: 1 urgent item with 2 signals, and 1 signal that does not count.
+            await app.harness.commit(async (tx) => {
+                (await tx.doc(DeskThreads)).issues = queueOf(
+                    [
+                        stored("frostyard/snosi#1123", {
+                            title: "Fix the ISO build",
+                            urgent: true,
+                            signals: ["queue", "urgent"],
+                            names: ["label agent-queue", "label agent-urgent"],
+                            latest: "urgent",
+                            agent: "duncan",
+                            at: ms(5),
+                            fixedBy: ["frostyard/snosi#1130"],
+                        }),
+                    ],
+                    {
+                        at: ms(6),
+                        ignored: [
+                            {
+                                ref: "frostyard/clix#9",
+                                signal: "agent-queue",
+                                actor: "frostyard-machines",
+                                at: ms(3),
+                            },
+                        ],
+                    },
+                );
+            }, context);
+
+            const after = await call("threads");
+            const expected = JSON.parse(
+                JSON.stringify(issuesView(await deskState(), Date.now())),
+            ) as Record<string, unknown>;
+
+            assert.equal(after.status, 200);
+            assert.deepEqual(after.data.issues, expected, "the page gets the stored state's view");
+
+            const item = after.data.issues.items[0];
+
+            assert.equal(item.ref, "frostyard/snosi#1123");
+            assert.equal(item.title, "Fix the ISO build");
+            assert.equal(item.urgent, true);
+            assert.deepEqual(item.names, ["label agent-queue", "label agent-urgent"]);
+            assert.equal(item.agent, "duncan");
+            assert.equal(item.by, "bketelsen");
+            assert.deepEqual(item.fixedBy, ["frostyard/snosi#1130"]);
+            assert.equal(after.data.issues.ok, true);
+            assert.deepEqual(after.data.issues.ignored, [
+                {
+                    ref: "frostyard/clix#9",
+                    signal: "agent-queue",
+                    actor: "frostyard-machines",
+                    at: ms(3),
+                },
+            ]);
+
+            await app.harness.commit(async (tx) => {
+                delete (await tx.doc(DeskThreads)).issues;
+            }, context);
+        });
+
+        test("a page answer to the ask about a still-open issue: the exact option is an acknowledgement, any other is work", async () => {
+            writeFileSync(
+                configPath,
+                JSON.stringify({ digest: { minutes: 15, now: [] }, cap: 100 }),
+            );
+
+            const source = await supervisor("page-issue-answer");
+            const ids: string[] = [];
+            let threadId = "";
+
+            await app.harness.commit(async (tx) => {
+                const state = await tx.doc(DeskThreads);
+                const opened = openThread(state, {
+                    key: "x.test.page-issue-answer",
+                    supervisor: Number(source),
+                    agents: ["duncan"],
+                    repo: "frostyard/test",
+                    title: "A part",
+                    at: Date.now(),
+                });
+
+                threadId = opened.thread.id;
+
+                for (const pr of ["#1", "#2", "#3"]) {
+                    const made = addAsk(state, {
+                        thread: threadId,
+                        text: `frostyard/test#9 is still open after ${pr} merged. Is that right?`,
+                        options: ["Open is right", "Needs a fix"],
+                        key: `issue-open:frostyard/test#9:frostyard/test${pr}`,
+                        by: "desk",
+                        supervisor: Number(source),
+                        at: Date.now(),
+                    });
+
+                    ids.push("askId" in made ? made.askId : "");
+                }
+            }, context);
+
+            const kindOf = async (id: string) =>
+                (await deskState())?.digests?.[String(Number(source))]?.items.find(
+                    (each) => each.key === `answer:${id}`,
+                )?.kind;
+
+            try {
+                for (const [index, words] of ["Open is right", "open is right!", "ok"].entries()) {
+                    assert.equal(
+                        (await call(`asks/${ids[index]}/answer`, { words })).status,
+                        200,
+                        words,
+                    );
+                }
+
+                assert.equal(await kindOf(ids[0]!), "answer", "the exact option");
+                assert.equal(await kindOf(ids[1]!), "answer-action", "a near match is work");
+                assert.equal(
+                    await kindOf(ids[2]!),
+                    "answer-action",
+                    "even an acknowledgement is not the acceptance",
+                );
+
+                // The sweep's rule agrees: the near match does not accept, the exact text does.
+                const asks = (await deskState())?.threads[threadId]?.asks ?? [];
+
+                assert.deepEqual(
+                    asks.map((ask) => acceptsOpen(ask.answer?.words ?? "")),
+                    [true, false, false],
+                );
+            } finally {
+                await stopDigests();
+                writeFileSync(configPath, JSON.stringify({ digest: { minutes: 0 }, cap: 100 }));
             }
         });
 
@@ -11965,6 +12724,8 @@ describe("the desk in a Pi Pocket", () => {
             not?: string[];
             answer?: unknown;
             prs?: Record<string, object>;
+            /** The fields of a PR that GraphQL fails on: the node has them null, and an error is under each path. */
+            prErrors?: Record<string, string[]>;
             issues?: Record<string, object>;
             exit?: number;
             stderr?: string;
@@ -11977,15 +12738,27 @@ fs.appendFileSync(${JSON.stringify(callsFile)}, JSON.stringify(query) + "\\n");
 const routes = JSON.parse(fs.readFileSync(${JSON.stringify(routesFile)}, "utf8"));
 const dynamic = (route) => {
     const data = { viewer: { login: "github-viewer" } };
+    const errors = [];
     const re = /([pi])(\\d+): repository\\(owner: "([^"]+)", name: "([^"]+)"\\) \\{\\s*nameWithOwner\\s*(?:isArchived\\s*)?(pullRequest|issue)\\(number: (\\d+)\\)/g;
-    for (const match of query.matchAll(re)) {
+    const found = [...query.matchAll(re)];
+    // The selection of an alias runs to the next alias: a field is answered only when the alias asked for it.
+    const selection = (index) => query.slice(found[index].index, found[index + 1] ? found[index + 1].index : query.length);
+    for (const [index, match] of found.entries()) {
         const ref = match[3] + "/" + match[4] + "#" + match[6];
-        const node = (match[5] === "issue" ? route.issues : route.prs)?.[ref];
-        if (node !== undefined) {
-            data[match[1] + match[2]] = { nameWithOwner: match[3] + "/" + match[4], isArchived: false, [match[5]]: node };
+        const source = (match[5] === "issue" ? route.issues : route.prs)?.[ref];
+        if (source === undefined) continue;
+        const node = { ...source };
+        if (match[5] === "pullRequest") {
+            if (!selection(index).includes("closingIssuesReferences")) delete node.closingIssuesReferences;
+            if (!/\\bbody\\b/.test(selection(index))) delete node.body;
+            for (const inside of route.prErrors?.[ref] ?? []) {
+                node[inside] = null;
+                errors.push({ path: [match[1] + match[2], "pullRequest", inside], message: "partial" });
+            }
         }
+        data[match[1] + match[2]] = { nameWithOwner: match[3] + "/" + match[4], isArchived: false, [match[5]]: node };
     }
-    return { data };
+    return errors.length > 0 ? { data, errors } : { data };
 };
 for (const route of routes) {
     if (route.has.every((text) => query.includes(text)) && !(route.not ?? []).some((text) => query.includes(text))) {
@@ -12165,7 +12938,7 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
                 assert.match(texts, /Brian queued 3 issues, 1 urgent \(read \d\d:\d\d\)\./);
                 assert.match(
                     texts,
-                    /urgent · frostyard\/test#102 · duncan · not started · “Issue 102” · label by bketelsen 2026-10-24/,
+                    /urgent · frostyard\/test#102 · duncan · not started · “Issue 102” · label agent-urgent by bketelsen 2026-10-24/,
                 );
                 assert.match(
                     texts,
@@ -12442,7 +13215,9 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
                 labeledAnswer([
                     issueNode(141, {
                         repo: "frostyard/test",
-                        labels: ["l1", "l2"],
+                        // 100 first labels, 105 in all: the next page goes on from the cursor.
+                        labels: Array.from({ length: 100 }, (_one, index) => `l${String(index)}`),
+                        labelsTotal: 105,
                         labelsNext: "Q3Vyc29y",
                         events: [labelEvent("agent-urgent", "bketelsen", at(3))],
                     }),
@@ -12459,6 +13234,14 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
                 assert.equal(item?.ref, "frostyard/test#141");
                 assert.equal(item?.urgent, true);
                 assert.equal(item?.unverified, undefined);
+                assert(
+                    calls().some(
+                        (query) =>
+                            query.includes("issue(number: 141)") &&
+                            query.includes('labels(first: 100, after: "Q3Vyc29y")'),
+                    ),
+                    "100 first labels lead to the by-number query with the cursor",
+                );
             } finally {
                 await finish();
             }
@@ -13117,10 +13900,14 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
                     await lastToolTexts(source),
                     /frostyard\/test#910 · duncan · .* · 1 part merged · /,
                 );
-                // The pinned read asked for the closing issues of the PR, and only for it.
-                assert(
-                    calls().some((query) => query.includes("closingIssuesReferences(first: 10)")),
-                );
+                // The selection of PR 911 itself asked for the body and the closing issues: the fake answers them only then.
+                const selection = calls()
+                    .flatMap((query) => query.split("\n"))
+                    .find((line) => line.includes("pullRequest(number: 911)"));
+
+                assert(selection, "the pinned read names PR 911");
+                assert.match(selection, /\bbody\b/);
+                assert.match(selection, /closingIssuesReferences\(first: 10\)/);
             } finally {
                 await finish();
             }
@@ -13154,9 +13941,20 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
             }
         });
 
-        test("the queue key sets the names, the actors and the owners of the search", async () => {
+        test("the queue key sets the names, the actors and the owners of the search, and the read works", async () => {
             await resetQueue();
-            useGh([]);
+            useGh([
+                labeledAnswer([
+                    mine(971, {
+                        labels: ["q"],
+                        events: [labelEvent("q", "brian", at(2))],
+                    }),
+                    mine(972, {
+                        labels: ["q"],
+                        events: [labelEvent("q", "bketelsen", at(3))],
+                    }),
+                ]),
+            ]);
             settings({
                 label: "q",
                 urgent: "u",
@@ -13175,6 +13973,150 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
                 assert.match(first, /user:acme user:frostyard label:q,u/);
                 assert.match(first, /user:acme user:frostyard assignee:bot2/);
                 assert.doesNotMatch(first, /evil/);
+
+                const queue = await storedQueue();
+
+                assert.equal(queue?.ok, true, queue?.error);
+                assert.deepEqual(
+                    queue?.items.map((item) => [item.ref, item.by, item.names]),
+                    [["frostyard/test#971", "brian", ["label q"]]],
+                    "brian counts",
+                );
+                assert.deepEqual(queue?.ignored, [
+                    { ref: "frostyard/test#972", signal: "q", actor: "bketelsen", at: ms(3) },
+                ]);
+            } finally {
+                await finish();
+            }
+        });
+
+        test("a partial answer that loses an issue's labels keeps the stored item, unverified, with no issue-left", async () => {
+            await resetQueue();
+            digestOn();
+            useGh([labeledAnswer([mine(951, { time: 2 })])]);
+
+            try {
+                const { source, linked, thread } = await delegated("queue-partial-labels");
+
+                await until(
+                    async () =>
+                        typeof (await deskState())?.threads[thread.id]?.run.sweptAt === "number",
+                    "the first sweep",
+                    20_000,
+                );
+                await until(() => !app.isBusy(linked), "the linked session to settle", 20_000);
+                await sweep(source);
+                issueAttachRef = "frostyard/test#951";
+                issueAttachThread = thread.id;
+                await say(app, source, "desk attach issue test");
+                await app.harness.commit(async (tx) => {
+                    delete (await tx.doc(DeskThreads)).digests;
+                }, context);
+
+                // `gh` exits 1 with data: the issue is there, its labels are not (an error under its node).
+                useGh([
+                    {
+                        has: ["labeled: search"],
+                        not: ["after:", "n0:"],
+                        exit: 1,
+                        stderr: "gh: partial",
+                        answer: {
+                            data: {
+                                labeled: searchPage([{ ...mine(951, { time: 2 }), labels: null }]),
+                                assigned: searchPage([]),
+                            },
+                            errors: [{ path: ["labeled", "nodes", 0, "labels"], message: "boom" }],
+                        },
+                    },
+                ]);
+                await sweep(source);
+
+                const queue = await storedQueue();
+
+                assert.equal(queue?.items.length, 1, "the item stays");
+                assert.equal(queue?.items[0]?.unverified, true);
+                assert.equal(queue?.seen["frostyard/test#951"], ms(2));
+                assert(!(await boxItems(source)).some((item) => item.kind === "issue-left"));
+                assert(
+                    !(await deskState())?.threads[thread.id]?.events.some((event) =>
+                        event.text.includes("dequeued"),
+                    ),
+                );
+
+                // The same issue with a short count and no error is partial too.
+                useGh([
+                    labeledAnswer([
+                        issueNode(951, {
+                            repo: "frostyard/test",
+                            labels: [],
+                            labelsTotal: 2,
+                            events: [],
+                        }),
+                    ]),
+                ]);
+                await sweep(source);
+                assert.equal((await storedQueue())?.items[0]?.unverified, true);
+                assert(!(await boxItems(source)).some((item) => item.kind === "issue-left"));
+            } finally {
+                await finish();
+            }
+        });
+
+        test("an error under a PR's closing issues is not a missing PR: it stays MERGED, and the warning and its ask stay", async () => {
+            await resetQueue();
+            const issue = "frostyard/test#960";
+            const pr = "frostyard/test#961";
+
+            useGh([
+                {
+                    has: ["viewer { login }"],
+                    exit: 1,
+                    stderr: "gh: partial",
+                    prs: {
+                        [pr]: mergedPr(961, {
+                            body: "A first step.\n\nPart of #960",
+                            closing: { total: 0, refs: [] },
+                        }),
+                    },
+                    prErrors: { [pr]: ["closingIssuesReferences"] },
+                    issues: { [issue]: openIssue(960) },
+                },
+                labeledAnswer([mine(960, { time: 2 })]),
+            ]);
+
+            try {
+                const { source, linked, thread } = await delegated("queue-detail-error");
+
+                await until(
+                    async () =>
+                        typeof (await deskState())?.threads[thread.id]?.run.sweptAt === "number",
+                    "the first sweep",
+                    20_000,
+                );
+                await until(() => !app.isBusy(linked), "the linked session to settle", 20_000);
+                await sweep(source);
+                await app.harness.commit(async (tx) => {
+                    const state = await tx.doc(DeskThreads);
+
+                    linkIssue(state, state.threads[thread.id]!, issue, Date.now());
+                    state.threads[thread.id]!.prs[pr] = { via: "attached", state: "OPEN" };
+                }, context);
+                await sweep(source);
+                await sweep(source);
+
+                const state = await deskState();
+                const after = state?.threads[thread.id];
+
+                assert.equal(after?.prs[pr]?.state, "MERGED", "not MISSING");
+                assert.equal(state?.github?.missing, undefined);
+                assert.deepEqual(
+                    issueOpenOf(after!),
+                    [{ issue, pr }],
+                    "the partial class is unknown",
+                );
+                assert.equal(after?.asks.length, 1, "1 ask, filed once");
+                assert.equal(after?.asks[0]?.resolved, undefined);
+                assert.equal(after?.run.issuePartial, undefined);
             } finally {
                 await finish();
             }
