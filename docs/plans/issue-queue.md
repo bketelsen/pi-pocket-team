@@ -559,3 +559,16 @@ Choices that the design left open:
   `closingIssuesReferences` keeps the PR's facts and drops `body` and `closing`: the partial class is unknown.
 - **Page status.** A failed (`ok: false`) or incomplete read shows its warning also with no row; a queue turned
   off (`IssuesView.off`) shows `queue read is off`; a good empty queue shows nothing.
+- **Timeline proof.** `IssueFact.timelineCut` is set (with `partial`) when the timeline is missing, has a null
+  or unreadable node, is short of its `totalCount` with no older page, or has an error under the issue.
+  `judgeIssue` then counts no signal of the fact: each shows as not counted with the actor `unknown`. A new
+  issue gets no entry and no news; a stored item keeps its signals, unverified. A null node in `labels` or
+  `assignees` makes the fact partial too.
+- **Joined connections.** The fact keeps `labelsTotal`, `assigneesTotal`, `eventsTotal` and `eventsRead`.
+  `joinIssueFact` marks the fact cut (and the timeline cut) when the paging ends with the joined count below the
+  total (the larger total of the 2 reads). A page cap leaves the cursor, which is a cut too.
+- **Thread merge, warnings.** `attachTo` moves `run.issueOpen` to the target without a repeat, so a later sweep
+  with an unknown issue state keeps the warning, and the target does not close.
+- **Missing PR by path.** An error under a `pN` alias makes the PR missing only when its path ends at the alias
+  or at `pullRequest` and that node is null or absent. Any deeper error, `NOT_FOUND` too, keeps the PR's facts
+  and drops `body` and `closing`.

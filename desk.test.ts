@@ -5628,6 +5628,53 @@ const pagedFixture = (numbers: number[], page: { total: number; cursor?: string 
         },
     },
 });
+
+/** The words at the top level of the first `{ … }` block of a GraphQL selection: its direct fields. */
+function topLevelFields(selection: string): string[] {
+    const words: string[] = [];
+    let depth = 0;
+    let paren = 0;
+    let word = "";
+
+    for (let at = selection.indexOf("pullRequest("); at < selection.length; at += 1) {
+        const char = selection[at]!;
+
+        if (char === "(") {
+            paren += 1;
+        } else if (char === ")") {
+            paren -= 1;
+        } else if (paren > 0) {
+            continue;
+        } else if (char === "{") {
+            depth += 1;
+            word = "";
+        } else if (char === "}") {
+            if (word !== "") {
+                words.push(word);
+            }
+
+            word = "";
+            depth -= 1;
+
+            if (depth === 0) {
+                break;
+            }
+        } else if (/\w/.test(char)) {
+            if (depth === 1) {
+                word += char;
+            }
+        } else {
+            if (word !== "" && depth === 1) {
+                words.push(word);
+            }
+
+            word = "";
+        }
+    }
+
+    return words;
+}
+
 /** The app's clock is this far ahead: the sweeper test moves it past its sleep. */
 let shift = 0;
 
@@ -6557,7 +6604,7 @@ describe("the signal rules", () => {
         const fact = parseIssueNode(
             issueNode(8, {
                 labels: ["l1", "l2"],
-                labelsTotal: 150,
+                labelsTotal: 3,
                 labelsNext: "Q3Vyc29y",
                 // The newest events are in the first read: the urgent label is on the second page of labels.
                 events: [labelEvent("agent-urgent", "bketelsen", at(3))],
@@ -6571,7 +6618,7 @@ describe("the signal rules", () => {
         const rest = parseIssueNode(
             issueNode(8, {
                 labels: ["agent-urgent"],
-                labelsTotal: 150,
+                labelsTotal: 3,
                 events: [labelEvent("agent-urgent", "bketelsen", at(3))],
             }),
             { labels: true },
@@ -6584,7 +6631,7 @@ describe("the signal rules", () => {
         const one = judgeIssue(whole, QUEUE, ROSTER);
 
         assert.equal(one.item?.urgent, true, "the signal was on the second page");
-        assert.equal(one.cut, false);
+        assert.equal(one.cut, false, "3 of 3 labels read");
         assert.deepEqual(issueGaps({ ...fact, assigneesNext: "QQQ" }, QUEUE), [
             "labels",
             "assignees",
@@ -7525,6 +7572,263 @@ describe("merging a thread carries its issues", () => {
         attachTo(state, first.id, second.id, 300);
         assert.equal(second.issues, undefined);
         assert.equal(second.run.issuePartial, undefined);
+    });
+});
+
+describe("an incomplete timeline authorizes no signal", () => {
+    /** An issue whose newest event node is null: an older Brian event of the signal is all that shows. */
+    const lostNewest = (patch: IssuePatch = {}) => ({
+        ...issueNode(81, {
+            labels: ["agent-queue", "agent-urgent"],
+            events: [
+                labelEvent("agent-queue", "bketelsen", at(1)),
+                labelEvent("agent-urgent", "bketelsen", at(2)),
+            ],
+            ...patch,
+        }),
+    });
+
+    test("an older Brian event with a null newer node is not counted: actor unknown, and the fact is cut", () => {
+        const node = lostNewest();
+
+        (node.timelineItems.nodes as unknown[]).push(null);
+        node.timelineItems.totalCount = 3;
+
+        const fact = parseIssueNode(node)!;
+
+        assert.equal(fact.timelineCut, true);
+
+        const one = judgeIssue(fact, QUEUE, ROSTER);
+
+        assert.equal(one.item, undefined);
+        assert.equal(one.cut, true);
+        assert.deepEqual(
+            one.ignored.map((each) => [each.signal, each.actor]),
+            [
+                ["agent-queue", "unknown"],
+                ["agent-urgent", "unknown"],
+            ],
+        );
+    });
+
+    test("no new item and no issue-urgent item come from it: a null node, a short count, a missing timeline, an error path", () => {
+        const missing = lostNewest() as Record<string, unknown>;
+
+        missing.timelineItems = null;
+
+        const short = lostNewest();
+
+        short.timelineItems.totalCount = 5;
+
+        const withNull = lostNewest();
+
+        (withNull.timelineItems.nodes as unknown[]).unshift(null);
+
+        const viaError = parseIssueFacts({
+            data: { labeled: searchPage([lostNewest()]), assigned: searchPage([]) },
+            errors: [
+                { path: ["labeled", "nodes", 0, "timelineItems", "nodes", 2], message: "boom" },
+            ],
+        }).labeled.facts[0]!;
+
+        const facts = [missing, short, withNull].map((node) => parseIssueNode(node)!);
+
+        facts.push(viaError);
+
+        for (const [index, fact] of facts.entries()) {
+            assert.equal(fact.timelineCut, true, `case ${String(index)}`);
+
+            const merged = mergeQueue(
+                undefined,
+                readOf([judgeIssue(fact, QUEUE, ROSTER)]),
+                ms(10),
+            )!;
+
+            assert.deepEqual(merged.queue.items, [], `case ${String(index)}: no item`);
+            assert.deepEqual(merged.news, [], `case ${String(index)}: no news`);
+            assert.deepEqual(merged.queue.seen, {});
+            assert.deepEqual(merged.queue.urgentSeen, {});
+        }
+    });
+
+    test("a stored item keeps its stored signals through such a read, unverified, and tells nothing again", () => {
+        const good = mergeQueue(undefined, readOf([judged(lostNewest())]), ms(10))!;
+
+        assert.equal(good.queue.items[0]?.urgent, true);
+
+        const fact = parseIssueNode({ ...lostNewest(), timelineItems: null })!;
+        const kept = mergeQueue(good.queue, readOf([judgeIssue(fact, QUEUE, ROSTER)]), ms(20))!;
+
+        assert.equal(kept.queue.items[0]?.urgent, true);
+        assert.equal(kept.queue.items[0]?.unverified, true);
+        assert.deepEqual(kept.queue.urgentSeen, good.queue.urgentSeen);
+        assert.deepEqual(kept.news, []);
+        assert.deepEqual(kept.left, []);
+    });
+
+    test("a whole timeline still counts", () => {
+        assert.equal(judged(lostNewest()).item?.urgent, true);
+    });
+});
+
+describe("a joined connection must be complete", () => {
+    const page = (names: string[], total: number, next?: string, extra: IssuePatch = {}) =>
+        parseIssueNode(
+            issueNode(91, {
+                labels: names,
+                labelsTotal: total,
+                ...(next === undefined ? {} : { labelsNext: next }),
+                events: [],
+                ...extra,
+            }),
+            next === undefined ? { labels: true } : {},
+        )!;
+    const fillers = (count: number) =>
+        Array.from({ length: count }, (_one, index) => `l${String(index)}`);
+
+    test("a short last page (total 102, 100 then 1) stays cut, and keeps the stored item, seen and urgentSeen", () => {
+        const first = page(fillers(100), 102, "Q3Vyc29y");
+        const last = page(["l100"], 102);
+        const joined = joinIssueFact(first, last, "labels");
+
+        assert.equal(joined.labels.length, 101);
+        assert.equal(joined.partial, true);
+        assert.equal(judgeIssue(joined, QUEUE, ROSTER).cut, true);
+
+        const old = stored("frostyard/snosi#91", { urgent: true, signals: ["queue", "urgent"] });
+        const queue = queueOf([old]);
+        const next = mergeQueue(queue, readOf([judgeIssue(joined, QUEUE, ROSTER)]), ms(20))!;
+
+        assert.equal(next.queue.items[0]?.unverified, true);
+        assert.equal(next.queue.items[0]?.urgent, true);
+        assert.deepEqual(next.queue.seen, queue.seen);
+        assert.deepEqual(next.queue.urgentSeen, queue.urgentSeen);
+        assert.deepEqual(next.left, []);
+    });
+
+    test("the same list with its true total (102 read) is complete", () => {
+        const joined = joinIssueFact(
+            page(fillers(100), 102, "Q3Vyc29y"),
+            page(["l100", "l101"], 102),
+            "labels",
+        );
+
+        assert.equal(joined.partial, undefined);
+        assert.equal(judgeIssue(joined, QUEUE, ROSTER).cut, false);
+    });
+
+    test("a total that grew between reads is the one that counts", () => {
+        const joined = joinIssueFact(
+            page(fillers(100), 102, "Q3Vyc29y"),
+            page(["l100", "l101"], 103),
+            "labels",
+        );
+
+        assert.equal(joined.labelsTotal, 103);
+        assert.equal(joined.partial, true);
+    });
+
+    test("the assignees and the timeline are checked the same way", () => {
+        const base = parseIssueNode(
+            issueNode(92, { assignees: ["a"], assigneesNext: "Q3Vyc29y", events: [] }),
+        )!;
+        const withTotal = { ...base, assigneesTotal: 3 };
+        const short = joinIssueFact(
+            withTotal,
+            parseIssueNode(issueNode(92, { assignees: ["b"], events: [] }), { assignees: true })!,
+            "assignees",
+        );
+
+        assert.equal(short.partial, true, "2 of 3 assignees");
+
+        // The timeline: 50 read, 60 in all; the older page holds 5 only.
+        const first = parseIssueNode(
+            issueNode(93, {
+                labels: ["agent-queue"],
+                before: "Q1VS",
+                events: Array.from({ length: 50 }, () => labelEvent("bug", "x", at(5))),
+            }),
+        )!;
+        const older = (count: number) =>
+            parseIssueNode(
+                issueNode(93, {
+                    events: Array.from({ length: count }, () => labelEvent("bug", "x", at(1))),
+                }),
+                { timeline: true },
+            )!;
+
+        assert.equal(first.eventsRead, 50);
+
+        const withEvents = { ...first, eventsTotal: 60 };
+        const cut = joinIssueFact(withEvents, { ...older(5), eventsTotal: 60 }, "timeline");
+
+        assert.equal(cut.timelineCut, true);
+        assert.equal(cut.partial, true);
+
+        const whole = joinIssueFact(withEvents, { ...older(10), eventsTotal: 60 }, "timeline");
+
+        assert.equal(whole.timelineCut, undefined);
+        assert.equal(whole.partial, undefined);
+    });
+
+    test("a null label node is not read: the fact is partial", () => {
+        const node = issueNode(94, { labels: ["a"], events: [] });
+
+        (node.labels.nodes as unknown[]).push(null);
+        node.labels.totalCount = 2;
+        assert.equal(parseIssueNode(node)!.partial, true);
+    });
+});
+
+describe("a merge moves the warnings", () => {
+    const REF = "frostyard/snosi#1123";
+    const PR = "frostyard/snosi#1130";
+
+    test("the target keeps the warning of the source, with Brian's answer Needs a fix, through a failed read, and does not close", () => {
+        const state = deskOf();
+        const first = placed(state, 100);
+        const second = placed(state, 200);
+
+        state.issues = queueOf([stored(REF)]);
+        linkIssue(state, first, REF, 100);
+        first.prs[PR] = { via: "seen", state: "MERGED" };
+        first.run.archived = true;
+        second.run.archived = true;
+
+        const open: GitHubFacts = {
+            viewer: "v",
+            repos: {},
+            prs: {},
+            issues: { [REF]: { ref: REF, state: "OPEN", closedBy: [] } },
+        };
+
+        planIssues(state, first, open, 300);
+        answerAsk(state, first.asks[0]!.id, { at: 350, by: "Brian", words: "Needs a fix" });
+        assert.equal(issueOpenOf(first).length, 1);
+
+        attachTo(state, first.id, second.id, 400);
+        assert.deepEqual(issueOpenOf(second), [{ issue: REF, pr: PR }]);
+        assert.equal(issueOpenOf(first).length, 0);
+
+        // A sweep with a failed pinned issue read and no queue read: unknown, so the warning stays.
+        state.issues = queueOf([]);
+
+        const failed: GitHubFacts = { viewer: "v", repos: {}, prs: {} };
+
+        planIssues(state, second, failed, 500);
+        assert.deepEqual(issueOpenOf(second), [{ issue: REF, pr: PR }]);
+        assert.equal(nextActor(second), "odrade");
+        assert.equal(closeCheck(second, facts_(1000)).close, false);
+        assert.equal(second.asks.length, 1, "no new ask");
+
+        // The warning does not repeat when both threads had it.
+        const third = placed(state, 300);
+
+        third.run.issueOpen = [{ issue: REF, pr: PR }];
+        third.issues = [REF];
+        second.run.issueOpen = [{ issue: REF, pr: PR }];
+        attachTo(state, third.id, second.id, 600);
+        assert.equal(issueOpenOf(second).length, 1);
     });
 });
 
@@ -12726,6 +13030,8 @@ describe("the desk in a Pi Pocket", () => {
             prs?: Record<string, object>;
             /** The fields of a PR that GraphQL fails on: the node has them null, and an error is under each path. */
             prErrors?: Record<string, string[]>;
+            /** The `type` of those errors, such as NOT_FOUND. */
+            prErrorType?: string;
             issues?: Record<string, object>;
             exit?: number;
             stderr?: string;
@@ -12736,6 +13042,24 @@ const fs = require("node:fs");
 const query = process.argv.slice(2).join("\\n");
 fs.appendFileSync(${JSON.stringify(callsFile)}, JSON.stringify(query) + "\\n");
 const routes = JSON.parse(fs.readFileSync(${JSON.stringify(routesFile)}, "utf8"));
+const topFields = (sel) => {
+    let at = sel.indexOf("pullRequest(");
+    let depth = 0;
+    let word = "";
+    const words = [];
+    // Skip the arguments, then read the words at depth 1 of the first brace block.
+    for (let paren = 0; at < sel.length; at += 1) {
+        const char = sel[at];
+        if (char === "(") paren += 1;
+        else if (char === ")") paren -= 1;
+        else if (paren > 0) continue;
+        else if (char === "{") { depth += 1; word = ""; }
+        else if (char === "}") { if (word) words.push(word); word = ""; depth -= 1; if (depth === 0) break; }
+        else if (/\\w/.test(char)) { if (depth === 1) word += char; }
+        else { if (word && depth === 1) words.push(word); word = ""; }
+    }
+    return words;
+};
 const dynamic = (route) => {
     const data = { viewer: { login: "github-viewer" } };
     const errors = [];
@@ -12749,11 +13073,14 @@ const dynamic = (route) => {
         if (source === undefined) continue;
         const node = { ...source };
         if (match[5] === "pullRequest") {
-            if (!selection(index).includes("closingIssuesReferences")) delete node.closingIssuesReferences;
-            if (!/\\bbody\\b/.test(selection(index))) delete node.body;
+            // Only a field that the PR's own selection asks at its top level is answered (reviews and comments have a body too).
+            const top = topFields(selection(index));
+            if (!top.includes("closingIssuesReferences")) delete node.closingIssuesReferences;
+            if (!top.includes("body")) delete node.body;
             for (const inside of route.prErrors?.[ref] ?? []) {
                 node[inside] = null;
-                errors.push({ path: [match[1] + match[2], "pullRequest", inside], message: "partial" });
+                const type = route.prErrorType;
+                errors.push({ path: [match[1] + match[2], "pullRequest", inside], message: "partial", ...(type ? { type } : {}) });
             }
         }
         data[match[1] + match[2]] = { nameWithOwner: match[3] + "/" + match[4], isArchived: false, [match[5]]: node };
@@ -13204,9 +13531,11 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
                         data: {
                             n0: {
                                 nameWithOwner: "frostyard/test",
+                                // The last page: 5 labels, so 100 and 5 make the total of 105.
                                 issue: issueNode(141, {
                                     repo: "frostyard/test",
-                                    labels: ["agent-urgent"],
+                                    labels: ["agent-urgent", "m1", "m2", "m3", "m4"],
+                                    labelsTotal: 105,
                                 }),
                             },
                         },
@@ -13906,8 +14235,20 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
                     .find((line) => line.includes("pullRequest(number: 911)"));
 
                 assert(selection, "the pinned read names PR 911");
-                assert.match(selection, /\bbody\b/);
+
+                // `body` as a direct field of the pullRequest selection: reviews and comments have their own.
+                const top = topLevelFields(selection);
+
+                assert(top.includes("body"), "a top-level body");
+                assert(top.includes("closingIssuesReferences"));
                 assert.match(selection, /closingIssuesReferences\(first: 10\)/);
+                assert.equal(
+                    topLevelFields(
+                        selection.replace(/ body closingIssuesReferences.*$/, " }"),
+                    ).includes("body"),
+                    false,
+                    "without the closing part, the body of reviews and comments is not a top-level body",
+                );
             } finally {
                 await finish();
             }
@@ -14062,65 +14403,74 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
             }
         });
 
-        test("an error under a PR's closing issues is not a missing PR: it stays MERGED, and the warning and its ask stay", async () => {
-            await resetQueue();
-            const issue = "frostyard/test#960";
-            const pr = "frostyard/test#961";
+        for (const [kind, type, number] of [
+            ["a plain error", undefined, 960],
+            ["a nested NOT_FOUND", "NOT_FOUND", 965],
+        ] as const) {
+            test(`${kind} under a PR's closing issues is not a missing PR: it stays MERGED, and the warning and its ask stay`, async () => {
+                await resetQueue();
+                const issue = `frostyard/test#${String(number)}`;
+                const pr = `frostyard/test#${String(number + 1)}`;
 
-            useGh([
-                {
-                    has: ["viewer { login }"],
-                    exit: 1,
-                    stderr: "gh: partial",
-                    prs: {
-                        [pr]: mergedPr(961, {
-                            body: "A first step.\n\nPart of #960",
-                            closing: { total: 0, refs: [] },
-                        }),
+                useGh([
+                    {
+                        has: ["viewer { login }"],
+                        exit: 1,
+                        stderr: "gh: partial",
+                        prs: {
+                            [pr]: mergedPr(number + 1, {
+                                body: `A first step.\n\nPart of #${String(number)}`,
+                                closing: { total: 0, refs: [] },
+                            }),
+                        },
+                        prErrors: { [pr]: ["closingIssuesReferences"] },
+                        ...(type === undefined ? {} : { prErrorType: type }),
+                        issues: { [issue]: openIssue(number) },
                     },
-                    prErrors: { [pr]: ["closingIssuesReferences"] },
-                    issues: { [issue]: openIssue(960) },
-                },
-                labeledAnswer([mine(960, { time: 2 })]),
-            ]);
+                    labeledAnswer([mine(number, { time: 2 })]),
+                ]);
 
-            try {
-                const { source, linked, thread } = await delegated("queue-detail-error");
+                try {
+                    const { source, linked, thread } = await delegated(
+                        `queue-detail-error-${String(number)}`,
+                    );
 
-                await until(
-                    async () =>
-                        typeof (await deskState())?.threads[thread.id]?.run.sweptAt === "number",
-                    "the first sweep",
-                    20_000,
-                );
-                await until(() => !app.isBusy(linked), "the linked session to settle", 20_000);
-                await sweep(source);
-                await app.harness.commit(async (tx) => {
-                    const state = await tx.doc(DeskThreads);
+                    await until(
+                        async () =>
+                            typeof (await deskState())?.threads[thread.id]?.run.sweptAt ===
+                            "number",
+                        "the first sweep",
+                        20_000,
+                    );
+                    await until(() => !app.isBusy(linked), "the linked session to settle", 20_000);
+                    await sweep(source);
+                    await app.harness.commit(async (tx) => {
+                        const state = await tx.doc(DeskThreads);
 
-                    linkIssue(state, state.threads[thread.id]!, issue, Date.now());
-                    state.threads[thread.id]!.prs[pr] = { via: "attached", state: "OPEN" };
-                }, context);
-                await sweep(source);
-                await sweep(source);
+                        linkIssue(state, state.threads[thread.id]!, issue, Date.now());
+                        state.threads[thread.id]!.prs[pr] = { via: "attached", state: "OPEN" };
+                    }, context);
+                    await sweep(source);
+                    await sweep(source);
 
-                const state = await deskState();
-                const after = state?.threads[thread.id];
+                    const state = await deskState();
+                    const after = state?.threads[thread.id];
 
-                assert.equal(after?.prs[pr]?.state, "MERGED", "not MISSING");
-                assert.equal(state?.github?.missing, undefined);
-                assert.deepEqual(
-                    issueOpenOf(after!),
-                    [{ issue, pr }],
-                    "the partial class is unknown",
-                );
-                assert.equal(after?.asks.length, 1, "1 ask, filed once");
-                assert.equal(after?.asks[0]?.resolved, undefined);
-                assert.equal(after?.run.issuePartial, undefined);
-            } finally {
-                await finish();
-            }
-        });
+                    assert.equal(after?.prs[pr]?.state, "MERGED", "not MISSING");
+                    assert.equal(state?.github?.missing, undefined);
+                    assert.deepEqual(
+                        issueOpenOf(after!),
+                        [{ issue, pr }],
+                        "the partial class is unknown",
+                    );
+                    assert.equal(after?.asks.length, 1, "1 ask, filed once");
+                    assert.equal(after?.asks[0]?.resolved, undefined);
+                    assert.equal(after?.run.issuePartial, undefined);
+                } finally {
+                    await finish();
+                }
+            });
+        }
     });
 
     describe("the Clerk", () => {

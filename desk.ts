@@ -4301,6 +4301,21 @@ export function attachTo(
         source.asks = plainAsks.filter((ask) => !aboutIssues(ask));
     }
 
+    // The warnings go too, without a repeat: they stay until a read or Brian's acceptance ends them.
+    const warned = issueOpenOf(source);
+
+    if (warned.length > 0) {
+        const kept = issueOpenOf(target);
+
+        for (const warning of warned) {
+            if (!kept.some((each) => each.issue === warning.issue && each.pr === warning.pr)) {
+                kept.push(warning);
+            }
+        }
+
+        target.run.issueOpen = kept;
+    }
+
     delete source.issues;
     delete source.run.issuePartial;
     delete source.run.issueOpen;
@@ -4632,6 +4647,13 @@ export type IssueFact = {
      * next page, or an error under the issue. A fact like that never proves a removal.
      */
     partial?: true;
+    /** The events cannot prove the newest actor of a signal (a node is null, or the timeline is cut): none counts. */
+    timelineCut?: true;
+    /** The `totalCount` of each connection, and the events read so far: a joined list that is short stays cut. */
+    labelsTotal?: number;
+    assigneesTotal?: number;
+    eventsTotal?: number;
+    eventsRead?: number;
 };
 
 /** A cut part of an issue's read: its labels, its assignees, or its signal events. */
@@ -4685,6 +4707,8 @@ export function parseIssueNode(
 
     // A part of the read that is missing or short: the fact is partial, and never proves a removal.
     let partial = typeof node.state !== "string";
+    // The events cannot prove the newest actor of a signal: no signal of the fact counts.
+    let timelineCut = false;
 
     const page = (list: unknown, key: "login" | "name", again: boolean | undefined) => {
         const found = list as
@@ -4701,6 +4725,12 @@ export function parseIssueNode(
         }
 
         const nodes = Array.isArray(found?.nodes) ? found.nodes : [];
+
+        // A node that is null or not an object was not read: it may have been a signal.
+        if (nodes.some((one) => one === null || typeof one !== "object")) {
+            partial = true;
+        }
+
         const names = nodes
             .map((one) => text((one as Record<string, unknown> | null)?.[key]))
             .filter((name) => name !== "");
@@ -4718,6 +4748,7 @@ export function parseIssueNode(
 
         return {
             names,
+            total: typeof found?.totalCount === "number" ? found.totalCount : undefined,
             // Unread parts with no cursor cannot go on: they stay marked as cut with a cursor that never fits.
             next: more ? cursor || "-" : undefined,
         };
@@ -4737,6 +4768,7 @@ export function parseIssueNode(
 
     if (timeline === null || typeof timeline !== "object" || !Array.isArray(timeline.nodes)) {
         partial = true;
+        timelineCut = true;
     } else if (
         timeline.pageInfo?.hasPreviousPage !== true &&
         continued.timeline !== true &&
@@ -4744,6 +4776,7 @@ export function parseIssueNode(
         timeline.totalCount > timeline.nodes.length
     ) {
         partial = true;
+        timelineCut = true;
     }
 
     for (const one of Array.isArray(timeline?.nodes) ? timeline.nodes : []) {
@@ -4756,6 +4789,9 @@ export function parseIssueNode(
         } | null;
 
         if (event === null || typeof event !== "object") {
+            // An event node that was not read may be the newest one of a signal.
+            partial = true;
+            timelineCut = true;
             continue;
         }
 
@@ -4816,7 +4852,16 @@ export function parseIssueNode(
         events,
         ...(timeline?.pageInfo?.hasPreviousPage === true ? { eventsBefore: before || "-" } : {}),
         closing,
+        ...(labels.total === undefined ? {} : { labelsTotal: labels.total }),
+        ...(assignees.total === undefined ? {} : { assigneesTotal: assignees.total }),
+        ...(typeof timeline?.totalCount === "number"
+            ? {
+                  eventsTotal: timeline.totalCount,
+                  eventsRead: Array.isArray(timeline.nodes) ? timeline.nodes.length : 0,
+              }
+            : {}),
         ...(partial ? { partial: true as const } : {}),
+        ...(timelineCut ? { timelineCut: true as const } : {}),
     };
 }
 
@@ -4914,14 +4959,20 @@ export function judgeIssue(
             unresolved = true;
         }
 
-        if (event !== undefined && event.actor !== null && by.has(event.actor.toLowerCase())) {
+        // A cut timeline cannot prove which event is the newest: no signal counts, and the actor is unknown.
+        if (
+            fact.timelineCut !== true &&
+            event !== undefined &&
+            event.actor !== null &&
+            by.has(event.actor.toLowerCase())
+        ) {
             counted.push({ signal: signal.signal, at: event.at, actor: event.actor });
         } else {
             ignored.push({
                 ref: fact.ref,
                 signal: signal.kind === "assigned" ? "assigned" : signal.name,
-                actor: event?.actor ?? "unknown",
-                at: event?.at ?? 0,
+                actor: fact.timelineCut === true ? "unknown" : (event?.actor ?? "unknown"),
+                at: fact.timelineCut === true ? 0 : (event?.at ?? 0),
             });
         }
     }
@@ -5041,11 +5092,7 @@ export function parseIssueFacts(json: unknown): Record<QueueAlias, SearchPage> {
 
                 return fact === undefined
                     ? []
-                    : [
-                          bad === "all" || bad?.has(index) === true
-                              ? { ...fact, partial: true as const }
-                              : fact,
-                      ];
+                    : [bad === "all" || bad?.has(index) === true ? cutFact(fact) : fact];
             }),
             ...(search.pageInfo?.hasNextPage === true ? { next: cursor || "-" } : {}),
         };
@@ -5075,6 +5122,13 @@ export function parseIssues(
 
     return { issues, pages };
 }
+
+/** A fact with an error under its node: some part is not trusted, so no signal of it counts, and it proves nothing. */
+const cutFact = (fact: IssueFact): IssueFact => ({
+    ...fact,
+    partial: true,
+    timelineCut: true,
+});
 
 /**
  * The by-number answer: each read's fact, by ref. An issue that GitHub says is not there (a NOT_FOUND error on its
@@ -5117,7 +5171,7 @@ export function parseIssueNumbers(
         });
 
         if (fact !== undefined) {
-            facts[read.ref] = errored.has(alias) ? { ...fact, partial: true } : fact;
+            facts[read.ref] = errored.has(alias) ? cutFact(fact) : fact;
         } else if (
             notFound.has(alias) &&
             !(
@@ -5140,35 +5194,55 @@ export function parseIssueNumbers(
  * read went on with: the other parts of `more` are the first page again, and change nothing.
  */
 export function joinIssueFact(base: IssueFact, more: IssueFact, asked: IssueGap): IssueFact {
+    /** The larger of 2 totals: a count that grew between reads is the safer one. */
+    const total = (one: number | undefined, two: number | undefined): number | undefined =>
+        one === undefined ? two : two === undefined ? one : Math.max(one, two);
+
     if (asked === "labels") {
         const { labelsNext: _next, ...rest } = base;
+        const labels = [...new Set([...base.labels, ...more.labels])];
+        const all = total(base.labelsTotal, more.labelsTotal);
+        // The paging ended: a joined list below the total is short, and never proves an absence.
+        const short = more.labelsNext === undefined && all !== undefined && labels.length < all;
 
         return {
             ...rest,
-            labels: [...new Set([...base.labels, ...more.labels])],
+            labels,
+            ...(all === undefined ? {} : { labelsTotal: all }),
             ...(more.labelsNext === undefined ? {} : { labelsNext: more.labelsNext }),
-            ...(more.partial === true ? { partial: true as const } : {}),
+            ...(more.partial === true || short ? { partial: true as const } : {}),
         };
     }
 
     if (asked === "assignees") {
         const { assigneesNext: _next, ...rest } = base;
+        const assignees = [...new Set([...base.assignees, ...more.assignees])];
+        const all = total(base.assigneesTotal, more.assigneesTotal);
+        const short =
+            more.assigneesNext === undefined && all !== undefined && assignees.length < all;
 
         return {
             ...rest,
-            assignees: [...new Set([...base.assignees, ...more.assignees])],
+            assignees,
+            ...(all === undefined ? {} : { assigneesTotal: all }),
             ...(more.assigneesNext === undefined ? {} : { assigneesNext: more.assigneesNext }),
-            ...(more.partial === true ? { partial: true as const } : {}),
+            ...(more.partial === true || short ? { partial: true as const } : {}),
         };
     }
 
     const { eventsBefore: _before, ...rest } = base;
+    const read = (base.eventsRead ?? base.events.length) + (more.eventsRead ?? more.events.length);
+    const all = total(base.eventsTotal, more.eventsTotal);
+    const short = more.eventsBefore === undefined && all !== undefined && read < all;
 
     return {
         ...rest,
         events: [...more.events, ...base.events],
+        eventsRead: read,
+        ...(all === undefined ? {} : { eventsTotal: all }),
         ...(more.eventsBefore === undefined ? {} : { eventsBefore: more.eventsBefore }),
-        ...(more.partial === true ? { partial: true as const } : {}),
+        ...(more.partial === true || short ? { partial: true as const } : {}),
+        ...(more.timelineCut === true || short ? { timelineCut: true as const } : {}),
     };
 }
 
@@ -8182,23 +8256,21 @@ export default function createDesk(host: Host, web: Web) {
                             continue;
                         }
 
-                        // An error under the PR's own fields (`body`, `closingIssuesReferences`) is not a missing PR:
-                        // the PR keeps its facts, and its detail is left out, so a partial class is unknown.
+                        // The PR is missing only when the error ends at the alias or at its `pullRequest` node, and that
+                        // node is null or absent. An error deeper in the path (`NOT_FOUND` too) is in a detail: the PR
+                        // keeps its facts, and its detail is left out, so a partial class is unknown.
                         const inside = Array.isArray(path) ? path.slice(1) : [];
-                        const notFound = (entry as { type?: unknown } | null)?.type === "NOT_FOUND";
+                        const ends =
+                            inside.length === 0 ||
+                            (inside.length === 1 && inside[0] === "pullRequest");
                         const fact = Object.values(facts.prs).find(
                             (pr) => pr.ref.toLowerCase() === ref.toLowerCase(),
                         );
-                        const detail =
-                            !notFound &&
-                            inside[0] === "pullRequest" &&
-                            inside.length > 1 &&
-                            fact !== undefined;
 
-                        if (detail) {
+                        if (fact !== undefined) {
                             delete fact.body;
                             delete fact.closing;
-                        } else if (!missing.includes(ref)) {
+                        } else if (ends && !missing.includes(ref)) {
                             missing.push(ref);
                         }
                     } else if (/^r[0-9]+$/.test(alias)) {
