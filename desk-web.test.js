@@ -174,3 +174,75 @@ test("a good empty queue shows nothing", async () => {
     assert.doesNotMatch(out, /Brian queued/);
     assert.doesNotMatch(out, /queue read/);
 });
+
+test("the top count opens the Other PRs section: grouped by repository, each a link with its author and age", async () => {
+    const out = await render({
+        ...viewWith(null),
+        others: { "frostyard/test": 3, "frostyard/empty": 0, "frostyard/old": 2 },
+        otherPrs: {
+            "frostyard/test": [
+                {
+                    ref: "frostyard/test#9",
+                    number: 9,
+                    title: "Bump x from 1 to 2",
+                    author: "dependabot[bot]",
+                    url: "https://github.com/frostyard/test/pull/9",
+                    createdAt: NOW - 3 * 86400_000,
+                    draft: true,
+                    checks: "FAILURE",
+                },
+                {
+                    ref: "frostyard/test#8",
+                    number: 8,
+                    title: "A script link",
+                    author: "someone",
+                    url: "javascript:alert(1)",
+                    createdAt: NOW - 30 * 60_000,
+                    draft: false,
+                    checks: "SUCCESS",
+                },
+            ],
+        },
+    });
+
+    assert.match(
+        out,
+        /aria-controls="desk-others" onClick=\[fn\] > 5 other PRs \(dependabot and others\)/,
+    );
+    assert.match(
+        out,
+        /<details id="desk-others" class="desk-closed desk-others"> <summary>Other PRs \(5\)<\/summary>/,
+    );
+    assert.doesNotMatch(out, /<details[^>]* open/, "collapsed by default");
+    assert.match(
+        out,
+        /<a class="desk-link" href=https:\/\/github\.com\/frostyard\/test\/pull\/9 target="_blank" rel="noopener"><span class="mono">frostyard\/test#9<\/span> <span class="desk-title">Bump x from 1 to 2<\/span><\/a> <span class="small muted"> \(dependabot\[bot\], 3 d ago\)<\/span >/,
+    );
+    assert.match(out, /desk-chip">draft</);
+    assert.match(out, /checks fail/);
+    assert.doesNotMatch(out, /href=javascript/, "an unsafe URL is no link");
+    assert.match(
+        out,
+        /frostyard\/test#8<\/span> <span class="desk-title">A script link<\/span> <span class="small muted"> \(someone, 30 min ago\)/,
+    );
+    assert.match(
+        out,
+        /… and 1 more: <a class="desk-link" href=https:\/\/github\.com\/frostyard\/test\/pulls/,
+    );
+    assert.doesNotMatch(out, /frostyard\/empty/, "a repository with no other PR has no group");
+    assert.match(
+        out,
+        /frostyard\/old <span class="desk-count">2<\/span>.*The list comes with the next sweep\./,
+    );
+    assert.ok(
+        out.indexOf("frostyard/old") < out.indexOf("frostyard/test#9"),
+        "repositories in name order",
+    );
+});
+
+test("no other PR: no count and no section", async () => {
+    const out = await render(viewWith(null));
+
+    assert.doesNotMatch(out, /other PR/);
+    assert.doesNotMatch(out, /desk-others/);
+});

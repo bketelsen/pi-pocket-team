@@ -303,3 +303,33 @@
     font: inherit;
     cursor: pointer;
 }
+
+.desk-others-repo h3 {
+    margin: 14px 0 6px;
+    font-size: 14px;
+}
+
+.desk-others-list {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+}
+
+.desk-other {
+    padding: 6px 0;
+    border-bottom: 1px solid var(--line);
+    overflow-wrap: anywhere;
+}
+
+.desk-other .desk-chip {
+    margin-left: 4px;
+}
+
+.desk-chip.desk-chip-fail {
+    border-color: var(--err);
+    color: var(--err);
+}
+
+.desk-other > .small {
+    margin-left: 4px;
+}

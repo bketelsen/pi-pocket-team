@@ -48,6 +48,8 @@ import {
     readText,
     threadView,
     threadsView,
+    othersFile,
+    OTHER_PRS_MAX,
     seedThreads,
     shortLine,
     detachFrom,
@@ -4405,6 +4407,136 @@ describe("attribute", () => {
 
         assert.equal(thread2.prs["frostyard/test#7"]?.via, "window");
         assert.equal(state2.others?.["frostyard/test"], 0);
+    });
+
+    test("the other PRs are kept as a list, newest first; a closed one leaves at the next read", () => {
+        const state = deskOf();
+
+        attribute(
+            state,
+            githubOf([
+                prFact({
+                    author: "dependabot[bot]",
+                    number: 9,
+                    ref: "frostyard/test#9",
+                    title: "Bump  x\nfrom 1 to 2",
+                    url: "https://github.com/frostyard/test/pull/9",
+                    createdAt: 100,
+                    checks: "FAILURE",
+                }),
+                prFact({
+                    author: "someone",
+                    number: 10,
+                    ref: "frostyard/test#10",
+                    createdAt: 200,
+                    isDraft: true,
+                }),
+                prFact({ author: "github-viewer" }),
+                prFact({ author: "bketelsen", number: 11, ref: "frostyard/test#11" }),
+            ]),
+            gitOf({ ownAuthors: ["bketelsen"] }),
+            400,
+        );
+
+        assert.equal(state.others?.["frostyard/test"], 2);
+        assert.deepEqual(
+            state.otherPrs?.["frostyard/test"]?.map((pr) => pr.ref),
+            ["frostyard/test#10", "frostyard/test#9"],
+            "newest first; ours and Brian's own are not in it",
+        );
+        assert.deepEqual(state.otherPrs?.["frostyard/test"]?.[1], {
+            ref: "frostyard/test#9",
+            number: 9,
+            title: "Bump x from 1 to 2",
+            author: "dependabot[bot]",
+            url: "https://github.com/frostyard/test/pull/9",
+            createdAt: 100,
+            draft: false,
+            checks: "FAILURE",
+        });
+        assert.equal(state.otherPrs?.["frostyard/test"]?.[0]?.draft, true);
+
+        attribute(
+            state,
+            githubOf([prFact({ author: "someone", number: 10, ref: "frostyard/test#10" })]),
+            gitOf(),
+            500,
+        );
+        assert.deepEqual(
+            state.otherPrs?.["frostyard/test"]?.map((pr) => pr.ref),
+            ["frostyard/test#10"],
+            "the merged PR left",
+        );
+
+        attribute(state, githubOf([]), gitOf(), 600);
+        assert.equal(state.others?.["frostyard/test"], 0);
+        assert.equal(state.otherPrs?.["frostyard/test"], undefined, "no key for an empty list");
+    });
+
+    test("the list keeps at most OTHER_PRS_MAX PRs of a repository; the count keeps all", () => {
+        const state = deskOf();
+        const many = Array.from({ length: OTHER_PRS_MAX + 5 }, (_, index) =>
+            prFact({
+                author: "dependabot[bot]",
+                number: index + 1,
+                ref: `frostyard/test#${String(index + 1)}`,
+                createdAt: index + 1,
+            }),
+        );
+
+        attribute(state, githubOf(many), gitOf(), 400);
+        assert.equal(state.others?.["frostyard/test"], OTHER_PRS_MAX + 5);
+        assert.equal(state.otherPrs?.["frostyard/test"]?.length, OTHER_PRS_MAX);
+        assert.equal(
+            state.otherPrs?.["frostyard/test"]?.[0]?.ref,
+            `frostyard/test#${String(OTHER_PRS_MAX + 5)}`,
+        );
+
+        const view = threadsView(state, 400);
+
+        assert.equal(view.otherPrs["frostyard/test"]?.length, OTHER_PRS_MAX);
+        assert.equal(view.others["frostyard/test"], OTHER_PRS_MAX + 5);
+
+        const file = othersFile(state);
+
+        assert.match(file, /^# Other PRs\n/);
+        assert.match(file, /## frostyard\/test \(55\)/);
+        assert.match(file, /- … and 5 more on GitHub\./);
+    });
+
+    test("others.md: a link, the title, the author, the date, and the marks; None. when empty", () => {
+        const state = deskOf();
+
+        attribute(
+            state,
+            githubOf([
+                prFact({
+                    author: "dependabot[bot]",
+                    number: 9,
+                    ref: "frostyard/test#9",
+                    title: "Bump [x]",
+                    url: "https://github.com/frostyard/test/pull/9",
+                    createdAt: Date.parse("2026-10-20T12:00:00Z"),
+                    isDraft: true,
+                    checks: "FAILURE",
+                }),
+            ]),
+            gitOf(),
+            400,
+        );
+
+        const files = exportFiles(state, {}, 1000, 12);
+
+        assert.match(
+            files["others.md"] ?? "",
+            /- \[frostyard\/test#9\]\(https:\/\/github\.com\/frostyard\/test\/pull\/9\) Bump \\\[x\\\] · dependabot\\\[bot\\\] · 2026-10-20 · draft · checks: failure\n/,
+        );
+        assert.match(othersFile(deskOf()), /\nNone\.\n$/);
+
+        const old = deskOf();
+
+        old.others = { "frostyard/test": 2 };
+        assert.match(othersFile(old), /- The list comes with the next sweep\./);
     });
 
     test("an archived repository attaches nothing; an attached PR becomes FROZEN", () => {
