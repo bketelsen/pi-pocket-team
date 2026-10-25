@@ -78,15 +78,15 @@ It escalates to Odrade (1 `team_message`, 1 line for each item, with the thread 
 | `desk` list, read, sync                                                    | yes, for its supervisor's threads                                 |
 | `desk` attach, detach, watch, result                                       | yes, on its supervisor's threads                                  |
 | `desk send` (new)                                                          | yes: 1 message to a thread's agent, from the supervisor's session |
-| `desk` ask, answer, seed                                                   | **refused**: asks and Brian's words are Odrade's                  |
+| `desk` ask, answer, seed, own                                              | **refused**: `own`, asks, and Brian's words are Odrade's          |
 | `team_delegate`                                                            | **refused** (supervisor only, as today)                           |
 | `team_message`                                                             | yes: to its return address (Odrade), for escalations              |
 | `bash`, `read`, `edit`, `write`                                            | yes, in its workspace                                             |
 | `gh pr merge`, `gh pr review`, `gh release`, `git tag`, `git push --force` | **blocked** by a hook in the Clerk's session                      |
 
-The Clerk never approves, merges, tags, releases, files an ask, records an answer for Brian, or writes a
-decision that Brian did not make. A decision line in `decided.md` copies Brian's words from the desk
-(`desk read` shows each answer); it never makes one.
+The Clerk never approves, merges, tags, releases, files an ask, records an answer for Brian, marks a
+thread as Brian's own, or writes a decision that Brian did not make. A decision line in `decided.md`
+copies Brian's words from the desk (`desk read` shows each answer); it never makes one.
 
 `desk send` is new, and the supervisor can use it too. It sends 1 message from the supervisor's session to
 the thread's agent at the thread's stored address, with a replay key, and adds 1 event to the thread. The
