@@ -1,7 +1,7 @@
 // The Desk page's queue section: rendered with stand-ins for Pocket's page tools, no browser.
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import setup, { queueStatus } from "./desk-web/index.js";
+import setup, { badgeOf, groupOf, queueStatus } from "./desk-web/index.js";
 
 const NOW = Date.now();
 
@@ -50,8 +50,8 @@ const html = (strings, ...values) => {
     );
 };
 
-/** Render the page with this view. */
-const render = async (view) => {
+/** Render the page with this view. `onBadge` takes each rail update. */
+const render = async (view, onBadge = () => {}) => {
     let page;
 
     setup({
@@ -64,7 +64,7 @@ const render = async (view) => {
         page: (each) => {
             page = each;
         },
-        rail: () => ({ update() {} }),
+        rail: () => ({ update: onBadge }),
         on: () => () => {},
         onDispose() {},
     });
@@ -267,4 +267,123 @@ test("a desk with room shows no banner", async () => {
     assert.doesNotMatch(out, /The desk is full/);
     assert.doesNotMatch(out, /extra allowed/);
     assert.doesNotMatch(out, /desk-full/);
+});
+
+// ─── An open ask needs Brian, whatever else the thread is ────────────────────
+
+/** One thread of the page's view, as the server sends it. */
+const threadView = (patch = {}) => ({
+    id: "T1",
+    title: "A task",
+    origin: "delegate",
+    agents: ["duncan"],
+    repo: "frostyard/test",
+    state: "open",
+    next: "agent",
+    stale: false,
+    open: false,
+    prs: [],
+    asks: [],
+    answered: [],
+    resolved: [],
+    lastEventAt: NOW - 60_000,
+    asleep: false,
+    ...patch,
+});
+
+/** The ask the thread waits on. */
+const openAsk = { id: "T1a", text: "Which one?", at: NOW - 1000 };
+
+test("a found thread with an open ask is under Needs you, with its ask card and its attach actions", async () => {
+    let badge = null;
+    const out = await render(
+        {
+            ...viewWith(null),
+            threads: [
+                threadView({ id: "F2", origin: "found", title: "A found PR", asks: [openAsk] }),
+            ],
+        },
+        (next) => {
+            badge = next.badge;
+        },
+    );
+
+    const need = out.slice(out.indexOf("<h2>Needs you"), out.indexOf("</section>"));
+
+    assert.match(need, /F2/);
+    assert.match(need, /T1a · Which one\?/);
+    assert.match(need, /aria-label=Answered T1a/);
+    assert.match(need, /> Answered </);
+    assert.match(need, /Attach to…/, "it can still be attached");
+    assert.doesNotMatch(out, /<h2>Found /, "it is not in Found");
+    assert.equal(badge, 1, "the badge counts it");
+});
+
+test("a watched thread with an open ask is under Needs you, with its ask card and its check date", async () => {
+    let badge = null;
+    const out = await render(
+        {
+            ...viewWith(null),
+            threads: [
+                threadView({
+                    id: "T3",
+                    title: "A sleeping task",
+                    asleep: true,
+                    next: "brian",
+                    asks: [openAsk],
+                    watch: {
+                        checkOn: "2026-12-01",
+                        check: "the blob sweep",
+                        setBy: "odrade",
+                        due: false,
+                    },
+                }),
+            ],
+        },
+        (next) => {
+            badge = next.badge;
+        },
+    );
+
+    const need = out.slice(out.indexOf("<h2>Needs you"), out.indexOf("</section>"));
+
+    assert.match(need, /T3/);
+    assert.match(need, /T1a · Which one\?/);
+    assert.match(need, /> Answered </);
+    assert.match(need, /check on 2026-12-01/, "the watch date still shows");
+    assert.doesNotMatch(out, /<h2>Watching /, "it is not in Watching");
+    assert.equal(badge, 1, "the badge counts it");
+});
+
+test("groupOf: an ask comes first after closed and parked; else asleep, found, Brian, stale, the reviewer", () => {
+    assert.equal(groupOf(threadView({ state: "closed" })), "closed");
+    assert.equal(groupOf(threadView({ state: "parked", asks: [openAsk] })), "parked");
+    assert.equal(groupOf(threadView({ asks: [openAsk] })), "need");
+    assert.equal(groupOf(threadView({ asleep: true, asks: [openAsk] })), "need");
+    assert.equal(groupOf(threadView({ origin: "found", asks: [openAsk] })), "need");
+    assert.equal(groupOf(threadView({ asleep: true, origin: "found" })), "watching");
+    assert.equal(groupOf(threadView({ origin: "found" })), "found");
+    assert.equal(groupOf(threadView({ next: "brian" })), "need");
+    assert.equal(groupOf(threadView({ stale: true })), "stale");
+    assert.equal(groupOf(threadView({ next: "reviewer" })), "review");
+    assert.equal(groupOf(threadView({})), "working");
+});
+
+test("badgeOf: an open ask counts, also when asleep; a plain sleeping thread does not", () => {
+    const view = (threads) => ({ ...viewWith(null), threads });
+
+    assert.equal(badgeOf(null), 0);
+    assert.equal(badgeOf(view([threadView({ next: "brian" })])), 1);
+    assert.equal(badgeOf(view([threadView({ stale: true })])), 1);
+    assert.equal(badgeOf(view([threadView({})])), 0);
+    assert.equal(badgeOf(view([threadView({ state: "closed", asks: [openAsk] })])), 0);
+    assert.equal(badgeOf(view([threadView({ state: "parked", asks: [openAsk] })])), 0);
+    assert.equal(badgeOf(view([threadView({ origin: "found", asks: [openAsk] })])), 1);
+
+    const sleeping = threadView({ id: "T3", asleep: true, next: "odrade" });
+    const sleepingAsked = threadView({ id: "T4", asleep: true, next: "brian", asks: [openAsk] });
+
+    assert.equal(groupOf(sleeping), "watching");
+    assert.equal(badgeOf(view([sleeping])), 0, "a plain sleeping thread does not count");
+    assert.equal(badgeOf(view([sleepingAsked])), 1);
 });

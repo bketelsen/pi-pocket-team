@@ -12,16 +12,67 @@ let rail = null;
 /** The running module's `pocket`: the shared loader is called from effects and events too. */
 let app = null;
 
-const badgeOf = (next) =>
+/** The groups of the page, in the order it shows them. */
+const GROUPS = ["closed", "parked", "need", "watching", "found", "stale", "review", "working"];
+
+/**
+ * The section a thread goes in. First match: closed, parked, an open ask (it needs Brian, and neither a watch nor a
+ * found origin hides it), asleep, found, Brian, stale, the reviewer.
+ */
+export const groupOf = (thread) => {
+    if (thread.state === "closed") {
+        return "closed";
+    }
+
+    if (thread.state === "parked") {
+        return "parked";
+    }
+
+    if ((thread.asks ?? []).length > 0) {
+        return "need";
+    }
+
+    if (thread.asleep) {
+        return "watching";
+    }
+
+    if (thread.origin === "found") {
+        return "found";
+    }
+
+    if (thread.next === "brian") {
+        return "need";
+    }
+
+    if (thread.stale) {
+        return "stale";
+    }
+
+    if (thread.next === "reviewer") {
+        return "review";
+    }
+
+    return "working";
+};
+
+/**
+ * The rail badge: the threads that need Brian. A thread that is not parked or closed counts when it has an open ask,
+ * also when it is asleep; else it counts when it is not asleep and it needs Brian or is stale.
+ */
+export const badgeOf = (next) =>
     next === null || next === undefined
         ? 0
-        : next.threads.filter(
-              (thread) =>
-                  thread.state !== "parked" &&
-                  thread.state !== "closed" &&
-                  !thread.asleep &&
-                  (thread.next === "brian" || thread.stale),
-          ).length;
+        : next.threads.filter((thread) => {
+              if (thread.state === "parked" || thread.state === "closed") {
+                  return false;
+              }
+
+              if ((thread.asks ?? []).length > 0) {
+                  return true;
+              }
+
+              return !thread.asleep && (thread.next === "brian" || thread.stale);
+          }).length;
 
 const publish = (next) => {
     view = next;
@@ -398,35 +449,10 @@ export default function setup(pocket) {
         }
 
         const threads = view?.threads ?? [];
-        const groups = {
-            need: [],
-            stale: [],
-            found: [],
-            watching: [],
-            working: [],
-            review: [],
-            parked: [],
-            closed: [],
-        };
+        const groups = Object.fromEntries(GROUPS.map((group) => [group, []]));
 
         for (const thread of threads) {
-            if (thread.state === "closed") {
-                groups.closed.push(thread);
-            } else if (thread.state === "parked") {
-                groups.parked.push(thread);
-            } else if (thread.asleep) {
-                groups.watching.push(thread);
-            } else if (thread.origin === "found") {
-                groups.found.push(thread);
-            } else if (thread.next === "brian") {
-                groups.need.push(thread);
-            } else if (thread.stale) {
-                groups.stale.push(thread);
-            } else if (thread.next === "reviewer") {
-                groups.review.push(thread);
-            } else {
-                groups.working.push(thread);
-            }
+            groups[groupOf(thread)].push(thread);
         }
 
         // The soonest check first.
@@ -1032,7 +1058,12 @@ export default function setup(pocket) {
             ${error ? html`<div class="error-box" role="alert">${error}</div>` : null}
             ${loadError ? html`<div class="error-box" role="alert">${loadError}</div>` : null}
             ${queueSection}
-            ${section("Needs you", groups.need, (thread) => row(thread, withWatch(thread, needDetail(thread))))}
+            ${section("Needs you", groups.need, (thread) =>
+                row(
+                    thread,
+                    html`${withWatch(thread, needDetail(thread))}${thread.origin === "found" ? foundActions(thread) : null}`,
+                ),
+            )}
             ${section(
                 "Found",
                 groups.found,

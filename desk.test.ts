@@ -48,6 +48,7 @@ import {
     readText,
     threadView,
     threadsView,
+    threadWord,
     othersFile,
     OTHER_PRS_MAX,
     seedThreads,
@@ -114,6 +115,7 @@ import {
     wakeWatch,
     FOUND_FOLDER_DELAY_MS,
     grantText,
+    hasOpenAsk,
     parseGitHub,
     prNext,
     scanText,
@@ -1041,6 +1043,66 @@ describe("reportBlocks", () => {
         );
         assert.equal(reportBlocks("anything", "done"), false);
         assert.equal(reportBlocks("anything"), false);
+    });
+
+    test("T248: a report that quotes `BLOCKED` in code, and asks Brian to merge and install its PR, is not blocked", () => {
+        // The T248 report (pi-pocket-team#54), word for word.
+        const t248 =
+            'Done. PR bketelsen/pi-pocket-team#54 has the fix. It has the label `ready-for-human`. CI is green. The cross-review result is Ready, Blocking: none. Brian must merge and install it (`npm run install-check`, then `npm run install-extension`). `desk.ts` then reloads live. No restart is necessary.\n\nCauses. I replayed the live `x.desk.threads` revisions. Then I ran `closeCheck` on each thread just before Odrade closed it. Each thread had 1 open part:\n- T231, T240, T131, T137, T145, T172, T180, T197: "1 unpushed commit". Each Moneo worktree branch starts at `fe79ff2`, the head of squash-merged truenas-mcp#43. No remote has that commit. It is in the base, not the thread\'s work.\n- T236, T238: "the night shift is paused". A message stopped the shift, and nobody resumed it. Only `ended` counted as done.\n- F32: "2 unpushed commits". The snosi main checkout is on the squash-merged branch of snosi#1150, and its upstream is gone. HEAD is that PR\'s head oid.\n- These were not causes: an idle session that is not archived, `branches`, and the close-out wake-up.\n\nNew rule:\n- A `paused` shift does not hold a thread. Only `running` and `summary` hold it.\n- The unpushed count includes only the thread\'s own commits. A commit in the delegation worktree\'s base does not count. The base is the creation entry of the branch reflog, also after a rename. A commit that GitHub had as a PR head does not count.\n- A newest report that says `BLOCKED`, or asks for a decision (`asksBrian`), keeps the thread open. Odrade is next ("report says blocked"). The new field is `run.reportBlocked`. An older thread gets the flag from its newest stored report at the next sweep. It stays open until the desk reads that report.\n- The other close conditions stay the same: PRs, asks, watch, idle and reported, a clean folder. The close-out wake-up stays the same: it is sent 1 time, and the thread closes at a sweep after the report.\n\nChecks: typecheck, lint, and `npm test` pass (692 pass, 0 fail). There are tests for the 5 cases and for the open cases (an open PR, an open ask, a running shift, a BLOCKED report, a dirty folder), plus real-git tests for T231, F32, and the rename.\n\nCoder: deepseek/deepseek-flash. Reviewer: openai/gpt-6.1-sol, 1 review and 2 re-reviews.\n\nLimit: in a main checkout, squash leftovers still count when no desk thread had the PR and the PR is not open.';
+
+        assert.equal(reportBlocks(t248), false);
+        assert.equal(reportBlocks("The rule: a report that says `BLOCKED` waits."), false);
+        assert.equal(
+            reportBlocks("Done.\n\n```\nBLOCKED\nblocked on X\nNeeds Brian: yes\n```"),
+            false,
+        );
+        // A request to merge or install, with no choice in it, is no decision.
+        assert.equal(reportBlocks("Done. PR #54 is ready.\n\nPlease merge and install it."), false);
+        assert.equal(
+            reportBlocks("Done.\n\nBrian must merge #54, then run the installation."),
+            false,
+        );
+        // A question still counts, also when it names a merge; so does another ask beside the merge.
+        assert.equal(reportBlocks("Done.\n\nCan you merge #54 and run the install?"), true);
+        assert.equal(
+            reportBlocks("Done.\n\nCan you approve the database deletion before I merge #54?"),
+            true,
+        );
+        assert.equal(
+            reportBlocks("Done.\n\nPlease merge #54 and please confirm the deletion."),
+            true,
+        );
+        // A choice is still a decision, and BLOCKED outside code still counts.
+        assert.equal(
+            reportBlocks("Done.\n\nShould I merge #54 now, or wait for the release?"),
+            true,
+        );
+        assert.equal(reportBlocks("Done.\n\nPlease merge #54 or #55: your call."), true);
+        assert.equal(reportBlocks("Done.\n\nPlease merge #54 or #55."), true);
+        assert.equal(reportBlocks("The deploy is BLOCKED. Please merge #54 after the fix."), true);
+        assert.equal(reportBlocks("Status: BLOCKED"), true);
+        assert.equal(reportBlocks("The deploy is currently BLOCKED."), true);
+        assert.equal(reportBlocks("The deploy has been BLOCKED since Monday."), true);
+        assert.equal(reportBlocks("This is a BLOCKED report test."), false);
+        // Code in every Markdown form is quoted, not said.
+        assert.equal(reportBlocks("The rule names ``BLOCKED`` in capitals."), false);
+        assert.equal(reportBlocks("Done.\n\n~~~\nBLOCKED\n~~~"), false);
+        assert.equal(reportBlocks("Done.\n\n~~~sh\nprintf '~~~'\n# BLOCKED\n~~~"), false);
+        assert.equal(reportBlocks("Done.\n\n```\nBLOCKED\n~~~\n```\n\nAll set."), false);
+        assert.equal(reportBlocks("Done.\n\n```\nBLOCKED\n````\n\nAll set."), false);
+        // A fence closes the code: the words after it count again.
+        assert.equal(reportBlocks("```\ncode\n```\nThe deploy is BLOCKED."), true);
+        assert.equal(reportBlocks("```\r\nexample\r\n```\r\n\r\nThe deploy is BLOCKED."), true);
+        assert.equal(reportBlocks("Done.\r\n\r\n```\r\nBLOCKED\r\n```\r\n\r\nAll set."), false);
+        assert.equal(reportBlocks("Done.\n\n````\nBLOCKED\n```\nstill code\n````"), false);
+        assert.equal(reportBlocks("The release stays BLOCKED until the key is set."), true);
+        assert.equal(reportBlocks("The deploy: BLOCKED on the token."), true);
+        assert.equal(
+            reportBlocks("There are tests for a BLOCKED report and a dirty folder."),
+            false,
+        );
+        // Outside a report, a merge request still asks Brian.
+        assert.equal(asksBrian("Can you merge #54?"), true);
     });
 });
 
@@ -2490,6 +2552,75 @@ describe("the watch's rules", () => {
 
         assert.equal(block?.[0], `2026-11-20 · ${other.id} · frostyard/test · the second check`);
         assert.equal(block?.[1], `2026-12-01 · ${sleeping.id} · frostyard/test · the blob sweep`);
+    });
+
+    test("an open ask waits on Brian, over a watch and over a found origin, and it still does not count", () => {
+        const state = deskOf();
+        const found = placed(state, 100);
+        const sleeping = placed(state, 200);
+        const now = on("2026-11-02");
+
+        found.origin = "found";
+        found.asks = [{ id: "T1a", text: "Which one?", at: 1 }];
+        sleeping.asks = [{ id: "T2a", text: "Attach it?", at: 1 }];
+        sleeping.watch = {
+            checkOn: "2026-12-01",
+            check: "the blob sweep",
+            setAt: 1,
+            setBy: "odrade",
+            key: "k-1",
+        };
+
+        for (const one of [found, sleeping]) {
+            assert.equal(hasOpenAsk(one), true);
+            assert.equal(nextActor(one), "brian");
+            assert.equal(threadWord(one, now), "waits on Brian");
+        }
+
+        assert.equal(found.origin, "found", "the found origin still shows");
+        assert.equal(asleep(sleeping, now), true, "the watch still sleeps");
+        assert.equal(
+            isCounted(sleeping, now),
+            false,
+            "a watched thread with an ask does not count",
+        );
+
+        const text = listText(state, now);
+
+        assert.match(
+            text,
+            new RegExp(`^${found.id} · open · next: brian · .*T1a · `, "m"),
+            "the found thread has its own line, with its ask id",
+        );
+        assert.match(
+            text,
+            new RegExp(
+                `^${sleeping.id} · open · next: brian · .*watch: 2026-12-01 · .*T2a · `,
+                "m",
+            ),
+            "the sleeping thread has its own line, with its watch date and its ask id",
+        );
+        assert.doesNotMatch(
+            text,
+            new RegExp(`^2026-12-01 · ${sleeping.id} `, "m"),
+            "it is not under Watching",
+        );
+
+        const readme = exportFiles(state, {}, now, 12)["threads.md"] ?? "";
+        const needs = readme.split("## Needs Brian\n")[1]?.split("\n## ")[0] ?? "";
+
+        assert.match(needs, new RegExp(`\\*\\*${found.id}\\*\\*`), "the found thread is here");
+        assert.match(
+            needs,
+            new RegExp(`\\*\\*${sleeping.id}\\*\\*`),
+            "the sleeping thread is here",
+        );
+        assert.match(
+            exportFiles(state, {}, now, 12)[`${sleeping.id}.md`] ?? "",
+            /- Watch: 2026-12-01 · the blob sweep · set by odrade/,
+            "its own file keeps the watch",
+        );
+        assert.doesNotMatch(readme, /## Watching\n\n- \*\*/, "no thread sleeps under Watching");
     });
 
     test("readText has a Watch line, with its date, check, who set it, the wake and the result", () => {
