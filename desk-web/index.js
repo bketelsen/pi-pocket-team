@@ -162,10 +162,14 @@ export default function setup(pocket) {
     /** A GitHub link that is safe to open: http(s) only. */
     const webUrl = (url) => (/^https?:\/\/\S+$/.test(url ?? "") ? url : undefined);
 
+    /** A watch's date as people read it: "2026-10-26", or "2026-10-26 09:00" when it has a time. */
+    const watchWhen = (watch) =>
+        watch.checkTime ? `${watch.checkOn} ${watch.checkTime}` : watch.checkOn;
+
     /** One line about a thread's watch, for the detail view. */
     const watchLine = (watch) =>
         [
-            watch.checkOn,
+            watchWhen(watch),
             watch.check,
             `set by ${watch.setBy}`,
             watch.due ? "due" : "",
@@ -338,6 +342,7 @@ export default function setup(pocket) {
         const [answers, setAnswers] = useState({});
         const [watchFor, setWatchFor] = useState(null);
         const [checkOn, setCheckOn] = useState("");
+        const [checkTime, setCheckTime] = useState("");
         const [checkText, setCheckText] = useState("");
         const [resultFor, setResultFor] = useState(null);
         const [resultText, setResultText] = useState("");
@@ -400,6 +405,7 @@ export default function setup(pocket) {
                 setReason("");
                 setWatchFor(null);
                 setCheckOn("");
+                setCheckTime("");
                 setCheckText("");
                 setResultFor(null);
                 setResultText("");
@@ -418,7 +424,12 @@ export default function setup(pocket) {
 
         const drop = (id) => act(`threads/${id}/drop`, { reason });
 
-        const watchOn = (id) => act(`threads/${id}/watch`, { checkOn, check: checkText.trim() });
+        // The date alone, or the date and the optional time, as 1 text: the desk parses it.
+        const watchOn = (id) =>
+            act(`threads/${id}/watch`, {
+                checkOn: checkTime === "" ? checkOn : `${checkOn} ${checkTime}`,
+                check: checkText.trim(),
+            });
 
         const passCheck = (id) =>
             act(`threads/${id}/result`, { pass: true, text: "Passed on the Desk page." });
@@ -458,8 +469,9 @@ export default function setup(pocket) {
         // The soonest check first.
         groups.watching.sort(
             (a, b) =>
-                (a.watch?.checkOn ?? "").localeCompare(b.watch?.checkOn ?? "") ||
-                a.id.localeCompare(b.id, undefined, { numeric: true }),
+                (a.watch ? watchWhen(a.watch) : "").localeCompare(
+                    b.watch ? watchWhen(b.watch) : "",
+                ) || a.id.localeCompare(b.id, undefined, { numeric: true }),
         );
 
         const others = Object.values(view?.others ?? {}).reduce((sum, count) => sum + count, 0);
@@ -475,7 +487,7 @@ export default function setup(pocket) {
                 thread.watch && thread.watch.due
                     ? `due: ${thread.watch.check}`
                     : thread.asleep && thread.watch
-                      ? `check on ${thread.watch.checkOn}`
+                      ? `check on ${watchWhen(thread.watch)}`
                       : "",
                 thread.stale ? "stale" : "",
             ]
@@ -649,6 +661,14 @@ export default function setup(pocket) {
                           value=${checkOn}
                           disabled=${busy}
                           onInput=${(event) => setCheckOn(event.currentTarget.value)}
+                      />
+                      <input
+                          class="desk-reason"
+                          type="time"
+                          aria-label=${`The check's time for ${thread.id} (optional)`}
+                          value=${checkTime}
+                          disabled=${busy}
+                          onInput=${(event) => setCheckTime(event.currentTarget.value)}
                       />
                       <input
                           class="desk-reason"

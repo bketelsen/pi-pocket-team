@@ -355,6 +355,26 @@ test("a watched thread with an open ask is under Needs you, with its ask card an
     assert.equal(badge, 1, "the badge counts it");
 });
 
+test("a watch with a time shows the time in its row; one without shows the date only", async () => {
+    const watching = (id, watch) =>
+        threadView({
+            id,
+            title: `Sleeping ${id}`,
+            asleep: true,
+            watch: { check: "the blob sweep", setBy: "odrade", due: false, ...watch },
+        });
+    const out = await render({
+        ...viewWith(null),
+        threads: [
+            watching("T3", { checkOn: "2026-12-01", checkTime: "09:00" }),
+            watching("T4", { checkOn: "2026-12-02" }),
+        ],
+    });
+
+    assert.match(out, /check on 2026-12-01 09:00/);
+    assert.match(out, /check on 2026-12-02(?! \d)/);
+});
+
 test("groupOf: an ask comes first after closed and parked; else asleep, found, Brian, stale, the reviewer", () => {
     assert.equal(groupOf(threadView({ state: "closed" })), "closed");
     assert.equal(groupOf(threadView({ state: "parked", asks: [openAsk] })), "parked");

@@ -867,7 +867,7 @@ export default function createTeam(host: Host, web: Web) {
      * The desk module's API, from a global: team.ts must not import desk.ts. A static import would keep a stale copy
      * after a reload.
      */
-    type DeskThread = { id: string; watch?: { checkOn: string } };
+    type DeskThread = { id: string; watch?: { checkOn: string; checkTime?: string } };
     type DeskApi = {
         version: number;
         open: (
@@ -1316,7 +1316,7 @@ export default function createTeam(host: Host, web: Web) {
                     check_on: Type.String({
                         minLength: 1,
                         description:
-                            "The check's date as 2026-10-29, or a span from today: 7d, 2w, 1m",
+                            "The check's date as 2026-10-29, 2026-10-29 09:00 (local time, the server's zone), or a span from today: 7d, 2w, 1m, optionally with a time (1d 09:00)",
                     }),
                     check: Type.String({
                         minLength: 1,
@@ -1424,7 +1424,12 @@ export default function createTeam(host: Host, web: Web) {
                           context,
                       );
             // The watch's date is the one the desk resolved at open: a span such as "2w" is kept as its day.
-            const checkOn = opened?.thread.watch?.checkOn;
+            const checkOn =
+                opened?.thread.watch === undefined
+                    ? undefined
+                    : opened.thread.watch.checkTime === undefined
+                      ? opened.thread.watch.checkOn
+                      : `${opened.thread.watch.checkOn} ${opened.thread.watch.checkTime}`;
             const thread =
                 opened === undefined
                     ? ""
