@@ -6781,7 +6781,8 @@ function withoutCode(text: string): string {
     const kept: string[] = [];
     let fence: { mark: string; length: number } | undefined;
 
-    for (const line of text.split("\n")) {
+    // CRLF and CR line ends are line ends too: a fence's closing line must match without its "\r".
+    for (const line of text.split(/\r\n?|\n/)) {
         if (fence === undefined) {
             const open = /^ {0,3}(`{3,}|~{3,})/.exec(line);
 

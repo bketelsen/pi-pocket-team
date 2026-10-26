@@ -1092,6 +1092,8 @@ describe("reportBlocks", () => {
         assert.equal(reportBlocks("Done.\n\n```\nBLOCKED\n````\n\nAll set."), false);
         // A fence closes the code: the words after it count again.
         assert.equal(reportBlocks("```\ncode\n```\nThe deploy is BLOCKED."), true);
+        assert.equal(reportBlocks("```\r\nexample\r\n```\r\n\r\nThe deploy is BLOCKED."), true);
+        assert.equal(reportBlocks("Done.\r\n\r\n```\r\nBLOCKED\r\n```\r\n\r\nAll set."), false);
         assert.equal(reportBlocks("Done.\n\n````\nBLOCKED\n```\nstill code\n````"), false);
         assert.equal(reportBlocks("The release stays BLOCKED until the key is set."), true);
         assert.equal(reportBlocks("The deploy: BLOCKED on the token."), true);
