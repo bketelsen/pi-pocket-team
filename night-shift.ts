@@ -747,9 +747,10 @@ export function parseVerdict(text: string): { verdict: Verdict; reason: string }
 const FROM = /^\[from: ([^\]\n]{1,60})\] /;
 /**
  * Messages that no person typed: this module's rounds, Pocket's linked sessions, PiP, webhooks and watches (all
- * `[via …]`), schedules, subagent reports, and Done when's checks.
+ * `[via …]`), schedules, subagent reports, Done when's checks, and the end of a background task (Pocket 0.24's
+ * `BACKGROUND_PREFIX`, `[background] `).
  */
-const AUTOMATED = /^\[(?:night-shift\]|via |scheduled\]|subagent |goal\] )/;
+const AUTOMATED = /^\[(?:night-shift\]|via |scheduled\]|subagent |goal\] |background\] )/;
 
 function textOf(content: unknown): string {
     if (typeof content === "string") {
