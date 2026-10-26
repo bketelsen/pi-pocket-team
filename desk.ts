@@ -214,7 +214,10 @@ export type Thread = {
      * repair wake-ups that went to the agent: never pruned), `worktreeGone` (when a sweep removed the thread's
      * delegation worktree), `worktreeKeptAt` (when git refused to remove it: the next try waits a day), and `unready`
      * (the `ready-for-human` removals the sweep decided, by key `unready:<ref>:<label time>`:
-     * `{ at, why, to, removed, sent }`, at most 30).
+     * `{ at, why, to, removed, sent }`, at most 30), and `reportBlocked` (true when the newest report says BLOCKED or
+     * asks for a decision, false when it does not, absent when the desk did not derive it yet: an older thread gets it
+     * at its next sweep, from its newest stored report, and it stays open until then because an absent flag is not
+     * `false`).
      */
     run: Record<string, JsonValue>;
     /** The last 50; `key` makes an event unique. */
@@ -1663,6 +1666,46 @@ function openSession(thread: Thread): string | undefined {
           : "it did not report in its last turn";
 }
 
+/**
+ * Whether a night shift still holds its thread open. Only `running` and `summary` work: `ended` is done, and `paused` has
+ * no driver (a message stopped it, and nobody resumed it), so it is stopped.
+ */
+export function shiftWorks(shift: JsonValue | undefined): boolean {
+    return typeof shift === "string" && shift !== "ended" && shift !== "paused";
+}
+
+/**
+ * Whether a report says the work is blocked, or asks for a decision: the reason `blocked` or `failed`, the word `BLOCKED`
+ * in capitals, a line that starts with `blocked` (any case, after a bullet or bold mark), `needs brian: yes` (any case),
+ * a line that starts with `needs a decision` or `decision needed` (any case), or a last paragraph that asks Brian
+ * something (`asksBrian`: a question, or the ask words).
+ */
+export function reportBlocks(text: string, reason?: string): boolean {
+    if (reason === "blocked" || reason === "failed") {
+        return true;
+    }
+
+    if (/\bBLOCKED\b/.test(text) || /needs\s+brian:\s*yes\b/i.test(text)) {
+        return true;
+    }
+
+    for (const line of text.split("\n")) {
+        // A bullet, a heading, a quote, and a bold mark are no words: the line's first word is after them.
+        const start = line.replace(/^[\s>#*-]+/, "").toLowerCase();
+
+        if (
+            start.startsWith("blocked") ||
+            start.startsWith("needs a decision") ||
+            start.startsWith("decision needed")
+        ) {
+            return true;
+        }
+    }
+
+    // A report whose last paragraph asks Brian something waits for his answer, as a blocked one does.
+    return asksBrian(text);
+}
+
 export type CloseFacts = {
     /** The sweep's clock. */
     now: number;
@@ -1723,6 +1766,21 @@ export function closeCheck(thread: Thread, facts: CloseFacts): { close: boolean;
         open.push(session);
     }
 
+    // A report that says the work is blocked, or asks for a decision, waits on Odrade: the thread is not done.
+    if (thread.run.reportBlocked === true) {
+        open.push("its last report says BLOCKED or asks for a decision");
+    }
+
+    // A thread that reported before the desk derived its flag: a failed read of its reports leaves the flag absent, and
+    // an absent flag is not `false`, so the thread waits until a sweep reads the report.
+    if (
+        thread.session !== undefined &&
+        thread.run.reportedAt !== undefined &&
+        typeof thread.run.reportBlocked !== "boolean"
+    ) {
+        open.push("its newest report is not checked yet");
+    }
+
     // A thread whose last PR merged is not done until its agent did the after-merge steps.
     const held = closeoutHold(thread);
 
@@ -1732,8 +1790,8 @@ export function closeCheck(thread: Thread, facts: CloseFacts): { close: boolean;
 
     const shift = thread.run.shift;
 
-    if (typeof shift === "string" && shift !== "ended") {
-        open.push(`the night shift is ${shift}`);
+    if (shiftWorks(shift)) {
+        open.push(`the night shift is ${String(shift)}`);
     }
 
     const folder = folderOf(thread);
@@ -1762,6 +1820,41 @@ export function closeCheck(thread: Thread, facts: CloseFacts): { close: boolean;
     }
 
     return { close: open.length === 0, open };
+}
+
+/**
+ * The commit oids GitHub had as a PR head: each non-empty `head` of each PR link of each thread (any thread state, any
+ * PR state), and each non-empty `head` in `github.prs` and in each `github.repos[*].open`. Such a commit is pushed, also
+ * when its remote branch is gone (a squash-merge leaves the branch's commits behind, and no remote ref holds them).
+ */
+export function knownHeads(threads: Iterable<Thread>, github?: GitHubFacts): Set<string> {
+    const heads = new Set<string>();
+
+    for (const thread of threads) {
+        for (const pr of Object.values(thread.prs)) {
+            if (typeof pr.head === "string" && pr.head !== "") {
+                heads.add(pr.head);
+            }
+        }
+    }
+
+    if (github !== undefined) {
+        for (const pr of Object.values(github.prs)) {
+            if (typeof pr.head === "string" && pr.head !== "") {
+                heads.add(pr.head);
+            }
+        }
+
+        for (const repo of Object.values(github.repos)) {
+            for (const pr of repo.open) {
+                if (typeof pr.head === "string" && pr.head !== "") {
+                    heads.add(pr.head);
+                }
+            }
+        }
+    }
+
+    return heads;
 }
 
 /**
@@ -2416,7 +2509,10 @@ export function planUnready(thread: Thread, github: GitHubFacts, now: number): n
 
 export type NextActor = "brian" | "agent" | "odrade" | "reviewer" | "none";
 
-/** Who acts next on a thread. First match: brian, odrade (a due watch), agent (a failed watch), agent, odrade. */
+/**
+ * Who acts next on a thread. First match: brian, odrade (a due watch), agent (a failed watch), agent, odrade (a found
+ * thread, or a report that says BLOCKED), so a thread whose report asks for a decision waits on Odrade.
+ */
 export function nextActor(thread: Thread): NextActor {
     if (thread.state === "closed") {
         return "none";
@@ -2464,7 +2560,7 @@ export function nextActor(thread: Thread): NextActor {
     // A worktree of the thread's folder that holds it: work of the agent, as the folder's own counts are.
     const worktree = storedWorktrees(thread).length > 0;
     const shift = thread.run.shift;
-    const shiftOpen = typeof shift === "string" && shift !== "ended";
+    const shiftOpen = shiftWorks(shift);
 
     if (
         busy ||
@@ -2479,6 +2575,11 @@ export function nextActor(thread: Thread): NextActor {
     }
 
     if (thread.origin === "found" || openPrs.includes("odrade")) {
+        return "odrade";
+    }
+
+    // A report that says BLOCKED or asks for a decision waits on Odrade, unless the agent works now.
+    if (thread.run.reportBlocked === true && thread.run.busy !== true) {
         return "odrade";
     }
 
@@ -2514,8 +2615,8 @@ const SILENT_SESSION = "silent session";
 
 /**
  * Why a thread waits on Odrade now, in `nextActor`'s order, in words: a due watch, a found thread, a PR GitHub cannot
- * find, else a silent session. Undefined when Odrade is not next, or the thread is parked: a parked thread waits on
- * Brian, not on her.
+ * find, a report that says blocked, else a silent session. Undefined when Odrade is not next, or the thread is parked: a
+ * parked thread waits on Brian, not on her.
  */
 export function odradeReason(thread: Thread): string | undefined {
     if (thread.state === "parked" || nextActor(thread) !== "odrade") {
@@ -2558,6 +2659,10 @@ export function odradeReason(thread: Thread): string | undefined {
 
     if (stays !== undefined) {
         return issueOpenWords(stays);
+    }
+
+    if (thread.run.reportBlocked === true) {
+        return "report says blocked";
     }
 
     return SILENT_SESSION;
@@ -7831,6 +7936,10 @@ export default function createDesk(host: Host, web: Web) {
 
             thread.run.reportedAt = request.at;
 
+            // A later report replaces it: only the newest report counts. `false` is not absent: an absent flag is a
+            // thread that the desk did not derive yet.
+            thread.run.reportBlocked = reportBlocks(request.text, request.reason);
+
             if (newest !== undefined) {
                 thread.run.reportedUserEntry = newest;
             }
@@ -7939,6 +8048,12 @@ export default function createDesk(host: Host, web: Web) {
         ownAuthors: string[];
         /** folder → branch → the oldest reflog time, in ms. */
         branches: Record<string, Record<string, number>>;
+        /**
+         * By thread id: the newest stored report of a thread from before `run.reportBlocked`, whose flag the commit then
+         * sets; `null` is a good read with no report. A thread whose report is not here (a failed read) keeps its absent
+         * flag until a later sweep, and stays open meanwhile.
+         */
+        reports?: Record<string, StoredReport | null>;
     };
 
     const run = promisify(execFile);
@@ -8137,8 +8252,14 @@ export default function createDesk(host: Host, web: Web) {
      * `git status` of one folder: null when it is not a git repository, as before. A repository whose status git cannot
      * read is a fact with `statusFailed`: a failed read is not a clean folder. When git prints no `# branch.ab` line,
      * `git rev-list --count HEAD --not --remotes` counts the commits that no remote-tracking ref has.
+     *
+     * Only the commits the thread made count: a commit that was in its worktree's base is not its work, and neither is a
+     * commit that GitHub had as a PR head (a squash-merge leaves it behind, on no remote).
      */
-    async function statusOf(folder: string): Promise<FolderFact | null> {
+    async function statusOf(
+        folder: string,
+        options: { heads?: ReadonlySet<string>; branch?: string } = {},
+    ): Promise<FolderFact | null> {
         const text = await gitText(folder, ["status", "--porcelain=v2", "--branch"]);
 
         if (text === undefined) {
@@ -8158,9 +8279,17 @@ export default function createDesk(host: Host, web: Web) {
         }
 
         const status = parseStatus(text);
+        // The branch the folder is on now: a renamed delegation branch is the thread's branch under another name.
+        const own = {
+            ...options,
+            ...(status.branch === undefined ? {} : { current: status.branch }),
+        };
 
         if (status.ahead !== undefined) {
-            return { dirty: status.dirty, ahead: status.ahead };
+            return {
+                dirty: status.dirty,
+                ahead: await ownAhead(folder, status.ahead, own),
+            };
         }
 
         // No `# branch.ab` line: this works for a branch with no upstream and for a detached HEAD. It fails when there is
@@ -8175,12 +8304,132 @@ export default function createDesk(host: Host, web: Web) {
         const ahead = counted === undefined ? Number.NaN : Number(counted.trim());
 
         return Number.isInteger(ahead) && ahead >= 0
-            ? { dirty: status.dirty, ahead }
+            ? { dirty: status.dirty, ahead: await ownAhead(folder, ahead, own) }
             : {
                   dirty: status.dirty,
                   ahead: undefined,
                   aheadUnknown: status.aheadUnknown ?? "no branch",
               };
+    }
+
+    /** One entry of a branch's reflog: the commit it holds, and its subject (`%gs`). */
+    type ReflogEntry = { oid: string; subject: string };
+
+    /** A branch's reflog in `folder`, newest entry first; undefined when git cannot read it. */
+    async function reflogOf(folder: string, branch: string): Promise<ReflogEntry[] | undefined> {
+        const text = await gitText(folder, [
+            "reflog",
+            "show",
+            "--format=%H %gs",
+            `refs/heads/${branch}`,
+        ]);
+
+        if (text === undefined) {
+            return undefined;
+        }
+
+        const entries: ReflogEntry[] = [];
+
+        for (const line of text.split("\n")) {
+            const match = /^([0-9a-f]{40,64})(?: (.*))?$/.exec(line.trim());
+
+            if (match !== null) {
+                entries.push({ oid: match[1]!, subject: match[2] ?? "" });
+            }
+        }
+
+        return entries;
+    }
+
+    /**
+     * The commit a branch was made from: its oldest reflog entry, when that entry is the creation (`branch: Created from
+     * ...`). Git expires old entries, so an oldest entry is a base only when it says it is one.
+     */
+    function baseOf(entries: readonly ReflogEntry[]): string | undefined {
+        const oldest = entries.at(-1);
+
+        return oldest !== undefined && oldest.subject.startsWith("branch: Created from")
+            ? oldest.oid
+            : undefined;
+    }
+
+    /** The commits on HEAD that no remote has, above `base`: undefined when git cannot count them. */
+    async function aboveBase(folder: string, base: string): Promise<number | undefined> {
+        const counted = await gitText(folder, [
+            "rev-list",
+            "--count",
+            "HEAD",
+            "--not",
+            "--remotes",
+            base,
+        ]);
+        const own = counted === undefined ? Number.NaN : Number(counted.trim());
+
+        return Number.isInteger(own) && own >= 0 ? own : undefined;
+    }
+
+    /**
+     * The unpushed commits that are the thread's own work, from the count git gave: 0 when GitHub had HEAD as a PR
+     * head, and otherwise the commits on no remote above the branch's base (`HEAD` is not in `--not`, so the base stays
+     * out of the count). The base is the branch's oldest reflog entry when that entry is its creation. An agent may
+     * rename its delegation branch: git then moves the reflog to the new name, and the current branch of the folder is
+     * that branch only when its reflog says the stored one was renamed into it. Any step that fails keeps the count.
+     */
+    async function ownAhead(
+        folder: string,
+        count: number,
+        options: { heads?: ReadonlySet<string>; branch?: string; current?: string },
+    ): Promise<number> {
+        if (count <= 0) {
+            return count;
+        }
+
+        const head = (await gitText(folder, ["rev-parse", "--verify", "HEAD"]))?.trim();
+
+        if (head !== undefined && head !== "" && options.heads?.has(head) === true) {
+            return 0;
+        }
+
+        const branch = branchName(options.branch);
+
+        if (branch === undefined) {
+            return count;
+        }
+
+        const stored = await reflogOf(folder, branch);
+        const base = stored === undefined ? undefined : baseOf(stored);
+        const own = base === undefined ? undefined : await aboveBase(folder, base);
+
+        if (own !== undefined) {
+            return own;
+        }
+
+        // The stored branch's reflog is gone (a rename, which git moves to the new name): the current branch is it only
+        // when its reflog says so.
+        const current = branchName(options.current);
+
+        if (current === undefined) {
+            return count;
+        }
+
+        const entries = await reflogOf(folder, current);
+        const renamed = `Branch: renamed refs/heads/${branch} to `;
+
+        if (entries?.some((entry) => entry.subject.startsWith(renamed)) !== true) {
+            return count;
+        }
+
+        const moved = baseOf(entries);
+        const movedOwn = moved === undefined ? undefined : await aboveBase(folder, moved);
+
+        return movedOwn ?? count;
+    }
+
+    /** A branch name that may go into a git command: the pattern's rule, and no `..`. */
+    function branchName(name: string | undefined): string | undefined {
+        return name !== undefined && BRANCH_NAME.test(name) && !name.includes("..")
+            ? name
+            : undefined;
     }
 
     /**
@@ -9054,6 +9303,30 @@ export default function createDesk(host: Host, web: Web) {
             (thread) => thread.supervisor === Number(supervisor) && thread.state !== "closed",
         );
 
+        // A thread filed before `run.reportBlocked` existed: its newest stored report decides the flag, 1 time. The read
+        // is here, not in the commit: a commit cannot read a table after its first write, and this read never makes the
+        // document of a session that has no reports. `null` is a good read with no report, which is no blocked report;
+        // a failed read leaves the key out, so the flag stays absent and the thread stays open.
+        const reports: Record<string, StoredReport | null> = {};
+
+        for (const thread of open) {
+            if (
+                thread.session === undefined ||
+                thread.run.reportedAt === undefined ||
+                thread.run.reportBlocked !== undefined
+            ) {
+                continue;
+            }
+
+            try {
+                reports[thread.id] =
+                    (await read.snapshot(DeskReports, thread.session as ConversationId, context))
+                        ?.reports[0] ?? null;
+            } catch {
+                // Not readable now: no key, so the flag stays absent and the thread waits for the next sweep.
+            }
+        }
+
         let sessions: SessionFact[] | undefined;
 
         try {
@@ -9222,9 +9495,24 @@ export default function createDesk(host: Host, web: Web) {
                 .map((thread) => thread.worktree?.path)
                 .filter((path): path is string => path !== undefined),
         );
+        // A commit that GitHub had as a PR head is pushed, and a worktree's base is not the thread's work: neither counts
+        // as unpushed. One read for every folder, from every thread, of every supervisor.
+        const heads = knownHeads(all, githubRead.facts);
+        const worktreeBranches = new Map<string, string>();
+
+        for (const thread of all) {
+            const worktree = thread.worktree;
+
+            if (worktree !== undefined && !worktreeBranches.has(worktree.path)) {
+                worktreeBranches.set(worktree.path, worktree.branch);
+            }
+        }
 
         for (const folder of folders) {
-            facts[folder] = await statusOf(folder);
+            facts[folder] = await statusOf(folder, {
+                heads,
+                branch: worktreeBranches.get(folder),
+            });
             worktrees[folder] = delegations.has(folder) ? [] : await worktreeFacts(folder, owned);
         }
 
@@ -9241,6 +9529,7 @@ export default function createDesk(host: Host, web: Web) {
             authors,
             ownAuthors,
             branches,
+            ...(Object.keys(reports).length === 0 ? {} : { reports }),
         };
     };
 
@@ -9698,6 +9987,16 @@ export default function createDesk(host: Host, web: Web) {
                     if (addEvent(thread, event.key, event.text, now)) {
                         events += 1;
                     }
+                }
+            }
+
+            // A thread from before `run.reportBlocked` existed: its newest stored report sets the flag now, once. No
+            // report is `false`. A key that is not here is a failed read: the flag stays absent, and the thread waits.
+            if (thread.run.reportBlocked === undefined) {
+                const report = facts.reports?.[thread.id];
+
+                if (report !== undefined) {
+                    thread.run.reportBlocked = report === null ? false : reportBlocks(report.text);
                 }
             }
 
