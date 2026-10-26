@@ -1746,12 +1746,14 @@ const SILENT_WORDS = "it did not report in its last turn";
 const FROM_PREFIX = /^\[from: [^\]\n]{1,60}\] /;
 
 /**
- * Whether a message in a session came from an address. Pocket's envelope for a linked session's message starts the text
- * (after the optional `[from: <name>] ` prefix) with
- * `[via linked session <address>] Message from linked session <address>, written by another session's agent`, and the
- * text holds the fence `<linked-session-message>` later. Only that start counts: the same words later in the text, as a
- * person's quote of a message, prove nothing. A person who types the whole envelope by hand can still forge it. No
- * address: no.
+ * Whether a message in a session came from an address. Pocket's envelope for a linked session's message is, after the
+ * optional `[from: <name>] ` prefix,
+ * `[via linked session <address>] Message from linked session <address>, written by another session's agent, …`, then
+ * `\n<linked-session-message>\n`, the body, and `\n</linked-session-message>` as the last thing in the text. The text
+ * must start with those words, hold the opening fence line once, hold the closing fence once, and end with it (after
+ * trailing blank space). Pocket's `defang` keeps the closing fence out of the body. So a quote of a message with a
+ * person's words after it, or a text with 2 closing fences, is not from the address. Only a person who types a whole
+ * well-formed envelope by hand, with nothing outside it, can forge it. No address: no.
  */
 export function fromAddress(text: string, address: string | undefined): boolean {
     if (address === undefined || address === "") {
@@ -1759,12 +1761,18 @@ export function fromAddress(text: string, address: string | undefined): boolean 
     }
 
     const trimmed = text.trimStart();
-    const rest = trimmed.slice(FROM_PREFIX.exec(trimmed)?.[0].length ?? 0);
+    const rest = trimmed.slice(FROM_PREFIX.exec(trimmed)?.[0].length ?? 0).trimEnd();
+    const open = "\n<linked-session-message>\n";
+    const close = "</linked-session-message>";
+    const count = (part: string): number => rest.split(part).length - 1;
 
     return (
         rest.startsWith(
             `[via linked session ${address}] Message from linked session ${address}, written by another session's agent`,
-        ) && rest.includes("<linked-session-message>")
+        ) &&
+        count(open) === 1 &&
+        count(close) === 1 &&
+        rest.endsWith(`\n${close}`)
     );
 }
 
