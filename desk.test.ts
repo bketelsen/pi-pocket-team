@@ -1058,7 +1058,20 @@ describe("reportBlocks", () => {
         );
         // A request to merge or install, with no choice in it, is no decision.
         assert.equal(reportBlocks("Done. PR #54 is ready.\n\nPlease merge and install it."), false);
-        assert.equal(reportBlocks("Done.\n\nCan you merge #54 and run the install?"), false);
+        assert.equal(
+            reportBlocks("Done.\n\nBrian must merge #54, then run the installation."),
+            false,
+        );
+        // A question still counts, also when it names a merge; so does another ask beside the merge.
+        assert.equal(reportBlocks("Done.\n\nCan you merge #54 and run the install?"), true);
+        assert.equal(
+            reportBlocks("Done.\n\nCan you approve the database deletion before I merge #54?"),
+            true,
+        );
+        assert.equal(
+            reportBlocks("Done.\n\nPlease merge #54 and please confirm the deletion."),
+            true,
+        );
         // A choice is still a decision, and BLOCKED outside code still counts.
         assert.equal(
             reportBlocks("Done.\n\nShould I merge #54 now, or wait for the release?"),
@@ -1067,6 +1080,13 @@ describe("reportBlocks", () => {
         assert.equal(reportBlocks("Done.\n\nPlease merge #54 or #55: your call."), true);
         assert.equal(reportBlocks("The deploy is BLOCKED. Please merge #54 after the fix."), true);
         assert.equal(reportBlocks("Status: BLOCKED"), true);
+        assert.equal(reportBlocks("The deploy is currently BLOCKED."), true);
+        assert.equal(reportBlocks("The deploy has been BLOCKED since Monday."), true);
+        assert.equal(reportBlocks("This is a BLOCKED report test."), false);
+        // Code in every Markdown form is quoted, not said.
+        assert.equal(reportBlocks("The rule names ``BLOCKED`` in capitals."), false);
+        assert.equal(reportBlocks("Done.\n\n~~~\nBLOCKED\n~~~"), false);
+        assert.equal(reportBlocks("Done.\n\n````\nBLOCKED\n```\nstill code\n````"), false);
         assert.equal(reportBlocks("The release stays BLOCKED until the key is set."), true);
         assert.equal(reportBlocks("The deploy: BLOCKED on the token."), true);
         assert.equal(

@@ -1678,12 +1678,13 @@ export function shiftWorks(shift: JsonValue | undefined): boolean {
 }
 
 /**
- * `BLOCKED` in capitals said of the work: after a verb or a status word ("is BLOCKED", "Status: BLOCKED"), or before
+ * `BLOCKED` in capitals said of the work: after a verb or a status word, with at most 2 adverbs between ("is BLOCKED",
+ * "is currently BLOCKED", "has been BLOCKED", "Status: BLOCKED"), or before
  * a colon or its cause ("BLOCKED: …", "BLOCKED on the key", "BLOCKED until …"). A line that starts with it is the
  * blocked line rule's.
  */
 const BLOCKED_SAID =
-    /\b(?:[Ii]s|[Aa]re|[Aa]m|[Ww]as|[Ww]ere|[Ss]tays?|[Rr]emains?|[Ss]till|[Nn]ow|[Ss]tatus|[Ss]tate|[Rr]esult)\s*:?\s+\**BLOCKED\b|\bBLOCKED\**\s*(?::|\b(?:by|on|until)\b)/;
+    /\b(?:[Ii]s|[Aa]re|[Aa]m|[Ww]as|[Ww]ere|[Bb]een|[Ss]tays?|[Rr]emains?|[Ss]till|[Nn]ow|[Ss]tatus|[Ss]tate|[Rr]esult)\s*:?\s+(?:(?:\w+ly|still|now|again|also)\s+){0,2}\**BLOCKED\b|\bBLOCKED\**\s*(?::|\b(?:by|on|until)\b)/;
 
 /**
  * Whether a report says the work is blocked, or asks for a decision: the reason `blocked` or `failed`, the word `BLOCKED`
@@ -6759,21 +6760,29 @@ const ASK_WORDS =
 const NEGATED =
     /nothing needs you|no ask|nothing for you|does(?: not|n't) need you|no action|not needed|nothing to decide/i;
 
-/** A request to merge or install: in a report it is no decision, unless it holds a choice. */
-const MERGE_REQUEST = /\b(merge|install)/i;
+/**
+ * The ask words of a report: `ASK_WORDS` without "please merge". In a report, a statement (no "?") that only asks Brian
+ * to merge or install is no decision: the PR's label `ready-for-human` already brings it to him. A question still counts.
+ */
+const REPORT_ASK_WORDS = new RegExp(
+    ASK_WORDS.source.replace("please (tap|merge|", "please (tap|"),
+    ASK_WORDS.flags,
+);
 
-/** The words of a choice: a merge or install request with one of them is still a decision. */
-const CHOICE = /should i|your call|which|whether|\bor\b|do you want/i;
-
-/** The text without its code blocks and inline code: words in code are quoted, never said. */
+/**
+ * The text without its code: fenced blocks (3 or more backticks or tildes) and inline code (a run of backticks, closed
+ * by a run of the same length). Words in code are quoted, never said.
+ */
 function withoutCode(text: string): string {
-    return text.replace(/```[\s\S]*?```/g, " ").replace(/`[^`\n]*`/g, " ");
+    return text
+        .replace(/(`{3,}|~{3,})[\s\S]*?\1/g, " ")
+        .replace(/(?<!`)(`+)(?!`)[^\n]*?(?<!`)\1(?!`)/g, " ");
 }
 
 /**
  * Whether the last paragraph asks Brian something. Code blocks and inline code never count, a sentence that says
- * there is no ask never counts, and a "?" counts in every other sentence. In a report (`report`), a request to merge
- * or install with no choice in it does not count: the PR's label brings it to Brian, and it is no decision.
+ * there is no ask never counts, and a "?" counts in every other sentence. In a report (`report`), "please merge" is no
+ * ask word (`REPORT_ASK_WORDS`): a statement that only asks for the merge is no decision.
  */
 export function asksBrian(text: string, options: { report?: boolean } = {}): boolean {
     const plain = withoutCode(text);
@@ -6793,11 +6802,10 @@ export function asksBrian(text: string, options: { report?: boolean } = {}): boo
             return false;
         }
 
-        if (options.report === true && MERGE_REQUEST.test(sentence) && !CHOICE.test(sentence)) {
-            return false;
-        }
-
-        return sentence.includes("?") || ASK_WORDS.test(sentence);
+        return (
+            sentence.includes("?") ||
+            (options.report === true ? REPORT_ASK_WORDS : ASK_WORDS).test(sentence)
+        );
     });
 }
 
