@@ -246,3 +246,25 @@ test("no other PR: no count and no section", async () => {
     assert.doesNotMatch(out, /other PR/);
     assert.doesNotMatch(out, /desk-others/);
 });
+
+test("a full desk says Allow 1 tells Odrade, and how many extra OKs wait", async () => {
+    const out = await render({
+        ...viewWith(null),
+        cap: { counted: 13, cap: 12, full: true, grants: 2 },
+    });
+
+    assert.match(
+        out,
+        /The desk is full: 13 of 12 count\. Allow 1 lets Odrade open 1 more thread, and tells her to delegate the work that waited\./,
+    );
+    assert.match(out, /2 extra allowed/);
+    assert.match(out, /> Allow 1 /);
+});
+
+test("a desk with room shows no banner", async () => {
+    const out = await render(viewWith(null));
+
+    assert.doesNotMatch(out, /The desk is full/);
+    assert.doesNotMatch(out, /extra allowed/);
+    assert.doesNotMatch(out, /desk-full/);
+});

@@ -231,6 +231,8 @@ export type Grant = {
     key: string;
     /** The delegation key that used it: absent again when that start failed. */
     usedBy?: string;
+    /** When the desk was below the cap with this OK unused: it is not usable after that. */
+    lapsed?: number;
     expires: number;
 };
 
@@ -6243,7 +6245,7 @@ export type CapView = {
     counted: number;
     cap: number;
     full: boolean;
-    /** The usable OKs: not used, and not expired. */
+    /** The usable OKs: not used, not lapsed, and not expired. */
     grants: Grant[];
 };
 
@@ -6253,10 +6255,33 @@ export function capView(state: Readonly<DeskState> | undefined, cap: number, now
         isCounted(thread, now),
     ).length;
     const grants = (state?.grants ?? []).filter(
-        (grant) => grant.usedBy === undefined && grant.expires > now,
+        (grant) => grant.usedBy === undefined && grant.lapsed === undefined && grant.expires > now,
     );
 
     return { counted, cap, full: counted >= cap, grants };
+}
+
+/**
+ * Lapse the OKs that no longer fit: an OK is for a full desk. When the desk drops below the cap, an unused OK lapses,
+ * so OKs never pile up silently. Returns how many it lapsed.
+ */
+export function lapseGrants(state: DeskState, cap: number, now: number): number {
+    if (capView(state, cap, now).full) {
+        return 0;
+    }
+
+    let lapsed = 0;
+
+    for (const grant of state.grants) {
+        if (grant.usedBy !== undefined || grant.lapsed !== undefined || grant.expires <= now) {
+            continue;
+        }
+
+        grant.lapsed = now;
+        lapsed += 1;
+    }
+
+    return lapsed;
 }
 
 /** The refusal: no thread is made, and the model reads the words as the tool's error. */
@@ -6271,7 +6296,21 @@ export function deskFullText(
         .map((thread) => thread.id)
         .sort((a, b) => idNumber(a) - idNumber(b));
 
-    return `The desk is full: ${String(view.counted)} of ${String(view.cap)} threads count. Stale: ${stale.join(", ") || "none"}. Ask Brian for an OK: he taps "Allow 1" on the Desk page, or writes "desk ok" in this chat. Then delegate again.`;
+    return `The desk is full: ${String(view.counted)} of ${String(view.cap)} threads count. Stale: ${stale.join(", ") || "none"}. Ask Brian for an OK: he taps "Allow 1" on the Desk page (a [desk] message then tells you), or writes "desk ok" in this chat. Then delegate again.`;
+}
+
+/**
+ * The message a tap on the page sends each supervisor: 1 line that says the desk has room again, and asks for the work
+ * that waited. Its `[desk] ` prefix makes it an automated message, so it never counts as a "desk ok".
+ */
+export function grantText(
+    by: string,
+    count: number,
+    view: { counted: number; cap: number },
+): string {
+    const more = count === 1 ? "1 more thread" : `${String(count)} more threads`;
+
+    return `[desk] ${by} allowed ${more} over the cap (${String(view.counted)} of ${String(view.cap)} count). Delegate the work that waited now, with team_delegate.`;
 }
 
 // ─── The chat's "desk ok" ───────────────────────────────────────────────────
@@ -7643,6 +7682,9 @@ export default function createDesk(host: Host, web: Web) {
             const { cap } = await deskConfig();
 
             await scanChatGrants(tx, state, request.supervisor, request.at);
+
+            // An OK is for a full desk: an unused one lapses when the desk has room without it.
+            lapseGrants(state, cap, request.at);
 
             const view = capView(state, cap, request.at);
             let grant: Grant | undefined;
@@ -9373,7 +9415,7 @@ export default function createDesk(host: Host, web: Web) {
         state.baseline ??= {};
         repairEpoch(state, now);
         // The digest's setting, read at each sweep: a change works without a reload.
-        const { digest } = await deskConfig();
+        const { cap, digest } = await deskConfig();
         const digestOn = digest.minutes > 0;
 
         // A Clerk whose session is archived leaves the desk: desk news goes to the supervisor again. A failed session
@@ -10055,6 +10097,9 @@ export default function createDesk(host: Host, web: Web) {
             }
         }
 
+        // An OK is for a full desk: after this sweep's threads moved, an unused OK lapses when the desk has room.
+        lapseGrants(state, cap, now);
+
         return { events };
     };
 
@@ -10661,7 +10706,7 @@ export default function createDesk(host: Host, web: Web) {
                     const held = host.heldBack(supervisor);
 
                     if (held !== undefined) {
-                        warning = `The desk answer did not reach the supervisor: ${held}.`;
+                        warning = `The desk message did not reach the supervisor: ${held}.`;
                     } else {
                         try {
                             await conversation.submit(
@@ -10674,7 +10719,7 @@ export default function createDesk(host: Host, web: Web) {
                                 context,
                             );
                         } catch (error) {
-                            warning = `The desk answer did not reach the supervisor: ${(error as Error).message}`;
+                            warning = `The desk message did not reach the supervisor: ${(error as Error).message}`;
                         }
                     }
                 }
@@ -10963,6 +11008,9 @@ export default function createDesk(host: Host, web: Web) {
             const now = Date.now();
 
             change(state, now);
+
+            // An OK is for a full desk: a page action that frees a place lapses the OKs that wait.
+            lapseGrants(state, cap, now);
 
             return threadsView(state, now, cap);
         });
@@ -11406,6 +11454,15 @@ export default function createDesk(host: Host, web: Web) {
             const view = await request.commit(async (tx) => {
                 const state = await tx.doc(DeskThreads);
                 const now = Date.now();
+                const before = capView(state, cap, now);
+
+                // An OK is for a full desk: with room, Odrade delegates without one, and a tap would only pile up.
+                if (!before.full) {
+                    throw web.error(
+                        409,
+                        "The desk is not full: Odrade can delegate without an OK.",
+                    );
+                }
 
                 for (let index = 1; index <= count; index += 1) {
                     addGrant(state, {
@@ -11415,6 +11472,35 @@ export default function createDesk(host: Host, web: Web) {
                         key: `tap:${String(now)}:${String(index)}`,
                         expires: now + GRANT_MS,
                     });
+                }
+
+                // The tap wakes each supervisor with counted threads at once: never through the digest, because an OK
+                // is only useful while the desk is full. The request id makes a rerun after a restart act once.
+                const supervisors = [
+                    ...new Set(
+                        Object.values(state.threads)
+                            .filter((thread) => isCounted(thread, now))
+                            .map((thread) => thread.supervisor)
+                            .filter((supervisor): supervisor is number => supervisor !== undefined),
+                    ),
+                ].sort((a, b) => a - b);
+                const text = grantText(request.user.name, count, before);
+
+                for (const supervisor of supervisors) {
+                    await tx.createTask(
+                        Notify,
+                        {
+                            supervisor,
+                            text,
+                            requestId: `x.desk.grant:${String(now)}:${String(supervisor)}`,
+                        },
+                        {
+                            ownership: { kind: "conversation" },
+                            conversationId: supervisor as ConversationId,
+                            background: true,
+                            abandonOnRestart: false,
+                        },
+                    );
                 }
 
                 return threadsView(state, now, cap);
@@ -11857,7 +11943,7 @@ export default function createDesk(host: Host, web: Web) {
                 const snapshot = await api.snapshot(DeskThreads, context);
                 const view = capView(snapshot, cap, Date.now());
                 const waiting = view.grants.length;
-                const first = `Counted: ${String(view.counted)} of ${String(view.cap)}${waiting === 0 ? "" : ` (${String(waiting)} OK${waiting === 1 ? "" : "s"} waiting)`}`;
+                const first = `Counted: ${String(view.counted)} of ${String(view.cap)}${waiting === 0 ? "" : ` (${String(waiting)} extra allowed)`}`;
 
                 const queued = issuesSummary(snapshot);
 
@@ -12446,7 +12532,7 @@ export default function createDesk(host: Host, web: Web) {
                     ...githubLines(state),
                     ...(capped.full
                         ? [
-                              'The desk is full: team_delegate refuses new work until Brian gives an OK (a tap on the Desk page, or "desk ok" in this chat).',
+                              'The desk is full: team_delegate refuses new work; it does not queue it. When Brian taps Allow on the Desk page, a [desk] message tells you; when he writes "desk ok" in this chat, you see it. Then delegate the work again.',
                           ]
                         : []),
                     `Stale: ${stale.length === 0 ? "none" : stale.join(", ")}.`,
