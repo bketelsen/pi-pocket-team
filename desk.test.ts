@@ -110,6 +110,11 @@ import {
     isCounted,
     isDue,
     parseCheckOn,
+    parseCheckWhen,
+    fromAddress,
+    quietSilence,
+    watchDueAt,
+    watchWhen,
     recordResult,
     setWatch,
     wakeWatch,
@@ -2080,6 +2085,377 @@ describe("watch dates", () => {
         for (const long of ["401d", "53w", "13m"]) {
             assert.match(errorOf(parseCheckOn(long, now)), /1 to 400 days, 1 to 52 weeks/);
         }
+    });
+});
+
+describe("a watch with a time of day", () => {
+    /** A local time on a day: "2026-10-26" and "09:00". */
+    const at = (day: string, time: string) => new Date(`${day}T${time}:00`).getTime();
+
+    test("parseCheckWhen takes a day or a span, then a time", () => {
+        const now = on("2026-10-26");
+
+        assert.deepEqual(parseCheckWhen("2026-10-29", now), { checkOn: "2026-10-29" });
+        assert.deepEqual(parseCheckWhen("2026-10-29 09:00", now), {
+            checkOn: "2026-10-29",
+            checkTime: "09:00",
+        });
+        assert.deepEqual(parseCheckWhen(" 2026-10-29T09:30 ", now), {
+            checkOn: "2026-10-29",
+            checkTime: "09:30",
+        });
+        assert.deepEqual(parseCheckWhen("2026-10-29 9:05", now), {
+            checkOn: "2026-10-29",
+            checkTime: "09:05",
+        });
+        assert.deepEqual(parseCheckWhen("1d 09:00", now), {
+            checkOn: "2026-10-27",
+            checkTime: "09:00",
+        });
+        assert.deepEqual(parseCheckWhen("2w  23:59", now), {
+            checkOn: "2026-11-09",
+            checkTime: "23:59",
+        });
+        assert.deepEqual(parseCheckWhen("7d", now), { checkOn: "2026-11-02" });
+    });
+
+    test("parseCheckWhen refuses a bad time, a past time, and a bad day", () => {
+        const now = at("2026-10-26", "09:00");
+
+        for (const bad of ["24:00", "09:60", "9", "09:0", "09:00:00", "noon", "-1:00"]) {
+            assert.match(errorOf(parseCheckWhen(`2026-10-29 ${bad}`, now)), /is not a time/, bad);
+        }
+
+        assert.equal(
+            errorOf(parseCheckWhen("2026-10-26 09:00", now)),
+            "The check time 2026-10-26 09:00 is in the past.",
+            "at now is the past",
+        );
+        assert.equal(
+            errorOf(parseCheckWhen("2026-10-26 08:59", now)),
+            "The check time 2026-10-26 08:59 is in the past.",
+        );
+        assert.deepEqual(parseCheckWhen("2026-10-26 09:01", now), {
+            checkOn: "2026-10-26",
+            checkTime: "09:01",
+        });
+        assert.match(
+            errorOf(parseCheckWhen("2026-10-25 23:00", now)),
+            /check date 2026-10-25 is in the past/,
+        );
+        assert.match(errorOf(parseCheckWhen("2026-02-30 09:00", now)), /not a real date/);
+        assert.match(errorOf(parseCheckWhen("401d 09:00", now)), /1 to 400 days/);
+        assert.match(errorOf(parseCheckWhen("soon 09:00", now)), /A check date is a day such as/);
+        assert.match(errorOf(parseCheckWhen("", now)), /optional time/);
+    });
+
+    test("a date-only day today stays allowed, and parseCheckOn keeps its old results", () => {
+        const now = at("2026-10-26", "15:00");
+
+        assert.deepEqual(parseCheckWhen("2026-10-26", now), { checkOn: "2026-10-26" });
+        assert.equal(parseCheckOn("2026-10-26", now), "2026-10-26");
+        assert.equal(parseCheckOn("1w", now), "2026-11-02");
+        assert.match(errorOf(parseCheckOn("2026-10-30 09:00", now)), /takes no time/);
+    });
+
+    test("watchDueAt is the start of the day, or the local instant of the time", () => {
+        const dateOnly = { checkOn: "2026-10-26" };
+        const timed = { checkOn: "2026-10-26", checkTime: "09:05" };
+
+        assert.equal(watchDueAt(dateOnly), new Date(2026, 9, 26, 0, 0).getTime());
+        assert.equal(watchDueAt(timed), new Date(2026, 9, 26, 9, 5).getTime());
+        assert.equal(watchWhen(dateOnly), "2026-10-26");
+        assert.equal(watchWhen(timed), "2026-10-26 09:05");
+    });
+
+    test("asleep and isDue turn at the due instant, to the millisecond", () => {
+        const dateOnly = watched({}, "2026-10-26");
+        const timed = watched(
+            { watch: { ...watched().watch!, checkOn: "2026-10-26", checkTime: "09:00" } },
+            "2026-10-26",
+        );
+
+        for (const [each, due] of [
+            [dateOnly, at("2026-10-26", "00:00")],
+            [timed, at("2026-10-26", "09:00")],
+        ] as const) {
+            assert.equal(asleep(each, due - 1), true);
+            assert.equal(isDue(each, due - 1), false);
+            assert.equal(asleep(each, due), false);
+            assert.equal(isDue(each, due), true);
+        }
+
+        // At 08:00 the date-only watch is due, and the timed one still sleeps.
+        assert.equal(isDue(dateOnly, at("2026-10-26", "08:00")), true);
+        assert.equal(asleep(timed, at("2026-10-26", "08:00")), true);
+        assert.equal(isCounted(timed, at("2026-10-26", "08:00")), false);
+    });
+
+    test("wakeWatch leaves a timed watch asleep before its time, and keys its event with the time", () => {
+        const timed = watched(
+            { watch: { ...watched().watch!, checkOn: "2026-10-26", checkTime: "09:00" } },
+            "2026-10-26",
+        );
+        const events = timed.events.length;
+
+        assert.equal(wakeWatch(timed, at("2026-10-26", "08:59")), false);
+        assert.equal(timed.watch?.dueAt, undefined);
+        assert.equal(timed.events.length, events);
+
+        assert.equal(wakeWatch(timed, at("2026-10-26", "09:00")), true);
+        assert.equal(timed.events.at(-1)?.key, "watch:2026-10-26 09:00:due");
+
+        // A date-only watch keeps the key it always had.
+        const plain = watched({}, "2026-10-26");
+
+        assert.equal(wakeWatch(plain, at("2026-10-26", "00:00")), true);
+        assert.equal(plain.events.at(-1)?.key, "watch:2026-10-26:due");
+    });
+
+    test("setWatch stores checkTime, and shows it in its event; a date-only watch stores none", () => {
+        const fresh = thread();
+        const now = at("2026-10-22", "10:00");
+
+        assert.deepEqual(
+            setWatch(fresh, {
+                checkOn: "2026-10-26 09:00",
+                check: "the blob sweep",
+                by: "odrade",
+                key: "call-t",
+                at: now,
+            }),
+            { changed: true },
+        );
+        assert.equal(fresh.watch?.checkOn, "2026-10-26");
+        assert.equal(fresh.watch?.checkTime, "09:00");
+        assert.equal(
+            fresh.events.at(-1)?.text,
+            "watch: check on 2026-10-26 09:00 by odrade: the blob sweep",
+        );
+
+        // A past time is refused, and the watch stays.
+        assert.match(
+            errorOf(
+                setWatch(fresh, {
+                    checkOn: "2026-10-22 09:00",
+                    check: "x",
+                    by: "odrade",
+                    key: "call-p",
+                    at: now,
+                }),
+            ),
+            /in the past/,
+        );
+        assert.equal(fresh.watch?.checkTime, "09:00");
+
+        // A new date-only watch replaces it, with no time left.
+        setWatch(fresh, { checkOn: "2026-10-30", check: "y", by: "brian", key: "call-d", at: now });
+        assert.equal(fresh.watch?.checkTime, undefined);
+        assert.equal("checkTime" in (fresh.watch ?? {}), false);
+    });
+
+    test("closeCheck says when a timed watch is due, and the openThread watch keeps its time", () => {
+        const timed = watched(
+            { watch: { ...watched().watch!, checkOn: "2026-10-26", checkTime: "09:00" } },
+            "2026-10-26",
+        );
+
+        assert.match(
+            closeCheck(timed, facts(at("2026-10-26", "08:00"))).open.join(";"),
+            /watch: check on 2026-10-26 09:00/,
+        );
+        assert.match(
+            closeCheck(timed, facts(at("2026-10-26", "09:00"))).open.join(";"),
+            /watch is due: the blob sweep/,
+        );
+
+        const opened = openThread(empty(), {
+            key: "k-time",
+            supervisor: 5,
+            agents: ["duncan"],
+            title: "A task",
+            at: at("2026-10-22", "10:00"),
+            watch: { checkOn: "2026-10-26 09:00", check: "look", by: "odrade" },
+        });
+
+        assert.equal(opened.thread.watch?.checkTime, "09:00");
+        assert.match(
+            opened.thread.events.at(-1)?.text ?? "",
+            /check on 2026-10-26 09:00 by odrade/,
+        );
+    });
+});
+
+describe("a quiet session after a supervisor's message", () => {
+    const ADDRESS = "session-aaa-111";
+    const message = (address: string, body = "Thanks.") =>
+        `[via linked session ${address}] Message from linked session ${address}, written by another session's agent, not a person.\n<linked-session-message>\n${body}\n</linked-session-message>`;
+
+    /** A reopened thread that is quiet: reported at entry 5, reopened at 500 for a message at entry 6. */
+    const quiet = (run: Record<string, JsonValue> = {}, patch: Partial<Thread> = {}): Thread =>
+        thread({
+            run: {
+                reportedUserEntry: 5,
+                reportedAt: 400,
+                reportBlocked: false,
+                lastUserEntry: 6,
+                otherUserEntry: 5,
+                quietReopen: { at: 500, entry: 5 },
+                ...run,
+            },
+            ...patch,
+        });
+
+    test("fromAddress reads the words before the first fence", () => {
+        assert.equal(fromAddress(message(ADDRESS), ADDRESS), true);
+        assert.equal(
+            fromAddress(
+                message(ADDRESS).replace("[via linked session session-aaa-111] ", ""),
+                ADDRESS,
+            ),
+            true,
+            "with no marker",
+        );
+        assert.equal(fromAddress(message("session-bbb-222"), ADDRESS), false, "another address");
+        assert.equal(fromAddress(message("session-aaa-1112"), ADDRESS), false, "a longer address");
+        assert.equal(fromAddress("A person writes.", ADDRESS), false);
+        assert.equal(fromAddress(message(ADDRESS), undefined), false, "no address: no");
+        assert.equal(fromAddress(message(ADDRESS), ""), false);
+        // The sender's own text, inside the fence, says nothing of who sent it.
+        assert.equal(
+            fromAddress(
+                message("session-bbb-222", `Message from linked session ${ADDRESS},`),
+                ADDRESS,
+            ),
+            false,
+        );
+        assert.equal(
+            fromAddress(`Message from linked session ${ADDRESS}, with no fence`, ADDRESS),
+            false,
+            "no fence: not a linked session's message",
+        );
+    });
+
+    test("quietSilence is true for a quiet idle session, and each condition alone makes it false", () => {
+        assert.equal(quietSilence(quiet()), true);
+        assert.equal(quietSilence(quiet({}, { run: { ...quiet().run, otherUserEntry: 5 } })), true);
+
+        const without = (key: string): Thread => {
+            const each = quiet();
+
+            delete each.run[key];
+
+            return each;
+        };
+
+        assert.equal(quietSilence(without("quietReopen")), false, "no mark");
+        assert.equal(quietSilence(quiet({ quietReopen: "x" })), false, "a bad mark");
+        assert.equal(
+            quietSilence(quiet({ quietReopen: { at: 500 } })),
+            false,
+            "a mark with no entry",
+        );
+        assert.equal(quietSilence(quiet({ quietReopen: { at: "5", entry: 5 } })), false);
+        assert.equal(quietSilence(quiet({}, { state: "closed" })), false, "closed");
+        assert.equal(quietSilence(quiet({}, { state: "parked" })), false, "parked");
+        assert.equal(quietSilence(quiet({}, { session: undefined })), false, "no session");
+        assert.equal(quietSilence(quiet({ busy: true })), false, "busy");
+        assert.equal(quietSilence(without("busy")), false, "not seen idle");
+        assert.equal(quietSilence(quiet({ archived: true })), false, "archived");
+        assert.equal(quietSilence(without("reportedUserEntry")), false, "never reported");
+        assert.equal(quietSilence(without("reportedAt")), false, "no report time");
+        assert.equal(quietSilence(quiet({ reportedAt: 501 })), false, "a report after the reopen");
+        assert.equal(
+            quietSilence(quiet({ reportedAt: 500 })),
+            true,
+            "a report at the reopen is not after",
+        );
+        assert.equal(quietSilence(without("otherUserEntry")), false, "no other entry known");
+        assert.equal(
+            quietSilence(quiet({ otherUserEntry: 6 })),
+            false,
+            "another's message after the close",
+        );
+    });
+
+    test("closeCheck leaves the silence out for a quiet session, and keeps every other part", () => {
+        assert.deepEqual(closeCheck(quiet(), facts()), { close: true, open: [] });
+
+        // The same thread without the mark: the silence holds it.
+        const unmarked = quiet();
+
+        delete unmarked.run.quietReopen;
+        assert.deepEqual(closeCheck(unmarked, facts()).open, [
+            "it did not report in its last turn",
+        ]);
+
+        // A report after the reopen: the session part is closed by the report itself.
+        assert.equal(
+            closeCheck(quiet({ reportedAt: 600, reportedUserEntry: 6 }), facts()).close,
+            true,
+        );
+
+        // A person's message after the close: the silence holds it.
+        assert.deepEqual(closeCheck(quiet({ otherUserEntry: 6 }), facts()).open, [
+            "it did not report in its last turn",
+        ]);
+
+        // A busy session holds it, with its own words.
+        assert.deepEqual(closeCheck(quiet({ busy: true }), facts()).open, [
+            "its session is working",
+        ]);
+
+        // Every other condition still applies.
+        assert.deepEqual(closeCheck(quiet({ dirty: 2 }), facts()).open.length, 1);
+        assert.match(
+            closeCheck(quiet({ dirty: 2 }), facts()).open.join(";"),
+            /changed|dirty|uncommitted/,
+        );
+        assert.equal(
+            closeCheck(quiet({ reportBlocked: true }), facts()).close,
+            false,
+            "a BLOCKED report",
+        );
+        assert.equal(
+            closeCheck(
+                quiet(
+                    {},
+                    {
+                        asks: [{ id: "T1a", text: "?", at: 1, key: "k", by: "Odrade" }],
+                    },
+                ),
+                facts(),
+            ).close,
+            false,
+            "an open ask",
+        );
+        assert.equal(
+            closeCheck(
+                quiet({}, { prs: { "frostyard/test#1": { state: "OPEN" } as PrLink } }),
+                facts(),
+            ).close,
+            false,
+            "an open PR",
+        );
+        assert.equal(
+            closeCheck(
+                quiet(
+                    {},
+                    {
+                        watch: {
+                            checkOn: "2999-01-01",
+                            check: "x",
+                            setAt: 1,
+                            setBy: "a",
+                            key: "w",
+                        },
+                    },
+                ),
+                facts(),
+            ).close,
+            false,
+            "a watch",
+        );
     });
 });
 
@@ -4414,9 +4790,11 @@ describe("repairReopen", () => {
     test("a closed thread reopens, and the repair goes to Odrade with closed", () => {
         const one = closedThread();
 
+        one.run.quietReopen = { at: 50, entry: 3 };
         assert.equal(repairReopen(one, conflicting(), 100), true);
         assert.equal(one.state, "open");
         assert.equal(one.closed, undefined);
+        assert.equal(one.run.quietReopen, undefined, "a repair reopen is no quiet reopen");
         assert.deepEqual(
             (one.run.repairs as object)[`repair:${REPAIR_REF}:h1:CONFLICTING` as never],
             {
@@ -5078,12 +5456,14 @@ describe("attachTo", () => {
 
         target.state = "closed";
         target.closed = { at: 200, why: "done", by: "sweep" };
+        target.run.quietReopen = { at: 150, entry: 3 };
 
         const result = attachTo(state, "frostyard/test#7", target.id, 300, "Odrade");
 
         assert("text" in result);
         assert.equal(target.state, "open");
         assert.equal(target.closed, undefined);
+        assert.equal(target.run.quietReopen, undefined, "an attach reopen is no quiet reopen");
         assert.equal(target.prs["frostyard/test#7"]?.via, "attached");
         assert.match(
             target.events.map((event) => event.text).join("; "),
@@ -5424,7 +5804,7 @@ describe("asks", () => {
         assert.equal(thread.asks[0]?.by, "Odrade");
     });
 
-    test("a closed thread is refused", () => {
+    test("a closed thread with no record of how it closed is refused", () => {
         const state = deskOf();
         const thread = placed(state, 100);
 
@@ -5440,6 +5820,113 @@ describe("asks", () => {
         });
 
         assert.match("error" in result ? result.error : "", /is closed/);
+    });
+
+    test("an ask on a thread that closed as done or failed opens it again, with 1 event", () => {
+        for (const why of ["done", "failed"] as const) {
+            const state = deskOf();
+            const thread = placed(state, 100);
+
+            thread.state = "closed";
+            thread.closed = { at: 150, why, by: "sweep" };
+            thread.run = { ...thread.run, quietReopen: { at: 140, entry: 3 } };
+            thread.events.length = 0;
+
+            const result = addAsk(state, {
+                thread: thread.id,
+                text: "Keep it?",
+                options: ["yes", "no"],
+                key: `k-${why}`,
+                by: "Odrade",
+                supervisor: 1,
+                at: 200,
+            });
+
+            assert.deepEqual(result, { threadId: "T1", askId: "T1a", reopened: true }, why);
+            assert.equal(thread.state, "open");
+            assert.equal(thread.closed, undefined);
+            assert.equal("closed" in thread, false);
+            assert.equal(thread.run.quietReopen, undefined, "the quiet mark goes");
+            assert.equal(thread.run.next, "brian", "the open ask waits on Brian");
+            assert.equal(thread.asks.length, 1);
+            assert.equal(thread.events.length, 1, "the reopen and the ask are 1 event");
+            assert.equal(thread.events[0]?.key, `ask:T1a:200`);
+            assert.equal(
+                thread.events[0]?.text,
+                "ask T1a reopened the thread: Keep it? [yes | no]",
+            );
+            assert.equal(thread.lastEventAt, 200);
+        }
+    });
+
+    test("an ask on a thread that closed as dropped stays refused", () => {
+        const state = deskOf();
+        const thread = placed(state, 100);
+
+        thread.state = "closed";
+        thread.closed = { at: 150, why: "dropped", by: "brian" };
+
+        const result = addAsk(state, {
+            thread: thread.id,
+            text: "Merge it?",
+            key: "k1",
+            by: "Odrade",
+            supervisor: 1,
+            at: 200,
+        });
+
+        assert.equal(
+            errorOf(result),
+            "Thread T1 was dropped: file the ask on an open thread, or with new.",
+        );
+        assert.equal(thread.state, "closed");
+        assert.equal(thread.asks.length, 0);
+    });
+
+    test("a replay of an ask that reopened a thread changes nothing", () => {
+        const state = deskOf();
+        const thread = placed(state, 100);
+
+        thread.state = "closed";
+        thread.closed = { at: 150, why: "done", by: "sweep" };
+
+        const request = {
+            thread: thread.id,
+            text: "Keep it?",
+            key: "k-replay",
+            by: "Odrade",
+            supervisor: 1,
+            at: 200,
+        };
+
+        assert.equal("reopened" in addAsk(state, request), true);
+
+        // The thread closes again; the same call replayed must not reopen it or add an event.
+        thread.state = "closed";
+        thread.closed = { at: 250, why: "done", by: "sweep" };
+
+        const events = thread.events.length;
+
+        assert.deepEqual(addAsk(state, { ...request, at: 300 }), { threadId: "T1", askId: "T1a" });
+        assert.equal(thread.asks.length, 1);
+        assert.equal(thread.events.length, events);
+        assert.equal(thread.state, "closed", "a replay does not reopen it");
+    });
+
+    test("an ask on an open thread works as before, with no reopened flag", () => {
+        const state = deskOf();
+        const thread = placed(state, 100);
+        const result = addAsk(state, {
+            thread: thread.id,
+            text: "Keep it?",
+            key: "k-open",
+            by: "Odrade",
+            supervisor: 1,
+            at: 200,
+        });
+
+        assert.deepEqual(result, { threadId: "T1", askId: "T1a" });
+        assert.equal(thread.events.at(-1)?.text, "ask T1a: Keep it?");
     });
 
     test("an answer is recorded once, and an ask thread closes when every ask is answered", () => {
@@ -6066,6 +6553,8 @@ const PlanDoc = defineDoc<{ on: boolean }>({
 });
 /** The address the linked session sends a message to, in the tests that need one. */
 let otherAddress = "";
+/** The address of a thread's agent: the supervisor's `team_message` goes there. */
+let quietAddress = "";
 /** The supervisor's address for the linked session, for the built-in team tool's guard. */
 let guardAddress = "";
 let app: App;
@@ -6287,6 +6776,10 @@ const model = scriptedModel((request) => {
 
     if (text.endsWith("report to supervisor test")) {
         return call("team_message", { to: linkedAddressOf(request), message: LONG_REPORT });
+    }
+
+    if (text.endsWith("message to agent test")) {
+        return call("team_message", { to: quietAddress, message: "Thanks, noted." });
     }
 
     if (text.endsWith("message elsewhere test")) {
@@ -10211,6 +10704,66 @@ describe("the desk in a Pi Pocket", () => {
         assert.equal(closed?.closed?.why, "done");
     });
 
+    test("desk ask on a thread that closed as done opens it again, and starts the sweeper", async () => {
+        const source = await supervisor("ask-reopen");
+        let id = "";
+
+        await app.harness.commit(async (tx) => {
+            const state = await tx.doc(DeskThreads);
+            const opened = openThread(state, {
+                key: "x.test.ask-reopen",
+                supervisor: Number(source),
+                agents: ["duncan"],
+                repo: "frostyard/test",
+                title: "A closed task",
+                at: Date.now(),
+            });
+
+            id = opened.thread.id;
+            state.threads[id]!.state = "closed";
+            state.threads[id]!.closed = { at: Date.now(), why: "done", by: "sweep" };
+        }, context);
+
+        assert.equal(await sweepers(source), 0, "every thread of the supervisor is closed");
+
+        try {
+            askThreadId = id;
+            await say(app, source, "desk ask thread test");
+
+            const stored = (await deskState())?.threads[id];
+
+            assert.equal(stored?.state, "open");
+            assert.equal(stored?.closed, undefined);
+            assert.equal(stored?.asks.at(-1)?.id, `${id}a`);
+            assert.equal(stored?.events.filter((event) => event.key.startsWith("ask:")).length, 1);
+            assert.match(
+                stored?.events.at(-1)?.text ?? "",
+                new RegExp(`ask ${id}a reopened the thread: Should I merge #106\\?`),
+            );
+            assert.match(
+                (await modelTexts(app, source)).join("\n"),
+                new RegExp(`Filed ${id}a\\. ${id} was closed: the ask opened it again\\.`),
+            );
+            assert.equal(await sweepers(source), 1, "the reopen started the sweeper");
+
+            // A thread that was dropped stays closed.
+            await app.harness.commit(async (tx) => {
+                const state = await tx.doc(DeskThreads);
+
+                state.threads[id]!.state = "closed";
+                state.threads[id]!.closed = { at: Date.now(), why: "dropped", by: "brian" };
+            }, context);
+            await say(app, source, "desk ask thread test");
+            assert.equal((await deskState())?.threads[id]?.state, "closed");
+            assert.match(
+                (await modelTexts(app, source)).join("\n"),
+                new RegExp(`Thread ${id} was dropped: file the ask on an open thread`),
+            );
+        } finally {
+            await quiet([]);
+        }
+    });
+
     test("the reminder continues once when a reply asks Brian something and filed no ask", async () => {
         const source = await supervisor("reminder");
 
@@ -10843,6 +11396,7 @@ describe("the desk in a Pi Pocket", () => {
             assert.equal(back?.state, "open");
             assert.equal(back?.closed, undefined);
             assert.equal(back?.prs["frostyard/pilothouse#215"]?.via, "seen");
+            assert.equal(back?.run.quietReopen, undefined, "a PR is no session message");
             assert.match(
                 back?.events.map((event) => event.text).join("; ") ?? "",
                 /reopened: a PR it made is open/,
@@ -10854,6 +11408,102 @@ describe("the desk in a Pi Pocket", () => {
             );
             prNumber = 212;
         }
+    });
+
+    /** Delegate, let the agent report, and sweep until the thread closes as done. */
+    const closedDone = async (name: string) => {
+        await stopSweepers();
+        await new Promise((resolve) => setTimeout(resolve, 250));
+
+        const made = await delegated(name);
+
+        await until(sweepersAsleep, "the sweepers to sleep", 20_000);
+        await say(app, made.linked, "report to supervisor test");
+        await until(() => !app.isBusy(made.linked), "the report's turn", 20_000);
+        await say(app, made.source, "desk sync test");
+
+        const closed = (await deskState())?.threads[made.thread.id];
+
+        assert.equal(closed?.state, "closed");
+        assert.equal(closed?.closed?.why, "done");
+        assert.equal(typeof closed?.run.otherUserEntry, "number");
+
+        return made;
+    };
+
+    test("a supervisor's message to a done session, with no report after it, closes the thread again", async () => {
+        const { source, linked, thread } = await closedDone("quiet-close");
+
+        quietAddress = thread.address ?? "";
+        assert.notEqual(quietAddress, "");
+
+        await say(app, source, "message to agent test");
+        await until(() => !app.isBusy(linked), "the agent's turn", 20_000);
+        await say(app, source, "desk sync test");
+
+        const back = (await deskState())?.threads[thread.id];
+
+        assert.equal(back?.state, "open", "the message reopened it");
+        assert.match(
+            back?.events.map((event) => event.text).join("; ") ?? "",
+            /reopened: new work in its session/,
+        );
+        assert.equal(typeof (back?.run.quietReopen as { at?: number } | undefined)?.at, "number");
+
+        // The agent is idle and did not report: the next sweep closes it again.
+        await say(app, source, "desk sync test");
+
+        const again = (await deskState())?.threads[thread.id];
+
+        assert.equal(again?.state, "closed");
+        assert.equal(again?.closed?.why, "done");
+        assert.equal(again?.run.quietReopen, undefined);
+        assert.match(
+            again?.events.at(-1)?.text ?? "",
+            /^closed again: completed \(no PRs\); no new report after a supervisor message$/,
+        );
+    });
+
+    test("a thread from before otherUserEntry takes its newest user entry as another's", async () => {
+        const { source, linked, thread } = await closedDone("quiet-migrate");
+        const before = (await deskState())?.threads[thread.id]?.run.lastUserEntry;
+
+        await app.harness.commit(async (tx) => {
+            delete (await tx.doc(DeskThreads)).threads[thread.id]!.run.otherUserEntry;
+        }, context);
+
+        quietAddress = thread.address ?? "";
+        await say(app, source, "message to agent test");
+        await until(() => !app.isBusy(linked), "the agent's turn", 20_000);
+        await say(app, source, "desk sync test");
+
+        const back = (await deskState())?.threads[thread.id];
+
+        assert.equal(back?.run.otherUserEntry, before, "migrated before the new entries counted");
+        assert.equal(back?.state, "open");
+        assert.equal(
+            (back?.run.quietReopen as { entry?: number } | undefined)?.entry,
+            before,
+            "the supervisor's message after the migration is quiet",
+        );
+    });
+
+    test("a person's message after the close keeps the thread open: it is no quiet close", async () => {
+        const { source, linked, thread } = await closedDone("quiet-person");
+
+        quietAddress = thread.address ?? "";
+        await say(app, source, "message to agent test");
+        await until(() => !app.isBusy(linked), "the agent's turn", 20_000);
+        await say(app, linked, "Please look at the logs too.");
+        await until(() => !app.isBusy(linked), "the agent's second turn", 20_000);
+        await say(app, source, "desk sync test");
+        await say(app, source, "desk sync test");
+
+        const stays = (await deskState())?.threads[thread.id];
+
+        assert.equal(stays?.state, "open", "the person's message makes the silence count");
+        assert.equal(stays?.run.quietReopen, undefined);
+        assert.equal(stays?.run.next, "odrade");
     });
 
     test("the export writes the desk's files, and writes only what changed", async () => {
@@ -11884,6 +12534,55 @@ describe("the desk in a Pi Pocket", () => {
             }
         });
 
+        test("a page watch with a time stores it, shows it, and a double tap changes nothing", async () => {
+            const { thread } = await delegated("page-watch-time");
+
+            await until(
+                async () =>
+                    typeof (await deskState())?.threads[thread.id]?.run.sweptAt === "number",
+                "the first sweep",
+                20_000,
+            );
+
+            const body = { checkOn: "2099-03-04 09:30", check: "the blob sweep" };
+            const watched = await call(`threads/${thread.id}/watch`, body);
+
+            assert.equal(watched.status, 200);
+
+            const stored = (await deskState())?.threads[thread.id];
+
+            assert.equal(stored?.watch?.checkOn, "2099-03-04");
+            assert.equal(stored?.watch?.checkTime, "09:30");
+
+            const row = watched.data.threads.find((each: { id: string }) => each.id === thread.id);
+
+            assert.equal(row.watch.checkOn, "2099-03-04");
+            assert.equal(row.watch.checkTime, "09:30");
+            assert.equal(row.asleep, true);
+
+            const events = stored?.events.length ?? 0;
+
+            assert.equal((await call(`threads/${thread.id}/watch`, body)).status, 200);
+            assert.equal(
+                (await deskState())?.threads[thread.id]?.events.length,
+                events,
+                "a double tap changes nothing",
+            );
+
+            // A new time on the same day is a new watch; a past time is refused.
+            assert.equal(
+                (await call(`threads/${thread.id}/watch`, { ...body, checkOn: "2099-03-04 10:00" }))
+                    .status,
+                200,
+            );
+            assert.equal((await deskState())?.threads[thread.id]?.watch?.checkTime, "10:00");
+            assert.equal(
+                (await call(`threads/${thread.id}/watch`, { ...body, checkOn: "2020-01-01 09:00" }))
+                    .status,
+                400,
+            );
+        });
+
         test("watch, unwatch and result change the thread; a second POST changes nothing", async () => {
             const { thread } = await delegated("page-watch");
 
@@ -12187,6 +12886,97 @@ describe("the desk in a Pi Pocket", () => {
                     "x.desk.watch:task-watch:call-1",
                 );
                 assert.match(again, /watched already/);
+            } finally {
+                shared[Symbol.for("pi-pocket-team.desk")] = saved;
+            }
+        });
+
+        test("a desk watch with a time stores it and the reply shows it", async () => {
+            const source = await supervisor("watch-time");
+            let id = "";
+
+            await app.harness.commit(async (tx) => {
+                const state = await tx.doc(DeskThreads);
+                const opened = openThread(state, {
+                    key: "x.test.watch-time",
+                    supervisor: Number(source),
+                    agents: ["duncan"],
+                    repo: "frostyard/test",
+                    title: "A timed watch",
+                    at: Date.now(),
+                });
+
+                id = opened.thread.id;
+                state.threads[id]!.state = "open";
+            }, context);
+
+            const stubWeb = {
+                conversationRoute() {},
+                route() {},
+                client() {},
+                command() {},
+                send() {},
+                onDispose() {},
+                error: (status: number, message: string) =>
+                    Object.assign(new Error(message), { status }),
+            };
+            const stubHost = {
+                requesterOf: () => owner(app).id,
+                text: { defang: (value: string) => value, quoted: () => "" },
+                notice() {},
+                linkedSessions: {},
+            };
+            const shared = globalThis as unknown as Record<symbol, unknown>;
+            const saved = shared[Symbol.for("pi-pocket-team.desk")];
+            const extension = createDesk(stubHost as never, stubWeb as never) as unknown as {
+                tools: {
+                    name: string;
+                    execute: (args: object, api: object, context: unknown) => Promise<unknown>;
+                }[];
+            };
+            const tool = extension.tools.find((each) => each.name === "desk")!;
+            const api = {
+                conversationId: source,
+                taskId: "task-watch-time",
+                callId: "call-1",
+                snapshot: (...args: unknown[]) =>
+                    Reflect.apply(app.harness.snapshot, app.harness, args),
+                commit: (change: never, ctx: never) => app.harness.commit(change, ctx),
+            };
+
+            try {
+                const reply = JSON.stringify(
+                    await tool.execute(
+                        {
+                            action: "watch",
+                            thread: id,
+                            check_on: "2099-03-04 09:00",
+                            text: "the blob sweep",
+                        },
+                        api,
+                        context,
+                    ),
+                );
+                const stored = (await deskState())?.threads[id]?.watch;
+
+                assert.equal(stored?.checkOn, "2099-03-04");
+                assert.equal(stored?.checkTime, "09:00");
+                assert.match(reply, /check on 2099-03-04 09:00\./);
+
+                await assert.rejects(
+                    tool.execute(
+                        {
+                            action: "watch",
+                            thread: id,
+                            check_on: "2020-01-01 09:00",
+                            text: "the blob sweep",
+                        },
+                        { ...api, callId: "call-2" },
+                        context,
+                    ),
+                    /is in the past/,
+                );
+                assert.equal((await deskState())?.threads[id]?.watch?.checkTime, "09:00");
             } finally {
                 shared[Symbol.for("pi-pocket-team.desk")] = saved;
             }
