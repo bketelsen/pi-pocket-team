@@ -409,6 +409,10 @@ describe("parsing", () => {
         assert.equal(personOf("[via PR watch] checks failed"), undefined);
         assert.equal(personOf("[scheduled] standup"), undefined);
         assert.equal(personOf("[subagent a answered, no reply needed] ok"), undefined);
+        assert.equal(personOf("[background] Task bg1 exited with code 0 after 2m."), undefined);
+        assert.equal(personOf("[from: Brian] [background] Task bg1 ended."), undefined);
+        assert.equal(personOf("[backgrounds] not Pocket's"), "A person");
+        assert.equal(personOf("[from: Brian] the build is done"), "Brian");
     });
 
     test("the status line's words", () => {
@@ -511,6 +515,7 @@ const route: FauxResponseStep = async (request, options) => {
 
             return say("STATUS: CONTINUE: more to do");
         case "scenario-person":
+        case "scenario-background":
         case "scenario-stop":
         case "scenario-command":
         case "scenario-plan":
@@ -811,6 +816,29 @@ describe("stop reasons", () => {
 
         assert.match(JSON.stringify(resumed), /resumed/);
         goal = await settled(id);
+        assert.equal(goal.reason, "max-rounds");
+        assert.deepEqual(await sent(id), ["Round 1", "Round 2", "The night shift has stopped"]);
+    });
+
+    test("a background task's message does not pause it", async () => {
+        const id = await session("background");
+
+        await command(id, "max 2: scenario-background; stop when never");
+        await until(() => gates.has("scenario-background"), "round 1 to start");
+        // Pocket 0.24 tells Pi that a background task ended, as Pocket's background.ts does: a follow-up input.
+        await (await app.harness.conversation(id, context))!.submit(
+            {
+                type: "input",
+                content: "[background] Task bg1 exited with code 0 after 2m.\nIt printed nothing.",
+                whenBusy: "followUp",
+                requestId: "background:test-task",
+            },
+            context,
+        );
+        open("scenario-background");
+        const goal = await settled(id);
+
+        assert.equal(goal.status, "ended");
         assert.equal(goal.reason, "max-rounds");
         assert.deepEqual(await sent(id), ["Round 1", "Round 2", "The night shift has stopped"]);
     });
