@@ -110,6 +110,9 @@ export type Ask = {
 export const askIsOpen = (ask: Pick<Ask, "answer" | "resolved">): boolean =>
     ask.answer === undefined && ask.resolved === undefined;
 
+/** Whether the thread waits on Brian's words: it has an ask that is still open. A watch or a found origin does not hide it. */
+export const hasOpenAsk = (thread: Thread): boolean => thread.asks.some((ask) => askIsOpen(ask));
+
 /** One attached PR: how it was attached, and what GitHub said about it. */
 export type PrLink = {
     via: "seen" | "branch" | "window" | "attached";
@@ -1675,21 +1678,34 @@ export function shiftWorks(shift: JsonValue | undefined): boolean {
 }
 
 /**
+ * `BLOCKED` in capitals said of the work: after a verb or a status word ("is BLOCKED", "Status: BLOCKED"), or before
+ * a colon or its cause ("BLOCKED: …", "BLOCKED on the key", "BLOCKED until …"). A line that starts with it is the
+ * blocked line rule's.
+ */
+const BLOCKED_SAID =
+    /\b(?:[Ii]s|[Aa]re|[Aa]m|[Ww]as|[Ww]ere|[Ss]tays?|[Rr]emains?|[Ss]till|[Nn]ow|[Ss]tatus|[Ss]tate|[Rr]esult)\s*:?\s+\**BLOCKED\b|\bBLOCKED\**\s*(?::|\b(?:by|on|until)\b)/;
+
+/**
  * Whether a report says the work is blocked, or asks for a decision: the reason `blocked` or `failed`, the word `BLOCKED`
  * in capitals, a line that starts with `blocked` (any case, after a bullet or bold mark), `needs brian: yes` (any case),
  * a line that starts with `needs a decision` or `decision needed` (any case), or a last paragraph that asks Brian
- * something (`asksBrian`: a question, or the ask words).
+ * something (`asksBrian`: a question, or the ask words). Code blocks and inline code never count: a report that quotes
+ * the word `BLOCKED` is not blocked. `BLOCKED` counts only when it is said of the work (`BLOCKED_SAID`): "a BLOCKED
+ * report" names a kind of report, and is not blocked. A request to merge or install, with no choice in it, is no
+ * decision: the PR's label `ready-for-human` already brings it to Brian.
  */
 export function reportBlocks(text: string, reason?: string): boolean {
     if (reason === "blocked" || reason === "failed") {
         return true;
     }
 
-    if (/\bBLOCKED\b/.test(text) || /needs\s+brian:\s*yes\b/i.test(text)) {
+    const plain = withoutCode(text);
+
+    if (BLOCKED_SAID.test(plain) || /needs\s+brian:\s*yes\b/i.test(plain)) {
         return true;
     }
 
-    for (const line of text.split("\n")) {
+    for (const line of plain.split("\n")) {
         // A bullet, a heading, a quote, and a bold mark are no words: the line's first word is after them.
         const start = line.replace(/^[\s>#*-]+/, "").toLowerCase();
 
@@ -1703,7 +1719,7 @@ export function reportBlocks(text: string, reason?: string): boolean {
     }
 
     // A report whose last paragraph asks Brian something waits for his answer, as a blocked one does.
-    return asksBrian(text);
+    return asksBrian(text, { report: true });
 }
 
 export type CloseFacts = {
@@ -2518,7 +2534,7 @@ export function nextActor(thread: Thread): NextActor {
         return "none";
     }
 
-    if (thread.asks.some((ask) => askIsOpen(ask))) {
+    if (hasOpenAsk(thread)) {
         return "brian";
     }
 
@@ -6137,6 +6153,11 @@ export function threadWord(thread: Thread, now: number): string {
         return "parked";
     }
 
+    // An open ask hides neither a watch nor a found origin: it still waits on Brian.
+    if (hasOpenAsk(thread)) {
+        return "waits on Brian";
+    }
+
     if (thread.state === "starting") {
         return "starting";
     }
@@ -6738,12 +6759,24 @@ const ASK_WORDS =
 const NEGATED =
     /nothing needs you|no ask|nothing for you|does(?: not|n't) need you|no action|not needed|nothing to decide/i;
 
+/** A request to merge or install: in a report it is no decision, unless it holds a choice. */
+const MERGE_REQUEST = /\b(merge|install)/i;
+
+/** The words of a choice: a merge or install request with one of them is still a decision. */
+const CHOICE = /should i|your call|which|whether|\bor\b|do you want/i;
+
+/** The text without its code blocks and inline code: words in code are quoted, never said. */
+function withoutCode(text: string): string {
+    return text.replace(/```[\s\S]*?```/g, " ").replace(/`[^`\n]*`/g, " ");
+}
+
 /**
  * Whether the last paragraph asks Brian something. Code blocks and inline code never count, a sentence that says
- * there is no ask never counts, and a "?" counts in every other sentence.
+ * there is no ask never counts, and a "?" counts in every other sentence. In a report (`report`), a request to merge
+ * or install with no choice in it does not count: the PR's label brings it to Brian, and it is no decision.
  */
-export function asksBrian(text: string): boolean {
-    const plain = text.replace(/```[\s\S]*?```/g, " ").replace(/`[^`\n]*`/g, " ");
+export function asksBrian(text: string, options: { report?: boolean } = {}): boolean {
+    const plain = withoutCode(text);
     const last =
         plain
             .trim()
@@ -6757,6 +6790,10 @@ export function asksBrian(text: string): boolean {
 
     return sentences.some((sentence) => {
         if (NEGATED.test(sentence)) {
+            return false;
+        }
+
+        if (options.report === true && MERGE_REQUEST.test(sentence) && !CHOICE.test(sentence)) {
             return false;
         }
 
@@ -6902,6 +6939,10 @@ function sectionOf(thread: Thread, now: number): string {
 
     if (thread.state === "parked") {
         return "Parked";
+    }
+
+    if (hasOpenAsk(thread)) {
+        return "Needs Brian";
     }
 
     if (asleep(thread, now)) {
@@ -7441,7 +7482,8 @@ const counted = (count: number, noun: string) =>
 
 /**
  * One line for each thread that is not closed, newest last. A due watch goes first; a sleeping thread waits under
- * "Watching", with its date, and not in the lines below.
+ * "Watching", with its date, and not in the lines below. A sleeping thread with an open ask waits on Brian: it gets a
+ * normal line, with the ask ids and the watch date, and it does not go under "Watching".
  */
 export function listText(state: Readonly<DeskState> | undefined, now = Date.now()): string {
     const threads = Object.values(state?.threads ?? {})
@@ -7455,12 +7497,14 @@ export function listText(state: Readonly<DeskState> | undefined, now = Date.now(
     const byCheck = (a: Thread, b: Thread) =>
         (a.watch?.checkOn ?? "").localeCompare(b.watch?.checkOn ?? "") || byId(a, b);
     const due = threads.filter((thread) => isDue(thread, now)).sort(byCheck);
-    const watching = threads.filter((thread) => asleep(thread, now)).sort(byCheck);
+    const watching = threads
+        .filter((thread) => asleep(thread, now) && !hasOpenAsk(thread))
+        .sort(byCheck);
 
     return [
         ...due.map((thread) => `due: ${thread.id} ${thread.watch?.check ?? ""}`),
         ...threads
-            .filter((thread) => !asleep(thread, now))
+            .filter((thread) => !asleep(thread, now) || hasOpenAsk(thread))
             .map((thread) => {
                 const prs = Object.keys(thread.prs).length;
                 const asks = thread.asks.filter((ask) => askIsOpen(ask)).map((ask) => ask.id);
@@ -7470,6 +7514,7 @@ export function listText(state: Readonly<DeskState> | undefined, now = Date.now(
                     thread.state,
                     `next: ${nextActor(thread)}`,
                     ...(isStale(thread, now) ? ["stale"] : []),
+                    ...(asleep(thread, now) ? [`watch: ${thread.watch?.checkOn ?? ""}`] : []),
                     thread.repo ?? "no repo",
                     thread.agents.join(", ") || "nobody",
                     ...(prs === 0 ? [] : [counted(prs, "PR")]),
