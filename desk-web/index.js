@@ -354,6 +354,12 @@ export default function setup(pocket) {
                 setResultText("");
             } catch (failure) {
                 setError(failure.message);
+
+                // A refused tap means the page's view is out of date (the desk is not full now): load it again, so a
+                // stale banner goes.
+                if (path === "grant") {
+                    void load();
+                }
             } finally {
                 setBusy(false);
             }
@@ -983,7 +989,11 @@ export default function setup(pocket) {
                 ${
                     capInfo.full
                         ? html`<div class="desk-full" role="status">
-                              <p>The desk is full. New delegations wait for your OK.</p>
+                              <p>
+                                  The desk is full: ${capInfo.counted} of ${capInfo.cap} count. Allow 1
+                                  lets Odrade open 1 more thread, and tells her to delegate the work
+                                  that waited.
+                              </p>
                               <div class="desk-actions">
                                   <button
                                       class="button primary"
@@ -996,7 +1006,7 @@ export default function setup(pocket) {
                                   ${
                                       capInfo.grants > 0
                                           ? html`<span class="small muted"
-                                            >${capInfo.grants} OK${capInfo.grants === 1 ? "" : "s"} waiting</span
+                                            >${capInfo.grants} extra allowed</span
                                         >`
                                           : null
                                   }

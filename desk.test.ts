@@ -110,6 +110,7 @@ import {
     setWatch,
     wakeWatch,
     FOUND_FOLDER_DELAY_MS,
+    grantText,
     parseGitHub,
     prNext,
     scanText,
@@ -151,6 +152,7 @@ import {
     issuesView,
     joinIssueFact,
     judgeIssue,
+    lapseGrants,
     linkIssue,
     mergeQueue,
     ownersOfRepos,
@@ -5173,6 +5175,68 @@ describe("the cap", () => {
             ["usable"],
         );
         assert.equal(capView(state, 1, 1000).full, true);
+    });
+
+    test("capView ignores an OK that lapsed", () => {
+        const state = deskOf();
+
+        state.grants.push(
+            { at: 1, by: "Brian", via: "tap", key: "lapsed", lapsed: 500, expires: 100_000 },
+            { at: 2, by: "Brian", via: "tap", key: "usable", expires: 100_000 },
+        );
+
+        assert.deepEqual(
+            capView(state, 12, 1000).grants.map((grant) => grant.key),
+            ["usable"],
+        );
+    });
+
+    test("lapseGrants does nothing while the desk is full", () => {
+        const state = deskOf();
+
+        placed(state, 100);
+        state.grants.push({ at: 1, by: "Brian", via: "tap", key: "ok", expires: 100_000 });
+
+        assert.equal(lapseGrants(state, 1, 1000), 0);
+        assert.equal(state.grants[0]?.lapsed, undefined);
+    });
+
+    test("lapseGrants lapses each unused, unexpired OK below the cap, and returns the count", () => {
+        const state = deskOf();
+
+        placed(state, 100);
+        state.grants.push(
+            { at: 1, by: "Brian", via: "tap", key: "unused", expires: 100_000 },
+            { at: 2, by: "Brian", via: "tap", key: "used", usedBy: "k-100", expires: 100_000 },
+            { at: 3, by: "Brian", via: "tap", key: "expired", expires: 10 },
+            { at: 4, by: "Brian", via: "tap", key: "lapsed", lapsed: 500, expires: 100_000 },
+        );
+
+        assert.equal(lapseGrants(state, 2, 1000), 1);
+        assert.equal(state.grants.find((grant) => grant.key === "unused")?.lapsed, 1000);
+        // A used, an expired, and an already lapsed OK stay as they were.
+        assert.deepEqual(
+            state.grants.map((grant) => [grant.key, grant.lapsed]),
+            [
+                ["unused", 1000],
+                ["used", undefined],
+                ["expired", undefined],
+                ["lapsed", 500],
+            ],
+        );
+        assert.equal(lapseGrants(state, 2, 2000), 0, "nothing lapsed twice");
+        assert.deepEqual(capView(state, 2, 1000).grants, []);
+    });
+
+    test("grantText says how many threads Brian allowed over the cap", () => {
+        assert.equal(
+            grantText("Brian", 1, { counted: 13, cap: 12 }),
+            "[desk] Brian allowed 1 more thread over the cap (13 of 12 count). Delegate the work that waited now, with team_delegate.",
+        );
+        assert.equal(
+            grantText("Brian", 2, { counted: 13, cap: 12 }),
+            "[desk] Brian allowed 2 more threads over the cap (13 of 12 count). Delegate the work that waited now, with team_delegate.",
+        );
     });
 
     test("chatGrants reads desk ok, and nothing else", () => {
@@ -11002,17 +11066,94 @@ describe("the desk in a Pi Pocket", () => {
             assert.equal(again.data.resolved, 0, "nothing left to resolve");
         });
 
-        test("POST grant adds an OK, for the owner only", async () => {
+        test("POST grant refuses a desk that is not full, for the owner only", async () => {
             const before = (await call("threads")).data.cap.grants;
-            const granted = await call("grant", { count: 1 });
+            const refused = await call("grant", { count: 1 });
 
-            assert.equal(granted.status, 200);
-            assert.equal(granted.data.cap.grants, before + 1);
+            assert.equal(refused.status, 409);
+            assert.match(
+                String(refused.data.error),
+                /The desk is not full: Odrade can delegate without an OK\./,
+            );
+            assert.equal((await call("threads")).data.cap.grants, before, "no OK was added");
 
             const guest = app.config.addUser("A cap guest", "guest");
 
             assert.equal((await call("grant", { count: 1 }, guest.token)).status, 404);
             assert.equal((await call("grant", { count: 9 })).status, 400);
+        });
+
+        test("POST grant on a full desk allows 1 more thread and tells the supervisor", async () => {
+            const source = await supervisor("page-grant");
+            const at = Date.now();
+            let filler = "";
+
+            writeFileSync(configPath, JSON.stringify({ digest: { minutes: 0 }, cap: 1 }));
+            await clearGrants();
+
+            try {
+                // One counted thread fills a cap of 1. Threads of earlier tests count too, so the desk is full.
+                filler = await app.harness.commit(async (tx) => {
+                    const state = await tx.doc(DeskThreads);
+                    const opened = openThread(state, {
+                        key: `x.test.grant-fill:${String(at)}`,
+                        supervisor: Number(source),
+                        agents: ["duncan"],
+                        repo: "frostyard/test",
+                        title: "Fill",
+                        at,
+                    });
+
+                    state.threads[opened.thread.id]!.state = "open";
+                    state.threads[opened.thread.id]!.run.next = "agent";
+
+                    return opened.thread.id;
+                }, context);
+
+                const granted = await call("grant", { count: 1 });
+
+                assert.equal(granted.status, 200);
+                assert.equal(granted.data.cap.grants, 1, "1 more usable OK");
+
+                // The tap wakes the supervisor at once, with its own [desk] message.
+                const tapMessage =
+                    /\[desk\] [^"]+ allowed 1 more thread over the cap \(\d+ of 1 count\)\. Delegate the work that waited now, with team_delegate\./;
+
+                await until(
+                    async () => tapMessage.test((await modelTexts(app, source)).join("\n")),
+                    "the tap's [desk] message at the supervisor",
+                    20_000,
+                );
+
+                // The desk has room again: the OK lapses at the next page action, and the view shows none.
+                writeFileSync(configPath, JSON.stringify({ digest: { minutes: 0 }, cap: 100 }));
+                await app.harness.commit(async (tx) => {
+                    const state = await tx.doc(DeskThreads);
+
+                    state.threads[filler]!.state = "closed";
+                    state.threads[filler]!.closed = { at: Date.now(), why: "done", by: "brian" };
+                }, context);
+
+                const seen = await call("seen", {});
+
+                assert.equal(seen.status, 200);
+                assert.equal(seen.data.cap.grants, 0, "no usable OK in the view");
+                assert.equal(
+                    typeof (await deskState())?.grants.find((grant) => grant.usedBy === undefined)
+                        ?.lapsed,
+                    "number",
+                    "the unused OK lapsed",
+                );
+            } finally {
+                await app.harness.commit(async (tx) => {
+                    const state = await tx.doc(DeskThreads);
+
+                    state.grants = state.grants.filter(
+                        (grant) => !(grant.via === "tap" && grant.at >= at),
+                    );
+                }, context);
+                writeFileSync(configPath, JSON.stringify({ digest: { minutes: 0 }, cap: 100 }));
+            }
         });
 
         test("POST asks/:id/answer records Brian's words, and a second POST changes nothing", async () => {
@@ -13136,6 +13277,89 @@ describe("the desk in a Pi Pocket", () => {
                     (grant) =>
                         grant.key !== `tap:test:${String(at)}` &&
                         grant.key !== `tap:expired:${String(at)}`,
+                );
+            }, context);
+            writeFileSync(configPath, JSON.stringify({ digest: { minutes: 0 }, cap: 100 }));
+        }
+    });
+
+    test("a usable OK lapses when open runs below the cap", async () => {
+        const folder = join(root, "cap-lapse");
+
+        mkdirSync(folder, { recursive: true });
+        const source = await newSession(app, folder);
+        const api = (
+            globalThis as unknown as Record<
+                symbol,
+                {
+                    open: (
+                        tx: unknown,
+                        request: object,
+                    ) => Promise<{ thread: Thread; reused: boolean }>;
+                }
+            >
+        )[Symbol.for("pi-pocket-team.desk")]!;
+        const at = Date.now();
+        const key = `tap:lapse:${String(at)}`;
+        const counted = capView(await deskState(), DEFAULT_CAP, at).counted;
+
+        // The desk has a place free: 1 more than the threads that count now.
+        writeFileSync(
+            configPath,
+            JSON.stringify({ digest: { minutes: 0 }, cap: Math.min(100, counted + 1) }),
+        );
+        await clearGrants();
+
+        try {
+            assert.equal(
+                capView(await deskState(), Math.min(100, counted + 1), at).full,
+                false,
+                "the desk has room",
+            );
+
+            await app.harness.commit(async (tx) => {
+                (await tx.doc(DeskThreads)).grants.push({
+                    at,
+                    by: "Brian",
+                    via: "tap",
+                    key,
+                    expires: at + DAY,
+                });
+            }, context);
+
+            const opened = await app.harness.commit(
+                (tx) =>
+                    api.open(tx, {
+                        key: `x.test.lapse:${String(at)}`,
+                        supervisor: Number(source),
+                        agents: ["duncan"],
+                        repo: "frostyard/test",
+                        title: "Below the cap",
+                        at,
+                    }),
+                context,
+            );
+
+            assert.equal(opened.reused, false, "the thread opened with no OK");
+            assert.equal(
+                typeof (await deskState())?.grants.find((grant) => grant.key === key)?.lapsed,
+                "number",
+                "the unused OK lapsed",
+            );
+            assert.equal(
+                (await deskState())?.grants.find((grant) => grant.key === key)?.usedBy,
+                undefined,
+                "the OK was not used",
+            );
+        } finally {
+            await app.harness.commit(async (tx) => {
+                const state = await tx.doc(DeskThreads);
+
+                state.grants = state.grants.filter((grant) => grant.key !== key);
+                state.threads = Object.fromEntries(
+                    Object.entries(state.threads).filter(
+                        (entry) => entry[1].key !== `x.test.lapse:${String(at)}`,
+                    ),
                 );
             }, context);
             writeFileSync(configPath, JSON.stringify({ digest: { minutes: 0 }, cap: 100 }));
