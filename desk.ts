@@ -216,7 +216,8 @@ export type Thread = {
      * (the `ready-for-human` removals the sweep decided, by key `unready:<ref>:<label time>`:
      * `{ at, why, to, removed, sent }`, at most 30), and `reportBlocked` (true when the newest report says BLOCKED or
      * asks for a decision, false when it does not, absent when the desk did not derive it yet: an older thread gets it
-     * at its next sweep, from its newest stored report).
+     * at its next sweep, from its newest stored report, and it stays open until then because an absent flag is not
+     * `false`).
      */
     run: Record<string, JsonValue>;
     /** The last 50; `key` makes an event unique. */
@@ -1768,6 +1769,16 @@ export function closeCheck(thread: Thread, facts: CloseFacts): { close: boolean;
     // A report that says the work is blocked, or asks for a decision, waits on Odrade: the thread is not done.
     if (thread.run.reportBlocked === true) {
         open.push("its last report says BLOCKED or asks for a decision");
+    }
+
+    // A thread that reported before the desk derived its flag: a failed read of its reports leaves the flag absent, and
+    // an absent flag is not `false`, so the thread waits until a sweep reads the report.
+    if (
+        thread.session !== undefined &&
+        thread.run.reportedAt !== undefined &&
+        typeof thread.run.reportBlocked !== "boolean"
+    ) {
+        open.push("its newest report is not checked yet");
     }
 
     // A thread whose last PR merged is not done until its agent did the after-merge steps.
@@ -8039,9 +8050,10 @@ export default function createDesk(host: Host, web: Web) {
         branches: Record<string, Record<string, number>>;
         /**
          * By thread id: the newest stored report of a thread from before `run.reportBlocked`, whose flag the commit then
-         * sets. A thread whose report is not here keeps its absent flag until a later sweep.
+         * sets; `null` is a good read with no report. A thread whose report is not here (a failed read) keeps its absent
+         * flag until a later sweep, and stays open meanwhile.
          */
-        reports?: Record<string, StoredReport | undefined>;
+        reports?: Record<string, StoredReport | null>;
     };
 
     const run = promisify(execFile);
@@ -9293,8 +9305,9 @@ export default function createDesk(host: Host, web: Web) {
 
         // A thread filed before `run.reportBlocked` existed: its newest stored report decides the flag, 1 time. The read
         // is here, not in the commit: a commit cannot read a table after its first write, and this read never makes the
-        // document of a session that has no reports.
-        const reports: Record<string, StoredReport | undefined> = {};
+        // document of a session that has no reports. `null` is a good read with no report, which is no blocked report;
+        // a failed read leaves the key out, so the flag stays absent and the thread stays open.
+        const reports: Record<string, StoredReport | null> = {};
 
         for (const thread of open) {
             if (
@@ -9306,11 +9319,11 @@ export default function createDesk(host: Host, web: Web) {
             }
 
             try {
-                reports[thread.id] = (
-                    await read.snapshot(DeskReports, thread.session as ConversationId, context)
-                )?.reports[0];
+                reports[thread.id] =
+                    (await read.snapshot(DeskReports, thread.session as ConversationId, context))
+                        ?.reports[0] ?? null;
             } catch {
-                // Not readable now: the flag waits for the next sweep.
+                // Not readable now: no key, so the flag stays absent and the thread waits for the next sweep.
             }
         }
 
@@ -9977,13 +9990,13 @@ export default function createDesk(host: Host, web: Web) {
                 }
             }
 
-            // A thread from before `run.reportBlocked` existed: its newest stored report sets the flag now, once. An
-            // absent flag stays absent while the report cannot be read: it is not the same as `false`.
+            // A thread from before `run.reportBlocked` existed: its newest stored report sets the flag now, once. No
+            // report is `false`. A key that is not here is a failed read: the flag stays absent, and the thread waits.
             if (thread.run.reportBlocked === undefined) {
                 const report = facts.reports?.[thread.id];
 
                 if (report !== undefined) {
-                    thread.run.reportBlocked = reportBlocks(report.text);
+                    thread.run.reportBlocked = report === null ? false : reportBlocks(report.text);
                 }
             }
 

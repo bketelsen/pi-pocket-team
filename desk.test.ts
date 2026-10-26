@@ -891,6 +891,26 @@ describe("closeCheck", () => {
         });
     });
 
+    test("a report that the desk did not check yet holds the thread open", () => {
+        // A failed read of its reports leaves the flag absent: an absent flag is not `false`, so the thread waits.
+        const unchecked = closeCheck(thread({ run: { reportedAt: 900 } }), facts());
+
+        assert.equal(unchecked.close, false);
+        assert.deepEqual(unchecked.open, ["its newest report is not checked yet"]);
+
+        // A thread that never reported, and one with an address only (no session), are held by no such rule.
+        assert.deepEqual(closeCheck(thread(), facts()), { close: true, open: [] });
+        assert.deepEqual(
+            closeCheck(thread({ session: undefined, run: { reportedAt: 900 } }), facts()),
+            { close: true, open: [] },
+        );
+        // A derived flag, either way, lifts the hold.
+        assert.deepEqual(
+            closeCheck(thread({ run: { reportedAt: 900, reportBlocked: false } }), facts()),
+            { close: true, open: [] },
+        );
+    });
+
     test("a thread still starting closes as failed after an hour", () => {
         const starting = thread({ state: "starting", startedAt: 0 });
 
@@ -12776,7 +12796,11 @@ describe("the desk in a Pi Pocket", () => {
 
             assert(before, "the thread is stored");
             assert.equal(before.run.reportBlocked, undefined, "the flag is not derived yet");
-            assert.deepEqual(closeCheck(before, facts()), { close: true, open: [] });
+            // Without the flag the session and the folder are closed, but an unchecked report still holds it.
+            assert.deepEqual(closeCheck(before, facts()), {
+                close: false,
+                open: ["its newest report is not checked yet"],
+            });
 
             await say(app, source, "desk list test");
             await until(
@@ -12793,6 +12817,62 @@ describe("the desk in a Pi Pocket", () => {
             assert.deepEqual(closeCheck(after, facts()).open, [
                 "its last report says BLOCKED or asks for a decision",
             ]);
+        } finally {
+            await quiet([]);
+            shift = 0;
+        }
+    });
+
+    test("a session with no stored report gives the derived flag false, not absent", async () => {
+        await stopSweepers();
+        const folder = join(root, "no-stored-report");
+
+        rmSync(folder, { recursive: true, force: true });
+        repository(folder);
+
+        const source = await supervisor("no-stored-report");
+        // A session that never filed a report: the read works, and no report is a report that does not block.
+        const session = await newSession(app, folder);
+        const at = Date.now();
+        let id = "";
+
+        await app.harness.commit(async (tx) => {
+            const state = await tx.doc(DeskThreads);
+            const opened = openThread(state, {
+                key: "x.test.no-stored-report",
+                supervisor: Number(source),
+                agents: ["duncan"],
+                repo: "frostyard/no-stored-report",
+                cwd: folder,
+                title: "A thread with no stored report",
+                at,
+            }).thread;
+            const stored = state.threads[opened.id]!;
+
+            id = opened.id;
+            stored.state = "open";
+            stored.session = Number(session);
+            stored.run = {
+                busy: false,
+                reportedAt: at,
+                reportedUserEntry: 100_000,
+                lastUserEntry: 1,
+            };
+        }, context);
+
+        try {
+            await say(app, source, "desk list test");
+            await until(
+                async () => typeof (await deskState())?.threads[id]?.run.sweptAt === "number",
+                "the first sweep",
+                20_000,
+            );
+
+            const after = (await deskState())?.threads[id];
+
+            assert(after, "the thread is stored");
+            assert.equal(after.run.reportBlocked, false, "no stored report is no blocked report");
+            assert.equal(after.state, "closed", "the unchecked report no longer holds it");
         } finally {
             await quiet([]);
             shift = 0;
