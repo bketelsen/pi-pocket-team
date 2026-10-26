@@ -2149,6 +2149,19 @@ describe("a watch with a time of day", () => {
         assert.match(errorOf(parseCheckWhen("", now)), /optional time/);
     });
 
+    test("parseCheckWhen with syntaxOnly skips the past checks and still checks the syntax", () => {
+        const now = at("2026-10-26", "09:00");
+
+        assert.deepEqual(parseCheckWhen("2026-10-26 08:00", now, true), {
+            checkOn: "2026-10-26",
+            checkTime: "08:00",
+        });
+        assert.deepEqual(parseCheckWhen("2020-01-01", now, true), { checkOn: "2020-01-01" });
+        assert.match(errorOf(parseCheckWhen("2020-01-01 24:00", now, true)), /is not a time/);
+        assert.match(errorOf(parseCheckWhen("2026-02-30 09:00", now, true)), /not a real date/);
+        assert.match(errorOf(parseCheckWhen("2026-10-26 08:00", now)), /in the past/);
+    });
+
     test("a date-only day today stays allowed, and parseCheckOn keeps its old results", () => {
         const now = at("2026-10-26", "15:00");
 
@@ -2306,33 +2319,52 @@ describe("a quiet session after a supervisor's message", () => {
             ...patch,
         });
 
-    test("fromAddress reads the words before the first fence", () => {
+    test("fromAddress takes Pocket's envelope at the start of the text, with or without a [from: …] prefix", () => {
         assert.equal(fromAddress(message(ADDRESS), ADDRESS), true);
         assert.equal(
-            fromAddress(
-                message(ADDRESS).replace("[via linked session session-aaa-111] ", ""),
-                ADDRESS,
-            ),
+            fromAddress(`[from: Brian] ${message(ADDRESS)}`, ADDRESS),
             true,
-            "with no marker",
+            "with a prefix",
         );
+        assert.equal(fromAddress(`  \n${message(ADDRESS)}`, ADDRESS), true, "after blank space");
         assert.equal(fromAddress(message("session-bbb-222"), ADDRESS), false, "another address");
         assert.equal(fromAddress(message("session-aaa-1112"), ADDRESS), false, "a longer address");
         assert.equal(fromAddress("A person writes.", ADDRESS), false);
         assert.equal(fromAddress(message(ADDRESS), undefined), false, "no address: no");
         assert.equal(fromAddress(message(ADDRESS), ""), false);
-        // The sender's own text, inside the fence, says nothing of who sent it.
         assert.equal(
             fromAddress(
-                message("session-bbb-222", `Message from linked session ${ADDRESS},`),
+                `Message from linked session ${ADDRESS}, written by another session's agent, with no fence`,
                 ADDRESS,
             ),
             false,
-        );
-        assert.equal(
-            fromAddress(`Message from linked session ${ADDRESS}, with no fence`, ADDRESS),
-            false,
             "no fence: not a linked session's message",
+        );
+    });
+
+    test("fromAddress: a person's quote of a supervisor message is not from the address", () => {
+        const quote = `Please look at this message too:\n${message(ADDRESS)}`;
+
+        assert.equal(fromAddress(quote, ADDRESS), false);
+        assert.equal(fromAddress(`[from: Brian] ${quote}`, ADDRESS), false, "with a prefix");
+        // A different prefix does not work either: the envelope must come right after `[from: …] `.
+        assert.equal(fromAddress(`[note] ${message(ADDRESS)}`, ADDRESS), false);
+        assert.equal(fromAddress(`[from: ${"x".repeat(61)}] ${message(ADDRESS)}`, ADDRESS), false);
+    });
+
+    test("fromAddress: the envelope without the [via …] marker is not from the address", () => {
+        const bare = message(ADDRESS).replace(`[via linked session ${ADDRESS}] `, "");
+
+        assert.equal(fromAddress(bare, ADDRESS), false);
+        assert.equal(fromAddress(`[from: Brian] ${bare}`, ADDRESS), false);
+        assert.equal(
+            fromAddress(message(ADDRESS).replace("[via linked session", "[via session"), ADDRESS),
+            false,
+        );
+        // The sender's own text, inside the fence, says nothing of who sent it.
+        assert.equal(
+            fromAddress(message("session-bbb-222", `${message(ADDRESS)}`), ADDRESS),
+            false,
         );
     });
 
@@ -10764,6 +10796,44 @@ describe("the desk in a Pi Pocket", () => {
         }
     });
 
+    test("an ask by another supervisor on a closed thread starts the sweeper of the thread's supervisor", async () => {
+        const owner = await supervisor("ask-owner");
+        const caller = await supervisor("ask-caller");
+        let id = "";
+
+        await app.harness.commit(async (tx) => {
+            const state = await tx.doc(DeskThreads);
+            const opened = openThread(state, {
+                key: "x.test.ask-other",
+                supervisor: Number(owner),
+                agents: ["duncan"],
+                repo: "frostyard/test",
+                title: "A closed task of another supervisor",
+                at: Date.now(),
+            });
+
+            id = opened.thread.id;
+            state.threads[id]!.state = "closed";
+            state.threads[id]!.closed = { at: Date.now(), why: "done", by: "sweep" };
+        }, context);
+
+        assert.equal(await sweepers(owner), 0);
+        assert.equal(await sweepers(caller), 0);
+
+        try {
+            askThreadId = id;
+            await say(app, caller, "desk ask thread test");
+
+            assert.equal((await deskState())?.threads[id]?.state, "open");
+            assert.equal(await sweepers(owner), 1, "the thread's supervisor gets the sweeper");
+            assert.equal(typeof (await deskState())?.sweepers?.[String(Number(owner))], "string");
+            assert.equal(await sweepers(caller), 0, "the caller's sweeper is not started");
+            assert.equal((await deskState())?.sweepers?.[String(Number(caller))], undefined);
+        } finally {
+            await quiet([]);
+        }
+    });
+
     test("the reminder continues once when a reply asks Brian something and filed no ask", async () => {
         const source = await supervisor("reminder");
 
@@ -12581,6 +12651,51 @@ describe("the desk in a Pi Pocket", () => {
                     .status,
                 400,
             );
+        });
+
+        test("a repeated timed watch request after its due instant changes nothing, and a new past time is refused", async () => {
+            const { thread } = await delegated("page-watch-due");
+
+            await until(
+                async () =>
+                    typeof (await deskState())?.threads[thread.id]?.run.sweptAt === "number",
+                "the first sweep",
+                20_000,
+            );
+
+            // A watch whose time is past already, as the first request left it: it was in the future when it came.
+            await app.harness.commit(async (tx) => {
+                (await tx.doc(DeskThreads)).threads[thread.id]!.watch = {
+                    checkOn: "2020-01-01",
+                    checkTime: "09:00",
+                    check: "the blob sweep",
+                    setAt: 1,
+                    setBy: "brian",
+                    key: "page:watch:1",
+                };
+            }, context);
+
+            const events = (await deskState())?.threads[thread.id]?.events.length;
+            const again = await call(`threads/${thread.id}/watch`, {
+                checkOn: "2020-01-01 09:00",
+                check: "the blob sweep",
+            });
+
+            assert.equal(again.status, 200, "the repeat is a double tap, not a past time");
+            assert.equal((await deskState())?.threads[thread.id]?.events.length, events);
+            assert.equal((await deskState())?.threads[thread.id]?.watch?.key, "page:watch:1");
+
+            // A different past time is a new watch, and it is refused.
+            assert.equal(
+                (
+                    await call(`threads/${thread.id}/watch`, {
+                        checkOn: "2020-01-01 10:00",
+                        check: "the blob sweep",
+                    })
+                ).status,
+                400,
+            );
+            assert.equal((await deskState())?.threads[thread.id]?.watch?.checkTime, "09:00");
         });
 
         test("watch, unwatch and result change the thread; a second POST changes nothing", async () => {

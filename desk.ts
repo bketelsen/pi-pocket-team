@@ -1057,17 +1057,20 @@ export function watchWhen(watch: Pick<Watch, "checkOn" | "checkTime">): string {
  * A check date and its optional time: a day, today or later, or a span from today ("7d", "2w", "1m"), then maybe a
  * time, 24-hour, in the server's zone: "2026-10-26 09:00", "2026-10-26T09:00", "1d 09:00". The hour has 1 or 2 digits.
  * A day with a time that is at or before `now` is in the past; a day alone may be today. The span is resolved here,
- * once: the caller stores the day, so a replay keeps the date it first got.
+ * once: the caller stores the day, so a replay keeps the date it first got. With `syntaxOnly` the past checks are
+ * skipped: the result is the normalized request, for a caller that compares it with a stored watch before it asks
+ * whether the time is past.
  */
 export function parseCheckWhen(
     text: string,
     now: number,
+    syntaxOnly = false,
 ): { checkOn: string; checkTime?: string } | { error: string } {
     const plain = text.trim();
     const split = DAY_AND_TIME.exec(plain);
 
     if (split === null) {
-        const day = parseCheckDay(plain, now);
+        const day = parseCheckDay(plain, now, syntaxOnly);
 
         return typeof day === "string" ? { checkOn: day } : day;
     }
@@ -1082,7 +1085,7 @@ export function parseCheckWhen(
         };
     }
 
-    const day = parseCheckDay(split[1] ?? "", now);
+    const day = parseCheckDay(split[1] ?? "", now, syntaxOnly);
 
     if (typeof day !== "string") {
         return day;
@@ -1090,7 +1093,7 @@ export function parseCheckWhen(
 
     const checkTime = `${String(hours).padStart(2, "0")}:${time[2] ?? "00"}`;
 
-    if (instantOf(day, checkTime) <= now) {
+    if (!syntaxOnly && instantOf(day, checkTime) <= now) {
         return { error: `The check time ${day} ${checkTime} is in the past.` };
     }
 
@@ -1117,7 +1120,7 @@ export function parseCheckOn(text: string, now: number): string | { error: strin
  * A check day, as "YYYY-MM-DD". It takes a real day, today or later, or a span from today: "7d", "2w", "1m", 1 to
  * 400 days, 1 to 52 weeks, or 1 to 12 months. A month span keeps the day of the month, or takes that month's last one.
  */
-function parseCheckDay(plain: string, now: number): string | { error: string } {
+function parseCheckDay(plain: string, now: number, syntaxOnly = false): string | { error: string } {
     if (DATE.test(plain)) {
         const date = dateOf(plain);
 
@@ -1129,7 +1132,9 @@ function parseCheckDay(plain: string, now: number): string | { error: string } {
 
         const day = dayOf(date.getTime());
 
-        return day < dayOf(now) ? { error: `The check date ${day} is in the past.` } : day;
+        return !syntaxOnly && day < dayOf(now)
+            ? { error: `The check date ${day} is in the past.` }
+            : day;
     }
 
     const span = SPAN.exec(plain);
@@ -1737,20 +1742,30 @@ function closeOutcomeWords(thread: Thread): string {
 /** What `openSession` says of an idle session that reported in an earlier turn, and not in its last. */
 const SILENT_WORDS = "it did not report in its last turn";
 
+/** The optional prefix that Pocket puts before a message for a person's name: `[from: Brian] `. */
+const FROM_PREFIX = /^\[from: [^\]\n]{1,60}\] /;
+
 /**
- * Whether a message in a session came from an address: Pocket's text for a linked session's message holds
- * `Message from linked session <address>,` before the first fence `<linked-session-message>` (a marker such as
- * `[via linked session …]` may come first). Only the words before the first fence count, and a text with no fence is
- * not a linked session's message. No address: no.
+ * Whether a message in a session came from an address. Pocket's envelope for a linked session's message starts the text
+ * (after the optional `[from: <name>] ` prefix) with
+ * `[via linked session <address>] Message from linked session <address>, written by another session's agent`, and the
+ * text holds the fence `<linked-session-message>` later. Only that start counts: the same words later in the text, as a
+ * person's quote of a message, prove nothing. A person who types the whole envelope by hand can still forge it. No
+ * address: no.
  */
 export function fromAddress(text: string, address: string | undefined): boolean {
     if (address === undefined || address === "") {
         return false;
     }
 
-    const fence = text.indexOf("<linked-session-message>");
+    const trimmed = text.trimStart();
+    const rest = trimmed.slice(FROM_PREFIX.exec(trimmed)?.[0].length ?? 0);
 
-    return fence !== -1 && text.slice(0, fence).includes(`Message from linked session ${address},`);
+    return (
+        rest.startsWith(
+            `[via linked session ${address}] Message from linked session ${address}, written by another session's agent`,
+        ) && rest.includes("<linked-session-message>")
+    );
 }
 
 /**
@@ -11819,8 +11834,9 @@ export default function createDesk(host: Host, web: Web) {
                     throw web.error(404, `There is no thread ${id}.`);
                 }
 
-                // A double tap: the same date, time, and check change nothing.
-                const when = parseCheckWhen(checkOn, now);
+                // A double tap: the same date, time, and check change nothing, also just after the due instant. The
+                // syntax is read first, without the past check: only a new watch must be in the future.
+                const when = parseCheckWhen(checkOn, now, true);
 
                 if (
                     !("error" in when) &&
@@ -12651,10 +12667,9 @@ export default function createDesk(host: Host, web: Web) {
                     const filed = state.threads[added.threadId];
 
                     // An ask thread needs its sweeper. So does a thread that the ask opened again: the sweeper of its
-                    // supervisor may have ended when every thread of it was closed.
-                    if (filed?.origin === "ask") {
-                        await startSweeper(tx, supervisor);
-                    } else if (added.reopened === true) {
+                    // supervisor may have ended when every thread of it was closed. It is the thread's supervisor, not
+                    // the caller's: a new ask thread has the caller's, and a reopened one may have another's.
+                    if (filed?.origin === "ask" || added.reopened === true) {
                         await startSweeper(tx, filed?.supervisor ?? supervisor);
                     }
 
