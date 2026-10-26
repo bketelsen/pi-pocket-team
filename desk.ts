@@ -215,7 +215,8 @@ export type Thread = {
      * delegation worktree), `worktreeKeptAt` (when git refused to remove it: the next try waits a day), and `unready`
      * (the `ready-for-human` removals the sweep decided, by key `unready:<ref>:<label time>`:
      * `{ at, why, to, removed, sent }`, at most 30), and `reportBlocked` (true when the newest report says BLOCKED or
-     * asks for a decision: a later report that does not clears it).
+     * asks for a decision, false when it does not, absent when the desk did not derive it yet: an older thread gets it
+     * at its next sweep, from its newest stored report).
      */
     run: Record<string, JsonValue>;
     /** The last 50; `key` makes an event unique. */
@@ -1675,7 +1676,8 @@ export function shiftWorks(shift: JsonValue | undefined): boolean {
 /**
  * Whether a report says the work is blocked, or asks for a decision: the reason `blocked` or `failed`, the word `BLOCKED`
  * in capitals, a line that starts with `blocked` (any case, after a bullet or bold mark), `needs brian: yes` (any case),
- * or a line that starts with `needs a decision` or `decision needed` (any case).
+ * a line that starts with `needs a decision` or `decision needed` (any case), or a last paragraph that asks Brian
+ * something (`asksBrian`: a question, or the ask words).
  */
 export function reportBlocks(text: string, reason?: string): boolean {
     if (reason === "blocked" || reason === "failed") {
@@ -1699,7 +1701,8 @@ export function reportBlocks(text: string, reason?: string): boolean {
         }
     }
 
-    return false;
+    // A report whose last paragraph asks Brian something waits for his answer, as a blocked one does.
+    return asksBrian(text);
 }
 
 export type CloseFacts = {
@@ -7922,12 +7925,9 @@ export default function createDesk(host: Host, web: Web) {
 
             thread.run.reportedAt = request.at;
 
-            // A later report that says nothing blocked clears it: only the newest report counts.
-            if (reportBlocks(request.text, request.reason)) {
-                thread.run.reportBlocked = true;
-            } else {
-                delete thread.run.reportBlocked;
-            }
+            // A later report replaces it: only the newest report counts. `false` is not absent: an absent flag is a
+            // thread that the desk did not derive yet.
+            thread.run.reportBlocked = reportBlocks(request.text, request.reason);
 
             if (newest !== undefined) {
                 thread.run.reportedUserEntry = newest;
@@ -8037,6 +8037,11 @@ export default function createDesk(host: Host, web: Web) {
         ownAuthors: string[];
         /** folder → branch → the oldest reflog time, in ms. */
         branches: Record<string, Record<string, number>>;
+        /**
+         * By thread id: the newest stored report of a thread from before `run.reportBlocked`, whose flag the commit then
+         * sets. A thread whose report is not here keeps its absent flag until a later sweep.
+         */
+        reports?: Record<string, StoredReport | undefined>;
     };
 
     const run = promisify(execFile);
@@ -8262,11 +8267,16 @@ export default function createDesk(host: Host, web: Web) {
         }
 
         const status = parseStatus(text);
+        // The branch the folder is on now: a renamed delegation branch is the thread's branch under another name.
+        const own = {
+            ...options,
+            ...(status.branch === undefined ? {} : { current: status.branch }),
+        };
 
         if (status.ahead !== undefined) {
             return {
                 dirty: status.dirty,
-                ahead: await ownAhead(folder, status.ahead, options),
+                ahead: await ownAhead(folder, status.ahead, own),
             };
         }
 
@@ -8282,7 +8292,7 @@ export default function createDesk(host: Host, web: Web) {
         const ahead = counted === undefined ? Number.NaN : Number(counted.trim());
 
         return Number.isInteger(ahead) && ahead >= 0
-            ? { dirty: status.dirty, ahead: await ownAhead(folder, ahead, options) }
+            ? { dirty: status.dirty, ahead: await ownAhead(folder, ahead, own) }
             : {
                   dirty: status.dirty,
                   ahead: undefined,
@@ -8290,16 +8300,73 @@ export default function createDesk(host: Host, web: Web) {
               };
     }
 
+    /** One entry of a branch's reflog: the commit it holds, and its subject (`%gs`). */
+    type ReflogEntry = { oid: string; subject: string };
+
+    /** A branch's reflog in `folder`, newest entry first; undefined when git cannot read it. */
+    async function reflogOf(folder: string, branch: string): Promise<ReflogEntry[] | undefined> {
+        const text = await gitText(folder, [
+            "reflog",
+            "show",
+            "--format=%H %gs",
+            `refs/heads/${branch}`,
+        ]);
+
+        if (text === undefined) {
+            return undefined;
+        }
+
+        const entries: ReflogEntry[] = [];
+
+        for (const line of text.split("\n")) {
+            const match = /^([0-9a-f]{40,64})(?: (.*))?$/.exec(line.trim());
+
+            if (match !== null) {
+                entries.push({ oid: match[1]!, subject: match[2] ?? "" });
+            }
+        }
+
+        return entries;
+    }
+
+    /**
+     * The commit a branch was made from: its oldest reflog entry, when that entry is the creation (`branch: Created from
+     * ...`). Git expires old entries, so an oldest entry is a base only when it says it is one.
+     */
+    function baseOf(entries: readonly ReflogEntry[]): string | undefined {
+        const oldest = entries.at(-1);
+
+        return oldest !== undefined && oldest.subject.startsWith("branch: Created from")
+            ? oldest.oid
+            : undefined;
+    }
+
+    /** The commits on HEAD that no remote has, above `base`: undefined when git cannot count them. */
+    async function aboveBase(folder: string, base: string): Promise<number | undefined> {
+        const counted = await gitText(folder, [
+            "rev-list",
+            "--count",
+            "HEAD",
+            "--not",
+            "--remotes",
+            base,
+        ]);
+        const own = counted === undefined ? Number.NaN : Number(counted.trim());
+
+        return Number.isInteger(own) && own >= 0 ? own : undefined;
+    }
+
     /**
      * The unpushed commits that are the thread's own work, from the count git gave: 0 when GitHub had HEAD as a PR
      * head, and otherwise the commits on no remote above the branch's base (`HEAD` is not in `--not`, so the base stays
-     * out of the count). The base is the branch's first reflog entry, the commit its worktree was made from. Any step
-     * that fails keeps the count git gave.
+     * out of the count). The base is the branch's oldest reflog entry when that entry is its creation. An agent may
+     * rename its delegation branch: git then moves the reflog to the new name, and the current branch of the folder is
+     * that branch only when its reflog says the stored one was renamed into it. Any step that fails keeps the count.
      */
     async function ownAhead(
         folder: string,
         count: number,
-        options: { heads?: ReadonlySet<string>; branch?: string },
+        options: { heads?: ReadonlySet<string>; branch?: string; current?: string },
     ): Promise<number> {
         if (count <= 0) {
             return count;
@@ -8311,44 +8378,46 @@ export default function createDesk(host: Host, web: Web) {
             return 0;
         }
 
-        const branch = options.branch;
+        const branch = branchName(options.branch);
 
-        if (branch === undefined || !BRANCH_NAME.test(branch) || branch.includes("..")) {
+        if (branch === undefined) {
             return count;
         }
 
-        const log = await gitText(folder, [
-            "reflog",
-            "show",
-            "--format=%H",
-            `refs/heads/${branch}`,
-        ]);
+        const stored = await reflogOf(folder, branch);
+        const base = stored === undefined ? undefined : baseOf(stored);
+        const own = base === undefined ? undefined : await aboveBase(folder, base);
 
-        if (log === undefined) {
+        if (own !== undefined) {
+            return own;
+        }
+
+        // The stored branch's reflog is gone (a rename, which git moves to the new name): the current branch is it only
+        // when its reflog says so.
+        const current = branchName(options.current);
+
+        if (current === undefined) {
             return count;
         }
 
-        const base = log
-            .split("\n")
-            .map((line) => line.trim())
-            .filter((line) => line !== "")
-            .at(-1);
+        const entries = await reflogOf(folder, current);
+        const renamed = `Branch: renamed refs/heads/${branch} to `;
 
-        if (base === undefined || !/^[0-9a-f]{40,64}$/.test(base)) {
+        if (entries?.some((entry) => entry.subject.startsWith(renamed)) !== true) {
             return count;
         }
 
-        const counted = await gitText(folder, [
-            "rev-list",
-            "--count",
-            "HEAD",
-            "--not",
-            "--remotes",
-            base,
-        ]);
-        const own = counted === undefined ? Number.NaN : Number(counted.trim());
+        const moved = baseOf(entries);
+        const movedOwn = moved === undefined ? undefined : await aboveBase(folder, moved);
 
-        return Number.isInteger(own) && own >= 0 ? own : count;
+        return movedOwn ?? count;
+    }
+
+    /** A branch name that may go into a git command: the pattern's rule, and no `..`. */
+    function branchName(name: string | undefined): string | undefined {
+        return name !== undefined && BRANCH_NAME.test(name) && !name.includes("..")
+            ? name
+            : undefined;
     }
 
     /**
@@ -9222,6 +9291,29 @@ export default function createDesk(host: Host, web: Web) {
             (thread) => thread.supervisor === Number(supervisor) && thread.state !== "closed",
         );
 
+        // A thread filed before `run.reportBlocked` existed: its newest stored report decides the flag, 1 time. The read
+        // is here, not in the commit: a commit cannot read a table after its first write, and this read never makes the
+        // document of a session that has no reports.
+        const reports: Record<string, StoredReport | undefined> = {};
+
+        for (const thread of open) {
+            if (
+                thread.session === undefined ||
+                thread.run.reportedAt === undefined ||
+                thread.run.reportBlocked !== undefined
+            ) {
+                continue;
+            }
+
+            try {
+                reports[thread.id] = (
+                    await read.snapshot(DeskReports, thread.session as ConversationId, context)
+                )?.reports[0];
+            } catch {
+                // Not readable now: the flag waits for the next sweep.
+            }
+        }
+
         let sessions: SessionFact[] | undefined;
 
         try {
@@ -9424,6 +9516,7 @@ export default function createDesk(host: Host, web: Web) {
             authors,
             ownAuthors,
             branches,
+            ...(Object.keys(reports).length === 0 ? {} : { reports }),
         };
     };
 
@@ -9881,6 +9974,16 @@ export default function createDesk(host: Host, web: Web) {
                     if (addEvent(thread, event.key, event.text, now)) {
                         events += 1;
                     }
+                }
+            }
+
+            // A thread from before `run.reportBlocked` existed: its newest stored report sets the flag now, once. An
+            // absent flag stays absent while the report cannot be read: it is not the same as `false`.
+            if (thread.run.reportBlocked === undefined) {
+                const report = facts.reports?.[thread.id];
+
+                if (report !== undefined) {
+                    thread.run.reportBlocked = reportBlocks(report.text);
                 }
             }
 

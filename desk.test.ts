@@ -883,6 +883,12 @@ describe("closeCheck", () => {
 
         assert.equal(dirty.close, false);
         assert.deepEqual(dirty.open, ["2 changed files in /work/test"]);
+
+        // `false` is a derived flag that says the newest report does not block: it holds nothing.
+        assert.deepEqual(closeCheck(thread({ run: { reportBlocked: false } }), facts()), {
+            close: true,
+            open: [],
+        });
     });
 
     test("a thread still starting closes as failed after an hour", () => {
@@ -985,6 +991,9 @@ describe("reportBlocks", () => {
         assert.equal(reportBlocks("needs brian: yes, a token."), true);
         assert.equal(reportBlocks("Needs a decision: which repository?"), true);
         assert.equal(reportBlocks("Decision needed."), true);
+        // A last paragraph that asks Brian something (`asksBrian`) is a decision too.
+        assert.equal(reportBlocks("Which option should I use?"), true);
+        assert.equal(reportBlocks("Please decide whether to deploy."), true);
     });
 
     test("a no, a lower-case word in a line, and a plain report are not blocked", () => {
@@ -997,6 +1006,19 @@ describe("reportBlocks", () => {
             false,
         );
         assert.equal(reportBlocks("Needs Brian: no. Depends on: the 00:00 runs."), false);
+        // A report that only states what was done, or what comes later, is not a decision.
+        assert.equal(
+            reportBlocks(
+                '- Follow-up for later: after Frostnotes M4 Phase 7, the Status text "moving behind lodge" needs a change.',
+            ),
+            false,
+        );
+        assert.equal(
+            reportBlocks(
+                "- The T240a record on line 446 already had the date 2026-10-26. I did not change it.",
+            ),
+            false,
+        );
         assert.equal(reportBlocks("anything", "done"), false);
         assert.equal(reportBlocks("anything"), false);
     });
@@ -6411,6 +6433,57 @@ function repository(folder: string): void {
     git(folder, "update-ref", `refs/remotes/origin/${branch}`, "HEAD");
     git(folder, "config", `branch.${branch}.remote`, "origin");
     git(folder, "config", `branch.${branch}.merge`, `refs/heads/${branch}`);
+}
+
+/** 1 commit in a test folder, with the file every test folder has: the words keep 2 folders' commit oids apart. */
+function commitFile(folder: string, words: string): void {
+    appendFileSync(join(folder, "file.txt"), `${words}\n`);
+    git(folder, "add", ".");
+    git(
+        folder,
+        "-c",
+        "user.email=test@example.com",
+        "-c",
+        "user.name=Test",
+        "commit",
+        "-qm",
+        words,
+    );
+}
+
+/**
+ * Open a thread for a sweep on a folder that is its own delegation worktree, with no session and no address: the session
+ * part is closed and idle, so only the folder's counts decide whether it closes.
+ */
+async function openWorktreeThread(
+    source: ConversationId,
+    folder: string,
+    branch: string,
+): Promise<string> {
+    let id = "";
+
+    await app.harness.commit(async (tx) => {
+        const state = await tx.doc(DeskThreads);
+        const opened = openThread(state, {
+            key: `x.test.worktree:${folder}`,
+            supervisor: Number(source),
+            agents: ["duncan"],
+            repo: "frostyard/worktree-base",
+            cwd: folder,
+            worktree: { path: folder, branch, checkout: folder },
+            title: "A delegation in a worktree",
+            at: Date.now(),
+        }).thread;
+        const stored = state.threads[opened.id]!;
+
+        id = opened.id;
+        stored.state = "open";
+        delete stored.session;
+        delete stored.address;
+        stored.run = { busy: false };
+    }, context);
+
+    return id;
 }
 
 before(async () => {
@@ -12361,22 +12434,6 @@ describe("the desk in a Pi Pocket", () => {
         // The app's clock moves here: no sweeper of an earlier test may wake and see the folder too.
         await stopSweepers();
 
-        /** 1 commit in a test folder, with the file every test folder has. */
-        const commit = (where: string, message: string): void => {
-            appendFileSync(join(where, "file.txt"), `${message}\n`);
-            git(where, "add", ".");
-            git(
-                where,
-                "-c",
-                "user.email=test@example.com",
-                "-c",
-                "user.name=Test",
-                "commit",
-                "-qm",
-                message,
-            );
-        };
-
         /**
          * A folder as a delegation left it: a base commit that no remote has, then a worktree branch made from it. The
          * base is the commit the squashed main branch was on when the worktree was made: no remote ref holds it.
@@ -12386,7 +12443,7 @@ describe("the desk in a Pi Pocket", () => {
 
             rmSync(folder, { recursive: true, force: true });
             repository(folder);
-            commit(folder, "base");
+            commitFile(folder, "base");
             git(folder, "checkout", "-q", "-b", "moneo/base-test");
 
             return folder;
@@ -12396,42 +12453,12 @@ describe("the desk in a Pi Pocket", () => {
         const own = worktree("own-commits");
 
         // The second worktree's thread made 1 commit of its own, after the checkout.
-        commit(own, "own work");
+        commitFile(own, "own work");
 
         const source = await supervisor("worktree-base");
-        let closedId = "";
-        let openId = "";
 
-        const openAt = async (folder: string): Promise<string> => {
-            let id = "";
-
-            await app.harness.commit(async (tx) => {
-                const state = await tx.doc(DeskThreads);
-                const opened = openThread(state, {
-                    key: `x.test.base:${folder}`,
-                    supervisor: Number(source),
-                    agents: ["duncan"],
-                    repo: "frostyard/worktree-base",
-                    cwd: folder,
-                    worktree: { path: folder, branch: "moneo/base-test", checkout: folder },
-                    title: "A delegation in a worktree",
-                    at: Date.now(),
-                }).thread;
-                const stored = state.threads[opened.id]!;
-
-                // The session part is closed: no session to read, and an idle one.
-                id = opened.id;
-                stored.state = "open";
-                delete stored.session;
-                delete stored.address;
-                stored.run = { busy: false };
-            }, context);
-
-            return id;
-        };
-
-        closedId = await openAt(base);
-        openId = await openAt(own);
+        const closedId = await openWorktreeThread(source, base, "moneo/base-test");
+        const openId = await openWorktreeThread(source, own, "moneo/base-test");
 
         try {
             await say(app, source, "desk list test");
@@ -12473,22 +12500,6 @@ describe("the desk in a Pi Pocket", () => {
     test("a squash-merged PR head is not unpushed work (F32)", async () => {
         await stopSweepers();
 
-        /** 1 commit in a test folder, with the file every test folder has. */
-        const commit = (where: string, message: string): void => {
-            appendFileSync(join(where, "file.txt"), `${message}\n`);
-            git(where, "add", ".");
-            git(
-                where,
-                "-c",
-                "user.email=test@example.com",
-                "-c",
-                "user.name=Test",
-                "commit",
-                "-qm",
-                message,
-            );
-        };
-
         /**
          * A folder whose branch tracks a remote branch that is gone (a squash-merge deleted it), with 2 commits that no
          * remote ref holds. The commits' own words keep 2 folders' commit oids apart: a commit oid is its tree and its
@@ -12500,8 +12511,8 @@ describe("the desk in a Pi Pocket", () => {
             rmSync(folder, { recursive: true, force: true });
             repository(folder);
             git(folder, "checkout", "-q", "-b", "fix/gone");
-            commit(folder, words[0]);
-            commit(folder, words[1]);
+            commitFile(folder, words[0]);
+            commitFile(folder, words[1]);
             git(folder, "config", "branch.fix/gone.remote", "origin");
             git(folder, "config", "branch.fix/gone.merge", "refs/heads/fix/gone");
 
@@ -12592,6 +12603,195 @@ describe("the desk in a Pi Pocket", () => {
             assert.equal(loose.state, "open");
             assert.deepEqual(closeCheck(loose, facts()).open, [
                 `2 unpushed commits in ${looseFolder}`,
+            ]);
+        } finally {
+            await quiet([]);
+            shift = 0;
+        }
+    });
+
+    test("a branch whose reflog has no creation entry keeps its count", async () => {
+        await stopSweepers();
+        const folder = join(root, "no-creation-entry");
+
+        rmSync(folder, { recursive: true, force: true });
+        repository(folder);
+        commitFile(folder, "base");
+        git(folder, "checkout", "-q", "-b", "moneo/base-test");
+        commitFile(folder, "own");
+        // Git expired the creation entry: the oldest entry left is a commit, which is no base. The log is written by hand,
+        // so the newest entry stays while the creation one is gone.
+        const log = join(folder, ".git", "logs", "refs", "heads", "moneo", "base-test");
+        const lines = readFileSync(log, "utf8")
+            .split("\n")
+            .filter((line) => line !== "");
+
+        writeFileSync(log, `${lines.at(-1) ?? ""}\n`);
+
+        const source = await supervisor("no-creation");
+        const id = await openWorktreeThread(source, folder, "moneo/base-test");
+
+        try {
+            await say(app, source, "desk list test");
+            await until(
+                async () => typeof (await deskState())?.threads[id]?.run.sweptAt === "number",
+                "the first sweep",
+                20_000,
+            );
+
+            const thread = (await deskState())?.threads[id];
+
+            assert(thread, "the thread is stored");
+            assert.equal(thread.run.ahead, 2, "with no creation entry the count git gave stays");
+            assert.equal(thread.state, "open");
+            assert.deepEqual(closeCheck(thread, facts()).open, [`2 unpushed commits in ${folder}`]);
+        } finally {
+            await quiet([]);
+            shift = 0;
+        }
+    });
+
+    test("a renamed delegation branch keeps its worktree's base (T231)", async () => {
+        await stopSweepers();
+        const folder = join(root, "renamed-branch");
+
+        rmSync(folder, { recursive: true, force: true });
+        repository(folder);
+        commitFile(folder, "base");
+        git(folder, "checkout", "-q", "-b", "moneo/base-test");
+        // The agent renamed its branch: git moved the reflog, and the creation entry is the oldest one there still.
+        git(folder, "branch", "-m", "moneo/renamed");
+
+        const source = await supervisor("renamed");
+        const id = await openWorktreeThread(source, folder, "moneo/base-test");
+
+        try {
+            await say(app, source, "desk list test");
+            await until(
+                async () => typeof (await deskState())?.threads[id]?.run.sweptAt === "number",
+                "the first sweep",
+                20_000,
+            );
+
+            const thread = (await deskState())?.threads[id];
+
+            assert(thread, "the thread is stored");
+            assert.equal(thread.run.ahead, 0, "the renamed branch holds the same base");
+            assert.equal(thread.state, "closed");
+        } finally {
+            await quiet([]);
+            shift = 0;
+        }
+    });
+
+    test("a branch created from HEAD is not a renamed delegation branch", async () => {
+        await stopSweepers();
+        const folder = join(root, "branch-from-head");
+
+        rmSync(folder, { recursive: true, force: true });
+        repository(folder);
+        commitFile(folder, "base");
+        git(folder, "checkout", "-q", "-b", "moneo/base-test");
+        commitFile(folder, "own");
+        // The thread's branch is gone, and the folder's branch was made from HEAD: no rename entry names the stored
+        // branch, so the new branch's creation point is not the stored branch's base.
+        git(folder, "checkout", "-q", "-b", "feature");
+        git(folder, "branch", "-q", "-D", "moneo/base-test");
+
+        const source = await supervisor("branch-from-head");
+        const id = await openWorktreeThread(source, folder, "moneo/base-test");
+
+        try {
+            await say(app, source, "desk list test");
+            await until(
+                async () => typeof (await deskState())?.threads[id]?.run.sweptAt === "number",
+                "the first sweep",
+                20_000,
+            );
+
+            const thread = (await deskState())?.threads[id];
+
+            assert(thread, "the thread is stored");
+            assert.equal(thread.run.ahead, 2, "the own commit still counts");
+            assert.equal(thread.state, "open");
+            assert.deepEqual(closeCheck(thread, facts()).open, [`2 unpushed commits in ${folder}`]);
+        } finally {
+            await quiet([]);
+            shift = 0;
+        }
+    });
+
+    test("an old thread gets its blocked flag from its newest stored report", async () => {
+        await stopSweepers();
+        const folder = join(root, "old-report");
+
+        rmSync(folder, { recursive: true, force: true });
+        repository(folder);
+
+        const source = await supervisor("old-report");
+        const session = await newSession(app, folder);
+        const at = Date.now();
+
+        await app.harness.commit(async (tx) => {
+            const reports = await tx.doc(DeskReports, session);
+
+            reports.reports.unshift({
+                key: "report:old",
+                at,
+                from: "team_message",
+                text: "BLOCKED: the release token is missing, so the publish step waits.",
+                line: "[desk] a report from before the flag",
+            });
+        }, context);
+
+        let id = "";
+
+        await app.harness.commit(async (tx) => {
+            const state = await tx.doc(DeskThreads);
+            const opened = openThread(state, {
+                key: "x.test.old-report",
+                supervisor: Number(source),
+                agents: ["duncan"],
+                repo: "frostyard/old-report",
+                cwd: folder,
+                title: "A thread from before the flag",
+                at,
+            }).thread;
+            const stored = state.threads[opened.id]!;
+
+            id = opened.id;
+            stored.state = "open";
+            stored.session = Number(session);
+            // The agent reported, and the session is idle: without the flag the thread closes at the sweep.
+            stored.run = {
+                busy: false,
+                reportedAt: at,
+                reportedUserEntry: 100_000,
+                lastUserEntry: 1,
+            };
+        }, context);
+
+        try {
+            const before = (await deskState())?.threads[id];
+
+            assert(before, "the thread is stored");
+            assert.equal(before.run.reportBlocked, undefined, "the flag is not derived yet");
+            assert.deepEqual(closeCheck(before, facts()), { close: true, open: [] });
+
+            await say(app, source, "desk list test");
+            await until(
+                async () => typeof (await deskState())?.threads[id]?.run.sweptAt === "number",
+                "the first sweep",
+                20_000,
+            );
+
+            const after = (await deskState())?.threads[id];
+
+            assert(after, "the thread is still stored");
+            assert.equal(after.run.reportBlocked, true, "the stored report says BLOCKED");
+            assert.equal(after.state, "open");
+            assert.deepEqual(closeCheck(after, facts()).open, [
+                "its last report says BLOCKED or asks for a decision",
             ]);
         } finally {
             await quiet([]);
