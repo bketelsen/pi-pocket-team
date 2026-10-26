@@ -6769,20 +6769,52 @@ const REPORT_ASK_WORDS = new RegExp(
     ASK_WORDS.flags,
 );
 
+/** The words of a choice: a merge request with one of them is still a decision ("Please merge #54 or #55."). */
+const CHOICE = /\bor\b|which|whether|should i|your call|do you want/i;
+
 /**
- * The text without its code: fenced blocks (3 or more backticks or tildes) and inline code (a run of backticks, closed
- * by a run of the same length). Words in code are quoted, never said.
+ * The text without its code. A fence opens on a line that starts with 3 or more backticks or tildes (after at most 3
+ * spaces), and closes on a line of only the same mark, at least as long; an unclosed fence runs to the end. Inline code
+ * is a run of backticks closed by a run of the same length. Words in code are quoted, never said.
  */
 function withoutCode(text: string): string {
-    return text
-        .replace(/(`{3,}|~{3,})[\s\S]*?\1/g, " ")
-        .replace(/(?<!`)(`+)(?!`)[^\n]*?(?<!`)\1(?!`)/g, " ");
+    const kept: string[] = [];
+    let fence: { mark: string; length: number } | undefined;
+
+    for (const line of text.split("\n")) {
+        if (fence === undefined) {
+            const open = /^ {0,3}(`{3,}|~{3,})/.exec(line);
+
+            if (
+                open === null ||
+                (open[1]![0] === "`" && line.slice(open[0].length).includes("`"))
+            ) {
+                kept.push(line);
+            } else {
+                fence = { mark: open[1]![0]!, length: open[1]!.length };
+                kept.push("");
+            }
+
+            continue;
+        }
+
+        const close = /^ {0,3}(`{3,}|~{3,})[ \t]*$/.exec(line);
+
+        if (close !== null && close[1]![0] === fence.mark && close[1]!.length >= fence.length) {
+            fence = undefined;
+        }
+
+        kept.push("");
+    }
+
+    return kept.join("\n").replace(/(?<!`)(`+)(?!`)[^\n]*?(?<!`)\1(?!`)/g, " ");
 }
 
 /**
  * Whether the last paragraph asks Brian something. Code blocks and inline code never count, a sentence that says
  * there is no ask never counts, and a "?" counts in every other sentence. In a report (`report`), "please merge" is no
- * ask word (`REPORT_ASK_WORDS`): a statement that only asks for the merge is no decision.
+ * ask word (`REPORT_ASK_WORDS`) unless the sentence holds a choice (`CHOICE`): a statement that only asks for the merge
+ * is no decision.
  */
 export function asksBrian(text: string, options: { report?: boolean } = {}): boolean {
     const plain = withoutCode(text);
@@ -6804,7 +6836,9 @@ export function asksBrian(text: string, options: { report?: boolean } = {}): boo
 
         return (
             sentence.includes("?") ||
-            (options.report === true ? REPORT_ASK_WORDS : ASK_WORDS).test(sentence)
+            (options.report === true && !CHOICE.test(sentence) ? REPORT_ASK_WORDS : ASK_WORDS).test(
+                sentence,
+            )
         );
     });
 }

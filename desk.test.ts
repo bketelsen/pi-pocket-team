@@ -1078,6 +1078,7 @@ describe("reportBlocks", () => {
             true,
         );
         assert.equal(reportBlocks("Done.\n\nPlease merge #54 or #55: your call."), true);
+        assert.equal(reportBlocks("Done.\n\nPlease merge #54 or #55."), true);
         assert.equal(reportBlocks("The deploy is BLOCKED. Please merge #54 after the fix."), true);
         assert.equal(reportBlocks("Status: BLOCKED"), true);
         assert.equal(reportBlocks("The deploy is currently BLOCKED."), true);
@@ -1086,6 +1087,11 @@ describe("reportBlocks", () => {
         // Code in every Markdown form is quoted, not said.
         assert.equal(reportBlocks("The rule names ``BLOCKED`` in capitals."), false);
         assert.equal(reportBlocks("Done.\n\n~~~\nBLOCKED\n~~~"), false);
+        assert.equal(reportBlocks("Done.\n\n~~~sh\nprintf '~~~'\n# BLOCKED\n~~~"), false);
+        assert.equal(reportBlocks("Done.\n\n```\nBLOCKED\n~~~\n```\n\nAll set."), false);
+        assert.equal(reportBlocks("Done.\n\n```\nBLOCKED\n````\n\nAll set."), false);
+        // A fence closes the code: the words after it count again.
+        assert.equal(reportBlocks("```\ncode\n```\nThe deploy is BLOCKED."), true);
         assert.equal(reportBlocks("Done.\n\n````\nBLOCKED\n```\nstill code\n````"), false);
         assert.equal(reportBlocks("The release stays BLOCKED until the key is set."), true);
         assert.equal(reportBlocks("The deploy: BLOCKED on the token."), true);
