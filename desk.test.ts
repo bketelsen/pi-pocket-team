@@ -64,6 +64,9 @@ import {
     closeOutcome,
     closeoutHold,
     closeoutKey,
+    knownHeads,
+    reportBlocks,
+    shiftWorks,
     assignWorktrees,
     ownedWorktrees,
     parseWorktrees,
@@ -773,6 +776,115 @@ describe("closeCheck", () => {
         assert.equal(closeCheck(thread({ run: { worktrees: [] } }), facts()).close, true);
     });
 
+    test("T236/T238: a paused night shift after the close-out report closes", () => {
+        // A message paused the shift, and nobody resumed it: a paused shift has no driver, so it is stopped.
+        const ref = "frostyard/test#469";
+        const paused = thread({
+            prs: { [ref]: { via: "seen", state: "MERGED" } },
+            asks: [
+                {
+                    id: "T1a",
+                    text: "Which PR?",
+                    at: 1,
+                    answer: { at: 2, by: "brian", words: "that one" },
+                },
+            ],
+            run: {
+                busy: false,
+                shift: "paused",
+                closeout: `closeout:k:${ref}`,
+                closeoutRefs: [ref],
+                closeoutEntry: 5,
+                reportedUserEntry: 6,
+                lastUserEntry: 6,
+            },
+        });
+
+        assert.deepEqual(closeCheck(paused, facts()), { close: true, open: [] });
+        assert.equal(nextActor(paused), "none", "a stopped shift is no agent work");
+    });
+
+    test("shiftWorks: only a running or a summary shift still works", () => {
+        assert.equal(shiftWorks("running"), true);
+        assert.equal(shiftWorks("summary"), true);
+        assert.equal(shiftWorks("paused"), false);
+        assert.equal(shiftWorks("ended"), false);
+        assert.equal(shiftWorks(undefined), false);
+        assert.equal(shiftWorks(null), false);
+        assert.equal(shiftWorks(3), false);
+    });
+
+    test("T231/T240: a delegation with no unpushed work of its own closes", () => {
+        const answered = (id: string) => ({
+            id,
+            text: "Which one?",
+            at: 1,
+            answer: { at: 2, by: "brian", words: "that one" },
+        });
+        const done = thread({
+            asks: [answered("T1a"), answered("T1b")],
+            run: { busy: false, shift: "ended", dirty: 0, ahead: 0 },
+        });
+
+        assert.deepEqual(closeCheck(done, facts()), { close: true, open: [] });
+    });
+
+    test("F32: a found folder thread with a clean folder closes", () => {
+        const folder = "/work/found";
+        const found = thread({
+            id: "F32",
+            key: `found:folder:${folder}:1`,
+            origin: "found",
+            session: undefined,
+            address: undefined,
+            run: { busy: false, folder, dirty: 0, ahead: 0 },
+        });
+
+        assert.deepEqual(closeCheck(found, facts()), { close: true, open: [] });
+    });
+
+    test("an open PR, an open ask, a running shift, a blocked report, or a dirty folder holds it", () => {
+        const ref = "frostyard/test#2";
+        const merged = {
+            [ref]: { via: "attached" as const, state: "MERGED" as const },
+        };
+        const sent = {
+            closeout: `closeout:k:${ref}`,
+            closeoutRefs: [ref],
+            closeoutEntry: 5,
+            reportedUserEntry: 6,
+            lastUserEntry: 6,
+        };
+
+        const pr = closeCheck(thread({ prs: { [ref]: { via: "attached" } } }), facts());
+
+        assert.equal(pr.close, false);
+        assert.deepEqual(pr.open, [`PR ${ref} is not read`]);
+
+        const ask = closeCheck(thread({ asks: [{ id: "T1a", text: "Which?", at: 1 }] }), facts());
+
+        assert.equal(ask.close, false);
+        assert.deepEqual(ask.open, ["ask T1a has no answer"]);
+
+        const running = closeCheck(thread({ run: { shift: "running" } }), facts());
+
+        assert.equal(running.close, false);
+        assert.deepEqual(running.open, ["the night shift is running"]);
+
+        const blocked = closeCheck(
+            thread({ prs: merged, run: { ...sent, reportBlocked: true } }),
+            facts(),
+        );
+
+        assert.equal(blocked.close, false);
+        assert.deepEqual(blocked.open, ["its last report says BLOCKED or asks for a decision"]);
+
+        const dirty = closeCheck(thread({ run: { dirty: 2 } }), facts());
+
+        assert.equal(dirty.close, false);
+        assert.deepEqual(dirty.open, ["2 changed files in /work/test"]);
+    });
+
     test("a thread still starting closes as failed after an hour", () => {
         const starting = thread({ state: "starting", startedAt: 0 });
 
@@ -845,6 +957,48 @@ describe("nextActor", () => {
         assert.equal(nextActor(newer), "odrade");
         assert.equal(odradeReason(newer), "silent session");
         assert.equal(waitsText([newer]), "T1: silent session");
+    });
+
+    test("a report that says BLOCKED waits on Odrade, and a paused shift is nobody's turn", () => {
+        const blocked = thread({ run: { reportBlocked: true } });
+
+        assert.equal(nextActor(blocked), "odrade");
+        assert.equal(odradeReason(blocked), "report says blocked");
+        assert.equal(waitsText([blocked]), "T1: report says blocked");
+        // A working session is the agent's turn before Odrade's.
+        assert.equal(nextActor(thread({ run: { reportBlocked: true, busy: true } })), "agent");
+        // A paused shift has no driver: an idle, reported session with nothing else open waits on nobody.
+        assert.equal(nextActor(thread({ run: { shift: "paused" } })), "none");
+    });
+});
+
+describe("reportBlocks", () => {
+    test("a stop reason, BLOCKED in capitals, a blocked line, or a decision is blocked", () => {
+        assert.equal(reportBlocks("anything", "blocked"), true);
+        assert.equal(reportBlocks("anything", "failed"), true);
+        assert.equal(reportBlocks("The deploy is BLOCKED until the token is set."), true);
+        assert.equal(reportBlocks("Blocked on the release key."), true);
+        assert.equal(reportBlocks("- blocked on the release key."), true);
+        assert.equal(reportBlocks("**Blocked:** the release key."), true);
+        assert.equal(reportBlocks("## Blocked\nnothing else."), true);
+        assert.equal(reportBlocks("Needs Brian: yes"), true);
+        assert.equal(reportBlocks("needs brian: yes, a token."), true);
+        assert.equal(reportBlocks("Needs a decision: which repository?"), true);
+        assert.equal(reportBlocks("Decision needed."), true);
+    });
+
+    test("a no, a lower-case word in a line, and a plain report are not blocked", () => {
+        assert.equal(reportBlocks("Needs Brian: no."), false);
+        assert.equal(reportBlocks("**Blocking issues:** none"), false);
+        assert.equal(reportBlocks("The work is blocked on the token."), false);
+        assert.equal(reportBlocks("No decision needed."), false);
+        assert.equal(
+            reportBlocks("Done. The after-merge steps for T236 (updex PR #469) are complete."),
+            false,
+        );
+        assert.equal(reportBlocks("Needs Brian: no. Depends on: the 00:00 runs."), false);
+        assert.equal(reportBlocks("anything", "done"), false);
+        assert.equal(reportBlocks("anything"), false);
     });
 });
 
@@ -2666,6 +2820,43 @@ const githubOf = (
     viewer: patch.viewer ?? "github-viewer",
     repos: { "frostyard/test": { archived: patch.archived ?? false, open: prs } },
     prs: {},
+});
+
+describe("knownHeads", () => {
+    test("the heads of the threads' PR links, the pinned PRs, and each repository's open PRs", () => {
+        const linked = thread({
+            prs: {
+                "frostyard/test#1": { via: "seen", state: "MERGED", head: "aaaa1" },
+                "frostyard/test#2": { via: "attached", state: "OPEN", head: "" },
+            },
+        });
+        // Any thread state counts: a closed thread's PR head is still pushed.
+        const closed = thread({
+            id: "T2",
+            key: "k2",
+            state: "closed",
+            prs: { "frostyard/test#3": { via: "branch", state: "CLOSED", head: "bbbb2" } },
+        });
+        const github: GitHubFacts = {
+            viewer: "github-viewer",
+            repos: {
+                "frostyard/test": {
+                    archived: false,
+                    open: [prFact({ ref: "a", head: "cccc3" }), prFact({ ref: "b", head: "" })],
+                },
+            },
+            prs: { "frostyard/test#9": prFact({ ref: "frostyard/test#9", head: "dddd4" }) },
+        };
+
+        assert.deepEqual([...knownHeads([linked, closed], github)].sort(), [
+            "aaaa1",
+            "bbbb2",
+            "cccc3",
+            "dddd4",
+        ]);
+        assert.deepEqual([...knownHeads([thread()])], [], "an empty head is not added");
+        assert.deepEqual([...knownHeads([], github)].sort(), ["cccc3", "dddd4"]);
+    });
 });
 
 const deskOf = (): DeskState => ({
@@ -12160,6 +12351,248 @@ describe("the desk in a Pi Pocket", () => {
                 true,
             );
             assert.equal(closeCheck(third, facts()).close, false);
+        } finally {
+            await quiet([]);
+            shift = 0;
+        }
+    });
+
+    test("a delegation worktree's base commit is not its unpushed work (T231)", async () => {
+        // The app's clock moves here: no sweeper of an earlier test may wake and see the folder too.
+        await stopSweepers();
+
+        /** 1 commit in a test folder, with the file every test folder has. */
+        const commit = (where: string, message: string): void => {
+            appendFileSync(join(where, "file.txt"), `${message}\n`);
+            git(where, "add", ".");
+            git(
+                where,
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "-qm",
+                message,
+            );
+        };
+
+        /**
+         * A folder as a delegation left it: a base commit that no remote has, then a worktree branch made from it. The
+         * base is the commit the squashed main branch was on when the worktree was made: no remote ref holds it.
+         */
+        const worktree = (name: string): string => {
+            const folder = join(root, name);
+
+            rmSync(folder, { recursive: true, force: true });
+            repository(folder);
+            commit(folder, "base");
+            git(folder, "checkout", "-q", "-b", "moneo/base-test");
+
+            return folder;
+        };
+
+        const base = worktree("base-of-worktree");
+        const own = worktree("own-commits");
+
+        // The second worktree's thread made 1 commit of its own, after the checkout.
+        commit(own, "own work");
+
+        const source = await supervisor("worktree-base");
+        let closedId = "";
+        let openId = "";
+
+        const openAt = async (folder: string): Promise<string> => {
+            let id = "";
+
+            await app.harness.commit(async (tx) => {
+                const state = await tx.doc(DeskThreads);
+                const opened = openThread(state, {
+                    key: `x.test.base:${folder}`,
+                    supervisor: Number(source),
+                    agents: ["duncan"],
+                    repo: "frostyard/worktree-base",
+                    cwd: folder,
+                    worktree: { path: folder, branch: "moneo/base-test", checkout: folder },
+                    title: "A delegation in a worktree",
+                    at: Date.now(),
+                }).thread;
+                const stored = state.threads[opened.id]!;
+
+                // The session part is closed: no session to read, and an idle one.
+                id = opened.id;
+                stored.state = "open";
+                delete stored.session;
+                delete stored.address;
+                stored.run = { busy: false };
+            }, context);
+
+            return id;
+        };
+
+        closedId = await openAt(base);
+        openId = await openAt(own);
+
+        try {
+            await say(app, source, "desk list test");
+            await until(
+                async () => {
+                    const state = await deskState();
+
+                    return [closedId, openId].every(
+                        (id) => typeof state?.threads[id]?.run.sweptAt === "number",
+                    );
+                },
+                "the first sweep",
+                20_000,
+            );
+
+            const settled = (await deskState())?.threads[closedId];
+
+            assert(settled, "the first thread is stored");
+            assert.equal(settled.run.ahead, 0, "the base commit is not the thread's work");
+            assert.equal(settled.run.aheadUnknown, undefined);
+            assert.equal(settled.state, "closed");
+            assert.equal(
+                settled.events.some((event) => event.text === "nothing is unpushed"),
+                true,
+            );
+
+            const working = (await deskState())?.threads[openId];
+
+            assert(working, "the second thread is stored");
+            assert.equal(working.run.ahead, 1, "only the commit after the checkout counts");
+            assert.equal(working.state, "open");
+            assert.deepEqual(closeCheck(working, facts()).open, [`1 unpushed commit in ${own}`]);
+        } finally {
+            await quiet([]);
+            shift = 0;
+        }
+    });
+
+    test("a squash-merged PR head is not unpushed work (F32)", async () => {
+        await stopSweepers();
+
+        /** 1 commit in a test folder, with the file every test folder has. */
+        const commit = (where: string, message: string): void => {
+            appendFileSync(join(where, "file.txt"), `${message}\n`);
+            git(where, "add", ".");
+            git(
+                where,
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "-qm",
+                message,
+            );
+        };
+
+        /**
+         * A folder whose branch tracks a remote branch that is gone (a squash-merge deleted it), with 2 commits that no
+         * remote ref holds. The commits' own words keep 2 folders' commit oids apart: a commit oid is its tree and its
+         * text, so the same text twice makes the same oid in both.
+         */
+        const squashed = (name: string, words: [string, string]): string => {
+            const folder = join(root, name);
+
+            rmSync(folder, { recursive: true, force: true });
+            repository(folder);
+            git(folder, "checkout", "-q", "-b", "fix/gone");
+            commit(folder, words[0]);
+            commit(folder, words[1]);
+            git(folder, "config", "branch.fix/gone.remote", "origin");
+            git(folder, "config", "branch.fix/gone.merge", "refs/heads/fix/gone");
+
+            return folder;
+        };
+
+        const mergedFolder = squashed("squash-merged", ["two", "three"]);
+        const looseFolder = squashed("no-pr-head", ["four", "five"]);
+        const head = execFileSync("git", ["rev-parse", "HEAD"], {
+            cwd: mergedFolder,
+            env: gitEnv,
+            encoding: "utf8",
+        }).trim();
+        const source = await supervisor("squash-head");
+        let foundId = "";
+        let looseId = "";
+
+        await app.harness.commit(async (tx) => {
+            const state = await tx.doc(DeskThreads);
+            const done = openThread(state, {
+                key: "x.test.squash-merged",
+                supervisor: Number(source),
+                agents: ["duncan"],
+                repo: "frostyard/test",
+                title: "The PR that squashed",
+                at: Date.now() - 60_000,
+            }).thread;
+            const closed = state.threads[done.id]!;
+
+            // The PR that GitHub squashed: its head commit is this folder's HEAD, and its branch is gone.
+            closed.state = "closed";
+            closed.closed = { at: Date.now(), why: "done", by: "desk" };
+            closed.prs = { "frostyard/test#99": { via: "seen", state: "MERGED", head } };
+
+            // A found folder thread for each folder, as the sweep made them: 2 commits on no remote each.
+            for (const folder of [mergedFolder, looseFolder]) {
+                const opened = openThread(state, {
+                    key: `found:folder:${folder}:1`,
+                    supervisor: Number(source),
+                    agents: [],
+                    title: `Uncommitted work in ${folder}`,
+                    at: Date.now(),
+                }).thread;
+                const found = state.threads[opened.id]!;
+
+                if (folder === mergedFolder) {
+                    foundId = opened.id;
+                } else {
+                    looseId = opened.id;
+                }
+
+                found.origin = "found";
+                found.state = "open";
+                found.run = { busy: false, folder, dirty: 0, ahead: 2, next: "odrade" };
+            }
+        }, context);
+
+        try {
+            await say(app, source, "desk list test");
+            await until(
+                async () =>
+                    typeof (await deskState())?.threads[foundId]?.run.sweptAt === "number" &&
+                    typeof (await deskState())?.threads[looseId]?.run.sweptAt === "number",
+                "the first sweep",
+                20_000,
+            );
+
+            const merged = (await deskState())?.threads[foundId];
+
+            assert(merged, "the found thread is stored");
+            assert.equal(merged.run.ahead, 0, "a commit GitHub had as a PR head is pushed");
+            assert.equal(merged.state, "closed");
+            assert.equal(
+                Object.values((await deskState())?.threads ?? {}).some(
+                    (each) =>
+                        each.origin === "found" &&
+                        each.run.folder === mergedFolder &&
+                        each.id !== foundId,
+                ),
+                false,
+                "a clean folder makes no new found thread",
+            );
+
+            const loose = (await deskState())?.threads[looseId];
+
+            assert(loose, "the second found thread is stored");
+            assert.equal(loose.run.ahead, 2, "a head that no PR has stays unpushed");
+            assert.equal(loose.state, "open");
+            assert.deepEqual(closeCheck(loose, facts()).open, [
+                `2 unpushed commits in ${looseFolder}`,
+            ]);
         } finally {
             await quiet([]);
             shift = 0;
