@@ -271,6 +271,7 @@ export default function setup(pocket) {
                                         ${thread.asks.map(
                                             (ask) => html`<li>
                                                 <span class="desk-id">${ask.id}</span> ${ask.text}
+                                                ${ask.from ? html`<div class="small">from ${ask.from}</div>` : null}
                                             </li>`,
                                         )}
                                     </ul>`
@@ -278,12 +279,15 @@ export default function setup(pocket) {
                           ${
                               (thread.resolved ?? []).length === 0
                                   ? null
-                                  : html`<h3>Resolved by the desk</h3>
+                                  : html`<h3>Resolved</h3>
                                         <ul class="desk-list">
                                             ${thread.resolved.map(
                                                 (ask) => html`<li>
                                                     <span class="desk-id">${ask.id}</span> ${ask.text}
-                                                    <div class="small">${ask.why}</div>
+                                                    <div class="small">
+                                                        ${ask.by ? `withdrawn by ${ask.by}` : "by the desk"}:
+                                                        ${ask.why}
+                                                    </div>
                                                 </li>`,
                                             )}
                                         </ul>`
@@ -773,7 +777,7 @@ export default function setup(pocket) {
                 ${thread.asks.map(
                     (ask) => html`<div class="desk-ask">
                         <p class="small">
-                            ${ask.id} · ${ask.text}${
+                            ${ask.id}${ask.from ? ` · from ${ask.from}` : ""} · ${ask.text}${
                                 ask.options && ask.options.length > 0
                                     ? ` [${ask.options.join(" | ")}]`
                                     : ""
