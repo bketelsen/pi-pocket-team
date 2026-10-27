@@ -29,16 +29,18 @@ console, or a choice). Every other step runs as the `team` user on the VM, unles
 
 ## Names used here
 
-| Name      | Value                                                                                                              | Who sets it                         |
-| --------- | ------------------------------------------------------------------------------------------------------------------ | ----------------------------------- |
-| `VM`      | the team VM's host name (for example `team-vm`)                                                                    | Teg, fleet (`tofu/minideb`)         |
-| `VM_IP`   | its LAN address, a UDM DHCP reservation on `br0`                                                                   | **Brian:** UDM reservation          |
-| `TS_NAME` | its Tailscale node (for example `pocket`); Pocket at `https://pocket.goat-snake.ts.net`                            | **Brian:** Tailscale sign-in        |
-| team user | `team`, home `/var/home/team`                                                                                      | Teg, fleet (Firn recipe or Ansible) |
-| `TAG`     | the Pocket release framework runs at the cut-over: `git -C ~/projects/pi-pocket describe --tags` (`v0.25.0` today) | framework                           |
-| `DATE`    | the cut-over date, `YYYY-MM-DD`                                                                                    |                                     |
+Teg's fleet runbook (`fleet` repository, `docs/team-vm.md`, thread T330) sets these; this runbook uses them as
+agreed with Teg on 2026-10-27. When fleet changes one, fleet wins.
 
-Replace them where they appear. When Teg's fleet PRs choose other names, those win.
+| Name        | Value                                                                                                              | Who sets it                                      |
+| ----------- | ------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------ |
+| VM          | Incus project `team`, instance `team` on minideb; guest hostname `team`                                            | Teg, fleet                                       |
+| LAN address | `10.0.1.176`, a UniFi DHCP reservation for the MAC that fleet pins                                                 | **Brian:** the reservation                       |
+| Tailscale   | node `pocket`; Pocket at `https://pocket.goat-snake.ts.net`                                                        | **Brian:** `sudo tailscale up --hostname=pocket` |
+| team user   | `team`, home `/var/home/team`, no sudo, group `kvm`, linger on                                                     | Teg, fleet                                       |
+| admin user  | `fleet` (sudo); every `sudo` line below runs as `fleet` (`ssh fleet@10.0.1.176`), by Brian or Teg                  | Teg, fleet                                       |
+| `TAG`       | the Pocket release framework runs at the cut-over: `git -C ~/projects/pi-pocket describe --tags` (`v0.25.0` today) | framework                                        |
+| `DATE`      | the cut-over date, `YYYY-MM-DD`                                                                                    |                                                  |
 
 ## Layout on the VM
 
@@ -60,7 +62,10 @@ Replace them where they appear. When Teg's fleet PRs choose other names, those w
 Teg's fleet work ends when these hold. Check each one; stop if one fails.
 
 ```sh
-ssh team@VM_IP true                      # the team user can ssh
+ssh team@10.0.1.176 true                 # the team user can ssh
+for h in selfie minideb caddy; do ssh -o BatchMode=yes $h true && echo $h ok; done
+id -nG | tr ' ' '\n' | grep -x sudo || echo no-sudo   # no-sudo
+node -v                                  # v24.22.1 or newer, /usr/local/bin/node (fleet)
 gh api user -q .login                    # prints frostyard-machines
 git config --global user.name            # the machine identity
 id -nG | tr ' ' '\n' | grep -x kvm       # nsl machines need /dev/kvm
@@ -73,18 +78,19 @@ ssh -G <host> | grep -i '^identityfile'  # for each host Teg keyed: the team key
 ```
 
 Brian's steps in Teg's part, for reference: the UDM DHCP reservation, MokManager on the VGA console
-(`incus console VM --type=vga`) once, and `gh auth login --insecure-storage` as frostyard-machines (device flow; the
+(`incus console --project team team --type=vga`) once, and `gh auth login --insecure-storage` as frostyard-machines (device flow; the
 flag keeps the token in `~/.config/gh/hosts.yml`, because the VM has no keyring). Teg's runbook owns them. The team ssh
 keys have no passphrase: after a reboot nobody is there to unlock them. Their file mode and the VM protect them.
 
 ## 1. Prepare the VM (no Pocket data yet; framework keeps running)
 
-1. **Tools in the team user's home** (Snow's `/usr` is read-only). Skip what Teg's role installed.
+1. **Tools.** Fleet installs a pinned `gh` and Node 24.22.1 or newer in `/usr/local/bin` (Snow's `/usr` is
+   read-only; `/usr/local` is not). Pocket's docs/systemd.md wants a system Node. If fleet has no Node there, install
+   it for `team` with mise (`curl -fsSL https://mise.run | sh; mise use -g node@24`) and use mise's absolute Node
+   path in the unit (step 7).
 
     ```sh
-    curl -fsSL https://mise.run | sh                     # ~/.local/bin/mise, unless Homebrew's mise is on PATH
-    mise use -g node@24 gh@latest                        # Node 24.22.1 or newer: the launcher warns below that
-    node -v; gh --version
+    command -v node gh; node -v; gh --version
     ```
 
     The `~/.gitconfig` (Teg) must have the machine identity, `gh auth git-credential` for github.com
@@ -133,31 +139,34 @@ keys have no passphrase: after a reboot nobody is there to unlock them. Their fi
     ls ~/.cache/ms-playwright/                         # chromium-* and chromium_headless_shell-*
     ```
 
-6. **Tailscale.** **Brian:** sign the VM in to the tailnet once (`sudo tailscale up`, or an auth key), with the node
-   name `TS_NAME`. Then let the team user run Serve, and check that HTTPS certificates are on in the tailnet:
+6. **Tailscale.** **Brian:** as `fleet`, sign the VM in to the tailnet once: `sudo tailscale up --hostname=pocket`.
+   Fleet's role then runs `sudo tailscale set --operator=team` (docs/systemd.md requires it for `tailscale-serve`).
+   Check that HTTPS certificates are on in the tailnet. Fleet adds no Serve mapping: in `tailscale-serve` mode,
+   Pocket's launcher adds and removes it.
 
     ```sh
-    sudo tailscale set --operator=team
-    tailscale status | head -3
+    tailscale status | head -3     # as team: the node pocket is online
     ```
 
 7. **The systemd unit** (a system unit, run as `team`; it starts at boot with no login). Copy Pocket's template
    and edit the copy (docs/systemd.md, "run as an existing user"):
 
+    As `fleet` (Teg's role can own this file as a template with the same lines):
+
     ```sh
-    sudo cp ~/projects/pi-pocket/contrib/systemd/pi-pocket@.service /etc/systemd/system/
+    sudo cp /var/home/team/projects/pi-pocket/contrib/systemd/pi-pocket@.service /etc/systemd/system/
     sudoedit /etc/systemd/system/pi-pocket@.service
     ```
 
-    Set these lines; leave the others as shipped. `NODE` is the absolute folder of `mise which node` (for example
-    `/var/home/team/.local/share/mise/installs/node/24.22.1/bin`): a service does not see mise's shell setup.
+    Set these lines; leave the others as shipped. `NODE` is `/usr/local/bin` (fleet's Node), or with the mise
+    fallback the absolute folder of `mise which node` (a service does not see mise's shell setup).
 
     ```ini
     User=team
     Group=team
     Environment=POCKET_HOME=/var/home/team/projects/pi-pocket
     Environment=HOME=/var/home/team
-    Environment=PATH=NODE:/var/home/team/.local/share/mise/shims:/var/home/team/.local/bin:/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin
+    Environment=PATH=NODE:/var/home/team/.local/bin:/usr/local/bin:/usr/bin:/bin
     WorkingDirectory=/var/home/team/agents
     ExecStart=NODE/node ${POCKET_HOME}/bin/pi-pocket.js --access %i --port 8787 --data /var/home/team/.pi-pocket --cwd /var/home/team/agents
     UnsetEnvironment=SSH_AUTH_SOCK DISPLAY WAYLAND_DISPLAY
@@ -168,14 +177,17 @@ keys have no passphrase: after a reboot nobody is there to unlock them. Their fi
     browser tool Chromium headless. Linger (Teg) keeps the team user's own systemd manager running for nsl machines.
 
     Keep `NoNewPrivileges=yes` (agents need no sudo on the VM) and `PrivateTmp=yes`. If nsl machines fail under the
-    unit (systemd-vmspawn), remove `NoNewPrivileges` first and say so in the cut-over report. When Node's version
-    changes, edit `NODE` and run `sudo systemctl daemon-reload`.
+    unit (systemd-vmspawn), remove `NoNewPrivileges` first and say so in the cut-over report. With the mise fallback,
+    edit `NODE` when Node's version changes, and run `sudo systemctl daemon-reload`.
 
     ```sh
-    sudo systemctl daemon-reload            # do not enable or start it yet
+    sudo systemctl daemon-reload            # as fleet; do not enable or start it yet
     ```
 
-8. **Snapshot.** Teg or **Brian:** on minideb, `incus snapshot create VM pre-cutover-DATE`.
+    `team` has no sudo, so only `fleet` (Brian or Teg) starts and stops the unit. Brian controls restarts; Menu →
+    **Update Pi Pocket** restarts Pocket from inside, as `team`.
+
+8. **Snapshot.** Teg or **Brian:** on minideb, `incus snapshot create --project team team pre-cutover-DATE`.
 
 ## 2. Drain framework (the quiet window)
 
@@ -238,15 +250,15 @@ From here, framework's `~/.pi-pocket` must not start again unless the rollback s
 
 ## 4. Copy to the VM
 
-**Brian:** run these on framework, with an ssh login as `team@VM_IP` (his own key, for the copy only). They copy
+**Brian:** run these on framework, with an ssh login as `team@10.0.1.176` (his own key, for the copy only). They copy
 4 folders. They never copy Brian's `~/.ssh`, `~/.config/gh`, `~/.config/gh-machines`, `~/.config/pi-pocket-agents`,
 `~/.pi/agent/sessions` (Pi CLI only), or `harness.lock*`.
 
 ```sh
-rsync -a --exclude 'harness.lock*' ~/.pi-pocket/ team@VM_IP:.pi-pocket/
-rsync -a --exclude sessions/ ~/.pi/agent/ team@VM_IP:.pi/agent/
-rsync -a ~/.config/pi-pocket-team/ team@VM_IP:.config/pi-pocket-team/
-rsync -a ~/projects/odrade/ team@VM_IP:agents/odrade/
+rsync -a --exclude 'harness.lock*' ~/.pi-pocket/ team@10.0.1.176:.pi-pocket/
+rsync -a --exclude sessions/ ~/.pi/agent/ team@10.0.1.176:.pi/agent/
+rsync -a ~/.config/pi-pocket-team/ team@10.0.1.176:.config/pi-pocket-team/
+rsync -a ~/projects/odrade/ team@10.0.1.176:agents/odrade/
 ```
 
 On the VM, check the database copy before anything opens it:
@@ -327,12 +339,12 @@ Rewrite configuration and text, never the database. Each command keeps a `.bak` 
 ## 7. First start, local only
 
 ```sh
-sudo systemctl start pi-pocket@local          # start only; not enabled yet
+sudo systemctl start pi-pocket@local          # as fleet; start only, not enabled yet
 journalctl -u pi-pocket@local -n 50 --no-pager
 journalctl -u pi-pocket@local | grep -o 'http://127.0.0.1:8787/login?token=[^ ]*' | tail -1
 ```
 
-Open the sign-in link through an ssh tunnel (`ssh -L 8787:127.0.0.1:8787 team@VM_IP`). Do not paste the link in a
+Open the sign-in link through an ssh tunnel (`ssh -L 8787:127.0.0.1:8787 team@10.0.1.176`). Do not paste the link in a
 chat. Then run the checks in step 8. When a check fails, stop and use the rollback.
 
 ## 8. Checks
@@ -363,6 +375,7 @@ belongs.
 1. Stop the local instance and enable the real one, started at boot:
 
     ```sh
+    # as fleet
     sudo systemctl stop pi-pocket@local
     sudo systemctl enable --now pi-pocket@tailscale-serve
     journalctl -u pi-pocket@tailscale-serve | grep -o 'https://[^ ]*/login?token=[^ ]*' | tail -1
@@ -408,7 +421,7 @@ checkouts stay; Brian deletes them when he wants the disk.
 
 Any time before step 11, and with framework's data unchanged since step 3:
 
-1. On the VM: `sudo systemctl disable --now pi-pocket@tailscale-serve pi-pocket@local`. Check: `systemctl is-active` says
+1. On the VM, as `fleet`: `sudo systemctl disable --now pi-pocket@tailscale-serve pi-pocket@local`. Check: `systemctl is-active` says
    inactive for both.
 2. On framework: `mv ~/.pi-pocket.framework-DATE ~/.pi-pocket` (after step 11 only), `mv ~/bin/pocket-start.retired-DATE ~/bin/pocket-start`,
    then `pocket-start`.
@@ -416,7 +429,7 @@ Any time before step 11, and with framework's data unchanged since step 3:
 4. Work done on the VM after the cut-over is on GitHub only (PRs and issues). The VM's database cannot go back to
    framework: its paths and its homes are new.
 
-To retry the VM later: restore the snapshot (`incus snapshot restore VM pre-cutover-DATE` on minideb), then start
+To retry the VM later: restore the snapshot (`incus snapshot restore --project team team pre-cutover-DATE` on minideb), then start
 again at step 2.
 
 ## Not in this runbook
@@ -425,4 +438,8 @@ again at step 2.
   PRs (thread T330).
 - nsl-builder's memory change on minideb (12 GiB and a swap file; never on a Monday morning; run the Images job once
   after it): Duncan and Teg.
-- A backup job for the VM to the NAS: Teg (hosts.md, section d).
+- The daily backup (Teg, a host job on minideb at 07:00, after step 9 of this runbook): it stops the active Pocket
+  instance, streams a tar of `.pi-pocket` (without `harness.lock*`), `.pi/agent`, `.config/pi-pocket-team`, `agents`
+  and `projects/truenas-mcp/.envrc` to a private NAS dataset, and starts the same instance again, also when the tar
+  fails. It never starts an instance that was not active before (one server only). The 07:30 reboot waits for it.
+  Unpushed work in `projects/` is not in the backup: the desk and the audit track it.
