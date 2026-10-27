@@ -9,7 +9,16 @@
 // changes nothing. It plans every change and checks the planned profiles before it writes anything.
 // Exit 0: done (or, with --check, a plan with no problem). Exit 1: a profile it cannot convert, or an active file
 // or link that still names /var/home/bjk. Exit 2: a usage error.
-import { copyFile, lstat, readdir, readFile, readlink, writeFile } from "node:fs/promises";
+import {
+    copyFile,
+    lstat,
+    readdir,
+    readFile,
+    readlink,
+    realpath,
+    stat,
+    writeFile,
+} from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, relative } from "node:path";
 
@@ -26,7 +35,8 @@ function parseArgs(argv) {
         } else if (
             argv[i] === "--root" &&
             options.root === undefined &&
-            argv[i + 1] !== undefined
+            argv[i + 1] !== undefined &&
+            !argv[i + 1].startsWith("-")
         ) {
             options.root = argv[++i];
         } else {
@@ -168,11 +178,24 @@ for (const name of ["prompts/cross-review.md", "trust.json"]) {
 
 // 4. Odrade's AGENTS.md and plans/ (a git folder: no .bak, commit the change there). desk/, decisions/ and reports/
 // are history and stay as they are.
-/** Files and links under `dir`, without `.git` folders; a missing `dir` has none, a read error stops the run. */
-async function* walk(dir) {
+/**
+ * Files and links under `dir`, without `.git` folders; a missing `dir` has none, a read error stops the run. With
+ * `follow`, a link to a folder is walked too (each real folder once), because Pi loads resources through links.
+ */
+async function* walk(dir, follow = false, seen = new Set()) {
     let entries;
 
     try {
+        if (follow) {
+            const real = await realpath(dir);
+
+            if (seen.has(real)) {
+                return;
+            }
+
+            seen.add(real);
+        }
+
         entries = await readdir(dir, { withFileTypes: true });
     } catch (error) {
         if (error.code === "ENOENT") {
@@ -187,10 +210,18 @@ async function* walk(dir) {
 
         if (item.isDirectory()) {
             if (item.name !== ".git") {
-                yield* walk(path);
+                yield* walk(path, follow, seen);
             }
         } else {
             yield path;
+
+            if (
+                follow &&
+                item.isSymbolicLink() &&
+                (await stat(path).catch(() => undefined))?.isDirectory()
+            ) {
+                yield* walk(path, follow, seen);
+            }
         }
     }
 }
@@ -255,7 +286,7 @@ for (const top of [
     const paths = [];
 
     if (kind?.isDirectory()) {
-        for await (const path of walk(top)) {
+        for await (const path of walk(top, true)) {
             if (
                 !path.endsWith(".bak") &&
                 !relative(join(root, ".pi/agent"), path).startsWith("sessions/")
@@ -268,12 +299,13 @@ for (const top of [
     }
 
     for (const path of paths) {
+        // A link counts by its own text and by the file behind it (a folder behind it is walked above).
         const item = await lstat(path);
-        const text = item.isSymbolicLink()
-            ? await readlink(path)
-            : item.isFile()
-              ? (planned.get(path) ?? (await readFile(path, "utf8")))
-              : "";
+        const target = item.isSymbolicLink() ? await stat(path).catch(() => undefined) : item;
+        const text = [
+            item.isSymbolicLink() ? await readlink(path) : "",
+            target?.isFile() ? (planned.get(path) ?? (await readFile(path, "utf8"))) : "",
+        ].join("\n");
 
         if (text.includes(OLD)) {
             leftovers.push(`${relative(root, path)}${item.isSymbolicLink() ? " (a link)" : ""}`);

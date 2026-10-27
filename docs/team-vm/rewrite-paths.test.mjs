@@ -176,6 +176,8 @@ test("a usage error writes nothing, also without --root", async () => {
             ["--root", root, "--root", root],
             ["--check", "--check", "--root", root],
             ["--root", ""],
+            ["--root", "--check"],
+            ["--root", "--bogus"],
         ]) {
             fails(root, args, 2, /^usage:/);
         }
@@ -258,6 +260,29 @@ test("Pi's git packages and links are checked; .git folders are not; a read erro
         fails(root, ["--root", root], 1, /EACCES/);
     } finally {
         await chmod(join(root, "agents/odrade/plans"), 0o755).catch(() => {});
+        await rm(root, { recursive: true, force: true });
+    }
+});
+
+test("a relative link to a folder outside is followed, and a link loop ends", async () => {
+    const root = await fixture();
+
+    try {
+        await mkdir(join(root, "projects/tool/skills"), { recursive: true });
+        await writeFile(join(root, "projects/tool/skills/SKILL.md"), "read ~/notes\n");
+        await mkdir(join(root, ".pi/agent/skills"), { recursive: true });
+        await symlink("../../../projects/tool/skills", join(root, ".pi/agent/skills/tool"));
+        await symlink("..", join(root, ".pi/agent/skills/loop"));
+        assert.match(run(root), /REWRITE OK/);
+
+        await writeFile(join(root, "projects/tool/skills/SKILL.md"), `read ${OLD}/notes\n`);
+        fails(
+            root,
+            ["--root", root],
+            1,
+            /LEFT naming \/var\/home\/bjk: 1\n {2}\.pi\/agent\/skills\/tool\/SKILL\.md\n/,
+        );
+    } finally {
         await rm(root, { recursive: true, force: true });
     }
 });
