@@ -123,13 +123,24 @@ export function checkGitArgs(args) {
     }
 }
 
-/** A read-only `git` in 1 folder. `--no-optional-locks` keeps `status` from refreshing the index. */
+/**
+ * The settings every audit git call gets: no hook and no filesystem monitor runs the user's code. A read must never
+ * run a program that a repository names.
+ */
+export const GIT_SAFE_ARGS = ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false"];
+
+/**
+ * A read-only `git` in 1 folder. `--no-optional-locks` keeps `status` from refreshing the index, and `GIT_SAFE_ARGS`
+ * keeps a hook or a filesystem monitor from running.
+ */
 export function makeGit(run = defaultRun) {
     return {
         call(dir, args) {
             checkGitArgs(args);
 
-            return String(run("git", ["--no-optional-locks", "-C", dir, ...args]) ?? "");
+            return String(
+                run("git", ["--no-optional-locks", ...GIT_SAFE_ARGS, "-C", dir, ...args]) ?? "",
+            );
         },
     };
 }
@@ -669,15 +680,26 @@ export function readHomes(dir, git, { exclude = [] } = {}) {
     const homes = [];
 
     for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
-        const folder = path.join(dir, entry.name);
-        // A home is a folder, or a link to one; a name that starts with a dot is not a home.
-        const stat = fs.statSync(folder, { throwIfNoEntry: false });
-
-        if (!stat?.isDirectory() || entry.name.startsWith(".")) {
+        // A name that starts with a dot is not a home, and it is not even looked at.
+        if (entry.name.startsWith(".")) {
             continue;
         }
 
-        if (!fs.existsSync(path.join(folder, ".git")) || skip.has(realPath(folder))) {
+        const folder = path.join(dir, entry.name);
+
+        try {
+            // A home is a folder, or a link to one. A broken link, a link loop or a folder that cannot be read is
+            // left out: 1 such entry must not fail the whole source.
+            const stat = fs.statSync(folder, { throwIfNoEntry: false });
+
+            if (!stat?.isDirectory() || !fs.existsSync(path.join(folder, ".git"))) {
+                continue;
+            }
+
+            if (skip.has(realPath(folder))) {
+                continue;
+            }
+        } catch {
             continue;
         }
 

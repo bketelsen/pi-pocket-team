@@ -31,8 +31,7 @@ The pipeline, as the audit sees it:
 ## 2. Rules
 
 1. **Read-only, always.** The database opens with `readOnly: true`. `gh` gets only `GET` requests
-   and GraphQL queries (the script refuses a query that holds `mutation`). `git` gets only `log`,
-   `status` and `show`. The audit never calls a Pocket route that writes, never uses `desk`,
+   and GraphQL queries (the script refuses a query that holds `mutation`). `git` gets only `log`, `status` and `show`, and every call sets `core.hooksPath=/dev/null` and `core.fsmonitor=false`: a read never runs a program that a repository names. The audit never calls a Pocket route that writes, never uses `desk`,
    `team_message`, `team_delegate` or `schedule`, and never commits.
 2. **A fact or nothing.** Each finding has a check id, a count, the times, and evidence a person can
    open: a desk file (`desk/T36.md`), a GitHub URL, or an entry id. A proposal cites finding ids.

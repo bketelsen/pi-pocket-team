@@ -19,6 +19,10 @@ node homes/seed.mjs --agent irulan  # 1 agent only
 - **A folder that is already a git repository is left as it is.** The seed adds no file there and makes no
   commit: Odrade's desk `~/agents/odrade` is an existing repository, and a new file in it would stay
   uncommitted.
+- **It refuses a home that a link could take a write out of.** When the home, `notes/`, `plans/`, `reports/`,
+  `AGENTS.md` or `.gitignore` is a symbolic link, that home is refused and the other homes still seed.
+- **Its git runs with no hook and no filesystem monitor** (`core.hooksPath=/dev/null`,
+  `core.fsmonitor=false`), keeps the user's own identity, and ignores a `GIT_DIR` in the environment.
 - **It never overwrites a file and never deletes one.** An `AGENTS.md` that is there stays as it is:
   the agent owns its home after the seed. To take a changed template, move the old file away first.
 - **It never adds a remote and never pushes.** A home is backed up by the machine, not by GitHub.

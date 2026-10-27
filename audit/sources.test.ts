@@ -28,6 +28,57 @@ import {
 
 const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), "audit-sources-"));
 
+/** The git variables that point a command at another repository: no test inherits them. */
+const GIT_LOCATION_VARS = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_NAMESPACE",
+];
+
+/**
+ * A git environment that no setting of this machine reaches: a temporary config file with a test identity, no system
+ * config, an empty template folder, and none of the variables that point at another repository.
+ */
+function gitEnvironment(extraConfig = "") {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "audit-git-"));
+    const config = path.join(root, "gitconfig");
+    const template = path.join(root, "template");
+
+    fs.writeFileSync(
+        config,
+        `[user]\n\tname = Audit test\n\temail = audit@example.invalid\n${extraConfig}`,
+    );
+    fs.mkdirSync(template);
+
+    const env: Record<string, string> = {};
+
+    for (const [name, value] of Object.entries(process.env)) {
+        if (value === undefined || GIT_LOCATION_VARS.includes(name)) {
+            continue;
+        }
+
+        env[name] = value;
+    }
+
+    return {
+        ...env,
+        GIT_CONFIG_NOSYSTEM: "1",
+        GIT_CONFIG_GLOBAL: config,
+        GIT_TEMPLATE_DIR: template,
+    };
+}
+
+/** Real git, as a process runner, in that environment. */
+const realGit =
+    (env = gitEnvironment()) =>
+    (command: string, args: string[]) =>
+        execFileSync(command, args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], env });
+
 /** A Pocket folder with the fixture database, an Odrade folder, and a recording runner for `git`. */
 function setup() {
     const root = tmp();
@@ -224,12 +275,20 @@ test("loadData reads Odrade's notes through the read-only git wrapper", () => {
     assert.deepEqual(data.odrade.dirty, [" M plans/x.md", "?? reports/2026-10-23-daily-audit/"]);
     assert.equal(data.odrade.lastCommitAt, NOW - 5 * HOUR);
 
-    // Only git, only log and status, always with the locks off and in Odrade's folder.
+    // Only git, only log and status, always with the locks off, no hook, no fsmonitor, and in Odrade's folder.
+    const safe = [
+        "--no-optional-locks",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "core.fsmonitor=false",
+    ];
+
     assert.deepEqual(
-        calls.map((call) => [call.command, call.args[0], call.args[1], call.args[2], call.args[3]]),
+        calls.map((call) => [call.command, ...call.args]),
         [
-            ["git", "--no-optional-locks", "-C", odradeDir, "status"],
-            ["git", "--no-optional-locks", "-C", odradeDir, "log"],
+            ["git", ...safe, "-C", odradeDir, "status", "--porcelain"],
+            ["git", ...safe, "-C", odradeDir, "log", "-1", "--format=%cI"],
         ],
     );
 });
@@ -411,7 +470,17 @@ test("git wrapper: a refused call never reaches the runner; an allowed one turns
     assert.throws(() => git.call("/x", ["push"]));
     assert.equal(calls.length, 0);
     assert.equal(git.call("/x", ["status", "--porcelain"]), "ok");
-    assert.deepEqual(calls[0], ["--no-optional-locks", "-C", "/x", "status", "--porcelain"]);
+    assert.deepEqual(calls[0], [
+        "--no-optional-locks",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "core.fsmonitor=false",
+        "-C",
+        "/x",
+        "status",
+        "--porcelain",
+    ]);
 });
 
 test("readOdrade reads the index, the reports, the dirty files and the last commit", () => {
@@ -478,7 +547,7 @@ test("readHomes reads each git folder with its dirty lines and last commit, and 
 
     // git ran in the 2 homes only: never in Odrade's folder, the link, the plain folder or the hidden one.
     assert.deepEqual(
-        calls.map((args) => args[2]),
+        calls.map((args) => args[args.indexOf("-C") + 1]),
         [irulan, irulan, moneo, moneo],
     );
 });
@@ -491,9 +560,11 @@ test("readHomes: an empty git init folder is 1 home with no last commit, and its
     fs.mkdirSync(folder, { recursive: true });
     fs.writeFileSync(path.join(folder, "AGENTS.md"), "# Irulan's home\n");
     // A repository with no commit: `git log` fails there.
-    execFileSync("git", ["-C", folder, "init", "-b", "main"], { encoding: "utf8" });
+    const run = realGit();
 
-    const homes = readHomes(homesDir, makeGit());
+    run("git", ["-C", folder, "init", "-b", "main"]);
+
+    const homes = readHomes(homesDir, makeGit(run));
 
     assert.deepEqual(
         homes.map((home: { id: string }) => home.id),
@@ -533,6 +604,64 @@ test("readHomes: 1 home whose git fails does not fail the source; 1 whose status
     );
     assert.deepEqual(homes[0].dirty, [" M notes/x.md"]);
     assert.equal(homes[0].lastCommitAt, null);
+});
+
+test("readHomes: a core.fsmonitor script is never run", () => {
+    const root = tmp();
+    const homesDir = path.join(root, "agents");
+    const folder = path.join(homesDir, "irulan");
+    const marker = path.join(root, "fsmonitor-ran");
+    const script = path.join(root, "fsmonitor.sh");
+    const run = realGit();
+
+    fs.mkdirSync(folder, { recursive: true });
+    fs.writeFileSync(path.join(folder, "AGENTS.md"), "# Irulan's home\n");
+    run("git", ["-C", folder, "init", "-b", "main"]);
+    run("git", ["-C", folder, "add", "-A"]);
+    run("git", ["-C", folder, "commit", "-m", "home"]);
+
+    // A filesystem monitor that writes a marker: `git status` runs it, if the audit lets it.
+    fs.writeFileSync(script, `#!/bin/sh\ntouch '${marker}'\nexit 1\n`, { mode: 0o755 });
+    run("git", ["-C", folder, "config", "core.fsmonitor", script]);
+
+    // It does run for a plain `git status`, so the test above means something.
+    execFileSync("git", ["-C", folder, "status"], { encoding: "utf8", env: gitEnvironment() });
+    assert.equal(fs.existsSync(marker), true);
+    fs.rmSync(marker);
+
+    const homes = readHomes(homesDir, makeGit(run));
+
+    assert.equal(fs.existsSync(marker), false);
+    assert.deepEqual(
+        homes.map((home: { id: string }) => home.id),
+        ["irulan"],
+    );
+});
+
+test("readHomes: a symlink loop beside a healthy home is skipped, and the healthy home is read", () => {
+    const root = tmp();
+    const homesDir = path.join(root, "agents");
+    const healthy = path.join(homesDir, "moneo");
+
+    fs.mkdirSync(path.join(healthy, ".git"), { recursive: true });
+    // A link that points at itself: `stat` fails there, and 1 such entry must not stop the source.
+    fs.symlinkSync("loop", path.join(homesDir, "loop"));
+
+    const run = (_: string, args: string[]) => {
+        if (args.includes("status")) {
+            return "";
+        }
+
+        return new Date(NOW - HOUR).toISOString();
+    };
+
+    const homes = readHomes(homesDir, makeGit(run));
+
+    assert.deepEqual(
+        homes.map((home: { id: string }) => home.id),
+        ["moneo"],
+    );
+    assert.equal(homes[0].lastCommitAt, NOW - HOUR);
 });
 
 test("a missing homes folder gives an empty list, not a source error", () => {

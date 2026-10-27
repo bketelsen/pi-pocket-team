@@ -178,12 +178,39 @@ export function readProfiles(directory) {
 
 // ---------- Git ----------
 
-/** Run a command and return its stdout. A command that fails throws an error with `stderr`. */
-export function defaultRun(command, args) {
+/** The git variables that point a command at another repository. A seed never follows them. */
+export const GIT_LOCATION_VARS = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_NAMESPACE",
+];
+
+/** The environment of a seed's git call: the user's own (so the identity is theirs), without those variables. */
+export function cleanGitEnv(env = process.env) {
+    const clean = { ...env };
+
+    for (const name of GIT_LOCATION_VARS) {
+        delete clean[name];
+    }
+
+    return clean;
+}
+
+/** The settings every seed's git call gets: no hook and no filesystem monitor runs the user's code. */
+export const GIT_SAFE_ARGS = ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false"];
+
+/** Run a command and return its stdout. `options.env` is the child's environment. A failure throws, with `stderr`. */
+export function defaultRun(command, args, options = {}) {
     return execFileSync(command, args, {
         encoding: "utf8",
         stdio: ["ignore", "pipe", "pipe"],
         timeout: 120_000,
+        ...(options.env ? { env: options.env } : {}),
     });
 }
 
@@ -210,24 +237,170 @@ const dayOf = (now) =>
         day: "2-digit",
     }).format(now);
 
-/** Write a file, and only when it is missing: an existing file is never overwritten. */
-function writeNew(file, text) {
-    if (fs.existsSync(file)) {
-        return false;
+/**
+ * Write a file and only when it is missing: the `wx` flag refuses to replace a file, and `EEXIST` means "it is
+ * already there". A file whose folder leads outside the home is refused.
+ */
+function writeNew(file, text, home) {
+    const realHome = fs.realpathSync(home);
+    const parent = fs.realpathSync(path.dirname(file));
+
+    if (parent !== realHome && !parent.startsWith(`${realHome}${path.sep}`)) {
+        throw new Error(`${file} leads outside the home ${home}, so the seed refuses to write it.`);
     }
 
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.writeFileSync(file, text);
+    try {
+        fs.writeFileSync(file, text, { flag: "wx" });
 
-    return true;
+        return true;
+    } catch (error) {
+        if (error?.code === "EEXIST") {
+            return false;
+        }
+
+        throw error;
+    }
+}
+
+/** The paths of a home that the seed may write: the home itself, its 3 folders, and its 2 files. */
+const targetsOf = (folder) => [
+    folder,
+    ...HOME_FOLDERS.map((name) => path.join(folder, name)),
+    path.join(folder, "AGENTS.md"),
+    path.join(folder, ".gitignore"),
+];
+
+/** Refuse a home where a link could take a write outside it. Throws an Error for that home. */
+function refuseLinks(folder) {
+    for (const target of targetsOf(folder)) {
+        const stat = fs.lstatSync(target, { throwIfNoEntry: false });
+
+        if (stat?.isSymbolicLink()) {
+            throw new Error(
+                `${target} is a symbolic link, so the seed refuses to write through it.`,
+            );
+        }
+    }
+}
+
+/**
+ * What already holds the folder: "a bare git repository" or "inside a git work tree" when git owns it, `undefined`
+ * when it does not. A missing folder is asked about through its nearest existing ancestor, so a home that would sit
+ * inside a parent repository is found too.
+ */
+function gitOwns(folder, git) {
+    let dir = path.resolve(folder);
+
+    while (!fs.existsSync(dir) && path.dirname(dir) !== dir) {
+        dir = path.dirname(dir);
+    }
+
+    const out = fs.existsSync(dir)
+        ? git(dir, ["rev-parse", "--is-inside-work-tree", "--is-bare-repository"], {
+              allowFailure: true,
+          })
+        : undefined;
+
+    if (out === undefined) {
+        return undefined;
+    }
+
+    const [workTree, bare] = out
+        .trim()
+        .split("\n")
+        .map((line) => line.trim());
+
+    if (bare === "true") {
+        return "a bare git repository";
+    }
+
+    return workTree === "true" ? "inside a git work tree" : undefined;
+}
+
+/** The plan of 1 home: what git already holds, or the actions and the steps of a seed. Throws on a refusal. */
+function planHome(profile, { folder, date, userHome, git }) {
+    // A folder that git already holds is left as it is: Odrade's desk is one, and a new file in it would stay
+    // uncommitted. The seed adds nothing there, and never commits.
+    if (fs.existsSync(path.join(folder, ".git"))) {
+        return { owned: "already a git repository" };
+    }
+
+    const owned = gitOwns(folder, git);
+
+    if (owned !== undefined) {
+        return { owned };
+    }
+
+    refuseLinks(folder);
+
+    const text = homeAgentsText({
+        name: profile.name,
+        charter: profile.charter,
+        date,
+        repositories: profile.repositories,
+        userHome,
+    });
+    const actions = [];
+    const steps = [];
+
+    if (!fs.existsSync(folder)) {
+        actions.push("make the folder");
+        steps.push(() => fs.mkdirSync(folder, { recursive: true }));
+    }
+
+    const agentsFile = path.join(folder, "AGENTS.md");
+
+    if (!fs.existsSync(agentsFile)) {
+        actions.push("write AGENTS.md");
+        steps.push(() => writeNew(agentsFile, text, folder));
+    }
+
+    for (const name of HOME_FOLDERS) {
+        const keep = path.join(folder, name, ".gitkeep");
+
+        if (fs.existsSync(keep)) {
+            continue;
+        }
+
+        actions.push(`make ${name}/`);
+        steps.push(() => {
+            fs.mkdirSync(path.join(folder, name), { recursive: true });
+            writeNew(keep, "", folder);
+        });
+    }
+
+    const gitignore = path.join(folder, ".gitignore");
+
+    if (!fs.existsSync(gitignore)) {
+        actions.push("write .gitignore");
+        steps.push(() => writeNew(gitignore, GITIGNORE, folder));
+    }
+
+    const message = `Seed ${profile.name}'s home`;
+
+    actions.push(`git init -b main, git add -A, 1 commit "${message}"`);
+
+    return {
+        text,
+        actions,
+        steps: [
+            ...steps,
+            () => {
+                git(folder, ["init", "--template=", "-b", "main"]);
+                git(folder, ["add", "-A"]);
+                git(folder, ["commit", "-m", message]);
+            },
+        ],
+    };
 }
 
 /**
  * Seed the home of each profile that names one. Options: `profilesDir`, `userHome` (the folder `~/` means),
- * `check` (write nothing), `agent` (1 id), `now`, `log` and `run` (a process runner, for tests).
+ * `check` (write nothing), `agent` (1 id), `now`, `log`, `env` (the environment of the seed's git) and `run` (a
+ * process runner, for tests).
  *
- * Returns `{ homes, skipped }`: each home with its id, name, folder and the actions it lists, and each skipped
- * profile with the reason.
+ * Returns `{ homes, skipped, refused }`: each home with its id, name, folder and the actions it lists, each
+ * skipped profile with the reason, and each home the seed refused to write.
  */
 export function seedHomes({
     profilesDir = process.env.PI_POCKET_TEAM_AGENTS ??
@@ -237,6 +410,7 @@ export function seedHomes({
     agent,
     now = Date.now(),
     log = console.log,
+    env = process.env,
     run = defaultRun,
 } = {}) {
     const date = dayOf(now);
@@ -246,16 +420,25 @@ export function seedHomes({
         throw new Error(`no profile for ${agent} in ${profilesDir}.`);
     }
 
-    const git = (folder, args) => {
+    const gitEnv = cleanGitEnv(env);
+
+    const git = (folder, args, { allowFailure = false } = {}) => {
         try {
-            return String(run("git", ["-C", folder, ...args]) ?? "");
+            return String(
+                run("git", [...GIT_SAFE_ARGS, "-C", folder, ...args], { env: gitEnv }) ?? "",
+            );
         } catch (error) {
+            if (allowFailure) {
+                return undefined;
+            }
+
             throw new Error(`${folder}: git ${args.join(" ")} failed: ${reasonOf(error)}`);
         }
     };
 
     const homes = [];
     const skipped = [];
+    const refused = [];
 
     for (const profile of agent === undefined ? profiles : profiles.filter((p) => p.id === agent)) {
         if (profile.home === undefined) {
@@ -268,90 +451,45 @@ export function seedHomes({
         const folder = resolveFolder(profile.home, userHome);
         const shown = displayPath(folder, userHome);
 
-        // A folder that is already a git repository is left as it is: Odrade's desk is one, and a new file in it
-        // would stay uncommitted. The seed adds nothing there, and never commits.
-        if (fs.existsSync(path.join(folder, ".git"))) {
-            homes.push({ id: profile.id, name: profile.name, folder, shown, actions: [] });
-            log(`${profile.id}: already a git repository, left as it is (${shown}).`);
+        try {
+            const plan = planHome(profile, { folder, date, userHome, git });
 
-            continue;
-        }
+            if (plan.owned !== undefined) {
+                homes.push({ id: profile.id, name: profile.name, folder, shown, actions: [] });
+                log(`${profile.id}: ${plan.owned}, left as it is (${shown}).`);
 
-        const actions = [];
-        const work = [];
-
-        if (!fs.existsSync(folder)) {
-            actions.push("make the folder");
-            work.push(() => fs.mkdirSync(folder, { recursive: true }));
-        }
-
-        const text = homeAgentsText({
-            name: profile.name,
-            charter: profile.charter,
-            date,
-            repositories: profile.repositories,
-            userHome,
-        });
-        const agentsFile = path.join(folder, "AGENTS.md");
-
-        if (!fs.existsSync(agentsFile)) {
-            actions.push("write AGENTS.md");
-            work.push(() => writeNew(agentsFile, text));
-        }
-
-        for (const name of HOME_FOLDERS) {
-            const keep = path.join(folder, name, ".gitkeep");
-
-            if (fs.existsSync(keep)) {
                 continue;
             }
 
-            actions.push(`make ${name}/`);
-            work.push(() => writeNew(keep, ""));
+            homes.push({
+                id: profile.id,
+                name: profile.name,
+                folder,
+                shown,
+                actions: plan.actions,
+            });
+
+            if (check) {
+                log(`${profile.id}: would ${plan.actions.join("; ")} (${shown}).`);
+                log(`--- AGENTS.md of ${shown} ---`);
+                log(plan.text);
+                log(`--- end of ${shown} ---`);
+
+                continue;
+            }
+
+            plan.steps.forEach((step) => step());
+            log(`${profile.id}: ${plan.actions.join("; ")} (${shown}).`);
+        } catch (error) {
+            // 1 home that cannot be written safely is refused, and the other homes still seed.
+            const reason = String(error?.message ?? error);
+
+            refused.push({ id: profile.id, reason });
+            log(`${profile.id}: refused, ${reason}`);
         }
-
-        const gitignore = path.join(folder, ".gitignore");
-
-        if (!fs.existsSync(gitignore)) {
-            actions.push("write .gitignore");
-            work.push(() => writeNew(gitignore, GITIGNORE));
-        }
-
-        const message = `Seed ${profile.name}'s home`;
-
-        actions.push(`git init -b main, git add -A, 1 commit "${message}"`);
-        work.push(() => {
-            git(folder, ["init", "-b", "main"]);
-            git(folder, ["add", "-A"]);
-            git(folder, ["commit", "-m", message]);
-        });
-
-        homes.push({ id: profile.id, name: profile.name, folder, shown, actions });
-
-        if (check) {
-            log(
-                actions.length === 0
-                    ? `${profile.id}: up to date (${shown}).`
-                    : `${profile.id}: would ${actions.join("; ")} (${shown}).`,
-            );
-            log(`--- AGENTS.md of ${shown} ---`);
-            log(text);
-            log(`--- end of ${shown} ---`);
-
-            continue;
-        }
-
-        if (actions.length === 0) {
-            log(`${profile.id}: up to date (${shown}).`);
-
-            continue;
-        }
-
-        work.forEach((step) => step());
-        log(`${profile.id}: ${actions.join("; ")} (${shown}).`);
     }
 
-    return { homes, skipped };
+    return { homes, skipped, refused };
 }
 
 // ---------- Command line ----------

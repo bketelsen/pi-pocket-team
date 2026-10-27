@@ -202,9 +202,20 @@ test("main writes exactly README.md and findings.json in the day's folder, and t
     assert.match(lines[0]!, /README\.md: \d+ findings, 1 proposals$/);
     assert.equal(result.line, lines[0]);
 
-    // Only git ran (never gh, with --no-github), and only log and status.
+    // Only git ran (never gh, with --no-github), and only log and status, with no hook and no fsmonitor.
     assert.ok(t.calls.every((call) => call.command === "git"));
-    assert.deepEqual([...new Set(t.calls.map((call) => call.args[3]))].sort(), ["log", "status"]);
+    assert.ok(
+        t.calls.every(
+            (call) =>
+                call.args.includes("core.hooksPath=/dev/null") &&
+                call.args.includes("core.fsmonitor=false"),
+        ),
+    );
+    // The subcommand follows the folder: only `log` and `status`.
+    assert.deepEqual(
+        [...new Set(t.calls.map((call) => call.args[call.args.indexOf("-C") + 2]))].sort(),
+        ["log", "status"],
+    );
 });
 
 test("main: the report holds the LLM proposal, the owner from the table, and the day compare", async () => {

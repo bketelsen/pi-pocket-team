@@ -1,5 +1,6 @@
 // The seed script of the agents' homes, on temporary folders and real git. Nothing here reads or writes Brian's
-// profiles, his homes or his data: every folder comes from `fs.mkdtempSync`.
+// profiles, his homes or his data: every folder comes from `fs.mkdtempSync`, and git runs with an environment of its
+// own (a temporary config, no GIT_DIR-type variable, an empty template).
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -9,7 +10,9 @@ import path from "node:path";
 import test from "node:test";
 import {
     GITIGNORE,
+    GIT_LOCATION_VARS,
     HOME_FOLDERS,
+    cleanGitEnv,
     displayPath,
     homeAgentsText,
     parseArgs,
@@ -21,32 +24,60 @@ import {
 const NOW = Date.UTC(2026, 9, 27, 14, 0);
 const DATE = "2026-10-27";
 
-/** A git that needs no setting of the machine: identity and signing come from the environment, not from a config. */
-const gitEnv = {
-    ...process.env,
-    GIT_CONFIG_GLOBAL: "/dev/null",
-    GIT_CONFIG_NOSYSTEM: "1",
-    GIT_AUTHOR_NAME: "Seed test",
-    GIT_AUTHOR_EMAIL: "seed@example.invalid",
-    GIT_COMMITTER_NAME: "Seed test",
-    GIT_COMMITTER_EMAIL: "seed@example.invalid",
-};
+/**
+ * A git environment that no setting of this machine reaches: a temporary config file with a test identity, no system
+ * config, an empty template folder, and none of the variables that point at another repository.
+ */
+function gitEnvironment(extraConfig = "") {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "homes-git-"));
+    const config = path.join(root, "gitconfig");
+    const template = path.join(root, "template");
 
-/** The seed's runner: real git, with the test's identity. */
-const gitRun = (command: string, args: string[]) =>
-    execFileSync(command, args, {
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "pipe"],
-        env: gitEnv,
-    });
+    fs.writeFileSync(
+        config,
+        `[user]\n\tname = Seed test\n\temail = seed@example.invalid\n${extraConfig}`,
+    );
+    fs.mkdirSync(template);
 
-/** 1 git command's stdout, trimmed. */
-const git = (folder: string, args: string[]) =>
+    const env = {};
+
+    for (const [name, value] of Object.entries(process.env)) {
+        if (value === undefined || GIT_LOCATION_VARS.includes(name)) {
+            continue;
+        }
+
+        env[name] = value;
+    }
+
+    return {
+        ...env,
+        GIT_CONFIG_NOSYSTEM: "1",
+        GIT_CONFIG_GLOBAL: config,
+        GIT_TEMPLATE_DIR: template,
+    };
+}
+
+const gitEnv = gitEnvironment();
+
+/** A runner for the seed: real git, with `env` under what the seed itself passes (its clean environment). */
+const makeRun =
+    (env = gitEnv) =>
+    (command, args, options = {}) =>
+        execFileSync(command, args, {
+            encoding: "utf8",
+            stdio: ["ignore", "pipe", "pipe"],
+            env: { ...(options.env ?? {}), ...env },
+        });
+
+const gitRun = makeRun();
+
+/** 1 git command's stdout, trimmed, in the isolated environment. */
+const git = (folder, args) =>
     execFileSync("git", ["-C", folder, ...args], { encoding: "utf8", env: gitEnv }).trim();
 
 /** Every file under a folder, with its hash. */
-function snapshot(dir: string, base: string = dir): Record<string, string> {
-    const out: Record<string, string> = {};
+function snapshot(dir, base = dir) {
+    const out = {};
 
     for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
         const file = path.join(dir, entry.name);
@@ -129,27 +160,37 @@ function setup() {
     return { root, profilesDir, userHome, home: path.join(userHome, "agents", "irulan") };
 }
 
-test("the seed makes a home with 1 commit, every folder and no remote", () => {
-    const t = setup();
-    const logs: string[] = [];
+/** Seed every profile of `t`, in the isolated environment, and keep the log. */
+function seed(t, over = {}) {
+    const logs = [];
     const result = seedHomes({
         profilesDir: t.profilesDir,
         userHome: t.userHome,
         now: NOW,
         run: gitRun,
-        log: (line: string) => logs.push(line),
+        env: {},
+        log: (line) => logs.push(line),
+        ...over,
     });
+
+    return { result, logs };
+}
+
+test("the seed makes a home with 1 commit, every folder and no remote", () => {
+    const t = setup();
+    const { result, logs } = seed(t);
 
     // The profile with no home is skipped and listed.
     assert.deepEqual(
-        result.skipped.map((profile: { id: string }) => profile.id),
+        result.skipped.map((profile) => profile.id),
         ["odrade"],
     );
     assert.deepEqual(
-        result.homes.map((home: { id: string }) => home.id),
+        result.homes.map((home) => home.id),
         ["irulan", "moneo"],
     );
     assert.equal(result.homes[0].shown, "~/agents/irulan");
+    assert.deepEqual(result.refused, []);
 
     // The files.
     assert.ok(
@@ -174,9 +215,7 @@ test("the seed makes a home with 1 commit, every folder and no remote", () => {
     assert.equal(git(t.home, ["remote"]), "");
 
     // The commit holds every seeded file.
-    const tracked = git(t.home, ["ls-files"]).split("\n").sort();
-
-    assert.deepEqual(tracked, [
+    assert.deepEqual(git(t.home, ["ls-files"]).split("\n").sort(), [
         ".gitignore",
         "AGENTS.md",
         "notes/.gitkeep",
@@ -192,23 +231,14 @@ test("the seed makes a home with 1 commit, every folder and no remote", () => {
 
 test("a second run changes nothing, and never makes a second commit", () => {
     const t = setup();
-    const options = {
-        profilesDir: t.profilesDir,
-        userHome: t.userHome,
-        now: NOW,
-        run: gitRun,
-        log: () => undefined,
-    };
 
-    seedHomes(options);
+    seed(t);
 
     const first = snapshot(t.home);
 
     assert.deepEqual(snapshot(t.home), first);
 
-    const logs: string[] = [];
-
-    seedHomes({ ...options, log: (line: string) => logs.push(line) });
+    const { logs } = seed(t);
 
     assert.deepEqual(snapshot(t.home), first);
     assert.equal(git(t.home, ["rev-list", "--count", "HEAD"]), "1");
@@ -224,13 +254,7 @@ test("an existing AGENTS.md is never overwritten, and the folder still gets git"
     fs.mkdirSync(t.home, { recursive: true });
     fs.writeFileSync(path.join(t.home, "AGENTS.md"), "# My own home\n\nThe agent wrote this.\n");
 
-    seedHomes({
-        profilesDir: t.profilesDir,
-        userHome: t.userHome,
-        now: NOW,
-        run: gitRun,
-        log: () => undefined,
-    });
+    seed(t);
 
     assert.equal(
         fs.readFileSync(path.join(t.home, "AGENTS.md"), "utf8"),
@@ -250,15 +274,7 @@ test("a home that is already a git repository is left as it is: no new folder, n
     git(t.home, ["commit", "-m", "desk"]);
 
     const before = snapshot(t.home);
-    const logs: string[] = [];
-
-    seedHomes({
-        profilesDir: t.profilesDir,
-        userHome: t.userHome,
-        now: NOW,
-        run: gitRun,
-        log: (line: string) => logs.push(line),
-    });
+    const { logs } = seed(t);
 
     assert.deepEqual(snapshot(t.home), before);
     assert.equal(fs.existsSync(path.join(t.home, "notes")), false);
@@ -273,17 +289,152 @@ test("a home that is already a git repository is left as it is: no new folder, n
     );
 });
 
+test("a home inside a git work tree is left as it is, so a parent repository gets no new file", () => {
+    const t = setup();
+    const repo = path.join(t.root, "repo");
+
+    fs.mkdirSync(repo);
+    git(repo, ["init", "-b", "main"]);
+    fs.writeFileSync(path.join(repo, "README.md"), "# repo\n");
+    git(repo, ["add", "-A"]);
+    git(repo, ["commit", "-m", "repo"]);
+
+    // `~/agents/irulan` is now `repo/agents/irulan`, which does not exist yet, inside the repository.
+    const { result, logs } = seed(t, { userHome: repo });
+
+    assert.equal(fs.existsSync(path.join(repo, "agents")), false);
+    assert.equal(git(repo, ["status", "--porcelain"]), "");
+    assert.deepEqual(
+        result.homes.map((home) => home.actions),
+        [[], []],
+    );
+    assert.match(
+        logs.join("\n"),
+        /irulan: inside a git work tree, left as it is \(~\/agents\/irulan\)\./,
+    );
+});
+
+test("a home that is a bare git repository is left as it is", () => {
+    const t = setup();
+    const bare = path.join(t.root, "agents", "irulan");
+
+    fs.mkdirSync(path.join(t.root, "agents"));
+    git(t.root, ["init", "--bare", "-b", "main", bare]);
+
+    const before = snapshot(bare);
+    const { result, logs } = seed(t, { userHome: t.root });
+
+    assert.deepEqual(snapshot(bare), before);
+    assert.equal(fs.existsSync(path.join(bare, "AGENTS.md")), false);
+    assert.equal(git(bare, ["rev-parse", "--is-bare-repository"]), "true");
+    // The bare repository gets no action; Moneo's home is a plain folder, so it is seeded.
+    assert.deepEqual(result.homes[0].actions, []);
+    assert.match(
+        logs.join("\n"),
+        /irulan: a bare git repository, left as it is \(~\/agents\/irulan\)\./,
+    );
+});
+
+test("a core.hooksPath hook is never run", () => {
+    const t = setup();
+    const hooks = path.join(t.root, "hooks");
+    const marker = path.join(t.root, "hook-ran");
+
+    fs.mkdirSync(hooks);
+
+    for (const name of ["pre-commit", "post-commit", "reference-transaction"]) {
+        fs.writeFileSync(path.join(hooks, name), `#!/bin/sh\ntouch '${marker}'\nexit 0\n`, {
+            mode: 0o755,
+        });
+    }
+
+    // The user's own configuration holds the hook: it is the identity's, so the seed keeps it.
+    const env = gitEnvironment(`[core]\n\thooksPath = ${hooks}\n`);
+
+    seed(t, { run: makeRun(env) });
+
+    assert.equal(fs.existsSync(marker), false);
+    assert.equal(git(t.home, ["rev-list", "--count", "HEAD"]), "1");
+});
+
+test("a GIT_DIR in the environment never moves the seed's writes into another repository", () => {
+    const t = setup();
+    const other = path.join(t.root, "other");
+
+    fs.mkdirSync(other);
+    git(other, ["init", "-b", "main"]);
+    fs.writeFileSync(path.join(other, "keep.txt"), "keep\n");
+    git(other, ["add", "-A"]);
+    git(other, ["commit", "-m", "other"]);
+
+    const before = snapshot(other);
+    const { result } = seed(t, { env: { GIT_DIR: path.join(other, ".git") } });
+
+    assert.deepEqual(snapshot(other), before);
+    assert.deepEqual(result.refused, []);
+    // The home is a repository of its own, with its own 1 commit.
+    assert.equal(git(t.home, ["rev-list", "--count", "HEAD"]), "1");
+    assert.equal(git(t.home, ["status", "--porcelain"]), "");
+});
+
+test("cleanGitEnv keeps the identity and drops every variable that points at another repository", () => {
+    const env = Object.fromEntries(GIT_LOCATION_VARS.map((name) => [name, "/tmp/other"]));
+
+    assert.deepEqual(
+        cleanGitEnv({
+            ...env,
+            PATH: "/bin",
+            GIT_CONFIG_GLOBAL: "/tmp/config",
+            GIT_AUTHOR_NAME: "A",
+        }),
+        { PATH: "/bin", GIT_CONFIG_GLOBAL: "/tmp/config", GIT_AUTHOR_NAME: "A" },
+    );
+});
+
+test("a dangling symlink at AGENTS.md is refused, and its target stays missing", () => {
+    const t = setup();
+    const missing = path.join(t.root, "elsewhere", "AGENTS.md");
+
+    fs.mkdirSync(t.home, { recursive: true });
+    fs.symlinkSync(missing, path.join(t.home, "AGENTS.md"));
+
+    const { result, logs } = seed(t);
+
+    assert.equal(fs.existsSync(missing), false);
+    assert.deepEqual(
+        result.refused.map((home) => home.id),
+        ["irulan"],
+    );
+    assert.match(logs.join("\n"), /irulan: refused, .*AGENTS\.md is a symbolic link/);
+    // Nothing else was written: no folder, no file, no repository.
+    assert.equal(fs.existsSync(path.join(t.home, ".git")), false);
+    assert.equal(fs.existsSync(path.join(t.home, "notes")), false);
+    assert.equal(fs.existsSync(path.join(t.home, ".gitignore")), false);
+    assert.equal(fs.readlinkSync(path.join(t.home, "AGENTS.md")), missing);
+});
+
+test("a notes/ symlink to another folder gets no .gitkeep, and the home is refused", () => {
+    const t = setup();
+    const other = path.join(t.root, "other-notes");
+
+    fs.mkdirSync(other);
+    fs.mkdirSync(t.home, { recursive: true });
+    fs.symlinkSync(other, path.join(t.home, "notes"));
+
+    const { result } = seed(t);
+
+    assert.deepEqual(fs.readdirSync(other), []);
+    assert.deepEqual(
+        result.refused.map((home) => home.id),
+        ["irulan"],
+    );
+    assert.equal(fs.existsSync(path.join(t.home, ".gitignore")), false);
+    assert.equal(fs.existsSync(path.join(t.home, ".git")), false);
+});
+
 test("--check writes nothing and prints what it would do, with each AGENTS.md text", () => {
     const t = setup();
-    const logs: string[] = [];
-    const result = seedHomes({
-        profilesDir: t.profilesDir,
-        userHome: t.userHome,
-        now: NOW,
-        run: gitRun,
-        check: true,
-        log: (line: string) => logs.push(line),
-    });
+    const { result, logs } = seed(t, { check: true });
 
     assert.equal(fs.existsSync(path.join(t.userHome, "agents")), false);
     assert.deepEqual(fs.readdirSync(t.userHome), []);
@@ -298,20 +449,11 @@ test("--check writes nothing and prints what it would do, with each AGENTS.md te
 
 test("--check on a seeded home reports it as it is, and still writes nothing", () => {
     const t = setup();
-    const options = {
-        profilesDir: t.profilesDir,
-        userHome: t.userHome,
-        now: NOW,
-        run: gitRun,
-        log: () => undefined,
-    };
 
-    seedHomes(options);
+    seed(t);
 
     const before = snapshot(t.home);
-    const logs: string[] = [];
-
-    seedHomes({ ...options, check: true, log: (line: string) => logs.push(line) });
+    const { logs } = seed(t, { check: true });
 
     assert.deepEqual(snapshot(t.home), before);
 
@@ -325,29 +467,12 @@ test("--check on a seeded home reports it as it is, and still writes nothing", (
 test("--agent seeds 1 home only", () => {
     const t = setup();
 
-    seedHomes({
-        profilesDir: t.profilesDir,
-        userHome: t.userHome,
-        now: NOW,
-        run: gitRun,
-        agent: "moneo",
-        log: () => undefined,
-    });
+    seed(t, { agent: "moneo" });
 
     assert.equal(fs.existsSync(path.join(t.userHome, "agents", "moneo", "AGENTS.md")), true);
     assert.equal(fs.existsSync(path.join(t.userHome, "agents", "irulan")), false);
     // 1 agent means 1 home, and no list of the profiles it did not seed.
-    assert.throws(
-        () =>
-            seedHomes({
-                profilesDir: t.profilesDir,
-                userHome: t.userHome,
-                run: gitRun,
-                agent: "nobody",
-                log: () => undefined,
-            }),
-        /no profile for nobody/,
-    );
+    assert.throws(() => seed(t, { agent: "nobody" }), /no profile for nobody/);
 });
 
 test("the text holds the charter, the repositories table and the rules", () => {
