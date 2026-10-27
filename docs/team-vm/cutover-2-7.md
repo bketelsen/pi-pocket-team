@@ -27,7 +27,8 @@ them from a terminal, not from a Pocket session.
   instance is enabled; Tailscale node `pocket` online, operator `team`, HTTPS certificate domain on, no Serve mapping.
 - The rewrite of step 6 (`rewrite-paths.mjs`) passed on a throwaway copy of framework's configuration on the VM:
   19 files, a second run changes 0, both team.ts versions read the profiles, and the database copy kept its hash.
-  The copy was deleted.
+  The copy was deleted. After the cross-review, the stricter version (it plans every write, checks the planned
+  profiles, and also scans Pi's git packages and links) gave the same result on a throwaway copy on framework.
 
 ## Changed from the runbook: access is `local` behind Tailscale Serve
 
@@ -196,7 +197,7 @@ opens the database. It keeps `<file>.bak` once for each changed file outside Odr
 
 ```sh
 cd ~
-node ~/cutover/rewrite-paths.mjs --check      # would change: 19 file(s) or so; read the list
+node ~/cutover/rewrite-paths.mjs --check      # would change: 19 file(s) or so; read the list; exit 0
 node ~/cutover/rewrite-paths.mjs              # REWRITE OK, exit 0
 node ~/cutover/rewrite-paths.mjs              # changed: 0 file(s), REWRITE OK
 grep -h -e '^home:' -e '^workspace:' ~/.config/pi-pocket-team/agents/{odrade,clerk,moneo}.md
@@ -207,8 +208,10 @@ grep -rln /var/home/bjk ~/projects/*/AGENTS.md ~/projects/frostyard/*/AGENTS.md
                                               # homewiki/AGENTS.md only: Bellonda changes it later with a PR
 ```
 
-`REWRITE INCOMPLETE` names each file that still holds `/var/home/bjk`: fix it by hand (the `.bak` keeps the
-original), then run the script again. The charter text in `moneo.md` (root ssh to the NAS) and `teg.md` (Brian's ssh
+`REWRITE INCOMPLETE` names each file or link that still holds `/var/home/bjk`: fix it by hand (the `.bak` keeps the
+original), then run the script again. `STOPPED, nothing written` names a profile whose front matter the script does
+not handle (a quoted value, for example), or whose result is not what step 6 asks: fix that profile by hand, then
+run the script again. The charter text in `moneo.md` (root ssh to the NAS) and `teg.md` (Brian's ssh
 addresses) is **Brian's** to change; it does not block the first start.
 
 ## H. Step 7: first start, local only
@@ -279,7 +282,15 @@ Before step 11 of the runbook, and with framework's `~/.pi-pocket` unchanged sin
    closed: Odrade re-delegates from `plans/desk-at-cutover-DATE.md`. Unarchive a session in the app when needed.
 5. The TrueNAS key stays on the VM, unused while Pocket there is stopped. If the VM does not come back, **Brian**
    revokes it in TrueNAS and deletes `~team/projects/truenas-mcp/.envrc`.
-6. To try the VM again later: [T] keep a copy of what the VM made
-   (`tar -C ~ -czf ~/vm-after-cutover-$DATE.tgz .pi-pocket .pi/agent .config/pi-pocket-team agents`), then [M]
-   `sudo incus snapshot restore --project team team pre-cutover-DATE` (it deletes everything made on the VM after the
-   snapshot) and start again at block C.
+6. To try the VM again later: keep a copy of what the VM made **on framework** first, because the snapshot restore
+   deletes everything on the VM after the snapshot, this archive included. [F], with the VM's Pocket stopped (item 2):
+
+    ```sh
+    $TEAM_SSH sudo -iu team tar -C /var/home/team -czf /var/home/team/vm-after-cutover-$DATE.tgz .pi-pocket .pi/agent .config/pi-pocket-team agents
+    rsync -a -e "$FLEET_SSH" --rsync-path="sudo -u team rsync" fleet@10.0.1.176:/var/home/team/vm-after-cutover-$DATE.tgz ~/
+    $TEAM_SSH sudo -iu team sha256sum vm-after-cutover-$DATE.tgz; sha256sum ~/vm-after-cutover-$DATE.tgz   # the same hash
+    tar -tzf ~/vm-after-cutover-$DATE.tgz >/dev/null && echo archive-ok                                    # archive-ok
+    ```
+
+    Only after the same hash and `archive-ok`: [M] `sudo incus snapshot restore --project team team <name>`, with the
+    snapshot name of block B.2 (`sudo incus snapshot list --project team team`). Then start again at block C.

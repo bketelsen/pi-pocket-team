@@ -2,7 +2,7 @@
 // second run changes nothing. The profiles it writes must read back through team.ts's roster().
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -151,11 +151,113 @@ test("a file it cannot rewrite is named, and the run fails", async () => {
             () => run(root),
             (error) =>
                 error.status === 1 &&
-                /LEFT naming \/var\/home\/bjk: 1 file\(s\)\n {2}\.pi\/agent\/models\.json/.test(
-                    error.stdout,
-                ),
+                /LEFT naming \/var\/home\/bjk: 1\n {2}\.pi\/agent\/models\.json/.test(error.stdout),
         );
     } finally {
+        await rm(root, { recursive: true, force: true });
+    }
+});
+
+const fails = (root, args, status, pattern) =>
+    assert.throws(
+        () =>
+            execFileSync(process.execPath, [SCRIPT, ...args], { encoding: "utf8", stdio: "pipe" }),
+        (error) => error.status === status && pattern.test(`${error.stdout}${error.stderr}`),
+    );
+
+test("a usage error writes nothing, also without --root", async () => {
+    const root = await fixture();
+
+    try {
+        for (const args of [
+            ["--help"],
+            ["--check", "--bogus"],
+            ["--root"],
+            ["--root", root, "--root", root],
+            ["--check", "--check", "--root", root],
+            ["--root", ""],
+        ]) {
+            fails(root, args, 2, /^usage:/);
+        }
+
+        assert.match(
+            await readFile(join(root, ".config/pi-pocket-team/agents/odrade.md"), "utf8"),
+            /workspace: \/var\/home\/bjk/,
+        );
+    } finally {
+        await rm(root, { recursive: true, force: true });
+    }
+});
+
+test("front matter it does not understand stops the run before any write", async () => {
+    const root = await fixture();
+
+    try {
+        await writeFile(
+            join(root, ".config/pi-pocket-team/agents/clerk.md"),
+            profile(`role: "clerk"\nmodel: m\nworkspace: ${OLD}/projects/odrade`, "# Clerk"),
+        );
+        fails(
+            root,
+            ["--root", root],
+            1,
+            /STOPPED, nothing written: 1 profile problem\(s\)\n {2}clerk\.md/,
+        );
+        fails(root, ["--check", "--root", root], 1, /STOPPED/);
+        assert.match(
+            await readFile(join(root, ".config/pi-pocket-team/agents/odrade.md"), "utf8"),
+            /workspace: \/var\/home\/bjk/,
+        );
+        assert.match(
+            await readFile(join(root, ".pi/agent/trust.json"), "utf8"),
+            /\/var\/home\/bjk/,
+        );
+
+        // A profile whose conversion does not come out as the runbook asks also stops it.
+        await writeFile(
+            join(root, ".config/pi-pocket-team/agents/clerk.md"),
+            profile(`role: clerk\nmodel: m\nworkspace: ${OLD}/projects/odrade`, "# Clerk"),
+        );
+        await writeFile(
+            join(root, ".config/pi-pocket-team/agents/moneo.md"),
+            profile(`model: m\nrole: agent\nworkspace: ${OLD}/projects/other`, "# Moneo"),
+        );
+        fails(
+            root,
+            ["--root", root],
+            1,
+            /moneo\.md: wants "home: ~\/agents\/moneo" and no workspace:/,
+        );
+    } finally {
+        await rm(root, { recursive: true, force: true });
+    }
+});
+
+test("Pi's git packages and links are checked; .git folders are not; a read error fails", async () => {
+    const root = await fixture();
+    const pkg = join(root, ".pi/agent/git/github.com/o/p");
+
+    try {
+        await mkdir(join(pkg, ".git"), { recursive: true });
+        await writeFile(join(pkg, ".git/config"), `url = ${OLD}/x\n`);
+        assert.match(run(root), /REWRITE OK/);
+
+        await mkdir(join(pkg, "skills"), { recursive: true });
+        await writeFile(join(pkg, "skills/SKILL.md"), `read ${OLD}/notes\n`);
+        await symlink(`${OLD}/projects/x`, join(root, ".pi/agent/linked"));
+        fails(
+            root,
+            ["--root", root],
+            1,
+            /LEFT naming \/var\/home\/bjk: 2\n {2}\.pi\/agent\/git\/github\.com\/o\/p\/skills\/SKILL\.md\n {2}\.pi\/agent\/linked \(a link\)/,
+        );
+
+        await rm(join(root, ".pi/agent/linked"));
+        await rm(join(pkg, "skills"), { recursive: true });
+        await chmod(join(root, "agents/odrade/plans"), 0o000);
+        fails(root, ["--root", root], 1, /EACCES/);
+    } finally {
+        await chmod(join(root, "agents/odrade/plans"), 0o755).catch(() => {});
         await rm(root, { recursive: true, force: true });
     }
 });
