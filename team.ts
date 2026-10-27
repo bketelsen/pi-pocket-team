@@ -1265,7 +1265,7 @@ export default function createTeam(host: Host, web: Web) {
     const delegate = defineTool({
         name: "team_delegate",
         description:
-            "Supervisor only: give a self-contained task to a named agent in their repository folder. Choose a repository from the roster if the agent owns more than one. Runs on the agent's profile model when the owner allows it for subagents, otherwise on your model (the roster shows each agent's model); thinking no higher than yours. Returns an address without waiting for completion. With night_shift, the linked session runs a night-shift goal in rounds, and its report comes back here by itself when it stops; a night shift has no check command. With watch, the desk thread sleeps until the check's date: it does not count toward the cap, and a check result closes it.",
+            "Supervisor only: give a self-contained task to a named agent in their repository folder. Choose a repository from the roster if the agent owns more than one. Runs on the agent's profile model when the owner allows it for subagents, otherwise on your model (the roster shows each agent's model); thinking is yours, or the nearest level the model has. Returns an address without waiting for completion. With night_shift, the linked session runs a night-shift goal in rounds, and its report comes back here by itself when it stops; a night shift has no check command. With watch, the desk thread sleeps until the check's date: it does not count toward the cap, and a check result closes it.",
         parameters: Type.Object({
             agent: Type.String(),
             task: Type.String({ minLength: 1, maxLength: 6000 }),
