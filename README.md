@@ -44,6 +44,8 @@ The server must already have `node_modules` in its extensions folder. Pocket's d
 
 An install writes into the running server: a saved module reloads at once, and open tabs pick up browser changes. Installing never turns a module on or off and never restarts the server; the owner does both, in **Menu → Extensions**. Run `npm test` before every install.
 
+To move the server, these drop-ins and the team to another machine and user, follow [docs/team-vm-cutover.md](docs/team-vm-cutover.md).
+
 # Team
 
 ## Try it
@@ -477,11 +479,15 @@ node audit/daily.mjs --no-llm --out-dir /tmp/audit-dry-run/$(date +%F)-daily-aud
 ```
 
 - **It reads only.** Pocket's database opens with `readOnly: true`. `gh` gets only `gh api` GET requests, GraphQL queries (a `mutation` is refused) and `gh search prs`, at most 40 calls a run. `git` gets only `log`, `status` and `show`.
-- **It writes 2 files:** `README.md` and `findings.json` in `$ODRADE_DIR/reports/YYYY-MM-DD-daily-audit/` (default `~/projects/odrade`), or in `--out-dir`. Other files in that folder stay as they are. Earlier days come from the sibling `*-daily-audit/findings.json` files, for "new, repeating, gone".
-- **The checks come first.** `audit/checks.mjs` has 1 function for each check of the design (A1 to J1). A check whose source fails is listed under "Skipped checks"; the run goes on.
+- **It writes 2 files:** `README.md` and `findings.json` in `$ODRADE_DIR/reports/YYYY-MM-DD-daily-audit/` (default `~/agents/odrade` when that folder exists, else `~/projects/odrade`), or in `--out-dir`. Other files in that folder stay as they are. Earlier days come from the sibling `*-daily-audit/findings.json` files, for "new, repeating, gone".
+- **The checks come first.** `audit/checks.mjs` has 1 function for each check of the design (A1 to J1). I3 reads each agent's home folder (`~/agents/<id>/`): a home with uncommitted files and a last commit more than 24 h old is 1 low finding. A check whose source fails is listed under "Skipped checks"; the run goes on.
 - **1 model call, with its limits in code** (`audit/llm.mjs`): `deepseek/deepseek-flash` through Pi's model runtime and Pi's stored sign-in; at most 30,000 input tokens, 2,000 output tokens and $0.50 a day; no call after 2 days over $0.50. The model sees only finding texts, metrics and, for up to 10 pairs, 2 report texts of at most 1,500 characters. Code checks its answer (at most 5 proposals, cited ids that exist, numbers from the cited findings). An answer that fails, or `--no-llm`, gives the plain ranked list.
 - **No secrets.** A line that matches the redaction filter is dropped, not masked; a quote is at most 80 characters; report texts never go into the report or the JSON.
-- **Options:** `--hours N` (default 24), `--date YYYY-MM-DD` (the label and the folder name; default today in America/New_York), `--out-dir DIR`, `--no-llm`, `--no-github`, `--json`. Environment: `PI_POCKET_DIR`, `ODRADE_DIR`.
+- **Options:** `--hours N` (default 24), `--date YYYY-MM-DD` (the label and the folder name; default today in America/New_York), `--out-dir DIR`, `--no-llm`, `--no-github`, `--json`. Environment: `PI_POCKET_DIR`, `ODRADE_DIR`, `TEAM_HOMES_DIR` (default `~/agents`; a missing folder reads as no homes).
 - **Tests:** `audit/*.test.ts`, on invented fixtures (a temporary SQLite file, a fake `gh` and `git`, a fake model). They never read Brian's data or call a model.
 
 Brian runs it each day at 06:30 America/New_York with a Pocket schedule in a "Daily audit" session; Odrade reads the report for the 07:30 brief.
+
+# Home seed
+
+`homes/seed.mjs` makes each agent's home folder, `~/agents/<id>/`: a local git repository with no remote, an `AGENTS.md` with the agent's charter and its repositories, and the folders `notes/`, `plans/` and `reports/`. It reads the `home:` field of the profile, writes nothing over an existing file, and leaves a folder that is already a git repository as it is. `--check` prints what it would do; `--agent <id>` seeds 1 agent. See [homes/README.md](homes/README.md). How a session uses a home: [Agent homes](#agent-homes) under Team.

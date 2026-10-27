@@ -16,22 +16,22 @@ but one, and it corrected 3 of them. The trial script is
 
 The pipeline, as the audit sees it:
 
-| Part                   | What the audit looks at                                                                  |
-| ---------------------- | ---------------------------------------------------------------------------------------- |
-| Team drop-in           | `team_delegate` calls and refusals, identities, the roster's repositories                |
-| Desk module            | threads, events, sweeps, cap, asks, watches, close-out and repair wake-ups, attributions |
-| Night and day shifts   | `x.night-shift.goal`: rounds, verdicts, stop reasons, workers                            |
-| Linked-session traffic | `team_message` and `team` results, filed reports, the queue continues to Odrade          |
-| Schedules              | `pocket.schedule` tasks and their outcomes                                               |
-| GitHub                 | PRs by `frostyard-machines`: states, checks, merges, head branches left after a merge    |
-| Odrade's notes         | `~/projects/odrade`: the desk export (git), `README.md` index, `decisions/`, `reports/`  |
-| Spend                  | model cost per agent and per thread, and the cost of turns that did no work              |
+| Part                   | What the audit looks at                                                                                                          |
+| ---------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| Team drop-in           | `team_delegate` calls and refusals, identities, the roster's repositories                                                        |
+| Desk module            | threads, events, sweeps, cap, asks, watches, close-out and repair wake-ups, attributions                                         |
+| Night and day shifts   | `x.night-shift.goal`: rounds, verdicts, stop reasons, workers                                                                    |
+| Linked-session traffic | `team_message` and `team` results, filed reports, the queue continues to Odrade                                                  |
+| Schedules              | `pocket.schedule` tasks and their outcomes                                                                                       |
+| GitHub                 | PRs by `frostyard-machines`: states, checks, merges, head branches left after a merge                                            |
+| Odrade's notes         | `~/agents/odrade` when that folder exists, else `~/projects/odrade`: the desk (git), `README.md` index, `decisions/`, `reports/` |
+| Agents' homes          | `~/agents/<id>/`: each git folder but Odrade's, its uncommitted files and its last commit                                        |
+| Spend                  | model cost per agent and per thread, and the cost of turns that did no work                                                      |
 
 ## 2. Rules
 
 1. **Read-only, always.** The database opens with `readOnly: true`. `gh` gets only `GET` requests
-   and GraphQL queries (the script refuses a query that holds `mutation`). `git` gets only `log`,
-   `status` and `show`. The audit never calls a Pocket route that writes, never uses `desk`,
+   and GraphQL queries (the script refuses a query that holds `mutation`). `git` gets only `log`, `status` and `show`, and every call sets `core.hooksPath=/dev/null` and `core.fsmonitor=false`: a read never runs a program that a repository names. The audit never calls a Pocket route that writes, never uses `desk`,
    `team_message`, `team_delegate` or `schedule`, and never commits.
 2. **A fact or nothing.** Each finding has a check id, a count, the times, and evidence a person can
    open: a desk file (`desk/T36.md`), a GitHub URL, or an entry id. A proposal cites finding ids.
@@ -48,16 +48,17 @@ The pipeline, as the audit sees it:
 
 ## 3. Data sources
 
-| Source                                                               | How it is read                                                                                                                                            | Notes                                                                                                                                                   |
-| -------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `~/.pi-pocket/pocket.sqlite`                                         | `node:sqlite`, `readOnly: true`; a document is its last `base` revision plus each `delta` (`@earendil-works/chord/delta` `apply`), as Pi Durable folds it | Not public API: a Pocket upgrade can change it. Each check that cannot read its source says "source unavailable" and is skipped; the run does not fail. |
-| `x.desk.threads` deltas                                              | every `events` insert, not only the last 50 a thread keeps                                                                                                | The full event history since the desk started (2026-10-22 00:50Z).                                                                                      |
-| `x.desk.reports` deltas                                              | every report, not only the last 10 a session keeps                                                                                                        | Report text is read to compare, never copied out.                                                                                                       |
-| `entries` (transcripts)                                              | fixed patterns only: `Desk queue:` user entries, tool results with `isError`, `usage.cost.total`                                                          | No free reading of transcripts by the LLM.                                                                                                              |
-| `x.night-shift.goal`, `x.team.identity`, `tasks` (`pocket.schedule`) | materialized documents and task records                                                                                                                   |                                                                                                                                                         |
-| `~/projects/odrade`                                                  | `git log`, `git status --porcelain`, the file list of `reports/`, `README.md`                                                                             | Odrade's folder; read. The audit writes only its own report folder there (Section 7).                                                                   |
-| GitHub                                                               | `gh search prs --author frostyard-machines`, 1 GraphQL query per 40 PRs, check runs of each repair's commit, `repos/:r` for settings                      | About 10 to 20 calls a day.                                                                                                                             |
-| `~/.pi-pocket/extensions/*.ts`                                       | file modification time only                                                                                                                               | The install time for rule 4.                                                                                                                            |
+| Source                                                               | How it is read                                                                                                                                            | Notes                                                                                                                                                                                     |
+| -------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `~/.pi-pocket/pocket.sqlite`                                         | `node:sqlite`, `readOnly: true`; a document is its last `base` revision plus each `delta` (`@earendil-works/chord/delta` `apply`), as Pi Durable folds it | Not public API: a Pocket upgrade can change it. Each check that cannot read its source says "source unavailable" and is skipped; the run does not fail.                                   |
+| `x.desk.threads` deltas                                              | every `events` insert, not only the last 50 a thread keeps                                                                                                | The full event history since the desk started (2026-10-22 00:50Z).                                                                                                                        |
+| `x.desk.reports` deltas                                              | every report, not only the last 10 a session keeps                                                                                                        | Report text is read to compare, never copied out.                                                                                                                                         |
+| `entries` (transcripts)                                              | fixed patterns only: `Desk queue:` user entries, tool results with `isError`, `usage.cost.total`                                                          | No free reading of transcripts by the LLM.                                                                                                                                                |
+| `x.night-shift.goal`, `x.team.identity`, `tasks` (`pocket.schedule`) | materialized documents and task records                                                                                                                   |                                                                                                                                                                                           |
+| `~/agents/odrade`, else `~/projects/odrade`                          | `git log`, `git status --porcelain`, the file list of `reports/`, `README.md`                                                                             | Odrade's folder; read. The audit writes only its own report folder there (Section 7). `ODRADE_DIR` names another one.                                                                     |
+| `~/agents/<id>/`                                                     | `git log`, `git status --porcelain`                                                                                                                       | Each agent's home: a local git repository, no remote. `TEAM_HOMES_DIR` names another root; a folder that does not exist gives no homes and no error. Odrade's home is left out (group I). |
+| GitHub                                                               | `gh search prs --author frostyard-machines`, 1 GraphQL query per 40 PRs, check runs of each repair's commit, `repos/:r` for settings                      | About 10 to 20 calls a day.                                                                                                                                                               |
+| `~/.pi-pocket/extensions/*.ts`                                       | file modification time only                                                                                                                               | The install time for rule 4.                                                                                                                                                              |
 
 ## 4. Checks
 
@@ -128,10 +129,11 @@ positives (marked †).
 
 ### I. Odrade's notes
 
-| Id  | Check                                                                                                              | Kind | A finding when                 |
-| --- | ------------------------------------------------------------------------------------------------------------------ | ---- | ------------------------------ |
-| I1  | `reports/*` folders that `README.md` does not link.                                                                | D    | 1 or more                      |
-| I2  | Uncommitted files in the desk repository, and the time since the last commit (the digests are at 07:30 and 20:00). | D    | uncommitted for more than 13 h |
+| Id  | Check                                                                                                                                                                                                                        | Kind | A finding when                 |
+| --- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---- | ------------------------------ |
+| I1  | `reports/*` folders that `README.md` does not link.                                                                                                                                                                          | D    | 1 or more                      |
+| I2  | Uncommitted files in the desk repository, and the time since the last commit (the digests are at 07:30 and 20:00).                                                                                                           | D    | uncommitted for more than 13 h |
+| I3  | Each agent's home (`~/agents/<id>/`, Odrade's left out): uncommitted files, and the time since the last commit. The agent commits its home at the end of each task. 1 finding for each such home. Metrics: `homes`, `dirty`. | D    | uncommitted for more than 24 h |
 
 ### J. Spend
 
@@ -164,7 +166,8 @@ with weight high 3, medium 2, low 1. A finding marked "maybe fixed" (rule 4) get
 | G                     | Pocket schedules                              | Odrade                         | S                         |
 | H1                    | repository settings                           | Brian (settings stay his)      | S: 1 click per repository |
 | H2, H3                | agents' briefs and CI                         | Odrade, the repository's owner | S–M                       |
-| I                     | Odrade's notes                                | Odrade                         | S                         |
+| I1–I2                 | Odrade's notes                                | Odrade                         | S                         |
+| I3                    | the agents' homes                             | each agent (its own home)      | S                         |
 | J                     | models and briefs                             | Brian decides, Odrade proposes | M                         |
 
 ## 6. Output
