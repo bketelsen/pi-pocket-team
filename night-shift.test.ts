@@ -22,6 +22,7 @@ import { fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi
 import { type ConversationId, LiveDoc, type TaskId } from "@earendil-works/pi-durable";
 import { SubagentsDoc } from "./_pocket/src/server/docs.ts";
 import {
+    asksForBrian,
     deepseekStart,
     DEFAULT_ROUNDS,
     type Goal,
@@ -379,11 +380,63 @@ describe("parsing", () => {
             summaryMessage(delegated),
             /Write it in ASD-STE100 .*\nThis summary is your shift report\. It goes to Sheeana by itself: do not send a separate team_message report\. Answer a later message from Sheeana as usual\./,
         );
+        // A delegated shift's summary ends with its decisions for Brian, 1 line each, or a "none".
+        assert.match(
+            summaryMessage(delegated),
+            /End the summary with a line "ASKS FOR BRIAN:" and 1 line under it for each decision Brian must make, with its options in \[a \| b\] when it is a pick-one\. Write "ASKS FOR BRIAN: none" when there is none\. A merge or install request is no decision\./,
+        );
 
         const plain = goal();
 
         assert.ok(!roundMessage(plain, 1, now).includes("team_message report"));
         assert.ok(!summaryMessage(plain).includes("team_message report"));
+        assert.ok(!summaryMessage(plain).includes("ASKS FOR BRIAN"), "a shift of a session's own");
+    });
+
+    test("a summary's ASKS FOR BRIAN block gives the desk its asks", () => {
+        // A "none" is no ask at all.
+        assert.deepEqual(asksForBrian("Done.\n\nASKS FOR BRIAN: none"), []);
+        assert.deepEqual(asksForBrian("Done.\n\nASKS FOR BRIAN:\n- Nothing for Brian."), []);
+        // No line: nothing.
+        assert.equal(asksForBrian("Done. Nothing for Brian."), undefined);
+        // 2 items: the rest of the line, then each line under it, up to the blank line.
+        assert.deepEqual(
+            asksForBrian(
+                "Done.\n\nASKS FOR BRIAN:\n- Rotate the console cloud key?\n- Which host first?\n\nThe rest is done.",
+            ),
+            [{ question: "Rotate the console cloud key?" }, { question: "Which host first?" }],
+        );
+        // A pick-one gives its options, and the question is before the bracket.
+        assert.deepEqual(
+            asksForBrian("ASKS FOR BRIAN:\n1. Rotate the key now or later? [rotate now | keep it]"),
+            [{ question: "Rotate the key now or later?", options: ["rotate now", "keep it"] }],
+        );
+        // A bare merge, install, tag, or review request is no decision; with a choice it is one.
+        assert.deepEqual(asksForBrian("ASKS FOR BRIAN:\n- merge bketelsen/pi-pocket-team#60"), []);
+        assert.deepEqual(asksForBrian("ASKS FOR BRIAN: merge #54 or #55"), [
+            { question: "merge #54 or #55" },
+        ]);
+        // More than 4 items: undefined, and the text alone holds the thread.
+        assert.equal(asksForBrian("ASKS FOR BRIAN:\n- a\n- b\n- c\n- d\n- e"), undefined);
+        assert.equal(
+            asksForBrian("ASKS FOR BRIAN:\n- a\n- b\n- c\n- d").length,
+            4,
+            "4 asks are filed",
+        );
+        // A fenced block is quoted, not said.
+        assert.equal(
+            asksForBrian("Done.\n\n```\nASKS FOR BRIAN: rotate the key\n```\n\nAll set."),
+            undefined,
+        );
+        assert.equal(
+            asksForBrian("Done.\n\n~~~\nASKS FOR BRIAN: rotate the key\n~~~\n\nAll set."),
+            undefined,
+        );
+        // The last block is the one that counts.
+        assert.deepEqual(
+            asksForBrian("ASKS FOR BRIAN: rotate the key\n\nASKS FOR BRIAN: keep it"),
+            [{ question: "keep it" }],
+        );
     });
 
     test("Pi's status line, and whose a message is", () => {

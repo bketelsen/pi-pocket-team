@@ -911,6 +911,127 @@ export function roundMessage(goal: Goal, n: number, now: number): string {
     ].join("\n");
 }
 
+/** An item that names nothing for Brian: "none", "nothing left", "no". */
+const NO_ASK_ITEM = /^(?:no|none|nothing)\b/i;
+
+/** An item that only asks for a merge, an install, a tag, or a review, with no choice: `ready-for-human` covers it. */
+const ROUTINE_ASK = /\b(?:merge|install|tag|review)\b/i;
+
+/** The words of a choice in an item: a merge request with one of them is still a decision. */
+const ASK_CHOICE = /\bor\b|which|whether/i;
+
+/** The words of an `ASKS FOR BRIAN:` line: its items are the label of the block. */
+const ASKS_BRIAN_LINE = /^asks\s+for\s+brian\s*:\s*(.*)$/i;
+
+/** The lines of a text without its fenced code: a fence opens on 3 or more backticks or tildes and closes on the same. */
+function withoutFences(text: string): string[] {
+    const kept: string[] = [];
+    let fence: { mark: string; length: number } | undefined;
+
+    for (const line of text.split(/\r\n?|\n/)) {
+        if (fence === undefined) {
+            const open = /^ {0,3}(`{3,}|~{3,})/.exec(line);
+
+            if (open === null) {
+                kept.push(line);
+            } else {
+                fence = { mark: open[1]![0]!, length: open[1]!.length };
+                kept.push("");
+            }
+
+            continue;
+        }
+
+        const close = /^ {0,3}(`{3,}|~{3,})[ \t]*$/.exec(line);
+
+        if (close !== null && close[1]![0] === fence.mark && close[1]!.length >= fence.length) {
+            fence = undefined;
+        }
+
+        kept.push("");
+    }
+
+    return kept;
+}
+
+/** The options of an item that ends with `[a | b]`: 2 to 6 of 1 to 40 characters each, and its question before them. */
+function askOptions(item: string): { question: string; options: string[] } | undefined {
+    const bracket = /^(.*?)\[([^\]]*)\]\s*$/.exec(item);
+
+    if (bracket === null) {
+        return undefined;
+    }
+
+    const question = bracket[1]!.trim();
+    const options = bracket[2]!.split("|").map((option) => option.trim());
+    const good =
+        question !== "" &&
+        options.length >= 2 &&
+        options.length <= 6 &&
+        options.every((option) => option !== "" && option.length <= 40);
+
+    return good ? { question, options } : undefined;
+}
+
+/**
+ * The asks of the last `ASKS FOR BRIAN:` block in a summary: the rest of that line, then each non-empty line under it up
+ * to the first blank line, with its list mark removed. Lines in fenced code are not read. An item that starts with
+ * `none`, `nothing`, or `no` is left out, and so is a plain merge, install, tag, or review request with no choice, so
+ * `ASKS FOR BRIAN: none` gives []. An item that ends with `[a | b]` gives its options, and the text before them is the
+ * question. Undefined when there is no such line, or when there are more than 4 items: the text alone holds the thread
+ * then.
+ */
+export function asksForBrian(text: string): { question: string; options?: string[] }[] | undefined {
+    const lines = withoutFences(text);
+    let start: number | undefined;
+    let rest = "";
+
+    for (const [index, line] of lines.entries()) {
+        const bare = line
+            .replace(/^[\s>#*-]+/, "")
+            .replace(/\*+/g, "")
+            .trim();
+        const found = ASKS_BRIAN_LINE.exec(bare);
+
+        if (found !== null) {
+            start = index;
+            rest = found[1]!.trim();
+        }
+    }
+
+    if (start === undefined) {
+        return undefined;
+    }
+
+    const items = rest === "" ? [] : [rest];
+
+    for (const line of lines.slice(start + 1)) {
+        if (line.trim() === "") {
+            break;
+        }
+
+        const item = line.replace(/^\s*(?:[-*+]|\d+[.)])\s+/, "").trim();
+
+        if (item !== "") {
+            items.push(item);
+        }
+    }
+
+    const asks: { question: string; options?: string[] }[] = [];
+
+    for (const item of items) {
+        if (NO_ASK_ITEM.test(item) || (ROUTINE_ASK.test(item) && !ASK_CHOICE.test(item))) {
+            continue;
+        }
+
+        const choice = askOptions(item);
+
+        asks.push(choice ?? { question: item });
+    }
+
+    return asks.length > 4 ? undefined : asks;
+}
+
 export function summaryMessage(goal: Goal): string {
     const rounds =
         goal.worker === undefined
@@ -925,6 +1046,7 @@ export function summaryMessage(goal: Goal): string {
             : [
                   `Write it in ASD-STE100 (Simplified Technical English): it goes to ${goal.delegated.supervisor}.`,
                   `This summary is your shift report. It goes to ${goal.delegated.supervisor} by itself: do not send a separate team_message report. Answer a later message from ${goal.delegated.supervisor} as usual.`,
+                  'End the summary with a line "ASKS FOR BRIAN:" and 1 line under it for each decision Brian must make, with its options in [a | b] when it is a pick-one. Write "ASKS FOR BRIAN: none" when there is none. A merge or install request is no decision.',
               ]),
         "Do not end with a STATUS line.",
     ].join("\n");
@@ -1248,6 +1370,8 @@ export default function createNightShift(host: Host, web: Web) {
                 digest?: true;
                 /** The stop reason: `blocked` and `failed` go at once. */
                 reason?: string;
+                /** The decisions for Brian that the summary names, 1 to 4: the desk files each as an ask. */
+                asks?: { question: string; options?: string[] }[];
             },
         ) => Promise<{ line: string; held?: boolean } | undefined>;
     };
@@ -1922,6 +2046,9 @@ export default function createNightShift(host: Host, web: Web) {
                     found.address = await returnAddress(tx, id);
 
                     const desk = deskApi();
+                    // The summary's own `ASKS FOR BRIAN:` block becomes the desk's asks: 1 to 4 of them. More than
+                    // 4 leaves the decisions in the text alone.
+                    const asks = asksForBrian(text);
 
                     if (desk !== undefined && found.address !== undefined && report !== undefined) {
                         found.filed = await desk.file(tx, id, {
@@ -1932,6 +2059,7 @@ export default function createNightShift(host: Host, web: Web) {
                             at: runtime.now(),
                             digest: true,
                             ...(goal?.reason === undefined ? {} : { reason: goal.reason }),
+                            ...(asks === undefined || asks.length === 0 ? {} : { asks }),
                         });
                     }
 

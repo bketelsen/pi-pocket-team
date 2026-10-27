@@ -230,7 +230,10 @@ export type Thread = {
      * `{ at, why, to, removed, sent }`, at most 30), and `reportBlocked` (true when the newest report says BLOCKED or
      * asks for a decision, false when it does not, absent when the desk did not derive it yet: an older thread gets it
      * at its next sweep, from its newest stored report, and it stays open until then because an absent flag is not
-     * `false`), `otherUserEntry` (the newest `pi.user` entry of its session that did not come from the supervisor's
+     * `false`), `reportAsks` (true when the newest report asks Brian for a decision by itself: a refused ask, or a
+     * report that names a decision with no ask filed, so the report went to the supervisor at once as
+     * `report-blocked`; false when it does not, absent for a thread filed before the field), `otherUserEntry` (the
+     * newest `pi.user` entry of its session that did not come from the supervisor's
      * address `returnAddress`: a person, or another session, wrote it; with an unknown address every entry counts), and
      * `quietReopen` (`{ at, entry }`: the sweep reopened a done thread for a message from the supervisor's address, with
      * no other new message: `at` is the sweep's time, `entry` the session's newest user entry before that message; a
@@ -268,7 +271,8 @@ export type DigestKind =
     | "repair"
     | "issue"
     | "issue-urgent"
-    | "issue-left";
+    | "issue-left"
+    | "report-blocked";
 
 /** Every digest kind, in the design's order: new kinds go at the end. */
 export const DIGEST_KINDS: readonly DigestKind[] = [
@@ -283,6 +287,7 @@ export const DIGEST_KINDS: readonly DigestKind[] = [
     "issue",
     "issue-urgent",
     "issue-left",
+    "report-blocked",
 ];
 
 /** One piece of desk news for the supervisor's digest. Stored data: never rename a field. */
@@ -1872,9 +1877,8 @@ const BLOCKED_SAID =
 
 /**
  * Whether a report says the work is blocked, or asks for a decision: the reason `blocked` or `failed`, the word `BLOCKED`
- * in capitals, a line that starts with `blocked` (any case, after a bullet or bold mark), `needs brian: yes` (any case),
- * a line that starts with `needs a decision` or `decision needed` (any case), a decision for Brian named in words
- * (`namesDecision`), or a last paragraph that asks Brian something (`asksBrian`: a question, or the ask words). Code blocks and inline code never count: a report that quotes
+ * in capitals, a line that starts with `blocked` (any case, after a bullet or bold mark), or a decision for Brian
+ * (`reportAsksBrian`). Code blocks and inline code never count: a report that quotes
  * the word `BLOCKED` is not blocked. `BLOCKED` counts only when it is said of the work (`BLOCKED_SAID`): "a BLOCKED
  * report" names a kind of report, and is not blocked. A request to merge or install, with no choice in it, is no
  * decision: the PR's label `ready-for-human` already brings it to Brian.
@@ -1886,7 +1890,7 @@ export function reportBlocks(text: string, reason?: string): boolean {
 
     const plain = withoutCode(text);
 
-    if (BLOCKED_SAID.test(plain) || /needs\s+brian:\s*yes\b/i.test(plain)) {
+    if (BLOCKED_SAID.test(plain)) {
         return true;
     }
 
@@ -1894,11 +1898,32 @@ export function reportBlocks(text: string, reason?: string): boolean {
         // A bullet, a heading, a quote, and a bold mark are no words: the line's first word is after them.
         const start = line.replace(/^[\s>#*-]+/, "").toLowerCase();
 
-        if (
-            start.startsWith("blocked") ||
-            start.startsWith("needs a decision") ||
-            start.startsWith("decision needed")
-        ) {
+        if (start.startsWith("blocked")) {
+            return true;
+        }
+    }
+
+    return reportAsksBrian(text);
+}
+
+/**
+ * Whether a report asks Brian for a decision: `needs brian: yes` (any case), a line that starts with `needs a decision`
+ * or `decision needed` (any case), a decision for Brian named in words (`namesDecision`, which reads an
+ * `ASKS FOR BRIAN:` block too), or a last paragraph that asks Brian something (`asksBrian`: a question, or the ask
+ * words). Code blocks and inline code never count. A request to merge, install, tag, or review, with no choice in it,
+ * is no decision: the PR's label `ready-for-human` already brings it to Brian.
+ */
+export function reportAsksBrian(text: string): boolean {
+    const plain = withoutCode(text);
+
+    if (/needs\s+brian:\s*yes\b/i.test(plain)) {
+        return true;
+    }
+
+    for (const line of plain.split("\n")) {
+        const start = line.replace(/^[\s>#*-]+/, "").toLowerCase();
+
+        if (start.startsWith("needs a decision") || start.startsWith("decision needed")) {
             return true;
         }
     }
@@ -1911,13 +1936,90 @@ export function reportBlocks(text: string, reason?: string): boolean {
     return asksBrian(text, { report: true });
 }
 
-/** A sentence that gives Brian a decision: "Brian must decide", "a decision from Brian", "needs Brian's choice". */
+/**
+ * A sentence that gives Brian a decision: "Brian must decide", "a decision from Brian", "needs Brian's choice",
+ * "is Brian's decision", "stays up to Brian".
+ */
 const DECISION_SAID =
-    /\bBrian\s+(?:must|should|needs to|has to|may want to|can)\s+(?:decide|choose|pick|confirm|answer|accept|allow|authori[sz]e|grant|rotate|treat|say)\b|\b(?:decisions?|choices?)\s+(?:for|from)\s+Brian\b|\bneeds?\s+Brian's\s+(?:decision|choice|answer|yes|ok|approval)\b/i;
+    /\bBrian\s+(?:must|should|needs to|has to|may want to|can)\s+(?:decide|choose|pick|confirm|answer|accept|allow|authori[sz]e|grant|rotate|treat|say)\b|\b(?:decisions?|choices?)\s+(?:for|from)\s+Brian\b|\bneeds?\s+Brian's\s+(?:decision|choice|answer|yes|ok|approval)\b|\b(?:is|are|stays?|remains?|awaits?)\s+(?:an?\s+)?Brian's\s+(?:decision|call|choice)\b|\b(?:is|are|stays?|remains?)\s+up\s+to\s+Brian\b/i;
+
+/** "needs Brian" in a sentence: a thing that is his to do, or to decide. */
+const NEEDS_BRIAN = /\bneeds?\s+Brian\b(?!'s)/i;
+
+/** A negation before "needs Brian": "This does not need Brian", "Nothing here needs Brian". */
+const NEEDS_BRIAN_NOT = /(?:\bnot|\bnever|\bnothing|\bno|\bnone|n't)\b/i;
+
+/** A label that says there is nothing for him: "Needs Brian: no.", "Needs Brian: none." */
+const NEEDS_BRIAN_NO = /\bneeds?\s+brian\s*\)?\s*:\s*(?:no|none|nothing)\b/i;
+
+/** A sentence that is only the label ("**Needs Brian**"): the heading rule reads it, with the items under it. */
+const NEEDS_BRIAN_LABEL = /^[\s>#*_()\-]*needs\s+brian\b[\s*_()]*:?[\s*_()]*$/i;
 
 /** A heading, or a label, that opens a list of things for Brian: "**Needs Brian**", "What is left (needs Brian)". */
 const BRIAN_HEADING =
-    /^(?:what\s+(?:is\s+left\s+)?)?\(?(?:needs\s+brian|decisions?\s+for\s+brian|human\s+decisions?|for\s+brian)\)?\s*:?\s*(.*)$/i;
+    /^(?:what\s+(?:is\s+left\s+)?)?\(?(?:needs\s+brian|decisions?\s+for\s+brian|human\s+decisions?|for\s+brian|(?:steps?|asks?|questions?|actions?|items?)\s+for\s+brian)\)?\s*:?\s*(.*)$/i;
+
+/** A "for Brian:" label anywhere in a line: "Note for Brian: PR #5 is ready to merge." */
+const BRIAN_LABEL = /\b(?:needs\s+brian|for\s+brian)\s*\)?\s*:\s*(.*)$/i;
+
+/** The words of an "ASKS FOR BRIAN:" line: its items are the label of the block. */
+const ASKS_BRIAN_LINE = /^asks\s+for\s+brian\s*:\s*(.*)$/i;
+
+/** An item that names nothing for Brian: "none", "nothing left", "no". */
+const NO_ITEM = /^(?:no|none|nothing)\b/i;
+
+/**
+ * The items of the last `ASKS FOR BRIAN:` block in a report: the rest of that line, then each non-empty line under it up
+ * to the first blank line, with its list mark removed. An item that starts with `none`, `nothing`, or `no` is left out,
+ * so `ASKS FOR BRIAN: none` gives `[]`. Undefined when there is no such line. Code blocks and inline code never count.
+ */
+export function asksForBrian(text: string): string[] | undefined {
+    const lines = withoutCode(text).split("\n");
+    let start: number | undefined;
+    let rest = "";
+
+    for (const [index, line] of lines.entries()) {
+        const bare = line
+            .replace(/^[\s>#*-]+/, "")
+            .replace(/\*+/g, "")
+            .trim();
+        const found = ASKS_BRIAN_LINE.exec(bare);
+
+        if (found !== null) {
+            start = index;
+            rest = found[1]!.trim();
+        }
+    }
+
+    if (start === undefined) {
+        return undefined;
+    }
+
+    const items = rest === "" ? [] : [rest];
+
+    for (const line of lines.slice(start + 1)) {
+        if (line.trim() === "") {
+            break;
+        }
+
+        const item = line.replace(/^\s*(?:[-*+]|\d+[.)])\s+/, "").trim();
+
+        if (item !== "") {
+            items.push(item);
+        }
+    }
+
+    return items.filter((item) => !NO_ITEM.test(item));
+}
+
+/** Whether 1 item names a decision for Brian: not a no, and not a plain merge, install, tag, or review. */
+function decisionItem(item: string): boolean {
+    return (
+        !NO_ITEM.test(item.trim()) &&
+        !NO_DECISION.test(item) &&
+        (!ROUTINE_ITEM.test(item) || CHOICE.test(item))
+    );
+}
 
 /** An item that only asks for a merge, an install, a review, or a tag, with no choice: `ready-for-human` covers it. */
 const ROUTINE_ITEM = /\b(?:merge|install|tag|review)\b/i;
@@ -1934,11 +2036,29 @@ const NO_DECISION =
 export function namesDecision(plain: string): boolean {
     const lines = plain.split("\n");
 
+    // An "ASKS FOR BRIAN:" block that names a decision: the report's own list of them.
+    if (asksForBrian(plain)?.some(decisionItem) === true) {
+        return true;
+    }
+
     for (const sentence of plain.split(/(?<=[.!?])\s+|\n/)) {
+        if (NO_DECISION.test(sentence) || NEGATED.test(sentence)) {
+            continue;
+        }
+
+        if (DECISION_SAID.test(sentence)) {
+            return true;
+        }
+
+        // "The key rotation needs Brian.": a thing that is his, unless it is a routine merge, install, tag, or review.
+        const needs = NEEDS_BRIAN.exec(sentence);
+
         if (
-            DECISION_SAID.test(sentence) &&
-            !NO_DECISION.test(sentence) &&
-            !NEGATED.test(sentence)
+            needs !== null &&
+            !NEEDS_BRIAN_NOT.test(sentence.slice(0, needs.index)) &&
+            !NEEDS_BRIAN_NO.test(sentence) &&
+            !NEEDS_BRIAN_LABEL.test(sentence) &&
+            (!ROUTINE_ITEM.test(sentence) || CHOICE.test(sentence))
         ) {
             return true;
         }
@@ -1949,7 +2069,7 @@ export function namesDecision(plain: string): boolean {
             .replace(/^[\s>#*-]+/, "")
             .replace(/\*+/g, "")
             .trim();
-        const heading = BRIAN_HEADING.exec(bare);
+        const heading = BRIAN_HEADING.exec(bare) ?? BRIAN_LABEL.exec(bare);
 
         if (heading === null) {
             continue;
@@ -1970,14 +2090,7 @@ export function namesDecision(plain: string): boolean {
             }
         }
 
-        if (
-            items.some(
-                (item) =>
-                    !NO_DECISION.test(item) &&
-                    !/^(?:no|none|nothing)\b/i.test(item.trim()) &&
-                    (!ROUTINE_ITEM.test(item) || CHOICE.test(item)),
-            )
-        ) {
+        if (items.some(decisionItem)) {
             return true;
         }
     }
@@ -2048,7 +2161,11 @@ export function closeCheck(thread: Thread, facts: CloseFacts): { close: boolean;
 
     // A report that says the work is blocked, or asks for a decision, waits on Odrade: the thread is not done.
     if (thread.run.reportBlocked === true) {
-        open.push("its last report says BLOCKED or asks for a decision");
+        open.push(
+            thread.run.reportAsks === true
+                ? "its last report asks Brian for a decision"
+                : "its last report says BLOCKED or asks for a decision",
+        );
     }
 
     // A thread that reported before the desk derived its flag: a failed read of its reports leaves the flag absent, and
@@ -2943,7 +3060,7 @@ export function odradeReason(thread: Thread): string | undefined {
     }
 
     if (thread.run.reportBlocked === true) {
-        return "report says blocked";
+        return thread.run.reportAsks === true ? "report asks Brian" : "report says blocked";
     }
 
     return SILENT_SESSION;
@@ -2996,6 +3113,7 @@ export const DIGEST_NOW: readonly DigestKind[] = [
     "answer-action",
     "repair",
     "issue-urgent",
+    "report-blocked",
 ];
 /** The kinds the Clerk gets, by default: the routine news. The issue kinds go to the supervisor: she plans the shifts. */
 export const DIGEST_CLERK: readonly DigestKind[] = ["report", "shift", "closed", "queue"];
@@ -3074,7 +3192,7 @@ export function askAnswerKind(ask: Pick<Ask, "key">, words: string): "answer" | 
 const ISSUE_KINDS: readonly DigestKind[] = ["issue", "issue-urgent", "issue-left"];
 
 /** The kinds that carry a report. */
-const REPORT_KINDS: readonly DigestKind[] = ["report", "shift", "shift-blocked"];
+const REPORT_KINDS: readonly DigestKind[] = ["report", "shift", "shift-blocked", "report-blocked"];
 
 /**
  * A supervisor's box as a plain copy, with a fresh one when it is not there yet: a change goes back through
@@ -8456,12 +8574,23 @@ export default function createDesk(host: Host, web: Web) {
             const line =
                 filedAsks.length === 0 ? reported : `${reported} · asks ${filedAsks.join(", ")}`;
 
+            // A later report replaces these: only the newest report counts. `false` is not absent: an absent flag is a
+            // thread that the desk did not derive yet. Filed asks hold the thread by themselves, so the text then
+            // decides nothing; without them the text is read, whatever the status says, so a decision named only in
+            // words still holds the thread. A report that asks Brian by itself went to him at once (`report-blocked`).
+            const reportAsks = refused || (filedAsks.length === 0 && reportAsksBrian(request.text));
+            const blocked =
+                request.status === "blocked" ||
+                refused ||
+                (filedAsks.length === 0 && reportBlocks(request.text, request.reason));
+
             // The session's newest user entry, read before this commit writes a task: a transaction cannot read tables
             // after its first table write.
             const newest = await newestUserEntry(tx, session);
 
             // With the digest on, the report goes into the box in this same commit: the caller sends nothing, and the
-            // supervisor gets it in the next digest.
+            // supervisor gets it in the next digest. A report that asks Brian for a decision goes at once, not in the
+            // interval: the thread waits on his answer.
             let held = false;
 
             if (request.digest === true && thread.supervisor !== undefined) {
@@ -8469,11 +8598,14 @@ export default function createDesk(host: Host, web: Web) {
 
                 if (digest.minutes > 0) {
                     const kind: DigestKind =
-                        request.from === "team_message"
-                            ? "report"
-                            : request.reason === "blocked" || request.reason === "failed"
-                              ? "shift-blocked"
-                              : "shift";
+                        request.from === "night-shift" &&
+                        (request.reason === "blocked" || request.reason === "failed")
+                            ? "shift-blocked"
+                            : blocked
+                              ? "report-blocked"
+                              : request.from === "team_message"
+                                ? "report"
+                                : "shift";
                     const due = enqueueDigest(
                         state,
                         thread.supervisor,
@@ -8511,14 +8643,8 @@ export default function createDesk(host: Host, web: Web) {
 
             thread.run.reportedAt = request.at;
 
-            // A later report replaces it: only the newest report counts. `false` is not absent: an absent flag is a
-            // thread that the desk did not derive yet. Filed asks hold the thread by themselves, so the text then
-            // decides nothing; without them the text is read, whatever the status says, so a decision named only in
-            // words still holds the thread.
-            thread.run.reportBlocked =
-                request.status === "blocked" ||
-                refused ||
-                (filedAsks.length === 0 && reportBlocks(request.text, request.reason));
+            thread.run.reportBlocked = blocked;
+            thread.run.reportAsks = reportAsks;
 
             if (newest !== undefined) {
                 thread.run.reportedUserEntry = newest;
@@ -10601,11 +10727,13 @@ export default function createDesk(host: Host, web: Web) {
 
             // A thread from before `run.reportBlocked` existed: its newest stored report sets the flag now, once. No
             // report is `false`. A key that is not here is a failed read: the flag stays absent, and the thread waits.
+            // `run.reportAsks` comes from the same report: it says whether the report asks Brian by itself.
             if (thread.run.reportBlocked === undefined) {
                 const report = facts.reports?.[thread.id];
 
                 if (report !== undefined) {
                     thread.run.reportBlocked = report === null ? false : reportBlocks(report.text);
+                    thread.run.reportAsks = report === null ? false : reportAsksBrian(report.text);
                 }
             }
 
