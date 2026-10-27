@@ -695,7 +695,7 @@ export function openThread(
         const when = parseCheckWhen(request.watch.checkOn, request.at);
 
         if (check === "" || check.length > MAX_LINE) {
-            throw new Error("A watch's check is 1 to 200 characters, on one line: shorten it.");
+            throw new Error("A watch's check is 1 to 200 characters, on one line. Shorten it.");
         }
 
         if ("error" in when) {
@@ -1279,7 +1279,7 @@ export function setWatch(
     const check = flatLine(request.check);
 
     if (check === "" || check.length > MAX_LINE) {
-        return { error: "A watch's check is 1 to 200 characters, on one line: shorten it." };
+        return { error: "A watch's check is 1 to 200 characters, on one line. Shorten it." };
     }
 
     const when = parseCheckWhen(request.checkOn, request.at);
@@ -1361,7 +1361,7 @@ export function recordResult(
 
     if (text === "" || text.length > MAX_LINE) {
         return {
-            error: "A watch's result is 1 to 200 characters, on one line: write a short line.",
+            error: "A watch's result is 1 to 200 characters, on one line. Write a short line.",
         };
     }
 

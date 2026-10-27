@@ -2760,7 +2760,7 @@ describe("the watch's rules", () => {
                     at: on("2026-10-22"),
                 }),
             ),
-            /1 to 200 characters/,
+            /check is 1 to 200 characters, on one line\. Shorten it\./,
         );
         assert.match(
             errorOf(
@@ -2772,7 +2772,7 @@ describe("the watch's rules", () => {
                     at: on("2026-10-22"),
                 }),
             ),
-            /1 to 200 characters/,
+            /check is 1 to 200 characters, on one line\. Shorten it\./,
         );
         assert.match(
             errorOf(
@@ -18426,7 +18426,7 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
                             "task-clip",
                             "call-empty",
                         ),
-                    /1 to 200 characters, on one line: write a short line\./,
+                    /1 to 200 characters, on one line\. Write a short line\./,
                 );
 
                 const args = { action: "result", thread: thread.id, pass: true, text: long };
