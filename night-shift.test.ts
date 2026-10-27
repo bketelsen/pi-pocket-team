@@ -22,7 +22,6 @@ import { fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi
 import { type ConversationId, LiveDoc, type TaskId } from "@earendil-works/pi-durable";
 import { SubagentsDoc } from "./_pocket/src/server/docs.ts";
 import {
-    asksForBrian,
     deepseekStart,
     DEFAULT_ROUNDS,
     type Goal,
@@ -391,84 +390,6 @@ describe("parsing", () => {
         assert.ok(!roundMessage(plain, 1, now).includes("team_message report"));
         assert.ok(!summaryMessage(plain).includes("team_message report"));
         assert.ok(!summaryMessage(plain).includes("ASKS FOR BRIAN"), "a shift of a session's own");
-    });
-
-    test("a summary's ASKS FOR BRIAN block gives the desk its asks", () => {
-        // A "none" is no ask at all.
-        assert.deepEqual(asksForBrian("Done.\n\nASKS FOR BRIAN: none"), []);
-        assert.deepEqual(asksForBrian("Done.\n\nASKS FOR BRIAN:\n- Nothing for Brian."), []);
-        // No line: nothing.
-        assert.equal(asksForBrian("Done. Nothing for Brian."), undefined);
-        // 2 items: the rest of the line, then each line under it, up to the blank line.
-        assert.deepEqual(
-            asksForBrian(
-                "Done.\n\nASKS FOR BRIAN:\n- Rotate the console cloud key?\n- Which host first?\n\nThe rest is done.",
-            ),
-            [{ question: "Rotate the console cloud key?" }, { question: "Which host first?" }],
-        );
-        // A pick-one gives its options, and the question is before the bracket.
-        assert.deepEqual(
-            asksForBrian("ASKS FOR BRIAN:\n1. Rotate the key now or later? [rotate now | keep it]"),
-            [{ question: "Rotate the key now or later?", options: ["rotate now", "keep it"] }],
-        );
-        // A bare merge, install, tag, or review request is no decision; with a choice it is one.
-        assert.deepEqual(asksForBrian("ASKS FOR BRIAN:\n- merge bketelsen/pi-pocket-team#60"), []);
-        // Options are a choice: the merge rule leaves the item in, and it keeps its options.
-        assert.deepEqual(
-            asksForBrian(
-                "ASKS FOR BRIAN:\n- Approve the key rotation before install. [approve | reject]",
-            ),
-            [
-                {
-                    question: "Approve the key rotation before install.",
-                    options: ["approve", "reject"],
-                },
-            ],
-        );
-        assert.deepEqual(
-            asksForBrian("ASKS FOR BRIAN: review the diff or tag it [tag v2 | tag v3 | wait]"),
-            [{ question: "review the diff or tag it", options: ["tag v2", "tag v3", "wait"] }],
-        );
-        // A decision verb makes an install request a decision: no options are needed for it.
-        assert.deepEqual(
-            asksForBrian("ASKS FOR BRIAN:\n- Authorize credential access for the install."),
-            [{ question: "Authorize credential access for the install." }],
-        );
-        assert.deepEqual(asksForBrian("ASKS FOR BRIAN:\n- Install it first."), [], "no verb");
-        // A routine word first is the request: "remove" says what the merge does.
-        assert.deepEqual(asksForBrian("ASKS FOR BRIAN:\n- Merge #59 to remove the typo."), []);
-        // A second request joined by "and" with a decision verb first is a decision of its own.
-        assert.deepEqual(
-            asksForBrian(
-                "ASKS FOR BRIAN:\n- Merge #59 and authorize credential access for the production install.",
-            ),
-            [{ question: "Merge #59 and authorize credential access for the production install." }],
-        );
-        assert.deepEqual(asksForBrian("ASKS FOR BRIAN:\n- Merge #59. CI is green."), []);
-        assert.deepEqual(asksForBrian("ASKS FOR BRIAN: merge #54 or #55"), [
-            { question: "merge #54 or #55" },
-        ]);
-        // More than 4 items: undefined, and the text alone holds the thread.
-        assert.equal(asksForBrian("ASKS FOR BRIAN:\n- a\n- b\n- c\n- d\n- e"), undefined);
-        assert.equal(
-            asksForBrian("ASKS FOR BRIAN:\n- a\n- b\n- c\n- d").length,
-            4,
-            "4 asks are filed",
-        );
-        // A fenced block is quoted, not said.
-        assert.equal(
-            asksForBrian("Done.\n\n```\nASKS FOR BRIAN: rotate the key\n```\n\nAll set."),
-            undefined,
-        );
-        assert.equal(
-            asksForBrian("Done.\n\n~~~\nASKS FOR BRIAN: rotate the key\n~~~\n\nAll set."),
-            undefined,
-        );
-        // The last block is the one that counts.
-        assert.deepEqual(
-            asksForBrian("ASKS FOR BRIAN: rotate the key\n\nASKS FOR BRIAN: keep it"),
-            [{ question: "keep it" }],
-        );
     });
 
     test("Pi's status line, and whose a message is", () => {

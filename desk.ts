@@ -1918,9 +1918,12 @@ export function reportAsksBrian(text: string): boolean {
     const plain = withoutCode(text);
     const rest = withoutAsksBlocks(plain);
 
-    // The last block is the report's own list of decisions for him.
-    if (asksForBrian(plain)?.some(decisionItem) === true) {
-        return true;
+    // The last block is the report's own list of decisions for him, and it decides alone: an explicit
+    // "ASKS FOR BRIAN: none" releases the thread, whatever the prose above it says.
+    const block = asksForBrian(plain);
+
+    if (block !== undefined) {
+        return block.some(decisionItem);
     }
 
     if (/needs\s+brian:\s*yes\b/i.test(rest)) {
@@ -1945,26 +1948,18 @@ export function reportAsksBrian(text: string): boolean {
 
 /**
  * A sentence that gives Brian a decision: "Brian must decide", "a decision from Brian", "needs Brian's choice",
- * "is Brian's decision", "stays up to Brian".
+ * "is Brian's decision", "stays up to Brian", "needs Brian to confirm", "until Brian decides".
  */
 const DECISION_SAID =
-    /\bBrian\s+(?:must|should|needs to|has to|may want to|can)\s+(?:decide|choose|pick|confirm|answer|accept|allow|authori[sz]e|grant|rotate|treat|say)\b|\b(?:decisions?|choices?)\s+(?:for|from)\s+Brian\b|\bneeds?\s+Brian's\s+(?:decision|choice|answer|yes|ok|approval)\b|\b(?:is|are|stays?|remains?|awaits?)\s+(?:an?\s+)?Brian's\s+(?:decision|call|choice)\b|\b(?:is|are|stays?|remains?)\s+up\s+to\s+Brian\b/i;
+    /\bBrian\s+(?:must|should|needs to|has to|may want to|can)\s+(?:decide|choose|pick|confirm|answer|accept|allow|authori[sz]e|grant|rotate|treat|say)\b|\b(?:decisions?|choices?)\s+(?:for|from)\s+Brian\b|\bneeds?\s+Brian's\s+(?:decision|choice|answer|yes|ok|approval)\b|\b(?:is|are|stays?|remains?|awaits?)\s+(?:an?\s+)?Brian's\s+(?:decision|call|choice)\b|\b(?:is|are|stays?|remains?)\s+up\s+to\s+Brian\b|\bneeds?\s+Brian\s+to\s+(?:decide|choose|pick|confirm|answer|accept|allow|approve|authori[sz]e|grant)\b|\b(?:until|once|when|after)\s+Brian\s+(?:decides|chooses|picks|confirms|answers|approves|allows)\b/i;
 
-/** "needs Brian" in a sentence: a thing that is his to do, or to decide. */
-const NEEDS_BRIAN = /\bneeds?\s+Brian\b(?!'s)/i;
-
-/** A negation before "needs Brian": "This does not need Brian", "Nothing here needs Brian". */
+/** A negation before a label for Brian: "No action for Brian: …". */
 const NEEDS_BRIAN_NOT = /(?:\bnot|\bnever|\bnothing|\bno|\bnone|n't)\b/i;
-
-/** A label that says there is nothing for him: "Needs Brian: no.", "Needs Brian: none." */
-const NEEDS_BRIAN_NO = /\bneeds?\s+brian\s*\)?\s*:\s*(?:no|none|nothing)\b/i;
-
-/** A sentence that is only the label ("**Needs Brian**"): the heading rule reads it, with the items under it. */
-const NEEDS_BRIAN_LABEL = /^[\s>#*_()\-]*needs\s+brian\b[\s*_()]*:?[\s*_()]*$/i;
 
 /**
  * A heading that opens a list of things for Brian: "**Needs Brian**", "What is left (needs Brian)", "Steps for Brian".
- * An `ASKS FOR BRIAN:` line is no heading: `asksForBrian` reads its block, and only the last one counts.
+ * An `ASKS FOR BRIAN:` line is no heading: `asksForBrian` reads its block, and only the last one counts. A step that is
+ * the agent's own ("Then I repin …") is no decision (`decisionItem`).
  */
 const BRIAN_HEADING =
     /^(?:what\s+(?:is\s+left\s+)?)?\(?(?:needs\s+brian|decisions?\s+for\s+brian|human\s+decisions?|for\s+brian|(?:steps?|questions?|actions?|items?)\s+for\s+brian)\)?\s*:?\s*(.*)$/i;
@@ -1988,20 +1983,29 @@ const NO_ITEM = /^(?:no|none|nothing)\b/i;
  * so `ASKS FOR BRIAN: none` gives `[]`. Undefined when there is no such line. Code blocks and inline code never count.
  */
 export function asksForBrian(text: string): string[] | undefined {
-    const lines = withoutCode(text).split("\n");
-    let start: number | undefined;
-    let rest = "";
+    return lastAsksBlock(text)
+        ?.map((item) => item.plain)
+        .filter((item) => !NO_ITEM.test(item));
+}
 
-    for (const [index, line] of lines.entries()) {
-        const bare = line
+/**
+ * The items of the last `ASKS FOR BRIAN:` block, each code-free (`plain`) and as written (`raw`, with its inline code).
+ * The block is found in the code-free text; `withoutCode` keeps each line in its place, so the same lines of the text
+ * give the written items.
+ */
+function lastAsksBlock(text: string): { plain: string; raw: string }[] | undefined {
+    const lines = withoutCode(text).split("\n");
+    const raws = text.split(/\r\n?|\n/);
+    const bareOf = (line: string) =>
+        line
             .replace(/^[\s>#*-]+/, "")
             .replace(/\*+/g, "")
             .trim();
-        const found = ASKS_BRIAN_LINE.exec(bare);
+    let start: number | undefined;
 
-        if (found !== null) {
+    for (const [index, line] of lines.entries()) {
+        if (ASKS_BRIAN_LINE.test(bareOf(line))) {
             start = index;
-            rest = found[1]!.trim();
         }
     }
 
@@ -2009,21 +2013,65 @@ export function asksForBrian(text: string): string[] | undefined {
         return undefined;
     }
 
-    const items = rest === "" ? [] : [rest];
+    const rest = ASKS_BRIAN_LINE.exec(bareOf(lines[start]!))![1]!.trim();
+    const restRaw = ASKS_BRIAN_LINE.exec(bareOf(raws[start] ?? ""))?.[1]?.trim() ?? rest;
+    const items = rest === "" ? [] : [{ plain: rest, raw: restRaw }];
+    const unmark = (line: string) => line.replace(/^\s*(?:[-*+]|\d+[.)])\s+/, "").trim();
 
-    for (const line of lines.slice(start + 1)) {
+    for (let index = start + 1; index < lines.length; index += 1) {
+        const line = lines[index]!;
+
         if (line.trim() === "") {
             break;
         }
 
-        const item = line.replace(/^\s*(?:[-*+]|\d+[.)])\s+/, "").trim();
+        const plain = unmark(line);
 
-        if (item !== "") {
-            items.push(item);
+        if (plain !== "") {
+            items.push({ plain, raw: unmark(raws[index] ?? line) });
         }
     }
 
-    return items.filter((item) => !NO_ITEM.test(item));
+    return items;
+}
+
+/** The options of an item that ends with `[a | b]`: 2 to 6 of 1 to 40 characters each, and its question before them. */
+function askOptions(item: string): { question: string; options: string[] } | undefined {
+    const bracket = /^(.*?)\[([^\]]*)\]\s*$/.exec(item);
+
+    if (bracket === null) {
+        return undefined;
+    }
+
+    const question = bracket[1]!.trim();
+    const options = bracket[2]!.split("|").map((option) => option.trim());
+    const good =
+        question !== "" &&
+        options.length >= 2 &&
+        options.length <= 6 &&
+        options.every((option) => option !== "" && option.length <= 40);
+
+    return good ? { question, options } : undefined;
+}
+
+/**
+ * The asks a report's last `ASKS FOR BRIAN:` block names, to file on its thread: each item that is a decision
+ * (`decisionItem`, the rule that holds a thread), as written, with its options when it ends with `[a | b]`. `[]` for
+ * "none", or for a block of routine items only. Undefined when there is no block, or when it names more than 4: the
+ * text alone holds the thread then. Night shift reads it through the desk's API, so the 2 modules share 1 parser.
+ */
+export function reportAsksOf(text: string): { question: string; options?: string[] }[] | undefined {
+    const items = lastAsksBlock(text);
+
+    if (items === undefined) {
+        return undefined;
+    }
+
+    const asks = items
+        .filter((item) => decisionItem(item.plain))
+        .map((item) => askOptions(item.raw) ?? { question: item.raw });
+
+    return asks.length > 4 ? undefined : asks;
 }
 
 /**
@@ -2121,6 +2169,10 @@ function decisionItem(item: string): boolean {
                 return false;
             }
 
+            if (OWN_STEP.test(clause)) {
+                return false;
+            }
+
             return index === 0
                 ? !routineOnly(clause)
                 : VERB_FIRST.test(clause) || DECISION_SAID.test(clause) || hasChoice(clause);
@@ -2128,7 +2180,11 @@ function decisionItem(item: string): boolean {
 }
 
 /** An item that only asks for a merge, an install, a review, or a tag, with no choice: `ready-for-human` covers it. */
-const ROUTINE_ITEM = /\b(?:merge|install|tag|review)\b/i;
+const ROUTINE_ITEM =
+    /\b(?:merg(?:e|es|ed|ing)|install(?:s|ed|ing)?|tag(?:s|ged|ging)?|review(?:s|ed|ing)?)\b/i;
+
+/** A clause whose subject is the agent: "Then I repin #85 to the tag." It is the agent's work, not Brian's decision. */
+const OWN_STEP = /^[\s\W]*(?:(?:then|next|after that|later),?\s+)?(?:I|we)\b/i;
 
 /** Whether a sentence says there is nothing for Brian: "Nothing needs Brian", "No decision for Brian". */
 const NO_DECISION =
@@ -2153,20 +2209,6 @@ export function namesDecision(plain: string): boolean {
         }
 
         if (DECISION_SAID.test(sentence)) {
-            return true;
-        }
-
-        // "The key rotation needs Brian.": a thing that is his, unless it is a routine merge, install, tag, or review
-        // with no decision word in it ("Authorize the install." still counts).
-        const needs = NEEDS_BRIAN.exec(sentence);
-
-        if (
-            needs !== null &&
-            !NEEDS_BRIAN_NOT.test(sentence.slice(0, needs.index)) &&
-            !NEEDS_BRIAN_NO.test(sentence) &&
-            !NEEDS_BRIAN_LABEL.test(sentence) &&
-            !routineOnly(sentence)
-        ) {
             return true;
         }
     }
@@ -8495,6 +8537,8 @@ export type DeskApi = {
     clerk: (tx: Tx, request: ClerkRequest) => Promise<void>;
     /** The supervisor's Clerk, for the check before a Clerk starts: no write. */
     clerkOf: (tx: Tx, supervisor: number) => Promise<Clerk | undefined>;
+    /** The asks of a report's `ASKS FOR BRIAN:` block (`reportAsksOf`): Night shift files them with its report. */
+    asks: (text: string) => { question: string; options?: string[] }[] | undefined;
 };
 
 // ─── The module ──────────────────────────────────────────────────────────────
@@ -8810,6 +8854,7 @@ export default function createDesk(host: Host, web: Web) {
                 },
             };
         },
+        asks: reportAsksOf,
         clerkOf: async (tx, supervisor) => {
             const found = clerkOf(await tx.doc(DeskThreads), supervisor);
 

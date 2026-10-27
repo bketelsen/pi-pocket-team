@@ -95,6 +95,7 @@ import {
     parseStatus,
     addAsk,
     answerAsk,
+    reportAsksOf,
     namesDecision,
     rewriteAsk,
     withdrawAsk,
@@ -6340,6 +6341,17 @@ describe("a report that asks Brian for a decision", () => {
             "Needs Brian: the merge is already done.",
             // A routine word first is the request: a verb after it says what the work does.
             "ASKS FOR BRIAN:\n- Merge #59 to remove the typo.",
+            // An explicit none wins over the prose above it.
+            "Should the TTL change later? Your call.\n\nASKS FOR BRIAN: none",
+            "Brian must decide the TTL.\n\nASKS FOR BRIAN: none",
+            // Left-over work that "needs Brian" is no decision (the replay's false holds T18, T126, T278).
+            "The work that is left needs Brian on real devices, or it needs the GitHub manager app, which does not exist yet.",
+            "Do not change the hidden app storage backup. That needs Brian.",
+            "The 76 rows left in `docs/open-items.md` need Brian, a credential, or a physical read.",
+            "The key rotation needs Brian.",
+            // In "Steps for Brian", the agent's own steps and plain merges are no decision (the replay's false hold T27).
+            "These are the morning steps for Brian:\n1. Merge lodge #32 first.\n2. Tag the merge commit.\n3. Then I repin frostnotes #85 to the tag.\n4. Then Brian merges #85.",
+            "3. The morning steps for Brian: merge frostmail#112 at any time. Then I repin porter#12 to the tag, and Brian merges it.",
             // A fact after a merge request is no decision of its own.
             "ASKS FOR BRIAN:\n- Merge #59. CI is green.",
             "ASKS FOR BRIAN:\n- Merge #59 and install it.",
@@ -6355,26 +6367,116 @@ describe("a report that asks Brian for a decision", () => {
         for (const text of [
             "ASKS FOR BRIAN:\n- Rotate the key? [rotate | keep]",
             "ASKS FOR BRIAN: merge #54 or #55",
-            "The key rotation needs Brian.",
             "Question for Brian: keep the old cache?",
             "The support promise is Brian's decision.",
-            "STEPS FOR BRIAN:\n- Rotate the key.",
             // Options are a choice: a pick-one with a merge or an install in it is still a decision.
             "ASKS FOR BRIAN:\n- Approve the key rotation before install. [approve | reject]",
             // A decision verb makes a merge or an install request a decision too.
             "ASKS FOR BRIAN:\n- Authorize credential access for the install.",
             "Needs Brian: authorize the install.",
-            "The install needs Brian to authorize it.",
             // "already" alone is no sign that the decision is behind him.
             "ASKS FOR BRIAN:\n- Approve access to the already configured production server.",
             // Each sentence counts by itself: a done first action does not hide a current one.
             "ASKS FOR BRIAN:\n- Brian approved the plan. Brian must authorize credential access for the install.",
             // A second request joined by "and" counts by itself.
             "ASKS FOR BRIAN:\n- Merge #59 and authorize credential access for the production install.",
+            // The replay's right holds: T36 ("needs Brian to confirm"), T237 ("Until Brian decides"), T145 (steps for him).
+            "firn#116 (the bootc-v1 end date, which needs Brian to confirm 2026-12-30) is still open.",
+            "6. Until Brian decides, the same loop stays: fix, review, Brian merges, run.",
+            "Steps for Brian:\n- B1: shell. Record sizes, then destroy the dataset.\n- B2: Apps > searxng > Delete.",
         ]) {
             assert.equal(reportAsksBrian(text), true, text);
             assert.equal(reportBlocks(text), true, text);
         }
+    });
+
+    test("reportAsksOf: a report's ASKS FOR BRIAN block gives Night shift its asks", () => {
+        // A "none" is no ask at all.
+        assert.deepEqual(reportAsksOf("Done.\n\nASKS FOR BRIAN: none"), []);
+        assert.deepEqual(reportAsksOf("Done.\n\nASKS FOR BRIAN:\n- Nothing for Brian."), []);
+        // No line: nothing.
+        assert.equal(reportAsksOf("Done. Nothing for Brian."), undefined);
+        // 2 items: the rest of the line, then each line under it, up to the blank line.
+        assert.deepEqual(
+            reportAsksOf(
+                "Done.\n\nASKS FOR BRIAN:\n- Rotate the console cloud key?\n- Which host first?\n\nThe rest is done.",
+            ),
+            [{ question: "Rotate the console cloud key?" }, { question: "Which host first?" }],
+        );
+        // A pick-one gives its options, and the question is before the bracket.
+        assert.deepEqual(
+            reportAsksOf("ASKS FOR BRIAN:\n1. Rotate the key now or later? [rotate now | keep it]"),
+            [{ question: "Rotate the key now or later?", options: ["rotate now", "keep it"] }],
+        );
+        // A bare merge, install, tag, or review request is no decision; with a choice it is one.
+        assert.deepEqual(reportAsksOf("ASKS FOR BRIAN:\n- merge bketelsen/pi-pocket-team#60"), []);
+        // Options are a choice: the merge rule leaves the item in, and it keeps its options.
+        assert.deepEqual(
+            reportAsksOf(
+                "ASKS FOR BRIAN:\n- Approve the key rotation before install. [approve | reject]",
+            ),
+            [
+                {
+                    question: "Approve the key rotation before install.",
+                    options: ["approve", "reject"],
+                },
+            ],
+        );
+        assert.deepEqual(
+            reportAsksOf("ASKS FOR BRIAN: review the diff or tag it [tag v2 | tag v3 | wait]"),
+            [{ question: "review the diff or tag it", options: ["tag v2", "tag v3", "wait"] }],
+        );
+        // A decision verb makes an install request a decision: no options are needed for it.
+        assert.deepEqual(
+            reportAsksOf("ASKS FOR BRIAN:\n- Authorize credential access for the install."),
+            [{ question: "Authorize credential access for the install." }],
+        );
+        assert.deepEqual(reportAsksOf("ASKS FOR BRIAN:\n- Install it first."), [], "no verb");
+        // A routine word first is the request: "remove" says what the merge does.
+        assert.deepEqual(reportAsksOf("ASKS FOR BRIAN:\n- Merge #59 to remove the typo."), []);
+        // A second request joined by "and" with a decision verb first is a decision of its own.
+        assert.deepEqual(
+            reportAsksOf(
+                "ASKS FOR BRIAN:\n- Merge #59 and authorize credential access for the production install.",
+                // The replay's right holds: T36 ("needs Brian to confirm"), T237 ("Until Brian decides"), T145 (steps for him).
+                "firn#116 (the bootc-v1 end date, which needs Brian to confirm 2026-12-30) is still open.",
+                "6. Until Brian decides, the same loop stays: fix, review, Brian merges, run.",
+                "Steps for Brian:\n- B1: shell. Record sizes, then destroy the dataset.\n- B2: Apps > searxng > Delete.",
+            ),
+            [{ question: "Merge #59 and authorize credential access for the production install." }],
+        );
+        assert.deepEqual(reportAsksOf("ASKS FOR BRIAN:\n- Merge #59. CI is green."), []);
+        assert.deepEqual(reportAsksOf("ASKS FOR BRIAN: merge #54 or #55"), [
+            { question: "merge #54 or #55" },
+        ]);
+        // More than 4 items: undefined, and the text alone holds the thread.
+        assert.equal(reportAsksOf("ASKS FOR BRIAN:\n- a\n- b\n- c\n- d\n- e"), undefined);
+        assert.equal(
+            reportAsksOf("ASKS FOR BRIAN:\n- a\n- b\n- c\n- d").length,
+            4,
+            "4 asks are filed",
+        );
+        // A fenced block is quoted, not said.
+        assert.equal(
+            reportAsksOf("Done.\n\n```\nASKS FOR BRIAN: rotate the key\n```\n\nAll set."),
+            undefined,
+        );
+        assert.equal(
+            reportAsksOf("Done.\n\n~~~\nASKS FOR BRIAN: rotate the key\n~~~\n\nAll set."),
+            undefined,
+        );
+        // The last block is the one that counts.
+        assert.deepEqual(
+            reportAsksOf("ASKS FOR BRIAN: rotate the key\n\nASKS FOR BRIAN: keep it"),
+            [{ question: "keep it" }],
+        );
+
+        // A question keeps its inline code, as written.
+        assert.deepEqual(reportAsksOf("ASKS FOR BRIAN:\n- Pin `ui/v0.6.0` or wait?"), [
+            { question: "Pin `ui/v0.6.0` or wait?" },
+        ]);
+        // A done item is no ask: the rule that holds a thread is the rule that files an ask.
+        assert.deepEqual(reportAsksOf("ASKS FOR BRIAN:\n- You approved this yesterday."), []);
     });
 
     test("asksForBrian gives the items of the last block, without the no's", () => {
