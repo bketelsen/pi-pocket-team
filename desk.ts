@@ -93,17 +93,22 @@ export type Ask = {
     answer?: { at: number; by: string; words: string };
     /** The tool call that filed it: a replay finds it, and adds nothing. */
     key?: string;
-    /** Who filed it: the supervisor's name. */
+    /** Who filed it: the supervisor's name, or the agent's name when `from` is set. */
     by?: string;
+    /** The agent that filed it in a `team_message` report (`asks`): the supervisor did not write it. */
+    from?: string;
+    /** The first wording, kept when the supervisor rewrote the ask: `text` and `options` are the new ones. */
+    rewritten?: { at: number; by: string; text: string; options?: string[] };
     /** The session that filed it: the reminder hook counts it even on a thread of another supervisor. */
     session?: number;
     /** 2 to 6 choices, when the ask is a pick-one decision. */
     options?: string[];
     /**
      * The desk ended the question itself: its reason is gone (an issue closed, or a PR was verified partial work). Set by
-     * the desk, never by Brian, and it never sets `answer`. A resolved ask needs no answer.
+     * the desk, never by Brian, and it never sets `answer`. A resolved ask needs no answer. `by` is the supervisor who
+     * withdrew it (`desk withdraw`); absent when the desk resolved it.
      */
-    resolved?: { at: number; why: string };
+    resolved?: { at: number; why: string; by?: string };
 };
 
 /** Whether an ask waits for Brian: no answer, and the desk did not resolve it. */
@@ -1868,8 +1873,8 @@ const BLOCKED_SAID =
 /**
  * Whether a report says the work is blocked, or asks for a decision: the reason `blocked` or `failed`, the word `BLOCKED`
  * in capitals, a line that starts with `blocked` (any case, after a bullet or bold mark), `needs brian: yes` (any case),
- * a line that starts with `needs a decision` or `decision needed` (any case), or a last paragraph that asks Brian
- * something (`asksBrian`: a question, or the ask words). Code blocks and inline code never count: a report that quotes
+ * a line that starts with `needs a decision` or `decision needed` (any case), a decision for Brian named in words
+ * (`namesDecision`), or a last paragraph that asks Brian something (`asksBrian`: a question, or the ask words). Code blocks and inline code never count: a report that quotes
  * the word `BLOCKED` is not blocked. `BLOCKED` counts only when it is said of the work (`BLOCKED_SAID`): "a BLOCKED
  * report" names a kind of report, and is not blocked. A request to merge or install, with no choice in it, is no
  * decision: the PR's label `ready-for-human` already brings it to Brian.
@@ -1898,8 +1903,86 @@ export function reportBlocks(text: string, reason?: string): boolean {
         }
     }
 
+    if (namesDecision(plain)) {
+        return true;
+    }
+
     // A report whose last paragraph asks Brian something waits for his answer, as a blocked one does.
     return asksBrian(text, { report: true });
+}
+
+/** A sentence that gives Brian a decision: "Brian must decide", "a decision from Brian", "needs Brian's choice". */
+const DECISION_SAID =
+    /\bBrian\s+(?:must|should|needs to|has to|may want to|can)\s+(?:decide|choose|pick|confirm|answer|accept|allow|authori[sz]e|grant|rotate|treat|say)\b|\b(?:decisions?|choices?)\s+(?:for|from)\s+Brian\b|\bneeds?\s+Brian's\s+(?:decision|choice|answer|yes|ok|approval)\b/i;
+
+/** A heading, or a label, that opens a list of things for Brian: "**Needs Brian**", "What is left (needs Brian)". */
+const BRIAN_HEADING =
+    /^(?:what\s+(?:is\s+left\s+)?)?\(?(?:needs\s+brian|decisions?\s+for\s+brian|human\s+decisions?|for\s+brian)\)?\s*:?\s*(.*)$/i;
+
+/** An item that only asks for a merge, an install, a review, or a tag, with no choice: `ready-for-human` covers it. */
+const ROUTINE_ITEM = /\b(?:merge|install|tag|review)\b/i;
+
+/** Whether a sentence says there is nothing for Brian: "Nothing needs Brian", "No decision for Brian". */
+const NO_DECISION =
+    /\b(?:nothing|no(?:\s+\w+)?)\s+(?:needs|for)\s+brian\b|\bno\s+decisions?\b|\bno longer\b/i;
+
+/**
+ * Whether a report names a decision for Brian in words, in the forms agents write: a sentence like "Brian must decide"
+ * or "Decision for Brian:", or a "Needs Brian" heading whose items are more than merges and installs. A sentence that
+ * says there is nothing for Brian does not count, and neither does a plain merge or install request.
+ */
+export function namesDecision(plain: string): boolean {
+    const lines = plain.split("\n");
+
+    for (const sentence of plain.split(/(?<=[.!?])\s+|\n/)) {
+        if (
+            DECISION_SAID.test(sentence) &&
+            !NO_DECISION.test(sentence) &&
+            !NEGATED.test(sentence)
+        ) {
+            return true;
+        }
+    }
+
+    for (const [index, line] of lines.entries()) {
+        const bare = line
+            .replace(/^[\s>#*-]+/, "")
+            .replace(/\*+/g, "")
+            .trim();
+        const heading = BRIAN_HEADING.exec(bare);
+
+        if (heading === null) {
+            continue;
+        }
+
+        // A label with words after it ("Needs Brian: no.") is its own item. A bare heading's items are the list under
+        // it, up to the first line that is not an item.
+        const label = heading[1]!.trim();
+        const items = label === "" ? [] : [label];
+
+        for (const next of label === "" ? lines.slice(index + 1) : []) {
+            const item = /^\s*(?:[-*+]|\d+[.)])\s+(.*)$/.exec(next);
+
+            if (item !== null) {
+                items.push(item[1]!);
+            } else if (next.trim() !== "" || items.length > 0) {
+                break;
+            }
+        }
+
+        if (
+            items.some(
+                (item) =>
+                    !NO_DECISION.test(item) &&
+                    !/^(?:no|none|nothing)\b/i.test(item.trim()) &&
+                    (!ROUTINE_ITEM.test(item) || CHOICE.test(item)),
+            )
+        ) {
+            return true;
+        }
+    }
+
+    return false;
 }
 
 export type CloseFacts = {
@@ -6779,7 +6862,37 @@ export type AskRequest = {
     session?: number;
     /** 2 to 6 choices, each 1 to 40 characters on one line. */
     options?: string[];
+    /** The agent that filed it in a report: stored on the ask, and named in its event. */
+    from?: string;
 };
+
+/** The checked text and options of an ask, or why they are refused. */
+function askShape(
+    text: string,
+    options: readonly string[] | undefined,
+): { text: string; options?: string[] } | { error: string } {
+    const flat = flatLine(text);
+
+    if (flat === "" || flat.length > 500) {
+        return { error: "An ask is 1 to 500 characters, on one line." };
+    }
+
+    if (options === undefined) {
+        return { text: flat };
+    }
+
+    const cleaned = options.map((option) => flatLine(option));
+
+    if (cleaned.length < 2 || cleaned.length > 6) {
+        return { error: "An ask has 2 to 6 options." };
+    }
+
+    if (cleaned.some((option) => option === "" || option.length > 40)) {
+        return { error: "Each option is 1 to 40 characters, on one line." };
+    }
+
+    return { text: flat, options: cleaned };
+}
 
 /**
  * File an ask on a thread, or on a new "ask" thread. Pure over the state: the caller commits it. A thread that closed as
@@ -6796,27 +6909,14 @@ export function addAsk(
         return { threadId: known.thread.id, askId: known.ask.id };
     }
 
-    const text = flatLine(request.text);
+    const shape = askShape(request.text, request.options);
 
-    if (text === "" || text.length > 500) {
-        return { error: "An ask is 1 to 500 characters, on one line." };
+    if ("error" in shape) {
+        return shape;
     }
 
-    let options: string[] | undefined;
-
-    if (request.options !== undefined) {
-        const cleaned = request.options.map((option) => flatLine(option));
-
-        if (cleaned.length < 2 || cleaned.length > 6) {
-            return { error: "An ask has 2 to 6 options." };
-        }
-
-        if (cleaned.some((option) => option === "" || option.length > 40)) {
-            return { error: "Each option is 1 to 40 characters, on one line." };
-        }
-
-        options = cleaned;
-    }
+    const { text, options } = shape;
+    const from = request.from === undefined ? {} : { from: request.from };
 
     if (request.thread === undefined) {
         return { error: "ask needs thread: a thread id, or new." };
@@ -6850,6 +6950,7 @@ export function addAsk(
                     at: request.at,
                     key: request.key,
                     by: request.by,
+                    ...from,
                     ...(request.session === undefined ? {} : { session: request.session }),
                     ...(options === undefined ? {} : { options }),
                 },
@@ -6888,6 +6989,7 @@ export function addAsk(
         at: request.at,
         key: request.key,
         by: request.by,
+        ...from,
         ...(request.session === undefined ? {} : { session: request.session }),
         ...(options === undefined ? {} : { options }),
     });
@@ -6901,18 +7003,133 @@ export function addAsk(
         thread.run.next = nextActor(thread);
     }
 
+    const fromText = request.from === undefined ? "" : ` from ${request.from}`;
+
     addEvent(
         thread,
         `ask:${askId}:${String(request.at)}`,
         reopens
-            ? `ask ${askId} reopened the thread: ${text}${optionsText}`
-            : `ask ${askId}: ${text}${optionsText}`,
+            ? `ask ${askId}${fromText} reopened the thread: ${text}${optionsText}`
+            : `ask ${askId}${fromText}: ${text}${optionsText}`,
         request.at,
     );
 
     return reopens
         ? { threadId: thread.id, askId, reopened: true }
         : { threadId: thread.id, askId };
+}
+
+/**
+ * The supervisor rewrites an open ask: new words, and new options or none. The first wording stays in `rewritten`; a
+ * second rewrite keeps it. The same words again change nothing, so a replay adds no event.
+ */
+export function rewriteAsk(
+    state: DeskState,
+    id: string,
+    request: { text: string; options?: string[]; by: string; at: number },
+): { id: string; already: boolean } | { error: string } {
+    const found = askById(state, id);
+
+    if (found === undefined) {
+        return { error: `There is no ask ${id.toUpperCase()}.` };
+    }
+
+    if (!askIsOpen(found.ask)) {
+        return { error: `Ask ${found.ask.id} is not open: only an open ask can be rewritten.` };
+    }
+
+    const shape = askShape(request.text, request.options);
+
+    if ("error" in shape) {
+        return shape;
+    }
+
+    const ask = found.ask;
+
+    if (
+        ask.text === shape.text &&
+        (ask.options ?? []).join("\n") === (shape.options ?? []).join("\n")
+    ) {
+        return { id: ask.id, already: true };
+    }
+
+    ask.rewritten ??= {
+        at: request.at,
+        by: request.by,
+        text: ask.text,
+        ...(ask.options === undefined ? {} : { options: [...ask.options] }),
+    };
+    ask.text = shape.text;
+
+    if (shape.options === undefined) {
+        delete ask.options;
+    } else {
+        ask.options = shape.options;
+    }
+
+    const optionsText = shape.options === undefined ? "" : ` [${shape.options.join(" | ")}]`;
+
+    addEvent(
+        found.thread,
+        `rewrite:${ask.id}:${String(request.at)}`,
+        `${request.by} rewrote ${ask.id}: ${shape.text}${optionsText}`,
+        request.at,
+    );
+
+    return { id: ask.id, already: false };
+}
+
+/**
+ * The supervisor withdraws an open ask: it needs no answer from Brian. With `into`, it is merged into another open ask,
+ * which must carry the question now. A withdrawn ask is resolved, by the supervisor; an ask that is not open changes
+ * nothing.
+ */
+export function withdrawAsk(
+    state: DeskState,
+    id: string,
+    request: { why?: string; into?: string; by: string; at: number },
+): { id: string; already: boolean } | { error: string } {
+    const found = askById(state, id);
+
+    if (found === undefined) {
+        return { error: `There is no ask ${id.toUpperCase()}.` };
+    }
+
+    if (!askIsOpen(found.ask)) {
+        return { id: found.ask.id, already: true };
+    }
+
+    let why = flatLine(request.why ?? "");
+
+    if (request.into !== undefined) {
+        const target = askById(state, request.into);
+
+        if (target === undefined) {
+            return { error: `There is no ask ${request.into.toUpperCase()}.` };
+        }
+
+        if (target.ask.id === found.ask.id || !askIsOpen(target.ask)) {
+            return { error: `Merge into another open ask, not ${target.ask.id}.` };
+        }
+
+        why = why === "" ? `merged into ${target.ask.id}` : `merged into ${target.ask.id}: ${why}`;
+    }
+
+    if (why === "" || why.length > 300) {
+        return { error: "withdraw needs words: why Brian need not answer, 1 to 300 characters." };
+    }
+
+    found.ask.resolved = { at: request.at, why, by: request.by };
+    // Brian is next no more when this was his last open ask: the page shows it at once, not at the next sweep.
+    found.thread.run.next = nextActor(found.thread);
+    addEvent(
+        found.thread,
+        `withdrawn:${found.ask.id}:${String(request.at)}`,
+        `${request.by} withdrew ${found.ask.id}: ${why}`,
+        request.at,
+    );
+
+    return { id: found.ask.id, already: false };
 }
 
 /** Record Brian's answer to an ask. An ask that is answered already changes nothing. */
@@ -7271,9 +7488,9 @@ function threadFile(
         for (const ask of thread.asks) {
             lines.push(
                 ask.answer === undefined && ask.resolved !== undefined
-                    ? `- ${ask.id} · resolved by the desk · ${iso(ask.resolved.at)} · ${md(ask.resolved.why)} · ${md(ask.text)}`
+                    ? `- ${ask.id} · ${ask.resolved.by === undefined ? "resolved by the desk" : `withdrawn by ${md(ask.resolved.by)}`} · ${iso(ask.resolved.at)} · ${md(ask.resolved.why)} · ${md(ask.text)}`
                     : ask.answer === undefined
-                      ? `- ${ask.id} · open · ${md(ask.text)}${ask.options === undefined ? "" : ` [${ask.options.map(md).join(" | ")}]`}`
+                      ? `- ${ask.id} · open${ask.from === undefined ? "" : ` · from ${md(ask.from)}`} · ${md(ask.text)}${ask.options === undefined ? "" : ` [${ask.options.map(md).join(" | ")}]`}`
                       : `- ${ask.id} · answered by ${md(ask.answer.by)} · ${iso(ask.answer.at)} · ${md(ask.answer.words)}`,
             );
         }
@@ -7472,11 +7689,12 @@ export type ThreadView = {
         /** The label `ready-for-human` is on the PR. */
         ready?: boolean;
     }[];
-    asks: { id: string; text: string; at: number }[];
+    /** Open asks; `from` is the agent that filed one in a report. */
+    asks: { id: string; text: string; at: number; options?: string[]; from?: string }[];
     /** Answered asks, with the words that were recorded. */
     answered: { id: string; text: string; by: string; at: number; words: string }[];
-    /** Asks that the desk resolved itself, with the reason: they need no answer. */
-    resolved: { id: string; text: string; at: number; why: string }[];
+    /** Asks that need no answer, with the reason: the desk resolved them, or the supervisor `by` withdrew them. */
+    resolved: { id: string; text: string; at: number; why: string; by?: string }[];
     lastEventAt: number;
     events: { at: number; text: string }[];
     supervisor?: number;
@@ -7558,6 +7776,7 @@ export function threadView(
                 text: ask.text,
                 at: ask.at,
                 ...(ask.options === undefined ? {} : { options: [...ask.options] }),
+                ...(ask.from === undefined ? {} : { from: ask.from }),
             })),
         answered: thread.asks
             .filter((ask) => ask.answer !== undefined)
@@ -7575,6 +7794,7 @@ export function threadView(
                 text: ask.text,
                 at: ask.resolved!.at,
                 why: ask.resolved!.why,
+                ...(ask.resolved!.by === undefined ? {} : { by: ask.resolved!.by }),
             })),
         lastEventAt: thread.lastEventAt,
         events: thread.events.slice(-SHOWN_EVENTS).map((event) => ({
@@ -7830,7 +8050,7 @@ export function readText(state: Readonly<DeskState> | undefined, id: string): st
             : `Asks:\n${thread.asks
                   .map(
                       (ask) =>
-                          `  ${ask.id} · ${ask.answer !== undefined ? `answered by ${ask.answer.by}: "${ask.answer.words}"` : ask.resolved !== undefined ? `resolved by the desk: ${ask.resolved.why}` : "open"} · ${ask.text}${ask.options === undefined ? "" : ` [${ask.options.join(" | ")}]`}`,
+                          `  ${ask.id} · ${ask.answer !== undefined ? `answered by ${ask.answer.by}: "${ask.answer.words}"` : ask.resolved !== undefined ? `${ask.resolved.by === undefined ? "resolved by the desk" : `withdrawn by ${ask.resolved.by}`}: ${ask.resolved.why}` : "open"}${ask.from === undefined ? "" : ` · from ${ask.from}`}${ask.rewritten === undefined ? "" : ` · rewritten by ${ask.rewritten.by}`} · ${ask.text}${ask.options === undefined ? "" : ` [${ask.options.join(" | ")}]`}`,
                   )
                   .join("\n")}`,
         events.length === 0
@@ -8015,6 +8235,12 @@ export type FileRequest = {
     digest?: true;
     /** The night shift's stop reason: `blocked` and `failed` go at once. */
     reason?: string;
+    /** The agent's own word on the work (`team_message`): `blocked` holds the thread, as a BLOCKED report does. */
+    status?: "done" | "working" | "blocked";
+    /** Decisions for Brian, filed as asks on the thread in the same commit as the report. */
+    asks?: { question: string; options?: string[] }[];
+    /** The agent's name: the asks are filed by it. */
+    by?: string;
 };
 
 /** A Clerk's registration, as `team.ts` hands it over: the Clerk, and its supervisor. */
@@ -8030,7 +8256,7 @@ export type DeskApi = {
         tx: Tx,
         session: ConversationId,
         request: FileRequest,
-    ) => Promise<{ thread: Thread; line: string; held?: boolean } | undefined>;
+    ) => Promise<{ thread: Thread; line: string; held?: boolean; asked?: string[] } | undefined>;
     /** Register a supervisor's Clerk. The same values twice change nothing, and nothing else is added. */
     clerk: (tx: Tx, request: ClerkRequest) => Promise<void>;
     /** The supervisor's Clerk, for the check before a Clerk starts: no write. */
@@ -8169,18 +8395,66 @@ export default function createDesk(host: Host, web: Web) {
 
             // A replay: the stored report says whether the digest held it, so the caller sends nothing again.
             if (same !== undefined) {
+                const asked = Object.values(state.threads).flatMap((each) =>
+                    each.asks
+                        .filter((ask) => ask.key?.startsWith(`${request.key}:ask:`) === true)
+                        .map((ask) => ask.id),
+                );
+
                 return {
                     thread: copyThread(thread),
                     line: same.line,
                     held: same.held === true,
+                    ...(asked.length === 0 ? {} : { asked }),
                 };
             }
 
-            const line = shortLine(thread, {
+            // The report's asks go on the thread in this commit: Brian sees them at once, and Odrade may rewrite, merge or
+            // withdraw them. Each has its own key under the report's, so a replay files none twice. A refused ask is an
+            // event, and holds the thread as a blocked report does: the decision is in the text only.
+            const filedAsks: string[] = [];
+            let refused = false;
+            let reopened = false;
+
+            for (const [index, ask] of (request.asks ?? []).entries()) {
+                const added = addAsk(state, {
+                    thread: thread.id,
+                    text: ask.question,
+                    ...(ask.options === undefined ? {} : { options: ask.options }),
+                    key: `${request.key}:ask:${String(index)}`,
+                    by: request.by ?? "agent",
+                    ...(request.by === undefined ? {} : { from: request.by }),
+                    supervisor: thread.supervisor ?? Number(session),
+                    session: Number(session),
+                    at: request.at,
+                });
+
+                if ("error" in added) {
+                    refused = true;
+                    addEvent(
+                        thread,
+                        `ask-refused:${request.key}:${String(index)}`,
+                        `ask from ${request.by ?? "the agent"} refused: ${added.error}`,
+                        request.at,
+                    );
+                } else {
+                    filedAsks.push(added.askId);
+                    reopened ||= added.reopened === true;
+                }
+            }
+
+            // The page and the list show Brian as next at once, not at the next sweep.
+            if (filedAsks.length > 0) {
+                thread.run.next = nextActor(thread);
+            }
+
+            const reported = shortLine(thread, {
                 from: request.from,
                 text: request.text,
                 quote: host.text.quoted(request.text, 80),
             });
+            const line =
+                filedAsks.length === 0 ? reported : `${reported} · asks ${filedAsks.join(", ")}`;
 
             // The session's newest user entry, read before this commit writes a task: a transaction cannot read tables
             // after its first table write.
@@ -8238,8 +8512,13 @@ export default function createDesk(host: Host, web: Web) {
             thread.run.reportedAt = request.at;
 
             // A later report replaces it: only the newest report counts. `false` is not absent: an absent flag is a
-            // thread that the desk did not derive yet.
-            thread.run.reportBlocked = reportBlocks(request.text, request.reason);
+            // thread that the desk did not derive yet. Filed asks hold the thread by themselves, so the text then
+            // decides nothing; without them the text is read, whatever the status says, so a decision named only in
+            // words still holds the thread.
+            thread.run.reportBlocked =
+                request.status === "blocked" ||
+                refused ||
+                (filedAsks.length === 0 && reportBlocks(request.text, request.reason));
 
             if (newest !== undefined) {
                 thread.run.reportedUserEntry = newest;
@@ -8252,7 +8531,17 @@ export default function createDesk(host: Host, web: Web) {
                 request.at,
             );
 
-            return { thread: copyThread(thread), line, ...(held ? { held: true } : {}) };
+            // An ask opened a closed thread again: its supervisor's sweeper may have ended with the last open thread.
+            if (reopened && thread.supervisor !== undefined) {
+                await startSweeper(tx, thread.supervisor);
+            }
+
+            return {
+                thread: copyThread(thread),
+                line,
+                ...(held ? { held: true } : {}),
+                ...(filedAsks.length === 0 ? {} : { asked: filedAsks }),
+            };
         },
         clerk: async (tx, request) => {
             const state = await tx.doc(DeskThreads);
@@ -12449,7 +12738,7 @@ export default function createDesk(host: Host, web: Web) {
     const tool = defineTool({
         name: "desk",
         description:
-            "The desk of threads for work the team runs in the background. A supervisor session can use every action; a Clerk can use list, read, sync, attach, detach, watch, result, send, and issues for its supervisor's threads; an agent session can use watch and result on its own thread only. Actions: list (one line per open thread), read (one thread in full), sync (observe the threads now, with linked sessions, Night shift, git, and GitHub), seed (import a seed.json file one time), attach (put a PR, a queued issue, or all of another thread's work, on one thread), detach (take a PR off a thread for good: the sweep does not attach or find it again; only attach brings it back), own (mark a found PR thread as Brian's own: it closes, and no sweep finds its PR again), ask (file a question for Brian on a thread, or on a new one), answer (record Brian's words for an ask), watch (set a dated check on a thread: it sleeps until that date, and does not count toward the cap), result (record that check's pass, which closes the thread, or its fail, which opens it again), send (send 1 message from the supervisor's session to a thread's agent), issues (read the issues Brian queued on GitHub: read only).",
+            "The desk of threads for work the team runs in the background. A supervisor session can use every action; a Clerk can use list, read, sync, attach, detach, watch, result, send, and issues for its supervisor's threads; an agent session can use watch and result on its own thread only. Actions: list (one line per open thread), read (one thread in full), sync (observe the threads now, with linked sessions, Night shift, git, and GitHub), seed (import a seed.json file one time), attach (put a PR, a queued issue, or all of another thread's work, on one thread), detach (take a PR off a thread for good: the sweep does not attach or find it again; only attach brings it back), own (mark a found PR thread as Brian's own: it closes, and no sweep finds its PR again), ask (file a question for Brian on a thread, or on a new one), rewrite (give an open ask new words, and new options or none: an agent's ask is filed as it wrote it, so make it clear for Brian), withdraw (end an open ask that Brian need not answer, with words saying why, or with into to merge it into another open ask), answer (record Brian's words for an ask), watch (set a dated check on a thread: it sleeps until that date, and does not count toward the cap), result (record that check's pass, which closes the thread, or its fail, which opens it again), send (send 1 message from the supervisor's session to a thread's agent), issues (read the issues Brian queued on GitHub: read only).",
         parameters: Type.Object({
             action: Type.Union([
                 Type.Literal("list"),
@@ -12460,6 +12749,8 @@ export default function createDesk(host: Host, web: Web) {
                 Type.Literal("detach"),
                 Type.Literal("own"),
                 Type.Literal("ask"),
+                Type.Literal("rewrite"),
+                Type.Literal("withdraw"),
                 Type.Literal("answer"),
                 Type.Literal("watch"),
                 Type.Literal("result"),
@@ -12481,7 +12772,7 @@ export default function createDesk(host: Host, web: Web) {
             text: Type.Optional(
                 Type.String({
                     description:
-                        "ask: the question for Brian, 1 to 500 characters, on one line; watch: the check, 1 to 200 characters; result: what happened, 1 to 200 characters; send: the message to the thread's agent, 1 to 2000 characters",
+                        "ask, rewrite: the question for Brian, 1 to 500 characters, on one line; watch: the check, 1 to 200 characters; result: what happened, 1 to 200 characters; send: the message to the thread's agent, 1 to 2000 characters",
                 }),
             ),
             title: Type.Optional(
@@ -12494,13 +12785,24 @@ export default function createDesk(host: Host, web: Web) {
                     minItems: 2,
                     maxItems: 6,
                     description:
-                        "ask: 2 to 6 choices for a pick-one decision, each 1 to 40 characters",
+                        "ask, rewrite: 2 to 6 choices for a pick-one decision, each 1 to 40 characters; a rewrite without options has none",
                 }),
             ),
-            ask: Type.Optional(Type.String({ description: "answer: the ask's id, such as T13c" })),
+            ask: Type.Optional(
+                Type.String({
+                    description: "answer, rewrite, withdraw: the ask's id, such as T13c",
+                }),
+            ),
+            into: Type.Optional(
+                Type.String({
+                    description:
+                        "withdraw: the open ask that now carries this question, such as T13a: the two are merged",
+                }),
+            ),
             words: Type.Optional(
                 Type.String({
-                    description: "answer: Brian's words as he wrote them, 1 to 1000 characters",
+                    description:
+                        "answer: Brian's words as he wrote them, 1 to 1000 characters; withdraw: why Brian need not answer, 1 to 300 characters (optional with into)",
                 }),
             ),
             path: Type.Optional(
@@ -12553,7 +12855,13 @@ export default function createDesk(host: Host, web: Web) {
                     );
                 }
 
-                if (args.action === "ask" || args.action === "answer" || args.action === "seed") {
+                if (
+                    args.action === "ask" ||
+                    args.action === "rewrite" ||
+                    args.action === "withdraw" ||
+                    args.action === "answer" ||
+                    args.action === "seed"
+                ) {
                     throw new Error(
                         "Only the supervisor files asks, records Brian's answers, and seeds the desk. Escalate to your supervisor.",
                     );
@@ -12694,6 +13002,49 @@ export default function createDesk(host: Host, web: Web) {
                     result.reopened === true
                         ? `Filed ${result.askId}. ${result.threadId} was closed: the ask opened it again.`
                         : `Filed ${result.askId}.`,
+                );
+            }
+
+            if (args.action === "rewrite" || args.action === "withdraw") {
+                const asked = args.ask?.trim() ?? "";
+
+                if (asked === "") {
+                    throw new Error(`${args.action} needs ask: an ask id such as T13c.`);
+                }
+
+                const at = Date.now();
+                const result = await api.commit(async (tx) => {
+                    const state = await tx.doc(DeskThreads);
+
+                    return args.action === "rewrite"
+                        ? rewriteAsk(state, asked, {
+                              text: args.text ?? "",
+                              ...(args.options === undefined ? {} : { options: args.options }),
+                              by: persona.name,
+                              at,
+                          })
+                        : withdrawAsk(state, asked, {
+                              ...(args.words === undefined ? {} : { why: args.words }),
+                              ...(args.into === undefined ? {} : { into: args.into.trim() }),
+                              by: persona.name,
+                              at,
+                          });
+                }, context);
+
+                if ("error" in result) {
+                    throw new Error(result.error);
+                }
+
+                await exportNow(api, context);
+
+                return reply(
+                    result.already
+                        ? args.action === "rewrite"
+                            ? `${result.id} has these words already.`
+                            : `${result.id} is not open: nothing changed.`
+                        : args.action === "rewrite"
+                          ? `Rewrote ${result.id}.`
+                          : `Withdrew ${result.id}: Brian need not answer it.`,
                 );
             }
 

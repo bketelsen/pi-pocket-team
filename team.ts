@@ -275,7 +275,7 @@ ${
         ? "You own the team, not this conversation's repository. Do work directly when helpful. Use team_delegate for a specialist; select their repository by its roster name and give a self-contained task. Their task starts in that repository regardless of your folder. A greeting needs no audit of old work."
         : persona.role === "clerk"
           ? "You are the desk clerk of your supervisor. Desk digests arrive as messages whose lines start with [desk]. Escalate to your supervisor with team_message to the return address in your first message."
-          : "Do your assigned work directly. For a linked task, report the result once with team_message to the return address in its initial message."
+          : "Do your assigned work directly. For a linked task, report the result once with team_message to the return address in its initial message. Set its status. Put each decision you need from Brian in its asks, 1 question each, with options when it is a pick-one: a decision written only in the text can be missed. A plain merge or install request is no ask: the PR's label brings it to Brian."
 }`;
 
 const reply = (text: string) => ({ output: [{ type: "text" as const, text }] });
@@ -902,8 +902,16 @@ export default function createTeam(host: Host, web: Web) {
                 at: number;
                 /** The desk puts the report in the supervisor's digest: `held` says it did. */
                 digest?: true;
+                /** The agent's word on the work: `blocked` holds the thread. */
+                status?: "done" | "working" | "blocked";
+                /** Decisions for Brian: each is filed as an ask on the thread, in the report's commit. */
+                asks?: { question: string; options?: string[] }[];
+                /** The agent's name, as the asks' author. */
+                by?: string;
             },
-        ) => Promise<{ thread: DeskThread; line: string; held?: boolean } | undefined>;
+        ) => Promise<
+            { thread: DeskThread; line: string; held?: boolean; asked?: string[] } | undefined
+        >;
         /** Register a supervisor's Clerk. The same values twice change nothing. */
         clerk: (
             tx: Tx,
@@ -1006,7 +1014,7 @@ export default function createTeam(host: Host, web: Web) {
         request: DelegatedGoal,
         worktree?: DelegationWorktree,
     ) =>
-        `${taskText(persona, task, worktree)}\n\nThis task runs as a night shift. Round 1 comes as a separate message that starts with [night-shift], ${request.startLabel === undefined ? "now" : `at ${request.startLabel}`}. Answer this message with one short line only, and do the work in the rounds. The night shift reports to the source session by itself when it stops: do not send a report with team_message.`;
+        `${taskText(persona, task, worktree)}\n\nThis task runs as a night shift. Round 1 comes as a separate message that starts with [night-shift], ${request.startLabel === undefined ? "now" : `at ${request.startLabel}`}. Answer this message with one short line only, and do the work in the rounds. The night shift reports to the source session by itself when it stops: do not send a report with team_message. A decision you need from Brian is the one exception: send it at once with team_message, status working or blocked, and the decision in its asks.`;
 
     /** Tell the tabs that a session's identity changed: the id only, so each tab asks the route (which checks access). */
     const identityChanged = (conversationId: ConversationId) =>
@@ -1531,15 +1539,54 @@ export default function createTeam(host: Host, web: Web) {
     const message = defineTool({
         name: "team_message",
         description:
-            "Send a task follow-up or final report to a linked-session address. It returns when admitted, without waiting for an answer.",
+            "Send a task follow-up or final report to a linked-session address. It returns when admitted, without waiting for an answer. In a report to your supervisor, set status, and put each decision you need from Brian in asks: each becomes an ask on the desk thread, which Brian sees at once and your supervisor may rewrite, merge or withdraw. A plain merge or install request is no ask.",
         parameters: Type.Object({
             to: Type.String(),
             message: Type.String({ minLength: 1, maxLength: 6000 }),
+            status: Type.Optional(
+                Type.Union(
+                    [Type.Literal("done"), Type.Literal("working"), Type.Literal("blocked")],
+                    {
+                        description:
+                            "done: the task is finished; working: more work follows; blocked: you cannot go on without someone else",
+                    },
+                ),
+            ),
+            asks: Type.Optional(
+                Type.Array(
+                    Type.Object({
+                        question: Type.String({
+                            minLength: 1,
+                            maxLength: 500,
+                            description:
+                                "1 decision for Brian, on 1 line, with the facts he needs to answer it",
+                        }),
+                        options: Type.Optional(
+                            Type.Array(Type.String({ minLength: 1, maxLength: 40 }), {
+                                minItems: 2,
+                                maxItems: 6,
+                                description: "2 to 6 choices when it is a pick-one decision",
+                            }),
+                        ),
+                    }),
+                    { maxItems: 4 },
+                ),
+            ),
         }),
         replay: "safe",
         execute: async (args, api, context) => {
             const key = `x.team.message:${api.taskId}:${api.callId}`;
             const desk = deskApi();
+            const asks = args.asks ?? [];
+            const sender =
+                desk === undefined || asks.length === 0
+                    ? undefined
+                    : await published.persona(api, api.conversationId, context);
+            // The asks are in the text too: a reader of the report, or of a message that is no report, sees them.
+            const text =
+                asks.length === 0
+                    ? args.message
+                    : `${args.message}\n\nDecisions for Brian:\n${asks.map((ask) => `- ${ask.question}${ask.options === undefined ? "" : ` [${ask.options.join(" | ")}]`}`).join("\n")}`;
 
             // A report to the thread's supervisor is filed on the thread in one commit with the send's key, so a replay
             // finds it and sends the same line once. A message to anyone else goes as before. With the desk's digest on,
@@ -1553,9 +1600,12 @@ export default function createTeam(host: Host, web: Web) {
                                   to: args.to,
                                   key,
                                   from: "team_message",
-                                  text: args.message,
+                                  text,
                                   at: Date.now(),
                                   digest: true,
+                                  ...(args.status === undefined ? {} : { status: args.status }),
+                                  ...(asks.length === 0 ? {} : { asks }),
+                                  ...(sender === undefined ? {} : { by: sender.name }),
                               }),
                           context,
                       );
@@ -1563,17 +1613,27 @@ export default function createTeam(host: Host, web: Web) {
             if (filed?.held !== true) {
                 await host.linkedSessions.send(
                     api.conversationId,
-                    { to: args.to, message: filed?.line ?? args.message },
+                    { to: args.to, message: filed?.line ?? text },
                     key,
                 );
             }
 
+            // A desk that predates asks files none: the text still carries them.
+            const filedAsks = filed?.asked ?? [];
+            const asked =
+                filed === undefined || asks.length === 0
+                    ? ""
+                    : filedAsks.length === asks.length
+                      ? ` Filed for Brian: ${filedAsks.join(", ")}.`
+                      : ` ${String(asks.length - filedAsks.length)} of your asks were refused, and are in the report's text only: your supervisor sees them there.${filedAsks.length === 0 ? "" : ` Filed for Brian: ${filedAsks.join(", ")}.`}`;
+
             return reply(
-                filed === undefined
+                (filed === undefined
                     ? "Message sent. Do not send an acknowledgement or wait for a reply."
                     : filed.held === true
                       ? `Filed on ${filed.thread.id}. Your supervisor gets it in the next desk digest. Do not send an acknowledgement or wait for a reply.`
-                      : `Filed on ${filed.thread.id}. Your supervisor got 1 line. Do not send an acknowledgement or wait for a reply.`,
+                      : `Filed on ${filed.thread.id}. Your supervisor got 1 line. Do not send an acknowledgement or wait for a reply.`) +
+                    asked,
             );
         },
     });
