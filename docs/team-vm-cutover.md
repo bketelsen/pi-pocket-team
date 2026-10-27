@@ -544,14 +544,41 @@ that the restore leaves:
 - A VM with no Pocket data, before the cut-over: start again at step 1.
 - A restored Incus snapshot from before the cut-over: start at step 2.
 - **A VM rebuilt from the daily backup, after the cut-over** (the backup holds `.pi-pocket`, `.pi/agent`,
-  `.config/pi-pocket-team`, `agents` and the truenas `.envrc`, but no checkouts): the restored data is newer than
-  framework's copy, so **skip steps 2, 3 and 4** (no drain, no stop on framework, no copy) and never copy framework's
-  data over it. Do step 1 without its data: the tools, the checkouts, with Pocket at the tag that the backup ran (the backup manifest records
-  `git -C ~/projects/pi-pocket describe --tags` at each backup; a database must never go to an older Pocket), the truenas build (keep the restored
-  `.envrc`), Chromium, Tailscale and the unit. Then step 5 (the links), check that step 6's rewrites are in the
-  restored files (`grep -rn /var/home/bjk ~/.config/pi-pocket-team ~/.pi/agent/prompts ~/.pi/agent/trust.json`
-  finds nothing), then step 7 with the instance that ran before (`tailscale-serve` after go-live), and the checks of
-  step 8. The one-server rule holds: framework stays stopped.
+  `.config/pi-pocket-team`, `agents` and `projects/truenas-mcp/.envrc`, but no checkouts): the restored data is newer
+  than framework's copy, so **skip steps 2, 3 and 4** (no drain, no stop on framework, no copy), and never copy
+  framework's data over it. Framework stays stopped (one server only). As `team`, then as `fleet` where it says so:
+    1. `TAG` is the field `pocket_version` of the backup's `manifest.json`
+       (`python3 -c 'import json; print(json.load(open("manifest.json"))["pocket_version"])'`). Pocket must run at this
+       tag or newer, never older. When it is `null`, **Brian:** decides the tag; stop until then.
+    2. Step 1 without its data. The restored `.envrc` makes `~/projects/truenas-mcp` a folder that is not empty, so
+       clone it beside and move the file in:
+
+        ```sh
+        cd ~/projects
+        gh repo clone bketelsen/truenas-mcp truenas-mcp.new
+        mv truenas-mcp/.envrc truenas-mcp.new/.envrc && rmdir truenas-mcp && mv truenas-mcp.new truenas-mcp
+        stat -c '%a %U' truenas-mcp/.envrc     # 600 team
+        ```
+
+        Do the other parts of step 1 as written (Pocket at `TAG`, the drop-ins, the profile repositories, the truenas
+        build, Chromium, Tailscale, the unit). Skip the key write in step 1.4: the file is restored.
+
+    3. Step 5 (the links).
+    4. Check that step 6's rewrites are in the restored active files. The `.bak` copies of step 6 keep the old paths
+       on purpose, so leave them out:
+       `grep -rn --exclude='*.bak' /var/home/bjk ~/.config/pi-pocket-team ~/.pi/agent/prompts ~/.pi/agent/trust.json`
+       finds nothing.
+    5. As `fleet`, start and enable the instance that ran before (`tailscale-serve` after go-live; fleet's rebuild
+       installs the unit but enables nothing), and keep the other one stopped and disabled:
+
+        ```sh
+        sudo systemctl disable --now pi-pocket@local
+        sudo systemctl enable --now pi-pocket@tailscale-serve
+        systemctl is-enabled pi-pocket@tailscale-serve pi-pocket@local    # enabled, disabled
+        ```
+
+    6. The checks of step 8. The sign-in link and the cookies stay valid (the owner token is in the restored
+       `config.json`), when the Tailscale name `pocket` is the same.
 
 ## Not in this runbook
 
