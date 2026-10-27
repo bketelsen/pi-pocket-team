@@ -84,10 +84,9 @@ keys have no passphrase: after a reboot nobody is there to unlock them. Their fi
 
 ## 1. Prepare the VM (no Pocket data yet; framework keeps running)
 
-1. **Tools.** Fleet installs a pinned `gh` and Node 24.22.1 or newer in `/usr/local/bin` (Snow's `/usr` is
-   read-only; `/usr/local` is not). Pocket's docs/systemd.md wants a system Node. If fleet has no Node there, install
-   it for `team` with mise (`curl -fsSL https://mise.run | sh; mise use -g node@24`) and use mise's absolute Node
-   path in the unit (step 7).
+1. **Tools.** Fleet's `team_vm` role installs a pinned `gh` and Node.js 24.22.1 or newer (24.x, under
+   `/usr/local/lib/fleet`, linked as `node`, `npm` and `npx` in `/usr/local/bin`; Snow's `/usr` is read-only,
+   `/usr/local` is not). Pocket's docs/systemd.md wants a system Node, and the unit uses `/usr/local/bin/node`.
 
     ```sh
     command -v node gh; node -v; gh --version
@@ -156,44 +155,67 @@ keys have no passphrase: after a reboot nobody is there to unlock them. Their fi
     tailscale status | head -3     # as team: the node pocket is online
     ```
 
-7. **The systemd unit** (a system unit, run as `team`; it starts at boot with no login). Copy Pocket's template
-   and edit the copy (docs/systemd.md, "run as an existing user"):
-
-    As `fleet` (Teg's role can own this file as a template with the same lines):
-
-    ```sh
-    sudo cp /var/home/team/projects/pi-pocket/contrib/systemd/pi-pocket@.service /etc/systemd/system/
-    sudoedit /etc/systemd/system/pi-pocket@.service
-    ```
-
-    Set these lines; leave the others as shipped. `NODE` is `/usr/local/bin` (fleet's Node), or with the mise
-    fallback the absolute folder of `mise which node` (a service does not see mise's shell setup).
+7. **The systemd unit** (a system unit, run as `team`; it starts at boot with no login). Fleet's `team_vm` role owns
+   `/etc/systemd/system/pi-pocket@.service`: it installs this exact file and runs `systemctl daemon-reload`, and never
+   enables, starts or restarts an instance. The file is Pocket's `contrib/systemd/pi-pocket@.service` (v0.25.0)
+   with these changes: user `team`, the paths under `/var/home/team`, `/usr/local/bin/node`, no `StateDirectory`
+   (the data folder is not `/var/lib/pi-pocket`), and `UnsetEnvironment` (headless, T330a). Check that the installed
+   file is this one:
 
     ```ini
+    # Pi Pocket on the team VM, from Pi Pocket's contrib/systemd/pi-pocket@.service (v0.25.0), run as the team user.
+    # The instance name is the access mode: pi-pocket@local (first start of the cut-over) or pi-pocket@tailscale-serve.
+    # Managed by fleet (team_vm role): it installs this file and runs daemon-reload only. Brian enables, starts and stops.
+    # Source of the values: bketelsen/pi-pocket-team docs/team-vm-cutover.md, step 7.
+
+    [Unit]
+    Description=Pi Pocket (%i access)
+    Documentation=https://github.com/TannerMidd/pi-pocket/blob/main/docs/systemd.md
+    Wants=network-online.target
+    After=network-online.target tailscaled.service
+
+    [Service]
+    Type=simple
     User=team
     Group=team
+
     Environment=POCKET_HOME=/var/home/team/projects/pi-pocket
     Environment=HOME=/var/home/team
-    Environment=PATH=NODE:/var/home/team/.local/bin:/usr/local/bin:/usr/bin:/bin
-    WorkingDirectory=/var/home/team/agents
-    ExecStart=NODE/node ${POCKET_HOME}/bin/pi-pocket.js --access %i --port 8787 --data /var/home/team/.pi-pocket --cwd /var/home/team/agents
+    Environment=PATH=/var/home/team/.local/share/mise/shims:/var/home/team/.local/bin:/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin
+    EnvironmentFile=-/etc/pi-pocket.env
+    # Headless (T330a): no keyring agent, no display. ssh uses the key files in ~/.ssh/config.
     UnsetEnvironment=SSH_AUTH_SOCK DISPLAY WAYLAND_DISPLAY
-    # remove: StateDirectory=pi-pocket and StateDirectoryMode=0700 (the data folder is not /var/lib/pi-pocket)
-    ```
 
-    The unit runs with no login and no desktop: ssh uses the key files in `~/.ssh/config`, gh the token file, and the
-    browser tool Chromium headless. Linger (Teg) keeps the team user's own systemd manager running for nsl machines.
+    WorkingDirectory=/var/home/team/agents
+
+    # %i is the access mode: local, lan, cloudflare, tailscale, or tailscale-serve.
+    ExecStart=/usr/local/bin/node ${POCKET_HOME}/bin/pi-pocket.js --access %i --port 8787 --data /var/home/team/.pi-pocket --cwd /var/home/team/agents
+
+    Restart=on-failure
+    RestartSec=5
+    KillMode=mixed
+    TimeoutStopSec=20
+
+    UMask=0077
+    LimitNOFILE=65536
+
+    NoNewPrivileges=yes
+    PrivateTmp=yes
+
+    [Install]
+    WantedBy=multi-user.target
+    ```
 
     Keep `NoNewPrivileges=yes` (agents need no sudo on the VM) and `PrivateTmp=yes`. If nsl machines fail under the
-    unit (systemd-vmspawn), remove `NoNewPrivileges` first and say so in the cut-over report. With the mise fallback,
-    edit `NODE` when Node's version changes, and run `sudo systemctl daemon-reload`.
-
-    ```sh
-    sudo systemctl daemon-reload            # as fleet; do not enable or start it yet
-    ```
+    unit (systemd-vmspawn), remove `NoNewPrivileges` first (a fleet PR) and say so in the cut-over report.
+    `WorkingDirectory` must exist before a start: step 4 makes `~/agents`. The unit runs with no login and no
+    desktop: ssh uses the key files in `~/.ssh/config` (`IdentitiesOnly yes`, `IdentityAgent none`), gh the token
+    file, and the browser tool Chromium headless. Linger (fleet) keeps the team user's own systemd manager running
+    for nsl machines.
 
     `team` has no sudo, so only `fleet` (Brian or Teg) starts and stops the unit. Brian controls restarts; Menu →
-    **Update Pi Pocket** restarts Pocket from inside, as `team`.
+    **Update Pi Pocket** restarts Pocket from inside, as `team`. When Pocket's own template changes in a release,
+    compare it with this file before the update.
 
 8. **Snapshot.** Teg or **Brian:** on minideb, `incus snapshot create --project team team pre-cutover-DATE`.
 
