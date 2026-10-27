@@ -37,7 +37,15 @@ import type { ConversationId } from "@earendil-works/pi-durable";
 import { fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import { createHandler } from "./_pocket/src/server/http.ts";
 import { DeskThreads, threadOfSession } from "./desk.ts";
-import { guardRoster, Identity, roster, taskTarget, worktreeInUse, type TeamApi } from "./team.ts";
+import {
+    guardRoster,
+    Identity,
+    pinDecision,
+    roster,
+    taskTarget,
+    worktreeInUse,
+    type TeamApi,
+} from "./team.ts";
 
 const definitions = join(root, "agents");
 const repoA = join(root, "nsl");
@@ -48,6 +56,10 @@ const homeMoneo = join(root, "homes", "moneo");
 const homeLeto = join(root, "homes", "leto");
 // A repository whose folder has a space in its name: a tool path may write that space as a no-break space.
 const repoSpace = join(root, "sp ace");
+// A session's folder as Pocket stores it: through a link, so the tool's paths are spelled with the link's name.
+const alias = join(root, "alias");
+const aliasHome = join(alias, "duncan");
+const aliasRepo = join(alias, "repo");
 // The sibling worktree a delegation of frostyard/nsl would get: never a target from a home.
 const sibling = join(root, "nsl--duncan-deadbeef");
 
@@ -124,6 +136,14 @@ const model = scriptedModel((ctx) => {
             path: `${join(root, "sp\u00A0ace")}/space.txt`,
             content: "no\n",
         });
+    }
+
+    if (text.endsWith("guard-dangling")) {
+        return tool("write", { path: "dangling.txt", content: "no\n" });
+    }
+
+    if (text.endsWith("guard-alias")) {
+        return tool("write", { path: "../repo/file.txt", content: "no\n" });
     }
 
     if (text.endsWith("guard-outside")) {
@@ -209,6 +229,14 @@ before(async () => {
 
     // A symlink to a repository: the guard must judge where it leads, also for a file not made yet.
     symlinkSync(repoA, join(homeDuncan, "repo-link"));
+    // A dangling link to a file that is not there yet: a write through it would land in the repository.
+    symlinkSync(join(repoA, "later.txt"), join(homeDuncan, "dangling.txt"));
+    // The same home, reached through a link, with a repository beside it.
+    mkdirSync(join(root, "real", "homes"), { recursive: true });
+    mkdirSync(join(root, "real", "homes", "duncan"), { recursive: true });
+    mkdirSync(alias, { recursive: true });
+    mkdirSync(aliasRepo, { recursive: true });
+    symlinkSync(join(root, "real", "homes", "duncan"), aliasHome);
 
     writeFileSync(
         join(definitions, "odrade.md"),
@@ -234,6 +262,10 @@ before(async () => {
     writeFileSync(
         join(definitions, "thufir.md"),
         `---\nhome: ${homeTwin}\n---\n# Thufir Hawat\nYou are Thufir Hawat.`,
+    );
+    writeFileSync(
+        join(definitions, "fenring.md"),
+        `---\nhome: ${aliasHome}\nrepositories:\n  frostyard/alias: ${aliasRepo}\n---\n# Fenring\nYou are Fenring. Plan from the home behind the link.`,
     );
     writeFileSync(
         join(definitions, "shaddam.md"),
@@ -636,6 +668,32 @@ test("the guard follows a symlink to a repository, for a file and for a new fold
     assert.equal((told.match(/Do not change/g) ?? []).length, 2);
 });
 
+test("the guard follows a dangling link into a repository", async () => {
+    const inside = await sessionAs("duncan", homeDuncan);
+
+    await say(app, inside, "guard-dangling");
+    assert.equal(
+        existsSync(join(repoA, "later.txt")),
+        false,
+        "the link's missing target stays missing",
+    );
+    assert.match(await said(inside), /Do not change frostyard\/nsl from a home session/);
+});
+
+test("the guard resolves a path against the session's own folder, not its real path", async () => {
+    assert.equal(existsSync(aliasHome), true, "the home is reached through a link");
+    const inside = await sessionAs("fenring", aliasHome);
+
+    assert.equal(app.cwdOf(inside), aliasHome, "Pocket stores the link's spelling");
+    await say(app, inside, "guard-alias");
+    assert.equal(
+        existsSync(join(aliasRepo, "file.txt")),
+        false,
+        "the repository beside the link is untouched",
+    );
+    assert.match(await said(inside), /Do not change frostyard\/alias from a home session/);
+});
+
 test("the guard reads a path as Pi Durable does: @, file://, and a no-break space", async () => {
     const inside = await sessionAs("duncan", homeDuncan);
 
@@ -654,7 +712,9 @@ test("a refused start keeps a worktree that a session already works in", () => {
     const path = join(root, "nsl--duncan-1234abcd");
 
     assert.equal(worktreeInUse([{ cwd: path }], path), true, "a session's folder is the worktree");
-    assert.equal(worktreeInUse([{ cwd: join(root, "other") }, {}], path), false);
+    assert.equal(worktreeInUse([{ cwd: join(root, "other") }], path), false);
+    // An entry with no folder is unknown, not unused: the worktree may be its home, so it stays.
+    assert.equal(worktreeInUse([{ cwd: join(root, "other") }, {}], path), true);
     assert.equal(worktreeInUse([], path), false);
 });
 
@@ -703,6 +763,29 @@ test("the pin route follows the folder, and a choice, a clear or a moved folder 
     assert.equal(stored?.persona?.id, "duncan");
     assert.equal(stored?.cleared, undefined, "a pin sets no cleared mark");
     assert.equal((await call(`session/${fresh}`)).data.implicit, undefined, "it is explicit now");
+});
+
+test("a pin changes nothing when the folder read in the commit is another 1", () => {
+    const fenring = {
+        id: "fenring",
+        name: "Fenring",
+        role: "agent" as const,
+        model: "",
+        instructions: "",
+        repositories: {},
+        home: aliasHome,
+    };
+
+    // The folder moved between the route's read and its commit: no identity, and the words say why.
+    assert.equal(pinDecision({}, fenring, "fenring", false).persona, undefined);
+    assert.match(pinDecision({}, fenring, "fenring", false).reason, /moved while the pin was made/);
+    // The same folder: the pin sets the agent.
+    assert.equal(pinDecision({}, fenring, "fenring", true).persona?.id, "fenring");
+    // A selection, a clear, and another home win first.
+    assert.equal(pinDecision({ persona: fenring }, fenring, "fenring", true).persona, undefined);
+    assert.equal(pinDecision({ cleared: true }, fenring, "fenring", true).persona, undefined);
+    assert.match(pinDecision({}, undefined, "fenring", true).reason, /no agent's home/);
+    assert.match(pinDecision({}, fenring, "duncan", true).reason, /Fenring's home/);
 });
 
 test("a broken profile never blocks a session outside every home", async () => {

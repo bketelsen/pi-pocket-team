@@ -4,7 +4,7 @@
  */
 import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { access, readdir, readFile, realpath, stat } from "node:fs/promises";
+import { access, lstat, readFile, readdir, readlink, realpath, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -94,30 +94,64 @@ function targetPath(path: string, cwd: string): string {
     return isAbsolute(full) ? resolve(full) : resolve(cwd, full);
 }
 
+/** How many symbolic links a path may follow before its goal is unknown. */
+const MAX_LINKS = 40;
+
 /**
- * A path as the file system has it, when the file is there or not: the real path of the nearest ancestor that exists,
- * with the missing parts added. A symlink to a folder therefore holds its target, also for a file not made yet.
+ * A path with every symbolic link followed, and the walks of the links they lead to: a guard must judge where a change
+ * lands, not what its name points at. A link whose target does not exist is followed too, and so is the last part, so a
+ * write through a dangling link into a repository is caught. `undefined` after 40 links: the goal is unknown.
  */
-async function realPathDeep(path: string): Promise<string> {
-    const missing: string[] = [];
-    let here = resolve(path);
+async function followLinks(path: string): Promise<string | undefined> {
+    const queue = resolve(path)
+        .split(sep)
+        .filter((part) => part !== "");
+    const base: string[] = [];
+    let links = 0;
 
-    for (;;) {
-        const real = await realpath(here).catch(() => undefined);
+    while (queue.length > 0) {
+        const part = queue.shift()!;
 
-        if (real !== undefined) {
-            return missing.length === 0 ? real : join(real, ...missing.reverse());
+        if (part === ".") {
+            continue;
         }
 
-        const parent = dirname(here);
-
-        if (parent === here) {
-            return resolve(path);
+        if (part === "..") {
+            base.pop();
+            continue;
         }
 
-        missing.push(basename(here));
-        here = parent;
+        const next = join(sep, ...base, part);
+        const info = await lstat(next).catch(() => undefined);
+
+        if (info?.isSymbolicLink() !== true) {
+            base.push(part);
+            continue;
+        }
+
+        links += 1;
+
+        if (links > MAX_LINKS) {
+            return undefined;
+        }
+
+        const target = await readlink(next).catch(() => undefined);
+
+        // A link that cannot be read keeps its name: nothing better is known.
+        if (target === undefined) {
+            base.push(part);
+            continue;
+        }
+
+        // An absolute target starts again at the root; a relative 1 is against the link's own folder, which is `base`.
+        if (isAbsolute(target)) {
+            base.length = 0;
+        }
+
+        queue.unshift(...target.split(sep).filter((each) => each !== ""));
     }
+
+    return join(sep, ...base);
 }
 
 /** Whether `where` is a linked worktree beside `root`: a sibling folder named `<root>--…`. */
@@ -275,9 +309,51 @@ export async function delegationWorktree(
     return { checkout, path, branch, made: true, base };
 }
 
-/** Whether a session of this 1 already works in `path`: then a refused start keeps the worktree, and removes nothing. */
+/**
+ * What a pin may do: set the folder's agent, only when the document has no identity and no clear, the folder's agent is
+ * the 1 asked for, and the folder read in the commit is still the 1 the agent came from (`same`). Each refusal says why.
+ */
+export function pinDecision(
+    doc: { persona?: Persona; cleared?: true },
+    folderAgent: Persona | undefined,
+    wanted: string,
+    same: boolean,
+): { persona?: Persona; reason: string } {
+    if (doc.persona !== undefined) {
+        return { reason: `This session is ${doc.persona.name} already.` };
+    }
+
+    if (doc.cleared === true) {
+        return {
+            reason: "This session's identity was cleared: its folder does not bring the agent back.",
+        };
+    }
+
+    if (folderAgent === undefined) {
+        return { reason: "This session's folder is no agent's home." };
+    }
+
+    if (folderAgent.id !== wanted) {
+        return { reason: `This session's folder is ${folderAgent.name}'s home.` };
+    }
+
+    if (!same) {
+        return { reason: "This session's folder moved while the pin was made: nothing changed." };
+    }
+
+    return { persona: folderAgent, reason: "" };
+}
+
+/**
+ * Whether a session of this 1 may work in `path`: then a refused start keeps the worktree, and removes nothing. An
+ * entry with no folder is unknown, not unused, so 1 of them keeps the worktree: only a list where every session has a
+ * folder, and none of them is `path`, proves the folder unused.
+ */
 export function worktreeInUse(sessions: readonly { cwd?: string }[], path: string): boolean {
-    return sessions.some((each) => each.cwd === path);
+    return (
+        sessions.some((each) => each.cwd === undefined) ||
+        sessions.some((each) => each.cwd === path)
+    );
 }
 
 /**
@@ -1428,37 +1504,26 @@ export default function createTeam(host: Host, web: Web) {
             const folderAgent =
                 cwd === undefined ? undefined : await agentAtFolder(cwd, await roster(directory));
 
-            const { pinned, reason } = await req.commit(async (tx) => {
+            const decision = await req.commit(async (tx) => {
                 const doc = await tx.doc(Identity, req.conversation.id);
+                // The folder can move between the read above and this commit, so it is read again here, in the same
+                // commit that would set the identity. A transaction can read AgentDoc: it is a conversation document.
+                const now = (await tx.doc(AgentDoc, req.conversation.id)).cwd;
+                const chosen = pinDecision(
+                    doc,
+                    folderAgent,
+                    wanted,
+                    cwd !== undefined && now === cwd,
+                );
 
-                if (doc.persona !== undefined) {
-                    return {
-                        pinned: false,
-                        reason: `This session is ${doc.persona.name} already.`,
-                    };
+                if (chosen.persona !== undefined) {
+                    doc.persona = chosen.persona;
                 }
 
-                if (doc.cleared === true) {
-                    return {
-                        pinned: false,
-                        reason: "This session's identity was cleared: its folder does not bring the agent back.",
-                    };
-                }
-
-                if (folderAgent === undefined || folderAgent.id !== wanted) {
-                    return {
-                        pinned: false,
-                        reason:
-                            folderAgent === undefined
-                                ? "This session's folder is no agent's home."
-                                : `This session's folder is ${folderAgent.name}'s home.`,
-                    };
-                }
-
-                doc.persona = folderAgent;
-
-                return { pinned: true, reason: "" };
+                return chosen;
             });
+            const pinned = decision.persona !== undefined;
+            const reason = decision.reason;
 
             if (pinned) {
                 identityChanged(req.conversation.id);
@@ -2417,7 +2482,16 @@ export default function createTeam(host: Host, web: Web) {
                 return undefined;
             }
 
-            const where = await realPathDeep(targetPath(path, here));
+            // The tool resolves the path against the folder Pocket stores, with its symlink spelling, not against the
+            // real `here`: only then does the walk see the link names the tool itself would see. `here` is for the home
+            // membership above, and for nothing else.
+            const where = await followLinks(targetPath(path, cwd));
+
+            if (where === undefined) {
+                return {
+                    block: "This path follows more than 40 symbolic links, so I cannot tell where the change would land. Use the real path of the folder you mean.",
+                };
+            }
 
             if (homes.some((home) => within(where, home))) {
                 return undefined;
