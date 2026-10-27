@@ -553,6 +553,14 @@ async function subagentsBusy(
 /** One line, no double spaces, any length. */
 const flatLine = (text: string) => text.replace(/\s+/g, " ").trim();
 
+/** Cut a flat line longer than MAX_LINE to at most MAX_LINE characters, at a word when one is near, with "…". */
+const clipLine = (text: string): string => {
+    const head = text.slice(0, MAX_LINE - 1);
+    const space = head.lastIndexOf(" ");
+
+    return `${(space > 100 ? head.slice(0, space) : head).trimEnd()}…`;
+};
+
 /** The next thread id, T13, and it moves the counter past it. */
 function nextThreadId(state: DeskState): string {
     let number = state.next.T;
@@ -687,7 +695,7 @@ export function openThread(
         const when = parseCheckWhen(request.watch.checkOn, request.at);
 
         if (check === "" || check.length > MAX_LINE) {
-            throw new Error("A watch's check is 1 to 200 characters, on one line.");
+            throw new Error("A watch's check is 1 to 200 characters, on one line: shorten it.");
         }
 
         if ("error" in when) {
@@ -1271,7 +1279,7 @@ export function setWatch(
     const check = flatLine(request.check);
 
     if (check === "" || check.length > MAX_LINE) {
-        return { error: "A watch's check is 1 to 200 characters, on one line." };
+        return { error: "A watch's check is 1 to 200 characters, on one line: shorten it." };
     }
 
     const when = parseCheckWhen(request.checkOn, request.at);
@@ -1352,7 +1360,9 @@ export function recordResult(
     const text = flatLine(request.text);
 
     if (text === "" || text.length > MAX_LINE) {
-        return { error: "A watch's result is 1 to 200 characters, on one line." };
+        return {
+            error: "A watch's result is 1 to 200 characters, on one line: write a short line.",
+        };
     }
 
     watch.result = { at: request.at, by: request.by, pass: request.pass, text, key: request.key };
@@ -13140,13 +13150,17 @@ export default function createDesk(host: Host, web: Web) {
             }
 
             const persona = await team.persona(api, api.conversationId, context);
+            /** The supervisor's name for an error hint; "your supervisor" when the roster has none or cannot be read. */
+            const supervisorName = async (): Promise<string> =>
+                (await team.roster().catch(() => [])).find((member) => member.role === "supervisor")
+                    ?.name ?? "your supervisor";
             const watching = args.action === "watch" || args.action === "result";
 
             if (persona === undefined) {
                 throw new Error(
                     watching
-                        ? "A watch needs a session with a named identity: a supervisor, or the agent whose thread it is."
-                        : "Only a session assigned a supervisor identity can use the desk.",
+                        ? `A watch needs a session with a named identity: a supervisor, or the agent whose thread it is. Send desk work to ${await supervisorName()} with team_message.`
+                        : `Only a session assigned a supervisor identity can use the desk. This session has no named identity: send desk work to ${await supervisorName()} with team_message.`,
                 );
             }
 
@@ -13174,19 +13188,21 @@ export default function createDesk(host: Host, web: Web) {
                     args.action === "seed"
                 ) {
                     throw new Error(
-                        "Only the supervisor files asks, records Brian's answers, and seeds the desk. Escalate to your supervisor.",
+                        `Only the supervisor files asks, records Brian's answers, and seeds the desk. Escalate to ${await supervisorName()} with team_message.`,
                     );
                 }
 
                 if (args.action === "own") {
                     throw new Error(
-                        "Only the supervisor marks a thread as Brian's own. Escalate to your supervisor.",
+                        `Only the supervisor marks a thread as Brian's own. Escalate to ${await supervisorName()} with team_message.`,
                     );
                 }
 
                 supervisor = registered;
             } else if (persona.role !== "supervisor" && !watching) {
-                throw new Error("Only a session assigned a supervisor identity can use the desk.");
+                throw new Error(
+                    `Only a session assigned a supervisor identity can use the desk. An agent can use only watch and result, on its own thread. For ${args.action}, ask ${await supervisorName()} with team_message to the return address in your first message; your task is in that message.`,
+                );
             }
 
             /** The threads this session changes: a supervisor any, a Clerk its supervisor's, an agent its own. */
@@ -13403,6 +13419,7 @@ export default function createDesk(host: Host, web: Web) {
 
                 const key = `x.desk.${args.action}:${api.taskId}:${api.callId}`;
                 const at = Date.now();
+                const boss = await supervisorName();
                 const result = await api.commit(async (tx) => {
                     const state = await tx.doc(DeskThreads);
                     const thread = threadById(state, asked);
@@ -13414,7 +13431,7 @@ export default function createDesk(host: Host, web: Web) {
                     // A supervisor changes any thread, a Clerk any thread of its supervisor, an agent only its own.
                     if (!changes(thread)) {
                         return {
-                            error: `Only the supervisor can record a result or set a watch on ${thread.id}: it is not this session's thread.`,
+                            error: `Only the supervisor can record a result or set a watch on ${thread.id}: it is not this session's thread. Report it to ${boss} with team_message.`,
                         };
                     }
 
@@ -13440,9 +13457,11 @@ export default function createDesk(host: Host, web: Web) {
                         };
                     }
 
+                    const flat = flatLine(args.text ?? "");
+                    const clipped = flat.length > MAX_LINE;
                     const recorded = recordResult(thread, {
                         pass: args.pass === true,
-                        text: args.text ?? "",
+                        text: clipped ? clipLine(flat) : flat,
                         by: persona.id,
                         key,
                         at,
@@ -13457,9 +13476,12 @@ export default function createDesk(host: Host, web: Web) {
 
                     return {
                         text: recorded.changed
-                            ? passed
-                                ? `Check passed: ${thread.id} is closed.`
-                                : `Check failed: ${thread.id} is open again, and counts. Send it to the agent, or set a new watch.`
+                            ? (passed
+                                  ? `Check passed: ${thread.id} is closed.`
+                                  : `Check failed: ${thread.id} is open again, and counts. Send it to the agent, or set a new watch.`) +
+                              (clipped
+                                  ? " The result was cut to 200 characters; put the full text in a send or a report."
+                                  : "")
                             : `${thread.id} has this result already. Nothing changed.`,
                     };
                 }, context);
@@ -13609,6 +13631,7 @@ export default function createDesk(host: Host, web: Web) {
                 }
 
                 const key = `x.desk.send:${api.taskId}:${api.callId}`;
+                const boss = await supervisorName();
                 const found = await api.commit(async (tx) => {
                     const state = await tx.doc(DeskThreads);
                     const thread = threadById(state, id);
@@ -13620,12 +13643,18 @@ export default function createDesk(host: Host, web: Web) {
                     // From the supervisor's session only: an agent's own address for another session is not this one.
                     if (!changes(thread)) {
                         return {
-                            error: `Only the supervisor can message ${thread.id}: it is not this session's thread.`,
+                            error: `Only the supervisor can message ${thread.id}: it is not this session's thread. Report it to ${boss} with team_message.`,
                         };
                     }
 
                     if (thread.state === "closed") {
-                        return { error: `${thread.id} is closed: there is no agent to message.` };
+                        return {
+                            error: `${thread.id} is closed: there is no agent to message. ${
+                                persona.role === "clerk"
+                                    ? `For new work, escalate to ${boss} with team_message.`
+                                    : "For new work, use team_delegate; to put a question on it, use desk ask (it opens a done or failed thread again)."
+                            }`,
+                        };
                     }
 
                     if (thread.address === undefined) {
