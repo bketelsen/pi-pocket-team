@@ -255,6 +255,15 @@ const model = scriptedModel((request) => {
         });
     }
 
+    if (text.endsWith("home night shift test")) {
+        return teamCall({
+            agent: "duncan",
+            repository: "home",
+            task: TASK,
+            night_shift: { stop_when: "the work is done" },
+        });
+    }
+
     if (text.endsWith("night shift test")) {
         return teamCall({
             agent: "duncan",
@@ -274,18 +283,20 @@ const model = scriptedModel((request) => {
 const dataDir = join(root, "data");
 const definitions = join(root, "agents");
 const repo = join(root, "repo");
+const homeDuncan = join(root, "homes", "duncan");
 
 before(async () => {
     process.env.PI_POCKET_TEAM_AGENTS = definitions;
     mkdirSync(definitions, { recursive: true });
     mkdirSync(repo, { recursive: true });
+    mkdirSync(homeDuncan, { recursive: true });
     writeFileSync(
         join(definitions, "odrade.md"),
         "---\nmodel: faux/faux-2\nrole: supervisor\n---\n# Odrade\nYou are Odrade. Coordinate Brian's team.",
     );
     writeFileSync(
         join(definitions, "duncan.md"),
-        `---\nmodel: faux/faux-2\nrepositories:\n  frostyard/test: ${repo}\n---\n# Duncan Idaho\nYou are Duncan Idaho. Own the test repository.`,
+        `---\nmodel: faux/faux-2\nhome: ${homeDuncan}\nrepositories:\n  frostyard/test: ${repo}\n---\n# Duncan Idaho\nYou are Duncan Idaho. Own the test repository.`,
     );
     const dropIns = join(dataDir, "extensions");
 
@@ -599,5 +610,18 @@ describe("delegated goals", () => {
         } finally {
             shift = 0;
         }
+    });
+
+    test("a night shift at the home starts there, with no worktree", async () => {
+        const { source, linked } = await delegateShift("home-shift", "home night shift test");
+
+        await until(async () => (await goalOf(linked)) !== undefined, "the goal to be set", 20_000);
+        const goal = (await goalOf(linked))!;
+
+        assert.equal(goal.objective, TASK);
+        assert.equal(goal.stop, "the work is done");
+        assert.equal(app.cwdOf(linked), homeDuncan, "the home itself, with no worktree");
+        assert.equal(linkedTo(source).length, 1);
+        assert.equal(await drivers(linked), 1, "one driver for the goal");
     });
 });

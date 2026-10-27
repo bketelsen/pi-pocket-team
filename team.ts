@@ -4,18 +4,22 @@
  */
 import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { access, readdir, readFile, realpath } from "node:fs/promises";
+import { access, lstat, readFile, readdir, readlink, realpath, stat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, dirname, isAbsolute, join } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import type { Context } from "@earendil-works/chord";
 import { Type } from "@earendil-works/pi-ai";
 import { parseFrontmatter } from "@earendil-works/pi-coding-agent";
 import {
+    AgentDoc,
     defineDoc,
     defineExtension,
     defineTool,
+    hook,
     section,
+    ToolTask,
     type ConversationId,
     type DocumentReader,
     type ToolExecutionApi,
@@ -34,6 +38,8 @@ type Persona = {
     instructions: string;
     repositories: Record<string, string>;
     workspace?: string;
+    /** The agent's home folder: plans, notes and reports, apart from every repository. */
+    home?: string;
 };
 
 /** Where another module finds this one's live API. */
@@ -46,6 +52,121 @@ const localFolder = (path: unknown): string => {
 
     return path.startsWith("~/") ? join(homedir(), path.slice(2)) : path;
 };
+
+/** A folder as the file system has it when it exists: a symlinked home and its target are 1 folder. */
+async function realPathOr(folder: string): Promise<string> {
+    return realpath(folder).catch(() => resolve(folder));
+}
+
+/** Whether `folder` is `parent` or below it. */
+function within(folder: string, parent: string): boolean {
+    const path = resolve(folder);
+    const root = resolve(parent);
+
+    return path === root || path.startsWith(root.endsWith(sep) ? root : `${root}${sep}`);
+}
+
+/**
+ * The spaces Pi Durable turns into an ordinary space before it resolves a tool call's path, and the 1 it strips from the
+ * start (`@`: a pasted reference). Both are Pi Durable's own rules (tools/path-utils.js), so the guard judges the path
+ * the tool will really use.
+ */
+const UNICODE_SPACES = /[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g;
+
+/** A path a tool call names, as Pi Durable resolves it: 1 space, `@` stripped, `~`, `file://`, then cwd for relative. */
+function targetPath(path: string, cwd: string): string {
+    const spaced = path.replace(UNICODE_SPACES, " ");
+    const bare = spaced.startsWith("@") ? spaced.slice(1) : spaced;
+    let full = bare;
+
+    if (bare === "~") {
+        full = homedir();
+    } else if (bare.startsWith("~/") || (process.platform === "win32" && bare.startsWith("~\\"))) {
+        full = join(homedir(), bare.slice(2));
+    } else if (bare.startsWith("file://")) {
+        try {
+            full = fileURLToPath(bare);
+        } catch {
+            // A malformed URL stays an ordinary path, as Pi Durable keeps it.
+        }
+    }
+
+    return isAbsolute(full) ? resolve(full) : resolve(cwd, full);
+}
+
+/** How many symbolic links a path may follow before its goal is unknown. */
+const MAX_LINKS = 40;
+
+/**
+ * A path with every symbolic link followed, and the walks of the links they lead to: a guard must judge where a change
+ * lands, not what its name points at. A link whose target does not exist is followed too, and so is the last part, so a
+ * write through a dangling link into a repository is caught. `undefined` after 40 links: the goal is unknown.
+ */
+async function followLinks(path: string): Promise<string | undefined> {
+    const queue = resolve(path)
+        .split(sep)
+        .filter((part) => part !== "");
+    const base: string[] = [];
+    let links = 0;
+
+    while (queue.length > 0) {
+        const part = queue.shift()!;
+
+        if (part === ".") {
+            continue;
+        }
+
+        if (part === "..") {
+            base.pop();
+            continue;
+        }
+
+        const next = join(sep, ...base, part);
+        const info = await lstat(next).catch(() => undefined);
+
+        if (info?.isSymbolicLink() !== true) {
+            base.push(part);
+            continue;
+        }
+
+        links += 1;
+
+        if (links > MAX_LINKS) {
+            return undefined;
+        }
+
+        const target = await readlink(next).catch(() => undefined);
+
+        // A link that cannot be read keeps its name: nothing better is known.
+        if (target === undefined) {
+            base.push(part);
+            continue;
+        }
+
+        // An absolute target starts again at the root; a relative 1 is against the link's own folder, which is `base`.
+        if (isAbsolute(target)) {
+            base.length = 0;
+        }
+
+        queue.unshift(...target.split(sep).filter((each) => each !== ""));
+    }
+
+    return join(sep, ...base);
+}
+
+/** Whether `where` is a linked worktree beside `root`: a sibling folder named `<root>--…`. */
+function beside(where: string, root: string): boolean {
+    const parent = dirname(root);
+    const rest = relative(parent, where);
+
+    if (rest === "" || rest.startsWith("..") || isAbsolute(rest)) {
+        return false;
+    }
+
+    const first = rest.split(sep)[0] ?? "";
+
+    return first !== basename(root) && first.startsWith(`${basename(root)}--`);
+}
 
 const runGit = promisify(execFile);
 
@@ -95,12 +216,16 @@ async function branchOf(folder: string): Promise<string | undefined> {
 /**
  * A git worktree for one delegation: the folder the linked session starts in, its branch (the agent may rename it), and
  * the main checkout it came from. `error` says why no worktree was made: the delegation then uses the main checkout.
+ * `made` says this call made the worktree now, not a replay that found it: only then may a refused start remove it.
+ * `base` is the commit the branch started from, so a branch with no commit of its own can go.
  */
 export type DelegationWorktree = {
     checkout: string;
     path?: string;
     branch?: string;
     error?: string;
+    made?: true;
+    base?: string;
 };
 
 /**
@@ -181,30 +306,154 @@ export async function delegationWorktree(
         return { checkout, error: gitReason(error) };
     }
 
-    return { checkout, path, branch };
+    return { checkout, path, branch, made: true, base };
 }
 
-function taskFolder(persona: Persona, repository?: unknown): string | undefined {
-    const repositories = persona.repositories;
-    const names = Object.keys(repositories);
+/**
+ * What a pin may do: set the folder's agent, only when the document has no identity and no clear, the folder's agent is
+ * the 1 asked for, and the folder read in the commit is still the 1 the agent came from (`same`). Each refusal says why.
+ */
+export function pinDecision(
+    doc: { persona?: Persona; cleared?: true },
+    folderAgent: Persona | undefined,
+    wanted: string,
+    same: boolean,
+): { persona?: Persona; reason: string } {
+    if (doc.persona !== undefined) {
+        return { reason: `This session is ${doc.persona.name} already.` };
+    }
 
-    if (repository !== undefined) {
-        if (typeof repository !== "string" || !Object.hasOwn(repositories, repository)) {
-            throw new Error(`${persona.name} owns: ${names.join(", ") || "no repositories"}.`);
+    if (doc.cleared === true) {
+        return {
+            reason: "This session's identity was cleared: its folder does not bring the agent back.",
+        };
+    }
+
+    if (folderAgent === undefined) {
+        return { reason: "This session's folder is no agent's home." };
+    }
+
+    if (folderAgent.id !== wanted) {
+        return { reason: `This session's folder is ${folderAgent.name}'s home.` };
+    }
+
+    if (!same) {
+        return { reason: "This session's folder moved while the pin was made: nothing changed." };
+    }
+
+    return { persona: folderAgent, reason: "" };
+}
+
+/**
+ * Whether a session of this 1 may work in `path`: then a refused start keeps the worktree, and removes nothing. An
+ * entry with no folder is unknown, not unused, so 1 of them keeps the worktree: only a list where every session has a
+ * folder, and none of them is `path`, proves the folder unused.
+ */
+export function worktreeInUse(sessions: readonly { cwd?: string }[], path: string): boolean {
+    return (
+        sessions.some((each) => each.cwd === undefined) ||
+        sessions.some((each) => each.cwd === path)
+    );
+}
+
+/**
+ * Take away a worktree and its branch that a start this call made does not need, after Pi Pocket refused that start.
+ * Nothing is forced: git removes a folder only when it is unchanged, and the branch goes with `-d`; `-D` only when `-d`
+ * refuses and the branch holds no commit of its own beyond its base.
+ */
+export async function discardWorktree(worktree: DelegationWorktree): Promise<void> {
+    if (worktree.path === undefined || worktree.branch === undefined) {
+        return;
+    }
+
+    await git(worktree.checkout, ["worktree", "remove", worktree.path], 60_000).catch(
+        () => undefined,
+    );
+
+    const deleted = await git(worktree.checkout, ["branch", "-d", worktree.branch]).then(
+        () => true,
+        () => false,
+    );
+
+    if (deleted || worktree.base === undefined) {
+        return;
+    }
+
+    const own = await git(worktree.checkout, [
+        "rev-list",
+        "--count",
+        worktree.branch,
+        "--not",
+        worktree.base,
+    ]).then(
+        ({ stdout }) => Number(stdout.trim()),
+        () => undefined,
+    );
+
+    if (own === 0) {
+        await git(worktree.checkout, ["branch", "-D", worktree.branch]).catch(() => undefined);
+    }
+}
+
+/**
+ * Where a task runs: a repository's folder, the agent's home, or its workspace. `home` says the folder is a home, which
+ * never gets a worktree. An agent with 1 repository and an agent whose only folder is its home need no name.
+ */
+export type TaskTarget = { folder?: string; repo?: string; home?: boolean };
+
+/** The folders an agent's task can start in: the names it can be asked for, in the error that offers a choice. */
+function targetNames(persona: Persona): string[] {
+    const names = Object.keys(persona.repositories);
+
+    return persona.home === undefined ? names : [...names, "home"];
+}
+
+/** `repository: "home"`, a repository's name, or the 1 obvious folder: a task's folder and its roster repository. */
+export function taskTarget(persona: Persona, repository?: unknown): TaskTarget {
+    const names = Object.keys(persona.repositories);
+
+    if (repository === "home") {
+        if (persona.home === undefined) {
+            throw new Error(
+                `${persona.name} has no home in its profile: Brian adds home to ${persona.id}.md.`,
+            );
         }
 
-        return repositories[repository];
+        return { folder: persona.home, home: true };
+    }
+
+    if (repository !== undefined) {
+        if (typeof repository !== "string" || !Object.hasOwn(persona.repositories, repository)) {
+            throw new Error(
+                `${persona.name} works in: ${targetNames(persona).join(", ") || "no folder, until Brian gives one in the profile"}.`,
+            );
+        }
+
+        return { folder: persona.repositories[repository], repo: repository };
     }
 
     if (names.length > 1) {
-        throw new Error(`Choose one of ${persona.name}'s repositories: ${names.join(", ")}.`);
+        throw new Error(
+            `Choose one of ${persona.name}'s repositories: ${targetNames(persona).join(", ")}.`,
+        );
     }
 
-    return names.length === 1 ? repositories[names[0]!] : persona.workspace;
+    if (names.length === 1) {
+        return { folder: persona.repositories[names[0]!]!, repo: names[0] };
+    }
+
+    // No repository: the workspace, else the home, else the source session's folder.
+    return persona.workspace !== undefined
+        ? { folder: persona.workspace }
+        : persona.home !== undefined
+          ? { folder: persona.home, home: true }
+          : {};
 }
 
 // Snapshot the selected soul: edits to files affect new selections, not running work.
-export const Identity = defineDoc<{ persona?: Persona }>({
+// `cleared` is an explicit "no identity here": the folder's agent must not come back after a clear.
+// Stored data: never rename the kind, and never change what `persona` or `cleared` means.
+export const Identity = defineDoc<{ persona?: Persona; cleared?: true }>({
     kind: "x.team.identity",
     version: 1,
     checkpointWhen: () => false,
@@ -255,6 +504,7 @@ export async function roster(directory: string): Promise<Persona[]> {
             ...(frontmatter.workspace === undefined
                 ? {}
                 : { workspace: localFolder(frontmatter.workspace) }),
+            ...(frontmatter.home === undefined ? {} : { home: localFolder(frontmatter.home) }),
         });
     }
 
@@ -263,6 +513,164 @@ export async function roster(directory: string): Promise<Persona[]> {
             Number(b.role === "supervisor") - Number(a.role === "supervisor") ||
             a.name.localeCompare(b.name),
     );
+}
+
+/** The last good roster of a profile folder, with the files and times it was read from. */
+const rosterCache = new Map<string, { key: string; agents: Persona[] }>();
+
+/** The profile files and their times: a changed file, or a new 1, is another key. */
+async function rosterKey(directory: string): Promise<string> {
+    const names = await readdir(directory).catch((): string[] => []);
+    const parts: string[] = [];
+
+    for (const file of names.sort()) {
+        if (!/^[a-z0-9][a-z0-9_-]*\.md$/.test(file)) {
+            continue;
+        }
+
+        const info = await stat(join(directory, file)).catch(() => undefined);
+
+        parts.push(`${file}:${info?.mtimeMs ?? 0}`);
+    }
+
+    return parts.join("|");
+}
+
+/** The roster from the cache while its files are unchanged: a guard reads it on every edit and write. */
+export async function cachedRoster(directory: string): Promise<Persona[]> {
+    const key = await rosterKey(directory);
+    const held = rosterCache.get(directory);
+
+    if (held !== undefined && held.key === key) {
+        return held.agents;
+    }
+
+    const agents = await roster(directory);
+
+    rosterCache.set(directory, { key, agents });
+
+    return agents;
+}
+
+/**
+ * The roster a guard judges by: the last good 1 when a read fails, and none when there never was 1. A broken profile
+ * must never block a session: with no roster, no home is known.
+ */
+export async function guardRoster(directory: string): Promise<Persona[] | undefined> {
+    try {
+        return await cachedRoster(directory);
+    } catch {
+        return rosterCache.get(directory)?.agents;
+    }
+}
+
+/** The 1 agent whose home holds `folder`: the longest home, and none when 2 agents share it. */
+export async function agentAtFolder(
+    folder: string,
+    agents: readonly Persona[],
+): Promise<Persona | undefined> {
+    const here = await realPathOr(folder);
+    const held: { agent: Persona; home: string }[] = [];
+
+    for (const agent of agents) {
+        if (agent.home === undefined) {
+            continue;
+        }
+
+        const home = await realPathOr(agent.home);
+
+        if (within(here, home)) {
+            held.push({ agent, home });
+        }
+    }
+
+    // The longest home wins: a home inside another home holds its own agent. 2 agents with 1 home give none.
+    const longest = held.reduce((most, each) => Math.max(most, each.home.length), 0);
+    const best = held.filter((each) => each.home.length === longest);
+
+    return best.length === 1 ? best[0]!.agent : undefined;
+}
+
+/** Who a session is, and the folder the answer was read in. */
+export type Resolved = { persona?: Persona; implicit?: boolean; cwd?: string };
+
+/**
+ * Who a session is: the document's choice first; else an explicit clear; else the agent whose home holds the session's
+ * folder. `implicit` says the folder gave it, so a tab can pin it before the folder moves.
+ */
+export async function resolveIdentity(
+    read: Pick<DocumentReader, "snapshot">,
+    conversationId: ConversationId,
+    context: Context,
+    directory: string,
+): Promise<Resolved> {
+    const [doc, agent] = await Promise.all([
+        read.snapshot(Identity, conversationId, context),
+        read.snapshot(AgentDoc, conversationId, context),
+    ]);
+    const cwd = agent?.cwd;
+
+    if (doc?.persona !== undefined) {
+        return { persona: doc.persona, ...(cwd === undefined ? {} : { cwd }) };
+    }
+
+    if (cwd === undefined) {
+        return {};
+    }
+
+    if (doc?.cleared === true) {
+        return { cwd };
+    }
+
+    const persona = await agentAtFolder(cwd, await roster(directory));
+
+    return persona === undefined ? { cwd } : { persona, implicit: true, cwd };
+}
+
+/** What a home session must do before it touches a repository: paths only, never a file's contents. */
+const HOME_RULES = `You are in your home: plans, notes and reports for all your repositories live here. Read a repository's AGENTS.md before you answer about it. Never change a repository from your home: start the work with team_work, which opens a session in a fresh worktree of that repository with its own AGENTS.md, skills and memory. In a linked session, team_work is refused: report the plan to the session that started you.`;
+
+/** An identity's home and repositories, with the path of each repository's AGENTS.md when the file is there. */
+export async function placesText(persona: Persona, cwd?: string): Promise<string> {
+    const names = Object.entries(persona.repositories);
+
+    if (persona.home === undefined && names.length === 0) {
+        return "";
+    }
+
+    const lines: string[] = [];
+
+    if (persona.home !== undefined) {
+        lines.push(`Your home: ${persona.home}`);
+    }
+
+    const listed = await Promise.all(
+        names.map(async ([name, folder]) => {
+            const rules = join(folder, "AGENTS.md");
+            const there = await access(rules).then(
+                () => true,
+                () => false,
+            );
+
+            return `- ${name}: ${folder}${there ? ` (rules: ${rules})` : ""}`;
+        }),
+    );
+
+    lines.push(
+        names.length === 0
+            ? "Your repositories: none yet."
+            : `Your repositories:\n${listed.join("\n")}`,
+    );
+
+    if (
+        persona.home !== undefined &&
+        cwd !== undefined &&
+        within(await realPathOr(cwd), await realPathOr(persona.home))
+    ) {
+        lines.push(HOME_RULES);
+    }
+
+    return lines.join("\n");
 }
 
 const identityText = (persona: Persona) => `Named identity for this Pi Pocket session:
@@ -326,6 +734,7 @@ export type TeamApi = {
             name: string;
             role: Role;
             repositories: Record<string, string>;
+            home?: string;
         }[]
     >;
 };
@@ -700,6 +1109,19 @@ export default function createTeam(host: Host, web: Web) {
         return agent;
     };
 
+    /** Whether a folder is an agent's home, by real paths: a home never gets a worktree. */
+    const isHomeFolder = async (folder: string): Promise<boolean> => {
+        const here = await realPathOr(folder);
+
+        for (const agent of await roster(directory)) {
+            if (agent.home !== undefined && (await realPathOr(agent.home)) === here) {
+                return true;
+            }
+        }
+
+        return false;
+    };
+
     /** The 1 sentence that says a worktree was not made: the tool's result and the task both carry it. */
     const worktreeFailure = (worktree: DelegationWorktree | undefined): string =>
         worktree?.error === undefined
@@ -941,7 +1363,7 @@ export default function createTeam(host: Host, web: Web) {
     const published: TeamApi = {
         version: 1,
         persona: async (read, conversationId, context) => {
-            const found = (await read.snapshot(Identity, conversationId, context))?.persona;
+            const found = (await resolveIdentity(read, conversationId, context, directory)).persona;
 
             return found === undefined
                 ? undefined
@@ -953,6 +1375,7 @@ export default function createTeam(host: Host, web: Web) {
                 name: agent.name,
                 role: agent.role,
                 repositories: agent.repositories,
+                ...(agent.home === undefined ? {} : { home: agent.home }),
             })),
     };
     const sharedTeam = globalThis as unknown as Record<symbol, TeamApi | undefined>;
@@ -1027,12 +1450,21 @@ export default function createTeam(host: Host, web: Web) {
     web.conversationRoute(
         "GET",
         "session/:source",
-        async (req) => ({
-            identity:
-                (await req.snapshot(Identity, req.conversation.id, req.context))?.persona ?? null,
-            conversation: req.conversation,
-            linked: await req.linkedSessions.list(),
-        }),
+        async (req) => {
+            const identity = await resolveIdentity(
+                req,
+                req.conversation.id,
+                req.context,
+                directory,
+            );
+
+            return {
+                identity: identity.persona ?? null,
+                ...(identity.implicit === true ? { implicit: true } : {}),
+                conversation: req.conversation,
+                linked: await req.linkedSessions.list(),
+            };
+        },
         { conversation: "source" },
     );
     web.conversationRoute(
@@ -1046,14 +1478,58 @@ export default function createTeam(host: Host, web: Web) {
 
                 if (persona) {
                     doc.persona = persona;
+                    delete doc.cleared;
                 } else {
                     delete doc.persona;
+                    // An explicit none: the agent whose home holds this folder must not come back by itself.
+                    doc.cleared = true;
                 }
             });
 
             identityChanged(req.conversation.id);
 
             return { identity: persona ?? null };
+        },
+        { conversation: "source" },
+    );
+
+    // The folder's agent, pinned by the tab that shows the session: 1 commit, and only when the folder still says so.
+    // A selection or a clear outranks the folder, and a moved folder is another agent's or none, so nothing changes.
+    web.conversationRoute(
+        "POST",
+        "session/:source/pin",
+        async (req) => {
+            const wanted = typeof req.body.agent === "string" ? req.body.agent : "";
+            const cwd = (await req.snapshot(AgentDoc, req.conversation.id, req.context))?.cwd;
+            const folderAgent =
+                cwd === undefined ? undefined : await agentAtFolder(cwd, await roster(directory));
+
+            const decision = await req.commit(async (tx) => {
+                const doc = await tx.doc(Identity, req.conversation.id);
+                // The folder can move between the read above and this commit, so it is read again here, in the same
+                // commit that would set the identity. A transaction can read AgentDoc: it is a conversation document.
+                const now = (await tx.doc(AgentDoc, req.conversation.id)).cwd;
+                const chosen = pinDecision(
+                    doc,
+                    folderAgent,
+                    wanted,
+                    cwd !== undefined && now === cwd,
+                );
+
+                if (chosen.persona !== undefined) {
+                    doc.persona = chosen.persona;
+                }
+
+                return chosen;
+            });
+            const pinned = decision.persona !== undefined;
+            const reason = decision.reason;
+
+            if (pinned) {
+                identityChanged(req.conversation.id);
+            }
+
+            return { pinned, reason };
         },
         { conversation: "source" },
     );
@@ -1066,7 +1542,7 @@ export default function createTeam(host: Host, web: Web) {
             let cwd: string | undefined;
 
             try {
-                cwd = taskFolder(persona, req.body.repository);
+                cwd = taskTarget(persona, req.body.repository).folder;
             } catch (error) {
                 throw web.error(400, (error as Error).message);
             }
@@ -1245,8 +1721,10 @@ export default function createTeam(host: Host, web: Web) {
 
                 if (persona) {
                     doc.persona = persona;
+                    delete doc.cleared;
                 } else {
                     delete doc.persona;
+                    doc.cleared = true;
                 }
             });
 
@@ -1341,10 +1819,10 @@ export default function createTeam(host: Host, web: Web) {
             const given = args.title === undefined ? undefined : flat(args.title);
             const title =
                 given === undefined || given === "" ? taskTitle(task) : given.slice(0, 120);
-            const identity = await api.snapshot(Identity, api.conversationId, context);
-            const supervisor = identity?.persona?.name;
+            const identity = await resolveIdentity(api, api.conversationId, context, directory);
+            const supervisor = identity.persona?.name;
 
-            if (identity?.persona?.role !== "supervisor" || supervisor === undefined) {
+            if (identity.persona?.role !== "supervisor" || supervisor === undefined) {
                 throw new Error("Only a session assigned a supervisor identity can delegate.");
             }
 
@@ -1357,7 +1835,8 @@ export default function createTeam(host: Host, web: Web) {
             }
 
             const persona = await find(agent);
-            const cwd = taskFolder(persona, repository);
+            const target = taskTarget(persona, repository);
+            const cwd = target.folder;
 
             if (persona.role === "supervisor") {
                 throw new Error("Choose a specialist from the roster.");
@@ -1387,8 +1866,9 @@ export default function createTeam(host: Host, web: Web) {
             // Each delegation works in its own worktree beside the main checkout: 2 jobs in 1 repository share no folder
             // and no branch. A folder that is not a repository works as it did before, and a worktree that cannot be
             // made does not fail the delegation: the result says why, and the task runs in the main checkout.
+            // A home is no repository work: it never gets a worktree, or an agent's notes would split over branches.
             const worktree =
-                cwd === undefined
+                cwd === undefined || target.home === true || (await isHomeFolder(cwd))
                     ? undefined
                     : await delegationWorktree(cwd, { agent: persona.id, key });
             const where = worktree?.path ?? cwd;
@@ -1398,11 +1878,7 @@ export default function createTeam(host: Host, web: Web) {
                     : { path: worktree.path, branch: worktree.branch, checkout: worktree.checkout };
             const notMade = worktreeFailure(worktree);
             const desk = deskApi();
-            const repo =
-                repository ??
-                (Object.keys(persona.repositories).length === 1
-                    ? Object.keys(persona.repositories)[0]
-                    : undefined);
+            const repo = target.repo;
             const opened =
                 desk === undefined
                     ? undefined
@@ -1536,6 +2012,149 @@ export default function createTeam(host: Host, web: Web) {
             );
         },
     });
+
+    /**
+     * An agent's own repository work: a linked session in a fresh worktree of 1 of its repositories, started from its
+     * home. The repository's own AGENTS.md, skills and memory load there, which a session in the home never gets. It
+     * opens no desk thread: the agent keeps the worktree's cleanup.
+     */
+    const work = defineTool({
+        name: "team_work",
+        description:
+            "Agent only, in a session at your own home: start a linked session in a fresh worktree of one of your repositories. The repository's own AGENTS.md, skills and memory load there, so plan here and change the repository there. Name the repository when you own more than one. It opens no desk thread: report back with team_message, and remove the worktree when its PR merges. Refused in a linked session.",
+        parameters: Type.Object({
+            repository: Type.Optional(
+                Type.String({
+                    description:
+                        "A repository of your own, by its roster name. Omit when you own 1.",
+                }),
+            ),
+            task: Type.String({ minLength: 1, maxLength: 6000 }),
+            title: Type.Optional(
+                Type.String({ maxLength: 120, description: "A short title for the session." }),
+            ),
+        }),
+        replay: "safe",
+        execute: async (args, api, context) => {
+            const identity = await resolveIdentity(api, api.conversationId, context, directory);
+            const persona = identity.persona;
+
+            if (!persona) {
+                throw new Error(
+                    "team_work needs a named identity, and this session has none: choose an agent in the Team panel, or open a session in the agent's own home folder.",
+                );
+            }
+
+            if (persona.role !== "agent") {
+                throw new Error(
+                    `team_work works for an agent in its own home. ${persona.name} is the ${persona.role === "supervisor" ? "supervisor" : "Clerk"}: use team_delegate instead.`,
+                );
+            }
+
+            if (persona.home === undefined) {
+                throw new Error(
+                    `${persona.name} has no home in its profile: Brian adds home to ${persona.id}.md.`,
+                );
+            }
+
+            const cwd = identity.cwd;
+
+            if (
+                cwd === undefined ||
+                !within(await realPathOr(cwd), await realPathOr(persona.home))
+            ) {
+                throw new Error(
+                    `This session's folder${cwd === undefined ? "" : ` (${cwd})`} is not inside ${persona.name}'s home (${persona.home}). team_work starts repository work from the home only.`,
+                );
+            }
+
+            const names = Object.keys(persona.repositories);
+            const name = args.repository ?? (names.length === 1 ? names[0] : undefined);
+
+            if (name === undefined) {
+                throw new Error(
+                    names.length === 0
+                        ? `${persona.name} has no repositories in its profile: Brian adds them to ${persona.id}.md.`
+                        : `Choose one of ${persona.name}'s repositories: ${names.join(", ")}.`,
+                );
+            }
+
+            if (!Object.hasOwn(persona.repositories, name)) {
+                throw new Error(`${persona.name} owns: ${names.join(", ") || "no repositories"}.`);
+            }
+
+            const folder = persona.repositories[name]!;
+            const given = args.title === undefined ? undefined : flat(args.title);
+            const title =
+                given === undefined || given === "" ? taskTitle(args.task) : given.slice(0, 120);
+            const key = `x.team.work:${api.taskId}:${api.callId}`;
+            // The same key finds the worktree this call made, and the start returns this call's session: a replay adds
+            // neither a folder nor a session.
+            const worktree = await delegationWorktree(folder, { agent: persona.id, key });
+
+            // A fresh worktree is the point of this tool: only there do the repository's own AGENTS.md, skills and
+            // memory load. With none, it refuses and starts nothing, unlike a delegation's fallback.
+            if (worktree?.path === undefined || worktree.branch === undefined) {
+                throw new Error(
+                    `No worktree for ${name}: ${worktree?.error ?? `${folder} is not the top of a git work tree`}. team_work starts a session in a fresh worktree only, because that is where ${name}'s own AGENTS.md loads. Nothing was started.`,
+                );
+            }
+
+            const where = worktree.path;
+            const message = taskText(persona, args.task, worktree);
+            const preferred = allowedModel(persona);
+            let started: Awaited<ReturnType<typeof host.linkedSessions.start>>;
+
+            try {
+                started = await host.linkedSessions.start(
+                    api.conversationId,
+                    {
+                        title: `${persona.name}: ${title}`.slice(0, 120),
+                        message,
+                        cwd: where,
+                        ...(preferred === undefined ? {} : { model: preferred }),
+                    },
+                    key,
+                );
+            } catch (error) {
+                // The start made this worktree a moment ago: take it away, so no branch or folder is left behind. Not
+                // when a session of this 1 already works in it (a start can fail after the child exists), and not when
+                // the list cannot be read: then the folder stays, and the error says where.
+                let kept = false;
+
+                if (worktree.made === true) {
+                    kept = await host.linkedSessions.list(api.conversationId).then(
+                        (sessions) => worktreeInUse(sessions, where),
+                        () => true,
+                    );
+
+                    if (!kept) {
+                        await discardWorktree(worktree);
+                    }
+                }
+
+                const why = (error as Error).message;
+
+                throw new Error(
+                    (/cannot start sessions/i.test(why)
+                        ? "team_work works only in a top-level session. Report the plan to the session that started you."
+                        : why) +
+                        (kept
+                            ? ` The worktree at ${where} is kept: a linked session of this one uses it.`
+                            : ""),
+                );
+            }
+
+            // The identity lands in its own durable step, as a delegation's does.
+            await api.commit(async (tx) => {
+                (await tx.doc(Identity, started.session as ConversationId)).persona ??= persona;
+            }, context);
+
+            return reply(
+                `Started ${persona.name} at ${started.address} in ${name}, on ${modelText(persona)}. Worktree: ${worktree.path} on branch ${worktree.branch}. Report back here with team_message when the work is done, and remove the worktree (git worktree remove ${worktree.path}) when its PR merges.`,
+            );
+        },
+    });
     const message = defineTool({
         name: "team_message",
         description:
@@ -1664,7 +2283,8 @@ export default function createTeam(host: Host, web: Web) {
         // removing one that is gone changes nothing.
         replay: "safe",
         execute: async (args, api, context) => {
-            const persona = (await api.snapshot(Identity, api.conversationId, context))?.persona;
+            const persona = (await resolveIdentity(api, api.conversationId, context, directory))
+                .persona;
 
             if (!persona) {
                 throw new Error(
@@ -1816,19 +2436,102 @@ export default function createTeam(host: Host, web: Web) {
         { annotations: { readOnlyHint: true } },
     );
 
+    /**
+     * A home session must not change a repository: the repository's AGENTS.md, skills and memory never load there, so
+     * the change would go out without its rules. `edit` and `write` are blocked into any roster repository, or a
+     * worktree beside it; a path inside a home is the agent's own. `bash` is not parsed: a heuristic there would be
+     * wrong as often as right, and the home's own AGENTS.md carries the rule.
+     */
+    const homeGuard = hook(ToolTask, {
+        beforeTool: async (call, api, context) => {
+            if (call.name !== "edit" && call.name !== "write") {
+                return undefined;
+            }
+
+            const path = (call.arguments as { path?: unknown }).path;
+
+            if (typeof path !== "string" || path.trim() === "") {
+                return undefined;
+            }
+
+            const cwd = (await api.snapshot(AgentDoc, api.conversationId, context))?.cwd;
+
+            if (cwd === undefined) {
+                return undefined;
+            }
+
+            // A profile that cannot be read must never block a session: with no roster at all, no home is known.
+            const agents = await guardRoster(directory);
+
+            if (agents === undefined) {
+                return undefined;
+            }
+
+            const homes: string[] = [];
+
+            for (const agent of agents) {
+                if (agent.home !== undefined) {
+                    homes.push(await realPathOr(agent.home));
+                }
+            }
+
+            const here = await realPathOr(cwd);
+
+            // Only a session in a home is held to this: everywhere else, a repository session is the point.
+            if (!homes.some((home) => within(here, home))) {
+                return undefined;
+            }
+
+            // The tool resolves the path against the folder Pocket stores, with its symlink spelling, not against the
+            // real `here`: only then does the walk see the link names the tool itself would see. `here` is for the home
+            // membership above, and for nothing else.
+            const where = await followLinks(targetPath(path, cwd));
+
+            if (where === undefined) {
+                return {
+                    block: "This path follows more than 40 symbolic links, so I cannot tell where the change would land. Use the real path of the folder you mean.",
+                };
+            }
+
+            if (homes.some((home) => within(where, home))) {
+                return undefined;
+            }
+
+            for (const agent of agents) {
+                for (const [name, folder] of Object.entries(agent.repositories)) {
+                    const root = await realPathOr(folder);
+
+                    if (within(where, root) || beside(where, root)) {
+                        return {
+                            block: `Do not change ${name} from a home session: its AGENTS.md, skills and memory load only in a session there. Read ${join(root, "AGENTS.md")}, then start a repository session with team_work and change ${name} there. A path inside your home is yours to change.`,
+                        };
+                    }
+                }
+            }
+
+            return undefined;
+        },
+    });
+
     return defineExtension({
         name: "named-team",
-        tools: [delegate, message, list, teamMemory],
+        tools: [delegate, work, message, list, teamMemory],
+        hooks: [homeGuard],
         sections: [
             section("named_team", async (input, context) => {
-                const identity = await input.read.snapshot(Identity, input.conversationId, context);
+                const identity = await resolveIdentity(
+                    input.read,
+                    input.conversationId,
+                    context,
+                    directory,
+                );
+                const persona = identity.persona;
 
-                if (!identity?.persona) {
+                if (!persona) {
                     return undefined;
                 }
 
-                const agents =
-                    identity.persona.role === "supervisor" ? await roster(directory) : [];
+                const agents = persona.role === "supervisor" ? await roster(directory) : [];
                 const members = agents
                     .filter((a) => a.role !== "supervisor")
                     .map((a) => {
@@ -1839,21 +2542,24 @@ export default function createTeam(host: Host, web: Web) {
                         const folders = Object.entries(a.repositories)
                             .map(([name, folder]) => `  ${name}: ${folder}`)
                             .join("\n");
+                        const home = a.home === undefined ? "" : `\n  Home: ${a.home}`;
 
-                        return `${a.id}: ${a.name}\n${folders || `  Workspace: ${a.workspace ?? "source session folder"}`}\n  Model: ${modelText(a)}${responsibilities ? `\n${responsibilities}` : ""}`;
+                        return `${a.id}: ${a.name}\n${folders || `  Workspace: ${a.workspace ?? "source session folder"}`}${home}\n  Model: ${modelText(a)}${responsibilities ? `\n${responsibilities}` : ""}`;
                     });
 
                 const lessons = lessonsOf(
                     await input.read.snapshot(AgentMemory, context),
-                    identity.persona.id,
+                    persona.id,
                 );
+                const places = await placesText(persona, identity.cwd);
 
                 return (
-                    identityText(identity.persona) +
+                    identityText(persona) +
+                    (places === "" ? "" : `\n\n${places}`) +
                     (members.length
                         ? `\n\nNamed teammates:\n${members.join("\n")}\nDelegation runs each agent on its profile model when the owner allows that model for subagents, otherwise on your model.`
                         : "") +
-                    `\n\n${lessonsText(identity.persona, lessons, (text) => host.text.defang(text))}`
+                    `\n\n${lessonsText(persona, lessons, (text) => host.text.defang(text))}`
                 );
             }),
         ],

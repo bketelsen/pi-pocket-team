@@ -64,12 +64,13 @@ Profiles are Markdown files in `~/.config/pi-pocket-team/agents/` (override with
 
 Frontmatter fields:
 
-| Field          | Meaning                                               |
-| -------------- | ----------------------------------------------------- |
-| `model`        | `provider/model`. A list uses only the first model.   |
-| `role`         | `supervisor`, `clerk`, or `agent`. Default: `agent`.  |
-| `repositories` | Map of repository name to an absolute or `~/` folder. |
-| `workspace`    | One folder, for non-repository work.                  |
+| Field          | Meaning                                                                     |
+| -------------- | --------------------------------------------------------------------------- |
+| `model`        | `provider/model`. A list uses only the first model.                         |
+| `role`         | `supervisor`, `clerk`, or `agent`. Default: `agent`.                        |
+| `repositories` | Map of repository name to an absolute or `~/` folder.                       |
+| `workspace`    | One folder, for non-repository work.                                        |
+| `home`         | The agent's home folder: absolute or `~/`. See [Agent homes](#agent-homes). |
 
 A supervisor, `lead.md`, named "Lead", with no repositories:
 
@@ -121,7 +122,7 @@ repositories:
     frostyard/igloo: ~/projects/frostyard/igloo
 ```
 
-Odrade calls `team_delegate` with `agent: "duncan"` and `repository: "frostyard/nsl"`. A single owned repository is selected automatically; with multiple repositories the tool requires a name from the map. The Team panel has the same choices and shows the destination folder before starting. The tool's optional `title` names the desk thread and the linked session; without it, the task's first non-empty line is the title, without a leading `Task:`, `Goal:`, or `Title:`.
+Odrade calls `team_delegate` with `agent: "duncan"` and `repository: "frostyard/nsl"`. A single owned repository is selected automatically; with multiple repositories the tool requires a name from the map. The Team panel has the same choices and shows the destination folder before starting. The tool's optional `title` names the desk thread and the linked session; without it, the task's first non-empty line is the title, without a leading `Task:`, `Goal:`, or `Title:`. `repository: "home"` starts the task in the agent's own home; see [Agent homes](#agent-homes).
 When the folder is the top of a git work tree, each delegation gets its own worktree beside the main checkout, at `<checkout>--<agent>-<slug>` on branch `<agent>/<slug>`, so 2 jobs in 1 repository share no folder and no branch. When the worktree cannot be made, the delegation works in the main checkout, and the tool result and the task say so in 1 sentence.
 
 For non-repository work, `workspace: ~/projects/moneo` supplies a working folder. An agent with neither repositories nor a workspace inherits the source folder. All mapped paths are absolute or begin with `~/` and must exist when a task starts; delegation does not silently clone or create folders.
@@ -143,6 +144,22 @@ The tool takes an optional `night_shift` object, `{ objective?, stop_when, start
     }
 }
 ```
+
+## Agent homes
+
+An agent can have a home: 1 folder of its own, such as `~/agents/duncan`, with an AGENTS.md, `notes/`, `plans/` and `reports/`, apart from every repository. The profile names it with `home:`. A home is a local git repository with no remote, and it never gets a worktree.
+
+**Why a home only plans.** Pi loads AGENTS.md only from Pi's own folder, the session's folder, and the folders above it, never from a folder below. A session in a home never sees a repository's AGENTS.md, skills or project memory. So a change to a repository runs in a session that starts in that repository, which is the only place where its rules load.
+
+**The home section.** For an identity with a home or repositories, the `named_team` section adds `Your home: <folder>` and `Your repositories:`, 1 line for each repository: its name, its folder, and the path of its root `AGENTS.md` when that file exists. Paths only: the section never holds a file's contents, and it runs no git command. When the session's folder is inside the agent's home, 4 rules come with it: read a repository's AGENTS.md before you answer about it; never change a repository from the home; start the work with `team_work`; in a linked session, report the plan to the session that started you. The supervisor's roster shows each member's home.
+
+**Identity by folder.** A session whose folder is an agent's home (the home itself or a folder under it, by real paths) carries that agent's identity with no selection. The order is: the identity stored in the conversation; else an explicit clear; else the folder. The longest home wins, and 2 agents with 1 home give none. The session route says `implicit: true` when the folder gave it, and the status item pins such an identity once with `POST session/:source/pin`, in 1 commit, only when the folder still says so: a selection, a clear, or a folder that moved wins, and the route says why. The commit reads the session's folder again, so a folder that moves while the pin is made changes nothing. **Clear identity** (`POST session/:source/identity` with `agent: null`, or `/team-agent clear`) stores `cleared: true` beside the deleted `persona`: the folder must not bring the agent back. Selecting an agent deletes `cleared`. `x.team.identity` is stored data: the kind and the meaning of `persona` never change; `cleared` is a new field beside it.
+
+**The guard.** When a session's folder is inside any agent's home, a `beforeTool` hook blocks an `edit` or `write` whose target is inside a roster repository folder, or a sibling worktree of it (`<folder>--*`). The block names the repository and says to start a repository session with `team_work`. A path inside the home is the agent's own. The guard resolves the target as Pi Durable does (`@` stripped, `~/`, `file://`, a no-break space as a space), against the session's own folder as Pocket stores it, and follows every symbolic link: also a link to a file that is not there yet, or a link to a folder. More than 40 links make the goal unknown, and the call is blocked. A profile folder it cannot read never blocks a session: it keeps the last good roster, and with none, no home is known. `bash` is not parsed: the home's AGENTS.md carries that rule, and a command heuristic would be wrong as often as right.
+
+**`team_work`.** An agent (role `agent`) in a session inside its own home starts a linked session in a fresh worktree of 1 of its own repositories, with the tool `team_work`: `repository` (optional when it owns 1), `task` (1 to 6000 characters), `title` (optional, 120 at most). The child loads the repository's own AGENTS.md, skills and memory, and gets the identity and the profile model when the owner allows that model for subagents. It refuses a session with no identity, another role, a folder outside the agent's home, and an unknown repository, each with its own words. Pi Pocket refuses a start from a linked session, and the tool says so: "team_work works only in a top-level session. Report the plan to the session that started you." The result gives the address, the worktree path and its branch, and says to remove the worktree when its PR merges. It opens no desk thread: the agent keeps its own worktree and PR. A replay (`x.team.work:<task>:<call>`) finds the worktree it made and the session it started. A folder that is not the top of a git work tree gets no worktree, and the tool then refuses and starts nothing: `team_delegate` falls back to the main checkout, `team_work` does not. A start that Pi Pocket refuses takes away the worktree and branch this call made, with nothing forced; a worktree that a replay found, or that a linked session already works in, stays, and the error says where.
+
+**`repository: "home"`.** `team_delegate`, and the Team page's **Start linked task**, take `repository: "home"`: the task starts in the agent's home itself, with no worktree, and its desk thread has no repository and `cwd` = the home. It refuses an agent whose profile has no home. Without a repository, an only repository or a workspace, the home is the default target. With 2 or more repositories and none named, the error lists them and `home`. Code work with a repository still gets its worktree, also when the supervisor's own session is in a home. A Clerk keeps its `workspace`. On the Team page each agent card shows `Home: <folder>` and the hint "Star this folder in New session to get a launcher entry", and the repository picker offers `home`.
 
 ## Brian's team (an example)
 
@@ -186,7 +203,7 @@ Pi Pocket's memory has two scopes: a project (one repository or folder) and ever
 
 ## Team files
 
-Runtime copies: `~/.pi-pocket/extensions/team.ts` and `team-web/`. The extension reads only its independent profile directory (override with `PI_POCKET_TEAM_AGENTS`). Its durable document is `x.team.identity`; UI routes are in the owner-only `/api/x/team/` namespace.
+Runtime copies: `~/.pi-pocket/extensions/team.ts` and `team-web/`. The extension reads only its independent profile directory (override with `PI_POCKET_TEAM_AGENTS`). Its durable document is `x.team.identity` (`persona`, and `cleared` for an explicit none); UI routes are in the owner-only `/api/x/team/` namespace.
 
 Runtime imports use Pi Pocket's public extension API and installed Pi packages. Test and preview scripts (`team.test.ts`, `team-memory.test.ts`, `preview.ts`) use the checkout's internal test harness, isolated temporary data, and a fake model. They are not installed.
 
@@ -471,6 +488,6 @@ node audit/daily.mjs --no-llm --out-dir /tmp/audit-dry-run/$(date +%F)-daily-aud
 
 Brian runs it each day at 06:30 America/New_York with a Pocket schedule in a "Daily audit" session; Odrade reads the report for the 07:30 brief.
 
-# Agent homes
+# Home seed
 
-`homes/seed.mjs` makes each agent's home folder, `~/agents/<id>/`: a local git repository with no remote, an `AGENTS.md` with the agent's charter and its repositories, and the folders `notes/`, `plans/` and `reports/`. It reads the `home:` field of the profile, writes nothing over an existing file, and leaves a folder that is already a git repository as it is. `--check` prints what it would do; `--agent <id>` seeds 1 agent. See [homes/README.md](homes/README.md).
+`homes/seed.mjs` makes each agent's home folder, `~/agents/<id>/`: a local git repository with no remote, an `AGENTS.md` with the agent's charter and its repositories, and the folders `notes/`, `plans/` and `reports/`. It reads the `home:` field of the profile, writes nothing over an existing file, and leaves a folder that is already a git repository as it is. `--check` prints what it would do; `--agent <id>` seeds 1 agent. See [homes/README.md](homes/README.md). How a session uses a home: [Agent homes](#agent-homes) under Team.

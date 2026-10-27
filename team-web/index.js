@@ -252,13 +252,15 @@ export default function setup(pocket) {
         }, [source]);
         const agent = agents.find((a) => a.id === selected);
         const repositories = Object.entries(agent?.repositories ?? {});
-        const chosenRepository = Object.hasOwn(agent?.repositories ?? {}, repository)
-            ? repository
-            : (repositories[0]?.[0] ?? "");
+        // The home is 1 more place a task can start in: studies, triage and plans across the agent's repositories.
+        const choices = [...repositories.map(([name]) => name), ...(agent?.home ? ["home"] : [])];
+        const chosenRepository = choices.includes(repository) ? repository : (choices[0] ?? "");
         const taskCwd =
-            agent?.repositories?.[chosenRepository] ??
-            agent?.workspace ??
-            session?.conversation.cwd;
+            chosenRepository === "home"
+                ? agent?.home
+                : (agent?.repositories?.[chosenRepository] ??
+                  agent?.workspace ??
+                  session?.conversation.cwd);
 
         const perform = async (action) => {
             setBusy(true);
@@ -334,6 +336,12 @@ export default function setup(pocket) {
                         >
                             <strong>${a.name}</strong><span class="small muted">${a.role}</span>
                             ${
+                                a.home &&
+                                html`<span class="small muted"
+                                    >Home: <span class="mono">${a.home}</span></span
+                                >`
+                            }
+                            ${
                                 waitingCount(memory?.agents?.[a.id]) > 0 &&
                                 html`<span class="named-team-count" title="Lessons waiting for you"
                                     >${waitingCount(memory.agents[a.id])} waiting</span
@@ -343,6 +351,12 @@ export default function setup(pocket) {
                 )}
             </div>
             ${agents.length === 0 && html`<p>No agent files found. Import your team using this extension's installer.</p>`}
+            ${
+                agents.some((a) => a.home) &&
+                html`<p class="small muted">
+                    Star a home folder in New session to get a launcher entry.
+                </p>`
+            }
             ${
                 agent &&
                 html`<section class="named-team-details">
@@ -386,7 +400,7 @@ export default function setup(pocket) {
                     </details>
 
                     ${
-                        repositories.length > 0 &&
+                        choices.length > 0 &&
                         html`
                         <label class="named-team-task">Repository for the new task
                             <select value=${chosenRepository} disabled=${busy}
@@ -394,7 +408,7 @@ export default function setup(pocket) {
                                     setRepository(e.currentTarget.value);
                                     setRequestKey(null);
                                 }}>
-                                ${repositories.map(([name]) => html`<option value=${name}>${name}</option>`)}
+                                ${choices.map((name) => html`<option value=${name}>${name === "home" ? `home: ${agent.home}` : name}</option>`)}
                             </select>
                         </label>
                     `
@@ -482,6 +496,8 @@ export default function setup(pocket) {
     if (typeof pocket.status === "function") {
         let shown = null;
         let item = null;
+        // An identity the folder gave is pinned once per session: a later move of the session keeps it.
+        const pinned = new Set();
 
         const show = (spec) => {
             if (!spec) {
@@ -500,7 +516,20 @@ export default function setup(pocket) {
 
             if (id !== null) {
                 try {
-                    spec = identityStatus(await pocket.api(`session/${id}`));
+                    const seen = await pocket.api(`session/${id}`);
+
+                    if (seen?.implicit && seen.identity && !pinned.has(Number(id))) {
+                        try {
+                            // The server pins it only when its folder still says so: a choice or a clear wins, and
+                            // a folder that moved pins nothing.
+                            await pocket.api(`session/${id}/pin`, { agent: seen.identity.id });
+                            pinned.add(Number(id));
+                        } catch {
+                            // An owner-only route refused it: the folder keeps giving the identity.
+                        }
+                    }
+
+                    spec = identityStatus(seen);
                 } catch {
                     spec = null;
                 }
