@@ -18,7 +18,7 @@ console, or a choice). Every other step runs as the `team` user on the VM, unles
 - **New paths.** The VM has no `/var/home/bjk` and no symlink to it. Configuration that names
   `/var/home/bjk` is rewritten (step 6). The database is never edited.
 - **Old sessions are read-only history.** They move with the database, but their folders do not exist on the VM.
-  Brian archives them after the cut-over (step 9) and reads them there. Nobody sends a message in an old session,
+  Brian archives them on framework before the stop (step 2) and reads them on the VM under Archived. Nobody sends a message in an old session,
   except the 2 sessions in step 8 (Odrade's supervisor session and the Clerk).
 - **No secret in a command line, a file in git, or a report.** The commands below name secrets by path only.
 - **Headless** (Brian, T330a: no auto-login). The VM has no graphical login, so nothing may need a desktop session or
@@ -241,7 +241,7 @@ there would run in an old session whose folder is gone, or send a message to one
     node /tmp/pocket-tasks.mjs
     ```
 
-    Wait, or stop the work in the app, until the first table holds only what steps 3 and 4 below remove
+    Wait, or stop the work in the app, until the first table holds only what steps 3 and 5 below remove
     (`pocket.schedule`, `x.desk.sweeper`, `x.desk.digest`). Brian runs the cut-over from a terminal, not from a
     Pocket session, so no session of the cut-over is in the table.
 
@@ -268,20 +268,27 @@ there would run in an old session whose folder is gone, or send a message to one
    Never an old session. Odrade fills the table; **Brian:** confirms it. Then cancel each schedule in its session
    (`schedule cancel`).
 
-4. **The desk.** The desk's sweeper sends close-out and repair messages to the agents' sessions, which are old
+4. **Archive the old sessions.** **Brian:** on framework, archive every session except Odrade's supervisor session and
+   the Clerk (Sessions → Folders; Ctrl/⌘+click selects many). They stay readable under Archived. The desk reads
+   this: it sends no close-out to an archived agent session, and a repair for a thread whose agent session is
+   archived goes to Odrade instead (`planRepairs` and `closeoutDue` in `desk.ts`). A closed thread can still open
+   again when its PR fails or conflicts (`repairReopen`), but its wake-up then goes to Odrade, never to the old agent
+   session.
+
+5. **The desk.** The desk's sweeper sends close-out and repair messages to the agents' sessions, which are old
    sessions on the VM. It ends only when its supervisor has no thread that is not closed; the digest ends when no
-   news waits. So every thread must be closed in a way that cannot open again:
+   news waits. So every open or parked thread must close, after step 4:
     - Odrade first writes the record: `plans/desk-at-cutover-DATE.md` in her desk, with each open or parked thread,
       its agent, and each PR and issue on it (from the Desk page or the export in `desk/`). She commits it.
     - **Brian:** on the Desk page, **Drop** each open or parked thread, with the reason "team VM cut-over DATE". A
       dropped thread is closed for good: a repair never opens it again (`desk.ts`, the check for `"dropped"` before
-      a reopen), and a close-out goes only to an open thread. A thread that the desk closed by itself stays closed.
+      a reopen), and a close-out goes only to an open thread.
     - Wait until the first table of the script has no `x.desk.sweeper` and no `x.desk.digest`.
     - An open PR keeps its `ready-for-human` label, so Brian still finds it on GitHub. After step 9, Odrade goes
       through the record: each PR or issue that still needs work goes to its owner again with `team_delegate` (a new
       thread and a new session on the VM). Nothing from the record goes to an old session.
 
-5. **Odrade's desk folder.** Commit it (`git -C ~/projects/odrade status` is clean).
+6. **Odrade's desk folder.** Commit it (`git -C ~/projects/odrade status` is clean).
 
 ## 3. Stop framework and back it up
 
@@ -416,21 +423,21 @@ fails, stop and use the rollback.
 
 ## 8. Checks
 
-| Check         | How                                                                                      | Expect                                                                                                              |
-| ------------- | ---------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
-| Version       | `git -C ~/projects/pi-pocket describe --tags`                                            | `TAG`                                                                                                               |
-| Database      | the session list, the Archived switch                                                    | 700+ sessions, people and settings as on framework                                                                  |
-| Extensions    | Menu → Extensions                                                                        | Team, Desk, Night shift, Homewiki, MCP and Agent Teams on, no load errors                                           |
-| Desk          | the Desk page; after the move below, `desk sync` in Odrade's session                     | no open thread from before; open team PRs come back as found threads; the export writes into `~/agents/odrade/desk` |
-| Team          | the Team page                                                                            | 11 agents, repository folders under `/var/home/team/projects`, no error                                             |
-| gh and git    | a new session in `~/agents`: `gh api user -q .login`; `git config user.name`             | `frostyard-machines`; the machine identity                                                                          |
-| ssh           | from that session: `ssh -o BatchMode=yes <host> true` for each host Teg keyed            | no password prompt, no failure                                                                                      |
-| No Brian keys | `ls ~/.ssh`; `echo "${SSH_AUTH_SOCK:-unset}"`; `gh auth status 2>&1 \| grep -ci keyring` | team keys only; `unset` or a plain ssh-agent, never `/run/user/*/keyring/ssh`; `0`                                  |
-| Browser       | ask Pi to open `https://example.com` with the browser tool                               | a snapshot of the page                                                                                              |
-| truenas MCP   | the MCP page: truenas on; ask Pi for a read-only truenas tool                            | a pool list, no write                                                                                               |
-| Providers     | Menu → Providers                                                                         | each provider signed in; `halogen` (selfie `10.0.1.200:8731`) answers; **Brian:** sign in again where it says so    |
-| Lessons       | the Team panel's lessons                                                                 | the same lessons as on framework                                                                                    |
-| Homewiki      | the Wiki page                                                                            | renders `~/projects/homewiki`                                                                                       |
+| Check         | How                                                                                      | Expect                                                                                                                                                                          |
+| ------------- | ---------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Version       | `git -C ~/projects/pi-pocket describe --tags`                                            | `TAG`                                                                                                                                                                           |
+| Database      | the session list, the Archived switch                                                    | 700+ sessions, people and settings as on framework                                                                                                                              |
+| Extensions    | Menu → Extensions                                                                        | Team, Desk, Night shift, Homewiki, MCP and Agent Teams on, no load errors                                                                                                       |
+| Desk          | the Desk page; after the move below, `desk sync` in Odrade's session                     | no open thread from before (a reopened one tells Odrade, not an agent); the export writes into `~/agents/odrade/desk`; Odrade re-delegates from `plans/desk-at-cutover-DATE.md` |
+| Team          | the Team page                                                                            | 11 agents, repository folders under `/var/home/team/projects`, no error                                                                                                         |
+| gh and git    | a new session in `~/agents`: `gh api user -q .login`; `git config user.name`             | `frostyard-machines`; the machine identity                                                                                                                                      |
+| ssh           | from that session: `ssh -o BatchMode=yes <host> true` for each host Teg keyed            | no password prompt, no failure                                                                                                                                                  |
+| No Brian keys | `ls ~/.ssh`; `echo "${SSH_AUTH_SOCK:-unset}"`; `gh auth status 2>&1 \| grep -ci keyring` | team keys only; `unset` or a plain ssh-agent, never `/run/user/*/keyring/ssh`; `0`                                                                                              |
+| Browser       | ask Pi to open `https://example.com` with the browser tool                               | a snapshot of the page                                                                                                                                                          |
+| truenas MCP   | the MCP page: truenas on; ask Pi for a read-only truenas tool                            | a pool list, no write                                                                                                                                                           |
+| Providers     | Menu → Providers                                                                         | each provider signed in; `halogen` (selfie `10.0.1.200:8731`) answers; **Brian:** sign in again where it says so                                                                |
+| Lessons       | the Team panel's lessons                                                                 | the same lessons as on framework                                                                                                                                                |
+| Homewiki      | the Wiki page                                                                            | renders `~/projects/homewiki`                                                                                                                                                   |
 
 Odrade's supervisor session and the Clerk keep the desk's history, the Clerk's registration and Odrade's lessons.
 **Brian:** move both with Menu → **Working directory** to `/var/home/team/agents/odrade`, before anything else in
@@ -451,11 +458,9 @@ that Brian starts in the named VM folder.
 
 2. **Brian:** open the link once on the phone and once on the desktop (the address is new, so each device signs in
    again; a cookie lasts a year). Read it as `fleet` with `sudo journalctl`, as in step 7.
-3. **Brian:** archive the old sessions (Sessions → Folders, the groups under `/var/home/bjk`; Ctrl/⌘+click selects
-   many). They stay readable under Archived. Keep Odrade's and the Clerk's sessions.
-4. Odrade resumes the shifts. Until step 10, nobody starts a session in `~/agents/<id>` (only Odrade's desk exists
+3. Odrade resumes the shifts. Until step 10, nobody starts a session in `~/agents/<id>` (only Odrade's desk exists
    there).
-5. Reboot test: during the next reboot window, check that Pocket is up after the VM boots, and that the night shift
+4. Reboot test: during the next reboot window, check that Pocket is up after the VM boots, and that the night shift
    and the desk resume.
 
 ## 10. Agent homes and the new drop-ins
