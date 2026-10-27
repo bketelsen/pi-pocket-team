@@ -64,21 +64,29 @@ function gitEnvironment(extraConfig = "") {
 
 const gitEnv = gitEnvironment();
 
-/** A runner for the seed: real git, with `env`, and the environment the seed passes laid over it. */
+/**
+ * A runner for the seed: real git, with `env`, and the environment the seed passes laid over it. Every child starts
+ * in a temporary folder (`cwd`), never in the checkout that the tests run from.
+ */
 const makeRun =
-    (env = gitEnv) =>
+    (env = gitEnv, cwd = env.HOME) =>
     (command, args, options = {}) =>
         execFileSync(command, args, {
             encoding: "utf8",
             stdio: ["ignore", "pipe", "pipe"],
             env: { ...env, ...(options.env ?? {}) },
+            cwd,
         });
 
 const gitRun = makeRun();
 
-/** 1 git command's stdout, trimmed, in the isolated environment. */
+/** 1 git command's stdout, trimmed, in the isolated environment, started in a temporary folder. */
 const git = (folder, args) =>
-    execFileSync("git", ["-C", folder, ...args], { encoding: "utf8", env: gitEnv }).trim();
+    execFileSync("git", ["-C", folder, ...args], {
+        encoding: "utf8",
+        env: gitEnv,
+        cwd: gitEnv.HOME,
+    }).trim();
 
 /** Every file under a folder, with its hash. */
 function snapshot(dir, base = dir) {
@@ -580,6 +588,26 @@ test("--check writes nothing, and no trace file of a GIT_TRACE in the environmen
     assert.match(logs.join("\n"), /irulan: would make the folder/);
 });
 
+test("the seed reads the identity from the user's home, not from the repository it is started in", () => {
+    const t = setup();
+    const repo = path.join(t.root, "checkout");
+
+    // A temporary repository, and the folder every git child of this test starts in.
+    fs.mkdirSync(repo);
+    git(repo, ["init", "-b", "main"]);
+    fs.writeFileSync(path.join(repo, "README.md"), "# a checkout\n");
+    git(repo, ["add", "-A"]);
+    git(repo, ["commit", "-m", "checkout"]);
+    git(repo, ["config", "user.name", "Local identity"]);
+    git(repo, ["config", "user.email", "local@example.invalid"]);
+
+    const { result } = seed(t, { run: makeRun(gitEnv, repo) });
+
+    assert.deepEqual(result.refused, []);
+    // The fixture identity of the temporary HOME's .gitconfig, not the checkout's local one.
+    assert.equal(git(t.home, ["log", "--format=%an <%ae>"]), "Seed test <seed@example.invalid>");
+});
+
 test("a GIT_CONFIG of the environment is not used, and its file stays byte for byte as it is", () => {
     const t = setup();
     const file = path.join(t.root, "external-config");
@@ -715,6 +743,8 @@ test("the CLI exits 1 when a home is refused, prints it, and seeds the other hom
         {
             encoding: "utf8",
             env: { ...gitEnv, HOME: t.userHome, PI_POCKET_TEAM_AGENTS: t.profilesDir },
+            // A temporary working directory, never the checkout the tests run from.
+            cwd: t.root,
         },
     );
 

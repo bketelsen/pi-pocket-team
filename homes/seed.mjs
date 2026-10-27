@@ -179,14 +179,21 @@ export function readProfiles(directory) {
 // ---------- Git ----------
 
 /**
- * The process environment without every `GIT_` variable: the base of every git child environment of the seed. This
- * covers `GIT_DIR` and the other location variables, `GIT_CONFIG`, `GIT_TRACE*`, `GIT_CONFIG_COUNT` and the rest.
+ * The 2 git variables that only turn a configuration off. A seed keeps them as it inherits them: they can make a git
+ * call read less, never more.
+ */
+export const GIT_OFF_VARS = ["GIT_CONFIG_NOSYSTEM", "GIT_ATTR_NOSYSTEM"];
+
+/**
+ * The process environment without every `GIT_` variable but those 2: the base of every git child environment of the
+ * seed. This covers `GIT_DIR` and the other location variables, `GIT_CONFIG`, `GIT_TRACE*`, `GIT_CONFIG_COUNT` and
+ * the rest.
  */
 export function withoutGitEnv(env = process.env) {
     const clean = {};
 
     for (const [name, value] of Object.entries(env)) {
-        if (value === undefined || name.startsWith("GIT_")) {
+        if (value === undefined || (name.startsWith("GIT_") && !GIT_OFF_VARS.includes(name))) {
             continue;
         }
 
@@ -244,14 +251,18 @@ export const gitSafeArgs = (identity) => [
  * The user's name and email, read from the normal configuration. A read runs nothing, so the seed can ask for these 2
  * settings and then run git without any configuration at all. `undefined` when one of them is missing.
  */
-export function readIdentity(run, env) {
+export function readIdentity(run, env, userHome) {
     // The normal global and system config answer this, so the 2 settings are the user's own. No inherited `GIT_`
-    // variable comes along: a `GIT_CONFIG` or a `GIT_DIR` of the shell must not decide what the seed reads.
+    // variable comes along: a `GIT_CONFIG` or a `GIT_DIR` of the shell must not decide what the seed reads. The
+    // working folder is the user's home, never the folder the seed is started in: a repository's local config, such
+    // as a checkout's `user.name`, must not take part in a home's charter or in its commits.
     const readEnv = withoutGitEnv(env);
 
     const get = (key) => {
         try {
-            return String(run("git", ["config", "--get", key], { env: readEnv }) ?? "").trim();
+            return String(
+                run("git", ["-C", userHome, "config", "--get", key], { env: readEnv }) ?? "",
+            ).trim();
         } catch {
             return "";
         }
@@ -495,7 +506,7 @@ export function seedHomes({
     }
 
     // The identity is read from the normal configuration, and every other git call then runs without it.
-    const identity = readIdentity(run, env);
+    const identity = readIdentity(run, env, userHome);
     const gitEnv = cleanGitEnv(env);
     const safe = identity === undefined ? GIT_NO_IDENTITY_ARGS : gitSafeArgs(identity);
 
