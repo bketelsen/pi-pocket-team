@@ -2077,23 +2077,41 @@ function hasChoice(text: string): boolean {
  * ("approve", "authorize", "keep"), or a choice, makes it a decision.
  */
 function routineOnly(text: string): boolean {
-    return ROUTINE_ITEM.test(text) && !DECISION_VERB.test(text) && !hasChoice(text);
+    return (
+        ROUTINE_ITEM.test(text) &&
+        !hasChoice(text) &&
+        (ROUTINE_FIRST.test(text) || !DECISION_VERB.test(text))
+    );
 }
 
 /**
- * Whether 1 item names a decision for Brian: not a no, not a negation, not a thing that is done, and not a plain merge,
- * install, tag, or review. Options in brackets, a choice, or a question make it a decision.
+ * A text whose first word asks for the routine work: "Merge #59 to remove the typo." A decision verb after it says what
+ * the work does, and is no decision of its own.
+ */
+const ROUTINE_FIRST = /^[\s\W]*(?:please\s+)?(?:merge|install|tag|review)\b/i;
+
+/**
+ * Whether 1 item names a decision for Brian: 1 of its sentences is not a no, not a negation, not a thing that is done,
+ * and not a plain merge, install, tag, or review. Options in brackets, a choice, or a question make it a decision. Each
+ * sentence counts by itself: "Brian approved the plan. Brian must authorize the install." is a decision.
  */
 function decisionItem(item: string): boolean {
-    const choice = hasChoice(item);
+    if (NO_ITEM.test(item.trim())) {
+        return false;
+    }
 
-    return (
-        !NO_ITEM.test(item.trim()) &&
-        !NO_DECISION.test(item) &&
-        !NEGATED.test(item) &&
-        !routineOnly(item) &&
-        (choice || !DONE_ITEM.test(item))
-    );
+    return item
+        .split(/(?<=[.!?])\s+|;\s*/)
+        .map((sentence) => sentence.trim())
+        .filter((sentence) => sentence !== "")
+        .some(
+            (sentence) =>
+                !NO_ITEM.test(sentence) &&
+                !NO_DECISION.test(sentence) &&
+                !NEGATED.test(sentence) &&
+                !routineOnly(sentence) &&
+                (hasChoice(sentence) || !DONE_ITEM.test(sentence)),
+        );
 }
 
 /** An item that only asks for a merge, an install, a review, or a tag, with no choice: `ready-for-human` covers it. */

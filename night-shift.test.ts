@@ -435,6 +435,8 @@ describe("parsing", () => {
             [{ question: "Authorize credential access for the install." }],
         );
         assert.deepEqual(asksForBrian("ASKS FOR BRIAN:\n- Install it first."), [], "no verb");
+        // A routine word first is the request: "remove" says what the merge does.
+        assert.deepEqual(asksForBrian("ASKS FOR BRIAN:\n- Merge #59 to remove the typo."), []);
         assert.deepEqual(asksForBrian("ASKS FOR BRIAN: merge #54 or #55"), [
             { question: "merge #54 or #55" },
         ]);

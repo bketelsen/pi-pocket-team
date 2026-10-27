@@ -1031,7 +1031,13 @@ export function asksForBrian(text: string): { question: string; options?: string
         // The options come first: a pick-one is a decision, also when its question holds a merge, an install, a tag, or
         // a review. A decision verb does the same: "Authorize credential access for the install."
         const choice = askOptions(item);
-        const routine = ROUTINE_ASK.test(item) && !ASK_VERB.test(item) && !ASK_CHOICE.test(item);
+        // A routine word first ("Merge #59 to remove the typo.") is the request: a verb after it says what the work does.
+        const routine =
+            ROUTINE_ASK.test(item) &&
+            !ASK_CHOICE.test(item) &&
+            !item.includes("?") &&
+            (/^[\s\W]*(?:please\s+)?(?:merge|install|tag|review)\b/i.test(item) ||
+                !ASK_VERB.test(item));
 
         if (choice === undefined && routine) {
             continue;
