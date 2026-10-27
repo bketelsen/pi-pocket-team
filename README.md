@@ -44,6 +44,8 @@ The server must already have `node_modules` in its extensions folder. Pocket's d
 
 An install writes into the running server: a saved module reloads at once, and open tabs pick up browser changes. Installing never turns a module on or off and never restarts the server; the owner does both, in **Menu → Extensions**. Run `npm test` before every install.
 
+To move the server, these drop-ins and the team to another machine and user, follow [docs/team-vm-cutover.md](docs/team-vm-cutover.md).
+
 # Team
 
 ## Try it
