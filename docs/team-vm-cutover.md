@@ -21,6 +21,11 @@ console, or a choice). Every other step runs as the `team` user on the VM, unles
   Brian archives them after the cut-over (step 9) and reads them there. Nobody sends a message in an old session,
   except the 2 sessions in step 8 (Odrade's supervisor session and the Clerk).
 - **No secret in a command line, a file in git, or a report.** The commands below name secrets by path only.
+- **Headless** (Brian, T330a: no auto-login). The VM has no graphical login, so nothing may need a desktop session or
+  the GNOME keyring. Pocket runs as a system unit (user `team`, linger on). The browser tool runs Chromium headless
+  (Pocket starts it with `--headless=new`; no display). gh keeps its token in a file, `~/.config/gh/hosts.yml`
+  (mode `0600`), not in a keyring. Agents reach hosts with key files named in `~/.ssh/config`; `SSH_AUTH_SOCK` is
+  unset, or a plain `ssh-agent`, and never `/run/user/*/keyring/ssh`.
 
 ## Names used here
 
@@ -60,10 +65,17 @@ gh api user -q .login                    # prints frostyard-machines
 git config --global user.name            # the machine identity
 id -nG | tr ' ' '\n' | grep -x kvm       # nsl machines need /dev/kvm
 loginctl show-user team -p Linger        # Linger=yes
+gh auth status 2>&1 | grep -ci keyring   # 0: the token is not in a keyring
+grep -c oauth_token ~/.config/gh/hosts.yml   # 1: the token is in the file (prints a count, not the token)
+stat -c %a ~/.config/gh/hosts.yml ~/.ssh/id_* # 600 for each
+echo "${SSH_AUTH_SOCK:-unset}"           # unset, or a plain ssh-agent socket; never /run/user/*/keyring/ssh
+ssh -G <host> | grep -i '^identityfile'  # for each host Teg keyed: the team key file for that host
 ```
 
 Brian's steps in Teg's part, for reference: the UDM DHCP reservation, MokManager on the VGA console
-(`incus console VM --type=vga`) once, and `gh auth login` as frostyard-machines (device flow). Teg's runbook owns them.
+(`incus console VM --type=vga`) once, and `gh auth login --insecure-storage` as frostyard-machines (device flow; the
+flag keeps the token in `~/.config/gh/hosts.yml`, because the VM has no keyring). Teg's runbook owns them. The team ssh
+keys have no passphrase: after a reboot nobody is there to unlock them. Their file mode and the VM protect them.
 
 ## 1. Prepare the VM (no Pocket data yet; framework keeps running)
 
@@ -148,8 +160,12 @@ Brian's steps in Teg's part, for reference: the UDM DHCP reservation, MokManager
     Environment=PATH=NODE:/var/home/team/.local/share/mise/shims:/var/home/team/.local/bin:/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin
     WorkingDirectory=/var/home/team/agents
     ExecStart=NODE/node ${POCKET_HOME}/bin/pi-pocket.js --access %i --port 8787 --data /var/home/team/.pi-pocket --cwd /var/home/team/agents
+    UnsetEnvironment=SSH_AUTH_SOCK DISPLAY WAYLAND_DISPLAY
     # remove: StateDirectory=pi-pocket and StateDirectoryMode=0700 (the data folder is not /var/lib/pi-pocket)
     ```
+
+    The unit runs with no login and no desktop: ssh uses the key files in `~/.ssh/config`, gh the token file, and the
+    browser tool Chromium headless. Linger (Teg) keeps the team user's own systemd manager running for nsl machines.
 
     Keep `NoNewPrivileges=yes` (agents need no sudo on the VM) and `PrivateTmp=yes`. If nsl machines fail under the
     unit (systemd-vmspawn), remove `NoNewPrivileges` first and say so in the cut-over report. When Node's version
@@ -321,21 +337,21 @@ chat. Then run the checks in step 8. When a check fails, stop and use the rollba
 
 ## 8. Checks
 
-| Check         | How                                                                           | Expect                                                                                                           |
-| ------------- | ----------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
-| Version       | `git -C ~/projects/pi-pocket describe --tags`                                 | `TAG`                                                                                                            |
-| Database      | the session list, the Archived switch                                         | 700+ sessions, people and settings as on framework                                                               |
-| Extensions    | Menu → Extensions                                                             | Team, Desk, Night shift, Homewiki, MCP and Agent Teams on, no load errors                                        |
-| Desk          | the Desk page                                                                 | the open threads of step 2, `desk.json` export writes into `~/agents/odrade/desk`                                |
-| Team          | the Team page                                                                 | 11 agents, repository folders under `/var/home/team/projects`, no error                                          |
-| gh and git    | a new session in `~/agents`: `gh api user -q .login`; `git config user.name`  | `frostyard-machines`; the machine identity                                                                       |
-| ssh           | from that session: `ssh -o BatchMode=yes <host> true` for each host Teg keyed | no password prompt, no failure                                                                                   |
-| No Brian keys | `ls ~/.ssh`; `env \| grep -c SSH_AUTH_SOCK`                                   | team keys only; no keyring agent                                                                                 |
-| Browser       | ask Pi to open `https://example.com` with the browser tool                    | a snapshot of the page                                                                                           |
-| truenas MCP   | the MCP page: truenas on; ask Pi for a read-only truenas tool                 | a pool list, no write                                                                                            |
-| Providers     | Menu → Providers                                                              | each provider signed in; `halogen` (selfie `10.0.1.200:8731`) answers; **Brian:** sign in again where it says so |
-| Lessons       | the Team panel's lessons                                                      | the same lessons as on framework                                                                                 |
-| Homewiki      | the Wiki page                                                                 | renders `~/projects/homewiki`                                                                                    |
+| Check         | How                                                                                      | Expect                                                                                                           |
+| ------------- | ---------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| Version       | `git -C ~/projects/pi-pocket describe --tags`                                            | `TAG`                                                                                                            |
+| Database      | the session list, the Archived switch                                                    | 700+ sessions, people and settings as on framework                                                               |
+| Extensions    | Menu → Extensions                                                                        | Team, Desk, Night shift, Homewiki, MCP and Agent Teams on, no load errors                                        |
+| Desk          | the Desk page                                                                            | the open threads of step 2, `desk.json` export writes into `~/agents/odrade/desk`                                |
+| Team          | the Team page                                                                            | 11 agents, repository folders under `/var/home/team/projects`, no error                                          |
+| gh and git    | a new session in `~/agents`: `gh api user -q .login`; `git config user.name`             | `frostyard-machines`; the machine identity                                                                       |
+| ssh           | from that session: `ssh -o BatchMode=yes <host> true` for each host Teg keyed            | no password prompt, no failure                                                                                   |
+| No Brian keys | `ls ~/.ssh`; `echo "${SSH_AUTH_SOCK:-unset}"`; `gh auth status 2>&1 \| grep -ci keyring` | team keys only; `unset` or a plain ssh-agent, never `/run/user/*/keyring/ssh`; `0`                               |
+| Browser       | ask Pi to open `https://example.com` with the browser tool                               | a snapshot of the page                                                                                           |
+| truenas MCP   | the MCP page: truenas on; ask Pi for a read-only truenas tool                            | a pool list, no write                                                                                            |
+| Providers     | Menu → Providers                                                                         | each provider signed in; `halogen` (selfie `10.0.1.200:8731`) answers; **Brian:** sign in again where it says so |
+| Lessons       | the Team panel's lessons                                                                 | the same lessons as on framework                                                                                 |
+| Homewiki      | the Wiki page                                                                            | renders `~/projects/homewiki`                                                                                    |
 
 Odrade's supervisor session and the Clerk keep the desk's threads, digests and sweeper. **Brian:** move both with
 Menu → **Working directory** to `/var/home/team/agents/odrade` (only these 2 old sessions move). Then, in
