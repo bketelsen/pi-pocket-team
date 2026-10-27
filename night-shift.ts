@@ -917,6 +917,10 @@ const NO_ASK_ITEM = /^(?:no|none|nothing)\b/i;
 /** An item that only asks for a merge, an install, a tag, or a review, with no choice: `ready-for-human` covers it. */
 const ROUTINE_ASK = /\b(?:merge|install|tag|review)\b/i;
 
+/** A verb that asks Brian to decide something: "Authorize credential access for the install." is no plain install. */
+const ASK_VERB =
+    /\b(?:approve|authori[sz]e|allow|grant|decide|choose|pick|accept|rotate|confirm|reset|delete|remove|keep|treat|create)\b/i;
+
 /** The words of a choice in an item: a merge request with one of them is still a decision. */
 const ASK_CHOICE = /\bor\b|which|whether/i;
 
@@ -976,10 +980,10 @@ function askOptions(item: string): { question: string; options: string[] } | und
 /**
  * The asks of the last `ASKS FOR BRIAN:` block in a summary: the rest of that line, then each non-empty line under it up
  * to the first blank line, with its list mark removed. Lines in fenced code are not read. An item that starts with
- * `none`, `nothing`, or `no` is left out, and so is a plain merge, install, tag, or review request with no choice, so
- * `ASKS FOR BRIAN: none` gives []. An item that ends with `[a | b]` gives its options, and the text before them is the
- * question: its options are a choice, so the merge rule leaves it in. Undefined when there is no such line, or when
- * there are more than 4 items: the text alone holds the thread then.
+ * `none`, `nothing`, or `no` is left out, and so is a plain merge, install, tag, or review request with no choice and
+ * no decision word, so `ASKS FOR BRIAN: none` gives []. An item that ends with `[a | b]` gives its options, and the text
+ * before them is the question: its options are a choice, so the merge rule leaves it in. Undefined when there is no
+ * such line, or when there are more than 4 items: the text alone holds the thread then.
  */
 export function asksForBrian(text: string): { question: string; options?: string[] }[] | undefined {
     const lines = withoutFences(text);
@@ -1025,10 +1029,11 @@ export function asksForBrian(text: string): { question: string; options?: string
         }
 
         // The options come first: a pick-one is a decision, also when its question holds a merge, an install, a tag, or
-        // a review.
+        // a review. A decision verb does the same: "Authorize credential access for the install."
         const choice = askOptions(item);
+        const routine = ROUTINE_ASK.test(item) && !ASK_VERB.test(item) && !ASK_CHOICE.test(item);
 
-        if (choice === undefined && ROUTINE_ASK.test(item) && !ASK_CHOICE.test(item)) {
+        if (choice === undefined && routine) {
             continue;
         }
 

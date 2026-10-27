@@ -1908,19 +1908,26 @@ export function reportBlocks(text: string, reason?: string): boolean {
 
 /**
  * Whether a report asks Brian for a decision: `needs brian: yes` (any case), a line that starts with `needs a decision`
- * or `decision needed` (any case), a decision for Brian named in words (`namesDecision`, which reads an
- * `ASKS FOR BRIAN:` block too), or a last paragraph that asks Brian something (`asksBrian`: a question, or the ask
- * words). Code blocks and inline code never count. A request to merge, install, tag, or review, with no choice in it,
- * is no decision: the PR's label `ready-for-human` already brings it to Brian.
+ * or `decision needed` (any case), a decision for Brian named in words (`namesDecision`), or a last paragraph that asks
+ * Brian something (`asksBrian`: a question, or the ask words). Code blocks and inline code never count. Every scan runs
+ * on the text without its `ASKS FOR BRIAN:` blocks, and only the last block counts, through `asksForBrian`: its `none`
+ * wins over an earlier block. A request to merge, install, tag, or review, with no decision word and no choice in it, is
+ * no decision: the PR's label `ready-for-human` already brings it to Brian.
  */
 export function reportAsksBrian(text: string): boolean {
     const plain = withoutCode(text);
+    const rest = withoutAsksBlocks(plain);
 
-    if (/needs\s+brian:\s*yes\b/i.test(plain)) {
+    // The last block is the report's own list of decisions for him.
+    if (asksForBrian(plain)?.some(decisionItem) === true) {
         return true;
     }
 
-    for (const line of plain.split("\n")) {
+    if (/needs\s+brian:\s*yes\b/i.test(rest)) {
+        return true;
+    }
+
+    for (const line of rest.split("\n")) {
         const start = line.replace(/^[\s>#*-]+/, "").toLowerCase();
 
         if (start.startsWith("needs a decision") || start.startsWith("decision needed")) {
@@ -1928,12 +1935,12 @@ export function reportAsksBrian(text: string): boolean {
         }
     }
 
-    if (namesDecision(plain)) {
+    if (namesDecision(rest)) {
         return true;
     }
 
     // A report whose last paragraph asks Brian something waits for his answer, as a blocked one does.
-    return asksBrian(text, { report: true });
+    return asksBrian(rest, { report: true });
 }
 
 /**
@@ -2019,25 +2026,72 @@ export function asksForBrian(text: string): string[] | undefined {
     return items.filter((item) => !NO_ITEM.test(item));
 }
 
+/**
+ * The code-free text without its `ASKS FOR BRIAN:` blocks: each block is its line and the non-empty lines under it, up
+ * to the first blank line. Those lines become empty, so a line keeps its place. Only the last block counts
+ * (`asksForBrian` reads it), and none of them is a sentence of its own.
+ */
+function withoutAsksBlocks(plain: string): string {
+    let inBlock = false;
+
+    return plain
+        .split("\n")
+        .map((line) => {
+            if (inBlock && line.trim() !== "") {
+                return "";
+            }
+
+            const bare = line
+                .replace(/^[\s>#*-]+/, "")
+                .replace(/\*+/g, "")
+                .trim();
+
+            inBlock = ASKS_BRIAN_LINE.test(bare);
+
+            return inBlock ? "" : line;
+        })
+        .join("\n");
+}
+
 /** The words of a pick-one item: `[a | b]`, 2 to 6 options. A choice is a decision, also with a merge in it. */
 const OPTIONS = /\[[^\]]*\|[^\]]*\]/;
 
-/** An item that says the thing is behind him: "you approved this yesterday", "all work is done". */
-const DONE_ITEM = /\b(?:already|approved|is done|is complete|completed)\b/i;
+/**
+ * A verb that asks Brian to decide something: "Authorize credential access for the install." is a decision, not a plain
+ * install request.
+ */
+const DECISION_VERB =
+    /\b(?:approve|authori[sz]e|allow|grant|decide|choose|pick|accept|rotate|confirm|reset|delete|remove|keep|treat|create)\b/i;
+
+/** An item that says the action is behind him: "you approved this yesterday", "all work is done", "nothing left". */
+const DONE_ITEM =
+    /\b(?:you|brian|he)\s+(?:already\s+)?(?:approved|decided|answered|chose|confirmed)\b|\ball\s+(?:the\s+)?(?:work|tasks?)\s+(?:is|are)\s+(?:done|complete)\b|\bnothing\s+(?:is\s+)?left\b/i;
+
+/** Whether a text holds a choice: the choice words, options in brackets, or a question. */
+function hasChoice(text: string): boolean {
+    return CHOICE.test(text) || OPTIONS.test(text) || text.includes("?");
+}
+
+/**
+ * Whether a text only asks for a merge, an install, a review, or a tag: `ready-for-human` covers that. A decision verb
+ * ("approve", "authorize", "keep"), or a choice, makes it a decision.
+ */
+function routineOnly(text: string): boolean {
+    return ROUTINE_ITEM.test(text) && !DECISION_VERB.test(text) && !hasChoice(text);
+}
 
 /**
  * Whether 1 item names a decision for Brian: not a no, not a negation, not a thing that is done, and not a plain merge,
  * install, tag, or review. Options in brackets, a choice, or a question make it a decision.
  */
 function decisionItem(item: string): boolean {
-    // A choice, options in brackets, or a question is a decision, whatever else it says.
-    const choice = CHOICE.test(item) || OPTIONS.test(item) || item.includes("?");
+    const choice = hasChoice(item);
 
     return (
         !NO_ITEM.test(item.trim()) &&
         !NO_DECISION.test(item) &&
         !NEGATED.test(item) &&
-        (choice || !ROUTINE_ITEM.test(item)) &&
+        !routineOnly(item) &&
         (choice || !DONE_ITEM.test(item))
     );
 }
@@ -2071,7 +2125,8 @@ export function namesDecision(plain: string): boolean {
             return true;
         }
 
-        // "The key rotation needs Brian.": a thing that is his, unless it is a routine merge, install, tag, or review.
+        // "The key rotation needs Brian.": a thing that is his, unless it is a routine merge, install, tag, or review
+        // with no decision word in it ("Authorize the install." still counts).
         const needs = NEEDS_BRIAN.exec(sentence);
 
         if (
@@ -2079,7 +2134,7 @@ export function namesDecision(plain: string): boolean {
             !NEEDS_BRIAN_NOT.test(sentence.slice(0, needs.index)) &&
             !NEEDS_BRIAN_NO.test(sentence) &&
             !NEEDS_BRIAN_LABEL.test(sentence) &&
-            (!ROUTINE_ITEM.test(sentence) || CHOICE.test(sentence))
+            !routineOnly(sentence)
         ) {
             return true;
         }
@@ -2195,12 +2250,15 @@ export function closeCheck(thread: Thread, facts: CloseFacts): { close: boolean;
         );
     }
 
-    // A thread that reported before the desk derived its flag: a failed read of its reports leaves the flag absent, and
-    // an absent flag is not `false`, so the thread waits until a sweep reads the report.
+    // A thread that reported before the desk derived its flags: a failed read of its reports leaves a flag absent, and
+    // an absent flag is not `false`, so the thread waits until a sweep reads the report. Either flag holds it: a thread
+    // from before `reportAsks` can have `reportBlocked: false` and no `reportAsks`, and a report that asks him would
+    // close it too early.
     if (
         thread.session !== undefined &&
         thread.run.reportedAt !== undefined &&
-        typeof thread.run.reportBlocked !== "boolean"
+        (typeof thread.run.reportBlocked !== "boolean" ||
+            typeof thread.run.reportAsks !== "boolean")
     ) {
         open.push("its newest report is not checked yet");
     }

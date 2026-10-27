@@ -429,6 +429,12 @@ describe("parsing", () => {
             asksForBrian("ASKS FOR BRIAN: review the diff or tag it [tag v2 | tag v3 | wait]"),
             [{ question: "review the diff or tag it", options: ["tag v2", "tag v3", "wait"] }],
         );
+        // A decision verb makes an install request a decision: no options are needed for it.
+        assert.deepEqual(
+            asksForBrian("ASKS FOR BRIAN:\n- Authorize credential access for the install."),
+            [{ question: "Authorize credential access for the install." }],
+        );
+        assert.deepEqual(asksForBrian("ASKS FOR BRIAN:\n- Install it first."), [], "no verb");
         assert.deepEqual(asksForBrian("ASKS FOR BRIAN: merge #54 or #55"), [
             { question: "merge #54 or #55" },
         ]);

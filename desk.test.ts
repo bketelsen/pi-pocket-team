@@ -925,11 +925,72 @@ describe("closeCheck", () => {
             closeCheck(thread({ session: undefined, run: { reportedAt: 900 } }), facts()),
             { close: true, open: [] },
         );
-        // A derived flag, either way, lifts the hold.
+        // A pair of derived flags, either way, lifts the hold.
         assert.deepEqual(
-            closeCheck(thread({ run: { reportedAt: 900, reportBlocked: false } }), facts()),
+            closeCheck(
+                thread({ run: { reportedAt: 900, reportBlocked: false, reportAsks: false } }),
+                facts(),
+            ),
             { close: true, open: [] },
         );
+        assert.deepEqual(
+            closeCheck(
+                thread({ run: { reportedAt: 900, reportBlocked: true, reportAsks: true } }),
+                facts(),
+            ).open,
+            ["its last report asks Brian for a decision"],
+        );
+
+        // A thread from before `reportAsks` has `reportBlocked: false` and no `reportAsks`: a failed read of its
+        // report leaves it that way, and a report that asks him must not close it too early.
+        for (const run of [
+            { reportedAt: 900, reportBlocked: false },
+            { reportedAt: 900, reportAsks: false },
+        ]) {
+            assert.deepEqual(
+                closeCheck(thread({ run }), facts()),
+                { close: false, open: ["its newest report is not checked yet"] },
+                JSON.stringify(run),
+            );
+        }
+
+        // The same, with a blocked report: both parts hold it, and neither one goes away.
+        assert.deepEqual(
+            closeCheck(thread({ run: { reportedAt: 900, reportBlocked: true } }), facts()),
+            {
+                close: false,
+                open: [
+                    "its last report says BLOCKED or asks for a decision",
+                    "its newest report is not checked yet",
+                ],
+            },
+        );
+
+        // A thread that would close: an idle, reported session, and a merged PR. The missing pair alone holds it, and a
+        // sweep that reads the report lifts the hold.
+        const ref = "frostyard/test#2";
+        const done = (run: Record<string, JsonValue>): Thread =>
+            thread({
+                prs: { [ref]: { via: "attached" as const, state: "MERGED" as const } },
+                run: {
+                    closeout: `closeout:k:${ref}`,
+                    closeoutRefs: [ref],
+                    closeoutEntry: 5,
+                    reportedUserEntry: 6,
+                    lastUserEntry: 6,
+                    reportedAt: 900,
+                    ...run,
+                },
+            });
+
+        assert.deepEqual(closeCheck(done({ reportBlocked: false }), facts()), {
+            close: false,
+            open: ["its newest report is not checked yet"],
+        });
+        assert.deepEqual(closeCheck(done({ reportBlocked: false, reportAsks: false }), facts()), {
+            close: true,
+            open: [],
+        });
     });
 
     test("a thread still starting closes as failed after an hour", () => {
@@ -2335,6 +2396,7 @@ describe("a quiet session after a supervisor's message", () => {
                 reportedUserEntry: 5,
                 reportedAt: 400,
                 reportBlocked: false,
+                reportAsks: false,
                 lastUserEntry: 6,
                 otherUserEntry: 5,
                 quietReopen: { at: 500, entry: 5 },
@@ -6294,6 +6356,12 @@ describe("a report that asks Brian for a decision", () => {
             "STEPS FOR BRIAN:\n- Rotate the key.",
             // Options are a choice: a pick-one with a merge or an install in it is still a decision.
             "ASKS FOR BRIAN:\n- Approve the key rotation before install. [approve | reject]",
+            // A decision verb makes a merge or an install request a decision too.
+            "ASKS FOR BRIAN:\n- Authorize credential access for the install.",
+            "Needs Brian: authorize the install.",
+            "The install needs Brian to authorize it.",
+            // "already" alone is no sign that the decision is behind him.
+            "ASKS FOR BRIAN:\n- Approve access to the already configured production server.",
         ]) {
             assert.equal(reportAsksBrian(text), true, text);
             assert.equal(reportBlocks(text), true, text);
@@ -6328,6 +6396,19 @@ describe("a report that asks Brian for a decision", () => {
         assert.equal(reportAsksBrian(last), false, last);
         assert.equal(reportBlocks(last), false, last);
         assert.deepEqual(asksForBrian(last), []);
+        // Neither does its sentences: a decision named in an older block counts for nothing.
+        const older =
+            "Done.\n\nASKS FOR BRIAN:\n- Brian must decide which host to retire.\n\nASKS FOR BRIAN: none";
+
+        assert.equal(reportAsksBrian(older), false, older);
+        assert.equal(reportBlocks(older), false, older);
+        assert.equal(
+            reportAsksBrian("ASKS FOR BRIAN:\n- Brian must decide which host to retire."),
+            true,
+            "the same block, last, counts",
+        );
+        assert.equal(reportAsksBrian("ASKS FOR BRIAN:\n- Rotate the key?"), true);
+        assert.equal(reportBlocks("ASKS FOR BRIAN:\n- Rotate the key?"), true);
         // The items of the block are the desk's items, options and all.
         assert.deepEqual(
             asksForBrian("ASKS FOR BRIAN:\n- Approve it before install. [approve | reject]"),
@@ -14543,6 +14624,16 @@ describe("the desk in a Pi Pocket", () => {
                 { key: "report:asks", text: ASKS_REPORT },
                 { reportBlocked: false },
             );
+            // Before the sweep, the thread has `reportBlocked: false` and no `reportAsks`: a failed read of its
+            // report leaves it that way, and the pair that is not checked yet holds it open.
+            const before = (await deskState())?.threads[id];
+
+            assert(before, "the thread is stored");
+            assert.equal(before.run.reportAsks, undefined, "the read did not happen yet");
+            assert.deepEqual(closeCheck(before, facts()).open, [
+                "its newest report is not checked yet",
+            ]);
+
             const after = await swept(source, id);
 
             assert(after, "the thread is stored");
