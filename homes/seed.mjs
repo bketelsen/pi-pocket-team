@@ -178,38 +178,31 @@ export function readProfiles(directory) {
 
 // ---------- Git ----------
 
-/** The git variables that a seed never follows: they point at another repository or another configuration. */
-export const GIT_LOCATION_VARS = [
-    "GIT_DIR",
-    "GIT_WORK_TREE",
-    "GIT_INDEX_FILE",
-    "GIT_OBJECT_DIRECTORY",
-    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-    "GIT_COMMON_DIR",
-    "GIT_CEILING_DIRECTORIES",
-    "GIT_NAMESPACE",
-    "GIT_CONFIG_COUNT",
-    "GIT_CONFIG_PARAMETERS",
-];
-
-/** A variable the seed drops by its prefix: `GIT_CONFIG_KEY_<n>` and `GIT_CONFIG_VALUE_<n>` set a config in the env. */
-const GIT_CONFIG_VAR = /^GIT_CONFIG_(KEY|VALUE)_/;
-
 /**
- * The environment of a seed's git call: no user configuration, no system configuration, no system attributes, and
- * nothing that points at another repository. Signing, filters and includes can run a program, so the seed reads the
- * identity once (see `readIdentity`) and then works without any configuration of the machine.
+ * The process environment without every `GIT_` variable: the base of every git child environment of the seed. This
+ * covers `GIT_DIR` and the other location variables, `GIT_CONFIG`, `GIT_TRACE*`, `GIT_CONFIG_COUNT` and the rest.
  */
-export function cleanGitEnv(env = process.env) {
+export function withoutGitEnv(env = process.env) {
     const clean = {};
 
     for (const [name, value] of Object.entries(env)) {
-        if (value === undefined || GIT_LOCATION_VARS.includes(name) || GIT_CONFIG_VAR.test(name)) {
+        if (value === undefined || name.startsWith("GIT_")) {
             continue;
         }
 
         clean[name] = value;
     }
+
+    return clean;
+}
+
+/**
+ * The environment of a seed's git call: nothing of the user's git environment is inherited, the global config file is
+ * `/dev/null`, and the XDG config folder is not reached. Signing, filters, includes and hooks can run a program, so
+ * the seed reads the identity once (see `readIdentity`) and then works without any configuration of the machine.
+ */
+export function cleanGitEnv(env = process.env) {
+    const clean = withoutGitEnv(env);
 
     // The global config file is `/dev/null`; the XDG one is not reached either.
     delete clean.XDG_CONFIG_HOME;
@@ -252,9 +245,13 @@ export const gitSafeArgs = (identity) => [
  * settings and then run git without any configuration at all. `undefined` when one of them is missing.
  */
 export function readIdentity(run, env) {
+    // The normal global and system config answer this, so the 2 settings are the user's own. No inherited `GIT_`
+    // variable comes along: a `GIT_CONFIG` or a `GIT_DIR` of the shell must not decide what the seed reads.
+    const readEnv = withoutGitEnv(env);
+
     const get = (key) => {
         try {
-            return String(run("git", ["config", "--get", key], { env }) ?? "").trim();
+            return String(run("git", ["config", "--get", key], { env: readEnv }) ?? "").trim();
         } catch {
             return "";
         }

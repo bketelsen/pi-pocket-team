@@ -11,7 +11,6 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import {
     GITIGNORE,
-    GIT_LOCATION_VARS,
     HOME_FOLDERS,
     cleanGitEnv,
     displayPath,
@@ -19,6 +18,7 @@ import {
     parseArgs,
     resolveFolder,
     seedHomes,
+    withoutGitEnv,
 } from "./seed.mjs";
 
 /** 2026-10-27 14:00 UTC: 10:00 in New York. */
@@ -33,7 +33,6 @@ const DATE = "2026-10-27";
 function gitEnvironment(extraConfig = "") {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "homes-git-"));
     const home = path.join(root, "home");
-    const config = path.join(root, "gitconfig");
     const template = path.join(root, "template");
     const xdg = path.join(root, "xdg");
 
@@ -41,24 +40,16 @@ function gitEnvironment(extraConfig = "") {
         fs.mkdirSync(folder);
     }
 
+    // The identity sits where a user's does: `$HOME/.gitconfig`, the normal global config.
+    const config = path.join(home, ".gitconfig");
+
     fs.writeFileSync(
         config,
         `[user]\n\tname = Seed test\n\temail = seed@example.invalid\n${extraConfig}`,
     );
 
-    const env = {};
-
-    for (const [name, value] of Object.entries(process.env)) {
-        if (value === undefined || GIT_LOCATION_VARS.includes(name)) {
-            continue;
-        }
-
-        if (name.startsWith("GIT_CONFIG_KEY_") || name.startsWith("GIT_CONFIG_VALUE_")) {
-            continue;
-        }
-
-        env[name] = value;
-    }
+    // Every inherited `GIT_` variable goes, and then the test's own come in: nothing of this machine's git is used.
+    const env = withoutGitEnv(process.env);
 
     return {
         ...env,
@@ -486,18 +477,29 @@ test("a GIT_DIR in the environment never moves the seed's writes into another re
     assert.equal(git(t.home, ["status", "--porcelain"]), "");
 });
 
-test("cleanGitEnv drops every variable that could point at another repository or configuration", () => {
-    const env = Object.fromEntries(GIT_LOCATION_VARS.map((name) => [name, "/tmp/other"]));
-
+test("cleanGitEnv drops every inherited GIT_ variable, and adds only the seed's own", () => {
     assert.deepEqual(
-        cleanGitEnv({
-            ...env,
+        withoutGitEnv({
             PATH: "/bin",
             HOME: "/home/b",
-            XDG_CONFIG_HOME: "/home/b/.config",
+            GIT_DIR: "/tmp/other/.git",
+            GIT_CONFIG: "/tmp/other/config",
+            GIT_TRACE: "/tmp/trace",
+            GIT_TRACE2_EVENT: "/tmp/trace2",
+            GIT_CONFIG_COUNT: "1",
             GIT_CONFIG_KEY_0: "commit.gpgSign",
             GIT_CONFIG_VALUE_0: "true",
             GIT_CONFIG_PARAMETERS: "'core.hooksPath'='/tmp/hooks'",
+        }),
+        { PATH: "/bin", HOME: "/home/b" },
+    );
+
+    assert.deepEqual(
+        cleanGitEnv({
+            PATH: "/bin",
+            HOME: "/home/b",
+            XDG_CONFIG_HOME: "/home/b/.config",
+            GIT_CONFIG: "/tmp/other/config",
         }),
         {
             PATH: "/bin",
@@ -563,6 +565,34 @@ test("--check writes nothing and prints what it would do, with each AGENTS.md te
     assert.match(text, /irulan: would make the folder; write AGENTS\.md;/);
     assert.match(text, /--- AGENTS\.md of ~\/agents\/irulan ---\n# Irulan's home/);
     assert.match(text, /--- AGENTS\.md of ~\/agents\/moneo ---\n# Moneo's home/);
+});
+
+test("--check writes nothing, and no trace file of a GIT_TRACE in the environment appears", () => {
+    const t = setup();
+    const trace = path.join(t.root, "trace.log");
+    const trace2 = path.join(t.root, "trace2.json");
+
+    const { logs } = seed(t, { check: true, env: { GIT_TRACE: trace, GIT_TRACE2_EVENT: trace2 } });
+
+    assert.equal(fs.existsSync(trace), false);
+    assert.equal(fs.existsSync(trace2), false);
+    assert.deepEqual(fs.readdirSync(t.userHome), []);
+    assert.match(logs.join("\n"), /irulan: would make the folder/);
+});
+
+test("a GIT_CONFIG of the environment is not used, and its file stays byte for byte as it is", () => {
+    const t = setup();
+    const file = path.join(t.root, "external-config");
+    const content = "[user]\n\tname = Wrong identity\n\temail = wrong@example.invalid\n";
+
+    fs.writeFileSync(file, content);
+
+    const { result } = seed(t, { env: { GIT_CONFIG: file } });
+
+    assert.deepEqual(result.refused, []);
+    assert.equal(fs.readFileSync(file, "utf8"), content);
+    // The commit is the user's own, so the external file was never read.
+    assert.equal(git(t.home, ["log", "--format=%an <%ae>"]), "Seed test <seed@example.invalid>");
 });
 
 test("--check on a seeded home reports it as it is, and still writes nothing", () => {
@@ -673,6 +703,11 @@ test("the CLI exits 1 when a home is refused, prints it, and seeds the other hom
 
     fs.mkdirSync(t.home, { recursive: true });
     fs.symlinkSync(path.join(t.root, "missing", "AGENTS.md"), path.join(t.home, "AGENTS.md"));
+    // The CLI reads the user's normal config, which is `$HOME/.gitconfig`.
+    fs.writeFileSync(
+        path.join(t.userHome, ".gitconfig"),
+        "[user]\n\tname = Seed test\n\temail = seed@example.invalid\n",
+    );
 
     const done = spawnSync(
         process.execPath,

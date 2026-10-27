@@ -23,8 +23,9 @@ node homes/seed.mjs --agent irulan  # 1 agent only
   `AGENTS.md` or `.gitignore` is a symbolic link, that home is refused and the other homes still seed.
 - **Its git uses no configuration of the machine.** The seed reads 2 settings only, `user.name` and
   `user.email` (a read runs nothing), and then runs every git call with no global or system config: no
-  signing, no filter, no hook and no filesystem monitor can run a program. It also ignores a `GIT_DIR` in
-  the environment. Without both settings it refuses the home.
+  signing, no filter, no hook and no filesystem monitor can run a program. Every `GIT_` variable of the
+  environment is dropped first (`GIT_DIR`, `GIT_CONFIG`, `GIT_TRACE*` and the rest), so the shell cannot
+  change what the seed does. Without both settings it refuses the home.
 - **A discovery failure is never a guess.** Only `git rev-parse` saying "not a git repository" means the
   folder is free; any other failure, such as "dubious ownership", refuses that home before any write.
 - **It never overwrites a file and never deletes one.** An `AGENTS.md` that is there stays as it is:

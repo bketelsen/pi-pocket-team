@@ -28,24 +28,10 @@ import {
 
 const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), "audit-sources-"));
 
-/** The git variables that point a command at another repository or configuration: no test inherits them. */
-const GIT_LOCATION_VARS = [
-    "GIT_DIR",
-    "GIT_WORK_TREE",
-    "GIT_INDEX_FILE",
-    "GIT_OBJECT_DIRECTORY",
-    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-    "GIT_COMMON_DIR",
-    "GIT_CEILING_DIRECTORIES",
-    "GIT_NAMESPACE",
-    "GIT_CONFIG_COUNT",
-    "GIT_CONFIG_PARAMETERS",
-];
-
 /**
- * A git environment that no setting of this machine reaches: a temporary home, config file and XDG folder with a test
- * identity, no system config, an empty template folder, no system attributes, and none of the variables that point at
- * another repository or set a configuration in the environment.
+ * A git environment that no setting of this machine reaches: no inherited `GIT_` variable at all, then only the
+ * test's own (a temporary home, config file and XDG folder with a test identity, no system config, an empty template
+ * folder and no system attributes).
  */
 function gitEnvironment(extraConfig = "") {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "audit-git-"));
@@ -63,18 +49,13 @@ function gitEnvironment(extraConfig = "") {
         `[user]\n\tname = Audit test\n\temail = audit@example.invalid\n${extraConfig}`,
     );
 
+    // Every inherited `GIT_` variable goes, and then the test's own come in: nothing of this machine's git is used.
     const env: Record<string, string> = {};
 
     for (const [name, value] of Object.entries(process.env)) {
-        if (value === undefined || GIT_LOCATION_VARS.includes(name)) {
-            continue;
+        if (value !== undefined && !name.startsWith("GIT_")) {
+            env[name] = value;
         }
-
-        if (name.startsWith("GIT_CONFIG_KEY_") || name.startsWith("GIT_CONFIG_VALUE_")) {
-            continue;
-        }
-
-        env[name] = value;
     }
 
     return {
@@ -651,6 +632,46 @@ test("readHomes: a core.fsmonitor script is never run", () => {
         homes.map((home: { id: string }) => home.id),
         ["irulan"],
     );
+});
+
+test("readHomes: a GIT_CONFIG of the environment stays unchanged, and the repository's fsmonitor never runs", () => {
+    const root = tmp();
+    const homesDir = path.join(root, "agents");
+    const folder = path.join(homesDir, "irulan");
+    const marker = path.join(root, "fsmonitor-ran");
+    const script = path.join(root, "fsmonitor.sh");
+    const file = path.join(root, "external-config");
+    const content = "[core]\n\tquotePath = false\n";
+    const run = realGit();
+
+    fs.mkdirSync(folder, { recursive: true });
+    fs.writeFileSync(path.join(folder, "AGENTS.md"), "# Irulan's home\n");
+    run("git", ["-C", folder, "init", "-b", "main"]);
+    run("git", ["-C", folder, "add", "-A"]);
+    run("git", ["-C", folder, "commit", "-m", "home"]);
+
+    // The repository's own config names a filesystem monitor that writes a marker.
+    fs.writeFileSync(script, `#!/bin/sh\ntouch '${marker}'\nexit 1\n`, { mode: 0o755 });
+    run("git", ["-C", folder, "config", "core.fsmonitor", script]);
+    fs.writeFileSync(file, content);
+
+    // The external config file, named by `GIT_CONFIG`: the audit reads, and must write nothing there.
+    const env = { ...gitEnvironment(), GIT_CONFIG: file };
+    const runWithConfig = realGit(env);
+
+    // It runs for a plain `git status`, so the assertion below means something.
+    runWithConfig("git", ["-C", folder, "status"]);
+    assert.equal(fs.existsSync(marker), true);
+    fs.rmSync(marker);
+
+    const homes = readHomes(homesDir, makeGit(runWithConfig));
+
+    assert.deepEqual(
+        homes.map((home: { id: string }) => home.id),
+        ["irulan"],
+    );
+    assert.equal(fs.existsSync(marker), false);
+    assert.equal(fs.readFileSync(file, "utf8"), content);
 });
 
 test("readHomes: a symlink loop beside a healthy home is skipped, and the healthy home is read", () => {
