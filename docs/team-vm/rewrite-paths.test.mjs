@@ -2,7 +2,7 @@
 // second run changes nothing. The profiles it writes must read back through team.ts's roster().
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -199,12 +199,7 @@ test("front matter it does not understand stops the run before any write", async
             join(root, ".config/pi-pocket-team/agents/clerk.md"),
             profile(`role: "clerk"\nmodel: m\nworkspace: ${OLD}/projects/odrade`, "# Clerk"),
         );
-        fails(
-            root,
-            ["--root", root],
-            1,
-            /STOPPED, nothing written: 1 profile problem\(s\)\n {2}clerk\.md/,
-        );
+        fails(root, ["--root", root], 1, /STOPPED, nothing written: 1 problem\(s\)\n {2}clerk\.md/);
         fails(root, ["--check", "--root", root], 1, /STOPPED/);
         assert.match(
             await readFile(join(root, ".config/pi-pocket-team/agents/odrade.md"), "utf8"),
@@ -281,6 +276,86 @@ test("a relative link to a folder outside is followed, and a link loop ends", as
             ["--root", root],
             1,
             /LEFT naming \/var\/home\/bjk: 1\n {2}\.pi\/agent\/skills\/tool\/SKILL\.md\n/,
+        );
+    } finally {
+        await rm(root, { recursive: true, force: true });
+    }
+});
+
+test("a link into Pocket's data is never read, and the run fails", async () => {
+    const root = await fixture();
+    const db = join(root, ".pi-pocket/pocket.sqlite");
+
+    try {
+        // Unreadable: a read of the database would fail with EACCES instead of the refusal.
+        await chmod(db, 0o000);
+        await symlink("../../.pi-pocket/pocket.sqlite", join(root, ".pi/agent/linked-db"));
+        fails(
+            root,
+            ["--check", "--root", root],
+            1,
+            /NOT READ[^\n]*: 1\n {2}\.pi\/agent\/linked-db\n/,
+        );
+        await rm(join(root, ".pi/agent/linked-db"));
+
+        await symlink("../../.pi-pocket", join(root, ".pi/agent/linked-data"));
+        fails(
+            root,
+            ["--root", root],
+            1,
+            /NOT READ[^\n]*: 1\n {2}\.pi\/agent\/linked-data\n[\s\S]*REWRITE INCOMPLETE/,
+        );
+    } finally {
+        await chmod(db, 0o644);
+        await rm(root, { recursive: true, force: true });
+    }
+});
+
+test("a link target it cannot inspect stops the run; a linked .pi/agent is scanned", async () => {
+    const root = await fixture();
+    const closed = join(root, "closed");
+
+    try {
+        await mkdir(closed);
+        await writeFile(join(closed, "x.md"), "plain\n");
+        await symlink("../../closed/x.md", join(root, ".pi/agent/linked-x"));
+        await chmod(closed, 0o000);
+        fails(root, ["--root", root], 1, /EACCES/);
+        await chmod(closed, 0o755);
+        await rm(join(root, ".pi/agent/linked-x"));
+
+        assert.match(run(root), /REWRITE OK/);
+        await rename(join(root, ".pi/agent"), join(root, "agent-elsewhere"));
+        await symlink("../agent-elsewhere", join(root, ".pi/agent"));
+        await writeFile(join(root, "agent-elsewhere/AGENTS.md"), `see ${OLD}/notes\n`);
+        fails(
+            root,
+            ["--root", root],
+            1,
+            /LEFT naming \/var\/home\/bjk: 1\n {2}\.pi\/agent\/AGENTS\.md\n/,
+        );
+    } finally {
+        await chmod(closed, 0o755).catch(() => {});
+        await rm(root, { recursive: true, force: true });
+    }
+});
+
+test("a link where the plan would write stops the run before any write", async () => {
+    const root = await fixture();
+
+    try {
+        await writeFile(join(root, "elsewhere.md"), `cd ${OLD}/projects/x\n`);
+        await symlink("../../../elsewhere.md", join(root, "agents/odrade/plans/linked.md"));
+        fails(
+            root,
+            ["--root", root],
+            1,
+            /STOPPED, nothing written: 1 problem\(s\)\n {2}agents\/odrade\/plans\/linked\.md: not a plain file/,
+        );
+        assert.equal(await readFile(join(root, "elsewhere.md"), "utf8"), `cd ${OLD}/projects/x\n`);
+        assert.match(
+            await readFile(join(root, ".pi/agent/trust.json"), "utf8"),
+            /\/var\/home\/bjk/,
         );
     } finally {
         await rm(root, { recursive: true, force: true });
