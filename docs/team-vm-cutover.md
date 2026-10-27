@@ -432,8 +432,10 @@ sudo systemctl start pi-pocket@local          # start only, not enabled yet
 sudo journalctl -u pi-pocket@local -n 50 --no-pager
 ```
 
-**Brian:** sign in as the owner. On his own computer (not on the VM), open a tunnel and keep it open:
-`$TEAM_SSH -N -L 8787:127.0.0.1:8787` (in the fleet checkout). In a second terminal there, read the link:
+**Brian:** sign in as the owner, on framework (the computer with the fleet key), not on the VM. In a terminal in the
+fleet checkout, define `TEAM_SSH` as in step 0, then open a tunnel and keep it open:
+`$TEAM_SSH -N -L 8787:127.0.0.1:8787`. In a second terminal, in the fleet checkout, define `TEAM_SSH` again (a new
+shell does not have it), then read the link:
 `$TEAM_SSH "sudo journalctl -u pi-pocket@local | grep -o 'http://127.0.0.1:8787/login?token=[^ ]*' | tail -1"`.
 Open it in his browser on that computer. Do not paste the link in a chat. Then run the checks in step 8. When a check
 fails, stop and use the rollback.
@@ -537,8 +539,19 @@ To retry the VM later: keep the copy of step 6 first. Then restore the snapshot
 the snapshot), and start again at step 2.
 
 After a restore or a rebuild of the VM (fleet's "Rebuild" section, also for a key rotation), go on from the step
-that the restore leaves: a VM with no Pocket data starts again at step 1; a restored snapshot from before the cut-over
-starts at step 2.
+that the restore leaves:
+
+- A VM with no Pocket data, before the cut-over: start again at step 1.
+- A restored Incus snapshot from before the cut-over: start at step 2.
+- **A VM rebuilt from the daily backup, after the cut-over** (the backup holds `.pi-pocket`, `.pi/agent`,
+  `.config/pi-pocket-team`, `agents` and the truenas `.envrc`, but no checkouts): the restored data is newer than
+  framework's copy, so **skip steps 2, 3 and 4** (no drain, no stop on framework, no copy) and never copy framework's
+  data over it. Do step 1 without its data: the tools, the checkouts, with Pocket at the tag that the backup ran (the backup manifest records
+  `git -C ~/projects/pi-pocket describe --tags` at each backup; a database must never go to an older Pocket), the truenas build (keep the restored
+  `.envrc`), Chromium, Tailscale and the unit. Then step 5 (the links), check that step 6's rewrites are in the
+  restored files (`grep -rn /var/home/bjk ~/.config/pi-pocket-team ~/.pi/agent/prompts ~/.pi/agent/trust.json`
+  finds nothing), then step 7 with the instance that ran before (`tailscale-serve` after go-live), and the checks of
+  step 8. The one-server rule holds: framework stays stopped.
 
 ## Not in this runbook
 
