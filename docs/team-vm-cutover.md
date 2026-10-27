@@ -7,6 +7,9 @@ T322a; studies in `~/projects/odrade/reports/2026-10-27-team-vm/` and `…/2026-
 Nobody runs this runbook until Brian says so. A step marked **Brian:** needs Brian himself (a sign-in, a secret, a
 console, or a choice). Every other step runs as the `team` user on the VM, unless it says "on framework".
 
+Status (2026-10-27): steps 0 and 1 are done on the VM, except Brian's TrueNAS key (1.4) and the snapshot (1.8).
+Steps 2 to 7 are in a copy-paste command list for Brian: [team-vm/cutover-2-7.md](team-vm/cutover-2-7.md).
+
 ## Rules
 
 - **One server only.** Never run Pocket on framework and on the VM at the same time, not even to read old sessions.
@@ -75,7 +78,7 @@ git config --global user.name            # the machine identity
 id -nG | tr ' ' '\n' | grep -x kvm       # nsl machines need /dev/kvm
 loginctl show-user team -p Linger        # Linger=yes
 gh auth status 2>&1 | grep -ci keyring   # 0: the token is not in a keyring
-grep -c oauth_token ~/.config/gh/hosts.yml   # 1: the token is in the file (prints a count, not the token)
+grep -c oauth_token ~/.config/gh/hosts.yml   # 1 or 2 (gh 2.102 writes it under the host and under users:); a count, not the token
 stat -c %a ~/.config/gh/hosts.yml ~/.ssh/id_* # 600 for each
 echo "${SSH_AUTH_SOCK:-unset}"           # unset, or a plain ssh-agent socket; never /run/user/*/keyring/ssh
 ssh -G <host> | grep -i '^identityfile'  # for each host Teg keyed: the team key file for that host
@@ -132,7 +135,7 @@ keys have no passphrase: after a reboot nobody is there to unlock them. Their fi
 
     ```sh
     command -v mise || curl -fsSL https://mise.run | sh      # installs ~/.local/bin/mise
-    cd ~/projects/truenas-mcp && ~/.local/bin/mise install && ~/.local/bin/mise exec -- make build
+    cd ~/projects/truenas-mcp && ~/.local/bin/mise trust . && ~/.local/bin/mise install && ~/.local/bin/mise exec -- make build
     install -m 0755 build/truenas-mcp ~/.local/bin/truenas-mcp
     ```
 
@@ -164,9 +167,17 @@ keys have no passphrase: after a reboot nobody is there to unlock them. Their fi
     ```
 
 6. **Tailscale.** **Brian:** as `fleet`, sign the VM in to the tailnet once: `sudo tailscale up --hostname=pocket`.
-   Fleet's role then runs `sudo tailscale set --operator=team` (docs/systemd.md requires it for `tailscale-serve`).
-   Check that HTTPS certificates are on in the tailnet. Fleet adds no Serve mapping: in `tailscale-serve` mode,
-   Pocket's launcher adds and removes it.
+   Fleet's role then runs `sudo tailscale set --operator=team`, so `team` can change the Serve mapping. Check that
+   HTTPS certificates are on in the tailnet. Fleet adds no Serve mapping: `team` adds it at go-live (step 9).
+
+    Pocket `v0.25.0` has **no `tailscale-serve` access mode**: its launcher accepts only `local`, `lan`, `cloudflare`
+    and `tailscale` (`src/launcher/access.ts`; `--access tailscale-serve` exits with "--access must be one of"), although
+    its `docs/systemd.md` and unit file name it. So the VM runs `pi-pocket@local` (127.0.0.1:8787), and `team` puts
+    Tailscale Serve in front of it, the form Pocket's `docs/features.md` gives for https:
+    `tailscale serve --bg --https=443 http://127.0.0.1:8787`. The mapping stays in Tailscale's state across reboots.
+    Tested on the VM on 2026-10-27 (port 8443, a test server): the certificate came, and requests arrive with
+    `X-Forwarded-Proto: https`, so Pocket sets a Secure cookie. The unit file below keeps its text; only the instance
+    name changes.
 
     ```sh
     tailscale status | head -3     # as team: the node pocket is online
@@ -364,7 +375,7 @@ The copied drop-in folder links to framework's checkout. Point it at the VM's:
 cd ~/.pi-pocket/extensions
 ln -sfn ~/projects/pi-pocket/node_modules node_modules
 ln -sfn ~/projects/pi-pocket/types/pocket.d.ts _pocket.d.ts
-cd ~/projects/pi-pocket-team && npm run install-check     # lists nothing when the copy equals main
+cd ~/projects/pi-pocket-team && npm run install-check     # lists the files main changed since framework's last install
 ```
 
 Install no new drop-in version yet: the first start runs the same code as framework did (step 10 updates it).
@@ -372,6 +383,12 @@ Install no new drop-in version yet: the first start runs the same code as framew
 ## 6. Rewrite the paths that hold /var/home/bjk
 
 Rewrite configuration and text, never the database. Each command keeps a `.bak` copy.
+
+One script does parts 1 to 4: `node docs/team-vm/rewrite-paths.mjs --check`, then without `--check` (in
+pi-pocket-team; the command list in [team-vm/cutover-2-7.md](team-vm/cutover-2-7.md) gives the exact lines). It
+prints `REWRITE OK` only when no active file names `/var/home/bjk`, and a second run changes nothing. It was tested
+on a throwaway copy of framework's files on the VM on 2026-10-27, and `rewrite-paths.test.mjs` covers it. The commands
+below say what it does; use them by hand only when the script stops. Part 4's commit and part 5 stay by hand.
 
 1. **Agent profiles.** Repository folders become `~/projects/...` (team.ts expands `~/`). Odrade's desk moves to
    her home:
@@ -458,22 +475,32 @@ fails, stop and use the rollback.
 | Lessons       | the Team panel's lessons                                                                 | the same lessons as on framework                                                                                                                                                |
 | Homewiki      | the Wiki page                                                                            | renders `~/projects/homewiki`                                                                                                                                                   |
 
+Project lessons (Memory) are keyed by the repository's folder. On 2026-10-27, 1 project lesson exists, for
+`/var/home/bjk/projects/frostyard/frostyard-org`: it does not apply on the VM. Tamalane or Brian adds it again in a
+session in `~/projects/frostyard/frostyard-org`. The lessons for everywhere and the agents' lessons apply as before.
+
 Odrade's supervisor session and the Clerk keep the desk's history, the Clerk's registration and Odrade's lessons.
 **Brian:** move both with Menu → **Working directory** to `/var/home/team/agents/odrade`, before anything else in
-them. Only these 2 old sessions move; no other old session gets a message. Then re-make each schedule from
+them. Then run `/team-agent odrade` in Odrade's session and `/team-agent clerk` in the Clerk: each session keeps a
+snapshot of its profile from framework (old folders), and the command takes the rewritten one. Only these 2 old
+sessions move; no other old session gets a message. Then re-make each schedule from
 `plans/schedules-DATE.md` in its **new session** column, with the new paths: Odrade's moved session, or a new session
 that Brian starts in the named VM folder.
 
 ## 9. Go live
 
-1. Stop the local instance and enable the real one, started at boot:
+1. Keep the local instance, enable it at boot, and put Tailscale Serve in front of it (step 1.6: `v0.25.0` has no
+   `tailscale-serve` mode):
 
     ```sh
     # as fleet
-    sudo systemctl stop pi-pocket@local
-    sudo systemctl enable --now pi-pocket@tailscale-serve
-    journalctl -u pi-pocket@tailscale-serve | grep -o 'https://[^ ]*/login?token=[^ ]*' | tail -1
+    sudo systemctl enable pi-pocket@local                 # it runs already, since step 7
+    sudo -iu team tailscale serve --bg --https=443 http://127.0.0.1:8787
+    sudo -iu team tailscale serve status                  # https://pocket.goat-snake.ts.net -> http://127.0.0.1:8787
+    sudo journalctl -u pi-pocket@local | grep -o '/login?token=[^ ]*' | tail -1 | sed 's#^#https://pocket.goat-snake.ts.net#'
     ```
+
+    Undo: `sudo -iu team tailscale serve --https=443 off`.
 
 2. **Brian:** open the link once on the phone and once on the desktop (the address is new, so each device signs in
    again; a cookie lasts a year). Read it as `fleet` with `sudo journalctl`, as in step 7.
@@ -519,8 +546,9 @@ Any time before step 11, and with framework's data unchanged since step 3:
 1. Teg or **Brian:** on minideb, stop and disable the daily backup timer of the team VM (when it is applied), and wait
    until no backup job runs: a running job could start VM Pocket again after framework starts. It stays disabled
    while framework serves.
-2. On the VM, as `fleet`: `sudo systemctl disable --now pi-pocket@tailscale-serve pi-pocket@local`. Check:
-   `systemctl is-active pi-pocket@tailscale-serve pi-pocket@local` says inactive for both. Go on only then.
+2. On the VM, as `fleet`: `sudo -iu team tailscale serve --https=443 off`, then
+   `sudo systemctl disable --now pi-pocket@local pi-pocket@tailscale-serve`. Check:
+   `systemctl is-active pi-pocket@local pi-pocket@tailscale-serve` says inactive for both. Go on only then.
 3. On framework: `mv ~/.pi-pocket.framework-DATE ~/.pi-pocket` (after step 11 only), `mv ~/bin/pocket-start.retired-DATE ~/bin/pocket-start`,
    then `pocket-start`.
 4. Re-make the schedules on framework in their old sessions, from `plans/schedules-DATE.md` (step 2 cancelled them
@@ -568,13 +596,15 @@ that the restore leaves:
        on purpose, so leave them out:
        `grep -rn --exclude='*.bak' /var/home/bjk ~/.config/pi-pocket-team ~/.pi/agent/prompts ~/.pi/agent/trust.json`
        finds nothing.
-    5. As `fleet`, start and enable the instance that ran before (`tailscale-serve` after go-live; fleet's rebuild
-       installs the unit but enables nothing), and keep the other one stopped and disabled:
+    5. As `fleet`, start and enable the instance that ran before (`local` behind Tailscale Serve after go-live; fleet's
+       rebuild installs the unit but enables nothing), and keep any other one stopped and disabled. A rebuilt VM has
+       a new Tailscale state, so the Serve mapping is added again:
 
         ```sh
-        sudo systemctl disable --now pi-pocket@local
-        sudo systemctl enable --now pi-pocket@tailscale-serve
-        systemctl is-enabled pi-pocket@tailscale-serve pi-pocket@local    # enabled, disabled
+        sudo systemctl disable --now pi-pocket@tailscale-serve 2>/dev/null
+        sudo systemctl enable --now pi-pocket@local
+        sudo -iu team tailscale serve --bg --https=443 http://127.0.0.1:8787
+        systemctl is-enabled pi-pocket@local                 # enabled
         ```
 
     6. The checks of step 8. The sign-in link and the cookies stay valid (the owner token is in the restored
