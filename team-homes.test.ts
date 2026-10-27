@@ -18,7 +18,17 @@ import {
 } from "./_pocket/test/helpers.ts";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { chmodSync, cpSync, existsSync, mkdirSync, readdirSync, writeFileSync } from "node:fs";
+import {
+    chmodSync,
+    cpSync,
+    existsSync,
+    mkdirSync,
+    readdirSync,
+    readFileSync,
+    rmSync,
+    symlinkSync,
+    writeFileSync,
+} from "node:fs";
 import { createServer } from "node:http";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -27,7 +37,7 @@ import type { ConversationId } from "@earendil-works/pi-durable";
 import { fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import { createHandler } from "./_pocket/src/server/http.ts";
 import { DeskThreads, threadOfSession } from "./desk.ts";
-import { Identity, roster, taskTarget, type TeamApi } from "./team.ts";
+import { guardRoster, Identity, roster, taskTarget, worktreeInUse, type TeamApi } from "./team.ts";
 
 const definitions = join(root, "agents");
 const repoA = join(root, "nsl");
@@ -36,6 +46,8 @@ const homeDuncan = join(root, "homes", "duncan");
 const homeTwin = join(root, "homes", "twin");
 const homeMoneo = join(root, "homes", "moneo");
 const homeLeto = join(root, "homes", "leto");
+// A repository whose folder has a space in its name: a tool path may write that space as a no-break space.
+const repoSpace = join(root, "sp ace");
 // The sibling worktree a delegation of frostyard/nsl would get: never a target from a home.
 const sibling = join(root, "nsl--duncan-deadbeef");
 
@@ -87,6 +99,40 @@ const model = scriptedModel((ctx) => {
         return tool("write", { path: join(sibling, "blocked.txt"), content: "no\n" });
     }
 
+    if (text.endsWith("guard-link")) {
+        return tool("write", { path: join(homeDuncan, "repo-link", "new.txt"), content: "no\n" });
+    }
+
+    if (text.endsWith("guard-link-dir")) {
+        return tool("write", {
+            path: join(homeDuncan, "repo-link", "newdir", "new.txt"),
+            content: "no\n",
+        });
+    }
+
+    if (text.endsWith("guard-at")) {
+        return tool("write", { path: `@${join(repoA, "at.txt")}`, content: "no\n" });
+    }
+
+    if (text.endsWith("guard-url")) {
+        return tool("write", { path: `file://${join(repoA, "url.txt")}`, content: "no\n" });
+    }
+
+    if (text.endsWith("guard-space")) {
+        // The no-break space is a space to Pi Durable: the path is inside the repository that has a real one.
+        return tool("write", {
+            path: `${join(root, "sp\u00A0ace")}/space.txt`,
+            content: "no\n",
+        });
+    }
+
+    if (text.endsWith("guard-outside")) {
+        return tool("edit", {
+            path: join(work, "edited.txt"),
+            edits: [{ oldText: "before", newText: "after" }],
+        });
+    }
+
     if (text.endsWith("guard-home")) {
         return tool("write", { path: "notes/allowed.txt", content: "mine\n" });
     }
@@ -100,7 +146,14 @@ const model = scriptedModel((ctx) => {
     }
 
     if (text.endsWith("work-named")) {
-        return tool("team_work", { repository: "frostyard/igloo", task: "Say hello again." });
+        return tool("team_work", { repository: "frostyard/nsl", task: "Say hello again." });
+    }
+
+    if (text.endsWith("work-no-git")) {
+        return tool("team_work", {
+            repository: "frostyard/igloo",
+            task: "Say hello in a plain folder.",
+        });
     }
 
     if (text.endsWith("work-unknown")) {
@@ -146,12 +199,16 @@ before(async () => {
     mkdirSync(definitions, { recursive: true });
     repository(repoA);
     mkdirSync(repoB, { recursive: true });
+    mkdirSync(repoSpace, { recursive: true });
     writeFileSync(join(repoA, "AGENTS.md"), "# nsl\nRules for nsl.\n");
     writeFileSync(join(repoB, "AGENTS.md"), "# igloo\nRules for igloo.\n");
 
     for (const home of [homeDuncan, homeTwin, homeMoneo, homeLeto]) {
         mkdirSync(home, { recursive: true });
     }
+
+    // A symlink to a repository: the guard must judge where it leads, also for a file not made yet.
+    symlinkSync(repoA, join(homeDuncan, "repo-link"));
 
     writeFileSync(
         join(definitions, "odrade.md"),
@@ -177,6 +234,10 @@ before(async () => {
     writeFileSync(
         join(definitions, "thufir.md"),
         `---\nhome: ${homeTwin}\n---\n# Thufir Hawat\nYou are Thufir Hawat.`,
+    );
+    writeFileSync(
+        join(definitions, "shaddam.md"),
+        `---\nrepositories:\n  frostyard/space: ${repoSpace}\n---\n# Shaddam\nYou are Shaddam. Own the folder with a space.`,
     );
     // A home written with ~/ is expanded, and read no further.
     writeFileSync(
@@ -455,9 +516,18 @@ test("team_work starts a worktree session for the agent, on its profile model wh
     const second = (await app.agentState(secondLinked.id))?.model;
 
     assert.equal(`${second?.provider}/${second?.modelId}`, "faux/faux-2", "the profile model");
-    // frostyard/igloo is no git work tree's top: the session works in the folder itself.
-    assert.equal(app.cwdOf(secondLinked.id), repoB);
+    assert.equal((app.cwdOf(secondLinked.id) ?? "").startsWith(prefix), true);
     await app.setSubagentModels(owner(app), []);
+
+    // A folder that is not the top of a git work tree gets no worktree: team_work refuses, and starts nothing.
+    const count = app.sessions().length;
+
+    await say(app, inside, "work-no-git");
+    assert.match(
+        await said(inside),
+        /No worktree for frostyard\/igloo: .* is not the top of a git work tree\. team_work starts a session in a fresh worktree only/,
+    );
+    assert.equal(app.sessions().length, count, "the refusal started no session");
 
     // The refusals: another role, a folder outside the home, an unknown repository.
     const supervisor = await sessionAs("odrade", work);
@@ -551,6 +621,134 @@ test("team_work in a linked session is refused, and leaves no worktree and no br
         "the refused start left no worktree and no branch",
     );
     assert.equal(branches().length, before.branches.length);
+});
+
+test("the guard follows a symlink to a repository, for a file and for a new folder", async () => {
+    const inside = await sessionAs("duncan", homeDuncan);
+
+    await say(app, inside, "guard-link");
+    await say(app, inside, "guard-link-dir");
+    const told = await said(inside);
+
+    assert.equal(existsSync(join(repoA, "new.txt")), false, "the symlink's target is untouched");
+    assert.equal(existsSync(join(repoA, "newdir", "new.txt")), false, "also a folder not made yet");
+    assert.match(told, /Do not change frostyard\/nsl from a home session/);
+    assert.equal((told.match(/Do not change/g) ?? []).length, 2);
+});
+
+test("the guard reads a path as Pi Durable does: @, file://, and a no-break space", async () => {
+    const inside = await sessionAs("duncan", homeDuncan);
+
+    await say(app, inside, "guard-at");
+    await say(app, inside, "guard-url");
+    await say(app, inside, "guard-space");
+    const told = await said(inside);
+
+    assert.equal(existsSync(join(repoA, "at.txt")), false, "a leading @ is stripped");
+    assert.equal(existsSync(join(repoA, "url.txt")), false, "a file:// URL is a path");
+    assert.equal(existsSync(join(repoSpace, "space.txt")), false, "a no-break space is a space");
+    assert.equal((told.match(/Do not change/g) ?? []).length, 3);
+});
+
+test("a refused start keeps a worktree that a session already works in", () => {
+    const path = join(root, "nsl--duncan-1234abcd");
+
+    assert.equal(worktreeInUse([{ cwd: path }], path), true, "a session's folder is the worktree");
+    assert.equal(worktreeInUse([{ cwd: join(root, "other") }, {}], path), false);
+    assert.equal(worktreeInUse([], path), false);
+});
+
+test("the pin route follows the folder, and a choice, a clear or a moved folder wins", async () => {
+    const inside = await newSession(app, homeDuncan);
+    const implicit = (await call(`session/${inside}`)).data;
+
+    assert.equal(implicit.implicit, true);
+    // A clear after the GET: the pin changes nothing.
+    await call(`session/${inside}/identity`, { agent: null });
+    const cleared = await call(`session/${inside}/pin`, { agent: "duncan" });
+
+    assert.equal(cleared.data.pinned, false);
+    assert.match(cleared.data.reason, /cleared/);
+    assert.equal((await call(`session/${inside}`)).data.identity, null);
+
+    // A chosen agent: the pin changes nothing.
+    const chosen = await newSession(app, homeDuncan);
+
+    await call(`session/${chosen}/identity`, { agent: "odrade" });
+    const kept = await call(`session/${chosen}/pin`, { agent: "duncan" });
+
+    assert.equal(kept.data.pinned, false);
+    assert.match(kept.data.reason, /Odrade/);
+    assert.equal((await call(`session/${chosen}`)).data.identity.id, "odrade");
+
+    // The folder moved away: the folder's agent is no longer this 1, so the pin changes nothing.
+    const moved = await newSession(app, homeDuncan);
+
+    assert.equal((await call(`session/${moved}`)).data.implicit, true);
+    await app.commands.configure(moved, owner(app), { cwd: work });
+    const away = await call(`session/${moved}/pin`, { agent: "duncan" });
+
+    assert.equal(away.data.pinned, false);
+    assert.equal((await call(`session/${moved}`)).data.identity, null);
+
+    // The folder still says so: the pin sets the identity in 1 commit.
+    const pinned = await call(`session/${inside}/pin`, { agent: "duncan" });
+
+    assert.equal(pinned.data.pinned, false, "the clear still wins");
+    const fresh = await newSession(app, homeDuncan);
+
+    assert.equal((await call(`session/${fresh}/pin`, { agent: "duncan" })).data.pinned, true);
+    const stored = await app.harness.snapshot(Identity, fresh, context);
+
+    assert.equal(stored?.persona?.id, "duncan");
+    assert.equal(stored?.cleared, undefined, "a pin sets no cleared mark");
+    assert.equal((await call(`session/${fresh}`)).data.implicit, undefined, "it is explicit now");
+});
+
+test("a broken profile never blocks a session outside every home", async () => {
+    const broken = join(definitions, "broken.md");
+
+    writeFileSync(join(work, "edited.txt"), "before\n");
+    writeFileSync(broken, "---\nhome: 5\n---\n# Broken\n");
+
+    try {
+        // No roster read here: the profile folder is broken, which is the point of the test.
+        const outside = await newSession(app, work);
+
+        await app.harness.commit(async (tx) => {
+            (await tx.doc(Identity, outside)).persona = {
+                id: "odrade",
+                name: "Odrade",
+                role: "supervisor",
+                model: "",
+                instructions: "# Odrade",
+                repositories: {},
+            };
+        }, context);
+        await say(app, outside, "guard-outside");
+        assert.equal(readFileSync(join(work, "edited.txt"), "utf8"), "after\n", "the edit ran");
+        assert.doesNotMatch(await said(outside), /Do not change/);
+    } finally {
+        rmSync(broken, { force: true });
+    }
+});
+
+test("guardRoster keeps the last good roster, and has none when the first read fails", async () => {
+    const folder = join(root, "broken-agents");
+
+    mkdirSync(folder, { recursive: true });
+    writeFileSync(join(folder, "bad.md"), "---\nhome: 5\n---\n# Bad\n");
+    // A folder never read before, whose only profile is broken: no roster, so no home is known.
+    assert.equal(await guardRoster(folder), undefined);
+
+    rmSync(join(folder, "bad.md"));
+    writeFileSync(join(folder, "good.md"), "---\nhome: /tmp/somewhere\n---\n# Good\n");
+    const good = await guardRoster(folder);
+
+    assert.equal(good?.length, 1);
+    writeFileSync(join(folder, "bad-again.md"), "---\nrepositories: broken\n---\n# Bad\n");
+    // The read fails now: the last good roster holds, so a guard never loses the team to 1 bad file.
+    assert.equal((await guardRoster(folder))?.length, 1);
 });
 
 test("taskTarget offers home as a choice, and the errors say what is there", () => {

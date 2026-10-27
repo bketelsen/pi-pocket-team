@@ -4,9 +4,10 @@
  */
 import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { access, readdir, readFile, realpath } from "node:fs/promises";
+import { access, readdir, readFile, realpath, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import type { Context } from "@earendil-works/chord";
 import { Type } from "@earendil-works/pi-ai";
@@ -65,15 +66,58 @@ function within(folder: string, parent: string): boolean {
     return path === root || path.startsWith(root.endsWith(sep) ? root : `${root}${sep}`);
 }
 
-/** A path a tool call names, as an absolute path: `~/` and paths relative to the session's folder both work. */
-function targetPath(path: string, cwd: string): string {
-    const full = path.startsWith("~/")
-        ? join(homedir(), path.slice(2))
-        : isAbsolute(path)
-          ? path
-          : join(cwd, path);
+/**
+ * The spaces Pi Durable turns into an ordinary space before it resolves a tool call's path, and the 1 it strips from the
+ * start (`@`: a pasted reference). Both are Pi Durable's own rules (tools/path-utils.js), so the guard judges the path
+ * the tool will really use.
+ */
+const UNICODE_SPACES = /[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g;
 
-    return resolve(full);
+/** A path a tool call names, as Pi Durable resolves it: 1 space, `@` stripped, `~`, `file://`, then cwd for relative. */
+function targetPath(path: string, cwd: string): string {
+    const spaced = path.replace(UNICODE_SPACES, " ");
+    const bare = spaced.startsWith("@") ? spaced.slice(1) : spaced;
+    let full = bare;
+
+    if (bare === "~") {
+        full = homedir();
+    } else if (bare.startsWith("~/") || (process.platform === "win32" && bare.startsWith("~\\"))) {
+        full = join(homedir(), bare.slice(2));
+    } else if (bare.startsWith("file://")) {
+        try {
+            full = fileURLToPath(bare);
+        } catch {
+            // A malformed URL stays an ordinary path, as Pi Durable keeps it.
+        }
+    }
+
+    return isAbsolute(full) ? resolve(full) : resolve(cwd, full);
+}
+
+/**
+ * A path as the file system has it, when the file is there or not: the real path of the nearest ancestor that exists,
+ * with the missing parts added. A symlink to a folder therefore holds its target, also for a file not made yet.
+ */
+async function realPathDeep(path: string): Promise<string> {
+    const missing: string[] = [];
+    let here = resolve(path);
+
+    for (;;) {
+        const real = await realpath(here).catch(() => undefined);
+
+        if (real !== undefined) {
+            return missing.length === 0 ? real : join(real, ...missing.reverse());
+        }
+
+        const parent = dirname(here);
+
+        if (parent === here) {
+            return resolve(path);
+        }
+
+        missing.push(basename(here));
+        here = parent;
+    }
 }
 
 /** Whether `where` is a linked worktree beside `root`: a sibling folder named `<root>--…`. */
@@ -229,6 +273,11 @@ export async function delegationWorktree(
     }
 
     return { checkout, path, branch, made: true, base };
+}
+
+/** Whether a session of this 1 already works in `path`: then a refused start keeps the worktree, and removes nothing. */
+export function worktreeInUse(sessions: readonly { cwd?: string }[], path: string): boolean {
+    return sessions.some((each) => each.cwd === path);
 }
 
 /**
@@ -388,6 +437,55 @@ export async function roster(directory: string): Promise<Persona[]> {
             Number(b.role === "supervisor") - Number(a.role === "supervisor") ||
             a.name.localeCompare(b.name),
     );
+}
+
+/** The last good roster of a profile folder, with the files and times it was read from. */
+const rosterCache = new Map<string, { key: string; agents: Persona[] }>();
+
+/** The profile files and their times: a changed file, or a new 1, is another key. */
+async function rosterKey(directory: string): Promise<string> {
+    const names = await readdir(directory).catch((): string[] => []);
+    const parts: string[] = [];
+
+    for (const file of names.sort()) {
+        if (!/^[a-z0-9][a-z0-9_-]*\.md$/.test(file)) {
+            continue;
+        }
+
+        const info = await stat(join(directory, file)).catch(() => undefined);
+
+        parts.push(`${file}:${info?.mtimeMs ?? 0}`);
+    }
+
+    return parts.join("|");
+}
+
+/** The roster from the cache while its files are unchanged: a guard reads it on every edit and write. */
+export async function cachedRoster(directory: string): Promise<Persona[]> {
+    const key = await rosterKey(directory);
+    const held = rosterCache.get(directory);
+
+    if (held !== undefined && held.key === key) {
+        return held.agents;
+    }
+
+    const agents = await roster(directory);
+
+    rosterCache.set(directory, { key, agents });
+
+    return agents;
+}
+
+/**
+ * The roster a guard judges by: the last good 1 when a read fails, and none when there never was 1. A broken profile
+ * must never block a session: with no roster, no home is known.
+ */
+export async function guardRoster(directory: string): Promise<Persona[] | undefined> {
+    try {
+        return await cachedRoster(directory);
+    } catch {
+        return rosterCache.get(directory)?.agents;
+    }
 }
 
 /** The 1 agent whose home holds `folder`: the longest home, and none when 2 agents share it. */
@@ -1319,6 +1417,58 @@ export default function createTeam(host: Host, web: Web) {
         { conversation: "source" },
     );
 
+    // The folder's agent, pinned by the tab that shows the session: 1 commit, and only when the folder still says so.
+    // A selection or a clear outranks the folder, and a moved folder is another agent's or none, so nothing changes.
+    web.conversationRoute(
+        "POST",
+        "session/:source/pin",
+        async (req) => {
+            const wanted = typeof req.body.agent === "string" ? req.body.agent : "";
+            const cwd = (await req.snapshot(AgentDoc, req.conversation.id, req.context))?.cwd;
+            const folderAgent =
+                cwd === undefined ? undefined : await agentAtFolder(cwd, await roster(directory));
+
+            const { pinned, reason } = await req.commit(async (tx) => {
+                const doc = await tx.doc(Identity, req.conversation.id);
+
+                if (doc.persona !== undefined) {
+                    return {
+                        pinned: false,
+                        reason: `This session is ${doc.persona.name} already.`,
+                    };
+                }
+
+                if (doc.cleared === true) {
+                    return {
+                        pinned: false,
+                        reason: "This session's identity was cleared: its folder does not bring the agent back.",
+                    };
+                }
+
+                if (folderAgent === undefined || folderAgent.id !== wanted) {
+                    return {
+                        pinned: false,
+                        reason:
+                            folderAgent === undefined
+                                ? "This session's folder is no agent's home."
+                                : `This session's folder is ${folderAgent.name}'s home.`,
+                    };
+                }
+
+                doc.persona = folderAgent;
+
+                return { pinned: true, reason: "" };
+            });
+
+            if (pinned) {
+                identityChanged(req.conversation.id);
+            }
+
+            return { pinned, reason };
+        },
+        { conversation: "source" },
+    );
+
     web.conversationRoute(
         "POST",
         "session/:source/start",
@@ -1876,11 +2026,17 @@ export default function createTeam(host: Host, web: Web) {
             // The same key finds the worktree this call made, and the start returns this call's session: a replay adds
             // neither a folder nor a session.
             const worktree = await delegationWorktree(folder, { agent: persona.id, key });
-            const where = worktree?.path ?? folder;
-            const message =
-                worktree?.path === undefined && worktree?.error !== undefined
-                    ? `${taskText(persona, args.task)}\n\nThis task runs in ${folder}, because no worktree was made: ${worktree.error}.`
-                    : taskText(persona, args.task, worktree);
+
+            // A fresh worktree is the point of this tool: only there do the repository's own AGENTS.md, skills and
+            // memory load. With none, it refuses and starts nothing, unlike a delegation's fallback.
+            if (worktree?.path === undefined || worktree.branch === undefined) {
+                throw new Error(
+                    `No worktree for ${name}: ${worktree?.error ?? `${folder} is not the top of a git work tree`}. team_work starts a session in a fresh worktree only, because that is where ${name}'s own AGENTS.md loads. Nothing was started.`,
+                );
+            }
+
+            const where = worktree.path;
+            const message = taskText(persona, args.task, worktree);
             const preferred = allowedModel(persona);
             let started: Awaited<ReturnType<typeof host.linkedSessions.start>>;
 
@@ -1896,18 +2052,31 @@ export default function createTeam(host: Host, web: Web) {
                     key,
                 );
             } catch (error) {
-                // The start made this worktree a moment ago and nothing uses it: take it away, so no branch or folder
-                // is left behind. A worktree a replay found stays: that call did not make it.
-                if (worktree?.made === true) {
-                    await discardWorktree(worktree);
+                // The start made this worktree a moment ago: take it away, so no branch or folder is left behind. Not
+                // when a session of this 1 already works in it (a start can fail after the child exists), and not when
+                // the list cannot be read: then the folder stays, and the error says where.
+                let kept = false;
+
+                if (worktree.made === true) {
+                    kept = await host.linkedSessions.list(api.conversationId).then(
+                        (sessions) => worktreeInUse(sessions, where),
+                        () => true,
+                    );
+
+                    if (!kept) {
+                        await discardWorktree(worktree);
+                    }
                 }
 
                 const why = (error as Error).message;
 
                 throw new Error(
-                    /cannot start sessions/i.test(why)
+                    (/cannot start sessions/i.test(why)
                         ? "team_work works only in a top-level session. Report the plan to the session that started you."
-                        : why,
+                        : why) +
+                        (kept
+                            ? ` The worktree at ${where} is kept: a linked session of this one uses it.`
+                            : ""),
                 );
             }
 
@@ -1916,13 +2085,8 @@ export default function createTeam(host: Host, web: Web) {
                 (await tx.doc(Identity, started.session as ConversationId)).persona ??= persona;
             }, context);
 
-            const placed =
-                worktree?.path !== undefined && worktree.branch !== undefined
-                    ? `Worktree: ${worktree.path} on branch ${worktree.branch}.`
-                    : `No worktree: ${worktree?.error ?? "the folder is not the top of a git work tree"}. Work in ${folder}.`;
-
             return reply(
-                `Started ${persona.name} at ${started.address} in ${name}, on ${modelText(persona)}. ${placed} Report back here with team_message when the work is done, and remove the worktree (git worktree remove ${worktree?.path ?? "<path>"}) when its PR merges.`,
+                `Started ${persona.name} at ${started.address} in ${name}, on ${modelText(persona)}. Worktree: ${worktree.path} on branch ${worktree.branch}. Report back here with team_message when the work is done, and remove the worktree (git worktree remove ${worktree.path}) when its PR merges.`,
             );
         },
     });
@@ -2231,7 +2395,13 @@ export default function createTeam(host: Host, web: Web) {
                 return undefined;
             }
 
-            const agents = await roster(directory);
+            // A profile that cannot be read must never block a session: with no roster at all, no home is known.
+            const agents = await guardRoster(directory);
+
+            if (agents === undefined) {
+                return undefined;
+            }
+
             const homes: string[] = [];
 
             for (const agent of agents) {
@@ -2247,7 +2417,7 @@ export default function createTeam(host: Host, web: Web) {
                 return undefined;
             }
 
-            const where = await realPathOr(targetPath(path, here));
+            const where = await realPathDeep(targetPath(path, here));
 
             if (homes.some((home) => within(where, home))) {
                 return undefined;

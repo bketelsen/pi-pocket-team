@@ -520,9 +520,9 @@ export default function setup(pocket) {
 
                     if (seen?.implicit && seen.identity && !pinned.has(Number(id))) {
                         try {
-                            await pocket.api(`session/${id}/identity`, {
-                                agent: seen.identity.id,
-                            });
+                            // The server pins it only when its folder still says so: a choice or a clear wins, and
+                            // a folder that moved pins nothing.
+                            await pocket.api(`session/${id}/pin`, { agent: seen.identity.id });
                             pinned.add(Number(id));
                         } catch {
                             // An owner-only route refused it: the folder keeps giving the identity.
