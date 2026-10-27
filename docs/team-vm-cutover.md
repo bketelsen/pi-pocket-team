@@ -124,8 +124,16 @@ keys have no passphrase: after a reboot nobody is there to unlock them. Their fi
     On the VM, run `gh repo clone <name> <folder>` for each line, then `npm install` (or the repository's own setup)
     where the repository's AGENTS.md asks for it. Do not copy framework's checkouts: 431 GiB, mostly build output.
 
-4. **The truenas MCP server.** Build the binary: `cd ~/projects/truenas-mcp && mise install && make build` (Go from
-   `go.mod`), then copy `build/truenas-mcp` to `~/.local/bin/truenas-mcp`. Then:
+4. **The truenas MCP server.** It needs Go (from its `go.mod`) through mise. Install mise for `team` when it is not
+   there, and build with `mise exec`, which needs no shell setup:
+
+    ```sh
+    command -v mise || curl -fsSL https://mise.run | sh      # installs ~/.local/bin/mise
+    cd ~/projects/truenas-mcp && ~/.local/bin/mise install && ~/.local/bin/mise exec -- make build
+    install -m 0755 build/truenas-mcp ~/.local/bin/truenas-mcp
+    ```
+
+    (Where `mise` was already on `PATH`, use that one instead of `~/.local/bin/mise`.) Then:
 
     **Brian:** create the TrueNAS user and its role-bound API key in the TrueNAS UI (Teg's NAS step names the role).
     Write `~/projects/truenas-mcp/.envrc` (git ignores it; mode `0600`) with `TRUENAS_HOST` and `TRUENAS_API_KEY`
@@ -238,12 +246,18 @@ there would run in an old session whose folder is gone, or send a message to one
    Never an old session. Odrade fills the table; **Brian:** confirms it. Then cancel each schedule in its session
    (`schedule cancel`).
 
-4. **The desk (Odrade).** Every desk thread is closed: none open, none parked. The desk's sweeper sends close-out and
-   repair messages to the agents' old sessions, and it ends only when its supervisor has no thread that is not
-   closed; the digest ends when no news waits. Odrade closes the threads with her desk tools. An open PR that waits
-   for Brian keeps its `ready-for-human` label, so Brian still finds it on GitHub; after the cut-over, the sweep
-   finds the team's open PRs again as found threads, whose notices go to Odrade. Wait until the first table has no
-   `x.desk.sweeper` and no `x.desk.digest`.
+4. **The desk.** The desk's sweeper sends close-out and repair messages to the agents' sessions, which are old
+   sessions on the VM. It ends only when its supervisor has no thread that is not closed; the digest ends when no
+   news waits. So every thread must be closed in a way that cannot open again:
+    - Odrade first writes the record: `plans/desk-at-cutover-DATE.md` in her desk, with each open or parked thread,
+      its agent, and each PR and issue on it (from the Desk page or the export in `desk/`). She commits it.
+    - **Brian:** on the Desk page, **Drop** each open or parked thread, with the reason "team VM cut-over DATE". A
+      dropped thread is closed for good: a repair never opens it again (`desk.ts`, the check for `"dropped"` before
+      a reopen), and a close-out goes only to an open thread. A thread that the desk closed by itself stays closed.
+    - Wait until the first table of the script has no `x.desk.sweeper` and no `x.desk.digest`.
+    - An open PR keeps its `ready-for-human` label, so Brian still finds it on GitHub. After step 9, Odrade goes
+      through the record: each PR or issue that still needs work goes to its owner again with `team_delegate` (a new
+      thread and a new session on the VM). Nothing from the record goes to an old session.
 
 5. **Odrade's desk folder.** Commit it (`git -C ~/projects/odrade status` is clean).
 
@@ -253,11 +267,20 @@ there would run in an old session whose folder is gone, or send a message to one
 once (`q` in the `pocket-start` terminal, or Ctrl+C), and run:
 
 ```sh
-# on framework; prints STOPPED and makes the backup only when the server is down and no task is left
+# on framework: a gate that exits 0 only when it can read the database and every task is terminal
+cat > /tmp/pocket-gate.mjs <<'EOF'
+import { DatabaseSync } from "node:sqlite";
+const db = new DatabaseSync(`${process.env.HOME}/.pi-pocket/pocket.sqlite`, { readOnly: true });
+const { n } = db.prepare("select count(*) n from tasks where status <> 'terminal'").get();
+console.log(`tasks not terminal: ${n}`);
+process.exit(n === 0 ? 0 : 1);
+EOF
+
+# prints STOPPED and makes the backup only when the server is down and the gate passes
 if compgen -G "$HOME/.pi-pocket/harness.lock*" >/dev/null; then
   echo "STILL RUNNING: stop Pocket first. Nothing copied."
-elif [ -n "$(node /tmp/pocket-tasks.mjs | grep -E '\"(pi|pocket|x)\.')" ]; then
-  echo "TASKS LEFT: start framework again, drain (step 2), retry. Nothing copied."
+elif ! node /tmp/pocket-gate.mjs; then
+  echo "TASKS LEFT, or the database cannot be read: start framework again, drain (step 2), retry. Nothing copied."
 else
   cp -a ~/.pi-pocket ~/.pi-pocket.backup-DATE && echo STOPPED
 fi
@@ -447,20 +470,23 @@ checkouts stay; Brian deletes them when he wants the disk.
 
 Any time before step 11, and with framework's data unchanged since step 3:
 
-1. On the VM, as `fleet`: `sudo systemctl disable --now pi-pocket@tailscale-serve pi-pocket@local`. Check: `systemctl is-active` says
-   inactive for both.
-2. On framework: `mv ~/.pi-pocket.framework-DATE ~/.pi-pocket` (after step 11 only), `mv ~/bin/pocket-start.retired-DATE ~/bin/pocket-start`,
+1. Teg or **Brian:** on minideb, stop and disable the daily backup timer of the team VM (when it is applied), and wait
+   until no backup job runs: a running job could start VM Pocket again after framework starts. It stays disabled
+   while framework serves.
+2. On the VM, as `fleet`: `sudo systemctl disable --now pi-pocket@tailscale-serve pi-pocket@local`. Check:
+   `systemctl is-active pi-pocket@tailscale-serve pi-pocket@local` says inactive for both. Go on only then.
+3. On framework: `mv ~/.pi-pocket.framework-DATE ~/.pi-pocket` (after step 11 only), `mv ~/bin/pocket-start.retired-DATE ~/bin/pocket-start`,
    then `pocket-start`.
-3. Re-make the schedules on framework in their old sessions, from `plans/schedules-DATE.md` (step 2 cancelled them
+4. Re-make the schedules on framework in their old sessions, from `plans/schedules-DATE.md` (step 2 cancelled them
    there too).
-4. What does not go back: the VM's database cannot go back to framework (its paths and its homes are new). So the
+5. What does not go back: the VM's database cannot go back to framework (its paths and its homes are new). So the
    sessions, desk threads, lessons, schedules and provider sign-ins made on the VM, the agent homes, and Odrade's desk
    commits made there stay on the VM only. Work pushed to GitHub (PRs, issues) is safe. Before anything removes
    them, keep a copy of the stopped VM's data: as `team`,
    `tar -C ~ -czf ~/vm-after-cutover-DATE.tgz .pi-pocket .pi/agent .config/pi-pocket-team agents`, and copy the file
    to framework. Bring Odrade's desk commits back with `git fetch` from that copy. **Brian:** decides what else to keep.
 
-To retry the VM later: keep the copy of step 4 first. Then restore the snapshot
+To retry the VM later: keep the copy of step 5 first. Then restore the snapshot
 (`incus snapshot restore --project team team pre-cutover-DATE` on minideb; it deletes everything made on the VM after
 the snapshot), and start again at step 2.
 
