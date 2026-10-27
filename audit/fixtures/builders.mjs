@@ -23,6 +23,7 @@ export function emptyData(over = {}) {
         spawns: [],
         installed: { "desk.ts": null, "team.ts": null, "night-shift.ts": null },
         odrade: { readme: "", reports: [], dirty: [], lastCommitAt: NOW - HOUR },
+        homes: [],
         github: { botPrs: [], prs: {}, checkRuns: {}, autoDelete: {} },
         sourceErrors: {},
         ...over,

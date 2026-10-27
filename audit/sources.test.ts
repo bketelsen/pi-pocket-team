@@ -1,6 +1,7 @@
 // The audit's reads: Pocket's database (read-only, folded as Pi Durable folds it), the `gh` and `git` wrappers, and
 // Odrade's notes. Everything runs on invented data; the process runner is a fake, so no real `gh` or `git` runs.
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -21,16 +22,66 @@ import {
     makeGh,
     makeGit,
     openPocket,
+    readHomes,
     readOdrade,
 } from "./sources.mjs";
 
 const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), "audit-sources-"));
+
+/**
+ * A git environment that no setting of this machine reaches: no inherited `GIT_` variable at all, then only the
+ * test's own (a temporary home, config file and XDG folder with a test identity, no system config, an empty template
+ * folder and no system attributes).
+ */
+function gitEnvironment(extraConfig = "") {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "audit-git-"));
+    const home = path.join(root, "home");
+    const config = path.join(root, "gitconfig");
+    const template = path.join(root, "template");
+    const xdg = path.join(root, "xdg");
+
+    for (const folder of [home, template, xdg]) {
+        fs.mkdirSync(folder);
+    }
+
+    fs.writeFileSync(
+        config,
+        `[user]\n\tname = Audit test\n\temail = audit@example.invalid\n${extraConfig}`,
+    );
+
+    // Every inherited `GIT_` variable goes, and then the test's own come in: nothing of this machine's git is used.
+    const env: Record<string, string> = {};
+
+    for (const [name, value] of Object.entries(process.env)) {
+        if (value !== undefined && !name.startsWith("GIT_")) {
+            env[name] = value;
+        }
+    }
+
+    return {
+        ...env,
+        HOME: home,
+        XDG_CONFIG_HOME: xdg,
+        GIT_CONFIG_NOSYSTEM: "1",
+        GIT_CONFIG_GLOBAL: config,
+        GIT_TEMPLATE_DIR: template,
+        GIT_ATTR_NOSYSTEM: "1",
+    };
+}
+
+/** Real git, as a process runner, in that environment. */
+const realGit =
+    (env = gitEnvironment()) =>
+    (command: string, args: string[]) =>
+        execFileSync(command, args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], env });
 
 /** A Pocket folder with the fixture database, an Odrade folder, and a recording runner for `git`. */
 function setup() {
     const root = tmp();
     const pocketDir = path.join(root, "pocket");
     const odradeDir = path.join(root, "odrade");
+    // No homes folder in `setup`: the homes source is 1 test of its own, below.
+    const homesDir = path.join(root, "homes");
 
     fs.mkdirSync(pocketDir);
     fs.mkdirSync(path.join(odradeDir, "reports", "2026-10-22-a"), { recursive: true });
@@ -54,7 +105,7 @@ function setup() {
         throw new Error(`unexpected ${command}`);
     };
 
-    return { root, pocketDir, odradeDir, times, calls, run };
+    return { root, pocketDir, odradeDir, homesDir, times, calls, run };
 }
 
 test("a document is its last base plus each delta; the event history keeps what the document dropped", () => {
@@ -99,13 +150,23 @@ test("the database handle is read-only: a write throws", () => {
 });
 
 test("loadData reads every source into one plain object", () => {
-    const { pocketDir, odradeDir, times, run } = setup();
-    const data = loadData({ pocketDir, odradeDir, now: NOW, hours: 24, useGithub: false, run });
+    const { pocketDir, odradeDir, homesDir, times, run } = setup();
+    const data = loadData({
+        pocketDir,
+        odradeDir,
+        homesDir,
+        now: NOW,
+        hours: 24,
+        useGithub: false,
+        run,
+    });
 
     assert.deepEqual(data.sourceErrors, { github: "disabled by --no-github" });
     assert.deepEqual(Object.keys(data.threads).sort(), ["T1", "T2", "T3"]);
     assert.equal(data.events.length, 7);
     assert.deepEqual(data.agentOf, { 10: "odrade" });
+    // No homes folder in this fixture: the homes source is 1 test of its own.
+    assert.deepEqual(data.homes, []);
 
     // Reports: the base one and the one that a delta added.
     assert.deepEqual(data.reports[SESSION_T1].map((report: { key: string }) => report.key).sort(), [
@@ -174,32 +235,56 @@ test("loadData reads every source into one plain object", () => {
 });
 
 test("loadData reads the install time of a live module", () => {
-    const { pocketDir, odradeDir, run } = setup();
+    const { pocketDir, odradeDir, homesDir, run } = setup();
 
     fs.mkdirSync(path.join(pocketDir, "extensions"));
     fs.writeFileSync(path.join(pocketDir, "extensions", "desk.ts"), "// x");
 
-    const data = loadData({ pocketDir, odradeDir, now: NOW, hours: 24, useGithub: false, run });
+    const data = loadData({
+        pocketDir,
+        odradeDir,
+        homesDir,
+        now: NOW,
+        hours: 24,
+        useGithub: false,
+        run,
+    });
 
     assert.ok(data.installed["desk.ts"] > 0);
     assert.equal(data.installed["team.ts"], null);
 });
 
 test("loadData reads Odrade's notes through the read-only git wrapper", () => {
-    const { pocketDir, odradeDir, calls, run } = setup();
-    const data = loadData({ pocketDir, odradeDir, now: NOW, hours: 24, useGithub: false, run });
+    const { pocketDir, odradeDir, homesDir, calls, run } = setup();
+    const data = loadData({
+        pocketDir,
+        odradeDir,
+        homesDir,
+        now: NOW,
+        hours: 24,
+        useGithub: false,
+        run,
+    });
 
     assert.deepEqual(data.odrade.reports.sort(), ["2026-10-22-a", "2026-10-23-daily-audit"]);
     assert.equal(data.odrade.readme, "see reports/2026-10-22-a");
     assert.deepEqual(data.odrade.dirty, [" M plans/x.md", "?? reports/2026-10-23-daily-audit/"]);
     assert.equal(data.odrade.lastCommitAt, NOW - 5 * HOUR);
 
-    // Only git, only log and status, always with the locks off and in Odrade's folder.
+    // Only git, only log and status, always with the locks off, no hook, no fsmonitor, and in Odrade's folder.
+    const safe = [
+        "--no-optional-locks",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "core.fsmonitor=false",
+    ];
+
     assert.deepEqual(
-        calls.map((call) => [call.command, call.args[0], call.args[1], call.args[2], call.args[3]]),
+        calls.map((call) => [call.command, ...call.args]),
         [
-            ["git", "--no-optional-locks", "-C", odradeDir, "status"],
-            ["git", "--no-optional-locks", "-C", odradeDir, "log"],
+            ["git", ...safe, "-C", odradeDir, "status", "--porcelain"],
+            ["git", ...safe, "-C", odradeDir, "log", "-1", "--format=%cI"],
         ],
     );
 });
@@ -209,6 +294,7 @@ test("a missing source is reported by name and does not stop the load", () => {
     const none = loadData({
         pocketDir: path.join(root, "nowhere"),
         odradeDir: path.join(root, "nowhere"),
+        homesDir: path.join(root, "nowhere"),
         now: NOW,
         hours: 24,
         useGithub: false,
@@ -223,13 +309,21 @@ test("a missing source is reported by name and does not stop the load", () => {
 });
 
 test("a database with no desk document skips the desk only", () => {
-    const { pocketDir, odradeDir, run } = setup();
+    const { pocketDir, odradeDir, homesDir, run } = setup();
     const db = new DatabaseSync(path.join(pocketDir, "pocket.sqlite"));
 
     db.exec("delete from documents where kind='\"x.desk.threads\"'");
     db.close();
 
-    const data = loadData({ pocketDir, odradeDir, now: NOW, hours: 24, useGithub: false, run });
+    const data = loadData({
+        pocketDir,
+        odradeDir,
+        homesDir,
+        now: NOW,
+        hours: 24,
+        useGithub: false,
+        run,
+    });
 
     assert.equal(data.sourceErrors.desk, "no x.desk.threads document");
     assert.equal(data.sourceErrors.costs, undefined);
@@ -372,7 +466,17 @@ test("git wrapper: a refused call never reaches the runner; an allowed one turns
     assert.throws(() => git.call("/x", ["push"]));
     assert.equal(calls.length, 0);
     assert.equal(git.call("/x", ["status", "--porcelain"]), "ok");
-    assert.deepEqual(calls[0], ["--no-optional-locks", "-C", "/x", "status", "--porcelain"]);
+    assert.deepEqual(calls[0], [
+        "--no-optional-locks",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "core.fsmonitor=false",
+        "-C",
+        "/x",
+        "status",
+        "--porcelain",
+    ]);
 });
 
 test("readOdrade reads the index, the reports, the dirty files and the last commit", () => {
@@ -382,6 +486,244 @@ test("readOdrade reads the index, the reports, the dirty files and the last comm
     assert.equal(notes.reports.length, 2);
     assert.equal(notes.dirty.length, 2);
     assert.equal(notes.lastCommitAt, NOW - 5 * HOUR);
+});
+
+// ---------- The agents' homes ----------
+
+test("readHomes reads each git folder with its dirty lines and last commit, and leaves Odrade's out", () => {
+    const root = tmp();
+    const homesDir = path.join(root, "agents");
+    const odradeDir = path.join(homesDir, "odrade");
+    const irulan = path.join(homesDir, "irulan");
+    const moneo = path.join(homesDir, "moneo");
+
+    // 3 git folders: Odrade's, Irulan's and Moneo's. 1 folder that is no home, and 1 hidden folder.
+    for (const folder of [odradeDir, irulan, moneo, path.join(homesDir, "notes")]) {
+        fs.mkdirSync(folder, { recursive: true });
+    }
+
+    for (const folder of [odradeDir, irulan, moneo, path.join(homesDir, ".cache")]) {
+        fs.mkdirSync(path.join(folder, ".git"), { recursive: true });
+    }
+
+    // Odrade's folder, reached through a link, is still Odrade's folder: the real path decides.
+    fs.symlinkSync(odradeDir, path.join(homesDir, "desk"));
+
+    const calls: string[][] = [];
+
+    const run = (_: string, args: string[]) => {
+        calls.push(args);
+
+        if (args.includes(irulan) && args.includes("status")) {
+            return " M notes/x.md\n?? plans/y.md\n";
+        }
+
+        if (args.includes("status")) {
+            return "";
+        }
+
+        if (args.includes("log")) {
+            return new Date(args.includes(irulan) ? NOW - 30 * HOUR : NOW - HOUR).toISOString();
+        }
+
+        throw new Error(`unexpected git ${args.join(" ")}`);
+    };
+
+    const homes = readHomes(homesDir, makeGit(run), { exclude: [odradeDir] });
+
+    assert.deepEqual(
+        homes.map((home: { id: string }) => home.id),
+        ["irulan", "moneo"],
+    );
+    assert.equal(homes[0].folder, irulan);
+    assert.deepEqual(homes[0].dirty, [" M notes/x.md", "?? plans/y.md"]);
+    assert.equal(homes[0].lastCommitAt, NOW - 30 * HOUR);
+    assert.deepEqual(homes[1].dirty, []);
+    assert.equal(homes[1].lastCommitAt, NOW - HOUR);
+
+    // git ran in the 2 homes only: never in Odrade's folder, the link, the plain folder or the hidden one.
+    assert.deepEqual(
+        calls.map((args) => args[args.indexOf("-C") + 1]),
+        [irulan, irulan, moneo, moneo],
+    );
+});
+
+test("readHomes: an empty git init folder is 1 home with no last commit, and its status still counts", () => {
+    const root = tmp();
+    const homesDir = path.join(root, "agents");
+    const folder = path.join(homesDir, "irulan");
+
+    fs.mkdirSync(folder, { recursive: true });
+    fs.writeFileSync(path.join(folder, "AGENTS.md"), "# Irulan's home\n");
+    // A repository with no commit: `git log` fails there.
+    const run = realGit();
+
+    run("git", ["-C", folder, "init", "-b", "main"]);
+
+    const homes = readHomes(homesDir, makeGit(run));
+
+    assert.deepEqual(
+        homes.map((home: { id: string }) => home.id),
+        ["irulan"],
+    );
+    assert.deepEqual(homes[0].dirty, ["?? AGENTS.md"]);
+    assert.equal(homes[0].lastCommitAt, null);
+});
+
+test("readHomes: 1 home whose git fails does not fail the source; 1 whose status fails is left out", () => {
+    const root = tmp();
+    const homesDir = path.join(root, "agents");
+    const empty = path.join(homesDir, "irulan");
+    const broken = path.join(homesDir, "moneo");
+
+    for (const folder of [empty, broken]) {
+        fs.mkdirSync(path.join(folder, ".git"), { recursive: true });
+    }
+
+    const run = (_: string, args: string[]) => {
+        if (args.includes(broken)) {
+            throw new Error("fatal: not a git repository");
+        }
+
+        if (args.includes("status")) {
+            return " M notes/x.md\n";
+        }
+
+        throw new Error("fatal: your current branch 'main' does not have any commits yet");
+    };
+
+    const homes = readHomes(homesDir, makeGit(run));
+
+    assert.deepEqual(
+        homes.map((home: { id: string }) => home.id),
+        ["irulan"],
+    );
+    assert.deepEqual(homes[0].dirty, [" M notes/x.md"]);
+    assert.equal(homes[0].lastCommitAt, null);
+});
+
+test("readHomes: a core.fsmonitor script is never run", () => {
+    const root = tmp();
+    const homesDir = path.join(root, "agents");
+    const folder = path.join(homesDir, "irulan");
+    const marker = path.join(root, "fsmonitor-ran");
+    const script = path.join(root, "fsmonitor.sh");
+    const run = realGit();
+
+    fs.mkdirSync(folder, { recursive: true });
+    fs.writeFileSync(path.join(folder, "AGENTS.md"), "# Irulan's home\n");
+    run("git", ["-C", folder, "init", "-b", "main"]);
+    run("git", ["-C", folder, "add", "-A"]);
+    run("git", ["-C", folder, "commit", "-m", "home"]);
+
+    // A filesystem monitor that writes a marker: `git status` runs it, if the audit lets it.
+    fs.writeFileSync(script, `#!/bin/sh\ntouch '${marker}'\nexit 1\n`, { mode: 0o755 });
+    run("git", ["-C", folder, "config", "core.fsmonitor", script]);
+
+    // It does run for a plain `git status`, so the test above means something.
+    execFileSync("git", ["-C", folder, "status"], { encoding: "utf8", env: gitEnvironment() });
+    assert.equal(fs.existsSync(marker), true);
+    fs.rmSync(marker);
+
+    const homes = readHomes(homesDir, makeGit(run));
+
+    assert.equal(fs.existsSync(marker), false);
+    assert.deepEqual(
+        homes.map((home: { id: string }) => home.id),
+        ["irulan"],
+    );
+});
+
+test("readHomes: a GIT_CONFIG of the environment stays unchanged, and the repository's fsmonitor never runs", () => {
+    const root = tmp();
+    const homesDir = path.join(root, "agents");
+    const folder = path.join(homesDir, "irulan");
+    const marker = path.join(root, "fsmonitor-ran");
+    const script = path.join(root, "fsmonitor.sh");
+    const file = path.join(root, "external-config");
+    const content = "[core]\n\tquotePath = false\n";
+    const run = realGit();
+
+    fs.mkdirSync(folder, { recursive: true });
+    fs.writeFileSync(path.join(folder, "AGENTS.md"), "# Irulan's home\n");
+    run("git", ["-C", folder, "init", "-b", "main"]);
+    run("git", ["-C", folder, "add", "-A"]);
+    run("git", ["-C", folder, "commit", "-m", "home"]);
+
+    // The repository's own config names a filesystem monitor that writes a marker.
+    fs.writeFileSync(script, `#!/bin/sh\ntouch '${marker}'\nexit 1\n`, { mode: 0o755 });
+    run("git", ["-C", folder, "config", "core.fsmonitor", script]);
+    fs.writeFileSync(file, content);
+
+    // The external config file, named by `GIT_CONFIG`: the audit reads, and must write nothing there.
+    const env = { ...gitEnvironment(), GIT_CONFIG: file };
+    const runWithConfig = realGit(env);
+
+    // It runs for a plain `git status`, so the assertion below means something.
+    runWithConfig("git", ["-C", folder, "status"]);
+    assert.equal(fs.existsSync(marker), true);
+    fs.rmSync(marker);
+
+    const homes = readHomes(homesDir, makeGit(runWithConfig));
+
+    assert.deepEqual(
+        homes.map((home: { id: string }) => home.id),
+        ["irulan"],
+    );
+    assert.equal(fs.existsSync(marker), false);
+    assert.equal(fs.readFileSync(file, "utf8"), content);
+});
+
+test("readHomes: a symlink loop beside a healthy home is skipped, and the healthy home is read", () => {
+    const root = tmp();
+    const homesDir = path.join(root, "agents");
+    const healthy = path.join(homesDir, "moneo");
+
+    fs.mkdirSync(path.join(healthy, ".git"), { recursive: true });
+    // A link that points at itself: `stat` fails there, and 1 such entry must not stop the source.
+    fs.symlinkSync("loop", path.join(homesDir, "loop"));
+
+    const run = (_: string, args: string[]) => {
+        if (args.includes("status")) {
+            return "";
+        }
+
+        return new Date(NOW - HOUR).toISOString();
+    };
+
+    const homes = readHomes(homesDir, makeGit(run));
+
+    assert.deepEqual(
+        homes.map((home: { id: string }) => home.id),
+        ["moneo"],
+    );
+    assert.equal(homes[0].lastCommitAt, NOW - HOUR);
+});
+
+test("a missing homes folder gives an empty list, not a source error", () => {
+    const root = tmp();
+    const homes = readHomes(
+        path.join(root, "nowhere"),
+        makeGit(() => ""),
+    );
+
+    assert.deepEqual(homes, []);
+
+    const { pocketDir, odradeDir, homesDir, run } = setup();
+    const data = loadData({
+        pocketDir,
+        odradeDir,
+        homesDir,
+        now: NOW,
+        hours: 24,
+        useGithub: false,
+        run,
+    });
+
+    assert.deepEqual(data.homes, []);
+    assert.equal(data.sourceErrors.homes, undefined);
+    // The checks that need the homes still run, on no homes.
+    assert.deepEqual(data.sourceErrors, { github: "disabled by --no-github" });
 });
 
 // ---------- GitHub data ----------
@@ -537,10 +879,11 @@ test("loadGithub: with more runs than 5 pages hold, the commit's check runs are 
 });
 
 test("loadGithub: when gh gives nothing, the load fails and the source is reported", () => {
-    const { pocketDir, odradeDir } = setup();
+    const { pocketDir, odradeDir, homesDir } = setup();
     const data = loadData({
         pocketDir,
         odradeDir,
+        homesDir,
         now: NOW,
         hours: 24,
         useGithub: true,
@@ -558,12 +901,13 @@ test("loadGithub: when gh gives nothing, the load fails and the source is report
 });
 
 test("loadData notes when the GitHub call cap was reached", () => {
-    const { pocketDir, odradeDir } = setup();
+    const { pocketDir, odradeDir, homesDir } = setup();
     const refs = Array.from({ length: 2000 }, (_, i) => `acme/w${i}#1`);
     const fake = fakeGh(refs);
     const data = loadData({
         pocketDir,
         odradeDir,
+        homesDir,
         now: NOW,
         hours: 24,
         useGithub: true,

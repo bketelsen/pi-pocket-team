@@ -4,8 +4,9 @@
 //
 //     node audit/daily.mjs [--hours 24] [--date YYYY-MM-DD] [--out-dir DIR] [--no-llm] [--no-github] [--json]
 //
-// Environment: PI_POCKET_DIR (default ~/.pi-pocket), ODRADE_DIR (default ~/projects/odrade). The default out
-// folder is `$ODRADE_DIR/reports/<date>-daily-audit/`; earlier days are read from its sibling folders. See
+// Environment: PI_POCKET_DIR (default ~/.pi-pocket), ODRADE_DIR (default ~/agents/odrade when that folder exists,
+// else ~/projects/odrade), TEAM_HOMES_DIR (default ~/agents). The default out folder is
+// `$ODRADE_DIR/reports/<date>-daily-audit/`; earlier days are read from its sibling folders. See
 // docs/plans/daily-audit.md.
 import fs from "node:fs";
 import os from "node:os";
@@ -74,6 +75,22 @@ export function parseArgs(argv) {
     return options;
 }
 
+/** The user's home folder, as the environment names it. */
+const userHome = (env) =>
+    typeof env.HOME === "string" && env.HOME !== "" ? env.HOME : os.homedir();
+
+/**
+ * Odrade's notes: her home folder (`~/agents/odrade`) when it exists, else her desk (`~/projects/odrade`).
+ */
+export function defaultOdradeDir(env = process.env) {
+    const home = path.join(userHome(env), "agents", "odrade");
+
+    return fs.existsSync(home) ? home : path.join(userHome(env), "projects", "odrade");
+}
+
+/** The folder of the agents' homes (`TEAM_HOMES_DIR`). */
+export const defaultHomesDir = (env) => env.TEAM_HOMES_DIR ?? path.join(userHome(env), "agents");
+
 /** The audit's own last commit and its date, or null. The repo root is the parent folder of `audit/`. */
 function codeVersion(run) {
     try {
@@ -100,7 +117,8 @@ export async function main(
     const options = parseArgs(argv);
     const date = options.date ?? newYorkDate(now);
     const pocketDir = env.PI_POCKET_DIR ?? path.join(os.homedir(), ".pi-pocket");
-    const odradeDir = env.ODRADE_DIR ?? path.join(os.homedir(), "projects", "odrade");
+    const odradeDir = env.ODRADE_DIR ?? defaultOdradeDir(env);
+    const homesDir = defaultHomesDir(env);
     const outDir = path.resolve(
         options.outDir ?? path.join(odradeDir, "reports", `${date}-daily-audit`),
     );
@@ -109,6 +127,7 @@ export async function main(
     const data = loadData({
         pocketDir,
         odradeDir,
+        homesDir,
         now,
         hours: options.hours,
         useGithub: options.github,

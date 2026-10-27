@@ -29,6 +29,7 @@ import {
     checkH3,
     checkI1,
     checkI2,
+    checkI3,
     checkJ1,
     inDeepseekPeak,
     makeFinding,
@@ -1474,6 +1475,52 @@ test("I2: the audit's own folder is not an uncommitted file", () => {
     assert.equal(checkI2(own, ctx).metrics.uncommitted, 0);
 });
 
+// ---------- I. The agents' homes ----------
+
+/** 1 home as `readHomes` builds it. */
+const home = (id: string, dirty: string[], age: number | null = 30 * HOUR) => ({
+    id,
+    folder: `/home/b/agents/${id}`,
+    dirty,
+    lastCommitAt: age === null ? null : NOW - age,
+});
+
+test("I3: 1 low finding for each home dirty for more than 24 h; a recent commit, or a clean home, is none", () => {
+    const data = emptyData({
+        homes: [
+            home("irulan", [" M notes/x.md", "?? plans/y.md"], 30 * HOUR),
+            home("moneo", [" M notes/x.md"], 25 * HOUR),
+            home("teg", [" M notes/x.md"], 24 * HOUR),
+            home("lucilla", [], 3 * DAY),
+            home("duncan", ["?? notes/new.md"], HOUR),
+        ],
+    });
+    const result = checkI3(data, ctx);
+
+    assert.deepEqual(ids(result), ["I3:irulan", "I3:moneo"]);
+    assert.deepEqual(
+        result.findings.map((finding) => finding.severity),
+        ["low", "low"],
+    );
+    assert.equal(
+        result.findings[0]!.text,
+        "2 uncommitted files in irulan's home, and the last commit is 30 h old",
+    );
+    assert.equal(result.findings[0]!.cases, 2);
+    assert.deepEqual(result.findings[0]!.evidence, [" M notes/x.md", "?? plans/y.md"]);
+    // The metrics count every home, and the homes that are dirty.
+    assert.deepEqual(result.metrics, { homes: 5, dirty: 4 });
+});
+
+test("I3: a home with no commit at all is a finding when it is dirty, and no homes give no finding", () => {
+    const none = checkI3(emptyData({ homes: [home("irulan", [" M notes/x.md"], null)] }), ctx);
+
+    assert.deepEqual(ids(none), ["I3:irulan"]);
+    assert.match(none.findings[0]!.text, /the last commit is unknown/);
+    assert.deepEqual(ids(checkI3(emptyData(), ctx)), []);
+    assert.deepEqual(checkI3(emptyData(), ctx).metrics, { homes: 0, dirty: 0 });
+});
+
 // ---------- J. Spend ----------
 
 /** Cost rows of 1 session: `daily` dollars on each of the 7 days before the window, and `today` in it. */
@@ -1556,7 +1603,12 @@ test("runChecks: every check has an entry, and a missing source skips its checks
     const data = emptyData({ sourceErrors: { github: "disabled by --no-github" } });
     const result = runChecks(data, ctx);
 
-    assert.equal(CHECKS.length, 24);
+    assert.equal(CHECKS.length, 25);
+    // I3 sits beside I2 and reads the homes source.
+    assert.deepEqual(
+        CHECKS.find(([id]) => id === "I3"),
+        ["I3", checkI3, ["homes"]],
+    );
     assert.deepEqual(Object.keys(result.skipped).sort(), [
         "B1",
         "D1",
