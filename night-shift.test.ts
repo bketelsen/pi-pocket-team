@@ -379,11 +379,17 @@ describe("parsing", () => {
             summaryMessage(delegated),
             /Write it in ASD-STE100 .*\nThis summary is your shift report\. It goes to Sheeana by itself: do not send a separate team_message report\. Answer a later message from Sheeana as usual\./,
         );
+        // A delegated shift's summary ends with its decisions for Brian, 1 line each, or a "none".
+        assert.match(
+            summaryMessage(delegated),
+            /End the summary with a line "ASKS FOR BRIAN:" and 1 line under it for each decision Brian must make, with its options in \[a \| b\] when it is a pick-one\. Write "ASKS FOR BRIAN: none" when there is none\. A merge or install request is no decision\./,
+        );
 
         const plain = goal();
 
         assert.ok(!roundMessage(plain, 1, now).includes("team_message report"));
         assert.ok(!summaryMessage(plain).includes("team_message report"));
+        assert.ok(!summaryMessage(plain).includes("ASKS FOR BRIAN"), "a shift of a session's own");
     });
 
     test("Pi's status line, and whose a message is", () => {

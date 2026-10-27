@@ -925,6 +925,7 @@ export function summaryMessage(goal: Goal): string {
             : [
                   `Write it in ASD-STE100 (Simplified Technical English): it goes to ${goal.delegated.supervisor}.`,
                   `This summary is your shift report. It goes to ${goal.delegated.supervisor} by itself: do not send a separate team_message report. Answer a later message from ${goal.delegated.supervisor} as usual.`,
+                  'End the summary with a line "ASKS FOR BRIAN:" and 1 line under it for each decision Brian must make, with its options in [a | b] when it is a pick-one. Write "ASKS FOR BRIAN: none" when there is none. A merge or install request is no decision.',
               ]),
         "Do not end with a STATUS line.",
     ].join("\n");
@@ -1248,8 +1249,15 @@ export default function createNightShift(host: Host, web: Web) {
                 digest?: true;
                 /** The stop reason: `blocked` and `failed` go at once. */
                 reason?: string;
+                /** The decisions for Brian that the summary names, 1 to 4: the desk files each as an ask. */
+                asks?: { question: string; options?: string[] }[];
             },
         ) => Promise<{ line: string; held?: boolean } | undefined>;
+        /**
+         * The asks of a summary's `ASKS FOR BRIAN:` block, by the desk's own parser, so the 2 modules cannot drift.
+         * Absent in an older desk: the text alone holds the thread then.
+         */
+        asks?: (text: string) => { question: string; options?: string[] }[] | undefined;
     };
 
     const deskApi = (): DeskApi | undefined =>
@@ -1922,6 +1930,9 @@ export default function createNightShift(host: Host, web: Web) {
                     found.address = await returnAddress(tx, id);
 
                     const desk = deskApi();
+                    // The summary's own `ASKS FOR BRIAN:` block becomes the desk's asks, by the desk's parser: 1 to 4
+                    // of them. More than 4 leaves the decisions in the text alone.
+                    const asks = desk?.asks?.(text);
 
                     if (desk !== undefined && found.address !== undefined && report !== undefined) {
                         found.filed = await desk.file(tx, id, {
@@ -1932,6 +1943,7 @@ export default function createNightShift(host: Host, web: Web) {
                             at: runtime.now(),
                             digest: true,
                             ...(goal?.reason === undefined ? {} : { reason: goal.reason }),
+                            ...(asks === undefined || asks.length === 0 ? {} : { asks }),
                         });
                     }
 

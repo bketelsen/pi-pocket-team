@@ -67,6 +67,8 @@ import {
     closeoutKey,
     knownHeads,
     reportBlocks,
+    reportAsksBrian,
+    asksForBrian,
     shiftWorks,
     assignWorktrees,
     ownedWorktrees,
@@ -93,6 +95,7 @@ import {
     parseStatus,
     addAsk,
     answerAsk,
+    reportAsksOf,
     namesDecision,
     rewriteAsk,
     withdrawAsk,
@@ -889,6 +892,15 @@ describe("closeCheck", () => {
         assert.equal(blocked.close, false);
         assert.deepEqual(blocked.open, ["its last report says BLOCKED or asks for a decision"]);
 
+        // A report that asks him for a decision says so, and holds the thread the same way.
+        const asks = closeCheck(
+            thread({ prs: merged, run: { ...sent, reportBlocked: true, reportAsks: true } }),
+            facts(),
+        );
+
+        assert.equal(asks.close, false);
+        assert.deepEqual(asks.open, ["its last report asks Brian for a decision"]);
+
         const dirty = closeCheck(thread({ run: { dirty: 2 } }), facts());
 
         assert.equal(dirty.close, false);
@@ -914,11 +926,72 @@ describe("closeCheck", () => {
             closeCheck(thread({ session: undefined, run: { reportedAt: 900 } }), facts()),
             { close: true, open: [] },
         );
-        // A derived flag, either way, lifts the hold.
+        // A pair of derived flags, either way, lifts the hold.
         assert.deepEqual(
-            closeCheck(thread({ run: { reportedAt: 900, reportBlocked: false } }), facts()),
+            closeCheck(
+                thread({ run: { reportedAt: 900, reportBlocked: false, reportAsks: false } }),
+                facts(),
+            ),
             { close: true, open: [] },
         );
+        assert.deepEqual(
+            closeCheck(
+                thread({ run: { reportedAt: 900, reportBlocked: true, reportAsks: true } }),
+                facts(),
+            ).open,
+            ["its last report asks Brian for a decision"],
+        );
+
+        // A thread from before `reportAsks` has `reportBlocked: false` and no `reportAsks`: a failed read of its
+        // report leaves it that way, and a report that asks him must not close it too early.
+        for (const run of [
+            { reportedAt: 900, reportBlocked: false },
+            { reportedAt: 900, reportAsks: false },
+        ]) {
+            assert.deepEqual(
+                closeCheck(thread({ run }), facts()),
+                { close: false, open: ["its newest report is not checked yet"] },
+                JSON.stringify(run),
+            );
+        }
+
+        // The same, with a blocked report: both parts hold it, and neither one goes away.
+        assert.deepEqual(
+            closeCheck(thread({ run: { reportedAt: 900, reportBlocked: true } }), facts()),
+            {
+                close: false,
+                open: [
+                    "its last report says BLOCKED or asks for a decision",
+                    "its newest report is not checked yet",
+                ],
+            },
+        );
+
+        // A thread that would close: an idle, reported session, and a merged PR. The missing pair alone holds it, and a
+        // sweep that reads the report lifts the hold.
+        const ref = "frostyard/test#2";
+        const done = (run: Record<string, JsonValue>): Thread =>
+            thread({
+                prs: { [ref]: { via: "attached" as const, state: "MERGED" as const } },
+                run: {
+                    closeout: `closeout:k:${ref}`,
+                    closeoutRefs: [ref],
+                    closeoutEntry: 5,
+                    reportedUserEntry: 6,
+                    lastUserEntry: 6,
+                    reportedAt: 900,
+                    ...run,
+                },
+            });
+
+        assert.deepEqual(closeCheck(done({ reportBlocked: false }), facts()), {
+            close: false,
+            open: ["its newest report is not checked yet"],
+        });
+        assert.deepEqual(closeCheck(done({ reportBlocked: false, reportAsks: false }), facts()), {
+            close: true,
+            open: [],
+        });
     });
 
     test("a thread still starting closes as failed after an hour", () => {
@@ -1001,6 +1074,16 @@ describe("nextActor", () => {
         assert.equal(nextActor(blocked), "odrade");
         assert.equal(odradeReason(blocked), "report says blocked");
         assert.equal(waitsText([blocked]), "T1: report says blocked");
+        // A report that asks Brian by itself says so: the desk knows it needs his answer, not a fix.
+        const asks = thread({ run: { reportBlocked: true, reportAsks: true } });
+
+        assert.equal(odradeReason(asks), "report asks Brian");
+        assert.equal(waitsText([asks]), "T1: report asks Brian");
+        assert.equal(
+            odradeReason(thread({ run: { reportBlocked: true, reportAsks: false } })),
+            "report says blocked",
+        );
+        assert.equal(odradeReason(thread({ run: { reportBlocked: true } })), "report says blocked");
         // A working session is the agent's turn before Odrade's.
         assert.equal(nextActor(thread({ run: { reportBlocked: true, busy: true } })), "agent");
         // A paused shift has no driver: an idle, reported session with nothing else open waits on nobody.
@@ -2314,6 +2397,7 @@ describe("a quiet session after a supervisor's message", () => {
                 reportedUserEntry: 5,
                 reportedAt: 400,
                 reportBlocked: false,
+                reportAsks: false,
                 lastUserEntry: 6,
                 otherUserEntry: 5,
                 quietReopen: { at: 500, entry: 5 },
@@ -6222,6 +6306,229 @@ describe("decisions in a report's words", () => {
     });
 });
 
+describe("a report that asks Brian for a decision", () => {
+    // The real reports, word for word: the text between the fences of the "## Reports" part of each thread file.
+    const T207 =
+        "Night shift report from this linked session: stopped at round 1 of 6: Pi says the stop condition holds.\nRounds: 1, worker: github-copilot/claude-sonnet-5.5.\n\n**Shift report: Goal 5, UNKNOWN items in the homewiki**\n\n**1. What I did**\n- The UNKNOWN count is now 76 lines. It was 97. The command is: `grep -rn UNKNOWN README.md docs --include=*.md | grep -v open-items.md | wc -l`. About 7 of the 76 lines only define the word UNKNOWN. The register in `docs/open-items.md` is rebuilt.\n- I pulled first. The checkout equalled `origin/main` at `7f45caf`.\n- I made 7 small commits. They are all on `origin/main`. The head is `33c733f`. No PR was needed, because the homewiki AGENTS.md says to commit to `main`.\n- All checks were read-only. I changed nothing on any host. One worker on `github-copilot/claude-sonnet-5.5` gathered host facts. I re-read each fact myself before I wrote it.\n- The main answers came from `midclt call` over SSH to TrueNAS. The `truenas_*` MCP tools cannot read these:\n  - Scrub tasks: `fast` on Sunday 04:00, `slow` and `big` on Sunday 00:00, threshold 35 days. This explains why no scrub has run since the first ones.\n  - Snapshot tasks: retention 2 weeks.\n  - SMART tests: cron jobs 1 and 2, all disks.\n  - Also read: system dataset, VM devices, share ACLs, SMB users, UPS (stopped), alert services, update status (no update pending), cron coverage.\n- Other facts I recorded:\n  - The first selfie prune ran on 2026-10-25.\n  - The TrueNAS config-export copies are complete on TrueNAS and on selfie.\n  - Build stamps for `porterd` and `readd` in the hub VM.\n  - The 2026-09-22 Incus creation on minideb came from a `bjk` SSH login from framework.\n  - The ACME challenge types that caddy tries.\n  - Three fleet roles are byte-identical to the live files.\n  - No Tailscale peer advertises an exit node or routes.\n  - Facts about the UDM cloud registration and the offload flags.\n\n**2. What is left**\nEvery remaining UNKNOWN has a reason in its page.\n- Physical items: spare drives, the dropped drives, the Synology chassis. Only Brian can answer.\n- Retired Synology rows: the box no longer answers, so no read can reach it.\n- Items that need an external probe or an active test: WAN reachability, packet outcomes, a restore, a test alert.\n- Items that need a credential or the owner: Semaphore contents, Tailscale ACLs, the UniFi cloud remote-access flag, the reasons for dual-homing.\n\n**Needs Brian**\n- One read of the UDM file `/data/unifi-core/config/cloud.yaml` printed part of a private key (`deviceAuth`) into my session log. It is not in the wiki. Brian may want to treat that console cloud key as exposed to the session log. I recorded this in `collection-method.md`.\n- The served wiki reads `/var/home/bjk/projects/homewiki`. That checkout needs `git pull` to show the new commits. I did not touch it.\n- I grepped my whole diff for credentials. I found none.\n\n**3. Why the work stopped**\nThe stop condition holds:\n- The UNKNOWN count before and after is recorded.\n- Each remaining UNKNOWN has a reason.\n- The commits are on homewiki `main`.\n\nThe shift used 1 of 6 rounds.";
+    const T296 =
+        "Irulan: worktree cleanup is complete. I removed 100 of 128 worktrees in my 5 repositories. 28 stay. I committed nothing and pushed nothing.\n\nPer repository (before \u2192 after, removed):\n- `frostnotes`: 67 \u2192 18, 49 removed.\n- `lodge`: 27 \u2192 3, 24 removed.\n- `frostmail`: 25 \u2192 5, 20 removed.\n- `porter`: 6 \u2192 1, 5 removed.\n- `frostread`: 3 \u2192 1, 2 removed.\n\nMethod: I ran `git fetch --prune` first. I used `git worktree remove` (never `--force`), then `git worktree prune`. Each removed worktree was clean. Each one was merged into `origin/main`, or detached at a commit on `origin/main`, or its PR was merged. No process had its working directory in a removed folder.\n\nDelegation worktrees: I read the thread files in `odrade/desk/`. I removed 8 worktrees of CLOSED threads: T253, T257, T262, T264, T267, T272, T282, T291. The Desk sweep accepts a missing folder: it runs `git worktree prune` and records the worktree as gone.\n\nLocal branches: I deleted the merged ones with `git branch -d`. Git refused 5 squash-merged branches in `frostnotes`: `m3/one-desktop` (#42), `m3/phase7` (#39), `m3/phase8` (#41), `m3/vaults` (#40), `m4/plan` (#44). All 5 PRs are MERGED. The branches stay because I did not use `-D`.\n\nKept (main checkouts not counted):\n- In use: `frostnotes--irulan-3fcea7d7` (T213 is OPEN). `frostnotes--irulan-5a904448` (this task).\n- Unmerged: `frostnotes/.worktrees/exec-m3e` (`task/0082`) and `frostnotes/.worktrees/exec-m3f` (`task/0083`). Each branch has 5 commits that are not on `origin/main`. They have no PR and no remote branch. The work is probably in PR #40 (`m3/vaults`), but git cannot prove it. Brian must decide.\n- Brian's `.claude/worktrees` (not touched, by rule): 13 in `frostnotes`, 2 in `lodge`, 4 in `frostmail`.\n\nOther notes:\n- I removed 2 empty folders: `frostmail/.worktrees` and `lodge/worktrees`.\n- `../worktrees/deploy-frostmail`, `deploy-frostnotes`, `deploy-frostread` and `deploy-porter` are full clones, not worktrees. I did not touch them.\n- The other folders in `../worktrees/` (clix, core, std, updex, snowcat, repogen and others) belong to other repositories. I did not touch them.";
+    const T259 =
+        'Answer: the cause is on the Cloudflare side. It is not in the repository. Build watch paths, branch control and the changed paths are not the cause. I did not open a PR. A repository config change cannot fix this problem.\n\nCAUSE\n1. OBSERVED: The paths do not explain the skips. `a741426` (#45) and `d5fec4f` (#48) changed the same kinds of files as #46 and #49 (`scripts/check-site.mjs`, `src/content/docs/docs/apps/*.md`), and both built. The paths in `de263fe` are a subset of the paths in `a741426`. An include/exclude rule cannot build the superset and skip the subset.\n2. OBSERVED: The Cloudflare docs (`workers/ci-cd/builds/build-watch-paths`) say: "A push event contains 0 file changes" bypasses path matching, and the build always runs. But the empty commits `cc41a2f` (#49 branch), `d57ae0c` (#50 branch) and `cb31aaf` (#50 merge) got 0 check runs too.\n3. OBSERVED: Branch control is not the cause. Both main and PR branches lost builds on 2026-10-26. The last build was on `3564649` (PR #49 head, 13:41Z). Every push after it has 0 check runs: `0468197` 14:34Z, `cc41a2f` 14:49Z, `2d8f2d8` 15:19Z, `d57ae0c`, `cb31aaf` 15:21Z (checked at 15:24Z).\n4. OBSERVED: Same-tree dedup is not the cause. Each merge commit has the same tree as its PR head. This is true for the merges that built (`a741426`, `d5fec4f`) and for the merges that did not (`de263fe`, `2d8f2d8`).\n5. OBSERVED: cloudflarestatus.com has an open incident: "Cloudflare Workers build delays". Its component is "Workers Builds". Cloudflare opened it at 2026-10-26 15:12Z, and it is still "investigating".\n6. INFERENCE: The 2026-10-26 gap comes from this incident. It probably started near 14:34Z, before Cloudflare posted it. The builds can be delayed or lost.\n7. INFERENCE: For `de263fe` (2026-10-25 19:11Z), the status feed shows no incident. Builds ran at 19:03Z (PR head `e62a048`) and 19:39Z (`7aaa068`). Thus Cloudflare probably lost 1 push event or 1 build. Free-plan concurrency (1 build) can queue a build, but it does not drop the build.\n8. I cannot see the GitHub App delivery log. Only the app owner (Cloudflare) can see it. The repo hooks API and the org installations API need admin scopes that `frostyard-machines` does not have.\n9. OBSERVED: frostyard.org does not show #49 yet. `/docs/apps/frostnotes/` still pins frostnotes `5d27c70` (the #48 content).\n\nSTEPS FOR BRIAN (recommended now)\n1. Wait until Cloudflare resolves the incident. Then open dash.cloudflare.com > Workers & Pages > `frostyard-org` > Deployments > View build history.\n2. Look for builds of `de263fe` and `2d8f2d8`. If a build is there with a failed or cancelled status, the push arrived and the build failed in Cloudflare. If no build is there, the push event did not arrive.\n3. If no build of `cb31aaf` (current main) appears after the incident, select "Retry build" on the latest build, or run a manual build of `main`. Do not push more empty commits during the incident, because they go into the same queue.\n\nFALLBACK (recommended only if this happens again after the incident)\n1. Brian creates a Deploy Hook: Settings > Builds > Deploy Hooks, branch `main`. He stores the URL as the repository secret `CLOUDFLARE_DEPLOY_HOOK_URL`.\n2. Then I open 1 PR with a workflow on `push` to `main`. The workflow waits about 15 minutes. If the SHA has no check run named `Workers Builds: frostyard-org`, it sends a POST to the hook. The workflow skips when the secret is absent.\n3. Deploy hooks are idempotent while a build is `queued` or `initializing`. A late second build of the same commit deploys the same content again, and it costs only build minutes (3,000 per month on Free).\n4. Reason for this order: the cause is outside the repository. The fallback adds a secret and a new workflow for 2 lost builds in about 50 pushes. Brian must decide first. I can open the PR when he gives the hook and the secret.';
+    const T104 =
+        'Lucilla: I posted 2 comment-only reviews: #29 https://github.com/frostyard/frostyard-org/pull/29#pullrequestreview-5630350205 and #27 https://github.com/frostyard/frostyard-org/pull/27#pullrequestreview-5630350543.\nWrong facts: #29 has 0 of 5 listed facts wrong and 1 wrong statement in the diff ("A refresh activates every staged update"). #27 has 0 wrong updex facts.\nThe signing key is public at https://repository.frostyard.org/public.key; the fingerprint source is frostyard/core `.github/stable-repository.json` and snosi `shared/sysext/keys/README.md`; no page documents it, and the support promise for non-image hosts is Brian\'s decision.';
+
+    test("the 4 real reports ask Brian, and hold the thread", () => {
+        for (const [id, text] of Object.entries({ T207, T296, T259, T104 })) {
+            assert.equal(reportAsksBrian(text), true, id);
+            assert.equal(reportBlocks(text), true, id);
+        }
+    });
+
+    test("a no, a plain merge, install, or review request, and a past decision do not", () => {
+        for (const text of [
+            "ASKS FOR BRIAN: none",
+            "ASKS FOR BRIAN:\n- merge bketelsen/pi-pocket-team#60",
+            "Needs Brian: merge #12 and install it.",
+            "Nothing needs Brian.",
+            "This PR needs Brian to merge it.",
+            "This does not need Brian.",
+            "Nothing here needs Brian.",
+            "per Brian's decision in T13a, I removed it.",
+            "Note for Brian: PR #5 is ready to merge.",
+            "FYI for Brian: all checks passed.",
+            "No action for Brian: all work is complete.",
+            "For Brian: you approved this yesterday; all work is done.",
+            "Needs Brian: the merge is already done.",
+            // A routine word first is the request: a verb after it says what the work does.
+            "ASKS FOR BRIAN:\n- Merge #59 to remove the typo.",
+            // An explicit none wins over the prose above it.
+            "Should the TTL change later? Your call.\n\nASKS FOR BRIAN: none",
+            "Brian must decide the TTL.\n\nASKS FOR BRIAN: none",
+            // Left-over work that "needs Brian" is no decision (the replay's false holds T18, T126, T278).
+            "The work that is left needs Brian on real devices, or it needs the GitHub manager app, which does not exist yet.",
+            "Do not change the hidden app storage backup. That needs Brian.",
+            "The 76 rows left in `docs/open-items.md` need Brian, a credential, or a physical read.",
+            "The key rotation needs Brian.",
+            // In "Steps for Brian", the agent's own steps and plain merges are no decision (the replay's false hold T27).
+            "These are the morning steps for Brian:\n1. Merge lodge #32 first.\n2. Tag the merge commit.\n3. Then I repin frostnotes #85 to the tag.\n4. Then Brian merges #85.",
+            "3. The morning steps for Brian: merge frostmail#112 at any time. Then I repin porter#12 to the tag, and Brian merges it.",
+            // A fact after a merge request is no decision of its own.
+            "ASKS FOR BRIAN:\n- Merge #59. CI is green.",
+            "ASKS FOR BRIAN:\n- Merge #59 and install it.",
+            "Done.\n\n```\nASKS FOR BRIAN: rotate the key\n```\n\nAll set.",
+            "Done.\n\n~~~\nNeeds Brian: the key rotation\n~~~",
+        ]) {
+            assert.equal(reportAsksBrian(text), false, text);
+            assert.equal(reportBlocks(text), false, text);
+        }
+    });
+
+    test("a block, a label, a sentence, or a choice that asks Brian", () => {
+        for (const text of [
+            "ASKS FOR BRIAN:\n- Rotate the key? [rotate | keep]",
+            "ASKS FOR BRIAN: merge #54 or #55",
+            "Question for Brian: keep the old cache?",
+            "The support promise is Brian's decision.",
+            // Options are a choice: a pick-one with a merge or an install in it is still a decision.
+            "ASKS FOR BRIAN:\n- Approve the key rotation before install. [approve | reject]",
+            // A decision verb makes a merge or an install request a decision too.
+            "ASKS FOR BRIAN:\n- Authorize credential access for the install.",
+            "Needs Brian: authorize the install.",
+            // "already" alone is no sign that the decision is behind him.
+            "ASKS FOR BRIAN:\n- Approve access to the already configured production server.",
+            // Each sentence counts by itself: a done first action does not hide a current one.
+            "ASKS FOR BRIAN:\n- Brian approved the plan. Brian must authorize credential access for the install.",
+            // A second request joined by "and" counts by itself.
+            "ASKS FOR BRIAN:\n- Merge #59 and authorize credential access for the production install.",
+            // The replay's right holds: T36 ("needs Brian to confirm"), T237 ("Until Brian decides"), T145 (steps for him).
+            "firn#116 (the bootc-v1 end date, which needs Brian to confirm 2026-12-30) is still open.",
+            "6. Until Brian decides, the same loop stays: fix, review, Brian merges, run.",
+            "Steps for Brian:\n- B1: shell. Record sizes, then destroy the dataset.\n- B2: Apps > searxng > Delete.",
+        ]) {
+            assert.equal(reportAsksBrian(text), true, text);
+            assert.equal(reportBlocks(text), true, text);
+        }
+    });
+
+    test("reportAsksOf: a report's ASKS FOR BRIAN block gives Night shift its asks", () => {
+        // A "none" is no ask at all.
+        assert.deepEqual(reportAsksOf("Done.\n\nASKS FOR BRIAN: none"), []);
+        assert.deepEqual(reportAsksOf("Done.\n\nASKS FOR BRIAN:\n- Nothing for Brian."), []);
+        // No line: nothing.
+        assert.equal(reportAsksOf("Done. Nothing for Brian."), undefined);
+        // 2 items: the rest of the line, then each line under it, up to the blank line.
+        assert.deepEqual(
+            reportAsksOf(
+                "Done.\n\nASKS FOR BRIAN:\n- Rotate the console cloud key?\n- Which host first?\n\nThe rest is done.",
+            ),
+            [{ question: "Rotate the console cloud key?" }, { question: "Which host first?" }],
+        );
+        // A pick-one gives its options, and the question is before the bracket.
+        assert.deepEqual(
+            reportAsksOf("ASKS FOR BRIAN:\n1. Rotate the key now or later? [rotate now | keep it]"),
+            [{ question: "Rotate the key now or later?", options: ["rotate now", "keep it"] }],
+        );
+        // A bare merge, install, tag, or review request is no decision; with a choice it is one.
+        assert.deepEqual(reportAsksOf("ASKS FOR BRIAN:\n- merge bketelsen/pi-pocket-team#60"), []);
+        // Options are a choice: the merge rule leaves the item in, and it keeps its options.
+        assert.deepEqual(
+            reportAsksOf(
+                "ASKS FOR BRIAN:\n- Approve the key rotation before install. [approve | reject]",
+            ),
+            [
+                {
+                    question: "Approve the key rotation before install.",
+                    options: ["approve", "reject"],
+                },
+            ],
+        );
+        assert.deepEqual(
+            reportAsksOf("ASKS FOR BRIAN: review the diff or tag it [tag v2 | tag v3 | wait]"),
+            [{ question: "review the diff or tag it", options: ["tag v2", "tag v3", "wait"] }],
+        );
+        // A decision verb makes an install request a decision: no options are needed for it.
+        assert.deepEqual(
+            reportAsksOf("ASKS FOR BRIAN:\n- Authorize credential access for the install."),
+            [{ question: "Authorize credential access for the install." }],
+        );
+        assert.deepEqual(reportAsksOf("ASKS FOR BRIAN:\n- Install it first."), [], "no verb");
+        // A routine word first is the request: "remove" says what the merge does.
+        assert.deepEqual(reportAsksOf("ASKS FOR BRIAN:\n- Merge #59 to remove the typo."), []);
+        // A second request joined by "and" with a decision verb first is a decision of its own.
+        assert.deepEqual(
+            reportAsksOf(
+                "ASKS FOR BRIAN:\n- Merge #59 and authorize credential access for the production install.",
+                // The replay's right holds: T36 ("needs Brian to confirm"), T237 ("Until Brian decides"), T145 (steps for him).
+                "firn#116 (the bootc-v1 end date, which needs Brian to confirm 2026-12-30) is still open.",
+                "6. Until Brian decides, the same loop stays: fix, review, Brian merges, run.",
+                "Steps for Brian:\n- B1: shell. Record sizes, then destroy the dataset.\n- B2: Apps > searxng > Delete.",
+            ),
+            [{ question: "Merge #59 and authorize credential access for the production install." }],
+        );
+        assert.deepEqual(reportAsksOf("ASKS FOR BRIAN:\n- Merge #59. CI is green."), []);
+        assert.deepEqual(reportAsksOf("ASKS FOR BRIAN: merge #54 or #55"), [
+            { question: "merge #54 or #55" },
+        ]);
+        // More than 4 items: undefined, and the text alone holds the thread.
+        assert.equal(reportAsksOf("ASKS FOR BRIAN:\n- a\n- b\n- c\n- d\n- e"), undefined);
+        assert.equal(
+            reportAsksOf("ASKS FOR BRIAN:\n- a\n- b\n- c\n- d").length,
+            4,
+            "4 asks are filed",
+        );
+        // A fenced block is quoted, not said.
+        assert.equal(
+            reportAsksOf("Done.\n\n```\nASKS FOR BRIAN: rotate the key\n```\n\nAll set."),
+            undefined,
+        );
+        assert.equal(
+            reportAsksOf("Done.\n\n~~~\nASKS FOR BRIAN: rotate the key\n~~~\n\nAll set."),
+            undefined,
+        );
+        // The last block is the one that counts.
+        assert.deepEqual(
+            reportAsksOf("ASKS FOR BRIAN: rotate the key\n\nASKS FOR BRIAN: keep it"),
+            [{ question: "keep it" }],
+        );
+
+        // A question keeps its inline code, as written.
+        assert.deepEqual(reportAsksOf("ASKS FOR BRIAN:\n- Pin `ui/v0.6.0` or wait?"), [
+            { question: "Pin `ui/v0.6.0` or wait?" },
+        ]);
+        // A done item is no ask: the rule that holds a thread is the rule that files an ask.
+        assert.deepEqual(reportAsksOf("ASKS FOR BRIAN:\n- You approved this yesterday."), []);
+    });
+
+    test("asksForBrian gives the items of the last block, without the no's", () => {
+        assert.deepEqual(asksForBrian("ASKS FOR BRIAN: none"), []);
+        assert.deepEqual(
+            asksForBrian("ASKS FOR BRIAN:\n- Rotate the key? [rotate | keep]\n- Which host first?"),
+            ["Rotate the key? [rotate | keep]", "Which host first?"],
+        );
+        // The last block is the one that counts, and a list mark is no word.
+        assert.deepEqual(
+            asksForBrian(
+                "ASKS FOR BRIAN: rotate the key\n\nASKS FOR BRIAN:\n1. keep the cache\n2. no change",
+            ),
+            ["keep the cache"],
+        );
+        // A blank line ends the block.
+        assert.deepEqual(asksForBrian("ASKS FOR BRIAN:\n- one\n\n- not an item"), ["one"]);
+        // No line, and code only: nothing.
+        assert.equal(asksForBrian("Done. Nothing for Brian."), undefined);
+        assert.equal(asksForBrian("Done.\n\n```\nASKS FOR BRIAN: rotate the key\n```"), undefined);
+        assert.equal(namesDecision("**Needs Brian**\n\n- Merge #12, or close it."), true);
+    });
+
+    test("only the last ASKS FOR BRIAN block counts, and its items are decisions", () => {
+        // The last block says none: the block before it does not count, and no heading reads it.
+        const last = "Done.\n\nASKS FOR BRIAN:\n- Rotate the key.\n\nASKS FOR BRIAN: none";
+
+        assert.equal(reportAsksBrian(last), false, last);
+        assert.equal(reportBlocks(last), false, last);
+        assert.deepEqual(asksForBrian(last), []);
+        // Neither does its sentences: a decision named in an older block counts for nothing.
+        const older =
+            "Done.\n\nASKS FOR BRIAN:\n- Brian must decide which host to retire.\n\nASKS FOR BRIAN: none";
+
+        assert.equal(reportAsksBrian(older), false, older);
+        assert.equal(reportBlocks(older), false, older);
+        assert.equal(
+            reportAsksBrian("ASKS FOR BRIAN:\n- Brian must decide which host to retire."),
+            true,
+            "the same block, last, counts",
+        );
+        assert.equal(reportAsksBrian("ASKS FOR BRIAN:\n- Rotate the key?"), true);
+        assert.equal(reportBlocks("ASKS FOR BRIAN:\n- Rotate the key?"), true);
+        // The items of the block are the desk's items, options and all.
+        assert.deepEqual(
+            asksForBrian("ASKS FOR BRIAN:\n- Approve it before install. [approve | reject]"),
+            ["Approve it before install. [approve | reject]"],
+        );
+        assert.equal(namesDecision("ASKS FOR BRIAN:\n- Rotate the key."), true);
+    });
+});
+
 describe("asks from agents, rewritten and withdrawn", () => {
     const filed = (from?: string) => {
         const state = deskOf();
@@ -6505,7 +6812,13 @@ describe("the digest's rules", () => {
     });
 
     test("the setting: 0 to 240 minutes, known kinds only, and a default for a bad value", () => {
-        const fallback = ["shift-blocked", "answer-action", "repair", "issue-urgent"];
+        const fallback = [
+            "shift-blocked",
+            "answer-action",
+            "repair",
+            "issue-urgent",
+            "report-blocked",
+        ];
         const routine = ["report", "shift", "closed", "queue"];
 
         assert.deepEqual(digestConfig(undefined), {
@@ -6595,6 +6908,50 @@ describe("the digest's rules", () => {
             "the key is in the box already",
         );
         assert.equal(box?.items.filter((each) => each.key === "k119").length, 1);
+    });
+
+    test("a report that asks Brian goes at once: `report-blocked` wants now, not the interval", () => {
+        const state = empty();
+        const now = 1_000_000;
+
+        assert.equal(
+            enqueueDigest(
+                state,
+                5,
+                made("report:k", "report-blocked", "T9", now),
+                now,
+                digestConfig(undefined),
+            ),
+            now,
+            "the default setting sends it at once",
+        );
+        assert.deepEqual(
+            state.digests?.["5"]?.items.map((each) => each.kind),
+            ["report-blocked"],
+        );
+
+        // A report that does not ask him waits for the interval, as `report` does.
+        const later = empty();
+
+        assert.equal(
+            enqueueDigest(
+                later,
+                5,
+                made("report:k", "report", "T9", now),
+                now,
+                digestConfig(undefined),
+            ),
+            now + 15 * 60_000,
+        );
+
+        // A report only folds into a closed line, and the Clerk never takes it.
+        const text = digestText([
+            made("report:k", "report-blocked", "T9", now, "[desk] T9 · asks Brian"),
+            made("closed", "closed", "T9", now + 1, "[desk] T9 frostyard/x · closed: done"),
+        ]);
+
+        assert.match(text, /closed: done · 1 report/);
+        assert(!digestConfig(undefined).clerk.includes("report-blocked"));
     });
 
     test("queue: 1 item for a new wait, none for the same reason, and a leave when it stops", () => {
@@ -6779,6 +7136,9 @@ const ISSUE_TASK =
 let issueAttachRef = "";
 let issueAttachThread = "";
 const LONG_REPORT = `REPORT-START ${"z".repeat(1200)} REPORT-END`;
+/** The T104 report, word for word: no ask is filed, and the decision is named in the last sentence. */
+const ASKS_REPORT =
+    'Lucilla: I posted 2 comment-only reviews: #29 https://github.com/frostyard/frostyard-org/pull/29#pullrequestreview-5630350205 and #27 https://github.com/frostyard/frostyard-org/pull/27#pullrequestreview-5630350543.\nWrong facts: #29 has 0 of 5 listed facts wrong and 1 wrong statement in the diff ("A refresh activates every staged update"). #27 has 0 wrong updex facts.\nThe signing key is public at https://repository.frostyard.org/public.key; the fingerprint source is frostyard/core `.github/stable-repository.json` and snosi `shared/sysext/keys/README.md`; no page documents it, and the support promise for non-image hosts is Brian\'s decision.';
 const OTHER_REPORT = `OTHER-START ${"o".repeat(1200)} OTHER-END`;
 const LONG_SUMMARY = `NIGHT-REPORT-START ${"n".repeat(1200)} NIGHT-REPORT-END`;
 /** The seed file the scripted model hands to the tool. */
@@ -6825,6 +7185,8 @@ let otherAddress = "";
 let quietAddress = "";
 /** The supervisor's address for the linked session, for the built-in team tool's guard. */
 let guardAddress = "";
+/** The summary a night shift's model answers with: the long one when it is empty. */
+let nightSummary = "";
 let app: App;
 
 const answer = (text: string) => fauxAssistantMessage([fauxText(text)]);
@@ -6862,7 +7224,7 @@ const model = scriptedModel((request) => {
     }
 
     if (text.startsWith("[night-shift] The night shift has stopped")) {
-        return answer(LONG_SUMMARY);
+        return answer(nightSummary === "" ? LONG_SUMMARY : nightSummary);
     }
 
     if (text.startsWith("[night-shift] Round")) {
@@ -7075,6 +7437,10 @@ const model = scriptedModel((request) => {
 
     if (text.endsWith("report to supervisor test")) {
         return call("team_message", { to: linkedAddressOf(request), message: LONG_REPORT });
+    }
+
+    if (text.endsWith("report asks brian test")) {
+        return call("team_message", { to: linkedAddressOf(request), message: ASKS_REPORT });
     }
 
     if (text.endsWith("message to agent test")) {
@@ -10342,7 +10708,7 @@ describe("the queue's words", () => {
 });
 
 describe("the issue digest kinds", () => {
-    test("the 3 kinds come last, and the old kinds keep their order", () => {
+    test("the new kinds come last, and the old kinds keep their order", () => {
         assert.deepEqual(DIGEST_KINDS.slice(0, 8), [
             "report",
             "shift",
@@ -10353,7 +10719,12 @@ describe("the issue digest kinds", () => {
             "queue",
             "repair",
         ]);
-        assert.deepEqual(DIGEST_KINDS.slice(8), ["issue", "issue-urgent", "issue-left"]);
+        assert.deepEqual(DIGEST_KINDS.slice(8), [
+            "issue",
+            "issue-urgent",
+            "issue-left",
+            "report-blocked",
+        ]);
     });
 
     test("issue-urgent goes at once by default; none of the 3 goes to the Clerk", () => {
@@ -10776,6 +11147,48 @@ describe("the desk in a Pi Pocket", () => {
         assert.match(read, /NIGHT-REPORT-END/);
         assert.match(read, /<report/);
         assert.match(read, /Night shift report from this linked session/);
+    });
+
+    test("a night shift summary's ASKS FOR BRIAN block files asks on the thread", async () => {
+        nightSummary = [
+            "NIGHT-REPORT-START the shift is done.",
+            "",
+            "ASKS FOR BRIAN:",
+            "- Rotate the console cloud key? [rotate | keep]",
+            "- merge bketelsen/pi-pocket-team#60",
+            "",
+            "NIGHT-REPORT-END",
+        ].join("\n");
+
+        try {
+            const source = await supervisor("night-asks");
+
+            await say(app, source, "desk night shift test");
+            const linked = app
+                .sessions()
+                .find((session) => session.linkedFrom?.id === Number(source));
+
+            assert(linked, "the night shift started a linked session");
+            const thread = threadOfSession(await deskState(), Number(linked.id));
+
+            assert(thread);
+            await until(
+                async () => ((await deskState())?.threads[thread.id]?.asks ?? []).length > 0,
+                "the asks of the summary",
+                30_000,
+            );
+
+            const filed = (await deskState())?.threads[thread.id];
+            const ask = filed?.asks[0];
+
+            // The merge request is no ask; the pick-one is one, with its 2 options.
+            assert.equal(filed?.asks.length, 1);
+            assert.equal(ask?.text, "Rotate the console cloud key?");
+            assert.deepEqual(ask?.options, ["rotate", "keep"]);
+            assert.equal(filed?.run.reportAsks, false, "the asks hold the thread, not the text");
+        } finally {
+            nightSummary = "";
+        }
     });
 
     test("sync sees an idle session that did not report: open, and Odrade is next", async () => {
@@ -14236,6 +14649,167 @@ describe("the desk in a Pi Pocket", () => {
         }
     });
 
+    /**
+     * An open thread of its own supervisor, with a stored report and the run flags the test gives: the sweep migrates
+     * the flags from the report. Gives the thread's id.
+     */
+    const oldThread = async (
+        name: string,
+        report: { key: string; text: string } | undefined,
+        run: Record<string, unknown>,
+        asks: { id: string; text: string; at: number; key: string }[] = [],
+    ): Promise<{ id: string; source: ConversationId }> => {
+        await stopSweepers();
+        const folder = join(root, name);
+
+        rmSync(folder, { recursive: true, force: true });
+        repository(folder);
+
+        const source = await supervisor(name);
+        const session = await newSession(app, folder);
+        const at = Date.now();
+
+        if (report !== undefined) {
+            await app.harness.commit(async (tx) => {
+                const reports = await tx.doc(DeskReports, session);
+
+                reports.reports.unshift({
+                    key: report.key,
+                    at,
+                    from: "team_message",
+                    text: report.text,
+                    line: "[desk] a report from before the flag",
+                });
+            }, context);
+        }
+
+        let id = "";
+
+        await app.harness.commit(async (tx) => {
+            const state = await tx.doc(DeskThreads);
+            const opened = openThread(state, {
+                key: `x.test.${name}`,
+                supervisor: Number(source),
+                agents: ["duncan"],
+                repo: `frostyard/${name}`,
+                cwd: folder,
+                title: `A thread from before the flags: ${name}`,
+                at,
+            }).thread;
+            const stored = state.threads[opened.id]!;
+
+            id = opened.id;
+            stored.state = "open";
+            stored.session = Number(session);
+            stored.asks = asks;
+            // The agent reported, and the session is idle: without the flags the thread closes at the sweep.
+            stored.run = {
+                busy: false,
+                reportedAt: at,
+                reportedUserEntry: 100_000,
+                lastUserEntry: 1,
+                ...run,
+            };
+        }, context);
+
+        return { id, source };
+    };
+
+    /** The stored thread after 1 sweep of its supervisor. */
+    const swept = async (source: ConversationId, id: string) => {
+        await say(app, source, "desk list test");
+        await until(
+            async () => typeof (await deskState())?.threads[id]?.run.sweptAt === "number",
+            "the first sweep",
+            20_000,
+        );
+
+        return (await deskState())?.threads[id];
+    };
+
+    test("a thread with `reportBlocked: false` gets `reportAsks` from its report, and stays open", async () => {
+        try {
+            // The T104 report: a decision in words, and no ask.
+            const { id, source } = await oldThread(
+                "asks-migration",
+                { key: "report:asks", text: ASKS_REPORT },
+                { reportBlocked: false },
+            );
+            // Before the sweep, the thread has `reportBlocked: false` and no `reportAsks`: a failed read of its
+            // report leaves it that way, and the pair that is not checked yet holds it open.
+            const before = (await deskState())?.threads[id];
+
+            assert(before, "the thread is stored");
+            assert.equal(before.run.reportAsks, undefined, "the read did not happen yet");
+            assert.deepEqual(closeCheck(before, facts()).open, [
+                "its newest report is not checked yet",
+            ]);
+
+            const after = await swept(source, id);
+
+            assert(after, "the thread is stored");
+            assert.equal(after.run.reportBlocked, true, "the report names a decision");
+            assert.equal(after.run.reportAsks, true, "and it filed no ask");
+            assert.equal(after.state, "open", "the thread does not close by itself");
+            assert.deepEqual(closeCheck(after, facts()).open, [
+                "its last report asks Brian for a decision",
+            ]);
+        } finally {
+            await quiet([]);
+            shift = 0;
+        }
+    });
+
+    test("a `reportBlocked: true` report that only says blocked keeps `true`, with `reportAsks: false`", async () => {
+        try {
+            const { id, source } = await oldThread(
+                "blocked-migration",
+                { key: "report:blocked", text: "The work stopped: the release token is missing." },
+                { reportBlocked: true },
+            );
+            const after = await swept(source, id);
+
+            assert(after, "the thread is stored");
+            assert.equal(after.run.reportBlocked, true, "a true never goes back to false");
+            assert.equal(after.run.reportAsks, false);
+            assert.deepEqual(closeCheck(after, facts()).open, [
+                "its last report says BLOCKED or asks for a decision",
+            ]);
+        } finally {
+            await quiet([]);
+            shift = 0;
+        }
+    });
+
+    test("a report whose asks were filed decides nothing: both flags are false", async () => {
+        try {
+            const { id, source } = await oldThread(
+                "asked-migration",
+                {
+                    key: "report:asked",
+                    text: `${ASKS_REPORT}\n\nDecisions for Brian:\n- Rotate the key? [rotate | keep]`,
+                },
+                { reportBlocked: false },
+                [{ id: "T1a", text: "Rotate the key?", at: Date.now(), key: "report:asked:ask:0" }],
+            );
+            const after = await swept(source, id);
+
+            assert(after, "the thread is stored");
+            assert.equal(after.run.reportBlocked, false, "the ask holds the thread, not the text");
+            assert.equal(after.run.reportAsks, false);
+            assert.equal(
+                closeCheck(after, facts()).open.includes(
+                    "its last report says BLOCKED or asks for a decision",
+                ),
+                false,
+            );
+            assert.deepEqual(closeCheck(after, facts()).open, ["ask T1a has no answer"]);
+        } finally {
+            await quiet([]);
+            shift = 0;
+        }
+    });
+
     test("a thread whose folder is gone closes, and does not say git status failed", async () => {
         await stopSweepers();
         const folder = join(root, "gone-worktree");
@@ -15629,6 +16203,80 @@ describe("the desk in a Pi Pocket", () => {
 
                 assert.deepEqual(after?.items, [], "the box is empty after the digest");
                 assert.equal(typeof after?.sentAt, "number");
+            } finally {
+                await stopDigests();
+                await quiet([]);
+                shift = 0;
+                digestOff();
+            }
+        });
+
+        test("a report that asks Brian with no ask filed goes at once, as `report-blocked`", async () => {
+            digestOn();
+
+            try {
+                const { source, linked, thread } = await delegated("digest-asks");
+
+                await until(
+                    async () =>
+                        typeof (await deskState())?.threads[thread.id]?.run.sweptAt === "number",
+                    "the first sweep",
+                    20_000,
+                );
+                await until(() => !app.isBusy(linked), "the linked session to settle", 20_000);
+
+                // A digest time already in the past covers the report: no task takes it, so the test reads its kind.
+                await app.harness.commit(async (tx) => {
+                    (await tx.doc(DeskThreads)).digests = {
+                        [String(Number(source))]: {
+                            items: [],
+                            scheduled: [Date.now() - 60_000],
+                            queued: {},
+                            seq: 0,
+                        },
+                    };
+                }, context);
+
+                // The T104 report: it names a decision for Brian, and it files no ask.
+                await say(app, linked, "report asks brian test");
+                await until(
+                    async () =>
+                        typeof (await deskState())?.threads[thread.id]?.run.reportedAt === "number",
+                    "the report",
+                    20_000,
+                );
+
+                const after = (await deskState())?.threads[thread.id];
+
+                assert.equal(after?.run.reportBlocked, true, "the report names a decision");
+                assert.equal(
+                    after?.run.reportAsks,
+                    true,
+                    "no ask was filed, so the report asks him",
+                );
+
+                const item = (await boxOf(source))?.items.find((each) => each.thread === thread.id);
+
+                assert.equal(item?.kind, "report-blocked");
+                assert.equal((await digestTasks(source)).length, 0, "the past time covered it");
+
+                // With nothing scheduled, the same kind wants now: the digest goes at once, not in 15 minutes.
+                await app.harness.commit(async (tx) => {
+                    delete (await tx.doc(DeskThreads)).digests;
+                }, context);
+                await say(app, linked, "report asks brian test");
+                await until(
+                    async () =>
+                        /\[desk\] digest: \d+ new\./.test(
+                            (await modelTexts(app, source)).join("\n"),
+                        ),
+                    "the digest at once",
+                    20_000,
+                );
+                assert.match(
+                    (await modelTexts(app, source)).join("\n"),
+                    new RegExp(`\\[desk\\] ${thread.id}`),
+                );
             } finally {
                 await stopDigests();
                 await quiet([]);
