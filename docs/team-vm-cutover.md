@@ -194,8 +194,12 @@ keys have no passphrase: after a reboot nobody is there to unlock them. Their fi
 Pick a day-time window, outside the night shift and outside the VM's reboot window (07:00-08:00 local). Odrade
 pauses new delegations and night shifts.
 
-1. **Running now must be empty.** No running tool call, generation, subagent, background task or night shift. On
-   framework, this script reads the database read-only (the server may run):
+The goal of the drain: when Pocket stops, the database holds **no task that is not terminal**. Pi Durable resumes
+every such task at the first start on the VM: a generation, a tool call, a schedule, a night shift, or a desk sweep
+there would run in an old session whose folder is gone, or send a message to one.
+
+1. **Running now.** No running tool call, generation, subagent, background task or night shift. On framework, this
+   script reads the database read-only (the server may run):
 
     ```sh
     cat > /tmp/pocket-tasks.mjs <<'EOF'
@@ -207,8 +211,9 @@ pauses new delegations and night shifts.
     node /tmp/pocket-tasks.mjs
     ```
 
-    In the first table, only these may stay: `pocket.schedule` and `x.desk.sweeper` sleeping, and the tasks of the
-    session that runs the cut-over. A `x.night-shift.driver` must be done. Wait, or stop the rest in the app.
+    Wait, or stop the work in the app, until the first table holds only what steps 3 and 4 below remove
+    (`pocket.schedule`, `x.desk.sweeper`, `x.desk.digest`). Brian runs the cut-over from a terminal, not from a
+    Pocket session, so no session of the cut-over is in the table.
 
 2. **Unmerged work.** Each worktree with changed files or unpushed commits is pushed (a branch and a PR) or named in
    the report. On framework, read-only:
@@ -226,27 +231,39 @@ pauses new delegations and night shifts.
     `ahead=?` means a branch with no upstream: push it, or say why it can go.
 
 3. **Schedules.** The second table of the script lists the sessions with sleeping schedules (11 in 6 sessions on
-   2026-10-27). Each schedule is re-made on the VM (step 8), with new paths. In each listed session, ask Pi for `schedule list`, and copy the id, the time rule and the full text into
-   `~/agents/odrade/plans/schedules-DATE.md` (Odrade's desk, on framework at `~/projects/odrade/plans/`). Then cancel
-   each one there (`schedule cancel`). A schedule left sleeping would fire on the VM in an old session whose folder is
-   gone.
+   2026-10-27). In each listed session, ask Pi for `schedule list`. Write each schedule as 1 row in
+   `plans/schedules-DATE.md` of Odrade's desk (on framework `~/projects/odrade/plans/`), with 5 columns: old session,
+   time rule, full text, the text with new paths, and the **new session** on the VM where it goes. The new session is
+   Odrade's supervisor session (moved in step 8), or a new session in an existing VM folder (a home or a repository).
+   Never an old session. Odrade fills the table; **Brian:** confirms it. Then cancel each schedule in its session
+   (`schedule cancel`).
 
-4. **The desk.** Every open thread has its work on GitHub (a PR or an issue), or it is closed. A thread whose worktree
-   is gone on the VM shows "git status failed" and stays open: Odrade closes or re-delegates those after the
-   cut-over (step 9).
+4. **The desk (Odrade).** Every desk thread is closed: none open, none parked. The desk's sweeper sends close-out and
+   repair messages to the agents' old sessions, and it ends only when its supervisor has no thread that is not
+   closed; the digest ends when no news waits. Odrade closes the threads with her desk tools. An open PR that waits
+   for Brian keeps its `ready-for-human` label, so Brian still finds it on GitHub; after the cut-over, the sweep
+   finds the team's open PRs again as found threads, whose notices go to Odrade. Wait until the first table has no
+   `x.desk.sweeper` and no `x.desk.digest`.
 
 5. **Odrade's desk folder.** Commit it (`git -C ~/projects/odrade status` is clean).
 
 ## 3. Stop framework and back it up
 
+**Brian:** on framework, run the script of step 2 a last time: the first table must be empty. Then stop Pocket at
+once (`q` in the `pocket-start` terminal, or Ctrl+C), and run:
+
 ```sh
-# on framework
-# stop Pocket: q in the pocket-start terminal (or Ctrl+C), then:
-ls ~/.pi-pocket/harness.lock* 2>/dev/null && echo "STILL RUNNING: stop" || echo stopped
-cp -a ~/.pi-pocket ~/.pi-pocket.backup-DATE
+# on framework; prints STOPPED and makes the backup only when the server is down and no task is left
+if compgen -G "$HOME/.pi-pocket/harness.lock*" >/dev/null; then
+  echo "STILL RUNNING: stop Pocket first. Nothing copied."
+elif [ -n "$(node /tmp/pocket-tasks.mjs | grep -E '\"(pi|pocket|x)\.')" ]; then
+  echo "TASKS LEFT: start framework again, drain (step 2), retry. Nothing copied."
+else
+  cp -a ~/.pi-pocket ~/.pi-pocket.backup-DATE && echo STOPPED
+fi
 ```
 
-From here, framework's `~/.pi-pocket` must not start again unless the rollback says so.
+Go on only after `STOPPED`. From here, framework's `~/.pi-pocket` must not start again unless the rollback says so.
 
 ## 4. Copy to the VM
 
@@ -255,6 +272,8 @@ From here, framework's `~/.pi-pocket` must not start again unless the rollback s
 `~/.pi/agent/sessions` (Pi CLI only), or `harness.lock*`.
 
 ```sh
+set -e    # stop at the first failed copy
+ssh team@10.0.1.176 'mkdir -p .pi-pocket .pi/agent .config/pi-pocket-team agents/odrade'
 rsync -a --exclude 'harness.lock*' ~/.pi-pocket/ team@10.0.1.176:.pi-pocket/
 rsync -a --exclude sessions/ ~/.pi/agent/ team@10.0.1.176:.pi/agent/
 rsync -a ~/.config/pi-pocket-team/ team@10.0.1.176:.config/pi-pocket-team/
@@ -339,36 +358,40 @@ Rewrite configuration and text, never the database. Each command keeps a `.bak` 
 ## 7. First start, local only
 
 ```sh
-sudo systemctl start pi-pocket@local          # as fleet; start only, not enabled yet
-journalctl -u pi-pocket@local -n 50 --no-pager
-journalctl -u pi-pocket@local | grep -o 'http://127.0.0.1:8787/login?token=[^ ]*' | tail -1
+# as fleet
+sudo systemctl start pi-pocket@local          # start only, not enabled yet
+sudo journalctl -u pi-pocket@local -n 50 --no-pager
 ```
 
-Open the sign-in link through an ssh tunnel (`ssh -L 8787:127.0.0.1:8787 team@10.0.1.176`). Do not paste the link in a
-chat. Then run the checks in step 8. When a check fails, stop and use the rollback.
+**Brian:** sign in as the owner. On his own computer (not on the VM), open a tunnel and keep it open:
+`ssh -L 8787:127.0.0.1:8787 fleet@10.0.1.176`. In a second terminal there, read the link:
+`ssh fleet@10.0.1.176 "sudo journalctl -u pi-pocket@local | grep -o 'http://127.0.0.1:8787/login?token=[^ ]*' | tail -1"`.
+Open it in his browser on that computer. Do not paste the link in a chat. Then run the checks in step 8. When a check
+fails, stop and use the rollback.
 
 ## 8. Checks
 
-| Check         | How                                                                                      | Expect                                                                                                           |
-| ------------- | ---------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
-| Version       | `git -C ~/projects/pi-pocket describe --tags`                                            | `TAG`                                                                                                            |
-| Database      | the session list, the Archived switch                                                    | 700+ sessions, people and settings as on framework                                                               |
-| Extensions    | Menu → Extensions                                                                        | Team, Desk, Night shift, Homewiki, MCP and Agent Teams on, no load errors                                        |
-| Desk          | the Desk page                                                                            | the open threads of step 2, `desk.json` export writes into `~/agents/odrade/desk`                                |
-| Team          | the Team page                                                                            | 11 agents, repository folders under `/var/home/team/projects`, no error                                          |
-| gh and git    | a new session in `~/agents`: `gh api user -q .login`; `git config user.name`             | `frostyard-machines`; the machine identity                                                                       |
-| ssh           | from that session: `ssh -o BatchMode=yes <host> true` for each host Teg keyed            | no password prompt, no failure                                                                                   |
-| No Brian keys | `ls ~/.ssh`; `echo "${SSH_AUTH_SOCK:-unset}"`; `gh auth status 2>&1 \| grep -ci keyring` | team keys only; `unset` or a plain ssh-agent, never `/run/user/*/keyring/ssh`; `0`                               |
-| Browser       | ask Pi to open `https://example.com` with the browser tool                               | a snapshot of the page                                                                                           |
-| truenas MCP   | the MCP page: truenas on; ask Pi for a read-only truenas tool                            | a pool list, no write                                                                                            |
-| Providers     | Menu → Providers                                                                         | each provider signed in; `halogen` (selfie `10.0.1.200:8731`) answers; **Brian:** sign in again where it says so |
-| Lessons       | the Team panel's lessons                                                                 | the same lessons as on framework                                                                                 |
-| Homewiki      | the Wiki page                                                                            | renders `~/projects/homewiki`                                                                                    |
+| Check         | How                                                                                      | Expect                                                                                                              |
+| ------------- | ---------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| Version       | `git -C ~/projects/pi-pocket describe --tags`                                            | `TAG`                                                                                                               |
+| Database      | the session list, the Archived switch                                                    | 700+ sessions, people and settings as on framework                                                                  |
+| Extensions    | Menu → Extensions                                                                        | Team, Desk, Night shift, Homewiki, MCP and Agent Teams on, no load errors                                           |
+| Desk          | the Desk page; after the move below, `desk sync` in Odrade's session                     | no open thread from before; open team PRs come back as found threads; the export writes into `~/agents/odrade/desk` |
+| Team          | the Team page                                                                            | 11 agents, repository folders under `/var/home/team/projects`, no error                                             |
+| gh and git    | a new session in `~/agents`: `gh api user -q .login`; `git config user.name`             | `frostyard-machines`; the machine identity                                                                          |
+| ssh           | from that session: `ssh -o BatchMode=yes <host> true` for each host Teg keyed            | no password prompt, no failure                                                                                      |
+| No Brian keys | `ls ~/.ssh`; `echo "${SSH_AUTH_SOCK:-unset}"`; `gh auth status 2>&1 \| grep -ci keyring` | team keys only; `unset` or a plain ssh-agent, never `/run/user/*/keyring/ssh`; `0`                                  |
+| Browser       | ask Pi to open `https://example.com` with the browser tool                               | a snapshot of the page                                                                                              |
+| truenas MCP   | the MCP page: truenas on; ask Pi for a read-only truenas tool                            | a pool list, no write                                                                                               |
+| Providers     | Menu → Providers                                                                         | each provider signed in; `halogen` (selfie `10.0.1.200:8731`) answers; **Brian:** sign in again where it says so    |
+| Lessons       | the Team panel's lessons                                                                 | the same lessons as on framework                                                                                    |
+| Homewiki      | the Wiki page                                                                            | renders `~/projects/homewiki`                                                                                       |
 
-Odrade's supervisor session and the Clerk keep the desk's threads, digests and sweeper. **Brian:** move both with
-Menu → **Working directory** to `/var/home/team/agents/odrade` (only these 2 old sessions move). Then, in
-Odrade's session, re-make each schedule from `plans/schedules-DATE.md` with the new paths, in the session where it
-belongs.
+Odrade's supervisor session and the Clerk keep the desk's history, the Clerk's registration and Odrade's lessons.
+**Brian:** move both with Menu → **Working directory** to `/var/home/team/agents/odrade`, before anything else in
+them. Only these 2 old sessions move; no other old session gets a message. Then re-make each schedule from
+`plans/schedules-DATE.md` in its **new session** column, with the new paths: Odrade's moved session, or a new session
+that Brian starts in the named VM folder.
 
 ## 9. Go live
 
@@ -382,11 +405,11 @@ belongs.
     ```
 
 2. **Brian:** open the link once on the phone and once on the desktop (the address is new, so each device signs in
-   again; a cookie lasts a year). Star each agent home in **New** → Folder (favorites give "New session in irulan"
-   in the launcher).
+   again; a cookie lasts a year). Read it as `fleet` with `sudo journalctl`, as in step 7.
 3. **Brian:** archive the old sessions (Sessions → Folders, the groups under `/var/home/bjk`; Ctrl/⌘+click selects
    many). They stay readable under Archived. Keep Odrade's and the Clerk's sessions.
-4. Odrade resumes the shifts. She closes or re-delegates each desk thread whose folder is gone.
+4. Odrade resumes the shifts. Until step 10, nobody starts a session in `~/agents/<id>` (only Odrade's desk exists
+   there).
 5. Reboot test: during the next reboot window, check that Pocket is up after the VM boots, and that the night shift
    and the desk resume.
 
@@ -403,7 +426,10 @@ node homes/seed.mjs            # makes ~/agents/<id>/ for each profile with home
 ```
 
 The seed never overwrites a file, so Odrade's desk keeps its own AGENTS.md. Each home is a local git repository with
-no remote; the Incus snapshots of the VM are its backup.
+no remote; the daily backup and the Incus snapshots of the VM are its backup.
+
+**Brian:** then star each agent home in **New** → Folder. Each favorite gives "New session in irulan" (and so on) in
+the launcher; a session there takes that agent's identity from the folder.
 
 ## 11. Retire framework's start
 
@@ -425,12 +451,18 @@ Any time before step 11, and with framework's data unchanged since step 3:
    inactive for both.
 2. On framework: `mv ~/.pi-pocket.framework-DATE ~/.pi-pocket` (after step 11 only), `mv ~/bin/pocket-start.retired-DATE ~/bin/pocket-start`,
    then `pocket-start`.
-3. Re-make the schedules on framework from `plans/schedules-DATE.md` (step 2 cancelled them there too).
-4. Work done on the VM after the cut-over is on GitHub only (PRs and issues). The VM's database cannot go back to
-   framework: its paths and its homes are new.
+3. Re-make the schedules on framework in their old sessions, from `plans/schedules-DATE.md` (step 2 cancelled them
+   there too).
+4. What does not go back: the VM's database cannot go back to framework (its paths and its homes are new). So the
+   sessions, desk threads, lessons, schedules and provider sign-ins made on the VM, the agent homes, and Odrade's desk
+   commits made there stay on the VM only. Work pushed to GitHub (PRs, issues) is safe. Before anything removes
+   them, keep a copy of the stopped VM's data: as `team`,
+   `tar -C ~ -czf ~/vm-after-cutover-DATE.tgz .pi-pocket .pi/agent .config/pi-pocket-team agents`, and copy the file
+   to framework. Bring Odrade's desk commits back with `git fetch` from that copy. **Brian:** decides what else to keep.
 
-To retry the VM later: restore the snapshot (`incus snapshot restore --project team team pre-cutover-DATE` on minideb), then start
-again at step 2.
+To retry the VM later: keep the copy of step 4 first. Then restore the snapshot
+(`incus snapshot restore --project team team pre-cutover-DATE` on minideb; it deletes everything made on the VM after
+the snapshot), and start again at step 2.
 
 ## Not in this runbook
 
