@@ -91,9 +91,18 @@ const isPocketData = (real) =>
     real.startsWith(`${pocketData}/`) ||
     /\.sqlite(?:-\w+)?$|\.db$/.test(basename(real));
 
-/** A file the plan reads and writes must be a plain file: a link would write through to somewhere else. */
+/**
+ * A file the plan reads and writes must be a plain file outside Pocket's data: a link would write through to somewhere
+ * else, and a folder on the way can be a link too, so the real path is checked before any read.
+ */
 async function plainFile(path) {
     const item = await entry(path);
+
+    if (item !== undefined && isPocketData((await target(path))?.real ?? path)) {
+        problems.push(`${relative(root, path)}: in Pocket's data or a database; not read`);
+
+        return false;
+    }
 
     if (item !== undefined && !item.isFile()) {
         problems.push(`${relative(root, path)}: not a plain file (a link?); change it by hand`);
@@ -115,7 +124,21 @@ const agentsDir = join(root, ".config/pi-pocket-team/agents");
 /** Front matter lines this script understands: `key: plain value`, `key:`, and `  owner/name: plain value`. */
 const PLAIN_LINE =
     /^(?:[a-z]+:(?: [^\s"'][^"']*)?|  [A-Za-z0-9._-]+\/[A-Za-z0-9._-]+: [^\s"'][^"']*)$/;
-const profiles = (await readdir(agentsDir))
+
+/** A folder the plan reads must not be in Pocket's data, also through a link: undefined when it is. */
+async function planFolder(dir) {
+    const found = await target(dir);
+
+    if (found !== undefined && isPocketData(found.real)) {
+        problems.push(`${relative(root, dir)}: in Pocket's data; not read`);
+
+        return undefined;
+    }
+
+    return found;
+}
+
+const profiles = ((await planFolder(agentsDir)) === undefined ? [] : await readdir(agentsDir))
     .filter((f) => /^[a-z0-9][a-z0-9_-]*\.md$/.test(f))
     .sort();
 
@@ -274,7 +297,9 @@ async function* walk(dir, follow = false, seen = new Set()) {
 const odrade = join(root, "agents/odrade");
 const odradeFiles = [join(odrade, "AGENTS.md")];
 
-for await (const path of walk(join(odrade, "plans"))) {
+for await (const path of (await planFolder(join(odrade, "plans"))) === undefined
+    ? []
+    : walk(join(odrade, "plans"))) {
     odradeFiles.push(path);
 }
 

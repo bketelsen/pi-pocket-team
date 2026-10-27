@@ -361,3 +361,45 @@ test("a link where the plan would write stops the run before any write", async (
         await rm(root, { recursive: true, force: true });
     }
 });
+
+test("planning never reads Pocket's data: not through a linked plans/, not as a .sqlite file in plans/", async () => {
+    const root = await fixture();
+    const db = join(root, ".pi-pocket/pocket.sqlite");
+    const plans = join(root, "agents/odrade/plans");
+
+    try {
+        await rm(plans, { recursive: true });
+        await symlink("../../.pi-pocket", plans);
+        // Unreadable: a read of the database would fail with EACCES instead of the refusal.
+        await chmod(db, 0o000);
+        fails(
+            root,
+            ["--root", root],
+            1,
+            /STOPPED, nothing written: 1 problem\(s\)\n {2}agents\/odrade\/plans: in Pocket's data/,
+        );
+        await chmod(db, 0o644);
+        assert.equal(await readFile(db, "utf8"), `not a database ${OLD}\n`);
+        assert.match(
+            await readFile(join(root, ".pi/agent/trust.json"), "utf8"),
+            /\/var\/home\/bjk/,
+        );
+
+        await rm(plans);
+        await mkdir(plans);
+        await writeFile(join(plans, "copy.sqlite"), `not a database ${OLD}\n`);
+        await chmod(join(plans, "copy.sqlite"), 0o000);
+        fails(
+            root,
+            ["--check", "--root", root],
+            1,
+            /agents\/odrade\/plans\/copy\.sqlite: in Pocket's data or a database; not read/,
+        );
+        await chmod(join(plans, "copy.sqlite"), 0o644);
+        assert.equal(await readFile(join(plans, "copy.sqlite"), "utf8"), `not a database ${OLD}\n`);
+    } finally {
+        await chmod(db, 0o644).catch(() => {});
+        await chmod(join(plans, "copy.sqlite"), 0o644).catch(() => {});
+        await rm(root, { recursive: true, force: true });
+    }
+});
