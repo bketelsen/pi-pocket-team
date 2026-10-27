@@ -2,12 +2,13 @@
 // profiles, his homes or his data: every folder comes from `fs.mkdtempSync`, and git runs with an environment of its
 // own (a temporary config, no GIT_DIR-type variable, an empty template).
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 import {
     GITIGNORE,
     GIT_LOCATION_VARS,
@@ -25,19 +26,25 @@ const NOW = Date.UTC(2026, 9, 27, 14, 0);
 const DATE = "2026-10-27";
 
 /**
- * A git environment that no setting of this machine reaches: a temporary config file with a test identity, no system
- * config, an empty template folder, and none of the variables that point at another repository.
+ * A git environment that no setting of this machine reaches: a temporary home, config file and XDG folder with a test
+ * identity, no system config, an empty template folder, no system attributes, and none of the variables that point at
+ * another repository or set a configuration in the environment.
  */
 function gitEnvironment(extraConfig = "") {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "homes-git-"));
+    const home = path.join(root, "home");
     const config = path.join(root, "gitconfig");
     const template = path.join(root, "template");
+    const xdg = path.join(root, "xdg");
+
+    for (const folder of [home, template, xdg]) {
+        fs.mkdirSync(folder);
+    }
 
     fs.writeFileSync(
         config,
         `[user]\n\tname = Seed test\n\temail = seed@example.invalid\n${extraConfig}`,
     );
-    fs.mkdirSync(template);
 
     const env = {};
 
@@ -46,27 +53,34 @@ function gitEnvironment(extraConfig = "") {
             continue;
         }
 
+        if (name.startsWith("GIT_CONFIG_KEY_") || name.startsWith("GIT_CONFIG_VALUE_")) {
+            continue;
+        }
+
         env[name] = value;
     }
 
     return {
         ...env,
+        HOME: home,
+        XDG_CONFIG_HOME: xdg,
         GIT_CONFIG_NOSYSTEM: "1",
         GIT_CONFIG_GLOBAL: config,
         GIT_TEMPLATE_DIR: template,
+        GIT_ATTR_NOSYSTEM: "1",
     };
 }
 
 const gitEnv = gitEnvironment();
 
-/** A runner for the seed: real git, with `env` under what the seed itself passes (its clean environment). */
+/** A runner for the seed: real git, with `env`, and the environment the seed passes laid over it. */
 const makeRun =
     (env = gitEnv) =>
     (command, args, options = {}) =>
         execFileSync(command, args, {
             encoding: "utf8",
             stdio: ["ignore", "pipe", "pipe"],
-            env: { ...(options.env ?? {}), ...env },
+            env: { ...env, ...(options.env ?? {}) },
         });
 
 const gitRun = makeRun();
@@ -357,6 +371,101 @@ test("a core.hooksPath hook is never run", () => {
     assert.equal(git(t.home, ["rev-list", "--count", "HEAD"]), "1");
 });
 
+test("the seed runs no signing and no filter from the user's configuration, and the commit exists", () => {
+    const t = setup();
+    const marker = path.join(t.root, "ran");
+    const clean = path.join(t.root, "clean.sh");
+    const gpg = path.join(t.root, "gpg.sh");
+
+    fs.writeFileSync(clean, `#!/bin/sh\ntouch '${marker}'\ncat\n`, { mode: 0o755 });
+    fs.writeFileSync(gpg, `#!/bin/sh\ntouch '${marker}'\nexit 1\n`, { mode: 0o755 });
+
+    // The user's configuration signs every commit and runs a clean filter for every file.
+    const env = gitEnvironment(
+        `[commit]\n\tgpgSign = true\n[gpg]\n\tprogram = ${gpg}\n[filter "leak"]\n\tclean = ${clean}\n\trequired = true\n`,
+    );
+    const run = makeRun(env);
+
+    // It runs for a plain `git add`, so this test means something.
+    const scratch = path.join(t.root, "scratch");
+
+    fs.mkdirSync(scratch);
+    fs.writeFileSync(path.join(scratch, ".gitattributes"), "* filter=leak\n");
+    fs.writeFileSync(path.join(scratch, "a.txt"), "a\n");
+    run("git", ["-C", scratch, "init", "-b", "main"]);
+    run("git", ["-C", scratch, "add", "-A"]);
+    assert.equal(fs.existsSync(marker), true);
+    fs.rmSync(marker);
+
+    // The home carries the same attribute, so the seed's own `git add -A` would run the filter too.
+    fs.mkdirSync(t.home, { recursive: true });
+    fs.writeFileSync(path.join(t.home, ".gitattributes"), "* filter=leak\n");
+
+    const { result } = seed(t, { run });
+
+    assert.deepEqual(result.refused, []);
+    assert.equal(fs.existsSync(marker), false);
+    assert.equal(git(t.home, ["log", "--format=%s"]), "Seed Irulan's home");
+});
+
+test("a discovery failure that is not 'not a git repository' refuses the home before any write", () => {
+    const t = setup();
+
+    const run = (_: string, args: string[]) => {
+        if (args.includes("config")) {
+            return args.at(-1) === "user.name" ? "Seed test" : "seed@example.invalid";
+        }
+
+        if (args.includes("rev-parse")) {
+            throw Object.assign(new Error("Command failed: git rev-parse"), {
+                status: 128,
+                stderr: "fatal: detected dubious ownership in repository at '/home/x'\n",
+            });
+        }
+
+        throw new Error(`the seed ran git ${args.join(" ")}`);
+    };
+
+    const { result, logs } = seed(t, { run });
+
+    assert.deepEqual(
+        result.refused.map((home) => home.id),
+        ["irulan", "moneo"],
+    );
+    assert.match(logs.join("\n"), /dubious ownership/);
+    // Nothing was written, not even the home folder.
+    assert.equal(fs.existsSync(path.join(t.userHome, "agents")), false);
+});
+
+test("a missing user.name or user.email refuses the home with words a person can read", () => {
+    const t = setup();
+
+    const run = (_: string, args: string[]) => {
+        if (args.includes("config")) {
+            return "";
+        }
+
+        if (args.includes("rev-parse")) {
+            // The one failure that means the folder is free.
+            throw Object.assign(new Error("Command failed: git rev-parse"), {
+                status: 128,
+                stderr: "fatal: not a git repository (or any of the parent directories): .git\n",
+            });
+        }
+
+        throw new Error(`the seed ran git ${args.join(" ")}`);
+    };
+
+    const { result, logs } = seed(t, { run });
+
+    assert.deepEqual(
+        result.refused.map((home) => home.id),
+        ["irulan", "moneo"],
+    );
+    assert.match(logs.join("\n"), /user\.name and user\.email are not both set/);
+    assert.equal(fs.existsSync(path.join(t.userHome, "agents")), false);
+});
+
 test("a GIT_DIR in the environment never moves the seed's writes into another repository", () => {
     const t = setup();
     const other = path.join(t.root, "other");
@@ -377,17 +486,26 @@ test("a GIT_DIR in the environment never moves the seed's writes into another re
     assert.equal(git(t.home, ["status", "--porcelain"]), "");
 });
 
-test("cleanGitEnv keeps the identity and drops every variable that points at another repository", () => {
+test("cleanGitEnv drops every variable that could point at another repository or configuration", () => {
     const env = Object.fromEntries(GIT_LOCATION_VARS.map((name) => [name, "/tmp/other"]));
 
     assert.deepEqual(
         cleanGitEnv({
             ...env,
             PATH: "/bin",
-            GIT_CONFIG_GLOBAL: "/tmp/config",
-            GIT_AUTHOR_NAME: "A",
+            HOME: "/home/b",
+            XDG_CONFIG_HOME: "/home/b/.config",
+            GIT_CONFIG_KEY_0: "commit.gpgSign",
+            GIT_CONFIG_VALUE_0: "true",
+            GIT_CONFIG_PARAMETERS: "'core.hooksPath'='/tmp/hooks'",
         }),
-        { PATH: "/bin", GIT_CONFIG_GLOBAL: "/tmp/config", GIT_AUTHOR_NAME: "A" },
+        {
+            PATH: "/bin",
+            HOME: "/home/b",
+            GIT_CONFIG_GLOBAL: "/dev/null",
+            GIT_CONFIG_NOSYSTEM: "1",
+            GIT_ATTR_NOSYSTEM: "1",
+        },
     );
 });
 
@@ -548,4 +666,26 @@ test("parseArgs reads the 2 flags and refuses anything else", () => {
     assert.throws(() => parseArgs(["--nope"]), /unknown option --nope/);
     assert.throws(() => parseArgs(["--agent"]), /--agent needs an agent id/);
     assert.throws(() => parseArgs(["--agent", "../etc"]), /--agent needs an agent id/);
+});
+
+test("the CLI exits 1 when a home is refused, prints it, and seeds the other homes", () => {
+    const t = setup();
+
+    fs.mkdirSync(t.home, { recursive: true });
+    fs.symlinkSync(path.join(t.root, "missing", "AGENTS.md"), path.join(t.home, "AGENTS.md"));
+
+    const done = spawnSync(
+        process.execPath,
+        [fileURLToPath(new URL("./seed.mjs", import.meta.url))],
+        {
+            encoding: "utf8",
+            env: { ...gitEnv, HOME: t.userHome, PI_POCKET_TEAM_AGENTS: t.profilesDir },
+        },
+    );
+
+    assert.equal(done.status, 1, done.stderr);
+    assert.match(done.stdout, /irulan: refused, .*AGENTS\.md is a symbolic link/);
+    // The other home still seeded.
+    assert.match(done.stdout, /moneo: make the folder/);
+    assert.ok(fs.existsSync(path.join(t.userHome, "agents", "moneo", "AGENTS.md")));
 });

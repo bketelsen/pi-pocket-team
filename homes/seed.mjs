@@ -178,7 +178,7 @@ export function readProfiles(directory) {
 
 // ---------- Git ----------
 
-/** The git variables that point a command at another repository. A seed never follows them. */
+/** The git variables that a seed never follows: they point at another repository or another configuration. */
 export const GIT_LOCATION_VARS = [
     "GIT_DIR",
     "GIT_WORK_TREE",
@@ -188,21 +188,83 @@ export const GIT_LOCATION_VARS = [
     "GIT_COMMON_DIR",
     "GIT_CEILING_DIRECTORIES",
     "GIT_NAMESPACE",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_PARAMETERS",
 ];
 
-/** The environment of a seed's git call: the user's own (so the identity is theirs), without those variables. */
-export function cleanGitEnv(env = process.env) {
-    const clean = { ...env };
+/** A variable the seed drops by its prefix: `GIT_CONFIG_KEY_<n>` and `GIT_CONFIG_VALUE_<n>` set a config in the env. */
+const GIT_CONFIG_VAR = /^GIT_CONFIG_(KEY|VALUE)_/;
 
-    for (const name of GIT_LOCATION_VARS) {
-        delete clean[name];
+/**
+ * The environment of a seed's git call: no user configuration, no system configuration, no system attributes, and
+ * nothing that points at another repository. Signing, filters and includes can run a program, so the seed reads the
+ * identity once (see `readIdentity`) and then works without any configuration of the machine.
+ */
+export function cleanGitEnv(env = process.env) {
+    const clean = {};
+
+    for (const [name, value] of Object.entries(env)) {
+        if (value === undefined || GIT_LOCATION_VARS.includes(name) || GIT_CONFIG_VAR.test(name)) {
+            continue;
+        }
+
+        clean[name] = value;
     }
 
-    return clean;
+    // The global config file is `/dev/null`; the XDG one is not reached either.
+    delete clean.XDG_CONFIG_HOME;
+
+    return {
+        ...clean,
+        GIT_CONFIG_GLOBAL: "/dev/null",
+        GIT_CONFIG_NOSYSTEM: "1",
+        GIT_ATTR_NOSYSTEM: "1",
+    };
 }
 
-/** The settings every seed's git call gets: no hook and no filesystem monitor runs the user's code. */
-export const GIT_SAFE_ARGS = ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false"];
+/** The settings of a call that runs before the identity is known: discovery cannot write, so it needs no identity. */
+export const GIT_NO_IDENTITY_ARGS = [
+    "-c",
+    "core.hooksPath=/dev/null",
+    "-c",
+    "core.fsmonitor=false",
+];
+
+/**
+ * The settings every seed's git call gets: the user's identity (the only 2 settings the seed reads from the user),
+ * no signing, no hook and no filesystem monitor.
+ */
+export const gitSafeArgs = (identity) => [
+    "-c",
+    `user.name=${identity.name}`,
+    "-c",
+    `user.email=${identity.email}`,
+    "-c",
+    "commit.gpgSign=false",
+    "-c",
+    "core.hooksPath=/dev/null",
+    "-c",
+    "core.fsmonitor=false",
+];
+
+/**
+ * The user's name and email, read from the normal configuration. A read runs nothing, so the seed can ask for these 2
+ * settings and then run git without any configuration at all. `undefined` when one of them is missing.
+ */
+export function readIdentity(run, env) {
+    const get = (key) => {
+        try {
+            return String(run("git", ["config", "--get", key], { env }) ?? "").trim();
+        } catch {
+            return "";
+        }
+    };
+
+    const name = get("user.name");
+    const email = get("user.email");
+
+    return name === "" || email === "" ? undefined : { name, email };
+}
 
 /** Run a command and return its stdout. `options.env` is the child's environment. A failure throws, with `stderr`. */
 export function defaultRun(command, args, options = {}) {
@@ -295,14 +357,22 @@ function gitOwns(folder, git) {
         dir = path.dirname(dir);
     }
 
-    const out = fs.existsSync(dir)
-        ? git(dir, ["rev-parse", "--is-inside-work-tree", "--is-bare-repository"], {
-              allowFailure: true,
-          })
-        : undefined;
-
-    if (out === undefined) {
+    if (!fs.existsSync(dir)) {
         return undefined;
+    }
+
+    let out;
+
+    try {
+        out = git(dir, ["rev-parse", "--is-inside-work-tree", "--is-bare-repository"]);
+    } catch (error) {
+        // Only "not a git repository" means the folder is free. Any other failure, such as "dubious ownership", is
+        // not a guess: that home is refused before anything is written.
+        if (error?.status === 128 && /not a git repository/i.test(String(error?.stderr ?? ""))) {
+            return undefined;
+        }
+
+        throw error;
     }
 
     const [workTree, bare] = out
@@ -318,7 +388,7 @@ function gitOwns(folder, git) {
 }
 
 /** The plan of 1 home: what git already holds, or the actions and the steps of a seed. Throws on a refusal. */
-function planHome(profile, { folder, date, userHome, git }) {
+function planHome(profile, { folder, date, userHome, git, identity }) {
     // A folder that git already holds is left as it is: Odrade's desk is one, and a new file in it would stay
     // uncommitted. The seed adds nothing there, and never commits.
     if (fs.existsSync(path.join(folder, ".git"))) {
@@ -329,6 +399,13 @@ function planHome(profile, { folder, date, userHome, git }) {
 
     if (owned !== undefined) {
         return { owned };
+    }
+
+    // A seed makes a commit, so it needs the 2 settings it reads from the user, and nothing else.
+    if (identity === undefined) {
+        throw new Error(
+            "user.name and user.email are not both set in the git configuration, so the seed cannot make a commit.",
+        );
     }
 
     refuseLinks(folder);
@@ -420,19 +497,23 @@ export function seedHomes({
         throw new Error(`no profile for ${agent} in ${profilesDir}.`);
     }
 
+    // The identity is read from the normal configuration, and every other git call then runs without it.
+    const identity = readIdentity(run, env);
     const gitEnv = cleanGitEnv(env);
+    const safe = identity === undefined ? GIT_NO_IDENTITY_ARGS : gitSafeArgs(identity);
 
-    const git = (folder, args, { allowFailure = false } = {}) => {
+    const git = (folder, args) => {
         try {
-            return String(
-                run("git", [...GIT_SAFE_ARGS, "-C", folder, ...args], { env: gitEnv }) ?? "",
-            );
+            return String(run("git", [...safe, "-C", folder, ...args], { env: gitEnv }) ?? "");
         } catch (error) {
-            if (allowFailure) {
-                return undefined;
-            }
+            const failure = new Error(
+                `${folder}: git ${args.join(" ")} failed: ${reasonOf(error)}`,
+            );
 
-            throw new Error(`${folder}: git ${args.join(" ")} failed: ${reasonOf(error)}`);
+            failure.status = error?.status ?? error?.code;
+            failure.stderr = String(error?.stderr ?? error?.message ?? "");
+
+            throw failure;
         }
     };
 
@@ -452,7 +533,7 @@ export function seedHomes({
         const shown = displayPath(folder, userHome);
 
         try {
-            const plan = planHome(profile, { folder, date, userHome, git });
+            const plan = planHome(profile, { folder, date, userHome, git, identity });
 
             if (plan.owned !== undefined) {
                 homes.push({ id: profile.id, name: profile.name, folder, shown, actions: [] });
@@ -521,7 +602,12 @@ export function parseArgs(argv) {
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
     try {
-        seedHomes(parseArgs(process.argv.slice(2)));
+        // The other homes still seed, and each refused or failed home was printed by name.
+        const { refused } = seedHomes(parseArgs(process.argv.slice(2)));
+
+        if (refused.length > 0) {
+            process.exitCode = 1;
+        }
     } catch (error) {
         console.error(String(error?.message ?? error));
         process.exitCode = 2;

@@ -21,9 +21,15 @@ node homes/seed.mjs --agent irulan  # 1 agent only
   uncommitted.
 - **It refuses a home that a link could take a write out of.** When the home, `notes/`, `plans/`, `reports/`,
   `AGENTS.md` or `.gitignore` is a symbolic link, that home is refused and the other homes still seed.
-- **Its git runs with no hook and no filesystem monitor** (`core.hooksPath=/dev/null`,
-  `core.fsmonitor=false`), keeps the user's own identity, and ignores a `GIT_DIR` in the environment.
+- **Its git uses no configuration of the machine.** The seed reads 2 settings only, `user.name` and
+  `user.email` (a read runs nothing), and then runs every git call with no global or system config: no
+  signing, no filter, no hook and no filesystem monitor can run a program. It also ignores a `GIT_DIR` in
+  the environment. Without both settings it refuses the home.
+- **A discovery failure is never a guess.** Only `git rev-parse` saying "not a git repository" means the
+  folder is free; any other failure, such as "dubious ownership", refuses that home before any write.
 - **It never overwrites a file and never deletes one.** An `AGENTS.md` that is there stays as it is:
   the agent owns its home after the seed. To take a changed template, move the old file away first.
 - **It never adds a remote and never pushes.** A home is backed up by the machine, not by GitHub.
+- **The exit code says what happened:** 0 when every home seeded or was left as it is, 1 when any home was
+  refused (each one printed by name, and the other homes still seed), 2 on a bad option.
 - `PI_POCKET_TEAM_AGENTS` points it at another profiles folder, for a test.

@@ -28,7 +28,7 @@ import {
 
 const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), "audit-sources-"));
 
-/** The git variables that point a command at another repository: no test inherits them. */
+/** The git variables that point a command at another repository or configuration: no test inherits them. */
 const GIT_LOCATION_VARS = [
     "GIT_DIR",
     "GIT_WORK_TREE",
@@ -38,22 +38,30 @@ const GIT_LOCATION_VARS = [
     "GIT_COMMON_DIR",
     "GIT_CEILING_DIRECTORIES",
     "GIT_NAMESPACE",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_PARAMETERS",
 ];
 
 /**
- * A git environment that no setting of this machine reaches: a temporary config file with a test identity, no system
- * config, an empty template folder, and none of the variables that point at another repository.
+ * A git environment that no setting of this machine reaches: a temporary home, config file and XDG folder with a test
+ * identity, no system config, an empty template folder, no system attributes, and none of the variables that point at
+ * another repository or set a configuration in the environment.
  */
 function gitEnvironment(extraConfig = "") {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "audit-git-"));
+    const home = path.join(root, "home");
     const config = path.join(root, "gitconfig");
     const template = path.join(root, "template");
+    const xdg = path.join(root, "xdg");
+
+    for (const folder of [home, template, xdg]) {
+        fs.mkdirSync(folder);
+    }
 
     fs.writeFileSync(
         config,
         `[user]\n\tname = Audit test\n\temail = audit@example.invalid\n${extraConfig}`,
     );
-    fs.mkdirSync(template);
 
     const env: Record<string, string> = {};
 
@@ -62,14 +70,21 @@ function gitEnvironment(extraConfig = "") {
             continue;
         }
 
+        if (name.startsWith("GIT_CONFIG_KEY_") || name.startsWith("GIT_CONFIG_VALUE_")) {
+            continue;
+        }
+
         env[name] = value;
     }
 
     return {
         ...env,
+        HOME: home,
+        XDG_CONFIG_HOME: xdg,
         GIT_CONFIG_NOSYSTEM: "1",
         GIT_CONFIG_GLOBAL: config,
         GIT_TEMPLATE_DIR: template,
+        GIT_ATTR_NOSYSTEM: "1",
     };
 }
 
