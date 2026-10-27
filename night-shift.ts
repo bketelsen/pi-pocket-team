@@ -1032,12 +1032,18 @@ export function asksForBrian(text: string): { question: string; options?: string
         // a review. A decision verb does the same: "Authorize credential access for the install."
         const choice = askOptions(item);
         // A routine word first ("Merge #59 to remove the typo.") is the request: a verb after it says what the work does.
+        // A later clause with a decision verb first is a request of its own: "Merge #59 and authorize the install."
+        const clauses = item
+            .split(/(?<=[.!?;])\s+|,?\s+(?:and|then|also)\s+/i)
+            .map((clause) => clause.trim());
+        const verbFirst = new RegExp(`^[\\s\\W]*(?:please\\s+)?${ASK_VERB.source}`, "i");
         const routine =
             ROUTINE_ASK.test(item) &&
             !ASK_CHOICE.test(item) &&
             !item.includes("?") &&
             (/^[\s\W]*(?:please\s+)?(?:merge|install|tag|review)\b/i.test(item) ||
-                !ASK_VERB.test(item));
+                !ASK_VERB.test(item)) &&
+            !clauses.slice(1).some((clause) => verbFirst.test(clause));
 
         if (choice === undefined && routine) {
             continue;

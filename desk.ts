@@ -2090,10 +2090,17 @@ function routineOnly(text: string): boolean {
  */
 const ROUTINE_FIRST = /^[\s\W]*(?:please\s+)?(?:merge|install|tag|review)\b/i;
 
+/** The clauses of an item: its sentences, and the requests joined by "and", "then", or "also". */
+const CLAUSES = /(?<=[.!?;])\s+|,?\s+(?:and|then|also)\s+/i;
+
+/** A clause that starts with a decision verb, after "please": "authorize credential access". */
+const VERB_FIRST = new RegExp(`^[\\s\\W]*(?:please\\s+)?${DECISION_VERB.source}`, "i");
+
 /**
- * Whether 1 item names a decision for Brian: 1 of its sentences is not a no, not a negation, not a thing that is done,
- * and not a plain merge, install, tag, or review. Options in brackets, a choice, or a question make it a decision. Each
- * sentence counts by itself: "Brian approved the plan. Brian must authorize the install." is a decision.
+ * Whether 1 item names a decision for Brian. Its first clause counts when it is not a no, not a negation, not a thing
+ * that is done, and not a plain merge, install, tag, or review. A later clause counts only with a sign of its own: a
+ * decision verb first, a sentence that gives Brian a decision, or a choice. So "Brian approved the plan. Brian must
+ * authorize the install." and "Merge #59 and authorize the install." are decisions; "Merge #59. CI is green." is not.
  */
 function decisionItem(item: string): boolean {
     if (NO_ITEM.test(item.trim())) {
@@ -2101,17 +2108,23 @@ function decisionItem(item: string): boolean {
     }
 
     return item
-        .split(/(?<=[.!?])\s+|;\s*/)
-        .map((sentence) => sentence.trim())
-        .filter((sentence) => sentence !== "")
-        .some(
-            (sentence) =>
-                !NO_ITEM.test(sentence) &&
-                !NO_DECISION.test(sentence) &&
-                !NEGATED.test(sentence) &&
-                !routineOnly(sentence) &&
-                (hasChoice(sentence) || !DONE_ITEM.test(sentence)),
-        );
+        .split(CLAUSES)
+        .map((clause) => clause.trim())
+        .filter((clause) => clause !== "")
+        .some((clause, index) => {
+            if (
+                NO_ITEM.test(clause) ||
+                NO_DECISION.test(clause) ||
+                NEGATED.test(clause) ||
+                (!hasChoice(clause) && DONE_ITEM.test(clause))
+            ) {
+                return false;
+            }
+
+            return index === 0
+                ? !routineOnly(clause)
+                : VERB_FIRST.test(clause) || DECISION_SAID.test(clause) || hasChoice(clause);
+        });
 }
 
 /** An item that only asks for a merge, an install, a review, or a tag, with no choice: `ready-for-human` covers it. */

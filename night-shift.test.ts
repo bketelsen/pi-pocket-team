@@ -437,6 +437,14 @@ describe("parsing", () => {
         assert.deepEqual(asksForBrian("ASKS FOR BRIAN:\n- Install it first."), [], "no verb");
         // A routine word first is the request: "remove" says what the merge does.
         assert.deepEqual(asksForBrian("ASKS FOR BRIAN:\n- Merge #59 to remove the typo."), []);
+        // A second request joined by "and" with a decision verb first is a decision of its own.
+        assert.deepEqual(
+            asksForBrian(
+                "ASKS FOR BRIAN:\n- Merge #59 and authorize credential access for the production install.",
+            ),
+            [{ question: "Merge #59 and authorize credential access for the production install." }],
+        );
+        assert.deepEqual(asksForBrian("ASKS FOR BRIAN:\n- Merge #59. CI is green."), []);
         assert.deepEqual(asksForBrian("ASKS FOR BRIAN: merge #54 or #55"), [
             { question: "merge #54 or #55" },
         ]);

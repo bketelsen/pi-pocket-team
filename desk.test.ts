@@ -6340,6 +6340,9 @@ describe("a report that asks Brian for a decision", () => {
             "Needs Brian: the merge is already done.",
             // A routine word first is the request: a verb after it says what the work does.
             "ASKS FOR BRIAN:\n- Merge #59 to remove the typo.",
+            // A fact after a merge request is no decision of its own.
+            "ASKS FOR BRIAN:\n- Merge #59. CI is green.",
+            "ASKS FOR BRIAN:\n- Merge #59 and install it.",
             "Done.\n\n```\nASKS FOR BRIAN: rotate the key\n```\n\nAll set.",
             "Done.\n\n~~~\nNeeds Brian: the key rotation\n~~~",
         ]) {
@@ -6366,6 +6369,8 @@ describe("a report that asks Brian for a decision", () => {
             "ASKS FOR BRIAN:\n- Approve access to the already configured production server.",
             // Each sentence counts by itself: a done first action does not hide a current one.
             "ASKS FOR BRIAN:\n- Brian approved the plan. Brian must authorize credential access for the install.",
+            // A second request joined by "and" counts by itself.
+            "ASKS FOR BRIAN:\n- Merge #59 and authorize credential access for the production install.",
         ]) {
             assert.equal(reportAsksBrian(text), true, text);
             assert.equal(reportBlocks(text), true, text);
