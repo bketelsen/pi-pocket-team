@@ -1,10 +1,11 @@
-// Every read of the daily audit: Pocket's database, GitHub, git, and Odrade's notes.
+// Every read of the daily audit: Pocket's database, GitHub, git, Odrade's notes and the agents' home folders.
 //
 // Everything is read-only. The database opens with `readOnly: true`. `gh` gets only GET requests, GraphQL
 // queries and `gh search prs`, and stops after 40 calls. `git` gets only `log`, `status` and `show`.
 // The checks never read anything themselves: they get the plain `data` object that `loadData` builds.
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { apply } from "@earendil-works/chord/delta";
@@ -634,15 +635,94 @@ export function readOdrade(dir, git) {
     return { readme, reports, dirty, lastCommitAt: Number.isNaN(last) ? null : last };
 }
 
+// ---------- The agents' homes ----------
+
+/** A folder's real path, or its absolute path when it does not exist. */
+const realPath = (folder) => {
+    try {
+        return fs.realpathSync(folder);
+    } catch {
+        return path.resolve(folder);
+    }
+};
+
+/**
+ * The agents' home folders: every subfolder of `dir` that holds `.git`, with its id, its uncommitted lines and its
+ * last commit time. A folder in `exclude` (Odrade's: the checks of group I read it) is left out, compared by its
+ * real path. A `dir` that does not exist gives no homes and no error: the homes are optional. 1 home whose git
+ * fails does not fail the source: with no commit it has `lastCommitAt: null`, and when `status` fails it is skipped.
+ */
+export function readHomes(dir, git, { exclude = [] } = {}) {
+    const skip = new Set(exclude.filter(Boolean).map(realPath));
+    let entries;
+
+    try {
+        entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch (error) {
+        if (error?.code === "ENOENT") {
+            return [];
+        }
+
+        throw error;
+    }
+
+    const homes = [];
+
+    for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+        const folder = path.join(dir, entry.name);
+        // A home is a folder, or a link to one; a name that starts with a dot is not a home.
+        const stat = fs.statSync(folder, { throwIfNoEntry: false });
+
+        if (!stat?.isDirectory() || entry.name.startsWith(".")) {
+            continue;
+        }
+
+        if (!fs.existsSync(path.join(folder, ".git")) || skip.has(realPath(folder))) {
+            continue;
+        }
+
+        let dirty;
+
+        try {
+            dirty = git.call(folder, ["status", "--porcelain"]).split("\n").filter(Boolean);
+        } catch {
+            // Without `status` the home has no uncommitted lines to report: it is left out, not an error.
+            continue;
+        }
+
+        let lastCommitAt = null;
+
+        try {
+            const last = Date.parse(git.call(folder, ["log", "-1", "--format=%cI"]).trim());
+
+            lastCommitAt = Number.isNaN(last) ? null : last;
+        } catch {
+            // A repository with no commit yet has no log: the home has no last commit, and the rest still counts.
+        }
+
+        homes.push({ id: entry.name, folder, dirty, lastCommitAt });
+    }
+
+    return homes;
+}
+
 // ---------- Everything ----------
 
 /**
  * Load every source into one plain object. A source that cannot be read goes to `sourceErrors` by name, and the
  * checks that need it are skipped.
  *
- * Options: `pocketDir`, `odradeDir`, `now`, `hours`, `useGithub`, `run` (a process runner, for tests).
+ * Options: `pocketDir`, `odradeDir`, `homesDir`, `now`, `hours`, `useGithub`, `run` (a process runner, for tests).
  */
-export function loadData({ pocketDir, odradeDir, now, hours, useGithub, run = defaultRun }) {
+export function loadData({
+    pocketDir,
+    odradeDir,
+    homesDir = path.join(os.homedir(), "agents"),
+    now,
+    hours,
+    useGithub,
+    run = defaultRun,
+}) {
     const since = now - hours * HOUR;
     // J1 compares the window with the 7 days before it.
     const horizon = since - 7 * DAY;
@@ -661,6 +741,7 @@ export function loadData({ pocketDir, odradeDir, now, hours, useGithub, run = de
         spawns: [],
         installed: installedTimes(pocketDir),
         odrade: undefined,
+        homes: [],
         github: undefined,
         sourceErrors,
     };
@@ -718,8 +799,13 @@ export function loadData({ pocketDir, odradeDir, now, hours, useGithub, run = de
         data.githubCalls.note = "GitHub call cap reached";
     }
 
+    const git = makeGit(run);
+
     attempt("odrade", () => {
-        data.odrade = readOdrade(odradeDir, makeGit(run));
+        data.odrade = readOdrade(odradeDir, git);
+    });
+    attempt("homes", () => {
+        data.homes = readHomes(homesDir, git, { exclude: [odradeDir] });
     });
 
     return data;

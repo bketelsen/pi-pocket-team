@@ -56,6 +56,10 @@ export function ownerOf(check) {
         };
     }
 
+    if (check === "I3") {
+        return { component: "the agents' homes", owner: "each agent (its own home)", size: "S" };
+    }
+
     if (group === "I") {
         return { component: "Odrade's notes", owner: "Odrade", size: "S" };
     }

@@ -112,6 +112,7 @@ test("the owner and the size come from the fixed table, by check", () => {
         H2: ["Odrade, the repository's owner", "S–M"],
         H3: ["Odrade, the repository's owner", "S–M"],
         I1: ["Odrade", "S"],
+        I3: ["each agent (its own home)", "S"],
         J1: ["Brian decides, Odrade proposes", "M"],
     };
 

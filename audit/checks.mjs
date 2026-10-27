@@ -1549,6 +1549,44 @@ export function checkI2(data, ctx) {
     };
 }
 
+/**
+ * I3: each agent's home folder that has uncommitted files and whose last commit is older than 24 h. The agent commits
+ * its home at the end of each task, so a home dirty for a day means tasks are not closed (the homes of
+ * `TEAM_HOMES_DIR`; Odrade's home is I2's).
+ */
+export function checkI3(data, ctx) {
+    const homes = data.homes ?? [];
+    const dirty = homes.filter((home) => home.dirty.length > 0);
+    const findings = [];
+
+    for (const home of dirty) {
+        const age = home.lastCommitAt === null ? undefined : ctx.now - home.lastCommitAt;
+
+        if (age !== undefined && age <= 24 * HOUR) {
+            continue;
+        }
+
+        findings.push(
+            makeFinding({
+                check: "I3",
+                subject: home.id,
+                severity: "low",
+                text: `${home.dirty.length} uncommitted file${home.dirty.length === 1 ? "" : "s"} in ${home.id}'s home, and the last commit is ${age === undefined ? "unknown" : `${Math.round(age / HOUR)} h old`}`,
+                evidence: home.dirty.map((line) => line.slice(0, 120)),
+                cases: home.dirty.length,
+            }),
+        );
+    }
+
+    return {
+        findings,
+        metrics: {
+            homes: homes.length,
+            dirty: dirty.length,
+        },
+    };
+}
+
 // ---------- J. Spend ----------
 
 const roundAll = (object) =>
@@ -1672,6 +1710,7 @@ export const CHECKS = [
     ["H3", checkH3, ["github"]],
     ["I1", checkI1, ["odrade"]],
     ["I2", checkI2, ["odrade"]],
+    ["I3", checkI3, ["homes"]],
     ["J1", checkJ1, ["desk", "costs"]],
 ];
 

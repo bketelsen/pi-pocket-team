@@ -7,7 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { HOUR } from "./common.mjs";
-import { main, parseArgs } from "./daily.mjs";
+import { defaultOdradeDir, main, parseArgs } from "./daily.mjs";
 import { NOW } from "./fixtures/builders.mjs";
 import { createFixtureDb } from "./fixtures/pocket-db.mjs";
 
@@ -83,11 +83,17 @@ function setup() {
         root,
         pocketDir,
         odradeDir,
+        homesDir: path.join(root, "agents"),
         reports,
         outDir,
         calls,
         run,
-        env: { PI_POCKET_DIR: pocketDir, ODRADE_DIR: odradeDir },
+        env: {
+            PI_POCKET_DIR: pocketDir,
+            ODRADE_DIR: odradeDir,
+            // A temporary homes folder: a folder that does not exist gives no homes, and no real one is read.
+            TEAM_HOMES_DIR: path.join(root, "agents"),
+        },
     };
 }
 
@@ -389,6 +395,44 @@ test("main: the default folder is $ODRADE_DIR/reports/<date>-daily-audit, and --
     assert.match(
         fs.readFileSync(path.join(dir, "README.md"), "utf8"),
         /Gone since 2026-10-22: `X9`/,
+    );
+});
+
+test("the default ODRADE_DIR is Odrade's home folder when it exists, else her desk", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "audit-odrade-"));
+
+    assert.equal(defaultOdradeDir({ HOME: root }), path.join(root, "projects", "odrade"));
+
+    fs.mkdirSync(path.join(root, "agents", "odrade"), { recursive: true });
+
+    assert.equal(defaultOdradeDir({ HOME: root }), path.join(root, "agents", "odrade"));
+});
+
+test("main: with no ODRADE_DIR and no TEAM_HOMES_DIR, the home folder of the user decides both", async () => {
+    const t = setup();
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "audit-home-"));
+    const odradeHome = path.join(root, "agents", "odrade");
+
+    fs.mkdirSync(path.join(odradeHome, "reports"), { recursive: true });
+    fs.writeFileSync(path.join(odradeHome, "README.md"), "- reports/2026-10-22-notes");
+    // The desk is there too: Odrade's home wins.
+    fs.mkdirSync(path.join(root, "projects", "odrade", "reports"), { recursive: true });
+
+    await main(["--no-github", "--no-llm", "--date", "2026-10-25"], {
+        env: { HOME: root, PI_POCKET_DIR: t.pocketDir },
+        now: NOW,
+        run: t.run,
+        log: () => undefined,
+    });
+
+    const dir = path.join(odradeHome, "reports", "2026-10-25-daily-audit");
+
+    assert.deepEqual(fs.readdirSync(dir).sort(), ["README.md", "findings.json"]);
+    assert.deepEqual(fs.readdirSync(path.join(root, "projects", "odrade", "reports")), []);
+    // The homes folder is `HOME/agents`: Odrade's home has no `.git`, so there is no home in it.
+    assert.deepEqual(
+        JSON.parse(fs.readFileSync(path.join(dir, "findings.json"), "utf8")).metrics.I3,
+        { homes: 0, dirty: 0 },
     );
 });
 
