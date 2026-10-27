@@ -2760,7 +2760,7 @@ describe("the watch's rules", () => {
                     at: on("2026-10-22"),
                 }),
             ),
-            /1 to 200 characters/,
+            /check is 1 to 200 characters, on one line\. Shorten it\./,
         );
         assert.match(
             errorOf(
@@ -2772,7 +2772,7 @@ describe("the watch's rules", () => {
                     at: on("2026-10-22"),
                 }),
             ),
-            /1 to 200 characters/,
+            /check is 1 to 200 characters, on one line\. Shorten it\./,
         );
         assert.match(
             errorOf(
@@ -18405,6 +18405,59 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
             }
         });
 
+        test("a long watch result is cut to 200 characters, and an empty one is refused", async () => {
+            const stub = stubDesk();
+
+            try {
+                const { source, thread } = await delegated("result-clip");
+                const long = `${"word ".repeat(50)}end`;
+
+                await stub.tool(
+                    { action: "watch", thread: thread.id, check_on: "7d", text: "the sweep" },
+                    Number(source),
+                    "task-clip",
+                    "call-watch",
+                );
+                await assert.rejects(
+                    () =>
+                        stub.tool(
+                            { action: "result", thread: thread.id, pass: true, text: "  " },
+                            Number(source),
+                            "task-clip",
+                            "call-empty",
+                        ),
+                    /1 to 200 characters, on one line\. Write a short line\./,
+                );
+
+                const args = { action: "result", thread: thread.id, pass: true, text: long };
+                const first = JSON.stringify(
+                    await stub.tool(args, Number(source), "task-clip", "call-result"),
+                );
+
+                assert.match(
+                    first,
+                    /Check passed: .* is closed\. The result was cut to 200 characters; put the full text in a send or a report\./,
+                );
+
+                const stored = (await deskState())?.threads[thread.id];
+                const text = stored?.watch?.result?.text ?? "";
+
+                assert(text.length <= 200 && text.length > 100, `length ${String(text.length)}`);
+                assert(text.endsWith("…"));
+                assert(long.startsWith(text.slice(0, -1)));
+                assert.equal(stored?.state, "closed");
+
+                const replay = JSON.stringify(
+                    await stub.tool(args, Number(source), "task-clip", "call-result"),
+                );
+
+                assert.match(replay, /has this result already/);
+                assert.equal((await deskState())?.threads[thread.id]?.watch?.result?.text, text);
+            } finally {
+                stub.restore();
+            }
+        });
+
         test("desk send acts once on a replay, and refuses a closed thread and an agent session", async () => {
             const stub = stubDesk();
 
@@ -18439,6 +18492,44 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
                 await assert.rejects(
                     () => stub.tool(args, Number(linked), "task-send", "call-3"),
                     /Only a session assigned a supervisor identity can use the desk\./,
+                );
+
+                // The refusals say what to do instead.
+                await assert.rejects(
+                    () => stub.tool(args, Number(source), "task-send", "call-2b"),
+                    /For new work, use team_delegate; to put a question on it, use desk ask/,
+                );
+
+                for (const action of ["read", "list"]) {
+                    await assert.rejects(
+                        () =>
+                            stub.tool(
+                                { action, thread: thread.id },
+                                Number(linked),
+                                "task-send",
+                                `call-agent-${action}`,
+                            ),
+                        new RegExp(
+                            `Only a session assigned a supervisor identity can use the desk\\. An agent can use only watch and result.*For ${action}, ask Odrade with team_message`,
+                        ),
+                    );
+                }
+
+                const plain = join(root, "plain-send");
+
+                mkdirSync(plain, { recursive: true });
+
+                const plainSession = await newSession(app, plain);
+
+                await assert.rejects(
+                    () =>
+                        stub.tool(
+                            { action: "list" },
+                            Number(plainSession),
+                            "task-send",
+                            "call-plain",
+                        ),
+                    /Only a session assigned a supervisor identity can use the desk\. This session has no named identity: send desk work to Odrade with team_message\./,
                 );
 
                 // A thread with no address for its agent: refused.
@@ -18488,7 +18579,7 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
                     await say(app, clerkSession, words);
                     assert.match(
                         (await modelTexts(app, clerkSession)).join("\n"),
-                        /Only the supervisor files asks, records Brian's answers, and seeds the desk\. Escalate to your supervisor\./,
+                        /Only the supervisor files asks, records Brian's answers, and seeds the desk\. Escalate to Odrade with team_message\./,
                         words,
                     );
                 }
@@ -18507,7 +18598,7 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
                 await say(app, clerkSession, "clerk own test");
                 assert.match(
                     (await modelTexts(app, clerkSession)).join("\n"),
-                    /Only the supervisor marks a thread as Brian's own\. Escalate to your supervisor\./,
+                    /Only the supervisor marks a thread as Brian's own\. Escalate to Odrade with team_message\./,
                 );
 
                 const afterOwn = (await deskState())?.threads[thread.id];
@@ -18555,6 +18646,14 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
                         pass: after.watch.result.pass,
                     },
                     { by: "clerk", pass: true },
+                );
+
+                // send to the closed thread: the Clerk is told to escalate.
+                sendThreadId = thread.id;
+                await say(app, clerkSession, "clerk send test");
+                assert.match(
+                    (await modelTexts(app, clerkSession)).join("\n"),
+                    /is closed: there is no agent to message\. For new work, escalate to Odrade with team_message\./,
                 );
 
                 // The bash hook blocks a merge in the Clerk's session.
