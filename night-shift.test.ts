@@ -413,6 +413,22 @@ describe("parsing", () => {
         );
         // A bare merge, install, tag, or review request is no decision; with a choice it is one.
         assert.deepEqual(asksForBrian("ASKS FOR BRIAN:\n- merge bketelsen/pi-pocket-team#60"), []);
+        // Options are a choice: the merge rule leaves the item in, and it keeps its options.
+        assert.deepEqual(
+            asksForBrian(
+                "ASKS FOR BRIAN:\n- Approve the key rotation before install. [approve | reject]",
+            ),
+            [
+                {
+                    question: "Approve the key rotation before install.",
+                    options: ["approve", "reject"],
+                },
+            ],
+        );
+        assert.deepEqual(
+            asksForBrian("ASKS FOR BRIAN: review the diff or tag it [tag v2 | tag v3 | wait]"),
+            [{ question: "review the diff or tag it", options: ["tag v2", "tag v3", "wait"] }],
+        );
         assert.deepEqual(asksForBrian("ASKS FOR BRIAN: merge #54 or #55"), [
             { question: "merge #54 or #55" },
         ]);

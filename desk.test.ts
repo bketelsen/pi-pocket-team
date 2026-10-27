@@ -6272,6 +6272,10 @@ describe("a report that asks Brian for a decision", () => {
             "Nothing here needs Brian.",
             "per Brian's decision in T13a, I removed it.",
             "Note for Brian: PR #5 is ready to merge.",
+            "FYI for Brian: all checks passed.",
+            "No action for Brian: all work is complete.",
+            "For Brian: you approved this yesterday; all work is done.",
+            "Needs Brian: the merge is already done.",
             "Done.\n\n```\nASKS FOR BRIAN: rotate the key\n```\n\nAll set.",
             "Done.\n\n~~~\nNeeds Brian: the key rotation\n~~~",
         ]) {
@@ -6288,6 +6292,8 @@ describe("a report that asks Brian for a decision", () => {
             "Question for Brian: keep the old cache?",
             "The support promise is Brian's decision.",
             "STEPS FOR BRIAN:\n- Rotate the key.",
+            // Options are a choice: a pick-one with a merge or an install in it is still a decision.
+            "ASKS FOR BRIAN:\n- Approve the key rotation before install. [approve | reject]",
         ]) {
             assert.equal(reportAsksBrian(text), true, text);
             assert.equal(reportBlocks(text), true, text);
@@ -6313,6 +6319,21 @@ describe("a report that asks Brian for a decision", () => {
         assert.equal(asksForBrian("Done. Nothing for Brian."), undefined);
         assert.equal(asksForBrian("Done.\n\n```\nASKS FOR BRIAN: rotate the key\n```"), undefined);
         assert.equal(namesDecision("**Needs Brian**\n\n- Merge #12, or close it."), true);
+    });
+
+    test("only the last ASKS FOR BRIAN block counts, and its items are decisions", () => {
+        // The last block says none: the block before it does not count, and no heading reads it.
+        const last = "Done.\n\nASKS FOR BRIAN:\n- Rotate the key.\n\nASKS FOR BRIAN: none";
+
+        assert.equal(reportAsksBrian(last), false, last);
+        assert.equal(reportBlocks(last), false, last);
+        assert.deepEqual(asksForBrian(last), []);
+        // The items of the block are the desk's items, options and all.
+        assert.deepEqual(
+            asksForBrian("ASKS FOR BRIAN:\n- Approve it before install. [approve | reject]"),
+            ["Approve it before install. [approve | reject]"],
+        );
+        assert.equal(namesDecision("ASKS FOR BRIAN:\n- Rotate the key."), true);
     });
 });
 
@@ -14430,6 +14451,157 @@ describe("the desk in a Pi Pocket", () => {
             assert(after, "the thread is stored");
             assert.equal(after.run.reportBlocked, false, "no stored report is no blocked report");
             assert.equal(after.state, "closed", "the unchecked report no longer holds it");
+        } finally {
+            await quiet([]);
+            shift = 0;
+        }
+    });
+
+    /**
+     * An open thread of its own supervisor, with a stored report and the run flags the test gives: the sweep migrates
+     * the flags from the report. Gives the thread's id.
+     */
+    const oldThread = async (
+        name: string,
+        report: { key: string; text: string } | undefined,
+        run: Record<string, unknown>,
+        asks: { id: string; text: string; at: number; key: string }[] = [],
+    ): Promise<{ id: string; source: ConversationId }> => {
+        await stopSweepers();
+        const folder = join(root, name);
+
+        rmSync(folder, { recursive: true, force: true });
+        repository(folder);
+
+        const source = await supervisor(name);
+        const session = await newSession(app, folder);
+        const at = Date.now();
+
+        if (report !== undefined) {
+            await app.harness.commit(async (tx) => {
+                const reports = await tx.doc(DeskReports, session);
+
+                reports.reports.unshift({
+                    key: report.key,
+                    at,
+                    from: "team_message",
+                    text: report.text,
+                    line: "[desk] a report from before the flag",
+                });
+            }, context);
+        }
+
+        let id = "";
+
+        await app.harness.commit(async (tx) => {
+            const state = await tx.doc(DeskThreads);
+            const opened = openThread(state, {
+                key: `x.test.${name}`,
+                supervisor: Number(source),
+                agents: ["duncan"],
+                repo: `frostyard/${name}`,
+                cwd: folder,
+                title: `A thread from before the flags: ${name}`,
+                at,
+            }).thread;
+            const stored = state.threads[opened.id]!;
+
+            id = opened.id;
+            stored.state = "open";
+            stored.session = Number(session);
+            stored.asks = asks;
+            // The agent reported, and the session is idle: without the flags the thread closes at the sweep.
+            stored.run = {
+                busy: false,
+                reportedAt: at,
+                reportedUserEntry: 100_000,
+                lastUserEntry: 1,
+                ...run,
+            };
+        }, context);
+
+        return { id, source };
+    };
+
+    /** The stored thread after 1 sweep of its supervisor. */
+    const swept = async (source: ConversationId, id: string) => {
+        await say(app, source, "desk list test");
+        await until(
+            async () => typeof (await deskState())?.threads[id]?.run.sweptAt === "number",
+            "the first sweep",
+            20_000,
+        );
+
+        return (await deskState())?.threads[id];
+    };
+
+    test("a thread with `reportBlocked: false` gets `reportAsks` from its report, and stays open", async () => {
+        try {
+            // The T104 report: a decision in words, and no ask.
+            const { id, source } = await oldThread(
+                "asks-migration",
+                { key: "report:asks", text: ASKS_REPORT },
+                { reportBlocked: false },
+            );
+            const after = await swept(source, id);
+
+            assert(after, "the thread is stored");
+            assert.equal(after.run.reportBlocked, true, "the report names a decision");
+            assert.equal(after.run.reportAsks, true, "and it filed no ask");
+            assert.equal(after.state, "open", "the thread does not close by itself");
+            assert.deepEqual(closeCheck(after, facts()).open, [
+                "its last report asks Brian for a decision",
+            ]);
+        } finally {
+            await quiet([]);
+            shift = 0;
+        }
+    });
+
+    test("a `reportBlocked: true` report that only says blocked keeps `true`, with `reportAsks: false`", async () => {
+        try {
+            const { id, source } = await oldThread(
+                "blocked-migration",
+                { key: "report:blocked", text: "The work stopped: the release token is missing." },
+                { reportBlocked: true },
+            );
+            const after = await swept(source, id);
+
+            assert(after, "the thread is stored");
+            assert.equal(after.run.reportBlocked, true, "a true never goes back to false");
+            assert.equal(after.run.reportAsks, false);
+            assert.deepEqual(closeCheck(after, facts()).open, [
+                "its last report says BLOCKED or asks for a decision",
+            ]);
+        } finally {
+            await quiet([]);
+            shift = 0;
+        }
+    });
+
+    test("a report whose asks were filed decides nothing: both flags are false", async () => {
+        try {
+            const { id, source } = await oldThread(
+                "asked-migration",
+                {
+                    key: "report:asked",
+                    text: `${ASKS_REPORT}\n\nDecisions for Brian:\n- Rotate the key? [rotate | keep]`,
+                },
+                { reportBlocked: false },
+                [{ id: "T1a", text: "Rotate the key?", at: Date.now(), key: "report:asked:ask:0" }],
+            );
+            const after = await swept(source, id);
+
+            assert(after, "the thread is stored");
+            assert.equal(after.run.reportBlocked, false, "the ask holds the thread, not the text");
+            assert.equal(after.run.reportAsks, false);
+            assert.equal(
+                closeCheck(after, facts()).open.includes(
+                    "its last report says BLOCKED or asks for a decision",
+                ),
+                false,
+            );
+            assert.deepEqual(closeCheck(after, facts()).open, ["ask T1a has no answer"]);
         } finally {
             await quiet([]);
             shift = 0;

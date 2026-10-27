@@ -1955,12 +1955,19 @@ const NEEDS_BRIAN_NO = /\bneeds?\s+brian\s*\)?\s*:\s*(?:no|none|nothing)\b/i;
 /** A sentence that is only the label ("**Needs Brian**"): the heading rule reads it, with the items under it. */
 const NEEDS_BRIAN_LABEL = /^[\s>#*_()\-]*needs\s+brian\b[\s*_()]*:?[\s*_()]*$/i;
 
-/** A heading, or a label, that opens a list of things for Brian: "**Needs Brian**", "What is left (needs Brian)". */
+/**
+ * A heading that opens a list of things for Brian: "**Needs Brian**", "What is left (needs Brian)", "Steps for Brian".
+ * An `ASKS FOR BRIAN:` line is no heading: `asksForBrian` reads its block, and only the last one counts.
+ */
 const BRIAN_HEADING =
-    /^(?:what\s+(?:is\s+left\s+)?)?\(?(?:needs\s+brian|decisions?\s+for\s+brian|human\s+decisions?|for\s+brian|(?:steps?|asks?|questions?|actions?|items?)\s+for\s+brian)\)?\s*:?\s*(.*)$/i;
+    /^(?:what\s+(?:is\s+left\s+)?)?\(?(?:needs\s+brian|decisions?\s+for\s+brian|human\s+decisions?|for\s+brian|(?:steps?|questions?|actions?|items?)\s+for\s+brian)\)?\s*:?\s*(.*)$/i;
 
-/** A "for Brian:" label anywhere in a line: "Note for Brian: PR #5 is ready to merge." */
-const BRIAN_LABEL = /\b(?:needs\s+brian|for\s+brian)\s*\)?\s*:\s*(.*)$/i;
+/**
+ * A label for Brian anywhere in a line ("Decisions for Brian: …", "needs Brian: …"). A plain "for Brian:" is no label:
+ * "FYI for Brian: …" and "Note for Brian: …" give information, not a decision.
+ */
+const BRIAN_LABEL =
+    /\b(?:needs\s+brian|(?:questions?|decisions?|choices?|steps?|actions?|items?)\s+for\s+brian)\s*\)?\s*:\s*(.*)$/i;
 
 /** The words of an "ASKS FOR BRIAN:" line: its items are the label of the block. */
 const ASKS_BRIAN_LINE = /^asks\s+for\s+brian\s*:\s*(.*)$/i;
@@ -2012,12 +2019,26 @@ export function asksForBrian(text: string): string[] | undefined {
     return items.filter((item) => !NO_ITEM.test(item));
 }
 
-/** Whether 1 item names a decision for Brian: not a no, and not a plain merge, install, tag, or review. */
+/** The words of a pick-one item: `[a | b]`, 2 to 6 options. A choice is a decision, also with a merge in it. */
+const OPTIONS = /\[[^\]]*\|[^\]]*\]/;
+
+/** An item that says the thing is behind him: "you approved this yesterday", "all work is done". */
+const DONE_ITEM = /\b(?:already|approved|is done|is complete|completed)\b/i;
+
+/**
+ * Whether 1 item names a decision for Brian: not a no, not a negation, not a thing that is done, and not a plain merge,
+ * install, tag, or review. Options in brackets, a choice, or a question make it a decision.
+ */
 function decisionItem(item: string): boolean {
+    // A choice, options in brackets, or a question is a decision, whatever else it says.
+    const choice = CHOICE.test(item) || OPTIONS.test(item) || item.includes("?");
+
     return (
         !NO_ITEM.test(item.trim()) &&
         !NO_DECISION.test(item) &&
-        (!ROUTINE_ITEM.test(item) || CHOICE.test(item))
+        !NEGATED.test(item) &&
+        (choice || !ROUTINE_ITEM.test(item)) &&
+        (choice || !DONE_ITEM.test(item))
     );
 }
 
@@ -2071,7 +2092,13 @@ export function namesDecision(plain: string): boolean {
             .trim();
         const heading = BRIAN_HEADING.exec(bare) ?? BRIAN_LABEL.exec(bare);
 
-        if (heading === null) {
+        // A label that says there is nothing, or not, is no decision: "No action for Brian: all work is complete."
+        if (
+            heading === null ||
+            NO_DECISION.test(bare) ||
+            NEGATED.test(bare) ||
+            NEEDS_BRIAN_NOT.test(bare.slice(0, heading.index))
+        ) {
             continue;
         }
 
@@ -10019,17 +10046,18 @@ export default function createDesk(host: Host, web: Web) {
             (thread) => thread.supervisor === Number(supervisor) && thread.state !== "closed",
         );
 
-        // A thread filed before `run.reportBlocked` existed: its newest stored report decides the flag, 1 time. The read
-        // is here, not in the commit: a commit cannot read a table after its first write, and this read never makes the
-        // document of a session that has no reports. `null` is a good read with no report, which is no blocked report;
-        // a failed read leaves the key out, so the flag stays absent and the thread stays open.
+        // A thread filed before `run.reportBlocked` or `run.reportAsks` existed: its newest stored report decides the
+        // flags, 1 time. The read is here, not in the commit: a commit cannot read a table after its first write, and
+        // this read never makes the document of a session that has no reports. `null` is a good read with no report,
+        // which is no blocked report; a failed read leaves the key out, so the flags stay as they are and the thread
+        // stays open.
         const reports: Record<string, StoredReport | null> = {};
 
         for (const thread of open) {
             if (
                 thread.session === undefined ||
                 thread.run.reportedAt === undefined ||
-                thread.run.reportBlocked !== undefined
+                (thread.run.reportBlocked !== undefined && thread.run.reportAsks !== undefined)
             ) {
                 continue;
             }
@@ -10725,15 +10753,36 @@ export default function createDesk(host: Host, web: Web) {
                 }
             }
 
-            // A thread from before `run.reportBlocked` existed: its newest stored report sets the flag now, once. No
-            // report is `false`. A key that is not here is a failed read: the flag stays absent, and the thread waits.
-            // `run.reportAsks` comes from the same report: it says whether the report asks Brian by itself.
-            if (thread.run.reportBlocked === undefined) {
-                const report = facts.reports?.[thread.id];
+            // A thread from before `run.reportBlocked` or `run.reportAsks` existed: its newest stored report sets the
+            // flags now, once. No report is `false`. A key that is not here is a failed read: the flags stay as they
+            // are, and the thread waits. The report's own asks decide its text, as a new report's do: a filed ask, or a
+            // refused one, holds the thread by itself. A stored report keeps no `status`, so a `true` never goes back to
+            // `false`; but a report that asks him turns the hold into `report asks Brian`.
+            const report = facts.reports?.[thread.id];
 
-                if (report !== undefined) {
-                    thread.run.reportBlocked = report === null ? false : reportBlocks(report.text);
-                    thread.run.reportAsks = report === null ? false : reportAsksBrian(report.text);
+            if (report !== undefined) {
+                const asked =
+                    report !== null &&
+                    thread.asks.some((ask) => ask.key?.startsWith(`${report.key}:ask:`) === true);
+                const refused =
+                    report !== null &&
+                    thread.events.some((event) =>
+                        event.key.startsWith(`ask-refused:${report.key}:`),
+                    );
+
+                if (thread.run.reportAsks === undefined) {
+                    thread.run.reportAsks =
+                        report === null
+                            ? false
+                            : refused || (!asked && reportAsksBrian(report.text));
+                }
+
+                if (thread.run.reportBlocked === undefined) {
+                    thread.run.reportBlocked =
+                        report === null ? false : refused || (!asked && reportBlocks(report.text));
+                } else {
+                    thread.run.reportBlocked =
+                        thread.run.reportBlocked === true || thread.run.reportAsks === true;
                 }
             }
 

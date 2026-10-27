@@ -978,8 +978,8 @@ function askOptions(item: string): { question: string; options: string[] } | und
  * to the first blank line, with its list mark removed. Lines in fenced code are not read. An item that starts with
  * `none`, `nothing`, or `no` is left out, and so is a plain merge, install, tag, or review request with no choice, so
  * `ASKS FOR BRIAN: none` gives []. An item that ends with `[a | b]` gives its options, and the text before them is the
- * question. Undefined when there is no such line, or when there are more than 4 items: the text alone holds the thread
- * then.
+ * question: its options are a choice, so the merge rule leaves it in. Undefined when there is no such line, or when
+ * there are more than 4 items: the text alone holds the thread then.
  */
 export function asksForBrian(text: string): { question: string; options?: string[] }[] | undefined {
     const lines = withoutFences(text);
@@ -1020,11 +1020,17 @@ export function asksForBrian(text: string): { question: string; options?: string
     const asks: { question: string; options?: string[] }[] = [];
 
     for (const item of items) {
-        if (NO_ASK_ITEM.test(item) || (ROUTINE_ASK.test(item) && !ASK_CHOICE.test(item))) {
+        if (NO_ASK_ITEM.test(item)) {
             continue;
         }
 
+        // The options come first: a pick-one is a decision, also when its question holds a merge, an install, a tag, or
+        // a review.
         const choice = askOptions(item);
+
+        if (choice === undefined && ROUTINE_ASK.test(item) && !ASK_CHOICE.test(item)) {
+            continue;
+        }
 
         asks.push(choice ?? { question: item });
     }
