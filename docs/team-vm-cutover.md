@@ -32,15 +32,17 @@ console, or a choice). Every other step runs as the `team` user on the VM, unles
 Teg's fleet runbook (`fleet` repository, `docs/team-vm.md`, thread T330) sets these; this runbook uses them as
 agreed with Teg on 2026-10-27. When fleet changes one, fleet wins.
 
-| Name        | Value                                                                                                              | Who sets it                                      |
-| ----------- | ------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------ |
-| VM          | Incus project `team`, instance `team` on minideb; guest hostname `team`                                            | Teg, fleet                                       |
-| LAN address | `10.0.1.176`, a UniFi DHCP reservation for the MAC that fleet pins                                                 | **Brian:** the reservation                       |
-| Tailscale   | node `pocket`; Pocket at `https://pocket.goat-snake.ts.net`                                                        | **Brian:** `sudo tailscale up --hostname=pocket` |
-| team user   | `team`, home `/var/home/team`, no sudo, group `kvm`, linger on                                                     | Teg, fleet                                       |
-| admin user  | `fleet` (sudo); every `sudo` line below runs as `fleet` (`ssh fleet@10.0.1.176`), by Brian or Teg                  | Teg, fleet                                       |
-| `TAG`       | the Pocket release framework runs at the cut-over: `git -C ~/projects/pi-pocket describe --tags` (`v0.25.0` today) | framework                                        |
-| `DATE`      | the cut-over date, `YYYY-MM-DD`                                                                                    |                                                  |
+| Name        | Value                                                                                                                                                                                                         | Who sets it                                      |
+| ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------ |
+| VM          | Incus project `team`, instance `team` on minideb; guest hostname `team`                                                                                                                                       | Teg, fleet                                       |
+| LAN address | `10.0.1.176`, a UniFi DHCP reservation for the MAC that fleet pins                                                                                                                                            | **Brian:** the reservation                       |
+| Tailscale   | node `pocket`; Pocket at `https://pocket.goat-snake.ts.net`                                                                                                                                                   | **Brian:** `sudo tailscale up --hostname=pocket` |
+| team user   | `team`, home `/var/home/team`, no sudo, group `kvm`, linger on                                                                                                                                                | Teg, fleet                                       |
+| admin user  | `fleet` (sudo); every `sudo` line below runs as `fleet` through `$TEAM_SSH`, by Brian or Teg                                                                                                                  | Teg, fleet                                       |
+| `$TEAM_SSH` | fleet's admin access (fleet `docs/team-vm.md`, "Where commands run"): run on framework in the fleet checkout; the fleet automation key, user `fleet`, the pinned host key file `ansible/ssh/team_known_hosts` | Teg, fleet                                       |
+| as `team`   | in the guest: `$TEAM_SSH -t sudo -iu team` (a shell), or `$TEAM_SSH sudo -iu team <command>`                                                                                                                  | Teg, fleet                                       |
+| `TAG`       | the Pocket release framework runs at the cut-over: `git -C ~/projects/pi-pocket describe --tags` (`v0.25.0` today)                                                                                            | framework                                        |
+| `DATE`      | the cut-over date, `YYYY-MM-DD`                                                                                                                                                                               |                                                  |
 
 ## Layout on the VM
 
@@ -59,10 +61,12 @@ agreed with Teg on 2026-10-27. When fleet changes one, fleet wins.
 
 ## 0. Hand-over from Teg (before this runbook)
 
-Teg's fleet work ends when these hold. Check each one; stop if one fails.
+Teg's fleet work ends when these hold. Check each one; stop if one fails. On framework, in the fleet checkout, set
+`$TEAM_SSH` as fleet's runbook says (step "Where commands run"), and `FLEET_SSH="${TEAM_SSH% *}"` (the same command without its
+last word `fleet@10.0.1.176`; rsync needs it in step 4). Then open a shell as `team` with `$TEAM_SSH -t sudo -iu team`, and
+run there:
 
 ```sh
-ssh team@10.0.1.176 true                 # the team user can ssh
 for h in selfie minideb caddy; do ssh -o BatchMode=yes $h true && echo $h ok; done
 id -nG | tr ' ' '\n' | grep -x sudo || echo no-sudo   # no-sudo
 node -v                                  # v24.22.1 or newer, /usr/local/bin/node (fleet)
@@ -134,10 +138,23 @@ keys have no passphrase: after a reboot nobody is there to unlock them. Their fi
 
     (Where `mise` was already on `PATH`, use that one instead of `~/.local/bin/mise`.) Then:
 
-    **Brian:** create the TrueNAS user and its role-bound API key in the TrueNAS UI (Teg's NAS step names the role).
-    Write `~/projects/truenas-mcp/.envrc` (git ignores it; mode `0600`) with `TRUENAS_HOST` and `TRUENAS_API_KEY`
-    for that key. `~/.pi/agent/mcp.json` reads it from there, by the same path as on framework, so its entry needs no
-    change. Never paste the key in a chat or a command line.
+    **Brian:** write the TrueNAS API key to the VM now, after the clone. Fleet's step 12 created the TrueNAS user `team`,
+    its privilege and the key, but wrote the key nowhere, because this folder did not exist then. As `team`
+    (`$TEAM_SSH -t sudo -iu team`), with the key on the terminal's input, never in a command line:
+
+    ```sh
+    umask 077
+    cat > ~/projects/truenas-mcp/.envrc     # type or paste the 2 lines, then Ctrl+D:
+                                            #   export TRUENAS_HOST=<the NAS address>
+                                            #   export TRUENAS_API_KEY=<the key>
+    chmod 600 ~/projects/truenas-mcp/.envrc
+    stat -c '%a %U' ~/projects/truenas-mcp/.envrc   # 600 team
+    git -C ~/projects/truenas-mcp check-ignore -q .envrc && echo ignored   # ignored
+    ```
+
+    `~/.pi/agent/mcp.json` reads the file by the same path as on framework, so its entry needs no change. Never paste
+    the key in a chat. The read-only check is 1 call in step 8 ("truenas MCP"). Undo: **Brian:** revokes the key in
+    TrueNAS, then `rm ~/projects/truenas-mcp/.envrc`. The daily backup captures this file (fleet names it by path).
 
 5. **The browser tool.** Install Playwright's Chromium for the team user (Snow carries its libraries):
 
@@ -319,20 +336,20 @@ Go on only after `STOPPED`. From here, framework's `~/.pi-pocket` must not start
 
 ## 4. Copy to the VM
 
-**Brian:** run these on framework, with an ssh login as `team@10.0.1.176` (his own key, for the copy only). They copy
-4 folders. They never copy Brian's `~/.ssh`, `~/.config/gh`, `~/.config/gh-machines`, `~/.config/pi-pocket-agents`,
+**Brian:** run these on framework, in the fleet checkout, with `FLEET_SSH` from step 0. They log in as `fleet` and
+write as `team` (`sudo -u team rsync` on the VM), so the files belong to `team`. They copy 4 folders. They never copy Brian's `~/.ssh`, `~/.config/gh`, `~/.config/gh-machines`, `~/.config/pi-pocket-agents`,
 `~/.pi/agent/sessions` (Pi CLI only), or `harness.lock*`.
 
 ```sh
 set -e    # stop at the first failed copy
-ssh team@10.0.1.176 'mkdir -p .pi-pocket .pi/agent .config/pi-pocket-team agents/odrade'
-rsync -a --exclude 'harness.lock*' ~/.pi-pocket/ team@10.0.1.176:.pi-pocket/
-rsync -a --exclude sessions/ ~/.pi/agent/ team@10.0.1.176:.pi/agent/
-rsync -a ~/.config/pi-pocket-team/ team@10.0.1.176:.config/pi-pocket-team/
-rsync -a ~/projects/odrade/ team@10.0.1.176:agents/odrade/
+$TEAM_SSH sudo -iu team mkdir -p .pi-pocket .pi/agent .config/pi-pocket-team agents/odrade
+rsync -a -e "$FLEET_SSH" --rsync-path="sudo -u team rsync" --exclude 'harness.lock*' ~/.pi-pocket/ fleet@10.0.1.176:/var/home/team/.pi-pocket/
+rsync -a -e "$FLEET_SSH" --rsync-path="sudo -u team rsync" --exclude sessions/ ~/.pi/agent/ fleet@10.0.1.176:/var/home/team/.pi/agent/
+rsync -a -e "$FLEET_SSH" --rsync-path="sudo -u team rsync" ~/.config/pi-pocket-team/ fleet@10.0.1.176:/var/home/team/.config/pi-pocket-team/
+rsync -a -e "$FLEET_SSH" --rsync-path="sudo -u team rsync" ~/projects/odrade/ fleet@10.0.1.176:/var/home/team/agents/odrade/
 ```
 
-On the VM, check the database copy before anything opens it:
+On the VM, as `team`, check the database copy before anything opens it:
 
 ```sh
 node -e 'const {DatabaseSync}=require("node:sqlite"); const db=new DatabaseSync(process.env.HOME+"/.pi-pocket/pocket.sqlite",{readOnly:true}); console.log(db.prepare("pragma integrity_check").get())'   # ok
@@ -415,9 +432,11 @@ sudo systemctl start pi-pocket@local          # start only, not enabled yet
 sudo journalctl -u pi-pocket@local -n 50 --no-pager
 ```
 
-**Brian:** sign in as the owner. On his own computer (not on the VM), open a tunnel and keep it open:
-`ssh -L 8787:127.0.0.1:8787 fleet@10.0.1.176`. In a second terminal there, read the link:
-`ssh fleet@10.0.1.176 "sudo journalctl -u pi-pocket@local | grep -o 'http://127.0.0.1:8787/login?token=[^ ]*' | tail -1"`.
+**Brian:** sign in as the owner, on framework (the computer with the fleet key), not on the VM. In a terminal in the
+fleet checkout, define `TEAM_SSH` as in step 0, then open a tunnel and keep it open:
+`$TEAM_SSH -N -L 8787:127.0.0.1:8787`. In a second terminal, in the fleet checkout, define `TEAM_SSH` again (a new
+shell does not have it), then read the link:
+`$TEAM_SSH "sudo journalctl -u pi-pocket@local | grep -o 'http://127.0.0.1:8787/login?token=[^ ]*' | tail -1"`.
 Open it in his browser on that computer. Do not paste the link in a chat. Then run the checks in step 8. When a check
 fails, stop and use the rollback.
 
@@ -506,16 +525,60 @@ Any time before step 11, and with framework's data unchanged since step 3:
    then `pocket-start`.
 4. Re-make the schedules on framework in their old sessions, from `plans/schedules-DATE.md` (step 2 cancelled them
    there too).
-5. What does not go back: the VM's database cannot go back to framework (its paths and its homes are new). So the
+5. The TrueNAS key: if the VM does not come back, **Brian:** revokes the key in TrueNAS and deletes
+   `~team/projects/truenas-mcp/.envrc`. framework keeps its own NAS access as before.
+6. What does not go back: the VM's database cannot go back to framework (its paths and its homes are new). So the
    sessions, desk threads, lessons, schedules and provider sign-ins made on the VM, the agent homes, and Odrade's desk
    commits made there stay on the VM only. Work pushed to GitHub (PRs, issues) is safe. Before anything removes
    them, keep a copy of the stopped VM's data: as `team`,
    `tar -C ~ -czf ~/vm-after-cutover-DATE.tgz .pi-pocket .pi/agent .config/pi-pocket-team agents`, and copy the file
    to framework. Bring Odrade's desk commits back with `git fetch` from that copy. **Brian:** decides what else to keep.
 
-To retry the VM later: keep the copy of step 5 first. Then restore the snapshot
+To retry the VM later: keep the copy of step 6 first. Then restore the snapshot
 (`incus snapshot restore --project team team pre-cutover-DATE` on minideb; it deletes everything made on the VM after
 the snapshot), and start again at step 2.
+
+After a restore or a rebuild of the VM (fleet's "Rebuild" section, also for a key rotation), go on from the step
+that the restore leaves:
+
+- A VM with no Pocket data, before the cut-over: start again at step 1.
+- A restored Incus snapshot from before the cut-over: start at step 2.
+- **A VM rebuilt from the daily backup, after the cut-over** (the backup holds `.pi-pocket`, `.pi/agent`,
+  `.config/pi-pocket-team`, `agents` and `projects/truenas-mcp/.envrc`, but no checkouts): the restored data is newer
+  than framework's copy, so **skip steps 2, 3 and 4** (no drain, no stop on framework, no copy), and never copy
+  framework's data over it. Framework stays stopped (one server only). As `team`, then as `fleet` where it says so:
+    1. `TAG` is the field `pocket_version` of the backup's `manifest.json`
+       (`python3 -c 'import json; print(json.load(open("manifest.json"))["pocket_version"])'`). Pocket must run at this
+       tag or newer, never older. When it is `null`, **Brian:** decides the tag; stop until then.
+    2. Step 1 without its data. The restored `.envrc` makes `~/projects/truenas-mcp` a folder that is not empty, so
+       clone it beside and move the file in:
+
+        ```sh
+        cd ~/projects
+        gh repo clone bketelsen/truenas-mcp truenas-mcp.new
+        mv truenas-mcp/.envrc truenas-mcp.new/.envrc && rmdir truenas-mcp && mv truenas-mcp.new truenas-mcp
+        stat -c '%a %U' truenas-mcp/.envrc     # 600 team
+        ```
+
+        Do the other parts of step 1 as written (Pocket at `TAG`, the drop-ins, the profile repositories, the truenas
+        build, Chromium, Tailscale, the unit). Skip the key write in step 1.4: the file is restored.
+
+    3. Step 5 (the links).
+    4. Check that step 6's rewrites are in the restored active files. The `.bak` copies of step 6 keep the old paths
+       on purpose, so leave them out:
+       `grep -rn --exclude='*.bak' /var/home/bjk ~/.config/pi-pocket-team ~/.pi/agent/prompts ~/.pi/agent/trust.json`
+       finds nothing.
+    5. As `fleet`, start and enable the instance that ran before (`tailscale-serve` after go-live; fleet's rebuild
+       installs the unit but enables nothing), and keep the other one stopped and disabled:
+
+        ```sh
+        sudo systemctl disable --now pi-pocket@local
+        sudo systemctl enable --now pi-pocket@tailscale-serve
+        systemctl is-enabled pi-pocket@tailscale-serve pi-pocket@local    # enabled, disabled
+        ```
+
+    6. The checks of step 8. The sign-in link and the cookies stay valid (the owner token is in the restored
+       `config.json`), when the Tailscale name `pocket` is the same.
 
 ## Not in this runbook
 
