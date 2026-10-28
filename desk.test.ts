@@ -121,6 +121,12 @@ import {
     parseCheckWhen,
     fromAddress,
     quietSilence,
+    quietWakeOf,
+    quietWake,
+    quietTrigger,
+    markHandled,
+    handledAfter,
+    dropHandled,
     watchDueAt,
     watchWhen,
     recordResult,
@@ -2678,6 +2684,214 @@ describe("a quiet session after a supervisor's message", () => {
             ).close,
             false,
             "a watch",
+        );
+    });
+});
+
+describe("a handled report and a quiet wake", () => {
+    /** A closed done thread, closed at 1000: a report at 900 is before it, and one at 1001 is after it. */
+    const done = (run: Record<string, JsonValue> = {}, patch: Partial<Thread> = {}): Thread =>
+        thread({
+            state: "closed",
+            closed: { at: 1000, why: "done", by: "sweep" },
+            run: { lastUserEntry: 6, otherUserEntry: 5, dirty: 1, ahead: 2, ...run },
+            ...patch,
+        });
+
+    test("handledAfter is true at and after the mark, and false before it, with a safe read", () => {
+        const marked = thread({ run: { handled: { at: 500, by: "Odrade", act: "send" } } });
+
+        assert.equal(handledAfter(marked, 400), true);
+        assert.equal(handledAfter(marked, 500), true, "a report at the mark's time is handled");
+        assert.equal(handledAfter(marked, 501), false, "a report after the mark is not");
+        assert.equal(handledAfter(thread(), 0), false, "no mark");
+        assert.equal(handledAfter(thread({ run: { handled: "x" } }), 0), false, "a bad mark");
+        assert.equal(handledAfter(thread({ run: { handled: null } }), 0), false, "a null mark");
+        assert.equal(
+            handledAfter(thread({ run: { handled: { at: "5", by: "a", act: "send" } } }), 0),
+            false,
+            "a mark with text for a time",
+        );
+        assert.equal(
+            handledAfter(thread({ run: { handled: { at: 5, by: "a" } } }), 0),
+            false,
+            "a mark with no act",
+        );
+    });
+
+    test("markHandled keeps the newest action, and an older one never replaces it", () => {
+        const marked = thread();
+
+        assert.equal(markHandled(marked, { at: 100, by: "Odrade", act: "ask" }), true);
+        assert.deepEqual(marked.run.handled, { at: 100, by: "Odrade", act: "ask" });
+        assert.equal(markHandled(marked, { at: 200, by: "Odrade", act: "send" }), true);
+        assert.deepEqual(marked.run.handled, { at: 200, by: "Odrade", act: "send" });
+        assert.equal(markHandled(marked, { at: 150, by: "Odrade", act: "answer" }), false, "older");
+        assert.equal(
+            markHandled(marked, { at: 200, by: "Odrade", act: "result" }),
+            false,
+            "the same time",
+        );
+        assert.deepEqual(marked.run.handled, { at: 200, by: "Odrade", act: "send" });
+
+        // A mark of another shape is replaced: the newest action wins.
+        const odd = thread({ run: { handled: { at: "5" } } });
+
+        assert.equal(markHandled(odd, { at: 10, by: "Odrade", act: "watch" }), true);
+        assert.deepEqual(odd.run.handled, { at: 10, by: "Odrade", act: "watch" });
+    });
+
+    test("the Clerk's items lose a handled report or shift, and keep every other item", () => {
+        const handled = thread({
+            id: "T1",
+            run: { handled: { at: 500, by: "Odrade", act: "send" } },
+        });
+        const open = thread({ id: "T2" });
+        const state: DeskState = { ...empty(), threads: { T1: handled, T2: open } };
+        const item = (threadId: string, kind: DigestKind, at: number): DigestItem => ({
+            key: `${threadId}:${kind}:${String(at)}`,
+            thread: threadId,
+            kind,
+            line: "[desk] a line",
+            at,
+        });
+
+        assert.deepEqual(
+            dropHandled(
+                [
+                    item("T1", "report", 400),
+                    item("T1", "shift", 500),
+                    item("T1", "report", 501),
+                    item("T2", "report", 400),
+                    item("T1", "closed", 400),
+                    item("T1", "answer", 400),
+                    item("T9", "report", 400),
+                ],
+                state,
+            ).map((each) => `${each.thread}:${each.kind}:${String(each.at)}`),
+            ["T1:report:501", "T2:report:400", "T1:closed:400", "T1:answer:400", "T9:report:400"],
+        );
+        assert.equal(
+            dropHandled([item("T1", "report", 400)], undefined).length,
+            1,
+            "no state: nothing to drop",
+        );
+        assert.deepEqual(dropHandled([], state), []);
+    });
+
+    test("desk read shows the Handled line right after Closed, and no other time", () => {
+        const mark = { at: 500, by: "Odrade", act: "send" };
+        const marked = done({ reportedAt: 400, handled: mark });
+        const text = readText({ ...empty(), threads: { T1: marked } }, "T1") ?? "";
+
+        assert.match(
+            text,
+            /^Closed: .*\nHandled: .* · by Odrade · desk send · after the newest report: no escalation for it$/m,
+        );
+        // The mark is older than the newest report: no line.
+        assert.doesNotMatch(
+            readText(
+                { ...empty(), threads: { T1: done({ reportedAt: 600, handled: mark }) } },
+                "T1",
+            ) ?? "",
+            /^Handled:/m,
+        );
+        // No report at all: no line.
+        assert.doesNotMatch(
+            readText({ ...empty(), threads: { T1: done({ handled: mark }) } }, "T1") ?? "",
+            /^Handled:/m,
+        );
+        // A report at the mark's time is handled: the line is there.
+        assert.match(
+            readText(
+                { ...empty(), threads: { T1: done({ reportedAt: 500, handled: mark }) } },
+                "T1",
+            ) ?? "",
+            /^Handled:/m,
+        );
+    });
+
+    test("quietWakeOf reads a mark, and rejects another shape", () => {
+        assert.deepEqual(quietWakeOf(done({ quietWake: { at: 900, entry: 5 } })), {
+            at: 900,
+            entry: 5,
+        });
+        assert.equal(quietWakeOf(done()), undefined, "no mark");
+        assert.equal(quietWakeOf(done({ quietWake: "x" })), undefined);
+        assert.equal(quietWakeOf(done({ quietWake: { at: 900 } })), undefined, "no entry");
+        assert.equal(quietWakeOf(done({ quietWake: { at: "900", entry: 5 } })), undefined);
+        assert.equal(quietWakeOf(done({ quietWake: [1, 2] })), undefined);
+        assert.equal(quietWakeOf(done({ quietWake: null })), undefined);
+    });
+
+    test("a wake is quiet only when the supervisor's message is the only new entry", () => {
+        assert.equal(quietWake(done(), 5), true);
+        assert.equal(quietWake(done({ lastUserEntry: 5 }), 5), false, "no new entry");
+        assert.equal(quietWake(done(), 6), false, "the base is the newest entry");
+        assert.equal(quietWake(done({ otherUserEntry: 6 }), 5), false, "another's message");
+        assert.equal(
+            quietWake(done({ otherUserEntry: 5 }), 5),
+            true,
+            "another's entry at the base",
+        );
+        assert.equal(quietWake(done({ otherUserEntry: 4 }), 5), true, "another's entry before it");
+        assert.equal(
+            quietWake(done({ otherUserEntry: undefined }), 5),
+            false,
+            "no other entry known",
+        );
+        assert.equal(quietWake(done(), undefined), false, "no base");
+        assert.equal(quietWake(done({ lastUserEntry: undefined }), 5), false, "no entry seen");
+    });
+
+    test("a report after the close opens a quiet thread; one at or before it does not", () => {
+        const wake = { quietWake: { at: 1200, entry: 5 } };
+
+        assert.equal(
+            quietTrigger(done({ ...wake, reportedAt: 1001 }), null, new Set()),
+            "a report after a supervisor message",
+        );
+        assert.equal(
+            quietTrigger(done({ ...wake, reportedAt: 1000 }), null, new Set()),
+            undefined,
+            "a report at the close is before the wake",
+        );
+        assert.equal(quietTrigger(done({ ...wake, reportedAt: 900 }), null, new Set()), undefined);
+        assert.equal(quietTrigger(done({ ...wake }), null, new Set()), undefined, "no report");
+    });
+
+    test("folder work above the counts at the close opens it, and another thread's folder does not", () => {
+        const wake = { quietWake: { at: 1200, entry: 5 } };
+        const work = "work in its folder after a supervisor message";
+
+        assert.equal(quietTrigger(done(wake), { dirty: 2, ahead: 2 }, new Set()), work);
+        assert.equal(quietTrigger(done(wake), { dirty: 1, ahead: 3 }, new Set()), work);
+        assert.equal(
+            quietTrigger(done(wake), { dirty: 1, ahead: 2 }, new Set()),
+            undefined,
+            "the counts at the close",
+        );
+        assert.equal(quietTrigger(done(wake), { dirty: 0, ahead: 0 }, new Set()), undefined);
+        assert.equal(
+            quietTrigger(done(wake), { dirty: 5 }, new Set(["/work/test"])),
+            undefined,
+            "another open thread works there",
+        );
+        assert.equal(
+            quietTrigger(done(wake), { dirty: 5, statusFailed: true }, new Set()),
+            undefined,
+            "a failed read",
+        );
+        assert.equal(quietTrigger(done(wake), null, new Set()), undefined, "no read");
+        assert.equal(
+            quietTrigger(done(wake, { cwd: undefined }), { dirty: 5 }, new Set()),
+            undefined,
+            "no folder",
+        );
+        assert.equal(
+            quietTrigger(done({ ...wake, ahead: undefined }), { dirty: 1 }, new Set()),
+            undefined,
+            "an unknown unpushed count is no work by itself",
         );
     });
 });
@@ -7579,6 +7793,18 @@ const model = scriptedModel((request) => {
         return call("team_message", { to: quietAddress, message: "Thanks, noted." });
     }
 
+    // A supervisor's message that the agent answers with a report, in a done thread's session.
+    if (text.endsWith("message to agent with report test")) {
+        return call("team_message", {
+            to: quietAddress,
+            message: "Thanks. Send me a report when the merge is done.",
+        });
+    }
+
+    if (text.includes("Send me a report when the merge is done.")) {
+        return call("team_message", { to: linkedAddressOf(request), message: LONG_REPORT });
+    }
+
     if (text.endsWith("message elsewhere test")) {
         return call("team_message", { to: otherAddress, message: OTHER_REPORT });
     }
@@ -7621,6 +7847,14 @@ const model = scriptedModel((request) => {
             action: "send",
             thread: sendThreadId,
             text: "Send the after-merge check to your agent.",
+        });
+    }
+
+    if (text.endsWith("desk send handled test")) {
+        return call("desk", {
+            action: "send",
+            thread: sendThreadId,
+            text: "Check the merge.",
         });
     }
 
@@ -12417,7 +12651,7 @@ describe("the desk in a Pi Pocket", () => {
         return made;
     };
 
-    test("a supervisor's message to a done session, with no report after it, closes the thread again", async () => {
+    test("a supervisor's message to a done session keeps the thread closed, with a quiet-wake mark", async () => {
         const { source, linked, thread } = await closedDone("quiet-close");
 
         quietAddress = thread.address ?? "";
@@ -12428,25 +12662,28 @@ describe("the desk in a Pi Pocket", () => {
         await say(app, source, "desk sync test");
 
         const back = (await deskState())?.threads[thread.id];
+        const mark = back?.run.quietWake as { at?: number; entry?: number } | undefined;
 
-        assert.equal(back?.state, "open", "the message reopened it");
+        assert.equal(back?.state, "closed", "the message alone does not reopen it");
+        assert.equal(back?.closed?.why, "done");
+        assert.equal(typeof mark?.at, "number");
+        assert.equal(typeof mark?.entry, "number");
+        assert.equal(back?.run.quietReopen, undefined, "the new code sets no quiet reopen");
         assert.match(
             back?.events.map((event) => event.text).join("; ") ?? "",
-            /reopened: new work in its session/,
+            /a supervisor message woke its session: it stays closed until a report, folder work or a PR/,
         );
-        assert.equal(typeof (back?.run.quietReopen as { at?: number } | undefined)?.at, "number");
 
-        // The agent is idle and did not report: the next sweep closes it again.
+        // A later sweep adds no second mark and no second event.
         await say(app, source, "desk sync test");
 
         const again = (await deskState())?.threads[thread.id];
 
         assert.equal(again?.state, "closed");
-        assert.equal(again?.closed?.why, "done");
-        assert.equal(again?.run.quietReopen, undefined);
-        assert.match(
-            again?.events.at(-1)?.text ?? "",
-            /^closed again: completed \(no PRs\); no new report after a supervisor message$/,
+        assert.deepEqual(again?.run.quietWake, back?.run.quietWake);
+        assert.equal(
+            (again?.events ?? []).filter((event) => event.key.startsWith("quiet-wake:")).length,
+            1,
         );
     });
 
@@ -12466,9 +12703,9 @@ describe("the desk in a Pi Pocket", () => {
         const back = (await deskState())?.threads[thread.id];
 
         assert.equal(back?.run.otherUserEntry, before, "migrated before the new entries counted");
-        assert.equal(back?.state, "open");
+        assert.equal(back?.state, "closed");
         assert.equal(
-            (back?.run.quietReopen as { entry?: number } | undefined)?.entry,
+            (back?.run.quietWake as { entry?: number } | undefined)?.entry,
             before,
             "the supervisor's message after the migration is quiet",
         );
@@ -12490,6 +12727,77 @@ describe("the desk in a Pi Pocket", () => {
         assert.equal(stays?.state, "open", "the person's message makes the silence count");
         assert.equal(stays?.run.quietReopen, undefined);
         assert.equal(stays?.run.next, "odrade");
+    });
+
+    test("a report after a quiet wake reopens the thread, with its reason", async () => {
+        const { source, linked, thread } = await closedDone("quiet-report");
+
+        quietAddress = thread.address ?? "";
+        // The supervisor's message wakes the agent, and the agent reports in the same turn: a report after the close.
+        await say(app, source, "message to agent with report test");
+        await until(() => !app.isBusy(linked), "the agent's turn", 20_000);
+        await say(app, source, "desk sync test");
+
+        const quiet = (await deskState())?.threads[thread.id];
+
+        assert.equal(quiet?.state, "closed", "the wake is quiet");
+        assert.equal(
+            typeof (quiet?.run.quietWake as { at?: number } | undefined)?.at,
+            "number",
+            "the mark is new",
+        );
+        assert.equal(typeof quiet?.run.reportedAt, "number");
+
+        // The next sweep checks the triggers: the report is after the close.
+        await say(app, source, "desk sync test");
+
+        const back = (await deskState())?.threads[thread.id];
+
+        assert.equal(back?.state, "open", "the report opens it again");
+        assert.equal(back?.run.quietWake, undefined, "a reopen deletes the mark");
+        assert.match(
+            back?.events.map((event) => event.text).join("; ") ?? "",
+            /reopened: a report after a supervisor message/,
+        );
+    });
+
+    test("a supervisor's desk send after a report marks the thread handled, and desk read shows it", async () => {
+        const { source, linked, thread } = await delegated("handled-send");
+
+        try {
+            await say(app, linked, "report to supervisor test");
+            await until(() => !app.isBusy(linked), "the report's turn", 20_000);
+
+            const filed = (await deskState())?.threads[thread.id];
+
+            assert.equal(typeof filed?.run.reportedAt, "number");
+            assert.equal(filed?.run.handled, undefined, "no mark before the send");
+
+            sendThreadId = thread.id;
+            await say(app, source, "desk send handled test");
+            await until(
+                async () => (await deskState())?.threads[thread.id]?.run.handled !== undefined,
+                "the handled mark",
+                20_000,
+            );
+
+            const marked = (await deskState())?.threads[thread.id];
+            const handled = marked?.run.handled as { at?: number; by?: string; act?: string };
+
+            assert.equal(handled.act, "send");
+            assert.equal(handled.by, "Odrade");
+            assert.equal(
+                handledAfter(marked as Thread, filed?.run.reportedAt as number),
+                true,
+                "the mark is after the newest report",
+            );
+            assert.match(
+                readText(await deskState(), thread.id) ?? "",
+                /^Handled: .* · by Odrade · desk send · after the newest report: no escalation for it$/m,
+            );
+        } finally {
+            sendThreadId = "";
+        }
     });
 
     test("the export writes the desk's files, and writes only what changed", async () => {
@@ -13800,6 +14108,10 @@ describe("the desk in a Pi Pocket", () => {
                 "the first sweep",
                 20_000,
             );
+
+            // Every other supervisor's first sweep must finish: a sweeper that closes a thread later would move the
+            // count under this test's baseline.
+            await until(sweepersAsleep, "the sweepers to sleep", 20_000);
 
             const before = capView(await deskState(), 100, Date.now()).counted;
 
@@ -16435,6 +16747,123 @@ describe("the desk in a Pi Pocket", () => {
                 assert.deepEqual(after?.items, [], "the box is empty after the digest");
                 assert.equal(typeof after?.sentAt, "number");
             } finally {
+                await stopDigests();
+                await quiet([]);
+                shift = 0;
+                digestOff();
+            }
+        });
+
+        test("the Clerk's digest leaves out a report that the supervisor handled, and keeps one she did not", async () => {
+            digestOn();
+
+            const clerkFolder = join(root, "digest-handled-clerk");
+            let clerkSession: ConversationId | undefined;
+            let unhandledId = "";
+
+            try {
+                const { source, linked, thread } = await delegated("digest-handled");
+
+                mkdirSync(clerkFolder, { recursive: true });
+                clerkSession = await newSession(app, clerkFolder);
+                await until(
+                    async () =>
+                        typeof (await deskState())?.threads[thread.id]?.run.sweptAt === "number",
+                    "the first sweep",
+                    20_000,
+                );
+                await until(() => !app.isBusy(linked), "the linked session to settle", 20_000);
+
+                // The first sweep's queue item is not this test's news.
+                await app.harness.commit(async (tx) => {
+                    delete (await tx.doc(DeskThreads)).digests;
+                }, context);
+
+                // The agent's report starts the digest task: its item is the one that the supervisor handles below.
+                await say(app, linked, "report to supervisor test");
+                await until(() => !app.isBusy(linked), "the report's turn", 20_000);
+
+                // A Clerk, and a report that no supervisor handles: its item must reach the Clerk.
+                await app.harness.commit(async (tx) => {
+                    const state = await tx.doc(DeskThreads);
+                    const now = Date.now();
+                    const opened = openThread(state, {
+                        key: "x.test.digest-handled-unhandled",
+                        supervisor: Number(source),
+                        agents: [],
+                        repo: "frostyard/test",
+                        title: "A report that no supervisor handled",
+                        at: now,
+                    });
+
+                    unhandledId = opened.thread.id;
+                    state.clerks = {
+                        [String(Number(source))]: {
+                            session: Number(clerkSession),
+                            address: "session-clerk",
+                            agent: "clerk",
+                            at: now,
+                        },
+                    };
+                    // The item of the report that no supervisor handles. Its time is no later than the task's own:
+                    // the task that the report started takes it too.
+                    enqueueDigest(
+                        state,
+                        Number(source),
+                        {
+                            key: `report:${unhandledId}`,
+                            thread: unhandledId,
+                            kind: "report",
+                            line: `[desk] ${unhandledId} frostyard/test · duncan reported (no supervisor action)`,
+                            at: now,
+                        },
+                        now,
+                        digestConfig({ minutes: 15 }),
+                    );
+                }, context);
+
+                // The supervisor's send: the report's item is handled after it went in.
+                sendThreadId = thread.id;
+                await say(app, source, "desk send handled test");
+                await until(
+                    async () => (await deskState())?.threads[thread.id]?.run.handled !== undefined,
+                    "the handled mark",
+                    20_000,
+                );
+                sendThreadId = "";
+
+                await quiet([thread.id, unhandledId]);
+                await restartApp(16 * 60_000, undefined);
+                digestOff();
+
+                await until(
+                    async () =>
+                        (await modelTexts(app, clerkSession as ConversationId))
+                            .join("\n")
+                            .includes(`[desk] ${unhandledId}`),
+                    "the Clerk's digest",
+                    20_000,
+                );
+
+                const clerkTexts = (await modelTexts(app, clerkSession as ConversationId)).join(
+                    "\n",
+                );
+
+                assert.match(clerkTexts, /\[desk\] digest: 1 new\./);
+                assert.doesNotMatch(
+                    clerkTexts,
+                    new RegExp(`\\[desk\\] ${thread.id} `),
+                    "the handled report stays out",
+                );
+                assert.equal(
+                    (await modelTexts(app, source)).filter((each) =>
+                        each.includes("[desk] digest:"),
+                    ).length,
+                    0,
+                    "the supervisor gets no digest of it",
+                );
+            } finally {
+                sendThreadId = "";
                 await stopDigests();
                 await quiet([]);
                 shift = 0;

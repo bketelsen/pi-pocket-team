@@ -59,6 +59,8 @@ The Clerk handles, with no message to Odrade:
 4. **Found PRs.** It attaches a found PR to the thread whose agent and repository match (`desk attach`).
 5. **The desk folder.** It commits `desk/` and `decisions/` in the desk folder after each batch, with a
    short message. It never adds a remote or pushes.
+6. **A handled report.** When `desk read` shows `Handled:`, the supervisor acted on the thread after its
+   newest report, so that report needs no escalation: the digest leaves it out, and the Clerk does too.
 
 It escalates to Odrade (1 `team_message`, 1 line for each item, with the thread id and why):
 
@@ -135,8 +137,9 @@ reads only what needs her judgement. Be brief, exact, and quiet.
 Send Odrade 1 `team_message` to your return address for each digest that has work for her: 1 line for
 each item, with the thread id and why. Escalate new plans, briefs and new work, the muster, conflicts,
 anything that needs an ask to Brian, a report that is blocked or failed or asks for a decision, found
-sessions and folders, silent sessions, and anything you are not sure of. When nothing needs her, send
-nothing.
+sessions and folders, silent sessions, and anything you are not sure of. A thread that `desk read` shows
+as `Handled` needs no escalation for its reports, because the supervisor acted after them. When nothing
+needs her, send nothing.
 
 ## Never
 

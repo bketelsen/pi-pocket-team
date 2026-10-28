@@ -243,8 +243,14 @@ export type Thread = {
      * address `returnAddress`: a person, or another session, wrote it; with an unknown address every entry counts), and
      * `quietReopen` (`{ at, entry }`: the sweep reopened a done thread for a message from the supervisor's address, with
      * no other new message: `at` is the sweep's time, `entry` the session's newest user entry before that message; a
-     * thread that stays quiet, with no report after it, may close again, see `quietSilence`), and `journaled` (when the
-     * thread's 1 journal entry went into the queue: a thread that reopens and closes again gets no second entry).
+     * thread that stays quiet, with no report after it, may close again, see `quietSilence`; a thread stored with it
+     * keeps that meaning, and a quiet wake now keeps the thread closed, see `quietWake`), `handled` (`{ at, by, act
+     * }`: the newest `desk` action of the supervisor on the thread, `at` its time, `by` its name, and `act` the action's
+     * name; a report filed at or before `at` needs no escalation, see `handledAfter`), `quietWake` (`{ at, entry }`: a
+     * sweep found a supervisor message that woke a done thread, and kept it closed: `at` is the sweep's time, `entry`
+     * the session's newest user entry before that message; a report, folder work or a PR after the wake opens the thread
+     * again, see `quietTrigger`), and `journaled` (when the thread's 1 journal entry went into the queue: a thread that
+     * reopens and closes again gets no second entry).
      */
     run: Record<string, JsonValue>;
     /** The last 50; `key` makes an event unique. */
@@ -1886,6 +1892,94 @@ export function quietSilence(thread: Thread): boolean {
     );
 }
 
+/** The event text of a quiet wake: the supervisor's message woke the session, and the thread stays closed. */
+const QUIET_WAKE_TEXT =
+    "a supervisor message woke its session: it stays closed until a report, folder work or a PR";
+
+/**
+ * The quiet-wake mark a sweep left on a closed done thread: `{ at, entry }`, the sweep's time and the session's newest
+ * user entry before the supervisor's message. Undefined when the thread has no mark, or the stored one has another
+ * shape.
+ */
+export function quietWakeOf(thread: Thread): { at: number; entry: number } | undefined {
+    const mark = thread.run.quietWake;
+
+    if (mark === null || typeof mark !== "object" || Array.isArray(mark)) {
+        return undefined;
+    }
+
+    const at = numberOr(mark.at);
+    const entry = numberOr(mark.entry);
+
+    return at === undefined || entry === undefined ? undefined : { at, entry };
+}
+
+/**
+ * Whether the new user entries of a thread came from its supervisor only: its newest entry is after `base`, and no other
+ * entry is. `base` is the quiet-wake mark's entry, or the newest entry the sweep saw before the supervisor's message. A
+ * base that is not known makes no quiet wake.
+ */
+export function quietWake(thread: Thread, base: number | undefined): boolean {
+    const last = numberOr(thread.run.lastUserEntry);
+    const other = numberOr(thread.run.otherUserEntry);
+
+    return (
+        base !== undefined &&
+        last !== undefined &&
+        last > base &&
+        other !== undefined &&
+        other <= base
+    );
+}
+
+/** What the sweep read of a folder: its counts, or why they are not known. */
+export type FolderCounts = {
+    dirty: number;
+    ahead?: number;
+    statusFailed?: true;
+    gone?: true;
+};
+
+/**
+ * Why a closed done thread with a quiet-wake mark opens again, in words: a report after it closed, or folder work above
+ * the counts it had when it closed. A folder that an open thread works in does not count, and neither does a folder
+ * whose counts the sweep could not read. A PR that came back is the caller's own rule.
+ */
+export function quietTrigger(
+    thread: Thread,
+    counts: FolderCounts | null | undefined,
+    otherFolders: ReadonlySet<string>,
+): string | undefined {
+    const closedAt = numberOr(thread.closed?.at);
+    const reportedAt = numberOr(thread.run.reportedAt);
+
+    if (closedAt !== undefined && reportedAt !== undefined && reportedAt > closedAt) {
+        return "a report after a supervisor message";
+    }
+
+    const folder = folderOf(thread);
+
+    if (folder === undefined || otherFolders.has(folder)) {
+        return undefined;
+    }
+
+    if (
+        counts === null ||
+        counts === undefined ||
+        counts.statusFailed === true ||
+        counts.gone === true
+    ) {
+        return undefined;
+    }
+
+    const dirty = numberOr(thread.run.dirty) ?? 0;
+    const ahead = numberOr(thread.run.ahead) ?? 0;
+
+    return counts.dirty > dirty || (counts.ahead ?? 0) > ahead
+        ? "work in its folder after a supervisor message"
+        : undefined;
+}
+
 /** What keeps a thread's session part open, in words. Undefined when it is closed. */
 function openSession(thread: Thread): string | undefined {
     if (thread.session === undefined && thread.address === undefined) {
@@ -2906,6 +3000,7 @@ export function repairReopen(thread: Thread, github: GitHubFacts, now: number): 
     thread.state = "open";
     delete thread.closed;
     delete thread.run.quietReopen;
+    delete thread.run.quietWake;
     recordRepair(thread, found.key, { to: "odrade", why: "closed" }, now);
     thread.run.next = nextActor(thread);
     addEvent(
@@ -3579,6 +3674,70 @@ export function digestText(items: readonly DigestItem[]): string {
         ...shown,
         ...(more === 0 ? [] : [`… and ${String(more)} more on the Desk page.`]),
     ].join("\n");
+}
+
+/** The handled mark of a thread: `{ at, by, act }`. Undefined when it has none, or the stored one has another shape. */
+function handledMark(thread: Thread): { at: number; by: string; act: string } | undefined {
+    const mark = thread.run.handled;
+
+    if (mark === null || typeof mark !== "object" || Array.isArray(mark)) {
+        return undefined;
+    }
+
+    const at = numberOr(mark.at);
+    const by = typeof mark.by === "string" ? mark.by : undefined;
+    const act = typeof mark.act === "string" ? mark.act : undefined;
+
+    return at === undefined || by === undefined || act === undefined ? undefined : { at, by, act };
+}
+
+/**
+ * Record that the supervisor acted on a thread at `at`, with `act` the action's name. A newer action replaces an older
+ * one, and an older one never replaces a newer one. True when the mark changed.
+ */
+export function markHandled(
+    thread: Thread,
+    action: { at: number; by: string; act: string },
+): boolean {
+    const had = handledMark(thread);
+
+    if (had !== undefined && had.at >= action.at) {
+        return false;
+    }
+
+    thread.run.handled = { at: action.at, by: action.by, act: action.act };
+
+    return true;
+}
+
+/**
+ * Whether the supervisor acted on a thread at or after `at`: a report filed at `at` needs no escalation then. False
+ * when the thread has no mark, or the stored one has another shape.
+ */
+export function handledAfter(thread: Thread, at: number): boolean {
+    const mark = handledMark(thread);
+
+    return mark !== undefined && mark.at >= at;
+}
+
+/**
+ * The Clerk's digest items without the reports that a supervisor handled: an item of kind `report` or `shift` leaves
+ * when its thread's handled mark is at or after the item's time. Every other item stays, and so does an item whose
+ * thread is gone.
+ */
+export function dropHandled(
+    items: readonly DigestItem[],
+    state: Readonly<DeskState> | undefined,
+): DigestItem[] {
+    return items.filter((item) => {
+        if (item.kind !== "report" && item.kind !== "shift") {
+            return true;
+        }
+
+        const thread = state?.threads[item.thread];
+
+        return thread === undefined || !handledAfter(thread, item.at);
+    });
 }
 
 /**
@@ -5057,6 +5216,7 @@ export function attachTo(
         target.state = "open";
         delete target.closed;
         delete target.run.quietReopen;
+        delete target.run.quietWake;
         addEvent(
             target,
             `reopened:${ref}:${String(now)}`,
@@ -7340,6 +7500,7 @@ export function addAsk(
         thread.state = "open";
         delete thread.closed;
         delete thread.run.quietReopen;
+        delete thread.run.quietWake;
         thread.run.next = nextActor(thread);
     }
 
@@ -8428,6 +8589,13 @@ export function readText(state: Readonly<DeskState> | undefined, id: string): st
 
     const prs = Object.entries(thread.prs);
     const events = thread.events.slice(-SHOWN_EVENTS);
+    // A report that the supervisor handled needs no escalation: the mark came at or after the newest report.
+    const reportedAt = numberOr(thread.run.reportedAt);
+    const handled = handledMark(thread);
+    const handledLine =
+        handled === undefined || reportedAt === undefined || !handledAfter(thread, reportedAt)
+            ? undefined
+            : `Handled: ${iso(handled.at)} · by ${handled.by} · desk ${handled.act} · after the newest report: no escalation for it`;
 
     return [
         `${thread.id} · ${thread.state} · ${thread.title}`,
@@ -8449,6 +8617,7 @@ export function readText(state: Readonly<DeskState> | undefined, id: string): st
             : [
                   `Closed: ${iso(thread.closed.at)} · ${thread.closed.why}${thread.closed.outcome === undefined ? "" : ` (${thread.closed.outcome})`} · by ${thread.closed.by}`,
               ]),
+        ...(handledLine === undefined ? [] : [handledLine]),
         prs.length === 0
             ? "PRs: none"
             : `PRs:\n${prs.map(([ref, pr]) => `  ${ref} · ${pr.via}${pr.state === undefined ? "" : ` · ${pr.state}`}${pr.ready === undefined ? "" : ` · ${READY_LABEL}`}${pr.next === undefined ? "" : ` · next: ${pr.next}`}${pr.title === undefined || pr.title === "" ? "" : ` · ${pr.title}`}`).join("\n")}`,
@@ -11034,6 +11203,23 @@ export default function createDesk(host: Host, web: Web) {
         const recent = Object.values(state?.threads ?? {}).filter(
             (thread) => thread.supervisor === Number(supervisor) && reopenable(thread, now),
         );
+
+        // A closed done thread that a supervisor's message woke, or whose session works now, has its folder read: the
+        // sweep needs its counts for the folder trigger, and its work is not a found folder.
+        for (const thread of recent) {
+            const busy = sessions?.find((each) => each.address === thread.address)?.busy === true;
+
+            if (quietWakeOf(thread) === undefined && !busy) {
+                continue;
+            }
+
+            const folder = folderOf(thread);
+
+            if (folder !== undefined) {
+                folders.add(folder);
+            }
+        }
+
         const branches =
             githubRead.facts === undefined
                 ? {}
@@ -11618,13 +11804,33 @@ export default function createDesk(host: Host, web: Web) {
         }
 
         const reopen = new Map<string, string>();
+        // The threads that got their quiet-wake mark in this commit: their triggers wait for the next sweep.
+        const markedQuiet = new Set<string>();
 
         for (const thread of closedDone) {
+            const mark = quietWakeOf(thread);
+            const base = mark === undefined ? numberOr(usersBefore.get(thread.id)) : mark.entry;
+
+            // A message from the supervisor's address, and no other new message: the wake is quiet, and the thread stays
+            // closed. A mark that is there already keeps it closed as it is.
+            if (quietWake(thread, base)) {
+                if (mark === undefined && base !== undefined) {
+                    thread.run.quietWake = { at: now, entry: base };
+                    markedQuiet.add(thread.id);
+
+                    if (addEvent(thread, `quiet-wake:${String(base)}`, QUIET_WAKE_TEXT, now)) {
+                        events += 1;
+                    }
+                }
+
+                continue;
+            }
+
             const reason = reopenReason(
                 thread,
                 {
                     busy: thread.run.busy === true,
-                    userBefore: usersBefore.get(thread.id) as number | undefined,
+                    userBefore: numberOr(usersBefore.get(thread.id)),
                 },
                 now,
             );
@@ -11694,6 +11900,35 @@ export default function createDesk(host: Host, web: Web) {
             }
         }
 
+        // A thread a supervisor's message woke stays closed until a report, folder work, or a PR comes after the wake.
+        // A mark that this commit recorded waits for the next sweep: its triggers are read before the mark is here.
+        const openFolders = new Set(
+            open
+                .map((thread) => folderOf(thread))
+                .filter((folder): folder is string => folder !== undefined),
+        );
+
+        for (const thread of closedDone) {
+            if (reopen.has(thread.id) || markedQuiet.has(thread.id)) {
+                continue;
+            }
+
+            if (quietWakeOf(thread) === undefined) {
+                continue;
+            }
+
+            const folder = folderOf(thread);
+            const reason = quietTrigger(
+                thread,
+                folder === undefined ? undefined : facts.folders[folder],
+                openFolders,
+            );
+
+            if (reason !== undefined) {
+                reopen.set(thread.id, reason);
+            }
+        }
+
         for (const thread of closedDone) {
             const reason = reopen.get(thread.id);
 
@@ -11703,25 +11938,9 @@ export default function createDesk(host: Host, web: Web) {
 
             thread.state = "open";
             delete thread.closed;
-
-            // A message from the supervisor's address, and no other new message: the thread may close again when its
-            // session goes idle with no report. A PR that came back is no session message.
-            const before = usersBefore.get(thread.id);
-            const last = numberOr(thread.run.lastUserEntry);
-            const other = numberOr(thread.run.otherUserEntry);
-
-            if (
-                reason !== "a PR it made is open" &&
-                typeof before === "number" &&
-                last !== undefined &&
-                last > before &&
-                other !== undefined &&
-                other <= before
-            ) {
-                thread.run.quietReopen = { at: now, entry: before };
-            } else {
-                delete thread.run.quietReopen;
-            }
+            // A reopen for any reason ends the supervisor's quiet wake, and the mark that recorded it.
+            delete thread.run.quietReopen;
+            delete thread.run.quietWake;
 
             thread.run.next = nextActor(thread);
 
@@ -11911,7 +12130,13 @@ export default function createDesk(host: Host, web: Web) {
 
         const worked = new Set(
             Object.values(state.threads)
-                .filter((thread) => thread.state !== "closed")
+                // A closed thread that a supervisor's message woke, in the 7 days it may reopen, works in its folder still:
+                // its work is no found folder's. An older mark holds no folder.
+                .filter(
+                    (thread) =>
+                        thread.state !== "closed" ||
+                        (quietWakeOf(thread) !== undefined && reopenable(thread, now)),
+                )
                 .map((thread) => folderOf(thread))
                 .filter((folder): folder is string => folder !== undefined),
         );
@@ -12720,7 +12945,10 @@ export default function createDesk(host: Host, web: Web) {
                     const { digest } = await deskConfig();
                     const clerk = clerkOf(state, supervisor);
                     // The Clerk takes the routine kinds; a kind that goes at once always stays with the supervisor.
-                    const { theirs, ours } = splitDigest(taken.items, clerk !== undefined, digest);
+                    const split = splitDigest(taken.items, clerk !== undefined, digest);
+                    // A report that a supervisor handled after it left the Clerk's list: it needs no escalation.
+                    const theirs = dropHandled(split.theirs, state);
+                    const { ours } = split;
                     const base = `x.desk.digest:${String(supervisor)}:${String(taken.seq)}`;
                     const messages: DigestMessage[] = [];
 
@@ -14438,6 +14666,8 @@ export default function createDesk(host: Host, web: Web) {
                 const at = Date.now();
                 const result = await api.commit(async (tx) => {
                     const state = await tx.doc(DeskThreads);
+                    // A replay files no second ask: it changes nothing, so it marks nothing either.
+                    const known = findAsk(state, key);
                     const added = addAsk(state, {
                         ...(args.thread === undefined ? {} : { thread: args.thread }),
                         text: args.text ?? "",
@@ -14455,6 +14685,15 @@ export default function createDesk(host: Host, web: Web) {
                     }
 
                     const filed = state.threads[added.threadId];
+
+                    // The supervisor's ask is a decision about the thread: a report filed before it needs no escalation.
+                    if (
+                        persona.role === "supervisor" &&
+                        known === undefined &&
+                        filed !== undefined
+                    ) {
+                        markHandled(filed, { at, by: persona.name, act: "ask" });
+                    }
 
                     // An ask thread needs its sweeper. So does a thread that the ask opened again: the sweeper of its
                     // supervisor may have ended when every thread of it was closed. It is the thread's supervisor, not
@@ -14489,20 +14728,32 @@ export default function createDesk(host: Host, web: Web) {
                 const at = Date.now();
                 const result = await api.commit(async (tx) => {
                     const state = await tx.doc(DeskThreads);
+                    const done =
+                        args.action === "rewrite"
+                            ? rewriteAsk(state, asked, {
+                                  text: args.text ?? "",
+                                  ...(args.options === undefined ? {} : { options: args.options }),
+                                  by: persona.name,
+                                  at,
+                              })
+                            : withdrawAsk(state, asked, {
+                                  ...(args.words === undefined ? {} : { why: args.words }),
+                                  ...(args.into === undefined ? {} : { into: args.into.trim() }),
+                                  by: persona.name,
+                                  at,
+                              });
 
-                    return args.action === "rewrite"
-                        ? rewriteAsk(state, asked, {
-                              text: args.text ?? "",
-                              ...(args.options === undefined ? {} : { options: args.options }),
-                              by: persona.name,
-                              at,
-                          })
-                        : withdrawAsk(state, asked, {
-                              ...(args.words === undefined ? {} : { why: args.words }),
-                              ...(args.into === undefined ? {} : { into: args.into.trim() }),
-                              by: persona.name,
-                              at,
-                          });
+                    // A change of the ask is a decision about its thread: a report filed before it needs no
+                    // escalation. A second attempt changes nothing, so it marks nothing.
+                    if (!("error" in done) && !done.already && persona.role === "supervisor") {
+                        const found = askById(state, done.id);
+
+                        if (found !== undefined) {
+                            markHandled(found.thread, { at, by: persona.name, act: args.action });
+                        }
+                    }
+
+                    return done;
                 }, context);
 
                 if ("error" in result) {
@@ -14532,12 +14783,23 @@ export default function createDesk(host: Host, web: Web) {
                 const at = Date.now();
                 const result = await api.commit(async (tx) => {
                     const state = await tx.doc(DeskThreads);
-
-                    return answerAsk(state, asked, {
+                    const done = answerAsk(state, asked, {
                         at,
                         by: persona.name,
                         words: args.words ?? "",
                     });
+
+                    // Brian's answer, recorded by the supervisor, is a decision about the thread: a report filed
+                    // before it needs no escalation. An answer that is there already changes nothing.
+                    if (!("error" in done) && !done.already && persona.role === "supervisor") {
+                        const found = askById(state, done.id);
+
+                        if (found !== undefined) {
+                            markHandled(found.thread, { at, by: persona.name, act: "answer" });
+                        }
+                    }
+
+                    return done;
                 }, context);
 
                 if ("error" in result) {
@@ -14595,6 +14857,11 @@ export default function createDesk(host: Host, web: Web) {
                             return set;
                         }
 
+                        // The supervisor's watch is a decision about the thread's newest report: no escalation for it.
+                        if (set.changed && persona.role === "supervisor") {
+                            markHandled(thread, { at, by: persona.name, act: "watch" });
+                        }
+
                         const date = thread.watch === undefined ? "" : watchWhen(thread.watch);
 
                         return {
@@ -14617,6 +14884,11 @@ export default function createDesk(host: Host, web: Web) {
 
                     if ("error" in recorded) {
                         return recorded;
+                    }
+
+                    // The supervisor's result is a decision about the thread's newest report: no escalation for it.
+                    if (recorded.changed && persona.role === "supervisor") {
+                        markHandled(thread, { at, by: persona.name, act: args.action });
                     }
 
                     const passed = thread.watch?.result?.pass === true;
@@ -14839,9 +15111,16 @@ export default function createDesk(host: Host, web: Web) {
                 try {
                     await api.commit(async (tx) => {
                         const thread = threadById(await tx.doc(DeskThreads), found.id);
+                        const at = Date.now();
 
-                        if (thread !== undefined) {
-                            addEvent(thread, key, `message from ${persona.name} sent`, Date.now());
+                        if (
+                            thread !== undefined &&
+                            addEvent(thread, key, `message from ${persona.name} sent`, at) &&
+                            persona.role === "supervisor"
+                        ) {
+                            // The supervisor's message is a decision about the thread's newest report: no escalation
+                            // for it.
+                            markHandled(thread, { at, by: persona.name, act: "send" });
                         }
                     }, context);
                 } catch {

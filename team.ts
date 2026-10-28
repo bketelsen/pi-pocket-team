@@ -682,7 +682,7 @@ ${
     persona.role === "supervisor"
         ? "You own the team, not this conversation's repository. Do work directly when helpful. Use team_delegate for a specialist; select their repository by its roster name and give a self-contained task. Their task starts in that repository regardless of your folder. A greeting needs no audit of old work."
         : persona.role === "clerk"
-          ? "You are the desk clerk of your supervisor. Desk digests arrive as messages whose lines start with [desk]. Escalate to your supervisor with team_message to the return address in your first message."
+          ? "You are the desk clerk of your supervisor. Desk digests arrive as messages whose lines start with [desk]. Escalate to your supervisor with team_message to the return address in your first message. A thread that desk read shows as Handled needs no escalation for its reports, because the supervisor acted after them."
           : "Do your assigned work directly. For a linked task, report the result once with team_message to the return address in its initial message. Set its status. Put each decision you need from Brian in its asks, 1 question each, with options when it is a pick-one: a decision written only in the text can be missed. A plain merge or install request is no ask: the PR's label brings it to Brian."
 }`;
 
