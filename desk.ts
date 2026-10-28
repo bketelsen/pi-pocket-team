@@ -8841,6 +8841,63 @@ export function journalItemOf(thread: Thread, report?: string): JournalItem {
     };
 }
 
+/** The most PRs 1 entry reads again from GitHub before its write: 1 GraphQL call holds them all. */
+export const JOURNAL_REFRESH_PRS = 20;
+
+/**
+ * The PRs of a thread whose stored state may be old: every PR that is not a guess (`via: "window"`), not `MERGED`, and
+ * not `MISSING`, with a ref that may go into a query. A merge just before the close, with no sweep after it, is still
+ * `OPEN` here. At most `JOURNAL_REFRESH_PRS`, sorted.
+ */
+export function journalStale(thread: Thread): string[] {
+    return Object.entries(thread.prs)
+        .filter(
+            ([ref, pr]) =>
+                pr.via !== "window" &&
+                pr.state !== "MERGED" &&
+                pr.state !== "MISSING" &&
+                REF.test(ref) &&
+                isRepoName(repoOf(ref)),
+        )
+        .map(([ref]) => ref)
+        .sort((one, two) => one.localeCompare(two))
+        .slice(0, JOURNAL_REFRESH_PRS);
+}
+
+/**
+ * An entry with the PRs that GitHub now says are merged: each ref of `refs` with a `MERGED` fact gets its link and its
+ * title. A ref with no fact, or with another state, changes nothing. The entry's own PRs stay; none is added twice.
+ */
+export function journalRefreshed(
+    item: JournalItem,
+    refs: readonly string[],
+    facts: Readonly<Record<string, PrFact>>,
+): JournalItem {
+    const byRef = new Map(Object.values(facts).map((fact) => [fact.ref.toLowerCase(), fact]));
+    const prs = [...item.prs];
+
+    for (const ref of refs) {
+        const fact = byRef.get(ref.toLowerCase());
+
+        if (
+            fact?.state !== "MERGED" ||
+            prs.some((pr) => pr.ref.toLowerCase() === ref.toLowerCase())
+        ) {
+            continue;
+        }
+
+        prs.push({
+            ref,
+            ...(fact.url === "" ? {} : { url: fact.url }),
+            ...(fact.title === "" ? {} : { title: fact.title }),
+        });
+    }
+
+    prs.sort((one, two) => one.ref.localeCompare(two.ref));
+
+    return { ...item, prs };
+}
+
 /** The marker of 1 entry, hidden in a rendered note: a write whose answer was lost is not written twice. */
 export const journalMarker = (thread: string): string => `<!-- pocket-journal:${thread} -->`;
 
@@ -12763,6 +12820,11 @@ export default function createDesk(host: Host, web: Web) {
     type JournalInput = { supervisor: number };
     type JournalRun =
         | { phase: "take" }
+        /**
+         * The thread's PRs that may have merged since the desk last read them: 1 read from GitHub before the sentences,
+         * so a merge just before the close gets its link. Added after `compose`: an older run has no such phase.
+         */
+        | { phase: "refresh"; item: JournalItem; model: boolean; refs: string[] }
         /** The sentences are made once, before the write: a restart writes the same text. */
         | { phase: "compose"; item: JournalItem; model: boolean }
         | { phase: "write"; item: JournalItem; text: string; failures?: number };
@@ -12975,12 +13037,39 @@ export default function createDesk(host: Host, web: Web) {
                     }
 
                     const copy: JournalItem = JSON.parse(JSON.stringify(item)) as JournalItem;
+                    const thread = state.threads[item.thread];
+                    const refs = thread === undefined ? [] : journalStale(thread);
 
                     return {
                         status: "running",
-                        checkpoint: { phase: "compose", item: copy, model },
+                        checkpoint:
+                            refs.length === 0
+                                ? { phase: "compose", item: copy, model }
+                                : { phase: "refresh", item: copy, model, refs },
                     };
                 }, context);
+            },
+            refresh: async (task, runtime, context) => {
+                const checkpoint = task.state.checkpoint;
+                // The desk's own PR read: 1 GraphQL call for the refs, with its 1 retry. A failure keeps the stored PRs.
+                let facts: Record<string, PrFact> = {};
+
+                try {
+                    facts = (await readGitHub([], checkpoint.refs)).facts?.prs ?? {};
+                } catch {
+                    facts = {};
+                }
+
+                const item = journalRefreshed(checkpoint.item, checkpoint.refs, facts);
+
+                // Only the entry learns the merge: the closed thread keeps its stored PRs, as the sweep last saw them.
+                await runtime.commit(
+                    () => ({
+                        status: "running",
+                        checkpoint: { phase: "compose", item, model: checkpoint.model },
+                    }),
+                    context,
+                );
             },
             compose: async (task, runtime, context) => {
                 const checkpoint = task.state.checkpoint;
