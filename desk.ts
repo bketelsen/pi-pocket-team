@@ -7539,6 +7539,14 @@ const CHOICE = /\bor\b|which|whether|should i|your call|do you want/i;
  * is a run of backticks closed by a run of the same length. Words in code are quoted, never said.
  */
 function withoutCode(text: string): string {
+    return withoutFences(text).replace(/(?<!`)(`+)(?!`)[^\n]*?(?<!`)\1(?!`)/g, " ");
+}
+
+/**
+ * The text without its fenced code blocks: each line of a block becomes an empty line, so every other line keeps its
+ * place. Inline code stays (`withoutCode` removes it too).
+ */
+function withoutFences(text: string): string {
     const kept: string[] = [];
     let fence: { mark: string; length: number } | undefined;
 
@@ -7569,7 +7577,7 @@ function withoutCode(text: string): string {
         kept.push("");
     }
 
-    return kept.join("\n").replace(/(?<!`)(`+)(?!`)[^\n]*?(?<!`)\1(?!`)/g, " ");
+    return kept.join("\n");
 }
 
 /**
@@ -7602,6 +7610,46 @@ export function asksBrian(text: string, options: { report?: boolean } = {}): boo
                 sentence,
             )
         );
+    });
+}
+
+/** An ask id in a text: T13a, F2b, T5aa. */
+const ASK_IDS = /\b[TF][1-9][0-9]*[a-z]+\b/g;
+
+/**
+ * Whether the last paragraph, as `asksBrian` reads it, names at least 1 ask that is open on the desk now (`askIsOpen`),
+ * whatever turn or session filed it. Such a reply points Brian at an ask he already has ("T382g: rotate the key?"), so
+ * the reminder does not fire. An id in a fenced code block does not count; an id in inline code does, because it still
+ * names the ask. An answered or resolved ask, or an id the desk does not know, does not count.
+ */
+export function namesOpenAsk(text: string, state: Readonly<DeskState> | undefined): boolean {
+    // Both texts keep each line in its place: the paragraph is found where `asksBrian` finds it (code removed), and
+    // its ids are read with the inline code kept.
+    const fenced = withoutFences(text).split("\n");
+    const plain = withoutCode(text).split("\n");
+    const blank = (line: string | undefined) => line === undefined || line.trim() === "";
+    let end = plain.length - 1;
+
+    while (end >= 0 && blank(plain[end])) {
+        end -= 1;
+    }
+
+    let start = end;
+
+    while (start > 0 && !blank(plain[start - 1])) {
+        start -= 1;
+    }
+
+    if (end < 0) {
+        return false;
+    }
+
+    const last = fenced.slice(start, end + 1).join("\n");
+
+    return [...last.matchAll(ASK_IDS)].some((match) => {
+        const found = askById(state, match[0]);
+
+        return found !== undefined && askIsOpen(found.ask);
     });
 }
 
@@ -14016,7 +14064,8 @@ export default function createDesk(host: Host, web: Web) {
                 const state = await api.snapshot(DeskThreads, context);
                 const session = Number(api.conversationId);
 
-                if (asksBrian(said)) {
+                // A reply that names an ask open on the desk now points Brian at it: no new ask is needed.
+                if (asksBrian(said) && !namesOpenAsk(said, state)) {
                     const turnStart =
                         (await api.memo<number>("desk.turnStart", context)) ?? Date.now();
                     const filed = Object.values(state?.threads ?? {}).some((thread) =>
