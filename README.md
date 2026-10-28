@@ -201,6 +201,14 @@ Pi Pocket's memory has two scopes: a project (one repository or folder) and ever
 - **Rules, as Pi Pocket's own memory:** a lesson is one line with invisible characters stripped, at most 300 characters. An agent keeps at most 40 approved lessons, and one writer may have at most 20 waiting for each agent. The pending cap is per agent: Brian is the one requester, so a single global cap would let one busy agent block the rest. A tool call that runs again after a restart finds the lesson it saved (keyed by task and call), so it never adds one twice.
 - **Storage:** one app-wide document, `x.team.memory`: `{ agents: { <agentId>: { <lessonId>: lesson } } }`. Each lesson has its id, agent, text, who wrote it and whether Pi did, the source session, created and updated times, `pending`, and any `proposal`. It is stored data: never rename the kind or change what a field means.
 
+## The supervisor button
+
+The rail has a second Team button, with the supervisor's name ("Odrade") and a chess-queen icon: the piece that moves the whole board, with 3 rays above her crown. It shows on the phone's home screen too, and the launcher has "Open Odrade's session". One tap opens the supervisor session that the Desk binds threads to: when there are more, the one with the newest desk event. PiP stays the front door for spoken requests (it messages Odrade with `[via PiP]`); this button is the 1-tap way to her session.
+
+- **What it opens.** `GET /api/x/team/supervisor` (owner-only, read only) asks the Desk (`supervisors` on its global API) for every supervisor conversation that has a thread, newest `lastEventAt` first. It keeps those the owner can see, and prefers one that is not archived; an archived one still opens, with a warning.
+- **No bound session.** With the Desk off, or no thread bound to a supervisor yet, a tap only shows a notice. It opens, starts, and changes nothing.
+- **The badge** counts the open asks for Brian on that supervisor's threads that are not parked or closed. The button asks again once a minute while the tab shows, when the tab shows again, and at each tap.
+
 ## Team files
 
 Runtime copies: `~/.pi-pocket/extensions/team.ts` and `team-web/`. The extension reads only its independent profile directory (override with `PI_POCKET_TEAM_AGENTS`). Its durable document is `x.team.identity` (`persona`, and `cleared` for an explicit none); UI routes are in the owner-only `/api/x/team/` namespace.

@@ -39,6 +39,42 @@ export function expectedOf(lesson) {
     };
 }
 
+/** What the rail calls the supervisor before the first answer: Brian's supervisor. The route's answer replaces it. */
+export const SUPERVISOR_NAME = "Odrade";
+
+/**
+ * The supervisor's rail icon: a chess queen, the piece that moves the whole board, with 3 short rays of light above her
+ * crown. One stroked path in a 24 × 24 box, as the app's own icons; it takes the theme's color.
+ */
+export const SUPERVISOR_ICON =
+    "M7 18.5C8.5 16 9 13.5 9 11L6 7l3.5 2.5L12 6.5l2.5 3L18 7 15 11c0 2.5.5 5 2 7.5zM5 21h14M12 1.5v2M9 2.5l.8 1.3M15 2.5l-.8 1.3";
+
+/** The rail button's title and badge for the route's answer; the badge is the open asks for Brian, none at 0. */
+export const supervisorRail = (door) => {
+    const name = door?.found ? door.name || SUPERVISOR_NAME : SUPERVISOR_NAME;
+
+    return { title: name, badge: door?.found && door.asks > 0 ? door.asks : null };
+};
+
+/** What a tap does with the route's answer: open the session, or only say why not. */
+export const supervisorAction = (door) => {
+    if (door?.found) {
+        return {
+            open: door.conversationId,
+            ...(door.archived
+                ? { notice: ["warning", `${door.name}'s session "${door.title}" is archived.`] }
+                : {}),
+        };
+    }
+
+    return {
+        notice: [
+            "info",
+            door?.text ?? "No supervisor session is bound to the desk. Nothing was opened.",
+        ],
+    };
+};
+
 const MEMORY_LABELS = {
     add: "save agent lesson",
     update: "change agent lesson",
@@ -490,6 +526,86 @@ export default function setup(pocket) {
 
     void badge();
     pocket.onDispose(pocket.on("memory", () => void badge()));
+
+    // The supervisor's front door: 1 tap opens the session the desk binds threads to, from the rail, the phone's home
+    // screen, or the launcher. The route reads only; a tap with no bound session only says so.
+    const supervisorButton = pocket.rail({
+        id: "supervisor",
+        title: SUPERVISOR_NAME,
+        iconPath: SUPERVISOR_ICON,
+        run: () => void openSupervisor(),
+    });
+    const supervisorLauncher = pocket.launcher({
+        id: "supervisor",
+        label: `Open ${SUPERVISOR_NAME}'s session`,
+        detail: "The supervisor session the desk reports to",
+        iconPath: SUPERVISOR_ICON,
+        keywords: ["supervisor", "desk", "odrade"],
+        run: () => void openSupervisor(),
+    });
+    let lastName = SUPERVISOR_NAME;
+
+    const showSupervisor = (door) => {
+        const spec = supervisorRail(door);
+
+        supervisorButton.update(spec);
+
+        if (spec.title !== lastName) {
+            lastName = spec.title;
+            supervisorLauncher.update({ label: `Open ${spec.title}'s session` });
+        }
+    };
+
+    const loadSupervisor = () =>
+        pocket.api("supervisor").then(
+            (door) => {
+                showSupervisor(door);
+
+                return door;
+            },
+            () => null,
+        );
+
+    // A tap asks again, so it opens the session bound now, not the one of the last poll.
+    const openSupervisor = async () => {
+        const door = await loadSupervisor();
+
+        if (door === null) {
+            pocket.notify("error", "Could not find the supervisor session. Nothing was opened.");
+
+            return;
+        }
+
+        const action = supervisorAction(door);
+
+        if (action.notice) {
+            pocket.notify(action.notice[0], action.notice[1]);
+        }
+
+        if (action.open !== undefined) {
+            pocket.openConversation(action.open);
+        }
+    };
+
+    void loadSupervisor();
+    // The desk sends its events to its own module, so the badge polls: once a minute, and when the tab shows again.
+    const supervisorTimer = setInterval(() => {
+        if (document.visibilityState === "visible") {
+            void loadSupervisor();
+        }
+    }, 60_000);
+
+    const onVisible = () => {
+        if (document.visibilityState === "visible") {
+            void loadSupervisor();
+        }
+    };
+
+    document.addEventListener("visibilitychange", onVisible);
+    pocket.onDispose(() => {
+        clearInterval(supervisorTimer);
+        document.removeEventListener("visibilitychange", onVisible);
+    });
 
     // The shown session's identity in the status line (new in 0.19.0: an older app has none). Pocket sends no event when
     // the tab changes session, so a timer watches the id; the server's "identity" event says when the choice changes.

@@ -22,7 +22,13 @@ import { join } from "node:path";
 import { after, test } from "node:test";
 import { fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import { createHandler } from "./_pocket/src/server/http.ts";
-import { delegationWorktree, Identity, roster } from "./team.ts";
+import {
+    delegationWorktree,
+    FRONT_DOOR_DESK_OFF,
+    Identity,
+    pickSupervisor,
+    roster,
+} from "./team.ts";
 
 after(cleanUp);
 const definitions = join(root, "agents");
@@ -136,6 +142,13 @@ test("drop-in identities, named delegation, HTTP permissions, replay and restart
         const guest = app.config.addUser("Guest", "guest");
 
         assert.equal((await call("agents", undefined, guest.token)).status, 404);
+        // The supervisor button's route: owner-only; with the desk off it opens nothing and says why.
+        assert.equal((await call("supervisor", undefined, guest.token)).status, 404);
+        assert.deepEqual((await call("supervisor")).data, {
+            found: false,
+            reason: "desk-off",
+            text: FRONT_DOOR_DESK_OFF,
+        });
         assert.equal((await call(`session/${id}/identity`, { agent: "../missing" })).status, 400);
         assert.equal((await call(`session/${id}/identity`, { agent: "odrade" })).status, 200);
         assert.equal((await app.harness.snapshot(Identity, id, context))?.persona?.id, "odrade");
@@ -509,4 +522,35 @@ test("2 delegations to 1 repository work in 2 worktrees, and the task says where
     } finally {
         await app.close();
     }
+});
+
+test("pickSupervisor: the newest bound session that the person sees, not archived first", () => {
+    const bound = [
+        { supervisor: 9, lastEventAt: 300, asks: 1 },
+        { supervisor: 7, lastEventAt: 200, asks: 2 },
+        { supervisor: 5, lastEventAt: 100, asks: 0 },
+    ];
+    const session = (id: number, archived = false) => ({ id, title: `S${id}`, archived });
+
+    // The newest one that the person sees.
+    assert.deepEqual(pickSupervisor(bound, [session(5), session(7)]), {
+        id: 7,
+        title: "S7",
+        asks: 2,
+        archived: false,
+    });
+    // An archived one gives way to an older one that is not archived.
+    assert.equal(pickSupervisor(bound, [session(9, true), session(5)])?.id, 5);
+    // Only archived ones: the newest of them, marked.
+    assert.deepEqual(pickSupervisor(bound, [session(7, true), session(9, true)]), {
+        id: 9,
+        title: "S9",
+        asks: 1,
+        archived: true,
+    });
+    // None seen, or none bound: no session.
+    assert.equal(pickSupervisor(bound, [session(1)]), undefined);
+    assert.equal(pickSupervisor([], [session(1)]), undefined);
+    // An app with no session list: the newest bound one.
+    assert.equal(pickSupervisor(bound, undefined)?.id, 9);
 });
