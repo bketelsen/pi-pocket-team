@@ -125,6 +125,7 @@ import {
     quietWake,
     quietTrigger,
     quietWatched,
+    quietReopens,
     workedFolders,
     QUIET_WATCH_MS,
     markHandled,
@@ -2957,6 +2958,30 @@ describe("a handled report and a quiet wake", () => {
             "work in its folder after a supervisor message",
             "with no other thread there, the work is its own",
         );
+    });
+
+    test("a report opens its thread first, and that thread's folder is then no other quiet thread's", () => {
+        const wake = { quietWake: { at: 1200, entry: 5 } };
+        const reported = done({ ...wake, reportedAt: 1001 }, { id: "T1", supervisor: 1 });
+        const quiet = done(wake, { id: "T2", supervisor: 1 });
+        const state: DeskState = { ...empty(), threads: { T1: reported, T2: quiet } };
+        const folders = { "/work/test": { dirty: 9, ahead: 9 } };
+
+        assert.deepEqual(
+            [...quietReopens([reported, quiet], folders, state)],
+            [["T1", "a report after a supervisor message"]],
+        );
+
+        // With no report in the folder, the work is the quiet thread's own: it opens.
+        assert.deepEqual(
+            [...quietReopens([quiet], folders, { ...empty(), threads: { T2: quiet } })],
+            [["T2", "work in its folder after a supervisor message"]],
+        );
+        // A thread that is already to open is no trigger, and its folder counts as worked.
+        assert.deepEqual([...quietReopens([quiet], folders, state, new Set(["T1"]))], []);
+
+        // No mark: no reason.
+        assert.deepEqual([...quietReopens([done()], folders, state)], []);
     });
 });
 
@@ -8564,6 +8589,19 @@ async function closeThreadNow(id: string, ageMs = 0): Promise<void> {
     }, context);
 }
 
+/**
+ * Remove a thread's quiet-wake mark: its 24-hour watcher then ends, and a later test starts no sweeper for it.
+ */
+async function forgetQuietWake(id: string): Promise<void> {
+    await app.harness.commit(async (tx) => {
+        const thread = (await tx.doc(DeskThreads)).threads[id];
+
+        if (thread !== undefined) {
+            delete thread.run.quietWake;
+        }
+    }, context);
+}
+
 /** The live sweeper tasks of a supervisor session. */
 async function sweepers(id: ConversationId): Promise<number> {
     const live = await app.harness.inspect(context);
@@ -12718,68 +12756,83 @@ describe("the desk in a Pi Pocket", () => {
     test("a supervisor's message to a done session keeps the thread closed, with a quiet-wake mark", async () => {
         const { source, linked, thread } = await closedDone("quiet-close");
 
-        quietAddress = thread.address ?? "";
-        assert.notEqual(quietAddress, "");
+        try {
+            quietAddress = thread.address ?? "";
+            assert.notEqual(quietAddress, "");
 
-        await say(app, source, "message to agent test");
-        await until(() => !app.isBusy(linked), "the agent's turn", 20_000);
-        await say(app, source, "desk sync test");
+            await say(app, source, "message to agent test");
+            await until(() => !app.isBusy(linked), "the agent's turn", 20_000);
+            await say(app, source, "desk sync test");
 
-        const back = (await deskState())?.threads[thread.id];
-        const mark = back?.run.quietWake as { at?: number; entry?: number } | undefined;
+            const back = (await deskState())?.threads[thread.id];
+            const mark = back?.run.quietWake as { at?: number; entry?: number } | undefined;
 
-        assert.equal(back?.state, "closed", "the message alone does not reopen it");
-        assert.equal(back?.closed?.why, "done");
-        assert.equal(typeof mark?.at, "number");
-        assert.equal(typeof mark?.entry, "number");
-        assert.equal(back?.run.quietReopen, undefined, "the new code sets no quiet reopen");
-        assert.match(
-            back?.events.map((event) => event.text).join("; ") ?? "",
-            /a supervisor message woke its session: it stays closed until a report, folder work or a PR/,
-        );
+            assert.equal(back?.state, "closed", "the message alone does not reopen it");
+            assert.equal(back?.closed?.why, "done");
+            assert.equal(typeof mark?.at, "number");
+            assert.equal(typeof mark?.entry, "number");
+            assert.equal(back?.run.quietReopen, undefined, "the new code sets no quiet reopen");
+            assert.match(
+                back?.events.map((event) => event.text).join("; ") ?? "",
+                /a supervisor message woke its session: it stays closed until a report, folder work or a PR/,
+            );
 
-        // The mark keeps a sweeper: a report after the wake still opens the thread.
-        assert.equal(
-            typeof (await deskState())?.sweepers?.[String(Number(source))],
-            "string",
-            "the sweeper stays for the quiet wake",
-        );
+            // The mark keeps a sweeper: a report after the wake still opens the thread.
+            assert.equal(
+                typeof (await deskState())?.sweepers?.[String(Number(source))],
+                "string",
+                "the sweeper stays for the quiet wake",
+            );
 
-        // A later sweep adds no second mark and no second event.
-        await say(app, source, "desk sync test");
+            // A later sweep adds no second mark and no second event.
+            await say(app, source, "desk sync test");
 
-        const again = (await deskState())?.threads[thread.id];
+            const again = (await deskState())?.threads[thread.id];
 
-        assert.equal(again?.state, "closed");
-        assert.deepEqual(again?.run.quietWake, back?.run.quietWake);
-        assert.equal(
-            (again?.events ?? []).filter((event) => event.key.startsWith("quiet-wake:")).length,
-            1,
-        );
+            assert.equal(again?.state, "closed");
+            assert.deepEqual(again?.run.quietWake, back?.run.quietWake);
+            assert.equal(
+                (again?.events ?? []).filter((event) => event.key.startsWith("quiet-wake:")).length,
+                1,
+            );
+        } finally {
+            // A test leaves no 24-hour watcher behind: its sweeper would wake in later tests.
+            await forgetQuietWake(thread.id);
+            await stopSweepers();
+        }
     });
 
     test("a thread from before otherUserEntry takes its newest user entry as another's", async () => {
         const { source, linked, thread } = await closedDone("quiet-migrate");
         const before = (await deskState())?.threads[thread.id]?.run.lastUserEntry;
 
-        await app.harness.commit(async (tx) => {
-            delete (await tx.doc(DeskThreads)).threads[thread.id]!.run.otherUserEntry;
-        }, context);
+        try {
+            await app.harness.commit(async (tx) => {
+                delete (await tx.doc(DeskThreads)).threads[thread.id]!.run.otherUserEntry;
+            }, context);
 
-        quietAddress = thread.address ?? "";
-        await say(app, source, "message to agent test");
-        await until(() => !app.isBusy(linked), "the agent's turn", 20_000);
-        await say(app, source, "desk sync test");
+            quietAddress = thread.address ?? "";
+            await say(app, source, "message to agent test");
+            await until(() => !app.isBusy(linked), "the agent's turn", 20_000);
+            await say(app, source, "desk sync test");
 
-        const back = (await deskState())?.threads[thread.id];
+            const back = (await deskState())?.threads[thread.id];
 
-        assert.equal(back?.run.otherUserEntry, before, "migrated before the new entries counted");
-        assert.equal(back?.state, "closed");
-        assert.equal(
-            (back?.run.quietWake as { entry?: number } | undefined)?.entry,
-            before,
-            "the supervisor's message after the migration is quiet",
-        );
+            assert.equal(
+                back?.run.otherUserEntry,
+                before,
+                "migrated before the new entries counted",
+            );
+            assert.equal(back?.state, "closed");
+            assert.equal(
+                (back?.run.quietWake as { entry?: number } | undefined)?.entry,
+                before,
+                "the supervisor's message after the migration is quiet",
+            );
+        } finally {
+            await forgetQuietWake(thread.id);
+            await stopSweepers();
+        }
     });
 
     test("a person's message after the close keeps the thread open: it is no quiet close", async () => {
@@ -12865,6 +12918,44 @@ describe("the desk in a Pi Pocket", () => {
         } finally {
             sendThreadId = "";
         }
+    });
+
+    test("a sync that records a quiet wake starts a sweeper, with no open thread", async () => {
+        const { source, linked, thread } = await closedDone("quiet-start");
+
+        // The old sweeper is gone, and nothing is open: no later sweep would run without this.
+        await stopSweepers();
+
+        const before = await deskState();
+
+        assert.equal(before?.sweepers?.[String(Number(source))], undefined, "no sweeper");
+        assert.equal(before?.threads[thread.id]?.state, "closed");
+        assert.equal(
+            Object.values(before?.threads ?? {}).some(
+                (each) => each.supervisor === Number(source) && each.state !== "closed",
+            ),
+            false,
+            "no open thread",
+        );
+
+        quietAddress = thread.address ?? "";
+        await say(app, source, "message to agent test");
+        await until(() => !app.isBusy(linked), "the agent's turn", 20_000);
+        await say(app, source, "desk sync test");
+
+        const after = await deskState();
+        const mark = after?.threads[thread.id]?.run.quietWake as { at?: number } | undefined;
+
+        assert.equal(typeof mark?.at, "number", "the mark is recorded");
+        assert.equal(
+            typeof after?.sweepers?.[String(Number(source))],
+            "string",
+            "the sweeper is registered",
+        );
+
+        // A test leaves no 24-hour watcher behind: its sweeper would wake in later tests.
+        await forgetQuietWake(thread.id);
+        await stopSweepers();
     });
 
     test("the export writes the desk's files, and writes only what changed", async () => {

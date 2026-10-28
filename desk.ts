@@ -2006,6 +2006,52 @@ export function quietWatched(
 }
 
 /**
+ * The reasons the quiet-wake marks of `threads` open them again, by thread id, in 2 passes. Pass 1 takes the report
+ * triggers. Pass 2 takes the folder triggers, in a folder that no thread that opens in this commit works in: a thread
+ * that a report opens works in its folder now, so its work is not another quiet thread's.
+ */
+export function quietReopens(
+    threads: readonly Thread[],
+    folders: Readonly<Record<string, FolderCounts | null | undefined>>,
+    state: Readonly<DeskState> | undefined,
+    reopened: ReadonlySet<string> = new Set(),
+): Map<string, string> {
+    const reopen = new Map<string, string>();
+    const marked = threads.filter((thread) => quietWakeOf(thread) !== undefined);
+
+    // Pass 1: a report after the close.
+    for (const thread of marked) {
+        const reason = quietTrigger(thread, undefined, new Set());
+
+        if (reason !== undefined) {
+            reopen.set(thread.id, reason);
+        }
+    }
+
+    // Pass 2: folder work, in a folder that no open thread works in.
+    const openFolders = workedFolders(state, new Set([...reopened, ...reopen.keys()]));
+
+    for (const thread of marked) {
+        if (reopen.has(thread.id)) {
+            continue;
+        }
+
+        const folder = folderOf(thread);
+        const reason = quietTrigger(
+            thread,
+            folder === undefined ? undefined : folders[folder],
+            openFolders,
+        );
+
+        if (reason !== undefined) {
+            reopen.set(thread.id, reason);
+        }
+    }
+
+    return reopen;
+}
+
+/**
  * The folders that threads work in, for the folder trigger: every thread of every supervisor that is not closed, and
  * every thread that `reopen` opens in this commit. Work in one of them can be that thread's, so it never opens a quiet
  * thread.
@@ -11869,6 +11915,9 @@ export default function createDesk(host: Host, web: Web) {
                     if (addEvent(thread, `quiet-wake:${String(base)}`, QUIET_WAKE_TEXT, now)) {
                         events += 1;
                     }
+
+                    // The mark needs a later sweep: a sync runs this sweep itself, so it starts the sweeper here.
+                    await startSweeper(tx, supervisor);
                 }
 
                 continue;
@@ -11951,26 +12000,14 @@ export default function createDesk(host: Host, web: Web) {
         // A thread a supervisor's message woke stays closed until a report, folder work, or a PR comes after the wake.
         // The triggers run in this same sweep, also for a mark that this commit recorded: the sweep may be the last of
         // its supervisor, and no later one would check them.
-        const openFolders = workedFolders(state, new Set(reopen.keys()));
-
-        for (const thread of closedDone) {
-            if (reopen.has(thread.id)) {
-                continue;
-            }
-
-            if (quietWakeOf(thread) === undefined) {
-                continue;
-            }
-
-            const folder = folderOf(thread);
-            const reason = quietTrigger(
-                thread,
-                folder === undefined ? undefined : facts.folders[folder],
-                openFolders,
-            );
-
-            if (reason !== undefined) {
-                reopen.set(thread.id, reason);
+        for (const [id, reason] of quietReopens(
+            closedDone,
+            facts.folders,
+            state,
+            new Set(reopen.keys()),
+        )) {
+            if (!reopen.has(id)) {
+                reopen.set(id, reason);
             }
         }
 
@@ -12882,6 +12919,20 @@ export default function createDesk(host: Host, web: Web) {
                 .filter((thread) => thread.state !== "closed" && thread.supervisor !== undefined)
                 .map((thread) => thread.supervisor as number),
         );
+        const now = Date.now();
+
+        // A quiet-wake mark is watched for 24 hours: its supervisor keeps a sweeper, also with no open thread.
+        for (const thread of Object.values(state.threads)) {
+            const supervisor = thread.supervisor;
+
+            if (
+                supervisor !== undefined &&
+                !supervisors.has(supervisor) &&
+                quietWatched(state, supervisor, now)
+            ) {
+                supervisors.add(supervisor);
+            }
+        }
 
         for (const supervisor of supervisors) {
             await startSweeper(tx, supervisor);
