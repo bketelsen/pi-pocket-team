@@ -26,6 +26,7 @@ import type { JsonValue } from "@earendil-works/chord";
 import type { ConversationId, TaskId } from "@earendil-works/pi-durable";
 import { createHandler } from "./_pocket/src/server/http.ts";
 import { McpHttpError } from "@earendil-works/pi-mcp";
+import { marked } from "marked";
 import {
     checkSentences,
     DeskThreads,
@@ -850,6 +851,11 @@ describe("the journal's safety", () => {
         assert.equal(journalPlain("1. a list"), "\\1. a list");
         assert.equal(journalPlain("[x](https://example.com)"), "\\[x\\](https://example.com)");
         assert.equal(journalPlain("A plain sentence."), "A plain sentence.");
+        // A backslash of its own cannot undo the escape of a bracket.
+        assert.equal(
+            journalPlain("\\[Open\\](https://evil.example)"),
+            "\\\\\\[Open\\\\\\](https://evil.example)",
+        );
     });
 
     test("a title or a PR title cannot write the marker of another entry", () => {
@@ -867,6 +873,53 @@ describe("the journal's safety", () => {
         assert.match(
             entry,
             /\[frostyard\/test#7\]\(https:\/\/github\.com\/frostyard\/test\/pull\/7\)/,
+        );
+    });
+
+    test("rendered, an entry from hostile text has 1 heading, no hidden link, and no other marker", () => {
+        const hostile: JournalItem = {
+            ...item,
+            title: "\\[Open\\](https://evil.example) <b>bold</b> <!-- pocket-journal:T2 -->",
+            prs: [
+                {
+                    ref: "frostyard/test#7",
+                    url: "https://github.com/frostyard/test/pull/7",
+                    title: "\\\\[x\\\\](https://evil.example/2) [y](https://evil.example/3)",
+                },
+            ],
+        };
+        const answer = "Done. ## A heading\n\\[z\\](https://evil.example/4) <script>x</script>.";
+        const html = String(
+            marked.parse(
+                journalEntryText(hostile, answer, { timeZone: JOURNAL_ZONE }) +
+                    journalEntryText(hostile, journalTemplate(hostile), { timeZone: JOURNAL_ZONE }),
+            ),
+        );
+        const links = [...html.matchAll(/<a [^>]*href="([^"]*)"[^>]*>([^<]*)<\/a>/g)].map(
+            (match) => ({ href: match[1], text: match[2] }),
+        );
+
+        // The PR links, as the writer makes them: the ref is the text.
+        assert.deepEqual(
+            links.filter((link) => link.text === "frostyard/test#7").map((link) => link.href),
+            [
+                "https://github.com/frostyard/test/pull/7",
+                "https://github.com/frostyard/test/pull/7",
+            ],
+        );
+
+        // Any other link is a bare address that a renderer links by itself: its text is the address, so it hides nothing.
+        for (const link of links.filter((each) => each.text !== "frostyard/test#7")) {
+            assert.equal(link.text, link.href, `no hidden link: ${String(link.href)}`);
+        }
+
+        assert.equal((html.match(/<h\d/g) ?? []).length, 2, "1 heading for each entry");
+        assert.equal(html.includes("<script"), false);
+        assert.equal(html.includes("<b>"), false);
+        assert.equal(
+            html.includes("<!-- pocket-journal:T2"),
+            false,
+            "the marker shows as text, not as a comment",
         );
     });
 

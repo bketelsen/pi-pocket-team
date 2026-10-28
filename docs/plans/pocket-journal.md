@@ -82,9 +82,11 @@ gets its own note in the PocketJournal folder, with links to the merged pull req
   link `[owner/name#n](url)`. No line when there is none.
 - **Sentences:** 1 to 3 plain sentences (section 4).
 - **Text from outside** (titles, PR titles, the sentences) goes through `journalPlain`: 1 line, `<` and
-  `>` as entities, `[` and `]` escaped, and no Markdown mark at its start. So only the writer writes a
+  `>` as entities, `\` and `[` and `]` escaped, and no Markdown mark at its start. So only the writer writes a
   marker, and a title or a model answer cannot add a heading. The marker counts only alone on its line.
   A PR link is a link only when its URL is `https://github.com/<owner>/<name>/pull/<n>`.
+  A bare address in a title can still show as a link (GitHub Markdown links it by itself), but its
+  text is the address: it hides nothing.
 
 The item that the commit enqueues holds all of this, so the writer needs nothing else from the desk:
 thread id, title, agents, repo, close time, outcome, merged PRs (`ref`, `url`, `title`), and the text of

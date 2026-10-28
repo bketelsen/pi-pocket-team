@@ -8850,13 +8850,15 @@ export const hasJournalMarker = (note: string, thread: string): boolean =>
 
 /**
  * Text from outside (a title, a PR title, a report's words, a model's answer) on 1 line of a note: no line break, no
- * `<` or `>` (so no HTML, no comment, and no marker), no `[` or `]` (no link of its own), and no Markdown mark at its
+ * `<` or `>` (so no HTML, no comment, and no marker), no `\\` that escapes, no `[` or `]` (no link of its own), and no Markdown mark at its
  * start (no heading, quote, or list). Only `journalMarker` writes a marker.
  */
 export function journalPlain(text: string): string {
     const line = text
         .replace(/\s+/g, " ")
         .trim()
+        // A backslash of its own first: else `\[` would become `\\[`, and the bracket would open a link again.
+        .replace(/\\/g, "\\\\")
         .replace(/</g, "&lt;")
         .replace(/>/g, "&gt;")
         .replace(/([[\]])/g, "\\$1");
