@@ -8,10 +8,20 @@ Files: `terminal.ts` (server) and `terminal-web/` (browser module, with xterm.js
 
 **Can a drop-in hold a websocket or a streaming route?** No websocket: `web.route` answers JSON only, and a drop-in
 has no upgrade hook. It does not need one. A route has no time limit (`docs/extensions/routes.md`, "Time"), so output
-uses a **long poll**: `GET terminals/:id/output?from=N` answers at once when output past offset `N` exists, else
-waits up to 25 s. Input and resize are small `POST`s. Every request goes through the app's own sign-in and `X-Pocket`
-check. Events (`web.send`) are not used for output: they go to every tab of the person, are capped at 100 events and
-1 MB a second for the module, and drop the rest. Events carry only the list of terminals (for the rail badge).
+uses a **long poll**: `GET poll?t=<id>.<from>,<id>.<from>` answers at once when any named terminal has output past its
+offset, has exited, or is gone, else waits up to 25 s. It carries every terminal of the tab, 4 at most, in one answer:
+`{ terminals: { <id>: { data, from, to, exited?, exitCode? } | { gone: true } } }`. It holds an entry for each terminal
+that has something, and at the 25 s end an empty one for each live terminal, so a tab keeps its offsets. Input and
+resize are small `POST`s. Every request goes through the app's own sign-in and `X-Pocket` check. Events (`web.send`) are
+not used for output: they go to every tab of the person, are capped at 100 events and 1 MB a second for the module, and
+drop the rest. Events carry only the list of terminals (for the rail badge).
+
+**Why 1 poll for each tab, not 1 for each terminal?** A browser gives a host 6 connections over HTTP/1.1, and every tab
+of the app shares them. The live server is HTTP/1.1. A poll for each terminal would hold 1 connection for each shell:
+4 shells in 2 tabs would take all 6, and no other request of the app would get through. So the tab holds 1 poll, and it
+carries every terminal the tab shows. The poll starts again, with the new set, when a terminal is attached, ended, or
+closed; with no terminal it does not poll. Each rule stays for each terminal: the polls that keep a shell from the
+detach timer, the back pressure of its buffer, and 256 K characters at most for it in one answer.
 
 **No upstream change is needed.** The page, routes, rail button, `pocket.style`, and `escape: false` / `swipe:
 false` on the page are all in the v0.25 extension API.
@@ -51,7 +61,7 @@ shell's process group, then `SIGKILL` after 2 s, and exits. When the shell exits
   closes every helper's stdin, and a dead server process closes the pipes too).
 - **Reconnect:** after a tab reload or a network drop, yes, within 60 s: the page lists the live terminals, attaches
   again, and replays the buffer. After a server restart or a module reload, no: the shells are gone, and the page says
-  so. (Keeping shells across a reload would need hidden global state that outlives the module's code; not worth it.)
+  so (the poll answers `gone` for each one). (Keeping shells across a reload would need hidden global state that outlives the module's code; not worth it.)
 - **More than one tab** can show the same terminal. Each tab polls with its own offset.
 
 ## Security
@@ -75,7 +85,7 @@ shell's process group, then `SIGKILL` after 2 s, and exits. When the shell exits
 - xterm.js 6.0.0 and its fit add-on 0.11.0, vendored (`terminal-web/vendor/`, MIT, with their license) because the
   app's CSP allows scripts only from `'self'`. The fit add-on follows the page's size; each change sends a resize.
 - The poll loop belongs to the browser module, not the page: closing the page to read a session keeps the shell; the
-  rail badge counts the open terminals.
+  rail badge counts the open terminals. It is 1 poll for the tab, which carries every terminal the tab shows.
 - **Phone:** a key bar with Esc, Tab, Ctrl (sticky, for the next key), the arrows, Paste and Select. Paste uses
   `navigator.clipboard.readText()` when the browser allows it, else a text box to paste into and send. Select shows
   the screen's text in a plain text box, where the phone's own selection and copy work.
