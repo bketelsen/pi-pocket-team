@@ -124,6 +124,9 @@ import {
     quietWakeOf,
     quietWake,
     quietTrigger,
+    quietWatched,
+    workedFolders,
+    QUIET_WATCH_MS,
     markHandled,
     handledAfter,
     dropHandled,
@@ -2892,6 +2895,67 @@ describe("a handled report and a quiet wake", () => {
             quietTrigger(done({ ...wake, ahead: undefined }), { dirty: 1 }, new Set()),
             undefined,
             "an unknown unpushed count is no work by itself",
+        );
+    });
+
+    test("quietWatched keeps a sweeper for 24 hours after the wake, and no longer", () => {
+        const marked = (
+            patch: Partial<Thread> = {},
+            run: Record<string, JsonValue> = { quietWake: { at: 1000, entry: 5 } },
+        ): DeskState => ({
+            ...empty(),
+            threads: { T1: done(run, { supervisor: 5, ...patch }) },
+        });
+
+        assert.equal(quietWatched(marked(), 5, 2000), true);
+        assert.equal(quietWatched(marked(), 5, 1000 + QUIET_WATCH_MS), true, "at the last moment");
+        assert.equal(quietWatched(marked(), 5, 1001 + QUIET_WATCH_MS), false, "an old mark");
+        assert.equal(quietWatched(marked(), 6, 2000), false, "another supervisor");
+        assert.equal(quietWatched(marked({}, {}), 5, 2000), false, "no mark");
+        assert.equal(
+            quietWatched(marked({ state: "open" }), 5, 2000),
+            false,
+            "an open thread only",
+        );
+        assert.equal(
+            quietWatched(marked(), 5, 1000 + 7 * 24 * 3600_000 + 1),
+            false,
+            "a thread past its 7 days",
+        );
+        assert.equal(quietWatched(undefined, 5, 2000), false, "no desk");
+    });
+
+    test("the folder exclusion counts open threads of every supervisor, and the threads that open now", () => {
+        const quiet = done({ quietWake: { at: 1200, entry: 5 } }, { id: "T1", supervisor: 1 });
+        const other = thread({ id: "T2", supervisor: 2, cwd: "/work/other" });
+        const state: DeskState = { ...empty(), threads: { T1: quiet, T2: other } };
+
+        assert.deepEqual([...workedFolders(state, new Set())], ["/work/other"]);
+
+        // A closed thread is no worker, unless this commit opens it.
+        const shut: DeskState = {
+            ...empty(),
+            threads: { T1: quiet, T2: { ...other, state: "closed" } },
+        };
+
+        assert.deepEqual([...workedFolders(shut, new Set())], []);
+        assert.deepEqual([...workedFolders(shut, new Set(["T2"]))], ["/work/other"]);
+
+        // Folder work in the shared folder is the other thread's: the quiet thread takes no trigger from it.
+        const shared = done(
+            { quietWake: { at: 1200, entry: 5 } },
+            { id: "T1", supervisor: 1, cwd: "/work/other" },
+        );
+
+        assert.equal(
+            quietTrigger(shared, { dirty: 5, ahead: 5 }, workedFolders(state, new Set())),
+            undefined,
+            "another supervisor's open thread works there",
+        );
+        assert.equal(
+            quietTrigger(shared, { dirty: 5, ahead: 5 }, new Set()),
+            "work in its folder after a supervisor message",
+            "with no other thread there, the work is its own",
         );
     });
 });
@@ -12674,6 +12738,13 @@ describe("the desk in a Pi Pocket", () => {
             /a supervisor message woke its session: it stays closed until a report, folder work or a PR/,
         );
 
+        // The mark keeps a sweeper: a report after the wake still opens the thread.
+        assert.equal(
+            typeof (await deskState())?.sweepers?.[String(Number(source))],
+            "string",
+            "the sweeper stays for the quiet wake",
+        );
+
         // A later sweep adds no second mark and no second event.
         await say(app, source, "desk sync test");
 
@@ -12729,36 +12800,32 @@ describe("the desk in a Pi Pocket", () => {
         assert.equal(stays?.run.next, "odrade");
     });
 
-    test("a report after a quiet wake reopens the thread, with its reason", async () => {
+    test("a report after a quiet wake reopens the thread, with its reason, in 1 sweep", async () => {
         const { source, linked, thread } = await closedDone("quiet-report");
 
-        quietAddress = thread.address ?? "";
         // The supervisor's message wakes the agent, and the agent reports in the same turn: a report after the close.
+        quietAddress = thread.address ?? "";
         await say(app, source, "message to agent with report test");
         await until(() => !app.isBusy(linked), "the agent's turn", 20_000);
-        await say(app, source, "desk sync test");
 
-        const quiet = (await deskState())?.threads[thread.id];
-
-        assert.equal(quiet?.state, "closed", "the wake is quiet");
-        assert.equal(
-            typeof (quiet?.run.quietWake as { at?: number } | undefined)?.at,
-            "number",
-            "the mark is new",
+        const mine = Object.values((await deskState())?.threads ?? {}).filter(
+            (each) => each.supervisor === Number(source),
         );
-        assert.equal(typeof quiet?.run.reportedAt, "number");
 
-        // The next sweep checks the triggers: the report is after the close.
+        assert.equal(mine.length, 1, "the supervisor's last thread, and no open one");
+        assert.equal(mine[0]?.state, "closed");
+
+        // 1 sweep sets the mark and checks the triggers: the report is after the close.
         await say(app, source, "desk sync test");
 
         const back = (await deskState())?.threads[thread.id];
 
-        assert.equal(back?.state, "open", "the report opens it again");
+        assert.equal(back?.state, "open", "the report opens it again in the same sweep");
         assert.equal(back?.run.quietWake, undefined, "a reopen deletes the mark");
-        assert.match(
-            back?.events.map((event) => event.text).join("; ") ?? "",
-            /reopened: a report after a supervisor message/,
-        );
+        const texts = back?.events.map((event) => event.text).join("; ") ?? "";
+
+        assert.match(texts, /a supervisor message woke its session: it stays closed/);
+        assert.match(texts, /reopened: a report after a supervisor message/);
     });
 
     test("a supervisor's desk send after a report marks the thread handled, and desk read shows it", async () => {

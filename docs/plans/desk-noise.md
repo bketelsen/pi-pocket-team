@@ -53,14 +53,16 @@ session may work, and the thread stays closed, until 1 of these comes after the 
 1. **A report:** `run.reportedAt` is later than `closed.at`. Reason: `a report after a supervisor message`.
 2. **Folder work:** the thread's folder has more changed files or more unpushed commits than the thread had when it
    closed (`run.dirty`, `run.ahead`). Reason: `work in its folder after a supervisor message`. A folder that another
-   open thread works in does not count: its work can be that thread's.
+   open thread of any supervisor works in does not count: its work can be that thread's.
 3. **A PR:** the existing rule, `a PR it made is open`, reopens it as before.
 
 **The mark.** The first sweep that sees a quiet wake records `run.quietWake = { at, entry }`: `at` is the sweep's time,
 `entry` the session's newest user entry before the supervisor's message (`usersBefore`). It adds 1 event, key
 `quiet-wake:<entry>`: `a supervisor message woke its session: it stays closed until a report, folder work or a PR`.
-Each later sweep checks the triggers while the mark is there and the thread is closed and reopenable. A reopen for any
-reason deletes the mark.
+The triggers run in the same sweep that records the mark, and in each later sweep while the mark is there and the thread
+is closed and reopenable. The supervisor's sweeper stays for 24 hours after the mark (`QUIET_WATCH_MS`), also when that
+thread was its last one; after that, the mark still holds the thread closed, and a later sweep still checks its triggers.
+A reopen for any reason deletes the mark.
 
 **Quiet.** A wake is quiet when `run.otherUserEntry` is known and is at or before the base entry (`quietWake.entry`, or
 `usersBefore` when there is no mark yet), and `run.lastUserEntry` is after that base. A person's message, or another

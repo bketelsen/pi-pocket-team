@@ -1980,6 +1980,57 @@ export function quietTrigger(
         : undefined;
 }
 
+/** How long a supervisor's sweeper watches a quiet-wake mark: a day, so a report after the wake still opens the thread. */
+export const QUIET_WATCH_MS = 24 * 3600_000;
+
+/**
+ * Whether a supervisor's sweeper must stay: a thread of it is closed and reopenable, has a quiet-wake mark, and the mark
+ * is at most 24 hours old. The sweeper watches a quiet wake for 24 hours; after that, the mark still holds, and later
+ * sweeps still check it.
+ */
+export function quietWatched(
+    state: Readonly<DeskState> | undefined,
+    supervisor: number,
+    now: number,
+): boolean {
+    return Object.values(state?.threads ?? {}).some((thread) => {
+        const mark = quietWakeOf(thread);
+
+        return (
+            thread.supervisor === supervisor &&
+            reopenable(thread, now) &&
+            mark !== undefined &&
+            now - mark.at <= QUIET_WATCH_MS
+        );
+    });
+}
+
+/**
+ * The folders that threads work in, for the folder trigger: every thread of every supervisor that is not closed, and
+ * every thread that `reopen` opens in this commit. Work in one of them can be that thread's, so it never opens a quiet
+ * thread.
+ */
+export function workedFolders(
+    state: Readonly<DeskState> | undefined,
+    reopen: ReadonlySet<string>,
+): Set<string> {
+    const folders = new Set<string>();
+
+    for (const thread of Object.values(state?.threads ?? {})) {
+        if (thread.state === "closed" && !reopen.has(thread.id)) {
+            continue;
+        }
+
+        const folder = folderOf(thread);
+
+        if (folder !== undefined) {
+            folders.add(folder);
+        }
+    }
+
+    return folders;
+}
+
 /** What keeps a thread's session part open, in words. Undefined when it is closed. */
 function openSession(thread: Thread): string | undefined {
     if (thread.session === undefined && thread.address === undefined) {
@@ -11804,8 +11855,6 @@ export default function createDesk(host: Host, web: Web) {
         }
 
         const reopen = new Map<string, string>();
-        // The threads that got their quiet-wake mark in this commit: their triggers wait for the next sweep.
-        const markedQuiet = new Set<string>();
 
         for (const thread of closedDone) {
             const mark = quietWakeOf(thread);
@@ -11816,7 +11865,6 @@ export default function createDesk(host: Host, web: Web) {
             if (quietWake(thread, base)) {
                 if (mark === undefined && base !== undefined) {
                     thread.run.quietWake = { at: now, entry: base };
-                    markedQuiet.add(thread.id);
 
                     if (addEvent(thread, `quiet-wake:${String(base)}`, QUIET_WAKE_TEXT, now)) {
                         events += 1;
@@ -11901,15 +11949,12 @@ export default function createDesk(host: Host, web: Web) {
         }
 
         // A thread a supervisor's message woke stays closed until a report, folder work, or a PR comes after the wake.
-        // A mark that this commit recorded waits for the next sweep: its triggers are read before the mark is here.
-        const openFolders = new Set(
-            open
-                .map((thread) => folderOf(thread))
-                .filter((folder): folder is string => folder !== undefined),
-        );
+        // The triggers run in this same sweep, also for a mark that this commit recorded: the sweep may be the last of
+        // its supervisor, and no later one would check them.
+        const openFolders = workedFolders(state, new Set(reopen.keys()));
 
         for (const thread of closedDone) {
-            if (reopen.has(thread.id) || markedQuiet.has(thread.id)) {
+            if (reopen.has(thread.id)) {
                 continue;
             }
 
@@ -12652,8 +12697,10 @@ export default function createDesk(host: Host, web: Web) {
                         (thread) =>
                             thread.supervisor === Number(supervisor) && thread.state !== "closed",
                     );
+                    // A quiet-wake mark keeps the sweeper: its triggers need a later sweep.
+                    const watched = quietWatched(state, Number(supervisor), runtime.now());
 
-                    if (!open) {
+                    if (!open && !watched) {
                         if (
                             state.sweepers?.[String(Number(supervisor))] === String(runtime.taskId)
                         ) {
@@ -12804,7 +12851,9 @@ export default function createDesk(host: Host, web: Web) {
             (thread) => thread.supervisor === supervisor && thread.state !== "closed",
         );
 
-        if (!open) {
+        // A closed done thread that a supervisor's message woke is watched for 24 hours: a report after the wake opens
+        // it, and a sweeper must be there to see it.
+        if (!open && !quietWatched(state, supervisor, Date.now())) {
             return;
         }
 
