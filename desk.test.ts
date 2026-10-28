@@ -100,6 +100,7 @@ import {
     rewriteAsk,
     withdrawAsk,
     asksBrian,
+    namesOpenAsk,
     attachTo,
     boundSupervisors,
     attribute,
@@ -5881,6 +5882,71 @@ describe("asksBrian", () => {
     });
 });
 
+describe("namesOpenAsk", () => {
+    /** A desk with 3 asks on 1 thread: T1a open, T1b answered, T1c withdrawn. */
+    const desk = () => {
+        const state = deskOf();
+        const thread = placed(state, 100);
+
+        for (const [index, text] of ["Rotate the key?", "Merge #5?", "Keep the guard?"].entries()) {
+            addAsk(state, {
+                thread: thread.id,
+                text,
+                key: `k${String(index)}`,
+                by: "Odrade",
+                supervisor: 1,
+                at: 200,
+            });
+        }
+
+        answerAsk(state, "T1b", { at: 300, by: "brian", words: "yes" });
+        withdrawAsk(state, "T1c", { why: "moot", by: "Odrade", at: 300 });
+
+        return state;
+    };
+
+    test("a last paragraph that names an open ask counts, whatever turn filed it", () => {
+        const state = desk();
+
+        assert.equal(namesOpenAsk("T1a: rotate the key now?", state), true);
+        assert.equal(namesOpenAsk("Done.\n\nGo with T1a, or wait?", state), true);
+        assert.equal(
+            namesOpenAsk("Is `T1a` still the plan?", state),
+            true,
+            "inline code still names it",
+        );
+        assert.equal(
+            namesOpenAsk("Should I wait on t1a?", state),
+            false,
+            "an ask id starts with a capital",
+        );
+    });
+
+    test("an answered or withdrawn ask, an unknown id, or no id does not count", () => {
+        const state = desk();
+
+        assert.equal(namesOpenAsk("T1b: merge it now?", state), false);
+        assert.equal(namesOpenAsk("T1c: keep the guard?", state), false);
+        assert.equal(namesOpenAsk("T9a: rotate the key?", state), false);
+        assert.equal(namesOpenAsk("T1: rotate the key?", state), false, "a thread id is no ask id");
+        assert.equal(namesOpenAsk("Should I merge #106?", state), false);
+        assert.equal(namesOpenAsk("T1a: rotate the key?", undefined), false);
+    });
+
+    test("only the last paragraph counts, and a fenced code block never does", () => {
+        const state = desk();
+
+        assert.equal(namesOpenAsk("T1a is open.\n\nShould I merge #106?", state), false);
+        assert.equal(namesOpenAsk("Should I merge #106?\n\n```\nT1a\n```", state), false);
+        assert.equal(namesOpenAsk("Should I merge #106?\n```\nT1a\n```", state), false);
+        assert.equal(
+            namesOpenAsk("T1a: rotate?\n`x`\nNow?", state),
+            false,
+            "a line of only inline code ends the paragraph, as asksBrian reads it",
+        );
+    });
+});
+
 describe("asks", () => {
     test("an ask on a thread gets the next letter, and a replay adds nothing", () => {
         const state = deskOf();
@@ -7311,6 +7377,12 @@ const model = scriptedModel((request) => {
 
     if (text.endsWith("desk reminder test")) {
         return answer("Should I merge #106?");
+    }
+
+    const named = /names ask (T[0-9]+[a-z]+) test$/.exec(text);
+
+    if (named) {
+        return answer(`Done here.\n\n${named[1]!}: rotate the key now?`);
     }
 
     if (text.endsWith("ask other thread test")) {
@@ -11678,6 +11750,56 @@ describe("the desk in a Pi Pocket", () => {
 
         assert.equal(ask?.session, Number(source));
         assert.equal(ask?.by, "Odrade");
+    });
+
+    test("the reminder does not fire when the reply names an ask open on the desk, and fires when that ask is answered", async () => {
+        const owner = await supervisor("named-ask-owner");
+        let askId = "";
+
+        // An ask filed a minute ago, in another session's turn: open on the desk now.
+        await app.harness.commit(async (tx) => {
+            const state = await tx.doc(DeskThreads);
+            const opened = openThread(state, {
+                key: "x.test.named-ask",
+                supervisor: Number(owner),
+                agents: ["duncan"],
+                repo: "frostyard/test",
+                title: "A named ask",
+                at: Date.now(),
+            });
+            const filed = addAsk(state, {
+                thread: opened.thread.id,
+                text: "Rotate the key?",
+                key: "x.test.named-ask.a",
+                by: "Odrade",
+                supervisor: Number(owner),
+                at: Date.now() - 60_000,
+            });
+
+            assert.ok("askId" in filed);
+            askId = filed.askId;
+        }, context);
+
+        const open = await supervisor("reminder-named-open");
+
+        await say(app, open, `names ask ${askId} test`);
+        assert.doesNotMatch((await modelTexts(app, open)).join("\n"), /Desk check:/);
+
+        await app.harness.commit(async (tx) => {
+            answerAsk(await tx.doc(DeskThreads), askId, {
+                at: Date.now(),
+                by: "brian",
+                words: "yes",
+            });
+        }, context);
+
+        const answered = await supervisor("reminder-named-answered");
+
+        await say(app, answered, `names ask ${askId} test`);
+        assert.equal(
+            (await modelTexts(app, answered)).filter((each) => each.includes("Desk check:")).length,
+            1,
+        );
     });
 
     test("a turn that filed an ask gets no reminder, and a session without a supervisor identity gets none", async () => {
