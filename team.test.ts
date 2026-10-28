@@ -26,8 +26,10 @@ import {
     delegationWorktree,
     FRONT_DOOR_DESK_OFF,
     Identity,
+    MESSAGE_LIMITS,
     pickSupervisor,
     roster,
+    teamMessageProblems,
 } from "./team.ts";
 
 after(cleanUp);
@@ -98,6 +100,24 @@ test("drop-in identities, named delegation, HTTP permissions, replay and restart
                     fauxToolCall("team_message", {
                         to: address,
                         message: "Duncan finished the prototype task.",
+                    }),
+                ],
+                { stopReason: "toolUse" },
+            );
+        }
+
+        if (role === "user" && text.endsWith("long ask test")) {
+            const address = /Message from linked session (session-[a-f0-9-]+)/.exec(
+                requestContext,
+            )?.[1];
+
+            return fauxAssistantMessage(
+                [
+                    fauxToolCall("team_message", {
+                        to: address,
+                        message: "Duncan needs a decision.",
+                        status: "blocked",
+                        asks: [{ question: `Pick one. ${"x".repeat(530)}`, options: ["a", "b"] }],
                     }),
                 ],
                 { stopReason: "toolUse" },
@@ -235,6 +255,16 @@ test("drop-in identities, named delegation, HTTP permissions, replay and restart
             "specialist report delivered to supervisor",
         );
         await until(() => !app.isBusy(id), "supervisor received the report");
+        // An ask over its limit: the error says which argument, the limit, by how much, and what to do; nothing is sent.
+        await say(app, child, "long ask test");
+        await until(() => !app.isBusy(child), "long ask settled");
+        const longAsk = (await modelTexts(app, child)).join("\n");
+
+        assert.match(
+            longAsk,
+            /team_message was not sent\. Fix the arguments below, and call it again:\\n- asks\[0\]\.question has 540 characters; the limit is 500\. Cut at least 40 characters: keep 1 decision on 1 line/,
+        );
+        assert.doesNotMatch((await modelTexts(app, id)).join("\n"), /Duncan needs a decision/);
         type Linked = { conversationId: string; title?: string; cwd?: string };
 
         // Delegate once, and return the new session with the model it runs on.
@@ -553,4 +583,79 @@ test("pickSupervisor: the newest bound session that the person sees, not archive
     assert.equal(pickSupervisor([], [session(1)]), undefined);
     // An app with no session list: the newest bound one.
     assert.equal(pickSupervisor(bound, undefined)?.id, 9);
+});
+
+test("teamMessageProblems: each limit, with the count, the limit and the fix; the limits stay", () => {
+    assert.deepEqual(MESSAGE_LIMITS, {
+        message: 6000,
+        asks: 4,
+        question: 500,
+        options: { min: 2, max: 6 },
+        option: 40,
+    });
+    const ok = {
+        to: "s",
+        message: "Done.",
+        status: "done",
+        asks: [{ question: "Merge?", options: ["yes", "no"] }],
+    };
+
+    assert.deepEqual(teamMessageProblems(ok), []);
+    // At the limits exactly: no problem. Characters are code points, as the schema counts them.
+    assert.deepEqual(
+        teamMessageProblems({
+            to: "s",
+            message: "😀".repeat(6000),
+            asks: Array.from({ length: 4 }, () => ({
+                question: "q".repeat(500),
+                options: Array.from({ length: 6 }, () => "o".repeat(40)),
+            })),
+        }),
+        [],
+    );
+    // The 2 cases the audit found (2026-10-27): 1 question over 500 characters.
+    assert.deepEqual(
+        teamMessageProblems({ to: "s", message: "m", asks: [{ question: "q".repeat(538) }] }),
+        [
+            "asks[0].question has 538 characters; the limit is 500. Cut at least 38 characters: keep 1 decision on 1 line, with only the facts Brian needs to answer it; put the details in message.",
+        ],
+    );
+    assert.deepEqual(teamMessageProblems({ to: "s", message: "m".repeat(6523) }), [
+        "message has 6523 characters; the limit is 6000. Cut at least 523 characters: keep the result and the facts the reader needs, and leave out logs and repeated details.",
+    ]);
+    assert.deepEqual(teamMessageProblems({ to: "s", message: "" }), [
+        "message is empty: it needs 1 to 6000 characters.",
+    ]);
+    assert.deepEqual(teamMessageProblems({ to: "s", message: "m", status: "finished" }), [
+        'status is "finished": use done, working or blocked.',
+    ]);
+    assert.deepEqual(
+        teamMessageProblems({
+            to: "s",
+            message: "m",
+            asks: Array.from({ length: 5 }, () => ({ question: "q" })),
+        }),
+        [
+            "asks has 5 asks; the limit is 4. Merge related decisions, or send the others in a second team_message.",
+        ],
+    );
+    assert.deepEqual(
+        teamMessageProblems({
+            to: "s",
+            message: "m",
+            asks: [
+                { question: "q", options: ["only"] },
+                { question: "q", options: ["1", "2", "3", "4", "5", "6", "7"] },
+                { question: "q", options: ["yes", "o".repeat(41)] },
+            ],
+        }),
+        [
+            "asks[0].options has 1 choice; it needs 2 to 6. Leave options out when the ask is no pick-one.",
+            "asks[1].options has 7 choices; it needs 2 to 6. Keep the main choices, or split the ask.",
+            "asks[2].options[1] has 41 characters; the limit is 40. Cut at least 1 character: name the choice in a few words, and explain it in the question.",
+        ],
+    );
+    // A wrong type is the schema's to report.
+    assert.deepEqual(teamMessageProblems({ message: 5, asks: "x", status: undefined }), []);
+    assert.deepEqual(teamMessageProblems(null), []);
 });

@@ -19,6 +19,7 @@ import {
     repeatDays,
     scrubJson,
     scrubMarkdown,
+    summaryText,
     totalsOf,
 } from "./report.mjs";
 import { NOW, ctx, emptyData } from "./fixtures/builders.mjs";
@@ -704,8 +705,12 @@ test("the report names each proposal or summary that the checks dropped, in 1 sh
     );
     // The kept proposal is shown; a dropped summary shows as none, and the run is not called a failure.
     assert.match(markdown, /1\. \*\*Add reports\*\*/);
-    assert.match(markdown, /## Summary\n\nNone\./);
+    assert.match(
+        markdown,
+        /## Summary\n\nNone\. The checks dropped the LLM's summary: has more than 3 sentences\.\n/,
+    );
     assert.doesNotMatch(markdown, /LLM text failed the checks/);
+    assert.doesNotMatch(markdown, /undefined/);
     // Nothing is said when nothing was dropped.
     assert.doesNotMatch(
         renderReport(baseReport({ findings: rows, llm: { ...llm, dropped: [] } })),
@@ -726,4 +731,29 @@ test("the report names each proposal or summary that the checks dropped, in 1 sh
         ),
         /Dropped by the checks/,
     );
+});
+
+test("summaryText: the summary, or None with the real reason, never undefined", () => {
+    const used = { ...emptyLlm, used: true, reason: undefined };
+
+    assert.equal(summaryText({ ...used, summary: "All quiet." }), "All quiet.");
+    assert.equal(
+        summaryText({ ...used, failed: true, reason: "the answer is not valid JSON" }),
+        "None. LLM text failed the checks: the answer is not valid JSON",
+    );
+    assert.equal(
+        summaryText({
+            ...used,
+            summary: "",
+            dropped: [{ item: "summary", reason: "the number 18 is in no finding" }],
+        }),
+        "None. The checks dropped the LLM's summary: the number 18 is in no finding.",
+    );
+    assert.equal(summaryText(emptyLlm), "None. LLM text not used: --no-llm");
+    // A used run whose answer had no summary at all.
+    assert.equal(
+        summaryText({ ...used, summary: "", dropped: [] }),
+        "None. The LLM wrote no summary.",
+    );
+    assert.equal(summaryText({ used: false }), "None. LLM text not used.");
 });
