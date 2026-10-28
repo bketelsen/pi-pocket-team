@@ -40,6 +40,8 @@ npm run install-extension  # copy changed files into ~/.pi-pocket/extensions/
 
 The installer compares every file byte for byte and writes only those that differ, so installing unchanged source touches nothing. It never deletes: installed files the project doesn't have are listed and left alone. `install-extension` copies into `~/.pi-pocket/extensions/`, or `$PI_POCKET_DIR/extensions` when `PI_POCKET_DIR` (Pocket's data folder) selects another installation.
 
+Each file is written to a temporary file beside it (`.team.ts.install-<pid>`: a dot name without the `.ts` ending, so Pocket's watchers ignore it), then renamed over the installed file. A module therefore reloads once, from the whole file: a direct copy left the file empty for a moment (on btrfs, for about a second while the reflink waited), and the server tried to load it empty. A link in the extensions folder is replaced by a file, not written through.
+
 The server must already have `node_modules` in its extensions folder. Pocket's drop-in setup does this; see Pocket's `docs/extensions.md`.
 
 An install writes into the running server: a saved module reloads at once, and open tabs pick up browser changes. Installing never turns a module on or off and never restarts the server; the owner does both, in **Menu → Extensions**. Run `npm test` before every install.
