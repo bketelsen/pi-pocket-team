@@ -79,8 +79,8 @@ seq }`, and the server keeps, for each tab of a terminal, the last `seq` it wrot
   one is a 400. 16 tabs may type into one terminal at once: a 17th is answered 429, and writes nothing, until one of
   them has been quiet for RECEIPT_MS. Receipts are never dropped for their number: that is what keeps a repeated `seq`
   from writing twice. The browser keeps the chunk until the server has it, and tries it again after 0.5, 1, 2, and 4
-  s, then every 4 s, with a note that reads "Input waits for the server…". It tries a chunk for 60 s in all: after
-  that, the chunk is never sent again by itself, the page says how many characters may not have reached the shell, and
+  s, then every 4 s, with a note that reads "Input waits for the server…". It tries a chunk for 60 s in all, and the deadline also aborts a request in flight
+  (`deliver()`), so a request that never settles cannot hold the chunk longer. After that, the chunk is never sent again by itself, the page says how many characters may not have reached the shell, and
   its **Discard** button drops them, after which typing goes on with the next `seq`. 60 s is far less than
   RECEIPT_MS, so a retry never meets a receipt the server has forgotten.
 - **A 409 is a shell that exited.** On a key or a size, a 404 means the terminal is gone: the tab stops and says so.

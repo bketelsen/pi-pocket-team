@@ -6,6 +6,7 @@ import { test } from "node:test";
 import {
     afterFailure,
     backoffMs,
+    deliver,
     GIVE_UP_MS,
     newTabId,
     POLL_MAX,
@@ -108,4 +109,69 @@ test("a failed request says which it is: gone, a shell that closed, or a retry",
     assert.equal(afterFailure(429), "retry");
     assert.equal(afterFailure(undefined), "retry");
     assert.equal(afterFailure(0), "retry");
+});
+
+/** A request that never settles until its signal aborts, as a server that took the POST and never answered. */
+const hanging = (calls) => (signal) =>
+    new Promise((_resolve, reject) => {
+        calls.push(signal);
+        signal.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
+    });
+
+test("a chunk whose request never settles is lost at the deadline, and its request is aborted", async () => {
+    const calls = [];
+    const outcome = await deliver({
+        send: hanging(calls),
+        signal: new AbortController().signal,
+        giveUpMs: 50,
+    });
+
+    assert.equal(outcome, "lost");
+    assert.equal(calls.length, 1, "no second send of the same chunk after the deadline");
+    assert.equal(calls[0].aborted, true, "the request in flight was aborted");
+});
+
+test("a chunk is retried with no answer, and the deadline ends the wait between tries too", async () => {
+    let sends = 0;
+    let waits = 0;
+    const started = Date.now();
+    const outcome = await deliver({
+        send: async () => {
+            sends++;
+
+            throw new TypeError("network");
+        },
+        signal: new AbortController().signal,
+        giveUpMs: 700,
+        onWait: () => waits++,
+    });
+
+    assert.equal(outcome, "lost");
+    assert.equal(
+        sends,
+        2,
+        "the first try, and 1 after the 0.5 s wait; the 1 s wait ends at the deadline",
+    );
+    assert.equal(waits, 2);
+    assert.ok(Date.now() - started < 1_200, "the deadline cut the second wait short");
+});
+
+test("a delivered chunk, a 404, a 409, and a close each end delivery as they should", async () => {
+    const open = () => new AbortController().signal;
+
+    const failing = (status) => async () => {
+        throw Object.assign(new Error("no"), { status });
+    };
+
+    assert.equal(await deliver({ send: async () => ({}), signal: open() }), "sent");
+    assert.equal(await deliver({ send: failing(404), signal: open() }), "gone");
+    assert.equal(await deliver({ send: failing(409), signal: open() }), "closed");
+
+    const closing = new AbortController();
+    const calls = [];
+    const pending = deliver({ send: hanging(calls), signal: closing.signal, giveUpMs: 10_000 });
+
+    closing.abort();
+    assert.equal(await pending, "stopped");
+    assert.equal(calls[0].aborted, true);
 });

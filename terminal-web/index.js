@@ -61,8 +61,8 @@ export function pollRecords(records, max = POLL_MAX) {
 export const GIVE_UP_MS = 60_000;
 
 /** Whether a chunk that has gone unanswered since `startedAt` may be tried again at `now`. */
-export function retryAllowed(startedAt, now) {
-    return now - startedAt < GIVE_UP_MS;
+export function retryAllowed(startedAt, now, giveUpMs = GIVE_UP_MS) {
+    return now - startedAt < giveUpMs;
 }
 
 /**
@@ -83,6 +83,81 @@ export function afterFailure(status) {
 
 /** A wait that a close or a stop need not cut short: the caller looks at its own flags after it. */
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Delivers 1 chunk of input: `send(signal)` makes the request, and is tried again after a failure with no answer, with
+ * the same seq (the caller's), until `giveUpMs` has passed since the first try. The deadline also aborts a request in
+ * flight, so a request that never settles cannot hold the chunk past it. `signal` is the terminal's own (a close, a
+ * stop). `onWait` runs before each wait for a retry. It resolves with "sent", "gone" (404), "closed" (409: the shell
+ * exited), "lost" (the deadline passed: the text may or may not have reached the shell, and is never sent again by
+ * itself), or "stopped" (`signal` aborted).
+ */
+export async function deliver({ send, signal, giveUpMs = GIVE_UP_MS, onWait = () => {} }) {
+    const deadline = new AbortController();
+    const timer = setTimeout(() => deadline.abort(), giveUpMs);
+    const both = new AbortController();
+    const stop = () => both.abort();
+
+    signal.addEventListener("abort", stop, { once: true });
+    deadline.signal.addEventListener("abort", stop, { once: true });
+
+    if (signal.aborted) {
+        stop();
+    }
+
+    const started = Date.now();
+
+    try {
+        for (let attempt = 0; ; attempt++) {
+            if (signal.aborted) {
+                return "stopped";
+            }
+
+            if (deadline.signal.aborted || !retryAllowed(started, Date.now(), giveUpMs)) {
+                return "lost";
+            }
+
+            try {
+                await send(both.signal);
+
+                return "sent";
+            } catch (failure) {
+                if (signal.aborted) {
+                    return "stopped";
+                }
+
+                if (deadline.signal.aborted) {
+                    return "lost";
+                }
+
+                const what = afterFailure(failure?.status);
+
+                if (what !== "retry") {
+                    return what;
+                }
+            }
+
+            onWait();
+
+            // The wait for a retry ends at the deadline too: the loop then says "lost".
+            await new Promise((resolve) => {
+                const wait = setTimeout(resolve, backoffMs(attempt));
+
+                both.signal.addEventListener(
+                    "abort",
+                    () => {
+                        clearTimeout(wait);
+                        resolve();
+                    },
+                    { once: true },
+                );
+            });
+        }
+    } finally {
+        clearTimeout(timer);
+        signal.removeEventListener("abort", stop);
+    }
+}
 
 const GONE = "This terminal ended (the server restarted or the module reloaded)";
 
@@ -388,63 +463,45 @@ export default function setup(pocket) {
 
                 const chunk = record.pending.slice(0, size);
                 const seq = record.seq + 1;
-                const startedAt = Date.now();
 
                 record.pending = record.pending.slice(size);
 
-                for (let attempt = 0; ; attempt++) {
-                    // 60 s with no answer: the text stays for a Discard, and this chunk never goes again by itself.
-                    if (!retryAllowed(startedAt, Date.now())) {
-                        record.lost = { text: chunk, seq };
-                        record.waiting = false;
-                        bump();
-
-                        return;
-                    }
-
-                    try {
-                        await pocket.api(
+                // The same seq on every try, which the server writes once; 60 s at most, a request in flight too.
+                const what = await deliver({
+                    send: (signal) =>
+                        pocket.api(
                             `terminals/${record.id}/input`,
                             { data: chunk, tab, seq },
-                            { signal: record.abort.signal },
-                        );
-                        record.seq = seq;
-                        break;
-                    } catch (failure) {
-                        const what = afterFailure(failure?.status);
-
-                        if (what === "gone") {
-                            ended(record, GONE);
-
-                            return;
-                        }
-
-                        if (what === "closed") {
-                            // The shell exited: its last output still comes in a poll, and no key can reach it.
-                            record.inputClosed = true;
-                            record.waiting = false;
-                            bump();
-
-                            return;
-                        }
-
-                        if (!typable(record)) {
-                            return;
-                        }
-
-                        // No answer: the text waits here, and the same seq goes again, which the server writes once.
+                            { signal },
+                        ),
+                    signal: record.abort.signal,
+                    onWait: () => {
                         if (!record.waiting) {
                             record.waiting = true;
                             bump();
                         }
+                    },
+                });
 
-                        await delay(backoffMs(attempt));
-
-                        if (!typable(record)) {
-                            return;
-                        }
-                    }
+                if (what === "sent") {
+                    record.seq = seq;
+                    continue;
                 }
+
+                if (what === "gone") {
+                    ended(record, GONE);
+                } else if (what === "closed") {
+                    // The shell exited: its last output still comes in a poll, and no key can reach it.
+                    record.inputClosed = true;
+                } else if (what === "lost") {
+                    // 60 s with no answer: the text stays for a Discard, and this chunk never goes again by itself.
+                    record.lost = { text: chunk, seq };
+                }
+
+                record.waiting = false;
+                bump();
+
+                return;
             }
         } finally {
             record.sending = false;
