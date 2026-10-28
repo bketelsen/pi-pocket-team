@@ -14,6 +14,21 @@ const LAST_ACTIVE = "x.terminal.active";
 const INPUT_MAX = 32 * 1024;
 /** Terminals at once, as the server counts them. */
 const CAP = 4;
+
+/**
+ * A tab's id, for the server's back pressure: 1 to 64 letters, digits, and dashes. `randomUUID` is missing on a
+ * plain-HTTP LAN page, where `getRandomValues` still works.
+ */
+export function newTabId(random = globalThis.crypto) {
+    if (typeof random?.randomUUID === "function") {
+        return random.randomUUID();
+    }
+
+    const bytes = random.getRandomValues(new Uint8Array(16));
+
+    return [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
 const GONE = "This terminal ended (the server restarted or the module reloaded)";
 
 export default function setup(pocket) {
@@ -37,6 +52,8 @@ export default function setup(pocket) {
     let conversation = null;
     let version = 0;
     let stopped = false;
+    /** This tab's id for the server's back pressure, made once. */
+    const tab = newTabId();
     /** The tab's 1 long poll, and the terminals it was asked for. */
     let polling = null;
     let asked = "";
@@ -329,7 +346,7 @@ export default function setup(pocket) {
                 let answer;
 
                 try {
-                    answer = await pocket.api(`poll?t=${query}`, undefined, {
+                    answer = await pocket.api(`poll?tab=${tab}&t=${query}`, undefined, {
                         signal: mine.signal,
                     });
                 } catch {

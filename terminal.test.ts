@@ -9,11 +9,13 @@ import {
     until,
 } from "./_pocket/test/helpers.ts";
 import assert from "node:assert/strict";
-import { cpSync, mkdirSync } from "node:fs";
+import { cpSync, mkdirSync, readFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { join } from "node:path";
 import { after, afterEach, before, test } from "node:test";
 import { createHandler } from "./_pocket/src/server/http.ts";
+// The module itself, for the 1 test of a start that is in flight when the module goes: it uses a fake `web`.
+import createTerminal from "./terminal.ts";
 
 /** A folder with nothing of the user's in it: the login shell reads no dotfile, and `pwd` is easy to see. */
 const home = join(root, "terminal-home");
@@ -152,13 +154,21 @@ function collected(id: string) {
     return found;
 }
 
-/** One multiplexed poll, as the route takes it: `t=id.from,id.from`. It gives up after a moment, so a test never waits 25 s. */
-async function pollList(entries: { id: string; from: number }[], wait = 3000, who = "owner") {
+/**
+ * One multiplexed poll, as the route takes it: `t=id.from,id.from` for a tab. It gives up after a moment, so a test
+ * never waits 25 s.
+ */
+async function pollList(
+    entries: { id: string; from: number }[],
+    wait = 3000,
+    who = "owner",
+    tab = "tab-test",
+) {
     const query = entries.map((each) => `${each.id}.${each.from}`).join(",");
     let response;
 
     try {
-        response = await fetch(`${origin}/api/x/terminal/poll?t=${query}`, {
+        response = await fetch(`${origin}/api/x/terminal/poll?tab=${tab}&t=${query}`, {
             headers: { authorization: `Bearer ${tokens[who]}`, "x-pocket": "1" },
             signal: AbortSignal.timeout(wait),
         });
@@ -169,10 +179,10 @@ async function pollList(entries: { id: string; from: number }[], wait = 3000, wh
     return { status: response.status, data: await response.json() };
 }
 
-/** One poll for a terminal: what it wrote since the last one, or its exit or its end. */
-async function poll(id: string, wait = 3000) {
+/** One poll for a terminal, as one tab: what it wrote since the last one, or its exit or its end. */
+async function poll(id: string, wait = 3000, tab = "tab-test") {
     const state = collected(id);
-    const answer = await pollList([{ id, from: state.offset }], wait);
+    const answer = await pollList([{ id, from: state.offset }], wait, "owner", tab);
 
     if (answer.status !== 200) {
         return { status: answer.status, data: {} };
@@ -260,6 +270,46 @@ async function end(id: string) {
     const answer = await call("owner", `terminals/${id}`, { method: "DELETE" });
 
     assert.equal(answer.status, 200, JSON.stringify(answer.data));
+}
+
+/** A `web` that records what a module adds to it, and runs its cleanups on demand. */
+function fakeWeb() {
+    const handlers = new Map<string, (request: unknown) => unknown>();
+    const sent: { event: string; data: unknown }[] = [];
+    const cleanups: (() => unknown)[] = [];
+
+    return {
+        handlers,
+        sent,
+        route(method: string, path: string, handle: (request: unknown) => unknown) {
+            handlers.set(`${method} ${path}`, handle);
+        },
+        client() {},
+        error(status: number, message: string) {
+            return Object.assign(new Error(message), { status });
+        },
+        send(event: string, data: unknown) {
+            sent.push({ event, data });
+        },
+        onDispose(cleanup: () => unknown) {
+            cleanups.push(cleanup);
+        },
+        /** What Pi Pocket runs when the module goes. */
+        dispose: () => Promise.all(cleanups.map((cleanup) => cleanup())),
+    };
+}
+
+/** The request of an owner who starts a shell in a folder. */
+function startRequest(body: Record<string, unknown>) {
+    return {
+        method: "POST",
+        params: {},
+        query: new URLSearchParams(),
+        body,
+        user: { id: "owner", name: "Owner", role: "owner" },
+        signal: new AbortController().signal,
+        sessions: () => [],
+    };
 }
 
 /** Whether the process is there: a signal 0 that throws says it is gone. */
@@ -407,6 +457,15 @@ test("a poll refuses a bad list of terminals", async () => {
         assert.equal(answer.status, 400, JSON.stringify(query));
     }
 
+    // A tab id is 1 to 64 letters, digits, and dashes; none at all is the poll of a client that sends no tab.
+    for (const tab of ["", "a b", "x".repeat(65), "a/b"]) {
+        const answer = await call("owner", `poll?tab=${encodeURIComponent(tab)}&t=${id}.0`);
+
+        assert.equal(answer.status, 400, JSON.stringify(tab));
+    }
+
+    assert.equal((await call("owner", `poll?t=${id}.0`)).status, 200);
+
     await end(id);
 });
 
@@ -519,6 +578,123 @@ test("a shell that exits keeps its exit code for the next poll", async () => {
     assert.equal(listed.length, 1);
     assert.equal(listed[0].exited, true);
     assert.equal(listed[0].exitCode, 7);
+
+    await end(id);
+});
+
+test("6 starts at once: 4 shells run, and the other 2 are refused", async () => {
+    // Each start reads its folder with an await, so all 6 pass the first cap check: the check again before the spawn,
+    // with no await between it and the shell, is what keeps the server at 4.
+    const answers = await Promise.all(
+        Array.from({ length: 6 }, () =>
+            call("owner", "terminals", {
+                method: "POST",
+                body: { folder: "path", path: fixture },
+            }),
+        ),
+    );
+
+    assert.deepEqual(answers.map((each) => each.status).sort(), [200, 200, 200, 200, 429, 429]);
+
+    const ids = answers.filter((each) => each.status === 200).map((each) => each.data.id);
+
+    assert.equal(new Set(ids).size, 4);
+    assert.equal((await list()).length, 4);
+});
+
+test("DELETE ends a shell that closed its own fds and runs on", async () => {
+    const id = await start();
+
+    await type(id, "echo pid=$$\n");
+    const pid = await expectPid(id);
+
+    // The shell becomes a python process with its terminal fds closed: the pty gives EOF, and the helper waits.
+    await type(id, "exec python3 -c 'import os,time; os.closerange(0,1024); time.sleep(600)'\n");
+
+    const command = () => {
+        try {
+            return readFileSync(`/proc/${pid}/cmdline`, "utf8");
+        } catch {
+            return "";
+        }
+    };
+
+    await until(() => command().includes("python3"), "the shell to become python3", 10_000);
+    // The process is alive, and it holds no fd on the terminal: nothing but a closed stdin can end it.
+    assert.ok(running(pid));
+
+    await end(id);
+    await until(() => !running(pid), "the process with closed fds to end", 15_000);
+});
+
+test("a start that is in flight when the module goes starts no shell", async () => {
+    const web = fakeWeb();
+
+    createTerminal(undefined, web);
+
+    const start = web.handlers.get("POST terminals");
+
+    assert.equal(typeof start, "function");
+
+    const pending = start!(startRequest({ folder: "path", path: fixture })).then(
+        () => ({ started: true }),
+        (error: { status?: number }) => ({ status: error.status }),
+    );
+
+    // The module goes while the start waits for its folder check: the check after that await refuses the start.
+    await web.dispose();
+
+    assert.equal((await pending).status, 503);
+    assert.deepEqual(web.sent, []);
+});
+
+test("2 tabs: the slow one holds the shell back and loses no character", async () => {
+    const id = await start();
+    const fast = { tab: "tab-fast", offset: 0, text: "" };
+    const slow = { tab: "tab-slow", offset: 0, text: "" };
+    let lagged = false;
+
+    /** One poll of 1 tab: false when nothing came. Its answer must start at the offset that tab asked from. */
+    const stream = async (view: typeof fast) => {
+        // A short wait: a pause in the shell means a poll waits for output that the other tab must unlock first.
+        const answer = await pollList([{ id, from: view.offset }], 500, "owner", view.tab);
+
+        if (answer.status !== 200) {
+            return false;
+        }
+
+        const entry = answer.data.terminals[id];
+
+        assert.equal(entry.gone, undefined);
+        assert.equal(entry.from, view.offset, `${view.tab} lost output`);
+        assert.ok(entry.data.length <= 256 * 1024, "an answer of 256 K characters at most");
+        view.offset = entry.to;
+        view.text += entry.data;
+
+        return entry.data.length > 0;
+    };
+
+    // More output than the 256 K buffer, and more than 1 answer carries.
+    await type(id, "seq 1 300000\n");
+
+    await until(
+        async () => {
+            await stream(fast);
+            lagged ||= fast.offset > slow.offset;
+            await stream(slow);
+
+            // The last line of seq, and not the typed command line, which is echoed as "seq 1 300000".
+            return slow.text.includes("\r\n300000\r\n") && fast.text.includes("\r\n300000\r\n");
+        },
+        "both tabs to read the whole output",
+        30_000,
+    );
+
+    // The fast tab ran ahead, and the pause kept the slow tab inside the buffer: it lost nothing.
+    assert.ok(lagged);
+    assert.ok(slow.text.length > 256 * 1024, "more output than the buffer holds");
+    assert.equal(slow.text.length, fast.text.length);
+    assert.equal(slow.text, fast.text);
 
     await end(id);
 });

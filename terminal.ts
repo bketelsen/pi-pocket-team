@@ -9,9 +9,11 @@
  * websocket, and no token in an address. Every route is the owner's alone, and the app's own sign-in and `X-Pocket`
  * check come first.
  *
- * Memory holds the last 256 K characters of each shell's output, so a tab that reloads gets its screen back. Nothing
- * here writes a keystroke or output to the log. A shell ends on `DELETE`, when the shell exits, 60 s after the last
- * output poll, 60 minutes after the last input, or when this module goes.
+ * Memory holds the last 256 K characters of each shell's output, so a tab that reloads gets its screen back. Each tab
+ * names itself in its poll, and a shell reads only as fast as its slowest tab: the output pauses when the oldest tab
+ * that still watches is half a buffer behind. Nothing here writes a keystroke or output to the log. A shell ends on
+ * `DELETE`, when the shell exits, 60 s after the last output poll, 60 minutes after the last input, or when this
+ * module goes.
  */
 import { spawn, type ChildProcessByStdio } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -26,7 +28,8 @@ export const pocketApi = 2;
 
 /**
  * The pty helper, run as `python3 -I -c <this> <shell> <folder> <rows> <cols>`. It is a pty in front of one login
- * shell, framed input on stdin, and it carries the shell's exit code.
+ * shell, framed input on stdin, and it carries the shell's exit code. When the pty gives EOF, the helper keeps reading
+ * stdin, so a shell that closed its own fds and runs on is still ended by a closed stdin.
  */
 const HELPER = `import errno, fcntl, os, pty, select, signal, struct, sys, termios, time
 
@@ -43,11 +46,19 @@ if pid == 0:
     os.execv(shell, ["-" + os.path.basename(shell)])
 
 
+status = None
+
+
 def reaped():
+    global status
     try:
-        return os.waitpid(pid, os.WNOHANG)[0] != 0
+        done, waited = os.waitpid(pid, os.WNOHANG)
     except ChildProcessError:
         return True
+    if done != 0:
+        status = waited
+        return True
+    return False
 
 
 def end(code):
@@ -104,8 +115,19 @@ try:
                     fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", *struct.unpack(">HH", body), 0, 0))
 except BaseException:
     end(1)
-_, status = os.waitpid(pid, 0)
-sys.exit(os.waitstatus_to_exitcode(status) & 0xFF)
+while not reaped():
+    try:
+        ready = select.select([0], [], [], 0.2)[0]
+    except (OSError, ValueError):
+        ready = []
+    if ready:
+        try:
+            chunk = os.read(0, 65536)
+        except OSError:
+            chunk = b""
+        if not chunk:
+            end(129)
+sys.exit(0 if status is None else (os.waitstatus_to_exitcode(status) & 0xFF))
 `;
 
 /** Terminals at once: a 5th start answers 429. */
@@ -120,6 +142,12 @@ const TICK_MS = 5_000;
 const GRACE_MS = 60_000;
 /** The most input in one POST. */
 const INPUT_MAX = 32 * 1024;
+/** How long a tab counts for back pressure after its last poll: a poll waits 25 s, and 5 s is the margin. */
+const TAB_MS = 30_000;
+/** Tabs that one terminal keeps for back pressure: the oldest goes. */
+const TABS_MAX = 16;
+/** A tab's id in a poll: 1 to 64 letters, digits, and dashes. */
+const TAB_ID = /^[A-Za-z0-9-]{1,64}$/;
 /** A terminal with no output poll for this long has no tab: end it. Tests set the environment variable lower. */
 const DETACH_MS = span(process.env.PI_POCKET_TERMINAL_DETACH_MS, 60_000);
 /** A terminal with no input for this long is idle: end it. Tests set the environment variable lower. */
@@ -140,6 +168,12 @@ const ALLOWED = new Set([
     "DBUS_SESSION_BUS_ADDRESS",
 ]);
 
+/** What one tab last said about one terminal: the offset it asked from, and when. */
+interface Watcher {
+    offset: number;
+    seen: number;
+}
+
 /** 1 terminal in a poll's answer: its output from an offset, or the news that it is gone. */
 type Answer =
     | { gone: true }
@@ -157,6 +191,8 @@ interface Terminal {
     total: number;
     /** The highest offset any poll has asked for: the output after it is not read from the helper. */
     asked: number;
+    /** One entry for each tab that watches this terminal: the offset it asked from, and when it last polled. */
+    tabs: Map<string, Watcher>;
     lastPoll: number;
     lastInput: number;
     /** Output polls in progress now. */
@@ -205,6 +241,8 @@ async function isFolder(path: string): Promise<boolean> {
 
 export default function createTerminal(_host: unknown, web: Web) {
     const terminals = new Map<string, Terminal>();
+    /** Set when the module goes: a start that was in flight then never spawns a helper. */
+    let disposed = false;
 
     type Handler = (request: WebRequest) => unknown;
 
@@ -281,15 +319,56 @@ export default function createTerminal(_host: unknown, web: Web) {
         });
     }
 
-    /** A tab that is more than KEEP characters behind stops the helper's output, as a full pipe does on a real one. */
+    /** Drops the tabs that stopped polling, and all but the 16 that polled most recently. */
+    function prune(record: Terminal, now: number): void {
+        for (const [id, tab] of record.tabs) {
+            if (now - tab.seen >= TAB_MS) {
+                record.tabs.delete(id);
+            }
+        }
+
+        while (record.tabs.size > TABS_MAX) {
+            let oldest: string | undefined;
+            let seen = Infinity;
+
+            for (const [id, tab] of record.tabs) {
+                if (tab.seen < seen) {
+                    seen = tab.seen;
+                    oldest = id;
+                }
+            }
+
+            record.tabs.delete(oldest!);
+        }
+    }
+
+    /**
+     * The offset that back pressure measures the output against: the oldest tab that still watches. A tab that is gone,
+     * or a terminal that no tab has polled, leaves the highest offset asked for.
+     */
+    function watched(record: Terminal): number {
+        let oldest: number | undefined;
+
+        for (const tab of record.tabs.values()) {
+            oldest = oldest === undefined ? tab.offset : Math.min(oldest, tab.offset);
+        }
+
+        return oldest ?? record.asked;
+    }
+
+    /**
+     * A tab that is more than KEEP / 2 characters behind stops the helper's output, as a full pipe does on a real one:
+     * with the tabs seen, the shell writes only as fast as the slowest one reads. With no tab that watches, the last
+     * offset asked for is the measure, until the detach timer ends the terminal.
+     */
     function pressure(record: Terminal): void {
         if (record.exited || record.gone) {
             return;
         }
 
-        const behind = record.total - record.asked;
+        const behind = record.total - watched(record);
 
-        // Half the buffer, so a pipe read that comes in after the line (64 KB at most) still leaves the tab's offset in it.
+        // Half the buffer, so a pipe read that comes in after the line (64 KB at most) still leaves a tab's offset in it.
         if (!record.paused && behind > KEEP / 2) {
             record.child.stdout.pause();
             record.paused = true;
@@ -299,9 +378,18 @@ export default function createTerminal(_host: unknown, web: Web) {
         }
     }
 
-    /** A poll's offset: the highest one any tab asked for is what the helper's output is measured against. */
-    function claim(record: Terminal, offset: number): void {
+    /**
+     * A poll's offset: the tab that sent it, and the highest offset any request has sent. A tab's offset is all that
+     * counts against it: an answer that the server builds acknowledges nothing.
+     */
+    function claim(record: Terminal, tab: string | undefined, offset: number): void {
         record.asked = Math.max(record.asked, offset);
+
+        if (tab !== undefined) {
+            record.tabs.set(tab, { offset, seen: Date.now() });
+            prune(record, Date.now());
+        }
+
         pressure(record);
     }
 
@@ -461,16 +549,34 @@ export default function createTerminal(_host: unknown, web: Web) {
         throw web.error(400, 'Give folder as "home", "session", or "path".');
     }
 
-    async function start(request: WebRequest): Promise<unknown> {
-        const live = [...terminals.values()].filter((each) => !each.exited).length;
+    /** The terminals that are running now: the live ones count against the cap. */
+    function live(): number {
+        return [...terminals.values()].filter((each) => !each.exited).length;
+    }
 
-        if (live >= CAP) {
-            throw web.error(429, `A server runs ${CAP} terminals at once: close one first.`);
+    /** The answers of a start that must not begin: the module is going, or the server is full. */
+    function refuse(): void {
+        if (disposed) {
+            throw web.error(503, "This module is going: try again in a moment.");
         }
 
+        if (live() >= CAP) {
+            throw web.error(429, `A server runs ${CAP} terminals at once: close one first.`);
+        }
+    }
+
+    async function start(request: WebRequest): Promise<unknown> {
+        refuse();
+
+        // The folder is checked with an await: the module can go, or other shells can start, in the meantime.
         const cwd = await folder(request);
         const rows = dimension(request.body.rows, 24, 500);
         const cols = dimension(request.body.cols, 80, 1000);
+
+        // The last await was the folder: this check and the spawn have no await between them, so no shell of this
+        // module starts after it went, and the cap cannot be passed by 2 starts at once.
+        refuse();
+
         const child = spawn(
             "python3",
             ["-I", "-c", HELPER, SHELL, cwd, String(rows), String(cols)],
@@ -486,6 +592,7 @@ export default function createTerminal(_host: unknown, web: Web) {
             output: "",
             total: 0,
             asked: 0,
+            tabs: new Map(),
             lastPoll: Date.now(),
             lastInput: Date.now(),
             polls: 0,
@@ -562,23 +669,29 @@ export default function createTerminal(_host: unknown, web: Web) {
         // A tab that is older than the buffer gets it from its start: it lost what came before.
         const offset = offsetOf(record, from);
 
-        claim(record, offset);
-
         if (record.total > offset || record.exited) {
             const data = record.output.slice(offset - (record.total - record.output.length));
-            const to = offset + data.length;
-
-            claim(record, to);
 
             return {
                 data,
                 from: offset,
-                to,
+                to: offset + data.length,
                 ...(record.exited ? { exited: true, exitCode: record.exitCode } : {}),
             };
         }
 
         return undefined;
+    }
+
+    /** The `tab` query: the id of the tab that polls, which back pressure follows. It is optional, and checked. */
+    function tabId(request: WebRequest): string | undefined {
+        const tab = request.query.get("tab") ?? undefined;
+
+        if (tab !== undefined && !TAB_ID.test(tab)) {
+            throw web.error(400, "Give tab as 1 to 64 letters, digits, and dashes.");
+        }
+
+        return tab;
     }
 
     /**
@@ -590,6 +703,7 @@ export default function createTerminal(_host: unknown, web: Web) {
      */
     async function poll(request: WebRequest): Promise<unknown> {
         const deadline = Date.now() + POLL_MS;
+        const tab = tabId(request);
         const now = Date.now();
         const listed = entries(request).map((each) => {
             const record = terminals.get(each.id);
@@ -601,7 +715,7 @@ export default function createTerminal(_host: unknown, web: Web) {
             // A poll is what keeps a terminal from the detach timer: each one a poll names counts, and is claimed.
             record.polls++;
             record.lastPoll = now;
-            claim(record, each.from);
+            claim(record, tab, each.from);
 
             return { id: each.id, record, from: each.from };
         });
@@ -707,6 +821,9 @@ export default function createTerminal(_host: unknown, web: Web) {
         const now = Date.now();
 
         for (const record of [...terminals.values()]) {
+            // A tab that stopped polling no longer holds the output back.
+            prune(record, now);
+
             if (record.exited) {
                 if (now - record.exitedAt >= GRACE_MS) {
                     terminals.delete(record.id);
@@ -716,6 +833,8 @@ export default function createTerminal(_host: unknown, web: Web) {
                 stop(record);
             } else if (now - record.lastInput >= IDLE_MS) {
                 stop(record);
+            } else {
+                pressure(record);
             }
         }
     }
@@ -737,6 +856,7 @@ export default function createTerminal(_host: unknown, web: Web) {
     timer.unref();
 
     web.onDispose(async () => {
+        disposed = true;
         clearInterval(timer);
 
         const exits = [...terminals.values()].map((record) => close(record));
