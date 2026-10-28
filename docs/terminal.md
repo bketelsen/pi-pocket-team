@@ -8,8 +8,10 @@ Files: `terminal.ts` (server) and `terminal-web/` (browser module, with xterm.js
 
 **Can a drop-in hold a websocket or a streaming route?** No websocket: `web.route` answers JSON only, and a drop-in
 has no upgrade hook. It does not need one. A route has no time limit (`docs/extensions/routes.md`, "Time"), so output
-uses a **long poll**: `GET poll?tab=<tab>&t=<id>.<from>,<id>.<from>` answers at once when any named terminal has output
-past its offset, has exited, or is gone, else waits up to 25 s. It carries every terminal of the tab, 4 at most, in one answer:
+uses a **long poll**: `GET poll?tab=<tab>&t=<id>.<from>.<ack>,…` answers at once when any named terminal has output
+past its `from`, has exited, or is gone, else waits up to 25 s. `from` is the offset the tab has received, and the
+answer starts there; `ack` is the offset xterm has drawn. `id.from` alone is taken as `ack` = `from`, and a tab draws
+no more than it received (else a 400). It carries every terminal of the tab, 16 at most, in one answer:
 `{ terminals: { <id>: { data, from, to, exited?, exitCode? } | { gone: true } } }`. It holds an entry for each terminal
 that has something, and at the 25 s end an empty one for each live terminal, so a tab keeps its offsets. A poll names
 16 terminals at most: the 4 live ones, plus exited ones that still need their last output. Input and resize are small
@@ -24,12 +26,14 @@ carries every terminal the tab shows. The poll starts again, with the new set, w
 closed; with no terminal it does not poll. Each rule stays for each terminal: the polls that keep a shell from the
 detach timer, the back pressure of its buffer, and 256 K characters at most for it in one answer.
 
-**Back pressure is for each tab.** The tab sends an id of its own, `<tab>`: 1 to 64 letters, digits, and dashes, made
-once when the module sets up. Each shell keeps, for each tab, the offset that tab last asked from and when it last
-polled (at most 16 tabs, and one that has not polled for 30 s is dropped: a poll waits 25 s). The shell's output pauses
-when the oldest tab that still watches is more than KEEP / 2 characters behind, and it resumes when that tab catches
-up, so the shell writes only as fast as the slowest tab that reads it. A tab's next poll (its next offset) is what
-counts: building an answer acknowledges nothing. With no tab that watches, the highest offset any request asked for is
+**Back pressure is for each tab, by what it has drawn.** The tab sends an id of its own, `<tab>`: 1 to 64 letters,
+digits, and dashes, made once when the module sets up. Each shell keeps, for each tab, the `ack` that tab last sent and
+when it last polled (at most 16 tabs, and one that has not polled for 30 s is dropped: a poll waits 25 s). The shell's
+output pauses when the oldest tab that still watches has drawn more than KEEP / 2 characters less than the shell has
+written, and it resumes when that tab catches up, so the shell writes only as fast as the slowest tab that reads it.
+Only an `ack` counts: receiving an answer acknowledges nothing. With no tab that watches, the highest offset any
+request asked for is the measure, and the detach timer ends that shell anyway. So what a tab has received but not
+drawn stays about KEEP / 2 + 64 K, far under what xterm holds well. With no tab that watches, the highest offset any request asked for is
 the measure, and the detach timer ends that shell anyway.
 
 **No upstream change is needed.** The page, routes, rail button, `pocket.style`, and `escape: false` / `swipe:
@@ -68,15 +72,26 @@ shell's process group, then `SIGKILL` after 2 s, and exits. When the shell exits
   pauses the helper's stdout. The pipe then fills, and the shell's writes block, as on a slow real terminal. So a
   following tab loses no output, and a slow tab never falls behind the buffer.
 - **Input is written once.** Each tab numbers its chunks of keys: `POST terminals/:id/input` carries `{ data, tab,
-seq }`, and the server keeps, for each tab of a terminal, the last `seq` it wrote (16 tabs at most, the oldest tab
-  dropped, as for a poll's tabs: 30 s). A `seq` that is not newer than the last one is answered `{}` and writes
-  nothing, so a tab may send the same chunk again after a POST that failed on the way. `tab` is 1 to 64 letters,
-  digits, and dashes, and `seq` a positive whole number; a missing one is a 400. The browser keeps the chunk until
-  the server has it, and tries it again after 0.5, 1, 2, and 4 s, then every 4 s, with a note that reads "Input waits
-  for the server…". A 404 or a 409 ends the terminal, as before.
-- **A poll asks only for what the screen drew.** The tab writes an answer's text into xterm, and waits for xterm's
-  callback before it asks with the new offset: a slow screen is never asked past what it has drawn. A write that
-  fails ends that terminal's poll with a note, and the tab's poll starts again for the others.
+seq }`, and the server keeps, for each tab of a terminal, the last `seq` it wrote, for RECEIPT_MS (10 minutes) after
+  its last write. `PI_POCKET_TERMINAL_RECEIPT_MS` sets that span, as the detach and idle spans are set. A `seq` that is
+  not newer than the last one is answered `{}` and writes nothing, so a tab may send the same chunk again after a POST
+  that failed on the way. `tab` is 1 to 64 letters, digits, and dashes, and `seq` a positive whole number; a missing
+  one is a 400. 16 tabs may type into one terminal at once: a 17th is answered 429, and writes nothing, until one of
+  them has been quiet for RECEIPT_MS. Receipts are never dropped for their number: that is what keeps a repeated `seq`
+  from writing twice. The browser keeps the chunk until the server has it, and tries it again after 0.5, 1, 2, and 4
+  s, then every 4 s, with a note that reads "Input waits for the server…". It tries a chunk for 60 s in all: after
+  that, the chunk is never sent again by itself, the page says how many characters may not have reached the shell, and
+  its **Discard** button drops them, after which typing goes on with the next `seq`. 60 s is far less than
+  RECEIPT_MS, so a retry never meets a receipt the server has forgotten.
+- **A 409 is a shell that exited.** On a key or a size, a 404 means the terminal is gone: the tab stops and says so.
+  A 409 means the shell exited: the tab stops its keys and its sizes for that terminal, and keeps polling it until an
+  answer brings its last output and its exit code.
+- **The tab says what it has received, and what its screen has drawn.** The poll's `from` is the received offset, and
+  the loop asks again as soon as an answer is in; the text goes to xterm with a callback that moves `drawn`, the
+  poll's `ack`. The server's back pressure follows `ack`, so what waits undrawn stays small. When xterm draws more
+  than 64 K past the `ack` of the open poll, the tab starts that poll again, so a paused shell goes on at once instead
+  of waiting out its 25 s. A write that fails ends that terminal's poll with a note, and the tab's poll starts again
+  for the others.
 - **A size is sent when it changes, 1 `POST` at a time.** The wanted size and the size the server has are kept apart;
   a size that changed while a `POST` was in flight goes right after it, and a failed `POST` is tried again with the
   same bounded waits. A 404 or a 409 ends the terminal.
@@ -86,7 +101,7 @@ seq }`, and the server keeps, for each tab of a terminal, the last `seq` it wrot
 - **Reconnect:** after a tab reload or a network drop, yes, within 60 s: the page lists the live terminals, attaches
   again, and replays the buffer. After a server restart or a module reload, no: the shells are gone, and the page says
   so (the poll answers `gone` for each one). (Keeping shells across a reload would need hidden global state that outlives the module's code; not worth it.)
-- **More than one tab** can show the same terminal. Each tab polls with its own offset and its own id.
+- **More than one tab** can show the same terminal. Each tab polls with its own `from`, `ack`, and id.
 
 ## Security
 

@@ -4,11 +4,13 @@ import assert from "node:assert/strict";
 import { webcrypto } from "node:crypto";
 import { test } from "node:test";
 import {
+    afterFailure,
     backoffMs,
-    drawn,
+    GIVE_UP_MS,
     newTabId,
     POLL_MAX,
     pollRecords,
+    retryAllowed,
     sizeDue,
 } from "./terminal-web/index.js";
 
@@ -88,61 +90,22 @@ test("one poll carries the live terminals first, and an ended one until its last
     assert.equal(pollRecords(many, 2).length, 2);
 });
 
-test("a write is acknowledged when xterm has drawn it, when the poll stops, or as a failure", async () => {
-    const tick = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-    const timeout = (ms) => new Promise((resolve) => setTimeout(() => resolve("late"), ms));
+test("a chunk that goes unanswered is given up after 60 s, and no sooner", () => {
+    const startedAt = 1_000_000;
 
-    // Drawn: the callback is what settles it.
-    let called = null;
-    const drawing = { write: (data, callback) => (called = callback) };
-    let settled = false;
-    const first = drawn(drawing, "hello", new AbortController().signal).then(() => {
-        settled = true;
-    });
+    assert.equal(GIVE_UP_MS, 60_000);
+    assert.equal(retryAllowed(startedAt, startedAt), true);
+    assert.equal(retryAllowed(startedAt, startedAt + 59_999), true);
+    assert.equal(retryAllowed(startedAt, startedAt + 60_000), false);
+    assert.equal(retryAllowed(startedAt, startedAt + 120_000), false);
+});
 
-    assert.equal(settled, false, "not before the callback");
-    called();
-    await first;
-    assert.equal(settled, true);
-
-    // Nothing to draw: no wait and no call.
-    let writes = 0;
-
-    await drawn({ write: () => (writes += 1) }, "", new AbortController().signal);
-    assert.equal(writes, 0);
-
-    // Aborted while xterm has not drawn it: the wait ends all the same.
-    const stop = new AbortController();
-    const never = { write: () => {} };
-    const wait = drawn(never, "hello", stop.signal);
-
-    stop.abort();
-    assert.notEqual(
-        await Promise.race([wait.then(() => "ended"), tick(50).then(() => "waiting")]),
-        "waiting",
-    );
-
-    // A terminal that cannot write says so.
-    await assert.rejects(
-        drawn(
-            {
-                write: () => {
-                    throw new Error("the screen is gone");
-                },
-            },
-            "hello",
-            new AbortController().signal,
-        ),
-        /the screen is gone/,
-    );
-
-    // A callback that comes after the wait ended settles nothing twice.
-    let late = null;
-    const stop2 = new AbortController();
-    const second = drawn({ write: (_data, callback) => (late = callback) }, "hello", stop2.signal);
-
-    stop2.abort();
-    await second;
-    late();
-    assert.equal(await Promise.race([second, timeout(10)]), undefined);
+test("a failed request says which it is: gone, a shell that closed, or a retry", () => {
+    assert.equal(afterFailure(404), "gone");
+    assert.equal(afterFailure(409), "closed");
+    assert.equal(afterFailure(400), "retry");
+    assert.equal(afterFailure(500), "retry");
+    assert.equal(afterFailure(429), "retry");
+    assert.equal(afterFailure(undefined), "retry");
+    assert.equal(afterFailure(0), "retry");
 });

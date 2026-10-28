@@ -169,12 +169,18 @@ function collected(id: string) {
  * never waits 25 s.
  */
 async function pollList(
-    entries: { id: string; from: number }[],
+    entries: { id: string; from: number; ack?: number }[],
     wait = 3000,
     who = "owner",
     tab = "tab-test",
 ) {
-    const query = entries.map((each) => `${each.id}.${each.from}`).join(",");
+    const query = entries
+        .map((each) =>
+            each.ack === undefined
+                ? `${each.id}.${each.from}`
+                : `${each.id}.${each.from}.${each.ack}`,
+        )
+        .join(",");
     let response;
 
     try {
@@ -500,6 +506,18 @@ test("a poll refuses a bad list of terminals", async () => {
 
     assert.equal((await call("owner", `poll?t=${id}.0`)).status, 200);
 
+    // The drawn offset: `id.from` alone means ack = from, and a tab draws no more than it received.
+    assert.equal((await call("owner", `poll?t=${id}.0.0`)).status, 200);
+    assert.equal((await call("owner", `poll?t=${id}.0.1`)).status, 400, "ack past from");
+
+    for (const query of [`${id}.1.x`, `${id}.1.-1`, `${id}.1.2.3`, `${id}..1`]) {
+        assert.equal(
+            (await call("owner", `poll?t=${encodeURIComponent(query)}`)).status,
+            400,
+            query,
+        );
+    }
+
     // 16 terminals in one poll: the 4 live ones at most, plus the ended ones that still need their last output.
     const sixteen = Array.from({ length: 16 }, (_, each) => `id${each}.0`).join(",");
     const seventeen = `${sixteen},id16.0`;
@@ -536,6 +554,105 @@ test("keys are written once: a repeated seq and an older one write nothing", asy
     // Another tab numbers its own chunks: its seq 1 is not this tab's seq 1.
     assert.equal((await keys(id, "echo other-tab-9\n", "tab-other", 1)).status, 200);
     await expectOutput(id, (text) => /other-tab-9/.test(text), "the other tab's chunk");
+
+    await end(id);
+});
+
+test("back pressure follows the ack: a tab that received the output but drew little holds the shell", async () => {
+    const id = await start();
+
+    await type(id, "seq 1 400000\n");
+
+    // Receive it all, and draw nothing: the shell writes only as far as the pause.
+    let received = 0;
+
+    for (let round = 0; round < 20; round++) {
+        const answer = await pollList([{ id, from: received, ack: 0 }], 600);
+        const entry = answer.data.terminals?.[id];
+
+        if (!entry || entry.data === "") {
+            break;
+        }
+
+        received = entry.to;
+    }
+
+    assert.ok(received > 128 * 1024, `the shell wrote ${received} characters before the pause`);
+    assert.ok(received < 512 * 1024, "far less than the 2 MB of output");
+
+    // With no ack, the shell stays paused: nothing new comes, however long the poll waits.
+    const quiet = await pollList([{ id, from: received, ack: 0 }], 800);
+
+    assert.equal(quiet.data.terminals?.[id]?.data ?? "", "", "a tab that drew nothing holds it");
+
+    // The ack unlocks it at once, without the tab receiving anything new.
+    const more = await pollList([{ id, from: received, ack: received }], 5000);
+
+    assert.ok((more.data.terminals?.[id]?.data ?? "").length > 0, "the ack lets the shell go on");
+
+    await end(id);
+});
+
+test("16 tabs type into a terminal; a 17th is refused", async () => {
+    const id = await start();
+
+    for (let each = 0; each < 16; each++) {
+        assert.equal((await keys(id, "", `tab-${each}`, 1)).status, 200);
+    }
+
+    const refused = await keys(id, "echo seventeen\n", "tab-16", 1);
+
+    assert.equal(refused.status, 429);
+    assert.match(JSON.stringify(refused.data), /Too many tabs/);
+
+    // A tab whose receipt is there is not refused, and its newer seq goes through.
+    assert.equal((await keys(id, "echo sixteen-tabs\n", "tab-0", 2)).status, 200);
+    await expectOutput(id, (text) => /sixteen-tabs/.test(text), "the 16th tab's keys");
+
+    await end(id);
+});
+
+test("a receipt expires after its own span, and then another tab may type", async () => {
+    // A short span, as for the detach timer: the receipt lives its RECEIPT_MS, and not 30 s.
+    await reloadWith({ PI_POCKET_TERMINAL_RECEIPT_MS: "300" });
+
+    const id = await start();
+
+    try {
+        for (let each = 0; each < 16; each++) {
+            assert.equal((await keys(id, "", `tab-${each}`, 1)).status, 200);
+        }
+
+        assert.equal((await keys(id, "", "tab-16", 1)).status, 429);
+
+        await new Promise((resolve) => setTimeout(resolve, 400));
+
+        assert.equal(
+            (await keys(id, "", "tab-16", 1)).status,
+            200,
+            "the expired receipts let it in",
+        );
+    } finally {
+        await end(id);
+        await reloadWith({ PI_POCKET_TERMINAL_RECEIPT_MS: undefined });
+    }
+});
+
+test("a receipt older than 30 s still blocks a repeated seq", async () => {
+    const id = await start();
+
+    assert.equal((await keys(id, "echo receipt-1\n", "tab-receipt", 1)).status, 200);
+    await expectOutput(id, (text) => /receipt-1/.test(text), "the first chunk");
+    await quiet(id);
+
+    const after = collected(id).offset;
+
+    // Past the 30 s that a poll's tab is kept for: the receipt is still there, so the same seq writes nothing.
+    await new Promise((resolve) => setTimeout(resolve, 31_000));
+
+    assert.equal((await keys(id, "echo receipt-1\n", "tab-receipt", 1)).status, 200);
+    await quiet(id);
+    assert.equal(collected(id).offset, after, "the repeated seq still writes nothing");
 
     await end(id);
 });

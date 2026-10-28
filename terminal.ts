@@ -148,6 +148,8 @@ const POLL_MAX = 16;
 const TAB_MS = 30_000;
 /** Tabs that one terminal keeps for back pressure: the oldest goes. */
 const TABS_MAX = 16;
+/** How long a tab's input receipt keeps its seq. A tab that gives up after 60 s retries, so it passes this by far. */
+const RECEIPT_MS = span(process.env.PI_POCKET_TERMINAL_RECEIPT_MS, 10 * 60_000);
 /** A tab's id in a poll: 1 to 64 letters, digits, and dashes. */
 const TAB_ID = /^[A-Za-z0-9-]{1,64}$/;
 /** A terminal with no output poll for this long has no tab: end it. Tests set the environment variable lower. */
@@ -170,9 +172,9 @@ const ALLOWED = new Set([
     "DBUS_SESSION_BUS_ADDRESS",
 ]);
 
-/** What one tab last said about one terminal: the offset it asked from, and when. */
+/** What one tab last said about one terminal: the offset xterm had drawn (`ack`), and when. */
 interface Watcher {
-    offset: number;
+    ack: number;
     seen: number;
 }
 
@@ -199,7 +201,7 @@ interface Terminal {
     total: number;
     /** The highest offset any poll has asked for: the output after it is not read from the helper. */
     asked: number;
-    /** One entry for each tab that watches this terminal: the offset it asked from, and when it last polled. */
+    /** One entry for each tab that watches this terminal: the offset it has drawn, and when it last polled. */
     tabs: Map<string, Watcher>;
     /** One entry for each tab that typed into this terminal: the last sequence number it wrote. */
     sequences: Map<string, Written>;
@@ -356,14 +358,14 @@ export default function createTerminal(_host: unknown, web: Web) {
     }
 
     /**
-     * The offset that back pressure measures the output against: the oldest tab that still watches. A tab that is gone,
-     * or a terminal that no tab has polled, leaves the highest offset asked for.
+     * The offset that back pressure measures the output against: what the oldest tab that still watches has drawn. A tab
+     * that is gone, or a terminal that no tab has polled, leaves the highest offset asked for.
      */
     function watched(record: Terminal): number {
         let oldest: number | undefined;
 
         for (const tab of record.tabs.values()) {
-            oldest = oldest === undefined ? tab.offset : Math.min(oldest, tab.offset);
+            oldest = oldest === undefined ? tab.ack : Math.min(oldest, tab.ack);
         }
 
         return oldest ?? record.asked;
@@ -392,14 +394,15 @@ export default function createTerminal(_host: unknown, web: Web) {
     }
 
     /**
-     * A poll's offset: the tab that sent it, and the highest offset any request has sent. A tab's offset is all that
-     * counts against it: an answer that the server builds acknowledges nothing.
+     * A poll's offsets: the one the tab asked from, and the one xterm has drawn (`ack`). Back pressure follows the
+     * drawn one, so a tab that received a lot but drew little still holds the shell back. An answer that the server
+     * builds acknowledges nothing.
      */
-    function claim(record: Terminal, tab: string | undefined, offset: number): void {
-        record.asked = Math.max(record.asked, offset);
+    function claim(record: Terminal, tab: string | undefined, from: number, ack: number): void {
+        record.asked = Math.max(record.asked, from);
 
         if (tab !== undefined) {
-            record.tabs.set(tab, { offset, seen: Date.now() });
+            record.tabs.set(tab, { ack, seen: Date.now() });
             bounded(record.tabs, Date.now());
         }
 
@@ -640,23 +643,43 @@ export default function createTerminal(_host: unknown, web: Web) {
         return { id: record.id };
     }
 
-    /** The `t` query of a poll: `id.from` entries, POLL_MAX at most. */
-    function entries(request: WebRequest): { id: string; from: number }[] {
+    /**
+     * The `t` query of a poll: `id.from.ack` entries, POLL_MAX at most. `from` is the offset the tab has received, and
+     * the answer starts there; `ack` is the offset xterm has drawn, and back pressure follows it. `id.from` alone is
+     * taken as `ack` = `from`, for a client that has no separate drawn offset.
+     */
+    function entries(request: WebRequest): { id: string; from: number; ack: number }[] {
         const text = request.query.get("t") ?? "";
 
         if (text === "") {
-            throw web.error(400, 'Give t as "id.from,id.from".');
+            throw web.error(400, 'Give t as "id.from.ack".');
         }
 
         const asked = text.split(",").map((entry) => {
             const parts = entry.split(".");
-            const digits = parts[1] ?? "";
+            const from = parts[1] ?? "";
+            const ack = parts[2] ?? from;
 
-            if (parts.length !== 2 || parts[0] === "" || !/^\d+$/.test(digits)) {
-                throw web.error(400, `A poll entry is "id.from", not ${JSON.stringify(entry)}.`);
+            if (
+                (parts.length !== 2 && parts.length !== 3) ||
+                parts[0] === "" ||
+                !/^\d+$/.test(from) ||
+                !/^\d+$/.test(ack)
+            ) {
+                throw web.error(
+                    400,
+                    `A poll entry is "id.from.ack", not ${JSON.stringify(entry)}.`,
+                );
             }
 
-            return { id: parts[0]!, from: Number(digits) };
+            if (Number(ack) > Number(from)) {
+                throw web.error(
+                    400,
+                    `A poll entry draws no more than it received: ${JSON.stringify(entry)}.`,
+                );
+            }
+
+            return { id: parts[0]!, from: Number(from), ack: Number(ack) };
         });
 
         if (asked.length > POLL_MAX) {
@@ -723,8 +746,8 @@ export default function createTerminal(_host: unknown, web: Web) {
      * One long poll for a tab: the output of every terminal that it names, by id. A tab keeps 1 connection for the tab
      * and not 1 for each terminal, which would take all 6 that a browser gives a host.
      *
-     * It answers at once when any named terminal has output past its offset, has exited, or is gone (a nameless id
-     * counts as gone). Else it waits up to 25 s, and then answers with an empty entry for each terminal it named.
+     * It answers at once when any named terminal has output past its `from` offset, has exited, or is gone (a nameless
+     * id counts as gone). Else it waits up to 25 s, and then answers with an empty entry for each terminal it named.
      */
     async function poll(request: WebRequest): Promise<unknown> {
         const deadline = Date.now() + POLL_MS;
@@ -740,7 +763,7 @@ export default function createTerminal(_host: unknown, web: Web) {
             // A poll is what keeps a terminal from the detach timer: each one a poll names counts, and is claimed.
             record.polls++;
             record.lastPoll = now;
-            claim(record, tab, each.from);
+            claim(record, tab, each.from, each.ack);
 
             return { id: each.id, record, from: each.from };
         });
@@ -821,10 +844,24 @@ export default function createTerminal(_host: unknown, web: Web) {
         }
 
         const now = Date.now();
-        const last = record.sequences.get(tab)?.seq ?? 0;
+
+        // A receipt lives for RECEIPT_MS: a tab that retries for 60 s and then gives up never meets a seq it forgot.
+        for (const [id, receipt] of record.sequences) {
+            if (now - receipt.seen >= RECEIPT_MS) {
+                record.sequences.delete(id);
+            }
+        }
+
+        const known = record.sequences.get(tab);
+
+        // 16 tabs may type into one terminal at once. A 17th waits until one of them has been quiet for RECEIPT_MS.
+        if (known === undefined && record.sequences.size >= TABS_MAX) {
+            throw web.error(429, "Too many tabs type into this terminal.");
+        }
+
+        const last = known?.seq ?? 0;
 
         record.sequences.set(tab, { seq: Math.max(last, seq), seen: now });
-        bounded(record.sequences, now);
 
         // The same chunk again, or an older one: the shell already has it.
         if (seq <= last) {

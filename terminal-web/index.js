@@ -14,8 +14,8 @@ const LAST_ACTIVE = "x.terminal.active";
 const INPUT_MAX = 32 * 1024;
 /** Terminals at once, as the server counts them. */
 const CAP = 4;
-/** The longest wait for xterm to draw an answer: a terminal that cannot draw never holds the poll. */
-const DRAW_MS = 10_000;
+/** How far xterm may draw past the ack of an open poll before that poll starts again: it would wait 25 s otherwise. */
+const DRAWN_GAP = 64 * 1024;
 
 /**
  * A tab's id, for the server's back pressure: 1 to 64 letters, digits, and dashes. `randomUUID` is missing on a
@@ -57,47 +57,28 @@ export function pollRecords(records, max = POLL_MAX) {
     ].slice(0, max);
 }
 
+/** The longest a chunk of keys waits for the server before the tab gives up on it: 60 s, 6 times a retry's wait. */
+export const GIVE_UP_MS = 60_000;
+
+/** Whether a chunk that has gone unanswered since `startedAt` may be tried again at `now`. */
+export function retryAllowed(startedAt, now) {
+    return now - startedAt < GIVE_UP_MS;
+}
+
 /**
- * Resolves when xterm has drawn `data`, or when `signal` aborts, and rejects when the terminal cannot write it. A poll
- * moves its offset only after this: a slow screen is never asked past what it has drawn.
+ * What a failed request means: a 404 is a terminal that is gone, a 409 is a shell that has exited (so its last output
+ * still comes in a poll), and anything else is worth another try.
  */
-export function drawn(term, data, signal) {
-    return new Promise((resolve, reject) => {
-        if (!data) {
-            resolve();
+export function afterFailure(status) {
+    if (status === 404) {
+        return "gone";
+    }
 
-            return;
-        }
+    if (status === 409) {
+        return "closed";
+    }
 
-        let settled = false;
-
-        function finish(failure) {
-            if (settled) {
-                return;
-            }
-
-            settled = true;
-            signal.removeEventListener("abort", stop);
-
-            if (failure === undefined) {
-                resolve();
-            } else {
-                reject(failure);
-            }
-        }
-
-        function stop() {
-            finish();
-        }
-
-        signal.addEventListener("abort", stop, { once: true });
-
-        try {
-            term.write(data, () => finish());
-        } catch (failure) {
-            finish(failure);
-        }
-    });
+    return "retry";
 }
 
 /** A wait that a close or a stop need not cut short: the caller looks at its own flags after it. */
@@ -131,8 +112,8 @@ export default function setup(pocket) {
     /** The tab's 1 long poll, and the terminals it was asked for. */
     let polling = null;
     let asked = "";
-    /** Whether the poll is handing text to xterm now: it takes a new set at its next turn, not in the middle of one. */
-    let drawing = false;
+    /** Whether a restart of the poll waits for the current answer to be taken in. */
+    let restartQueued = false;
     /** A paste that the browser would not give: the box that the person pastes into. */
     let pasteBox = null;
 
@@ -291,9 +272,23 @@ export default function setup(pocket) {
         };
     }
 
-    /** Whether this terminal can still hear anything: it has not ended, this tab still shows it, and the module is on. */
+    /**
+     * Whether this terminal can still hear anything: it has not ended, this tab still shows it, its shell has not said
+     * that it went (a 409), and the module is on.
+     */
     function usable(record) {
-        return !stopped && !record.closing && record.exited === null && record.note === null;
+        return (
+            !stopped &&
+            !record.closing &&
+            record.exited === null &&
+            record.note === null &&
+            !record.inputClosed
+        );
+    }
+
+    /** Whether keys can go now: the terminal is there, and no chunk waits for a Discard. */
+    function typable(record) {
+        return usable(record) && record.lost === null;
     }
 
     /**
@@ -311,6 +306,10 @@ export default function setup(pocket) {
 
         try {
             for (let attempt = 0; ; attempt++) {
+                if (!usable(record)) {
+                    return;
+                }
+
                 try {
                     await pocket.api(
                         `terminals/${record.id}/resize`,
@@ -320,8 +319,18 @@ export default function setup(pocket) {
                     record.sent = want;
                     break;
                 } catch (failure) {
-                    if (failure?.status === 404 || failure?.status === 409) {
+                    const what = afterFailure(failure?.status);
+
+                    if (what === "gone") {
                         ended(record, GONE);
+
+                        return;
+                    }
+
+                    if (what === "closed") {
+                        // The shell exited: its last output comes in a poll, and a size means nothing to it now.
+                        record.inputClosed = true;
+                        bump();
 
                         return;
                     }
@@ -342,7 +351,7 @@ export default function setup(pocket) {
 
     /** Keys typed here: batched into the next POST, one at a time and in the order typed. */
     function send(record, data) {
-        if (!data || !usable(record)) {
+        if (!data || !typable(record)) {
             return;
         }
 
@@ -361,14 +370,14 @@ export default function setup(pocket) {
      * has it: a POST that fails goes again with the same chunk and the same seq, which the server writes once.
      */
     async function flush(record) {
-        if (record.sending || !usable(record)) {
+        if (record.sending || !typable(record)) {
             return;
         }
 
         record.sending = true;
 
         try {
-            while (record.pending !== "" && usable(record)) {
+            while (record.pending !== "" && typable(record)) {
                 let size = Math.min(record.pending.length, INPUT_MAX);
                 const last = record.pending.charCodeAt(size - 1);
 
@@ -379,10 +388,20 @@ export default function setup(pocket) {
 
                 const chunk = record.pending.slice(0, size);
                 const seq = record.seq + 1;
+                const startedAt = Date.now();
 
                 record.pending = record.pending.slice(size);
 
                 for (let attempt = 0; ; attempt++) {
+                    // 60 s with no answer: the text stays for a Discard, and this chunk never goes again by itself.
+                    if (!retryAllowed(startedAt, Date.now())) {
+                        record.lost = { text: chunk, seq };
+                        record.waiting = false;
+                        bump();
+
+                        return;
+                    }
+
                     try {
                         await pocket.api(
                             `terminals/${record.id}/input`,
@@ -392,13 +411,24 @@ export default function setup(pocket) {
                         record.seq = seq;
                         break;
                     } catch (failure) {
-                        if (failure?.status === 404 || failure?.status === 409) {
+                        const what = afterFailure(failure?.status);
+
+                        if (what === "gone") {
                             ended(record, GONE);
 
                             return;
                         }
 
-                        if (!usable(record)) {
+                        if (what === "closed") {
+                            // The shell exited: its last output still comes in a poll, and no key can reach it.
+                            record.inputClosed = true;
+                            record.waiting = false;
+                            bump();
+
+                            return;
+                        }
+
+                        if (!typable(record)) {
                             return;
                         }
 
@@ -410,7 +440,7 @@ export default function setup(pocket) {
 
                         await delay(backoffMs(attempt));
 
-                        if (!usable(record)) {
+                        if (!typable(record)) {
                             return;
                         }
                     }
@@ -425,9 +455,21 @@ export default function setup(pocket) {
             }
         }
 
-        if (record.pending !== "" && usable(record)) {
+        if (record.pending !== "" && typable(record)) {
             void flush(record);
         }
+    }
+
+    /** Drops the text that could not be delivered: the next keys go out with a seq past it. */
+    function discard(record) {
+        if (record.lost === null) {
+            return;
+        }
+
+        record.seq = Math.max(record.seq, record.lost.seq);
+        record.lost = null;
+        bump();
+        void flush(record);
     }
 
     /** The terminal is gone on the server: keep its screen, say why, and stop asking. */
@@ -444,6 +486,35 @@ export default function setup(pocket) {
      */
     function watchable() {
         return pollRecords([...clients.values()]);
+    }
+
+    /** Starts this tab's poll again, with the ack that xterm has drawn now: a paused shell goes on at once. */
+    function restartPoll() {
+        asked = "";
+        sync();
+    }
+
+    /**
+     * xterm has drawn up to `to`. An open poll that carries an older ack would wait for output that only a newer ack
+     * unlocks: past 64 K of that, the poll starts again. It starts in a task, so this answer's offsets are all in
+     * first.
+     */
+    function markDrawn(record, to) {
+        record.drawn = to;
+
+        if (record.drawn - record.ackSent <= DRAWN_GAP || stopped || polling === null) {
+            return;
+        }
+
+        if (restartQueued) {
+            return;
+        }
+
+        restartQueued = true;
+        setTimeout(() => {
+            restartQueued = false;
+            restartPoll();
+        }, 0);
     }
 
     /**
@@ -463,13 +534,6 @@ export default function setup(pocket) {
         }
 
         asked = key;
-
-        // A loop that is drawing is not waiting in a poll: it takes the new set at its next turn, which keeps every
-        // offset in step with what xterm has drawn.
-        if (drawing) {
-            return;
-        }
-
         polling?.abort();
         polling = null;
 
@@ -491,7 +555,15 @@ export default function setup(pocket) {
                     return;
                 }
 
-                const query = records.map((each) => `${each.id}.${each.offset}`).join(",");
+                // The ack each poll carries, for the restart that a fast screen asks for.
+                for (const each of records) {
+                    each.ackSent = each.drawn;
+                }
+
+                // `from` is what this tab has received; `drawn` is what its screen has drawn.
+                const query = records
+                    .map((each) => `${each.id}.${each.received}.${each.drawn}`)
+                    .join(",");
                 let answer;
 
                 try {
@@ -530,30 +602,20 @@ export default function setup(pocket) {
                         continue;
                     }
 
-                    // The offset moves only when xterm has drawn the text: this tab never asks past its own screen.
+                    // The text is received at once, and drawn a moment later: `drawn` moves in xterm's callback, and
+                    // the server's back pressure follows it, so what waits undrawn stays small.
                     if (entry.data) {
-                        drawing = true;
-
                         try {
-                            // The cap ends the wait for a screen that cannot draw; the abort ends it for a stop.
-                            await Promise.race([
-                                drawn(each.term, entry.data, mine.signal),
-                                delay(DRAW_MS),
-                            ]);
+                            each.term.write(entry.data, () => markDrawn(each, entry.to));
                         } catch (failure) {
                             each.note = `This tab could not draw the screen: ${failure?.message ?? "it gave no reason"}.`;
                             changed = true;
                             failed = true;
-                        } finally {
-                            drawing = false;
-                        }
-
-                        if (failed) {
                             break;
                         }
                     }
 
-                    each.offset = entry.to;
+                    each.received = entry.to;
 
                     if (entry.exited) {
                         each.exited = entry.exitCode ?? 0;
@@ -619,12 +681,19 @@ export default function setup(pocket) {
             cwd: info.cwd ?? "",
             term,
             addon,
-            offset: 0,
+            /** The offset this tab has received, and the offset xterm has drawn (the poll's `ack`). */
+            received: 0,
+            drawn: 0,
+            ackSent: 0,
             /** The last seq this tab had written to the shell, and the keys that wait for it. */
             seq: 0,
             pending: "",
             sending: false,
             waiting: false,
+            /** Set when the shell says it exited (a 409): no key and no size goes out again, and the poll goes on. */
+            inputClosed: false,
+            /** A chunk that went unanswered for 60 s: its text waits for a Discard, and its seq is spent. */
+            lost: null,
             exited: info.exited === true ? (info.exitCode ?? 0) : null,
             /** Whether this tab has its last output: an answer with `exited` came, so the poll is done with it. */
             final: false,
@@ -1014,6 +1083,14 @@ export default function setup(pocket) {
                 record?.waiting
                     ? html`<p class="terminal-note small muted">
                           Input waits for the server…
+                      </p>`
+                    : null
+            }
+            ${
+                record?.lost
+                    ? html`<p class="terminal-note small">
+                          ${record.lost.text.length} characters may not have reached the shell.
+                          <button class="button" onClick=${() => discard(record)}>Discard</button>
                       </p>`
                     : null
             }
