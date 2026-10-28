@@ -1196,7 +1196,12 @@ export function teamMessageProblems(args: unknown): string[] {
         "keep the result and the facts the reader needs, and leave out logs and repeated details.",
     );
 
-    if (status !== undefined && !(STATUSES as readonly unknown[]).includes(status)) {
+    // A null optional is the validator's: it drops it before the schema check, so it is no problem.
+    if (
+        status !== undefined &&
+        status !== null &&
+        !(STATUSES as readonly unknown[]).includes(status)
+    ) {
         problems.push(`status is ${JSON.stringify(status)}: use done, working or blocked.`);
     }
 

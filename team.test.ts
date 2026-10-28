@@ -106,6 +106,23 @@ test("drop-in identities, named delegation, HTTP permissions, replay and restart
             );
         }
 
+        if (role === "user" && text.endsWith("null status test")) {
+            const address = /Message from linked session (session-[a-f0-9-]+)/.exec(
+                requestContext,
+            )?.[1];
+
+            return fauxAssistantMessage(
+                [
+                    fauxToolCall("team_message", {
+                        to: address,
+                        message: "Duncan sent a null status.",
+                        status: null,
+                    }),
+                ],
+                { stopReason: "toolUse" },
+            );
+        }
+
         if (role === "user" && text.endsWith("long ask test")) {
             const address = /Message from linked session (session-[a-f0-9-]+)/.exec(
                 requestContext,
@@ -255,6 +272,14 @@ test("drop-in identities, named delegation, HTTP permissions, replay and restart
             "specialist report delivered to supervisor",
         );
         await until(() => !app.isBusy(id), "supervisor received the report");
+        // A null optional status is dropped by the validator, as before: the message goes.
+        await say(app, child, "null status test");
+        await until(
+            async () =>
+                (await modelTexts(app, id)).join("\n").includes("Duncan sent a null status."),
+            "a null status is no refusal",
+        );
+        await until(() => !app.isBusy(child) && !app.isBusy(id), "null status settled");
         // An ask over its limit: the error says which argument, the limit, by how much, and what to do; nothing is sent.
         await say(app, child, "long ask test");
         await until(() => !app.isBusy(child), "long ask settled");
@@ -655,6 +680,8 @@ test("teamMessageProblems: each limit, with the count, the limit and the fix; th
             "asks[2].options[1] has 41 characters; the limit is 40. Cut at least 1 character: name the choice in a few words, and explain it in the question.",
         ],
     );
+    // A null optional is the validator's to drop, as before: no refusal.
+    assert.deepEqual(teamMessageProblems({ to: "s", message: "m", status: null }), []);
     // A wrong type is the schema's to report.
     assert.deepEqual(teamMessageProblems({ message: 5, asks: "x", status: undefined }), []);
     assert.deepEqual(teamMessageProblems(null), []);
