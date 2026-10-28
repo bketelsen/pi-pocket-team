@@ -101,6 +101,7 @@ import {
     withdrawAsk,
     asksBrian,
     attachTo,
+    boundSupervisors,
     attribute,
     asleep,
     buildQuery,
@@ -329,6 +330,65 @@ describe("threads", () => {
         assert.match(text, /frostyard\/frostmail#106 · attached/);
         assert.match(text, /T1a · open · Keep the guard\?/);
         assert.match(text, /Events:/);
+    });
+});
+
+describe("boundSupervisors", () => {
+    test("each supervisor once, newest desk event first, with its open asks on threads that wait", () => {
+        const state = empty();
+        const a = open(state, "a", 10).thread;
+        const b = open(state, "b", 20).thread;
+        const c = open(state, "c", 30).thread;
+        const d = open(state, "d", 40).thread;
+        const e = open(state, "e", 50).thread;
+
+        a.supervisor = 5;
+        a.lastEventAt = 100;
+        a.asks = [
+            { id: `${a.id}a`, text: "Open", at: 1 },
+            {
+                id: `${a.id}b`,
+                text: "Answered",
+                at: 1,
+                answer: { at: 2, by: "Brian", words: "Yes" },
+            },
+            { id: `${a.id}c`, text: "Resolved", at: 1, resolved: { at: 2, why: "gone" } },
+        ];
+        b.supervisor = 8;
+        b.lastEventAt = 300;
+        // Asks on a parked or a closed thread do not count, but its events do.
+        c.supervisor = 5;
+        c.lastEventAt = 400;
+        c.state = "parked";
+        c.asks = [{ id: `${c.id}a`, text: "Parked", at: 1 }];
+        d.supervisor = 5;
+        d.lastEventAt = 50;
+        d.state = "closed";
+        d.asks = [{ id: `${d.id}a`, text: "Closed", at: 1 }];
+        // A thread with no supervisor binds nothing.
+        delete e.supervisor;
+        e.lastEventAt = 999;
+
+        assert.deepEqual(boundSupervisors(state), [
+            { supervisor: 5, lastEventAt: 400, asks: 1 },
+            { supervisor: 8, lastEventAt: 300, asks: 0 },
+        ]);
+    });
+
+    test("a tie goes to the higher conversation id; no state gives none", () => {
+        const state = empty();
+        const a = open(state, "a").thread;
+        const b = open(state, "b").thread;
+
+        a.supervisor = 3;
+        b.supervisor = 4;
+        a.lastEventAt = b.lastEventAt = 10;
+
+        assert.deepEqual(
+            boundSupervisors(state).map((entry) => entry.supervisor),
+            [4, 3],
+        );
+        assert.deepEqual(boundSupervisors(undefined), []);
     });
 });
 
@@ -12435,6 +12495,55 @@ describe("the desk in a Pi Pocket", () => {
 
         after(async () => {
             await new Promise<void>((resolve) => server?.close(() => resolve()));
+        });
+
+        test("Team's supervisor button finds the session with the newest desk event, owner-only", async () => {
+            const source = await supervisor("front-door");
+            // A thread of its own, with no delegation (a delegation's sweeps would reach the next tests): the newest
+            // desk event of all, and 1 open ask for Brian.
+            const id = await app.harness.commit(async (tx) => {
+                const state = await tx.doc(DeskThreads);
+                const { thread } = openThread(state, {
+                    key: "front-door",
+                    supervisor: Number(source),
+                    agents: ["duncan"],
+                    title: "The front door",
+                    at: Date.now(),
+                });
+                const stored = state.threads[thread.id]!;
+
+                stored.state = "open";
+                stored.lastEventAt = Date.now() + 365 * 24 * 3600_000;
+                stored.asks.push({ id: `${thread.id}z`, text: "Pick one.", at: Date.now() });
+
+                return thread.id;
+            }, context);
+
+            const team = `http://127.0.0.1:${(server!.address() as { port: number }).port}/api/x/team/supervisor`;
+            const get = (token: string) =>
+                fetch(team, { headers: { authorization: `Bearer ${token}`, "x-pocket": "1" } });
+            const answer = await get(app.config.ownerToken);
+
+            assert.equal(answer.status, 200);
+            const door = (await answer.json()) as Record<string, unknown>;
+
+            assert.equal(door.found, true);
+            assert.equal(door.conversationId, Number(source));
+            assert.equal(door.name, "Odrade");
+            assert.equal(door.asks, 1);
+            assert.equal(door.archived, undefined);
+
+            const guest = app.config.addUser("Front door guest", "guest");
+
+            assert.equal((await get(guest.token)).status, 404, "only the owner may ask");
+
+            // The thread closes, so no later test sees it.
+            await app.harness.commit(async (tx) => {
+                const stored = (await tx.doc(DeskThreads)).threads[id]!;
+
+                stored.state = "closed";
+                stored.closed = { at: Date.now(), why: "dropped", by: "brian" };
+            }, context);
         });
 
         test("GET threads gives the page the issue queue: null before a read, then the same view as the stored state", async () => {

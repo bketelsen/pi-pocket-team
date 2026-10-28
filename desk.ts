@@ -622,6 +622,48 @@ export function clerkOf(
     return state?.clerks?.[String(supervisor)];
 }
 
+/** A supervisor conversation the desk binds threads to: the Team module's front-door button reads it. */
+export type BoundSupervisor = {
+    /** The supervisor's conversation id. */
+    supervisor: number;
+    /** The newest `lastEventAt` of its threads. */
+    lastEventAt: number;
+    /** Its open asks for Brian, on its threads that are not parked or closed. */
+    asks: number;
+};
+
+/**
+ * Every supervisor conversation that has a thread, in any state: the one with the newest desk event first, and the
+ * higher conversation id first on a tie. Read only.
+ */
+export function boundSupervisors(state: Readonly<DeskState> | undefined): BoundSupervisor[] {
+    const found = new Map<number, BoundSupervisor>();
+
+    for (const thread of Object.values(state?.threads ?? {})) {
+        if (typeof thread.supervisor !== "number") {
+            continue;
+        }
+
+        const entry = found.get(thread.supervisor) ?? {
+            supervisor: thread.supervisor,
+            lastEventAt: 0,
+            asks: 0,
+        };
+
+        entry.lastEventAt = Math.max(entry.lastEventAt, thread.lastEventAt);
+
+        if (thread.state !== "closed" && thread.state !== "parked") {
+            entry.asks += thread.asks.filter((ask) => askIsOpen(ask)).length;
+        }
+
+        found.set(thread.supervisor, entry);
+    }
+
+    return [...found.values()].sort(
+        (a, b) => b.lastEventAt - a.lastEventAt || b.supervisor - a.supervisor,
+    );
+}
+
 /** The supervisor whose Clerk runs in a session, when that session is registered. */
 export function supervisorOfClerk(
     state: Readonly<DeskState> | undefined,
@@ -8549,6 +8591,11 @@ export type DeskApi = {
     clerkOf: (tx: Tx, supervisor: number) => Promise<Clerk | undefined>;
     /** The asks of a report's `ASKS FOR BRIAN:` block (`reportAsksOf`): Night shift files them with its report. */
     asks: (text: string) => { question: string; options?: string[] }[] | undefined;
+    /** The supervisor conversations the desk binds threads to (`boundSupervisors`), newest desk event first: no write. */
+    supervisors: (
+        read: Pick<DocumentReader, "snapshot">,
+        context: Context,
+    ) => Promise<BoundSupervisor[]>;
 };
 
 // ─── The module ──────────────────────────────────────────────────────────────
@@ -8865,6 +8912,8 @@ export default function createDesk(host: Host, web: Web) {
             };
         },
         asks: reportAsksOf,
+        supervisors: async (read, context) =>
+            boundSupervisors(await read.snapshot(DeskThreads, context)),
         clerkOf: async (tx, supervisor) => {
             const found = clerkOf(await tx.doc(DeskThreads), supervisor);
 

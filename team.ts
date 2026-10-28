@@ -688,6 +688,61 @@ ${
 
 const reply = (text: string) => ({ output: [{ type: "text" as const, text }] });
 
+/** What the supervisor rail button needs: the session it opens, or why there is none. */
+export type FrontDoor =
+    | {
+          found: true;
+          conversationId: number;
+          title: string;
+          /** The session's team identity, or "Supervisor". */
+          name: string;
+          /** Open asks for Brian on its desk threads. */
+          asks: number;
+          archived?: true;
+      }
+    | { found: false; reason: "desk-off" | "none"; text: string };
+
+export const FRONT_DOOR_DESK_OFF =
+    "The desk is off, so no supervisor session is bound to it. Nothing was opened.";
+export const FRONT_DOOR_NONE =
+    "No supervisor session is bound to the desk yet. A delegation from the supervisor's session binds it. Nothing was opened.";
+
+/**
+ * The supervisor session for the rail button: of the desk's bound supervisors (newest desk event first), the first that
+ * the person can see and that is not archived; else the first archived one. `visible` undefined: an app with no
+ * `request.sessions()` (before 0.20.0), so the first bound one.
+ */
+export function pickSupervisor(
+    bound: readonly { supervisor: number; lastEventAt: number; asks: number }[],
+    visible: readonly { id: number; title: string; archived: boolean }[] | undefined,
+): { id: number; title: string; asks: number; archived: boolean } | undefined {
+    if (visible === undefined) {
+        const first = bound[0];
+
+        return first === undefined
+            ? undefined
+            : { id: first.supervisor, title: "", asks: first.asks, archived: false };
+    }
+
+    const byId = new Map(visible.map((session) => [Number(session.id), session]));
+    const seen = bound.flatMap((entry) => {
+        const session = byId.get(entry.supervisor);
+
+        return session === undefined
+            ? []
+            : [
+                  {
+                      id: entry.supervisor,
+                      title: session.title,
+                      asks: entry.asks,
+                      archived: session.archived,
+                  },
+              ];
+    });
+
+    return seen.find((entry) => !entry.archived) ?? seen[0];
+}
+
 /** A short title for a task: its first non-empty line, without a leading "Task:", "Goal:", or "Title:". */
 export function taskTitle(task: string): string {
     const line =
@@ -1352,6 +1407,14 @@ export default function createTeam(host: Host, web: Web) {
             tx: Tx,
             supervisor: number,
         ) => Promise<{ address: string; key?: string } | undefined>;
+        /**
+         * The supervisor conversations the desk binds threads to, newest desk event first: no write. An older desk has
+         * none.
+         */
+        supervisors?: (
+            read: Pick<DocumentReader, "snapshot">,
+            context: Context,
+        ) => Promise<{ supervisor: number; lastEventAt: number; asks: number }[]>;
     };
 
     const deskApi = (): DeskApi | undefined =>
@@ -1447,6 +1510,45 @@ export default function createTeam(host: Host, web: Web) {
     web.route("GET", "agents", async () => ({
         agents: await roster(directory),
     }));
+    // The supervisor rail button: the session the desk binds threads to. Owner-only, read only: it opens nothing.
+    web.route(
+        "GET",
+        "supervisor",
+        async (req): Promise<FrontDoor> => {
+            const desk = deskApi();
+
+            if (desk === undefined || typeof desk.supervisors !== "function") {
+                return { found: false, reason: "desk-off", text: FRONT_DOOR_DESK_OFF };
+            }
+
+            const bound = await desk.supervisors(req, req.context);
+            const picked = pickSupervisor(
+                bound,
+                typeof req.sessions === "function" ? req.sessions() : undefined,
+            );
+
+            if (picked === undefined) {
+                return { found: false, reason: "none", text: FRONT_DOOR_NONE };
+            }
+
+            const identity = await resolveIdentity(
+                req,
+                picked.id as ConversationId,
+                req.context,
+                directory,
+            );
+
+            return {
+                found: true,
+                conversationId: picked.id,
+                title: picked.title,
+                name: identity.persona?.name ?? "Supervisor",
+                asks: picked.asks,
+                ...(picked.archived ? { archived: true as const } : {}),
+            };
+        },
+        { access: "owner" },
+    );
     web.conversationRoute(
         "GET",
         "session/:source",

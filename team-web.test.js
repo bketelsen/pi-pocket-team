@@ -1,7 +1,16 @@
 import assert from "node:assert/strict";
 import { webcrypto } from "node:crypto";
 import { test } from "node:test";
-import { expectedOf, identityStatus, newTaskKey, waitingCount } from "./team-web/index.js";
+import {
+    expectedOf,
+    identityStatus,
+    newTaskKey,
+    SUPERVISOR_ICON,
+    SUPERVISOR_NAME,
+    supervisorAction,
+    supervisorRail,
+    waitingCount,
+} from "./team-web/index.js";
 
 test("task keys work with the crypto API available on plain-HTTP LAN pages", () => {
     const lanCrypto = { getRandomValues: webcrypto.getRandomValues.bind(webcrypto) };
@@ -37,4 +46,35 @@ test("the status line shows the session's identity, and nothing without one", ()
         title: "Team identity: Murbella. Tap to change it.",
         page: "team",
     });
+});
+
+test("the supervisor button: its name, its badge of open asks, and a tap that opens only a bound session", () => {
+    const door = { found: true, conversationId: 42, title: "Desk", name: "Odrade", asks: 3 };
+
+    assert.deepEqual(supervisorRail(door), { title: "Odrade", badge: 3 });
+    assert.deepEqual(supervisorRail({ ...door, asks: 0 }), { title: "Odrade", badge: null });
+    assert.deepEqual(supervisorRail({ found: false, reason: "none", text: "No." }), {
+        title: SUPERVISOR_NAME,
+        badge: null,
+    });
+    assert.deepEqual(supervisorRail(null), { title: SUPERVISOR_NAME, badge: null });
+
+    assert.deepEqual(supervisorAction(door), { open: 42 });
+    assert.deepEqual(supervisorAction({ ...door, archived: true }), {
+        open: 42,
+        notice: ["warning", 'Odrade\'s session "Desk" is archived.'],
+    });
+    // No bound session: a notice, and nothing opens.
+    const none = supervisorAction({ found: false, reason: "none", text: "No session is bound." });
+
+    assert.deepEqual(none, { notice: ["info", "No session is bound."] });
+    assert.equal("open" in none, false);
+});
+
+test("the supervisor icon is 1 stroked path in the 24 by 24 box", () => {
+    assert.match(SUPERVISOR_ICON, /^M[0-9 .,MLCHVZmlchvz-]+$/);
+
+    for (const number of SUPERVISOR_ICON.match(/-?[0-9]*\.?[0-9]+/g)) {
+        assert(Math.abs(Number(number)) <= 24, `${number} fits the box`);
+    }
 });
