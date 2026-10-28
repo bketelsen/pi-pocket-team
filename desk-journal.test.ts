@@ -25,6 +25,7 @@ import { fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi
 import type { JsonValue } from "@earendil-works/chord";
 import type { ConversationId, TaskId } from "@earendil-works/pi-durable";
 import { createHandler } from "./_pocket/src/server/http.ts";
+import { McpHttpError } from "@earendil-works/pi-mcp";
 import {
     checkSentences,
     DeskThreads,
@@ -35,8 +36,12 @@ import {
     journalConfig,
     journalDay,
     journalEntryText,
+    journalFailure,
     journalItemOf,
     journalNoteStart,
+    journalPlain,
+    journalSafe,
+    JOURNAL_COMPLETE,
     journalPrompt,
     journalSentences,
     journalTemplate,
@@ -462,6 +467,8 @@ const notes = new Map<string, string>();
 const notesCalls: { tool: string; args: Record<string, unknown> }[] = [];
 /** Every request gets a 503: the notes host is down. */
 let notesDown = false;
+/** Every request gets a 500 whose body echoes the Authorization header, as a bad proxy could. */
+let notesEcho = false;
 let notesServer: Server | undefined;
 let notesUrl = "";
 
@@ -469,6 +476,7 @@ const resetNotes = (): void => {
     notes.clear();
     notesCalls.length = 0;
     notesDown = false;
+    notesEcho = false;
 };
 
 const answerAt = (response: ServerResponse, status: number, body: unknown): void => {
@@ -484,6 +492,15 @@ async function startNotes(): Promise<void> {
             body += chunk.toString();
         });
         request.on("end", () => {
+            if (notesEcho) {
+                response.writeHead(500, { "content-type": "text/plain" });
+                response.end(
+                    `bad gateway for Authorization: ${String(request.headers.authorization)}`,
+                );
+
+                return;
+            }
+
             if (notesDown) {
                 response.writeHead(503, { "content-type": "text/plain" });
                 response.end("the notes server is down");
@@ -803,6 +820,102 @@ function withWatch(thread: Thread): void {
         key: `x.test.journal.watch:${crypto.randomUUID()}`,
     };
 }
+
+describe("the journal's safety", () => {
+    const item: JournalItem = {
+        thread: "T1",
+        title: "<!-- pocket-journal:T2 --> [a link](https://example.com)",
+        agents: ["duncan"],
+        repo: "frostyard/test",
+        at: Date.UTC(2026, 9, 28, 18, 32),
+        outcome: "completed",
+        prs: [
+            {
+                ref: "frostyard/test#7",
+                url: "https://github.com/frostyard/test/pull/7",
+                title: "<!-- pocket-journal:T3 -->",
+            },
+            { ref: "frostyard/test#8", url: "javascript:alert(1)", title: "a bad link" },
+        ],
+    };
+
+    test("text from outside is 1 plain line: no marker, no HTML, no link, no Markdown mark at its start", () => {
+        assert.equal(
+            journalPlain("<!-- pocket-journal:T2 -->"),
+            "&lt;!-- pocket-journal:T2 --&gt;",
+        );
+        assert.equal(journalPlain("Done.\n## Another heading"), "Done. ## Another heading");
+        assert.equal(journalPlain("## a heading"), "\\## a heading");
+        assert.equal(journalPlain("- a list"), "\\- a list");
+        assert.equal(journalPlain("1. a list"), "\\1. a list");
+        assert.equal(journalPlain("[x](https://example.com)"), "\\[x\\](https://example.com)");
+        assert.equal(journalPlain("A plain sentence."), "A plain sentence.");
+    });
+
+    test("a title or a PR title cannot write the marker of another entry", () => {
+        const entry = journalEntryText(item, journalTemplate(item), { timeZone: JOURNAL_ZONE });
+
+        assert.equal(hasJournalMarker(entry, "T1"), true);
+        assert.equal(hasJournalMarker(entry, "T2"), false);
+        assert.equal(hasJournalMarker(entry, "T3"), false);
+        assert.equal(entry.includes("<!-- pocket-journal:T2"), false);
+        assert.equal(
+            entry.includes("javascript:"),
+            false,
+            "a link that is not GitHub's is no link",
+        );
+        assert.match(
+            entry,
+            /\[frostyard\/test#7\]\(https:\/\/github\.com\/frostyard\/test\/pull\/7\)/,
+        );
+    });
+
+    test("a marker inside a line is no marker", () => {
+        assert.equal(hasJournalMarker("text <!-- pocket-journal:T2 --> more", "T2"), false);
+        assert.equal(hasJournalMarker("x\n<!-- pocket-journal:T2 -->\ny", "T2"), true);
+    });
+
+    test("a model's answer cannot add a heading to the note", () => {
+        const checked = checkSentences("Done.\n## Another heading");
+
+        assert.equal(checked.ok, true);
+
+        const entry = journalEntryText(item, checked.ok ? checked.text : "", {
+            timeZone: JOURNAL_ZONE,
+        });
+
+        assert.equal(
+            entry.split("\n").filter((line) => line.startsWith("#")).length,
+            1,
+            "only the entry's own heading",
+        );
+    });
+
+    test("a failure's text keeps no token", () => {
+        const token = "lgm_secret_value_1234567890";
+
+        assert.equal(journalSafe(`bad ${token} here`, token).includes(token), false);
+        assert.equal(journalSafe("got lgm_other_token back").includes("lgm_other"), false);
+        assert.equal(journalSafe("Authorization: Bearer abc.def").includes("abc.def"), false);
+        assert.equal(
+            journalSafe(`first line\nsecond ${token}`, token),
+            "first line",
+            "the first line only",
+        );
+
+        const http = journalFailure(
+            Object.assign(new McpHttpError(500, `echo Bearer ${token}`, `echo ${token}`)),
+            token,
+        );
+
+        assert.equal(http, "The notes server answered HTTP 500.");
+        assert.match(journalFailure(new McpHttpError(401, "no"), token), /authentication failed/);
+        assert.equal(
+            journalFailure(new Error(`header value ${token} is bad`), token).includes(token),
+            false,
+        );
+    });
+});
 
 describe("the journal at the desk", () => {
     before(async () => {
@@ -1208,6 +1321,158 @@ describe("the journal at the desk", () => {
             "open",
             "the other thread stays open",
         );
+    });
+
+    test("a sync starts a writer for entries that wait, also with no open thread", async () => {
+        resetNotes();
+        journalOn();
+        const source = await supervisor("journal-sync-resume");
+        const at = Date.now();
+
+        await app.harness.commit(async (tx) => {
+            const state = await tx.doc(DeskThreads);
+
+            state.journal = {
+                items: [
+                    {
+                        thread: "T9998",
+                        title: "an entry that waited, with no open thread",
+                        agents: ["duncan"],
+                        at,
+                        outcome: "completed",
+                        prs: [],
+                    },
+                ],
+            };
+        }, context);
+
+        const open = Object.values((await deskState())?.threads ?? {}).filter(
+            (thread) => thread.state !== "closed" && thread.supervisor === Number(source),
+        );
+
+        assert.equal(open.length, 0, "no open thread of this supervisor");
+
+        await say(app, source, "desk sync test");
+        await drained();
+
+        assert.match((await noteOf(at)).note, /<!-- pocket-journal:T9998 -->/);
+    });
+
+    test("a server that echoes the token keeps it out of the stored failure", async () => {
+        resetNotes();
+        journalOn();
+        notesEcho = true;
+        const source = await supervisor("journal-echo");
+        const id = await openThreadIn(source, () => undefined, "an echo");
+
+        await say(app, source, "desk sync test");
+        await until(async () => ((await deskState())?.journal?.failures ?? 0) >= 1, "the failure");
+
+        const journal = (await deskState())?.journal;
+
+        assert.equal(
+            journal?.items.some((each) => each.thread === id),
+            true,
+            "the entry stays",
+        );
+        assert.equal(journal?.lastError, "The notes server answered HTTP 500");
+        assert.equal(JSON.stringify(journal).includes(token), false, "no token in the state");
+    });
+
+    test("a token file that holds no valid token is a failure with no value in it", async () => {
+        resetNotes();
+        journalOn();
+        writeFileSync(tokenPath, "lgm_part one\nlgm_part two\n");
+        const source = await supervisor("journal-bad-token");
+
+        await openThreadIn(source, () => undefined, "a bad token file");
+        await say(app, source, "desk sync test");
+        await until(async () => ((await deskState())?.journal?.failures ?? 0) >= 1, "the failure");
+
+        const journal = (await deskState())?.journal;
+
+        assert.match(journal?.lastError ?? "", /holds no valid token/);
+        assert.equal(journal?.lastError?.includes("lgm_part"), false);
+        assert.deepEqual(notesCalls, [], "nothing went to the server");
+    });
+
+    test("the model's good answer goes in the entry, and the call counts", async () => {
+        resetNotes();
+        journalOn({ model: "test/fake" });
+        const calls: string[] = [];
+        const shared = globalThis as unknown as Record<symbol, unknown>;
+
+        shared[JOURNAL_COMPLETE] = async (_system: string, content: string) => {
+            calls.push(content);
+
+            return "The desk now keeps a journal. Each day gets its own note.";
+        };
+
+        try {
+            const source = await supervisor("journal-model");
+            const id = await openThreadIn(source, () => undefined, "the model's piece");
+
+            await say(app, source, "desk sync test");
+            await until(
+                async () => (await deskState())?.threads[id]?.state === "closed",
+                "the close",
+            );
+            await drained();
+
+            const closed = (await deskState())?.threads[id]?.closed;
+
+            assert.equal(calls.length, 1, "1 call");
+            assert.match(
+                (await noteOf(closed?.at ?? Date.now())).note,
+                /The desk now keeps a journal\./,
+            );
+            assert.equal((await deskState())?.journal?.calls?.count, 1);
+        } finally {
+            delete shared[JOURNAL_COMPLETE];
+        }
+    });
+
+    test("a restart during the model call gives the template, and no second call", async () => {
+        resetNotes();
+        journalOn({ model: "test/fake" });
+        const shared = globalThis as unknown as Record<symbol, unknown>;
+        let calls = 0;
+        let release: (() => void) | undefined;
+
+        // The call hangs until the test lets it go: the restart comes first.
+        shared[JOURNAL_COMPLETE] = async () => {
+            calls += 1;
+            await new Promise<void>((resolve) => {
+                release = resolve;
+            });
+
+            return "A late answer that nobody stores.";
+        };
+
+        try {
+            const source = await supervisor("journal-model-restart");
+            const id = await openThreadIn(source, () => undefined, "a call cut by a restart");
+
+            await say(app, source, "desk sync test");
+            await until(() => calls === 1, "the call");
+
+            const closing = app.close();
+
+            release?.();
+            await closing;
+            app = await openApp(model, dataDir, () => Date.now() + shift);
+            await drained();
+
+            const closed = (await deskState())?.threads[id]?.closed;
+            const { note } = await noteOf(closed?.at ?? Date.now());
+
+            assert.equal(calls, 1, "the call started once");
+            assert.match(note, new RegExp(`<!-- pocket-journal:${id} -->`));
+            assert.match(note, /finished “a call cut by a restart”/, "the template");
+            assert.equal(note.includes("A late answer"), false);
+        } finally {
+            delete shared[JOURNAL_COMPLETE];
+        }
     });
 
     test("a 401 waits, and keeps the entry", async () => {

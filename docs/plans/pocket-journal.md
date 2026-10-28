@@ -81,6 +81,10 @@ gets its own note in the PocketJournal folder, with links to the merged pull req
 - **PRs:** every PR of the thread that is `MERGED` and not guessed (`via: "window"`), as a Markdown
   link `[owner/name#n](url)`. No line when there is none.
 - **Sentences:** 1 to 3 plain sentences (section 4).
+- **Text from outside** (titles, PR titles, the sentences) goes through `journalPlain`: 1 line, `<` and
+  `>` as entities, `[` and `]` escaped, and no Markdown mark at its start. So only the writer writes a
+  marker, and a title or a model answer cannot add a heading. The marker counts only alone on its line.
+  A PR link is a link only when its URL is `https://github.com/<owner>/<name>/pull/<n>`.
 
 The item that the commit enqueues holds all of this, so the writer needs nothing else from the desk:
 thread id, title, agents, repo, close time, outcome, merged PRs (`ref`, `url`, `title`), and the text of
@@ -106,7 +110,8 @@ The template: "{Agents} finished “{title}”{ in {repo}}." When PRs merged: "{
 {PR titles, joined}." For `verified`: "A dated check passed." That is 1 to 3 sentences, always.
 
 The sentences are made once, before the write, and kept in the writer task's checkpoint: a restart
-writes the same text.
+writes the same text. The model call starts at most once: the checkpoint drops the model before the
+call, so a restart during it gives the template, and the day's count stays true.
 
 ## 5. The note
 
@@ -134,7 +139,8 @@ conversation of the item that started it):
 3. `write`: connect, read, create or append, close. Success removes the item, resets `failures`, and
    goes back to `take`.
 4. On a failure (no token file, lodge or notesd down, 401, a tool error): `failures` + 1, `lastError`
-   (the first line, no secret), and a durable wait (`runtime.sleepUntil`) of
+   (a fixed text for an HTTP status, else the first line with the token, any `lgm_…` value and any
+   Bearer value taken out), and a durable wait (`runtime.sleepUntil`) of
    `min(5 min × 2^(failures−1), 2 h)`, then `write` again with the same text.
 5. At the 3rd failure in a row, 1 notice to the owner: the journal waits, with the reason. `desk list`
    says how many entries wait while `failures` > 0.
@@ -143,7 +149,7 @@ Restart safety: each phase starts from its checkpoint. A restart in `write` writ
 makes it act once.
 
 The journal turned off with entries waiting: the writer ends and keeps them. When it is on again, the
-next sweep (or the next close) starts a writer for them.
+next sweep, `desk sync`, or close starts a writer for them, also with no open thread.
 
 ## 7. Settings and Brian's steps
 

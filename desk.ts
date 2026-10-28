@@ -25,7 +25,12 @@ import { isAbsolute, join } from "node:path";
 import { promisify } from "node:util";
 import type { Context, JsonValue } from "@earendil-works/chord";
 import { Type } from "@earendil-works/pi-ai";
-import { McpClient, StreamableHttpTransport, type CallToolResult } from "@earendil-works/pi-mcp";
+import {
+    McpClient,
+    McpHttpError,
+    StreamableHttpTransport,
+    type CallToolResult,
+} from "@earendil-works/pi-mcp";
 import {
     defineDoc,
     defineExtension,
@@ -8839,9 +8844,28 @@ export function journalItemOf(thread: Thread, report?: string): JournalItem {
 /** The marker of 1 entry, hidden in a rendered note: a write whose answer was lost is not written twice. */
 export const journalMarker = (thread: string): string => `<!-- pocket-journal:${thread} -->`;
 
-/** Whether a note holds the entry of a thread. */
+/** Whether a note holds the entry of a thread: its marker, alone on a line, as `journalEntryText` writes it. */
 export const hasJournalMarker = (note: string, thread: string): boolean =>
-    note.includes(journalMarker(thread));
+    note.split("\n").some((line) => line.trim() === journalMarker(thread));
+
+/**
+ * Text from outside (a title, a PR title, a report's words, a model's answer) on 1 line of a note: no line break, no
+ * `<` or `>` (so no HTML, no comment, and no marker), no `[` or `]` (no link of its own), and no Markdown mark at its
+ * start (no heading, quote, or list). Only `journalMarker` writes a marker.
+ */
+export function journalPlain(text: string): string {
+    const line = text
+        .replace(/\s+/g, " ")
+        .trim()
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/([[\]])/g, "\\$1");
+
+    return line.replace(/^([#*+=|`~-]|\d+[.)])/, "\\$1");
+}
+
+/** A PR's GitHub link, as the desk reads it (its ref is `PR_REF`): anything else is not a link. */
+const PR_URL = /^https:\/\/github\.com\/[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+\/pull\/\d+$/;
 
 /** The agents' names for an entry: the roster's names, and an id where it has none. */
 function agentNames(
@@ -8947,6 +8971,9 @@ export function checkSentences(
     return { ok: true, text };
 }
 
+/** Where a test puts its fake model call: a function of type `JournalComplete`. */
+export const JOURNAL_COMPLETE = Symbol.for("pi-pocket-team.desk.journal-complete");
+
 /** The model's 1 call: the prompt in, the answer's text out. */
 export type JournalComplete = (system: string, content: string) => Promise<string>;
 
@@ -8990,15 +9017,19 @@ export function journalEntryText(
     sentences: string,
     options: { timeZone: string; names?: Record<string, string> },
 ): string {
-    const who = agentNames(item, options.names, " · ");
-    const prs = item.prs.map((pr) => (pr.url === undefined ? pr.ref : `[${pr.ref}](${pr.url})`));
+    const who = journalPlain(agentNames(item, options.names, " · "));
+    const prs = item.prs.map((pr) =>
+        pr.url !== undefined && PR_REF.test(pr.ref) && PR_URL.test(pr.url)
+            ? `[${pr.ref}](${pr.url})`
+            : journalPlain(pr.ref),
+    );
 
     return [
-        `## ${journalTime(item.at, options.timeZone)} · ${who} · ${item.title}`,
+        `## ${journalTime(item.at, options.timeZone)} · ${who} · ${journalPlain(item.title)}`,
         journalMarker(item.thread),
         "",
         ...(prs.length === 0 ? [] : [`PRs: ${prs.join(", ")}`, ""]),
-        sentences,
+        journalPlain(sentences),
         "",
         "",
     ].join("\n");
@@ -9016,18 +9047,37 @@ function toolText(result: CallToolResult): string {
     return result.content.flatMap((part) => (part.type === "text" ? [part.text] : [])).join("\n");
 }
 
-/** A tool's failure, in 1 short line. */
-function toolFailure(result: CallToolResult): string {
-    return (
-        toolText(result).split("\n")[0]?.slice(0, MAX_LINE) || "The notes server gave no reason."
-    );
+/**
+ * A failure's text, safe to store and to show: the token, any lodge token (`lgm_…`) and any Bearer value are taken out
+ * before the text is cut to its first line of at most `MAX_LINE`.
+ */
+export function journalSafe(text: string, token?: string): string {
+    let safe = token === undefined || token === "" ? text : text.split(token).join("[token]");
+
+    safe = safe
+        .replace(/lgm_[A-Za-z0-9_-]*/g, "[token]")
+        .replace(/(bearer)\s+[^\s"',;]+/gi, "$1 [token]");
+
+    return safe.split("\n")[0]?.trim().slice(0, MAX_LINE) || "The notes server gave no reason.";
 }
 
-/** Why a call failed, in 1 short line of at most `MAX_LINE`. No error of an MCP call carries the token. */
-function journalFailure(error: unknown): string {
-    const message = error instanceof Error ? error.message : String(error);
+/** A tool's failure, in 1 short line with no secret. */
+function toolFailure(result: CallToolResult, token: string): string {
+    return journalSafe(toolText(result), token);
+}
 
-    return message.split("\n")[0]?.slice(0, MAX_LINE) || "The notes server gave no reason.";
+/**
+ * Why a call failed, in 1 short line with no secret. An HTTP answer gives only its status: its body is the server's,
+ * and could echo a header.
+ */
+export function journalFailure(error: unknown, token?: string): string {
+    if (error instanceof McpHttpError) {
+        return error.status === 401 || error.status === 403
+            ? `The notes server refused the token (HTTP ${String(error.status)}): authentication failed.`
+            : `The notes server answered HTTP ${String(error.status)}.`;
+    }
+
+    return journalSafe(error instanceof Error ? error.message : String(error), token);
 }
 
 /** A note's text from a `read_note` answer: its structured answer, else its text blocks. */
@@ -12784,10 +12834,11 @@ export default function createDesk(host: Host, web: Web) {
         client: McpClient,
         path: string,
         entry: string,
+        token: string,
     ): Promise<string | undefined> => {
         const edited = await client.callTool("edit_note", { path, append: entry });
 
-        return edited.isError === true ? toolFailure(edited) : undefined;
+        return edited.isError === true ? toolFailure(edited, token) : undefined;
     };
 
     /**
@@ -12817,6 +12868,11 @@ export default function createDesk(host: Host, web: Web) {
             return `The journal's token file ${file} is empty.`;
         }
 
+        // 1 word of visible ASCII, as lodge issues it: anything else would fail as a header, maybe with its value.
+        if (!/^[\x21-\x7e]+$/.test(token)) {
+            return `The journal's token file ${file} holds no valid token.`;
+        }
+
         const client = new McpClient({ name: "pocket-journal", version: "1" });
 
         try {
@@ -12828,7 +12884,7 @@ export default function createDesk(host: Host, web: Web) {
                 }),
             );
         } catch (error) {
-            return journalFailure(error);
+            return journalFailure(error, token);
         }
 
         try {
@@ -12838,11 +12894,11 @@ export default function createDesk(host: Host, web: Web) {
             if (read.isError !== true) {
                 return hasJournalMarker(noteText(read), item.thread)
                     ? undefined
-                    : await journalAppend(client, path, entry);
+                    : await journalAppend(client, path, entry, token);
             }
 
             if (!noteMissing(read)) {
-                return toolFailure(read);
+                return toolFailure(read, token);
             }
 
             const created = await client.callTool("create_note", {
@@ -12858,14 +12914,14 @@ export default function createDesk(host: Host, web: Web) {
             const again = await client.callTool("read_note", { path });
 
             if (again.isError === true) {
-                return toolFailure(again);
+                return toolFailure(again, token);
             }
 
             return hasJournalMarker(noteText(again), item.thread)
                 ? undefined
-                : await journalAppend(client, path, entry);
+                : await journalAppend(client, path, entry, token);
         } catch (error) {
-            return journalFailure(error);
+            return journalFailure(error, token);
         } finally {
             await client.close().catch(() => undefined);
         }
@@ -12928,10 +12984,26 @@ export default function createDesk(host: Host, web: Web) {
                 const checkpoint = task.state.checkpoint;
                 const { journal } = await deskConfig();
                 const names = await journalNames();
+                // Tests put a fake call here, as they put a fake `gh` in `PI_POCKET_DESK_GH`: no test calls a real model.
+                const fake = (globalThis as unknown as Record<symbol, unknown>)[JOURNAL_COMPLETE];
                 const complete =
                     checkpoint.model && journal !== undefined
-                        ? journalComplete(journal)
+                        ? typeof fake === "function"
+                            ? (fake as JournalComplete)
+                            : journalComplete(journal)
                         : undefined;
+
+                // The call starts at most once: a restart during it, or before its text is stored, gives the template.
+                if (checkpoint.model) {
+                    await runtime.commit(
+                        () => ({
+                            status: "running",
+                            checkpoint: { phase: "compose", item: checkpoint.item, model: false },
+                        }),
+                        context,
+                    );
+                }
+
                 const text = await journalSentences(checkpoint.item, complete, names);
 
                 await runtime.commit(
@@ -14650,6 +14722,8 @@ export default function createDesk(host: Host, web: Web) {
                     );
 
                     await startMissingSweepers(tx);
+                    // Entries that wait with no writer: a sync starts one too, also with no open thread.
+                    await resumeJournal(tx, supervisor);
 
                     return swept;
                 }, context);
