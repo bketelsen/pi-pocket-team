@@ -25,6 +25,8 @@ const MODULES = [
     "night-shift-web",
     "desk.ts",
     "desk-web",
+    "terminal.ts",
+    "terminal-web",
 ];
 
 /**

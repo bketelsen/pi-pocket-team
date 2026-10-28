@@ -7,7 +7,7 @@
     "scripts": {
         "link": "node link.mjs",
         "pretest": "node link.mjs",
-        "test": "node --test team.test.ts team-homes.test.ts team-memory.test.ts team-web.test.js homewiki.test.ts night-shift.test.ts team-night-shift.test.ts desk.test.ts desk-journal.test.ts desk-web.test.js install.test.mjs audit/checks.test.ts audit/sources.test.ts audit/report.test.ts audit/llm.test.ts audit/daily.test.ts homes/seed.test.ts docs/team-vm/rewrite-paths.test.mjs && node --check team-web/index.js && node --check homewiki-web/index.js && node --check night-shift-web/index.js && node --check desk-web/index.js",
+        "test": "node --test team.test.ts team-homes.test.ts team-memory.test.ts team-web.test.js homewiki.test.ts terminal.test.ts night-shift.test.ts team-night-shift.test.ts desk.test.ts desk-journal.test.ts desk-web.test.js terminal-web.test.js install.test.mjs audit/checks.test.ts audit/sources.test.ts audit/report.test.ts audit/llm.test.ts audit/daily.test.ts homes/seed.test.ts docs/team-vm/rewrite-paths.test.mjs && node --check team-web/index.js && node --check homewiki-web/index.js && node --check night-shift-web/index.js && node --check desk-web/index.js && node --check terminal-web/index.js",
         "lint": "node link.mjs && prettier --check . && eslint .",
         "format": "node link.mjs && eslint --fix . && prettier --write .",
         "typecheck": "node link.mjs && tsc -p tsconfig.json",

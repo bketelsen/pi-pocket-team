@@ -5,7 +5,8 @@ import tseslint from "typescript-eslint";
 // Layout only: Prettier formats, and these rules give the code room to breathe.
 export default [
     {
-        ignores: ["node_modules/**", "_pocket/**"],
+        // The vendored xterm.js is not this project code: neither linter reads it (nor .prettierignore).
+        ignores: ["node_modules/**", "_pocket/**", "terminal-web/vendor/**"],
     },
     {
         files: ["**/*.ts"],
