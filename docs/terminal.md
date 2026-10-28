@@ -11,8 +11,9 @@ has no upgrade hook. It does not need one. A route has no time limit (`docs/exte
 uses a **long poll**: `GET poll?tab=<tab>&t=<id>.<from>,<id>.<from>` answers at once when any named terminal has output
 past its offset, has exited, or is gone, else waits up to 25 s. It carries every terminal of the tab, 4 at most, in one answer:
 `{ terminals: { <id>: { data, from, to, exited?, exitCode? } | { gone: true } } }`. It holds an entry for each terminal
-that has something, and at the 25 s end an empty one for each live terminal, so a tab keeps its offsets. Input and
-resize are small `POST`s. Every request goes through the app's own sign-in and `X-Pocket` check. Events (`web.send`) are
+that has something, and at the 25 s end an empty one for each live terminal, so a tab keeps its offsets. A poll names
+16 terminals at most: the 4 live ones, plus exited ones that still need their last output. Input and resize are small
+`POST`s. Every request goes through the app's own sign-in and `X-Pocket` check. Events (`web.send`) are
 not used for output: they go to every tab of the person, are capped at 100 events and 1 MB a second for the module, and
 drop the rest. Events carry only the list of terminals (for the rail badge).
 
@@ -66,6 +67,19 @@ shell's process group, then `SIGKILL` after 2 s, and exits. When the shell exits
   back. When the oldest tab that still watches a shell is more than 128 K (KEEP / 2) characters behind, the server
   pauses the helper's stdout. The pipe then fills, and the shell's writes block, as on a slow real terminal. So a
   following tab loses no output, and a slow tab never falls behind the buffer.
+- **Input is written once.** Each tab numbers its chunks of keys: `POST terminals/:id/input` carries `{ data, tab,
+seq }`, and the server keeps, for each tab of a terminal, the last `seq` it wrote (16 tabs at most, the oldest tab
+  dropped, as for a poll's tabs: 30 s). A `seq` that is not newer than the last one is answered `{}` and writes
+  nothing, so a tab may send the same chunk again after a POST that failed on the way. `tab` is 1 to 64 letters,
+  digits, and dashes, and `seq` a positive whole number; a missing one is a 400. The browser keeps the chunk until
+  the server has it, and tries it again after 0.5, 1, 2, and 4 s, then every 4 s, with a note that reads "Input waits
+  for the server…". A 404 or a 409 ends the terminal, as before.
+- **A poll asks only for what the screen drew.** The tab writes an answer's text into xterm, and waits for xterm's
+  callback before it asks with the new offset: a slow screen is never asked past what it has drawn. A write that
+  fails ends that terminal's poll with a note, and the tab's poll starts again for the others.
+- **A size is sent when it changes, 1 `POST` at a time.** The wanted size and the size the server has are kept apart;
+  a size that changed while a `POST` was in flight goes right after it, and a failed `POST` is tried again with the
+  same bounded waits. A 404 or a 409 ends the terminal.
 - **End:** the shell exits; the tab presses Close (`DELETE terminals/:id`); no tab polls for 60 s (the tab closed);
   no keystroke for 60 minutes (idle); the module reloads, is turned off, or the server restarts (`web.onDispose`
   closes every helper's stdin, and a dead server process closes the pipes too).
@@ -97,7 +111,11 @@ shell's process group, then `SIGKILL` after 2 s, and exits. When the shell exits
 - The poll loop belongs to the browser module, not the page: closing the page to read a session keeps the shell; the
   rail badge counts the open terminals. It is 1 poll for the tab, which carries every terminal the tab shows.
 - **Phone:** a key bar with Esc, Tab, Ctrl (sticky, for the next key), the arrows, Paste and Select. Paste uses
-  `navigator.clipboard.readText()` when the browser allows it, else a text box to paste into and send. Select shows
-  the screen's text in a plain text box, where the phone's own selection and copy work.
+  `navigator.clipboard.readText()` when the browser allows it, else a text box to paste into and send. Both go through
+  `term.paste()`, so a shell that asked for bracketed paste gets it, and the text takes its turn in the same queue as
+  the keys. Select shows the screen's text in a plain text box, where the phone's own selection and copy work.
 - Input goes in order: one `POST` at a time, with the keys typed meanwhile batched into the next one, 32 K
   characters at most per request.
+- **A terminal that ended is fetched once.** The page lists every terminal, ended ones too, and a tab that attaches to
+  one polls it once more: the buffer and the exit code arrive together, and then that terminal is done. A `terminals`
+  event that says a terminal ended marks it so, and the next poll brings its last output and its exit code.

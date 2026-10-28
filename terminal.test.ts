@@ -131,8 +131,18 @@ async function start(body: Record<string, unknown> = { folder: "path", path: fix
     return answer.data.id as string;
 }
 
-async function type(id: string, data: string) {
-    const answer = await call("owner", `terminals/${id}/input`, { method: "POST", body: { data } });
+/** The last seq this test wrote to a terminal: each chunk of keys carries one, as the tab does. */
+const sequences = new Map<string, number>();
+
+async function type(id: string, data: string, tab = "tab-test") {
+    const seq = (sequences.get(id) ?? 0) + 1;
+
+    sequences.set(id, seq);
+
+    const answer = await call("owner", `terminals/${id}/input`, {
+        method: "POST",
+        body: { data, tab, seq },
+    });
 
     assert.equal(answer.status, 200, JSON.stringify(answer.data));
 }
@@ -196,6 +206,31 @@ async function poll(id: string, wait = 3000, tab = "tab-test") {
     }
 
     return { status: answer.status, data: entry };
+}
+
+/** Keys from one tab, with the seq that tab gives them. */
+async function keys(id: string, data: string, tab: string, seq: number) {
+    return await call("owner", `terminals/${id}/input`, {
+        method: "POST",
+        body: { data, tab, seq },
+    });
+}
+
+/** Poll until the shell writes nothing for a moment: its prompt is out, and only a keystroke is news. */
+async function quiet(id: string) {
+    const state = collected(id);
+
+    for (let tries = 0; tries < 40; tries++) {
+        const answer = await pollList([{ id, from: state.offset }], 300);
+        const entry = answer.data.terminals?.[id];
+
+        if (!entry || entry.gone || entry.data === "") {
+            return;
+        }
+
+        state.offset = entry.to;
+        state.text += entry.data;
+    }
 }
 
 /** Poll until the shell's output so far satisfies `match`. */
@@ -362,7 +397,7 @@ test("a terminal starts in a folder, takes input, and follows its size", async (
     // More input than one POST may carry: refused, and nothing reaches the shell.
     const tooMuch = await call("owner", `terminals/${id}/input`, {
         method: "POST",
-        body: { data: "x".repeat(32 * 1024 + 1) },
+        body: { data: "x".repeat(32 * 1024 + 1), tab: "tab-test", seq: 1 },
     });
 
     assert.equal(tooMuch.status, 413);
@@ -449,9 +484,8 @@ test("1 poll carries every terminal of a tab, each with its own output", async (
 
 test("a poll refuses a bad list of terminals", async () => {
     const id = await start();
-    const ids = Array.from({ length: 5 }, (_, each) => `${id}.${each}`).join(",");
 
-    for (const query of ["", "abc", `${id}.`, `${id}.-1`, `${id}.1.2`, `${id}.one`, ids]) {
+    for (const query of ["", "abc", `${id}.`, `${id}.-1`, `${id}.1.2`, `${id}.one`]) {
         const answer = await call("owner", `poll?t=${encodeURIComponent(query)}`);
 
         assert.equal(answer.status, 400, JSON.stringify(query));
@@ -465,6 +499,70 @@ test("a poll refuses a bad list of terminals", async () => {
     }
 
     assert.equal((await call("owner", `poll?t=${id}.0`)).status, 200);
+
+    // 16 terminals in one poll: the 4 live ones at most, plus the ended ones that still need their last output.
+    const sixteen = Array.from({ length: 16 }, (_, each) => `id${each}.0`).join(",");
+    const seventeen = `${sixteen},id16.0`;
+
+    assert.equal((await call("owner", `poll?t=${sixteen}`)).status, 200);
+    assert.equal((await call("owner", `poll?t=${seventeen}`)).status, 400);
+
+    await end(id);
+});
+
+test("keys are written once: a repeated seq and an older one write nothing", async () => {
+    const id = await start();
+
+    assert.equal((await keys(id, "echo once-42\n", "tab-retry", 1)).status, 200);
+    await expectOutput(id, (text) => /once-42/.test(text), "the chunk to run");
+    await quiet(id);
+
+    const after = collected(id).offset;
+
+    // The same chunk with the same seq, the way a POST that failed on the way goes again: an answer, no keys.
+    assert.equal((await keys(id, "echo once-42\n", "tab-retry", 1)).status, 200);
+    await quiet(id);
+    assert.equal(collected(id).offset, after, "a repeated seq writes nothing");
+
+    // An older seq: nothing either.
+    assert.equal((await keys(id, "echo older-5\n", "tab-retry", 1)).status, 200);
+    await quiet(id);
+    assert.equal(collected(id).offset, after, "an older seq writes nothing");
+
+    // A newer seq is written, and the shell runs it.
+    assert.equal((await keys(id, "echo later-7\n", "tab-retry", 2)).status, 200);
+    await expectOutput(id, (text) => /later-7/.test(text), "the newer chunk");
+
+    // Another tab numbers its own chunks: its seq 1 is not this tab's seq 1.
+    assert.equal((await keys(id, "echo other-tab-9\n", "tab-other", 1)).status, 200);
+    await expectOutput(id, (text) => /other-tab-9/.test(text), "the other tab's chunk");
+
+    await end(id);
+});
+
+test("an input POST needs its tab and a positive seq", async () => {
+    const id = await start();
+    const good = { data: "x", tab: "tab-test", seq: 1 };
+
+    for (const body of [
+        { ...good, tab: undefined },
+        { ...good, tab: "" },
+        { ...good, tab: "a b" },
+        { ...good, tab: "x".repeat(65) },
+        { ...good, seq: undefined },
+        { ...good, seq: 0 },
+        { ...good, seq: -1 },
+        { ...good, seq: 1.5 },
+        { ...good, seq: "1" },
+        { ...good, seq: 2 ** 53 },
+    ]) {
+        const answer = await call("owner", `terminals/${id}/input`, {
+            method: "POST",
+            body,
+        });
+
+        assert.equal(answer.status, 400, JSON.stringify(body));
+    }
 
     await end(id);
 });

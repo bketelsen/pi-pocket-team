@@ -142,6 +142,8 @@ const TICK_MS = 5_000;
 const GRACE_MS = 60_000;
 /** The most input in one POST. */
 const INPUT_MAX = 32 * 1024;
+/** The most terminals in one poll: the 4 live ones at most, plus exited ones that wait for their last output. */
+const POLL_MAX = 16;
 /** How long a tab counts for back pressure after its last poll: a poll waits 25 s, and 5 s is the margin. */
 const TAB_MS = 30_000;
 /** Tabs that one terminal keeps for back pressure: the oldest goes. */
@@ -174,6 +176,12 @@ interface Watcher {
     seen: number;
 }
 
+/** The last input a tab had written: its sequence number, and when the tab last sent one. */
+interface Written {
+    seq: number;
+    seen: number;
+}
+
 /** 1 terminal in a poll's answer: its output from an offset, or the news that it is gone. */
 type Answer =
     | { gone: true }
@@ -193,6 +201,8 @@ interface Terminal {
     asked: number;
     /** One entry for each tab that watches this terminal: the offset it asked from, and when it last polled. */
     tabs: Map<string, Watcher>;
+    /** One entry for each tab that typed into this terminal: the last sequence number it wrote. */
+    sequences: Map<string, Written>;
     lastPoll: number;
     lastInput: number;
     /** Output polls in progress now. */
@@ -319,26 +329,29 @@ export default function createTerminal(_host: unknown, web: Web) {
         });
     }
 
-    /** Drops the tabs that stopped polling, and all but the 16 that polled most recently. */
-    function prune(record: Terminal, now: number): void {
-        for (const [id, tab] of record.tabs) {
-            if (now - tab.seen >= TAB_MS) {
-                record.tabs.delete(id);
+    /**
+     * Drops the tabs that stopped being seen, and all but the 16 seen most recently. A poll's tabs and a terminal's
+     * input sequences are bounded the same way.
+     */
+    function bounded<T extends { seen: number }>(map: Map<string, T>, now: number): void {
+        for (const [id, entry] of map) {
+            if (now - entry.seen >= TAB_MS) {
+                map.delete(id);
             }
         }
 
-        while (record.tabs.size > TABS_MAX) {
+        while (map.size > TABS_MAX) {
             let oldest: string | undefined;
             let seen = Infinity;
 
-            for (const [id, tab] of record.tabs) {
-                if (tab.seen < seen) {
-                    seen = tab.seen;
+            for (const [id, entry] of map) {
+                if (entry.seen < seen) {
+                    seen = entry.seen;
                     oldest = id;
                 }
             }
 
-            record.tabs.delete(oldest!);
+            map.delete(oldest!);
         }
     }
 
@@ -387,7 +400,7 @@ export default function createTerminal(_host: unknown, web: Web) {
 
         if (tab !== undefined) {
             record.tabs.set(tab, { offset, seen: Date.now() });
-            prune(record, Date.now());
+            bounded(record.tabs, Date.now());
         }
 
         pressure(record);
@@ -593,6 +606,7 @@ export default function createTerminal(_host: unknown, web: Web) {
             total: 0,
             asked: 0,
             tabs: new Map(),
+            sequences: new Map(),
             lastPoll: Date.now(),
             lastInput: Date.now(),
             polls: 0,
@@ -626,7 +640,7 @@ export default function createTerminal(_host: unknown, web: Web) {
         return { id: record.id };
     }
 
-    /** The `t` query of a poll: `id.from` entries, 4 at most, because a server runs 4 terminals at once. */
+    /** The `t` query of a poll: `id.from` entries, POLL_MAX at most. */
     function entries(request: WebRequest): { id: string; from: number }[] {
         const text = request.query.get("t") ?? "";
 
@@ -645,8 +659,8 @@ export default function createTerminal(_host: unknown, web: Web) {
             return { id: parts[0]!, from: Number(digits) };
         });
 
-        if (asked.length > CAP) {
-            throw web.error(400, `A poll carries ${CAP} terminals at most.`);
+        if (asked.length > POLL_MAX) {
+            throw web.error(400, `A poll carries ${POLL_MAX} terminals at most.`);
         }
 
         return asked;
@@ -688,6 +702,17 @@ export default function createTerminal(_host: unknown, web: Web) {
         const tab = request.query.get("tab") ?? undefined;
 
         if (tab !== undefined && !TAB_ID.test(tab)) {
+            throw web.error(400, "Give tab as 1 to 64 letters, digits, and dashes.");
+        }
+
+        return tab;
+    }
+
+    /** The `tab` of an input POST: the same id, and there it is needed, because each tab numbers its own chunks. */
+    function inputTab(request: WebRequest): string {
+        const tab = request.body.tab;
+
+        if (typeof tab !== "string" || !TAB_ID.test(tab)) {
             throw web.error(400, "Give tab as 1 to 64 letters, digits, and dashes.");
         }
 
@@ -768,12 +793,23 @@ export default function createTerminal(_host: unknown, web: Web) {
         }
     }
 
+    /**
+     * Keys from one tab. The tab numbers its chunks, so a POST that fails on the way keeps its text: the tab sends the
+     * same chunk again with the same sequence number, and this route writes it once. A number that is not newer than
+     * the last one a tab wrote is an answer with nothing written, because the tab already sent it.
+     */
     function input(request: WebRequest): unknown {
         const record = find(request);
         const data = request.body.data;
+        const tab = inputTab(request);
+        const seq = request.body.seq;
 
         if (typeof data !== "string") {
             throw web.error(400, "Give data as text.");
+        }
+
+        if (typeof seq !== "number" || !Number.isSafeInteger(seq) || seq < 1) {
+            throw web.error(400, "Give seq as a positive whole number.");
         }
 
         if (data.length > INPUT_MAX) {
@@ -784,8 +820,19 @@ export default function createTerminal(_host: unknown, web: Web) {
             throw web.error(409, "This terminal has ended.");
         }
 
+        const now = Date.now();
+        const last = record.sequences.get(tab)?.seq ?? 0;
+
+        record.sequences.set(tab, { seq: Math.max(last, seq), seen: now });
+        bounded(record.sequences, now);
+
+        // The same chunk again, or an older one: the shell already has it.
+        if (seq <= last) {
+            return {};
+        }
+
         if (data !== "") {
-            record.lastInput = Date.now();
+            record.lastInput = now;
             frame(record, "d", Buffer.from(data, "utf8"));
         }
 
@@ -822,7 +869,7 @@ export default function createTerminal(_host: unknown, web: Web) {
 
         for (const record of [...terminals.values()]) {
             // A tab that stopped polling no longer holds the output back.
-            prune(record, now);
+            bounded(record.tabs, now);
 
             if (record.exited) {
                 if (now - record.exitedAt >= GRACE_MS) {
