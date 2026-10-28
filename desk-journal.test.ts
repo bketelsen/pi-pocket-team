@@ -17,7 +17,7 @@ import {
 } from "./_pocket/test/helpers.ts";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { chmodSync, cpSync, mkdirSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { createServer, type Server, type ServerResponse } from "node:http";
 import { join } from "node:path";
 import { after, afterEach, before, describe, test } from "node:test";
@@ -44,13 +44,16 @@ import {
     journalSafe,
     JOURNAL_COMPLETE,
     journalPrompt,
+    journalRefreshed,
     journalSentences,
+    journalStale,
     journalTemplate,
     journalTime,
     listText,
     openThread,
     type DeskState,
     type JournalItem,
+    type PrFact,
     type Thread,
 } from "./desk.ts";
 
@@ -224,6 +227,47 @@ describe("the entry", () => {
         assert.equal(item.thread, "T1");
         assert.equal(item.repo, "frostyard/test");
         assert.deepEqual(item.agents, ["duncan"]);
+    });
+
+    test("the PRs read again: not merged, not missing, not guessed; a merged fact adds its link", () => {
+        const thread = baseThread({
+            prs: {
+                "frostyard/test#1": { via: "seen", state: "MERGED", title: "one" },
+                "frostyard/test#2": { via: "seen", state: "OPEN", title: "two" },
+                "frostyard/test#3": { via: "attached", state: "MISSING" },
+                "frostyard/test#4": { via: "window", state: "OPEN" },
+                "frostyard/test#5": { via: "branch" },
+                "frostyard/test#6": { via: "seen", state: "CLOSED" },
+                "not a ref": { via: "attached", state: "OPEN" },
+            },
+        });
+        const refs = journalStale(thread);
+
+        assert.deepEqual(refs, ["frostyard/test#2", "frostyard/test#5", "frostyard/test#6"]);
+
+        const fact = (number: number, state: PrFact["state"]) =>
+            ({
+                ref: `Frostyard/test#${String(number)}`,
+                state,
+                url: `https://github.com/Frostyard/test/pull/${String(number)}`,
+                title: `pr ${String(number)}`,
+            }) as PrFact;
+        const item = journalItemOf(thread);
+        const refreshed = journalRefreshed(item, refs, {
+            "Frostyard/test#2": fact(2, "MERGED"),
+            "Frostyard/test#6": fact(6, "CLOSED"),
+            "Frostyard/test#1": fact(1, "MERGED"),
+        });
+
+        assert.deepEqual(refreshed.prs, [
+            { ref: "frostyard/test#1", title: "one" },
+            {
+                ref: "frostyard/test#2",
+                url: "https://github.com/Frostyard/test/pull/2",
+                title: "pr 2",
+            },
+        ]);
+        assert.deepEqual(journalRefreshed(item, refs, {}), item, "no facts: no change");
     });
 
     test("the report is cut to 4,000 characters, and an empty one is left out", () => {
@@ -1098,6 +1142,128 @@ describe("the journal at the desk", () => {
         assert.equal(note.split(`<!-- pocket-journal:${id} -->`).length - 1, 1, "1 entry");
         assert.match(note, /^## \d\d:\d\d · Duncan Idaho · a dated check$/m, "the heading");
         assert.match(note, /A dated check passed\./, "the verified template");
+    });
+
+    test("a PR stored OPEN that GitHub says is MERGED gets its link: 1 read before the entry", async () => {
+        resetNotes();
+        journalOn();
+        const log = join(root, "journal-gh.log");
+        const merged = {
+            data: {
+                viewer: { login: "github-viewer" },
+                p0: {
+                    nameWithOwner: "frostyard/test",
+                    isArchived: false,
+                    pullRequest: {
+                        number: 7,
+                        title: "the merged fix",
+                        url: "https://github.com/frostyard/test/pull/7",
+                        state: "MERGED",
+                        isDraft: false,
+                        createdAt: "2026-10-27T10:00:00Z",
+                        headRefName: "duncan/fix",
+                        mergeable: "UNKNOWN",
+                        author: { login: "frostyard-machines" },
+                        labels: { nodes: [] },
+                        commits: { nodes: [] },
+                    },
+                },
+            },
+        };
+
+        writeFileSync(fixturePath, JSON.stringify(merged));
+        writeFileSync(log, "");
+        writeFileSync(
+            fakeGh,
+            `#!/bin/sh\nprintf '%s\\n---\\n' "$*" >> ${JSON.stringify(log)}\ncat ${JSON.stringify(fixturePath)}\n`,
+        );
+
+        try {
+            const source = await supervisor("journal-refresh");
+            // The merge came minutes before the close, and no sync ran between: the desk still says OPEN.
+            const id = await openThreadIn(
+                source,
+                (thread) => {
+                    withWatch(thread);
+                    thread.prs["frostyard/test#7"] = {
+                        via: "attached",
+                        state: "OPEN",
+                        title: "the fix",
+                        url: "https://github.com/frostyard/test/pull/7",
+                    };
+                },
+                "a fix that merged",
+            );
+
+            assert.equal(
+                (await route(`threads/${id}/result`, { pass: true, text: "it passed" })).status,
+                200,
+            );
+            await until(
+                async () => typeof (await deskState())?.threads[id]?.run.journaled === "number",
+                "the journal entry",
+            );
+            await drained();
+
+            const closed = (await deskState())?.threads[id];
+            const { note } = await noteOf(closed?.closed?.at ?? Date.now());
+
+            assert.equal(closed?.prs["frostyard/test#7"]?.state, "OPEN", "no sweep read it");
+            assert(
+                note.includes("PRs: [frostyard/test#7](https://github.com/frostyard/test/pull/7)"),
+                `the merged PR's link, in:\n${note}`,
+            );
+            assert.match(note, /the merged fix/, "the PR's live title");
+
+            const reads = readFileSync(log, "utf8")
+                .split("\n---\n")
+                .filter((each) => each.includes("pullRequest(number: 7)"));
+
+            assert.equal(reads.length, 1, "1 read of the PR");
+            assert(!reads[0]?.includes("r0:"), "the PR alone, with no repository list");
+        } finally {
+            writeFileSync(
+                fixturePath,
+                JSON.stringify({ data: { viewer: { login: "github-viewer" } } }),
+            );
+            writeFileSync(fakeGh, `#!/bin/sh\ncat ${JSON.stringify(fixturePath)}\n`);
+        }
+    });
+
+    test("a failed read of the PRs keeps the stored ones, and the entry is still written", async () => {
+        resetNotes();
+        journalOn();
+        writeFileSync(fakeGh, "#!/bin/sh\necho 'gh: not signed in' >&2\nexit 1\n");
+
+        try {
+            const source = await supervisor("journal-refresh-fails");
+            const id = await openThreadIn(
+                source,
+                (thread) => {
+                    withWatch(thread);
+                    thread.prs["frostyard/test#8"] = { via: "attached", state: "OPEN" };
+                },
+                "a fix GitHub cannot read",
+            );
+
+            assert.equal(
+                (await route(`threads/${id}/result`, { pass: true, text: "it passed" })).status,
+                200,
+            );
+            await until(
+                async () => typeof (await deskState())?.threads[id]?.run.journaled === "number",
+                "the journal entry",
+            );
+            await drained();
+
+            const closed = (await deskState())?.threads[id];
+            const { note } = await noteOf(closed?.closed?.at ?? Date.now());
+
+            assert(note.includes(`<!-- pocket-journal:${id} -->`), "the entry is in");
+            assert(!note.includes("frostyard/test#8"), "no link for a PR that the read missed");
+        } finally {
+            writeFileSync(fakeGh, `#!/bin/sh\ncat ${JSON.stringify(fixturePath)}\n`);
+        }
     });
 
     test("a watch pass from the page queues 1 entry, and a second pass adds none", async () => {

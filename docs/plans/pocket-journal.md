@@ -79,7 +79,11 @@ gets its own note in the PocketJournal folder, with links to the merged pull req
   first, and appends nothing when the marker is there: a write whose answer was lost (a timeout, a
   restart) is not written twice.
 - **PRs:** every PR of the thread that is `MERGED` and not guessed (`via: "window"`), as a Markdown
-  link `[owner/name#n](url)`. No line when there is none.
+  link `[owner/name#n](url)`. No line when there is none. A merge just before the close can still be
+  `OPEN` in the desk's state, when no sync ran between them. So before the sentences, the writer
+  reads the thread's other PRs again (not `MERGED`, not `MISSING`, not guessed; at most 20) in 1
+  GraphQL call, the desk's own PR read, and each that GitHub says is merged gets its link. A failed
+  read keeps the stored PRs. Only the entry changes: the closed thread keeps its stored PRs.
 - **Sentences:** 1 to 3 plain sentences (section 4).
 - **Text from outside** (titles, PR titles, the sentences) goes through `journalPlain`: 1 line, `<` and
   `>` as entities, `\` and `[` and `]` escaped, and no Markdown mark at its start. So only the writer writes a
