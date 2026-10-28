@@ -1143,6 +1143,123 @@ const listed = (lesson: Lesson) =>
     `[${lesson.id}] ${flat(lesson.text)}${lesson.pending === true ? " (waiting for the owner's approval)" : lesson.proposal?.forget === true ? " (forgetting it waits for the owner's approval)" : lesson.proposal?.text !== undefined ? " (new text waits for the owner's approval)" : ""}`;
 const WAITS = "it waits for the owner's approval in the Team panel";
 
+/** team_message's limits: its schema and `teamMessageProblems` use the same numbers. */
+export const MESSAGE_LIMITS = {
+    message: 6000,
+    asks: 4,
+    question: 500,
+    options: { min: 2, max: 6 },
+    option: 40,
+} as const;
+
+const STATUSES = ["done", "working", "blocked"] as const;
+
+const counted = (count: number, noun: string) =>
+    `${String(count)} ${noun}${count === 1 ? "" : "s"}`;
+
+/** Characters as the schema counts them: code points, not UTF-16 units. */
+const chars = (text: string) => [...text].length;
+
+/** One line for a string over its limit or empty, or none. */
+function lengthProblem(name: string, text: unknown, max: number, fix: string): string[] {
+    if (typeof text !== "string") {
+        return [];
+    }
+
+    const count = chars(text);
+
+    if (count === 0) {
+        return [`${name} is empty: it needs 1 to ${String(max)} characters.`];
+    }
+
+    return count > max
+        ? [
+              `${name} has ${String(count)} characters; the limit is ${String(max)}. Cut at least ${counted(count - max, "character")}: ${fix}`,
+          ]
+        : [];
+}
+
+/**
+ * What is wrong with team_message's arguments, 1 line each, with the limit and the fix: the schema's own error names
+ * only the path. It checks the limits only; a wrong type is left to the schema. The limits stay as they are.
+ */
+export function teamMessageProblems(args: unknown): string[] {
+    if (typeof args !== "object" || args === null) {
+        return [];
+    }
+
+    const { message, status, asks } = args as Record<string, unknown>;
+    const problems = lengthProblem(
+        "message",
+        message,
+        MESSAGE_LIMITS.message,
+        "keep the result and the facts the reader needs, and leave out logs and repeated details.",
+    );
+
+    // A null optional is the validator's: it drops it before the schema check, so it is no problem.
+    if (
+        status !== undefined &&
+        status !== null &&
+        !(STATUSES as readonly unknown[]).includes(status)
+    ) {
+        problems.push(`status is ${JSON.stringify(status)}: use done, working or blocked.`);
+    }
+
+    if (!Array.isArray(asks)) {
+        return problems;
+    }
+
+    if (asks.length > MESSAGE_LIMITS.asks) {
+        problems.push(
+            `asks has ${String(asks.length)} asks; the limit is ${String(MESSAGE_LIMITS.asks)}. Merge related decisions, or send the others in a second team_message.`,
+        );
+    }
+
+    asks.forEach((ask: unknown, index) => {
+        if (typeof ask !== "object" || ask === null) {
+            return;
+        }
+
+        const { question, options } = ask as Record<string, unknown>;
+        const at = `asks[${String(index)}]`;
+
+        problems.push(
+            ...lengthProblem(
+                `${at}.question`,
+                question,
+                MESSAGE_LIMITS.question,
+                "keep 1 decision on 1 line, with only the facts Brian needs to answer it; put the details in message.",
+            ),
+        );
+
+        if (!Array.isArray(options)) {
+            return;
+        }
+
+        if (
+            options.length < MESSAGE_LIMITS.options.min ||
+            options.length > MESSAGE_LIMITS.options.max
+        ) {
+            problems.push(
+                `${at}.options has ${counted(options.length, "choice")}; it needs ${String(MESSAGE_LIMITS.options.min)} to ${String(MESSAGE_LIMITS.options.max)}. ${options.length < MESSAGE_LIMITS.options.min ? "Leave options out when the ask is no pick-one." : "Keep the main choices, or split the ask."}`,
+            );
+        }
+
+        options.forEach((option: unknown, choice) => {
+            problems.push(
+                ...lengthProblem(
+                    `${at}.options[${String(choice)}]`,
+                    option,
+                    MESSAGE_LIMITS.option,
+                    "name the choice in a few words, and explain it in the question.",
+                ),
+            );
+        });
+    });
+
+    return problems;
+}
+
 // Its tools return `output`, so it needs version 2 of the extension API (Pi Pocket 0.19.0).
 export const pocketApi = 2;
 
@@ -2263,7 +2380,7 @@ export default function createTeam(host: Host, web: Web) {
             "Send a task follow-up or final report to a linked-session address. It returns when admitted, without waiting for an answer. In a report to your supervisor, set status, and put each decision you need from Brian in asks: each becomes an ask on the desk thread, which Brian sees at once and your supervisor may rewrite, merge or withdraw. A plain merge or install request is no ask.",
         parameters: Type.Object({
             to: Type.String(),
-            message: Type.String({ minLength: 1, maxLength: 6000 }),
+            message: Type.String({ minLength: 1, maxLength: MESSAGE_LIMITS.message }),
             status: Type.Optional(
                 Type.Union(
                     [Type.Literal("done"), Type.Literal("working"), Type.Literal("blocked")],
@@ -2278,22 +2395,39 @@ export default function createTeam(host: Host, web: Web) {
                     Type.Object({
                         question: Type.String({
                             minLength: 1,
-                            maxLength: 500,
+                            maxLength: MESSAGE_LIMITS.question,
                             description:
                                 "1 decision for Brian, on 1 line, with the facts he needs to answer it",
                         }),
                         options: Type.Optional(
-                            Type.Array(Type.String({ minLength: 1, maxLength: 40 }), {
-                                minItems: 2,
-                                maxItems: 6,
-                                description: "2 to 6 choices when it is a pick-one decision",
-                            }),
+                            Type.Array(
+                                Type.String({ minLength: 1, maxLength: MESSAGE_LIMITS.option }),
+                                {
+                                    minItems: MESSAGE_LIMITS.options.min,
+                                    maxItems: MESSAGE_LIMITS.options.max,
+                                    description: "2 to 6 choices when it is a pick-one decision",
+                                },
+                            ),
                         ),
                     }),
-                    { maxItems: 4 },
+                    { maxItems: MESSAGE_LIMITS.asks },
                 ),
             ),
         }),
+        // Before the schema: an argument over a limit gets an error that says the limit, by how much, and what to do.
+        // Pure, and it changes nothing; arguments within the limits go on to the schema as they are. The first line
+        // stays the same for every problem, so the daily audit (A4) counts these errors as 1 kind.
+        prepareArguments: (args) => {
+            const problems = teamMessageProblems(args);
+
+            if (problems.length > 0) {
+                throw new Error(
+                    `team_message was not sent. Fix the arguments below, and call it again:\n${problems.map((problem) => `- ${problem}`).join("\n")}`,
+                );
+            }
+
+            return args as never;
+        },
         replay: "safe",
         execute: async (args, api, context) => {
             const key = `x.team.message:${api.taskId}:${api.callId}`;

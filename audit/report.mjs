@@ -394,6 +394,32 @@ export function llmLine(llm) {
     return `LLM: ${llm.model}, ${llm.inputTokens} in, ${llm.outputTokens} out, ${moneyFine(llm.cost)}${llm.reason ? `. ${llm.reason}` : ""}`;
 }
 
+/**
+ * The Summary section's text: the LLM's summary, or "None." with the real reason. A summary that the checks dropped
+ * names their reason; a used run with no summary says so (it has no `reason`).
+ */
+export function summaryText(llm) {
+    if (llm.summary) {
+        return llm.summary;
+    }
+
+    if (llm.failed) {
+        return `None. LLM text failed the checks: ${llm.reason}`;
+    }
+
+    const dropped = (llm.dropped ?? []).find((item) => item.item === "summary");
+
+    if (dropped) {
+        return `None. The checks dropped the LLM's summary: ${dropped.reason}.`;
+    }
+
+    if (llm.reason) {
+        return `None. LLM text not used: ${llm.reason}`;
+    }
+
+    return llm.used ? "None. The LLM wrote no summary." : "None. LLM text not used.";
+}
+
 /** The Markdown report. `findings` are annotated (see `annotate`); `llm` holds a validated summary and proposals, or a reason. */
 export function renderReport({
     date,
@@ -422,9 +448,7 @@ export function renderReport({
         "",
         "## Summary",
         "",
-        llm.summary
-            ? llm.summary
-            : `None. ${llm.failed ? `LLM text failed the checks: ${llm.reason}` : `LLM text not used: ${llm.reason}`}`,
+        summaryText(llm),
         "",
         "## Proposals",
         "",

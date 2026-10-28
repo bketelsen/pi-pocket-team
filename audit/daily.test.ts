@@ -551,3 +551,30 @@ test("main: 1 bad proposal is dropped alone; the other stays, and the JSON and t
     assert.equal(json.llm.failed, undefined);
     assert.match(readme, /Spend \$\d+\.\d\d ·/);
 });
+
+test("main: a summary that the checks drop shows their reason in the Summary section, not undefined", async () => {
+    const t = setup();
+
+    await main(["--no-github", "--out-dir", t.outDir], {
+        env: t.env,
+        now: NOW,
+        run: t.run,
+        getModel: fakeModel({ ...answer, summary: "T1 reopened 18 times." }).getModel,
+        log: () => undefined,
+    });
+
+    const readme = fs.readFileSync(path.join(t.outDir, "README.md"), "utf8");
+    const json = JSON.parse(fs.readFileSync(path.join(t.outDir, "findings.json"), "utf8"));
+
+    assert.equal(json.llm.summary, "");
+    assert.deepEqual(json.llm.dropped, [
+        { item: "summary", reason: "the number 18 is in no finding" },
+    ]);
+    assert.match(
+        readme,
+        /## Summary\n\nNone\. The checks dropped the LLM's summary: the number 18 is in no finding\.\n/,
+    );
+    assert.ok(!readme.includes("undefined"));
+    // The proposal still stands.
+    assert.match(readme, /1\. \*\*Stop the reopen churn\*\*/);
+});
