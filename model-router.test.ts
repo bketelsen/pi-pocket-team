@@ -151,9 +151,18 @@ test("maskBrief takes a dotted name that is not a file name out", () => {
         "[host] and [host] and [host]",
         "a country code that is also a file extension, with 2 dots, is a host",
     );
+    assert.equal(maskBrief("run install.sh, read pocket.d.ts", []), "run [host], read pocket.d.ts");
+});
+
+test("maskBrief masks a 1-dot name whose suffix is both a file extension and a domain, unless it is surely a file", () => {
+    // `example.sh` can be a host: with no path before it and no `_` in it, it goes. `install.sh` goes the same way.
     assert.equal(
-        maskBrief("run install.sh, read pocket.d.ts", []),
-        "run install.sh, read pocket.d.ts",
+        maskBrief("Edit install.sh and deploy to example.sh; see README.md and docs/notes.md", []),
+        "Edit [host] and deploy to [host]; see [host] and docs/notes.md",
+    );
+    assert.equal(
+        maskBrief("run ./install.sh and my_tool.py", []),
+        "run ./install.sh and my_tool.py",
     );
 });
 
@@ -161,8 +170,9 @@ test("maskBrief leaves a file name and a version alone", () => {
     for (const kept of [
         "team.ts",
         "package.json",
-        "install.sh",
-        "README.md",
+        "./install.sh",
+        "docs/README.md",
+        "set_up.py",
         "node.js",
         "v0.26.0",
         "bketelsen/pi-pocket",

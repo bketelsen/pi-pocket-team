@@ -337,19 +337,23 @@ function maskIpv4(text: string): string {
 }
 
 /**
- * Every fully qualified host name, as `[host]`: a dotted name whose last label is 2 to 24 lowercase letters and is not
- * a file extension. `acme.example.info` goes; `team.ts`, `node.js` and `README.md` stay.
+ * Every fully qualified host name, as `[host]`: a dotted name whose last label is 2 to 24 letters (any case) and is not
+ * a file extension. `acme.example.info` goes; `team.ts`, `node.js` and `package.json` stay. A suffix that is a file
+ * extension and also a top-level domain (`sh`, `md`, `py`, ...) is ambiguous: such a name goes too (`install.sh`,
+ * `README.md`), unless it is surely a file. It is surely a file when a `/` comes before it (`docs/plans/x.md`,
+ * `./install.sh`), or when its stem holds `_` (`set_up.py`), which no host name has. More masking is safe; a host
+ * that reaches Jev is not.
  */
 function maskFqdn(text: string): string {
-    return text.replace(FQDN_CANDIDATE, (whole: string) => {
+    return text.replace(FQDN_CANDIDATE, (whole: string, offset: number, all: string) => {
         // DNS names have no case: `BUILD.EXAMPLE.COM` goes as `build.example.com` does.
         const last = whole.slice(whole.lastIndexOf(".") + 1).toLowerCase();
-        const dots = whole.split(".").length - 1;
 
-        // A name with 2 or more dots that ends in a country code which is also a file extension (`api.example.sh`) is
-        // a host. `install.sh`, with 1 dot, stays a file name, and so does `pocket.d.ts` (`ts` is no top-level domain).
-        if (dots >= 2 && TLD_EXTENSIONS.has(last)) {
-            return "[host]";
+        if (TLD_EXTENSIONS.has(last)) {
+            const inPath = offset > 0 && all[offset - 1] === "/";
+            const underscore = whole.slice(0, whole.lastIndexOf(".")).includes("_");
+
+            return inPath || underscore ? whole : "[host]";
         }
 
         return FILE_EXTENSIONS.has(last) ? whole : "[host]";
