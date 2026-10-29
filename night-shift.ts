@@ -583,6 +583,97 @@ export function parseArgs(input: string, now: number, zone: string): Parsed {
     };
 }
 
+// ─── A PR check for a delegated night shift ─────────────────────────────────
+
+/**
+ * A PR check that `team_delegate` can ask for, in place of a check command. The module builds the command from these
+ * values, and the program is always `gh`, read only: no model writes shell that runs unguarded.
+ */
+export type PrCheck = {
+    /** The PR number. Omitted: the PR of the current branch of the linked session's folder. */
+    pr?: number;
+    /** The repository, `owner/name`, when the folder is not the PR's repository. Needs `pr`. */
+    repo?: string;
+    /** Which checks must pass: `required` (the default), `all`, or `none` with a label. */
+    checks?: "required" | "all" | "none";
+    /** A label the PR must have, such as `ready-for-human`. */
+    label?: string;
+};
+
+const PR_REPO = /^[A-Za-z0-9][A-Za-z0-9_.-]*\/[A-Za-z0-9][A-Za-z0-9_.-]*$/;
+/** No quotes and no shell characters: the label goes into the command inside single quotes. */
+const PR_LABEL = /^[A-Za-z0-9][A-Za-z0-9 ._:\/+-]{0,49}$/;
+
+/**
+ * The command for a PR check, built from validated values only: `gh pr checks` and `gh pr view`, both read only. Parts
+ * are joined with ` && `, so every part must pass. A value that does not fit gives an error, never a command.
+ */
+export function prCheckCommand(check: PrCheck): string | { error: string } {
+    const { pr, repo, label } = check;
+    const which = check.checks ?? "required";
+
+    if (pr !== undefined && (typeof pr !== "number" || !Number.isSafeInteger(pr) || pr < 1)) {
+        return { error: "night_shift.pr_check.pr must be a whole number of 1 or more." };
+    }
+
+    if (repo !== undefined && (typeof repo !== "string" || !PR_REPO.test(repo))) {
+        return {
+            error: "night_shift.pr_check.repo must be owner/name, such as bketelsen/x: letters, digits, . _ and - only.",
+        };
+    }
+
+    // `gh` reads the current branch's PR only with no `--repo`: with one, it needs the number.
+    if (repo !== undefined && pr === undefined) {
+        return {
+            error: "night_shift.pr_check.repo needs pr: gh finds the current branch's PR only without a repo.",
+        };
+    }
+
+    if (which !== "required" && which !== "all" && which !== "none") {
+        return { error: 'night_shift.pr_check.checks must be "required", "all" or "none".' };
+    }
+
+    if (label !== undefined && (typeof label !== "string" || !PR_LABEL.test(label))) {
+        return {
+            error: "night_shift.pr_check.label must be 1 to 50 characters: a letter or digit first, then letters, digits, spaces and . _ : / + - only.",
+        };
+    }
+
+    if (which === "none" && label === undefined) {
+        return {
+            error: 'night_shift.pr_check.checks "none" needs a label: with neither, there is nothing to check.',
+        };
+    }
+
+    // The number and the repository are the same in every part: `gh` with no number reads the current branch's PR.
+    const where = `${pr === undefined ? "" : ` ${pr}`}${repo === undefined ? "" : ` --repo ${repo}`}`;
+    const parts: string[] = [];
+
+    if (which === "required") {
+        parts.push(`gh pr checks${where} --required`);
+    }
+
+    if (which === "all") {
+        parts.push(`gh pr checks${where}`);
+    }
+
+    if (label !== undefined) {
+        parts.push(
+            `gh pr view${where} --json labels --jq '.labels[].name' | grep -qxF -- '${label}'`,
+        );
+    }
+
+    const command = parts.join(" && ");
+
+    if (command === "" || command.length > MAX_COMMAND) {
+        return {
+            error: `night_shift.pr_check builds a command of 1 to ${MAX_COMMAND} characters: this one is ${command.length}.`,
+        };
+    }
+
+    return command;
+}
+
 /** The fields of `night_shift` in the `team_delegate` tool. */
 export type DelegatedFields = {
     objective: string;
@@ -592,6 +683,7 @@ export type DelegatedFields = {
     for?: string;
     max?: number;
     worker?: string;
+    pr_check?: PrCheck;
 };
 
 /** What one option alone accepts: its word, and the fields that only it can set. */
@@ -621,8 +713,10 @@ const OPTION_ALONE = {
 
 /**
  * The goal request for a night shift that `team_delegate` starts. Each option comes from its own field, so a field
- * cannot carry a second option: the check never comes from this path (only the owner sets one, with `/night-shift`).
- * The options combine here, so `until` after `start`, `for` from `start`, and one of `until`/`for` hold as usual.
+ * cannot carry a second option: the free check never comes from this path (only the owner sets one, with
+ * `/night-shift`). The 1 exception is `pr_check`, a structured PR check: `prCheckCommand` builds a fixed `gh` command
+ * from validated values, so no model-chosen shell runs. The options combine here, so `until` after `start`, `for` from
+ * `start`, and one of `until`/`for` hold as usual.
  */
 export function delegatedRequest(
     fields: DelegatedFields,
@@ -704,9 +798,23 @@ export function delegatedRequest(
         };
     }
 
+    // A PR check is the only way this path sets a check: the command is built here, from validated values.
+    let check: string | undefined;
+
+    if (fields.pr_check !== undefined) {
+        const built = prCheckCommand(fields.pr_check);
+
+        if (typeof built !== "string") {
+            return { error: built.error };
+        }
+
+        check = built;
+    }
+
     return {
         objective,
         stop,
+        ...(check === undefined ? {} : { check }),
         maxRounds: options.maxRounds ?? DEFAULT_ROUNDS,
         ...(options.start === undefined
             ? {}
@@ -1203,7 +1311,7 @@ const SUMMARIZED = new Set<StopReason>(["done", "max-rounds", "deadline", "block
 
 /** What `team.ts` uses: on `globalThis[Symbol.for("pi-pocket-team.night-shift")]`, so it finds the live version. */
 export type NightShiftApi = {
-    version: 1;
+    version: 2;
     delegatedRequest: typeof delegatedRequest;
     setDelegated: (
         tx: Tx,
@@ -2397,7 +2505,7 @@ export default function createNightShift(host: Host, web: Web) {
 
     // Another module finds this version here. A new version sets its own before the old one's cleanup runs.
     const api: NightShiftApi = {
-        version: 1,
+        version: 2,
         delegatedRequest,
         setDelegated,
         notifyChanged,

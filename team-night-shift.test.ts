@@ -21,7 +21,7 @@ import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
 import { fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import type { ConversationId } from "@earendil-works/pi-durable";
-import { delegatedRequest, type Goal, GoalDoc } from "./night-shift.ts";
+import { delegatedRequest, type Goal, GoalDoc, prCheckCommand } from "./night-shift.ts";
 
 const ZONE = "America/New_York";
 
@@ -169,6 +169,104 @@ describe("delegatedRequest", () => {
     });
 });
 
+// ─── The PR check ───────────────────────────────────────────────────────────
+
+describe("prCheckCommand", () => {
+    const now = Date.UTC(2026, 9, 22, 3, 30);
+
+    test("the command is built from the values, joined with &&", () => {
+        assert.equal(
+            prCheckCommand({
+                pr: 12,
+                repo: "bketelsen/x",
+                checks: "required",
+                label: "ready-for-human",
+            }),
+            "gh pr checks 12 --repo bketelsen/x --required && gh pr view 12 --repo bketelsen/x --json labels --jq '.labels[].name' | grep -qxF -- 'ready-for-human'",
+        );
+
+        // No number and no repository: `gh` reads the current branch's PR. The default is the required checks.
+        assert.equal(prCheckCommand({}), "gh pr checks --required");
+        assert.equal(prCheckCommand({ checks: "all" }), "gh pr checks");
+        assert.equal(
+            prCheckCommand({ checks: "none", label: "ready-for-human" }),
+            "gh pr view --json labels --jq '.labels[].name' | grep -qxF -- 'ready-for-human'",
+        );
+    });
+
+    test("delegatedRequest puts the built command in the goal's check", () => {
+        const request = delegatedRequest(
+            {
+                objective: "a",
+                stop_when: "b",
+                pr_check: { pr: 12, repo: "bketelsen/x", label: "ready-for-human" },
+            },
+            now,
+            ZONE,
+        );
+
+        assert(!("error" in request));
+        assert.equal(
+            request.check,
+            "gh pr checks 12 --repo bketelsen/x --required && gh pr view 12 --repo bketelsen/x --json labels --jq '.labels[].name' | grep -qxF -- 'ready-for-human'",
+        );
+
+        // A bad value gives no goal at all, and the error names the field.
+        const bad = delegatedRequest(
+            { objective: "a", stop_when: "b", pr_check: { repo: "a/b;rm -rf /" } },
+            now,
+            ZONE,
+        );
+
+        assert("error" in bad);
+        assert.match(bad.error, /^night_shift\.pr_check/);
+    });
+
+    test("a value that could write shell is refused", () => {
+        for (const pr_check of [
+            { repo: "a/b;rm -rf /" },
+            { repo: "-x/y" },
+            { repo: "x" },
+            { label: "it's" },
+            { label: "" },
+            { label: `a${"b".repeat(50)}` },
+            { checks: "none" as const },
+            { pr: 0 },
+            { pr: -1 },
+            { pr: 1.5 },
+            { checks: "some" as never },
+            // `--repo` with no number: gh does not read the current branch, so the check could never pass.
+            { repo: "bketelsen/x" },
+            { repo: "bketelsen/x", checks: "all" as const },
+            { pr: 1, repo: "a/b\nrm -rf /" },
+            { pr: 1, repo: "a/ b" },
+            { pr: 1, repo: "a/b " },
+            { pr: 1, repo: "ä/b" },
+            { pr: 1, repo: 7 as never },
+            { label: "ready\nrm -rf /" },
+            { label: "-x" },
+            { label: " x" },
+            { label: "réady" },
+            { label: "a;b" },
+            { label: "a$(b)" },
+            { label: 7 as never },
+            { pr: "12" as never },
+            { pr: Number.NaN },
+        ]) {
+            const built = prCheckCommand(pr_check);
+
+            assert(typeof built !== "string", JSON.stringify(pr_check));
+            assert.match(built.error, /^night_shift\.pr_check/, JSON.stringify(pr_check));
+        }
+
+        // 50 characters is the longest label that fits.
+        assert.equal(
+            typeof prCheckCommand({ checks: "none", label: `a${"b".repeat(49)}` }),
+            "string",
+        );
+    });
+});
+
 // ─── In a Pi Pocket ──────────────────────────────────────────────────────────
 
 /** How far the app's clock is ahead: a test moves it past a start time. */
@@ -234,6 +332,34 @@ const model = scriptedModel((request) => {
             repository: "frostyard/test",
             task: TASK,
             night_shift: { stop_when: "the work is done", start: waitStart },
+        });
+    }
+
+    if (text.endsWith("bare pr check night shift test")) {
+        return teamCall({
+            agent: "duncan",
+            repository: "home",
+            task: TASK,
+            night_shift: {
+                objective: "SCENARIO-CONTINUE tend the PR",
+                stop_when: "the PR is ready",
+                max: 1,
+                pr_check: { checks: "all" },
+            },
+        });
+    }
+
+    if (text.endsWith("pr check night shift test")) {
+        return teamCall({
+            agent: "duncan",
+            repository: "frostyard/test",
+            task: TASK,
+            night_shift: {
+                objective: "SCENARIO-CONTINUE tend the PR",
+                stop_when: "the PR is ready",
+                max: 1,
+                pr_check: { pr: 12, repo: "bketelsen/x", label: "ready-for-human" },
+            },
         });
     }
 
@@ -511,9 +637,42 @@ describe("delegated goals", () => {
         await say(app, source, "check night shift test");
         assert.match(
             (await modelTexts(app, source)).join("\n"),
-            /cannot have a check command: the check does not go through Lancet Guard/,
+            /cannot have a check command: the check does not go through Lancet Guard\. Use pr_check for a PR goal, or Brian sets a check with \/night-shift in the session\./,
         );
         assert.equal(app.sessions().length, before);
+    });
+
+    test("pr_check reaches the goal as the built gh command, and it never runs", async () => {
+        const { linked } = await delegateShift("pr-check", "pr check night shift test");
+
+        await until(async () => (await goalOf(linked)) !== undefined, "the goal to be set", 20_000);
+        const goal = (await goalOf(linked))!;
+
+        assert.equal(goal.maxRounds, 1);
+        assert.equal(
+            goal.check,
+            "gh pr checks 12 --repo bketelsen/x --required && gh pr view 12 --repo bketelsen/x --json labels --jq '.labels[].name' | grep -qxF -- 'ready-for-human'",
+        );
+
+        // SCENARIO-CONTINUE uses the 1 round: Pi never says DONE, so the check never runs a real gh.
+        const stopped = await settled(linked);
+
+        assert.equal(stopped.reason, "max-rounds");
+        assert.equal(stopped.check, goal.check);
+    });
+
+    test("pr_check without pr needs a worktree, and no linked session starts", async () => {
+        const source = await supervisor("pr-check-bare");
+        const before = app.sessions().length;
+
+        // The home repository never gets a worktree: the current branch there is not the task's branch.
+        await say(app, source, "bare pr check night shift test");
+        assert.match(
+            (await modelTexts(app, source)).join("\n"),
+            /night_shift\.pr_check needs pr when the task has no worktree of its own: the current branch is not the task's branch\./,
+        );
+        assert.equal(app.sessions().length, before);
+        assert.equal(linkedTo(source).length, 0);
     });
 
     test("a specialist session cannot delegate a night shift", async () => {
