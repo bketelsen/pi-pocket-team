@@ -6,6 +6,7 @@ import {
     type App,
     cleanUp,
     context,
+    fakeTab,
     lastText,
     modelTexts,
     newSession,
@@ -101,6 +102,7 @@ import {
     withdrawAsk,
     asksBrian,
     namesOpenAsk,
+    statusLineClears,
     attachTo,
     boundSupervisors,
     attribute,
@@ -367,7 +369,7 @@ describe("boundSupervisors", () => {
         ];
         b.supervisor = 8;
         b.lastEventAt = 300;
-        // Asks on a parked or a closed thread do not count, but its events do.
+        // Asks on a parked thread do not count, but its events do. Asks on a closed thread do: the page shows them.
         c.supervisor = 5;
         c.lastEventAt = 400;
         c.state = "parked";
@@ -375,13 +377,21 @@ describe("boundSupervisors", () => {
         d.supervisor = 5;
         d.lastEventAt = 50;
         d.state = "closed";
-        d.asks = [{ id: `${d.id}a`, text: "Closed", at: 1 }];
+        d.asks = [
+            { id: `${d.id}a`, text: "Closed", at: 1 },
+            {
+                id: `${d.id}b`,
+                text: "Closed, answered",
+                at: 1,
+                answer: { at: 2, by: "Brian", words: "ok" },
+            },
+        ];
         // A thread with no supervisor binds nothing.
         delete e.supervisor;
         e.lastEventAt = 999;
 
         assert.deepEqual(boundSupervisors(state), [
-            { supervisor: 5, lastEventAt: 400, asks: 1 },
+            { supervisor: 5, lastEventAt: 400, asks: 2 },
             { supervisor: 8, lastEventAt: 300, asks: 0 },
         ]);
     });
@@ -1137,6 +1147,72 @@ describe("nextActor", () => {
         assert.equal(nextActor(newer), "odrade");
         assert.equal(odradeReason(newer), "silent session");
         assert.equal(waitsText([newer]), "T1: silent session");
+    });
+
+    test("an open watch that is not due yet is no silent session: a due watch is Odrade's, a failed one the agent's", () => {
+        const watched = (extra: Partial<NonNullable<Thread["watch"]>>) =>
+            thread({
+                id: "T416",
+                key: "k416",
+                address: "session-watching",
+                run: { busy: false, lastUserEntry: 6 },
+                watch: {
+                    checkOn: "2099-01-01",
+                    check: "the blob sweep",
+                    setAt: 1,
+                    setBy: "brian",
+                    key: "watch:1",
+                    ...extra,
+                },
+            });
+        const plain = thread({ run: { busy: false, lastUserEntry: 6 } });
+
+        // The same quiet session, with no watch: it is silent, as before.
+        assert.equal(nextActor(plain), "odrade");
+        assert.equal(odradeReason(plain), "silent session");
+
+        // An open watch that is not due yet (no `dueAt`, no result): nobody is next, and no queue or digest lists it.
+        const waiting = watched({});
+
+        assert.equal(nextActor(waiting), "none");
+        assert.equal(odradeReason(waiting), undefined);
+        assert.equal(waitsText([waiting]), "");
+        assert.equal(waitsNeedLive([waiting]), false, "no live lookup for it");
+
+        // A due watch keeps its result: the watch is Odrade's to send.
+        const due = watched({ dueAt: 2 });
+
+        assert.equal(nextActor(due), "odrade");
+        assert.equal(odradeReason(due), "watch is due: the blob sweep");
+        assert.equal(waitsText([due]), "T416: watch is due: the blob sweep");
+
+        // A failed watch is the agent's to work again.
+        const failed = watched({ result: { pass: false, text: "2 blobs remain", by: "x", at: 3 } });
+
+        assert.equal(nextActor(failed), "agent");
+
+        // A passed watch is over: the quiet session is silent again, as without a watch.
+        const passed = watched({ result: { pass: true, text: "done", by: "x", at: 3 } });
+
+        assert.equal(nextActor(passed), "odrade");
+        assert.equal(odradeReason(passed), "silent session");
+
+        // The other rules do not change: a found thread with an open watch still waits on Odrade.
+        assert.equal(
+            nextActor(
+                thread({
+                    origin: "found",
+                    key: "found:pr:frostyard/test#1",
+                    watch: waiting.watch!,
+                }),
+            ),
+            "odrade",
+        );
+        // An open ask still comes first.
+        assert.equal(
+            nextActor({ ...waiting, asks: [{ id: "T416a", text: "Which?", at: 1 }] }),
+            "brian",
+        );
     });
 
     test("a report that says BLOCKED waits on Odrade, and a paused shift is nobody's turn", () => {
@@ -5743,6 +5819,50 @@ describe("attribute", () => {
         assert.equal(state.otherPrs?.["frostyard/test"], undefined, "no key for an empty list");
     });
 
+    test("a closed thread shows for 7 days, and always while it has an open ask", () => {
+        const state = deskOf();
+        const day = 24 * 3600_000;
+        const now = 100 * day;
+
+        const closedAt = (key: string, at: number, asks: Thread["asks"] = []) => {
+            const thread = open(state, key, 1).thread;
+
+            thread.state = "closed";
+            thread.closed = { at, why: "done", by: "odrade" };
+            thread.asks = asks;
+
+            return thread.id;
+        };
+
+        const recent = closedAt("recent", now - day);
+        const old = closedAt("old", now - 30 * day);
+        const oldAsked = closedAt("old-asked", now - 30 * day, [
+            { id: "T9a", text: "Keep it?", at: 1 },
+        ]);
+        const oldAnswered = closedAt("old-answered", now - 30 * day, [
+            { id: "T9b", text: "Done?", at: 1, answer: { at: 2, by: "Brian", words: "yes" } },
+        ]);
+        const oldResolved = closedAt("old-resolved", now - 30 * day, [
+            { id: "T9c", text: "Moot?", at: 1, resolved: { at: 2, why: "gone" } },
+        ]);
+        const view = threadsView(state, now);
+        const ids = view.threads.map((each) => each.id);
+
+        assert(ids.includes(recent), "closed 1 day ago");
+        assert(!ids.includes(old), "closed 30 days ago, no ask");
+        assert(ids.includes(oldAsked), "closed 30 days ago, with an open ask");
+        assert(!ids.includes(oldAnswered), "an answered ask is no reason");
+        assert(!ids.includes(oldResolved), "a resolved ask is no reason");
+        assert.deepEqual(
+            view.threads.find((each) => each.id === oldAsked)?.asks.map((ask) => ask.id),
+            ["T9a"],
+            "the view carries the open ask",
+        );
+        // A closed thread is no open work: it counts nowhere.
+        assert.equal(view.counts.open, 0);
+        assert.equal(view.counts.brian, 0);
+    });
+
     test("the list keeps at most OTHER_PRS_MAX PRs of a repository; the count keeps all", () => {
         const state = deskOf();
         const many = Array.from({ length: OTHER_PRS_MAX + 5 }, (_, index) =>
@@ -6247,6 +6367,114 @@ describe("namesOpenAsk", () => {
             false,
             "a line of only inline code ends the paragraph, as asksBrian reads it",
         );
+    });
+});
+
+describe("statusLineClears", () => {
+    /** A desk with 3 asks on 1 thread: T1a open, T1b answered, T1c withdrawn. */
+    const desk = () => {
+        const state = deskOf();
+        const thread = placed(state, 100);
+
+        for (const [index, text] of ["Rotate the key?", "Merge #5?", "Keep the guard?"].entries()) {
+            addAsk(state, {
+                thread: thread.id,
+                text,
+                key: `k${String(index)}`,
+                by: "Odrade",
+                supervisor: 1,
+                at: 200,
+            });
+        }
+
+        answerAsk(state, "T1b", { at: 300, by: "brian", words: "yes" });
+        withdrawAsk(state, "T1c", { why: "moot", by: "Odrade", at: 300 });
+
+        return state;
+    };
+
+    test("a last line 'Needs you: nothing' or 'none' clears the reply, in any case, with bold, with a period", () => {
+        const state = desk();
+
+        for (const line of [
+            "Needs you: nothing",
+            "Needs you: none",
+            "Needs you: nothing.",
+            "needs you: NONE.",
+            "NEEDS YOU: Nothing",
+            "**Needs you:** nothing",
+            "**Needs you: nothing**",
+            "__Needs you: nothing__",
+            "  Needs you :  nothing  ",
+        ]) {
+            assert.equal(statusLineClears(`Merged #106.\n\n${line}`, state), true, line);
+            assert.equal(statusLineClears(line, undefined), true, line);
+            assert.equal(asksBrian(line), true, "asksBrian alone still reads it as an ask");
+        }
+    });
+
+    test("a last line of ask ids clears the reply when each id is an ask on the desk, whatever its state", () => {
+        const state = desk();
+
+        for (const line of [
+            "Needs you: T1a",
+            "Needs you: T1b",
+            "Needs you: T1c",
+            "Needs you: T1a, T1b",
+            "Needs you: T1a and T1c",
+            "Needs you: T1a, T1b, and T1c.",
+            "**Needs you:** T1a, T1b",
+            "Needs you: `T1a`",
+        ]) {
+            assert.equal(statusLineClears(`Done.\n\n${line}`, state), true, line);
+        }
+
+        // An id that the desk does not know, a thread id, a mixed line, or no state at all: it is an ask, as before.
+        for (const line of [
+            "Needs you: T9a",
+            "Needs you: T1a, T9a",
+            "Needs you: T1",
+            "Needs you: t1a",
+            "Needs you: T1a to merge",
+            "Needs you: T1a or T1b",
+        ]) {
+            assert.equal(statusLineClears(`Done.\n\n${line}`, state), false, line);
+        }
+
+        assert.equal(statusLineClears("Needs you: T1a", undefined), false);
+    });
+
+    test("a 'Needs you:' line with other words still asks", () => {
+        const state = desk();
+
+        for (const line of [
+            "Needs you: approve the install",
+            "Needs you: nothing, but merge #5",
+            "Needs you: nothing yet",
+            "Needs you:",
+        ]) {
+            assert.equal(statusLineClears(`Done.\n\n${line}`, state), false, line);
+        }
+    });
+
+    test("only the last non-empty line outside code counts", () => {
+        const state = desk();
+
+        assert.equal(statusLineClears("Needs you: nothing\n\nShould I merge?", state), false);
+        assert.equal(statusLineClears("Needs you: nothing\nAll set.", state), false);
+        assert.equal(statusLineClears("Done.\nNeeds you: nothing\n\n\n", state), true);
+        assert.equal(statusLineClears("Done.\nNeeds you: nothing\r\n", state), true);
+        assert.equal(
+            statusLineClears("Done.\nNeeds you: nothing\n```\nNeeds you: T9a\n```", state),
+            true,
+            "a fenced block is code: the line before it is the last",
+        );
+        assert.equal(
+            statusLineClears("Done.\n```\nNeeds you: nothing\n```", state),
+            false,
+            "a line inside a fence is no status line",
+        );
+        assert.equal(statusLineClears("", state), false);
     });
 });
 
@@ -7680,6 +7908,13 @@ const model = scriptedModel((request) => {
 
     if (text.endsWith("desk reminder test")) {
         return answer("Should I merge #106?");
+    }
+
+    // A reply that ends with Odrade's status line: "Needs you: <what the test names>".
+    const status = /status line (.+) test$/.exec(text);
+
+    if (status) {
+        return answer(`Shipped.\nNeeds you: ${status[1]!}`);
     }
 
     const named = /names ask (T[0-9]+[a-z]+) test$/.exec(text);
@@ -11617,6 +11852,174 @@ describe("the desk in a Pi Pocket", () => {
         assert.match(read, /Night shift report from this linked session/);
     });
 
+    /** The desk's published API, from its global: a test watches what the other modules call on it. */
+    const published = () =>
+        (globalThis as unknown as Record<symbol, Record<string, unknown> | undefined>)[
+            Symbol.for("pi-pocket-team.desk")
+        ];
+
+    /** Log the calls of `open`, `bind`, `fail`, `file`, `clerk` and `changed`; give back the log and the undo. */
+    const spy = () => {
+        const api = published();
+
+        assert(api, "the desk publishes its API");
+        const log: string[] = [];
+        const originals: Record<string, unknown> = {};
+
+        for (const name of ["open", "bind", "fail", "file", "clerk", "changed"]) {
+            const original = api[name] as ((...args: unknown[]) => unknown) | undefined;
+
+            assert.equal(typeof original, "function", `the desk has ${name}`);
+            originals[name] = original;
+
+            api[name] = (...args: unknown[]) => {
+                log.push(name);
+
+                return original!(...args);
+            };
+        }
+
+        return {
+            log,
+            restore: () => {
+                for (const [name, original] of Object.entries(originals)) {
+                    api[name] = original;
+                }
+            },
+        };
+    };
+
+    /** How many `changed` events a tab got from the desk. */
+    const heard = (tab: ReturnType<typeof fakeTab>) =>
+        tab.events.filter(
+            (each) =>
+                each.event === "ext" &&
+                each.data.module === "desk" &&
+                each.data.event === "changed",
+        ).length;
+
+    describe("the page hears every desk write", () => {
+        test("a write by the desk tool sends changed after its commit", async () => {
+            const { source, thread } = await delegated("changed-tool");
+            const tab = fakeTab(source, owner(app));
+
+            await app.attach(tab.client);
+            askThreadId = thread.id;
+            watchThreadId = thread.id;
+            resultThreadId = thread.id;
+
+            const steps: [string, string][] = [
+                ["desk ask thread test", "ask"],
+                ["desk watch test", "watch"],
+                ["desk result test", "result"],
+            ];
+
+            for (const [words, action] of steps) {
+                const before = heard(tab);
+
+                await say(app, source, words);
+                await until(async () => heard(tab) > before, `changed after ${action}`);
+            }
+
+            // An answer needs the ask's id.
+            answerAskId = (await deskState())?.threads[thread.id]?.asks.at(-1)?.id ?? "";
+
+            const before = heard(tab);
+
+            await say(app, source, "desk answer test");
+            await until(async () => heard(tab) > before, "changed after answer");
+            assert.equal(
+                (await deskState())?.threads[thread.id]?.asks.find((ask) => ask.id === answerAskId)
+                    ?.answer?.words,
+                "Yes, merge it.",
+                "the state was committed when the event came",
+            );
+        });
+
+        test("a read writes nothing the page shows: it sends no changed", async () => {
+            const source = await supervisor("changed-list");
+            const tab = fakeTab(source, owner(app));
+
+            await app.attach(tab.client);
+            const before = heard(tab);
+
+            await say(app, source, "desk list test");
+            assert.equal(heard(tab), before);
+        });
+
+        test("a delegation and a report call changed on the desk, after their commits", async () => {
+            const watched = spy();
+
+            try {
+                const source = await supervisor("changed-delegate");
+                const tab = fakeTab(source, owner(app));
+
+                await app.attach(tab.client);
+                const before = heard(tab);
+
+                await say(app, source, "desk delegate test");
+                const linked = app
+                    .sessions()
+                    .find((session) => session.linkedFrom?.id === Number(source));
+
+                assert(linked, "the delegation started a linked session");
+                assert(
+                    watched.log.lastIndexOf("changed") > watched.log.lastIndexOf("bind"),
+                    "changed after the binding commit",
+                );
+                assert(watched.log.indexOf("changed") > watched.log.indexOf("open"));
+                assert(heard(tab) > before, "the tab heard it");
+
+                watched.log.length = 0;
+                await say(app, linked.id as ConversationId, "report to supervisor test");
+                assert.deepEqual(
+                    watched.log.filter((name) => name === "file" || name === "changed"),
+                    ["file", "changed"],
+                    "a report is filed, then the page is told",
+                );
+            } finally {
+                watched.restore();
+            }
+        });
+
+        test("a delegation that does not start closes its thread, then the page is told", async () => {
+            const watched = spy();
+
+            try {
+                const source = await supervisor("changed-failed");
+
+                await say(app, source, "desk failed delegate test");
+                const names = watched.log.filter((name) => name === "fail" || name === "changed");
+
+                assert.deepEqual(names.slice(-2), ["fail", "changed"]);
+            } finally {
+                watched.restore();
+            }
+        });
+
+        test("a night shift's report calls changed after its commit", async () => {
+            const watched = spy();
+
+            try {
+                const source = await supervisor("changed-night");
+
+                await say(app, source, "desk night shift test");
+                await until(
+                    async () => watched.log.includes("file"),
+                    "the report is filed",
+                    30_000,
+                );
+                await until(
+                    async () =>
+                        watched.log.lastIndexOf("changed") > watched.log.lastIndexOf("file"),
+                    "changed after the report's commit",
+                );
+            } finally {
+                watched.restore();
+            }
+        });
+    });
+
     test("a night shift summary's ASKS FOR BRIAN block files asks on the thread", async () => {
         nightSummary = [
             "NIGHT-REPORT-START the shift is done.",
@@ -12049,6 +12452,66 @@ describe("the desk in a Pi Pocket", () => {
             "one reminder, and no second one after the next answer",
         );
         assert.match(texts.join("\n"), /Desk check: your reply asks Brian something/);
+    });
+
+    test("the reminder does not fire on a reply that ends with the status line 'Needs you: nothing'", async () => {
+        const source = await supervisor("reminder-status-nothing");
+
+        await say(app, source, "status line nothing test");
+        assert.doesNotMatch((await modelTexts(app, source)).join("\n"), /Desk check:/);
+    });
+
+    test("the reminder does not fire on a status line of ask ids that the desk knows, and fires on one it does not", async () => {
+        const owner = await supervisor("status-ids-owner");
+        let askId = "";
+
+        await app.harness.commit(async (tx) => {
+            const state = await tx.doc(DeskThreads);
+            const opened = openThread(state, {
+                key: "x.test.status-ids",
+                supervisor: Number(owner),
+                agents: ["duncan"],
+                repo: "frostyard/test",
+                title: "A status line",
+                at: Date.now(),
+            });
+            const filed = addAsk(state, {
+                thread: opened.thread.id,
+                text: "Rotate the key?",
+                key: "x.test.status-ids.a",
+                by: "Odrade",
+                supervisor: Number(owner),
+                at: Date.now() - 60_000,
+            });
+
+            assert.ok("askId" in filed);
+            askId = filed.askId;
+            // The ask is answered: an id of any state is still on the desk.
+            answerAsk(state, askId, { at: Date.now(), by: "brian", words: "yes" });
+        }, context);
+
+        const known = await supervisor("reminder-status-known");
+
+        await say(app, known, `status line ${askId} test`);
+        assert.doesNotMatch((await modelTexts(app, known)).join("\n"), /Desk check:/);
+
+        const unknown = await supervisor("reminder-status-unknown");
+
+        await say(app, unknown, "status line T99999z test");
+        assert.equal(
+            (await modelTexts(app, unknown)).filter((each) => each.includes("Desk check:")).length,
+            1,
+        );
+    });
+
+    test("the reminder still fires on a status line that asks for something", async () => {
+        const source = await supervisor("reminder-status-asks");
+
+        await say(app, source, "status line approve the install test");
+        assert.equal(
+            (await modelTexts(app, source)).filter((each) => each.includes("Desk check:")).length,
+            1,
+        );
     });
 
     test("the reminder does not fire after an ask on another supervisor's thread", async () => {
@@ -13720,6 +14183,76 @@ describe("the desk in a Pi Pocket", () => {
                 }, context);
                 writeFileSync(configPath, JSON.stringify({ digest: { minutes: 0 }, cap: 100 }));
             }
+        });
+
+        test("an ask on a closed thread shows in the view, also when old, and Brian can answer it", async () => {
+            const source = await supervisor("page-closed-ask");
+            let threadId = "";
+            let askId = "";
+
+            await app.harness.commit(async (tx) => {
+                const state = await tx.doc(DeskThreads);
+                const opened = openThread(state, {
+                    key: "x.test.page-closed-ask",
+                    supervisor: Number(source),
+                    agents: ["duncan"],
+                    repo: "frostyard/test",
+                    title: "Closed with an ask",
+                    at: Date.now(),
+                });
+
+                threadId = opened.thread.id;
+
+                const first = addAsk(state, {
+                    thread: threadId,
+                    text: "Keep the blobs?",
+                    key: "x.test.page-closed-ask:1",
+                    by: "Odrade",
+                    supervisor: Number(source),
+                    at: Date.now(),
+                });
+
+                askId = "askId" in first ? first.askId : "";
+
+                // Closed in the same step as the ask, and long ago: the page still shows it.
+                const thread = state.threads[threadId]!;
+
+                thread.state = "closed";
+                thread.closed = {
+                    at: Date.now() - 30 * 24 * 3600_000,
+                    why: "done",
+                    by: "odrade",
+                    outcome: "completed",
+                };
+            }, context);
+
+            const listed = await call("threads");
+            const shown = (
+                listed.data.threads as { id: string; state: string; asks: { id: string }[] }[]
+            ).find((each) => each.id === threadId);
+
+            assert.equal(shown?.state, "closed");
+            assert.deepEqual(
+                shown?.asks.map((ask) => ask.id),
+                [askId],
+            );
+
+            const answered = await call(`asks/${askId}/answer`, { words: "Keep them." });
+
+            assert.equal(answered.status, 200);
+
+            const stored = (await deskState())?.threads[threadId];
+
+            assert.equal(stored?.asks.find((ask) => ask.id === askId)?.answer?.words, "Keep them.");
+            assert.equal(stored?.state, "closed", "the answer does not reopen it");
+
+            const after = await call("threads");
+
+            assert.equal(
+                (after.data.threads as { id: string }[]).some((each) => each.id === threadId),
+                false,
+                "answered and old: it leaves the view",
+            );
         });
 
         test("POST asks/:id/answer records Brian's words, and a second POST changes nothing", async () => {
@@ -18772,6 +19305,21 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
 
             return clerk;
         };
+
+        test("a Clerk's registration calls changed after its commit", async () => {
+            await app.setSubagentModels(owner(app), ["faux/faux-2"]);
+            writeClerk("faux/faux-2");
+            const watched = spy();
+
+            try {
+                await startClerk(await supervisor("changed-clerk"));
+                assert(watched.log.includes("clerk"), "the Clerk is registered");
+                assert(watched.log.lastIndexOf("changed") > watched.log.lastIndexOf("clerk"));
+            } finally {
+                watched.restore();
+                removeClerk();
+            }
+        });
 
         const newFolder = (name: string) => {
             const folder = join(root, name);

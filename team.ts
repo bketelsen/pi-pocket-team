@@ -1398,6 +1398,9 @@ export default function createTeam(host: Host, web: Web) {
             }
         }, context);
 
+        // The desk page loads again: the Clerk is registered now.
+        desk?.changed?.();
+
         return reply(
             `Assigned to ${persona.name} at ${started.address}, on ${model}. Routine desk news goes to the Clerk now. Send it work with team_message.${desk === undefined ? " The desk is off: the Clerk is not registered." : ""}`,
         );
@@ -1524,6 +1527,11 @@ export default function createTeam(host: Host, web: Web) {
             tx: Tx,
             supervisor: number,
         ) => Promise<{ address: string; key?: string } | undefined>;
+        /**
+         * Tell the desk page that the desk changed. Call it after the commit that used `open`, `bind`, `fail`, `file` or
+         * `clerk` returned, never inside it. An older desk has none: skip the call.
+         */
+        changed?: () => void;
         /**
          * The supervisor conversations the desk binds threads to, newest desk event first: no write. An older desk has
          * none.
@@ -2126,6 +2134,12 @@ export default function createTeam(host: Host, web: Web) {
                               }),
                           context,
                       );
+
+            // The new thread shows on the desk page at once, not at the next sweep.
+            if (opened !== undefined) {
+                desk?.changed?.();
+            }
+
             // The watch's date is the one the desk resolved at open: a span such as "2w" is kept as its day.
             const checkOn =
                 opened?.thread.watch === undefined
@@ -2172,6 +2186,7 @@ export default function createTeam(host: Host, web: Web) {
                             async (tx) => desk.fail(tx, key, (error as Error).message, Date.now()),
                             context,
                         );
+                        desk.changed?.();
                     } catch {
                         // The start's refusal is what the model must see: the desk can mark the thread later.
                     }
@@ -2208,6 +2223,9 @@ export default function createTeam(host: Host, web: Web) {
                           key,
                       );
             }, context);
+
+            // The thread is bound to its session now: the desk page loads again.
+            desk?.changed?.();
 
             if (shift !== undefined) {
                 shift.ns.notifyChanged(started.session as ConversationId);
@@ -2464,6 +2482,11 @@ export default function createTeam(host: Host, web: Web) {
                               }),
                           context,
                       );
+
+            // A report on a thread, or an ask that came with it, shows on the desk page now.
+            if (filed !== undefined) {
+                desk?.changed?.();
+            }
 
             if (filed?.held !== true) {
                 await host.linkedSessions.send(
