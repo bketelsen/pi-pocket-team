@@ -141,6 +141,12 @@ positives (marked †).
 | --- | -------------------------------------------------------------------------------------------------------------------------------------------- | ---- | ------------------------------------------------------ |
 | J1  | Spend per day, per agent, per thread (`usage.cost.total` of assistant entries); the spend of empty reopens (A1) and of queue continues (A2). | D    | a day 50% above the 7-day median; waste above $5 a day |
 
+### R. Model routing (shadow)
+
+| Id  | Check                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             | Kind | A finding when                          |
+| --- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---- | --------------------------------------- |
+| R1  | Every desk thread with a `route` (the model router's shadow record), in no time window, grouped by the kind, the suggested tier, the suggested model, the status and the model that really ran (the night-shift goal's `worker`, else the thread session's most common subagent model, cross-review reviewers left out): count, open, success (closed as done, completed or verified), not success, the goals' statuses, the median rounds, the median cost of the session, and the reopenings. A success rate shows only for 10 threads or more. | D    | never: metrics only (`routes`, `cells`) |
+
 ## 5. Where the LLM is needed, and nowhere else
 
 1. **Same facts or not** (E1 candidates, E3 samples): at most 10 pairs a day. Input: the 2 report

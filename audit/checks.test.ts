@@ -31,6 +31,7 @@ import {
     checkI2,
     checkI3,
     checkJ1,
+    checkR1,
     inDeepseekPeak,
     makeFinding,
     runChecks,
@@ -1603,7 +1604,12 @@ test("runChecks: every check has an entry, and a missing source skips its checks
     const data = emptyData({ sourceErrors: { github: "disabled by --no-github" } });
     const result = runChecks(data, ctx);
 
-    assert.equal(CHECKS.length, 25);
+    assert.equal(CHECKS.length, 26);
+    // R1 reads the router's records on the desk threads, and the goals beside them.
+    assert.deepEqual(
+        CHECKS.find(([id]) => id === "R1"),
+        ["R1", checkR1, ["desk", "goals"]],
+    );
     // I3 sits beside I2 and reads the homes source.
     assert.deepEqual(
         CHECKS.find(([id]) => id === "I3"),
@@ -1621,6 +1627,7 @@ test("runChecks: every check has an entry, and a missing source skips its checks
     assert.match(result.skipped.B1!, /source unavailable: github: disabled/);
     assert.ok(result.metrics.A1);
     assert.ok(result.metrics.J1);
+    assert.deepEqual(result.metrics.R1, { routes: 0, cells: [] });
 });
 
 test("runChecks: a check that throws is skipped and the run goes on", () => {

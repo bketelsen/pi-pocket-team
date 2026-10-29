@@ -23,6 +23,7 @@ const MODULES = [
     "homewiki-web",
     "night-shift.ts",
     "night-shift-web",
+    "model-router.ts",
     "desk.ts",
     "desk-web",
     "terminal.ts",

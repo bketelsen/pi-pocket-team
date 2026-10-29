@@ -1478,6 +1478,118 @@ export default function createTeam(host: Host, web: Web) {
         ];
 
     /**
+     * The model router's record of one delegation, as `model-router.ts` publishes it. This module does not import that
+     * one: a copy of the shape, and nothing else. It is a suggestion only, never a model that ran.
+     */
+    type ThreadRoute = {
+        mode: "off" | "shadow";
+        status: "shadow" | "explicit" | "failed" | "off";
+        kind?: string;
+        kindConfidence?: number;
+        complexity?: number;
+        capability?: number;
+        deepReasoning?: number;
+        demand?: number;
+        tier?: string;
+        model?: string;
+        thinking?: string;
+        profileModel?: string;
+        worker?: string;
+        jevModel?: string;
+        jevId?: string;
+        latencyMs?: number;
+        reason: string;
+        notes?: string[];
+        at: number;
+        line: string;
+    };
+
+    /**
+     * The model router's API, from a global: team.ts must not import model-router.ts. An import would keep a stale copy
+     * after a reload. The module records a suggestion; nothing here changes a model or a thinking level.
+     */
+    type RouterApi = {
+        version: number;
+        route: (request: {
+            brief: string;
+            startAt: number;
+            profileModel?: string;
+        }) => Promise<ThreadRoute>;
+        explicit: (request: { worker: string; profileModel?: string }) => ThreadRoute;
+    };
+
+    const routerApi = (): RouterApi | undefined =>
+        (globalThis as unknown as Record<symbol, RouterApi | undefined>)[
+            Symbol.for("pi-pocket-team.model-router")
+        ];
+
+    /** The router's memo for one delegation: the first answer, when the call runs again. */
+    const ROUTE_MEMO = "x.team.route";
+    /** The longest a route may hold a delegation: past it, the delegation goes on with no route. */
+    const ROUTE_GUARD_MS = 4000;
+
+    /** `work`, or undefined when it takes longer than `ms`: a slow router never holds a delegation. */
+    async function withinMs<T>(work: Promise<T>, ms: number): Promise<T | undefined> {
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const guard = new Promise<undefined>((resolve) => {
+            timer = setTimeout(() => resolve(undefined), ms);
+        });
+
+        try {
+            return await Promise.race([work, guard]);
+        } finally {
+            clearTimeout(timer);
+        }
+    }
+
+    /**
+     * The model router's shadow suggestion for one night shift: a record only, never a model. A worker the supervisor
+     * named wins, and then the router does not run at all. The answer is a memo keyed by the call, so a replay reads
+     * the first answer and Jev is never asked twice. A router that throws, or takes more than 4 s, gives no route: the
+     * delegation goes on as it would without the router.
+     */
+    async function shiftRoute(
+        api: ToolExecutionApi,
+        context: Context,
+        request: DelegatedGoal,
+        persona: Persona,
+        brief: string,
+    ): Promise<ThreadRoute | undefined> {
+        const router = routerApi();
+
+        if (router === undefined) {
+            return undefined;
+        }
+
+        try {
+            if (request.worker !== undefined) {
+                return router.explicit({ worker: request.worker, profileModel: persona.model });
+            }
+
+            const stored = await api.memo<ThreadRoute>(ROUTE_MEMO, context);
+
+            if (stored !== undefined) {
+                return stored;
+            }
+
+            const answer = await withinMs(
+                router.route({
+                    brief,
+                    startAt: request.start ?? Date.now(),
+                    profileModel: persona.model,
+                }),
+                ROUTE_GUARD_MS,
+            );
+
+            return answer === undefined
+                ? undefined
+                : await api.memo<ThreadRoute>(ROUTE_MEMO, answer, context);
+        } catch {
+            return undefined;
+        }
+    }
+
+    /**
      * The desk module's API, from a global: team.ts must not import desk.ts. A static import would keep a stale copy
      * after a reload.
      */
@@ -1505,6 +1617,11 @@ export default function createTeam(host: Host, web: Web) {
             binding: { session: number; address: string; at: number },
         ) => Promise<DeskThread | undefined>;
         fail: (tx: Tx, key: string, why: string, at: number) => Promise<void>;
+        /**
+         * Record the model router's suggestion on the thread, once: a replay changes nothing. An older desk has none:
+         * skip the call.
+         */
+        route?: (tx: Tx, key: string, route: ThreadRoute) => Promise<void>;
         file: (
             tx: Tx,
             session: ConversationId,
@@ -1547,8 +1664,8 @@ export default function createTeam(host: Host, web: Web) {
             supervisor: number,
         ) => Promise<{ address: string; key?: string } | undefined>;
         /**
-         * Tell the desk page that the desk changed. Call it after the commit that used `open`, `bind`, `fail`, `file` or
-         * `clerk` returned, never inside it. An older desk has none: skip the call.
+         * Tell the desk page that the desk changed. Call it after the commit that used `open`, `bind`, `fail`, `route`,
+         * `file` or `clerk` returned, never inside it. An older desk has none: skip the call.
          */
         changed?: () => void;
         /**
@@ -2243,6 +2360,20 @@ export default function createTeam(host: Host, web: Web) {
                     ? ""
                     : " The desk is off: the watch is not set.";
 
+            // The model router's shadow suggestion for this night shift: a record only, never a model. It runs only for
+            // a night shift with no worker named (a named worker wins, and the router does not run), and only when the
+            // router module is on. Without a route, the delegation is exactly as it is without the router.
+            const route =
+                shift === undefined || night_shift === undefined
+                    ? undefined
+                    : await shiftRoute(
+                          api,
+                          context,
+                          shift.request,
+                          persona,
+                          `${night_shift.objective ?? task}\n\nStop when: ${night_shift.stop_when}`,
+                      );
+
             // The owner's profile names the model, and the owner's allowed list permits it: neither is Pi's choice.
             // Not allowed: the source's model, as before, said in the result. Allowed but unusable now: core refuses
             // the start, and Pi is told not to try another model.
@@ -2293,6 +2424,11 @@ export default function createTeam(host: Host, web: Web) {
                     });
                 }
 
+                // The router's suggestion lands with the binding: a replay of the call finds it, and adds no second.
+                if (route !== undefined) {
+                    await desk?.route?.(tx, key, route);
+                }
+
                 return shift === undefined
                     ? undefined
                     : shift.ns.setDelegated(
@@ -2329,7 +2465,7 @@ export default function createTeam(host: Host, web: Web) {
                 goal.deadlineLabel === undefined ? "no deadline" : `until ${goal.deadlineLabel}`;
 
             return reply(
-                `Assigned to ${persona.name} at ${started.address}, on ${modelText(persona)}.${thread}${notMade === "" ? "" : ` ${notMade}`} Night shift set there: at most ${goal.maxRounds} rounds, ${begins}, ${ends}. Its report arrives here when it stops; do not poll. /night-shift status in that session shows it.${noDesk}`,
+                `Assigned to ${persona.name} at ${started.address}, on ${modelText(persona)}.${thread}${notMade === "" ? "" : ` ${notMade}`} Night shift set there: at most ${goal.maxRounds} rounds, ${begins}, ${ends}.${route === undefined ? "" : ` ${route.line}.`} Its report arrives here when it stops; do not poll. /night-shift status in that session shows it.${noDesk}`,
             );
         },
     });
