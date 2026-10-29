@@ -1258,6 +1258,11 @@ export default function createNightShift(host: Host, web: Web) {
          * Absent in an older desk: the text alone holds the thread then.
          */
         asks?: (text: string) => { question: string; options?: string[] }[] | undefined;
+        /**
+         * Tell the desk page that the desk changed: call it after the commit that used `file` returned, never inside
+         * it. Absent in an older desk: skip the call.
+         */
+        changed?: () => void;
     };
 
     const deskApi = (): DeskApi | undefined =>
@@ -1949,6 +1954,11 @@ export default function createNightShift(host: Host, web: Web) {
 
                     return undefined;
                 }, context);
+
+                // The report, and the asks that came with it, show on the desk page now.
+                if (found.filed !== undefined) {
+                    deskApi()?.changed?.();
+                }
 
                 if (found.address === undefined) {
                     host.notice(

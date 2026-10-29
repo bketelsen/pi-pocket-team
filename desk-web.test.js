@@ -375,8 +375,13 @@ test("a watch with a time shows the time in its row; one without shows the date 
     assert.match(out, /check on 2026-12-02(?! \d)/);
 });
 
-test("groupOf: an ask comes first after closed and parked; else asleep, found, Brian, stale, the reviewer", () => {
+test("groupOf: an ask comes first after parked; else closed, asleep, found, Brian, stale, the reviewer", () => {
     assert.equal(groupOf(threadView({ state: "closed" })), "closed");
+    assert.equal(
+        groupOf(threadView({ state: "closed", asks: [openAsk] })),
+        "need",
+        "a thread closed with an open ask still needs Brian",
+    );
     assert.equal(groupOf(threadView({ state: "parked", asks: [openAsk] })), "parked");
     assert.equal(groupOf(threadView({ asks: [openAsk] })), "need");
     assert.equal(groupOf(threadView({ asleep: true, asks: [openAsk] })), "need");
@@ -396,7 +401,12 @@ test("badgeOf: an open ask counts, also when asleep; a plain sleeping thread doe
     assert.equal(badgeOf(view([threadView({ next: "brian" })])), 1);
     assert.equal(badgeOf(view([threadView({ stale: true })])), 1);
     assert.equal(badgeOf(view([threadView({})])), 0);
-    assert.equal(badgeOf(view([threadView({ state: "closed", asks: [openAsk] })])), 0);
+    assert.equal(badgeOf(view([threadView({ state: "closed", asks: [openAsk] })])), 1);
+    assert.equal(
+        badgeOf(view([threadView({ state: "closed", next: "brian", stale: true })])),
+        0,
+        "a closed thread with no open ask never counts",
+    );
     assert.equal(badgeOf(view([threadView({ state: "parked", asks: [openAsk] })])), 0);
     assert.equal(badgeOf(view([threadView({ origin: "found", asks: [openAsk] })])), 1);
 
@@ -406,4 +416,77 @@ test("badgeOf: an open ask counts, also when asleep; a plain sleeping thread doe
     assert.equal(groupOf(sleeping), "watching");
     assert.equal(badgeOf(view([sleeping])), 0, "a plain sleeping thread does not count");
     assert.equal(badgeOf(view([sleepingAsked])), 1);
+});
+
+test("a thread closed with an open ask shows in Needs you with its answer controls, and not under Closed", async () => {
+    let badge;
+    const out = await render(
+        {
+            ...viewWith(null),
+            threads: [
+                threadView({
+                    id: "T406",
+                    title: "A closed watch",
+                    state: "closed",
+                    closed: {
+                        at: NOW - 30 * 86400_000,
+                        why: "done",
+                        by: "odrade",
+                        outcome: "done",
+                    },
+                    asks: [{ ...openAsk, id: "T406b", text: "Keep the old blob store?" }],
+                }),
+                threadView({
+                    id: "T407",
+                    title: "A plain closed one",
+                    state: "closed",
+                    closed: { at: NOW - 1000, why: "done", by: "odrade", outcome: "done" },
+                }),
+            ],
+        },
+        (next) => {
+            badge = next.badge;
+        },
+    );
+
+    const need = out.slice(out.indexOf("<h2>Needs you"), out.indexOf("</section>"));
+
+    assert.match(need, /T406/);
+    assert.match(need, /T406b · Keep the old blob store\?/);
+    assert.match(need, /Answered T406b/, "Brian can answer it");
+    assert.doesNotMatch(need, /T407/);
+    assert.match(out, /Closed in the last 7 days \(1\)/, "only the plain one is under Closed");
+    assert.equal(badge, 1, "the badge counts it");
+});
+
+test("a closed found thread with an open ask and a watch shows the answer controls, and no Attach, Drop or watch controls", async () => {
+    const out = await render({
+        ...viewWith(null),
+        threads: [
+            threadView({
+                id: "F7",
+                title: "A closed found PR",
+                state: "closed",
+                origin: "found",
+                closed: { at: NOW - 1000, why: "done", by: "odrade", outcome: "done" },
+                asks: [{ ...openAsk, id: "F7a", text: "Adopt it?" }],
+                prs: [{ ref: "frostyard/test#9", state: "OPEN", next: "brian" }],
+                watch: {
+                    checkOn: "2026-12-01",
+                    check: "the blob sweep",
+                    setBy: "odrade",
+                    due: false,
+                },
+            }),
+        ],
+    });
+    const need = out.slice(out.indexOf("<h2>Needs you"), out.indexOf("</section>"));
+
+    assert.match(need, /F7a · Adopt it\?/);
+    assert.match(need, /aria-label=Answered F7a/);
+    assert.doesNotMatch(need, /Attach/);
+    assert.doesNotMatch(need, /Drop/);
+    assert.doesNotMatch(need, /Park|Keep|Wake/);
+    assert.doesNotMatch(need, /Watch|Clear the watch|Pass the check|Fail the check/);
+    assert.doesNotMatch(need, /ready to merge/);
 });

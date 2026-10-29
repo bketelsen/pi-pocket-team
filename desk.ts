@@ -646,7 +646,7 @@ export type BoundSupervisor = {
     supervisor: number;
     /** The newest `lastEventAt` of its threads. */
     lastEventAt: number;
-    /** Its open asks for Brian, on its threads that are not parked or closed. */
+    /** Its open asks for Brian, on its threads that are not parked: also on a closed thread, which still shows them. */
     asks: number;
 };
 
@@ -670,7 +670,7 @@ export function boundSupervisors(state: Readonly<DeskState> | undefined): BoundS
 
         entry.lastEventAt = Math.max(entry.lastEventAt, thread.lastEventAt);
 
-        if (thread.state !== "closed" && thread.state !== "parked") {
+        if (thread.state !== "parked") {
             entry.asks += thread.asks.filter((ask) => askIsOpen(ask)).length;
         }
 
@@ -3323,7 +3323,9 @@ export type NextActor = "brian" | "agent" | "odrade" | "reviewer" | "none";
 
 /**
  * Who acts next on a thread. First match: brian, odrade (a due watch), agent (a failed watch), agent, odrade (a found
- * thread, or a report that says BLOCKED), so a thread whose report asks for a decision waits on Odrade.
+ * thread, or a report that says BLOCKED), so a thread whose report asks for a decision waits on Odrade. A silent
+ * session (idle, not archived, no report after the last user entry) waits on Odrade too, unless the thread has an open
+ * watch that is not due yet: the watch is the wait, and nobody is next until it is due.
  */
 export function nextActor(thread: Thread): NextActor {
     if (thread.state === "closed") {
@@ -3401,7 +3403,9 @@ export function nextActor(thread: Thread): NextActor {
     // A report at or past `lastUserEntry` counts: a report after the last scan is newer than the scan's newest entry.
     const silent = reported === undefined || (last !== undefined && reported < last);
 
-    if (thread.run.busy === false && !archived && silent) {
+    // A watch that is open and not due yet is the thread's reason to be quiet: its session sleeps until the check. Only
+    // a due watch (above) or a failed one wakes anyone, so a quiet session is no "silent session" meanwhile.
+    if (thread.run.busy === false && !archived && silent && openWatch(thread) === undefined) {
         return "odrade";
     }
 
@@ -7911,6 +7915,49 @@ export function namesOpenAsk(text: string, state: Readonly<DeskState> | undefine
     });
 }
 
+/**
+ * Whether a reply ends with Odrade's status line, and the line says nothing is asked now. Every reply to Brian ends
+ * with a line "Needs you: <ask ids>" or "Needs you: nothing". The line is a statement about the desk, not a new ask, so
+ * the reminder "your reply asks Brian something" must not fire on it. The last non-empty line, outside fenced code,
+ * is read: in any case, with markdown bold or code marks around any part of it. The line clears the reply when what
+ * follows the colon is:
+ *
+ * - "nothing" or "none", with an optional final period; or
+ * - only ask ids ("T13a", "T13a, T14b", "T13a and T14b"), each of them an ask on the desk now, whatever its state: an
+ *   id the desk does not know does not clear it.
+ *
+ * A "Needs you:" line with any other words ("Needs you: approve the install") still asks, and `asksBrian` reads it so.
+ */
+export function statusLineClears(text: string, state: Readonly<DeskState> | undefined): boolean {
+    const last = withoutFences(text)
+        .split("\n")
+        .findLast((line) => line.trim() !== "");
+
+    if (last === undefined) {
+        return false;
+    }
+
+    // Bold and code marks only wrap the words: "**Needs you:** T13a", "**Needs you: nothing**", "Needs you: `T13a`".
+    const found = /^\s*needs you\s*:\s*(.*?)\s*$/i.exec(last.replace(/[*_`]/g, ""));
+
+    if (found === null) {
+        return false;
+    }
+
+    const rest = found[1]!.replace(/\.$/, "").trim();
+
+    if (/^(?:nothing|none)$/i.test(rest)) {
+        return true;
+    }
+
+    const ids = rest.split(/\s*(?:,|;|&|\band\b)\s*/i).filter((each) => each !== "");
+
+    return (
+        ids.length > 0 &&
+        ids.every((id) => /^[TF][1-9][0-9]*[a-z]+$/.test(id) && askById(state, id) !== undefined)
+    );
+}
+
 /** A thread id in a text: T13, F2, or the thread of an ask id (T13 in T13a). */
 const THREAD_IDS = /\b([TF][1-9][0-9]*)[a-z]?\b/g;
 
@@ -8310,7 +8357,7 @@ export function exportFiles(
 
 // ─── The page's view ────────────────────────────────────────────────────────
 
-/** How many closed threads the page shows. */
+/** How long the page shows a closed thread, in milliseconds. A closed thread with an open ask is always shown. */
 const CLOSED_SHOWN_MS = 7 * 24 * 3600_000;
 
 /** One thread as the page reads it. No draft objects: this goes to the browser as JSON. */
@@ -8519,7 +8566,10 @@ export type ThreadsView = {
     };
 };
 
-/** The page's whole view: every open thread, and those closed in the last 7 days. */
+/**
+ * The page's whole view: every open thread, those closed in the last 7 days, and any closed thread that still has an
+ * open ask, however long ago it closed: an ask for Brian is never hidden by a close.
+ */
 export function threadsView(
     state: Readonly<DeskState> | undefined,
     now: number,
@@ -8562,7 +8612,8 @@ export function threadsView(
     const shown = all.filter(
         (thread) =>
             thread.state !== "closed" ||
-            (thread.closed !== undefined && now - thread.closed.at <= CLOSED_SHOWN_MS),
+            (thread.closed !== undefined && now - thread.closed.at <= CLOSED_SHOWN_MS) ||
+            hasOpenAsk(thread),
     );
 
     return {
@@ -8937,6 +8988,12 @@ export type DeskApi = {
     clerkOf: (tx: Tx, supervisor: number) => Promise<Clerk | undefined>;
     /** The asks of a report's `ASKS FOR BRIAN:` block (`reportAsksOf`): Night shift files them with its report. */
     asks: (text: string) => { question: string; options?: string[] }[] | undefined;
+    /**
+     * Tell the desk page that the desk changed. `open`, `bind`, `fail`, `file` and `clerk` write inside the caller's
+     * commit, so the desk cannot send after it: the caller calls this once its commit returned, never inside it.
+     * Optional: a desk module from before it has no such method, and a caller then skips the call.
+     */
+    changed?: () => void;
     /** The supervisor conversations the desk binds threads to (`boundSupervisors`), newest desk event first: no write. */
     supervisors: (
         read: Pick<DocumentReader, "snapshot">,
@@ -9799,6 +9856,7 @@ export default function createDesk(host: Host, web: Web) {
 
             return found === undefined ? undefined : { ...found };
         },
+        changed: () => web.send("changed", {}),
     };
     const shared = globalThis as unknown as Record<symbol, DeskApi | undefined>;
 
@@ -13665,6 +13723,17 @@ export default function createDesk(host: Host, web: Web) {
 
     web.client("desk-web", { access: "owner" });
 
+    /**
+     * Tell the page's tabs that the desk changed: they load the view again. Call it after a commit returned, never
+     * inside one, so a tab never loads a state that is not committed yet. It gives back its argument, so a commit can
+     * pass through it. An extra event is harmless: a tab loads the same view again.
+     */
+    const announced = <T>(value: T): T => {
+        web.send("changed", {});
+
+        return value;
+    };
+
     /** A sweep when nobody looked for 5 minutes, for each supervisor that has open threads. A failure never fails the page. */
     const SWEEP_VIEW_MS = 5 * 60_000;
 
@@ -14393,7 +14462,13 @@ export default function createDesk(host: Host, web: Web) {
                 const session = Number(api.conversationId);
 
                 // A reply that names an ask open on the desk now points Brian at it: no new ask is needed.
-                if (asksBrian(said) && !namesOpenAsk(said, state)) {
+                // A reply that ends with Odrade's status line ("Needs you: nothing", or ask ids the desk knows) states
+                // the desk's asks: it files none, and the line itself is no new ask.
+                if (
+                    asksBrian(said) &&
+                    !namesOpenAsk(said, state) &&
+                    !statusLineClears(said, state)
+                ) {
                     const turnStart =
                         (await api.memo<number>("desk.turnStart", context)) ?? Date.now();
                     const filed = Object.values(state?.threads ?? {}).some((thread) =>
@@ -14688,6 +14763,14 @@ export default function createDesk(host: Host, web: Web) {
 
             const looked = `supervisor:${String(supervisor)}`;
 
+            /**
+             * A commit that writes desk state the page shows: the page's tabs hear `changed` once it returned, never
+             * inside it. A commit that threw changed nothing, so it sends nothing. `list` and `read` write only the
+             * look, which the page does not show: they use `api.commit`.
+             */
+            const write = async <T>(change: (tx: Tx) => T | Promise<T>, at: Context): Promise<T> =>
+                announced(await api.commit(change, at));
+
             if (args.action === "list") {
                 // The look moves in the same commit: a section cannot write, so Odrade's last look is marked here.
                 const text = await api.commit(async (tx) => {
@@ -14764,7 +14847,7 @@ export default function createDesk(host: Host, web: Web) {
             if (args.action === "ask") {
                 const key = `x.desk.ask:${api.taskId}:${api.callId}`;
                 const at = Date.now();
-                const result = await api.commit(async (tx) => {
+                const result = await write(async (tx) => {
                     const state = await tx.doc(DeskThreads);
                     // A replay files no second ask: it changes nothing, so it marks nothing either.
                     const known = findAsk(state, key);
@@ -14826,7 +14909,7 @@ export default function createDesk(host: Host, web: Web) {
                 }
 
                 const at = Date.now();
-                const result = await api.commit(async (tx) => {
+                const result = await write(async (tx) => {
                     const state = await tx.doc(DeskThreads);
                     const done =
                         args.action === "rewrite"
@@ -14881,7 +14964,7 @@ export default function createDesk(host: Host, web: Web) {
                 }
 
                 const at = Date.now();
-                const result = await api.commit(async (tx) => {
+                const result = await write(async (tx) => {
                     const state = await tx.doc(DeskThreads);
                     const done = answerAsk(state, asked, {
                         at,
@@ -14929,7 +15012,7 @@ export default function createDesk(host: Host, web: Web) {
                 const key = `x.desk.${args.action}:${api.taskId}:${api.callId}`;
                 const at = Date.now();
                 const boss = await supervisorName();
-                const result = await api.commit(async (tx) => {
+                const result = await write(async (tx) => {
                     const state = await tx.doc(DeskThreads);
                     const thread = threadById(state, asked);
 
@@ -15039,7 +15122,7 @@ export default function createDesk(host: Host, web: Web) {
                     );
                 }
 
-                const result = await api.commit(async (tx) => {
+                const result = await write(async (tx) => {
                     const state = await tx.doc(DeskThreads);
                     const target = threadById(state, targetId);
                     const source = PR_REF.test(ref) ? undefined : threadById(state, ref);
@@ -15089,7 +15172,7 @@ export default function createDesk(host: Host, web: Web) {
                     throw new Error(`${ref} is not a PR ref such as owner/name#12.`);
                 }
 
-                const result = await api.commit(async (tx) => {
+                const result = await write(async (tx) => {
                     const state = await tx.doc(DeskThreads);
                     const target = threadById(state, targetId);
 
@@ -15118,7 +15201,7 @@ export default function createDesk(host: Host, web: Web) {
                     throw new Error("own needs thread: a found thread such as F2.");
                 }
 
-                const result = await api.commit(async (tx) => {
+                const result = await write(async (tx) => {
                     const state = await tx.doc(DeskThreads);
                     const target = threadById(state, id);
 
@@ -15156,7 +15239,7 @@ export default function createDesk(host: Host, web: Web) {
 
                 const key = `x.desk.send:${api.taskId}:${api.callId}`;
                 const boss = await supervisorName();
-                const found = await api.commit(async (tx) => {
+                const found = await write(async (tx) => {
                     const state = await tx.doc(DeskThreads);
                     const thread = threadById(state, id);
 
@@ -15209,7 +15292,7 @@ export default function createDesk(host: Host, web: Web) {
 
                 // A document change only, in its own commit: the send has its own record.
                 try {
-                    await api.commit(async (tx) => {
+                    await write(async (tx) => {
                         const thread = threadById(await tx.doc(DeskThreads), found.id);
                         const at = Date.now();
 
@@ -15298,7 +15381,7 @@ export default function createDesk(host: Host, web: Web) {
             const folders = Object.fromEntries(
                 members.flatMap((member) => Object.entries(member.repositories ?? {})),
             );
-            const result = await api.commit(async (tx) => {
+            const result = await write(async (tx) => {
                 const seeded = seedThreads(await tx.doc(DeskThreads), parsed.threads, {
                     hash,
                     supervisor,

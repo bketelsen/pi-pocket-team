@@ -16,12 +16,13 @@ let app = null;
 const GROUPS = ["closed", "parked", "need", "watching", "found", "stale", "review", "working"];
 
 /**
- * The section a thread goes in. First match: closed, parked, an open ask (it needs Brian, and neither a watch nor a
- * found origin hides it), asleep, found, Brian, stale, the reviewer.
+ * The section a thread goes in. First match: closed with no open ask, parked, an open ask (it needs Brian, and neither
+ * a watch nor a found origin hides it, nor does a close: an ask filed on a thread that closed in the same step still
+ * shows), asleep, found, Brian, stale, the reviewer.
  */
 export const groupOf = (thread) => {
     if (thread.state === "closed") {
-        return "closed";
+        return (thread.asks ?? []).length > 0 ? "need" : "closed";
     }
 
     if (thread.state === "parked") {
@@ -56,14 +57,14 @@ export const groupOf = (thread) => {
 };
 
 /**
- * The rail badge: the threads that need Brian. A thread that is not parked or closed counts when it has an open ask,
- * also when it is asleep; else it counts when it is not asleep and it needs Brian or is stale.
+ * The rail badge: the threads that need Brian. A thread that is not parked counts when it has an open ask, also when
+ * it is asleep or closed; else it counts when it is not closed or asleep and it needs Brian or is stale.
  */
 export const badgeOf = (next) =>
     next === null || next === undefined
         ? 0
         : next.threads.filter((thread) => {
-              if (thread.state === "parked" || thread.state === "closed") {
+              if (thread.state === "parked") {
                   return false;
               }
 
@@ -71,7 +72,11 @@ export const badgeOf = (next) =>
                   return true;
               }
 
-              return !thread.asleep && (thread.next === "brian" || thread.stale);
+              return (
+                  thread.state !== "closed" &&
+                  !thread.asleep &&
+                  (thread.next === "brian" || thread.stale)
+              );
           }).length;
 
 const publish = (next) => {
@@ -822,7 +827,7 @@ export default function setup(pocket) {
                         </div>
                     </div>`,
                 )}
-                ${thread.prs
+                ${(thread.state === "closed" ? [] : thread.prs)
                     .filter((pr) => pr.next === "brian")
                     .map((pr) =>
                         pr.url
@@ -1085,7 +1090,11 @@ export default function setup(pocket) {
             ${section("Needs you", groups.need, (thread) =>
                 row(
                     thread,
-                    html`${withWatch(thread, needDetail(thread))}${thread.origin === "found" ? foundActions(thread) : null}`,
+                    // A closed thread (it is here for its open ask) shows the ask and its answer controls only: the
+                    // watch, Attach and Drop routes do nothing on it.
+                    thread.state === "closed"
+                        ? needDetail(thread)
+                        : html`${withWatch(thread, needDetail(thread))}${thread.origin === "found" ? foundActions(thread) : null}`,
                 ),
             )}
             ${section(
