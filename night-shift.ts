@@ -592,7 +592,7 @@ export function parseArgs(input: string, now: number, zone: string): Parsed {
 export type PrCheck = {
     /** The PR number. Omitted: the PR of the current branch of the linked session's folder. */
     pr?: number;
-    /** The repository, `owner/name`, when the folder is not the PR's repository. */
+    /** The repository, `owner/name`, when the folder is not the PR's repository. Needs `pr`. */
     repo?: string;
     /** Which checks must pass: `required` (the default), `all`, or `none` with a label. */
     checks?: "required" | "all" | "none";
@@ -619,6 +619,13 @@ export function prCheckCommand(check: PrCheck): string | { error: string } {
     if (repo !== undefined && (typeof repo !== "string" || !PR_REPO.test(repo))) {
         return {
             error: "night_shift.pr_check.repo must be owner/name, such as bketelsen/x: letters, digits, . _ and - only.",
+        };
+    }
+
+    // `gh` reads the current branch's PR only with no `--repo`: with one, it needs the number.
+    if (repo !== undefined && pr === undefined) {
+        return {
+            error: "night_shift.pr_check.repo needs pr: gh finds the current branch's PR only without a repo.",
         };
     }
 

@@ -235,6 +235,23 @@ describe("prCheckCommand", () => {
             { pr: -1 },
             { pr: 1.5 },
             { checks: "some" as never },
+            // `--repo` with no number: gh does not read the current branch, so the check could never pass.
+            { repo: "bketelsen/x" },
+            { repo: "bketelsen/x", checks: "all" as const },
+            { pr: 1, repo: "a/b\nrm -rf /" },
+            { pr: 1, repo: "a/ b" },
+            { pr: 1, repo: "a/b " },
+            { pr: 1, repo: "ä/b" },
+            { pr: 1, repo: 7 as never },
+            { label: "ready\nrm -rf /" },
+            { label: "-x" },
+            { label: " x" },
+            { label: "réady" },
+            { label: "a;b" },
+            { label: "a$(b)" },
+            { label: 7 as never },
+            { pr: "12" as never },
+            { pr: Number.NaN },
         ]) {
             const built = prCheckCommand(pr_check);
 

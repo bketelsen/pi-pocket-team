@@ -2052,7 +2052,7 @@ export default function createTeam(host: Host, web: Web) {
                                         pattern:
                                             "^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$",
                                         description:
-                                            "The repository of the PR, owner/name, e.g. bketelsen/x. Omit when the folder is the PR's repository.",
+                                            "The repository of the PR, owner/name, e.g. bketelsen/x. Needs pr. Omit when the folder is the PR's repository.",
                                     }),
                                 ),
                                 checks: Type.Optional(
