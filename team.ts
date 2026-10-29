@@ -683,7 +683,7 @@ ${
         ? "You own the team, not this conversation's repository. Do work directly when helpful. Use team_delegate for a specialist; select their repository by its roster name and give a self-contained task. Their task starts in that repository regardless of your folder. A greeting needs no audit of old work."
         : persona.role === "clerk"
           ? "You are the desk clerk of your supervisor. Desk digests arrive as messages whose lines start with [desk]. Escalate to your supervisor with team_message to the return address in your first message. A thread that desk read shows as Handled needs no escalation for its reports, because the supervisor acted after them."
-          : "Do your assigned work directly. For a linked task, report the result once with team_message to the return address in its initial message. Set its status. Put each decision you need from Brian in its asks, 1 question each, with options when it is a pick-one: a decision written only in the text can be missed. A plain merge or install request is no ask: the PR's label brings it to Brian."
+          : "Do your assigned work directly. For a linked task, report the result once with team_message to the return address in its initial message. Set its status. Put each decision you need from Brian in its asks, 1 question each, with options when it is a pick-one: a decision written only in the text can be missed. A done or blocked report with no decision sends asks: []. A plain merge or install request is no ask: the PR's label brings it to Brian."
 }`;
 
 const reply = (text: string) => ({ output: [{ type: "text" as const, text }] });
@@ -1205,6 +1205,14 @@ export function teamMessageProblems(args: unknown): string[] {
         problems.push(`status is ${JSON.stringify(status)}: use done, working or blocked.`);
     }
 
+    // A done or blocked report says its decisions for Brian, or that there are none: the desk then reads no prose for
+    // them. A null is the validator's absent value, so it is missing too.
+    if ((status === "done" || status === "blocked") && (asks === undefined || asks === null)) {
+        problems.push(
+            `asks is missing: a ${status} report lists each decision for Brian in asks, or sends asks: [] when there is none.`,
+        );
+    }
+
     if (!Array.isArray(asks)) {
         return problems;
     }
@@ -1503,6 +1511,8 @@ export default function createTeam(host: Host, web: Web) {
                 status?: "done" | "working" | "blocked";
                 /** Decisions for Brian: each is filed as an ask on the thread, in the report's commit. */
                 asks?: { question: string; options?: string[] }[];
+                /** The agent sent asks: [], so the report holds no decision for Brian. */
+                asksNone?: true;
                 /** The agent's name, as the asks' author. */
                 by?: string;
             },
@@ -2395,7 +2405,7 @@ export default function createTeam(host: Host, web: Web) {
     const message = defineTool({
         name: "team_message",
         description:
-            "Send a task follow-up or final report to a linked-session address. It returns when admitted, without waiting for an answer. In a report to your supervisor, set status, and put each decision you need from Brian in asks: each becomes an ask on the desk thread, which Brian sees at once and your supervisor may rewrite, merge or withdraw. A plain merge or install request is no ask.",
+            "Send a task follow-up or final report to a linked-session address. It returns when admitted, without waiting for an answer. In a report to your supervisor, set status, and put each decision you need from Brian in asks: each becomes an ask on the desk thread, which Brian sees at once and your supervisor may rewrite, merge or withdraw. A done or blocked report must send asks: [] when there is no decision. A plain merge or install request is no ask.",
         parameters: Type.Object({
             to: Type.String(),
             message: Type.String({ minLength: 1, maxLength: MESSAGE_LIMITS.message }),
@@ -2478,6 +2488,10 @@ export default function createTeam(host: Host, web: Web) {
                                   digest: true,
                                   ...(args.status === undefined ? {} : { status: args.status }),
                                   ...(asks.length === 0 ? {} : { asks }),
+                                  // An explicit asks: [] says there is no decision for Brian.
+                                  ...(args.asks !== undefined && args.asks.length === 0
+                                      ? { asksNone: true as const }
+                                      : {}),
                                   ...(sender === undefined ? {} : { by: sender.name }),
                               }),
                           context,
