@@ -7879,7 +7879,11 @@ const EXTRA_STEP =
  * an order. Any other first word keeps the ask for Brian.
  */
 const FACT_WORD =
-    /^(?:@PR|\d[\w.-]*|[A-Za-z-]+(?:'s|’s)|[A-Za-z-]*[^\Wsuia]s|(?![A-Za-z-]*eed$|embed$|shred$)[A-Za-z-]{2,}ed|(?:a|an|the|this|that|these|those|it|its|both|all|each|every|no|none|only|one|two|three|four|five|low|high|medium|urgency|nothing|green|ready|done|pending|docs|doc|ci|pr|prs)$)$/i;
+    /^(?:@PR|\d[\w.-]*|[A-Za-z-]+(?:'s|’s)|[A-Za-z-]*[^\Wsuia]s|(?![A-Za-z-]*eed$|embed$|shred$)[A-Za-z-]{2,}ed|(?:a|an|the|this|that|these|those|it|its|both|all|each|every|no|none|one|two|three|four|five|low|high|medium|urgency|nothing|green|ready|done|pending|docs|doc|ci|pr|prs)$)$/i;
+
+/** Words that put a duty on someone beside the merge: "The device must be checked", "it needs a look". */
+const OBLIGATION =
+    /\b(?:must|should|shall|need(?:s|ed)?|required?|has\s+to|have\s+to|manual(?:ly)?|afterwards?|after\s+(?:that|it|the\s+merge)|once\s+merged|later\s+on|remember|don't\s+forget|do\s+not\s+forget)\b/i;
 
 /** A PR URL in a text: `github.com/owner/name/pull/7`. */
 const PR_URL_WORDS = /github\.com\/([A-Za-z0-9][\w.-]*\/[A-Za-z0-9][\w.-]*)\/pull\/([1-9][0-9]*)/gi;
@@ -8004,8 +8008,13 @@ export function plainMergeAsk(text: string, options?: string[]): boolean {
     // is a step.
     const beside = [...groups, rest].filter((one) => one.trim() !== "").join(". ");
 
-    // A question, or words to Brian ("you", "your", "Brian"), ask him something beside the merge.
-    if (/\?|\b(?:you(?:r)?|brian)\b/i.test(beside) || EXTRA_STEP.test(beside)) {
+    // A question, words to Brian ("you", "your", "Brian"), or an obligation ("must be checked", "needs a look") ask him
+    // something beside the merge.
+    if (
+        /\?|\b(?:you(?:r)?|brian)\b/i.test(beside) ||
+        OBLIGATION.test(beside) ||
+        EXTRA_STEP.test(beside)
+    ) {
         return false;
     }
 

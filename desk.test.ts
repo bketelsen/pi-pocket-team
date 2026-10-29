@@ -4892,6 +4892,16 @@ describe("merge asks", () => {
 
         assert.equal(mergeAskFor("Please merge frostyard/test#12.", one, merged), true);
         assert.equal(
+            mergeAskFor("Merge #12. Please only check the device afterward.", one, merged),
+            false,
+            "an adverb before an order",
+        );
+        assert.equal(
+            mergeAskFor("Merge #12. The device must be checked manually.", one, merged),
+            false,
+            "an obligation",
+        );
+        assert.equal(
             mergeAskFor("Merge frostyard/test#12.", one, merged, ["merged", "later"]),
             true,
             "merge-only options",
@@ -5078,6 +5088,9 @@ describe("merge asks", () => {
             "Merge #12. Feed the new key to the host.",
             "Merge #12 (check the device after).",
             "Merge #12. The device needs a look from Brian.",
+            "Merge #12. Please only check the device afterward.",
+            "Merge #12. The device must be checked manually.",
+            "Merge #12. It has to go out today.",
         ]) {
             assert.equal(plainMergeAsk(order), false, order);
         }
