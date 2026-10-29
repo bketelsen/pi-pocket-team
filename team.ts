@@ -1545,8 +1545,8 @@ export default function createTeam(host: Host, web: Web) {
     /**
      * The model router's shadow suggestion for one night shift: a record only, never a model. A worker the supervisor
      * named wins, and then the router does not run at all. The answer is a memo keyed by the call, so a replay reads
-     * the first answer and Jev is never asked twice. A router that throws, or takes more than 4 s, gives no route: the
-     * delegation goes on as it would without the router.
+     * the first answer and Jev is never asked twice. A router that throws, or takes more than 4 s, gives a `failed`
+     * route (so the audit counts it): the delegation goes on as it would without the router.
      */
     async function shiftRoute(
         api: ToolExecutionApi,
@@ -1572,18 +1572,33 @@ export default function createTeam(host: Host, web: Web) {
                 return stored;
             }
 
-            const answer = await withinMs(
-                router.route({
-                    brief,
-                    startAt: request.start ?? Date.now(),
-                    profileModel: persona.model,
-                }),
-                ROUTE_GUARD_MS,
-            );
+            let answer: ThreadRoute | undefined;
+            let reason = `the router took more than ${String(ROUTE_GUARD_MS / 1000)} s`;
 
-            return answer === undefined
-                ? undefined
-                : await api.memo<ThreadRoute>(ROUTE_MEMO, answer, context);
+            try {
+                answer = await withinMs(
+                    router.route({
+                        brief,
+                        startAt: request.start ?? Date.now(),
+                        profileModel: persona.model,
+                    }),
+                    ROUTE_GUARD_MS,
+                );
+            } catch {
+                reason = "the router failed";
+            }
+
+            // The router's own answer, or a failure in its shape: the memo keeps either, so a replay asks nothing.
+            const route: ThreadRoute = answer ?? {
+                mode: "shadow",
+                status: "failed",
+                ...(persona.model === undefined ? {} : { profileModel: persona.model }),
+                reason,
+                at: Date.now(),
+                line: `Route: failed (${reason}); no worker named, nothing changes`,
+            };
+
+            return await api.memo<ThreadRoute>(ROUTE_MEMO, route, context);
         } catch {
             return undefined;
         }

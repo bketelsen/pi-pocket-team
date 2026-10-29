@@ -13,6 +13,7 @@ import {
     TASK_KINDS,
     TIERS,
     TIMEOUT_MS,
+    type RouterApi,
     classify,
     decide,
     inDeepseekPeak,
@@ -23,6 +24,8 @@ import {
     routeLine,
     sshHostNames,
 } from "./model-router.ts";
+import createModelRouter from "./model-router.ts";
+import type { Host, Web } from "./_pocket.d.ts";
 
 // 12:00 UTC: outside DeepSeek's peak hours.
 const NOON = Date.UTC(2026, 9, 23, 12, 0);
@@ -533,4 +536,175 @@ test("classify does not put a failed fetch's text in its error", async () => {
 
 test("the tiers keep their order, cheapest first", () => {
     assert.deepEqual([...TIERS], ["quick", "standard", "high", "premium"]);
+});
+
+// ─── The module: settings, the key, and the published API ───────────────────
+
+const KEY = "tsk-module-test-key-0123456789";
+const ROUTER = Symbol.for("pi-pocket-team.model-router");
+
+/** The module on a fake host and web: the settings it reads, the values it hides, and the API it publishes. */
+function loadRouter(settings: Record<string, unknown>, allowed: string[], broken: string[] = []) {
+    const hidden: string[] = [];
+    const disposers: (() => void)[] = [];
+    const listeners: (() => void)[] = [];
+    const host = {
+        subagentModels: () => allowed,
+        resolveModel: (spec: string) => {
+            if (broken.includes(spec)) {
+                throw new Error(`${spec} is not signed in`);
+            }
+
+            return { provider: spec.split("/")[0], id: spec.split("/")[1] };
+        },
+        modelProblem: async () => undefined,
+        hide: ({ value }: { value: string }) => {
+            hidden.push(value);
+
+            return () => {
+                hidden.splice(hidden.indexOf(value), 1);
+            };
+        },
+    } as unknown as Host;
+    const web = {
+        settings: () => undefined,
+        setting: (name: string) => settings[name],
+        onSettings: (listener: () => void) => {
+            listeners.push(listener);
+
+            return () => undefined;
+        },
+        onDispose: (dispose: () => void) => {
+            disposers.push(dispose);
+        },
+    } as unknown as Web;
+
+    createModelRouter(host, web);
+
+    const api = (globalThis as unknown as Record<symbol, RouterApi | undefined>)[ROUTER]!;
+
+    return {
+        api,
+        hidden,
+        changed: () => listeners.forEach((listener) => listener()),
+        dispose: () => disposers.forEach((dispose) => dispose()),
+    };
+}
+
+/** Replace the global fetch for 1 test; the return value puts it back. */
+function stubFetch(answer: (url: string, init: RequestInit) => Promise<Response>) {
+    const calls: { url: string; init: RequestInit }[] = [];
+    const before = globalThis.fetch;
+
+    globalThis.fetch = (async (url: string, init: RequestInit) => {
+        calls.push({ url, init });
+
+        return answer(url, init);
+    }) as unknown as typeof fetch;
+
+    return { calls, restore: () => (globalThis.fetch = before) };
+}
+
+test("the module routes a masked brief in shadow mode, and hides its key", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "router-module-"));
+    const ssh = join(dir, "ssh-config");
+
+    await writeFile(ssh, "Host frostbox\n  HostName 10.0.0.9\n");
+    process.env.PI_POCKET_TEAM_SSH_CONFIG = ssh;
+    process.env.PI_POCKET_TEAM_ROUTER_CONFIG = join(dir, "missing.json");
+
+    const fetchStub = stubFetch(async () => new Response(JSON.stringify(ANSWER)));
+    const router = loadRouter({ mode: "shadow", typesafeApiKey: KEY }, [
+        "github-copilot/claude-sonnet-5.5",
+        "deepseek/deepseek-flash",
+    ]);
+
+    try {
+        assert.deepEqual(router.hidden, [KEY], "the key is hidden from Pi");
+
+        const route = await router.api.route({
+            brief: "Fix frostbox at https://frostbox.lan:8080/x and 192.168.1.4; mail me@example.com",
+            startAt: NOON,
+            profileModel: "github-copilot/claude-opus-5.5",
+        });
+
+        assert.equal(fetchStub.calls.length, 1);
+        assert.equal(fetchStub.calls[0].url, ENDPOINT);
+
+        const sent = String(fetchStub.calls[0].init.body);
+
+        assert.equal(sent.includes("frostbox"), false, "the SSH name is masked");
+        assert.equal(sent.includes("192.168"), false);
+        assert.equal(sent.includes("example.com"), false);
+        assert.equal(sent.includes(KEY), false, "the key goes in the header only");
+        assert.equal(route.status, "shadow");
+        assert.equal(route.tier, "high");
+        assert.equal(route.model, "github-copilot/claude-sonnet-5.5");
+        assert.equal(route.profileModel, "github-copilot/claude-opus-5.5");
+        assert.match(route.line, /shadow, not applied/);
+        assert.equal(JSON.stringify(route).includes(KEY), false);
+    } finally {
+        fetchStub.restore();
+        router.dispose();
+        delete process.env.PI_POCKET_TEAM_SSH_CONFIG;
+        delete process.env.PI_POCKET_TEAM_ROUTER_CONFIG;
+        await rm(dir, { recursive: true, force: true });
+    }
+
+    assert.equal(router.hidden.length, 0, "dispose stops the hiding");
+    assert.equal((globalThis as unknown as Record<symbol, unknown>)[ROUTER], undefined);
+});
+
+test("the module calls nothing when its mode is off or it has no key, and a failure is a record", async () => {
+    const fetchStub = stubFetch(async () => new Response("{}", { status: 500 }));
+
+    try {
+        const off = loadRouter({ mode: "off", typesafeApiKey: KEY }, ["deepseek/deepseek-flash"]);
+
+        assert.equal((await off.api.route({ brief: "x", startAt: NOON })).status, "off");
+        off.dispose();
+
+        const keyless = loadRouter({ mode: "shadow" }, ["deepseek/deepseek-flash"]);
+        const none = await keyless.api.route({ brief: "x", startAt: NOON });
+
+        assert.equal(none.status, "failed");
+        assert.equal(none.reason, "no TypeSafe key set");
+        keyless.dispose();
+        assert.equal(fetchStub.calls.length, 0, "no call without a key or with the mode off");
+
+        const failing = loadRouter({ mode: "shadow", typesafeApiKey: KEY }, [
+            "deepseek/deepseek-flash",
+        ]);
+        const failed = await failing.api.route({ brief: "x", startAt: NOON });
+
+        assert.equal(failed.status, "failed");
+        assert.match(failed.reason, /500/);
+        assert.equal(failed.model, undefined);
+        failing.dispose();
+    } finally {
+        fetchStub.restore();
+    }
+});
+
+test("the module skips a model it cannot resolve, and a named worker needs no call", async () => {
+    const fetchStub = stubFetch(async () => new Response(JSON.stringify(ANSWER)));
+    const router = loadRouter(
+        { mode: "shadow", typesafeApiKey: KEY },
+        ["github-copilot/claude-sonnet-5.5", "github-copilot/gpt-6.1-sol"],
+        ["github-copilot/claude-sonnet-5.5"],
+    );
+
+    try {
+        const route = await router.api.route({ brief: "x", startAt: NOON });
+
+        assert.equal(route.model, "github-copilot/gpt-6.1-sol");
+
+        const named = router.api.explicit({ worker: "github-copilot/claude-sonnet-5.5" });
+
+        assert.equal(named.status, "explicit");
+        assert.equal(fetchStub.calls.length, 1, "explicit makes no call");
+    } finally {
+        fetchStub.restore();
+        router.dispose();
+    }
 });

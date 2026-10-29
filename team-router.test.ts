@@ -348,7 +348,7 @@ describe("a delegated night shift and the model router", () => {
         }
     });
 
-    test("a router that throws records nothing, and the delegation goes on", async () => {
+    test("a router that throws records a failed route, and the delegation goes on", async () => {
         const router = fakeRouter("throw");
 
         try {
@@ -360,8 +360,16 @@ describe("a delegated night shift and the model router", () => {
             await until(async () => (await goalOf(linked)) !== undefined, "the goal", 20_000);
 
             assert.equal(router.calls.length, 1);
-            assert.equal((await threadOf(linked))?.route, undefined);
-            assert.doesNotMatch((await modelTexts(app, source)).join("\n"), /Route:/);
+
+            const route = (await threadOf(linked))?.route;
+
+            assert.equal(route?.status, "failed");
+            assert.equal(route?.reason, "the router failed");
+            assert.equal(route?.model, undefined, "a failed route suggests no model");
+            assert.match(
+                (await modelTexts(app, source)).join("\n"),
+                /Route: failed \(the router failed\); no worker named, nothing changes/,
+            );
         } finally {
             router.remove();
         }
@@ -377,7 +385,7 @@ describe("a delegated night shift and the model router", () => {
             await until(async () => (await goalOf(linked)) !== undefined, "the goal", 20_000);
 
             assert.equal(router.calls.length, 1);
-            assert.equal((await threadOf(linked))?.route, undefined);
+            assert.equal((await threadOf(linked))?.route?.reason, "the router took more than 4 s");
             assert.equal(Date.now() - started >= 4000, true, "the guard waited about 4 s");
         } finally {
             router.remove();

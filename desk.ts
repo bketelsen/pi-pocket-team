@@ -225,7 +225,7 @@ export type ThreadRoute = {
     /** The model the router would pick for the worker. */
     model?: string;
     thinking?: string;
-    /** The night-shift worker's model when the router ran. */
+    /** The agent's profile model: the model of the session itself, which the router never changes. */
     profileModel?: string;
     /** The model the supervisor named, for an `explicit` route. */
     worker?: string;

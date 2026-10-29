@@ -347,7 +347,7 @@ A supervisor identity (Odrade) can start a night shift in the linked session tha
 
 # Model router (shadow)
 
-A delegated night shift can get a **suggestion** of the model that would suit its brief. The router sends the brief to TypeSafe Jev, which judges the work, and it records the tier and the model it would pick. It is a record: nothing else changes. It needs Pi Pocket v0.22.0 or later for its settings.
+A delegated night shift can get a **suggestion** of the model that would suit its brief. The router sends the brief to TypeSafe Jev, which judges the work, and it records the tier and the model it would pick. It is a record: nothing else changes. It needs Pi Pocket v0.22.0 or later for its settings. Like every new module, it starts off: Brian turns it on in **Menu → Extensions**. Without it, `team_delegate` works as before and records no route.
 
 Brian's 3 rules, which the code keeps:
 
@@ -364,7 +364,7 @@ Brian's 3 rules, which the code keeps:
 
 ## What is sent
 
-One POST to `https://api.typesafe.ai/v1/systemone` (fixed in the code: there is no environment override, because a variable could send the key elsewhere), with `Authorization: Bearer <key>`, the masked brief as `state.request`, the model alias `jev-latest`, and 4 questions. No folder, no history, no spend, and no environment. The timeout is 3.5 s in total, there is no retry, and a failure never holds a delegation: `team.ts` gives the router 4 s, then goes on with no route.
+One POST to `https://api.typesafe.ai/v1/systemone` (fixed in the code: there is no environment override, because a variable could send the key elsewhere), with `Authorization: Bearer <key>`, the masked brief as `state.request`, the model alias `jev-latest`, and 4 questions. No folder, no history, no spend, and no environment. The timeout is 3.5 s in total, there is no retry, and a failure never holds a delegation: `team.ts` gives the router 4 s, then records a `failed` route and goes on.
 
 ## Tiers
 

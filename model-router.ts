@@ -624,7 +624,7 @@ export type Route = {
     /** The model the router would pick for the worker. */
     model?: string;
     thinking?: string;
-    /** The night-shift worker's model when the router ran. */
+    /** The agent's profile model: the model of the session itself, which the router never changes. */
     profileModel?: string;
     /** The model the supervisor named, for an `explicit` route. */
     worker?: string;
@@ -818,6 +818,10 @@ export default function createModelRouter(host: Host, web: Web) {
             // The owner's list and the tiers file are read while Jev answers: the whole route stays near the timeout.
             const models = usableModels(host);
             const tiersFile = readTiers(tiersPath());
+
+            // Jev can fail first: these 2 are then never awaited, and must not reject unhandled.
+            models.catch(() => undefined);
+            tiersFile.catch(() => undefined);
             const masked = maskBrief(request.brief, await sshNames());
             const analysis = await classify(masked, key);
             const [{ allowed, unusable }, { tiers, notes }] = await Promise.all([
