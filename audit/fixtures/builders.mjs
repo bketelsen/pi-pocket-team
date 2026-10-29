@@ -21,6 +21,8 @@ export function emptyData(over = {}) {
         toolErrors: [],
         costRows: [],
         spawns: [],
+        routeCosts: [],
+        routeSpawns: [],
         installed: { "desk.ts": null, "team.ts": null, "night-shift.ts": null },
         odrade: { readme: "", reports: [], dirty: [], lastCommitAt: NOW - HOUR },
         homes: [],

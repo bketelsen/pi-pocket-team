@@ -375,6 +375,18 @@ const metricLines = (metrics, github) => {
         );
     }
 
+    if (metrics.R1?.routes > 0) {
+        const cells = metrics.R1.cells
+            .slice(0, 5)
+            .map(
+                (cell) =>
+                    `${cell.kind}/${cell.tier} ${cell.model} (used ${cell.used}): ${cell.count}, success ${cell.success} of ${cell.count}${cell.successRate === null ? "" : `, rate ${Math.round(cell.successRate * 100)}%`}`,
+            )
+            .join("; ");
+
+        lines.push(`- Routes: ${metrics.R1.routes} recorded. ${cells}.`);
+    }
+
     lines.push(
         `- GitHub calls: ${github.calls}${github.capReached ? " (GitHub call cap reached)" : ""}.`,
     );

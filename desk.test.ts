@@ -48,6 +48,7 @@ import {
     openThread,
     parseSeed,
     readText,
+    routeThread,
     threadView,
     threadsView,
     threadWord,
@@ -335,6 +336,50 @@ describe("threads", () => {
         bindThread(state, "open", { session: 7, address: "session-abc", at: 3 });
         assert.equal(failThread(state, "open", "too late", 4), undefined);
         assert.equal(state.threads.T2?.state, "open");
+    });
+
+    test("route records the router's suggestion once, with 1 event", () => {
+        const state = empty();
+
+        open(state, "k");
+
+        const route = {
+            mode: "shadow" as const,
+            status: "shadow" as const,
+            kind: "implement",
+            kindConfidence: 0.82,
+            complexity: 1.8,
+            capability: 1.9,
+            deepReasoning: 0.4,
+            demand: 1.9,
+            tier: "high",
+            model: "github-copilot/claude-sonnet-5.5",
+            thinking: "medium",
+            profileModel: "github-copilot/claude-opus-5.5",
+            reason: "shadow: recorded only",
+            at: 5,
+            line: "Route: implement (kind 0.82), complexity 1.8/3, demand 1.9 → high: sonnet\nthinking medium (shadow, not applied)",
+        };
+
+        const first = routeThread(state, "k", route);
+
+        assert.equal(first?.route?.status, "shadow");
+        assert.equal(first?.route?.model, "github-copilot/claude-sonnet-5.5");
+        assert.equal(first?.events.filter((event) => event.key === "route").length, 1);
+        assert.match(first?.events.at(-1)?.text ?? "", /^Route: implement/);
+        assert.equal(first?.events.at(-1)?.text.includes("\n"), false, "1 line");
+        assert.equal(first?.events.at(-1)?.at, 5);
+        assert.notEqual(first?.route, route, "a copy");
+
+        const again = routeThread(state, "k", {
+            ...route,
+            status: "explicit",
+            line: "Route: other",
+        });
+
+        assert.equal(again?.route?.status, "shadow", "a second call changes nothing");
+        assert.equal(again?.events.filter((event) => event.key === "route").length, 1);
+        assert.equal(routeThread(state, "nobody", route), undefined);
     });
 
     test("fail keeps a starting thread that has an open ask, and says why it did not start", () => {

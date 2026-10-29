@@ -409,28 +409,62 @@ function loadToolErrors(db, since) {
         });
 }
 
+const COST_SQL = `select conversation_id c, ${ts} at, json_extract(record,'$.model[0].usage.cost.total') cost
+             from entries where json_extract(record,'$.kind')='pi.assistant' and `;
+
 /** The model cost of assistant entries, from `since` on. */
 function loadCosts(db, since) {
     return db
-        .prepare(
-            `select conversation_id c, ${ts} at, json_extract(record,'$.model[0].usage.cost.total') cost
-             from entries where json_extract(record,'$.kind')='pi.assistant' and ${ts} >= ?`,
-        )
+        .prepare(`${COST_SQL}${ts} >= ?`)
         .all(since)
         .filter((row) => row.cost)
         .map((row) => ({ c: row.c, at: row.at, cost: row.cost }));
 }
 
+/**
+ * The cost rows of some sessions, with no time limit: R1 compares a routed thread for its whole life, and the 8-day
+ * horizon of `loadCosts` would hide an older session's spend.
+ */
+function loadRouteCosts(db, sessions) {
+    const ids = [...sessions];
+
+    if (ids.length === 0) {
+        return [];
+    }
+
+    return db
+        .prepare(`${COST_SQL}conversation_id in (${ids.map(() => "?").join(",")})`)
+        .all(...ids)
+        .filter((row) => row.cost)
+        .map((row) => ({ c: row.c, at: row.at, cost: row.cost }));
+}
+
+const SPAWN_SQL = `select id, conversation_id c, record from entries where json_extract(record,'$.kind')='pi.assistant'
+             and `;
+
 /** `subagent` spawn calls: the model each one named (null when it named none), its name, its tools and the start of its brief. */
 function loadSpawns(db, since) {
+    return spawnRows(db, `${ts} >= ?`, [since]);
+}
+
+/** The spawn calls of some sessions, with no time limit: the same rows as `loadSpawns`, for R1's routed threads. */
+function loadRouteSpawns(db, sessions) {
+    const ids = [...sessions];
+
+    if (ids.length === 0) {
+        return [];
+    }
+
+    return spawnRows(db, `conversation_id in (${ids.map(() => "?").join(",")})`, ids);
+}
+
+/** The `subagent` spawn calls that `where` selects, as `loadSpawns` gives them. */
+function spawnRows(db, where, params) {
     const out = [];
 
     for (const row of db
-        .prepare(
-            `select id, conversation_id c, record from entries where json_extract(record,'$.kind')='pi.assistant'
-             and ${ts} >= ? and record like '%"name":"subagent"%'`,
-        )
-        .all(since)) {
+        .prepare(`${SPAWN_SQL}${where} and record like '%"name":"subagent"%'`)
+        .all(...params)) {
         const entry = parseEntry(row);
 
         for (const part of entry.model[0].content ?? []) {
@@ -761,6 +795,8 @@ export function loadData({
         toolErrors: [],
         costRows: [],
         spawns: [],
+        routeCosts: [],
+        routeSpawns: [],
         installed: installedTimes(pocketDir),
         odrade: undefined,
         homes: [],
@@ -783,13 +819,32 @@ export function loadData({
     } catch (error) {
         const message = String(error?.message ?? error).split("\n")[0];
 
-        for (const name of ["desk", "reports", "goals", "schedules", "entries", "costs"]) {
+        for (const name of [
+            "desk",
+            "reports",
+            "goals",
+            "schedules",
+            "entries",
+            "costs",
+            "routes",
+        ]) {
             sourceErrors[name] = message;
         }
     }
 
     if (db) {
         attempt("desk", () => Object.assign(data, loadDesk(db)));
+        // R1's own read, after the desk: every routed thread's session, with no time limit (see `checkR1`).
+        attempt("routes", () => {
+            const sessions = new Set(
+                Object.values(data.threads)
+                    .filter((thread) => thread.route !== undefined && thread.session !== undefined)
+                    .map((thread) => thread.session),
+            );
+
+            data.routeCosts = loadRouteCosts(db, sessions);
+            data.routeSpawns = loadRouteSpawns(db, sessions);
+        });
         attempt("reports", () => (data.reports = loadReports(db)));
         attempt("goals", () => (data.goals = loadGoals(db)));
         attempt("schedules", () => (data.schedules = loadSchedules(db)));

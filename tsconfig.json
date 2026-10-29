@@ -9,5 +9,12 @@
         "allowImportingTsExtensions": true,
         "types": ["node"]
     },
-    "files": ["team.ts", "homewiki.ts", "night-shift.ts", "desk.ts", "terminal.ts"]
+    "files": [
+        "team.ts",
+        "homewiki.ts",
+        "night-shift.ts",
+        "model-router.ts",
+        "desk.ts",
+        "terminal.ts"
+    ]
 }

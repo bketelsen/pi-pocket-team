@@ -1683,6 +1683,173 @@ export function checkJ1(data, ctx) {
     };
 }
 
+// ---------- R. Model routing (shadow) ----------
+
+/** The model that really ran a thread's work: the night-shift goal's worker, else its most common subagent model. */
+function usedModel(data, thread) {
+    const worker = (data.goals ?? [])
+        .filter((item) => item.session === thread.session)
+        .map((item) => item.goal?.worker)
+        .find((each) => typeof each === "string" && each !== "");
+
+    if (worker !== undefined) {
+        return worker;
+    }
+
+    const counts = {};
+
+    // `routeSpawns`: every spawn of the routed threads' sessions, with no time limit.
+    for (const spawn of data.routeSpawns ?? []) {
+        if (spawn.c !== thread.session) {
+            continue;
+        }
+
+        if (typeof spawn.model !== "string" || spawn.model === "") {
+            continue;
+        }
+
+        // A cross-review reviewer runs on another model family by design: it is not the worker.
+        if (isCrossReviewSpawn(spawn)) {
+            continue;
+        }
+
+        bump(counts, spawn.model);
+    }
+
+    const best = Object.entries(counts).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))[0];
+
+    return best === undefined ? "-" : best[0];
+}
+
+/** The night-shift goal of a thread's session, when it has one. */
+const goalOfThread = (data, thread) =>
+    (data.goals ?? []).find((item) => item.session === thread.session)?.goal;
+
+/**
+ * R1: the model router's shadow records, joined to what happened. Each cell is 1 (kind, suggested tier, suggested
+ * model, status, model used): how many threads, how many are open, how many closed as done, how many did not, the
+ * goals' statuses, the rounds and the cost, and the reopenings. It makes no finding: in shadow mode the table compares
+ * the suggestion with what really ran. A rate shows only for 10 threads or more, and no time window applies: a record
+ * is compared for as long as it is there.
+ */
+export function checkR1(data, ctx) {
+    const cells = new Map();
+    let routes = 0;
+
+    for (const thread of Object.values(data.threads ?? {})) {
+        const route = thread.route;
+
+        if (!route || typeof route !== "object") {
+            continue;
+        }
+
+        routes += 1;
+        const used = usedModel(data, thread);
+        const key = [
+            route.kind ?? "-",
+            route.tier ?? "-",
+            route.model ?? "-",
+            route.status ?? "-",
+            used,
+        ].join("\u0000");
+        const cell = cells.get(key) ?? {
+            kind: route.kind ?? "-",
+            tier: route.tier ?? "-",
+            model: route.model ?? "-",
+            status: route.status ?? "-",
+            used,
+            count: 0,
+            open: 0,
+            success: 0,
+            notSuccess: 0,
+            goals: {},
+            rounds: [],
+            costs: [],
+            reopenings: 0,
+        };
+
+        cells.set(key, cell);
+        cell.count += 1;
+
+        const closed = thread.closed;
+
+        if (closed === undefined) {
+            cell.open += 1;
+        } else if (
+            closed.why === "done" &&
+            (closed.outcome === undefined ||
+                closed.outcome === "completed" ||
+                closed.outcome === "verified")
+        ) {
+            cell.success += 1;
+        } else if (
+            closed.why === "dropped" ||
+            closed.why === "failed" ||
+            closed.outcome === "abandoned"
+        ) {
+            cell.notSuccess += 1;
+        }
+
+        const goal = goalOfThread(data, thread);
+
+        if (goal !== undefined) {
+            bump(
+                cell.goals,
+                goal.status === undefined
+                    ? "-"
+                    : `${goal.status}${goal.reason ? `: ${goal.reason}` : ""}`,
+            );
+
+            if (typeof goal.round === "number") {
+                cell.rounds.push(goal.round);
+            }
+        }
+
+        if (thread.session !== undefined) {
+            // `routeCosts`: the same rows as `costRows`, for this session, with no time limit.
+            const rows = (data.routeCosts ?? []).filter((row) => row.c === thread.session);
+
+            if (rows.length > 0) {
+                cell.costs.push(rows.reduce((sum, row) => sum + row.cost, 0));
+            }
+        }
+
+        cell.reopenings += (eventsByThread(data).get(thread.id) ?? []).filter((event) =>
+            String(event.key).startsWith("reopened"),
+        ).length;
+    }
+
+    const list = [...cells.values()]
+        .map((cell) => ({
+            kind: cell.kind,
+            tier: cell.tier,
+            model: cell.model,
+            status: cell.status,
+            used: cell.used,
+            count: cell.count,
+            open: cell.open,
+            success: cell.success,
+            notSuccess: cell.notSuccess,
+            successRate:
+                cell.count >= 10 ? Math.round((cell.success / cell.count) * 100) / 100 : null,
+            goals: cell.goals,
+            medianRounds: cell.rounds.length === 0 ? null : median(cell.rounds),
+            medianCost: cell.costs.length === 0 ? null : dollars(median(cell.costs)),
+            reopenings: cell.reopenings,
+        }))
+        .sort(
+            (a, b) =>
+                b.count - a.count ||
+                a.kind.localeCompare(b.kind) ||
+                a.tier.localeCompare(b.tier) ||
+                a.model.localeCompare(b.model) ||
+                a.status.localeCompare(b.status) ||
+                a.used.localeCompare(b.used),
+        );
+
+    return { findings: [], metrics: { routes, cells: list } };
+}
+
 // ---------- The registry ----------
 
 /** Each check, with the sources it needs. A source that is in `data.sourceErrors` skips the check. */
@@ -1712,6 +1879,7 @@ export const CHECKS = [
     ["I2", checkI2, ["odrade"]],
     ["I3", checkI3, ["homes"]],
     ["J1", checkJ1, ["desk", "costs"]],
+    ["R1", checkR1, ["desk", "goals", "routes"]],
 ];
 
 /**

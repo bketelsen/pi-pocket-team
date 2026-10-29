@@ -234,6 +234,55 @@ test("loadData reads every source into one plain object", () => {
     assert.deepEqual(data.githubCalls, { calls: 0, capReached: false });
 });
 
+test("the routes source reads a routed thread's session with no time limit", () => {
+    const { pocketDir, odradeDir, homesDir, run } = setup();
+    const data = loadData({
+        pocketDir,
+        odradeDir,
+        homesDir,
+        now: NOW,
+        hours: 24,
+        useGithub: false,
+        run,
+    });
+
+    // T1 carries the router's record, and its session is 11.
+    assert.equal(data.threads.T1.route.kind, "implement");
+
+    // The 8-day window leaves the 20-day-old row out; R1's own read keeps it, and takes no other session.
+    assert.deepEqual(
+        data.costRows
+            .map((row: { cost: number }) => row.cost)
+            .sort((a: number, b: number) => a - b),
+        [0.75, 1.25, 2],
+    );
+    assert.deepEqual(
+        data.routeCosts
+            .map((row: { c: number; cost: number }) => [row.c, row.cost])
+            .sort((a: number[], b: number[]) => a[1]! - b[1]!),
+        [
+            [SESSION_T1, 0.5],
+            [SESSION_T1, 0.75],
+            [SESSION_T1, 1.25],
+        ],
+    );
+    // The supervisor's spend is not a routed thread's: it is not here.
+    assert.ok(data.routeCosts.every((row: { c: number }) => row.c === SESSION_T1));
+
+    assert.deepEqual(
+        data.spawns.map((spawn: { c: number; model: string }) => [spawn.c, spawn.model]),
+        [
+            [SUPERVISOR, "other/model"],
+            [SUPERVISOR, "other/model"],
+        ],
+    );
+    assert.deepEqual(
+        data.routeSpawns.map((spawn: { c: number; model: string }) => [spawn.c, spawn.model]),
+        [[SESSION_T1, "old/model"]],
+        "the spawn from 20 days back is loaded",
+    );
+});
+
 test("loadData reads the install time of a live module", () => {
     const { pocketDir, odradeDir, homesDir, run } = setup();
 

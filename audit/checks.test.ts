@@ -31,6 +31,7 @@ import {
     checkI2,
     checkI3,
     checkJ1,
+    checkR1,
     inDeepseekPeak,
     makeFinding,
     runChecks,
@@ -1579,6 +1580,210 @@ test("J1: waste above $5 (empty reopens and queue continues) is a finding; $5 is
     assert.deepEqual(ids(checkJ1(reopen(5), ctx)), []);
 });
 
+// ---------- R. Model routing (shadow) ----------
+
+/** A thread that carries the model router's shadow record. */
+const routed = (id: string, route = {}, over = {}) =>
+    thread(id, {
+        route: {
+            mode: "shadow",
+            status: "shadow",
+            kind: "implement",
+            kindConfidence: 0.82,
+            complexity: 1.8,
+            capability: 1.9,
+            deepReasoning: 0.4,
+            demand: 1.9,
+            tier: "high",
+            model: "github-copilot/claude-sonnet-5.5",
+            thinking: "medium",
+            reason: "shadow: recorded only",
+            at: NOW - 2 * DAY,
+            line: "Route: implement (kind 0.82), complexity 1.8/3, demand 1.9",
+            ...route,
+        },
+        ...over,
+    });
+
+/** A closed thread, as the desk stores it. */
+const closed = (why: string, outcome?: string) => ({
+    state: "closed",
+    closed: { at: NOW - HOUR, why, by: "sweep", ...(outcome === undefined ? {} : { outcome }) },
+});
+
+/** A `subagent` spawn call of a session, as the audit's source gives it. */
+const spawn = (over = {}) => ({
+    id: "entry-1",
+    c: 101,
+    at: NOW - HOUR,
+    model: "deepseek/deepseek-flash",
+    name: "Worker",
+    tools: ["read", "bash", "edit"],
+    review: false,
+    brief: "Fix the failing test",
+    ...over,
+});
+
+test("R1: threads group by kind, tier, model, status and the model used, and the sort is by count", () => {
+    const data = emptyData({
+        threads: threadMap(
+            routed("T1", {}, closed("done", "completed")),
+            routed("T2", {}, closed("done", "verified")),
+            routed("T3", { kind: "plan", model: "github-copilot/claude-opus-5.5" }),
+        ),
+    });
+    const result = checkR1(data, ctx);
+
+    assert.deepEqual(result.findings, [], "no finding: it is a table");
+    assert.equal(result.metrics.routes, 3);
+    assert.deepEqual(
+        result.metrics.cells.map((cell) => [cell.kind, cell.tier, cell.model, cell.count]),
+        [
+            ["implement", "high", "github-copilot/claude-sonnet-5.5", 2],
+            ["plan", "high", "github-copilot/claude-opus-5.5", 1],
+        ],
+        "the bigger cell first",
+    );
+
+    const implement = result.metrics.cells[0]!;
+
+    assert.equal(implement.open, 0);
+    assert.equal(implement.success, 2, "done + completed, and done + verified");
+    assert.equal(implement.notSuccess, 0);
+    assert.equal(result.metrics.cells[1]!.open, 1, "a thread that is not closed is open");
+
+    const mark = (outcome: string) =>
+        checkR1(
+            emptyData({
+                threads: threadMap(
+                    routed("T1", {}, closed("done", outcome)),
+                    routed("T2", {}, closed("dropped")),
+                    routed("T3", {}, closed("failed")),
+                    routed("T4", {}, closed("done", "verified")),
+                ),
+            }),
+            ctx,
+        ).metrics.cells[0]!;
+
+    assert.equal(mark("completed").success, 2);
+    assert.equal(mark("completed").notSuccess, 2, "dropped and failed");
+    assert.equal(mark("abandoned").success, 1, "T4's verified watch is the only success");
+    assert.equal(mark("abandoned").notSuccess, 3, "done + abandoned, dropped, and failed");
+
+    // `done` with no outcome counts as a success too.
+    const plain = checkR1(emptyData({ threads: threadMap(routed("T1", {}, closed("done"))) }), ctx)
+        .metrics.cells[0]!;
+
+    assert.equal(plain.success, 1);
+    assert.equal(plain.notSuccess, 0);
+});
+
+test("R1: a success rate needs 10 threads in the cell", () => {
+    const cell = (count: number, wins: number) =>
+        checkR1(
+            emptyData({
+                threads: threadMap(
+                    ...Array.from({ length: count }, (_, index) =>
+                        routed(
+                            `T${index + 1}`,
+                            {},
+                            closed(
+                                index < wins ? "done" : "dropped",
+                                index < wins ? "completed" : undefined,
+                            ),
+                        ),
+                    ),
+                ),
+            }),
+            ctx,
+        ).metrics.cells[0]!;
+
+    assert.equal(cell(9, 9).successRate, null, "9 threads give no rate");
+    assert.equal(cell(9, 9).success, 9);
+
+    const ten = cell(10, 7);
+
+    assert.equal(ten.count, 10);
+    assert.equal(ten.success, 7);
+    assert.equal(ten.successRate, 0.7);
+});
+
+test("R1: the model used is the goal's worker, else the most common spawn model", () => {
+    const data = emptyData({
+        threads: threadMap(
+            routed("T1"),
+            routed("T2", { kind: "debug" }),
+            routed("T3", { kind: "plan" }),
+        ),
+        goals: [
+            {
+                session: 101,
+                goal: { status: "ended", reason: "done", worker: "acme/named", round: 1 },
+            },
+        ],
+        routeSpawns: [
+            spawn({ c: 102, model: "acme/ran" }),
+            spawn({ c: 102, model: "acme/ran" }),
+            spawn({ c: 102, model: "acme/other" }),
+            // A cross-review reviewer runs on another model family by design: it is not the worker.
+            spawn({
+                c: 102,
+                model: "acme/reviewer",
+                tools: ["read", "bash"],
+                name: "cross-review",
+            }),
+        ],
+    });
+    const used = (kind: string) =>
+        checkR1(data, ctx).metrics.cells.find((cell) => cell.kind === kind)!.used;
+
+    assert.equal(used("implement"), "acme/named", "the goal's worker wins");
+    assert.equal(used("debug"), "acme/ran", "else the most common spawn model");
+    assert.equal(used("plan"), "-", "with nothing to go on");
+});
+
+test("R1: the rounds, the cost and the reopenings of a cell", () => {
+    const data = emptyData({
+        threads: threadMap(
+            routed("T1", {}, closed("done", "completed")),
+            routed("T2", {}, closed("done", "verified")),
+        ),
+        goals: [
+            { session: 101, goal: { status: "ended", reason: "done", round: 3 } },
+            { session: 102, goal: { status: "ended", reason: "blocked", round: 5 } },
+        ],
+        routeCosts: [
+            { c: 101, at: NOW - 3 * HOUR, cost: 1 },
+            { c: 101, at: NOW - 2 * HOUR, cost: 1 },
+            { c: 102, at: NOW - 2 * HOUR, cost: 4 },
+        ],
+        events: [
+            event("T1", ago(4 * HOUR), "reopened:1", "reopened: its session is busy"),
+            event("T1", ago(3 * HOUR), "reopened:2", "reopened: new work in its session"),
+            event("T1", ago(2 * HOUR), "bound", "session 101 bound"),
+        ],
+    });
+    const cell = checkR1(data, ctx).metrics.cells[0]!;
+
+    assert.equal(cell.medianRounds, 4, "3 and 5");
+    assert.equal(cell.medianCost, 3, "2 and 4");
+    assert.equal(cell.reopenings, 2, "the `bound` event is not a reopening");
+    assert.deepEqual(cell.goals, { "ended: done": 1, "ended: blocked": 1 });
+});
+
+test("R1: a thread with no route is not counted", () => {
+    const data = emptyData({
+        threads: threadMap(routed("T1"), thread("T2"), thread("T3", { route: undefined })),
+    });
+    const result = checkR1(data, ctx);
+
+    assert.equal(result.metrics.routes, 1);
+    assert.equal(result.metrics.cells.length, 1);
+    assert.equal(result.metrics.cells[0]!.count, 1);
+
+    assert.deepEqual(checkR1(emptyData(), ctx).metrics, { routes: 0, cells: [] });
+});
+
 // ---------- Findings and the run ----------
 
 test("makeFinding: the id is stable, a secret in the text is dropped, a secret in evidence is dropped", () => {
@@ -1603,7 +1808,12 @@ test("runChecks: every check has an entry, and a missing source skips its checks
     const data = emptyData({ sourceErrors: { github: "disabled by --no-github" } });
     const result = runChecks(data, ctx);
 
-    assert.equal(CHECKS.length, 25);
+    assert.equal(CHECKS.length, 26);
+    // R1 reads the router's records on the desk threads, and the goals beside them.
+    assert.deepEqual(
+        CHECKS.find(([id]) => id === "R1"),
+        ["R1", checkR1, ["desk", "goals", "routes"]],
+    );
     // I3 sits beside I2 and reads the homes source.
     assert.deepEqual(
         CHECKS.find(([id]) => id === "I3"),
@@ -1621,6 +1831,7 @@ test("runChecks: every check has an entry, and a missing source skips its checks
     assert.match(result.skipped.B1!, /source unavailable: github: disabled/);
     assert.ok(result.metrics.A1);
     assert.ok(result.metrics.J1);
+    assert.deepEqual(result.metrics.R1, { routes: 0, cells: [] });
 });
 
 test("runChecks: a check that throws is skipped and the run goes on", () => {

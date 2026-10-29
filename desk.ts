@@ -208,6 +208,37 @@ export type Watch = {
  */
 export type CloseOutcome = "completed" | "abandoned" | "verified" | "frozen";
 
+/**
+ * The model router's record of one delegation, as `model-router.ts` publishes it (its `Route`). This module does not
+ * import that one: a copy of the shape, and nothing else. Stored data: never rename a field or change what one means.
+ */
+export type ThreadRoute = {
+    mode: "off" | "shadow";
+    status: "shadow" | "explicit" | "failed" | "off";
+    kind?: string;
+    kindConfidence?: number;
+    complexity?: number;
+    capability?: number;
+    deepReasoning?: number;
+    demand?: number;
+    tier?: string;
+    /** The model the router would pick for the worker. */
+    model?: string;
+    thinking?: string;
+    /** The agent's profile model: the model of the session itself, which the router never changes. */
+    profileModel?: string;
+    /** The model the supervisor named, for an `explicit` route. */
+    worker?: string;
+    jevModel?: string;
+    jevId?: string;
+    latencyMs?: number;
+    reason: string;
+    notes?: string[];
+    at: number;
+    /** The 1 line that went to the supervisor and to the thread's events. */
+    line: string;
+};
+
 /** One piece of work the team runs. Stored data: never rename a field or change what it means. */
 export type Thread = {
     /** "T13" for a delegated, seeded, or asked thread; "F2" for a found one. */
@@ -253,6 +284,11 @@ export type Thread = {
     watch?: Watch;
     /** Ask ids "T13a", "T13b", ... */
     asks: Ask[];
+    /**
+     * The model router's suggestion for this delegation, when a router recorded one. Stored data: never rename a field,
+     * and never change what one means. It is a record only: it never changed a model.
+     */
+    route?: ThreadRoute;
     /**
      * Facts the sweep keeps: `returnAddress`, `reportedAt`, `reportedUserEntry`, `scanCursor`, `lastUserEntry`,
      * `seenPrs`, `busy`, `archived`, `repoArchived` (its repository is archived, as the last read saw it), `shift`, `dirty`, `ahead`, `aheadUnknown` (why the unpushed count is unknown: it
@@ -884,6 +920,23 @@ export function bindThread(
         thread.state = "open";
         addEvent(thread, "bound", `session ${String(binding.session)} bound`, binding.at);
     }
+
+    return thread;
+}
+
+/**
+ * Record the model router's suggestion on the thread `key` made: once. A replay changes nothing, and the event says
+ * what the router would pick. Nothing here changes a model: the record is a suggestion only.
+ */
+export function routeThread(state: DeskState, key: string, route: ThreadRoute): Thread | undefined {
+    const thread = findThread(state, key);
+
+    if (thread === undefined || thread.route !== undefined) {
+        return thread;
+    }
+
+    thread.route = { ...route };
+    addEvent(thread, "route", oneLine(route.line), route.at);
 
     return thread;
 }
@@ -9640,6 +9693,8 @@ export type DeskApi = {
     open: (tx: Tx, request: OpenRequest) => Promise<{ thread: Thread; reused: boolean }>;
     bind: (tx: Tx, key: string, binding: BindRequest) => Promise<Thread | undefined>;
     fail: (tx: Tx, key: string, why: string, at: number) => Promise<void>;
+    /** Record the model router's suggestion, once: a replay changes nothing. */
+    route: (tx: Tx, key: string, route: ThreadRoute) => Promise<void>;
     file: (
         tx: Tx,
         session: ConversationId,
@@ -9652,9 +9707,9 @@ export type DeskApi = {
     /** The asks of a report's `ASKS FOR BRIAN:` block (`reportAsksOf`): Night shift files them with its report. */
     asks: (text: string) => { question: string; options?: string[] }[] | undefined;
     /**
-     * Tell the desk page that the desk changed. `open`, `bind`, `fail`, `file` and `clerk` write inside the caller's
-     * commit, so the desk cannot send after it: the caller calls this once its commit returned, never inside it.
-     * Optional: a desk module from before it has no such method, and a caller then skips the call.
+     * Tell the desk page that the desk changed. `open`, `bind`, `fail`, `route`, `file` and `clerk` write inside the
+     * caller's commit, so the desk cannot send after it: the caller calls this once its commit returned, never inside
+     * it. Optional: a desk module from before it has no such method, and a caller then skips the call.
      */
     changed?: () => void;
     /** The supervisor conversations the desk binds threads to (`boundSupervisors`), newest desk event first: no write. */
@@ -10304,6 +10359,9 @@ export default function createDesk(host: Host, web: Web) {
             await addressOf(tx, thread, binding.session as ConversationId);
 
             return copyThread(thread);
+        },
+        route: async (tx, key, route) => {
+            routeThread(await tx.doc(DeskThreads), key, route);
         },
         fail: async (tx, key, why, at) => {
             const state = await tx.doc(DeskThreads);
