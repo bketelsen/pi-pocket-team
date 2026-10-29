@@ -128,6 +128,7 @@ import {
     quietWake,
     quietTrigger,
     quietWatched,
+    readyWatched,
     quietReopens,
     workedFolders,
     QUIET_WATCH_MS,
@@ -188,7 +189,7 @@ import {
     mergeQueue,
     mergeAskFor,
     mergeAskNames,
-    mergeOnlyAsk,
+    plainMergeAsk,
     readyPrs,
     ownersOfRepos,
     parseIssueFacts,
@@ -3010,6 +3011,59 @@ describe("a handled report and a quiet wake", () => {
         assert.equal(quietWatched(undefined, 5, 2000), false, "no desk");
     });
 
+    test("readyWatched keeps a sweeper while a closed thread has an open ready PR", () => {
+        const ready = (prs: Thread["prs"], patch: Partial<Thread> = {}): DeskState => ({
+            ...empty(),
+            threads: { T1: done({}, { supervisor: 5, prs, ...patch }) },
+        });
+        const open = { "frostyard/test#7": { via: "seen" as const, state: "OPEN" as const } };
+        const labeled = ready({
+            "frostyard/test#7": { ...open["frostyard/test#7"], ready: { at: 900, head: "h" } },
+        });
+
+        assert.equal(readyWatched(labeled, 5, 2000), true);
+        assert.equal(
+            readyWatched(labeled, 5, 1000 + 7 * 24 * 3600_000 + 1),
+            false,
+            "past the 7 days",
+        );
+        assert.equal(readyWatched(labeled, 6, 2000), false, "another supervisor");
+        assert.equal(readyWatched(ready(open), 5, 2000), false, "no label: no row on the page");
+        assert.equal(
+            readyWatched(
+                ready(
+                    {
+                        "frostyard/test#7": {
+                            ...open["frostyard/test#7"],
+                            ready: { at: 900, head: "h" },
+                        },
+                    },
+                    { state: "open" },
+                ),
+                5,
+                2000,
+            ),
+            false,
+            "an open thread has a sweeper already",
+        );
+        assert.equal(
+            readyWatched(
+                ready({
+                    "frostyard/test#7": {
+                        via: "seen",
+                        state: "MERGED",
+                        ready: { at: 900, head: "h" },
+                    },
+                }),
+                5,
+                2000,
+            ),
+            false,
+            "a merged PR leaves the page",
+        );
+        assert.equal(readyWatched(undefined, 5, 2000), false, "no desk");
+    });
+
     test("the folder exclusion counts open threads of every supervisor, and the threads that open now", () => {
         const quiet = done({ quietWake: { at: 1200, entry: 5 } }, { id: "T1", supervisor: 1 });
         const other = thread({ id: "T2", supervisor: 2, cwd: "/work/other" });
@@ -4838,7 +4892,17 @@ describe("merge asks", () => {
 
         assert.equal(mergeAskFor("Please merge frostyard/test#12.", one, merged), true);
         assert.equal(
-            mergeAskFor("Frostyard/Test#12 can merge now.", one, merged),
+            mergeAskFor("Merge frostyard/test#12.", one, merged, ["merged", "later"]),
+            true,
+            "merge-only options",
+        );
+        assert.equal(
+            mergeAskFor("Merge frostyard/test#12.", one, merged, ["merged + installed", "later"]),
+            false,
+            "an option with another step stays for Brian",
+        );
+        assert.equal(
+            mergeAskFor("Merge FROSTYARD/TEST#12.", one, merged),
             true,
             "the owner is not case sensitive",
         );
@@ -4850,6 +4914,11 @@ describe("merge asks", () => {
         assert.equal(mergeAskFor("Merge #12.", one, merged), true, "a bare number of its repo");
         assert.equal(mergeAskFor("Merge #12.", asked([], { repo: undefined }), merged), false);
         assert.equal(mergeAskFor("Merge #13.", one, merged), false, "not the ref asked about");
+        assert.equal(
+            mergeAskFor("Frostyard/Test#12 can merge now.", one, merged),
+            false,
+            "the merge word must lead the sentence",
+        );
     });
 
     test("mergeAskFor: a second PR that has not merged, and the steps that stay with Brian", () => {
@@ -4886,25 +4955,98 @@ describe("merge asks", () => {
             false,
             "a release stays with Brian",
         );
+        assert.equal(
+            mergeAskFor("After frostyard/test#12 merges, can you restart the server?", one, merged),
+            false,
+            "another step is no plain merge",
+        );
+        assert.equal(
+            mergeAskFor("Merge frostyard/test#12 [squash | rebase]", one, merged),
+            false,
+            "an inline choice is a decision",
+        );
     });
 
-    test("mergeOnlyAsk: only a merge of a named PR, with no choice and no options", () => {
-        assert.equal(mergeOnlyAsk("Please merge #12."), true);
-        assert.equal(mergeOnlyAsk("Merge frostyard/test#12"), true);
-        assert.equal(mergeOnlyAsk("Merge https://github.com/frostyard/test/pull/12"), true);
-        assert.equal(mergeOnlyAsk("Install it after #12 merges."), false, "an install");
-        assert.equal(mergeOnlyAsk("Merge #12, then tag v1."), false, "a then and a tag");
-        assert.equal(mergeOnlyAsk("Merge #12, then cut a release."), false, "a release");
-        assert.equal(mergeOnlyAsk("Merge #12 and deploy."), false, "a deploy");
-        assert.equal(mergeOnlyAsk("Please merge #12 or #13."), false, "a choice");
-        assert.equal(mergeOnlyAsk("Should I merge #12?"), false, "a choice word");
-        assert.equal(mergeOnlyAsk("Please merge it."), false, "no PR is named");
-        assert.equal(mergeOnlyAsk("Please merge #12.", ["now", "later"]), false, "options");
+    test("mergeAskFor: an owner word before a bare number, as Odrade writes it", () => {
+        const org = thread({
+            repo: "frostyard/frostyard-org",
+            prs: {
+                "frostyard/frostyard-org#29": { via: "attached", state: "MERGED" },
+                "frostyard/frostyard-org#30": { via: "attached", state: "MERGED" },
+            },
+        });
+
         assert.equal(
-            mergeOnlyAsk("Please merge #12 and confirm the deletion."),
+            mergeAskFor("Merge frostyard-org #29 and #30.", org, "frostyard/frostyard-org#29"),
+            true,
+        );
+        assert.equal(
+            mergeAskFor("Merge frostyard-org #29 and #30.", org, "frostyard/frostyard-org#30"),
+            true,
+        );
+    });
+
+    test("plainMergeAsk: a merge of named PRs, and nothing else", () => {
+        assert.equal(plainMergeAsk("Please merge #12."), true);
+        assert.equal(plainMergeAsk("Merge frostyard/test#12"), true);
+        assert.equal(plainMergeAsk("Merge https://github.com/frostyard/test/pull/12"), true);
+        assert.equal(plainMergeAsk("Can you merge #12?"), true);
+        assert.equal(plainMergeAsk("Merge #12 (CI green)."), true, "a parenthetical group");
+        assert.equal(plainMergeAsk("Merge #12 and #13 now."), true, "2 PRs, and now");
+        assert.equal(plainMergeAsk("Please merge #12.", ["merged", "later"]), true, "its options");
+        assert.equal(plainMergeAsk("Please merge `owner/name#12`."), true, "an inline ref counts");
+    });
+
+    test("plainMergeAsk: another step, a decision, a choice, or options written in it is no plain merge", () => {
+        assert.equal(plainMergeAsk("Install it after #12 merges."), false, "an install");
+        assert.equal(plainMergeAsk("Merge #12, then tag v1."), false, "a then and a tag");
+        assert.equal(plainMergeAsk("Merge #12, then cut a release."), false, "a release");
+        assert.equal(plainMergeAsk("Merge #12 and deploy."), false, "a deploy");
+        assert.equal(plainMergeAsk("Please merge #12 or #13."), false, "a choice");
+        assert.equal(plainMergeAsk("Should I merge #12?"), false, "a choice word");
+        assert.equal(plainMergeAsk("Please merge it."), false, "no PR is named");
+        assert.equal(
+            plainMergeAsk("Please merge #12 and confirm the deletion."),
             false,
             "a decision beside the merge",
         );
+        assert.equal(plainMergeAsk("Merge #12 [squash | rebase]"), false, "inline options");
+        assert.equal(
+            plainMergeAsk("Merge #12.", ["merged + installed", "later"]),
+            false,
+            "an option that names another step",
+        );
+        assert.equal(
+            plainMergeAsk("Merge #12.", ["now", "later"]),
+            false,
+            "an option that is neither a merge, a yes, a later, nor a no",
+        );
+    });
+
+    test("plainMergeAsk: a step after the first sentence, or a question, keeps the ask for Brian", () => {
+        assert.equal(
+            plainMergeAsk("After #12 merges, can you restart the server?"),
+            false,
+            "no merge first",
+        );
+        assert.equal(plainMergeAsk("Merge #12 and restart the server."), false, "restart");
+        assert.equal(plainMergeAsk("Merge #12. Then restart it."), false, "then");
+        assert.equal(plainMergeAsk("Merge #12. Your step: set up the cron."), false, "your step");
+        assert.equal(plainMergeAsk("Merge #12. Can you run the tests?"), false, "a question");
+        assert.equal(plainMergeAsk("Merge #12. Close #13 after it."), false, "close");
+    });
+
+    test("plainMergeAsk: the 3 real asks Odrade filed", () => {
+        const snosi =
+            "Merge frostyard/snosi#1119: fixes snosi#1117 (the coder sysext started `coder.service` with an empty config) plus 3 doc drifts. CI green. A merge republishes the coder sysext.";
+        const install =
+            "Merge bketelsen/pi-pocket-team#30: the desk retries a GitHub read once. CI green. Then `npm run install-extension` (live, no restart). Low urgency.";
+        const bots =
+            "Merge frostyard/snowkit#6 (a Dependabot bump) and frostyard/intuneme#219 (a Dependabot bump). CI green. After snowkit#6, its Dependabot PRs #3 and #4 still bump tag refs: may Duncan close them as the bot (Dependabot reopens them pinned)?";
+
+        assert.equal(plainMergeAsk(snosi, ["merged", "later"]), true, "a plain merge ask");
+        assert.equal(plainMergeAsk(install, ["merged + installed", "later"]), false, "an install");
+        assert.equal(plainMergeAsk(bots), false, "a tag, and a question");
     });
 
     test("mergeAskNames: a ref, a URL, and a bare number name a PR; plain words do not", () => {
@@ -6240,9 +6382,9 @@ describe("readyPrs", () => {
 
     test("an open, a starting, and a parked thread give their labeled open PRs", () => {
         const state = deskOf();
-        const opened = withPr(state, 100);
-        const starting = withPr(state, 200, { state: "starting" });
-        const parked = withPr(state, 300, { state: "parked" });
+        const opened = withPr(state, 100, {}, readyLink(), "frostyard/test#7");
+        const starting = withPr(state, 200, { state: "starting" }, readyLink(), "frostyard/test#8");
+        const parked = withPr(state, 300, { state: "parked" }, readyLink(), "frostyard/test#9");
 
         assert.deepEqual(
             readyPrs(state, now)
@@ -6333,6 +6475,39 @@ describe("readyPrs", () => {
 
         assert.deepEqual(none.ready, []);
         assert.equal(none.counts.ready, 0);
+    });
+
+    test("the same PR on 2 threads is 1 row: the thread that is not closed, then the lowest id", () => {
+        const state = deskOf();
+        const first = placed(state, 100);
+        const second = placed(state, 200);
+
+        first.prs["frostyard/test#7"] = readyLink();
+        second.prs["frostyard/test#7"] = readyLink();
+
+        // Both threads are open: the lowest id has the row.
+        assert.deepEqual(
+            readyPrs(state, now).map((pr) => [pr.ref, pr.thread]),
+            [["frostyard/test#7", first.id]],
+        );
+
+        // A closed thread gives its row to the open one, also when its id is lower.
+        const reopened = deskOf();
+        const closed = placed(reopened, 100);
+        const open = placed(reopened, 200);
+
+        closed.prs["frostyard/test#7"] = readyLink();
+        closed.state = "closed";
+        closed.closed = { at: now - DAY, why: "done", by: "sweep" };
+        open.prs["frostyard/test#7"] = readyLink();
+
+        assert.deepEqual(
+            readyPrs(reopened, now).map((pr) => [pr.ref, pr.thread]),
+            [["frostyard/test#7", open.id]],
+        );
+
+        // 2 threads, 1 PR: the page counts it 1 time, so the badge does too.
+        assert.equal(threadsView(state, now).counts.ready, 1);
     });
 });
 
@@ -6628,6 +6803,26 @@ describe("asksBrian", () => {
             "an install stays with Brian",
         );
         assert.equal(asksBrian("Merge #12 or #13?"), true, "a choice is a decision");
+    });
+
+    test("an inline code run that holds only a PR name still counts as the name", () => {
+        assert.equal(asksBrian("Please merge `frostyard/test#12`."), false);
+        assert.equal(asksBrian("Please merge `#12`."), false);
+        assert.equal(
+            asksBrian("Merge `https://github.com/frostyard/test/pull/12`."),
+            false,
+            "a URL in code",
+        );
+        assert.equal(
+            asksBrian("Please merge `frostyard/test#12`, then install it."),
+            true,
+            "another step keeps it an ask",
+        );
+        assert.equal(
+            asksBrian("Keep `the guard` in place."),
+            false,
+            "another code run never counts",
+        );
     });
 });
 
@@ -8319,6 +8514,23 @@ const model = scriptedModel((request) => {
             action: "ask",
             thread: askThreadId,
             text: "Install pi-pocket-team from main after #106 merges.",
+        });
+    }
+
+    if (text.endsWith("desk ask squash test")) {
+        return call("desk", {
+            action: "ask",
+            thread: askThreadId,
+            text: "Merge #106 [squash | rebase]",
+        });
+    }
+
+    if (text.endsWith("desk ask merged options test")) {
+        return call("desk", {
+            action: "ask",
+            thread: askThreadId,
+            text: "Merge frostyard/test#106.",
+            options: ["merged", "later"],
         });
     }
 
@@ -12664,9 +12876,29 @@ describe("the desk in a Pi Pocket", () => {
         assert.equal(filed?.text, "Install pi-pocket-team from main after #106 merges.");
         assert.match((await modelTexts(app, source)).join("\n"), /Filed /);
 
-        // Answer it, so the thread does not wait on it for the rest of the suite.
-        answerAskId = filed?.id ?? "";
-        await say(app, source, "desk answer test");
+        // A plain merge ask with the options Odrade writes is refused too.
+        const before = (await deskState())?.threads[thread.id]?.asks.length ?? 0;
+
+        await say(app, source, "desk ask merged options test");
+
+        assert.equal(
+            (await deskState())?.threads[thread.id]?.asks.length,
+            before,
+            "a merge ask with options merged and later is refused",
+        );
+
+        // An inline option is a decision: the ask is filed.
+        await say(app, source, "desk ask squash test");
+
+        const squash = (await deskState())?.threads[thread.id]?.asks.at(-1);
+
+        assert.equal(squash?.text, "Merge #106 [squash | rebase]");
+
+        // Answer them, so the thread does not wait on them for the rest of the suite.
+        for (const id of [filed?.id ?? "", squash?.id ?? ""]) {
+            answerAskId = id;
+            await say(app, source, "desk answer test");
+        }
     });
 
     test("desk ask and answer work through the tool, and an ask thread closes at a sweep", async () => {
@@ -16652,6 +16884,51 @@ describe("the desk in a Pi Pocket", () => {
         } finally {
             await quiet([]);
             shift = 0;
+        }
+    });
+
+    test("the sweeper stays while a ready PR is on a thread closed as done in the last 7 days", async () => {
+        const source = await supervisor("ready-watch");
+        let id = "";
+
+        // A clean read: the fixture holds no PR, so no found thread comes from it.
+        writeFileSync(
+            fixturePath,
+            JSON.stringify({ data: { viewer: { login: "github-viewer" } } }),
+        );
+
+        await app.harness.commit(async (tx) => {
+            const state = await tx.doc(DeskThreads);
+            const opened = openThread(state, {
+                key: "x.test.ready-watch",
+                supervisor: Number(source),
+                agents: ["duncan"],
+                repo: "frostyard/test",
+                title: "A ready PR",
+                at: Date.now(),
+            });
+
+            id = opened.thread.id;
+            state.threads[id]!.state = "closed";
+            state.threads[id]!.closed = { at: Date.now(), why: "done", by: "sweep" };
+            state.threads[id]!.prs["frostyard/test#7"] = {
+                via: "seen",
+                state: "OPEN",
+                ready: { at: Date.now(), head: "a1b2c3d" },
+            };
+        }, context);
+
+        assert.equal((await deskState())?.threads[id]?.state, "closed");
+        assert.equal(await sweepers(source), 0, "no open thread yet: no sweeper");
+
+        try {
+            // A look starts the sweeper: the page lists the PR under Ready to merge, so its facts stay fresh.
+            await say(app, source, "desk sync test");
+
+            assert.equal(await sweepers(source), 1);
+            assert.equal(typeof (await deskState())?.sweepers?.[String(Number(source))], "string");
+        } finally {
+            await quiet([]);
         }
     });
 

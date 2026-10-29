@@ -456,6 +456,17 @@ test("badgeOf: each PR ready to merge counts 1, and its thread does not count tw
     assert.equal(badgeOf({ ...viewWith(null), threads: [brian] }), 1);
 });
 
+test("badgeOf: 1 row for a PR on 2 threads counts the PR 1 time", () => {
+    // The server's `readyPrs` gives 1 row for the same PR on 2 threads: the badge counts that row, not the 2 links.
+    const view = {
+        ...viewWith(null),
+        threads: [threadView({ id: "T1", next: "brian" })],
+        ready: [{ ref: "frostyard/test#12", thread: "T1", agents: ["duncan"], at: NOW }],
+    };
+
+    assert.equal(badgeOf(view), 1, "the PR counts, and its thread does not count again");
+});
+
 test("Ready to merge sits after Needs you, with the link, the head, the thread, and the CI state", async () => {
     const out = await render({
         ...viewWith(null),
