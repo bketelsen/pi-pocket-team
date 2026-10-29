@@ -4965,6 +4965,29 @@ describe("merge asks", () => {
             false,
             "an inline choice is a decision",
         );
+        assert.equal(
+            mergeAskFor("Merge frostyard/test#12 (restart the server afterward).", one, merged),
+            false,
+            "a step in a parenthetical group",
+        );
+        assert.equal(
+            mergeAskFor("Merge frostyard/test#12. Back up the database.", one, merged),
+            false,
+            "another step after the first sentence",
+        );
+        assert.equal(
+            mergeAskFor("Merge frostyard/test#12.", one, merged, [
+                "merged; drop incus commit 2",
+                "later",
+            ]),
+            false,
+            "an option that carries a step",
+        );
+        assert.equal(
+            mergeAskFor("Merge frostyard/test#12.", one, merged, ["merged", "later"]),
+            true,
+            "the options Odrade writes",
+        );
     });
 
     test("mergeAskFor: an owner word before a bare number, as Odrade writes it", () => {
@@ -5034,6 +5057,30 @@ describe("merge asks", () => {
         assert.equal(plainMergeAsk("Merge #12. Your step: set up the cron."), false, "your step");
         assert.equal(plainMergeAsk("Merge #12. Can you run the tests?"), false, "a question");
         assert.equal(plainMergeAsk("Merge #12. Close #13 after it."), false, "close");
+        assert.equal(
+            plainMergeAsk("Merge #12 (restart the server afterward)."),
+            false,
+            "a step in a parenthetical group",
+        );
+        assert.equal(plainMergeAsk("Merge #12. Back up the database."), false, "back up");
+        assert.equal(
+            plainMergeAsk("Merge #12. `sudo systemctl restart pocket`."),
+            false,
+            "a step in inline code",
+        );
+        assert.equal(plainMergeAsk("Merge #12. `make db-backup`."), false, "a clause of code only");
+        assert.equal(
+            plainMergeAsk("Merge #12: fixes the `coder.service` start. CI green."),
+            true,
+            "code inside a fact",
+        );
+        assert.equal(plainMergeAsk("Merge #12. Bump the pin."), false, "bump");
+        assert.equal(plainMergeAsk("Merge #12. Duncan owns the release."), false, "a name");
+        // A fact beside the merge is no step: it starts with a PR, a number, CI, a -ed/-ing/-s word, or these words.
+        assert.equal(plainMergeAsk("Merge #12. CI green."), true, "an acronym");
+        assert.equal(plainMergeAsk("Merge #12. The docs are updated."), true, "a plain word");
+        assert.equal(plainMergeAsk("Merge #12 (the coder started the job)."), true, "a -ed word");
+        assert.equal(plainMergeAsk("Merge #12. 3 doc fixes are in it."), true, "a number");
     });
 
     test("plainMergeAsk: the 3 real asks Odrade filed", () => {
@@ -8522,6 +8569,22 @@ const model = scriptedModel((request) => {
             action: "ask",
             thread: askThreadId,
             text: "Merge #106 [squash | rebase]",
+        });
+    }
+
+    if (text.endsWith("desk ask restart test")) {
+        return call("desk", {
+            action: "ask",
+            thread: askThreadId,
+            text: "Merge #106 (restart the server afterward).",
+        });
+    }
+
+    if (text.endsWith("desk ask back up test")) {
+        return call("desk", {
+            action: "ask",
+            thread: askThreadId,
+            text: "Merge #106. Back up the database.",
         });
     }
 
@@ -12887,7 +12950,22 @@ describe("the desk in a Pi Pocket", () => {
             "a merge ask with options merged and later is refused",
         );
 
-        // An inline option is a decision: the ask is filed.
+        // A step beside the merge is a decision: the ask is filed, in a parenthetical group or after the first sentence.
+        await say(app, source, "desk ask restart test");
+
+        assert.equal(
+            (await deskState())?.threads[thread.id]?.asks.at(-1)?.text,
+            "Merge #106 (restart the server afterward).",
+        );
+
+        await say(app, source, "desk ask back up test");
+
+        assert.equal(
+            (await deskState())?.threads[thread.id]?.asks.at(-1)?.text,
+            "Merge #106. Back up the database.",
+        );
+
+        // An inline option is a decision too: the ask is filed.
         await say(app, source, "desk ask squash test");
 
         const squash = (await deskState())?.threads[thread.id]?.asks.at(-1);

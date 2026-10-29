@@ -418,6 +418,17 @@ test("badgeOf: an open ask counts, also when asleep; a plain sleeping thread doe
     assert.equal(badgeOf(view([sleepingAsked])), 1);
 });
 
+/** 1 PR of a thread's row: the page's view, with the label on it. */
+const pagePr = (ref = "frostyard/test#12", patch = {}) => ({
+    ref,
+    url: `https://github.com/frostyard/test/pull/12`,
+    state: "OPEN",
+    via: "seen",
+    guessed: false,
+    ready: true,
+    ...patch,
+});
+
 test("badgeOf: each PR ready to merge counts 1, and its thread does not count twice", () => {
     const withReady = (threads, ready) => ({ ...viewWith(null), threads, ready });
     const readyPr = (patch = {}) => ({
@@ -428,8 +439,8 @@ test("badgeOf: each PR ready to merge counts 1, and its thread does not count tw
         ...patch,
     });
 
-    // A thread that counts only because it needs Brian: its PR counts, and the thread does not.
-    const brian = threadView({ id: "T1", next: "brian" });
+    // A thread that counts only because it needs Brian, and holds the PR: the PR counts, and the thread does not.
+    const brian = threadView({ id: "T1", next: "brian", prs: [pagePr()] });
 
     assert.equal(badgeOf(withReady([brian], [])), 1, "the thread alone counts");
     assert.equal(
@@ -457,14 +468,41 @@ test("badgeOf: each PR ready to merge counts 1, and its thread does not count tw
 });
 
 test("badgeOf: 1 row for a PR on 2 threads counts the PR 1 time", () => {
-    // The server's `readyPrs` gives 1 row for the same PR on 2 threads: the badge counts that row, not the 2 links.
-    const view = {
+    // The server's `readyPrs` gives 1 row for the same PR on 2 threads: the badge counts that row, not the 2 threads.
+    const view = (threads) => ({
         ...viewWith(null),
-        threads: [threadView({ id: "T1", next: "brian" })],
+        threads,
         ready: [{ ref: "frostyard/test#12", thread: "T1", agents: ["duncan"], at: NOW }],
-    };
+    });
+    const one = threadView({ id: "T1", next: "brian", prs: [pagePr()] });
+    const two = threadView({ id: "T2", next: "brian", prs: [pagePr()] });
 
-    assert.equal(badgeOf(view), 1, "the PR counts, and its thread does not count again");
+    assert.equal(badgeOf(view([one, two])), 1, "the PR counts, and neither thread counts");
+
+    // A thread that counts for another reason keeps its own count: an open ask, or a stale clock.
+    assert.equal(
+        badgeOf(
+            view([one, threadView({ id: "T2", next: "brian", prs: [pagePr()], asks: [openAsk] })]),
+        ),
+        2,
+        "the open ask counts beside the PR",
+    );
+    assert.equal(
+        badgeOf(view([one, threadView({ id: "T2", next: "brian", stale: true, prs: [pagePr()] })])),
+        2,
+        "a stale thread counts beside the PR",
+    );
+    // A PR that is not in the list does not stop the thread from counting.
+    assert.equal(
+        badgeOf(
+            view([
+                one,
+                threadView({ id: "T2", next: "brian", prs: [pagePr("frostyard/test#99")] }),
+            ]),
+        ),
+        2,
+        "another PR is no row of Ready to merge",
+    );
 });
 
 test("Ready to merge sits after Needs you, with the link, the head, the thread, and the CI state", async () => {

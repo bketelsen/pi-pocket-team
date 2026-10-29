@@ -59,8 +59,9 @@ export const groupOf = (thread) => {
 /**
  * The rail badge: the threads that need Brian, and the PRs ready to merge. A thread that is not parked counts when it
  * has an open ask, also when it is asleep or closed; else it counts when it is not closed or asleep and it needs Brian or
- * is stale. Each PR in `ready` counts 1, so a thread that counts only because it needs Brian does not count again when
- * its id is the thread of one of those PRs. A missing `ready` is no PR: an older view works as before.
+ * is stale. Each PR in `ready` counts 1, so a thread that counts only because it needs Brian does not count again when it
+ * holds 1 of those PRs: the same PR may be on 2 threads, and `ready` has 1 row for it. A missing `ready` is no PR: an
+ * older view works as before.
  */
 export const badgeOf = (next) => {
     if (next === null || next === undefined) {
@@ -68,7 +69,14 @@ export const badgeOf = (next) => {
     }
 
     const ready = next.ready ?? [];
-    const threads = new Set(ready.map((pr) => pr.thread));
+    const refs = new Set(ready.map((pr) => pr.ref.toLowerCase()));
+
+    /** Whether the thread holds 1 of the PRs in `ready`: that PR counts, so the thread does not count. */
+    const holds = (thread) =>
+        (thread.prs ?? []).some(
+            (pr) =>
+                pr.ready === true && pr.state === "OPEN" && refs.has(String(pr.ref).toLowerCase()),
+        );
 
     return (
         ready.length +
@@ -83,8 +91,8 @@ export const badgeOf = (next) => {
 
             const needsBrian = thread.next === "brian";
 
-            // Its PRs count under Ready to merge: the thread does not count a second time.
-            if (needsBrian && !thread.stale && threads.has(thread.id)) {
+            // Its PR is a row of Ready to merge: the PR counts, and the thread does not count again.
+            if (needsBrian && !thread.stale && holds(thread)) {
                 return false;
             }
 

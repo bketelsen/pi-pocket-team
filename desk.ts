@@ -7864,11 +7864,21 @@ const MERGE_STEP =
     /\b(?:install(?:s|ed|ing)?|tag(?:s|ged|ging)?|then|release[sd]?|deploy(?:s|ed|ing)?)\b/i;
 
 /**
- * The steps after the first sentence that keep an ask for Brian: a host action, or the end of a PR's life. "Restart the
- * server after #12 merges" is no plain merge ask.
+ * The steps beside the merge that keep an ask for Brian: a host action, or the end of a PR's life. "Restart the server
+ * after #12 merges" is no plain merge ask.
  */
 const EXTRA_STEP =
-    /\b(?:restart|reboot|run|enable|disable|turn\s+(?:on|off)|set\s*up|rotate|close|reopen)\b/i;
+    /\b(?:restart|reboot|run|enable|disable|turn\s+(?:on|off)|set\s*up|rotate|close|reopen|back\s+up|backup|restore|migrate|rebuild|redeploy|reload|rerun|re-run|retry|upgrade|bump|pin|unpin|schedule|notify|announce|post|email|purge|prune|clean\s+up)\b/i;
+
+/**
+ * A word that starts a fact beside the merge, and no action: a PR, a number, a word that ends in "ed", "ing" or "s", or
+ * one of the plain information words. Any other first word ("restart", "back", "Duncan") is a step for Brian.
+ */
+const FACT_WORD =
+    /^(?:@PR|\d|[A-Za-z'’-]*(?:ed|ing|[^su\W]s|'s|’s)$|(?:a|an|the|this|that|these|those|it|its|both|all|each|every|no|none|only|one|two|three|four|five|low|high|medium|urgency|nothing|not|now|green|red|ready|done|same|other|another|docs|doc|ci|review|tests|test|checks|check|build|builds)$)/i;
+
+/** An acronym in capitals, 2 or more letters: "CI", "PR", "OK". It starts a fact too. */
+const ACRONYM = /^[A-Z]{2,}\b/;
 
 /** A PR URL in a text: `github.com/owner/name/pull/7`. */
 const PR_URL_WORDS = /github\.com\/([A-Za-z0-9][\w.-]*\/[A-Za-z0-9][\w.-]*)\/pull\/([1-9][0-9]*)/gi;
@@ -7979,16 +7989,50 @@ export function plainMergeAsk(text: string, options?: string[]): boolean {
     // Each PR name is 1 token, so a "." inside a name or a URL does not end the first sentence.
     const marked = plain.replace(ANY_PR_WORDS, PR_TOKEN);
     const end = marked.search(/[:.?;!]/);
-    // A parenthetical group is no part of the request: "Merge #12 (CI green)" is a plain merge.
-    const first = (end === -1 ? marked : marked.slice(0, end)).replace(/\([^)]*\)/g, " ");
+    const head = end === -1 ? marked : marked.slice(0, end);
     const rest = end === -1 ? "" : marked.slice(end + 1);
+    // A parenthetical group is no part of the request, but it may hold another step: "Merge #12 (restart the server)".
+    const groups = [...head.matchAll(/\(([^)]*)\)/g)].map((match) => match[1] ?? "");
 
-    if (!PLAIN_MERGE.test(first)) {
+    // The first sentence holds the request only.
+    if (!PLAIN_MERGE.test(head.replace(/\([^)]*\)/g, " "))) {
         return false;
     }
 
-    // What follows must ask nothing of Brian: no question, no "you", and no other step.
-    return !/\?|\byou(?:r)?\b/i.test(rest) && !EXTRA_STEP.test(rest);
+    // Everything beside the request must be a fact. The step words count inside inline code too: "`systemctl restart x`"
+    // is a step.
+    const beside = [...groups, rest].filter((one) => one.trim() !== "").join(". ");
+
+    if (/\?|\byou(?:r)?\b/i.test(beside) || EXTRA_STEP.test(beside)) {
+        return false;
+    }
+
+    // Inline code is 1 word with no "." in it, and no fact word: "started `coder.service`" is a fact, and a clause that
+    // starts with code ("`npm run x`") is a step.
+    return clausesOf(beside.replace(INLINE_CODE, " \u00a7code ")).every(factClause);
+}
+
+/** The clauses of the facts beside a merge: its punctuation, and the joining words, start a new clause. */
+function clausesOf(text: string): string[] {
+    return text
+        .split(/[.;:!?,]|\b(?:and|so|also|please)\b/i)
+        .map((clause) =>
+            clause
+                .trim()
+                .replace(/^[("'*-]+/, "")
+                .trim(),
+        )
+        .filter((clause) => clause !== "");
+}
+
+/**
+ * Whether a clause beside the merge says a fact, and no step: it starts with a PR, a number, an acronym in capitals, a
+ * word that ends in "ed", "ing" or "s", or one of the plain information words of `FACT_WORD`.
+ */
+function factClause(clause: string): boolean {
+    const word = /^\S+/.exec(clause)?.[0] ?? "";
+
+    return word !== "" && (ACRONYM.test(word) || FACT_WORD.test(word));
 }
 
 /** A thread's link for a ref, in any case: the PRs of one repository are 1, however an ask writes the owner. */
