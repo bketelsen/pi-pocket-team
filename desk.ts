@@ -2006,6 +2006,26 @@ export function quietWatched(
 }
 
 /**
+ * Whether a supervisor's sweeper must stay for a PR that is ready to merge: a thread of it closed as done in the last 7
+ * days has an open PR with the label `ready-for-human`. The page shows that PR under Ready to merge, so its facts stay
+ * fresh until it merges, closes, loses the label, or the 7 days end.
+ */
+export function readyWatched(
+    state: Readonly<DeskState> | undefined,
+    supervisor: number,
+    now: number,
+): boolean {
+    return Object.values(state?.threads ?? {}).some(
+        (thread) =>
+            thread.supervisor === supervisor &&
+            reopenable(thread, now) &&
+            Object.values(thread.prs).some(
+                (link) => link.state === "OPEN" && link.ready !== undefined,
+            ),
+    );
+}
+
+/**
  * The reasons the quiet-wake marks of `threads` open them again, by thread id, in 2 passes. Pass 1 takes the report
  * triggers. Pass 2 takes the folder triggers, in a folder that no thread that opens in this commit works in: a thread
  * that a report opens works in its folder now, so its work is not another quiet thread's.
@@ -4849,6 +4869,32 @@ function pinnedIssue(value: unknown, repo: string): PinnedIssue | undefined {
     };
 }
 
+/** The event text of an answer, as `answerAsk` writes it: `answered T13a (desk): merged`. */
+const answeredLine = (id: string, by: string, words: string) =>
+    `answered ${id} (${by}): ${words.length > 120 ? `${words.slice(0, 119)}…` : words}`;
+
+/** A stored time to the second: `2026-10-27T10:00:00Z`. */
+const sweepTime = (at: number) => new Date(at).toISOString().replace(/\.\d{3}Z$/, "Z");
+
+/**
+ * Answer an open ask with the desk's own words: the answer, and 1 event, in the form `answerAsk` writes. An answered or
+ * resolved ask never changes. True when this added the event.
+ */
+function answerByDesk(thread: Thread, ask: Ask, words: string, now: number): boolean {
+    if (!askIsOpen(ask)) {
+        return false;
+    }
+
+    ask.answer = { at: now, by: "desk", words };
+
+    return addEvent(
+        thread,
+        `answered:${ask.id}:${String(now)}`,
+        answeredLine(ask.id, "desk", words),
+        now,
+    );
+}
+
 const linkFor = (pr: PrFact, via: PrLink["via"]): PrLink => ({
     via,
     state: pr.state,
@@ -4969,6 +5015,21 @@ export function updatePrs(thread: Thread, github: GitHubFacts, now: number): num
                 )
             ) {
                 events += 1;
+            }
+        }
+
+        // A merge ask on this PR needs no answer from Brian: the desk answers it, and says when the sweep saw the merge.
+        if (link.state === "MERGED") {
+            const words = `merged (seen by the sweep at ${sweepTime(now)})`;
+
+            for (const ask of thread.asks) {
+                if (
+                    askIsOpen(ask) &&
+                    mergeAskFor(ask.text, thread, ref, ask.options) &&
+                    answerByDesk(thread, ask, words, now)
+                ) {
+                    events += 1;
+                }
             }
         }
     }
@@ -7760,7 +7821,7 @@ export function answerAsk(
     addEvent(
         found.thread,
         `answered:${found.ask.id}:${String(answer.at)}`,
-        `answered ${found.ask.id} (${answer.by}): ${words.length > 120 ? `${words.slice(0, 119)}…` : words}`,
+        answeredLine(found.ask.id, answer.by, words),
         answer.at,
     );
 
@@ -7794,6 +7855,247 @@ const REPORT_ASK_WORDS = new RegExp(
 
 /** The words of a choice: a merge request with one of them is still a decision ("Please merge #54 or #55."). */
 const CHOICE = /\bor\b|which|whether|should i|your call|do you want/i;
+
+/**
+ * The steps that keep an ask for Brian: an install, a tag, a release, a deploy, or a "then" that carries another step.
+ * The desk never refuses or answers an ask with one of them.
+ */
+const MERGE_STEP =
+    /\b(?:install(?:s|ed|ing)?|tag(?:s|ged|ging)?|then|release[sd]?|deploy(?:s|ed|ing)?)\b/i;
+
+/**
+ * The steps beside the merge that keep an ask for Brian: a host action, or the end of a PR's life. "Restart the server
+ * after #12 merges" is no plain merge ask.
+ */
+const EXTRA_STEP =
+    /\b(?:restart|reboot|run|enable|disable|turn\s+(?:on|off)|set\s*up|rotate|close|reopen|back\s+up|backup|restore|migrate|rebuild|redeploy|reload|rerun|re-run|retry|upgrade|bump|pin|unpin|schedule|notify|announce|post|email|purge|prune|clean\s+up)\b/i;
+
+/**
+ * A word that starts a fact beside the merge, and never an order. An order starts with a verb in its base form ("Check
+ * the device", "Ping the host", "SSH into it"), so only these start a fact: a PR, a number, a possessive ("Lucilla's
+ * review applied"), a verb in "-s" ("fixes", "adds", "republishes"; not "-ss", "-us", "-is", "-as"), a past participle in
+ * "-ed" ("applied", "tested"; not "-eed", "embed", "shred"), or a word of the short list: determiners, pronouns, and
+ * status words ("CI green", "low urgency", "docs only"). A capital acronym is no fact by itself: "SSH into the host" is
+ * an order. Any other first word keeps the ask for Brian.
+ */
+const FACT_WORD =
+    /^(?:@PR|\d[\w.-]*|[A-Za-z-]+(?:'s|’s)|[A-Za-z-]*[^\Wsuia]s|(?![A-Za-z-]*eed$|embed$|shred$)[A-Za-z-]{2,}ed|(?:a|an|the|this|that|these|those|it|its|both|all|each|every|no|none|one|two|three|four|five|low|high|medium|urgency|nothing|green|ready|done|pending|docs|doc|ci|pr|prs)$)$/i;
+
+/** Words that put a duty on someone beside the merge: "The device must be checked", "it needs a look". */
+const OBLIGATION =
+    /\b(?:must|should|shall|need(?:s|ed)?|required?|has\s+to|have\s+to|manual(?:ly)?|afterwards?|after\s+(?:that|it|the\s+merge)|once\s+merged|later\s+on|remember|don't\s+forget|do\s+not\s+forget)\b/i;
+
+/** A PR URL in a text: `github.com/owner/name/pull/7`. */
+const PR_URL_WORDS = /github\.com\/([A-Za-z0-9][\w.-]*\/[A-Za-z0-9][\w.-]*)\/pull\/([1-9][0-9]*)/gi;
+
+/** A full PR ref in a text: `owner/name#7`, not inside a longer word. */
+const PR_REF_WORDS = /(?<![\w./#-])([A-Za-z0-9][\w.-]*\/[A-Za-z0-9][\w.-]*)#([1-9][0-9]*)\b/g;
+
+/** A bare PR number in a text: `#7`, not after a letter, a digit, `/`, `.`, `-`, or `_`. */
+const PR_NUMBER_WORDS = /(?<![\w./-])#([1-9][0-9]*)\b/g;
+
+/** Every way a text names a PR: a URL, a full ref, or a bare number. The first sentence reads each one as `@PR`. */
+const ANY_PR_WORDS =
+    /(?:https?:\/\/)?(?:www\.)?github\.com\/[A-Za-z0-9][\w.-]*\/[A-Za-z0-9][\w.-]*\/pull\/[1-9][0-9]*|(?<![\w./#-])[A-Za-z0-9][\w.-]*\/[A-Za-z0-9][\w.-]*#[1-9][0-9]*|(?<![\w./-])#[1-9][0-9]*/gi;
+
+/** The mark of a PR in the first sentence's rules. */
+const PR_TOKEN = "@PR";
+
+/** The words of a PR in a merge ask: an optional "pr" or "pull request", and an owner word before a bare number. */
+const PR_IN_ASK = "(?:(?:pr|pull request)\\s+)?(?:[A-Za-z0-9][\\w.-]*\\s+)?@PR";
+
+/**
+ * The first sentence of a plain merge ask: "Merge @PR", "Please merge @PR and @PR", "Can you merge frostyard-org
+ * @PR now". The sentence holds the PRs, and nothing else.
+ */
+const PLAIN_MERGE = new RegExp(
+    `^\\s*(?:please\\s+)?(?:(?:can|could|would)\\s+you\\s+)?merge\\s+${PR_IN_ASK}` +
+        `(?:\\s*(?:,|and|&|,\\s*and)\\s*${PR_IN_ASK})*` +
+        `\\s*(?:now|first|when ready|when you can)?\\s*$`,
+    "i",
+);
+
+/** An option of a plain merge ask: a merge, a yes, a later, a no. Any other option is a decision beside the merge. */
+const PLAIN_MERGE_OPTION =
+    /^(?:merged?(?:\s+(?:it|both|them|all(?:\s+\d+)?))?|yes|ok|later|not\s+(?:now|yet)|wait|no|skip)$/i;
+
+/** A run of inline code. */
+const INLINE_CODE = /(?<!`)(`+)(?!`)([^\n]*?)(?<!`)\1(?!`)/g;
+
+/** Whether a text is only a PR name: a full ref, a bare `#N`, or a PR URL. */
+const PR_NAME_ONLY =
+    /^(?:(?:https?:\/\/)?(?:www\.)?github\.com\/[A-Za-z0-9][\w.-]*\/[A-Za-z0-9][\w.-]*\/pull\/[1-9][0-9]*|[A-Za-z0-9][\w.-]*\/[A-Za-z0-9][\w.-]*#[1-9][0-9]*|#[1-9][0-9]*)$/i;
+
+/**
+ * The text with each inline code run that holds only a PR name unwrapped: `` `owner/name#12` `` becomes `owner/name#12`.
+ * Another inline code run keeps its marks, so it never counts as a word.
+ */
+function unwrapPrCode(text: string): string {
+    return text.replace(INLINE_CODE, (all: string, _marks: string, inner: string) => {
+        const name = inner.trim();
+
+        return PR_NAME_ONLY.test(name) ? name : all;
+    });
+}
+
+/**
+ * The PRs a text names: each URL, each full ref, and each bare `#N` as `repo` names it. A bare number with no repository
+ * to resolve it stays `#7`, which is no key of a thread's `prs`.
+ */
+function prNamesIn(text: string, repo: string | undefined): string[] {
+    const names: string[] = [];
+
+    for (const match of text.matchAll(PR_URL_WORDS)) {
+        names.push(`${match[1]}#${match[2]}`);
+    }
+
+    for (const match of text.matchAll(PR_REF_WORDS)) {
+        names.push(`${match[1]}#${match[2]}`);
+    }
+
+    for (const match of text.matchAll(PR_NUMBER_WORDS)) {
+        names.push(repo === undefined ? `#${match[1]}` : `${repo}#${match[1]}`);
+    }
+
+    return names;
+}
+
+/** Whether a text names a PR at all: a full ref, a PR URL, or a bare `#N`. */
+export function mergeAskNames(text: string): boolean {
+    return prNamesIn(text, undefined).length > 0;
+}
+
+/**
+ * Whether an ask says only "merge these PRs": its first sentence names 1 or more PRs and nothing else, the whole text
+ * has no other step (an install, a tag, a "then", a release, a deploy), no decision verb, no choice word and no inline
+ * options, the text after the first sentence asks nothing of Brian, and every option is only a merge, a yes, a later or a
+ * no. An inline code run that holds only a PR name counts as the name itself.
+ *
+ * Such an ask is no decision: the Desk page lists the PR under Ready to merge. `desk ask` refuses it, and the reminder
+ * does not count it. The auto-answer does not use this rule: see `mergeAskFor`.
+ */
+export function plainMergeAsk(text: string, options?: string[]): boolean {
+    const plain = unwrapPrCode(text);
+
+    // Another step, a decision, a choice, or options written inside the ask: Brian keeps it.
+    if (
+        MERGE_STEP.test(plain) ||
+        DECISION_VERB.test(plain) ||
+        CHOICE.test(plain) ||
+        OPTIONS.test(plain)
+    ) {
+        return false;
+    }
+
+    if (options !== undefined && !options.every((one) => PLAIN_MERGE_OPTION.test(one.trim()))) {
+        return false;
+    }
+
+    // Each PR name is 1 token, so a "." inside a name or a URL does not end the first sentence.
+    const marked = plain.replace(ANY_PR_WORDS, PR_TOKEN);
+    const end = marked.search(/[:.?;!]/);
+    const head = end === -1 ? marked : marked.slice(0, end);
+    const rest = end === -1 ? "" : marked.slice(end + 1);
+    // A parenthetical group is no part of the request, but it may hold another step: "Merge #12 (restart the server)".
+    const groups = [...head.matchAll(/\(([^)]*)\)/g)].map((match) => match[1] ?? "");
+
+    // The first sentence holds the request only.
+    if (!PLAIN_MERGE.test(head.replace(/\([^)]*\)/g, " "))) {
+        return false;
+    }
+
+    // Everything beside the request must be a fact. The step words count inside inline code too: "`systemctl restart x`"
+    // is a step.
+    const beside = [...groups, rest].filter((one) => one.trim() !== "").join(". ");
+
+    // A question, words to Brian ("you", "your", "Brian"), or an obligation ("must be checked", "needs a look") ask him
+    // something beside the merge.
+    if (
+        /\?|\b(?:you(?:r)?|brian)\b/i.test(beside) ||
+        OBLIGATION.test(beside) ||
+        EXTRA_STEP.test(beside)
+    ) {
+        return false;
+    }
+
+    // Inline code is 1 word with no "." in it, and no fact word: "started `coder.service`" is a fact, and a clause that
+    // starts with code ("`npm run x`") is a step.
+    return clausesOf(beside.replace(INLINE_CODE, " \u00a7code ")).every(factClause);
+}
+
+/** The clauses of the facts beside a merge: its punctuation, and the joining words, start a new clause. */
+function clausesOf(text: string): string[] {
+    return text
+        .split(/[.;:!?,]|\b(?:and|so|also|please)\b/i)
+        .map((clause) =>
+            clause
+                .trim()
+                .replace(/^[("'*-]+/, "")
+                .trim(),
+        )
+        .filter((clause) => clause !== "");
+}
+
+/** Whether a clause beside the merge says a fact, and no step: its first word is a `FACT_WORD`. */
+function factClause(clause: string): boolean {
+    const word = /^\S+/.exec(clause)?.[0] ?? "";
+
+    return word !== "" && FACT_WORD.test(word);
+}
+
+/** A thread's link for a ref, in any case: the PRs of one repository are 1, however an ask writes the owner. */
+function prLinkOf(thread: Thread, ref: string): PrLink | undefined {
+    const key = ref.toLowerCase();
+    const found = Object.keys(thread.prs).find((one) => one.toLowerCase() === key);
+
+    return found === undefined ? undefined : thread.prs[found];
+}
+
+/**
+ * Whether the options of an ask are exactly "merged" and "later", in any order and case (Brian, T447b). Such an ask has
+ * only 2 answers, and the merge is 1 of them: when the PR merges, "merged" is the answer Brian would tap.
+ */
+export function mergedLaterOptions(options: readonly string[] | undefined): boolean {
+    if (options === undefined || options.length !== 2) {
+        return false;
+    }
+
+    const words = options.map((one) => one.trim().toLowerCase()).sort();
+
+    return words[0] === "later" && words[1] === "merged";
+}
+
+/**
+ * Whether the desk answers an open ask when `ref` merged. The desk reads no free text to guess the ask's kind (Brian,
+ * T447b): the options must be exactly "merged" and "later" (`mergedLaterOptions`). The text must also name `ref`
+ * (`owner/name#N`, a PR URL, or `#N` of the thread's repository), every PR it names must be MERGED on the thread, and it
+ * must not say install, tag, then, release, or deploy (T446a: those asks stay with Brian). Every other ask waits on him.
+ */
+export function mergeAskFor(
+    text: string,
+    thread: Thread,
+    ref: string,
+    options?: string[],
+): boolean {
+    if (!mergedLaterOptions(options)) {
+        return false;
+    }
+
+    const plain = unwrapPrCode(text);
+
+    if (MERGE_STEP.test(plain)) {
+        return false;
+    }
+
+    const named = prNamesIn(plain, thread.repo);
+    const wanted = ref.toLowerCase();
+
+    if (!named.some((one) => one.toLowerCase() === wanted)) {
+        return false;
+    }
+
+    return named.every((one) => prLinkOf(thread, one)?.state === "MERGED");
+}
 
 /**
  * The text without its code. A fence opens on a line that starts with 3 or more backticks or tildes (after at most 3
@@ -7846,10 +8148,12 @@ function withoutFences(text: string): string {
  * Whether the last paragraph asks Brian something. Code blocks and inline code never count, a sentence that says
  * there is no ask never counts, and a "?" counts in every other sentence. In a report (`report`), "please merge" is no
  * ask word (`REPORT_ASK_WORDS`) unless the sentence holds a choice (`CHOICE`): a statement that only asks for the merge
- * is no decision.
+ * is no decision. A sentence that only asks for a merge of a named PR never counts, in either mode (`plainMergeAsk`): the
+ * Desk page lists that PR under Ready to merge. An inline code run that holds only a PR name counts as the name itself,
+ * so "Please merge `owner/name#12`" is a plain merge ask.
  */
 export function asksBrian(text: string, options: { report?: boolean } = {}): boolean {
-    const plain = withoutCode(text);
+    const plain = withoutCode(unwrapPrCode(text));
     const last =
         plain
             .trim()
@@ -7862,7 +8166,7 @@ export function asksBrian(text: string, options: { report?: boolean } = {}): boo
         .filter((sentence) => sentence !== "");
 
     return sentences.some((sentence) => {
-        if (NEGATED.test(sentence)) {
+        if (NEGATED.test(sentence) || plainMergeAsk(sentence)) {
             return false;
         }
 
@@ -8360,6 +8664,88 @@ export function exportFiles(
 /** How long the page shows a closed thread, in milliseconds. A closed thread with an open ask is always shown. */
 const CLOSED_SHOWN_MS = 7 * 24 * 3600_000;
 
+/**
+ * One PR that Brian can merge now: its stored link, from the last GitHub read, with no new read of its own. `at` is the
+ * time the label `ready-for-human` was seen (`link.ready.at`).
+ */
+export type ReadyPr = {
+    ref: string;
+    title?: string;
+    url?: string;
+    /** The head oid, at 7 characters. */
+    head?: string;
+    checks?: string;
+    /** The id of the thread the PR is attached to. */
+    thread: string;
+    agents: string[];
+    at: number;
+};
+
+/**
+ * The PRs that are ready for Brian to merge: each open PR with the label seen on it, on a thread that is not closed, or
+ * on a thread that closed as done in the last 7 days (`reopenable`) and may come back. The stored links only: no GitHub
+ * read. Oldest label first, then by ref.
+ *
+ * The same PR can be on 2 threads (a seed file allows it): it is 1 row, from a thread that is not closed first, then from
+ * the lowest thread id.
+ */
+export function readyPrs(state: Readonly<DeskState> | undefined, now: number): ReadyPr[] {
+    const ready = new Map<string, { pr: ReadyPr; closed: boolean }>();
+
+    for (const thread of Object.values(state?.threads ?? {})) {
+        const closed = thread.state === "closed";
+
+        // A closed thread counts only while it may come back: a parked one is still the team's work.
+        if (closed && !reopenable(thread, now)) {
+            continue;
+        }
+
+        for (const [ref, link] of Object.entries(thread.prs)) {
+            if (link.state !== "OPEN" || link.ready === undefined) {
+                continue;
+            }
+
+            const known = ready.get(ref.toLowerCase());
+
+            if (
+                known !== undefined &&
+                !takesRow(closed, thread.id, known.closed, known.pr.thread)
+            ) {
+                continue;
+            }
+
+            ready.set(ref.toLowerCase(), {
+                closed,
+                pr: {
+                    ref,
+                    ...(link.title === undefined ? {} : { title: link.title }),
+                    ...(link.url === undefined ? {} : { url: link.url }),
+                    ...(link.head === undefined ? {} : { head: link.head.slice(0, 7) }),
+                    ...(link.checks === undefined ? {} : { checks: link.checks }),
+                    thread: thread.id,
+                    agents: [...thread.agents],
+                    at: link.ready.at,
+                },
+            });
+        }
+    }
+
+    return [...ready.values()]
+        .map((each) => each.pr)
+        .sort((a, b) => a.at - b.at || a.ref.localeCompare(b.ref));
+}
+
+/** Whether the row of a thread beats the row a PR has: a thread that is not closed first, then the lowest thread id. */
+function takesRow(closed: boolean, id: string, knownClosed: boolean, knownId: string): boolean {
+    if (closed !== knownClosed) {
+        return knownClosed;
+    }
+
+    return (
+        idNumber(id) - idNumber(knownId) < 0 || (idNumber(id) === idNumber(knownId) && id < knownId)
+    );
+}
+
 /** One thread as the page reads it. No draft objects: this goes to the browser as JSON. */
 export type ThreadView = {
     id: string;
@@ -8552,6 +8938,8 @@ export type ThreadsView = {
     issues: IssuesView | null;
     /** The cap: how many threads count, and how many OKs wait. */
     cap: { counted: number; cap: number; full: boolean; grants: number };
+    /** The PRs with the label `ready-for-human`: Brian merges them from this page. */
+    ready: ReadyPr[];
     counts: {
         open: number;
         brian: number;
@@ -8563,6 +8951,8 @@ export type ThreadsView = {
         parked: number;
         /** Watched threads before their date: they do not count, and they are not stale. */
         watching: number;
+        /** The PRs in `ready`. */
+        ready: number;
     };
 };
 
@@ -8577,6 +8967,7 @@ export function threadsView(
 ): ThreadsView {
     const threads: Record<string, Thread> = state?.threads ?? {};
     const all = Object.values(threads);
+    const ready = readyPrs(state, now);
     const counts = {
         open: 0,
         brian: 0,
@@ -8587,6 +8978,7 @@ export function threadsView(
         stale: 0,
         parked: 0,
         watching: 0,
+        ready: ready.length,
     };
 
     for (const thread of all) {
@@ -8630,6 +9022,7 @@ export function threadsView(
         ),
         github: githubView(state),
         issues: issuesView(state, now),
+        ready,
         cap: (() => {
             const view = capView(state, cap, now);
 
@@ -11304,6 +11697,11 @@ export default function createDesk(host: Host, web: Web) {
             }
         }
 
+        // Threads that closed as done in the last 7 days: new work may bring them back.
+        const recent = Object.values(state?.threads ?? {}).filter(
+            (thread) => thread.supervisor === Number(supervisor) && reopenable(thread, now),
+        );
+
         // The roster's own repositories: they set the queue's default owners, before pinned PRs add theirs.
         const rosterRepos = [...repositories];
         const pinned = new Set<string>();
@@ -11334,6 +11732,16 @@ export default function createDesk(host: Host, web: Web) {
             }
         }
 
+        // A thread that closed as done in the last 7 days may come back, and the page still shows its PRs: its open ones
+        // are pinned too, so its label, its checks and its merge stay fresh. The same 1 read: a pinned PR only.
+        for (const thread of recent) {
+            for (const [ref, link] of Object.entries(thread.prs)) {
+                if (link.state === "OPEN" && REF.test(ref) && isRepoName(repoOf(ref))) {
+                    pinned.add(ref);
+                }
+            }
+        }
+
         const githubRead = await readGitHub(
             [...repositories],
             [...pinned],
@@ -11354,10 +11762,6 @@ export default function createDesk(host: Host, web: Web) {
                 queue = { error: githubError(error), found: [], checked: {}, unread: [] };
             }
         }
-
-        const recent = Object.values(state?.threads ?? {}).filter(
-            (thread) => thread.supervisor === Number(supervisor) && reopenable(thread, now),
-        );
 
         // A closed done thread that a supervisor's message woke, or whose session works now, has its folder read: the
         // sweep needs its counts for the folder trigger, and its work is not a found folder.
@@ -12029,6 +12433,12 @@ export default function createDesk(host: Host, web: Web) {
                 events += planUnready(thread, facts.github, now);
                 // A linked issue that closed, or that stays open after its PR merged: before the close rule runs.
                 events += planIssues(state, thread, facts.github, now);
+            }
+
+            // A thread that closed as done in the last 7 days keeps its PRs fresh: a merge shows on the page, and a merge
+            // ask on it is answered. Its labels and its issues are not planned: it is closed.
+            for (const thread of closedDone) {
+                events += updatePrs(thread, facts.github, now);
             }
 
             relinkIssues(state);
@@ -12792,8 +13202,11 @@ export default function createDesk(host: Host, web: Web) {
                         (thread) =>
                             thread.supervisor === Number(supervisor) && thread.state !== "closed",
                     );
-                    // A quiet-wake mark keeps the sweeper: its triggers need a later sweep.
-                    const watched = quietWatched(state, Number(supervisor), runtime.now());
+                    // A quiet-wake mark, or a ready PR on a recently closed thread, keeps the sweeper: both need a later
+                    // sweep.
+                    const watched =
+                        quietWatched(state, Number(supervisor), runtime.now()) ||
+                        readyWatched(state, Number(supervisor), runtime.now());
 
                     if (!open && !watched) {
                         if (
@@ -12947,8 +13360,12 @@ export default function createDesk(host: Host, web: Web) {
         );
 
         // A closed done thread that a supervisor's message woke is watched for 24 hours: a report after the wake opens
-        // it, and a sweeper must be there to see it.
-        if (!open && !quietWatched(state, supervisor, Date.now())) {
+        // it, and a sweeper must be there to see it. A ready PR on a recently closed thread needs one too.
+        if (
+            !open &&
+            !quietWatched(state, supervisor, Date.now()) &&
+            !readyWatched(state, supervisor, Date.now())
+        ) {
             return;
         }
 
@@ -12979,14 +13396,15 @@ export default function createDesk(host: Host, web: Web) {
         );
         const now = Date.now();
 
-        // A quiet-wake mark is watched for 24 hours: its supervisor keeps a sweeper, also with no open thread.
+        // A quiet-wake mark is watched for 24 hours: its supervisor keeps a sweeper, also with no open thread. A ready PR
+        // on a recently closed thread keeps one until the PR merges, closes, or loses the label.
         for (const thread of Object.values(state.threads)) {
             const supervisor = thread.supervisor;
 
             if (
                 supervisor !== undefined &&
                 !supervisors.has(supervisor) &&
-                quietWatched(state, supervisor, now)
+                (quietWatched(state, supervisor, now) || readyWatched(state, supervisor, now))
             ) {
                 supervisors.add(supervisor);
             }
@@ -14609,7 +15027,7 @@ export default function createDesk(host: Host, web: Web) {
     const tool = defineTool({
         name: "desk",
         description:
-            "The desk of threads for work the team runs in the background. A supervisor session can use every action; a Clerk can use list, read, sync, attach, detach, watch, result, send, and issues for its supervisor's threads; an agent session can use watch and result on its own thread only. Actions: list (one line per open thread), read (one thread in full), sync (observe the threads now, with linked sessions, Night shift, git, and GitHub), seed (import a seed.json file one time), attach (put a PR, a queued issue, or all of another thread's work, on one thread), detach (take a PR off a thread for good: the sweep does not attach or find it again; only attach brings it back), own (mark a found PR thread as Brian's own: it closes, and no sweep finds its PR again), ask (file a question for Brian on a thread, or on a new one), rewrite (give an open ask new words, and new options or none: an agent's ask is filed as it wrote it, so make it clear for Brian), withdraw (end an open ask that Brian need not answer, with words saying why, or with into to merge it into another open ask), answer (record Brian's words for an ask), watch (set a dated check on a thread: it sleeps until that date, and does not count toward the cap), result (record that check's pass, which closes the thread, or its fail, which opens it again), send (send 1 message from the supervisor's session to a thread's agent), issues (read the issues Brian queued on GitHub: read only).",
+            "The desk of threads for work the team runs in the background. A supervisor session can use every action; a Clerk can use list, read, sync, attach, detach, watch, result, send, and issues for its supervisor's threads; an agent session can use watch and result on its own thread only. Actions: list (one line per open thread), read (one thread in full), sync (observe the threads now, with linked sessions, Night shift, git, and GitHub), seed (import a seed.json file one time), attach (put a PR, a queued issue, or all of another thread's work, on one thread), detach (take a PR off a thread for good: the sweep does not attach or find it again; only attach brings it back), own (mark a found PR thread as Brian's own: it closes, and no sweep finds its PR again), ask (file a question for Brian on a thread, or on a new one; never for a plain merge: Ready to merge on the Desk page lists those), rewrite (give an open ask new words, and new options or none: an agent's ask is filed as it wrote it, so make it clear for Brian), withdraw (end an open ask that Brian need not answer, with words saying why, or with into to merge it into another open ask), answer (record Brian's words for an ask), watch (set a dated check on a thread: it sleeps until that date, and does not count toward the cap), result (record that check's pass, which closes the thread, or its fail, which opens it again), send (send 1 message from the supervisor's session to a thread's agent), issues (read the issues Brian queued on GitHub: read only).",
         parameters: Type.Object({
             action: Type.Union([
                 Type.Literal("list"),
@@ -14851,6 +15269,15 @@ export default function createDesk(host: Host, web: Web) {
                     const state = await tx.doc(DeskThreads);
                     // A replay files no second ask: it changes nothing, so it marks nothing either.
                     const known = findAsk(state, key);
+
+                    // A plain merge is no decision: Ready to merge on the Desk page lists it. An install, a tag, or
+                    // another step beside the merge is still an ask.
+                    if (known === undefined && plainMergeAsk(args.text ?? "", args.options)) {
+                        return {
+                            error: "A merge needs no ask: a PR with the label ready-for-human shows under Ready to merge on the Desk page, and Brian merges it from there. File an ask only for a decision, or for an install or another step.",
+                        };
+                    }
+
                     const added = addAsk(state, {
                         ...(args.thread === undefined ? {} : { thread: args.thread }),
                         text: args.text ?? "",
@@ -15468,6 +15895,11 @@ export default function createDesk(host: Host, web: Web) {
                     )
                     .map((thread) => `due: ${thread.id} ${thread.watch?.check ?? ""}`);
                 const watching = open.filter((thread) => asleep(thread, now)).length;
+                // The PRs of this supervisor's threads that Brian can merge now. A closed thread of it still counts while
+                // it may come back.
+                const ready = readyPrs(state, now)
+                    .filter((pr) => threads[pr.thread]?.supervisor === supervisor)
+                    .map((pr) => pr.ref);
                 // The section and the queue say the same thing: a silent session that works now is left out of both.
                 const waits = waitsText(open, {
                     busy: await busyNow(open, input.conversationId),
@@ -15494,6 +15926,11 @@ export default function createDesk(host: Host, web: Web) {
                         : `Desk: ${String(open.length)} open · ${byActor.join(" · ")}.`,
                     ...due,
                     `Watching: ${String(watching)}.`,
+                    ...(ready.length === 0
+                        ? []
+                        : [
+                              `Ready to merge: ${ready.join(", ")}. Brian merges them from the Desk page: file no ask for a merge.`,
+                          ]),
                     `Counted: ${String(capped.counted)} of ${String(capped.cap)}.`,
                     ...githubLines(state),
                     ...(capped.full
