@@ -238,6 +238,8 @@ const TRAILING_PUNCTUATION = /[.,;:!?)]+$/;
 
 const URL_PATTERN = /\b[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s<>"'`)\]]+/g;
 const WWW_PATTERN = /\bwww\.[^\s<>"'`)\]]+/gi;
+/** A protocol-relative URL (`//example.sh/api`): its authority is a host, so it never counts as a file path. */
+const RELATIVE_URL_PATTERN = /(?<![\w:/.])\/\/[^\s/<>"'`)\]][^\s<>"'`)\]]*/g;
 const EMAIL_PATTERN = /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}\b/g;
 const IPV6_CANDIDATE =
     /(?<![0-9A-Za-z:.])(?:[0-9A-Fa-f:.]+(?:%[0-9A-Za-z_.-]+)?(?:\/\d{1,3})?)[.,;:!?)]*(?![0-9A-Za-z:])/g;
@@ -382,7 +384,10 @@ function maskNames(text: string, hostNames: readonly string[]): string {
  * secret-like tokens. A repository name such as `bketelsen/pi-pocket` stays, and so does a file name such as `team.ts`.
  */
 export function maskBrief(text: string, hostNames: readonly string[]): string {
-    let out = text.replace(URL_PATTERN, "[url]").replace(WWW_PATTERN, "[url]");
+    let out = text
+        .replace(URL_PATTERN, "[url]")
+        .replace(RELATIVE_URL_PATTERN, "[url]")
+        .replace(WWW_PATTERN, "[url]");
 
     out = out.replace(EMAIL_PATTERN, "[email]");
     out = maskIpv6(out);

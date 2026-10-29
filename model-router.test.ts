@@ -164,6 +164,13 @@ test("maskBrief masks a 1-dot name whose suffix is both a file extension and a d
         maskBrief("run ./install.sh and my_tool.py", []),
         "run ./install.sh and my_tool.py",
     );
+    // A protocol-relative URL is a URL, not a path: its `/` does not keep the host.
+    assert.equal(maskBrief("fetch //example.sh/api now", []), "fetch [url] now");
+    assert.equal(maskBrief('src="//cdn.example.md/x.js"', []), 'src="[url]"');
+    assert.equal(
+        maskBrief("see docs/notes.md and a/b//c.md", []),
+        "see docs/notes.md and a/b//c.md",
+    );
 });
 
 test("maskBrief leaves a file name and a version alone", () => {
