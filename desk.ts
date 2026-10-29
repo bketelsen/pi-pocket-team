@@ -7858,7 +7858,7 @@ const CHOICE = /\bor\b|which|whether|should i|your call|do you want/i;
 
 /**
  * The steps that keep an ask for Brian: an install, a tag, a release, a deploy, or a "then" that carries another step.
- * The desk answers only an ask for 1 merge.
+ * The desk never refuses or answers an ask with one of them.
  */
 const MERGE_STEP =
     /\b(?:install(?:s|ed|ing)?|tag(?:s|ged|ging)?|then|release[sd]?|deploy(?:s|ed|ing)?)\b/i;
@@ -7971,8 +7971,8 @@ export function mergeAskNames(text: string): boolean {
  * options, the text after the first sentence asks nothing of Brian, and every option is only a merge, a yes, a later or a
  * no. An inline code run that holds only a PR name counts as the name itself.
  *
- * Such an ask is no decision: the Desk page lists the PR under Ready to merge, and the desk answers the ask when the PR
- * merges.
+ * Such an ask is no decision: the Desk page lists the PR under Ready to merge. `desk ask` refuses it, and the reminder
+ * does not count it. The auto-answer does not use this rule: see `mergeAskFor`.
  */
 export function plainMergeAsk(text: string, options?: string[]): boolean {
     const plain = unwrapPrCode(text);
@@ -8052,8 +8052,24 @@ function prLinkOf(thread: Thread, ref: string): PrLink | undefined {
 }
 
 /**
- * Whether an ask only asks Brian to merge `ref`: the text and its options are a plain merge ask (`plainMergeAsk`), it
- * names `ref`, and every PR it names has merged. Every other ask waits on him.
+ * Whether the options of an ask are exactly "merged" and "later", in any order and case (Brian, T447b). Such an ask has
+ * only 2 answers, and the merge is 1 of them: when the PR merges, "merged" is the answer Brian would tap.
+ */
+export function mergedLaterOptions(options: readonly string[] | undefined): boolean {
+    if (options === undefined || options.length !== 2) {
+        return false;
+    }
+
+    const words = options.map((one) => one.trim().toLowerCase()).sort();
+
+    return words[0] === "later" && words[1] === "merged";
+}
+
+/**
+ * Whether the desk answers an open ask when `ref` merged. The desk reads no free text to guess the ask's kind (Brian,
+ * T447b): the options must be exactly "merged" and "later" (`mergedLaterOptions`). The text must also name `ref`
+ * (`owner/name#N`, a PR URL, or `#N` of the thread's repository), every PR it names must be MERGED on the thread, and it
+ * must not say install, tag, then, release, or deploy (T446a: those asks stay with Brian). Every other ask waits on him.
  */
 export function mergeAskFor(
     text: string,
@@ -8061,10 +8077,13 @@ export function mergeAskFor(
     ref: string,
     options?: string[],
 ): boolean {
+    if (!mergedLaterOptions(options)) {
+        return false;
+    }
+
     const plain = unwrapPrCode(text);
 
-    // The ask's own options count too: "merged; drop incus commit 2" is a step beside the merge.
-    if (!plainMergeAsk(plain, options)) {
+    if (MERGE_STEP.test(plain)) {
         return false;
     }
 
@@ -15251,11 +15270,11 @@ export default function createDesk(host: Host, web: Web) {
                     // A replay files no second ask: it changes nothing, so it marks nothing either.
                     const known = findAsk(state, key);
 
-                    // A plain merge is no decision: Ready to merge on the Desk page lists it, and the desk answers the
-                    // ask when the PR merges. An install, a tag, or another step beside the merge is still an ask.
+                    // A plain merge is no decision: Ready to merge on the Desk page lists it. An install, a tag, or
+                    // another step beside the merge is still an ask.
                     if (known === undefined && plainMergeAsk(args.text ?? "", args.options)) {
                         return {
-                            error: "A merge needs no ask: a PR with the label ready-for-human shows under Ready to merge on the Desk page, and the desk answers merge asks when the PR merges. File an ask only for a decision, or for an install or another step.",
+                            error: "A merge needs no ask: a PR with the label ready-for-human shows under Ready to merge on the Desk page, and Brian merges it from there. File an ask only for a decision, or for an install or another step.",
                         };
                     }
 

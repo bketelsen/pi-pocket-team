@@ -188,6 +188,7 @@ import {
     linkIssue,
     mergeQueue,
     mergeAskFor,
+    mergedLaterOptions,
     mergeAskNames,
     plainMergeAsk,
     readyPrs,
@@ -4887,117 +4888,97 @@ describe("merge asks", () => {
             ...patch,
         });
 
-    test("mergeAskFor: a full ref, a URL, and a bare number of the thread's repository", () => {
+    /** The options Odrade writes on a merge ask: the only ones the desk answers. */
+    const ml = ["merged", "later"];
+
+    test("mergedLaterOptions: exactly merged and later, in any order and case", () => {
+        assert.equal(mergedLaterOptions(["merged", "later"]), true);
+        assert.equal(mergedLaterOptions([" Later ", "MERGED"]), true);
+        assert.equal(mergedLaterOptions(undefined), false, "no options");
+        assert.equal(mergedLaterOptions(["merged"]), false);
+        assert.equal(mergedLaterOptions(["yes", "no"]), false);
+        assert.equal(mergedLaterOptions(["merged", "later", "never"]), false);
+        assert.equal(mergedLaterOptions(["merged + installed", "later"]), false);
+        assert.equal(mergedLaterOptions(["merged all 3", "later"]), false);
+        assert.equal(mergedLaterOptions(["merged", "merged"]), false);
+    });
+
+    test("mergeAskFor: only an ask with the options merged and later", () => {
         const one = asked([]);
 
-        assert.equal(mergeAskFor("Please merge frostyard/test#12.", one, merged), true);
+        assert.equal(mergeAskFor("Merge frostyard/test#12.", one, merged, ml), true);
+        assert.equal(mergeAskFor("Merge frostyard/test#12.", one, merged), false, "no options");
         assert.equal(
-            mergeAskFor("Merge #12. Please only check the device afterward.", one, merged),
+            mergeAskFor("Merge frostyard/test#12.", one, merged, ["yes", "no"]),
             false,
-            "an adverb before an order",
-        );
-        assert.equal(
-            mergeAskFor("Merge #12. The device must be checked manually.", one, merged),
-            false,
-            "an obligation",
-        );
-        assert.equal(
-            mergeAskFor("Merge frostyard/test#12.", one, merged, ["merged", "later"]),
-            true,
-            "merge-only options",
+            "other options",
         );
         assert.equal(
             mergeAskFor("Merge frostyard/test#12.", one, merged, ["merged + installed", "later"]),
             false,
-            "an option with another step stays for Brian",
+            "an option with another step",
         );
+        // With merged and later, the text is not read for its kind: Brian's own answer would be "merged".
         assert.equal(
-            mergeAskFor("Merge FROSTYARD/TEST#12.", one, merged),
+            mergeAskFor(
+                "Merge frostyard/snosi#1119: fixes snosi#1117 plus 3 doc drifts. CI green.".replace(
+                    "frostyard/snosi#1119",
+                    "frostyard/test#12",
+                ),
+                one,
+                merged,
+                ml,
+            ),
+            true,
+            "a description beside the merge",
+        );
+    });
+
+    test("mergeAskFor: the text names the PR, and every PR it names merged", () => {
+        const one = asked([]);
+
+        assert.equal(
+            mergeAskFor("Merge FROSTYARD/TEST#12.", one, merged, ml),
             true,
             "the owner is not case sensitive",
         );
         assert.equal(
-            mergeAskFor("Merge https://github.com/frostyard/test/pull/12", one, merged),
+            mergeAskFor("Merge `frostyard/test#12`.", one, merged, ml),
+            true,
+            "a ref in inline code",
+        );
+        assert.equal(
+            mergeAskFor("Merge https://github.com/frostyard/test/pull/12", one, merged, ml),
             true,
             "a URL names it",
         );
-        assert.equal(mergeAskFor("Merge #12.", one, merged), true, "a bare number of its repo");
-        assert.equal(mergeAskFor("Merge #12.", asked([], { repo: undefined }), merged), false);
-        assert.equal(mergeAskFor("Merge #13.", one, merged), false, "not the ref asked about");
+        assert.equal(mergeAskFor("Merge #12.", one, merged, ml), true, "a bare number of its repo");
         assert.equal(
-            mergeAskFor("Frostyard/Test#12 can merge now.", one, merged),
+            mergeAskFor("Merge #12.", asked([], { repo: undefined }), merged, ml),
             false,
-            "the merge word must lead the sentence",
+            "a bare number with no repository",
         );
-    });
-
-    test("mergeAskFor: a second PR that has not merged, and the steps that stay with Brian", () => {
-        const one = asked([]);
-
+        assert.equal(mergeAskFor("Merge #13.", one, merged, ml), false, "not the ref asked about");
         assert.equal(
-            mergeAskFor("Merge frostyard/test#12 and frostyard/test#13.", one, merged),
+            mergeAskFor("Merge frostyard/test#12 and frostyard/test#13.", one, merged, ml),
             false,
             "#13 is open",
         );
-        assert.equal(mergeAskFor("Merge frostyard/test#13.", one, openPr), false);
-        assert.equal(
-            mergeAskFor("Install it after frostyard/test#12 merges.", one, merged),
-            false,
-            "an install stays with Brian",
-        );
-        assert.equal(
-            mergeAskFor("Merge frostyard/test#12 and confirm the deletion.", one, merged),
-            false,
-            "a decision verb beside the merge stays for Brian",
-        );
-        assert.equal(
-            mergeAskFor("Merge frostyard/test#12, then tag v1.", one, merged),
-            false,
-            "a then and a tag stay with Brian",
-        );
-        assert.equal(
-            mergeAskFor("Merge frostyard/test#12 and deploy it.", one, merged),
-            false,
-            "a deploy stays with Brian",
-        );
-        assert.equal(
-            mergeAskFor("Merged frostyard/test#12? Cut a release.", one, merged),
-            false,
-            "a release stays with Brian",
-        );
-        assert.equal(
-            mergeAskFor("After frostyard/test#12 merges, can you restart the server?", one, merged),
-            false,
-            "another step is no plain merge",
-        );
-        assert.equal(
-            mergeAskFor("Merge frostyard/test#12 [squash | rebase]", one, merged),
-            false,
-            "an inline choice is a decision",
-        );
-        assert.equal(
-            mergeAskFor("Merge frostyard/test#12 (restart the server afterward).", one, merged),
-            false,
-            "a step in a parenthetical group",
-        );
-        assert.equal(
-            mergeAskFor("Merge frostyard/test#12. Back up the database.", one, merged),
-            false,
-            "another step after the first sentence",
-        );
-        assert.equal(
-            mergeAskFor("Merge frostyard/test#12.", one, merged, [
-                "merged; drop incus commit 2",
-                "later",
-            ]),
-            false,
-            "an option that carries a step",
-        );
-        assert.equal(
-            mergeAskFor("Merge frostyard/test#12.", one, merged, ["merged", "later"]),
-            true,
-            "the options Odrade writes",
-        );
+        assert.equal(mergeAskFor("Merge frostyard/test#13.", one, openPr, ml), false);
+    });
+
+    test("mergeAskFor: install, tag, then, release, and deploy stay with Brian (T446a)", () => {
+        const one = asked([]);
+
+        for (const text of [
+            "Install it after frostyard/test#12 merges.",
+            "Merge frostyard/test#12, then restart the server.",
+            "Merge frostyard/test#12 and tag v1.",
+            "Merge frostyard/test#12 and deploy it.",
+            "Merge frostyard/test#12. Cut a release.",
+        ]) {
+            assert.equal(mergeAskFor(text, one, merged, ml), false, text);
+        }
     });
 
     test("mergeAskFor: an owner word before a bare number, as Odrade writes it", () => {
@@ -5010,11 +4991,11 @@ describe("merge asks", () => {
         });
 
         assert.equal(
-            mergeAskFor("Merge frostyard-org #29 and #30.", org, "frostyard/frostyard-org#29"),
+            mergeAskFor("Merge frostyard-org #29 and #30.", org, "frostyard/frostyard-org#29", ml),
             true,
         );
         assert.equal(
-            mergeAskFor("Merge frostyard-org #29 and #30.", org, "frostyard/frostyard-org#30"),
+            mergeAskFor("Merge frostyard-org #29 and #30.", org, "frostyard/frostyard-org#30", ml),
             true,
         );
     });
@@ -5139,9 +5120,12 @@ describe("merge asks", () => {
     });
 
     test("updatePrs answers 1 merge ask with the desk's words, and 1 event only", () => {
-        const thread = asked([{ id: "T1a", text: "Please merge frostyard/test#7.", at: 10 }], {
-            prs: { "frostyard/test#7": { via: "attached", state: "OPEN" } },
-        });
+        const thread = asked(
+            [{ id: "T1a", text: "Please merge frostyard/test#7.", at: 10, options: ml }],
+            {
+                prs: { "frostyard/test#7": { via: "attached", state: "OPEN" } },
+            },
+        );
 
         updatePrs(thread, githubOf([prFact({ state: "MERGED" })]), 500);
 
@@ -5171,13 +5155,13 @@ describe("merge asks", () => {
     });
 
     test("updatePrs answers a merge ask on a PR that had merged before the sweep", () => {
-        const one = asked([{ id: "T1a", text: "Please merge #12.", at: 10 }]);
+        const one = asked([{ id: "T1a", text: "Please merge #12.", at: 10, options: ml }]);
 
         updatePrs(one, githubOf([prFact({ ref: merged, number: 12, state: "MERGED" })]), 500);
         assert.equal(one.asks[0]?.answer?.by, "desk");
     });
 
-    test("an install ask, a merge and then ask, an answered ask, and a resolved ask stay as they are", () => {
+    test("an install ask, a then ask, an answered or resolved ask, and asks with other or no options stay as they are", () => {
         const one = thread({
             prs: { "frostyard/test#7": { via: "attached", state: "OPEN" } },
             asks: [
@@ -5185,19 +5169,34 @@ describe("merge asks", () => {
                     id: "T1a",
                     text: "Install pi-pocket-team from main after frostyard/test#7 merges.",
                     at: 10,
+                    options: ml,
                 },
-                { id: "T1b", text: "Merge frostyard/test#7, then install it.", at: 10 },
+                {
+                    id: "T1b",
+                    text: "Merge frostyard/test#7, then install it.",
+                    at: 10,
+                    options: ml,
+                },
                 {
                     id: "T1c",
                     text: "Merge frostyard/test#7.",
                     at: 10,
+                    options: ml,
                     answer: { at: 20, by: "Brian", words: "Do it." },
                 },
                 {
                     id: "T1d",
                     text: "Merge frostyard/test#7.",
                     at: 10,
+                    options: ml,
                     resolved: { at: 20, why: "gone" },
+                },
+                { id: "T1e", text: "Merge frostyard/test#7.", at: 10 },
+                {
+                    id: "T1f",
+                    text: "Merge frostyard/test#7. The device requires a smoke test.",
+                    at: 10,
+                    options: ["merged + tested", "later"],
                 },
             ],
         });
@@ -5212,6 +5211,8 @@ describe("merge asks", () => {
             words: "Do it.",
         });
         assert.deepEqual(one.asks[3]?.resolved, { at: 20, why: "gone" });
+        assert.equal(one.asks[4]?.answer, undefined, "an ask with no options waits");
+        assert.equal(one.asks[5]?.answer, undefined, "an ask with other options waits");
         assert.equal(
             one.events.filter((event) => event.key.startsWith("answered:")).length,
             0,
