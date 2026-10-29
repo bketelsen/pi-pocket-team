@@ -564,6 +564,65 @@ test("the metrics note the subagents on another model, and the cross-reviews tha
     );
 });
 
+test("the metrics note the routes, with a rate only where a cell has one", () => {
+    const cell = (over = {}) => ({
+        kind: "implement",
+        tier: "high",
+        model: "github-copilot/claude-sonnet-5.5",
+        status: "shadow",
+        used: "deepseek/deepseek-flash",
+        count: 10,
+        open: 0,
+        success: 7,
+        notSuccess: 3,
+        successRate: 0.7,
+        goals: {},
+        medianRounds: 4,
+        medianCost: 1,
+        reopenings: 0,
+        ...over,
+    });
+    const markdown = renderReport(
+        baseReport({
+            metrics: {
+                R1: {
+                    routes: 11,
+                    cells: [
+                        cell({ kind: "implement", count: 10, successRate: 0.7 }),
+                        cell({ kind: "plan", count: 1, success: 1, successRate: null }),
+                    ],
+                },
+            },
+        }),
+    );
+
+    assert.match(
+        markdown,
+        /- Routes: 11 recorded\. implement\/high github-copilot\/claude-sonnet-5\.5 \(used deepseek\/deepseek-flash\): 10, success 7 of 10, rate 70%; plan\/high github-copilot\/claude-sonnet-5\.5 \(used deepseek\/deepseek-flash\): 1, success 1 of 1\./,
+    );
+    // At most 5 cells, and no line at all when no route was recorded.
+    const many = renderReport(
+        baseReport({
+            metrics: {
+                R1: {
+                    routes: 9,
+                    cells: ["A", "B", "C", "D", "E", "F", "G"].map((kind) =>
+                        cell({ kind, successRate: null }),
+                    ),
+                },
+            },
+        }),
+    );
+
+    assert.equal(many.split(";").filter((part) => part.includes("/high")).length, 5);
+
+    assert.doesNotMatch(renderReport(baseReport({ metrics: {} })), /- Routes:/);
+    assert.doesNotMatch(
+        renderReport(baseReport({ metrics: { R1: { routes: 0, cells: [] } } })),
+        /- Routes:/,
+    );
+});
+
 test("buildJson keeps the findings and the metrics, and never the report texts", () => {
     const data = emptyData();
     const json = buildJson({
