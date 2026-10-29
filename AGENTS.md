@@ -14,3 +14,12 @@ This is Brian's extension project: drop-in modules for his running Pi Pocket ser
 - **Agent memory follows Pi Pocket's memory rules** (`src/server/memory.ts` in the checkout): Pi proposes, the owner approves, approvals check what the owner saw, and a replayed tool call never adds twice. Keep `team-memory.test.ts` covering each rule you touch.
 - **Team reaches Night shift only through the global `Symbol.for("pi-pocket-team.night-shift")`, never by an import** (an import keeps a stale copy after a reload, and a second driver definition). `team-night-shift.test.ts` covers delegated goals: the goal, the report back, replay, the refusals, and the start wait.
 - The homewiki's content belongs to Bellonda; this module only renders it.
+
+## Releases and dependencies
+
+- Tag format: none. This repository has no tags and no GitHub releases, and it needs none: nothing depends on a version of it.
+- How a release starts: there are no releases. A change reaches the running server when Brian runs `npm run install-check`, then `npm run install-extension`, from a checkout of `main` (see "Installs are live" above). Agents never install unless Brian asks.
+- Who tags: Brian. Agents never tag, push tags, or release.
+- Version rule: none. `package.json` keeps `version` at `0.1.0`, and `private: true`: it is never published.
+- Internal dependencies: the Pi Pocket checkout (bketelsen/pi-pocket, upstream TannerMidd/pi-pocket). `npm run link` links `node_modules`, `_pocket.d.ts` and `_pocket` into it (`PI_POCKET_CHECKOUT`, default `../pi-pocket`). There is no version pin in `package.json`. CI pins it in `.github/workflows/ci.yml` (`git clone --branch v0.25.0`): move that tag when the server moves to a new Pi Pocket release. `.github/workflows/upstream.yml` tests against upstream `main` each Monday and only warns. README.md names the oldest Pi Pocket release that works (v0.21.0).
+- Who uses this repository: only Brian's running Pi Pocket server, through `~/.pi-pocket/extensions/`. No other repository depends on it.
