@@ -146,6 +146,12 @@ export type PrLink = {
      * unknown), and `head` is the head oid the desk saw first with the label. Absent: no label.
      */
     ready?: { at: number; head: string };
+    /**
+     * When a GitHub read last gave this link's facts: the sweep's `now`. Absent on a link from before the field, or on one
+     * no read has covered yet (a seed, or an attach by hand). A link whose read is older than its thread's last read
+     * (`run.prsReadAt`) is stale, and the page does not show it as ready to merge.
+     */
+    readAt?: number;
 };
 
 /** One dated check on a thread. Stored data: never rename a field or change what it means. */
@@ -241,7 +247,8 @@ export type Thread = {
      * `report-blocked`; false when it does not, absent for a thread filed before the field), `otherUserEntry` (the
      * newest `pi.user` entry of its session that did not come from the supervisor's
      * address `returnAddress`: a person, or another session, wrote it; with an unknown address every entry counts), and
-     * `quietReopen` (`{ at, entry }`: the sweep reopened a done thread for a message from the supervisor's address, with
+     * `prsReadAt` (the `now` of the last sweep whose GitHub read covered this thread's PRs: a link the read did not
+     * cover keeps an older `readAt`, or none), `quietReopen` (`{ at, entry }`: the sweep reopened a done thread for a message from the supervisor's address, with
      * no other new message: `at` is the sweep's time, `entry` the session's newest user entry before that message; a
      * thread that stays quiet, with no report after it, may close again, see `quietSilence`; a thread stored with it
      * keeps that meaning, and a quiet wake now keeps the thread closed, see `quietWake`), `handled` (`{ at, by, act
@@ -630,6 +637,18 @@ export function threadOfSession(
     session: number,
 ): Thread | undefined {
     return Object.values(state?.threads ?? {}).find((thread) => thread.session === session);
+}
+
+/**
+ * The thread an agent session reads when it names none: its own are the threads with its `session`. The newest of those
+ * that is not closed, else the newest by `startedAt`.
+ */
+function ownThreadOf(state: Readonly<DeskState> | undefined, session: number): Thread | undefined {
+    const newest = (threads: Thread[]): Thread | undefined =>
+        [...threads].sort((a, b) => b.startedAt - a.startedAt)[0];
+    const mine = Object.values(state?.threads ?? {}).filter((thread) => thread.session === session);
+
+    return newest(mine.filter((thread) => thread.state !== "closed")) ?? newest(mine);
 }
 
 /** A supervisor's Clerk, when one is registered. */
@@ -3927,6 +3946,76 @@ export function takeDigest(
     return { items, seq };
 }
 
+/** A queue item's thread id and reason, from its key `queue:<thread id>:<reason>`; undefined for any other item. */
+function queueKeyOf(item: DigestItem): { id: string; reason: string } | undefined {
+    if ((item.kind !== "queue" && item.kind !== "repair") || !item.key.startsWith("queue:")) {
+        return undefined;
+    }
+
+    // Split at the first 2 colons only: a reason holds colons of its own ("watch is due: check X").
+    const first = item.key.indexOf(":");
+    const second = item.key.indexOf(":", first + 1);
+
+    return second < 0
+        ? undefined
+        : { id: item.key.slice(first + 1, second), reason: item.key.slice(second + 1) };
+}
+
+/**
+ * The items to send: a queue item whose reason no longer holds is dropped, and every other item stays. A queue item's
+ * kind is `queue` or `repair`, and its key is `queue:<thread id>:<reason>`. The reason must still hold when the digest
+ * goes: a watch, an answer, or a new PR state can change it after the item went into the box (T465: "silent session" at
+ * 11:26, the watch at 11:27). A thread that is gone, closed, or parked holds no reason now, so its item goes too.
+ */
+export function dropStaleQueue(
+    items: readonly DigestItem[],
+    state: Readonly<DeskState> | undefined,
+): DigestItem[] {
+    return items.filter((item) => {
+        const parsed = queueKeyOf(item);
+
+        if (parsed === undefined) {
+            return true;
+        }
+
+        const thread = state?.threads[parsed.id];
+
+        return thread !== undefined && odradeReason(thread) === parsed.reason;
+    });
+}
+
+/**
+ * Forget the reasons of dropped queue items: `box.queued` says a digest carried a reason, and `queueNews` sends no item
+ * for a reason it holds. A dropped item carried nothing, so its mark goes when it still holds that same reason; a newer
+ * reason stays. Without this, a reason that comes back before a sweep saw it leave (a watch set, then cleared) never
+ * reaches the supervisor. Call it in the commit that took the items.
+ */
+export function forgetDropped(
+    state: DeskState,
+    supervisor: number,
+    dropped: readonly DigestItem[],
+): void {
+    if (state.digests?.[String(supervisor)] === undefined) {
+        return;
+    }
+
+    const box = digestBox(state, supervisor);
+    let changed = false;
+
+    for (const item of dropped) {
+        const parsed = queueKeyOf(item);
+
+        if (parsed !== undefined && box.queued[parsed.id] === parsed.reason) {
+            delete box.queued[parsed.id];
+            changed = true;
+        }
+    }
+
+    if (changed) {
+        setDigestBox(state, supervisor, box);
+    }
+}
+
 /** The desk's start: the oldest seed thread's start, else the stored epoch. A seed sets the truth. */
 export function deskEpoch(state: Readonly<DeskState> | undefined): number | undefined {
     let oldest: number | undefined;
@@ -4911,9 +5000,24 @@ const linkFor = (pr: PrFact, via: PrLink["via"]): PrLink => ({
     ...(pr.ready ? { ready: { at: pr.readyAt > 0 ? pr.readyAt : 0, head: pr.head } } : {}),
 });
 
+/**
+ * A link copied to another thread. The read that gave it its facts was of the source thread (`readAt`), so the copy
+ * keeps none: the destination thread's next read must cover it, or the page hides it (`readCovered`).
+ */
+function withoutRead(link: PrLink): PrLink {
+    const copy: PrLink = { ...link };
+
+    delete copy.readAt;
+
+    return copy;
+}
+
 /** One attached PR's facts from a read: its state, its next actor, and what GitHub says. */
 export function updatePrs(thread: Thread, github: GitHubFacts, now: number): number {
     let events = 0;
+
+    // This read covered this thread's PRs: a link it gives no fact for keeps an older `readAt`, and the page hides it.
+    thread.run.prsReadAt = now;
 
     // The thread's repository, as the read saw it: an archived one freezes the thread, even with no PR to show it.
     const repo = thread.repo === undefined ? undefined : github.repos[thread.repo];
@@ -4924,6 +5028,8 @@ export function updatePrs(thread: Thread, github: GitHubFacts, now: number): num
 
     for (const [ref, link] of Object.entries(thread.prs)) {
         if (github.missing !== undefined && github.missing.includes(ref)) {
+            link.readAt = now;
+
             if (link.state !== "MISSING") {
                 link.state = "MISSING";
                 link.next = "odrade";
@@ -4949,6 +5055,8 @@ export function updatePrs(thread: Thread, github: GitHubFacts, now: number): num
         if (fact === undefined) {
             continue;
         }
+
+        link.readAt = now;
 
         const archived = fact.archived || github.repos[fact.repo]?.archived === true;
         const state = archived ? "FROZEN" : fact.state;
@@ -5216,7 +5324,7 @@ export function attribute(
 
                 if (newer !== undefined) {
                     delete holder.prs[pr.ref];
-                    newer.prs[pr.ref] = linkFor(pr, "seen");
+                    newer.prs[pr.ref] = { ...linkFor(pr, "seen"), readAt: now };
 
                     if (
                         addEvent(
@@ -5292,7 +5400,7 @@ export function attribute(
             }
 
             if (target !== undefined) {
-                target.prs[pr.ref] = linkFor(pr, via);
+                target.prs[pr.ref] = { ...linkFor(pr, via), readAt: now };
 
                 if (
                     addEvent(
@@ -5337,7 +5445,7 @@ export function attribute(
                 state: "open",
                 startedAt: now,
                 lastEventAt: now,
-                prs: { [pr.ref]: linkFor(pr, "attached") },
+                prs: { [pr.ref]: { ...linkFor(pr, "attached"), readAt: now } },
                 branches: [],
                 asks: [],
                 run: { next: "odrade", sweptAt: now },
@@ -5406,7 +5514,8 @@ export function attachTo(
             );
         }
 
-        target.prs[ref] = { ...(link ?? {}), via: "attached" };
+        // The read that gave this link its facts was of the other thread: the copy keeps no `readAt`.
+        target.prs[ref] = { ...(link === undefined ? {} : withoutRead(link)), via: "attached" };
         // A PR put on by hand comes back: the dropped list no longer holds it.
         delete state.dropped?.[ref];
         addEvent(target, `attached:${ref}:${String(now)}`, `${ref} attached`, now);
@@ -5431,7 +5540,8 @@ export function attachTo(
     }
 
     for (const [prRef, link] of Object.entries(source.prs)) {
-        target.prs[prRef] = { ...link };
+        // The source thread's read does not cover the target: its own next read must.
+        target.prs[prRef] = withoutRead(link);
     }
 
     source.prs = {};
@@ -8682,9 +8792,50 @@ export type ReadyPr = {
 };
 
 /**
+ * Whether the last GitHub read of a thread gave this link its facts: it has a `readAt`, and no later read of the thread
+ * came after it. A link with no read, or one its thread's last read did not cover, is stale: the page does not show it.
+ */
+function readCovered(thread: Thread, link: PrLink): boolean {
+    return link.readAt !== undefined && link.readAt >= (numberOr(thread.run.prsReadAt) ?? 0);
+}
+
+/** Whether a thread is one the page shows: not closed, or closed as done in the last 7 days (`reopenable`). */
+const shownThread = (thread: Thread, now: number): boolean =>
+    thread.state !== "closed" || reopenable(thread, now);
+
+/**
+ * Whether a supervisor has a ready PR that the page hides because no GitHub read covered it: an OPEN link with the label
+ * `ready-for-human`, on a thread that is not closed or may come back, that `readyPrs` leaves out. The page sweeps that
+ * supervisor at once, so the row comes back.
+ */
+export function staleReady(
+    state: Readonly<DeskState> | undefined,
+    supervisor: number,
+    now: number,
+): boolean {
+    for (const thread of Object.values(state?.threads ?? {})) {
+        if (thread.supervisor !== supervisor || !shownThread(thread, now)) {
+            continue;
+        }
+
+        for (const link of Object.values(thread.prs)) {
+            if (link.state === "OPEN" && link.ready !== undefined && !readCovered(thread, link)) {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+/**
  * The PRs that are ready for Brian to merge: each open PR with the label seen on it, on a thread that is not closed, or
  * on a thread that closed as done in the last 7 days (`reopenable`) and may come back. The stored links only: no GitHub
  * read. Oldest label first, then by ref.
+ *
+ * A link shows only when the last GitHub read of its thread gave its facts (`readCovered`): a link with no read, or one
+ * that read did not cover, is hidden, so a merged PR on a thread no sweep reads cannot stay in the list. The page sweeps
+ * the supervisor at once for such a link, see `staleReady`.
  *
  * The same PR can be on 2 threads (a seed file allows it): it is 1 row, from a thread that is not closed first, then from
  * the lowest thread id.
@@ -8696,12 +8847,12 @@ export function readyPrs(state: Readonly<DeskState> | undefined, now: number): R
         const closed = thread.state === "closed";
 
         // A closed thread counts only while it may come back: a parked one is still the team's work.
-        if (closed && !reopenable(thread, now)) {
+        if (!shownThread(thread, now)) {
             continue;
         }
 
         for (const [ref, link] of Object.entries(thread.prs)) {
-            if (link.state !== "OPEN" || link.ready === undefined) {
+            if (link.state !== "OPEN" || link.ready === undefined || !readCovered(thread, link)) {
                 continue;
             }
 
@@ -13509,9 +13660,19 @@ export default function createDesk(host: Host, web: Web) {
                 await runtime.commit(async (tx) => {
                     const state = await tx.doc(DeskThreads);
                     const taken = takeDigest(state, supervisor, task.input.due);
+                    // A queue item whose reason is gone (a watch, an answer, a new PR state) sends nothing: it is dropped
+                    // here, after the box emptied, so a stale line never reaches the supervisor.
+                    const items = dropStaleQueue(taken.items, state);
+
+                    // A dropped item carried nothing: its reason may come back, and must then go out.
+                    forgetDropped(
+                        state,
+                        supervisor,
+                        taken.items.filter((item) => !items.includes(item)),
+                    );
 
                     // Nothing waits: no message, and the task ends.
-                    if (taken.items.length === 0) {
+                    if (items.length === 0) {
                         return {
                             status: "terminal",
                             outcome: { status: "completed", result: null },
@@ -13521,7 +13682,7 @@ export default function createDesk(host: Host, web: Web) {
                     const { digest } = await deskConfig();
                     const clerk = clerkOf(state, supervisor);
                     // The Clerk takes the routine kinds; a kind that goes at once always stays with the supervisor.
-                    const split = splitDigest(taken.items, clerk !== undefined, digest);
+                    const split = splitDigest(items, clerk !== undefined, digest);
                     // A report that a supervisor handled after it left the Clerk's list: it needs no escalation.
                     const theirs = dropHandled(split.theirs, state);
                     const { ours } = split;
@@ -14155,6 +14316,12 @@ export default function createDesk(host: Host, web: Web) {
     /** A sweep when nobody looked for 5 minutes, for each supervisor that has open threads. A failure never fails the page. */
     const SWEEP_VIEW_MS = 5 * 60_000;
 
+    /**
+     * supervisor → the time of its last view sweep, for the sweep of a stale ready link. A reload of the module clears
+     * it, so the first page view after an install sweeps.
+     */
+    const viewSweeps = new Map<number, number>();
+
     const sweepForView = async (request: WebRequest): Promise<void> => {
         try {
             const state = await request.snapshot(DeskThreads, request.context);
@@ -14163,19 +14330,55 @@ export default function createDesk(host: Host, web: Web) {
                 (thread) => thread.state !== "closed" && thread.supervisor !== undefined,
             );
 
+            // A supervisor with a stale ready link: the page would hide a PR that waits for a read. It gets a sweep
+            // too, at most once each `SWEEP_VIEW_MS`.
+            const stale = new Set<number>();
+            const known = new Set<number>();
+
+            for (const thread of Object.values(state?.threads ?? {})) {
+                const supervisor = thread.supervisor;
+
+                if (supervisor === undefined || known.has(supervisor)) {
+                    continue;
+                }
+
+                known.add(supervisor);
+
+                if (staleReady(state, supervisor, now)) {
+                    stale.add(supervisor);
+                }
+            }
+
+            const supervisors = new Set<number>(open.map((thread) => thread.supervisor as number));
+
+            for (const supervisor of stale) {
+                supervisors.add(supervisor);
+            }
+
             let swept = false;
 
-            for (const supervisor of new Set(open.map((thread) => thread.supervisor as number))) {
+            for (const supervisor of supervisors) {
                 const mine = open.filter((thread) => thread.supervisor === supervisor);
                 const fresh = mine.some(
                     (thread) =>
                         typeof thread.run.sweptAt === "number" &&
                         now - (thread.run.sweptAt as number) < SWEEP_VIEW_MS,
                 );
+                const staleDue =
+                    stale.has(supervisor) &&
+                    now - (viewSweeps.get(supervisor) ?? 0) >= SWEEP_VIEW_MS;
+                // The open-thread path: a supervisor whose threads did not sweep a moment ago. A supervisor with no open
+                // thread has `mine` empty, so only a stale ready link, which has its own limit, sweeps it.
+                const openDue = mine.length > 0 && !fresh;
 
-                if (fresh) {
+                // 1 sweep at most. A supervisor that swept a moment ago waits, unless a stale ready link is due.
+                if (!openDue && !staleDue) {
                     continue;
                 }
+
+                // Each try counts, also one that fails: a stale ready link waits `SWEEP_VIEW_MS` for the next one, so a
+                // failing read does not run on every page load.
+                viewSweeps.set(supervisor, now);
 
                 try {
                     const facts = await gather(
@@ -15027,7 +15230,7 @@ export default function createDesk(host: Host, web: Web) {
     const tool = defineTool({
         name: "desk",
         description:
-            "The desk of threads for work the team runs in the background. A supervisor session can use every action; a Clerk can use list, read, sync, attach, detach, watch, result, send, and issues for its supervisor's threads; an agent session can use watch and result on its own thread only. Actions: list (one line per open thread), read (one thread in full), sync (observe the threads now, with linked sessions, Night shift, git, and GitHub), seed (import a seed.json file one time), attach (put a PR, a queued issue, or all of another thread's work, on one thread), detach (take a PR off a thread for good: the sweep does not attach or find it again; only attach brings it back), own (mark a found PR thread as Brian's own: it closes, and no sweep finds its PR again), ask (file a question for Brian on a thread, or on a new one; never for a plain merge: Ready to merge on the Desk page lists those), rewrite (give an open ask new words, and new options or none: an agent's ask is filed as it wrote it, so make it clear for Brian), withdraw (end an open ask that Brian need not answer, with words saying why, or with into to merge it into another open ask), answer (record Brian's words for an ask), watch (set a dated check on a thread: it sleeps until that date, and does not count toward the cap), result (record that check's pass, which closes the thread, or its fail, which opens it again), send (send 1 message from the supervisor's session to a thread's agent), issues (read the issues Brian queued on GitHub: read only).",
+            "The desk of threads for work the team runs in the background. A supervisor session can use every action; a Clerk can use list, read, sync, attach, detach, watch, result, send, and issues for its supervisor's threads; an agent session can use read, watch, and result on its own thread only. Actions: list (one line per open thread), read (one thread in full), sync (observe the threads now, with linked sessions, Night shift, git, and GitHub), seed (import a seed.json file one time), attach (put a PR, a queued issue, or all of another thread's work, on one thread), detach (take a PR off a thread for good: the sweep does not attach or find it again; only attach brings it back), own (mark a found PR thread as Brian's own: it closes, and no sweep finds its PR again), ask (file a question for Brian on a thread, or on a new one; never for a plain merge: Ready to merge on the Desk page lists those), rewrite (give an open ask new words, and new options or none: an agent's ask is filed as it wrote it, so make it clear for Brian), withdraw (end an open ask that Brian need not answer, with words saying why, or with into to merge it into another open ask), answer (record Brian's words for an ask), watch (set a dated check on a thread: it sleeps until that date, and does not count toward the cap), result (record that check's pass, which closes the thread, or its fail, which opens it again), send (send 1 message from the supervisor's session to a thread's agent), issues (read the issues Brian queued on GitHub: read only).",
         parameters: Type.Object({
             action: Type.Union([
                 Type.Literal("list"),
@@ -15049,7 +15252,7 @@ export default function createDesk(host: Host, web: Web) {
             thread: Type.Optional(
                 Type.String({
                     description:
-                        "read: a thread id, such as T13; attach: the target thread; watch, result: the thread to change; send: the thread whose agent gets the message; own: the found thread",
+                        "read: a thread id, such as T13; an agent may leave it out for its own thread; attach: the target thread; watch, result: the thread to change; send: the thread whose agent gets the message; own: the found thread",
                 }),
             ),
             ref: Type.Optional(
@@ -15123,6 +15326,9 @@ export default function createDesk(host: Host, web: Web) {
                 (await team.roster().catch(() => [])).find((member) => member.role === "supervisor")
                     ?.name ?? "your supervisor";
             const watching = args.action === "watch" || args.action === "result";
+            /** A session with no supervisor and no Clerk role: it reads, watches, and records results on its own thread. */
+            const agent =
+                persona !== undefined && persona.role !== "supervisor" && persona.role !== "clerk";
 
             if (persona === undefined) {
                 throw new Error(
@@ -15167,9 +15373,9 @@ export default function createDesk(host: Host, web: Web) {
                 }
 
                 supervisor = registered;
-            } else if (persona.role !== "supervisor" && !watching) {
+            } else if (agent && !watching && args.action !== "read") {
                 throw new Error(
-                    `Only a session assigned a supervisor identity can use the desk. An agent can use only watch and result, on its own thread. For ${args.action}, ask ${await supervisorName()} with team_message to the return address in your first message; your task is in that message.`,
+                    `Only a session assigned a supervisor identity can use the desk. An agent can use only read, watch, and result, on its own thread. For ${args.action}, ask ${await supervisorName()} with team_message to the return address in your first message; your task is in that message.`,
                 );
             }
 
@@ -15231,6 +15437,42 @@ export default function createDesk(host: Host, web: Web) {
 
             if (args.action === "read") {
                 const id = args.thread?.trim();
+
+                // An agent reads its own thread, and only that one. It writes nothing: no look, no sweeper.
+                if (agent) {
+                    const state = await api.snapshot(DeskThreads, context);
+                    const hint = `Ask ${await supervisorName()} with team_message to the return address in your first message.`;
+                    const thread =
+                        id === undefined || id === ""
+                            ? ownThreadOf(state, session)
+                            : threadById(state, id);
+
+                    if (thread === undefined) {
+                        throw new Error(
+                            id === undefined || id === ""
+                                ? `This session has no thread on the desk. ${hint}`
+                                : `${id.toUpperCase()} is not this session's thread: an agent can read only its own thread. ${hint}`,
+                        );
+                    }
+
+                    if (thread.session !== session) {
+                        throw new Error(
+                            `${thread.id} is not this session's thread: an agent can read only its own thread. ${hint}`,
+                        );
+                    }
+
+                    const text = readText(state, thread.id) ?? "";
+                    const reports =
+                        thread.session === undefined
+                            ? undefined
+                            : await api.snapshot(
+                                  DeskReports,
+                                  thread.session as ConversationId,
+                                  context,
+                              );
+
+                    return reply(text + reportsText(reports, (value) => host.text.defang(value)));
+                }
 
                 if (id === undefined || id === "") {
                     throw new Error("read needs thread: a thread id such as T13.");

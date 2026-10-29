@@ -135,6 +135,8 @@ import {
     markHandled,
     handledAfter,
     dropHandled,
+    dropStaleQueue,
+    forgetDropped,
     watchDueAt,
     watchWhen,
     recordResult,
@@ -192,6 +194,7 @@ import {
     mergeAskNames,
     plainMergeAsk,
     readyPrs,
+    staleReady,
     ownersOfRepos,
     parseIssueFacts,
     parseIssueNode,
@@ -6444,6 +6447,7 @@ describe("readyPrs", () => {
         checks: "SUCCESS",
         head: "a1b2c3d4e5",
         ready: { at: 500, head: "a1b2c3d4e5" },
+        readAt: 900,
         ...patch,
     });
 
@@ -6592,6 +6596,151 @@ describe("readyPrs", () => {
         // 2 threads, 1 PR: the page counts it 1 time, so the badge does too.
         assert.equal(threadsView(state, now).counts.ready, 1);
     });
+
+    test("a link with no readAt is hidden: no read gave its facts", () => {
+        const state = deskOf();
+
+        withPr(state, 100, {}, readyLink({ readAt: undefined }));
+        withPr(state, 200, {}, readyLink({ readAt: 900 }), "frostyard/test#8");
+
+        assert.deepEqual(
+            readyPrs(state, now).map((pr) => pr.ref),
+            ["frostyard/test#8"],
+            "the legacy link is hidden, the read one shows",
+        );
+    });
+
+    test("a link read at the thread's last read shows; one read before it is hidden", () => {
+        const state = deskOf();
+        const read = withPr(state, 100, { run: { prsReadAt: 900 } }, readyLink({ readAt: 900 }));
+
+        assert.deepEqual(
+            readyPrs(state, now).map((pr) => pr.ref),
+            ["frostyard/test#7"],
+            "equal to prsReadAt: the last read covered it",
+        );
+
+        read.run.prsReadAt = 901;
+        assert.deepEqual(readyPrs(state, now), [], "an older read: not covered");
+
+        // A thread with no prsReadAt shows a link that has a read: 0 is the floor.
+        delete read.run.prsReadAt;
+        assert.deepEqual(
+            readyPrs(state, now).map((pr) => pr.ref),
+            ["frostyard/test#7"],
+            "an older thread with no prsReadAt",
+        );
+    });
+
+    test("updatePrs sets the link's readAt and the thread's prsReadAt", () => {
+        const state = deskOf();
+        const linked = withPr(state, 100, { run: {} }, readyLink({ readAt: undefined }));
+
+        updatePrs(linked, githubOf([prFact({ ready: true, readyAt: 500 })]), 700);
+
+        assert.equal(linked.run.prsReadAt, 700);
+        assert.equal(linked.prs["frostyard/test#7"]?.readAt, 700);
+        assert.equal(linked.prs["frostyard/test#7"]?.ready?.at, 500);
+
+        // A PR the read does not cover keeps its older readAt, so the page hides it.
+        const other = withPr(state, 200, { run: {} }, readyLink({ readAt: 300 }));
+
+        updatePrs(other, githubOf([]), 800);
+
+        assert.equal(other.run.prsReadAt, 800);
+        assert.equal(other.prs["frostyard/test#7"]?.readAt, 300);
+        assert.deepEqual(
+            readyPrs(state, now).map((pr) => pr.ref),
+            ["frostyard/test#7"],
+            "only the thread the read covered has a row",
+        );
+    });
+
+    test("updatePrs gives a link it finds missing a readAt too", () => {
+        const state = deskOf();
+        const linked = withPr(state, 100, { run: {} }, readyLink({ readAt: undefined }));
+
+        updatePrs(
+            linked,
+            { viewer: "github-viewer", repos: {}, prs: {}, missing: ["frostyard/test#7"] },
+            700,
+        );
+
+        assert.equal(linked.prs["frostyard/test#7"]?.state, "MISSING");
+        assert.equal(linked.prs["frostyard/test#7"]?.readAt, 700);
+        assert.deepEqual(readyPrs(state, now), [], "MISSING is not ready");
+    });
+
+    test("the incident: a closed thread's old OPEN ready link is hidden until a read covers it", () => {
+        const state = deskOf();
+        const done = withPr(
+            state,
+            100,
+            { state: "closed", closed: { at: now - DAY, why: "done", by: "sweep" }, run: {} },
+            readyLink({ readAt: undefined }),
+        );
+
+        assert.deepEqual(readyPrs(state, now), [], "merged before the fix: no read covered it");
+        assert.equal(staleReady(state, 1, now), true, "the page sweeps this supervisor at once");
+
+        // The sweep reads the PR: it is MERGED, so it leaves the list for good.
+        updatePrs(done, githubOf([prFact({ state: "MERGED", ready: true, readyAt: 500 })]), 1200);
+
+        assert.equal(done.prs["frostyard/test#7"]?.state, "MERGED");
+        assert.deepEqual(readyPrs(state, now), [], "a merged PR is no row");
+        assert.equal(staleReady(state, 1, now), false);
+
+        // The same case with an OPEN read whose label has a new time: the row comes back.
+        const again = deskOf();
+        const reopened = withPr(
+            again,
+            100,
+            { state: "closed", closed: { at: now - DAY, why: "done", by: "sweep" }, run: {} },
+            readyLink({ readAt: undefined }),
+        );
+
+        updatePrs(reopened, githubOf([prFact({ ready: true, readyAt: 1100 })]), 1200);
+
+        assert.deepEqual(
+            readyPrs(again, now).map((pr) => pr.ref),
+            ["frostyard/test#7"],
+        );
+        assert.equal(staleReady(again, 1, now), false);
+    });
+
+    test("staleReady: only an open thread's OPEN ready link with no covering read counts", () => {
+        const state = deskOf();
+
+        assert.equal(staleReady(undefined, 1, now), false, "no desk");
+        assert.equal(staleReady(state, 1, now), false, "no thread");
+
+        const fresh = withPr(state, 100);
+
+        assert.equal(staleReady(state, 1, now), false, "a read link is not stale");
+        assert.equal(staleReady(state, 2, now), false, "another supervisor");
+
+        fresh.prs["frostyard/test#7"] = readyLink({ readAt: undefined });
+        assert.equal(staleReady(state, 1, now), true, "no read: stale");
+
+        // A link without the label is no Ready to merge row, so it is never stale.
+        fresh.prs["frostyard/test#7"] = readyLink({ readAt: undefined, ready: undefined });
+        assert.equal(staleReady(state, 1, now), false, "no label");
+
+        fresh.prs["frostyard/test#7"] = readyLink({ readAt: undefined, state: "MERGED" });
+        assert.equal(staleReady(state, 1, now), false, "not OPEN");
+
+        // A closed thread counts only while it may come back.
+        fresh.prs["frostyard/test#7"] = readyLink({ readAt: undefined });
+        fresh.state = "closed";
+        fresh.closed = { at: now - DAY, why: "done", by: "sweep" };
+        assert.equal(staleReady(state, 1, now), true, "closed as done in the last 7 days");
+
+        fresh.closed = { at: now - 8 * DAY, why: "done", by: "sweep" };
+        assert.equal(staleReady(state, 1, now), false, "past the 7 days");
+
+        fresh.closed = { at: now - DAY, why: "dropped", by: "sweep" };
+        assert.equal(staleReady(state, 1, now), false, "dropped");
+    });
 });
 
 describe("attachTo", () => {
@@ -6640,6 +6789,68 @@ describe("attachTo", () => {
         assert.match(
             source.events.map((event) => event.text).join("; "),
             new RegExp(`merged into ${rx(target.id)}`),
+        );
+    });
+
+    /** A ready link that its own thread's read covered: the page shows it. */
+    const covered = (): PrLink => ({
+        via: "seen",
+        state: "OPEN",
+        title: "A fix",
+        head: "a1b2c3d4e5",
+        ready: { at: 500, head: "a1b2c3d4e5" },
+        readAt: 700,
+    });
+
+    test("a moved PR keeps no readAt, so the page hides it until the target thread reads it", () => {
+        const state = deskOf();
+        const older = placed(state, 100);
+        const target = placed(state, 200);
+
+        older.prs["frostyard/test#7"] = covered();
+        assert.deepEqual(
+            readyPrs(state, 100 * DAY).map((pr) => pr.thread),
+            [older.id],
+            "it shows on its own thread",
+        );
+
+        attachTo(state, "frostyard/test#7", target.id, 300);
+
+        assert.equal(target.prs["frostyard/test#7"]?.readAt, undefined, "the copy keeps no read");
+        assert.equal(target.prs["frostyard/test#7"]?.ready?.at, 500, "the label stays");
+        assert.deepEqual(readyPrs(state, 100 * DAY), [], "no read covered it on the target");
+
+        updatePrs(target, githubOf([prFact({ ready: true, readyAt: 500 })]), 900);
+
+        assert.equal(target.prs["frostyard/test#7"]?.readAt, 900);
+        assert.deepEqual(
+            readyPrs(state, 100 * DAY).map((pr) => pr.thread),
+            [target.id],
+            "the target's own read covers it",
+        );
+    });
+
+    test("a whole thread's PRs keep no readAt on the target either", () => {
+        const state = deskOf();
+        const source = placed(state, 100);
+        const target = placed(state, 200);
+
+        source.prs["frostyard/test#7"] = covered();
+        assert.deepEqual(
+            readyPrs(state, 100 * DAY).map((pr) => pr.thread),
+            [source.id],
+        );
+
+        attachTo(state, source.id, target.id, 300);
+
+        assert.deepEqual(Object.keys(target.prs), ["frostyard/test#7"]);
+        assert.equal(target.prs["frostyard/test#7"]?.readAt, undefined);
+        assert.deepEqual(readyPrs(state, 100 * DAY), [], "no read covered it on the target");
+
+        updatePrs(target, githubOf([prFact({ ready: true, readyAt: 500 })]), 900);
+        assert.deepEqual(
+            readyPrs(state, 100 * DAY).map((pr) => pr.thread),
+            [target.id],
         );
     });
 
@@ -8276,6 +8487,128 @@ describe("the digest's rules", () => {
         assert.match(
             items[0]?.line ?? "",
             /waits on you: PR frostyard\/test#7 needs a repair: agent/,
+        );
+    });
+
+    /** A thread that waits on Odrade as a silent session: idle, and no report after the last user entry. */
+    const silent = (state: DeskState) => {
+        const thread = open(state, "x.test.stale-queue").thread;
+
+        thread.state = "open";
+        thread.run.busy = false;
+        thread.run.reportedUserEntry = 5;
+        thread.run.lastUserEntry = 9;
+
+        return thread;
+    };
+
+    test("a queue item is dropped when its reason is gone: the T465 watch, a due watch, and a thread gone or closed", () => {
+        const state = empty();
+        const thread = silent(state);
+        const item = made(`queue:${thread.id}:silent session`, "queue", thread.id, 1000);
+
+        assert.deepEqual(dropStaleQueue([item], state), [item], "the reason still holds");
+
+        // T465: a watch set 46 seconds later. The session sleeps until the check, so nobody waits on Odrade.
+        thread.watch = {
+            checkOn: "2099-01-01",
+            check: "a later check",
+            setAt: 1046,
+            setBy: "brian",
+            key: "x.test.watch",
+        };
+        assert.equal(odradeReason(thread), undefined, "the silent session left");
+        assert.deepEqual(dropStaleQueue([item], state), [], "the watch made the item stale");
+
+        // A reason with colons of its own: `queue:<id>:watch is due: check X`.
+        const due = open(state, "x.test.due-watch").thread;
+        const watch = {
+            checkOn: "2026-11-01",
+            check: "check X",
+            setAt: 1000,
+            dueAt: 2000,
+            setBy: "brian",
+            key: "x.test.due",
+        };
+
+        due.state = "open";
+        due.watch = watch;
+
+        const dueItem = made(`queue:${due.id}:watch is due: check X`, "queue", due.id, 2000);
+
+        assert.deepEqual(
+            dropStaleQueue([dueItem], state),
+            [dueItem],
+            "the reason holds, colons and all",
+        );
+
+        delete (watch as { dueAt?: number }).dueAt;
+        assert.deepEqual(dropStaleQueue([dueItem], state), [], "not due: the reason is gone");
+
+        // A thread that is gone, and one that closed: no reason holds.
+        assert.deepEqual(dropStaleQueue([item], empty()), [], "no such thread");
+
+        thread.watch = undefined;
+        thread.state = "closed";
+        thread.closed = { at: 3000, why: "done", by: "sweep" };
+        assert.deepEqual(dropStaleQueue([item], state), [], "a closed thread");
+    });
+
+    test("a dropped queue item forgets its reason, so the reason goes out when it comes back", () => {
+        const state = empty();
+        const thread = silent(state);
+        const supervisor = Number(thread.supervisor);
+        const box = newBox();
+
+        // A sweep queues the silent session, and marks that a digest carries it.
+        const queued = queueNews([thread], box, 1000);
+
+        assert.equal(queued.length, 1);
+        state.digests = { [String(supervisor)]: { ...box, items: queued } };
+
+        // A watch comes before the digest: the item is dropped, and its mark goes with it.
+        thread.watch = {
+            checkOn: "2099-01-01",
+            check: "a later check",
+            setAt: 1046,
+            setBy: "brian",
+            key: "x.test.watch",
+        };
+
+        const kept = dropStaleQueue(queued, state);
+
+        assert.deepEqual(kept, []);
+        forgetDropped(state, supervisor, queued);
+        assert.equal(state.digests[String(supervisor)]?.queued[thread.id], undefined);
+
+        // The watch goes before a sweep saw the thread leave: the next sweep queues the reason again.
+        thread.watch = undefined;
+
+        const again = queueNews([thread], state.digests[String(supervisor)]!, 2000);
+
+        assert.equal(again.length, 1, "the silent session goes out again");
+
+        // A newer reason stays: only a mark with the dropped item's own reason goes.
+        const other = state.digests[String(supervisor)]!;
+
+        other.queued[thread.id] = "report says blocked";
+        forgetDropped(state, supervisor, queued);
+        assert.equal(state.digests[String(supervisor)]?.queued[thread.id], "report says blocked");
+    });
+
+    test("every item that is not a queue item stays, also with no thread", () => {
+        const items = [
+            made("report:a", "report"),
+            made("closed", "closed", "T9"),
+            made("answer:b", "answer", "T9"),
+            made("shift:c", "shift", "T9"),
+        ];
+
+        assert.deepEqual(dropStaleQueue(items, empty()), items, "other kinds always stay");
+        assert.deepEqual(
+            dropStaleQueue([made("queue:T9:PR x needs a repair: agent", "repair", "T9")], empty()),
+            [],
+            "a repair item is a queue item: no thread, no reason",
         );
     });
 
@@ -14566,6 +14899,245 @@ describe("the desk in a Pi Pocket", () => {
             assert(after.data.seen >= seen.data.seen);
         });
 
+        test("the page sweeps a supervisor at once for a ready link no read covered", async () => {
+            const source = await supervisor("page-stale-ready");
+            const stalePath = join(root, "stale-ready.json");
+            const staleGh = join(root, "stale-ready-gh.sh");
+            let id = "";
+
+            // 1 pinned read, and it says PR #7 merged. No other PR: the second stale link stays uncovered.
+            writeFileSync(
+                stalePath,
+                JSON.stringify({
+                    data: {
+                        viewer: { login: "github-viewer" },
+                        p0: {
+                            nameWithOwner: "frostyard/test",
+                            isArchived: false,
+                            pullRequest: {
+                                number: 7,
+                                title: "A merged fix",
+                                url: "https://github.com/frostyard/test/pull/7",
+                                state: "MERGED",
+                                isDraft: false,
+                                createdAt: new Date(Date.now() - 3 * DAY).toISOString(),
+                                headRefName: "pr-7",
+                                mergeable: "UNKNOWN",
+                                reviewDecision: "",
+                                author: { login: "github-viewer" },
+                                labels: { nodes: [] },
+                                commits: { nodes: [] },
+                            },
+                        },
+                    },
+                }),
+            );
+            writeFileSync(staleGh, `#!/bin/sh\ncat ${JSON.stringify(stalePath)}\n`);
+            chmodSync(staleGh, 0o755);
+            process.env.PI_POCKET_DESK_GH = staleGh;
+
+            try {
+                // 1 open thread, so a sweeper starts for this supervisor and sweeps by itself: no page rule needed.
+                await app.harness.commit(async (tx) => {
+                    const state = await tx.doc(DeskThreads);
+                    const opened = openThread(state, {
+                        key: "x.test.page-stale-ready",
+                        supervisor: Number(source),
+                        agents: ["duncan"],
+                        repo: "frostyard/test",
+                        title: "A ready PR",
+                        at: Date.now(),
+                    });
+
+                    id = opened.thread.id;
+                    state.threads[id]!.state = "open";
+                    state.threads[id]!.address = "session-stale-ready";
+                    state.threads[id]!.run.busy = true;
+                }, context);
+                await say(app, source, "desk list test");
+                await until(
+                    async () => typeof (await deskState())?.threads[id]?.run.sweptAt === "number",
+                    "the sweeper's first sweep",
+                    20_000,
+                );
+                assert.equal(await sweepers(source), 1, "a live sweeper, asleep for 10 minutes");
+
+                // The thread closes as done a day ago, so the page still lists its PRs. Its link is from before the fix:
+                // the label is there, and no read ever gave its facts.
+                await app.harness.commit(async (tx) => {
+                    const stored = (await tx.doc(DeskThreads)).threads[id]!;
+
+                    stored.state = "closed";
+                    stored.closed = { at: Date.now() - DAY, why: "done", by: "sweep" };
+                    stored.prs["frostyard/test#7"] = {
+                        via: "seen",
+                        state: "OPEN",
+                        head: "a1b2c3d",
+                        ready: { at: 500, head: "a1b2c3d" },
+                    };
+                }, context);
+
+                assert.equal(
+                    (await deskState())?.threads[id]?.prs["frostyard/test#7"]?.readAt,
+                    undefined,
+                    "no read covered it yet",
+                );
+
+                // The page finds the link stale, and sweeps that supervisor at once: no open thread is needed.
+                const noRow = (view: { ready: { thread: string }[] }) =>
+                    !view.ready.some((pr) => pr.thread === id);
+                const first = await call("threads");
+
+                assert.equal(first.status, 200);
+                assert(noRow(first.data), "no ready row for a PR that no read gave");
+
+                await until(
+                    async () =>
+                        (await deskState())?.threads[id]?.prs["frostyard/test#7"]?.state ===
+                        "MERGED",
+                    "the page's sweep",
+                    20_000,
+                );
+
+                const read = (await deskState())?.threads[id];
+
+                assert.equal(typeof read?.prs["frostyard/test#7"]?.readAt, "number");
+                assert.equal(
+                    read?.prs["frostyard/test#7"]?.readAt,
+                    read?.run.prsReadAt,
+                    "the link is covered by the thread's last read",
+                );
+
+                // A second stale link, and a second look at once: the page sweep has its own limit, so no sweep.
+                const swept = read?.run.prsReadAt;
+
+                await app.harness.commit(async (tx) => {
+                    (await tx.doc(DeskThreads)).threads[id]!.prs["frostyard/test#8"] = {
+                        via: "seen",
+                        state: "OPEN",
+                        head: "d4e5f60",
+                        ready: { at: 600, head: "d4e5f60" },
+                    };
+                }, context);
+
+                const second = await call("threads");
+
+                assert.equal(second.status, 200);
+                assert(noRow(second.data), "still no row: the PR merged");
+                assert.equal(
+                    (await deskState())?.threads[id]?.run.prsReadAt,
+                    swept,
+                    "no second sweep at once",
+                );
+                assert.equal(
+                    (await deskState())?.threads[id]?.prs["frostyard/test#8"]?.readAt,
+                    undefined,
+                    "the rate limit kept the second stale link unread",
+                );
+            } finally {
+                process.env.PI_POCKET_DESK_GH = fakeGh;
+                await stopSweepers();
+            }
+        });
+
+        test("a supervisor with no open thread sweeps at most once for a stale ready link", async () => {
+            const source = await supervisor("page-stale-rate");
+            const flatPath = join(root, "stale-rate.json");
+            const flatGh = join(root, "stale-rate-gh.sh");
+            let id = "";
+
+            // A read that works, and holds no PR: the link stays stale after every sweep.
+            writeFileSync(
+                flatPath,
+                JSON.stringify({ data: { viewer: { login: "github-viewer" } } }),
+            );
+            writeFileSync(flatGh, `#!/bin/sh\ncat ${JSON.stringify(flatPath)}\n`);
+            chmodSync(flatGh, 0o755);
+            process.env.PI_POCKET_DESK_GH = flatGh;
+
+            try {
+                // 1 open thread first, so a sweeper starts and sweeps once: the page's rule then takes no part.
+                await app.harness.commit(async (tx) => {
+                    const state = await tx.doc(DeskThreads);
+                    const opened = openThread(state, {
+                        key: "x.test.page-stale-rate",
+                        supervisor: Number(source),
+                        agents: ["duncan"],
+                        repo: "frostyard/test",
+                        title: "A ready PR",
+                        at: Date.now(),
+                    });
+
+                    id = opened.thread.id;
+                    state.threads[id]!.state = "open";
+                    state.threads[id]!.address = "session-stale-rate";
+                    state.threads[id]!.run.busy = true;
+                }, context);
+                await say(app, source, "desk list test");
+                await until(
+                    async () => typeof (await deskState())?.threads[id]?.run.sweptAt === "number",
+                    "the sweeper's first sweep",
+                    20_000,
+                );
+                assert.equal(await sweepers(source), 1, "a live sweeper, asleep for 10 minutes");
+
+                // Closed as done a day ago, with a link no read covered: the page would hide its Ready to merge row.
+                await app.harness.commit(async (tx) => {
+                    const stored = (await tx.doc(DeskThreads)).threads[id]!;
+
+                    stored.state = "closed";
+                    stored.closed = { at: Date.now() - DAY, why: "done", by: "sweep" };
+                    // No busy session: a sweep must not reopen it, or the second look meets an open thread.
+                    delete stored.run.busy;
+                    stored.prs["frostyard/test#7"] = {
+                        via: "seen",
+                        state: "OPEN",
+                        head: "a1b2c3d",
+                        ready: { at: 500, head: "a1b2c3d" },
+                    };
+                }, context);
+
+                // The first look sweeps: the stale link is due.
+                const first = await call("threads");
+
+                assert.equal(first.status, 200);
+
+                const swept = (await deskState())?.threads[id]?.run.prsReadAt;
+
+                assert.equal(typeof swept, "number", "the page swept");
+                assert.equal(
+                    (await deskState())?.threads[id]?.prs["frostyard/test#7"]?.readAt,
+                    undefined,
+                    "the read gave no fact for it",
+                );
+
+                // A second look at once: no open thread, and the rate limit holds, so no sweep.
+                await new Promise((resolve) => setTimeout(resolve, 25));
+
+                const second = await call("threads");
+
+                assert.equal(second.status, 200);
+                assert.equal(
+                    (await deskState())?.threads[id]?.run.prsReadAt,
+                    swept,
+                    "1 sweep only",
+                );
+            } finally {
+                process.env.PI_POCKET_DESK_GH = fakeGh;
+                // Leave nothing stale for the tests after: a dropped thread with no PR gets no sweeper, and no page sweep.
+                await app.harness.commit(async (tx) => {
+                    const stored = (await tx.doc(DeskThreads)).threads[id];
+
+                    if (stored !== undefined) {
+                        stored.state = "closed";
+                        stored.closed = { at: Date.now(), why: "dropped", by: "brian" };
+                        stored.prs = {};
+                    }
+                }, context);
+                await stopSweepers();
+            }
+        });
+
         test("keep, park and drop change the thread; a second POST changes nothing", async () => {
             const { thread } = await delegated("page-actions");
 
@@ -18617,6 +19189,68 @@ describe("the desk in a Pi Pocket", () => {
                 digestOff();
             }
         });
+
+        test("a queue item whose reason is gone sends no message (T465)", async () => {
+            digestOn();
+
+            try {
+                const { source, linked, thread } = await delegated("digest-stale-queue");
+
+                await until(() => !app.isBusy(linked), "the linked session to settle", 20_000);
+                // Its turn ended with no report: the sweep queues it as a silent session.
+                await say(app, source, "desk sync test");
+                await until(
+                    async () =>
+                        (await boxOf(source))?.items.some(
+                            (each) =>
+                                each.kind === "queue" &&
+                                each.thread === thread.id &&
+                                each.key === `queue:${thread.id}:silent session`,
+                        ) === true,
+                    "the queue item",
+                    20_000,
+                );
+
+                // A watch a moment later: the session sleeps until the check, so the reason is gone.
+                await app.harness.commit(async (tx) => {
+                    (await tx.doc(DeskThreads)).threads[thread.id]!.watch = {
+                        checkOn: "2099-01-01",
+                        check: "a later check",
+                        setAt: Date.now(),
+                        setBy: "brian",
+                        key: "x.test.digest-stale",
+                    };
+                }, context);
+
+                assert.equal(
+                    odradeReason((await deskState())?.threads[thread.id] as Thread),
+                    undefined,
+                    "no reason holds now",
+                );
+
+                await quiet([thread.id]);
+                await restartApp(16 * 60_000, undefined);
+                digestOff();
+
+                // The digest takes the box and ends with no message: the stale item is dropped.
+                await until(
+                    async () => (await digestTasks(source)).length === 0,
+                    "the digest to end",
+                    20_000,
+                );
+
+                const texts = (await modelTexts(app, source)).join("\n");
+
+                assert.doesNotMatch(texts, /\[desk\] digest:/, "no digest message");
+                assert.doesNotMatch(texts, /waits on you: silent session/);
+                assert.deepEqual((await boxOf(source))?.items, [], "the box is empty");
+            } finally {
+                await stopDigests();
+                await quiet([]);
+                shift = 0;
+                digestOff();
+            }
+        });
     });
 
     describe("the issue queue", () => {
@@ -20675,7 +21309,8 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
                     /For new work, use team_delegate; to put a question on it, use desk ask/,
                 );
 
-                for (const action of ["read", "list"]) {
+                // An agent may read its own thread. `list` and the other actions stay refused.
+                for (const action of ["list", "sync", "attach", "ask"]) {
                     await assert.rejects(
                         () =>
                             stub.tool(
@@ -20685,7 +21320,7 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
                                 `call-agent-${action}`,
                             ),
                         new RegExp(
-                            `Only a session assigned a supervisor identity can use the desk\\. An agent can use only watch and result.*For ${action}, ask Odrade with team_message`,
+                            `Only a session assigned a supervisor identity can use the desk\\. An agent can use only read, watch, and result.*For ${action}, ask Odrade with team_message`,
                         ),
                     );
                 }
@@ -20728,6 +21363,86 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
                             "call-4",
                         ),
                     /has no address for its agent/,
+                );
+            } finally {
+                stub.restore();
+            }
+        });
+
+        test("an agent reads its own thread, by id and with no thread, and no other thread", async () => {
+            const stub = stubDesk();
+
+            try {
+                const { source, linked, thread } = await delegated("agent-read");
+                const { thread: other } = await delegated("agent-read-other");
+                const before = JSON.stringify((await deskState())?.seen ?? {});
+                const read = (args: object, session: number, call: string) =>
+                    stub.tool(args, session, "task-read", call);
+
+                const messageOf = async (id: string): Promise<string> => {
+                    try {
+                        await read({ action: "read", thread: id }, Number(linked), `call-${id}`);
+                    } catch (error) {
+                        return (error as Error).message;
+                    }
+
+                    return "";
+                };
+
+                // By id: the text holds the thread, and the reports part of its own session comes after it.
+                const byId = JSON.stringify(
+                    await read({ action: "read", thread: thread.id }, Number(linked), "call-own"),
+                );
+
+                assert.match(byId, new RegExp(`${thread.id} · open · ${thread.title}`));
+
+                // With no thread: the thread with its session.
+                const noThread = JSON.stringify(
+                    await read({ action: "read" }, Number(linked), "call-none"),
+                );
+
+                assert.match(noThread, new RegExp(`${thread.id} · open · ${thread.title}`));
+
+                // Another thread, and an id that does not exist: the same words, so a read never says that one exists.
+                const another = await messageOf(other.id);
+                const missing = await messageOf("T99");
+
+                assert.match(
+                    another,
+                    /is not this session's thread: an agent can read only its own thread\. Ask Odrade with team_message to the return address in your first message\./,
+                );
+                assert.equal(
+                    another.replace(other.id, "X"),
+                    missing.replace("T99", "X"),
+                    "the same error for another thread and a missing one",
+                );
+
+                // An agent with no thread of its own: the error says so, with the same hint.
+                const looseFolder = join(root, "agent-read-loose");
+
+                mkdirSync(looseFolder, { recursive: true });
+                const loose = await newSession(app, looseFolder);
+
+                await command(loose, "team-agent", "duncan");
+                await assert.rejects(
+                    () => read({ action: "read" }, Number(loose), "call-loose"),
+                    /This session has no thread on the desk\. Ask Odrade with team_message to the return address in your first message\./,
+                );
+
+                // An agent's read writes nothing: no look, and no sweeper.
+                assert.equal(
+                    JSON.stringify((await deskState())?.seen ?? {}),
+                    before,
+                    "seen does not change",
+                );
+                assert.equal(await sweepers(linked), 0, "an agent's read starts no sweeper");
+
+                // A supervisor's read still writes the look.
+                await read({ action: "read", thread: thread.id }, Number(source), "call-source");
+                assert.notEqual(
+                    JSON.stringify((await deskState())?.seen ?? {}),
+                    before,
+                    "the supervisor's look is written",
                 );
             } finally {
                 stub.restore();
