@@ -136,6 +136,7 @@ import {
     handledAfter,
     dropHandled,
     dropStaleQueue,
+    forgetDropped,
     watchDueAt,
     watchWhen,
     recordResult,
@@ -8551,6 +8552,48 @@ describe("the digest's rules", () => {
         thread.state = "closed";
         thread.closed = { at: 3000, why: "done", by: "sweep" };
         assert.deepEqual(dropStaleQueue([item], state), [], "a closed thread");
+    });
+
+    test("a dropped queue item forgets its reason, so the reason goes out when it comes back", () => {
+        const state = empty();
+        const thread = silent(state);
+        const supervisor = Number(thread.supervisor);
+        const box = newBox();
+
+        // A sweep queues the silent session, and marks that a digest carries it.
+        const queued = queueNews([thread], box, 1000);
+
+        assert.equal(queued.length, 1);
+        state.digests = { [String(supervisor)]: { ...box, items: queued } };
+
+        // A watch comes before the digest: the item is dropped, and its mark goes with it.
+        thread.watch = {
+            checkOn: "2099-01-01",
+            check: "a later check",
+            setAt: 1046,
+            setBy: "brian",
+            key: "x.test.watch",
+        };
+
+        const kept = dropStaleQueue(queued, state);
+
+        assert.deepEqual(kept, []);
+        forgetDropped(state, supervisor, queued);
+        assert.equal(state.digests[String(supervisor)]?.queued[thread.id], undefined);
+
+        // The watch goes before a sweep saw the thread leave: the next sweep queues the reason again.
+        thread.watch = undefined;
+
+        const again = queueNews([thread], state.digests[String(supervisor)]!, 2000);
+
+        assert.equal(again.length, 1, "the silent session goes out again");
+
+        // A newer reason stays: only a mark with the dropped item's own reason goes.
+        const other = state.digests[String(supervisor)]!;
+
+        other.queued[thread.id] = "report says blocked";
+        forgetDropped(state, supervisor, queued);
+        assert.equal(state.digests[String(supervisor)]?.queued[thread.id], "report says blocked");
     });
 
     test("every item that is not a queue item stays, also with no thread", () => {

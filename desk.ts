@@ -3946,6 +3946,21 @@ export function takeDigest(
     return { items, seq };
 }
 
+/** A queue item's thread id and reason, from its key `queue:<thread id>:<reason>`; undefined for any other item. */
+function queueKeyOf(item: DigestItem): { id: string; reason: string } | undefined {
+    if ((item.kind !== "queue" && item.kind !== "repair") || !item.key.startsWith("queue:")) {
+        return undefined;
+    }
+
+    // Split at the first 2 colons only: a reason holds colons of its own ("watch is due: check X").
+    const first = item.key.indexOf(":");
+    const second = item.key.indexOf(":", first + 1);
+
+    return second < 0
+        ? undefined
+        : { id: item.key.slice(first + 1, second), reason: item.key.slice(second + 1) };
+}
+
 /**
  * The items to send: a queue item whose reason no longer holds is dropped, and every other item stays. A queue item's
  * kind is `queue` or `repair`, and its key is `queue:<thread id>:<reason>`. The reason must still hold when the digest
@@ -3957,22 +3972,48 @@ export function dropStaleQueue(
     state: Readonly<DeskState> | undefined,
 ): DigestItem[] {
     return items.filter((item) => {
-        if (item.kind !== "queue" && item.kind !== "repair") {
+        const parsed = queueKeyOf(item);
+
+        if (parsed === undefined) {
             return true;
         }
 
-        // Split at the first 2 colons only: a reason holds colons of its own ("watch is due: check X").
-        const first = item.key.indexOf(":");
-        const second = first < 0 ? -1 : item.key.indexOf(":", first + 1);
+        const thread = state?.threads[parsed.id];
 
-        if (!item.key.startsWith("queue:") || second < 0) {
-            return true;
-        }
-
-        const thread = state?.threads[item.key.slice(first + 1, second)];
-
-        return thread !== undefined && odradeReason(thread) === item.key.slice(second + 1);
+        return thread !== undefined && odradeReason(thread) === parsed.reason;
     });
+}
+
+/**
+ * Forget the reasons of dropped queue items: `box.queued` says a digest carried a reason, and `queueNews` sends no item
+ * for a reason it holds. A dropped item carried nothing, so its mark goes when it still holds that same reason; a newer
+ * reason stays. Without this, a reason that comes back before a sweep saw it leave (a watch set, then cleared) never
+ * reaches the supervisor. Call it in the commit that took the items.
+ */
+export function forgetDropped(
+    state: DeskState,
+    supervisor: number,
+    dropped: readonly DigestItem[],
+): void {
+    if (state.digests?.[String(supervisor)] === undefined) {
+        return;
+    }
+
+    const box = digestBox(state, supervisor);
+    let changed = false;
+
+    for (const item of dropped) {
+        const parsed = queueKeyOf(item);
+
+        if (parsed !== undefined && box.queued[parsed.id] === parsed.reason) {
+            delete box.queued[parsed.id];
+            changed = true;
+        }
+    }
+
+    if (changed) {
+        setDigestBox(state, supervisor, box);
+    }
 }
 
 /** The desk's start: the oldest seed thread's start, else the stored epoch. A seed sets the truth. */
@@ -13622,6 +13663,13 @@ export default function createDesk(host: Host, web: Web) {
                     // A queue item whose reason is gone (a watch, an answer, a new PR state) sends nothing: it is dropped
                     // here, after the box emptied, so a stale line never reaches the supervisor.
                     const items = dropStaleQueue(taken.items, state);
+
+                    // A dropped item carried nothing: its reason may come back, and must then go out.
+                    forgetDropped(
+                        state,
+                        supervisor,
+                        taken.items.filter((item) => !items.includes(item)),
+                    );
 
                     // Nothing waits: no message, and the task ends.
                     if (items.length === 0) {
