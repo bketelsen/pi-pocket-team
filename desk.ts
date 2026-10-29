@@ -124,6 +124,33 @@ export const askIsOpen = (ask: Pick<Ask, "answer" | "resolved">): boolean =>
 /** Whether the thread waits on Brian's words: it has an ask that is still open. A watch or a found origin does not hide it. */
 export const hasOpenAsk = (thread: Thread): boolean => thread.asks.some((ask) => askIsOpen(ask));
 
+/** The ids of a thread's open asks, in the order they were filed. */
+export const openAskIds = (thread: Thread): string[] =>
+    thread.asks.filter((ask) => askIsOpen(ask)).map((ask) => ask.id);
+
+/**
+ * The refusal of an action that would close a thread while the thread has an open ask: a closed thread hides the ask
+ * from Brian. `audience` is "tool" for a `desk` call, which says how to end the ask with `desk withdraw`, and "page"
+ * for Brian's own page, which says to answer it.
+ */
+export function openAskRefusal(
+    threadId: string,
+    ids: readonly string[],
+    action: string,
+    audience: "tool" | "page" = "tool",
+): string {
+    const one = ids.length === 1;
+    const named = ids.length === 0 ? "" : `: ${ids.join(", ")}`;
+    const head = `${action} refused: ${threadId} has ${one ? "an open ask" : "open asks"}${named}.`;
+    const them = one ? "it" : "them";
+
+    if (audience === "page") {
+        return `${head} A closed thread hides ${them}. Answer ${them} first, then ${action} again.`;
+    }
+
+    return `${head} A closed thread hides ${them} from Brian. Brian ${one ? "answers it" : "answers them"}, or the supervisor ends ${one ? "it" : "each"} with \`desk withdraw\`: give words, or give \`into\` with another open ask to merge it there. Then run ${action} again.`;
+}
+
 /** One attached PR: how it was attached, and what GitHub said about it. */
 export type PrLink = {
     via: "seen" | "branch" | "window" | "attached";
@@ -874,6 +901,14 @@ export function failThread(
         return undefined;
     }
 
+    // A thread with an open ask stays open: a closed thread hides the ask from Brian. The event still says why it did
+    // not start.
+    if (hasOpenAsk(thread)) {
+        addEvent(thread, "failed", `failed: ${oneLine(why)}`, at);
+
+        return undefined;
+    }
+
     thread.state = "closed";
     thread.closed = { at, why: "failed", by: "desk" };
     addEvent(thread, "failed", `failed: ${oneLine(why)}`, at);
@@ -1434,6 +1469,20 @@ export function recordResult(
 
     if (thread.state === "closed") {
         return { error: `Thread ${thread.id} is closed: there is no watch to record.` };
+    }
+
+    // A pass closes the thread, and a closed thread hides an open ask from Brian: a fail is never refused.
+    if (request.pass && hasOpenAsk(thread)) {
+        const page = request.closedBy === "brian";
+
+        return {
+            error: openAskRefusal(
+                thread.id,
+                openAskIds(thread),
+                page ? "the pass" : "desk result",
+                page ? "page" : "tool",
+            ),
+        };
     }
 
     const text = flatLine(request.text);
@@ -2561,9 +2610,22 @@ export function closeCheck(thread: Thread, facts: CloseFacts): { close: boolean;
     }
 
     if (thread.state === "starting") {
-        return facts.now - thread.startedAt > STARTING_LIMIT_MS
+        if (facts.now - thread.startedAt <= STARTING_LIMIT_MS) {
+            return { close: false, open: ["it is starting"] };
+        }
+
+        // An open ask holds a thread that never started, as it holds an open one.
+        const asks = openAskIds(thread);
+
+        return asks.length === 0
             ? { close: true, open: ["the session never started"] }
-            : { close: false, open: ["it is starting"] };
+            : {
+                  close: false,
+                  open: [
+                      "the session never started",
+                      ...asks.map((id) => `ask ${id} has no answer`),
+                  ],
+              };
     }
 
     const open: string[] = [];
@@ -5470,11 +5532,35 @@ export function attachTo(
     targetId: string,
     now: number,
     by = "the desk",
+    audience: "tool" | "page" = "tool",
 ): { text: string } | { error: string } {
     const target = threadById(state, targetId);
 
     if (target === undefined) {
         return { error: `There is no thread ${targetId.toUpperCase()}.` };
+    }
+
+    // A merge closes the source thread, and its asks that are not about an issue stay there: it must have none open.
+    // The check is here, before the target reopens, so a refusal changes nothing.
+    if (!PR_REF.test(ref)) {
+        const source = threadById(state, ref);
+
+        if (source !== undefined && source !== target && source.state !== "closed") {
+            const kept = source.asks
+                .filter((ask) => askIsOpen(ask) && ask.key?.startsWith("issue-open:") !== true)
+                .map((ask) => ask.id);
+
+            if (kept.length > 0) {
+                return {
+                    error: openAskRefusal(
+                        source.id,
+                        kept,
+                        audience === "page" ? "the merge" : "desk attach",
+                        audience,
+                    ),
+                };
+            }
+        }
     }
 
     if (target.state === "closed") {
@@ -5676,6 +5762,11 @@ export function ownThread(
                 ? `${thread.id} is Brian's own already. Nothing changed.`
                 : `${thread.id} is closed already. Nothing changed.`,
         };
+    }
+
+    // It closes here, and a closed thread hides an open ask from Brian: the ask goes first.
+    if (hasOpenAsk(thread)) {
+        return { error: openAskRefusal(thread.id, openAskIds(thread), "desk own") };
     }
 
     const refs = Object.keys(thread.prs);
@@ -14738,6 +14829,14 @@ export default function createDesk(host: Host, web: Web) {
                     return;
                 }
 
+                // A drop closes the thread, and a closed thread hides an open ask from Brian.
+                if (hasOpenAsk(thread)) {
+                    throw web.error(
+                        409,
+                        openAskRefusal(thread.id, openAskIds(thread), "the drop", "page"),
+                    );
+                }
+
                 const check = closeCheck(thread, {
                     now,
                     folders: otherFolders(state.threads, thread),
@@ -14768,10 +14867,11 @@ export default function createDesk(host: Host, web: Web) {
             }
 
             return answer(request, (state, now) => {
-                const result = attachTo(state, id, into, now, request.user.name);
+                const result = attachTo(state, id, into, now, request.user.name, "page");
 
                 if ("error" in result) {
-                    throw web.error(/closed/.test(result.error) ? 409 : 404, result.error);
+                    // A closed target, and a source with an open ask, are conflicts; a missing thread is not found.
+                    throw web.error(/closed|open ask/.test(result.error) ? 409 : 404, result.error);
                 }
             });
         },
@@ -15230,7 +15330,7 @@ export default function createDesk(host: Host, web: Web) {
     const tool = defineTool({
         name: "desk",
         description:
-            "The desk of threads for work the team runs in the background. A supervisor session can use every action; a Clerk can use list, read, sync, attach, detach, watch, result, send, and issues for its supervisor's threads; an agent session can use read, watch, and result on its own thread only. Actions: list (one line per open thread), read (one thread in full), sync (observe the threads now, with linked sessions, Night shift, git, and GitHub), seed (import a seed.json file one time), attach (put a PR, a queued issue, or all of another thread's work, on one thread), detach (take a PR off a thread for good: the sweep does not attach or find it again; only attach brings it back), own (mark a found PR thread as Brian's own: it closes, and no sweep finds its PR again), ask (file a question for Brian on a thread, or on a new one; never for a plain merge: Ready to merge on the Desk page lists those), rewrite (give an open ask new words, and new options or none: an agent's ask is filed as it wrote it, so make it clear for Brian), withdraw (end an open ask that Brian need not answer, with words saying why, or with into to merge it into another open ask), answer (record Brian's words for an ask), watch (set a dated check on a thread: it sleeps until that date, and does not count toward the cap), result (record that check's pass, which closes the thread, or its fail, which opens it again), send (send 1 message from the supervisor's session to a thread's agent), issues (read the issues Brian queued on GitHub: read only).",
+            "The desk of threads for work the team runs in the background. A supervisor session can use every action; a Clerk can use list, read, sync, attach, detach, watch, result, send, and issues for its supervisor's threads; an agent session can use read, watch, and result on its own thread only. Actions: list (one line per open thread), read (one thread in full), sync (observe the threads now, with linked sessions, Night shift, git, and GitHub), seed (import a seed.json file one time), attach (put a PR, a queued issue, or all of another thread's work, on one thread), detach (take a PR off a thread for good: the sweep does not attach or find it again; only attach brings it back), own (mark a found PR thread as Brian's own: it closes, and no sweep finds its PR again), ask (file a question for Brian on a thread, or on a new one; never for a plain merge: Ready to merge on the Desk page lists those), rewrite (give an open ask new words, and new options or none: an agent's ask is filed as it wrote it, so make it clear for Brian), withdraw (end an open ask that Brian need not answer, with words saying why, or with into to merge it into another open ask), answer (record Brian's words for an ask), watch (set a dated check on a thread: it sleeps until that date, and does not count toward the cap), result (record that check's pass, which closes the thread, or its fail, which opens it again: a pass is refused while the thread has an open ask), send (send 1 message from the supervisor's session to a thread's agent), issues (read the issues Brian queued on GitHub: read only).",
         parameters: Type.Object({
             action: Type.Union([
                 Type.Literal("list"),
