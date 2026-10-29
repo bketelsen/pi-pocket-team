@@ -827,7 +827,7 @@ export default function setup(pocket) {
                         </div>
                     </div>`,
                 )}
-                ${thread.prs
+                ${(thread.state === "closed" ? [] : thread.prs)
                     .filter((pr) => pr.next === "brian")
                     .map((pr) =>
                         pr.url
@@ -1090,7 +1090,11 @@ export default function setup(pocket) {
             ${section("Needs you", groups.need, (thread) =>
                 row(
                     thread,
-                    html`${withWatch(thread, needDetail(thread))}${thread.origin === "found" ? foundActions(thread) : null}`,
+                    // A closed thread (it is here for its open ask) shows the ask and its answer controls only: the
+                    // watch, Attach and Drop routes do nothing on it.
+                    thread.state === "closed"
+                        ? needDetail(thread)
+                        : html`${withWatch(thread, needDetail(thread))}${thread.origin === "found" ? foundActions(thread) : null}`,
                 ),
             )}
             ${section(

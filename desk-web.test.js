@@ -458,3 +458,35 @@ test("a thread closed with an open ask shows in Needs you with its answer contro
     assert.match(out, /Closed in the last 7 days \(1\)/, "only the plain one is under Closed");
     assert.equal(badge, 1, "the badge counts it");
 });
+
+test("a closed found thread with an open ask and a watch shows the answer controls, and no Attach, Drop or watch controls", async () => {
+    const out = await render({
+        ...viewWith(null),
+        threads: [
+            threadView({
+                id: "F7",
+                title: "A closed found PR",
+                state: "closed",
+                origin: "found",
+                closed: { at: NOW - 1000, why: "done", by: "odrade", outcome: "done" },
+                asks: [{ ...openAsk, id: "F7a", text: "Adopt it?" }],
+                prs: [{ ref: "frostyard/test#9", state: "OPEN", next: "brian" }],
+                watch: {
+                    checkOn: "2026-12-01",
+                    check: "the blob sweep",
+                    setBy: "odrade",
+                    due: false,
+                },
+            }),
+        ],
+    });
+    const need = out.slice(out.indexOf("<h2>Needs you"), out.indexOf("</section>"));
+
+    assert.match(need, /F7a · Adopt it\?/);
+    assert.match(need, /aria-label=Answered F7a/);
+    assert.doesNotMatch(need, /Attach/);
+    assert.doesNotMatch(need, /Drop/);
+    assert.doesNotMatch(need, /Park|Keep|Wake/);
+    assert.doesNotMatch(need, /Watch|Clear the watch|Pass the check|Fail the check/);
+    assert.doesNotMatch(need, /ready to merge/);
+});

@@ -103,6 +103,7 @@ import {
     asksBrian,
     namesOpenAsk,
     statusLineClears,
+    askById,
     attachTo,
     boundSupervisors,
     attribute,
@@ -7910,6 +7911,10 @@ const model = scriptedModel((request) => {
         return answer("Should I merge #106?");
     }
 
+    if (text.endsWith("status line nothing after question test")) {
+        return answer("Should I merge?\nNeeds you: nothing");
+    }
+
     // A reply that ends with Odrade's status line: "Needs you: <what the test names>".
     const status = /status line (.+) test$/.exec(text);
 
@@ -12502,6 +12507,49 @@ describe("the desk in a Pi Pocket", () => {
             (await modelTexts(app, unknown)).filter((each) => each.includes("Desk check:")).length,
             1,
         );
+    });
+
+    test("the reminder does not fire when a question and 'Needs you: nothing' share the last paragraph", async () => {
+        const source = await supervisor("reminder-status-question");
+
+        await say(app, source, "status line nothing after question test");
+        assert.doesNotMatch((await modelTexts(app, source)).join("\n"), /Desk check:/);
+    });
+
+    test("the reminder does not fire on a status line whose ask id is answered", async () => {
+        const owner = await supervisor("status-answered-owner");
+        let askId = "";
+
+        await app.harness.commit(async (tx) => {
+            const state = await tx.doc(DeskThreads);
+            const opened = openThread(state, {
+                key: "x.test.status-answered",
+                supervisor: Number(owner),
+                agents: ["duncan"],
+                repo: "frostyard/test",
+                title: "An answered ask",
+                at: Date.now(),
+            });
+            const filed = addAsk(state, {
+                thread: opened.thread.id,
+                text: "Rotate the key?",
+                key: "x.test.status-answered.a",
+                by: "Odrade",
+                supervisor: Number(owner),
+                at: Date.now() - 60_000,
+            });
+
+            assert.ok("askId" in filed);
+            askId = filed.askId;
+            answerAsk(state, askId, { at: Date.now(), by: "brian", words: "yes" });
+        }, context);
+
+        const source = await supervisor("reminder-status-answered");
+        const state = await deskState();
+
+        assert.equal(askIsOpen(askById(state, askId)!.ask), false, "the ask is answered");
+        await say(app, source, `status line ${askId} test`);
+        assert.doesNotMatch((await modelTexts(app, source)).join("\n"), /Desk check:/);
     });
 
     test("the reminder still fires on a status line that asks for something", async () => {
