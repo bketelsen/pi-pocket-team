@@ -53,6 +53,8 @@ test("sshHostNames reads Host and HostName lines, in any case, and skips pattern
         "Host alpha beta",
         "  HostName=Gamma.Example.COM",
         "host delta",
+        'Host "build01" db',
+        "Host a",
         "Host *",
         "Host 192.168.* prod",
         "Host ab",
@@ -62,15 +64,20 @@ test("sshHostNames reads Host and HostName lines, in any case, and skips pattern
         "Host !refused alpha",
     ].join("\n");
 
+    // 2-letter names are kept (`db`), 1-letter names are not: "a" would mask the word "a". Double quotes come off.
     assert.deepEqual(sshHostNames(config), [
         "alpha",
         "beta",
         "gamma.example.com",
         "delta",
+        "build01",
+        "db",
         "prod",
+        "ab",
         "zeta",
     ]);
     assert.deepEqual(sshHostNames(""), []);
+    assert.deepEqual(sshHostNames('Host "just-quoted"'), ["just-quoted"]);
 });
 
 // ─── Masking ─────────────────────────────────────────────────────────────────
@@ -97,6 +104,14 @@ test("maskBrief takes IPv4 addresses out, with a port or a CIDR too", () => {
     assert.equal(masked, "ssh [ip] and [ip] and [ip] twice: [ip]");
 });
 
+test("maskBrief takes an IPv4 address at the end of a sentence out, and keeps the punctuation", () => {
+    assert.equal(maskBrief("Check 192.168.1.4.", []), "Check [ip].");
+    assert.equal(maskBrief("Check 192.168.1.4, then go", []), "Check [ip], then go");
+    assert.equal(maskBrief("Check 192.168.1.4)", []), "Check [ip])");
+    assert.equal(maskBrief("Check 192.168.1.4:2222.", []), "Check [ip].");
+    assert.equal(maskBrief("Check 192.168.1.0/24,", []), "Check [ip],");
+});
+
 test("maskBrief takes IPv6 addresses out, and leaves a clock time alone", () => {
     assert.equal(maskBrief("::1", []), "[ip]");
     assert.equal(maskBrief("fe80::1%eth0", []), "[ip]");
@@ -107,24 +122,37 @@ test("maskBrief takes IPv6 addresses out, and leaves a clock time alone", () => 
     );
 });
 
-test("maskBrief takes a network host name out, and leaves a file name and a version alone", () => {
-    const masked = maskBrief(
-        "open https://x.test for acme.example.com, then edit team.ts, package.json, install.sh, README.md, v0.26.0 and bketelsen/pi-pocket",
-        [],
+test("maskBrief takes an IPv6 address at the end of a sentence out, and keeps the punctuation", () => {
+    assert.equal(maskBrief("Check 2001:db8::1.", []), "Check [ip].");
+    assert.equal(maskBrief("Check 2001:db8::1, then go", []), "Check [ip], then go");
+    assert.equal(maskBrief("Check 2001:db8::1)", []), "Check [ip])");
+    assert.equal(maskBrief("Check 2001:db8::1/64.", []), "Check [ip].");
+    // An address that ends in its own colons keeps them: they are not sentence punctuation.
+    assert.equal(maskBrief("Route 2001:db8:: and fd00::.", []), "Route [ip] and [ip].");
+    assert.equal(maskBrief("Check fe80::1%eth0, too", []), "Check [ip], too");
+});
+
+test("maskBrief takes a dotted name that is not a file name out", () => {
+    assert.equal(
+        maskBrief("open api.example.info, build.example.ca and node.example.network", []),
+        "open [host], [host] and [host]",
+        "a last label that is no file extension is a host",
     );
+    assert.equal(maskBrief("see acme.example.com", []), "see [host]");
+    assert.equal(maskBrief("call api.memo now", []), "call [host] now", "code may be masked too");
+});
 
-    assert.equal(masked.includes("acme.example.com"), false);
-    assert.match(masked, /\[host\]/);
-
+test("maskBrief leaves a file name and a version alone", () => {
     for (const kept of [
         "team.ts",
         "package.json",
         "install.sh",
         "README.md",
+        "node.js",
         "v0.26.0",
         "bketelsen/pi-pocket",
     ]) {
-        assert.equal(masked.includes(kept), true, kept);
+        assert.equal(maskBrief(`use ${kept} now`, []), `use ${kept} now`, kept);
     }
 });
 
@@ -683,6 +711,36 @@ test("the module calls nothing when its mode is off or it has no key, and a fail
         failing.dispose();
     } finally {
         fetchStub.restore();
+    }
+});
+
+test("the key goes out of the brief, and out of the Jev model and id", async () => {
+    const fetchStub = stubFetch(
+        async () =>
+            new Response(JSON.stringify({ ...ANSWER, id: `req-${KEY}`, model: `jev-${KEY}` }), {
+                status: 200,
+            }),
+    );
+    const router = loadRouter({ mode: "shadow", typesafeApiKey: KEY }, [
+        "github-copilot/claude-sonnet-5.5",
+    ]);
+
+    try {
+        const route = await router.api.route({
+            brief: `Deploy with ${KEY} to acme.example.info`,
+            startAt: NOON,
+        });
+        const sent = String(fetchStub.calls[0]!.init.body);
+
+        assert.equal(sent.includes(KEY), false, "the key never goes to Jev");
+        assert.match(sent, /\[TYPESAFE_API_KEY\]/);
+        assert.equal(route.status, "shadow");
+        assert.equal(JSON.stringify(route).includes(KEY), false, "the record holds no key");
+        assert.equal(route.jevModel, "jev-[TYPESAFE_API_KEY]");
+        assert.equal(route.jevId, "req-[TYPESAFE_API_KEY]");
+    } finally {
+        fetchStub.restore();
+        router.dispose();
     }
 });
 

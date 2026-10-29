@@ -1525,6 +1525,8 @@ export default function createTeam(host: Host, web: Web) {
 
     /** The router's memo for one delegation: the first answer, when the call runs again. */
     const ROUTE_MEMO = "x.team.route";
+    /** Set before the router is asked: a restart finds it and no answer, and asks nothing more. */
+    const ROUTE_STARTED = "x.team.route.started";
     /** The longest a route may hold a delegation: past it, the delegation goes on with no route. */
     const ROUTE_GUARD_MS = 4000;
 
@@ -1540,6 +1542,18 @@ export default function createTeam(host: Host, web: Web) {
         } finally {
             clearTimeout(timer);
         }
+    }
+
+    /** A route with no suggestion: the delegation goes on as it would without the router, and the line says why. */
+    function failedRoute(reason: string, persona: Persona): ThreadRoute {
+        return {
+            mode: "shadow",
+            status: "failed",
+            ...(persona.model === undefined ? {} : { profileModel: persona.model }),
+            reason,
+            at: Date.now(),
+            line: `Route: failed (${reason}); no worker named, nothing changes`,
+        };
     }
 
     /**
@@ -1572,6 +1586,19 @@ export default function createTeam(host: Host, web: Web) {
                 return stored;
             }
 
+            // The call is set up before it is made. A restart between the 2 finds this memo and no answer: the router
+            // may still have run, so a second call would spend money twice and could pick another model for the same
+            // work. That replay records a failed route instead, and asks Jev nothing.
+            if ((await api.memo<boolean>(ROUTE_STARTED, context)) === true) {
+                return await api.memo<ThreadRoute>(
+                    ROUTE_MEMO,
+                    failedRoute("interrupted by a server restart", persona),
+                    context,
+                );
+            }
+
+            await api.memo<boolean>(ROUTE_STARTED, true, context);
+
             let answer: ThreadRoute | undefined;
             let reason = `the router took more than ${String(ROUTE_GUARD_MS / 1000)} s`;
 
@@ -1589,16 +1616,11 @@ export default function createTeam(host: Host, web: Web) {
             }
 
             // The router's own answer, or a failure in its shape: the memo keeps either, so a replay asks nothing.
-            const route: ThreadRoute = answer ?? {
-                mode: "shadow",
-                status: "failed",
-                ...(persona.model === undefined ? {} : { profileModel: persona.model }),
-                reason,
-                at: Date.now(),
-                line: `Route: failed (${reason}); no worker named, nothing changes`,
-            };
-
-            return await api.memo<ThreadRoute>(ROUTE_MEMO, route, context);
+            return await api.memo<ThreadRoute>(
+                ROUTE_MEMO,
+                answer ?? failedRoute(reason, persona),
+                context,
+            );
         } catch {
             return undefined;
         }

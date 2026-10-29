@@ -1721,7 +1721,7 @@ test("R1: the model used is the goal's worker, else the most common spawn model"
                 goal: { status: "ended", reason: "done", worker: "acme/named", round: 1 },
             },
         ],
-        spawns: [
+        routeSpawns: [
             spawn({ c: 102, model: "acme/ran" }),
             spawn({ c: 102, model: "acme/ran" }),
             spawn({ c: 102, model: "acme/other" }),
@@ -1752,7 +1752,7 @@ test("R1: the rounds, the cost and the reopenings of a cell", () => {
             { session: 101, goal: { status: "ended", reason: "done", round: 3 } },
             { session: 102, goal: { status: "ended", reason: "blocked", round: 5 } },
         ],
-        costRows: [
+        routeCosts: [
             { c: 101, at: NOW - 3 * HOUR, cost: 1 },
             { c: 101, at: NOW - 2 * HOUR, cost: 1 },
             { c: 102, at: NOW - 2 * HOUR, cost: 4 },
@@ -1812,7 +1812,7 @@ test("runChecks: every check has an entry, and a missing source skips its checks
     // R1 reads the router's records on the desk threads, and the goals beside them.
     assert.deepEqual(
         CHECKS.find(([id]) => id === "R1"),
-        ["R1", checkR1, ["desk", "goals"]],
+        ["R1", checkR1, ["desk", "goals", "routes"]],
     );
     // I3 sits beside I2 and reads the homes source.
     assert.deepEqual(

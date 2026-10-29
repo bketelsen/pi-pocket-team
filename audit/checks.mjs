@@ -1698,7 +1698,8 @@ function usedModel(data, thread) {
 
     const counts = {};
 
-    for (const spawn of data.spawns ?? []) {
+    // `routeSpawns`: every spawn of the routed threads' sessions, with no time limit.
+    for (const spawn of data.routeSpawns ?? []) {
         if (spawn.c !== thread.session) {
             continue;
         }
@@ -1805,7 +1806,8 @@ export function checkR1(data, ctx) {
         }
 
         if (thread.session !== undefined) {
-            const rows = (data.costRows ?? []).filter((row) => row.c === thread.session);
+            // `routeCosts`: the same rows as `costRows`, for this session, with no time limit.
+            const rows = (data.routeCosts ?? []).filter((row) => row.c === thread.session);
 
             if (rows.length > 0) {
                 cell.costs.push(rows.reduce((sum, row) => sum + row.cost, 0));
@@ -1877,7 +1879,7 @@ export const CHECKS = [
     ["I2", checkI2, ["odrade"]],
     ["I3", checkI3, ["homes"]],
     ["J1", checkJ1, ["desk", "costs"]],
-    ["R1", checkR1, ["desk", "goals"]],
+    ["R1", checkR1, ["desk", "goals", "routes"]],
 ];
 
 /**

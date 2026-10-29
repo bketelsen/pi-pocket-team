@@ -90,6 +90,17 @@ export function createFixtureDb(file, now) {
                 lastEventAt: e.closed1.at,
                 prs: {},
                 asks: [],
+                // The model router's shadow record: the audit's `routes` source reads its session, with no time limit.
+                route: {
+                    mode: "shadow",
+                    status: "shadow",
+                    kind: "implement",
+                    tier: "high",
+                    model: "github-copilot/claude-sonnet-5.5",
+                    reason: "shadow: recorded only",
+                    at: now - 30 * HOUR,
+                    line: "Route: implement (kind 0.82), shadow, not applied",
+                },
                 run: { returnAddress: "session-aaa" },
                 events: [e.opened, e.closed1],
             },
@@ -280,6 +291,22 @@ export function createFixtureDb(file, now) {
                 model: "other/model",
                 tools: ["read", "bash"],
                 message: `${"x".repeat(320)} This is a cross-review.`,
+            },
+        },
+    ]);
+    // T1's session, 20 days back: its spend and its spawn are outside the 8-day horizon of `costRows` and `spawns`,
+    // and the `routes` source still loads them.
+    assistant(SESSION_T1, now - 20 * 24 * HOUR, 0.5, [
+        {
+            type: "toolCall",
+            id: "c0",
+            name: "subagent",
+            arguments: {
+                action: "spawn",
+                name: "old",
+                model: "old/model",
+                tools: ["read", "bash"],
+                message: "old work",
             },
         },
     ]);

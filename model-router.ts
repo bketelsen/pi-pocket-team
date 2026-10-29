@@ -129,42 +129,119 @@ export function inDeepseekPeak(ms: number): boolean {
 
 // ─── Masking ─────────────────────────────────────────────────────────────────
 
-/** The last labels that make a dotted name a network host name, not a file name. */
-const NETWORK_TLDS = new Set([
-    "com",
-    "net",
-    "org",
-    "io",
-    "dev",
-    "app",
-    "ai",
-    "cloud",
-    "local",
-    "lan",
-    "internal",
-    "home",
-    "arpa",
-    "localdomain",
-    "edu",
-    "gov",
-    "co",
-    "us",
-    "uk",
-    "de",
-    "xyz",
-    "me",
-    "tech",
-    "site",
+/**
+ * The last labels that make a dotted name a file name, not a host name. A name ends in 1 of these: it stays. Anything
+ * else with a lowercase last label of 2 to 24 letters is a host name, and goes. A deny-list keeps a new network TLD
+ * masked without a code change, and code such as `api.memo` is masked too: more masking is safe.
+ */
+const FILE_EXTENSIONS = new Set([
+    "ts",
+    "tsx",
+    "js",
+    "jsx",
+    "mjs",
+    "cjs",
+    "json",
+    "md",
+    "mdx",
+    "sh",
+    "bash",
+    "zsh",
+    "py",
+    "go",
+    "rs",
+    "rb",
+    "java",
+    "kt",
+    "swift",
+    "c",
+    "h",
+    "cpp",
+    "hpp",
+    "cs",
+    "yml",
+    "yaml",
+    "toml",
+    "ini",
+    "cfg",
+    "conf",
+    "env",
+    "txt",
+    "log",
+    "lock",
+    "css",
+    "scss",
+    "less",
+    "html",
+    "htm",
+    "xml",
+    "svg",
+    "png",
+    "jpg",
+    "jpeg",
+    "gif",
+    "webp",
+    "ico",
+    "pdf",
+    "csv",
+    "sql",
+    "zip",
+    "gz",
+    "tgz",
+    "xz",
+    "tar",
+    "bz2",
+    "deb",
+    "rpm",
+    "iso",
+    "img",
+    "qcow2",
+    "raw",
+    "nix",
+    "lua",
+    "vue",
+    "svelte",
+    "wasm",
+    "so",
+    "sock",
+    "pid",
+    "bak",
+    "tmp",
+    "orig",
+    "diff",
+    "patch",
+    "mod",
+    "sum",
+    "gradle",
+    "plist",
+    "desktop",
+    "service",
+    "timer",
+    "mount",
+    "socket",
+    "target",
+    "path",
+    "ign",
+    "bu",
+    "pem",
+    "crt",
+    "key",
+    "pub",
+    "d",
 ]);
+
+/** Sentence punctuation a candidate can collect at its end: it stays in the text, after the mask. */
+const TRAILING_PUNCTUATION = /[.,;:!?)]+$/;
 
 const URL_PATTERN = /\b[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s<>"'`)\]]+/g;
 const WWW_PATTERN = /\bwww\.[^\s<>"'`)\]]+/gi;
 const EMAIL_PATTERN = /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}\b/g;
 const IPV6_CANDIDATE =
-    /(?<![0-9A-Za-z:.])([0-9A-Fa-f:.]+(?:%[0-9A-Za-z_.-]+)?)(?:\/\d{1,3})?(?![0-9A-Za-z:.])/g;
-const IPV4_CANDIDATE = /(?<![\w.])(\d{1,3}(?:\.\d{1,3}){3})(?:\/\d{1,2})?(?::\d{1,5})?(?![\w.])/g;
+    /(?<![0-9A-Za-z:.])(?:[0-9A-Fa-f:.]+(?:%[0-9A-Za-z_.-]+)?(?:\/\d{1,3})?)[.,;:!?)]*(?![0-9A-Za-z:])/g;
+const IPV4_CANDIDATE =
+    /(?<![\w.])\d{1,3}(?:\.\d{1,3}){3}(?:\/\d{1,2})?(?::\d{1,5})?[.,;:!?)]*(?!\w)/g;
 const FQDN_CANDIDATE =
-    /(?<![A-Za-z0-9_.-])((?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+([A-Za-z]{2,}))(?![A-Za-z0-9_-])/g;
+    /(?<![A-Za-z0-9_.-])(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[a-z]{2,24}(?![A-Za-z0-9_-])/g;
 const SECRET_PATTERNS = [
     /\b(?:ghp_|gho_|ghs_|github_pat_)[A-Za-z0-9_]{8,}\b/g,
     /\bsk-[A-Za-z0-9_-]{16,}\b/g,
@@ -173,8 +250,8 @@ const SECRET_PATTERNS = [
 
 /**
  * The host names of an SSH config: the names on its `Host` and `HostName` lines, case-insensitive, with `Host a b` and
- * `HostName=x` both read. A pattern (`*`, `?`, `!`) and a name shorter than 3 characters are left out. Lowercase,
- * unique, in the order the file gives them.
+ * `HostName=x` both read, and double quotes taken off (`Host "build01"`). A pattern (`*`, `?`, `!`) and a 1-letter name
+ * are left out: the word "a" would go with it. Lowercase, unique, in the order the file gives them.
  */
 export function sshHostNames(configText: string): string[] {
     const names: string[] = [];
@@ -193,9 +270,9 @@ export function sshHostNames(configText: string): string[] {
         }
 
         for (const part of match[1].split(/[\s,]+/)) {
-            const name = part.trim().toLowerCase();
+            const name = part.replaceAll('"', "").trim().toLowerCase();
 
-            if (name.length < 3 || /[*?!]/.test(name) || names.includes(name)) {
+            if (name.length < 2 || /[*?!]/.test(name) || names.includes(name)) {
                 continue;
             }
 
@@ -209,28 +286,62 @@ export function sshHostNames(configText: string): string[] {
 /** An escaped regular expression body: a host name is matched as text, not as a pattern. */
 const escaped = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
-/** Every IPv6 token in `text` that `isIPv6` confirms, as `[ip]`. A time such as `10:00` has 1 colon and stays. */
-function maskIpv6(text: string): string {
-    return text.replace(IPV6_CANDIDATE, (whole, token: string) => {
-        const address = token.split("%")[0];
-        const colons = address.split(":").length - 1;
+/**
+ * A candidate address split into its core and the sentence punctuation after it: an address at the end of a sentence
+ * (`Check 192.168.1.4.`) is still an address, and the period stays.
+ */
+function splitTrailing(candidate: string): { core: string; tail: string } {
+    const tail = TRAILING_PUNCTUATION.exec(candidate)?.[0] ?? "";
 
-        return colons >= 2 && isIPv6(address) ? "[ip]" : whole;
+    return { core: candidate.slice(0, candidate.length - tail.length), tail };
+}
+
+/**
+ * Every IPv6 token in `text` that `isIPv6` confirms, as `[ip]`, with its `/prefix`, `%zone` and sentence punctuation
+ * kept. A time such as `10:00` has 1 colon and stays.
+ */
+function maskIpv6(text: string): string {
+    const isAddress = (core: string): boolean => {
+        const address = core.split("/")[0]!.split("%")[0]!;
+
+        return address.split(":").length - 1 >= 2 && isIPv6(address);
+    };
+
+    return text.replace(IPV6_CANDIDATE, (whole: string) => {
+        // `2001:db8::` ends in colons that belong to it: the punctuation without colons goes first, then all of it.
+        const tail = /[.,;!?)]*$/.exec(whole)![0];
+        const core = whole.slice(0, whole.length - tail.length);
+
+        if (isAddress(core)) {
+            return `[ip]${tail}`;
+        }
+
+        const split = splitTrailing(whole);
+
+        return isAddress(split.core) ? `[ip]${split.tail}` : whole;
     });
 }
 
-/** Every IPv4 address, with an optional `/cidr` and `:port`, as `[ip]`. */
+/** Every IPv4 address, with an optional `/cidr` and `:port`, as `[ip]`, and its punctuation kept. */
 function maskIpv4(text: string): string {
-    return text.replace(IPV4_CANDIDATE, (whole, address: string) =>
-        isIPv4(address) ? "[ip]" : whole,
-    );
+    return text.replace(IPV4_CANDIDATE, (whole: string) => {
+        const { core, tail } = splitTrailing(whole);
+        const address = core.split("/")[0]!.split(":")[0]!;
+
+        return isIPv4(address) ? `[ip]${tail}` : whole;
+    });
 }
 
-/** Every fully qualified host name whose last label is a network TLD, as `[host]`. `team.ts` stays. */
+/**
+ * Every fully qualified host name, as `[host]`: a dotted name whose last label is 2 to 24 lowercase letters and is not
+ * a file extension. `acme.example.info` goes; `team.ts`, `node.js` and `README.md` stay.
+ */
 function maskFqdn(text: string): string {
-    return text.replace(FQDN_CANDIDATE, (whole, name: string, tld: string) =>
-        NETWORK_TLDS.has(tld.toLowerCase()) ? "[host]" : whole,
-    );
+    return text.replace(FQDN_CANDIDATE, (whole: string) => {
+        const last = whole.slice(whole.lastIndexOf(".") + 1);
+
+        return FILE_EXTENSIONS.has(last) ? whole : "[host]";
+    });
 }
 
 /** Every given host name, as a whole word and in any case, as `[host]`. The longest name goes first. */
@@ -787,10 +898,13 @@ export default function createModelRouter(host: Host, web: Web) {
             at,
         });
 
+    /** `text` with the key taken out: it never goes to Jev, to the desk, or to the supervisor. */
+    const redact = (text: string, key: string): string =>
+        text.replaceAll(key, "[TYPESAFE_API_KEY]");
+
     /** One line, 200 characters at most, without the key. */
     const reasonOf = (error: unknown, key: string): string =>
-        (error instanceof Error ? error.message : String(error))
-            .replaceAll(key, "[TYPESAFE_API_KEY]")
+        redact(error instanceof Error ? error.message : String(error), key)
             .replace(/\s+/g, " ")
             .trim()
             .slice(0, MAX_REASON);
@@ -822,7 +936,8 @@ export default function createModelRouter(host: Host, web: Web) {
             // Jev can fail first: these 2 are then never awaited, and must not reject unhandled.
             models.catch(() => undefined);
             tiersFile.catch(() => undefined);
-            const masked = maskBrief(request.brief, await sshNames());
+            // The key itself goes before the call, and out of the answer too: it never reaches Jev or the record.
+            const masked = redact(maskBrief(request.brief, await sshNames()), key);
             const analysis = await classify(masked, key);
             const [{ allowed, unusable }, { tiers, notes }] = await Promise.all([
                 models,
@@ -830,6 +945,9 @@ export default function createModelRouter(host: Host, web: Web) {
             ]);
             const decision = decide(analysis, { allowed, unusable, at: request.startAt, tiers });
             const all = [...notes, ...decision.notes];
+            const jevModel =
+                analysis.jevModel === undefined ? undefined : redact(analysis.jevModel, key);
+            const jevId = analysis.jevId === undefined ? undefined : redact(analysis.jevId, key);
 
             if (
                 decision.model === undefined ||
@@ -854,8 +972,8 @@ export default function createModelRouter(host: Host, web: Web) {
                 ...(request.profileModel === undefined
                     ? {}
                     : { profileModel: request.profileModel }),
-                ...(analysis.jevModel === undefined ? {} : { jevModel: analysis.jevModel }),
-                ...(analysis.jevId === undefined ? {} : { jevId: analysis.jevId }),
+                ...(jevModel === undefined ? {} : { jevModel }),
+                ...(jevId === undefined ? {} : { jevId }),
                 latencyMs: analysis.latencyMs,
                 reason: "shadow: recorded only",
                 ...(all.length === 0 ? {} : { notes: all }),

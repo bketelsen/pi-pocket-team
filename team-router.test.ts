@@ -392,6 +392,58 @@ describe("a delegated night shift and the model router", () => {
         }
     });
 
+    test("a restart while the router waits records a failed route, and asks once", async () => {
+        const router = fakeRouter("hang");
+        let thread: Thread | undefined;
+
+        try {
+            const source = await supervisor("route-restart");
+
+            // Pi asks for the delegation; the tool then waits on a router that never answers. The answer is not
+            // awaited: the app must stop while the call is still in flight.
+            void say(app, source, "hang route night shift test").catch(() => undefined);
+            await until(() => router.calls.length === 1, "the router to be asked", 20_000);
+
+            await app.close();
+            app = await openApp(model, dataDir, () => Date.now());
+
+            // The tool runs again after the restart: the started memo is there, and the answer is not.
+            await until(
+                async () => {
+                    const linked = app
+                        .sessions()
+                        .filter((session) => session.linkedFrom?.id === Number(source))
+                        .at(-1);
+
+                    if (linked === undefined) {
+                        return false;
+                    }
+
+                    thread = await threadOf(linked.id as ConversationId);
+
+                    return thread?.route !== undefined;
+                },
+                "the route to be recorded",
+                20_000,
+            );
+
+            assert.equal(router.calls.length, 1, "1 call over both runs");
+            assert.equal(thread?.route?.status, "failed");
+            assert.equal(thread?.route?.reason, "interrupted by a server restart");
+            assert.equal(
+                thread?.route?.line,
+                "Route: failed (interrupted by a server restart); no worker named, nothing changes",
+            );
+            assert.equal(
+                thread?.events.filter((event) => event.key === "route").length,
+                1,
+                "1 route event",
+            );
+        } finally {
+            router.remove();
+        }
+    });
+
     test("a delegation with no night shift asks the router nothing", async () => {
         const router = fakeRouter();
 
