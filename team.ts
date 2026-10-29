@@ -1414,9 +1414,18 @@ export default function createTeam(host: Host, web: Web) {
         for?: string;
         max?: number;
         worker?: string;
+        pr_check?: {
+            pr?: number;
+            repo?: string;
+            checks?: "required" | "all" | "none";
+            label?: string;
+        };
     };
 
-    /** The `night_shift` argument: a goal for the linked session. It has no check command. */
+    /**
+     * The `night_shift` argument: a goal for the linked session. It has no check command of its own: `pr_check` is a
+     * structured PR check, and the night-shift module builds its `gh` command from validated values.
+     */
     type NightShiftArg = Omit<DelegatedFields, "objective"> & { objective?: string };
 
     /** A night-shift goal as team.ts sets it and reads it back. */
@@ -1587,6 +1596,12 @@ export default function createTeam(host: Host, web: Web) {
         if (ns === undefined) {
             throw new Error(
                 "The night-shift module is off. Brian turns it on in Menu → Extensions.",
+            );
+        }
+
+        if (fields.pr_check !== undefined && ns.version < 2) {
+            throw new Error(
+                "The night-shift module is too old for pr_check: Brian must install the new version.",
             );
         }
 
@@ -1978,7 +1993,7 @@ export default function createTeam(host: Host, web: Web) {
     const delegate = defineTool({
         name: "team_delegate",
         description:
-            "Supervisor only: give a self-contained task to a named agent in their repository folder. Choose a repository from the roster if the agent owns more than one. Runs on the agent's profile model when the owner allows it for subagents, otherwise on your model (the roster shows each agent's model); thinking is yours, or the nearest level the model has. Returns an address without waiting for completion. With night_shift, the linked session runs a night-shift goal in rounds, and its report comes back here by itself when it stops; a night shift has no check command. With watch, the desk thread sleeps until the check's date: it does not count toward the cap, and a check result closes it.",
+            "Supervisor only: give a self-contained task to a named agent in their repository folder. Choose a repository from the roster if the agent owns more than one. Runs on the agent's profile model when the owner allows it for subagents, otherwise on your model (the roster shows each agent's model); thinking is yours, or the nearest level the model has. Returns an address without waiting for completion. With night_shift, the linked session runs a night-shift goal in rounds, and its report comes back here by itself when it stops. A night shift takes no free check command, and team_delegate refuses one. It can take pr_check instead: a structured PR check that runs gh pr checks and gh pr view, read only, in the linked session's folder after Pi says DONE, and must pass. With watch, the desk thread sleeps until the check's date: it does not count toward the cap, and a check result closes it.",
         parameters: Type.Object({
             agent: Type.String(),
             task: Type.String({ minLength: 1, maxLength: 6000 }),
@@ -2022,6 +2037,51 @@ export default function createTeam(host: Host, web: Web) {
                                 "provider/model for subagents, from the owner's allowed list for subagents, e.g. github-copilot/claude-sonnet-5.5",
                         }),
                     ),
+                    pr_check: Type.Optional(
+                        Type.Object(
+                            {
+                                pr: Type.Optional(
+                                    Type.Integer({
+                                        minimum: 1,
+                                        description:
+                                            "The PR number. Omit to check the PR of the current branch of the linked session's folder.",
+                                    }),
+                                ),
+                                repo: Type.Optional(
+                                    Type.String({
+                                        pattern:
+                                            "^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$",
+                                        description:
+                                            "The repository of the PR, owner/name, e.g. bketelsen/x. Omit when the folder is the PR's repository.",
+                                    }),
+                                ),
+                                checks: Type.Optional(
+                                    Type.Union(
+                                        [
+                                            Type.Literal("required"),
+                                            Type.Literal("all"),
+                                            Type.Literal("none"),
+                                        ],
+                                        {
+                                            description:
+                                                'Which checks must pass: "required" (the default), "all", or "none" with a label.',
+                                        },
+                                    ),
+                                ),
+                                label: Type.Optional(
+                                    Type.String({
+                                        maxLength: 50,
+                                        description:
+                                            "A label the PR must have, such as ready-for-human. Letters, digits, spaces and . _ : / + - only.",
+                                    }),
+                                ),
+                            },
+                            {
+                                description:
+                                    "A PR check that must pass after Pi says DONE. This is not a shell command: it runs gh pr checks and gh pr view, read only, in the linked session's folder. A free check command is refused.",
+                            },
+                        ),
+                    ),
                 }),
             ),
             watch: Type.Optional(
@@ -2054,10 +2114,11 @@ export default function createTeam(host: Host, web: Web) {
             }
 
             // The check runs unasked, with the owner's rights, and Lancet Guard does not see it: only the owner sets one,
-            // with /night-shift in the session itself.
+            // with /night-shift in the session itself. `pr_check` is the exception: a fixed, read-only `gh` command
+            // that the night-shift module builds from validated values.
             if (night_shift !== undefined && Object.hasOwn(night_shift, "check")) {
                 throw new Error(
-                    "A night shift from team_delegate cannot have a check command: the check does not go through Lancet Guard. Only Brian can set one, with /night-shift in the session.",
+                    "A night shift from team_delegate cannot have a check command: the check does not go through Lancet Guard. Use pr_check for a PR goal, or Brian sets a check with /night-shift in the session.",
                 );
             }
 
@@ -2104,6 +2165,19 @@ export default function createTeam(host: Host, web: Web) {
                     ? undefined
                     : { path: worktree.path, branch: worktree.branch, checkout: worktree.checkout };
             const notMade = worktreeFailure(worktree);
+
+            // A PR check with no number reads the current branch's PR: that is the task's branch only when this
+            // delegation made a worktree of its own.
+            if (
+                night_shift?.pr_check !== undefined &&
+                night_shift.pr_check.pr === undefined &&
+                made === undefined
+            ) {
+                throw new Error(
+                    "night_shift.pr_check needs pr when the task has no worktree of its own: the current branch is not the task's branch.",
+                );
+            }
+
             const desk = deskApi();
             const repo = target.repo;
             const opened =

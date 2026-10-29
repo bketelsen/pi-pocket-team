@@ -130,7 +130,7 @@ When the folder is the top of a git work tree, each delegation gets its own work
 
 For non-repository work, `workspace: ~/projects/moneo` supplies a working folder. An agent with neither repositories nor a workspace inherits the source folder. All mapped paths are absolute or begin with `~/` and must exist when a task starts; delegation does not silently clone or create folders.
 
-The tool takes an optional `night_shift` object, `{ objective?, stop_when, start?, until?, for?, max?, worker? }`: the linked session then runs a night-shift goal in rounds and reports back to Odrade's session when it stops. A night shift from the tool cannot have a check command. `worker` is the provider/model for subagents, such as `github-copilot/claude-sonnet-5.5`; it must be in the owner's allowed list for subagents. See [Delegated night shifts](#delegated-night-shifts).
+The tool takes an optional `night_shift` object, `{ objective?, stop_when, start?, until?, for?, max?, worker?, pr_check? }`: the linked session then runs a night-shift goal in rounds and reports back to Odrade's session when it stops. A night shift from the tool cannot have a free check command. `pr_check` is the only check it takes: a structured PR check, and the module builds the `gh` command. `worker` is the provider/model for subagents, such as `github-copilot/claude-sonnet-5.5`; it must be in the owner's allowed list for subagents. See [Delegated night shifts](#delegated-night-shifts).
 
 ```json
 {
@@ -143,7 +143,13 @@ The tool takes an optional `night_shift` object, `{ objective?, stop_when, start
         "start": "06:00",
         "for": "8h",
         "max": 30,
-        "worker": "github-copilot/claude-sonnet-5.5"
+        "worker": "github-copilot/claude-sonnet-5.5",
+        "pr_check": {
+            "pr": 128,
+            "repo": "frostyard/nsl",
+            "checks": "required",
+            "label": "ready-for-human"
+        }
     }
 }
 ```
@@ -309,7 +315,8 @@ State is one document per conversation, `x.night-shift.goal` (`{ goal?: Goal }`;
 
 ## Limits and rules
 
-- **Lancet Guard:** every tool call of every round goes through the guard as usual. If the guard asks a person, the round waits for that person; the deadline does not cut it short. The check command runs unasked, with the owner's rights, and the guard does not see it (a drop-in cannot ask the guard): like the owner's own `!` commands. So only the owner can set or resume a goal with a check.
+- **Lancet Guard:** every tool call of every round goes through the guard as usual. If the guard asks a person, the round waits for that person; the deadline does not cut it short. A free check command runs unasked, with the owner's rights, and the guard does not see it (a drop-in cannot ask the guard): like the owner's own `!` commands. So only the owner can set or resume a goal with a free check, with `/night-shift` in the session.
+- **The 1 exception: `pr_check`.** A delegated night shift can take `night_shift.pr_check`, and only that. It is safe: the program is always `gh`, the calls are read only (`gh pr checks`, and `gh pr view --json labels`), every value is checked before it is used, and the module writes the command itself. No model chooses the shell. A free check command stays owner-only.
 - **Plan mode:** a goal does not start in plan mode, and pauses before a round when plan mode is on. Reading plan mode uses Pocket's own `pocket.plan` document, which is not public API: if it changes, the read fails and the goal relies on Pi saying BLOCKED, as the prompt asks.
 - **Worker:** the model must be in the owner's allowed list for subagents. The command and `team_delegate` refuse another model; `resume` checks the list again, because it can change. No other model is ever used in its place.
 - **Who:** anyone who can steer the session runs `/night-shift`; a check needs the owner. One goal per session. Any session works, linked sessions included.
@@ -319,7 +326,7 @@ State is one document per conversation, `x.night-shift.goal` (`{ goal?: Goal }`;
 
 A supervisor identity (Odrade) can start a night shift in the linked session that `team_delegate` makes, with its `night_shift` argument. It works for the person behind Odrade's session (Brian), and the goal's spend is his. The goal is set in one commit with the specialist's identity, so a restart leaves either both or neither.
 
-- **No check.** A check command runs unasked with the owner's rights, and Lancet Guard does not see it, so only the owner sets one, with `/night-shift` in the session. `team_delegate` refuses a `night_shift` that has `check`.
+- **No free check, but `pr_check`.** A free check command runs unasked with the owner's rights, and Lancet Guard does not see it, so only the owner sets one, with `/night-shift` in the session. `team_delegate` refuses a `night_shift` that has `check`. It takes `pr_check` instead: `{ pr?, repo?, checks?, label? }`. `checks` is `required` (the default), `all`, or `none` with a label; `none` with no label is refused. The module builds `gh pr checks` and `gh pr view`, read only, and `&&` joins them: every part must pass. `pr` may be left out only when the delegation made a worktree of its own, because then the current branch is the task's branch. `repo`, `pr` and `label` are checked, so a value that holds shell characters is refused. `gh pr checks --required` fails when the repository requires no checks: use `checks: "all"` there, or `none` with a label.
 - **The first message is the message before round 1.** It says that round 1 comes as a separate `[night-shift]` message, to answer it with one short line, and not to send a report with `team_message`.
 - **The report comes back by itself.** When the goal stops, the driver sends one report to Odrade's session, with the reason and Pi's summary answer (in ASD-STE100). With a worker, the report adds `Rounds: N, worker: <worker>.`, so rounds can be counted per provider. A restart reruns the report phase, and its key makes the send happen once. `/night-shift stop` sends the same kind of report, best effort. A delegated goal's summary prompt asks Pi to end with an `ASKS FOR BRIAN:` line and 1 line for each decision Brian must make (with `[a | b]` options for a pick-one, or `none`). The night-shift module reads that block with the desk's own parser (`asks` on the desk's API, `reportAsksOf` in `desk.ts`), so the 2 modules cannot drift, and passes 1 to 4 asks to the desk, so each becomes an ask on the thread in the report's commit; more than 4, or none, leaves the decisions in the text. The items it files are the items that hold a thread (`decisionItem`), as written, and an item that ends with `[a | b]` keeps its options. It does not import `desk.ts`: the desk's API comes from the global, as `team.ts` finds the night shift. An older desk with no `asks` gives none: the text alone holds the thread then.
 - **Two modules, no import.** `team.ts` finds the night-shift module through `globalThis[Symbol.for("pi-pocket-team.night-shift")]`. An import would keep a stale copy after a reload. Both modules must be on in **Menu → Extensions**; without night-shift the tool says so.
