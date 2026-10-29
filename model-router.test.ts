@@ -543,7 +543,7 @@ test("routeLine says a worker runs beside the router's suggestion, and a failure
             reason: "Jev timed out after 3.5 s",
             at: NOON,
         }),
-        "Route: failed (Jev timed out after 3.5 s); named deepseek/deepseek-flash runs",
+        "Route: failed, named deepseek/deepseek-flash runs (Jev timed out after 3.5 s)",
     );
     assert.equal(
         routeLine({
@@ -879,6 +879,20 @@ test("a worker line is at most 120 characters with 2 models of 32 characters", (
     assert.equal(worker.length, 32);
     assert.equal(line, `Route: standard: ${model} (implement 1.9); named ${worker} runs; shadow`);
     assert.ok(line.length <= 120, `the line has ${String(line.length)} characters`);
+
+    // A failure's reason can hold 200 characters: the worker comes first, so the desk's 120-character cut keeps it.
+    const failed = routeLine({
+        mode: "shadow",
+        status: "failed",
+        worker,
+        reason: "x".repeat(200),
+        at: NOON,
+    });
+
+    assert.ok(
+        failed.slice(0, 120).startsWith(`Route: failed, named ${worker} runs (`),
+        "the first 120 characters hold the named worker",
+    );
 });
 
 test("a named worker is routed all the same: 1 Jev call, masking as before, and the record carries the worker", async () => {
@@ -947,7 +961,7 @@ test("a failed or off route beside a named worker carries the worker", async () 
         assert.equal(failed.worker, worker);
         assert.match(
             failed.line,
-            /^Route: failed \(.*500.*\); named deepseek\/deepseek-flash runs/,
+            /^Route: failed, named deepseek\/deepseek-flash runs \(.*500.*\)/,
         );
         failing.dispose();
 

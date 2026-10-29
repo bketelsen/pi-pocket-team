@@ -435,7 +435,7 @@ describe("a delegated night shift and the model router", () => {
                 );
                 assert.equal(
                     route?.line,
-                    `Route: failed (${route?.reason}); named faux/faux-2 runs`,
+                    `Route: failed, named faux/faux-2 runs (${route?.reason})`,
                 );
                 assert.equal(
                     (await goalOf(linked))!.worker,
@@ -581,7 +581,7 @@ describe("a delegated night shift and the model router", () => {
             assert.equal(thread?.route?.worker, "faux/faux-2");
             assert.equal(
                 thread?.route?.line,
-                "Route: failed (interrupted by a server restart); named faux/faux-2 runs",
+                "Route: failed, named faux/faux-2 runs (interrupted by a server restart)",
             );
             assert.equal(
                 thread?.events.filter((event) => event.key === "route").length,

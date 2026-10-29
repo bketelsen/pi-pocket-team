@@ -792,7 +792,7 @@ export function routeLine(route: RouteFields): string {
     if (route.status === "failed") {
         return route.worker === undefined
             ? `Route: failed (${route.reason}); no worker named, nothing changes`
-            : `Route: failed (${route.reason}); named ${route.worker} runs`;
+            : `Route: failed, named ${route.worker} runs (${route.reason})`;
     }
 
     if (route.worker !== undefined) {

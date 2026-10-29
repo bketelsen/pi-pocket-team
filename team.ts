@@ -1562,7 +1562,7 @@ export default function createTeam(host: Host, web: Web) {
             line:
                 worker === undefined
                     ? `Route: failed (${reason}); no worker named, nothing changes`
-                    : `Route: failed (${reason}); named ${worker} runs`,
+                    : `Route: failed, named ${worker} runs (${reason})`,
         };
     }
 
