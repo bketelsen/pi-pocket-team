@@ -57,27 +57,41 @@ export const groupOf = (thread) => {
 };
 
 /**
- * The rail badge: the threads that need Brian. A thread that is not parked counts when it has an open ask, also when
- * it is asleep or closed; else it counts when it is not closed or asleep and it needs Brian or is stale.
+ * The rail badge: the threads that need Brian, and the PRs ready to merge. A thread that is not parked counts when it
+ * has an open ask, also when it is asleep or closed; else it counts when it is not closed or asleep and it needs Brian or
+ * is stale. Each PR in `ready` counts 1, so a thread that counts only because it needs Brian does not count again when
+ * its id is the thread of one of those PRs. A missing `ready` is no PR: an older view works as before.
  */
-export const badgeOf = (next) =>
-    next === null || next === undefined
-        ? 0
-        : next.threads.filter((thread) => {
-              if (thread.state === "parked") {
-                  return false;
-              }
+export const badgeOf = (next) => {
+    if (next === null || next === undefined) {
+        return 0;
+    }
 
-              if ((thread.asks ?? []).length > 0) {
-                  return true;
-              }
+    const ready = next.ready ?? [];
+    const threads = new Set(ready.map((pr) => pr.thread));
 
-              return (
-                  thread.state !== "closed" &&
-                  !thread.asleep &&
-                  (thread.next === "brian" || thread.stale)
-              );
-          }).length;
+    return (
+        ready.length +
+        next.threads.filter((thread) => {
+            if (thread.state === "parked") {
+                return false;
+            }
+
+            if ((thread.asks ?? []).length > 0) {
+                return true;
+            }
+
+            const needsBrian = thread.next === "brian";
+
+            // Its PRs count under Ready to merge: the thread does not count a second time.
+            if (needsBrian && !thread.stale && threads.has(thread.id)) {
+                return false;
+            }
+
+            return thread.state !== "closed" && !thread.asleep && (needsBrian || thread.stale);
+        }).length
+    );
+};
 
 const publish = (next) => {
     view = next;
@@ -485,6 +499,7 @@ export default function setup(pocket) {
 
         const others = Object.values(view?.others ?? {}).reduce((sum, count) => sum + count, 0);
         const counts = view?.counts ?? {};
+        const ready = view?.ready ?? [];
         const capInfo = view?.cap ?? { counted: 0, cap: 0, full: false, grants: 0 };
         const fresh = (thread) => thread.lastEventAt > (seenBefore ?? 0);
 
@@ -548,6 +563,34 @@ export default function setup(pocket) {
                     }
                 </button>
                 ${actions}
+            </li>`;
+
+        /** One PR that Brian can merge now: its link, its head, the thread it belongs to, and its CI state. */
+        const readyRow = (pr) =>
+            html`<li class="desk-row">
+                <span class="desk-line">
+                    ${
+                        pr.url
+                            ? html`<a class="desk-link" href=${pr.url} target="_blank" rel="noopener"
+                                  >${pr.ref}</a
+                              >`
+                            : html`<span class="desk-title">${pr.ref}</span>`
+                    }
+                    ${pr.title ? html`<span class="desk-title">${pr.title}</span>` : null}
+                    ${pr.head ? html`<code class="desk-pr-head">${pr.head}</code>` : null}
+                    <button
+                        type="button"
+                        class="desk-thread-link"
+                        aria-label=${`Open ${pr.thread}`}
+                        onClick=${() => setOpenId(pr.thread)}
+                    >
+                        ${pr.thread}
+                    </button>
+                </span>
+                <span class="small muted">
+                    ${(pr.agents ?? []).join(", ")} ·
+                    ${pr.checks ? pr.checks.toLowerCase() : "no checks"}
+                </span>
             </li>`;
 
         const dropField = (thread) =>
@@ -1021,7 +1064,7 @@ export default function setup(pocket) {
             <header class="desk-head">
                 <h1>Desk</h1>
                 <p class="small muted">
-                    ${counts.brian ?? 0} need you · ${counts.open ?? 0} open · ${counts.stale ?? 0} stale · ${counts.watching ?? 0} watching · ${counts.parked ?? 0} parked · ${capInfo.counted} of ${capInfo.cap} count
+                    ${counts.brian ?? 0} need you · ${counts.ready ?? 0} ready to merge · ${counts.open ?? 0} open · ${counts.stale ?? 0} stale · ${counts.watching ?? 0} watching · ${counts.parked ?? 0} parked · ${capInfo.counted} of ${capInfo.cap} count
                 </p>
                 ${
                     view.github && view.github.ok === false
@@ -1096,6 +1139,12 @@ export default function setup(pocket) {
                         ? needDetail(thread)
                         : html`${withWatch(thread, needDetail(thread))}${thread.origin === "found" ? foundActions(thread) : null}`,
                 ),
+            )}
+            ${section(
+                "Ready to merge",
+                ready,
+                readyRow,
+                "PRs with the label ready-for-human. A PR leaves the list when it merges, closes, or loses the label.",
             )}
             ${section(
                 "Found",

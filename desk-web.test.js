@@ -418,6 +418,96 @@ test("badgeOf: an open ask counts, also when asleep; a plain sleeping thread doe
     assert.equal(badgeOf(view([sleepingAsked])), 1);
 });
 
+test("badgeOf: each PR ready to merge counts 1, and its thread does not count twice", () => {
+    const withReady = (threads, ready) => ({ ...viewWith(null), threads, ready });
+    const readyPr = (patch = {}) => ({
+        ref: "frostyard/test#12",
+        thread: "T1",
+        agents: ["duncan"],
+        at: NOW,
+        ...patch,
+    });
+
+    // A thread that counts only because it needs Brian: its PR counts, and the thread does not.
+    const brian = threadView({ id: "T1", next: "brian" });
+
+    assert.equal(badgeOf(withReady([brian], [])), 1, "the thread alone counts");
+    assert.equal(
+        badgeOf(withReady([brian], [readyPr()])),
+        1,
+        "the PR counts, and the thread does not count again",
+    );
+    assert.equal(badgeOf(withReady([], [readyPr(), readyPr({ ref: "frostyard/test#13" })])), 2);
+
+    // A thread that counts for another reason keeps its own count.
+    const asked = threadView({ id: "T1", next: "brian", asks: [openAsk] });
+
+    assert.equal(badgeOf(withReady([asked], [readyPr()])), 2, "the open ask counts beside the PR");
+
+    const stale = threadView({ id: "T1", next: "brian", stale: true });
+
+    assert.equal(
+        badgeOf(withReady([stale], [readyPr()])),
+        2,
+        "a stale thread counts beside the PR",
+    );
+
+    // An older view has no ready list.
+    assert.equal(badgeOf({ ...viewWith(null), threads: [brian] }), 1);
+});
+
+test("Ready to merge sits after Needs you, with the link, the head, the thread, and the CI state", async () => {
+    const out = await render({
+        ...viewWith(null),
+        counts: { ready: 2 },
+        threads: [threadView({ id: "T9", next: "brian", title: "Needs him" })],
+        ready: [
+            {
+                ref: "frostyard/test#12",
+                title: "A fix",
+                url: "https://github.com/frostyard/test/pull/12",
+                head: "a1b2c3d",
+                checks: "SUCCESS",
+                thread: "T1",
+                agents: ["duncan"],
+                at: NOW,
+            },
+            {
+                ref: "frostyard/test#13",
+                title: "No CI yet",
+                thread: "T2",
+                agents: ["irulan"],
+                at: NOW,
+            },
+        ],
+    });
+
+    const need = out.indexOf("<h2>Needs you");
+    const start = out.indexOf("<h2>Ready to merge");
+    const part = out.slice(start, out.indexOf("</section>", start));
+
+    assert(need >= 0 && start > need, "it comes after Needs you");
+    assert.match(part, /class="desk-count">2</);
+    assert.match(
+        part,
+        /<a class="desk-link" href=https:\/\/github.com\/frostyard\/test\/pull\/12 target="_blank" rel="noopener"/,
+    );
+    assert.match(part, /A fix/);
+    assert.match(part, /<code class="desk-pr-head">a1b2c3d<\/code>/);
+    assert.match(part, /aria-label=Open T1/, "the thread opens from the row");
+    assert.match(part, /duncan · success/);
+    assert.match(part, /irulan · no checks/);
+    assert.match(part, /A PR leaves the list when it merges, closes, or loses the label\./);
+    assert.match(out, /2 ready to merge/);
+});
+
+test("no PR is ready: no section and no count", async () => {
+    const out = await render(viewWith(null));
+
+    assert.doesNotMatch(out, /Ready to merge/);
+    assert.match(out, /0 need you · 0 ready to merge/);
+});
+
 test("a thread closed with an open ask shows in Needs you with its answer controls, and not under Closed", async () => {
     let badge;
     const out = await render(

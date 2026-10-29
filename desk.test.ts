@@ -186,6 +186,10 @@ import {
     lapseGrants,
     linkIssue,
     mergeQueue,
+    mergeAskFor,
+    mergeAskNames,
+    mergeOnlyAsk,
+    readyPrs,
     ownersOfRepos,
     parseIssueFacts,
     parseIssueNode,
@@ -1310,6 +1314,7 @@ describe("reportBlocks", () => {
         assert.equal(
             reportBlocks("Done.\n\nPlease merge #54 and please confirm the deletion."),
             true,
+            "a decision beside the merge keeps it an ask",
         );
         // A choice is still a decision, and BLOCKED outside code still counts.
         assert.equal(
@@ -1340,8 +1345,10 @@ describe("reportBlocks", () => {
             reportBlocks("There are tests for a BLOCKED report and a dirty folder."),
             false,
         );
-        // Outside a report, a merge request still asks Brian.
-        assert.equal(asksBrian("Can you merge #54?"), true);
+        // A merge of a named PR is no ask, in a report or outside one: the Desk page lists it under Ready to merge.
+        assert.equal(asksBrian("Can you merge #54?"), false);
+        // A step beside the merge still asks him.
+        assert.equal(asksBrian("Can you install it after #54 merges?"), true);
     });
 });
 
@@ -4811,6 +4818,184 @@ describe("the label ready-for-human: the link", () => {
     });
 });
 
+describe("merge asks", () => {
+    const merged = "frostyard/test#12";
+    const openPr = "frostyard/test#13";
+    /** A thread with 1 merged PR, 1 open PR, and the asks of the test. */
+    const asked = (asks: Thread["asks"], patch: Partial<Thread> = {}): Thread =>
+        thread({
+            repo: "frostyard/test",
+            prs: {
+                [merged]: { via: "attached", state: "MERGED" },
+                [openPr]: { via: "attached", state: "OPEN" },
+            },
+            asks,
+            ...patch,
+        });
+
+    test("mergeAskFor: a full ref, a URL, and a bare number of the thread's repository", () => {
+        const one = asked([]);
+
+        assert.equal(mergeAskFor("Please merge frostyard/test#12.", one, merged), true);
+        assert.equal(
+            mergeAskFor("Frostyard/Test#12 can merge now.", one, merged),
+            true,
+            "the owner is not case sensitive",
+        );
+        assert.equal(
+            mergeAskFor("Merge https://github.com/frostyard/test/pull/12", one, merged),
+            true,
+            "a URL names it",
+        );
+        assert.equal(mergeAskFor("Merge #12.", one, merged), true, "a bare number of its repo");
+        assert.equal(mergeAskFor("Merge #12.", asked([], { repo: undefined }), merged), false);
+        assert.equal(mergeAskFor("Merge #13.", one, merged), false, "not the ref asked about");
+    });
+
+    test("mergeAskFor: a second PR that has not merged, and the steps that stay with Brian", () => {
+        const one = asked([]);
+
+        assert.equal(
+            mergeAskFor("Merge frostyard/test#12 and frostyard/test#13.", one, merged),
+            false,
+            "#13 is open",
+        );
+        assert.equal(mergeAskFor("Merge frostyard/test#13.", one, openPr), false);
+        assert.equal(
+            mergeAskFor("Install it after frostyard/test#12 merges.", one, merged),
+            false,
+            "an install stays with Brian",
+        );
+        assert.equal(
+            mergeAskFor("Merge frostyard/test#12 and confirm the deletion.", one, merged),
+            false,
+            "a decision verb beside the merge stays for Brian",
+        );
+        assert.equal(
+            mergeAskFor("Merge frostyard/test#12, then tag v1.", one, merged),
+            false,
+            "a then and a tag stay with Brian",
+        );
+        assert.equal(
+            mergeAskFor("Merge frostyard/test#12 and deploy it.", one, merged),
+            false,
+            "a deploy stays with Brian",
+        );
+        assert.equal(
+            mergeAskFor("Merged frostyard/test#12? Cut a release.", one, merged),
+            false,
+            "a release stays with Brian",
+        );
+    });
+
+    test("mergeOnlyAsk: only a merge of a named PR, with no choice and no options", () => {
+        assert.equal(mergeOnlyAsk("Please merge #12."), true);
+        assert.equal(mergeOnlyAsk("Merge frostyard/test#12"), true);
+        assert.equal(mergeOnlyAsk("Merge https://github.com/frostyard/test/pull/12"), true);
+        assert.equal(mergeOnlyAsk("Install it after #12 merges."), false, "an install");
+        assert.equal(mergeOnlyAsk("Merge #12, then tag v1."), false, "a then and a tag");
+        assert.equal(mergeOnlyAsk("Merge #12, then cut a release."), false, "a release");
+        assert.equal(mergeOnlyAsk("Merge #12 and deploy."), false, "a deploy");
+        assert.equal(mergeOnlyAsk("Please merge #12 or #13."), false, "a choice");
+        assert.equal(mergeOnlyAsk("Should I merge #12?"), false, "a choice word");
+        assert.equal(mergeOnlyAsk("Please merge it."), false, "no PR is named");
+        assert.equal(mergeOnlyAsk("Please merge #12.", ["now", "later"]), false, "options");
+        assert.equal(
+            mergeOnlyAsk("Please merge #12 and confirm the deletion."),
+            false,
+            "a decision beside the merge",
+        );
+    });
+
+    test("mergeAskNames: a ref, a URL, and a bare number name a PR; plain words do not", () => {
+        assert.equal(mergeAskNames("Merge frostyard/test#12."), true);
+        assert.equal(mergeAskNames("Merge https://github.com/frostyard/test/pull/12"), true);
+        assert.equal(mergeAskNames("Merge #12."), true);
+        assert.equal(mergeAskNames("Merge it when the CI is green."), false);
+    });
+
+    test("updatePrs answers 1 merge ask with the desk's words, and 1 event only", () => {
+        const thread = asked([{ id: "T1a", text: "Please merge frostyard/test#7.", at: 10 }], {
+            prs: { "frostyard/test#7": { via: "attached", state: "OPEN" } },
+        });
+
+        updatePrs(thread, githubOf([prFact({ state: "MERGED" })]), 500);
+
+        assert.deepEqual(thread.asks[0]?.answer, {
+            at: 500,
+            by: "desk",
+            words: `merged (seen by the sweep at ${new Date(500).toISOString().replace(/\.\d{3}Z$/, "Z")})`,
+        });
+        assert.equal(
+            thread.events.filter((event) => event.key.startsWith("answered:")).length,
+            1,
+            "1 event",
+        );
+        assert.equal(
+            thread.events.find((event) => event.key.startsWith("answered:"))?.text,
+            "answered T1a (desk): merged (seen by the sweep at 1970-01-01T00:00:00Z)",
+        );
+
+        // A second sweep: the ask is answered, so nothing more goes to it.
+        updatePrs(thread, githubOf([prFact({ state: "MERGED" })]), 600);
+        assert.equal(
+            thread.events.filter((event) => event.key.startsWith("answered:")).length,
+            1,
+            "a replay adds no second event",
+        );
+        assert.equal(thread.asks[0]?.answer?.at, 500, "the first answer stays");
+    });
+
+    test("updatePrs answers a merge ask on a PR that had merged before the sweep", () => {
+        const one = asked([{ id: "T1a", text: "Please merge #12.", at: 10 }]);
+
+        updatePrs(one, githubOf([prFact({ ref: merged, number: 12, state: "MERGED" })]), 500);
+        assert.equal(one.asks[0]?.answer?.by, "desk");
+    });
+
+    test("an install ask, a merge and then ask, an answered ask, and a resolved ask stay as they are", () => {
+        const one = thread({
+            prs: { "frostyard/test#7": { via: "attached", state: "OPEN" } },
+            asks: [
+                {
+                    id: "T1a",
+                    text: "Install pi-pocket-team from main after frostyard/test#7 merges.",
+                    at: 10,
+                },
+                { id: "T1b", text: "Merge frostyard/test#7, then install it.", at: 10 },
+                {
+                    id: "T1c",
+                    text: "Merge frostyard/test#7.",
+                    at: 10,
+                    answer: { at: 20, by: "Brian", words: "Do it." },
+                },
+                {
+                    id: "T1d",
+                    text: "Merge frostyard/test#7.",
+                    at: 10,
+                    resolved: { at: 20, why: "gone" },
+                },
+            ],
+        });
+
+        updatePrs(one, githubOf([prFact({ state: "MERGED" })]), 500);
+
+        assert.equal(one.asks[0]?.answer, undefined, "the install ask waits");
+        assert.equal(one.asks[1]?.answer, undefined, "the then ask waits");
+        assert.deepEqual(one.asks[2]?.answer, {
+            at: 20,
+            by: "Brian",
+            words: "Do it.",
+        });
+        assert.deepEqual(one.asks[3]?.resolved, { at: 20, why: "gone" });
+        assert.equal(
+            one.events.filter((event) => event.key.startsWith("answered:")).length,
+            0,
+            "no event on any of them",
+        );
+    });
+});
+
 describe("unreadyReason", () => {
     const labeled = (at = 1000, head = "h1"): PrLink => ({
         via: "attached",
@@ -6023,6 +6208,134 @@ describe("attribute", () => {
     });
 });
 
+describe("readyPrs", () => {
+    const now = 100 * DAY;
+
+    const readyLink = (patch: Partial<PrLink> = {}): PrLink => ({
+        via: "seen",
+        state: "OPEN",
+        title: "A fix",
+        url: "https://github.com/frostyard/test/pull/7",
+        checks: "SUCCESS",
+        head: "a1b2c3d4e5",
+        ready: { at: 500, head: "a1b2c3d4e5" },
+        ...patch,
+    });
+
+    /** A thread of the state, with 1 PR and these facts. */
+    const withPr = (
+        state: DeskState,
+        at: number,
+        patch: Partial<Thread> = {},
+        pr: PrLink = readyLink(),
+        ref = "frostyard/test#7",
+    ): Thread => {
+        const thread = placed(state, at);
+
+        Object.assign(thread, patch);
+        thread.prs[ref] = pr;
+
+        return thread;
+    };
+
+    test("an open, a starting, and a parked thread give their labeled open PRs", () => {
+        const state = deskOf();
+        const opened = withPr(state, 100);
+        const starting = withPr(state, 200, { state: "starting" });
+        const parked = withPr(state, 300, { state: "parked" });
+
+        assert.deepEqual(
+            readyPrs(state, now)
+                .map((pr) => pr.thread)
+                .sort(),
+            [opened.id, starting.id, parked.id].sort(),
+        );
+    });
+
+    test("a row has the ref, the title, the URL, the head at 7 characters, the checks, the thread, and the agents", () => {
+        const state = deskOf();
+        const thread = withPr(state, 100, { agents: ["duncan", "irulan"] });
+        const list = readyPrs(state, now);
+
+        assert.deepEqual(list, [
+            {
+                ref: "frostyard/test#7",
+                title: "A fix",
+                url: "https://github.com/frostyard/test/pull/7",
+                head: "a1b2c3d",
+                checks: "SUCCESS",
+                thread: thread.id,
+                agents: ["duncan", "irulan"],
+                at: 500,
+            },
+        ]);
+    });
+
+    test("a thread closed as done in the last 7 days counts; an older one and a dropped one do not", () => {
+        const state = deskOf();
+        const done = (at: number, closed: number, why: "done" | "dropped", readyAt: number) =>
+            withPr(
+                state,
+                at,
+                {
+                    state: "closed",
+                    closed: { at: closed, why, by: "sweep" },
+                },
+                readyLink({ ready: { at: readyAt, head: "h" } }),
+            );
+
+        const recent = done(100, now - DAY, "done", 600);
+
+        done(200, now - 8 * DAY, "done", 700);
+        done(300, now - DAY, "dropped", 800);
+
+        assert.deepEqual(
+            readyPrs(state, now).map((pr) => pr.thread),
+            [recent.id],
+        );
+    });
+
+    test("a merged PR, a closed PR, and an open PR with no label are not ready", () => {
+        const state = deskOf();
+
+        withPr(state, 100, {}, readyLink({ state: "MERGED" }));
+        withPr(state, 200, {}, readyLink({ state: "CLOSED" }));
+        withPr(state, 300, {}, readyLink({ ready: undefined }));
+
+        assert.deepEqual(readyPrs(state, now), []);
+    });
+
+    test("the oldest label first, then by ref", () => {
+        const state = deskOf();
+
+        withPr(state, 100, {}, readyLink({ ready: { at: 900, head: "a" } }), "frostyard/test#9");
+        withPr(state, 200, {}, readyLink({ ready: { at: 100, head: "b" } }), "frostyard/test#2");
+        withPr(state, 300, {}, readyLink({ ready: { at: 900, head: "c" } }), "frostyard/test#1");
+
+        assert.deepEqual(
+            readyPrs(state, now).map((pr) => pr.ref),
+            ["frostyard/test#2", "frostyard/test#1", "frostyard/test#9"],
+        );
+    });
+
+    test("threadsView carries the list and its count", () => {
+        const state = deskOf();
+        const thread = withPr(state, 100);
+        const view = threadsView(state, now);
+
+        assert.deepEqual(
+            view.ready.map((pr) => [pr.ref, pr.thread]),
+            [["frostyard/test#7", thread.id]],
+        );
+        assert.equal(view.counts.ready, 1);
+
+        const none = threadsView(undefined, now);
+
+        assert.deepEqual(none.ready, []);
+        assert.equal(none.counts.ready, 0);
+    });
+});
+
 describe("attachTo", () => {
     test("a PR ref moves to the target, with an event on both threads", () => {
         const state = deskOf();
@@ -6303,6 +6616,18 @@ describe("asksBrian", () => {
         assert.equal(asksBrian("Should I merge #106?\n\nMerged and tested."), false);
         assert.equal(asksBrian("Use `desk ok?` in chat.\n\nAll set."), false);
         assert.equal(asksBrian(""), false);
+    });
+
+    test("a plain merge ask is no ask: Ready to merge on the Desk page lists the PR", () => {
+        assert.equal(asksBrian("Please merge #12."), false);
+        assert.equal(asksBrian("Merge #12?"), false);
+        assert.equal(asksBrian("Please merge #12.", { report: true }), false);
+        assert.equal(
+            asksBrian("Install it after #12 merges?"),
+            true,
+            "an install stays with Brian",
+        );
+        assert.equal(asksBrian("Merge #12 or #13?"), true, "a choice is a decision");
     });
 });
 
@@ -7978,6 +8303,22 @@ const model = scriptedModel((request) => {
             action: "ask",
             thread: askThreadId,
             text: "Should I merge #106?",
+        });
+    }
+
+    if (text.endsWith("desk ask merge test")) {
+        return call("desk", {
+            action: "ask",
+            thread: askThreadId,
+            text: "Please merge #106.",
+        });
+    }
+
+    if (text.endsWith("desk ask install test")) {
+        return call("desk", {
+            action: "ask",
+            thread: askThreadId,
+            text: "Install pi-pocket-team from main after #106 merges.",
         });
     }
 
@@ -12297,6 +12638,35 @@ describe("the desk in a Pi Pocket", () => {
 
         assert.equal(other?.title, "2 items that Brian decided on 2026-10-22.");
         assert.equal(plain.title, "Duncan Idaho: 2 items that Brian decided on 2026-10-22.");
+    });
+
+    test("desk ask refuses a plain merge ask, and files an install ask", async () => {
+        const { source, thread } = await delegated("ask-merge");
+
+        askThreadId = thread.id;
+        await say(app, source, "desk ask merge test");
+
+        assert.equal(
+            (await deskState())?.threads[thread.id]?.asks.length,
+            0,
+            "a plain merge ask is refused",
+        );
+        assert.match(
+            (await modelTexts(app, source)).join("\n"),
+            /A merge needs no ask: a PR with the label ready-for-human shows under Ready to merge/,
+        );
+
+        // An install beside the merge is still an ask for Brian.
+        await say(app, source, "desk ask install test");
+
+        const filed = (await deskState())?.threads[thread.id]?.asks.at(-1);
+
+        assert.equal(filed?.text, "Install pi-pocket-team from main after #106 merges.");
+        assert.match((await modelTexts(app, source)).join("\n"), /Filed /);
+
+        // Answer it, so the thread does not wait on it for the rest of the suite.
+        answerAskId = filed?.id ?? "";
+        await say(app, source, "desk answer test");
     });
 
     test("desk ask and answer work through the tool, and an ask thread closes at a sweep", async () => {

@@ -82,6 +82,12 @@
     color: var(--muted);
 }
 
+/* The head of a PR that is ready to merge: 7 characters, small and quiet. */
+.desk-pr-head {
+    font-size: 11px;
+    color: var(--muted);
+}
+
 .desk-title {
     font-weight: 600;
 }
