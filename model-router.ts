@@ -230,6 +230,9 @@ const FILE_EXTENSIONS = new Set([
     "d",
 ]);
 
+/** The file extensions that are also top-level domains: with 2 or more dots, a name that ends in one is a host. */
+const TLD_EXTENSIONS = new Set(["sh", "so", "md", "py", "rs", "pub", "zip"]);
+
 /** Sentence punctuation a candidate can collect at its end: it stays in the text, after the mask. */
 const TRAILING_PUNCTUATION = /[.,;:!?)]+$/;
 
@@ -241,7 +244,7 @@ const IPV6_CANDIDATE =
 const IPV4_CANDIDATE =
     /(?<![\w.])\d{1,3}(?:\.\d{1,3}){3}(?:\/\d{1,2})?(?::\d{1,5})?[.,;:!?)]*(?!\w)/g;
 const FQDN_CANDIDATE =
-    /(?<![A-Za-z0-9_.-])(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[a-z]{2,24}(?![A-Za-z0-9_-])/g;
+    /(?<![A-Za-z0-9_.-])(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,24}(?![A-Za-z0-9_-])/g;
 const SECRET_PATTERNS = [
     /\b(?:ghp_|gho_|ghs_|github_pat_)[A-Za-z0-9_]{8,}\b/g,
     /\bsk-[A-Za-z0-9_-]{16,}\b/g,
@@ -250,8 +253,9 @@ const SECRET_PATTERNS = [
 
 /**
  * The host names of an SSH config: the names on its `Host` and `HostName` lines, case-insensitive, with `Host a b` and
- * `HostName=x` both read, and double quotes taken off (`Host "build01"`). A pattern (`*`, `?`, `!`) and a 1-letter name
- * are left out: the word "a" would go with it. Lowercase, unique, in the order the file gives them.
+ * `HostName=x` both read, and double quotes taken off (`Host "build01"`). A pattern (`*`, `?`, `!`) is left out. Every
+ * literal alias stays, a 1-letter one too: `Host x` masks the word "x", which costs Jev a little and keeps the host
+ * private. Lowercase, unique, in the order the file gives them.
  */
 export function sshHostNames(configText: string): string[] {
     const names: string[] = [];
@@ -272,7 +276,7 @@ export function sshHostNames(configText: string): string[] {
         for (const part of match[1].split(/[\s,]+/)) {
             const name = part.replaceAll('"', "").trim().toLowerCase();
 
-            if (name.length < 2 || /[*?!]/.test(name) || names.includes(name)) {
+            if (name === "" || /[*?!]/.test(name) || names.includes(name)) {
                 continue;
             }
 
@@ -338,7 +342,15 @@ function maskIpv4(text: string): string {
  */
 function maskFqdn(text: string): string {
     return text.replace(FQDN_CANDIDATE, (whole: string) => {
-        const last = whole.slice(whole.lastIndexOf(".") + 1);
+        // DNS names have no case: `BUILD.EXAMPLE.COM` goes as `build.example.com` does.
+        const last = whole.slice(whole.lastIndexOf(".") + 1).toLowerCase();
+        const dots = whole.split(".").length - 1;
+
+        // A name with 2 or more dots that ends in a country code which is also a file extension (`api.example.sh`) is
+        // a host. `install.sh`, with 1 dot, stays a file name, and so does `pocket.d.ts` (`ts` is no top-level domain).
+        if (dots >= 2 && TLD_EXTENSIONS.has(last)) {
+            return "[host]";
+        }
 
         return FILE_EXTENSIONS.has(last) ? whole : "[host]";
     });

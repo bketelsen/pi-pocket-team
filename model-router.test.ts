@@ -64,7 +64,7 @@ test("sshHostNames reads Host and HostName lines, in any case, and skips pattern
         "Host !refused alpha",
     ].join("\n");
 
-    // 2-letter names are kept (`db`), 1-letter names are not: "a" would mask the word "a". Double quotes come off.
+    // Every literal alias is kept, a 1-letter one too (`a`). Double quotes come off.
     assert.deepEqual(sshHostNames(config), [
         "alpha",
         "beta",
@@ -72,6 +72,7 @@ test("sshHostNames reads Host and HostName lines, in any case, and skips pattern
         "delta",
         "build01",
         "db",
+        "a",
         "prod",
         "ab",
         "zeta",
@@ -140,6 +141,20 @@ test("maskBrief takes a dotted name that is not a file name out", () => {
     );
     assert.equal(maskBrief("see acme.example.com", []), "see [host]");
     assert.equal(maskBrief("call api.memo now", []), "call [host] now", "code may be masked too");
+    assert.equal(
+        maskBrief("BUILD.EXAMPLE.COM is down", []),
+        "[host] is down",
+        "DNS names have no case",
+    );
+    assert.equal(
+        maskBrief("api.example.sh and build.example.so and docs.example.md", []),
+        "[host] and [host] and [host]",
+        "a country code that is also a file extension, with 2 dots, is a host",
+    );
+    assert.equal(
+        maskBrief("run install.sh, read pocket.d.ts", []),
+        "run install.sh, read pocket.d.ts",
+    );
 });
 
 test("maskBrief leaves a file name and a version alone", () => {
@@ -162,6 +177,11 @@ test("maskBrief takes this machine's SSH names out, as whole words in any case",
     ]);
 
     assert.equal(masked, "Deploy to [host] and [host]; build-012 stays.");
+    // A 1-letter alias is masked too: the host stays private, and Jev loses only the word.
+    assert.equal(
+        maskBrief("Deploy to x, then check box", ["x"]),
+        "Deploy to [host], then check box",
+    );
 });
 
 test("maskBrief takes secret-like tokens out", () => {
