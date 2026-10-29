@@ -7,8 +7,8 @@ Drop-in extensions for [Pi Pocket](https://github.com/TannerMidd/pi-pocket), wri
 | **Team**        | `team.ts`, `team-web/`               | Named agents in ordinary Pi Pocket sessions, a supervisor's delegation into their repositories, and each agent's own memory.                                                                                                                                                                                                                                                                                                                           |
 | **Homewiki**    | `homewiki.ts`, `homewiki-web/`       | The "Wiki" rail page: renders a Markdown wiki checkout (`README.md` and `docs/**/*.md`) live from disk, read-only and owner-only. Default folder `~/projects/homewiki`; set `PI_POCKET_HOMEWIKI_ROOT` for another one.                                                                                                                                                                                                                                 |
 | **Night shift** | `night-shift.ts`, `night-shift-web/` | `/night-shift`: Pi works on an objective in rounds while you sleep, until a stop condition in words (and an optional check command), a round limit, or a deadline; then it writes a summary for the morning.                                                                                                                                                                                                                                           |
+| **Desk**        | `desk.ts`, `desk-web/`               | One thread for each piece of work the team runs in the background: opened by `team_delegate`, listed and read by a supervisor session, seeded once from a `seed.json` triage file, given its agents' reports, observed by a sweep that closes it when every part is closed, tied to the PRs in its repository, held to a cap, carrying the asks to Brian, shown on an owner-only page, copied to a git folder, and woken by a dated check (parts 1–9). |
 | **Terminal**    | `terminal.ts`, `terminal-web/`       | The "Terminal" rail page: an interactive login shell as the server's user, in a folder you pick, drawn by the vendored xterm.js. Output by 1 long poll for each tab (25 s at most), input and resize by small POSTs, the shell on a Python pty helper. Owner-only; keys go straight to the shell, where Lancet Guard and Pi do not see them.                                                                                                           |
-| **Desk**        | `desk.ts`                            | One thread for each piece of work the team runs in the background: opened by `team_delegate`, listed and read by a supervisor session, seeded once from a `seed.json` triage file, given its agents' reports, observed by a sweep that closes it when every part is closed, tied to the PRs in its repository, held to a cap, carrying the asks to Brian, shown on an owner-only page, copied to a git folder, and woken by a dated check (parts 1–9). |
 
 ## Requirements
 
@@ -24,7 +24,7 @@ Clone this repository next to a Pi Pocket checkout, or set `PI_POCKET_CHECKOUT` 
 ```sh
 npm run link       # make node_modules, _pocket.d.ts, and _pocket point into the checkout
 npm test           # node --test, plus node --check of the browser modules
-npm run typecheck  # types of team.ts, homewiki.ts, and night-shift.ts
+npm run typecheck  # types of team.ts, homewiki.ts, night-shift.ts, desk.ts, and terminal.ts
 npm run lint       # Prettier and ESLint, Pi Pocket's config (npm run format fixes)
 ```
 
