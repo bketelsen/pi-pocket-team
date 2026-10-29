@@ -1583,6 +1583,8 @@ test("J1: waste above $5 (empty reopens and queue continues) is a finding; $5 is
 // ---------- R. Model routing (shadow) ----------
 
 /** A thread that carries the model router's shadow record. */
+const zeroNamed = { count: 0, open: 0, success: 0, notSuccess: 0, suggestionRan: 0 };
+
 const routed = (id: string, route = {}, over = {}) =>
     thread(id, {
         route: {
@@ -1781,7 +1783,72 @@ test("R1: a thread with no route is not counted", () => {
     assert.equal(result.metrics.cells.length, 1);
     assert.equal(result.metrics.cells[0]!.count, 1);
 
-    assert.deepEqual(checkR1(emptyData(), ctx).metrics, { routes: 0, cells: [] });
+    assert.deepEqual(checkR1(emptyData(), ctx).metrics, {
+        routes: 0,
+        cells: [],
+        named: { routes: 0, same: zeroNamed, differs: zeroNamed },
+    });
+});
+
+test("R1: a cell holds the named worker, `-` when none was named", () => {
+    const result = checkR1(
+        emptyData({
+            threads: threadMap(
+                routed("T1"),
+                routed("T2", { worker: "acme/named" }),
+                routed("T3", { worker: "acme/named" }),
+                routed("T4", { worker: "acme/another" }),
+            ),
+        }),
+        ctx,
+    );
+
+    assert.deepEqual(
+        result.metrics.cells.map((cell) => [cell.named, cell.count]),
+        [
+            ["acme/named", 2],
+            ["-", 1],
+            ["acme/another", 1],
+        ],
+        "the named worker splits a cell, and sorts after the status",
+    );
+    assert.equal(result.metrics.named.routes, 3, "3 shadow routes with a worker");
+});
+
+test("R1: named compares the suggestion with the named worker, and counts how the threads ended", () => {
+    const sonnet = "github-copilot/claude-sonnet-5.5";
+    const data = emptyData({
+        threads: threadMap(
+            // The suggestion is the named worker: 1 success that ran it, 1 open that ran another model.
+            routed("T1", { worker: sonnet }, closed("done", "completed")),
+            routed("T2", { worker: sonnet }),
+            // The suggestion differs: 1 success, 1 not success, and 1 open.
+            routed("T3", { worker: "acme/named" }, closed("done", "verified")),
+            routed("T4", { worker: "acme/named" }, closed("dropped")),
+            routed("T5", { worker: "acme/named" }),
+            // Not counted: no worker, a failed route, an explicit route.
+            routed("T6"),
+            routed("T7", { worker: "acme/named", status: "failed", model: undefined }),
+            routed("T8", { worker: "acme/named", status: "explicit", model: undefined }),
+        ),
+        goals: [
+            // T1 ran the suggestion; T3 ran the named worker.
+            { session: 101, goal: { status: "ended", reason: "done", worker: sonnet } },
+            { session: 103, goal: { status: "ended", reason: "done", worker: "acme/named" } },
+        ],
+        routeSpawns: [
+            // T2 ran the suggestion too, found from its spawns.
+            spawn({ c: 102, model: sonnet }),
+        ],
+    });
+    const { named, routes } = checkR1(data, ctx).metrics;
+
+    assert.equal(routes, 8);
+    assert.deepEqual(named, {
+        routes: 5,
+        same: { count: 2, open: 1, success: 1, notSuccess: 0, suggestionRan: 2 },
+        differs: { count: 3, open: 1, success: 1, notSuccess: 1, suggestionRan: 0 },
+    });
 });
 
 // ---------- Findings and the run ----------
@@ -1831,7 +1898,11 @@ test("runChecks: every check has an entry, and a missing source skips its checks
     assert.match(result.skipped.B1!, /source unavailable: github: disabled/);
     assert.ok(result.metrics.A1);
     assert.ok(result.metrics.J1);
-    assert.deepEqual(result.metrics.R1, { routes: 0, cells: [] });
+    assert.deepEqual(result.metrics.R1, {
+        routes: 0,
+        cells: [],
+        named: { routes: 0, same: zeroNamed, differs: zeroNamed },
+    });
 });
 
 test("runChecks: a check that throws is skipped and the run goes on", () => {

@@ -385,6 +385,14 @@ const metricLines = (metrics, github) => {
             .join("; ");
 
         lines.push(`- Routes: ${metrics.R1.routes} recorded. ${cells}.`);
+
+        const named = metrics.R1.named;
+
+        if (named?.routes > 0) {
+            lines.push(
+                `- Named workers: ${named.routes} routed beside a named worker. Suggestion same as named: ${named.same.count} (success ${named.same.success} of ${named.same.count}); differs: ${named.differs.count} (success ${named.differs.success} of ${named.differs.count}).`,
+            );
+        }
     }
 
     lines.push(

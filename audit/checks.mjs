@@ -1726,14 +1726,52 @@ const goalOfThread = (data, thread) =>
     (data.goals ?? []).find((item) => item.session === thread.session)?.goal;
 
 /**
+ * How a routed thread ended: `open` (not closed), `success` (closed as done, and every PR merged or verified, or none),
+ * `notSuccess` (dropped, failed, or a PR closed unmerged), or undefined (closed in another way: no count holds it).
+ */
+function outcomeOf(thread) {
+    const closed = thread.closed;
+
+    if (closed === undefined) {
+        return "open";
+    }
+
+    if (
+        closed.why === "done" &&
+        (closed.outcome === undefined ||
+            closed.outcome === "completed" ||
+            closed.outcome === "verified")
+    ) {
+        return "success";
+    }
+
+    if (closed.why === "dropped" || closed.why === "failed" || closed.outcome === "abandoned") {
+        return "notSuccess";
+    }
+
+    return undefined;
+}
+
+/** The counts of 1 group of routes beside a named worker. */
+const zeroNamedStats = () => ({ count: 0, open: 0, success: 0, notSuccess: 0, suggestionRan: 0 });
+
+/**
  * R1: the model router's shadow records, joined to what happened. Each cell is 1 (kind, suggested tier, suggested
- * model, status, model used): how many threads, how many are open, how many closed as done, how many did not, the
- * goals' statuses, the rounds and the cost, and the reopenings. It makes no finding: in shadow mode the table compares
- * the suggestion with what really ran. A rate shows only for 10 threads or more, and no time window applies: a record
- * is compared for as long as it is there.
+ * model, status, named worker, model used): how many threads, how many are open, how many closed as done, how many did
+ * not, the goals' statuses, the rounds and the cost, and the reopenings. `named` is the model the supervisor named
+ * (`route.worker`), or `-` when none was named: since the router also runs beside a named worker, the named worker
+ * shows in its own cell. It makes no finding: in shadow mode the table compares the suggestion with what really ran. A
+ * rate shows only for 10 threads or more, and no time window applies: a record is compared for as long as it is there.
+ *
+ * The metric `named` looks at the routes with the status `shadow` and a `worker` only: how many there are, and, for
+ * those whose suggested model is the named worker (`same`) and the rest (`differs`), how many threads (`count`), how
+ * many are open, closed as success, or closed as not success (the cells' rules), and for how many the suggestion is
+ * also the model that really ran (`suggestionRan`). It says whether the router would have chosen what the supervisor
+ * chose, and how those threads ended.
  */
 export function checkR1(data, ctx) {
     const cells = new Map();
+    const named = { routes: 0, same: zeroNamedStats(), differs: zeroNamedStats() };
     let routes = 0;
 
     for (const thread of Object.values(data.threads ?? {})) {
@@ -1750,6 +1788,7 @@ export function checkR1(data, ctx) {
             route.tier ?? "-",
             route.model ?? "-",
             route.status ?? "-",
+            route.worker ?? "-",
             used,
         ].join("\u0000");
         const cell = cells.get(key) ?? {
@@ -1757,6 +1796,7 @@ export function checkR1(data, ctx) {
             tier: route.tier ?? "-",
             model: route.model ?? "-",
             status: route.status ?? "-",
+            named: route.worker ?? "-",
             used,
             count: 0,
             open: 0,
@@ -1771,23 +1811,25 @@ export function checkR1(data, ctx) {
         cells.set(key, cell);
         cell.count += 1;
 
-        const closed = thread.closed;
+        const outcome = outcomeOf(thread);
 
-        if (closed === undefined) {
-            cell.open += 1;
-        } else if (
-            closed.why === "done" &&
-            (closed.outcome === undefined ||
-                closed.outcome === "completed" ||
-                closed.outcome === "verified")
-        ) {
-            cell.success += 1;
-        } else if (
-            closed.why === "dropped" ||
-            closed.why === "failed" ||
-            closed.outcome === "abandoned"
-        ) {
-            cell.notSuccess += 1;
+        if (outcome !== undefined) {
+            cell[outcome] += 1;
+        }
+
+        if (route.status === "shadow" && typeof route.worker === "string" && route.worker !== "") {
+            const stats = route.model === route.worker ? named.same : named.differs;
+
+            named.routes += 1;
+            stats.count += 1;
+
+            if (outcome !== undefined) {
+                stats[outcome] += 1;
+            }
+
+            if (used === route.model) {
+                stats.suggestionRan += 1;
+            }
         }
 
         const goal = goalOfThread(data, thread);
@@ -1825,6 +1867,7 @@ export function checkR1(data, ctx) {
             tier: cell.tier,
             model: cell.model,
             status: cell.status,
+            named: cell.named,
             used: cell.used,
             count: cell.count,
             open: cell.open,
@@ -1844,10 +1887,11 @@ export function checkR1(data, ctx) {
                 a.tier.localeCompare(b.tier) ||
                 a.model.localeCompare(b.model) ||
                 a.status.localeCompare(b.status) ||
+                a.named.localeCompare(b.named) ||
                 a.used.localeCompare(b.used),
         );
 
-    return { findings: [], metrics: { routes, cells: list } };
+    return { findings: [], metrics: { routes, cells: list, named } };
 }
 
 // ---------- The registry ----------

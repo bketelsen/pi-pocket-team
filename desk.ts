@@ -227,7 +227,10 @@ export type ThreadRoute = {
     thinking?: string;
     /** The agent's profile model: the model of the session itself, which the router never changes. */
     profileModel?: string;
-    /** The model the supervisor named, for an `explicit` route. */
+    /**
+     * The model the supervisor named. On an `explicit` route (an older router) the router did not run. On a `shadow`,
+     * `failed` or `off` route with a `worker`, the router ran beside the named worker, and the named worker ran.
+     */
     worker?: string;
     jevModel?: string;
     jevId?: string;

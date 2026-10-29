@@ -758,7 +758,11 @@ export type Route = {
     thinking?: string;
     /** The agent's profile model: the model of the session itself, which the router never changes. */
     profileModel?: string;
-    /** The model the supervisor named, for an `explicit` route. */
+    /**
+     * The model the supervisor named. On an `explicit` route (written by an older `team.ts`) the router did not run. On
+     * a `shadow`, `failed` or `off` route with a `worker`, the router ran beside the named worker, and the named worker
+     * ran: the suggestion is a record to compare with it, and it changes nothing.
+     */
     worker?: string;
     jevModel?: string;
     jevId?: string;
@@ -786,7 +790,14 @@ export function routeLine(route: RouteFields): string {
     }
 
     if (route.status === "failed") {
-        return `Route: failed (${route.reason}); no worker named, nothing changes`;
+        return route.worker === undefined
+            ? `Route: failed (${route.reason}); no worker named, nothing changes`
+            : `Route: failed (${route.reason}); named ${route.worker} runs`;
+    }
+
+    if (route.worker !== undefined) {
+        // Short on purpose: with 32-character model names it stays within 120 characters, so the desk event holds it whole.
+        return `Route: ${route.tier ?? "?"}: ${route.model ?? "?"} (${route.kind ?? "?"} ${fixed(route.demand, 1)}); named ${route.worker} runs; shadow`;
     }
 
     const profile = route.profileModel === undefined ? "" : `; profile: ${route.profileModel}`;
@@ -798,15 +809,27 @@ const withLine = (fields: RouteFields): Route => ({ ...fields, line: routeLine(f
 
 // ─── The module ──────────────────────────────────────────────────────────────
 
-/** A brief to classify, and when the work starts. */
-export type RouteRequest = { brief: string; startAt: number; profileModel?: string };
+/**
+ * A brief to classify, and when the work starts. `worker` is the model the supervisor named, when it named one: the
+ * router still classifies the brief and records its suggestion, and the record carries the `worker`. The named worker
+ * runs either way.
+ */
+export type RouteRequest = {
+    brief: string;
+    startAt: number;
+    profileModel?: string;
+    worker?: string;
+};
 
 /** What another module finds on `globalThis[Symbol.for("pi-pocket-team.model-router")]`. */
 export type RouterApi = {
-    version: 1;
-    /** Classify a brief and record the suggestion. It never throws. */
+    version: 2;
+    /**
+     * Classify a brief and record the suggestion. It never throws. With a `worker` in the request, the route carries it
+     * (version 2): the router ran beside the named worker.
+     */
     route: (request: RouteRequest) => Promise<Route>;
-    /** Record that the supervisor named the worker, so the router did not run. */
+    /** Record that the supervisor named the worker, so the router did not run. Kept for a `team.ts` of version 1. */
     explicit: (request: { worker: string; profileModel?: string }) => Route;
 };
 
@@ -910,10 +933,11 @@ export default function createModelRouter(host: Host, web: Web) {
     web.onDispose(() => unhide?.());
 
     /** A route that holds no suggestion: the delegation goes on as it would without the router. */
-    const failed = (reason: string, at: number, notes?: string[]): Route =>
+    const failed = (reason: string, at: number, worker?: string, notes?: string[]): Route =>
         withLine({
             mode: mode(),
             status: "failed",
+            ...(worker === undefined ? {} : { worker }),
             reason,
             ...(notes === undefined || notes.length === 0 ? {} : { notes }),
             at,
@@ -938,6 +962,7 @@ export default function createModelRouter(host: Host, web: Web) {
             return withLine({
                 mode: held,
                 status: "off",
+                ...(request.worker === undefined ? {} : { worker: request.worker }),
                 reason: "the router's mode is off",
                 at: now,
             });
@@ -946,7 +971,7 @@ export default function createModelRouter(host: Host, web: Web) {
         const key = apiKey();
 
         if (key === undefined) {
-            return failed("no TypeSafe key set", now);
+            return failed("no TypeSafe key set", now, request.worker);
         }
 
         try {
@@ -975,7 +1000,7 @@ export default function createModelRouter(host: Host, web: Web) {
                 decision.tier === undefined ||
                 decision.thinking === undefined
             ) {
-                return failed("no usable model in the allowed list", now, all);
+                return failed("no usable model in the allowed list", now, request.worker, all);
             }
 
             return withLine({
@@ -993,6 +1018,7 @@ export default function createModelRouter(host: Host, web: Web) {
                 ...(request.profileModel === undefined
                     ? {}
                     : { profileModel: request.profileModel }),
+                ...(request.worker === undefined ? {} : { worker: request.worker }),
                 ...(jevModel === undefined ? {} : { jevModel }),
                 ...(jevId === undefined ? {} : { jevId }),
                 latencyMs: analysis.latencyMs,
@@ -1001,7 +1027,7 @@ export default function createModelRouter(host: Host, web: Web) {
                 at: now,
             });
         } catch (error) {
-            return failed(reasonOf(error, key), now);
+            return failed(reasonOf(error, key), now, request.worker);
         }
     };
 
@@ -1016,7 +1042,7 @@ export default function createModelRouter(host: Host, web: Web) {
         });
 
     // Another module finds this version here. A new version sets its own before the old one's cleanup runs.
-    const published: RouterApi = { version: 1, route, explicit };
+    const published: RouterApi = { version: 2, route, explicit };
     const shared = globalThis as unknown as Record<symbol, RouterApi | undefined>;
 
     shared[API] = published;
