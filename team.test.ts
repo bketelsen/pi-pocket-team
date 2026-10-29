@@ -680,6 +680,19 @@ test("teamMessageProblems: each limit, with the count, the limit and the fix; th
             "asks[2].options[1] has 41 characters; the limit is 40. Cut at least 1 character: name the choice in a few words, and explain it in the question.",
         ],
     );
+    // A done or blocked report says its asks, or asks: [] for none; a working one or a follow-up need not.
+    assert.deepEqual(teamMessageProblems({ to: "s", message: "m", status: "done" }), [
+        "asks is missing: a done report lists each decision for Brian in asks, or sends asks: [] when there is none.",
+    ]);
+    assert.deepEqual(
+        teamMessageProblems({ to: "s", message: "m", status: "blocked", asks: null }),
+        [
+            "asks is missing: a blocked report lists each decision for Brian in asks, or sends asks: [] when there is none.",
+        ],
+    );
+    assert.deepEqual(teamMessageProblems({ to: "s", message: "m", status: "done", asks: [] }), []);
+    assert.deepEqual(teamMessageProblems({ to: "s", message: "m", status: "working" }), []);
+    assert.deepEqual(teamMessageProblems({ to: "s", message: "m" }), []);
     // A null optional is the validator's to drop, as before: no refusal.
     assert.deepEqual(teamMessageProblems({ to: "s", message: "m", status: null }), []);
     // A wrong type is the schema's to report.

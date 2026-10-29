@@ -3641,6 +3641,12 @@ export const DIGEST_MAX_ITEMS = 100;
 /** The most item lines 1 digest message shows. */
 export const DIGEST_MAX_LINES = 30;
 
+/** The export commits its changes at most this often, with `exportCommit` on: 10 minutes, as the sweep runs. */
+export const EXPORT_COMMIT_MS = 10 * 60_000;
+
+/** The message of the export's own commit. */
+export const EXPORT_COMMIT_MESSAGE = "desk: export";
+
 /**
  * The digest's setting: an interval of 0 to 240 minutes, the kinds that go at once, and the kinds the Clerk gets. A
  * kind in `now` always goes to the supervisor.
@@ -3825,10 +3831,27 @@ function putBeforeRead(line: string, text: string): string {
 }
 
 /**
- * The digest message: 1 header line, then 1 line for each item. A thread closed in this digest gets its closed line
- * only, with the count of its reports in the same digest. At most 30 item lines; the rest are counted.
+ * A time as a reader of the digest reads it, in 1 zone: `2026-10-29 15:20 EDT`. The zone's short name is the one `Intl`
+ * gives, such as "EDT", or "GMT-4" where it has no other.
  */
-export function digestText(items: readonly DigestItem[]): string {
+export function deskTime(at: number, timeZone: string): string {
+    const name =
+        new Intl.DateTimeFormat("en-US", { timeZone, timeZoneName: "short" })
+            .formatToParts(new Date(at))
+            .find((part) => part.type === "timeZoneName")?.value ?? timeZone;
+
+    return `${journalDay(at, timeZone)} ${journalTime(at, timeZone)} ${name}`;
+}
+
+/**
+ * The digest message: 1 header line, then 1 line for each item. A thread closed in this digest gets its closed line
+ * only, with the count of its reports in the same digest. At most 30 item lines; the rest are counted. With `now`, the
+ * header says the time, so the reader needs no `date` call to set a watch or date a record.
+ */
+export function digestText(
+    items: readonly DigestItem[],
+    now?: { at: number; timeZone: string },
+): string {
     const closed = new Set(
         items.filter((item) => item.kind === "closed").map((item) => item.thread),
     );
@@ -3872,7 +3895,7 @@ export function digestText(items: readonly DigestItem[]): string {
     const more = lines.length - shown.length;
 
     return [
-        `[desk] digest: ${String(lines.length)} new. Read each with desk read <id> before you act.`,
+        `[desk] digest: ${String(lines.length)} new.${now === undefined ? "" : ` Now ${deskTime(now.at, now.timeZone)}.`} Read each with desk read <id> before you act.`,
         ...shown,
         ...(more === 0 ? [] : [`… and ${String(more)} more on the Desk page.`]),
     ].join("\n");
@@ -9599,6 +9622,11 @@ export type FileRequest = {
     status?: "done" | "working" | "blocked";
     /** Decisions for Brian, filed as asks on the thread in the same commit as the report. */
     asks?: { question: string; options?: string[] }[];
+    /**
+     * The agent sent `asks: []` (`team_message`): the report holds no decision for Brian, so its prose is not read for
+     * one. An `ASKS FOR BRIAN:` block with items in the text still counts: the text is read then, as without it.
+     */
+    asksNone?: true;
     /** The agent's name: the asks are filed by it. */
     by?: string;
 };
@@ -9750,6 +9778,13 @@ export function journalConfig(raw: unknown, home = homedir()): JournalConfig | u
                 : JOURNAL_DAILY_CALLS,
         tokenFile,
     };
+}
+
+/** The server's own time zone, as `Intl` reads it; the journal's default when it gives none that works. */
+function serverZone(): string {
+    const zone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+
+    return typeof zone === "string" && zone !== "" && zoneOk(zone) ? zone : JOURNAL_ZONE;
 }
 
 /** The parts of a time in 1 zone, as `Intl` gives them. */
@@ -10367,11 +10402,16 @@ export default function createDesk(host: Host, web: Web) {
             // thread that the desk did not derive yet. Filed asks hold the thread by themselves, so the text then
             // decides nothing; without them the text is read, whatever the status says, so a decision named only in
             // words still holds the thread. A report that asks Brian by itself went to him at once (`report-blocked`).
-            const reportAsks = refused || (filedAsks.length === 0 && reportAsksBrian(request.text));
+            // An explicit `asks: []` decides as filed asks do: the status and the asks are the agent's word, and the
+            // prose is not read, unless its text has an `ASKS FOR BRIAN:` block with items that says otherwise.
+            const read =
+                filedAsks.length === 0 &&
+                !(request.asksNone === true && (asksForBrian(request.text)?.length ?? 0) === 0);
+            const reportAsks = refused || (read && reportAsksBrian(request.text));
             const blocked =
                 request.status === "blocked" ||
                 refused ||
-                (filedAsks.length === 0 && reportBlocks(request.text, request.reason));
+                (read && reportBlocks(request.text, request.reason));
 
             // The session's newest user entry, read before this commit writes a task: a transaction cannot read tables
             // after its first table write.
@@ -10968,6 +11008,8 @@ export default function createDesk(host: Host, web: Web) {
         ownAuthors: string[];
         cap: number;
         export?: string;
+        /** Commit the export folder's changes in its git checkout (`exportCommit: true`); off by default. */
+        exportCommit?: true;
         digest: DigestConfig;
         /** The `queue` key as it is in the file: `queueConfig` checks it, with the roster's owners. */
         queue: unknown;
@@ -10980,6 +11022,7 @@ export default function createDesk(host: Host, web: Web) {
                 ownAuthors?: unknown;
                 cap?: unknown;
                 export?: unknown;
+                exportCommit?: unknown;
                 digest?: unknown;
                 queue?: unknown;
                 journal?: unknown;
@@ -11019,6 +11062,9 @@ export default function createDesk(host: Host, web: Web) {
                 queue: value?.queue,
                 ...(journal === undefined ? {} : { journal }),
                 ...(exported === undefined ? {} : { export: exported }),
+                ...(exported !== undefined && value?.exportCommit === true
+                    ? { exportCommit: true as const }
+                    : {}),
             };
         } catch {
             return {
@@ -11099,9 +11145,71 @@ export default function createDesk(host: Host, web: Web) {
             }
 
             await writeChanged(config.export, exportFiles(state, reports, Date.now(), config.cap));
+
+            if (config.exportCommit === true) {
+                await commitExport(config.export);
+            }
         } catch (error) {
             noteExport(`The desk export did not write: ${(error as Error).message}`);
         }
+    };
+
+    /** When the export's last commit try ran: at most 1 in each `EXPORT_COMMIT_MS`. */
+    let exportCommitAt = 0;
+    /** The commit that runs now: a second export waits for it, so 2 never run git at once. */
+    let exportCommitting: Promise<void> = Promise.resolve();
+
+    /**
+     * Commit the export folder's changes, and only them: `git add -A -- .`, then `git commit -- .` in the folder, so a
+     * file that someone else staged elsewhere in the checkout stays staged and out of this commit. At most once in
+     * `EXPORT_COMMIT_MS`: a change in between goes with the next try. Nothing changed is no commit. A git that another
+     * process holds (`index.lock`) waits for the next try with no notice; any other failure gives the hourly notice.
+     */
+    const commitExport = (folder: string): Promise<void> => {
+        const at = Date.now();
+
+        if (at - exportCommitAt < EXPORT_COMMIT_MS) {
+            return exportCommitting;
+        }
+
+        exportCommitAt = at;
+        exportCommitting = exportCommitting.then(async () => {
+            try {
+                const { stdout } = await run(
+                    "git",
+                    ["-C", folder, "status", "--porcelain", "--", "."],
+                    GIT_OPTIONS,
+                );
+
+                if (stdout.trim() === "") {
+                    return;
+                }
+
+                await run("git", ["-C", folder, "add", "-A", "--", "."], GIT_OPTIONS);
+                await run(
+                    "git",
+                    [
+                        "-C",
+                        folder,
+                        "commit",
+                        "--quiet",
+                        "--message",
+                        EXPORT_COMMIT_MESSAGE,
+                        "--",
+                        ".",
+                    ],
+                    GIT_OPTIONS,
+                );
+            } catch (error) {
+                const reason = gitReason(error);
+
+                if (!reason.includes("index.lock")) {
+                    noteExport(`The desk export did not commit: ${reason}`);
+                }
+            }
+        });
+
+        return exportCommitting;
     };
 
     /** Why a GitHub read failed, in one line of 200 characters at most. */
@@ -13770,7 +13878,7 @@ export default function createDesk(host: Host, web: Web) {
                         };
                     }
 
-                    const { digest } = await deskConfig();
+                    const { digest, journal } = await deskConfig();
                     const clerk = clerkOf(state, supervisor);
                     // The Clerk takes the routine kinds; a kind that goes at once always stays with the supervisor.
                     const split = splitDigest(items, clerk !== undefined, digest);
@@ -13779,11 +13887,13 @@ export default function createDesk(host: Host, web: Web) {
                     const { ours } = split;
                     const base = `x.desk.digest:${String(supervisor)}:${String(taken.seq)}`;
                     const messages: DigestMessage[] = [];
+                    // The journal's zone, or the server's. The checkpoint keeps the text, so a replay says the same time.
+                    const now = { at: runtime.now(), timeZone: journal?.timeZone ?? serverZone() };
 
                     if (theirs.length > 0 && clerk !== undefined) {
                         messages.push({
                             conversation: clerk.session,
-                            text: digestText(theirs),
+                            text: digestText(theirs, now),
                             requestId: `${base}:clerk`,
                         });
                     }
@@ -13791,7 +13901,7 @@ export default function createDesk(host: Host, web: Web) {
                     if (ours.length > 0) {
                         messages.push({
                             conversation: supervisor,
-                            text: digestText(ours),
+                            text: digestText(ours, now),
                             requestId: base,
                         });
                     }

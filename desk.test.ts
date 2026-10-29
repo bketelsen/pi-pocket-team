@@ -42,6 +42,7 @@ import {
     bindThread,
     DeskReports,
     DeskThreads,
+    EXPORT_COMMIT_MESSAGE,
     failThread,
     listText,
     openThread,
@@ -84,6 +85,7 @@ import {
     clerkOf,
     digestConfig,
     digestMessages,
+    deskTime,
     digestText,
     enqueueDigest,
     queueNews,
@@ -8884,6 +8886,23 @@ describe("the digest's rules", () => {
         );
     });
 
+    test("with a time, the header says it in the zone, so the reader needs no date call", () => {
+        const at = Date.UTC(2026, 9, 29, 19, 20);
+        const items = [made("r1", "report", "T1", 1, "[desk] T1 · a")];
+
+        assert.equal(deskTime(at, "America/New_York"), "2026-10-29 15:20 EDT");
+        assert.equal(deskTime(at, "UTC"), "2026-10-29 19:20 UTC");
+        assert.equal(
+            lines(digestText(items, { at, timeZone: "America/New_York" }))[0],
+            "[desk] digest: 1 new. Now 2026-10-29 15:20 EDT. Read each with desk read <id> before you act.",
+        );
+        // Without a time, the header is as before.
+        assert.equal(
+            lines(digestText(items))[0],
+            "[desk] digest: 1 new. Read each with desk read <id> before you act.",
+        );
+    });
+
     test("the message keeps 30 item lines, and counts the rest", () => {
         const items = Array.from({ length: 35 }, (_, index) =>
             made(
@@ -9289,6 +9308,24 @@ const model = scriptedModel((request) => {
                     options: ["rotate now", "keep it"],
                 },
             ],
+        });
+    }
+
+    if (text.endsWith("report with no asks test")) {
+        return call("team_message", {
+            to: linkedAddressOf(request),
+            message: "Done. The token is in a 0600 file. Brian must decide about rotation.",
+            status: "done",
+            asks: [],
+        });
+    }
+
+    if (text.endsWith("report with no asks and a block test")) {
+        return call("team_message", {
+            to: linkedAddressOf(request),
+            message: "Done.\n\nASKS FOR BRIAN:\n- Approve the token rotation on caddy?",
+            status: "done",
+            asks: [],
         });
     }
 
@@ -12983,6 +13020,30 @@ describe("the desk in a Pi Pocket", () => {
         );
     });
 
+    test("a report with asks: [] holds no decision, whatever its prose says, unless an ASKS FOR BRIAN block names one", async () => {
+        const { linked, thread } = await delegated("no-asker");
+
+        await say(app, linked, "report with no asks test");
+
+        const filed = (await deskState())?.threads[thread.id];
+
+        // The same words without asks: [] hold the thread ("Brian must decide"): the agent's own word wins here.
+        assert.equal(filed?.asks.length, 0);
+        assert.equal(filed?.run.reportAsks, false);
+        assert.equal(filed?.run.reportBlocked, false);
+
+        await say(app, linked, "report with no asks and a block test");
+
+        const blocked = (await deskState())?.threads[thread.id];
+
+        assert.equal(
+            blocked?.run.reportAsks,
+            true,
+            "a block with items is read, as without asks: []",
+        );
+        assert.equal(blocked?.run.reportBlocked, true);
+    });
+
     test("a message to another address sends the full text unchanged", async () => {
         const { source, linked, thread } = await delegated("messenger");
 
@@ -14792,6 +14853,60 @@ describe("the desk in a Pi Pocket", () => {
         } finally {
             writeFileSync(configPath, JSON.stringify({ digest: { minutes: 0 }, cap: 100 }));
             rmSync(folder, { recursive: true, force: true });
+        }
+    });
+
+    test("exportCommit commits the export folder's changes only, and leaves what others staged", async () => {
+        const checkout = join(root, "export-checkout");
+        const folder = join(checkout, "desk");
+        const git = (...args: string[]) =>
+            execFileSync("git", ["-C", checkout, ...args], { encoding: "utf8" });
+
+        mkdirSync(folder, { recursive: true });
+        git("init", "--quiet");
+        git("config", "user.email", "desk@example.test");
+        git("config", "user.name", "Desk Test");
+        git("config", "commit.gpgsign", "false");
+        // Someone else's staged work beside the export: the desk's commit leaves it staged.
+        writeFileSync(join(checkout, "decided.md"), "a decision\n");
+        git("add", "decided.md");
+        writeFileSync(
+            configPath,
+            JSON.stringify({
+                digest: { minutes: 0 },
+                cap: 100,
+                export: folder,
+                exportCommit: true,
+            }),
+        );
+
+        try {
+            const { source } = await delegated("export-commit");
+
+            await say(app, source, "desk sync test");
+            await until(
+                async () => {
+                    try {
+                        return git("log", "--format=%s").includes(EXPORT_COMMIT_MESSAGE);
+                    } catch {
+                        return false;
+                    }
+                },
+                "the export's commit",
+                20_000,
+            );
+
+            const files = git("show", "--name-only", "--format=", "HEAD").trim().split("\n");
+
+            assert(files.includes("desk/threads.md"), "the export is in the commit");
+            assert(
+                files.every((file) => file.startsWith("desk/")),
+                "only the export is in it",
+            );
+            assert.equal(git("diff", "--cached", "--name-only").trim(), "decided.md");
+        } finally {
+            writeFileSync(configPath, JSON.stringify({ digest: { minutes: 0 }, cap: 100 }));
+            rmSync(checkout, { recursive: true, force: true });
         }
     });
 
