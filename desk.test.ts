@@ -5069,6 +5069,28 @@ describe("merge asks", () => {
             "a step in inline code",
         );
         assert.equal(plainMergeAsk("Merge #12. `make db-backup`."), false, "a clause of code only");
+
+        for (const order of [
+            "Merge #12. Check the device.",
+            "Merge #12. Ping the device.",
+            "Merge #12. SSH into the host.",
+            "Merge #12. Bring the old box back.",
+            "Merge #12. Feed the new key to the host.",
+            "Merge #12 (check the device after).",
+            "Merge #12. The device needs a look from Brian.",
+        ]) {
+            assert.equal(plainMergeAsk(order), false, order);
+        }
+
+        for (const fact of [
+            "Merge #12. CI green. Low urgency.",
+            "Merge #12: adds 3 tests. Lucilla's review applied, 0 blocking.",
+            "Merge #12 (docs only). Tested in Debian 13.",
+            "Merge #12. Checks pass; PRs #13 and #14 follow.",
+        ]) {
+            assert.equal(plainMergeAsk(fact), true, fact);
+        }
+
         assert.equal(
             plainMergeAsk("Merge #12: fixes the `coder.service` start. CI green."),
             true,

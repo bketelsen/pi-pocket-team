@@ -7871,14 +7871,15 @@ const EXTRA_STEP =
     /\b(?:restart|reboot|run|enable|disable|turn\s+(?:on|off)|set\s*up|rotate|close|reopen|back\s+up|backup|restore|migrate|rebuild|redeploy|reload|rerun|re-run|retry|upgrade|bump|pin|unpin|schedule|notify|announce|post|email|purge|prune|clean\s+up)\b/i;
 
 /**
- * A word that starts a fact beside the merge, and no action: a PR, a number, a word that ends in "ed", "ing" or "s", or
- * one of the plain information words. Any other first word ("restart", "back", "Duncan") is a step for Brian.
+ * A word that starts a fact beside the merge, and never an order. An order starts with a verb in its base form ("Check
+ * the device", "Ping the host", "SSH into it"), so only these start a fact: a PR, a number, a possessive ("Lucilla's
+ * review applied"), a verb in "-s" ("fixes", "adds", "republishes"; not "-ss", "-us", "-is", "-as"), a past participle in
+ * "-ed" ("applied", "tested"; not "-eed", "embed", "shred"), or a word of the short list: determiners, pronouns, and
+ * status words ("CI green", "low urgency", "docs only"). A capital acronym is no fact by itself: "SSH into the host" is
+ * an order. Any other first word keeps the ask for Brian.
  */
 const FACT_WORD =
-    /^(?:@PR|\d|[A-Za-z'’-]*(?:ed|ing|[^su\W]s|'s|’s)$|(?:a|an|the|this|that|these|those|it|its|both|all|each|every|no|none|only|one|two|three|four|five|low|high|medium|urgency|nothing|not|now|green|red|ready|done|same|other|another|docs|doc|ci|review|tests|test|checks|check|build|builds)$)/i;
-
-/** An acronym in capitals, 2 or more letters: "CI", "PR", "OK". It starts a fact too. */
-const ACRONYM = /^[A-Z]{2,}\b/;
+    /^(?:@PR|\d[\w.-]*|[A-Za-z-]+(?:'s|’s)|[A-Za-z-]*[^\Wsuia]s|(?![A-Za-z-]*eed$|embed$|shred$)[A-Za-z-]{2,}ed|(?:a|an|the|this|that|these|those|it|its|both|all|each|every|no|none|only|one|two|three|four|five|low|high|medium|urgency|nothing|green|ready|done|pending|docs|doc|ci|pr|prs)$)$/i;
 
 /** A PR URL in a text: `github.com/owner/name/pull/7`. */
 const PR_URL_WORDS = /github\.com\/([A-Za-z0-9][\w.-]*\/[A-Za-z0-9][\w.-]*)\/pull\/([1-9][0-9]*)/gi;
@@ -8003,7 +8004,8 @@ export function plainMergeAsk(text: string, options?: string[]): boolean {
     // is a step.
     const beside = [...groups, rest].filter((one) => one.trim() !== "").join(". ");
 
-    if (/\?|\byou(?:r)?\b/i.test(beside) || EXTRA_STEP.test(beside)) {
+    // A question, or words to Brian ("you", "your", "Brian"), ask him something beside the merge.
+    if (/\?|\b(?:you(?:r)?|brian)\b/i.test(beside) || EXTRA_STEP.test(beside)) {
         return false;
     }
 
@@ -8025,14 +8027,11 @@ function clausesOf(text: string): string[] {
         .filter((clause) => clause !== "");
 }
 
-/**
- * Whether a clause beside the merge says a fact, and no step: it starts with a PR, a number, an acronym in capitals, a
- * word that ends in "ed", "ing" or "s", or one of the plain information words of `FACT_WORD`.
- */
+/** Whether a clause beside the merge says a fact, and no step: its first word is a `FACT_WORD`. */
 function factClause(clause: string): boolean {
     const word = /^\S+/.exec(clause)?.[0] ?? "";
 
-    return word !== "" && (ACRONYM.test(word) || FACT_WORD.test(word));
+    return word !== "" && FACT_WORD.test(word);
 }
 
 /** A thread's link for a ref, in any case: the PRs of one repository are 1, however an ask writes the owner. */
