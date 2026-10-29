@@ -3946,6 +3946,35 @@ export function takeDigest(
     return { items, seq };
 }
 
+/**
+ * The items to send: a queue item whose reason no longer holds is dropped, and every other item stays. A queue item's
+ * kind is `queue` or `repair`, and its key is `queue:<thread id>:<reason>`. The reason must still hold when the digest
+ * goes: a watch, an answer, or a new PR state can change it after the item went into the box (T465: "silent session" at
+ * 11:26, the watch at 11:27). A thread that is gone, closed, or parked holds no reason now, so its item goes too.
+ */
+export function dropStaleQueue(
+    items: readonly DigestItem[],
+    state: Readonly<DeskState> | undefined,
+): DigestItem[] {
+    return items.filter((item) => {
+        if (item.kind !== "queue" && item.kind !== "repair") {
+            return true;
+        }
+
+        // Split at the first 2 colons only: a reason holds colons of its own ("watch is due: check X").
+        const first = item.key.indexOf(":");
+        const second = first < 0 ? -1 : item.key.indexOf(":", first + 1);
+
+        if (!item.key.startsWith("queue:") || second < 0) {
+            return true;
+        }
+
+        const thread = state?.threads[item.key.slice(first + 1, second)];
+
+        return thread !== undefined && odradeReason(thread) === item.key.slice(second + 1);
+    });
+}
+
 /** The desk's start: the oldest seed thread's start, else the stored epoch. A seed sets the truth. */
 export function deskEpoch(state: Readonly<DeskState> | undefined): number | undefined {
     let oldest: number | undefined;
@@ -4930,6 +4959,18 @@ const linkFor = (pr: PrFact, via: PrLink["via"]): PrLink => ({
     ...(pr.ready ? { ready: { at: pr.readyAt > 0 ? pr.readyAt : 0, head: pr.head } } : {}),
 });
 
+/**
+ * A link copied to another thread. The read that gave it its facts was of the source thread (`readAt`), so the copy
+ * keeps none: the destination thread's next read must cover it, or the page hides it (`readCovered`).
+ */
+function withoutRead(link: PrLink): PrLink {
+    const copy: PrLink = { ...link };
+
+    delete copy.readAt;
+
+    return copy;
+}
+
 /** One attached PR's facts from a read: its state, its next actor, and what GitHub says. */
 export function updatePrs(thread: Thread, github: GitHubFacts, now: number): number {
     let events = 0;
@@ -5432,7 +5473,8 @@ export function attachTo(
             );
         }
 
-        target.prs[ref] = { ...(link ?? {}), via: "attached" };
+        // The read that gave this link its facts was of the other thread: the copy keeps no `readAt`.
+        target.prs[ref] = { ...(link === undefined ? {} : withoutRead(link)), via: "attached" };
         // A PR put on by hand comes back: the dropped list no longer holds it.
         delete state.dropped?.[ref];
         addEvent(target, `attached:${ref}:${String(now)}`, `${ref} attached`, now);
@@ -5457,7 +5499,8 @@ export function attachTo(
     }
 
     for (const [prRef, link] of Object.entries(source.prs)) {
-        target.prs[prRef] = { ...link };
+        // The source thread's read does not cover the target: its own next read must.
+        target.prs[prRef] = withoutRead(link);
     }
 
     source.prs = {};
@@ -13576,9 +13619,12 @@ export default function createDesk(host: Host, web: Web) {
                 await runtime.commit(async (tx) => {
                     const state = await tx.doc(DeskThreads);
                     const taken = takeDigest(state, supervisor, task.input.due);
+                    // A queue item whose reason is gone (a watch, an answer, a new PR state) sends nothing: it is dropped
+                    // here, after the box emptied, so a stale line never reaches the supervisor.
+                    const items = dropStaleQueue(taken.items, state);
 
                     // Nothing waits: no message, and the task ends.
-                    if (taken.items.length === 0) {
+                    if (items.length === 0) {
                         return {
                             status: "terminal",
                             outcome: { status: "completed", result: null },
@@ -13588,7 +13634,7 @@ export default function createDesk(host: Host, web: Web) {
                     const { digest } = await deskConfig();
                     const clerk = clerkOf(state, supervisor);
                     // The Clerk takes the routine kinds; a kind that goes at once always stays with the supervisor.
-                    const split = splitDigest(taken.items, clerk !== undefined, digest);
+                    const split = splitDigest(items, clerk !== undefined, digest);
                     // A report that a supervisor handled after it left the Clerk's list: it needs no escalation.
                     const theirs = dropHandled(split.theirs, state);
                     const { ours } = split;
@@ -14273,9 +14319,12 @@ export default function createDesk(host: Host, web: Web) {
                 const staleDue =
                     stale.has(supervisor) &&
                     now - (viewSweeps.get(supervisor) ?? 0) >= SWEEP_VIEW_MS;
+                // The open-thread path: a supervisor whose threads did not sweep a moment ago. A supervisor with no open
+                // thread has `mine` empty, so only a stale ready link, which has its own limit, sweeps it.
+                const openDue = mine.length > 0 && !fresh;
 
-                // 1 sweep at most, and never one for an open thread that swept a moment ago and no stale link.
-                if (fresh && !staleDue) {
+                // 1 sweep at most. A supervisor that swept a moment ago waits, unless a stale ready link is due.
+                if (!openDue && !staleDue) {
                     continue;
                 }
 

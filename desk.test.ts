@@ -135,6 +135,7 @@ import {
     markHandled,
     handledAfter,
     dropHandled,
+    dropStaleQueue,
     watchDueAt,
     watchWhen,
     recordResult,
@@ -6790,6 +6791,68 @@ describe("attachTo", () => {
         );
     });
 
+    /** A ready link that its own thread's read covered: the page shows it. */
+    const covered = (): PrLink => ({
+        via: "seen",
+        state: "OPEN",
+        title: "A fix",
+        head: "a1b2c3d4e5",
+        ready: { at: 500, head: "a1b2c3d4e5" },
+        readAt: 700,
+    });
+
+    test("a moved PR keeps no readAt, so the page hides it until the target thread reads it", () => {
+        const state = deskOf();
+        const older = placed(state, 100);
+        const target = placed(state, 200);
+
+        older.prs["frostyard/test#7"] = covered();
+        assert.deepEqual(
+            readyPrs(state, 100 * DAY).map((pr) => pr.thread),
+            [older.id],
+            "it shows on its own thread",
+        );
+
+        attachTo(state, "frostyard/test#7", target.id, 300);
+
+        assert.equal(target.prs["frostyard/test#7"]?.readAt, undefined, "the copy keeps no read");
+        assert.equal(target.prs["frostyard/test#7"]?.ready?.at, 500, "the label stays");
+        assert.deepEqual(readyPrs(state, 100 * DAY), [], "no read covered it on the target");
+
+        updatePrs(target, githubOf([prFact({ ready: true, readyAt: 500 })]), 900);
+
+        assert.equal(target.prs["frostyard/test#7"]?.readAt, 900);
+        assert.deepEqual(
+            readyPrs(state, 100 * DAY).map((pr) => pr.thread),
+            [target.id],
+            "the target's own read covers it",
+        );
+    });
+
+    test("a whole thread's PRs keep no readAt on the target either", () => {
+        const state = deskOf();
+        const source = placed(state, 100);
+        const target = placed(state, 200);
+
+        source.prs["frostyard/test#7"] = covered();
+        assert.deepEqual(
+            readyPrs(state, 100 * DAY).map((pr) => pr.thread),
+            [source.id],
+        );
+
+        attachTo(state, source.id, target.id, 300);
+
+        assert.deepEqual(Object.keys(target.prs), ["frostyard/test#7"]);
+        assert.equal(target.prs["frostyard/test#7"]?.readAt, undefined);
+        assert.deepEqual(readyPrs(state, 100 * DAY), [], "no read covered it on the target");
+
+        updatePrs(target, githubOf([prFact({ ready: true, readyAt: 500 })]), 900);
+        assert.deepEqual(
+            readyPrs(state, 100 * DAY).map((pr) => pr.thread),
+            [target.id],
+        );
+    });
+
     test("a closed target is refused, and a second call changes nothing", () => {
         const state = deskOf();
         const source = placed(state, 100);
@@ -8423,6 +8486,86 @@ describe("the digest's rules", () => {
         assert.match(
             items[0]?.line ?? "",
             /waits on you: PR frostyard\/test#7 needs a repair: agent/,
+        );
+    });
+
+    /** A thread that waits on Odrade as a silent session: idle, and no report after the last user entry. */
+    const silent = (state: DeskState) => {
+        const thread = open(state, "x.test.stale-queue").thread;
+
+        thread.state = "open";
+        thread.run.busy = false;
+        thread.run.reportedUserEntry = 5;
+        thread.run.lastUserEntry = 9;
+
+        return thread;
+    };
+
+    test("a queue item is dropped when its reason is gone: the T465 watch, a due watch, and a thread gone or closed", () => {
+        const state = empty();
+        const thread = silent(state);
+        const item = made(`queue:${thread.id}:silent session`, "queue", thread.id, 1000);
+
+        assert.deepEqual(dropStaleQueue([item], state), [item], "the reason still holds");
+
+        // T465: a watch set 46 seconds later. The session sleeps until the check, so nobody waits on Odrade.
+        thread.watch = {
+            checkOn: "2099-01-01",
+            check: "a later check",
+            setAt: 1046,
+            setBy: "brian",
+            key: "x.test.watch",
+        };
+        assert.equal(odradeReason(thread), undefined, "the silent session left");
+        assert.deepEqual(dropStaleQueue([item], state), [], "the watch made the item stale");
+
+        // A reason with colons of its own: `queue:<id>:watch is due: check X`.
+        const due = open(state, "x.test.due-watch").thread;
+        const watch = {
+            checkOn: "2026-11-01",
+            check: "check X",
+            setAt: 1000,
+            dueAt: 2000,
+            setBy: "brian",
+            key: "x.test.due",
+        };
+
+        due.state = "open";
+        due.watch = watch;
+
+        const dueItem = made(`queue:${due.id}:watch is due: check X`, "queue", due.id, 2000);
+
+        assert.deepEqual(
+            dropStaleQueue([dueItem], state),
+            [dueItem],
+            "the reason holds, colons and all",
+        );
+
+        delete (watch as { dueAt?: number }).dueAt;
+        assert.deepEqual(dropStaleQueue([dueItem], state), [], "not due: the reason is gone");
+
+        // A thread that is gone, and one that closed: no reason holds.
+        assert.deepEqual(dropStaleQueue([item], empty()), [], "no such thread");
+
+        thread.watch = undefined;
+        thread.state = "closed";
+        thread.closed = { at: 3000, why: "done", by: "sweep" };
+        assert.deepEqual(dropStaleQueue([item], state), [], "a closed thread");
+    });
+
+    test("every item that is not a queue item stays, also with no thread", () => {
+        const items = [
+            made("report:a", "report"),
+            made("closed", "closed", "T9"),
+            made("answer:b", "answer", "T9"),
+            made("shift:c", "shift", "T9"),
+        ];
+
+        assert.deepEqual(dropStaleQueue(items, empty()), items, "other kinds always stay");
+        assert.deepEqual(
+            dropStaleQueue([made("queue:T9:PR x needs a repair: agent", "repair", "T9")], empty()),
+            [],
+            "a repair item is a queue item: no thread, no reason",
         );
     });
 
@@ -14854,6 +14997,104 @@ describe("the desk in a Pi Pocket", () => {
             }
         });
 
+        test("a supervisor with no open thread sweeps at most once for a stale ready link", async () => {
+            const source = await supervisor("page-stale-rate");
+            const flatPath = join(root, "stale-rate.json");
+            const flatGh = join(root, "stale-rate-gh.sh");
+            let id = "";
+
+            // A read that works, and holds no PR: the link stays stale after every sweep.
+            writeFileSync(
+                flatPath,
+                JSON.stringify({ data: { viewer: { login: "github-viewer" } } }),
+            );
+            writeFileSync(flatGh, `#!/bin/sh\ncat ${JSON.stringify(flatPath)}\n`);
+            chmodSync(flatGh, 0o755);
+            process.env.PI_POCKET_DESK_GH = flatGh;
+
+            try {
+                // 1 open thread first, so a sweeper starts and sweeps once: the page's rule then takes no part.
+                await app.harness.commit(async (tx) => {
+                    const state = await tx.doc(DeskThreads);
+                    const opened = openThread(state, {
+                        key: "x.test.page-stale-rate",
+                        supervisor: Number(source),
+                        agents: ["duncan"],
+                        repo: "frostyard/test",
+                        title: "A ready PR",
+                        at: Date.now(),
+                    });
+
+                    id = opened.thread.id;
+                    state.threads[id]!.state = "open";
+                    state.threads[id]!.address = "session-stale-rate";
+                    state.threads[id]!.run.busy = true;
+                }, context);
+                await say(app, source, "desk list test");
+                await until(
+                    async () => typeof (await deskState())?.threads[id]?.run.sweptAt === "number",
+                    "the sweeper's first sweep",
+                    20_000,
+                );
+                assert.equal(await sweepers(source), 1, "a live sweeper, asleep for 10 minutes");
+
+                // Closed as done a day ago, with a link no read covered: the page would hide its Ready to merge row.
+                await app.harness.commit(async (tx) => {
+                    const stored = (await tx.doc(DeskThreads)).threads[id]!;
+
+                    stored.state = "closed";
+                    stored.closed = { at: Date.now() - DAY, why: "done", by: "sweep" };
+                    // No busy session: a sweep must not reopen it, or the second look meets an open thread.
+                    delete stored.run.busy;
+                    stored.prs["frostyard/test#7"] = {
+                        via: "seen",
+                        state: "OPEN",
+                        head: "a1b2c3d",
+                        ready: { at: 500, head: "a1b2c3d" },
+                    };
+                }, context);
+
+                // The first look sweeps: the stale link is due.
+                const first = await call("threads");
+
+                assert.equal(first.status, 200);
+
+                const swept = (await deskState())?.threads[id]?.run.prsReadAt;
+
+                assert.equal(typeof swept, "number", "the page swept");
+                assert.equal(
+                    (await deskState())?.threads[id]?.prs["frostyard/test#7"]?.readAt,
+                    undefined,
+                    "the read gave no fact for it",
+                );
+
+                // A second look at once: no open thread, and the rate limit holds, so no sweep.
+                await new Promise((resolve) => setTimeout(resolve, 25));
+
+                const second = await call("threads");
+
+                assert.equal(second.status, 200);
+                assert.equal(
+                    (await deskState())?.threads[id]?.run.prsReadAt,
+                    swept,
+                    "1 sweep only",
+                );
+            } finally {
+                process.env.PI_POCKET_DESK_GH = fakeGh;
+                // Leave nothing stale for the tests after: a dropped thread with no PR gets no sweeper, and no page sweep.
+                await app.harness.commit(async (tx) => {
+                    const stored = (await tx.doc(DeskThreads)).threads[id];
+
+                    if (stored !== undefined) {
+                        stored.state = "closed";
+                        stored.closed = { at: Date.now(), why: "dropped", by: "brian" };
+                        stored.prs = {};
+                    }
+                }, context);
+                await stopSweepers();
+            }
+        });
+
         test("keep, park and drop change the thread; a second POST changes nothing", async () => {
             const { thread } = await delegated("page-actions");
 
@@ -18902,6 +19143,68 @@ describe("the desk in a Pi Pocket", () => {
                 assert.doesNotMatch(text, /waits on you/, "the wait is inside the closed line");
             } finally {
                 await stopDigests();
+                digestOff();
+            }
+        });
+
+        test("a queue item whose reason is gone sends no message (T465)", async () => {
+            digestOn();
+
+            try {
+                const { source, linked, thread } = await delegated("digest-stale-queue");
+
+                await until(() => !app.isBusy(linked), "the linked session to settle", 20_000);
+                // Its turn ended with no report: the sweep queues it as a silent session.
+                await say(app, source, "desk sync test");
+                await until(
+                    async () =>
+                        (await boxOf(source))?.items.some(
+                            (each) =>
+                                each.kind === "queue" &&
+                                each.thread === thread.id &&
+                                each.key === `queue:${thread.id}:silent session`,
+                        ) === true,
+                    "the queue item",
+                    20_000,
+                );
+
+                // A watch a moment later: the session sleeps until the check, so the reason is gone.
+                await app.harness.commit(async (tx) => {
+                    (await tx.doc(DeskThreads)).threads[thread.id]!.watch = {
+                        checkOn: "2099-01-01",
+                        check: "a later check",
+                        setAt: Date.now(),
+                        setBy: "brian",
+                        key: "x.test.digest-stale",
+                    };
+                }, context);
+
+                assert.equal(
+                    odradeReason((await deskState())?.threads[thread.id] as Thread),
+                    undefined,
+                    "no reason holds now",
+                );
+
+                await quiet([thread.id]);
+                await restartApp(16 * 60_000, undefined);
+                digestOff();
+
+                // The digest takes the box and ends with no message: the stale item is dropped.
+                await until(
+                    async () => (await digestTasks(source)).length === 0,
+                    "the digest to end",
+                    20_000,
+                );
+
+                const texts = (await modelTexts(app, source)).join("\n");
+
+                assert.doesNotMatch(texts, /\[desk\] digest:/, "no digest message");
+                assert.doesNotMatch(texts, /waits on you: silent session/);
+                assert.deepEqual((await boxOf(source))?.items, [], "the box is empty");
+            } finally {
+                await stopDigests();
+                await quiet([]);
+                shift = 0;
                 digestOff();
             }
         });
