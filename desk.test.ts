@@ -335,6 +335,20 @@ describe("threads", () => {
         assert.equal(state.threads.T2?.state, "open");
     });
 
+    test("fail keeps a starting thread that has an open ask, and says why it did not start", () => {
+        const state = empty();
+        const starting = open(state, "k").thread;
+
+        starting.asks = [{ id: "T1a", text: "Keep the guard?", at: 1 }];
+
+        assert.equal(failThread(state, "k", "no model was usable", 2), undefined);
+        assert.equal(starting.state, "starting", "the thread stays open");
+        assert.equal(starting.closed, undefined);
+        assert.equal(starting.events.at(-1)?.key, "failed");
+        assert.match(starting.events.at(-1)?.text ?? "", /no model was usable/);
+        assert.equal(hasOpenAsk(starting), true, "Brian still has the ask");
+    });
+
     test("the list hides closed threads and read gives the fields", () => {
         const state = empty();
         const seeded = seedThreads(state, rows(), { hash: "abc", supervisor: 9, at: 10 });
@@ -1092,6 +1106,28 @@ describe("closeCheck", () => {
         assert.deepEqual(closeCheck(starting, facts(3600_001)), {
             close: true,
             open: ["the session never started"],
+        });
+    });
+
+    test("an old starting thread holds while it has an open ask", () => {
+        const held = thread({
+            state: "starting",
+            startedAt: 0,
+            asks: [
+                { id: "T1a", text: "Keep the guard?", at: 1 },
+                {
+                    id: "T1b",
+                    text: "Which one?",
+                    at: 1,
+                    answer: { at: 2, by: "Brian", words: "this" },
+                },
+                { id: "T1c", text: "Gone?", at: 1, resolved: { at: 2, why: "the issue closed" } },
+            ],
+        });
+
+        assert.deepEqual(closeCheck(held, facts(3600_001)), {
+            close: false,
+            open: ["the session never started", "ask T1a has no answer"],
         });
     });
 });
@@ -2063,6 +2099,34 @@ describe("ownThread", () => {
 
         assert("error" in refused);
         assert.equal(refused.error, "There is no thread F9.");
+    });
+
+    test("a thread with an open ask is refused, and nothing changes", () => {
+        const state = deskOf();
+        const found = foundPrThread(state);
+
+        found.asks = [{ id: `${found.id}a`, text: "Take this PR?", at: 100 }];
+
+        const events = found.events.length;
+        const refused = errorOf(ownThread(state, found.id, 200, "Odrade"));
+
+        assert.match(
+            refused,
+            new RegExp(
+                `^desk own refused: ${found.id} has an open ask: ${found.id}a\\. A closed thread hides it from Brian\\.`,
+            ),
+        );
+        assert.match(refused, /`desk withdraw`/);
+        assert.equal(found.state, "open", "it stays open");
+        assert.equal(found.closed, undefined);
+        assert.equal(found.prs["frostyard/test#7"]?.via, "attached", "the PR stays");
+        assert.equal(found.events.length, events, "no event");
+
+        // Once Brian answers, the same call closes it.
+        found.asks[0]!.answer = { at: 300, by: "Brian", words: "yes, mine" };
+
+        assert("text" in ownThread(state, found.id, 400, "Odrade"));
+        assert.equal(found.state, "closed");
     });
 
     test("after it, attribute makes no found thread for the PR, and reopens nothing", () => {
@@ -3381,6 +3445,85 @@ describe("the watch's rules", () => {
         });
         assert.equal(abandoned.closed?.why, "done", "why stays done");
         assert.equal(abandoned.closed?.outcome, "abandoned", "the PR was closed unmerged");
+    });
+
+    test("a pass is refused while the thread has an open ask, and a fail still goes", () => {
+        const at = on("2026-11-01");
+        const pass = (each: Thread, closedBy: "desk" | "brian") =>
+            recordResult(each, {
+                pass: true,
+                text: "the blobs are gone",
+                by: "odrade",
+                key: "p-1",
+                at,
+                closedBy,
+            });
+
+        // One open ask: the tool says which, and how to end it.
+        const single = watched({ asks: [{ id: "T1a", text: "Keep the guard?", at: 1 }] });
+        const refusal = errorOf(pass(single, "desk"));
+
+        assert.match(
+            refusal,
+            /^desk result refused: T1 has an open ask: T1a\. A closed thread hides it from Brian\./,
+        );
+        assert.match(refusal, /`desk withdraw`/);
+        assert.match(refusal, /`into` with another open ask/);
+        assert.match(refusal, /Then run desk result again\.$/);
+        assert.equal(single.state, "open", "nothing changed");
+        assert.equal(single.watch?.result, undefined, "no result was stored");
+        assert.equal(single.closed, undefined);
+
+        // Two open asks: the plural words, and both ids.
+        const both = watched({
+            asks: [
+                { id: "T1a", text: "Keep the guard?", at: 1 },
+                { id: "T1b", text: "Which one?", at: 1 },
+            ],
+        });
+
+        assert.match(
+            errorOf(pass(both, "desk")),
+            /^desk result refused: T1 has open asks: T1a, T1b\. A closed thread hides them from Brian\. Brian answers them, or the supervisor ends each/,
+        );
+
+        // The page's pass has its own words.
+        const page = watched({ asks: [{ id: "T1a", text: "Keep the guard?", at: 1 }] });
+
+        assert.equal(
+            errorOf(pass(page, "brian")),
+            "the pass refused: T1 has an open ask: T1a. A closed thread hides it. Answer it first, then the pass again.",
+        );
+
+        // A fail is never refused, and it stores its result.
+        const failed = watched({ asks: [{ id: "T1a", text: "Keep the guard?", at: 1 }] });
+
+        assert.deepEqual(
+            recordResult(failed, {
+                pass: false,
+                text: "2 blobs remain",
+                by: "odrade",
+                key: "f-1",
+                at,
+                closedBy: "desk",
+            }),
+            { changed: true },
+        );
+        assert.equal(failed.watch?.result?.pass, false);
+        assert.equal(failed.state, "open");
+
+        // Brian's answer, or the supervisor's withdrawal, lets the pass through.
+        const answered = watched({ asks: [{ id: "T1a", text: "Keep the guard?", at: 1 }] });
+
+        answered.asks[0]!.answer = { at: 2, by: "Brian", words: "yes" };
+        assert.deepEqual(pass(answered, "desk"), { changed: true });
+        assert.equal(answered.state, "closed");
+
+        const withdrawn = watched({ asks: [{ id: "T1a", text: "Keep the guard?", at: 1 }] });
+
+        withdrawn.asks[0]!.resolved = { at: 2, why: "the issue closed" };
+        assert.deepEqual(pass(withdrawn, "brian"), { changed: true });
+        assert.equal(withdrawn.state, "closed");
     });
 
     test("a fail keeps it open, counts again, and starts the stale clock at the fail", () => {
@@ -6923,6 +7066,77 @@ describe("attachTo", () => {
             target.events.map((event) => event.text).join("; "),
             new RegExp(`reopened: ${source.id} attached by Odrade`),
         );
+    });
+
+    test("a source thread with an open ask is refused, and nothing moves or reopens", () => {
+        const state = deskOf();
+        const target = placed(state, 100);
+        const source = placed(state, 200);
+
+        // The target closed as done in the last 7 days: an allowed merge would reopen it.
+        target.state = "closed";
+        target.closed = { at: 250, why: "done", by: "sweep" };
+        source.prs["frostyard/test#7"] = { via: "seen" };
+        source.asks = [
+            { id: `${source.id}a`, text: "Rotate the token?", at: 200 },
+            {
+                id: `${source.id}b`,
+                text: "Old one",
+                at: 200,
+                answer: { at: 210, by: "Brian", words: "ok" },
+            },
+        ];
+
+        const events = { target: target.events.length, source: source.events.length };
+        const refused = errorOf(attachTo(state, source.id, target.id, 300, "Odrade"));
+
+        assert.match(
+            refused,
+            new RegExp(
+                `^desk attach refused: ${source.id} has an open ask: ${source.id}a\\. A closed thread hides it from Brian\\.`,
+            ),
+        );
+        assert.match(refused, /Then run desk attach again\.$/);
+        assert.equal(target.state, "closed", "the target did not reopen");
+        assert.deepEqual(target.closed, { at: 250, why: "done", by: "sweep" });
+        assert.deepEqual(target.prs, {}, "nothing moved");
+        assert.equal(source.state, "open", "the source did not close");
+        assert.equal(source.prs["frostyard/test#7"]?.via, "seen");
+        assert.equal(target.events.length, events.target, "no event on the target");
+        assert.equal(source.events.length, events.source, "no event on the source");
+
+        // The page says its own words, and gets the same refusal.
+        assert.match(
+            errorOf(attachTo(state, source.id, target.id, 300, "Brian", "page")),
+            new RegExp(
+                `^the merge refused: ${source.id} has an open ask: ${source.id}a\\. A closed thread hides it\\. Answer it first, then the merge again\\.$`,
+            ),
+        );
+        assert.equal(target.state, "closed");
+    });
+
+    test("a source thread whose only open asks are about an issue moves, as its issue asks do", () => {
+        const state = deskOf();
+        const source = placed(state, 100);
+        const target = placed(state, 200);
+
+        source.prs["frostyard/test#7"] = { via: "seen" };
+        source.asks = [
+            {
+                id: `${source.id}a`,
+                text: "frostyard/test#3 is still open after #7 merged. Is that right?",
+                at: 100,
+                key: `issue-open:frostyard/test#3:frostyard/test#7`,
+            },
+        ];
+
+        const result = attachTo(state, source.id, target.id, 300);
+
+        assert("text" in result, JSON.stringify(result));
+        assert.equal(source.state, "closed");
+        assert.deepEqual(source.asks, [], "the issue ask went with the work");
+        assert.equal(target.asks.length, 1);
+        assert.equal(target.asks[0]?.key, "issue-open:frostyard/test#3:frostyard/test#7");
     });
 
     test("a target dropped, failed, or closed long ago is still refused", () => {
@@ -15205,6 +15419,204 @@ describe("the desk in a Pi Pocket", () => {
             );
         });
 
+        test("a page drop is refused while the thread has an open ask, and the thread stays open", async () => {
+            const source = await supervisor("page-drop-ask");
+            let id = "";
+
+            await app.harness.commit(async (tx) => {
+                const state = await tx.doc(DeskThreads);
+                const opened = openThread(state, {
+                    key: "x.test.page-drop-ask",
+                    supervisor: Number(source),
+                    agents: ["duncan"],
+                    repo: "frostyard/test",
+                    title: "An open ask",
+                    at: Date.now(),
+                });
+
+                id = opened.thread.id;
+                state.threads[id]!.state = "open";
+                addAsk(state, {
+                    thread: id,
+                    text: "Drop this?",
+                    key: "x.test.page-drop-ask:1",
+                    by: "Odrade",
+                    supervisor: Number(source),
+                    at: Date.now(),
+                });
+            }, context);
+
+            const events = (await deskState())?.threads[id]?.events.length;
+            const refused = await call(`threads/${id}/drop`, { reason: "not needed" });
+
+            assert.equal(refused.status, 409);
+            assert.match(
+                String(refused.data.error),
+                new RegExp(
+                    `^the drop refused: ${rx(id)} has an open ask: ${rx(id)}a\\. A closed thread hides it\\. Answer it first, then the drop again\\.$`,
+                ),
+            );
+
+            const stored = (await deskState())?.threads[id];
+
+            assert.equal(stored?.state, "open", "the thread stays open");
+            assert.equal(stored?.closed, undefined);
+            assert.equal(stored?.events.length, events, "no drop event");
+
+            // The thread closes, so no later test sees it.
+            await app.harness.commit(async (tx) => {
+                const each = (await tx.doc(DeskThreads)).threads[id]!;
+
+                each.state = "closed";
+                each.closed = { at: Date.now(), why: "dropped", by: "brian" };
+            }, context);
+        });
+
+        test("a page pass is refused while the thread has an open ask, and the thread stays open", async () => {
+            const source = await supervisor("page-pass-ask");
+            let id = "";
+            let askId = "";
+
+            await app.harness.commit(async (tx) => {
+                const state = await tx.doc(DeskThreads);
+                const opened = openThread(state, {
+                    key: "x.test.page-pass-ask",
+                    supervisor: Number(source),
+                    agents: ["duncan"],
+                    repo: "frostyard/test",
+                    title: "A watched ask",
+                    at: Date.now(),
+                });
+
+                id = opened.thread.id;
+                state.threads[id]!.state = "open";
+                state.threads[id]!.watch = {
+                    checkOn: "2026-11-01",
+                    check: "the blobs are gone",
+                    setAt: Date.now(),
+                    setBy: "odrade",
+                    key: "watch-1",
+                };
+
+                const filed = addAsk(state, {
+                    thread: id,
+                    text: "Keep the guard?",
+                    key: "x.test.page-pass-ask:1",
+                    by: "Odrade",
+                    supervisor: Number(source),
+                    at: Date.now(),
+                });
+
+                askId = "askId" in filed ? filed.askId : "";
+            }, context);
+
+            const refused = await call(`threads/${id}/result`, { pass: true, text: "gone" });
+
+            assert.equal(refused.status, 400);
+            assert.equal(
+                String(refused.data.error),
+                `the pass refused: ${id} has an open ask: ${askId}. A closed thread hides it. Answer it first, then the pass again.`,
+            );
+            assert.equal((await deskState())?.threads[id]?.state, "open");
+            assert.equal(
+                (await deskState())?.threads[id]?.watch?.result,
+                undefined,
+                "no result was stored",
+            );
+
+            // Brian answers, and the same tap closes the thread.
+            assert.equal((await call(`asks/${askId}/answer`, { words: "keep it" })).status, 200);
+
+            const passed = await call(`threads/${id}/result`, { pass: true, text: "gone" });
+
+            assert.equal(passed.status, 200);
+            assert.equal((await deskState())?.threads[id]?.state, "closed");
+
+            // The thread closes, so no later test sees it.
+            await app.harness.commit(async (tx) => {
+                const each = (await tx.doc(DeskThreads)).threads[id]!;
+
+                each.state = "closed";
+                each.closed = { at: Date.now(), why: "dropped", by: "brian" };
+            }, context);
+        });
+
+        test("a page merge is refused while the source has an open ask, and the target does not reopen", async () => {
+            const source = await supervisor("page-merge-ask");
+            let movedId = "";
+            let targetId = "";
+
+            await app.harness.commit(async (tx) => {
+                const state = await tx.doc(DeskThreads);
+                const from = openThread(state, {
+                    key: "x.test.page-merge-ask:from",
+                    supervisor: Number(source),
+                    agents: ["duncan"],
+                    repo: "frostyard/test",
+                    title: "The source",
+                    at: Date.now(),
+                });
+                const into = openThread(state, {
+                    key: "x.test.page-merge-ask:into",
+                    supervisor: Number(source),
+                    agents: ["duncan"],
+                    repo: "frostyard/test",
+                    title: "The target",
+                    at: Date.now(),
+                });
+
+                movedId = from.thread.id;
+                targetId = into.thread.id;
+                state.threads[movedId]!.state = "open";
+                state.threads[movedId]!.prs["frostyard/test#7"] = { via: "seen", state: "OPEN" };
+                state.threads[targetId]!.state = "closed";
+                state.threads[targetId]!.closed = {
+                    at: Date.now(),
+                    why: "done",
+                    by: "sweep",
+                };
+                addAsk(state, {
+                    thread: movedId,
+                    text: "Merge this?",
+                    key: "x.test.page-merge-ask:1",
+                    by: "Odrade",
+                    supervisor: Number(source),
+                    at: Date.now(),
+                });
+            }, context);
+
+            const refused = await call(`threads/${movedId}/attach`, { into: targetId });
+
+            assert.equal(refused.status, 409);
+            assert.match(
+                String(refused.data.error),
+                new RegExp(
+                    `^the merge refused: ${rx(movedId)} has an open ask: ${rx(movedId)}a\\.`,
+                ),
+            );
+
+            const state = await deskState();
+
+            assert.equal(state?.threads[movedId]?.state, "open", "the source did not close");
+            assert.equal(
+                state?.threads[movedId]?.prs["frostyard/test#7"]?.via,
+                "seen",
+                "nothing moved",
+            );
+            assert.equal(state?.threads[targetId]?.state, "closed", "the target did not reopen");
+            assert.deepEqual(state?.threads[targetId]?.prs, {});
+
+            // The threads close, so no later test sees them.
+            await app.harness.commit(async (tx) => {
+                const stored = await tx.doc(DeskThreads);
+
+                for (const each of [stored.threads[movedId]!, stored.threads[targetId]!]) {
+                    each.state = "closed";
+                    each.closed = { at: Date.now(), why: "dropped", by: "brian" };
+                }
+            }, context);
+        });
+
         test("wake opens a parked thread, and a second call changes nothing", async () => {
             const { thread } = await delegated("page-wake");
 
@@ -21521,7 +21933,11 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
                     new RegExp(`Sent 1 message to the agent of ${thread.id}`),
                 );
 
-                // watch and result: any thread of its supervisor. A pass closes it.
+                // watch and result: any thread of its supervisor. A pass closes it, and a pass is refused while the
+                // thread has an open ask: the supervisor answers it first.
+                answerAskId = askId;
+                await say(app, source, "desk answer test");
+
                 watchThreadId = thread.id;
                 await say(app, source, "desk watch test");
                 resultThreadId = thread.id;
