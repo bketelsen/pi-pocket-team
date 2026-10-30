@@ -380,3 +380,119 @@
     background: var(--bg);
     border-top: 1px solid var(--line);
 }
+
+/* Plan decisions: the marks matrix, its 3-way cells, comments, the tasks a scope change stops, and the diff. */
+
+.desk-plan-matrix {
+    margin: 6px 0;
+    overflow-x: auto;
+}
+
+.desk-plan-matrix table {
+    border-collapse: collapse;
+    font-size: 12px;
+}
+
+.desk-plan-matrix th,
+.desk-plan-matrix td {
+    padding: 2px 4px;
+    text-align: center;
+    border-bottom: 1px solid var(--line);
+}
+
+.desk-plan-matrix th[scope="row"] {
+    text-align: left;
+    overflow-wrap: anywhere;
+}
+
+.desk-mark {
+    min-width: 52px;
+    min-height: 32px;
+    padding: 2px 6px;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    background: var(--card);
+    color: var(--muted);
+    font: inherit;
+}
+
+.desk-mark.yes {
+    border-color: var(--ok, var(--line));
+    color: var(--ok, var(--text));
+}
+
+.desk-mark.partly {
+    color: var(--text);
+}
+
+.desk-mark.no {
+    border-color: var(--err);
+    color: var(--err);
+}
+
+.desk-plan-comment {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 4px 0;
+    overflow-wrap: anywhere;
+}
+
+.desk-plan-tasks {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin: 6px 0;
+    padding: 6px 8px;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+}
+
+.desk-plan-check {
+    display: flex;
+    align-items: flex-start;
+    gap: 6px;
+    font-size: 13px;
+}
+
+.desk-plan-attempt {
+    margin: 2px 0 2px 8px;
+}
+
+.desk-plan-change {
+    margin: 6px 0;
+}
+
+.desk-diff-line {
+    display: block;
+}
+
+.desk-diff-line.add {
+    color: var(--ok, var(--text));
+}
+
+.desk-diff-line.del {
+    color: var(--err);
+}
+
+.desk-form {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin-top: 8px;
+}
+
+.desk-form .desk-reason {
+    flex: none;
+    width: 100%;
+    box-sizing: border-box;
+}
+
+.desk-form .desk-actions {
+    margin-top: 0;
+}
+
+.desk-plan-bar {
+    flex-wrap: wrap;
+}

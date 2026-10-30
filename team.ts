@@ -873,7 +873,34 @@ export type TeamApi = {
             home?: string;
         }[]
     >;
+    /**
+     * Start a plan from the desk page's New plan, as the person who taps: the same start as `team_delegate` with
+     * `plan.start`, bound to the supervisor's conversation. An older Team has none: the desk then refuses the route.
+     */
+    startPlan?: (request: TeamStartPlanRequest) => Promise<TeamStartPlanResult>;
 };
+
+/** A New plan from the desk page: the route's conversation is the supervisor's, and the start is the person's own. */
+export type TeamStartPlanRequest = {
+    supervisor: number;
+    read: Pick<DocumentReader, "snapshot">;
+    commit: <T>(change: (tx: Tx) => T | Promise<T>) => Promise<T>;
+    context: Context;
+    start: (
+        request: { title: string; message: string; cwd?: string; model?: string },
+        key: string,
+    ) => Promise<{ session: ConversationId | number; address: string }>;
+    key: string;
+    lead: string;
+    title: string;
+    idea: string;
+    model?: string;
+};
+
+/** What a page start did: the plan and its planning session, or why the start failed. */
+export type TeamStartPlanResult =
+    | { id: string; session: number; address: string; replay: boolean; model?: string }
+    | { error: string };
 
 export type Lesson = {
     /** Short and stable: what Pi and the owner use to change or remove it. */
@@ -1750,7 +1777,17 @@ export default function createTeam(host: Host, web: Web) {
                 /** The delegation's task text: the desk links the queued issues named in it. */
                 task?: string;
                 /** A plan start (the desk makes its file), or 1 task of an approved plan. */
-                plan?: { start: { idea: string; lead: string } } | { id: string; task: string };
+                plan?:
+                    | {
+                          start: {
+                              idea: string;
+                              lead: string;
+                              source?: "page" | "chat";
+                              issue?: string;
+                              model?: string;
+                          };
+                      }
+                    | { id: string; task: string };
             },
         ) => Promise<{
             thread: DeskThread;
@@ -1854,6 +1891,8 @@ export default function createTeam(host: Host, web: Web) {
         >;
         /** This desk knows plans. An older desk has none. */
         plans?: true;
+        /** This desk takes a plan start's source and issue. An older desk has none. */
+        planSources?: true;
         /** Publish every plan whose write is not in its file yet. An older desk has none: skip the call. */
         publishPlans?: (
             api: {
@@ -1887,6 +1926,55 @@ export default function createTeam(host: Host, web: Web) {
                 repositories: agent.repositories,
                 ...(agent.home === undefined ? {} : { home: agent.home }),
             })),
+        startPlan: async (request) => {
+            const supervisor = request.supervisor as ConversationId;
+            const identity = await resolveIdentity(
+                request.read,
+                supervisor,
+                request.context,
+                directory,
+            );
+
+            // The plan's thread belongs to a supervisor: the page binds the start to her conversation.
+            if (identity.persona?.role !== "supervisor") {
+                throw new Error(
+                    `Conversation ${String(request.supervisor)} is not a supervisor's: a plan starts from the supervisor's conversation.`,
+                );
+            }
+
+            // A named model must be on the owner's allowed list, as for every delegation.
+            if (request.model !== undefined && !host.subagentModels().includes(request.model)) {
+                throw new Error(
+                    `${request.model} is not on the allowed list for subagents: choose one of ${host.subagentModels().join(", ") || "none"}, or none for the lead's profile model.`,
+                );
+            }
+
+            const persona = (await roster(directory)).find((agent) => agent.id === request.lead);
+
+            if (persona === undefined) {
+                throw new Error(
+                    `${request.lead} is not on the team: choose a lead from the roster.`,
+                );
+            }
+
+            return startPlanThread(
+                {
+                    supervisor,
+                    read: request.read,
+                    commit: request.commit,
+                    context: request.context,
+                    start: request.start,
+                },
+                {
+                    key: request.key,
+                    persona,
+                    title: request.title,
+                    idea: request.idea,
+                    source: "page",
+                    ...(request.model === undefined ? {} : { model: request.model }),
+                },
+            );
+        },
     };
     const sharedTeam = globalThis as unknown as Record<symbol, TeamApi | undefined>;
 
@@ -2303,6 +2391,188 @@ export default function createTeam(host: Host, web: Web) {
         (persona.model
             ? `your model (${persona.model} is not allowed for subagents)`
             : "your model (no profile model)");
+
+    /** What 1 plan start needs of its caller: the tool's session, or the desk page's request. */
+    type PlanStartDeps = {
+        /** The supervisor's conversation: the plan thread's supervisor, and the start's source. */
+        supervisor: ConversationId;
+        read: Pick<DocumentReader, "snapshot">;
+        commit: <T>(change: (tx: Tx) => T | Promise<T>) => Promise<T>;
+        context: Context;
+        /** Pocket's start: the tool's from the supervisor's session, or the page's as the person who taps. */
+        start: (
+            request: { title: string; message: string; cwd?: string; model?: string },
+            key: string,
+        ) => Promise<{ session: ConversationId | number; address: string }>;
+    };
+
+    /** 1 plan start: the lead, the title, Brian's idea, and where it came from. */
+    type PlanStartInput = {
+        key: string;
+        persona: Persona;
+        title: string;
+        idea: string;
+        /** A model from the allowed list; absent: the lead's profile model, when it is allowed. */
+        model?: string;
+        source: "chat" | "page";
+        /** A queued issue that asked for the plan: `owner/name#N`. */
+        issue?: string;
+    };
+
+    /**
+     * Start a plan: the plan thread, its file, and a planning session in the lead agent's home, then the bind and the
+     * publish. `team_delegate` with `plan.start` and the desk page's New plan both use it, so a replay of the same key
+     * starts nothing again and binds nothing twice, either way. A failed start fails the thread and gives its error.
+     */
+    const startPlanThread = async (
+        deps: PlanStartDeps,
+        input: PlanStartInput,
+    ): Promise<
+        | { id: string; session: number; address: string; replay: boolean; model?: string }
+        | { error: string }
+    > => {
+        const { persona, key } = input;
+        const desk = deskApi();
+
+        if (desk === undefined || desk.plans !== true) {
+            throw new Error(
+                "The desk module is off or too old for plans: Brian installs and turns on the new version.",
+            );
+        }
+
+        if (desk.threadOfKey === undefined) {
+            throw new Error(
+                "The desk module is older than the Team module: Brian installs both from 1 checkout (npm run install-extension), then delegates again.",
+            );
+        }
+
+        // A replay of a start that bound its session: nothing starts again. A thread that closed unbound is refused.
+        const known = await desk.threadOfKey(deps.read, deps.context, key);
+
+        if (known !== undefined) {
+            const decision = replayDecision(known);
+
+            if (decision === "refuse") {
+                throw new Error(closedThreadRefusal(known, true));
+            }
+
+            if (decision === "replay") {
+                return {
+                    id: known.id,
+                    session: known.session ?? 0,
+                    address: known.address ?? "",
+                    replay: true,
+                };
+            }
+        }
+
+        if (persona.role !== "agent") {
+            throw new Error(
+                `A plan needs a lead agent with role agent: ${persona.name} is a ${persona.role}.`,
+            );
+        }
+
+        if (persona.home === undefined) {
+            throw new Error(
+                `${persona.name} has no home in its profile: a plan starts in the lead agent's home, so Brian adds home to ${persona.id}.md.`,
+            );
+        }
+
+        // An older desk would drop the issue or the source without a word: it refuses here instead.
+        if ((input.issue !== undefined || input.source === "page") && desk.planSources !== true) {
+            throw new Error(
+                "The desk module is too old for a plan of an issue or of the page: Brian installs both modules from 1 checkout.",
+            );
+        }
+
+        // The named model, or the owner's profile model when the owner's allowed list permits it. The plan stores it in
+        // its first commit, so a resumed start under the same key must name the same.
+        const model = input.model ?? allowedModel(persona);
+        const opened = await deps.commit(async (tx) =>
+            desk.open(tx, {
+                key,
+                supervisor: Number(deps.supervisor),
+                agents: [persona.id],
+                title: input.title,
+                at: Date.now(),
+                // The desk makes the plan's file, its revision and its root.
+                plan: {
+                    start: {
+                        idea: input.idea,
+                        lead: persona.id,
+                        ...(input.source === "page" ? { source: "page" as const } : {}),
+                        ...(input.issue === undefined ? {} : { issue: input.issue }),
+                        ...(model === undefined || desk.planSources !== true ? {} : { model }),
+                    },
+                },
+            }),
+        );
+
+        desk.changed?.();
+
+        const refused = closedThreadRefusal(opened.thread, opened.reused);
+
+        if (refused !== undefined) {
+            throw new Error(refused);
+        }
+
+        const request = {
+            title: `${persona.name}: plan ${input.title}`.slice(0, 120),
+            message: taskText(persona, `${opened.plan?.brief ?? ""}\n\n${input.idea}`),
+            cwd: persona.home,
+            ...(model === undefined ? {} : { model }),
+        };
+        const replay = replayedStart(opened.thread, opened.reused);
+
+        // A bound session from a replay: nothing starts again, and nothing is bound twice.
+        if (replay !== undefined) {
+            return { id: opened.thread.id, ...replay, replay: true };
+        }
+
+        let started: { session: ConversationId | number; address: string };
+
+        try {
+            started = await deps.start(request, key);
+        } catch (error) {
+            // A thrown start is an unknown outcome: the desk fails the thread with the reason.
+            try {
+                await deps.commit(async (tx) =>
+                    desk.fail(tx, key, (error as Error).message, Date.now()),
+                );
+                desk.changed?.();
+            } catch {
+                // The start's refusal is what the caller must see: the desk marks the thread later.
+            }
+
+            return { error: (error as Error).message };
+        }
+
+        await deps.commit(async (tx) => {
+            (await tx.doc(Identity, started.session as ConversationId)).persona ??= persona;
+            await desk.bind(tx, key, {
+                session: Number(started.session),
+                address: started.address,
+                at: Date.now(),
+            });
+        });
+
+        desk.changed?.();
+
+        // The plan's file goes out once its thread is bound: a plan file nobody can read is no plan.
+        await desk.publishPlans?.(
+            { snapshot: deps.read.snapshot, commit: (change) => deps.commit(change) },
+            deps.context,
+        );
+
+        return {
+            id: opened.thread.id,
+            session: Number(started.session),
+            address: started.address,
+            replay: false,
+            ...(model === undefined ? {} : { model }),
+        };
+    };
+
     const delegate = defineTool({
         name: "team_delegate",
         description:
@@ -2417,6 +2687,12 @@ export default function createTeam(host: Host, web: Web) {
                                 description: "the graph task to deliver, such as t2; with id",
                             }),
                         ),
+                        issue: Type.Optional(
+                            Type.String({
+                                description:
+                                    "with start: the queued issue that asked for the plan, owner/name#N (desk issues lists them; the label needs-plan)",
+                            }),
+                        ),
                     },
                     {
                         description:
@@ -2445,6 +2721,8 @@ export default function createTeam(host: Host, web: Web) {
             const { agent, task, repository, night_shift, plan } = args;
             const starting = plan?.start === true;
             const delivering = plan !== undefined && !starting;
+            /** The whole-plan check: the lead, in its home, with no repository and no worktree. */
+            const verifying = delivering && plan.task?.trim() === "verify";
 
             // A plan: a start (with repository home), or 1 task of an approved plan. Its rules come first: nothing
             // starts before they hold.
@@ -2470,6 +2748,12 @@ export default function createTeam(host: Host, web: Web) {
                 if (starting && args.watch !== undefined) {
                     throw new Error(
                         "A plan start takes no watch: a plan has no watch. It closes when it is verified or dropped.",
+                    );
+                }
+
+                if (!starting && plan.issue !== undefined) {
+                    throw new Error(
+                        "plan.issue goes with start: a plan for a queued issue starts with plan { start: true, issue }.",
                     );
                 }
 
@@ -2500,13 +2784,29 @@ export default function createTeam(host: Host, web: Web) {
             }
 
             const persona = await find(agent);
-            // A plan start runs in the lead's home: it names no repository, so it asks for none.
-            const target = starting
-                ? {
-                      ...(persona.home === undefined ? {} : { folder: persona.home }),
-                      home: true,
-                  }
-                : taskTarget(persona, repository);
+
+            if (verifying) {
+                if (persona.home === undefined) {
+                    throw new Error(
+                        `${persona.name} has no home in its profile: the whole-plan check runs in the lead agent's home, so Brian adds home to ${persona.id}.md.`,
+                    );
+                }
+
+                if (repository !== undefined && repository !== "home") {
+                    throw new Error(
+                        `The whole-plan check runs in the lead agent's home: leave repository out, or name "home".`,
+                    );
+                }
+            }
+
+            // A plan start and the whole-plan check run in the lead's home: they name no repository, so they ask for none.
+            const target =
+                starting || verifying
+                    ? {
+                          ...(persona.home === undefined ? {} : { folder: persona.home }),
+                          home: true,
+                      }
+                    : taskTarget(persona, repository);
             const cwd = target.folder;
 
             if (persona.role === "supervisor") {
@@ -2622,59 +2922,31 @@ export default function createTeam(host: Host, web: Web) {
 
             // A plan start: a planning session in the lead agent's home, and the desk's plan file. No worktree, no cap.
             if (starting) {
-                if (persona.role !== "agent") {
-                    throw new Error(
-                        `A plan needs a lead agent with role agent: ${persona.name} is a ${persona.role}.`,
-                    );
-                }
-
-                if (persona.home === undefined) {
-                    throw new Error(
-                        `${persona.name} has no home in its profile: a plan starts in the lead agent's home, so Brian adds home to ${persona.id}.md.`,
-                    );
-                }
-
                 if (repository !== undefined && repository !== "home") {
                     throw new Error(
                         `A plan starts in the lead agent's home: leave repository out, or name "home". ${persona.name} works in: ${targetNames(persona).join(", ") || "no folder"}.`,
                     );
                 }
 
-                const opened = await api.commit(
-                    async (tx) =>
-                        desk?.open(tx, {
-                            key,
-                            supervisor: Number(api.conversationId),
-                            agents: [persona.id],
-                            title,
-                            at: Date.now(),
-                            // The desk makes the plan's file, its revision and its root.
-                            plan: { start: { idea: task, lead: persona.id } },
-                        }),
-                    context,
+                const issue = plan.issue?.trim();
+                const started = await startPlanThread(
+                    {
+                        supervisor: api.conversationId,
+                        read: api,
+                        commit: (change) => api.commit(change, context),
+                        context,
+                        start: (request, startKey) =>
+                            host.linkedSessions.start(api.conversationId, request, startKey),
+                    },
+                    {
+                        key,
+                        persona,
+                        title,
+                        idea: task,
+                        source: "chat",
+                        ...(issue === undefined || issue === "" ? {} : { issue }),
+                    },
                 );
-
-                desk?.changed?.();
-
-                if (opened !== undefined) {
-                    const refused = closedThreadRefusal(opened.thread, opened.reused);
-
-                    if (refused !== undefined) {
-                        throw new Error(refused);
-                    }
-                }
-
-                // The owner's profile names the model, and the owner's allowed list permits it.
-                const preferred = allowedModel(persona);
-                const request = {
-                    title: `${persona.name}: plan ${title}`.slice(0, 120),
-                    message: taskText(persona, `${opened?.plan?.brief ?? ""}\n\n${task}`),
-                    cwd: persona.home,
-                    ...(preferred === undefined ? {} : { model: preferred }),
-                };
-                const replay =
-                    opened === undefined ? undefined : replayedStart(opened.thread, opened.reused);
-                const started = replay ?? (await startLinked(request));
 
                 if ("error" in started) {
                     throw new Error(
@@ -2682,29 +2954,14 @@ export default function createTeam(host: Host, web: Web) {
                     );
                 }
 
-                // A bound session from a replay: nothing starts again, and nothing is bound twice.
-                if (replay !== undefined && opened !== undefined) {
+                if (started.replay) {
                     return reply(
-                        `Plan ${opened.thread.id}: ${persona.name} leads it at ${replay.address} (a replay of this call). Nothing started again.`,
+                        `Plan ${started.id}: ${persona.name} leads it at ${started.address} (a replay of this call). Nothing started again.`,
                     );
                 }
 
-                await api.commit(async (tx) => {
-                    (await tx.doc(Identity, started.session as ConversationId)).persona ??= persona;
-                    await desk?.bind(tx, key, {
-                        session: Number(started.session),
-                        address: started.address,
-                        at: Date.now(),
-                    });
-                }, context);
-
-                desk?.changed?.();
-
-                // The plan's file goes out once its thread is bound: a plan file nobody can read is no plan.
-                await desk?.publishPlans?.(api, context);
-
                 return reply(
-                    `Plan ${opened?.plan?.id ?? "?"} started: ${persona.name} leads it at ${started.address}, on ${modelText(persona)}. Brian chats there and approves on the Desk page. Do not delegate its tasks before the plan-approved news.`,
+                    `Plan ${started.id} started: ${persona.name} leads it at ${started.address}, on ${modelText(persona)}. Brian chats there and approves on the Desk page. Do not delegate its tasks before the plan-approved news.`,
                 );
             }
 
