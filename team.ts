@@ -361,15 +361,30 @@ export function worktreeInUse(sessions: readonly { cwd?: string }[], path: strin
  * cannot bring it back. A new call makes a new thread.
  */
 export function closedThreadRefusal(
-    thread: { id: string; state?: string; closed?: { why: string } },
+    thread: { id: string; state?: string; closed?: { why: string }; session?: number },
     reused: boolean,
 ): string | undefined {
-    // A done thread is a replay of a start that worked: Pocket gives back the same session, and nothing starts again.
-    if (!reused || thread.state !== "closed" || thread.closed?.why === "done") {
+    // A closed thread with a session was a start that worked: Pocket gives back that same session, so it passes.
+    if (!reused || thread.state !== "closed" || thread.session !== undefined) {
         return undefined;
     }
 
     return `This delegation's thread ${thread.id} is closed (${thread.closed?.why ?? "failed"}): start it again with a new team_delegate call.`;
+}
+
+/**
+ * The session-list check of a failed start: `"no"` only when the list was read and no session of this one uses `where`
+ * (an entry with no folder counts as in use). Every other case is `"unknown"`: a session may run.
+ */
+export function admittedBy(
+    list: readonly { cwd?: string }[] | undefined,
+    where: string | undefined,
+): "no" | "unknown" {
+    if (list === undefined || where === undefined) {
+        return "unknown";
+    }
+
+    return worktreeInUse(list, where) ? "unknown" : "no";
 }
 
 /**
@@ -1690,6 +1705,8 @@ export default function createTeam(host: Host, web: Web) {
         id: string;
         state?: "starting" | "open" | "parked" | "closed";
         closed?: { why: string };
+        /** The linked session the thread bound: a closed thread with one was a start that worked. */
+        session?: number;
         watch?: { checkOn: string; checkTime?: string };
     };
     type DeskApi = {
@@ -1723,7 +1740,14 @@ export default function createTeam(host: Host, web: Web) {
             key: string,
             binding: { session: number; address: string; at: number },
         ) => Promise<DeskThread | undefined>;
-        fail: (tx: Tx, key: string, why: string, at: number) => Promise<void>;
+        /** Fail a start. `admitted` says whether a session may run for it: see the desk's `failThread`. */
+        fail: (
+            tx: Tx,
+            key: string,
+            why: string,
+            at: number,
+            options?: { admitted?: "no" | "unknown" },
+        ) => Promise<void>;
         /**
          * Record the model router's suggestion on the thread, once: a replay changes nothing. An older desk has none:
          * skip the call.
@@ -1783,6 +1807,15 @@ export default function createTeam(host: Host, web: Web) {
             read: Pick<DocumentReader, "snapshot">,
             context: Context,
         ) => Promise<{ supervisor: number; lastEventAt: number; asks: number }[]>;
+        /**
+         * Whether a desk thread holds a folder. An older desk has none: a caller then keeps the worktree. A throw keeps
+         * it too.
+         */
+        worktreeHeld?: (
+            read: Pick<DocumentReader, "snapshot">,
+            context: Context,
+            path: string,
+        ) => Promise<boolean>;
         /** This desk knows plans. An older desk has none. */
         plans?: true;
         /** Publish every plan whose write is not in its file yet. An older desk has none: skip the call. */
@@ -2449,6 +2482,73 @@ export default function createTeam(host: Host, web: Web) {
             const key = `x.team.delegate:${api.taskId}:${api.callId}`;
             const desk = deskApi();
 
+            /** `"no"` only when the session list was read and no session of this one uses `where`. */
+            const admittedHere = async (where: string | undefined): Promise<"no" | "unknown"> => {
+                try {
+                    return admittedBy(await host.linkedSessions.list(api.conversationId), where);
+                } catch {
+                    return "unknown";
+                }
+            };
+
+            /**
+             * Start a linked session, with 1 more try when the call throws: Pocket is idempotent by the key, so the
+             * second call gives back the session the first may have made. A double failure fails the desk thread with
+             * the decision on whether a session may run, and gives back the error.
+             */
+            const startLinked = async (
+                request: { title: string; message: string; cwd?: string; model?: string },
+                where: string | undefined,
+            ): Promise<{ session: ConversationId; address: string } | { error: string }> => {
+                let failure = "The session did not start.";
+
+                for (let at = 0; at < 2; at += 1) {
+                    try {
+                        const started = await host.linkedSessions.start(
+                            api.conversationId,
+                            request,
+                            key,
+                        );
+
+                        return {
+                            session: started.session as ConversationId,
+                            address: started.address,
+                        };
+                    } catch (error) {
+                        failure = (error as Error).message;
+                    }
+                }
+
+                const admitted = await admittedHere(where);
+
+                try {
+                    await api.commit(
+                        async (tx) => desk?.fail(tx, key, failure, Date.now(), { admitted }),
+                        context,
+                    );
+                    desk?.changed?.();
+                } catch {
+                    // The start's refusal is what the model must see: the desk marks the thread later.
+                }
+
+                return { error: failure };
+            };
+
+            /**
+             * Whether the desk holds a folder: no `worktreeHeld` (an older desk), or a throw, keeps the worktree.
+             */
+            const deskHolds = async (path: string | undefined): Promise<boolean> => {
+                if (path === undefined || desk?.worktreeHeld === undefined) {
+                    return true;
+                }
+
+                try {
+                    return await desk.worktreeHeld(api, context, path);
+                } catch {
+                    return true;
+                }
+            };
+
             if (persona.role === "clerk") {
                 // A Clerk is 1 long-lived session with no desk thread: neither option has anything to attach to.
                 if (night_shift !== undefined) {
@@ -2520,37 +2620,24 @@ export default function createTeam(host: Host, web: Web) {
 
                 // The owner's profile names the model, and the owner's allowed list permits it.
                 const preferred = allowedModel(persona);
-                let started: Awaited<ReturnType<typeof host.linkedSessions.start>>;
-
-                try {
-                    started = await host.linkedSessions.start(
-                        api.conversationId,
-                        {
-                            title: `${persona.name}: plan ${title}`.slice(0, 120),
-                            message: taskText(
-                                persona,
-                                `${opened?.plan?.brief ?? ""}
+                const started = await startLinked(
+                    {
+                        title: `${persona.name}: plan ${title}`.slice(0, 120),
+                        message: taskText(
+                            persona,
+                            `${opened?.plan?.brief ?? ""}
 
 ${task}`,
-                            ),
-                            cwd: persona.home,
-                            ...(preferred === undefined ? {} : { model: preferred }),
-                        },
-                        key,
-                    );
-                } catch (error) {
-                    try {
-                        await api.commit(
-                            async (tx) => desk?.fail(tx, key, (error as Error).message, Date.now()),
-                            context,
-                        );
-                        desk?.changed?.();
-                    } catch {
-                        // The start's refusal is what the model must see: the desk marks the thread later.
-                    }
+                        ),
+                        cwd: persona.home,
+                        ...(preferred === undefined ? {} : { model: preferred }),
+                    },
+                    persona.home,
+                );
 
+                if ("error" in started) {
                     throw new Error(
-                        `${(error as Error).message} Do not delegate on another model: stop and tell the user.`,
+                        `${started.error} Do not delegate on another model: stop and tell the user.`,
                     );
                 }
 
@@ -2645,12 +2732,13 @@ ${task}`,
                               context,
                           );
             } catch (error) {
-                // The thread never opened: no desk thread holds the worktree of this key, so the one this call made, or
-                // found (a restart), goes again. Not when a session of this 1 works in it, and not when the list cannot
-                // be read: then the folder stays.
-                await discardRefusedWorktree(worktree, where, () =>
-                    host.linkedSessions.list(api.conversationId),
-                );
+                // The thread never opened. A desk thread may still hold the folder (a starting one, an older one): it
+                // keeps its worktree then. Only when the desk says no, the worktree of this key goes, made or found.
+                if (!(await deskHolds(where))) {
+                    await discardRefusedWorktree(worktree, where, () =>
+                        host.linkedSessions.list(api.conversationId),
+                    );
+                }
 
                 throw error;
             }
@@ -2712,37 +2800,22 @@ ${task}`,
             const preferred = allowedModel(persona);
             // A plan's brief comes before the task: a delivery names the plan, its task and its acceptance lines.
             const firstTask = opened?.plan === undefined ? task : `${opened.plan.brief}\n\n${task}`;
-            let started: Awaited<ReturnType<typeof host.linkedSessions.start>>;
+            const started = await startLinked(
+                {
+                    title: `${persona.name}: ${title}`.slice(0, 120),
+                    message:
+                        shift === undefined
+                            ? taskText(persona, firstTask, worktree)
+                            : delegatedText(persona, firstTask, shift.request, worktree),
+                    ...(where === undefined ? {} : { cwd: where }),
+                    ...(preferred === undefined ? {} : { model: preferred }),
+                },
+                where,
+            );
 
-            try {
-                started = await host.linkedSessions.start(
-                    api.conversationId,
-                    {
-                        title: `${persona.name}: ${title}`.slice(0, 120),
-                        message:
-                            shift === undefined
-                                ? taskText(persona, firstTask, worktree)
-                                : delegatedText(persona, firstTask, shift.request, worktree),
-                        ...(where === undefined ? {} : { cwd: where }),
-                        ...(preferred === undefined ? {} : { model: preferred }),
-                    },
-                    key,
-                );
-            } catch (error) {
-                if (desk !== undefined) {
-                    try {
-                        await api.commit(
-                            async (tx) => desk.fail(tx, key, (error as Error).message, Date.now()),
-                            context,
-                        );
-                        desk.changed?.();
-                    } catch {
-                        // The start's refusal is what the model must see: the desk can mark the thread later.
-                    }
-                }
-
+            if ("error" in started) {
                 throw new Error(
-                    `${(error as Error).message} Do not delegate on another model: stop and tell the user.`,
+                    `${started.error} Do not delegate on another model: stop and tell the user.`,
                 );
             }
 

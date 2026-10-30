@@ -691,3 +691,9 @@ Each line below differs from the design above, and says why.
 - **The answer wake-up's checkpoint holds `messages`** (`{ text, requestId, keys }[]`): a batch over 15000 characters
   goes as several messages, each with its own keys, and a message that fails gives its keys back, so its answers go
   again.
+- **A failed start of a task thread is an unknown outcome**: Pocket can admit the first message and still throw, so
+  Team tries the start once more with the same key (Pocket reuses a session it made), and the task goes back to
+  `ready` only when the session list proves that no session runs in its folder. Otherwise, and after the sweep's
+  1-hour starting limit, the task stays `delegated` with 1 event on the plan thread: a second worker for 1 task is
+  worse than a task that waits for a person (PR 2's `revise` ends it). A replay of a delegation whose thread closed
+  before any session was bound starts no session.

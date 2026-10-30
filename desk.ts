@@ -1204,11 +1204,35 @@ export function routeThread(state: DeskState, key: string, route: ThreadRoute): 
 }
 
 /** Close a thread whose linked session did not start. */
+/**
+ * The event of a task thread whose start threw, when a session may still run: the task stays delegated, and Brian
+ * looks at the session list.
+ */
+export function planTaskUnclear(
+    planThread: Thread,
+    taskId: string,
+    threadId: string,
+    at: number,
+): boolean {
+    return addEvent(
+        planThread,
+        `plan-task-unclear:${taskId}:${threadId}`,
+        `${taskId}: the start of ${threadId} failed, and a session may run: the task stays delegated. Look at the session list.`,
+        at,
+    );
+}
+
+/**
+ * Close a thread whose linked session did not start. `admitted` says whether a session may run for it: `"no"` when the
+ * caller read the session list and found none in its folder. A task thread ends its attempt and makes its task ready
+ * again only then; a session that may run keeps the task delegated, with 1 event on the plan thread.
+ */
 export function failThread(
     state: DeskState,
     key: string,
     why: string,
     at: number,
+    options: { admitted?: "no" | "unknown" } = {},
 ): Thread | undefined {
     const thread = findThread(state, key);
 
@@ -1228,7 +1252,7 @@ export function failThread(
     thread.closed = { at, why: "failed", by: "desk" };
     addEvent(thread, "failed", `failed: ${oneLine(why)}`, at);
 
-    // A task thread whose start failed: its attempt ends, and the task is ready for a new delegation.
+    // A task thread whose start failed: only a session list that proves none runs ends its attempt.
     const named = thread.planTask;
 
     if (named !== undefined) {
@@ -1236,17 +1260,19 @@ export function failThread(
         const graph = plan === undefined ? undefined : approvedGraphOf(plan);
         const task = graph?.tasks.find((each) => each.id === named.task);
         const attempt = task?.attempts.findLast((each) => each.thread === thread.id);
+        const planThread = threadById(state, plan?.thread ?? "");
 
-        if (attempt !== undefined) {
+        if (
+            options.admitted === "no" &&
+            task !== undefined &&
+            attempt !== undefined &&
+            task.attempts.at(-1) === attempt
+        ) {
             attempt.end = { at, how: "stopped" };
-        }
 
-        if (task !== undefined && attempt !== undefined && task.attempts.at(-1) === attempt) {
             if (task.state === "delegated") {
                 task.state = "ready";
             }
-
-            const planThread = threadById(state, plan?.thread ?? "");
 
             if (planThread !== undefined) {
                 addEvent(
@@ -1256,6 +1282,8 @@ export function failThread(
                     at,
                 );
             }
+        } else if (planThread !== undefined) {
+            planTaskUnclear(planThread, named.task, thread.id, at);
         }
     }
 
@@ -12435,7 +12463,14 @@ export type DeskApi = {
         warning?: string;
     }>;
     bind: (tx: Tx, key: string, binding: BindRequest) => Promise<Thread | undefined>;
-    fail: (tx: Tx, key: string, why: string, at: number) => Promise<void>;
+    /** Fail a start. `admitted` says whether a session may run for it: see `failThread`. */
+    fail: (
+        tx: Tx,
+        key: string,
+        why: string,
+        at: number,
+        options?: { admitted?: "no" | "unknown" },
+    ) => Promise<void>;
     /** Record the model router's suggestion, once: a replay changes nothing. */
     route: (tx: Tx, key: string, route: ThreadRoute) => Promise<void>;
     file: (
@@ -12467,6 +12502,15 @@ export type DeskApi = {
      * a task delivery. An older desk has none: skip the call.
      */
     publishPlans?: (api: PlanCommitApi, context: Context) => Promise<void>;
+    /**
+     * Whether a desk thread holds a folder: any thread, in any state, whose worktree or folder is `path`. A delegation
+     * keeps its worktree when a thread holds it. An older desk has none: a caller then keeps the worktree.
+     */
+    worktreeHeld?: (
+        read: Pick<DocumentReader, "snapshot">,
+        context: Context,
+        path: string,
+    ) => Promise<boolean>;
 };
 
 // ─── PocketJournal: 1 daily note of finished work, in frostnotes ────────────
@@ -13498,10 +13542,10 @@ export default function createDesk(host: Host, web: Web) {
         route: async (tx, key, route) => {
             routeThread(await tx.doc(DeskThreads), key, route);
         },
-        fail: async (tx, key, why, at) => {
+        fail: async (tx, key, why, at, options) => {
             const state = await tx.doc(DeskThreads);
 
-            failThread(state, key, why, at);
+            failThread(state, key, why, at, options);
 
             // A start that did not happen gives its OK back.
             for (const grant of state.grants) {
@@ -13725,6 +13769,13 @@ export default function createDesk(host: Host, web: Web) {
             return found === undefined ? undefined : { ...found };
         },
         changed: () => web.send("changed", {}),
+        worktreeHeld: async (read, context, path) => {
+            const state = await read.snapshot(DeskThreads, context);
+
+            return Object.values(state?.threads ?? {}).some(
+                (thread) => thread.worktree?.path === path || thread.cwd === path,
+            );
+        },
         plans: true,
         publishPlans: async (api, context) => {
             await publishAll(accessOf(api, context));
@@ -16121,6 +16172,17 @@ export default function createDesk(host: Host, web: Web) {
 
                 if (addEvent(thread, `failed:${String(now)}`, "the session never started", now)) {
                     events += 1;
+                }
+
+                // A task thread that timed out: a session may run, so its task stays delegated, with 1 event.
+                const named = thread.planTask;
+                const plan = named === undefined ? undefined : planOf(state, named.plan);
+                const planThread = plan === undefined ? undefined : threadById(state, plan.thread);
+
+                if (named !== undefined && planThread !== undefined) {
+                    if (planTaskUnclear(planThread, named.task, thread.id, now)) {
+                        events += 1;
+                    }
                 }
             } else {
                 thread.closed = {
