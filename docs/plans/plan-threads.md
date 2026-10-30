@@ -3,7 +3,8 @@
 Status: design only, no code. Brian asked for it on 2026-10-30 (T547a), after Odrade's report on
 githubnext/chopin (`~/agents/odrade/reports/2026-10-30-chopin/README.md`, Chopin commit `3548849`). Chopin is
 MIT; this design borrows its ideas (decision records, findings, a build gate, an approved revision, a task graph,
-a whole-graph check). It copies no code. Section 12 holds the decisions Brian must make.
+a whole-graph check). It copies no code. Brian decided 4 of the 8 questions in section 12 on 2026-10-30 (T548a to
+T548d); the other 4 stay open.
 
 ## 1. The gap
 
@@ -53,11 +54,11 @@ Odrade proposed 7 points to Brian. This design keeps their aim, and changes thes
 6. **Consults cross a Pocket bound, on purpose.** Pi Pocket refuses a start from a linked session ("a linked session
    starts none"), and the planning session is linked. So the Team drop-in starts each consult **with the supervisor's
    session as its source**, and a hook makes the consult read-only. That is a deliberate exception, with its own bounds
-   (section 8). Decision 2 lets Brian choose a subagent instead.
+   (section 8). Brian chose this over a subagent (decision 2, T548b).
 7. **Design canvas comments cannot gate.** Pocket's artifact comments are stored by the Design module, and no extension
    API reads them: they reach Pi only when a person taps "Send N to Pi". The desk cannot count them, so the gate cannot
    see them. And a comment belongs to 1 artifact version, so each new revision would drop the old pins. This design
-   keeps section comments in the desk (section 6), and leaves an artifact as an optional read view (decision 1).
+   keeps section comments in the desk (section 6). Brian chose the Desk page view (decision 1, T548a).
 
 ## 4. Data model
 
@@ -532,8 +533,8 @@ and findings as data.
 - **No nesting.** A consult session is not a planning session: `plan consult` refuses it, and the hook blocks `team`,
   `subagent` and `team_work`. A consult is not a desk thread, and does not count toward the cap.
 - **What it costs Pocket's rules.** "A linked session starts none" is a core bound. This design keeps it for Pi's own
-  `team` tool, and crosses it only through 1 extension tool with the bounds above. Decision 2 lets Brian keep the
-  bound whole instead.
+  `team` tool, and crosses it only through 1 extension tool with the bounds above. Brian accepted this exception
+  (decision 2, T548b).
 - **A human expert** (Ben, for example) is not a consult: the planning session can use Pocket's **Ask someone**, and
   Brian pastes the answer back. A later kind of finding can record it.
 
@@ -568,7 +569,7 @@ When every task is `done`, the desk sets `verifying` and sends `plan-verify` at 
 - No multiplayer editing, no live co-writing agent on the page, no MCP endpoint, no Chopin code or service.
 - No approval, merge, tag, release, label change or issue close by a bot. Approve is Brian's tap only, never chat
   words relayed by Odrade.
-- No delegation by the desk itself (decision 4 can change this).
+- No delegation by the desk itself: Odrade delegates (decision 4, T548d).
 - No research on the web or in a codebase as a finding kind in the MVP: only consults.
 - No change to Pi Pocket's core, and no local patch: all of it is in this repository's drop-ins.
 - No replacement for ADRs or `docs/plans` in repositories: a plan can have a task that writes one.
@@ -577,26 +578,22 @@ When every task is `done`, the desk sets `verifying` and sends `plan-verify` at 
 
 ## 12. Decisions for Brian
 
-The recommended option is first in each list.
+### 12.1 Decided (Brian, 2026-10-30)
 
-1. **The phone view.**
-    - a. A Desk page plan view, with section comments in the desk: the gate sees them.
-    - b. An HTML artifact with `data-pid` per section and Pocket's comments: no new UI, but the gate cannot see
-      comments.
-    - c. Both: the page is the truth; the planning session publishes a read-only artifact on request.
-2. **Consults.**
-    - a. A Team tool starts them under the supervisor's session, read-only by a hook.
-    - b. A subagent of the planning session, with the expert's profile in its brief: no home, no memory, and no Pocket
-      bound crossed.
-    - c. Odrade relays each consult by hand, with `team_delegate` to the expert's home.
-3. **The plan store.**
-    - a. `~/agents/odrade/desk/plans/`, written only by the desk, committed with the export.
-    - b. The lead's home, `plans/`: only Odrade's home is a git repository today, so a revision has no history.
-    - c. A PR in the lead's repository (`docs/plans/`): a review for each revision is heavy on a phone.
-4. **Who delegates after the approval.**
-    - a. Odrade, at once on `plan-approved`, inside the cap.
-    - b. The desk, by itself, for each ready task.
-    - c. Brian taps "Start" for each task on the page.
+1. **The phone view: a Desk page plan view**, with section comments in the desk, so the gate sees them (T548a). Not
+   chosen: an HTML artifact with `data-pid` and Pocket's comments (the gate cannot read them), or both.
+2. **Consults: a Team tool starts them under the supervisor's session, read-only by a hook** (T548b), with the bounds
+   of section 8. Not chosen: a subagent with the expert's profile, or Odrade relaying each consult by hand.
+3. **The plan store: `~/agents/odrade/desk/plans/`, written only by the desk** (T548c), with the revision store of
+   section 4.4, committed with the export. Not chosen: the lead's home, or a PR in the lead's repository.
+4. **Delegation after the approval: Odrade delegates at once on `plan-approved`, inside the cap** (T548d). Not
+   chosen: the desk by itself, or a tap for each task.
+
+### 12.2 Open
+
+The recommended option is first in each list. Only decision 6 touches PR 1 (PR 1 opens plan threads, so it must
+know whether they count toward the cap). Decisions 5, 7 and 8 touch PR 2.
+
 5. **A scope change.**
     - a. It stops only the tasks it names.
     - b. It stops every open task of the plan.
@@ -635,8 +632,8 @@ The MVP is 3 PRs. Each one is tested with the Pi Pocket test harness and fixture
    (Pocket's envelope, not a bare fixture): a tool call before the start returns is blocked; an unknown
    nonce is blocked; a second finding is refused; every tool is blocked after the finding.
 
-Later, by need: findings from web research or a codebase spike; the artifact read view (decision 1c); a criteria
-matrix for asks outside plans.
+Later, by need: findings from web research or a codebase spike; a criteria matrix for asks outside plans. No artifact
+view is planned (decision 1).
 
 ## 14. Security
 
