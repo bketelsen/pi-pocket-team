@@ -1223,16 +1223,14 @@ export function planTaskUnclear(
 }
 
 /**
- * Close a thread whose linked session did not start. `admitted` says whether a session may run for it: `"no"` when the
- * caller read the session list and found none in its folder. A task thread ends its attempt and makes its task ready
- * again only then; a session that may run keeps the task delegated, with 1 event on the plan thread.
+ * Close a thread whose linked session did not start. A thrown start is no proof that no session runs: a task thread's
+ * task stays delegated, with its attempt open, and the plan thread gets 1 event.
  */
 export function failThread(
     state: DeskState,
     key: string,
     why: string,
     at: number,
-    options: { admitted?: "no" | "unknown" } = {},
 ): Thread | undefined {
     const thread = findThread(state, key);
 
@@ -1252,37 +1250,14 @@ export function failThread(
     thread.closed = { at, why: "failed", by: "desk" };
     addEvent(thread, "failed", `failed: ${oneLine(why)}`, at);
 
-    // A task thread whose start failed: only a session list that proves none runs ends its attempt.
+    // A task thread whose start failed: a session may run, so the task stays delegated, with 1 event.
     const named = thread.planTask;
 
     if (named !== undefined) {
         const plan = planOf(state, named.plan);
-        const graph = plan === undefined ? undefined : approvedGraphOf(plan);
-        const task = graph?.tasks.find((each) => each.id === named.task);
-        const attempt = task?.attempts.findLast((each) => each.thread === thread.id);
-        const planThread = threadById(state, plan?.thread ?? "");
+        const planThread = plan === undefined ? undefined : threadById(state, plan.thread);
 
-        if (
-            options.admitted === "no" &&
-            task !== undefined &&
-            attempt !== undefined &&
-            task.attempts.at(-1) === attempt
-        ) {
-            attempt.end = { at, how: "stopped" };
-
-            if (task.state === "delegated") {
-                task.state = "ready";
-            }
-
-            if (planThread !== undefined) {
-                addEvent(
-                    planThread,
-                    `plan-task-failed:${named.task}:${thread.id}`,
-                    `${named.task}: the start of ${thread.id} failed; the task is ready again`,
-                    at,
-                );
-            }
-        } else if (planThread !== undefined) {
+        if (planThread !== undefined) {
             planTaskUnclear(planThread, named.task, thread.id, at);
         }
     }
@@ -12463,14 +12438,7 @@ export type DeskApi = {
         warning?: string;
     }>;
     bind: (tx: Tx, key: string, binding: BindRequest) => Promise<Thread | undefined>;
-    /** Fail a start. `admitted` says whether a session may run for it: see `failThread`. */
-    fail: (
-        tx: Tx,
-        key: string,
-        why: string,
-        at: number,
-        options?: { admitted?: "no" | "unknown" },
-    ) => Promise<void>;
+    fail: (tx: Tx, key: string, why: string, at: number) => Promise<void>;
     /** Record the model router's suggestion, once: a replay changes nothing. */
     route: (tx: Tx, key: string, route: ThreadRoute) => Promise<void>;
     file: (
@@ -13542,10 +13510,10 @@ export default function createDesk(host: Host, web: Web) {
         route: async (tx, key, route) => {
             routeThread(await tx.doc(DeskThreads), key, route);
         },
-        fail: async (tx, key, why, at, options) => {
+        fail: async (tx, key, why, at) => {
             const state = await tx.doc(DeskThreads);
 
-            failThread(state, key, why, at, options);
+            failThread(state, key, why, at);
 
             // A start that did not happen gives its OK back.
             for (const grant of state.grants) {

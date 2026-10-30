@@ -373,18 +373,16 @@ export function closedThreadRefusal(
 }
 
 /**
- * The session-list check of a failed start: `"no"` only when the list was read and no session of this one uses `where`
- * (an entry with no folder counts as in use). Every other case is `"unknown"`: a session may run.
+ * The session a reused desk thread already bound: a replay of a start that worked uses it, and Pocket's start is not
+ * called again (its message would not go twice, and nothing new must start).
  */
-export function admittedBy(
-    list: readonly { cwd?: string }[] | undefined,
-    where: string | undefined,
-): "no" | "unknown" {
-    if (list === undefined || where === undefined) {
-        return "unknown";
-    }
-
-    return worktreeInUse(list, where) ? "unknown" : "no";
+export function replayedStart(
+    thread: { session?: number; address?: string },
+    reused: boolean,
+): { session: number; address: string } | undefined {
+    return reused && thread.session !== undefined && thread.address !== undefined
+        ? { session: thread.session, address: thread.address }
+        : undefined;
 }
 
 /**
@@ -1707,6 +1705,8 @@ export default function createTeam(host: Host, web: Web) {
         closed?: { why: string };
         /** The linked session the thread bound: a closed thread with one was a start that worked. */
         session?: number;
+        /** The supervisor's address for it: a replay of a start that worked sends nothing again. */
+        address?: string;
         watch?: { checkOn: string; checkTime?: string };
     };
     type DeskApi = {
@@ -1740,14 +1740,7 @@ export default function createTeam(host: Host, web: Web) {
             key: string,
             binding: { session: number; address: string; at: number },
         ) => Promise<DeskThread | undefined>;
-        /** Fail a start. `admitted` says whether a session may run for it: see the desk's `failThread`. */
-        fail: (
-            tx: Tx,
-            key: string,
-            why: string,
-            at: number,
-            options?: { admitted?: "no" | "unknown" },
-        ) => Promise<void>;
+        fail: (tx: Tx, key: string, why: string, at: number) => Promise<void>;
         /**
          * Record the model router's suggestion on the thread, once: a replay changes nothing. An older desk has none:
          * skip the call.
@@ -2482,56 +2475,37 @@ export default function createTeam(host: Host, web: Web) {
             const key = `x.team.delegate:${api.taskId}:${api.callId}`;
             const desk = deskApi();
 
-            /** `"no"` only when the session list was read and no session of this one uses `where`. */
-            const admittedHere = async (where: string | undefined): Promise<"no" | "unknown"> => {
-                try {
-                    return admittedBy(await host.linkedSessions.list(api.conversationId), where);
-                } catch {
-                    return "unknown";
-                }
-            };
-
             /**
-             * Start a linked session, with 1 more try when the call throws: Pocket is idempotent by the key, so the
-             * second call gives back the session the first may have made. A double failure fails the desk thread with
-             * the decision on whether a session may run, and gives back the error.
+             * Start a linked session. A thrown start is an unknown outcome: Pocket may have admitted the first message,
+             * so the desk thread is failed with the reason, and a thread's task stays delegated.
              */
-            const startLinked = async (
-                request: { title: string; message: string; cwd?: string; model?: string },
-                where: string | undefined,
-            ): Promise<{ session: ConversationId; address: string } | { error: string }> => {
-                let failure = "The session did not start.";
-
-                for (let at = 0; at < 2; at += 1) {
-                    try {
-                        const started = await host.linkedSessions.start(
-                            api.conversationId,
-                            request,
-                            key,
-                        );
-
-                        return {
-                            session: started.session as ConversationId,
-                            address: started.address,
-                        };
-                    } catch (error) {
-                        failure = (error as Error).message;
-                    }
-                }
-
-                const admitted = await admittedHere(where);
-
+            const startLinked = async (request: {
+                title: string;
+                message: string;
+                cwd?: string;
+                model?: string;
+            }): Promise<{ session: ConversationId; address: string } | { error: string }> => {
                 try {
-                    await api.commit(
-                        async (tx) => desk?.fail(tx, key, failure, Date.now(), { admitted }),
-                        context,
+                    const started = await host.linkedSessions.start(
+                        api.conversationId,
+                        request,
+                        key,
                     );
-                    desk?.changed?.();
-                } catch {
-                    // The start's refusal is what the model must see: the desk marks the thread later.
-                }
 
-                return { error: failure };
+                    return { session: started.session as ConversationId, address: started.address };
+                } catch (error) {
+                    try {
+                        await api.commit(
+                            async (tx) => desk?.fail(tx, key, (error as Error).message, Date.now()),
+                            context,
+                        );
+                        desk?.changed?.();
+                    } catch {
+                        // The start's refusal is what the model must see: the desk marks the thread later.
+                    }
+
+                    return { error: (error as Error).message };
+                }
             };
 
             /**
@@ -2620,20 +2594,15 @@ export default function createTeam(host: Host, web: Web) {
 
                 // The owner's profile names the model, and the owner's allowed list permits it.
                 const preferred = allowedModel(persona);
-                const started = await startLinked(
-                    {
-                        title: `${persona.name}: plan ${title}`.slice(0, 120),
-                        message: taskText(
-                            persona,
-                            `${opened?.plan?.brief ?? ""}
-
-${task}`,
-                        ),
-                        cwd: persona.home,
-                        ...(preferred === undefined ? {} : { model: preferred }),
-                    },
-                    persona.home,
-                );
+                const request = {
+                    title: `${persona.name}: plan ${title}`.slice(0, 120),
+                    message: taskText(persona, `${opened?.plan?.brief ?? ""}\n\n${task}`),
+                    cwd: persona.home,
+                    ...(preferred === undefined ? {} : { model: preferred }),
+                };
+                const replay =
+                    opened === undefined ? undefined : replayedStart(opened.thread, opened.reused);
+                const started = replay ?? (await startLinked(request));
 
                 if ("error" in started) {
                     throw new Error(
@@ -2800,18 +2769,18 @@ ${task}`,
             const preferred = allowedModel(persona);
             // A plan's brief comes before the task: a delivery names the plan, its task and its acceptance lines.
             const firstTask = opened?.plan === undefined ? task : `${opened.plan.brief}\n\n${task}`;
-            const started = await startLinked(
-                {
-                    title: `${persona.name}: ${title}`.slice(0, 120),
-                    message:
-                        shift === undefined
-                            ? taskText(persona, firstTask, worktree)
-                            : delegatedText(persona, firstTask, shift.request, worktree),
-                    ...(where === undefined ? {} : { cwd: where }),
-                    ...(preferred === undefined ? {} : { model: preferred }),
-                },
-                where,
-            );
+            const request = {
+                title: `${persona.name}: ${title}`.slice(0, 120),
+                message:
+                    shift === undefined
+                        ? taskText(persona, firstTask, worktree)
+                        : delegatedText(persona, firstTask, shift.request, worktree),
+                ...(where === undefined ? {} : { cwd: where }),
+                ...(preferred === undefined ? {} : { model: preferred }),
+            };
+            const replay =
+                opened === undefined ? undefined : replayedStart(opened.thread, opened.reused);
+            const started = replay ?? (await startLinked(request));
 
             if ("error" in started) {
                 throw new Error(

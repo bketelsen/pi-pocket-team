@@ -33,10 +33,10 @@ import {
 } from "./_pocket/test/helpers.ts";
 import { createHandler } from "./_pocket/src/server/http.ts";
 import {
-    admittedBy,
     closedThreadRefusal,
     delegationWorktree,
     discardRefusedWorktree,
+    replayedStart,
 } from "./team.ts";
 import type { ConversationId } from "@earendil-works/pi-durable";
 import {
@@ -3055,7 +3055,7 @@ describe("the idea's own text", () => {
 });
 
 describe("a task whose start failed", () => {
-    test("its attempt ends, the task is ready, and a new delivery opens a second attempt", () => {
+    test("a failed start changes no task, and adds 1 event", () => {
         const { state, graph } = approvedPlan();
 
         other(state, "T5");
@@ -3066,24 +3066,16 @@ describe("a task whose start failed", () => {
         const task = graph.tasks[0] ?? assert.fail("a task");
 
         assert.equal(task.state, "delegated");
+        assert(failThread(state, "x.test:T5", "it did not start", tick(5)));
 
-        assert(failThread(state, "x.test:T5", "it did not start", tick(5), { admitted: "no" }));
-
-        assert.deepEqual(task.attempts[0]?.end, { at: tick(5), how: "stopped" });
-        assert.equal(task.state, "ready");
+        // Pocket may have admitted the first message: a failed start proves nothing, so the task keeps its attempt.
+        assert.equal(task.state, "delegated");
+        assert.equal(task.attempts[0]?.end, undefined);
+        assert.equal(state.threads.T5?.state, "closed");
         assert.equal(
             state.threads.T1?.events.at(-1)?.text,
-            "t1: the start of T5 failed; the task is ready again",
+            "t1: the start of T5 failed, and a session may run: the task stays delegated. Look at the session list.",
         );
-
-        // A new delegation, with a new call, opens a second attempt.
-        other(state, "T6");
-        (state.threads.T6 ?? assert.fail("a thread")).state = "starting";
-
-        assert(!("error" in startTask(state, "T1", "t1", "T6", tick(6))));
-        assert.equal(task.attempts.length, 2);
-        assert.equal(task.state, "delegated");
-        assert.deepEqual(state.threads.T6?.planTask, { plan: "T1", task: "t1" });
     });
 
     test("a closed thread without a session that a call reuses is refused", () => {
@@ -3112,17 +3104,15 @@ describe("a task whose start failed", () => {
         assert.equal(closedThreadRefusal({ id: "T5", state: "open" }, true), undefined);
     });
 
-    test("a start that threw is admitted only when the session list proves it is not", () => {
-        assert.equal(admittedBy(undefined, "/work/a"), "unknown", "the list was not read");
-        assert.equal(admittedBy([], "/work/a"), "no", "the list has no session in the folder");
-        assert.equal(admittedBy([{ cwd: "/work/b" }], "/work/a"), "no");
-        assert.equal(admittedBy([{ cwd: "/work/a" }], "/work/a"), "unknown", "a session is there");
-        assert.equal(
-            admittedBy([{}], "/work/a"),
-            "unknown",
-            "an entry with no folder counts as in use",
-        );
-        assert.equal(admittedBy([], undefined), "unknown", "no folder to check");
+    test("a replay of a start that worked uses the session the desk bound", () => {
+        assert.deepEqual(replayedStart({ session: 7, address: "session-a" }, true), {
+            session: 7,
+            address: "session-a",
+        });
+        assert.equal(replayedStart({ session: 7, address: "session-a" }, false), undefined);
+        assert.equal(replayedStart({ session: 7 }, true), undefined);
+        assert.equal(replayedStart({ address: "session-a" }, true), undefined);
+        assert.equal(replayedStart({}, true), undefined);
     });
 });
 
@@ -3138,23 +3128,6 @@ describe("a start whose outcome is unknown", () => {
 
         return { state, graph };
     }
-
-    test("an unknown outcome changes no task, and adds 1 event", () => {
-        for (const options of [{ admitted: "unknown" as const }, {}]) {
-            const { state, graph } = delivered();
-            const task = graph.tasks[0] ?? assert.fail("a task");
-
-            assert(failThread(state, "x.test:T5", "it did not start", tick(5), options));
-
-            assert.equal(task.state, "delegated");
-            assert.equal(task.attempts[0]?.end, undefined);
-            assert.equal(state.threads.T5?.state, "closed");
-            assert.equal(
-                state.threads.T1?.events.at(-1)?.text,
-                "t1: the start of T5 failed, and a session may run: the task stays delegated. Look at the session list.",
-            );
-        }
-    });
 
     test("the same event comes once from the sweep's path, and changes no task", () => {
         const { state, graph } = delivered();

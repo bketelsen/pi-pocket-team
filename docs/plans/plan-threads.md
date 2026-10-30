@@ -692,8 +692,8 @@ Each line below differs from the design above, and says why.
   goes as several messages, each with its own keys, and a message that fails gives its keys back, so its answers go
   again.
 - **A failed start of a task thread is an unknown outcome**: Pocket can admit the first message and still throw, so
-  Team tries the start once more with the same key (Pocket reuses a session it made), and the task goes back to
-  `ready` only when the session list proves that no session runs in its folder. Otherwise, and after the sweep's
-  1-hour starting limit, the task stays `delegated` with 1 event on the plan thread: a second worker for 1 task is
-  worse than a task that waits for a person (PR 2's `revise` ends it). A replay of a delegation whose thread closed
-  before any session was bound starts no session.
+  the desk never treats a failed start as proof that no worker runs. The task stays `delegated` with 1 event on the
+  plan thread, after a thrown start and after the sweep's 1-hour starting limit: a second worker for 1 task is worse
+  than a task that waits for a person (PR 2's `revise` ends it). A replay of a start that worked uses the session the
+  desk bound, and never calls Pocket's start again; a replay of a thread that closed before any session was bound
+  starts no session.
