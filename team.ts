@@ -369,7 +369,23 @@ export function closedThreadRefusal(
         return undefined;
     }
 
-    return `This delegation's thread ${thread.id} is closed (${thread.closed?.why ?? "failed"}): start it again with a new team_delegate call.`;
+    return `This delegation's thread ${thread.id} closed (${thread.closed?.why ?? "failed"}) before a session was bound. Read it with desk read ${thread.id}. For a plan task, the task stays delegated until a person decides.`;
+}
+
+/**
+ * What a delegation call does with the thread its key made: `"replay"` when a session is bound (nothing starts again),
+ * `"refuse"` when it closed before any session was bound, else `"go"`.
+ */
+export function replayDecision(thread: {
+    state?: string;
+    session?: number;
+    address?: string;
+}): "replay" | "refuse" | "go" {
+    if (thread.session !== undefined && thread.address !== undefined) {
+        return "replay";
+    }
+
+    return thread.state === "closed" ? "refuse" : "go";
 }
 
 /**
@@ -1809,6 +1825,24 @@ export default function createTeam(host: Host, web: Web) {
             context: Context,
             path: string,
         ) => Promise<boolean>;
+        /**
+         * The thread a delegation key made, as a copy, or none: a replay of that call reads it first, so it sets nothing
+         * up again. An older desk has none.
+         */
+        threadOfKey?: (
+            read: Pick<DocumentReader, "snapshot">,
+            context: Context,
+            key: string,
+        ) => Promise<
+            | {
+                  id: string;
+                  state: string;
+                  session?: number;
+                  address?: string;
+                  closed?: { why: string };
+              }
+            | undefined
+        >;
         /** This desk knows plans. An older desk has none. */
         plans?: true;
         /** Publish every plan whose write is not in its file yet. An older desk has none: skip the call. */
@@ -2523,6 +2557,28 @@ export default function createTeam(host: Host, web: Web) {
                 }
             };
 
+            /**
+             * A replay of a call whose session is bound does no setup again: no worktree, no open, no start, no bind.
+             * A thread that closed before any session was bound is refused. No `threadOfKey` (an older desk): go on.
+             */
+            const known =
+                desk?.threadOfKey === undefined
+                    ? undefined
+                    : await desk.threadOfKey(api, context, key);
+            const early = known === undefined ? "go" : replayDecision(known);
+
+            if (early === "refuse" && known !== undefined) {
+                throw new Error(closedThreadRefusal(known, true));
+            }
+
+            if (early === "replay" && known !== undefined) {
+                return reply(
+                    starting
+                        ? `Plan ${known.id}: ${persona.name} leads it at ${known.address ?? ""} (a replay of this call). Nothing started again.`
+                        : `Assigned to ${persona.name} at ${known.address ?? ""} (a replay of this call: thread ${known.id}). Nothing started again.`,
+                );
+            }
+
             if (persona.role === "clerk") {
                 // A Clerk is 1 long-lived session with no desk thread: neither option has anything to attach to.
                 if (night_shift !== undefined) {
@@ -2607,6 +2663,13 @@ export default function createTeam(host: Host, web: Web) {
                 if ("error" in started) {
                     throw new Error(
                         `${started.error} Do not delegate on another model: stop and tell the user.`,
+                    );
+                }
+
+                // A bound session from a replay: nothing starts again, and nothing is bound twice.
+                if (replay !== undefined && opened !== undefined) {
+                    return reply(
+                        `Plan ${opened.thread.id}: ${persona.name} leads it at ${replay.address} (a replay of this call). Nothing started again.`,
                     );
                 }
 
@@ -2785,6 +2848,13 @@ export default function createTeam(host: Host, web: Web) {
             if ("error" in started) {
                 throw new Error(
                     `${started.error} Do not delegate on another model: stop and tell the user.`,
+                );
+            }
+
+            // A bound session from a replay: no bind, no route and no goal again.
+            if (replay !== undefined && opened !== undefined) {
+                return reply(
+                    `Assigned to ${persona.name} at ${replay.address} (a replay of this call: thread ${opened.thread.id}). Nothing started again.`,
                 );
             }
 

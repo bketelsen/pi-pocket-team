@@ -36,6 +36,7 @@ import {
     closedThreadRefusal,
     delegationWorktree,
     discardRefusedWorktree,
+    replayDecision,
     replayedStart,
 } from "./team.ts";
 import type { ConversationId } from "@earendil-works/pi-durable";
@@ -3079,18 +3080,18 @@ describe("a task whose start failed", () => {
     });
 
     test("a closed thread without a session that a call reuses is refused", () => {
+        const words = (why: string): string =>
+            `This delegation's thread T5 closed (${why}) before a session was bound. Read it with desk read T5. For a plan task, the task stays delegated until a person decides.`;
+
         assert.equal(
             closedThreadRefusal({ id: "T5", state: "closed", closed: { why: "failed" } }, true),
-            "This delegation's thread T5 is closed (failed): start it again with a new team_delegate call.",
+            words("failed"),
         );
-        assert.equal(
-            closedThreadRefusal({ id: "T5", state: "closed" }, true),
-            "This delegation's thread T5 is closed (failed): start it again with a new team_delegate call.",
-        );
+        assert.equal(closedThreadRefusal({ id: "T5", state: "closed" }, true), words("failed"));
         // Never bound: refused, whatever the close reason.
         assert.equal(
             closedThreadRefusal({ id: "T5", state: "closed", closed: { why: "done" } }, true),
-            "This delegation's thread T5 is closed (done): start it again with a new team_delegate call.",
+            words("done"),
         );
         // A session: a start that worked, and Pocket gives the same session back.
         assert.equal(
@@ -3102,6 +3103,23 @@ describe("a task whose start failed", () => {
         );
         assert.equal(closedThreadRefusal({ id: "T5", state: "closed" }, false), undefined);
         assert.equal(closedThreadRefusal({ id: "T5", state: "open" }, true), undefined);
+    });
+
+    test("a call's thread is a replay, a refusal, or work to do", () => {
+        assert.equal(replayDecision({ state: "open", session: 7, address: "session-a" }), "replay");
+        assert.equal(
+            replayDecision({ state: "closed", session: 7, address: "session-a" }),
+            "replay",
+            "a start that worked, closed later: Pocket gives the same session back",
+        );
+        assert.equal(replayDecision({ state: "closed" }), "refuse");
+        assert.equal(
+            replayDecision({ state: "closed", session: 7 }),
+            "refuse",
+            "no address is no bound session",
+        );
+        assert.equal(replayDecision({ state: "starting" }), "go");
+        assert.equal(replayDecision({ state: "open" }), "go");
     });
 
     test("a replay of a start that worked uses the session the desk bound", () => {
@@ -3984,5 +4002,43 @@ describe("with the Pi Pocket app", () => {
         assert.equal(dropped.status, 200);
         assert.equal((await planSnapshot())?.state, "dropped");
         assert.equal((await planThread())?.state, "closed");
+    });
+
+    test("the desk gives a thread by its delegation key, with the session it bound", async () => {
+        const state = await deskSnapshot();
+        const task = Object.values(state?.threads ?? {}).find(
+            (each) => each.planTask?.plan === planId,
+        );
+
+        assert(task, "the task thread is there");
+
+        const desk = (
+            globalThis as unknown as Record<
+                symbol,
+                | {
+                      threadOfKey?: (
+                          read: unknown,
+                          context: unknown,
+                          key: string,
+                      ) => Promise<Record<string, unknown> | undefined>;
+                  }
+                | undefined
+            >
+        )[Symbol.for("pi-pocket-team.desk")];
+
+        assert(desk?.threadOfKey, "the desk gives a thread by its key");
+        const found = await desk.threadOfKey(
+            {
+                snapshot: (doc: never, ctx: never) => app.harness.snapshot(doc, ctx),
+            },
+            context,
+            task.key,
+        );
+
+        assert.equal(found?.id, task.id);
+        assert.equal(found?.state, task.state);
+        assert.equal(found?.session, task.session);
+        assert.equal(found?.address, task.address);
+        assert.equal(replayDecision(found as never), "replay", "a replay starts nothing again");
     });
 });

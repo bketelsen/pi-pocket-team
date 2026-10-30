@@ -12479,6 +12479,24 @@ export type DeskApi = {
         context: Context,
         path: string,
     ) => Promise<boolean>;
+    /**
+     * The thread a delegation key made, as a copy, or none: a replay of that call reads it before it sets anything up.
+     * No write. An older desk has none.
+     */
+    threadOfKey?: (
+        read: Pick<DocumentReader, "snapshot">,
+        context: Context,
+        key: string,
+    ) => Promise<
+        | {
+              id: string;
+              state: string;
+              session?: number;
+              address?: string;
+              closed?: { why: string };
+          }
+        | undefined
+    >;
 };
 
 // ─── PocketJournal: 1 daily note of finished work, in frostnotes ────────────
@@ -13737,6 +13755,21 @@ export default function createDesk(host: Host, web: Web) {
             return found === undefined ? undefined : { ...found };
         },
         changed: () => web.send("changed", {}),
+        threadOfKey: async (read, context, key) => {
+            const found = Object.values(
+                (await read.snapshot(DeskThreads, context))?.threads ?? {},
+            ).find((thread) => thread.key === key);
+
+            return found === undefined
+                ? undefined
+                : {
+                      id: found.id,
+                      state: found.state,
+                      ...(found.session === undefined ? {} : { session: found.session }),
+                      ...(found.address === undefined ? {} : { address: found.address }),
+                      ...(found.closed === undefined ? {} : { closed: { why: found.closed.why } }),
+                  };
+        },
         worktreeHeld: async (read, context, path) => {
             const state = await read.snapshot(DeskThreads, context);
 
