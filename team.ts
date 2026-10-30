@@ -2241,7 +2241,7 @@ export default function createTeam(host: Host, web: Web) {
                                         ],
                                         {
                                             description:
-                                                'Which checks must pass: "required" (the default), "all", or "none" with a label.',
+                                                'Which checks must pass: "required" (the default; when the repository requires no checks, all checks), "all", or "none" with a label.',
                                         },
                                     ),
                                 ),

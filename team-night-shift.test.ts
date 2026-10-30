@@ -16,12 +16,32 @@ import {
     until,
 } from "./_pocket/test/helpers.ts";
 import assert from "node:assert/strict";
-import { cpSync, mkdirSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import {
+    chmodSync,
+    cpSync,
+    mkdirSync,
+    mkdtempSync,
+    readFileSync,
+    rmSync,
+    writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
 import { fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import type { ConversationId } from "@earendil-works/pi-durable";
-import { delegatedRequest, type Goal, GoalDoc, prCheckCommand } from "./night-shift.ts";
+import {
+    checkNote,
+    delegatedRequest,
+    type Goal,
+    GoalDoc,
+    PR_CHECK_ALL_PASS,
+    PR_CHECK_NO_REQUIRED,
+    PR_CHECK_REQUIRED_PASS,
+    prCheckCommand,
+    statusCard,
+} from "./night-shift.ts";
 
 const ZONE = "America/New_York";
 
@@ -171,6 +191,12 @@ describe("delegatedRequest", () => {
 
 // ─── The PR check ───────────────────────────────────────────────────────────
 
+/** The `required` part of the command, for a `where` such as ` 12 --repo bketelsen/x`. */
+const requiredPart = (where: string) =>
+    `{ { e=$(gh pr checks${where} --required 2>&1 >&3); s=$?; } 3>&1; [ -z "$e" ] || printf '%s\\n' "$e" >&2; if [ "$s" -eq 0 ]; then echo '${PR_CHECK_REQUIRED_PASS}'; elif [ "$s" -eq 1 ] && printf '%s\\n' "$e" | grep -qx '${PR_CHECK_NO_REQUIRED}'; then gh pr checks${where} && echo '${PR_CHECK_ALL_PASS}'; else (exit "$s"); fi; }`;
+const REQ_12 = requiredPart(" 12 --repo bketelsen/x");
+const REQ_NONE = requiredPart("");
+
 describe("prCheckCommand", () => {
     const now = Date.UTC(2026, 9, 22, 3, 30);
 
@@ -182,11 +208,12 @@ describe("prCheckCommand", () => {
                 checks: "required",
                 label: "ready-for-human",
             }),
-            "gh pr checks 12 --repo bketelsen/x --required && gh pr view 12 --repo bketelsen/x --json labels --jq '.labels[].name' | grep -qxF -- 'ready-for-human'",
+            REQ_12 +
+                " && gh pr view 12 --repo bketelsen/x --json labels --jq '.labels[].name' | grep -qxF -- 'ready-for-human'",
         );
 
         // No number and no repository: `gh` reads the current branch's PR. The default is the required checks.
-        assert.equal(prCheckCommand({}), "gh pr checks --required");
+        assert.equal(prCheckCommand({}), REQ_NONE);
         assert.equal(prCheckCommand({ checks: "all" }), "gh pr checks");
         assert.equal(
             prCheckCommand({ checks: "none", label: "ready-for-human" }),
@@ -208,7 +235,8 @@ describe("prCheckCommand", () => {
         assert(!("error" in request));
         assert.equal(
             request.check,
-            "gh pr checks 12 --repo bketelsen/x --required && gh pr view 12 --repo bketelsen/x --json labels --jq '.labels[].name' | grep -qxF -- 'ready-for-human'",
+            REQ_12 +
+                " && gh pr view 12 --repo bketelsen/x --json labels --jq '.labels[].name' | grep -qxF -- 'ready-for-human'",
         );
 
         // A bad value gives no goal at all, and the error names the field.
@@ -264,6 +292,198 @@ describe("prCheckCommand", () => {
             typeof prCheckCommand({ checks: "none", label: `a${"b".repeat(49)}` }),
             "string",
         );
+    });
+});
+
+describe("prCheckCommand run with a fake gh", () => {
+    let dir = "";
+
+    before(() => {
+        dir = mkdtempSync(join(tmpdir(), "fake-gh-"));
+        writeFileSync(
+            join(dir, "gh"),
+            `#!/bin/sh
+echo "$*" >> "$FAKE_GH_LOG"
+case "$*" in
+    *"pr view"*) printf '%s\\n' "$FAKE_LABELS"; exit 0 ;;
+    *--required*) [ -z "$REQ_OUT" ] || printf '%s\\n' "$REQ_OUT"; [ -z "$REQ_ERR" ] || printf '%s\\n' "$REQ_ERR" >&2; exit "$REQ_CODE" ;;
+    *) printf '%s\\n' "$ALL_OUT"; exit "$ALL_CODE" ;;
+esac
+`,
+        );
+        chmodSync(join(dir, "gh"), 0o755);
+    });
+
+    after(() => rmSync(dir, { recursive: true, force: true }));
+
+    function run(
+        check: Parameters<typeof prCheckCommand>[0],
+        env: Record<string, string>,
+    ): { code: number | null; out: string; calls: string[] } {
+        const command = prCheckCommand(check);
+
+        assert.equal(typeof command, "string");
+
+        const log = join(dir, "log");
+
+        rmSync(log, { force: true });
+
+        const result = spawnSync("bash", ["-c", command as string], {
+            encoding: "utf8",
+            env: {
+                PATH: `${dir}:${process.env.PATH}`,
+                FAKE_GH_LOG: log,
+                FAKE_LABELS: "",
+                REQ_OUT: "",
+                REQ_ERR: "",
+                REQ_CODE: "0",
+                ALL_OUT: "",
+                ALL_CODE: "0",
+                ...env,
+            },
+        });
+        let calls: string[] = [];
+
+        try {
+            calls = readFileSync(log, "utf8").trim().split("\n");
+        } catch {
+            // No call at all.
+        }
+
+        return { code: result.status, out: result.stdout + result.stderr, calls };
+    }
+
+    // The real diagnostic of `gh pr checks --required`: on stderr, with no check rows on stdout.
+    const NO_REQUIRED = {
+        REQ_CODE: "1",
+        REQ_ERR: "no required checks reported on the 'sheeana/router-named-worker' branch",
+    };
+
+    test("required checks pass", () => {
+        const r = run({ pr: 12 }, { REQ_CODE: "0", REQ_OUT: "build\tpass" });
+
+        assert.equal(r.code, 0);
+        assert(r.out.includes(PR_CHECK_REQUIRED_PASS));
+        assert(!r.out.includes(PR_CHECK_ALL_PASS));
+        assert.equal(r.calls.length, 1);
+    });
+
+    test("a failing required check fails, and all checks are not run", () => {
+        const r = run({ pr: 12 }, { REQ_CODE: "1", REQ_OUT: "build\tfail" });
+
+        assert.equal(r.code, 1);
+        assert(r.out.includes("build\tfail"));
+        assert(!r.out.includes("pr_check:"));
+        assert.equal(r.calls.length, 1);
+        assert(r.calls.every((call) => call.includes("--required")));
+    });
+
+    test("no required checks and all pass: the fallback passes", () => {
+        const r = run({ pr: 12 }, { ...NO_REQUIRED, ALL_CODE: "0", ALL_OUT: "build\tpass" });
+
+        assert.equal(r.code, 0);
+        assert(r.out.includes(PR_CHECK_ALL_PASS));
+        assert(!r.out.includes(PR_CHECK_REQUIRED_PASS));
+        assert.equal(r.calls.length, 2);
+    });
+
+    test("no required checks and one check fails: it fails", () => {
+        const r = run({ pr: 12 }, { ...NO_REQUIRED, ALL_CODE: "1", ALL_OUT: "build\tfail" });
+
+        assert.equal(r.code, 1);
+        assert(!r.out.includes("pr_check:"));
+    });
+
+    test("pending checks keep exit code 8", () => {
+        const required = run({ pr: 12 }, { REQ_CODE: "8", REQ_OUT: "build\tpending" });
+
+        assert.equal(required.code, 8);
+        assert(!required.out.includes("pr_check:"));
+        assert.equal(required.calls.length, 1);
+
+        const all = run({ pr: 12 }, { ...NO_REQUIRED, ALL_CODE: "8", ALL_OUT: "build\tpending" });
+
+        assert.equal(all.code, 8);
+        assert(!all.out.includes("pr_check:"));
+    });
+
+    // A check name is data on stdout: it must never start the fallback, whatever it says.
+    const TRICKY = `no required checks reported on the 'x' branch\tfail`;
+
+    test("a failing required check named like the diagnostic does not start the fallback", () => {
+        const r = run({ pr: 12 }, { REQ_CODE: "1", REQ_OUT: TRICKY });
+
+        assert.equal(r.code, 1);
+        assert(!r.out.includes("pr_check:"));
+        assert.equal(r.calls.length, 1);
+        assert(r.calls[0]?.includes("--required"));
+    });
+
+    test("a pending required check named like the diagnostic does not start the fallback", () => {
+        const r = run({ pr: 12 }, { REQ_CODE: "8", REQ_OUT: TRICKY.replace("fail", "pending") });
+
+        assert.equal(r.code, 8);
+        assert(!r.out.includes("pr_check:"));
+        assert.equal(r.calls.length, 1);
+        assert(r.calls[0]?.includes("--required"));
+    });
+
+    test("exit 1 with another stderr text does not start the fallback", () => {
+        const r = run({ pr: 12 }, { REQ_CODE: "1", REQ_ERR: "gh: authentication required" });
+
+        assert.equal(r.code, 1);
+        assert(r.out.includes("gh: authentication required"));
+        assert(!r.out.includes("pr_check:"));
+        assert.equal(r.calls.length, 1);
+    });
+
+    test("a label part joins after the required part", () => {
+        const check = { pr: 12, label: "ready-for-human" };
+
+        assert.notEqual(run(check, { FAKE_LABELS: "bug" }).code, 0);
+        assert.equal(run(check, { FAKE_LABELS: "bug\nready-for-human" }).code, 0);
+        // A failing required part never reaches the label.
+        assert.equal(run(check, { REQ_CODE: "1", FAKE_LABELS: "ready-for-human" }).code, 1);
+    });
+});
+
+describe("checkNote and statusCard", () => {
+    const passed = (tail: string) => ({ passed: true, code: 0, tail });
+
+    test("checkNote gives the last pr_check line of a passing check", () => {
+        assert.equal(checkNote(passed(`build\tpass\n${PR_CHECK_ALL_PASS}\n`)), PR_CHECK_ALL_PASS);
+        assert.equal(checkNote(passed("pr_check: a\npr_check: b")), "pr_check: b");
+        assert.equal(checkNote(passed("build\tpass")), undefined);
+        assert.equal(checkNote({ passed: false, code: 1, tail: PR_CHECK_ALL_PASS }), undefined);
+        assert.equal(checkNote(undefined), undefined);
+    });
+
+    test("statusCard shows the note of a passed pr_check round", () => {
+        const goal = {
+            id: "g",
+            objective: "o",
+            stop: "s",
+            check: "gh pr checks",
+            maxRounds: 5,
+            by: "u",
+            byName: "U",
+            status: "running",
+            round: 1,
+            rounds: [
+                {
+                    n: 1,
+                    verdict: "done",
+                    reason: "x",
+                    at: 0,
+                    check: passed(PR_CHECK_REQUIRED_PASS),
+                },
+                { n: 2, verdict: "done", reason: "y", at: 0, check: passed("ok") },
+            ],
+        } as unknown as Goal;
+        const card = statusCard(goal, Date.now());
+
+        assert(card.includes(` · check passed: ${PR_CHECK_REQUIRED_PASS}`));
+        assert(/y · check passed\n/.test(card) || /y · check passed$/m.test(card));
     });
 });
 
@@ -651,7 +871,8 @@ describe("delegated goals", () => {
         assert.equal(goal.maxRounds, 1);
         assert.equal(
             goal.check,
-            "gh pr checks 12 --repo bketelsen/x --required && gh pr view 12 --repo bketelsen/x --json labels --jq '.labels[].name' | grep -qxF -- 'ready-for-human'",
+            REQ_12 +
+                " && gh pr view 12 --repo bketelsen/x --json labels --jq '.labels[].name' | grep -qxF -- 'ready-for-human'",
         );
 
         // SCENARIO-CONTINUE uses the 1 round: Pi never says DONE, so the check never runs a real gh.

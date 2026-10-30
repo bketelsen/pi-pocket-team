@@ -594,7 +594,10 @@ export type PrCheck = {
     pr?: number;
     /** The repository, `owner/name`, when the folder is not the PR's repository. Needs `pr`. */
     repo?: string;
-    /** Which checks must pass: `required` (the default), `all`, or `none` with a label. */
+    /**
+     * Which checks must pass: `required` (the default; when the repository requires no checks, all checks), `all`, or
+     * `none` with a label.
+     */
     checks?: "required" | "all" | "none";
     /** A label the PR must have, such as `ready-for-human`. */
     label?: string;
@@ -604,9 +607,24 @@ const PR_REPO = /^[A-Za-z0-9][A-Za-z0-9_.-]*\/[A-Za-z0-9][A-Za-z0-9_.-]*$/;
 /** No quotes and no shell characters: the label goes into the command inside single quotes. */
 const PR_LABEL = /^[A-Za-z0-9][A-Za-z0-9 ._:\/+-]{0,49}$/;
 
+/** Printed when the required checks pass. */
+export const PR_CHECK_REQUIRED_PASS = "pr_check: the required checks pass.";
+/** Printed when the repository requires no checks and all checks pass. */
+export const PR_CHECK_ALL_PASS =
+    "pr_check: the repository requires no checks, and all checks pass.";
+/**
+ * The grep pattern (whole line, `grep -x`) for what `gh pr checks --required` writes to stderr when the repository has
+ * no required check, for example `no required checks reported on the 'main' branch`. Check rows go to stdout, so a
+ * check name never matches.
+ */
+export const PR_CHECK_NO_REQUIRED = "no required checks reported on the .* branch";
+
 /**
  * The command for a PR check, built from validated values only: `gh pr checks` and `gh pr view`, both read only. Parts
  * are joined with ` && `, so every part must pass. A value that does not fit gives an error, never a command.
+ * `required` runs `gh pr checks --required`; only when that exits 1 and its stderr (not its stdout) says the repository
+ * has no required checks does it run `gh pr checks` (all checks). A failing or pending required check keeps its exit
+ * code. Each pass prints a line that starts with `pr_check: ` (`checkNote` reads it).
  */
 export function prCheckCommand(check: PrCheck): string | { error: string } {
     const { pr, repo, label } = check;
@@ -650,7 +668,14 @@ export function prCheckCommand(check: PrCheck): string | { error: string } {
     const parts: string[] = [];
 
     if (which === "required") {
-        parts.push(`gh pr checks${where} --required`);
+        parts.push(
+            `{ { e=$(gh pr checks${where} --required 2>&1 >&3); s=$?; } 3>&1; ` +
+                `[ -z "$e" ] || printf '%s\\n' "$e" >&2; ` +
+                `if [ "$s" -eq 0 ]; then echo '${PR_CHECK_REQUIRED_PASS}'; ` +
+                `elif [ "$s" -eq 1 ] && printf '%s\\n' "$e" | grep -qx '${PR_CHECK_NO_REQUIRED}'; ` +
+                `then gh pr checks${where} && echo '${PR_CHECK_ALL_PASS}'; ` +
+                `else (exit "$s"); fi; }`,
+        );
     }
 
     if (which === "all") {
@@ -672,6 +697,19 @@ export function prCheckCommand(check: PrCheck): string | { error: string } {
     }
 
     return command;
+}
+
+/** The last `pr_check: ` line of a passing check, else undefined. */
+export function checkNote(check: CheckResult | undefined): string | undefined {
+    if (check === undefined || !check.passed) {
+        return undefined;
+    }
+
+    return check.tail
+        .split("\n")
+        .map((line) => line.trim())
+        .filter((line) => line.startsWith("pr_check: "))
+        .at(-1);
 }
 
 /** The fields of `night_shift` in the `team_delegate` tool. */
@@ -1136,12 +1174,13 @@ export function statusCard(goal: Goal | undefined, now: number): string {
         lines.push("Rounds:");
 
         for (const round of goal.rounds.slice(-10)) {
+            const note = checkNote(round.check);
             const check =
                 round.check === undefined
                     ? ""
                     : round.check.cutOff
                       ? " · check cut off"
-                      : ` · check ${round.check.passed ? "passed" : `failed (exit ${round.check.code})`}`;
+                      : ` · check ${round.check.passed ? `passed${note === undefined ? "" : `: ${note}`}` : `failed (exit ${round.check.code})`}`;
 
             lines.push(
                 `  ${round.n}. ${VERDICT_WORD[round.verdict]}${round.reason === "" ? "" : ` ${round.reason}`}${check}`,
@@ -1283,10 +1322,18 @@ function keep(goal: Goal, round: RoundRecord): void {
 
 function stopWords(reason: StopReason, goal: Goal, detail = ""): string {
     switch (reason) {
-        case "done":
-            return goal.check === undefined
-                ? "Pi says the stop condition holds"
-                : `Pi says the stop condition holds, and \`${goal.check}\` passes`;
+        case "done": {
+            if (goal.check === undefined) {
+                return "Pi says the stop condition holds";
+            }
+
+            const note = checkNote(goal.rounds.at(-1)?.check);
+
+            return `Pi says the stop condition holds, and \`${goal.check}\` passes${
+                note === undefined ? "" : ` (${note.slice("pr_check: ".length)})`
+            }`;
+        }
+
         case "max-rounds":
             return `it used all ${goal.maxRounds} rounds`;
         case "deadline":
