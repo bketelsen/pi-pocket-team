@@ -7266,6 +7266,40 @@ function stopGate() {
     };
 }
 
+/**
+ * Run cleanup steps in order: each step runs also when an earlier one failed. With `first` (the test's own error), a
+ * failed step does not hide it: the caller rethrows `first`. With no `first`, the first failed step's error comes back.
+ */
+async function runSteps(
+    steps: readonly (() => void | Promise<void>)[],
+    first?: { error: unknown },
+): Promise<void> {
+    let failed: { error: unknown } | undefined;
+
+    for (const step of steps) {
+        try {
+            await step();
+        } catch (error) {
+            failed ??= { error };
+        }
+    }
+
+    if (first === undefined && failed !== undefined) {
+        throw failed.error;
+    }
+}
+
+/** Give `process.env` back as `saved` holds it: a name that was not set goes. */
+function restoreEnv(saved: Record<string, string | undefined>): void {
+    for (const [name, value] of Object.entries(saved)) {
+        if (value === undefined) {
+            delete process.env[name];
+        } else {
+            process.env[name] = value;
+        }
+    }
+}
+
 /** Open the app as `openApp` does, with its server log kept: `host.notice` writes each notice there. */
 const { PocketApp } = await import("./_pocket/src/server/app.ts");
 
@@ -7433,20 +7467,33 @@ before(async () => {
 });
 
 after(async () => {
-    // The environment goes back as it was before this file set it.
-    for (const [name, value] of Object.entries(envBefore)) {
-        if (value === undefined) {
-            delete process.env[name];
-        } else {
-            process.env[name] = value;
-        }
-    }
-
-    await new Promise<void>((resolve) => server?.close(() => resolve()));
-    await app?.close();
-    await new Promise<void>((resolve) => notesServer?.close(() => resolve()));
-    cleanUp();
+    // The fixture environment stays until the server, the app and the notes server have stopped completely: a task
+    // that runs during the close must never read the real settings, run the real gh, or read a real token. Each close
+    // runs also when an earlier one failed; then the environment goes back; then the fixture files go.
+    await runSteps([
+        () => new Promise<void>((resolve) => server?.close(() => resolve())),
+        async () => {
+            assertFixtureEnv("before the app closes");
+            await app?.close();
+            assertFixtureEnv("after the app closed");
+        },
+        () => new Promise<void>((resolve) => notesServer?.close(() => resolve())),
+        () => restoreEnv(envBefore),
+        () => cleanUp(),
+    ]);
 });
+
+/** The fixture environment is still set: the teardown checks it around the app's close. */
+function assertFixtureEnv(when: string): void {
+    assert.equal(process.env.PI_POCKET_DESK_CONFIG, configPath, `the fixture settings ${when}`);
+    assert.equal(process.env.PI_POCKET_DESK_GH, fakeGh, `the fixture gh ${when}`);
+    assert.equal(
+        process.env.PI_POCKET_DESK_JOURNAL_TOKEN,
+        journalTokenPath,
+        `the fixture token ${when}`,
+    );
+    assert.equal(process.env.PI_POCKET_TEAM_AGENTS, definitions, `the fixture agents ${when}`);
+}
 
 /** Stop every live task of 1 kind: a test that moves the clock must not wake the tasks of earlier tests. */
 async function stopTasks(kind: string): Promise<void> {
@@ -8002,6 +8049,7 @@ describe("with the Pi Pocket app", () => {
         // The send goes in, and the app stops inside the send's hook, before the task's progress commit: a crash
         // between the two. The test opens the gate after its own checks.
         const gate = stopGate();
+        let failure: { error: unknown } | undefined;
         const held = holdSends(planSendKey, async (real, source, request, key) => {
             await real(source, request, key);
             await gate.afterSend();
@@ -8046,10 +8094,14 @@ describe("with the Pi Pocket app", () => {
             assert.equal(held.matched[1], held.matched[0], "the same request id");
             assert.equal(await told(), 1, "the session stores exactly 1 message");
             assert.deepEqual(held.others, [], "no other send went in this test");
+        } catch (error) {
+            failure = { error };
+
+            throw error;
         } finally {
-            // Whatever failed: no hook stays blocked, the real send comes back, and a close that started ends.
-            await gate.cleanup();
-            held.release();
+            // Whatever failed: no hook stays blocked, the real send comes back also when the wait for a close fails,
+            // and the test's own error stays the one that shows.
+            await runSteps([() => gate.cleanup(), () => held.release()], failure);
         }
 
         await say(app, planningId!, "plan ready test");
@@ -8706,6 +8758,7 @@ describe("with the Pi Pocket app", () => {
         };
         const readFileReal = fsp.readFile;
         let stopping: Promise<{ closing: Promise<void> }> | undefined;
+        let failure: { error: unknown } | undefined;
         let committed: Plan | undefined;
         let journaledAtStop: number | undefined;
 
@@ -8828,21 +8881,39 @@ describe("with the Pi Pocket app", () => {
                 "no second journal item",
             );
             assert.equal(markers(planId), 1, "1 written entry");
+        } catch (error) {
+            failure = { error };
+
+            throw error;
         } finally {
-            fsp.readFile = readFileReal;
-            syncBuiltinESMExports();
-            notesDown = false;
-
-            // A close that started from the hook ends before the next test.
-            if (stopping !== undefined) {
-                await (
-                    await stopping
-                ).closing;
-            }
-
-            writeFileSync(
-                configPath,
-                JSON.stringify({ digest: { minutes: 0 }, cap: 100, plans: { root: plansFolder } }),
+            // Each step runs also when an earlier one failed (a close that rejects too), and the test's own error
+            // stays the one that shows.
+            await runSteps(
+                [
+                    () => {
+                        fsp.readFile = readFileReal;
+                        syncBuiltinESMExports();
+                        notesDown = false;
+                    },
+                    // A close that started from the hook ends before the next test.
+                    async () => {
+                        if (stopping !== undefined) {
+                            await (
+                                await stopping
+                            ).closing;
+                        }
+                    },
+                    () =>
+                        writeFileSync(
+                            configPath,
+                            JSON.stringify({
+                                digest: { minutes: 0 },
+                                cap: 100,
+                                plans: { root: plansFolder },
+                            }),
+                        ),
+                ],
+                failure,
             );
         }
     });
@@ -9220,11 +9291,16 @@ describe("with the Pi Pocket app", () => {
                     "x.desk.plan-send:T0:0000000000000000",
                 );
                 assert.fail("on purpose");
+            } catch (error) {
+                failure = { error };
+
+                throw error;
             } finally {
-                await gate.cleanup();
-                held.release();
+                await runSteps([() => gate.cleanup(), () => held.release()], failure);
             }
         };
+
+        let failure: { error: unknown } | undefined;
 
         await assert.rejects(failing(), /on purpose/);
         await blocked;
@@ -9232,6 +9308,107 @@ describe("with the Pi Pocket app", () => {
         assert.equal(gate.state.opened, true, "the gate is open");
         assert.equal(gate.state.cancelled, true);
         assert.equal(closes, 0, "the cancelled hook started no close");
+    });
+
+    test("a close that rejects in the cleanup: the first error still shows, and every patch and the settings come back", async () => {
+        const proto = Object.getPrototypeOf(app.linkedSessions) as { send: LinkedSend };
+        const realSend = proto.send;
+        const settings = readFileSync(configPath, "utf8");
+        const gate = stopGate();
+        let blocked: Promise<void> | undefined;
+
+        /** A hook test whose stop started, whose close rejects, and whose own assertion fails. */
+        const failing = async (): Promise<void> => {
+            let failure: { error: unknown } | undefined;
+            const held = holdSends(planSendKey, async () => {
+                await gate.afterSend(async () => {
+                    // The close fails a moment later: the cleanup waits for it, and it rejects there. The empty catch
+                    // only keeps Node from calling it unhandled before the cleanup waits for it.
+                    const closing = new Promise<void>((_resolve, reject) => {
+                        setTimeout(() => reject(new Error("the close failed")), 20);
+                    });
+
+                    closing.catch(() => undefined);
+
+                    return { closing };
+                });
+            });
+
+            try {
+                writeFileSync(configPath, JSON.stringify({ digest: { minutes: 9 }, cap: 1 }));
+                blocked = proto.send.call(
+                    app.linkedSessions,
+                    1 as unknown as ConversationId,
+                    { to: "session-x", message: "a test send" },
+                    "x.desk.plan-send:T0:1111111111111111",
+                );
+                gate.open();
+                await until(async () => gate.state.stopping !== undefined, "the stop", 5000);
+                assert.fail("the first error");
+            } catch (error) {
+                failure = { error };
+
+                throw error;
+            } finally {
+                await runSteps(
+                    [
+                        () => gate.cleanup(),
+                        () => held.release(),
+                        () => writeFileSync(configPath, settings),
+                    ],
+                    failure,
+                );
+            }
+        };
+
+        await assert.rejects(failing(), /the first error/);
+        await blocked;
+        assert.equal(proto.send, realSend, "the real send is back");
+        assert.equal(readFileSync(configPath, "utf8"), settings, "the settings are back");
+        assert.equal(gate.state.opened, true, "the gate is open");
+
+        // With no earlier error, the failed close is the error that shows, and the later steps still run.
+        let ran = false;
+
+        await assert.rejects(
+            runSteps([
+                () => Promise.reject(new Error("the close failed")),
+                () => {
+                    ran = true;
+                },
+            ]),
+            /the close failed/,
+        );
+        assert.equal(ran, true);
+    });
+
+    test("the teardown order: the closes end, then the environment goes back, also when a close fails", async () => {
+        const saved = { PI_POCKET_TEST_ORDER: process.env.PI_POCKET_TEST_ORDER };
+        const order: string[] = [];
+
+        process.env.PI_POCKET_TEST_ORDER = "fixture";
+
+        await assert.rejects(
+            runSteps([
+                async () => {
+                    await new Promise((resolve) => setTimeout(resolve, 10));
+                    order.push(`server: ${String(process.env.PI_POCKET_TEST_ORDER)}`);
+
+                    throw new Error("the server close failed");
+                },
+                async () => {
+                    await new Promise((resolve) => setTimeout(resolve, 10));
+                    order.push(`app: ${String(process.env.PI_POCKET_TEST_ORDER)}`);
+                },
+                () => {
+                    restoreEnv(saved);
+                    order.push(`restored: ${String(process.env.PI_POCKET_TEST_ORDER)}`);
+                },
+            ]),
+            /the server close failed/,
+        );
+        assert.deepEqual(order, ["server: fixture", "app: fixture", "restored: undefined"]);
+        assert.equal(process.env.PI_POCKET_TEST_ORDER, undefined);
     });
 
     test("the roster route gives the leads with a home, the supervisors, and the plan count", async () => {
