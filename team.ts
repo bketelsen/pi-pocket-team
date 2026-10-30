@@ -1784,6 +1784,7 @@ export default function createTeam(host: Host, web: Web) {
                               lead: string;
                               source?: "page" | "chat";
                               issue?: string;
+                              model?: string;
                           };
                       }
                     | { id: string; task: string };
@@ -2484,6 +2485,9 @@ export default function createTeam(host: Host, web: Web) {
             );
         }
 
+        // The named model, or the owner's profile model when the owner's allowed list permits it. The plan stores it in
+        // its first commit, so a resumed start under the same key must name the same.
+        const model = input.model ?? allowedModel(persona);
         const opened = await deps.commit(async (tx) =>
             desk.open(tx, {
                 key,
@@ -2498,6 +2502,7 @@ export default function createTeam(host: Host, web: Web) {
                         lead: persona.id,
                         ...(input.source === "page" ? { source: "page" as const } : {}),
                         ...(input.issue === undefined ? {} : { issue: input.issue }),
+                        ...(model === undefined || desk.planSources !== true ? {} : { model }),
                     },
                 },
             }),
@@ -2511,8 +2516,6 @@ export default function createTeam(host: Host, web: Web) {
             throw new Error(refused);
         }
 
-        // The named model, or the owner's profile model when the owner's allowed list permits it.
-        const model = input.model ?? allowedModel(persona);
         const request = {
             title: `${persona.name}: plan ${input.title}`.slice(0, 120),
             message: taskText(persona, `${opened.plan?.brief ?? ""}\n\n${input.idea}`),

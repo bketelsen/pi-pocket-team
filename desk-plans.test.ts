@@ -55,6 +55,12 @@ import {
     dismissPlanComment,
     reopenPlanAsk,
     requestChanges,
+    planSendStep,
+    planSendGaveUp,
+    rewriteAsk,
+    planStartMismatch,
+    planAttemptsText,
+    liveVerification,
     lineDiff,
     planChanges,
     planFacts,
@@ -3927,16 +3933,6 @@ describe("section comments", () => {
             ],
             [{ section: "idea", text: "TPM.", comments: ["c2"] }, /c2 is dismissed already/],
             [{ section: "idea", text: "TPM.", comments: ["c9"] }, /There is no comment c9/],
-            // The ask could settle, the comment cannot: nothing of the write is applied.
-            [
-                {
-                    section: "goal",
-                    text: "Sign it now.",
-                    asks: [{ ask: id, gen: 0 }],
-                    comments: ["c1"],
-                },
-                /did not change section idea/,
-            ],
         ] as const) {
             const result = write(state, {
                 ...request,
@@ -3950,6 +3946,44 @@ describe("section comments", () => {
         assert.equal(plan.rev, rev);
         assert.equal(plan.comments[0]?.state, "open");
         assert.equal(theAsk(thread).written, undefined);
+    });
+
+    test("a write whose ask could settle and whose comment cannot is refused whole: the comment's own error", () => {
+        const { state, plan, thread, id } = askedPlan();
+
+        answerPageAsk(state, id, { at: tick(2), by: "Brian", words: "TPM", gen: 0 });
+        assert(!("error" in write(state, { section: "goal", heading: "Goal", text: "Sign it." })));
+        // The ask is on idea; the comment is on goal. The write changes idea only.
+        assert(
+            !(
+                "error" in
+                addPlanComment(state, "T1", {
+                    key: "comment:goal",
+                    by: "Brian",
+                    at: tick(3),
+                    section: "goal",
+                    text: "Say who signs.",
+                })
+            ),
+        );
+
+        const comment = plan.comments.find((each) => each.section === "goal") ?? assert.fail("c1");
+        const before = JSON.stringify(state);
+        const result = write(state, {
+            section: "idea",
+            text: "The keys live in the TPM.",
+            asks: [{ ask: id, gen: 0 }],
+            comments: [comment.id],
+        });
+
+        assert.equal(
+            (result as { error: string }).error,
+            `The write did not change section goal, the section of ${comment.id}.`,
+        );
+        // Nothing of the write is applied: the plan, its thread, the ask and the comment are as they were.
+        assert.equal(JSON.stringify(state), before);
+        assert.equal(theAsk(thread).written, undefined);
+        assert.equal(comment.state, "open");
     });
 });
 
@@ -4041,6 +4075,33 @@ describe("Request changes", () => {
         assert.equal(thread.events.length, events);
     });
 
+    test("a replay of a done tap after a later Ready changes nothing", () => {
+        const { state, plan } = reviewed();
+
+        assert.equal(
+            (
+                requestChanges(state, "T1", { key: "changes:1", by: "Brian", at: tick(4) }) as {
+                    changed: boolean;
+                }
+            ).changed,
+            true,
+        );
+        assert.deepEqual(plan.changes, [{ key: "changes:1", at: tick(4), by: "Brian" }]);
+        assert(!("error" in readyPlan(state, "T1", { key: "ready:2", at: tick(5) })));
+        assert.equal(plan.state, "review");
+
+        const snapshot = JSON.stringify(state);
+
+        assert.deepEqual(
+            requestChanges(state, "T1", { key: "changes:1", by: "Brian", at: tick(6) }),
+            {
+                changed: false,
+            },
+        );
+        assert.equal(plan.state, "review");
+        assert.equal(JSON.stringify(state), snapshot);
+    });
+
     test("with text it files a section comment, and a replay finds it", () => {
         const { state, plan } = reviewed();
         const request = {
@@ -4054,7 +4115,11 @@ describe("Request changes", () => {
         assert.deepEqual(requestChanges(state, "T1", request), { comment: "c1", changed: true });
         assert.equal(plan.state, "drafting");
         assert.deepEqual(planWaiting(state, "T1"), ["c1 open"]);
-        assert.deepEqual(requestChanges(state, "T1", request), { comment: "c1", changed: false });
+        assert.deepEqual(requestChanges(state, "T1", request), { changed: false });
+        assert.deepEqual(
+            plan.changes?.map((each) => each.key),
+            ["changes:2"],
+        );
         assert.equal(plan.comments.length, 1);
     });
 
@@ -4312,12 +4377,94 @@ describe("a scope change", () => {
         assert.equal(taskOf(graph, "t1").state, "stopped");
         assert.equal(taskOf(graph, "t2").state, "stopped");
         assert.deepEqual(taskOf(graph, "t2").attempts, []);
-        // No open attempt: only the planning session gets a message.
+        // t1's attempt ended, but its thread T2 is open: it gets the stop too, with its stable request id. t2 has no
+        // attempt: no message.
+        assert.deepEqual(
+            done.sends.map((send) => [send.to, send.requestId]),
+            [
+                ["session-T2", planSendId("T1", "revise:1", "task:t1:T2")],
+                ["session-31", planSendId("T1", "revise:1", "planning")],
+            ],
+        );
+        assert.match(done.item.line, /Stopped: t1 \(T2\), t2\./);
+        assert(state.threads.T2?.events.some((event) => event.key === "plan-stopped:revise:1"));
+        assert.deepEqual(state.plans?.T1?.revising?.tasks, ["t1", "t2"]);
+    });
+
+    test("a named task whose attempt ended with no change still stops its open thread; a closed one gets nothing", () => {
+        const { state, graph } = buildingPlan();
+
+        assert(
+            !(
+                "error" in
+                planNoChange(state, "T1", {
+                    thread: "T3",
+                    at: tick(5),
+                    reason: "It is there.",
+                    evidence: "nsl does it.",
+                })
+            ),
+        );
+
+        const ended = JSON.stringify(taskOf(graph, "t3").attempts);
+        const done = revise(state, "revise:1", ["t3"]);
+
+        assert(!("error" in done) && !done.replay);
+        assert.equal(
+            JSON.stringify(taskOf(graph, "t3").attempts),
+            ended,
+            "the ended attempt stays",
+        );
         assert.deepEqual(
             done.sends.map((send) => send.to),
+            ["session-T3", "session-31"],
+        );
+
+        const other = buildingPlan();
+
+        merged(other.graph, "t1", tick(5));
+        (other.state.threads.T2 ?? assert.fail("T2")).state = "closed";
+
+        const quiet = revise(other.state, "revise:1", ["t1"]);
+
+        assert(!("error" in quiet) && !quiet.replay);
+        assert.deepEqual(
+            quiet.sends.map((send) => send.to),
             ["session-31"],
         );
-        assert.deepEqual(state.plans?.T1?.revising?.tasks, ["t1", "t2"]);
+    });
+
+    test("a scope change names the approved graph it read: a newer graph refuses it, and a replay still returns first", () => {
+        const { state, plan } = buildingPlan();
+        const withGraph = (key: string, graph: unknown, needGraph = false) =>
+            revisePlan(
+                state,
+                "T1",
+                { key, by: "Brian", at: tick(6), why: "Why.", tasks: ["t1"], graph, needGraph },
+                quoted,
+            );
+        const snapshot = JSON.stringify(state);
+
+        assert.equal(
+            (withGraph("revise:stale", 2) as { error: string }).error,
+            "The plan changed since you read it.",
+        );
+        assert.match(
+            (withGraph("revise:none", undefined, true) as { error: string }).error,
+            /needs graph: the approved graph version that the page showed/,
+        );
+        assert.equal(JSON.stringify(state), snapshot, "a refused scope change changes nothing");
+
+        // The tool may leave graph out; the page may not. The right version goes.
+        assert(!("error" in withGraph("revise:1", 1, true)));
+        assert.equal(plan.revising?.key, "revise:1");
+
+        // A replay of the key returns first, also with a graph that is stale now.
+        assert.deepEqual(withGraph("revise:1", 7, true), { replay: true });
+        assert(
+            !("error" in revise(buildingPlan().state, "revise:tool", ["t1"])),
+            "the tool needs no graph",
+        );
     });
 
     test("a closed task thread gets no message, and its attempt still ends", () => {
@@ -4469,6 +4616,67 @@ describe("a reopen after the approval", () => {
 
         assert.deepEqual(again, { id, replay: true, gen: 1 });
         assert.equal(JSON.stringify(state), snapshot);
+    });
+
+    test("from the page it names the approved graph: a stale one is refused, and a plain reopen needs none", () => {
+        const made = decidedInReview();
+
+        approvePlan(made.state, "T1", {
+            rev: made.plan.rev,
+            graph: 1,
+            key: "approve:decided",
+            by: "brian",
+            at: tick(6),
+        });
+
+        const snapshot = JSON.stringify(made.state);
+        const request = {
+            gen: 0,
+            by: "Brian",
+            at: tick(8),
+            why: "Why.",
+            tasks: [],
+            needGraph: true,
+        };
+
+        assert.equal(
+            (
+                reopenPlanAsk(made.state, made.id, { ...request, key: "r:stale", graph: 2 }) as {
+                    error: string;
+                }
+            ).error,
+            "The plan changed since you read it.",
+        );
+        assert.match(
+            (reopenPlanAsk(made.state, made.id, { ...request, key: "r:none" }) as { error: string })
+                .error,
+            /needs graph/,
+        );
+        assert.equal(JSON.stringify(made.state), snapshot);
+        assert(
+            !("error" in reopenPlanAsk(made.state, made.id, { ...request, key: "r:1", graph: 1 })),
+        );
+        assert.deepEqual(reopenPlanAsk(made.state, made.id, { ...request, key: "r:1", graph: 9 }), {
+            id: made.id,
+            replay: true,
+            gen: 1,
+        });
+
+        // In drafting a reopen is no scope change: the page sends no graph, and none is needed.
+        const plain = decidedPlan();
+
+        assert(
+            !(
+                "error" in
+                reopenPlanAsk(plain.state, plain.id, {
+                    gen: 0,
+                    key: "r:plain",
+                    by: "Brian",
+                    at: tick(8),
+                    needGraph: true,
+                })
+            ),
+        );
     });
 
     test("in approved it needs why, and a refused one changes nothing", () => {
@@ -4935,7 +5143,7 @@ describe("the PR facts of a task thread", () => {
         assert.equal(plan.state, "building");
         assert.deepEqual(
             done.items.map((item) => [item.kind, item.key]),
-            [["plan-approved", "plan-tasks:T1:t2:2"]],
+            [["plan-approved", "plan-tasks:T1:v1:t2:2"]],
         );
         assert.match(
             done.items[0]?.line ?? "",
@@ -4980,26 +5188,42 @@ describe("the PR facts of a task thread", () => {
     test("a second PR gives 1 warning on both threads, once for each ref", () => {
         const { state } = buildingPlan();
         const warnings = (id: string) =>
-            (state.threads[id]?.events ?? []).filter((event) => event.key.startsWith("plan-prs:"));
+            (state.threads[id]?.events ?? [])
+                .filter((event) => event.key.startsWith("plan-prs:"))
+                .map((event) => [event.key, event.text]);
 
         prOn(state, "T2", "frostyard/snow#1", "OPEN");
         planFacts(state, "T1", tick(10));
-        assert.equal(warnings("T2").length, 0);
+        assert.deepEqual(warnings("T2"), []);
 
         prOn(state, "T2", "frostyard/snow#2", "OPEN");
         assert.equal(planFacts(state, "T1", tick(11)).events, 2);
         assert.equal(planFacts(state, "T1", tick(12)).events, 0);
-        assert.deepEqual(
-            warnings("T1").map((event) => event.text),
-            ["T2 has 2 PRs for 1 task (t1 of T1)"],
-        );
 
+        const first = [["plan-prs:T2:frostyard/snow#2", "T2 has 2 PRs for 1 task (t1 of T1)"]];
+
+        assert.deepEqual(warnings("T1"), first);
+        assert.deepEqual(warnings("T2"), first);
+
+        // Another ref takes the place of #2: the count stays 2, and the new ref still gets its own warning, on both
+        // threads. A warning per count would stay quiet here.
+        delete state.threads.T2?.prs["frostyard/snow#2"];
         prOn(state, "T2", "frostyard/snow#3", "OPEN");
-        planFacts(state, "T1", tick(13));
-        assert.deepEqual(
-            warnings("T2").map((event) => event.text),
-            ["T2 has 2 PRs for 1 task (t1 of T1)", "T2 has 3 PRs for 1 task (t1 of T1)"],
-        );
+        assert.equal(Object.keys(state.threads.T2?.prs ?? {}).length, 2);
+        assert.equal(planFacts(state, "T1", tick(13)).events, 2);
+
+        const second = [
+            ...first,
+            ["plan-prs:T2:frostyard/snow#3", "T2 has 2 PRs for 1 task (t1 of T1)"],
+        ];
+
+        assert.deepEqual(warnings("T1"), second);
+        assert.deepEqual(warnings("T2"), second);
+
+        // A second sweep with the same facts: no new warning.
+        assert.equal(planFacts(state, "T1", tick(14)).events, 0);
+        assert.deepEqual(warnings("T1"), second);
+        assert.deepEqual(warnings("T2"), second);
     });
 
     test("a PR that closed unmerged while its thread is open changes nothing", () => {
@@ -5029,7 +5253,7 @@ describe("the PR facts of a task thread", () => {
         assert.equal(t1.attempts[0]?.end?.how, "stopped");
         assert.deepEqual(
             done.items.map((item) => item.key),
-            ["plan-tasks:T1:t1:2"],
+            ["plan-tasks:T1:v1:t1:2"],
         );
         assert(
             state.threads.T1?.events.some(
@@ -5121,7 +5345,7 @@ describe("the PR facts of a task thread", () => {
         assert.equal(plan.state, "verifying");
         assert.deepEqual(
             done.items.map((item) => [item.kind, item.key]),
-            [["plan-verify", "plan-verify:T1:round:3"]],
+            [["plan-verify", "plan-verify:T1:round:v1:3"]],
         );
         assert.deepEqual(planFacts(state, "T1", tick(13)), { events: 0, items: [] });
     });
@@ -5146,7 +5370,7 @@ describe("plan nochange", () => {
         assert.equal(taskOf(graph, "t2").state, "ready");
         assert.deepEqual(
             done.items.map((item) => item.key),
-            ["plan-tasks:T1:t2:2"],
+            ["plan-tasks:T1:v1:t2:2"],
         );
     });
 
@@ -5167,7 +5391,7 @@ describe("plan nochange", () => {
         prOn(state, "T2", "frostyard/snow#1", "OPEN");
         assert.match(
             (noChange(state, "T2") as { error: string }).error,
-            /T2 has an open PR \(frostyard\/snow#1\)/,
+            /T2 has a PR that is open, or not read yet \(frostyard\/snow#1\)/,
         );
         delete state.threads.T2?.prs["frostyard/snow#1"];
 
@@ -5363,7 +5587,7 @@ describe("the whole-plan check", () => {
         assert.equal(JSON.stringify(t2.attempts), earlier, "a failed round changes no attempt");
         assert.deepEqual(
             done.items.map((item) => [item.kind, item.key]),
-            [["plan-approved", "plan-tasks:T1:t2:3"]],
+            [["plan-approved", "plan-tasks:T1:v1:t2:3"]],
         );
         assert.equal(failedRounds(plan), 1);
 
@@ -5494,7 +5718,7 @@ describe("the task and verify briefs", () => {
         prOn(made.state, "T4", "frostyard/snow#2", "MERGED");
         planFacts(made.state, "T1", tick(12));
 
-        const brief = planVerifyBrief(made.plan, "Snow ISO signing", made.graph, quoted);
+        const brief = planVerifyBrief(made.plan, "Snow ISO signing", made.graph);
 
         assert.match(
             brief,
@@ -5505,16 +5729,616 @@ describe("the task and verify briefs", () => {
             brief,
             new RegExp(`attempt T4: merged \\(frostyard/snow#2 at 2${"0".repeat(39)}\\)`),
         );
-        assert.match(
-            brief,
-            /attempt T2: no-change: reason "The code does it already\.", evidence "sign\.sh line 3 signs the ISO\."/,
-        );
+        // The evidence is not in the brief: plan read gives it in full, quoted.
+        assert.match(brief, /attempt T2: no-change: its reason and evidence are in plan read/);
+        assert.doesNotMatch(brief, /sign\.sh line 3/);
+
+        const read = planAttemptsText(made.graph, quoted).join("\n");
+
+        assert.match(read, /attempt T4: merged · PRs: frostyard\/snow#2 at 20{39}/);
+        assert.match(read, /no-change reason: "The code does it already\."/);
+        assert.match(read, /no-change evidence: "sign\.sh line 3 signs the ISO\."/);
         assert.match(brief, /~\/\.pi\/agent\/skills\/cross-review\/SKILL\.md/);
         assert.match(
             brief,
             /Rounds so far: 0; 0 failed since the approval\. The budget is 1 review and 3 re-reviews/,
         );
         assert.match(brief, /plan \{ action: "verify", reviewer:/);
+    });
+});
+
+// ─── Review batch 2: the whole-plan check's bounds, repairs, keys and warnings ───
+
+describe("review batch 2", () => {
+    const allPass = () =>
+        ["t1", "t2", "t3"].map((task) => ({
+            task,
+            pass: true,
+            evidence: "It meets its acceptance.",
+        }));
+    const fail = (ids: string[]) =>
+        ["t1", "t2", "t3"].map((task) => ({
+            task,
+            pass: !ids.includes(task),
+            evidence: ids.includes(task) ? "Not met." : "Met.",
+        }));
+
+    /** The building plan with every task done (t2 merged on T4), verifying. */
+    function verifying(): { state: DeskState; plan: Plan; graph: TaskGraph } {
+        const made = buildingPlan();
+
+        noChange(made.state, "T2");
+        taskThread(made.state, "T4");
+        startTask(made.state, "T1", "t2", "T4", tick(11));
+        prOn(made.state, "T4", "frostyard/snow#2", "MERGED");
+        planFacts(made.state, "T1", tick(12));
+        noChange(made.state, "T3", tick(13));
+        assert.equal(made.plan.state, "verifying");
+
+        return made;
+    }
+
+    const record = (state: DeskState, thread: string, key: string, tasks: unknown, at = tick(20)) =>
+        recordVerify(state, "T1", { key, at, thread, reviewer: "openai/gpt-6.1-sol", tasks });
+
+    test("a check is bound to the approval it started under: an older one cannot verify a newer approval", () => {
+        const { state, plan } = verifying();
+
+        taskThread(state, "T5");
+        startTask(state, "T1", "verify", "T5", tick(14));
+        assert.deepEqual(plan.verification?.bound?.T5, {
+            rev: plan.approvals[0]?.rev,
+            graph: 1,
+            approval: "approve:1",
+        });
+
+        // A new approval comes (as after a scope change): T5 checks the old one.
+        plan.approvals.push({
+            rev: plan.rev,
+            graph: 1,
+            at: tick(15),
+            by: "brian",
+            key: "approve:2",
+        });
+
+        const snapshot = JSON.stringify(state);
+
+        assert.match(
+            (record(state, "T5", "verify:old", allPass()) as { error: string }).error,
+            /^This check was for an older approval/,
+        );
+        assert.equal(JSON.stringify(state), snapshot);
+
+        // The open old thread does not block a new check, and the new one verifies.
+        assert.equal(liveVerification(state, plan), undefined);
+        assert.equal(deliverCheck(state, "T1", "verify", { agent: "lucilla" }), undefined);
+        taskThread(state, "T6");
+        startTask(state, "T1", "verify", "T6", tick(16));
+        assert.equal(liveVerification(state, plan)?.id, "T6");
+
+        const done = record(state, "T6", "verify:new", allPass());
+
+        assert(!("error" in done) && !done.replay && done.pass);
+    });
+
+    test("1 thread records at most 1 round, and no round goes after the budget is spent", () => {
+        const { state, plan } = verifying();
+
+        taskThread(state, "T5");
+        startTask(state, "T1", "verify", "T5", tick(14));
+        assert(!("error" in record(state, "T5", "verify:1", fail(["t3"]))));
+
+        // The repair merges, and the plan verifies again; T5 is still open but did its round.
+        taskThread(state, "T7");
+        startTask(state, "T1", "t3", "T7", tick(21));
+        prOn(state, "T7", "frostyard/nsl#9", "MERGED");
+        planFacts(state, "T1", tick(22));
+        assert.equal(plan.state, "verifying");
+        assert.match(
+            (record(state, "T5", "verify:2", allPass(), tick(23)) as { error: string }).error,
+            /T5 recorded its round already: each round needs its own verify delivery/,
+        );
+        assert.equal(
+            deliverCheck(state, "T1", "verify", { agent: "lucilla" }),
+            undefined,
+            "T5 blocks no new check",
+        );
+
+        // The budget: 4 failed rounds, then no round from any thread.
+        plan.verification?.rounds.push(
+            ...[2, 3, 4].map((round) => ({
+                at: tick(30 + round),
+                by: "lucilla",
+                reviewer: "x",
+                heads: {},
+                pass: false,
+                tasks: [],
+                key: `old:${String(round)}`,
+                thread: `T${String(40 + round)}`,
+            })),
+        );
+        taskThread(state, "T8");
+        plan.verification?.threads.push("T8");
+        plan.verification = {
+            ...(plan.verification ?? { threads: [], rounds: [] }),
+            bound: {
+                ...(plan.verification?.bound ?? {}),
+                T8: { rev: plan.rev, graph: 1, approval: "approve:1" },
+            },
+        };
+
+        const snapshot = JSON.stringify(state);
+
+        assert.match(
+            (record(state, "T8", "verify:5", allPass(), tick(40)) as { error: string }).error,
+            /failed its whole-plan check 4 times since its approval: the review budget is spent/,
+        );
+        assert.equal(JSON.stringify(state), snapshot);
+    });
+
+    test("a failed task whose dep failed too waits, and the repair item names only the ready tasks", () => {
+        const { state, graph } = verifying();
+
+        taskThread(state, "T5");
+        startTask(state, "T1", "verify", "T5", tick(14));
+
+        const done = record(state, "T5", "verify:1", fail(["t1", "t2"]));
+
+        assert(!("error" in done) && !done.replay);
+        assert.equal(taskOf(graph, "t1").state, "ready");
+        assert.equal(taskOf(graph, "t2").state, "waiting", "its dep t1 is not done");
+        assert.deepEqual(
+            done.items.map((item) => item.key),
+            ["plan-tasks:T1:v1:t1:3"],
+        );
+        assert.equal(
+            deliverCheck(state, "T1", "t2", { agent: "lucilla", repo: "frostyard/snow" }),
+            "t2 is waiting: a task starts when it is ready.",
+        );
+
+        // A task that is ready by hand but whose dep is not done is refused too.
+        taskOf(graph, "t2").state = "ready";
+        assert.equal(
+            deliverCheck(state, "T1", "t2", { agent: "lucilla", repo: "frostyard/snow" }),
+            "t2 waits for t1: a task starts when its deps are done.",
+        );
+    });
+
+    test("the verify brief stays under 15000 characters for 30 tasks with long evidence, and names what it leaves out", () => {
+        const { state, plan } = startPlan();
+        const many: PlanTask[] = Array.from({ length: 30 }, (_, at) => ({
+            id: `t${String(at + 1)}`,
+            title: `Task ${String(at + 1)} ${"x".repeat(100)}`,
+            agent: "lucilla",
+            repo: "frostyard/snow",
+            acceptance: Array.from(
+                { length: 8 },
+                (_, line) => `${String(line)} ${"y".repeat(290)}`,
+            ),
+            deps: [],
+            state: "done",
+            attempts: [
+                {
+                    thread: `T${String(100 + at)}`,
+                    at: tick(1),
+                    prs: [{ ref: `frostyard/snow#${String(at)}`, head: "a".repeat(40) }],
+                    end: {
+                        at: tick(2),
+                        how: "no-change",
+                        noChange: { reason: "r".repeat(1000), evidence: "e".repeat(5000) },
+                    },
+                },
+            ],
+        }));
+        const graph: TaskGraph = {
+            version: 1,
+            rev: plan.rev,
+            state: "approved",
+            at: now,
+            key: "g",
+            tasks: many,
+        };
+        const brief = planVerifyBrief(plan, "Big plan", graph);
+
+        assert(brief.length < 15_000, `the brief has ${String(brief.length)} characters`);
+        assert.doesNotMatch(brief, /eeeeeeeeee/, "no evidence in the brief");
+        assert.match(
+            brief,
+            /- t30 Task 30 x+ · lucilla in frostyard\/snow: its acceptance lines and attempts are in plan read\./,
+        );
+        assert.match(
+            brief,
+            /The brief has no room for the details of t\d+(, t\d+)*: read them with plan read/,
+        );
+
+        // plan read gives every attempt in full: the evidence is not cut.
+        const read = planAttemptsText(graph, (text) => `"${text}"`).join("\n");
+
+        assert.match(read, new RegExp(`"${"e".repeat(5000)}"`));
+        assert.equal(state.plans?.T1?.thread, "T1");
+    });
+
+    test("the news keys and their events carry the approved graph's version", () => {
+        const { state, plan } = buildingPlan();
+
+        prOn(state, "T2", "frostyard/snow#1", "MERGED");
+        taskThread(state, "T4");
+        assert.deepEqual(
+            planFacts(state, "T1", tick(10)).items.map((item) => item.key),
+            ["plan-tasks:T1:v1:t2:2"],
+        );
+        startTask(state, "T1", "t2", "T4", tick(11));
+        prOn(state, "T4", "frostyard/snow#2", "MERGED");
+        prOn(state, "T3", "frostyard/nsl#7", "MERGED");
+        assert.deepEqual(
+            planFacts(state, "T1", tick(12)).items.map((item) => item.key),
+            ["plan-verify:T1:round:v1:3"],
+        );
+        assert(state.threads.T1?.events.some((event) => event.key === "plan-verifying:round:v1:3"));
+        assert.equal(plan.state, "verifying");
+    });
+
+    test("plan nochange refuses a PR whose state is not read yet", () => {
+        const { state, graph } = buildingPlan();
+
+        prOn(state, "T2", "frostyard/snow#1");
+        assert.match(
+            (noChange(state, "T2") as { error: string }).error,
+            /T2 has a PR that is open, or not read yet \(frostyard\/snow#1\)/,
+        );
+        assert.equal(taskOf(graph, "t1").attempts[0]?.end, undefined);
+
+        prOn(state, "T2", "frostyard/snow#1", "CLOSED");
+        assert(!("error" in noChange(state, "T2")), "a closed PR does not hold it");
+    });
+
+    test("the 1-PR warning comes for an open thread whose attempt ended, once for each ref, and the attempt stays", () => {
+        const { state, graph } = buildingPlan();
+
+        prOn(state, "T2", "frostyard/snow#1", "MERGED");
+        planFacts(state, "T1", tick(10));
+
+        const ended = JSON.stringify(taskOf(graph, "t1").attempts);
+
+        assert.equal(taskOf(graph, "t1").attempts[0]?.end?.how, "merged");
+
+        // T2 is still open, and gets a second PR after its attempt ended.
+        prOn(state, "T2", "frostyard/snow#5", "OPEN");
+        assert.equal(planFacts(state, "T1", tick(11)).events, 2);
+        assert.equal(planFacts(state, "T1", tick(12)).events, 0, "once for each ref");
+        assert.equal(
+            JSON.stringify(taskOf(graph, "t1").attempts),
+            ended,
+            "the ended attempt stays",
+        );
+        assert(
+            state.threads.T1?.events.some(
+                (event) =>
+                    event.key === "plan-prs:T2:frostyard/snow#5" &&
+                    event.text === "T2 has 2 PRs for 1 task (t1 of T1)",
+            ),
+        );
+
+        // A closed thread gets no warning.
+        (state.threads.T2 ?? assert.fail("T2")).state = "closed";
+        prOn(state, "T2", "frostyard/snow#6", "OPEN");
+        assert.equal(planFacts(state, "T1", tick(13)).events, 0);
+    });
+});
+
+// ─── Review batch 3: late answers, resumed starts, fixed options, read revisions ───
+
+describe("review batch 3", () => {
+    test("a late page answer to a withdrawn ask, or after the plan moved on, is refused", () => {
+        const made = askedPlan();
+
+        theAsk(made.thread).resolved = { at: tick(2), why: "Not needed.", by: "odrade" };
+        assert.match(
+            (
+                answerPageAsk(made.state, made.id, {
+                    at: tick(3),
+                    by: "Brian",
+                    words: "TPM",
+                    gen: 0,
+                }) as {
+                    error: string;
+                }
+            ).error,
+            /is not open: it was withdrawn by odrade, and needs no answer/,
+        );
+        assert.equal(theAsk(made.thread).answer, undefined);
+
+        const moved = askedPlan();
+
+        moved.plan.state = "approved";
+        assert.match(
+            (
+                answerPageAsk(moved.state, moved.id, {
+                    at: tick(3),
+                    by: "Brian",
+                    words: "TPM",
+                    gen: 0,
+                }) as {
+                    error: string;
+                }
+            ).error,
+            /Plan T1 is approved: its asks are answered while it is drafting or in review/,
+        );
+        assert.equal(theAsk(moved.thread).answer, undefined);
+    });
+
+    test("a plan ask's options are fixed: a rewrite of the text only is allowed", () => {
+        const { state, thread, id } = askedPlan();
+
+        assert.match(
+            (
+                rewriteAsk(state, id, {
+                    text: "Where do the keys live?",
+                    options: ["YubiKey", "TPM", "A file"],
+                    by: "odrade",
+                    at: tick(2),
+                }) as { error: string }
+            ).error,
+            /A plan ask's options are fixed: withdraw it, and the planning session asks again/,
+        );
+        assert.match(
+            (
+                rewriteAsk(state, id, { text: "Where?", by: "odrade", at: tick(2) }) as {
+                    error: string;
+                }
+            ).error,
+            /options are fixed/,
+            "dropping the options is a change too",
+        );
+        assert.deepEqual(theAsk(thread).options, ["TPM", "YubiKey", "A file"]);
+
+        const done = rewriteAsk(state, id, {
+            text: "Where do the signing keys live?",
+            options: ["TPM", "YubiKey", "A file"],
+            by: "odrade",
+            at: tick(2),
+        });
+
+        assert.deepEqual(done, { id, already: false });
+        assert.equal(theAsk(thread).text, "Where do the signing keys live?");
+    });
+
+    test("a comment names the revision Brian read: a stale one is refused before any change", () => {
+        const { state, plan } = startPlan();
+        const base = { by: "Brian", at: tick(3), section: "idea", text: "Name the period." };
+
+        assert.equal(
+            (
+                addPlanComment(state, "T1", { ...base, key: "c:stale", rev: "0".repeat(40) }) as {
+                    error: string;
+                }
+            ).error,
+            "The plan changed since you read it.",
+        );
+        assert.match(
+            (
+                addPlanComment(state, "T1", { ...base, key: "c:none", needRev: true }) as {
+                    error: string;
+                }
+            ).error,
+            /needs rev/,
+        );
+        assert.equal(plan.comments.length, 0);
+        assert(
+            !(
+                "error" in
+                addPlanComment(state, "T1", { ...base, key: "c:1", rev: plan.rev, needRev: true })
+            ),
+        );
+
+        // A replay of a known key returns first, also with a revision that is stale now.
+        assert.deepEqual(
+            addPlanComment(state, "T1", { ...base, key: "c:1", rev: "1".repeat(40) }),
+            {
+                id: "c1",
+                replay: true,
+            },
+        );
+
+        // Request changes with text is a comment: the same check.
+        const review = reviewed();
+
+        assert.equal(
+            (
+                requestChanges(review.state, "T1", {
+                    key: "changes:stale",
+                    by: "Brian",
+                    at: tick(4),
+                    text: "More.",
+                    section: "idea",
+                    rev: "0".repeat(40),
+                    needRev: true,
+                }) as { error: string }
+            ).error,
+            "The plan changed since you read it.",
+        );
+        assert.equal(review.plan.state, "review");
+    });
+
+    test("an interrupted plan start resumes only with the payload it started with", () => {
+        const { state, thread } = startPlan();
+        const request = (
+            patch: Record<string, unknown> = {},
+            start: Record<string, unknown> = {},
+        ) => ({
+            key: "x.test:plan",
+            supervisor: 7,
+            agents: [],
+            title: "Snow ISO signing",
+            at: now,
+            plan: {
+                start: {
+                    idea: "Sign the ISO with the TPM key.",
+                    lead: "lucilla",
+                    root: ROOT,
+                    text: "",
+                    rev: "",
+                    ...start,
+                },
+            },
+            ...patch,
+        });
+
+        // The start of the test plan bound a session: a replay is not compared.
+        assert.equal(
+            planStartMismatch(state, thread, request({}, { lead: "teg" }) as never),
+            undefined,
+        );
+
+        delete thread.session;
+        assert.equal(
+            planStartMismatch(state, thread, request() as never),
+            undefined,
+            "the same payload resumes",
+        );
+
+        for (const [patch, start] of [
+            [{}, { lead: "teg" }],
+            [{ title: "Another title" }, {}],
+            [{}, { idea: "Another idea." }],
+            [{ supervisor: 8 }, {}],
+            [{}, { model: "faux/faux-2" }],
+            [{}, { issue: "frostyard/snow#42" }],
+        ] as const) {
+            assert.equal(
+                planStartMismatch(state, thread, request(patch, start) as never),
+                "This key started plan T1 for lucilla: start a new plan with a new key.",
+            );
+        }
+    });
+});
+
+// ─── Review batch 5: the durable plan message, step by step ─────────────────
+
+describe("a durable plan message (x.desk.plan-send)", () => {
+    const input = {
+        supervisor: 7,
+        to: "session-31",
+        text: "[desk] Stop: plan T1 is under revision.",
+        requestId: planSendId("T1", "revise:1", "planning"),
+    };
+
+    /** A send that fails `fails` times, then works; it records each call. */
+    function sender(fails: number) {
+        const calls: { supervisor: number; to: string; message: string; requestId: string }[] = [];
+
+        return {
+            calls,
+            send: async (
+                supervisor: number,
+                request: { to: string; message: string },
+                requestId: string,
+            ) => {
+                calls.push({ supervisor, ...request, requestId });
+
+                if (calls.length <= fails) {
+                    throw new Error(`refused ${String(calls.length)}`);
+                }
+            },
+        };
+    }
+
+    /** A restart: the stored checkpoint, as JSON, and nothing else. */
+    const restart = <T>(checkpoint: T): T => JSON.parse(JSON.stringify(checkpoint)) as T;
+
+    test("a failure, then no try before 60 seconds, then a success with the same id and text", async () => {
+        const { calls, send } = sender(1);
+        const first = await planSendStep({ phase: "send", tries: 0 }, input, tick(0), send);
+
+        assert.deepEqual(first, {
+            kind: "retry",
+            failure: "refused 1",
+            next: { phase: "wait", tries: 1, due: tick(60) },
+        });
+        assert(first.kind === "retry");
+
+        // Before the due time: no send, only a sleep until it.
+        const early = await planSendStep(first.next, input, tick(59), send);
+
+        assert.deepEqual(early, {
+            kind: "sleep",
+            until: tick(60),
+            next: { phase: "send", tries: 1 },
+        });
+        assert.equal(calls.length, 1, "no try before 60 seconds");
+
+        // A restart in the wait: the stored checkpoint goes on.
+        const due = await planSendStep(restart(first.next), input, tick(60), send);
+
+        assert.deepEqual(due, { kind: "continue", next: { phase: "send", tries: 1 } });
+        assert(due.kind === "continue");
+        assert.deepEqual(await planSendStep(restart(due.next), input, tick(60), send), {
+            kind: "sent",
+        });
+        assert.equal(calls.length, 2);
+        assert.deepEqual(calls[0], calls[1], "the same request id and text on each try");
+        assert.deepEqual(calls[0], {
+            supervisor: 7,
+            to: "session-31",
+            message: input.text,
+            requestId: input.requestId,
+        });
+    });
+
+    test("a try admitted before a restart, with no progress commit, goes again under the same id", async () => {
+        // The send went in, and the process stopped before its commit: the stored checkpoint is still the send.
+        const stored = restart({ phase: "send" as const, tries: 0 });
+        const { calls, send } = sender(0);
+
+        assert.deepEqual(await planSendStep(stored, input, tick(0), send), { kind: "sent" });
+        assert.deepEqual(await planSendStep(restart(stored), input, tick(1), send), {
+            kind: "sent",
+        });
+        assert.deepEqual(
+            calls.map((call) => call.requestId),
+            [input.requestId, input.requestId],
+            "the rerun is a replay of the same request id, which Pocket takes once",
+        );
+    });
+
+    test("the end after 3 failures: 1 event, 1 notice, and no 4th try", async () => {
+        const { state } = startPlan();
+        const { calls, send } = sender(10);
+        let checkpoint: Parameters<typeof planSendStep>[0] = { phase: "send", tries: 0 };
+        let at = tick(0);
+        let last: Awaited<ReturnType<typeof planSendStep>> | undefined;
+
+        for (let step = 0; step < 10; step += 1) {
+            last = await planSendStep(checkpoint, input, at, send);
+
+            if (last.kind === "retry" || last.kind === "continue") {
+                checkpoint = last.next;
+            } else if (last.kind === "sleep") {
+                at = last.until;
+                checkpoint = restart(checkpoint);
+            } else {
+                break;
+            }
+        }
+
+        assert.equal(last?.kind, "gave-up");
+        assert(last?.kind === "gave-up");
+        assert.equal(calls.length, 3, "3 tries, and no 4th");
+        assert.equal(at, tick(120), "60 seconds between the tries");
+        assert.equal(
+            last.notice,
+            "A plan message to session-31 did not go after 3 tries: refused 3",
+        );
+
+        const events = state.threads.T1?.events.length ?? 0;
+
+        assert.equal(planSendGaveUp(state, input, last.failure, at), true);
+        assert.equal(planSendGaveUp(state, input, last.failure, at), false, "1 event");
+        assert.equal(state.threads.T1?.events.length, events + 1);
+        assert.match(
+            state.threads.T1?.events.at(-1)?.text ?? "",
+            /a desk message to session-31 did not go after 3 tries: refused 3/,
+        );
     });
 });
 
@@ -5625,6 +6449,138 @@ const plansFolder = join(root, "plans");
 const configPath = join(root, "desk.json");
 const fixturePath = join(root, "github.json");
 const fakeGh = join(root, "fake-gh.sh");
+/** The journal's test token, in a file of the test: never the token of the person who runs the tests. */
+const journalToken = "lgm_plan_test_token";
+const journalTokenPath = join(root, "journal-token");
+
+/** A local notes server, as the journal's MCP endpoint: the notes it holds, and whether it answers now. */
+const notes = new Map<string, string>();
+let notesDown = false;
+let notesServer: ReturnType<typeof createServer> | undefined;
+let notesUrl = "";
+
+/** Start the local notes server: initialize, and the tools read_note, create_note and edit_note. */
+async function startNotes(): Promise<void> {
+    const answerAt = (response: import("node:http").ServerResponse, body: unknown) => {
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify(body));
+    };
+
+    notesServer = createServer((request, response) => {
+        let body = "";
+
+        request.on("data", (chunk: Buffer) => {
+            body += chunk.toString();
+        });
+        request.on("end", () => {
+            if (notesDown || request.headers.authorization !== `Bearer ${journalToken}`) {
+                response.writeHead(notesDown ? 503 : 401, { "content-type": "text/plain" });
+                response.end(notesDown ? "the notes server is down" : "no token");
+
+                return;
+            }
+
+            const message = JSON.parse(body === "" ? "{}" : body) as {
+                id?: number;
+                method?: string;
+                params?: {
+                    protocolVersion?: string;
+                    name?: string;
+                    arguments?: Record<string, unknown>;
+                };
+            };
+
+            if (message.method === "initialize") {
+                answerAt(response, {
+                    jsonrpc: "2.0",
+                    id: message.id,
+                    result: {
+                        protocolVersion: message.params?.protocolVersion,
+                        capabilities: { tools: {} },
+                        serverInfo: { name: "fake-notes", version: "1" },
+                    },
+                });
+
+                return;
+            }
+
+            if (message.method === "notifications/initialized") {
+                response.writeHead(202);
+                response.end();
+
+                return;
+            }
+
+            const name = String(message.params?.name ?? "");
+            const args = message.params?.arguments ?? {};
+            const path = String(args.path ?? "");
+            const tool = (result: unknown) =>
+                answerAt(response, { jsonrpc: "2.0", id: message.id, result });
+            const fail = (text: string) =>
+                tool({ isError: true, content: [{ type: "text", text }] });
+            const ok = (text: string, structured: unknown) =>
+                tool({ content: [{ type: "text", text }], structuredContent: structured });
+
+            if (message.method !== "tools/call") {
+                answerAt(response, {
+                    jsonrpc: "2.0",
+                    id: message.id,
+                    error: { code: -32601, message: "no such method" },
+                });
+
+                return;
+            }
+
+            if (name === "read_note") {
+                const note = notes.get(path);
+
+                if (note === undefined) {
+                    fail(`notFound: the note ${path} does not exist`);
+                } else {
+                    ok(note, { path, text: note });
+                }
+
+                return;
+            }
+
+            if (name === "create_note") {
+                if (notes.has(path)) {
+                    fail(`the note ${path} exists already`);
+                } else {
+                    notes.set(path, String(args.content ?? ""));
+                    ok(`created ${path}`, { path });
+                }
+
+                return;
+            }
+
+            if (name === "edit_note") {
+                const note = notes.get(path);
+
+                if (note === undefined) {
+                    fail(`notFound: the note ${path} does not exist`);
+                } else {
+                    notes.set(path, note + String(args.append ?? ""));
+                    ok(`edited ${path}`, { path });
+                }
+
+                return;
+            }
+
+            fail(`no tool ${name}`);
+        });
+    });
+
+    await new Promise<void>((resolve) => notesServer?.listen(0, "127.0.0.1", resolve));
+    notesUrl = `http://127.0.0.1:${String((notesServer.address() as { port: number }).port)}/mcp/notes`;
+}
+
+/** How many times every note together holds a thread's journal marker. */
+const markers = (id: string): number =>
+    [...notes.values()].reduce(
+        (count, note) => count + note.split(`<!-- pocket-journal:${id} -->`).length - 1,
+        0,
+    );
 
 /** One git command in a test folder, with no global or system configuration. */
 function git(folder: string, ...args: string[]): string {
@@ -5941,6 +6897,38 @@ const model = scriptedModel((request) => {
 /** The revision the next write names: the tests set it from the plan's rev. */
 let writeRev = "";
 
+/** The send that Pocket's linked sessions do, as a test holds it. */
+type LinkedSend = (
+    source: ConversationId,
+    request: { to: string; message: string },
+    key: string,
+) => Promise<void>;
+
+/**
+ * Hold the linked-session sends of the app that runs now: `gate` gets each one, with the real send, and decides. It gives
+ * back the request ids it saw. The next app (after a restart) has its own sends again.
+ */
+function holdSends(
+    gate: (
+        real: LinkedSend,
+        source: ConversationId,
+        request: { to: string; message: string },
+        key: string,
+    ) => Promise<void>,
+): string[] {
+    const sessions = app.linkedSessions as unknown as { send: LinkedSend };
+    const real = sessions.send.bind(sessions);
+    const seen: string[] = [];
+
+    sessions.send = async (source, request, key) => {
+        seen.push(key);
+
+        return gate(real, source, request, key);
+    };
+
+    return seen;
+}
+
 /** The messages a session got, as text: the scripted model's echo of one is no second message. */
 async function userTexts(id: ConversationId): Promise<string[]> {
     const view = await (await app.harness.conversation(id, context))!.context(context);
@@ -6065,6 +7053,10 @@ before(async () => {
     chmodSync(fakeGh, 0o755);
     process.env.PI_POCKET_DESK_GH = fakeGh;
     process.env.PI_POCKET_DESK_CONFIG = configPath;
+    // The journal reads this test's token file only: never a real one in the home of the person who runs the tests.
+    writeFileSync(journalTokenPath, `${journalToken}\n`, { mode: 0o600 });
+    process.env.PI_POCKET_DESK_JOURNAL_TOKEN = journalTokenPath;
+    await startNotes();
     writeFileSync(
         configPath,
         JSON.stringify({ digest: { minutes: 0 }, cap: 100, plans: { root: plansFolder } }),
@@ -6080,6 +7072,7 @@ before(async () => {
 after(async () => {
     await new Promise<void>((resolve) => server?.close(() => resolve()));
     await app?.close();
+    await new Promise<void>((resolve) => notesServer?.close(() => resolve()));
     cleanUp();
 });
 
@@ -6468,7 +7461,38 @@ describe("with the Pi Pocket app", () => {
     });
 
     test("a page comment waits, wakes the planning session once across a restart, and a write settles it", async () => {
+        // The comment names the revision the page read: none is refused, and a stale one gives 409.
+        assert.equal(
+            (
+                await routes(`plans/${planId}/comment`, {
+                    section: "idea",
+                    text: "Name the rotation period.",
+                    key: "comment-key-no-rev",
+                })
+            ).status,
+            400,
+        );
+
+        const stale = await routes(`plans/${planId}/comment`, {
+            section: "idea",
+            text: "Name the rotation period.",
+            rev: "0".repeat(40),
+            key: "comment-key-stale",
+        });
+
+        assert.equal(stale.status, 409);
+        assert.match(
+            String(stale.data.error ?? stale.data.message ?? ""),
+            /changed since you read it/,
+        );
+        assert.equal((await planSnapshot())?.comments.length, 0);
+
+        // The task clock runs with the wall clock now: the wake-up the comment makes is due in 30 seconds, so it cannot
+        // go before the restart below.
+        shift = 0;
+
         const comment = await routes(`plans/${planId}/comment`, {
+            rev: (await planSnapshot())?.rev,
             section: "idea",
             text: "Name the rotation period.",
             key: "comment-key-1",
@@ -6478,6 +7502,7 @@ describe("with the Pi Pocket app", () => {
         assert.equal(
             (
                 await routes(`plans/${planId}/comment`, {
+                    rev: (await planSnapshot())?.rev,
                     section: "idea",
                     text: "Name the rotation period.",
                     key: "comment-key-1",
@@ -6489,6 +7514,7 @@ describe("with the Pi Pocket app", () => {
         assert.equal(
             (
                 await routes(`plans/${planId}/comment`, {
+                    rev: (await planSnapshot())?.rev,
                     section: "decisions",
                     text: "No.",
                     key: "comment-key-2",
@@ -6511,14 +7537,6 @@ describe("with the Pi Pocket app", () => {
             "c1 open",
         ]);
 
-        // A restart right after the commit: the wake-up the commit made still goes, and only once.
-        await stopTasks("x.desk.sweeper");
-        await stopTasks("x.desk.digest");
-        await app.close();
-        shift = 120_000;
-        app = await openApp(model, dataDir, () => Date.now() + shift);
-        await startServer();
-
         const told = async () =>
             (await userTexts(planningId!)).filter(
                 (each) =>
@@ -6526,6 +7544,21 @@ describe("with the Pi Pocket app", () => {
                     (each.includes(`Brian answered and commented on plan ${planId}`) &&
                         each.includes("Name the rotation period.")),
             ).length;
+
+        // Before the restart: the comment and its wake-up are committed, the wake-up is due later by the task clock,
+        // and no message went.
+        const waiting = (await planSnapshot())?.wake?.due ?? 0;
+
+        assert(waiting > Date.now() + shift, "the wake-up is due after now");
+        assert.equal(await told(), 0, "no message before the restart");
+
+        // A restart between the commit and the send: the wake-up goes after it, and only once.
+        await stopTasks("x.desk.sweeper");
+        await stopTasks("x.desk.digest");
+        await app.close();
+        shift = 120_000;
+        app = await openApp(model, dataDir, () => Date.now() + shift);
+        await startServer();
 
         await until(async () => (await told()) >= 1, "the comment wake-up", 20_000);
 
@@ -6537,6 +7570,7 @@ describe("with the Pi Pocket app", () => {
         assert.equal(
             (
                 await routes(`plans/${planId}/comment`, {
+                    rev: (await planSnapshot())?.rev,
                     section: "idea",
                     text: "Drop this one.",
                     key: "comment-key-4",
@@ -6590,6 +7624,15 @@ describe("with the Pi Pocket app", () => {
     test("Request changes sends the plan back to drafting, and ready brings it back", async () => {
         assert.equal((await routes(`plans/${planId}/changes`, {})).status, 400, "a key is needed");
 
+        // The send goes in, and then fails before the task's progress commit, as a crash there would: the task
+        // tries again later, under the same request id.
+        const held = holdSends(async (real, source, request, key) => {
+            await real(source, request, key);
+
+            if (key.startsWith("x.desk.plan-send:")) {
+                throw new Error("lost after the send");
+            }
+        });
         const changes = await routes(`plans/${planId}/changes`, { key: "changes-key-1" });
 
         assert.equal(changes.status, 200);
@@ -6606,8 +7649,27 @@ describe("with the Pi Pocket app", () => {
                 each.includes(`Brian asked for changes on plan ${planId}`),
             ).length;
 
+        await until(
+            async () => held.some((key) => key.startsWith("x.desk.plan-send:")),
+            "the first try",
+            20_000,
+        );
         await until(async () => (await told()) >= 1, "the changes message", 20_000);
-        assert.equal(await told(), 1);
+
+        const first = held.find((key) => key.startsWith("x.desk.plan-send:")) ?? "";
+
+        // A restart in the task's wait: the retry goes after it, with the same request id, and Pocket takes it once.
+        await stopTasks("x.desk.sweeper");
+        await stopTasks("x.desk.digest");
+        await app.close();
+        shift = 200_000;
+        app = await openApp(model, dataDir, () => Date.now() + shift);
+
+        const retried = holdSends((real, source, request, key) => real(source, request, key));
+
+        await startServer();
+        await until(async () => retried.includes(first), "the retry, under the same id", 20_000);
+        assert.equal(await told(), 1, "the session stores exactly 1 message");
 
         await say(app, planningId!, "plan ready test");
         await until(async () => (await planSnapshot())?.state === "review", "the review", 20_000);
@@ -6678,6 +7740,7 @@ describe("with the Pi Pocket app", () => {
 
     test("after the approval, a comment and Request changes give 409, and a reopen needs why", async () => {
         const comment = await routes(`plans/${planId}/comment`, {
+            rev: (await planSnapshot())?.rev,
             section: "idea",
             text: "Late.",
             key: "comment-key-late",
@@ -6768,6 +7831,7 @@ describe("with the Pi Pocket app", () => {
                 await routes(`plans/${planId}/revise`, {
                     why: "The key moves.",
                     tasks: ["t9"],
+                    graph: 1,
                     key: "revise-key-bad",
                 })
             ).status,
@@ -6780,9 +7844,42 @@ describe("with the Pi Pocket app", () => {
             "a key is needed",
         );
 
+        // The page names the approved graph it read: none, or a newer one, is refused before any change.
+        assert.equal(
+            (
+                await routes(`plans/${planId}/revise`, {
+                    why: "The key moves to a YubiKey.",
+                    tasks: ["t1"],
+                    key: "revise-key-no-graph",
+                })
+            ).status,
+            400,
+        );
+
+        const stale = await routes(`plans/${planId}/revise`, {
+            why: "The key moves to a YubiKey.",
+            tasks: ["t1"],
+            graph: 2,
+            key: "revise-key-stale",
+        });
+
+        assert.equal(stale.status, 409);
+        assert.match(
+            String(stale.data.error ?? stale.data.message ?? ""),
+            /changed since you read it/,
+        );
+        assert.equal((await planSnapshot())?.revising, undefined);
+
+        // The sends are held: Pocket admits none of them before the restart below.
+        const refused = holdSends(async (_real, _source, _request, key) => {
+            if (key.startsWith("x.desk.plan-send:")) {
+                throw new Error("held by the test");
+            }
+        });
         const revise = await routes(`plans/${planId}/revise`, {
             why: "The key moves to a YubiKey.",
             tasks: ["t1"],
+            graph: 1,
             key: "revise-key-1",
         });
 
@@ -6808,6 +7905,7 @@ describe("with the Pi Pocket app", () => {
                 await routes(`plans/${planId}/revise`, {
                     why: "The key moves to a YubiKey.",
                     tasks: ["t1"],
+                    graph: 1,
                     key: "revise-key-1",
                 })
             ).status,
@@ -6818,6 +7916,7 @@ describe("with the Pi Pocket app", () => {
         const again = await routes(`plans/${planId}/revise`, {
             why: "Another change.",
             tasks: [],
+            graph: 1,
             key: "revise-key-2",
         });
 
@@ -6827,12 +7926,38 @@ describe("with the Pi Pocket app", () => {
             /under revision already/,
         );
 
-        // A restart right after the commit: each message the commit made goes, and only once.
+        // Before the restart: the scope change is committed, its 2 messages were tried, and none went.
+        await until(
+            async () => refused.filter((key) => key.startsWith("x.desk.plan-send:")).length >= 2,
+            "the 2 held sends",
+            20_000,
+        );
+
+        const stopKeys = [...new Set(refused.filter((key) => key.startsWith("x.desk.plan-send:")))];
+        const before = await deskSnapshot();
+        const t1Before =
+            before?.threads[t1.attempts.at(-1)?.thread ?? ""] ?? assert.fail("t1's thread");
+        const sent = async (id: ConversationId, text: string): Promise<number> =>
+            (await userTexts(id)).filter((each) => each.includes(text)).length;
+
+        assert.equal(
+            await sent(
+                t1Before.session as ConversationId,
+                `Stop: plan ${planId} is under revision`,
+            ),
+            0,
+        );
+        assert.equal(await sent(planningId!, `Plan ${planId} is under revision`), 0);
+
+        // A restart between the commit and the send: each message goes after it, and only once.
         await stopTasks("x.desk.sweeper");
         await stopTasks("x.desk.digest");
         await app.close();
-        shift = 240_000;
+        shift = 300_000;
         app = await openApp(model, dataDir, () => Date.now() + shift);
+
+        const resent = holdSends((real, source, request, key) => real(source, request, key));
+
         await startServer();
 
         const state = await deskSnapshot();
@@ -6861,6 +7986,11 @@ describe("with the Pi Pocket app", () => {
         );
         assert.equal(await count(t1Thread.session as ConversationId, stop), 1);
         assert.equal(await count(planningId!, `Plan ${planId} is under revision`), 1);
+        assert.deepEqual(
+            stopKeys.filter((key) => !resent.includes(key)),
+            [],
+            "each message went after the restart under the request id of its held try",
+        );
         assert.equal(await count(t3Thread.session as ConversationId, stop), 0, "t3 goes on");
     });
 
@@ -7078,25 +8208,51 @@ describe("with the Pi Pocket app", () => {
 
         const t2 = await taskOf("t2");
 
-        await say(app, t2.session as ConversationId, "plan nochange test");
-
-        // A restart right after the commit: the plan-verify news it made goes, and only once.
-        await stopTasks("x.desk.sweeper");
-        await stopTasks("x.desk.digest");
-        await app.close();
-        shift = 360_000;
-        app = await openApp(model, dataDir, () => Date.now() + shift);
-        await startServer();
-
-        assert.equal((await planSnapshot())?.state, "verifying");
-
         const told = async () =>
             (await userTexts(startSource!)).filter((each) =>
                 each.includes(`${planId} every task of the plan is done`),
             ).length;
 
-        await until(async () => (await told()) >= 1, "the plan-verify news", 20_000);
-        assert.equal(await told(), 1);
+        // The news waits in a 1-minute digest by the task clock, which runs with the wall clock now: it cannot go
+        // before the restart below.
+        shift = 0;
+        writeFileSync(
+            configPath,
+            JSON.stringify({
+                digest: { minutes: 1, now: [] },
+                cap: 100,
+                plans: { root: plansFolder },
+            }),
+        );
+
+        try {
+            await say(app, t2.session as ConversationId, "plan nochange test");
+            await until(
+                async () => (await planSnapshot())?.state === "verifying",
+                "the verifying plan",
+                20_000,
+            );
+
+            // Before the restart: the plan is verifying, its news waits in the digest, and no message went.
+            const box = JSON.stringify((await deskSnapshot()) ?? {});
+
+            assert.match(box, new RegExp(`plan-verify:${planId}:round:v2:`));
+            assert.equal(await told(), 0, "no news before the restart");
+
+            // A restart between the commit and the send: the news goes after it, and only once.
+            await stopTasks("x.desk.sweeper");
+            await app.close();
+            shift = 360_000;
+            app = await openApp(model, dataDir, () => Date.now() + shift);
+            await startServer();
+            await until(async () => (await told()) >= 1, "the plan-verify news", 20_000);
+            assert.equal(await told(), 1);
+        } finally {
+            writeFileSync(
+                configPath,
+                JSON.stringify({ digest: { minutes: 0 }, cap: 100, plans: { root: plansFolder } }),
+            );
+        }
     });
 
     test("the check goes to the lead in its home, and a pass closes the plan as verified with its journal entry", async () => {
@@ -7135,14 +8291,16 @@ describe("with the Pi Pocket app", () => {
             20_000,
         );
 
-        // The journal is on for this step: the plan thread's close as verified gets its 1 entry.
+        // The journal is on, with the local notes server, which is down for now: the close commits its 1 entry, and no
+        // writer can write it before the restart below.
+        notesDown = true;
         writeFileSync(
             configPath,
             JSON.stringify({
                 digest: { minutes: 0 },
                 cap: 100,
                 plans: { root: plansFolder },
-                journal: { url: "http://127.0.0.1:9/mcp/notes" },
+                journal: { url: notesUrl, model: "" },
             }),
         );
 
@@ -7153,25 +8311,69 @@ describe("with the Pi Pocket app", () => {
                 "the verified plan",
                 20_000,
             );
+
+            const thread = (await planThread()) ?? assert.fail("the plan thread");
+            const after = await deskSnapshot();
+            const journaled = thread.run.journaled;
+
+            assert.equal(thread.state, "closed");
+            assert.equal(thread.closed?.outcome, "verified");
+            assert.equal(thread.closed?.by, "desk");
+            assert.notEqual(journaled, undefined);
+            assert.equal(
+                (after?.journal?.items ?? []).filter((item) => item.thread === planId).length,
+                1,
+            );
+            assert.equal(planOf(after, planId)?.verification?.rounds.length, 1);
+            assert.equal(planOf(after, planId)?.verification?.rounds[0]?.pass, true);
+            assert.equal(markers(planId), 0, "no entry is written before the restart");
+
+            // A restart after the close commit, before the write: the entry goes after it, once.
+            await stopTasks("x.desk.sweeper");
+            await app.close();
+            notesDown = false;
+            shift = 360_000 + 3_600_000;
+            app = await openApp(model, dataDir, () => Date.now() + shift);
+            await startServer();
+            await until(async () => markers(planId) >= 1, "the journal entry", 30_000);
+            await until(
+                async () =>
+                    ((await deskSnapshot())?.journal?.items ?? []).every(
+                        (item) => item.thread !== planId,
+                    ),
+                "the journal queue",
+                20_000,
+            );
+
+            // The same plan verify call again, through the tool: refused, and nothing doubles.
+            await say(app, verify.session as ConversationId, "plan verify pass test");
+            await until(
+                async () =>
+                    (await modelTexts(app, verify.session as ConversationId)).some((each) =>
+                        each.includes(
+                            `Plan ${planId} is done: a check is recorded while it is verifying.`,
+                        ),
+                    ),
+                "the refused second call",
+                20_000,
+            );
+
+            const final = await deskSnapshot();
+
+            assert.equal(planOf(final, planId)?.verification?.rounds.length, 1, "1 round");
+            assert.equal(final?.threads[planId]?.run.journaled, journaled, "the marker stays");
+            assert.equal(
+                (final?.journal?.items ?? []).filter((item) => item.thread === planId).length,
+                0,
+                "no second journal item",
+            );
+            assert.equal(markers(planId), 1, "1 written entry");
         } finally {
             writeFileSync(
                 configPath,
                 JSON.stringify({ digest: { minutes: 0 }, cap: 100, plans: { root: plansFolder } }),
             );
         }
-
-        const thread = (await planThread()) ?? assert.fail("the plan thread");
-        const after = await deskSnapshot();
-
-        assert.equal(thread.state, "closed");
-        assert.equal(thread.closed?.outcome, "verified");
-        assert.equal(thread.closed?.by, "desk");
-        assert.notEqual(thread.run.journaled, undefined);
-        assert.equal(
-            (after?.journal?.items ?? []).filter((item) => item.thread === planId).length,
-            1,
-        );
-        assert.equal(planOf(after, planId)?.verification?.rounds[0]?.pass, true);
     });
 
     test("the page drops a plan", async () => {
@@ -7373,6 +8575,59 @@ describe("with the Pi Pocket app", () => {
                 Symbol.for("pi-pocket-team.team")
             ] = team;
         }
+    });
+
+    test("an interrupted page start under the same key resumes only with its own lead and payload", async () => {
+        const source = await supervisor("plan-page-resume");
+        const page = Object.values((await deskSnapshot())?.plans ?? {}).find(
+            (each) => each.source === "page",
+        );
+
+        // A place for the start: the earlier page plan goes.
+        if (page !== undefined) {
+            assert.equal(
+                (await routes(`threads/${page.thread}/drop`, { reason: "done" })).status,
+                200,
+            );
+        }
+
+        const desk = (
+            globalThis as unknown as Record<
+                symbol,
+                { open: (tx: unknown, request: object) => Promise<unknown> } | undefined
+            >
+        )[Symbol.for("pi-pocket-team.desk")];
+
+        assert(desk, "the desk publishes its API");
+
+        // The start's first commit is in, and its session never bound: an interrupted start.
+        await app.harness.commit(
+            async (tx) =>
+                desk.open(tx, {
+                    key: "x.desk.plan-new:resume-key-1",
+                    supervisor: Number(source),
+                    agents: ["lucilla"],
+                    title: "Resumed plan",
+                    at: Date.now(),
+                    plan: { start: { idea: "Resume me.", lead: "lucilla", source: "page" } },
+                }),
+            context,
+        );
+
+        const sessions = app.sessions().length;
+        const other = await routes(`plans/new/${String(source)}`, {
+            title: "Resumed plan",
+            idea: "Resume me.",
+            lead: "teg",
+            key: "resume-key-1",
+        });
+
+        assert.equal(other.status, 400);
+        assert.match(
+            String(other.data.error ?? other.data.message ?? ""),
+            /This key started plan T\d+ for lucilla: start a new plan with a new key\./,
+        );
+        assert.equal(app.sessions().length, sessions, "no session started");
     });
 
     test("the roster route gives the leads with a home, the supervisors, and the plan count", async () => {

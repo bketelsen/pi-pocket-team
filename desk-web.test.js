@@ -13,6 +13,13 @@ import setup, {
     revisingLine,
     withoutAsk,
     keyFor,
+    keyForForm,
+    deskAct,
+    dropPlanAct,
+    clearIfSent,
+    draftKey,
+    sameForm,
+    shownMarks,
     markKey,
     markText,
     newKey,
@@ -986,4 +993,177 @@ test("a reopen's history, a scope change and a cleared draft read right", () => 
         "Under revision (Brian): x · stopped: t1, t2",
     );
     assert.deepEqual(withoutAsk({ T1a: { "0/r1": "yes" }, T1b: {} }, "T1a"), { T1b: {} });
+});
+
+test("a form's key stays while its values stay, and a changed field makes a new key", () => {
+    const keys = {};
+    let made = 0;
+    const make = (act) => `${act}-${++made}`;
+    const form = { title: "Keys", idea: "Rotate.", lead: "lucilla", model: "", supervisor: 7 };
+
+    assert.equal(keyForForm(keys, "new-plan", form, make), "new-plan-1");
+    assert.equal(keyForForm(keys, "new-plan", { ...form }, make), "new-plan-1", "a second tap");
+    assert.equal(keyForForm(keys, "new-plan", { ...form, lead: "teg" }, make), "new-plan-2");
+    assert.equal(
+        keyForForm(keys, "new-plan", { ...form, lead: "teg", supervisor: 8 }, make),
+        "new-plan-3",
+    );
+    forgetKey(keys, "new-plan");
+    assert.equal(
+        keyForForm(keys, "new-plan", form, make),
+        "new-plan-4",
+        "a done start gets a new key",
+    );
+});
+
+test("a marks save right after a load sends the stored marks, so it clears nothing", () => {
+    const ask = { id: "T5a", gen: 0, open: true, marks: { "0/r1": "yes", "1/r2": "no" } };
+
+    assert.deepEqual(
+        shownMarks({}, ask),
+        { "0/r1": "yes", "1/r2": "no" },
+        "no edit: the stored marks",
+    );
+    assert.deepEqual(shownMarks({ "T5a:0": { "0/r1": "partly" } }, ask), { "0/r1": "partly" });
+    assert.deepEqual(shownMarks({}, { id: "T5b", gen: 0, open: true }), {});
+    assert.deepEqual(
+        shownMarks({ "T5a:0": { "0/r1": "no" } }, { ...ask, open: false }),
+        ask.marks,
+        "an answered ask shows its stored marks",
+    );
+});
+
+test("a draft belongs to 1 generation of its ask: after a reopen it is not shown or sent", () => {
+    assert.equal(draftKey({ id: "T5a", gen: 0 }), "T5a:0");
+    assert.equal(draftKey({ id: "T5a", gen: 1 }), "T5a:1");
+    assert.equal(draftKey({ id: "F7a" }), "F7a:0", "an ask with no generation");
+
+    const drafts = { "T5a:0": { "0/r1": "yes" } };
+    const reopened = { id: "T5a", gen: 1, open: true };
+
+    assert.deepEqual(shownMarks(drafts, reopened), {}, "the draft of generation 0 does not show");
+    assert.equal({ "T5a:0": "TPM" }[draftKey(reopened)], undefined, "nor its answer");
+});
+
+test("a changed payload after a failed send gets a new key, and a send clears only the text it sent", () => {
+    const keys = {};
+    let made = 0;
+    const make = (act) => `${act}-${++made}`;
+    const first = { section: "idea", text: "Name the period.", rev: "abc" };
+
+    assert.equal(keyForForm(keys, "comment-idea", first, make), "comment-idea-1");
+    // The send failed; Brian sends the same text again: the same key.
+    assert.equal(keyForForm(keys, "comment-idea", { ...first }, make), "comment-idea-1");
+    // He changed the text: a new comment, with a new key.
+    assert.equal(
+        keyForForm(
+            keys,
+            "comment-idea",
+            { ...first, text: "Name the period and the owner." },
+            make,
+        ),
+        "comment-idea-2",
+    );
+
+    assert.equal(clearIfSent(" Name the period. ", "Name the period."), "");
+    assert.equal(
+        clearIfSent("Name the period. And more", "Name the period."),
+        "Name the period. And more",
+        "text typed after the send stays",
+    );
+    assert.equal(clearIfSent(undefined, ""), "");
+    assert.equal(sameForm({ title: "a", idea: "b" }, { title: "a", idea: "b" }), true);
+    assert.equal(sameForm({ title: "a", idea: "b!" }, { title: "a", idea: "b" }), false);
+});
+
+/** A fake API: each path's answer, or the refusal it throws; it records each call in order. */
+const fakeApi = (answers) => {
+    const calls = [];
+
+    return {
+        calls,
+        call: async (path, body) => {
+            calls.push(body === undefined ? ["GET", path] : ["POST", path, body]);
+
+            const answer = answers[path];
+
+            if (answer instanceof Error) {
+                throw answer;
+            }
+
+            return answer;
+        },
+    };
+};
+
+const conflict = (message) => Object.assign(new Error(message), { status: 409 });
+
+test("a 409 on a plan answer from Needs you loads the view again, and the error stays", async () => {
+    const newer = { threads: [{ id: "T5", asks: [{ id: "T5a", gen: 1 }] }] };
+    const api = fakeApi({
+        "asks/T5a/answer": conflict("T5a was reopened since you read it."),
+        threads: newer,
+    });
+    const done = await deskAct(api.call, () => api.call("threads"), "asks/T5a/answer", {
+        words: "TPM",
+        gen: 0,
+    });
+
+    assert.deepEqual(api.calls, [
+        ["POST", "asks/T5a/answer", { words: "TPM", gen: 0 }],
+        ["GET", "threads"],
+    ]);
+    assert.deepEqual(done, {
+        ok: false,
+        error: "T5a was reopened since you read it.",
+        reloaded: newer,
+    });
+
+    // A plain refusal (400) loads nothing; a done act gives its view.
+    const plain = fakeApi({ "asks/T5a/answer": new Error("An answer is 1 to 1000 characters.") });
+
+    assert.deepEqual(
+        await deskAct(plain.call, () => plain.call("threads"), "asks/T5a/answer", {}),
+        {
+            ok: false,
+            error: "An answer is 1 to 1000 characters.",
+        },
+    );
+    assert.deepEqual(
+        plain.calls.map((each) => each[1]),
+        ["asks/T5a/answer"],
+    );
+
+    const ok = fakeApi({ "asks/T5a/answer": newer });
+
+    assert.deepEqual(await deskAct(ok.call, () => ok.call("threads"), "asks/T5a/answer", {}), {
+        ok: true,
+        next: newer,
+    });
+});
+
+test("a 409 on the plan's Drop loads the plan again, and the error says so and stays", async () => {
+    const newer = { id: "T5", state: "drafting", waiting: ["T5a open"] };
+    const api = fakeApi({
+        "threads/T5/drop": conflict("the drop refused: T5 has an open ask: T5a."),
+        "plans/T5": newer,
+    });
+    const done = await dropPlanAct(api.call, () => api.call("plans/T5"), "T5", "not now");
+
+    assert.deepEqual(api.calls, [
+        ["POST", "threads/T5/drop", { reason: "not now" }],
+        ["GET", "plans/T5"],
+    ]);
+    assert.deepEqual(done, {
+        ok: false,
+        error: "the drop refused: T5 has an open ask: T5a. The view is loaded again.",
+        reloaded: newer,
+    });
+
+    const ok = fakeApi({ "threads/T5/drop": {} });
+
+    assert.deepEqual(await dropPlanAct(ok.call, () => ok.call("plans/T5"), "T5", "done"), {
+        ok: true,
+    });
+    assert.equal(ok.calls.length, 1, "a done drop loads nothing here");
 });

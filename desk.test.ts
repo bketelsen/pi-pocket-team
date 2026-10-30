@@ -22308,3 +22308,59 @@ describe("the label needs-plan", () => {
         assert.match(issuesText(state), /^needs a plan · frostyard\/snosi#31 · duncan/m);
     });
 });
+
+describe("a needs-plan label on an issue that is queued already", () => {
+    test("it is plan news once, with its own seen record and key", () => {
+        const queued = judged(
+            issueNode(41, {
+                labels: ["agent-queue"],
+                events: [labelEvent("agent-queue", "bketelsen", at(1))],
+            }),
+        );
+        const first = mergeQueue(undefined, readOf([queued]), ms(10))!;
+
+        assert.deepEqual(
+            first.news.map((news) => [news.kind, news.plan === true]),
+            [["issue", false]],
+        );
+
+        const planned = judged(
+            issueNode(41, {
+                labels: ["agent-queue", "needs-plan"],
+                events: [
+                    labelEvent("agent-queue", "bketelsen", at(1)),
+                    labelEvent("needs-plan", "bketelsen", at(3)),
+                ],
+            }),
+        );
+        const second = mergeQueue(first.queue, readOf([planned]), ms(20))!;
+
+        assert.deepEqual(
+            second.news.map((news) => [news.kind, news.plan === true, news.item.ref]),
+            [["issue", true, "frostyard/snosi#41"]],
+        );
+        assert.equal(second.queue.planSeen?.["frostyard/snosi#41"], ms(3));
+        assert.match(issueLine("issue", second.news[0]!.item, ""), /for a plan/);
+        assert.deepEqual(mergeQueue(second.queue, readOf([planned]), ms(30))!.news, [], "once");
+
+        // The label goes and comes back: it is news again.
+        const third = mergeQueue(second.queue, readOf([queued]), ms(40))!;
+
+        assert.equal(third.queue.planSeen?.["frostyard/snosi#41"], undefined);
+        assert.equal(mergeQueue(third.queue, readOf([planned]), ms(50))!.news.length, 1);
+    });
+
+    test("a new issue with the label gets 1 news item, not 2", () => {
+        const planned = judged(
+            issueNode(42, {
+                labels: ["needs-plan"],
+                events: [labelEvent("needs-plan", "bketelsen", at(3))],
+            }),
+        );
+        const first = mergeQueue(undefined, readOf([planned]), ms(10))!;
+
+        assert.equal(first.news.length, 1);
+        assert.equal(first.news[0]?.plan, undefined);
+        assert.equal(first.queue.planSeen?.["frostyard/snosi#42"], ms(3));
+    });
+});

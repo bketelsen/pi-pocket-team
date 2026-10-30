@@ -145,6 +145,22 @@ export const keyFor = (keys, act, make = newKey) => {
     return keys[act];
 };
 
+/**
+ * The key of a form's act: the same while the form holds the same values, and a new one when a value changed, so a
+ * resumed start never goes on with other values under an old key.
+ */
+export const keyForForm = (keys, act, form, make = newKey) => {
+    // A payload's key: the same payload keeps it; another one (Brian changed a field after a failed send) gets a new key.
+    const values = JSON.stringify(form);
+    const known = keys[act];
+
+    if (known === undefined || known.values !== values) {
+        keys[act] = { values, key: make(act) };
+    }
+
+    return keys[act].key;
+};
+
 /** The act is done: its next tap is a new act, with a new key. */
 export const forgetKey = (keys, act) => {
     delete keys[act];
@@ -153,9 +169,75 @@ export const forgetKey = (keys, act) => {
 /** Whether a refusal says that the page read an older state: the page then loads the view again. */
 export const isConflict = (failure) => failure?.status === 409;
 
+/** A refusal's words on the screen: a 409 says that the view was loaded again. */
+export const refusalText = (failure) =>
+    isConflict(failure) ? `${failure.message} The view is loaded again.` : failure.message;
+
+/**
+ * 1 act of the Desk page, with the API call and the view's load given: the call, and after a refusal that is a 409 (or
+ * any refusal of an OK, which goes stale with the desk) a GET of the view, so the page shows the newer state. The error
+ * comes back after the load, so it stays on the screen.
+ */
+export const deskAct = async (call, load, path, body) => {
+    try {
+        return { ok: true, next: await call(path, body) };
+    } catch (failure) {
+        const reloaded = path === "grant" || isConflict(failure) ? await load() : undefined;
+
+        return {
+            ok: false,
+            error: failure.message,
+            ...(reloaded === undefined ? {} : { reloaded }),
+        };
+    }
+};
+
+/**
+ * The plan view's Drop, with the API call and the plan's load given: after a 409 the plan loads again, and the error
+ * says so and stays.
+ */
+export const dropPlanAct = async (call, loadPlan, id, reason) => {
+    try {
+        await call(`threads/${id}/drop`, { reason });
+
+        return { ok: true };
+    } catch (failure) {
+        // A load that fails keeps the view that is there: the error stays either way.
+        const reloaded = isConflict(failure) ? await loadPlan().catch(() => undefined) : undefined;
+
+        return {
+            ok: false,
+            error: refusalText(failure),
+            ...(reloaded === undefined ? {} : { reloaded }),
+        };
+    }
+};
+
 /** A scope change in force, in 1 line: who, why, and the tasks it stopped. */
 export const revisingLine = (revising) =>
     `Under revision (${revising.by}): ${revising.why} · stopped: ${revising.tasks.join(", ") || "none"}`;
+
+/**
+ * The key of an ask's local drafts (its answer, why and marks): the ask id and its generation, `T5a:0`. A draft of
+ * another generation is never shown or sent.
+ */
+export const draftKey = (ask) => `${ask.id}:${ask.gen ?? 0}`;
+
+/**
+ * The marks the matrix shows: Brian's draft of this generation, else the stored marks. A save sends these, so a save
+ * with no edit keeps the stored marks.
+ */
+export const shownMarks = (drafts, ask) =>
+    ask.open ? (drafts?.[draftKey(ask)] ?? ask.marks ?? {}) : (ask.marks ?? {});
+
+/**
+ * The text a field holds after its send: empty when it still holds the text that was sent, else what Brian typed
+ * after the send.
+ */
+export const clearIfSent = (now, sent) => ((now ?? "").trim() === sent ? "" : now);
+
+/** Whether a form holds the same values as when it was sent. */
+export const sameForm = (now, sent) => JSON.stringify(now) === JSON.stringify(sent);
 
 /** The page's drafts without 1 ask's: a new object. */
 export const withoutAsk = (drafts, id) => {
@@ -497,9 +579,12 @@ export default function setup(pocket) {
         const [reopenFor, setReopenFor] = useState(null);
         const [reopenWhy, setReopenWhy] = useState("");
         const [reopenTasks, setReopenTasks] = useState([]);
+        // Drafts by `draftKey` (ask id and generation): a draft of another generation is never shown or sent.
         const [answers, setAnswers] = useState({});
         const [whys, setWhys] = useState({});
         const [marks, setMarks] = useState({});
+        // What the fields hold now, for after a send: only the text that was sent is cleared.
+        const [live] = useState(() => ({ comment: "", changes: "" }));
 
         const openPlan = async () => {
             const answer = await pocket.api(`plans/${id}`);
@@ -578,34 +663,32 @@ export default function setup(pocket) {
             run("approve", `plans/${id}/approve`, {
                 rev: plan.rev,
                 graph: plan.graph?.version,
-                key: keyFor(keys, "approve"),
+                key: keyForForm(keys, "approve", { rev: plan.rev, graph: plan.graph?.version }),
             });
 
-        /** Drop the plan: the desk refuses it while an ask is open, and says so. */
+        /** Drop the plan: the desk refuses it while an ask is open, and says so. A 409 loads the plan again. */
         const drop = async () => {
             setBusy(true);
             setError("");
 
-            try {
-                await pocket.api(`threads/${id}/drop`, { reason: dropWhy.trim() });
+            const done = await dropPlanAct(pocket.api, openPlan, id, dropWhy.trim());
 
-                // Brian went back while the drop ran: the page he is on now must not close.
-                if (!stillMounted(life)) {
-                    return;
-                }
+            // Brian went back while the drop ran: the page he is on now must not close.
+            if (!stillMounted(life)) {
+                return;
+            }
 
-                await onChanged();
+            if (!done.ok) {
+                setError(done.error);
+                setBusy(false);
 
-                if (!stillMounted(life)) {
-                    return;
-                }
+                return;
+            }
 
+            await onChanged();
+
+            if (stillMounted(life)) {
                 onBack();
-            } catch (failure) {
-                if (stillMounted(life)) {
-                    setError(failure.message);
-                    setBusy(false);
-                }
             }
         };
 
@@ -616,48 +699,67 @@ export default function setup(pocket) {
                 return;
             }
 
+            const draft = draftKey(ask);
+            const why = (whys[draft] ?? "").trim();
             const done = await run(
                 undefined,
                 `asks/${ask.id}/answer`,
-                planAnswerBody(text, ask.gen, whys[ask.id] ?? "", marks[ask.id]),
+                planAnswerBody(text, ask.gen, why, marks[draft]),
             );
 
             if (done) {
-                setAnswers({ ...answers, [ask.id]: "" });
-                setWhys({ ...whys, [ask.id]: "" });
+                // Only what was sent goes: words typed after the send stay.
+                setAnswers((now) => ({ ...now, [draft]: clearIfSent(now[draft], text) }));
+                setWhys((now) => ({ ...now, [draft]: clearIfSent(now[draft], why) }));
                 // The marks went with the answer: the next view shows the stored ones.
-                setMarks(withoutAsk(marks, ask.id));
+                setMarks((now) => withoutAsk(now, draft));
             }
         };
 
+        // The marks the matrix shows go: with no edit, that is the stored marks, which stay.
         const saveMarks = (ask) =>
-            run(undefined, `asks/${ask.id}/marks`, { gen: ask.gen, marks: marks[ask.id] ?? {} });
+            run(undefined, `asks/${ask.id}/marks`, { gen: ask.gen, marks: shownMarks(marks, ask) });
 
         const reopen = async (ask) => {
             const scope = reopenIsScope(plan);
-            const done = await run(`reopen-${ask.id}`, `asks/${ask.id}/reopen`, {
+            const act = `reopen-${ask.id}`;
+            // A scope change names the approved graph this view showed: a newer one refuses it with 409.
+            const payload = {
                 gen: ask.gen,
-                key: keyFor(keys, `reopen-${ask.id}`),
-                ...(scope ? { why: reopenWhy.trim(), tasks: reopenTasks } : {}),
+                ...(scope
+                    ? {
+                          why: reopenWhy.trim(),
+                          tasks: reopenTasks,
+                          graph: plan.approvedGraph?.version,
+                      }
+                    : {}),
+            };
+            const done = await run(act, `asks/${ask.id}/reopen`, {
+                ...payload,
+                key: keyForForm(keys, act, payload),
             });
 
             if (done) {
                 setReopenFor(null);
                 setReopenWhy("");
                 setReopenTasks([]);
-                // The old marks went to the history: the new generation starts blank.
-                setMarks(withoutAsk(marks, ask.id));
             }
         };
 
         const comment = async (section) => {
-            const done = await run(`comment-${section.id}`, `plans/${id}/comment`, {
-                section: section.id,
-                text: commentText.trim(),
-                key: keyFor(keys, `comment-${section.id}`),
+            const act = `comment-${section.id}`;
+            const text = commentText.trim();
+            // The revision this view showed: a newer one refuses the comment with 409.
+            const payload = { section: section.id, text, rev: plan.rev };
+            // Brian changed the text after a failed send: a new comment, with a new key.
+            const done = await run(act, `plans/${id}/comment`, {
+                ...payload,
+                key: keyForForm(keys, act, payload),
             });
 
-            if (done) {
+            // Only the text that was sent goes: text typed after the send stays, with its form.
+            if (done && clearIfSent(live.comment, text) === "") {
+                live.comment = "";
                 setCommentFor(null);
                 setCommentText("");
             }
@@ -668,22 +770,29 @@ export default function setup(pocket) {
 
         const requestChanges = async () => {
             const text = changesText.trim();
+            const payload = text === "" ? {} : { text, section: changesSection, rev: plan.rev };
             const done = await run("changes", `plans/${id}/changes`, {
-                key: keyFor(keys, "changes"),
-                ...(text === "" ? {} : { text, section: changesSection }),
+                ...payload,
+                key: keyForForm(keys, "changes", payload),
             });
 
-            if (done) {
+            if (done && clearIfSent(live.changes, text) === "") {
+                live.changes = "";
                 setChangesOpen(false);
                 setChangesText("");
             }
         };
 
         const revise = async () => {
-            const done = await run("revise", `plans/${id}/revise`, {
+            // The approved graph this view showed: a newer one refuses it with 409.
+            const payload = {
                 why: reviseWhy.trim(),
                 tasks: reviseTasks,
-                key: keyFor(keys, "revise"),
+                graph: plan.approvedGraph?.version,
+            };
+            const done = await run("revise", `plans/${id}/revise`, {
+                ...payload,
+                key: keyForForm(keys, "revise", payload),
             });
 
             if (done) {
@@ -718,7 +827,7 @@ export default function setup(pocket) {
                 return null;
             }
 
-            const current = ask.open ? (marks[ask.id] ?? ask.marks ?? {}) : (ask.marks ?? {});
+            const current = shownMarks(marks, ask);
 
             return html`<div class="desk-plan-matrix">
                 <table>
@@ -745,7 +854,7 @@ export default function setup(pocket) {
                                             onClick=${() =>
                                                 setMarks({
                                                     ...marks,
-                                                    [ask.id]: withMark(
+                                                    [draftKey(ask)]: withMark(
                                                         current,
                                                         cell,
                                                         nextMark(mark),
@@ -807,10 +916,10 @@ export default function setup(pocket) {
                           maxlength="300"
                           placeholder="Why (optional)"
                           aria-label=${`Why, for ${ask.id}`}
-                          value=${whys[ask.id] ?? ""}
+                          value=${whys[draftKey(ask)] ?? ""}
                           disabled=${busy}
                           onInput=${(event) =>
-                              setWhys({ ...whys, [ask.id]: event.currentTarget.value })}
+                              setWhys({ ...whys, [draftKey(ask)]: event.currentTarget.value })}
                       />
                       <div class="desk-actions">
                           <input
@@ -819,15 +928,18 @@ export default function setup(pocket) {
                               maxlength="1000"
                               placeholder="Your answer"
                               aria-label=${`Your answer to ${ask.id}`}
-                              value=${answers[ask.id] ?? ""}
+                              value=${answers[draftKey(ask)] ?? ""}
                               disabled=${busy}
                               onInput=${(event) =>
-                                  setAnswers({ ...answers, [ask.id]: event.currentTarget.value })}
+                                  setAnswers({
+                                      ...answers,
+                                      [draftKey(ask)]: event.currentTarget.value,
+                                  })}
                           />
                           <button
                               class="button"
-                              disabled=${busy || (answers[ask.id] ?? "").trim() === ""}
-                              onClick=${() => void answerAsk(ask, answers[ask.id])}
+                              disabled=${busy || (answers[draftKey(ask)] ?? "").trim() === ""}
+                              onClick=${() => void answerAsk(ask, answers[draftKey(ask)])}
                           >
                               Answered
                           </button>
@@ -917,7 +1029,10 @@ export default function setup(pocket) {
                             placeholder=${`A comment on ${section.heading}`}
                             aria-label=${`A comment on ${section.heading}`}
                             value=${commentText}
-                            onInput=${(event) => setCommentText(event.currentTarget.value)}
+                            onInput=${(event) => {
+                                live.comment = event.currentTarget.value;
+                                setCommentText(event.currentTarget.value);
+                            }}
                         ></textarea>
                         <div class="desk-actions">
                             <button
@@ -936,6 +1051,7 @@ export default function setup(pocket) {
                         onClick=${() => {
                             setCommentFor(section.id);
                             setCommentText("");
+                            live.comment = "";
                         }}
                     >
                         + Comment on ${section.heading}
@@ -1113,7 +1229,10 @@ export default function setup(pocket) {
                                   placeholder="What to change (optional)"
                                   aria-label="What to change"
                                   value=${changesText}
-                                  onInput=${(event) => setChangesText(event.currentTarget.value)}
+                                  onInput=${(event) => {
+                                      live.changes = event.currentTarget.value;
+                                      setChangesText(event.currentTarget.value);
+                                  }}
                               ></textarea>
                               ${
                                   changesText.trim() === ""
@@ -1488,7 +1607,16 @@ export default function setup(pocket) {
             setError("");
 
             try {
-                const next = await pocket.api(path, body);
+                // A 409 loads the view again inside `deskAct`; its error comes after, so it stays on the screen.
+                const done = await deskAct(pocket.api, load, path, body);
+
+                if (!done.ok) {
+                    setError(done.error);
+
+                    return;
+                }
+
+                const next = done.next;
 
                 if (next?.threads) {
                     publish(next);
@@ -1504,12 +1632,6 @@ export default function setup(pocket) {
                 setResultText("");
             } catch (failure) {
                 setError(failure.message);
-
-                // A refused tap means the page's view is out of date (the desk is not full now): load it again, so a
-                // stale banner goes.
-                if (path === "grant") {
-                    void load();
-                }
             } finally {
                 setBusy(false);
             }
@@ -1530,12 +1652,13 @@ export default function setup(pocket) {
         const failCheck = (id) =>
             act(`threads/${id}/result`, { pass: false, text: resultText.trim() });
 
-        const answer = async (id, gen) => {
-            const words = (answers[id] ?? "").trim();
+        const answer = async (ask) => {
+            // The draft of this generation only: a draft from before a reopen is never sent.
+            const words = (answers[draftKey(ask)] ?? "").trim();
 
             // The page never sends an empty answer: the button waits for Brian's words.
             if (words !== "") {
-                await act(`asks/${id}/answer`, answerBody(words, gen));
+                await act(`asks/${ask.id}/answer`, answerBody(words, ask.gen));
             }
         };
 
@@ -1546,9 +1669,11 @@ export default function setup(pocket) {
 
         /** Start a plan as Brian, from the supervisor's conversation; the plan view opens on it. */
         const startPlan = async (supervisor) => {
+            const form = { ...planForm, lead: planForm.lead || (planInfo?.leads?.[0]?.id ?? "") };
+            // The key follows the form's values and the supervisor: a changed field is a new start, with a new key.
             const made = newPlanBody(
-                { ...planForm, lead: planForm.lead || (planInfo?.leads?.[0]?.id ?? "") },
-                keyFor(planKeys, "new-plan"),
+                form,
+                keyForForm(planKeys, "new-plan", { ...form, supervisor }),
             );
 
             if ("error" in made) {
@@ -1565,7 +1690,10 @@ export default function setup(pocket) {
 
                 forgetKey(planKeys, "new-plan");
                 setNewPlanOpen(false);
-                setPlanForm({ title: "", idea: "", lead: "", model: "" });
+                // Only the values that were sent go: a field Brian changed after the tap stays.
+                setPlanForm((now) =>
+                    sameForm(now, planForm) ? { title: "", idea: "", lead: "", model: "" } : now,
+                );
                 await load();
                 await loadPlanInfo();
                 setPlanId(started.plan);
@@ -1975,16 +2103,19 @@ export default function setup(pocket) {
                                 type="text"
                                 maxlength="1000"
                                 placeholder="Your answer"
-                                value=${answers[ask.id] ?? ""}
+                                value=${answers[draftKey(ask)] ?? ""}
                                 disabled=${busy}
                                 onInput=${(event) =>
-                                    setAnswers({ ...answers, [ask.id]: event.currentTarget.value })}
+                                    setAnswers({
+                                        ...answers,
+                                        [draftKey(ask)]: event.currentTarget.value,
+                                    })}
                             />
                             <button
                                 class="button"
-                                disabled=${busy || (answers[ask.id] ?? "").trim() === ""}
+                                disabled=${busy || (answers[draftKey(ask)] ?? "").trim() === ""}
                                 aria-label=${`Answered ${ask.id}`}
-                                onClick=${() => void answer(ask.id, ask.gen)}
+                                onClick=${() => void answer(ask)}
                             >
                                 Answered
                             </button>
