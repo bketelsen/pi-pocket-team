@@ -666,9 +666,10 @@ Each line below differs from the design above, and says why.
   `sk-` alone would refuse the ordinary text `desk-web`.
 - **`Plan` gains `wake`** (`{ due?, sent }`): Brian's answers within 30 seconds go to the planning session as 1
   message, and the stored keys make each answer wake it once, also across a restart.
-- **`Plan.wake` also holds `outstanding`** (the messages an abort did not confirm, with their text and request id): a
-  send can be admitted just before a stop, so the next batch sends that same message under its own id, never the same
-  answer twice under a new one.
+- **`Plan.wake` also holds `outstanding`** (the messages an abort or a failed send did not confirm, with their text,
+  request id and tries): a send can be admitted just before a stop, so the next batch sends that same message under its
+  own id, never the same answer twice under a new one. After 5 tries the desk drops the message and says so in 1 event:
+  the keys stay, and `plan read` shows the answers.
 - **`plan tasks` is a desk write**: the Tasks section and the graph go in 1 commit, so a graph's `rev` is the revision
   that carries its Tasks section, and any later write makes the draft stale, so Ready asks for `plan tasks` again.
 - **A write that names an ask it cannot settle is refused**, not partly applied: the check runs in the commit, so a

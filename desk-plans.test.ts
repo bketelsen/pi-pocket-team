@@ -72,6 +72,8 @@ import {
     validateGraph,
     waitingText,
     wakeAbort,
+    wakeFailed,
+    wakeGaveUpText,
     wakeMessages,
     wakeNext,
     wakeTake,
@@ -83,6 +85,7 @@ import {
     storePath,
     threadOfSession,
     writeStore,
+    type PlanWakeMessage,
     type PlanWriteIo,
     type DeskState,
     type Plan,
@@ -2660,6 +2663,150 @@ describe("the ready replay's result", () => {
     });
 });
 
+describe("a message that does not reach the session", () => {
+    /** A session that admits 1 message for each request id, as Pocket does, and can be told to refuse. */
+    function fakeSend(refuse: () => boolean = () => false) {
+        const admitted = new Map<string, string>();
+
+        return {
+            admitted,
+            send: (message: PlanWakeMessage): void => {
+                if (refuse()) {
+                    throw new Error("refused");
+                }
+
+                if (!admitted.has(message.requestId)) {
+                    admitted.set(message.requestId, message.text);
+                }
+            },
+            texts: () => [...admitted.values()],
+        };
+    }
+
+    /** A plan with 1 answered ask, and its wake-up ready to take. */
+    function asked(
+        words = "A: in the TPM.",
+        text = "Where do the keys live?",
+    ): { state: DeskState; plan: Plan; thread: Thread } {
+        const { state, plan, thread } = startPlan();
+
+        plan.state = "review";
+        addPlanAsk(state, "T1", {
+            key: "ask:1",
+            by: "lucilla",
+            at: tick(1),
+            section: "idea",
+            rev: plan.rev,
+            text,
+        });
+
+        (thread.asks[0] ?? assert.fail("an ask")).answer = {
+            at: tick(2),
+            by: "Brian",
+            words,
+        };
+
+        return { state, plan, thread };
+    }
+
+    const quote = (value: string): string => `"${value}"`;
+
+    test("a failed retry keeps its message, and the answer goes once", () => {
+        const { state, plan, thread } = asked();
+
+        // M goes, is admitted, and the progress commit never happens: the abort keeps it as it is.
+        const first = wakeTake(state, "T1", quote);
+        const message = first.messages[0] ?? assert.fail("a message");
+
+        wakeAbort(plan, { phase: "deliver", to: "session-31", messages: [message], next: 0 });
+
+        // The next batch takes it again, and that send throws.
+        const second = wakeTake(state, "T1", quote);
+        const again = second.messages[0] ?? assert.fail("the kept message");
+
+        assert.equal(again.requestId, message.requestId);
+
+        const failed = wakeFailed(plan, again);
+
+        assert.equal(failed.gaveUp, false);
+        assert.deepEqual(plan.wake?.outstanding, [{ ...again, tries: 1 }]);
+        assert.deepEqual(
+            plan.wake?.sent,
+            ["answer:T1a:0"],
+            "the key stays: the answer may have gone",
+        );
+
+        // Brian answers a second question.
+        addPlanAsk(state, "T1", {
+            key: "ask:2",
+            by: "lucilla",
+            at: tick(3),
+            section: "idea",
+            rev: plan.rev,
+            text: "And the second key?",
+        });
+
+        (thread.asks[1] ?? assert.fail("a second ask")).answer = {
+            at: tick(4),
+            by: "Brian",
+            words: "B: in the file.",
+        };
+
+        const third = wakeTake(state, "T1", quote);
+
+        assert.equal(third.messages.length, 2);
+        assert.equal(third.messages[0]?.requestId, message.requestId);
+        assert.match(third.messages[1]?.text ?? "", /B: in the file\./);
+
+        const fake = fakeSend();
+
+        for (const each of third.messages) {
+            fake.send(each);
+        }
+
+        assert.equal(fake.texts().filter((each) => each.includes("A: in the TPM.")).length, 1);
+        assert.equal(fake.texts().filter((each) => each.includes("B: in the file.")).length, 1);
+    });
+
+    test("a message that fails 5 times is dropped with its event, and its keys stay", () => {
+        const { plan } = asked();
+        const message = { text: "one", requestId: "r1", keys: ["answer:T1a:0"] };
+
+        plan.wake = { sent: ["answer:T1a:0"] };
+
+        let tries = 0;
+        let gaveUp = false;
+
+        for (let at = 1; at <= 5; at += 1) {
+            // A take sends the kept message again, so its failure starts with nothing in `outstanding`.
+            plan.wake.outstanding = [];
+
+            const done = wakeFailed(plan, { ...message, tries });
+
+            gaveUp = done.gaveUp;
+
+            if (!done.gaveUp) {
+                const kept = plan.wake.outstanding?.[0] ?? assert.fail("a kept message");
+
+                assert.equal(kept.tries, at);
+                assert.equal(kept.requestId, message.requestId);
+                tries = kept.tries ?? 0;
+            }
+        }
+
+        assert.equal(gaveUp, true);
+        assert.deepEqual(plan.wake.outstanding, [], "the message is dropped");
+        assert.deepEqual(
+            plan.wake.sent,
+            ["answer:T1a:0"],
+            "its keys stay: plan read shows the answer",
+        );
+        assert.equal(
+            wakeGaveUpText(message),
+            "the answer wake-up gave up after 5 tries: T1a; the planning session reads the answers with plan read",
+        );
+    });
+});
 // ─── With the Pi Pocket app ─────────────────────────────────────────────────
 
 const dataDir = join(root, "data");

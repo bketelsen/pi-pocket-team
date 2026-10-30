@@ -11497,8 +11497,18 @@ export function planWarning(
 /** How long the desk waits for more answers before it wakes a planning session: 30 seconds. */
 export const PLAN_WAKE_MS = 30_000;
 
-/** 1 message of a plan's answer wake-up: its text, its stable request id, and the answer keys it carries. */
-export type PlanWakeMessage = { text: string; requestId: string; keys: string[] };
+/** 1 message of a plan's answer wake-up: its text, its stable request id, its answer keys, and its failures. */
+export type PlanWakeMessage = { text: string; requestId: string; keys: string[]; tries?: number };
+
+/** The tries a wake-up message gets before the desk stops keeping it: 5. */
+export const WAKE_TRIES = 5;
+
+/** The event of a message that gave up: its ask ids, and the way the session reads the answers itself. */
+export function wakeGaveUpText(message: PlanWakeMessage): string {
+    const asks = message.keys.map((key) => key.split(":")[1] ?? key).join(", ");
+
+    return `the answer wake-up gave up after ${String(WAKE_TRIES)} tries: ${asks}; the planning session reads the answers with plan read`;
+}
 
 /** The most characters 1 wake-up message has: a session's message may be long, but not endless. */
 export const WAKE_MESSAGE_MAX = 15_000;
@@ -11576,6 +11586,36 @@ export function wakeAbort(
     if (plan.wake !== undefined) {
         delete plan.wake.due;
     }
+}
+
+/**
+ * 1 message that did not reach the session: it goes back to `wake.outstanding` with 1 more try, under its own request
+ * id, so the next batch sends the same message, never the same answer under a new id. Its keys stay in `wake.sent`.
+ * After `WAKE_TRIES` failures the desk stops keeping it: it is dropped, and the caller says so in 1 event.
+ */
+export function wakeFailed(plan: Plan, message: PlanWakeMessage): { gaveUp: boolean } {
+    const tries = (message.tries ?? 0) + 1;
+    const kept = { ...message, tries };
+
+    plan.wake ??= { sent: [] };
+
+    if (tries >= WAKE_TRIES) {
+        plan.wake.outstanding = (plan.wake.outstanding ?? []).filter(
+            (each) => each.requestId !== message.requestId,
+        );
+
+        return { gaveUp: true };
+    }
+
+    const known = (plan.wake.outstanding ?? []).some(
+        (each) => each.requestId === message.requestId,
+    );
+
+    if (!known) {
+        plan.wake.outstanding = [...(plan.wake.outstanding ?? []), kept];
+    }
+
+    return { gaveUp: false };
 }
 
 /**
@@ -17102,28 +17142,29 @@ export default function createDesk(host: Host, web: Web) {
                     failed = true;
                 }
 
-                // 1 commit for this message: on success the next one is due; on failure its keys go back in the same
-                // commit, with the event. A restart after this commit never sends this message again.
+                let gaveUp = false;
+
+                // 1 commit for this message: on success the next one is due; on failure the message is kept, with its
+                // own request id, and its keys stay in `sent`. A restart after this commit never sends this one again.
                 await runtime.commit(async (tx) => {
                     const state = await tx.doc(DeskThreads);
                     const plan = planOf(state, task.input.plan);
 
-                    if (failed && plan?.wake !== undefined) {
-                        plan.wake.sent = plan.wake.sent.filter(
-                            (key) => !message.keys.includes(key),
-                        );
-                    }
+                    if (failed && plan !== undefined) {
+                        gaveUp = wakeFailed(plan, message).gaveUp;
 
-                    if (failed) {
-                        const thread = threadById(state, task.input.plan);
+                        // The desk gave up on this message: 1 event, and the session reads the answers itself.
+                        if (gaveUp) {
+                            const thread = threadById(state, task.input.plan);
 
-                        if (thread !== undefined) {
-                            addEvent(
-                                thread,
-                                `plan-wake:${message.requestId}`,
-                                "the answer wake-up did not reach the session: it goes again",
-                                runtime.now(),
-                            );
+                            if (thread !== undefined) {
+                                addEvent(
+                                    thread,
+                                    `plan-wake:${message.requestId}`,
+                                    wakeGaveUpText(message),
+                                    runtime.now(),
+                                );
+                            }
                         }
                     }
 
@@ -17144,7 +17185,9 @@ export default function createDesk(host: Host, web: Web) {
                 if (failed) {
                     host.notice(
                         "warning",
-                        `The answers on plan ${task.input.plan} did not reach its session. They go again in a moment.`,
+                        gaveUp
+                            ? `The answers on plan ${task.input.plan} did not reach its session, and the desk gave up after ${String(WAKE_TRIES)} tries: the planning session reads them with plan read.`
+                            : `The answers on plan ${task.input.plan} did not reach its session. They go again in a moment.`,
                         task.input.supervisor as ConversationId,
                     );
                 }
