@@ -682,3 +682,8 @@ Each line below differs from the design above, and says why.
   there can never be settled, and the gate would then stay open for ever.
 - **`plan ask` takes an optional `rev`**, and the plan's revision now is its default: a question is anchored to the
   revision the caller read, and the ask needs no second read for it.
+- **`Plan` gains `readies`** (`{ key, rev, graph, at }[]`, the last 20): a replayed `plan ready` finds its own call
+  in it, whatever the plan's state is now, where an event key could be gone from the last 50.
+- **The answer wake-up's checkpoint holds `messages`** (`{ text, requestId, keys }[]`): a batch over 15000 characters
+  goes as several messages, each with its own keys, and a message that fails gives its keys back, so its answers go
+  again.

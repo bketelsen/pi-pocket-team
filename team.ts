@@ -2548,43 +2548,63 @@ ${task}`,
                 );
             }
 
-            // A plan write that is not in its file yet finishes first: the task's brief names the approved revision.
-            if (delivering) {
-                await desk?.publishPlans?.(api, context);
-            }
-
             const repo = target.repo;
-            const opened =
-                desk === undefined
-                    ? undefined
-                    : await api.commit(
-                          async (tx) =>
-                              desk.open(tx, {
-                                  key,
-                                  supervisor: Number(api.conversationId),
-                                  agents: [persona.id],
-                                  ...(delivering
-                                      ? { plan: { id: plan.id ?? "", task: plan.task ?? "" } }
-                                      : {}),
-                                  ...(repo === undefined ? {} : { repo }),
-                                  ...(where === undefined ? {} : { cwd: where }),
-                                  ...(made === undefined ? {} : { worktree: made }),
-                                  title,
-                                  // Every queued issue named in the task text links to the thread.
-                                  task,
-                                  at: Date.now(),
-                                  ...(args.watch === undefined
-                                      ? {}
-                                      : {
-                                            watch: {
-                                                checkOn: args.watch.check_on,
-                                                check: args.watch.check,
-                                                by: identity?.persona?.id ?? supervisor,
-                                            },
-                                        }),
-                              }),
-                          context,
-                      );
+            let opened: Awaited<ReturnType<NonNullable<DeskApi["open"]>>> | undefined;
+
+            try {
+                // A plan write that is not in its file yet finishes first: the task's brief names the approved revision.
+                if (delivering) {
+                    await desk?.publishPlans?.(api, context);
+                }
+
+                opened =
+                    desk === undefined
+                        ? undefined
+                        : await api.commit(
+                              async (tx) =>
+                                  desk.open(tx, {
+                                      key,
+                                      supervisor: Number(api.conversationId),
+                                      agents: [persona.id],
+                                      ...(delivering
+                                          ? { plan: { id: plan.id ?? "", task: plan.task ?? "" } }
+                                          : {}),
+                                      ...(repo === undefined ? {} : { repo }),
+                                      ...(where === undefined ? {} : { cwd: where }),
+                                      ...(made === undefined ? {} : { worktree: made }),
+                                      title,
+                                      // Every queued issue named in the task text links to the thread.
+                                      task,
+                                      at: Date.now(),
+                                      ...(args.watch === undefined
+                                          ? {}
+                                          : {
+                                                watch: {
+                                                    checkOn: args.watch.check_on,
+                                                    check: args.watch.check,
+                                                    by: identity?.persona?.id ?? supervisor,
+                                                },
+                                            }),
+                                  }),
+                              context,
+                          );
+            } catch (error) {
+                // This call made a worktree a moment ago, and the thread never opened: take it away, so no branch or
+                // folder is left behind. Not when a session of this 1 already works in it, and not when the list cannot
+                // be read: then the folder stays.
+                if (worktree?.made === true) {
+                    const kept = await host.linkedSessions.list(api.conversationId).then(
+                        (sessions) => worktreeInUse(sessions, where ?? ""),
+                        () => true,
+                    );
+
+                    if (!kept) {
+                        await discardWorktree(worktree);
+                    }
+                }
+
+                throw error;
+            }
 
             // The new thread shows on the desk page at once, not at the next sweep.
             if (opened !== undefined) {

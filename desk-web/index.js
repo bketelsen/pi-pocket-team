@@ -111,6 +111,13 @@ export const planAskLine = (ask) => {
         return `${ask.id}: ${ask.text} · open`;
     }
 
+    // The desk ended it: Brian need not answer it, and no write-back waits.
+    if (ask.resolved !== undefined) {
+        const how = ask.resolved.by === undefined ? "resolved" : "withdrawn";
+
+        return `${ask.id}: ${ask.text} · ${how}: ${ask.resolved.why}`;
+    }
+
     const answer = ask.answer === undefined ? "" : ` → ${ask.answer.words} (${ask.answer.by})`;
 
     return `${ask.id}: ${ask.text}${answer}${ask.written ? "" : " · not written"}`;
@@ -374,6 +381,11 @@ export default function setup(pocket) {
                                         Waiting: ${plan.waiting.join(" · ")}
                                     </p>`
                                   : html`<p class="small muted">Settled.</p>`
+                          }
+                          ${
+                              plan.preamble === undefined || plan.preamble === ""
+                                  ? null
+                                  : html`<pre class="desk-plan-text">${plan.preamble}</pre>`
                           }
                           ${plan.sections.map(
                               (section) => html`<details class="desk-plan-section">

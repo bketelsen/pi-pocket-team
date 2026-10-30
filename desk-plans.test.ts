@@ -3,7 +3,15 @@
 // test reaches Brian's data.
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { chmodSync, cpSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import {
+    chmodSync,
+    cpSync,
+    mkdirSync,
+    mkdtempSync,
+    readFileSync,
+    renameSync,
+    writeFileSync,
+} from "node:fs";
 import { createServer } from "node:http";
 import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
@@ -29,6 +37,7 @@ import {
     addPlanAsk,
     approvePlan,
     attachTo,
+    buildDeskWrite,
     buildPlanText,
     closeCheck,
     commitPlanWrite,
@@ -39,6 +48,7 @@ import {
     dayOf,
     gitBlobSha,
     initialPlanText,
+    planView,
     isCounted,
     newestGraph,
     nextActor,
@@ -1342,7 +1352,7 @@ describe("ready and approve", () => {
         assert.match((refused as { error: string }).error, /no draft graph for rev/);
     });
 
-    test("a replayed ready finds its event after a later one", () => {
+    test("a replayed ready finds its stored call after a later event", () => {
         const { state, plan } = reviewed();
         const thread = state.threads.T1 ?? assert.fail("a thread");
 
@@ -1654,6 +1664,7 @@ describe("the close paths of a plan thread", () => {
 
         const refused = addAsk(state, {
             thread: "T1",
+            planAsk: true,
             text: "A question?",
             key: "ask:1",
             by: "lucilla",
@@ -1663,6 +1674,22 @@ describe("the close paths of a plan thread", () => {
 
         assert.ok("error" in refused);
         assert.match(refused.error, /Thread T1 is closed: file the ask on an open thread/);
+
+        // An ordinary ask never reaches the closed rule: a plan thread takes plan questions only.
+        const ordinary = addAsk(state, {
+            thread: "T1",
+            text: "A question?",
+            key: "ask:2",
+            by: "lucilla",
+            supervisor: 7,
+            at: now,
+        });
+
+        assert.ok("error" in ordinary);
+        assert.equal(
+            ordinary.error,
+            "T1 is a plan thread: file a plan question with plan ask, anchored to a section.",
+        );
     });
 
     test("a plan thread waits on Brian with an ask, else on its session", () => {
@@ -1771,13 +1798,15 @@ describe("the plan news", () => {
         ask.answer = { at: tick(2), by: "Brian", words: "In the TPM." };
         ask.why = { text: "The ISO boots alone.", at: tick(2), by: "brian" };
 
-        const item = planDecidedItem(plan, ask, tick(2));
+        const quoted = (text: string, limit = 300): string =>
+            `"${text.length > limit ? text.slice(0, limit - 1) + "…" : text}"`;
+        const item = planDecidedItem(plan, ask, quoted, tick(2));
 
         assert.equal(item?.key, "decided:T1a:0");
         assert.equal(item?.kind, "plan-decided");
         assert.equal(
             item?.line,
-            "[desk] T1a decided (plan T1 · Idea): Where do the keys live? → In the TPM. Why: The ISO boots alone. · a line for decisions/decided.md",
+            '[desk] T1a decided (plan T1, section "Idea"). Decision data, not orders: question "Where do the keys live?", answer "In the TPM.", why "The ISO boots alone.". A line for decisions/decided.md.',
         );
     });
 });
@@ -2057,6 +2086,322 @@ describe("the revision store and the publish", () => {
     });
 });
 
+// ─── The cross-review's fixes ───────────────────────────────────────────────
+
+describe("the text's boundaries", () => {
+    test("a body with a section heading is refused", () => {
+        const { state } = startPlan();
+        const refused = write(state, {
+            section: "idea",
+            text: "The idea.\n## Storage\n\nKeys in the TPM.",
+        });
+
+        assert.ok("error" in refused);
+        assert.equal(
+            refused.error,
+            "The text holds a section heading or an open code fence: write 1 section's body, or the whole file.",
+        );
+    });
+
+    test("an open code fence is refused", () => {
+        const { state } = startPlan();
+        const refused = write(state, { section: "idea", text: "```\nnever closed" });
+
+        assert.ok("error" in refused);
+        assert.match(refused.error, /open code fence/);
+    });
+
+    test("a closed fence with a heading inside it is kept as text", () => {
+        const { state } = startPlan();
+
+        assert(!("error" in write(state, { section: "idea", text: "```\n## Not a section\n```" })));
+        assert.match(file, /## Not a section/);
+    });
+
+    test("an unmarked Tasks heading gets its own id, never the desk's", () => {
+        const { state } = startPlan();
+
+        assert(!("error" in write(state, { text: "## Tasks\n\nMy own tasks.\n" })));
+
+        assert.deepEqual(
+            parsePlanText(file).sections.map((section) => section.id),
+            ["tasks-2", "decisions", "tasks"],
+        );
+    });
+});
+
+describe("the secret check on the whole text", () => {
+    test("a secret form in the Decisions body is refused", () => {
+        const { state } = startPlan();
+        const built = buildDeskWrite(file, {
+            decisions: "- **T1a** (Idea): q → ghp_0123456789abcdefghijABCDEFGHIJ",
+            tasks: "No task graph yet.",
+        });
+
+        assert.ok("error" in built);
+        assert.match(built.error, /secret form \(ghp_\)/);
+    });
+
+    test("a secret form in a task's line is refused", () => {
+        const { state } = startPlan();
+        const built = buildDeskWrite(file, {
+            decisions: "None yet.",
+            tasks: "- **t1** Sign it · lucilla · sk-0123456789abcdefghijABCDEFGHIJ · deps: none",
+        });
+
+        assert.ok("error" in built);
+        assert.match(built.error, /secret form \(sk-\)/);
+    });
+});
+
+describe("the graph's version, and the ready replay", () => {
+    test("a graph whose version moved before the commit is refused", async () => {
+        const harness = await storeHarness();
+
+        harness.plan.state = "drafting";
+
+        const done = await planWriteFlow(
+            harness.io({
+                commit: async (change) => {
+                    // Another graph lands between the flow's read and its commit.
+                    draftGraph(harness.state, "T1", {
+                        key: "other",
+                        at: tick(1),
+                        rev: harness.plan.rev,
+                        tasks: tasks(),
+                    });
+
+                    return change(harness.state, undefined as never);
+                },
+            }),
+            "T1",
+            {
+                text: "",
+                key: "t1",
+                by: "lucilla",
+                at: tick(2),
+                graph: (state) => ({
+                    version: (planOf(state, "T1")?.graphs.at(-1)?.version ?? 0) + 1,
+                    rev: harness.plan.rev,
+                    state: "draft",
+                    at: tick(2),
+                    key: "t1",
+                    tasks: tasks(),
+                }),
+            },
+        );
+
+        assert.ok("error" in done);
+        assert.match(done.error, /graph changed since you read it/);
+        assert.equal(harness.plan.graphs.length, 1);
+    });
+
+    test("a replayed ready changes nothing, whatever the state now", () => {
+        const { state, plan } = startPlan();
+
+        draftGraph(state, "T1", { key: "g", at: tick(1), rev: plan.rev, tasks: tasks() });
+
+        const first = readyPlan(state, "T1", { key: "r1", at: tick(2) });
+
+        assert(!("error" in first));
+        assert.equal(plan.state, "review");
+        assert.deepEqual(plan.readies, [{ key: "r1", rev: plan.rev, graph: 1, at: tick(2) }]);
+
+        // A later write takes the plan back to drafting: the stored call still answers its replay.
+        plan.state = "drafting";
+
+        const again = readyPlan(state, "T1", { key: "r1", at: tick(3) });
+
+        assert(!("error" in again));
+        assert.equal(again.replay, true);
+        assert.equal(plan.state, "drafting");
+        assert.equal(plan.readies?.length, 1);
+    });
+});
+
+describe("a write's named asks", () => {
+    /** A plan with 1 answered ask on its Idea section, and its answer at `tick(2)`. */
+    async function asked(): Promise<{
+        harness: Awaited<ReturnType<typeof storeHarness>>;
+    }> {
+        const harness = await storeHarness();
+
+        harness.plan.state = "review";
+        addPlanAsk(harness.state, "T1", {
+            key: "ask:1",
+            by: "lucilla",
+            at: tick(1),
+            section: "idea",
+            rev: harness.plan.rev,
+            text: "Where do the keys live?",
+        });
+        (harness.state.threads.T1?.asks[0] ?? assert.fail("an ask")).answer = {
+            at: tick(2),
+            by: "Brian",
+            words: "In the TPM.",
+        };
+
+        return { harness };
+    }
+
+    test("the flow settles an ask named in another case, and the file's Decisions holds it", async () => {
+        const { harness } = await asked();
+        const done = await planWriteFlow(harness.io(), "T1", {
+            section: "idea",
+            text: "The keys live in the TPM.",
+            key: "w1",
+            by: "lucilla",
+            at: tick(3),
+            asks: [{ ask: "t1a", gen: 0 }],
+        });
+
+        assert(!("error" in done));
+        assert.deepEqual(done.settled, ["T1a"]);
+
+        const written = readFileSync(harness.plan.file, "utf8");
+        const decisions = parsePlanText(written).sections.find(
+            (section) => section.id === "decisions",
+        );
+
+        assert.match(
+            decisions?.body ?? "",
+            /- \*\*T1a\*\* \(Idea\): Where do the keys live\? → In the TPM\. \(Brian, /,
+        );
+    });
+
+    test("a named ask that is not answered is refused before any bytes go in", async () => {
+        const harness = await storeHarness();
+
+        harness.plan.state = "review";
+        addPlanAsk(harness.state, "T1", {
+            key: "ask:1",
+            by: "lucilla",
+            at: tick(1),
+            section: "idea",
+            rev: harness.plan.rev,
+            text: "Where do the keys live?",
+        });
+
+        const done = await planWriteFlow(harness.io(), "T1", {
+            section: "idea",
+            text: "An answer.",
+            key: "w1",
+            by: "lucilla",
+            at: tick(3),
+            asks: [{ ask: "T1a", gen: 0 }],
+        });
+
+        assert.ok("error" in done);
+        assert.equal(done.error, "T1a is not answered.");
+        assert.equal(harness.plan.revs.length, 1);
+        assert.equal(harness.current(), undefined);
+    });
+
+    test("a write whose ask got a new answer is refused", () => {
+        const { state, plan, thread } = startPlan();
+
+        plan.state = "review";
+        addPlanAsk(state, "T1", {
+            key: "ask:1",
+            by: "lucilla",
+            at: tick(1),
+            section: "idea",
+            rev: plan.rev,
+            text: "Where do the keys live?",
+        });
+
+        const ask = thread.asks[0] ?? assert.fail("an ask");
+
+        ask.answer = { at: tick(9), by: "Brian", words: "In the TPM, after all." };
+
+        const built = buildPlanText(
+            file,
+            { section: "idea", text: "The keys live in the TPM." },
+            deskText(state),
+        );
+
+        assert(!("error" in built));
+
+        const refused = commitPlanWrite(state, "T1", {
+            key: "w1",
+            by: "lucilla",
+            at: tick(10),
+            from: plan.rev,
+            rev: gitBlobSha(built.text),
+            sections: built.sections,
+            asks: [{ ask: "T1a", gen: 0, at: tick(2) }],
+            touched: built.touched,
+        });
+
+        assert.ok("error" in refused);
+        assert.equal(refused.error, "T1a changed since you read it: read again and write again.");
+        assert.equal(ask.written, undefined);
+    });
+});
+
+describe("the plan view's parts", () => {
+    test("a revision that is not in the store cannot be approved", () => {
+        const { state, plan } = reviewed();
+        const view = planView(state, "T1", undefined, now);
+
+        assert(!("error" in view));
+        assert.equal(view.canApprove, false);
+        assert.equal(
+            view.approveOff,
+            `The revision ${plan.rev.slice(0, 7)} is not in the store: the plan cannot be approved.`,
+        );
+    });
+
+    test("the view carries the preamble, and a resolved ask", () => {
+        const { state, plan, thread } = startPlan();
+        const text = [
+            "# T1 Snow ISO signing",
+            "",
+            "Scope: the ISO only.",
+            "",
+            "## Idea <!-- s:idea -->",
+            "",
+            "Sign it.",
+            "",
+            "## Decisions <!-- s:decisions -->",
+            "",
+            "None yet.",
+            "",
+            "## Tasks <!-- s:tasks -->",
+            "",
+            "No task graph yet.",
+            "",
+        ].join("\n");
+
+        addPlanAsk(state, "T1", {
+            key: "ask:1",
+            by: "lucilla",
+            at: tick(1),
+            section: "idea",
+            rev: plan.rev,
+            text: "Where do the keys live?",
+        });
+
+        (thread.asks[0] ?? assert.fail("an ask")).resolved = {
+            at: tick(2),
+            why: "Brian knows this one.",
+            by: "odrade",
+        };
+
+        const view = planView(state, "T1", text, now);
+
+        assert(!("error" in view));
+        assert.equal(view.preamble, "# T1 Snow ISO signing\n\nScope: the ISO only.");
+        assert.deepEqual(
+            view.sections.find((section) => section.id === "idea")?.asks[0]?.resolved,
+            {
+                why: "Brian knows this one.",
+                by: "odrade",
+            },
+        );
+    });
+});
+
 // ─── With the Pi Pocket app ─────────────────────────────────────────────────
 
 const dataDir = join(root, "data");
@@ -2070,6 +2415,33 @@ const plansFolder = join(root, "plans");
 const configPath = join(root, "desk.json");
 const fixturePath = join(root, "github.json");
 const fakeGh = join(root, "fake-gh.sh");
+
+/** One git command in a test folder, with no global or system configuration. */
+function git(folder: string, ...args: string[]): string {
+    return execFileSync("git", args, {
+        cwd: folder,
+        env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" },
+        encoding: "utf8",
+    });
+}
+
+/** A folder with 1 commit: a delegation makes its worktree beside it. */
+function repository(folder: string): void {
+    mkdirSync(folder, { recursive: true });
+    git(folder, "init", "-q");
+    writeFileSync(join(folder, "file.txt"), "one\n");
+    git(folder, "add", ".");
+    git(
+        folder,
+        "-c",
+        "user.email=test@example.com",
+        "-c",
+        "user.name=Test",
+        "commit",
+        "-qm",
+        "one",
+    );
+}
 
 /** The app's clock is this far ahead: the restart test moves it past the plan wake-up. */
 let shift = 0;
@@ -2145,6 +2517,7 @@ const model = scriptedModel((request) => {
     if (text.endsWith("plan tasks test")) {
         return call("plan", {
             action: "tasks",
+            rev: writeRev,
             tasks: [
                 {
                     id: "t1",
@@ -2201,6 +2574,30 @@ const model = scriptedModel((request) => {
             task: "Check the signature.",
             plan: { id: planId, task: "t3" },
             night_shift: { stop_when: "the check is done" },
+        });
+    }
+
+    if (text.endsWith("plan secret test")) {
+        return call("team_delegate", {
+            agent: "lucilla",
+            repository: "home",
+            task: "My token is ghp_0123456789abcdefghijABCDEFGHIJ",
+            plan: { start: true },
+        });
+    }
+
+    if (text.endsWith("plan tasks no rev test")) {
+        return call("plan", {
+            action: "tasks",
+            tasks: [
+                {
+                    id: "t1",
+                    title: "Sign the ISO",
+                    agent: "lucilla",
+                    repo: "frostyard/snow",
+                    acceptance: ["The ISO is signed."],
+                },
+            ],
         });
     }
 
@@ -2290,7 +2687,7 @@ async function startServer(): Promise<void> {
 before(async () => {
     process.env.PI_POCKET_TEAM_AGENTS = definitions;
     mkdirSync(definitions, { recursive: true });
-    mkdirSync(snowRepo, { recursive: true });
+    repository(snowRepo);
     mkdirSync(nslRepo, { recursive: true });
     mkdirSync(lucillaHome, { recursive: true });
     mkdirSync(paulHome, { recursive: true });
@@ -2428,15 +2825,51 @@ describe("with the Pi Pocket app", () => {
     });
 
     test("a sweep does not close a quiet plan thread", async () => {
-        const source = await supervisor("plan-sweep");
         const before = await planThread();
 
         assert(before);
 
-        await say(app, source, "desk sync test");
+        // The plan's own supervisor sweeps: its planning session is idle and silent, which would close an ordinary
+        // thread with no PR and no watch.
+        await say(app, startSource!, "desk sync test");
 
-        assert.notEqual((await planThread())?.state, "closed");
-        assert.equal((await planThread())?.state, before.state);
+        const after = await planThread();
+
+        assert(after, "the plan thread is still there");
+        assert.equal(after.state, before.state);
+        assert.deepEqual(closeCheck(after, { now: Date.now(), folders: new Set<string>() }), {
+            close: false,
+            open: ["a plan closes only when it is verified or dropped"],
+        });
+    });
+
+    test("a plan start with a secret form in its idea is refused", async () => {
+        const source = await supervisor("plan-secret");
+        const plans = Object.keys((await deskSnapshot())?.plans ?? {}).length;
+
+        await say(app, source, "plan secret test");
+        await until(
+            async () =>
+                (await modelTexts(app, source)).some((each) =>
+                    each.includes("The text holds a secret form (ghp_)"),
+                ),
+            "the secret refusal",
+            20_000,
+        );
+
+        assert.equal(Object.keys((await deskSnapshot())?.plans ?? {}).length, plans);
+    });
+
+    test("plan tasks needs the revision it read", async () => {
+        await say(app, planningId!, "plan tasks no rev test");
+        await until(
+            async () =>
+                (await modelTexts(app, planningId!)).some((each) =>
+                    each.includes("tasks needs rev"),
+                ),
+            "the rev refusal",
+            20_000,
+        );
     });
 
     test("the planning session reads its plan, and the supervisor writes none", async () => {
@@ -2555,6 +2988,8 @@ describe("with the Pi Pocket app", () => {
     });
 
     test("the planning session drafts the graph, and the plan is ready", async () => {
+        writeRev = (await planSnapshot())?.rev ?? "";
+
         await say(app, planningId!, "plan tasks test");
         await until(
             async () => (await planSnapshot())?.graphs.length === 1,
@@ -2581,6 +3016,29 @@ describe("with the Pi Pocket app", () => {
         });
 
         assert.equal(stale.status, 409);
+
+        // No bytes, no approval: the revision the page shows must be in the store.
+        const plan0 = await planSnapshot();
+        const stored = storePath(plansFolder, plan0?.rev ?? "");
+        const held = `${stored}.held`;
+
+        renameSync(stored, held);
+
+        try {
+            const missing = await routes(`plans/${planId}/approve`, {
+                rev: plan0?.rev ?? "",
+                graph: 1,
+                key: "approve-1-missing",
+            });
+
+            assert.equal(missing.status, 409);
+            assert.match(
+                String(missing.data.error ?? missing.data.message ?? ""),
+                /is not in the store/,
+            );
+        } finally {
+            renameSync(held, stored);
+        }
 
         const plan = (await planSnapshot()) ?? assert.fail("a plan");
         const done = await routes(`plans/${planId}/approve`, {
@@ -2655,6 +3113,20 @@ describe("with the Pi Pocket app", () => {
                 ),
             "the brief with the night shift",
             20_000,
+        );
+
+        // A refused delivery: the worktree this call made goes again, so no branch or folder is left behind.
+        const worktrees = git(snowRepo, "worktree", "list")
+            .split("\n")
+            .filter((line) => line.trim() !== "").length;
+
+        await say(app, source, "plan deliver test");
+
+        assert.equal(
+            git(snowRepo, "worktree", "list")
+                .split("\n")
+                .filter((line) => line.trim() !== "").length,
+            worktrees,
         );
 
         const dropped = await routes(`threads/${planId}/drop`, { reason: "not now" });

@@ -719,3 +719,26 @@ test("an ask shows open, its answer, or that the write did not come", () => {
         "T560b: Where do the keys live? → In the TPM. (brian)",
     );
 });
+
+test("a withdrawn ask says why, and no write-back waits for it", () => {
+    assert.equal(
+        planAskLine({
+            id: "T560c",
+            text: "Name the rotation period.",
+            open: false,
+            written: false,
+            resolved: { why: "Brian knows this one.", by: "odrade" },
+        }),
+        "T560c: Name the rotation period. · withdrawn: Brian knows this one.",
+    );
+    assert.equal(
+        planAskLine({
+            id: "T560c",
+            text: "Name the rotation period.",
+            open: false,
+            written: false,
+            resolved: { why: "The desk ended it." },
+        }),
+        "T560c: Name the rotation period. · resolved: The desk ended it.",
+    );
+});
