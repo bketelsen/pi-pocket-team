@@ -72,13 +72,16 @@ import {
     validateGraph,
     waitingText,
     wakeAbort,
+    wakeEnded,
     wakeFailed,
     wakeGaveUpText,
     wakeMessages,
     wakeNext,
     wakeTake,
     DeskThreads,
+    planLocks,
     planOf,
+    planReplay,
     planWriteFlow,
     publishPending,
     readStore,
@@ -1969,10 +1972,11 @@ describe("the revision store and the publish", () => {
 
         await publishPending(new Map(), "T1", io);
 
-        assert.equal(harness.current(), "one\n");
+        // The revision moved while the copy ran: the file follows it, and the newer write's key stays for its publisher.
+        assert.equal(harness.current(), "two\n");
         assert.equal(harness.plan.pending?.key, "k2");
 
-        // The next publisher moves the file to the newer revision, and clears its own key.
+        // The next publisher lands the newer revision again, and clears its own key.
         await publishPending(new Map(), "T1", io);
 
         assert.equal(harness.current(), "two\n");
@@ -2711,13 +2715,19 @@ describe("a message that does not reach the session", () => {
 
     const quote = (value: string): string => `"${value}"`;
 
-    test("a failed retry keeps its message, and the answer goes once", () => {
+    test("a failed retry keeps its message, and each answer goes once", () => {
         const { state, plan, thread } = asked();
+        // 1 fake session for the whole run: it acts once for each request id, as Pocket does, and can refuse.
+        let refuse = false;
+        const fake = fakeSend(() => refuse);
 
-        // M goes, is admitted, and the progress commit never happens: the abort keeps it as it is.
+        // The message goes, and is admitted.
         const first = wakeTake(state, "T1", quote);
         const message = first.messages[0] ?? assert.fail("a message");
 
+        fake.send(message);
+
+        // The progress commit never happens: the abort keeps the message as it is.
         wakeAbort(plan, { phase: "deliver", to: "session-31", messages: [message], next: 0 });
 
         // The next batch takes it again, and that send throws.
@@ -2726,17 +2736,16 @@ describe("a message that does not reach the session", () => {
 
         assert.equal(again.requestId, message.requestId);
 
+        refuse = true;
+        assert.throws(() => fake.send(again));
+
         const failed = wakeFailed(plan, again);
 
         assert.equal(failed.gaveUp, false);
         assert.deepEqual(plan.wake?.outstanding, [{ ...again, tries: 1 }]);
-        assert.deepEqual(
-            plan.wake?.sent,
-            ["answer:T1a:0"],
-            "the key stays: the answer may have gone",
-        );
+        assert.deepEqual(plan.wake?.sent, ["answer:T1a:0"], "the key stays: the answer went");
 
-        // Brian answers a second question.
+        // Brian answers a second question, and the batch recovers.
         addPlanAsk(state, "T1", {
             key: "ask:2",
             by: "lucilla",
@@ -2751,6 +2760,7 @@ describe("a message that does not reach the session", () => {
             by: "Brian",
             words: "B: in the file.",
         };
+        refuse = false;
 
         const third = wakeTake(state, "T1", quote);
 
@@ -2758,14 +2768,13 @@ describe("a message that does not reach the session", () => {
         assert.equal(third.messages[0]?.requestId, message.requestId);
         assert.match(third.messages[1]?.text ?? "", /B: in the file\./);
 
-        const fake = fakeSend();
-
         for (const each of third.messages) {
             fake.send(each);
         }
 
         assert.equal(fake.texts().filter((each) => each.includes("A: in the TPM.")).length, 1);
         assert.equal(fake.texts().filter((each) => each.includes("B: in the file.")).length, 1);
+        assert.equal(fake.admitted.size, 2);
     });
 
     test("a message that fails 5 times is dropped with its event, and its keys stay", () => {
@@ -2807,6 +2816,172 @@ describe("a message that does not reach the session", () => {
         );
     });
 });
+describe("the publish lock across a module reload", () => {
+    test("every instance of the module finds the same lock map", () => {
+        assert.equal(planLocks(), planLocks());
+        assert.equal(planLocks() instanceof Map, true);
+    });
+
+    test("a new instance's publisher waits for an old chain, and the file ends at the newest revision", async () => {
+        const harness = await storeHarness();
+        const one = await writeStore(harness.folder, "one\n");
+        const two = await writeStore(harness.folder, "two\n");
+
+        harness.plan.rev = one;
+        harness.plan.pending = { key: "k1", from: "", rev: one, at: now };
+
+        let release = (): void => undefined;
+        const gate = new Promise<void>((resolve) => {
+            release = resolve;
+        });
+        let inside = (): void => undefined;
+        const started = new Promise<void>((resolve) => {
+            inside = resolve;
+        });
+        const oldIo = publishIo(harness.state, "T1", harness.folder);
+        // The old instance's publisher reads R1, and waits inside its lock before its copy.
+        const slow = {
+            ...oldIo,
+            copy: async (rev: string) => {
+                inside();
+                await gate;
+                await oldIo.copy(rev);
+            },
+        };
+        const first = publishPending(planLocks(), "T1", slow);
+
+        await started;
+
+        // The new instance queues behind the old chain, then a newer write commits.
+        const second = publishPending(
+            planLocks(),
+            "T1",
+            publishIo(harness.state, "T1", harness.folder),
+        );
+
+        harness.plan.rev = two;
+        harness.plan.pending = { key: "k2", from: one, rev: two, at: now };
+        release();
+        await Promise.all([first, second]);
+
+        assert.equal(readFileSync(harness.plan.file, "utf8"), "two\n");
+        assert.equal(harness.plan.pending, undefined);
+    });
+});
+
+describe("a call's own result", () => {
+    test("a write, a tasks call and an ask answer their own replay", async () => {
+        const harness = await storeHarness();
+        const wrote = await planWriteFlow(harness.io(), "T1", {
+            section: "idea",
+            text: "A changed idea.",
+            key: "w1",
+            by: "lucilla",
+            at: tick(1),
+        });
+
+        assert(!("error" in wrote));
+        assert.deepEqual(planReplay(harness.state, "T1", "write", "w1"), { rev: wrote.rev });
+        assert.equal(planReplay(harness.state, "T1", "write", "other"), undefined);
+
+        const drafted = await planWriteFlow(harness.io(), "T1", {
+            text: "",
+            key: "t1",
+            by: "lucilla",
+            at: tick(2),
+            graph: (state) => ({
+                version: (planOf(state, "T1")?.graphs.at(-1)?.version ?? 0) + 1,
+                rev: harness.plan.rev,
+                state: "draft",
+                at: tick(2),
+                key: "t1",
+                tasks: tasks(),
+            }),
+            extra: (state2, _tx, rev) => {
+                draftGraph(state2, "T1", { key: "t1", at: tick(2), rev, tasks: tasks() });
+            },
+        });
+
+        assert(!("error" in drafted));
+        assert.deepEqual(planReplay(harness.state, "T1", "tasks", "t1"), {
+            rev: drafted.rev,
+            graph: 1,
+        });
+
+        addPlanAsk(harness.state, "T1", {
+            key: "a1",
+            by: "lucilla",
+            at: tick(3),
+            section: "idea",
+            rev: harness.plan.rev,
+            text: "Where do the keys live?",
+        });
+        assert.deepEqual(planReplay(harness.state, "T1", "ask", "a1"), {
+            askId: "T1a",
+            section: "idea",
+        });
+        assert.equal(planReplay(harness.state, "T1", "ask", "other"), undefined);
+    });
+});
+
+describe("a plan whose wake-up is over", () => {
+    test("a done plan takes no batch, and marks nothing", () => {
+        const { state, plan, thread } = startPlan();
+
+        addPlanAsk(state, "T1", {
+            key: "ask:1",
+            by: "lucilla",
+            at: tick(1),
+            section: "idea",
+            rev: plan.rev,
+            text: "Where do the keys live?",
+        });
+
+        (thread.asks[0] ?? assert.fail("an ask")).answer = {
+            at: tick(2),
+            by: "Brian",
+            words: "In the TPM.",
+        };
+
+        plan.state = "done";
+        plan.wake = { due: tick(3), sent: [], outstanding: [] };
+
+        const taken = wakeTake(state, "T1", (text) => `"${text}"`);
+
+        assert.deepEqual(taken, { messages: [] });
+        assert.equal(plan.wake.due, undefined);
+        assert.equal(plan.wake.outstanding, undefined);
+        assert.equal(wakeEnded(plan), true);
+    });
+
+    test("a dropped plan keeps no failed message", () => {
+        const { plan } = startPlan();
+
+        plan.state = "dropped";
+        plan.wake = { sent: [] };
+
+        const message = { text: "one", requestId: "r1", keys: ["answer:T1a:0"] };
+
+        assert.deepEqual(wakeFailed(plan, message), { gaveUp: false });
+        assert.equal(plan.wake.outstanding, undefined);
+    });
+
+    test("a drop clears the batch that waits", () => {
+        const { state, plan } = startPlan();
+
+        plan.wake = {
+            due: tick(3),
+            sent: ["answer:T1a:0"],
+            outstanding: [{ text: "one", requestId: "r1", keys: ["answer:T1a:0"] }],
+        };
+
+        assert(!("error" in dropPlan(state, "T1", { by: "brian", why: "not now", at: tick(4) })));
+        assert.equal(plan.state, "dropped");
+        assert.equal(plan.wake.due, undefined);
+        assert.equal(plan.wake.outstanding, undefined);
+    });
+});
+
 // ─── With the Pi Pocket app ─────────────────────────────────────────────────
 
 const dataDir = join(root, "data");

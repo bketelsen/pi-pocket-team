@@ -10592,6 +10592,60 @@ export function planOf(state: Readonly<DeskState> | undefined, id: string): Plan
     return state?.plans?.[id.trim().replace(/^#/, "").toUpperCase()];
 }
 
+/** 1 call's own stored result, for its replay: the revision of a write, a graph, or an ask. */
+export type PlanReplayResult = {
+    /** The revision the call wrote. */
+    rev?: string;
+    /** The graph version a tasks call drafted. */
+    graph?: number;
+    /** The ask an ask call filed. */
+    askId?: string;
+    /** The section that ask is anchored to. */
+    section?: string;
+};
+
+/**
+ * The stored result of a call, by its key: a write or a tasks call in the plan's writes (and the graph of its key), or
+ * an ask on the plan's thread. A replay of the call answers from this, so it never runs a live check that can fail now.
+ */
+export function planReplay(
+    state: Readonly<DeskState> | undefined,
+    planId: string,
+    want: "write" | "tasks" | "ask",
+    key: string,
+): PlanReplayResult | undefined {
+    const plan = planOf(state, planId);
+
+    if (plan === undefined) {
+        return undefined;
+    }
+
+    if (want === "ask") {
+        const ask = threadById(state, plan.thread)?.asks.find((each) => each.key === key);
+
+        return ask === undefined
+            ? undefined
+            : {
+                  askId: ask.id,
+                  ...(ask.plan === undefined ? {} : { section: ask.plan.section }),
+              };
+    }
+
+    const entry = plan.revs.find((each) => each.key === key);
+
+    if (entry === undefined) {
+        return undefined;
+    }
+
+    if (want === "tasks") {
+        const graph = plan.graphs.find((each) => each.key === key);
+
+        return graph === undefined ? undefined : { rev: entry.rev, graph: graph.version };
+    }
+
+    return { rev: entry.rev };
+}
+
 /**
  * Why a plan is not settled, in the gate's order: 1 entry for each open ask, each answered ask that is not written
  * back, each open comment, each consult that runs, and the write that is not published. Empty: the plan is settled.
@@ -11458,6 +11512,13 @@ export function dropPlan(
     }
 
     plan.state = "dropped";
+
+    // A dropped plan wakes no planning session: no batch waits for it.
+    if (plan.wake !== undefined) {
+        delete plan.wake.due;
+        delete plan.wake.outstanding;
+    }
+
     thread.state = "closed";
     thread.closed = { at: request.at, why: "dropped", by: "brian" };
     thread.run.next = "none";
@@ -11499,6 +11560,9 @@ export const PLAN_WAKE_MS = 30_000;
 
 /** 1 message of a plan's answer wake-up: its text, its stable request id, its answer keys, and its failures. */
 export type PlanWakeMessage = { text: string; requestId: string; keys: string[]; tries?: number };
+
+/** Whether a plan's wake-ups are over: a plan that is done or dropped wakes no planning session. */
+export const wakeEnded = (plan: Plan): boolean => plan.state === "done" || plan.state === "dropped";
 
 /** The tries a wake-up message gets before the desk stops keeping it: 5. */
 export const WAKE_TRIES = 5;
@@ -11594,6 +11658,11 @@ export function wakeAbort(
  * After `WAKE_TRIES` failures the desk stops keeping it: it is dropped, and the caller says so in 1 event.
  */
 export function wakeFailed(plan: Plan, message: PlanWakeMessage): { gaveUp: boolean } {
+    // A plan that is over keeps nothing: no batch runs for it.
+    if (wakeEnded(plan)) {
+        return { gaveUp: false };
+    }
+
     const tries = (message.tries ?? 0) + 1;
     const kept = { ...message, tries };
 
@@ -11632,6 +11701,16 @@ export function wakeTake(
     const thread = threadById(state, planId);
 
     if (plan === undefined) {
+        return { messages: [] };
+    }
+
+    // The plan is done or dropped: no answer wakes its session, and nothing waits.
+    if (wakeEnded(plan)) {
+        if (plan.wake !== undefined) {
+            delete plan.wake.due;
+            delete plan.wake.outstanding;
+        }
+
         return { messages: [] };
     }
 
@@ -11762,6 +11841,22 @@ export async function writeStore(root: string, text: string): Promise<string> {
 /** The plan's root: its file's folder, never an argument. */
 export const planRoot = (plan: Plan): string => dirname(plan.file);
 
+/** Where every instance of this module in the process finds the 1 plan lock map. */
+const PLAN_LOCKS = Symbol.for("pi-pocket-team.desk.plan-locks");
+
+/**
+ * The plan publish locks: 1 promise chain for each plan, shared by every instance of this module in the process. Pocket
+ * starts a new module before the old one's cleanup, so a new publisher must wait behind an old one's chain; the map is
+ * made once, never replaced, and never deleted.
+ */
+export function planLocks(): Map<string, Promise<void>> {
+    const shared = globalThis as unknown as Record<symbol, Map<string, Promise<void>> | undefined>;
+
+    shared[PLAN_LOCKS] ??= new Map<string, Promise<void>>();
+
+    return shared[PLAN_LOCKS];
+}
+
 /** What a publish reads and does, fresh, under the plan's lock. */
 export type PublishIo = {
     read: () => Promise<{ rev: string; pending?: { key: string } } | undefined>;
@@ -11786,14 +11881,33 @@ export function publishPending(
     const run = previous
         .catch(() => undefined)
         .then(async () => {
-            const plan = await io.read();
+            let plan = await io.read();
 
             if (plan === undefined || plan.pending === undefined) {
                 return;
             }
 
-            await io.copy(plan.rev);
-            await io.clear(plan.pending.key);
+            const key = plan.pending.key;
+
+            // The file follows `Plan.rev`: a revision that moved while the copy ran is copied again, at most 3 times.
+            for (let at = 0; at < 3; at += 1) {
+                await io.copy(plan.rev);
+
+                const fresh = await io.read();
+
+                // A newer write has its own publisher: this one clears only the key it read.
+                if (fresh === undefined || fresh.rev === plan.rev) {
+                    break;
+                }
+
+                plan = fresh;
+
+                if (fresh.pending === undefined) {
+                    return;
+                }
+            }
+
+            await io.clear(key);
         });
     const quiet = run.catch(() => undefined);
 
@@ -12856,8 +12970,8 @@ const copyThread = (thread: Thread): Thread => JSON.parse(JSON.stringify(thread)
 export const pocketApi = 2;
 
 export default function createDesk(host: Host, web: Web) {
-    /** The plan stores' locks: 1 promise chain for each plan, in this process only. A restart drops them. */
-    const planLocks = new Map<string, Promise<void>>();
+    /** The plan stores' locks, shared with every other instance of this module in the process. */
+    const locks = planLocks();
 
     /** The desk's document, as a plan flow needs it: read, and 1 commit that takes the state. */
     type PlanAccess = {
@@ -12918,7 +13032,7 @@ export default function createDesk(host: Host, web: Web) {
 
         const root = planRoot(plan);
 
-        await publishPending(planLocks, plan.thread, {
+        await publishPending(locks, plan.thread, {
             read: async () => {
                 const fresh = planOf(await access.read(), planId);
 
@@ -17130,6 +17244,21 @@ export default function createDesk(host: Host, web: Web) {
                     return;
                 }
 
+                // A plan that is done or dropped wakes no session: the messages are over, and nothing goes.
+                const now = planOf(await runtime.snapshot(DeskThreads, context), task.input.plan);
+
+                if (now !== undefined && wakeEnded(now)) {
+                    await runtime.commit(
+                        () => ({
+                            status: "terminal",
+                            outcome: { status: "completed", result: null },
+                        }),
+                        context,
+                    );
+
+                    return;
+                }
+
                 let failed = false;
 
                 try {
@@ -19809,6 +19938,37 @@ export default function createDesk(host: Host, web: Web) {
 
             const key = `plan:${api.taskId}:${api.callId}`;
             const at = Date.now();
+            /** The call's own result, when it ran before: a replay answers from it, and runs no live check. */
+            const replay =
+                args.action === "write" || args.action === "tasks" || args.action === "ask"
+                    ? planReplay(state, plan.thread, args.action, key)
+                    : undefined;
+
+            if (args.action === "write" && replay !== undefined) {
+                // Only the publish: a write whose file did not go out yet finishes here.
+                await publishAll(access);
+
+                const entry = planOf(state, plan.thread)?.revs.find((each) => each.key === key);
+                const settled = entry?.asks ?? [];
+
+                return reply(
+                    settled.length === 0
+                        ? `Wrote rev ${replay.rev ?? ""}.`
+                        : `Wrote rev ${replay.rev ?? ""}. Settled: ${settled.join(", ")}.`,
+                );
+            }
+
+            if (args.action === "tasks" && replay !== undefined) {
+                await publishAll(access);
+
+                return reply(
+                    `Drafted graph v${String(replay.graph ?? 0)} for rev ${(replay.rev ?? "").slice(0, 7)}.`,
+                );
+            }
+
+            if (args.action === "ask" && replay !== undefined) {
+                return reply(`Filed ${replay.askId ?? ""} on section ${replay.section ?? ""}.`);
+            }
 
             if (args.action === "read") {
                 const text = await readStore(planRoot(plan), plan.rev).catch(() => undefined);
