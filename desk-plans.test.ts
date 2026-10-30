@@ -55,6 +55,10 @@ import {
     dismissPlanComment,
     reopenPlanAsk,
     requestChanges,
+    revisePlan,
+    carryProblem,
+    planSendId,
+    taskDone,
     savePlanMarks,
     approvePlan,
     attachTo,
@@ -718,7 +722,7 @@ describe("a plan write", () => {
         assert.ok("error" in refused);
         assert.equal(
             refused.error,
-            `Plan T1 is approved: a write needs a scope change first (plan revise comes in a later desk version).`,
+            `Plan T1 is approved: a write needs a scope change first (plan revise, or Brian's Stop and revise).`,
         );
         assert.equal(plan.revs.length, 1);
     });
@@ -3696,7 +3700,7 @@ describe("a reopen", () => {
                     at: tick(7),
                 }) as { error: string }
             ).error,
-            /is approved: a reopen after the approval is a scope change/,
+            /A scope change needs why/,
         );
 
         approved.plan.state = "done";
@@ -4003,10 +4007,17 @@ describe("Request changes", () => {
         const { state, plan } = reviewed();
         const thread = state.threads.T1 ?? assert.fail("a thread");
 
+        // No text: 1 durable message tells the planning session, with a request id from the key.
         assert.deepEqual(
             requestChanges(state, "T1", { key: "changes:1", by: "Brian", at: tick(4) }),
             {
                 changed: true,
+                send: {
+                    supervisor: 7,
+                    to: "session-31",
+                    text: "Brian asked for changes on plan T1: it is back in drafting. Read the plan and ask Brian in the chat what to change.",
+                    requestId: planSendId("T1", "changes:1", "planning"),
+                },
             },
         );
         assert.equal(plan.state, "drafting");
@@ -4114,6 +4125,757 @@ describe("the plan view's decisions and comments", () => {
             [["c1", "open"]],
         );
         assert.deepEqual(view.sections.find((section) => section.id === "decisions")?.comments, []);
+    });
+});
+
+// ─── PR 2, part B: scope changes, and the carry rule ────────────────────────
+
+/** 3 tasks: t1, then t2 after it, and t3 for teg on its own. */
+const threeTasks = (): PlanTask[] => [
+    ...tasks(),
+    {
+        id: "t3",
+        title: "Publish the check",
+        agent: "teg",
+        repo: "frostyard/nsl",
+        acceptance: ["The check is published."],
+        deps: [],
+        state: "waiting",
+        attempts: [],
+    },
+];
+
+/** A task thread with its own session address, for a plan task. */
+function taskThread(state: DeskState, id: string): Thread {
+    const thread = other(state, id);
+
+    thread.address = `session-${id}`;
+
+    return thread;
+}
+
+/** A plan that builds: graph v1 with t1, t2 and t3 approved; t1 is delegated on T2, t3 on T3; t2 waits for t1. */
+function buildingPlan(): { state: DeskState; plan: Plan; graph: TaskGraph } {
+    const { state, plan } = startPlan();
+
+    assert(
+        !(
+            "error" in
+            draftGraph(state, "T1", {
+                key: "graph:1",
+                at: tick(1),
+                rev: plan.rev,
+                tasks: threeTasks(),
+            })
+        ),
+    );
+    assert(!("error" in readyPlan(state, "T1", { key: "ready:1", at: tick(2) })));
+
+    const graph = plan.graphs[0] ?? assert.fail("a graph");
+
+    assert(
+        !(
+            "error" in
+            approvePlan(state, "T1", {
+                rev: plan.rev,
+                graph: 1,
+                key: "approve:1",
+                by: "brian",
+                at: tick(3),
+            })
+        ),
+    );
+    taskThread(state, "T2");
+    taskThread(state, "T3");
+    assert(!("error" in startTask(state, "T1", "t1", "T2", tick(4))));
+    assert(!("error" in startTask(state, "T1", "t3", "T3", tick(4))));
+
+    return { state, plan, graph };
+}
+
+/** A task of a graph, by its id. */
+const taskOf = (graph: TaskGraph, id: string): PlanTask =>
+    graph.tasks.find((each) => each.id === id) ?? assert.fail(`task ${id}`);
+
+/** End a task's open attempt as merged, as the PR facts do in a later part: the task is done. */
+function merged(graph: TaskGraph, id: string, at: number): void {
+    const task = taskOf(graph, id);
+    const attempt = task.attempts.at(-1) ?? assert.fail("an attempt");
+
+    attempt.prs = [{ ref: `frostyard/snow#${String(at % 1000)}`, head: "a".repeat(40) }];
+    attempt.end = { at, how: "merged" };
+    task.state = "done";
+}
+
+const quoted = (text: string): string => `"${text}"`;
+
+describe("a scope change", () => {
+    const revise = (
+        state: DeskState,
+        key: string,
+        tasks: unknown,
+        why: unknown = "The key moves.",
+    ) => revisePlan(state, "T1", { key, by: "Brian", at: tick(6), why, tasks }, quoted);
+
+    test("it stops only the named task; the other tasks go on, unchanged", () => {
+        const { state, plan, graph } = buildingPlan();
+        const t3 = JSON.stringify(taskOf(graph, "t3"));
+        const t2 = JSON.stringify(taskOf(graph, "t2"));
+        const done = revise(state, "revise:1", ["t1"]);
+
+        assert(!("error" in done) && !done.replay, "the scope change is made");
+        assert.equal(plan.state, "drafting");
+        assert.deepEqual(plan.revising, {
+            at: tick(6),
+            by: "Brian",
+            why: "The key moves.",
+            tasks: ["t1"],
+            key: "revise:1",
+        });
+        assert.deepEqual(plan.revises, [
+            { key: "revise:1", at: tick(6), by: "Brian", why: "The key moves.", tasks: ["t1"] },
+        ]);
+        assert.equal(taskOf(graph, "t1").state, "stopped");
+        assert.deepEqual(taskOf(graph, "t1").attempts[0]?.end, { at: tick(6), how: "stopped" });
+        // Decision 5: t3 and t2 are not named: they do not change, and the old graph stays the approved one.
+        assert.equal(JSON.stringify(taskOf(graph, "t3")), t3);
+        assert.equal(JSON.stringify(taskOf(graph, "t2")), t2);
+        assert.equal(graph.state, "approved");
+        assert.equal(
+            deliverCheck(state, "T1", "t2", { agent: "lucilla", repo: "frostyard/snow" }),
+            "Plan T1 is drafting: a task starts while the plan is approved or building.",
+        );
+
+        assert.deepEqual(done.sends, [
+            {
+                supervisor: 7,
+                to: "session-T2",
+                text: '[desk] Stop: plan T1 is under revision ("The key moves."). Push nothing more on this task. Report what you have.',
+                requestId: planSendId("T1", "revise:1", "task:t1:T2"),
+            },
+            {
+                supervisor: 7,
+                to: "session-31",
+                text: '[desk] Plan T1 is under revision ("The key moves."), by Brian. Stopped tasks: t1 (T2); the other tasks go on. Read the plan, and write the sections that change. Then draft a new graph with plan tasks: a task that is done and stays the same is carried (carried: { why }). Then call plan ready: Brian approves the new revision.',
+                requestId: planSendId("T1", "revise:1", "planning"),
+            },
+        ]);
+        assert.equal(done.item.kind, "plan-revise");
+        assert.equal(done.item.key, "plan-revise:T1:revise:1");
+        assert.match(done.item.line, /Stopped: t1 \(T2\)\. The other tasks go on\./);
+        assert(state.threads.T2?.events.some((event) => event.key === "plan-stopped:revise:1"));
+    });
+
+    test("a replay of the key changes nothing, and sends nothing", () => {
+        const { state } = buildingPlan();
+
+        revise(state, "revise:1", ["t1"]);
+
+        const snapshot = JSON.stringify(state);
+
+        assert.deepEqual(revise(state, "revise:1", ["t1"]), { replay: true });
+        assert.equal(JSON.stringify(state), snapshot);
+    });
+
+    test("a second scope change while the first is in force is refused", () => {
+        const { state } = buildingPlan();
+
+        revise(state, "revise:1", ["t1"]);
+
+        const snapshot = JSON.stringify(state);
+        const again = revise(state, "revise:2", ["t3"]);
+
+        assert.match(
+            (again as { error: string }).error,
+            /^Plan T1 is under revision already \(The key moves\.\)/,
+        );
+        assert.equal(JSON.stringify(state), snapshot);
+    });
+
+    test("a task in any state can be named, and an attempt that ended stays as it ended", () => {
+        const { state, graph } = buildingPlan();
+
+        merged(graph, "t1", tick(5));
+
+        const done = revise(state, "revise:1", ["t1", "T2", "t1"]);
+
+        assert(!("error" in done) && !done.replay);
+        assert.deepEqual(taskOf(graph, "t1").attempts[0]?.end, { at: tick(5), how: "merged" });
+        assert.equal(taskOf(graph, "t1").state, "stopped");
+        assert.equal(taskOf(graph, "t2").state, "stopped");
+        assert.deepEqual(taskOf(graph, "t2").attempts, []);
+        // No open attempt: only the planning session gets a message.
+        assert.deepEqual(
+            done.sends.map((send) => send.to),
+            ["session-31"],
+        );
+        assert.deepEqual(state.plans?.T1?.revising?.tasks, ["t1", "t2"]);
+    });
+
+    test("a closed task thread gets no message, and its attempt still ends", () => {
+        const { state, graph } = buildingPlan();
+
+        (state.threads.T2 ?? assert.fail("T2")).state = "closed";
+
+        const done = revise(state, "revise:1", ["t1"]);
+
+        assert(!("error" in done) && !done.replay);
+        assert.equal(taskOf(graph, "t1").attempts[0]?.end?.how, "stopped");
+        assert.deepEqual(
+            done.sends.map((send) => send.to),
+            ["session-31"],
+        );
+    });
+
+    test("the open verification thread gets the stop too", () => {
+        const { state, plan, graph } = buildingPlan();
+
+        merged(graph, "t1", tick(5));
+        merged(graph, "t3", tick(5));
+        plan.state = "verifying";
+        taskThread(state, "T4").state = "closed";
+        taskThread(state, "T5");
+        plan.verification = { threads: ["T4", "T5"], rounds: [] };
+
+        const done = revise(state, "revise:1", []);
+
+        assert(!("error" in done) && !done.replay);
+        assert.deepEqual(
+            done.sends.map((send) => [send.to, send.requestId]),
+            [
+                ["session-T5", planSendId("T1", "revise:1", "verify:T5")],
+                ["session-31", planSendId("T1", "revise:1", "planning")],
+            ],
+        );
+        assert.equal(plan.state, "drafting");
+    });
+
+    test("drafting, review, a finished plan, a bad why and an unknown task are refused", () => {
+        const { state, plan } = buildingPlan();
+        const snapshot = JSON.stringify(state);
+
+        for (const [why, tasks, pattern] of [
+            ["", [], /needs why: 1 to 300 characters/],
+            ["one\ntwo", [], /needs why/],
+            ["x".repeat(301), [], /needs why/],
+            [7, [], /needs why/],
+            ["Why.", ["t9"], /t9 is not a task of the approved graph v1 of T1/],
+            ["Why.", "t1", /names tasks: a list of task ids/],
+            ["Why.", [1], /names tasks/],
+        ] as const) {
+            assert.match(
+                (revise(state, "revise:x", tasks, why) as { error: string }).error,
+                pattern,
+            );
+        }
+
+        assert.equal(JSON.stringify(state), snapshot);
+
+        for (const [planState, pattern] of [
+            ["drafting", /is drafting: a scope change is for an approved plan/],
+            ["review", /is review: a scope change is for an approved plan/],
+            ["done", /is done: it takes no scope change/],
+            ["dropped", /is dropped: it takes no scope change/],
+        ] as const) {
+            plan.state = planState;
+            assert.match((revise(state, "revise:y", []) as { error: string }).error, pattern);
+        }
+    });
+
+    test("a request id comes from the key and the target", () => {
+        assert.equal(planSendId("T1", "k", "planning"), planSendId("T1", "k", "planning"));
+        assert.notEqual(planSendId("T1", "k", "planning"), planSendId("T1", "k", "task:t1:T2"));
+        assert.notEqual(planSendId("T1", "k", "planning"), planSendId("T1", "k2", "planning"));
+        assert.match(planSendId("T1", "k", "planning"), /^x\.desk\.plan-send:T1:[0-9a-f]{16}$/);
+    });
+});
+
+describe("a reopen after the approval", () => {
+    /** The decided plan, approved, with t1 delegated on T2. */
+    function decidedBuilding(): { state: DeskState; plan: Plan; thread: Thread; id: string } {
+        const made = decidedInReview();
+
+        assert(
+            !(
+                "error" in
+                approvePlan(made.state, "T1", {
+                    rev: made.plan.rev,
+                    graph: 1,
+                    key: "approve:decided",
+                    by: "brian",
+                    at: tick(6),
+                })
+            ),
+        );
+        taskThread(made.state, "T2");
+        assert(!("error" in startTask(made.state, "T1", "t1", "T2", tick(7))));
+
+        return made;
+    }
+
+    test("in building it is a scope change: the ask opens, the named task stops, and the plan drafts", () => {
+        const { state, plan, thread, id } = decidedBuilding();
+        const done = reopenPlanAsk(
+            state,
+            id,
+            {
+                gen: 0,
+                key: "reopen:1",
+                by: "Brian",
+                at: tick(8),
+                why: "TPM resets lose keys.",
+                tasks: ["t1"],
+            },
+            quoted,
+        );
+
+        assert(!("error" in done), "the reopen is made");
+        assert.equal(done.replay, false);
+        assert.equal(done.gen, 1);
+        assert.equal(theAsk(thread).answer, undefined);
+        assert.equal(theAsk(thread).history?.length, 1);
+        assert.equal(plan.state, "drafting");
+        assert.equal(plan.revising?.key, "reopen:1");
+        assert.equal(plan.revising?.why, "TPM resets lose keys.");
+        assert.equal(taskOf(plan.graphs[0] ?? assert.fail("a graph"), "t1").state, "stopped");
+        assert.deepEqual(
+            done.revise?.sends.map((send) => send.to),
+            ["session-T2", "session-31"],
+        );
+        assert.equal(done.revise?.item.kind, "plan-revise");
+
+        const snapshot = JSON.stringify(state);
+        const again = reopenPlanAsk(
+            state,
+            id,
+            {
+                gen: 0,
+                key: "reopen:1",
+                by: "Brian",
+                at: tick(9),
+                why: "TPM resets lose keys.",
+                tasks: ["t1"],
+            },
+            quoted,
+        );
+
+        assert.deepEqual(again, { id, replay: true, gen: 1 });
+        assert.equal(JSON.stringify(state), snapshot);
+    });
+
+    test("in approved it needs why, and a refused one changes nothing", () => {
+        const made = decidedInReview();
+
+        approvePlan(made.state, "T1", {
+            rev: made.plan.rev,
+            graph: 1,
+            key: "approve:decided",
+            by: "brian",
+            at: tick(6),
+        });
+
+        const snapshot = JSON.stringify(made.state);
+
+        for (const request of [
+            { why: undefined, tasks: [] },
+            { why: "Why.", tasks: ["t9"] },
+        ]) {
+            const result = reopenPlanAsk(made.state, made.id, {
+                gen: 0,
+                key: "reopen:2",
+                by: "Brian",
+                at: tick(8),
+                ...request,
+            });
+
+            assert("error" in result, "the reopen is refused");
+        }
+
+        assert.equal(JSON.stringify(made.state), snapshot);
+
+        const done = reopenPlanAsk(made.state, made.id, {
+            gen: 0,
+            key: "reopen:3",
+            by: "Brian",
+            at: tick(8),
+            why: "Why.",
+        });
+
+        assert(
+            !("error" in done) && done.revise !== undefined,
+            "no tasks named is a scope change too",
+        );
+        assert.deepEqual(made.plan.revising?.tasks, []);
+    });
+});
+
+describe("the carry rule", () => {
+    /** The building plan with t1 merged, then a scope change that names no task: the plan drafts a new graph. */
+    function revisedPlan(): { state: DeskState; plan: Plan; graph: TaskGraph } {
+        const made = buildingPlan();
+
+        merged(made.graph, "t1", tick(5));
+        assert(
+            !(
+                "error" in
+                revisePlan(made.state, "T1", {
+                    key: "revise:1",
+                    by: "Brian",
+                    at: tick(6),
+                    why: "Add a step.",
+                    tasks: ["t3"],
+                })
+            ),
+        );
+
+        return made;
+    }
+
+    /** A new graph: t1 carried, t2 and t3 as given. */
+    const carried = (patch: Partial<PlanTask> = {}, id = "t1"): PlanTask[] =>
+        threeTasks().map((task) =>
+            task.id === id
+                ? { ...task, carried: { graph: 1, why: "It is merged." }, ...patch }
+                : task,
+        );
+
+    test("a done task with the same parts is carried", () => {
+        const { plan } = revisedPlan();
+
+        assert.equal(carryProblem(plan, carried()), undefined);
+        assert.equal(
+            carryProblem(plan, threeTasks()),
+            undefined,
+            "no carried task: nothing to check",
+        );
+    });
+
+    test("a changed repository, agent, acceptance or dep is refused", () => {
+        const { plan } = revisedPlan();
+
+        assert.match(
+            carryProblem(plan, carried({ repo: "frostyard/other" })) ?? "",
+            /t1 is carried, but its repository changed \(frostyard\/snow → frostyard\/other\)/,
+        );
+        assert.match(carryProblem(plan, carried({ agent: "teg" })) ?? "", /its agent changed/);
+        assert.match(
+            carryProblem(plan, carried({ acceptance: ["The ISO is signed twice."] })) ?? "",
+            /its acceptance lines changed/,
+        );
+        assert.match(
+            carryProblem(plan, carried({ deps: ["t3"] })) ?? "",
+            /t1 is carried, but its deps changed \(none → t3\)/,
+        );
+    });
+
+    test("a task that is not done, not in the graph, or whose dep is not carried is refused", () => {
+        const { plan, graph } = revisedPlan();
+
+        assert.match(
+            carryProblem(plan, carried({}, "t2")) ?? "",
+            /t2 is carried, but it is not done in the approved graph v1 \(it is waiting\)/,
+        );
+        assert.match(
+            carryProblem(plan, carried({}, "t3")) ?? "",
+            /t3 is carried, but it is not done .*\(it is stopped\)/,
+        );
+
+        // t2 done too, and carried without t1: its dep is new work, so t2 is.
+        const t2 = taskOf(graph, "t2");
+
+        t2.attempts.push({ thread: "T9", at: tick(5), prs: [] });
+        merged(graph, "t2", tick(5));
+        assert.match(carryProblem(plan, carried({}, "t2")) ?? "", /its dep t1 is not carried/);
+        assert.match(
+            carryProblem(plan, [
+                ...threeTasks(),
+                {
+                    id: "t9",
+                    title: "New",
+                    agent: "teg",
+                    acceptance: ["x"],
+                    deps: [],
+                    state: "ready",
+                    attempts: [],
+                    carried: { graph: 1, why: "Done." },
+                },
+            ]) ?? "",
+            /t9 is carried, but it is not in the approved graph v1/,
+        );
+        assert.match(
+            carryProblem(plan, carried({ carried: { graph: 1, why: "" } })) ?? "",
+            /carried why is 1 to 300/,
+        );
+    });
+
+    test("a plan with no approved graph carries nothing", () => {
+        const { plan } = startPlan();
+
+        assert.match(carryProblem(plan, carried()) ?? "", /has no approved graph/);
+    });
+
+    test("a failed check that names a task after its attempt makes it not done", () => {
+        const { plan, graph } = revisedPlan();
+        const t1 = taskOf(graph, "t1");
+
+        assert.equal(taskDone(plan, t1), true);
+        plan.verification = {
+            threads: [],
+            rounds: [
+                {
+                    at: tick(7),
+                    by: "lucilla",
+                    reviewer: "openai/gpt-6.1-sol",
+                    heads: {},
+                    pass: false,
+                    tasks: [{ task: "t1", pass: false, evidence: "The key is not used." }],
+                    key: "verify:1",
+                },
+            ],
+        };
+        assert.equal(taskDone(plan, t1), false);
+        assert.match(carryProblem(plan, carried()) ?? "", /t1 is carried, but it is not done/);
+    });
+});
+
+describe("the approval of a new graph", () => {
+    /** The revised plan, its t3 thread closed, with a new draft graph for its revision and ready. */
+    function redrafted(
+        newTasks: PlanTask[],
+        prepare: (made: { state: DeskState; plan: Plan; graph: TaskGraph }) => void = () => {},
+    ): { state: DeskState; plan: Plan; old: TaskGraph; draft: TaskGraph } {
+        const made = buildingPlan();
+
+        merged(made.graph, "t1", tick(5));
+        prepare(made);
+        assert(
+            !(
+                "error" in
+                revisePlan(made.state, "T1", {
+                    key: "revise:1",
+                    by: "Brian",
+                    at: tick(6),
+                    why: "Add a step.",
+                    tasks: made.graph.tasks
+                        .filter((task) => task.state === "delegated")
+                        .map((task) => task.id),
+                })
+            ),
+        );
+        assert(
+            !(
+                "error" in
+                draftGraph(made.state, "T1", {
+                    key: "graph:2",
+                    at: tick(7),
+                    rev: made.plan.rev,
+                    tasks: newTasks,
+                })
+            ),
+        );
+        assert(!("error" in readyPlan(made.state, "T1", { key: "ready:2", at: tick(8) })));
+
+        return {
+            state: made.state,
+            plan: made.plan,
+            old: made.graph,
+            draft: made.plan.graphs.at(-1) ?? assert.fail("a draft"),
+        };
+    }
+
+    const approve = (state: DeskState, plan: Plan, key = "approve:2") =>
+        approvePlan(state, "T1", { rev: plan.rev, graph: 2, key, by: "brian", at: tick(9) });
+
+    const withCarry = (ids: string[]): PlanTask[] =>
+        threeTasks().map((task) =>
+            ids.includes(task.id) ? { ...task, carried: { graph: 1, why: "It is merged." } } : task,
+        );
+
+    test("a carried task keeps its attempts and stays done; a task after it is ready; the scope change ends", () => {
+        const { state, plan, old, draft } = redrafted(withCarry(["t1"]));
+        const attempts = JSON.stringify(taskOf(old, "t1").attempts);
+
+        assert.equal(taskOf(draft, "t1").state, "done");
+        assert.equal(JSON.stringify(taskOf(draft, "t1").attempts), attempts);
+
+        const done = approve(state, plan);
+
+        assert(!("error" in done), "the new graph is approved");
+        assert.equal(done.item.kind, "plan-approved");
+        assert.equal(plan.state, "approved");
+        assert.equal(plan.revising, undefined);
+        assert.equal(plan.revises?.length, 1);
+        assert.equal(old.state, "superseded");
+        assert.equal(draft.state, "approved");
+        assert.equal(taskOf(draft, "t1").state, "done");
+        assert.deepEqual(taskOf(draft, "t1").carried, { graph: 1, why: "It is merged." });
+        assert.equal(JSON.stringify(taskOf(draft, "t1").attempts), attempts);
+        assert.equal(taskOf(draft, "t2").state, "ready", "its dep is carried as done");
+        assert.equal(taskOf(draft, "t3").state, "ready");
+        assert.deepEqual(
+            taskOf(draft, "t3").attempts,
+            [],
+            "a task that is not carried is new work",
+        );
+        assert.equal(
+            deliverCheck(state, "T1", "t2", { agent: "lucilla", repo: "frostyard/snow" }),
+            undefined,
+        );
+        assert.match(done.item.line, /t2, t3/);
+    });
+
+    test("approve is refused while a task of the old graph is delegated", () => {
+        // The scope change names nothing that is delegated here: t3 stays delegated on T3 (decision 5).
+        const made = buildingPlan();
+
+        merged(made.graph, "t1", tick(5));
+        revisePlan(made.state, "T1", {
+            key: "revise:1",
+            by: "Brian",
+            at: tick(6),
+            why: "Add a step.",
+            tasks: [],
+        });
+        draftGraph(made.state, "T1", {
+            key: "graph:2",
+            at: tick(7),
+            rev: made.plan.rev,
+            tasks: withCarry(["t1"]),
+        });
+        assert(!("error" in readyPlan(made.state, "T1", { key: "ready:2", at: tick(8) })));
+        assert.equal(taskOf(made.graph, "t3").state, "delegated");
+
+        const snapshot = JSON.stringify(made.state);
+        const refused = approve(made.state, made.plan);
+
+        assert.equal(
+            (refused as { error: string }).error,
+            "t3 is delegated (T3): wait for its end, or stop it with Stop and revise.",
+        );
+        assert.equal(JSON.stringify(made.state), snapshot);
+
+        // t3 ends as merged: the approval goes.
+        merged(made.graph, "t3", tick(9));
+        assert(!("error" in approve(made.state, made.plan)));
+    });
+
+    test("the carry rule is checked again at the approval", () => {
+        const { state, plan, old } = redrafted(withCarry(["t1"]));
+
+        plan.verification = {
+            threads: [],
+            rounds: [
+                {
+                    at: tick(8),
+                    by: "lucilla",
+                    reviewer: "openai/gpt-6.1-sol",
+                    heads: {},
+                    pass: false,
+                    tasks: [{ task: "t1", pass: false, evidence: "No." }],
+                    key: "verify:1",
+                },
+            ],
+        };
+
+        const snapshot = JSON.stringify(state);
+        const refused = approve(state, plan);
+
+        assert.match(
+            (refused as { error: string }).error,
+            /^The plan changed since you read it: t1 is carried, but it is not done/,
+        );
+        assert.equal(JSON.stringify(state), snapshot);
+        assert.equal(old.state, "approved");
+    });
+
+    test("ready refuses a carry that no longer holds", () => {
+        const made = buildingPlan();
+
+        merged(made.graph, "t1", tick(5));
+        revisePlan(made.state, "T1", {
+            key: "revise:1",
+            by: "Brian",
+            at: tick(6),
+            why: "Add a step.",
+            tasks: ["t3"],
+        });
+        draftGraph(made.state, "T1", {
+            key: "graph:2",
+            at: tick(7),
+            rev: made.plan.rev,
+            tasks: withCarry(["t1"]),
+        });
+        taskOf(made.graph, "t1").state = "ready";
+
+        assert.match(
+            (readyPlan(made.state, "T1", { key: "ready:2", at: tick(8) }) as { error: string })
+                .error,
+            /t1 is carried, but it is not done .* Call plan tasks again\./,
+        );
+        assert.equal(made.plan.state, "drafting");
+    });
+
+    test("an all-carried graph goes to verifying at the approval, with its plan-verify news", () => {
+        const { state, plan, draft } = redrafted(withCarry(["t1", "t2", "t3"]), (made) => {
+            const t2 = taskOf(made.graph, "t2");
+
+            t2.attempts.push({ thread: "T9", at: tick(5), prs: [] });
+            merged(made.graph, "t2", tick(5));
+            merged(made.graph, "t3", tick(5));
+        });
+        const done = approve(state, plan);
+
+        assert(!("error" in done), "the approval goes");
+        assert.equal(plan.state, "verifying");
+        assert.equal(plan.revising, undefined);
+        assert(draft.tasks.every((task) => task.state === "done"));
+        assert.equal(done.item.kind, "plan-verify");
+        assert.equal(done.item.key, "plan-verify:T1:approve:2");
+        assert.match(done.item.line, /plan \{ id: "T1", task: "verify" \}, to lucilla in its home/);
+        assert(
+            state.threads.T1?.events.some((event) =>
+                event.text.includes("every task is carried as done: verifying"),
+            ),
+        );
+    });
+
+    test("the Tasks section names a carried task and its reason", () => {
+        const { draft } = redrafted(withCarry(["t1"]));
+
+        assert.match(
+            renderTasks(draft),
+            /- \*\*t1\*\* Sign the ISO .* · carried as done: It is merged\./,
+        );
+    });
+});
+
+describe("the plan view's scope change", () => {
+    test("the view says the scope change, and whether Brian can Stop and revise", () => {
+        const { state } = buildingPlan();
+        const before = planView(state, "T1", file, now);
+
+        assert(!("error" in before));
+        assert.equal(before.canRevise, true);
+        assert.equal(before.revising, undefined);
+
+        revisePlan(state, "T1", {
+            key: "revise:1",
+            by: "Brian",
+            at: tick(6),
+            why: "The key moves.",
+            tasks: ["t1"],
+        });
+
+        const after = planView(state, "T1", file, now);
+
+        assert(!("error" in after));
+        assert.equal(after.canRevise, false);
+        assert.deepEqual(after.revising, {
+            at: tick(6),
+            by: "Brian",
+            why: "The key moves.",
+            tasks: ["t1"],
+        });
     });
 });
 
@@ -4227,6 +4989,15 @@ const model = scriptedModel((request) => {
             text: "Where do the keys live?",
             options: ["TPM", "A file"],
             criteria: ["Easy reset"],
+        });
+    }
+
+    if (text.endsWith("plan revise test")) {
+        return call("plan", {
+            action: "revise",
+            plan: planId,
+            why: "Another change.",
+            tasks: [],
         });
     }
 
@@ -4347,6 +5118,15 @@ const model = scriptedModel((request) => {
 
 /** The revision the next write names: the tests set it from the plan's rev. */
 let writeRev = "";
+
+/** The messages a session got, as text: the scripted model's echo of one is no second message. */
+async function userTexts(id: ConversationId): Promise<string[]> {
+    const view = await (await app.harness.conversation(id, context))!.context(context);
+
+    return view.messages
+        .filter((message) => message.role === "user")
+        .map((message) => JSON.stringify(message.content));
+}
 
 /** The desk's document now. */
 const deskSnapshot = (): Promise<DeskState | undefined> =>
@@ -4918,7 +5698,7 @@ describe("with the Pi Pocket app", () => {
         await startServer();
 
         const told = async () =>
-            (await modelTexts(app, planningId!)).filter(
+            (await userTexts(planningId!)).filter(
                 (each) =>
                     each.includes(`Brian commented on plan ${planId}`) ||
                     (each.includes(`Brian answered and commented on plan ${planId}`) &&
@@ -4998,6 +5778,15 @@ describe("with the Pi Pocket app", () => {
         );
         assert.equal((await planSnapshot())?.state, "drafting");
 
+        // No text: 1 durable message tells the planning session, once for the key.
+        const told = async () =>
+            (await userTexts(planningId!)).filter((each) =>
+                each.includes(`Brian asked for changes on plan ${planId}`),
+            ).length;
+
+        await until(async () => (await told()) >= 1, "the changes message", 20_000);
+        assert.equal(await told(), 1);
+
         await say(app, planningId!, "plan ready test");
         await until(async () => (await planSnapshot())?.state === "review", "the review", 20_000);
     });
@@ -5065,7 +5854,7 @@ describe("with the Pi Pocket app", () => {
         assert.equal((await planSnapshot())?.approvals.length, 1);
     });
 
-    test("after the approval, a comment, a reopen and Request changes give 409", async () => {
+    test("after the approval, a comment and Request changes give 409, and a reopen needs why", async () => {
         const comment = await routes(`plans/${planId}/comment`, {
             section: "idea",
             text: "Late.",
@@ -5076,7 +5865,7 @@ describe("with the Pi Pocket app", () => {
         assert.match(String(comment.data.error ?? comment.data.message ?? ""), /Stop and revise/);
         assert.equal(
             (await routes(`asks/${askId}/reopen`, { gen: 1, key: "reopen-key-late" })).status,
-            409,
+            400,
         );
         assert.equal(
             (await routes(`plans/${planId}/changes`, { key: "changes-key-late" })).status,
@@ -5086,7 +5875,7 @@ describe("with the Pi Pocket app", () => {
         assert.equal((await planSnapshot())?.comments.length, 2);
     });
 
-    test("the right task is delivered with its brief, and the page drops the plan", async () => {
+    test("the right task is delivered with its brief", async () => {
         const source = await supervisor("plan-deliver");
 
         await say(app, source, "plan deliver test");
@@ -5143,12 +5932,139 @@ describe("with the Pi Pocket app", () => {
                 .filter((line) => line.trim() !== "").length,
             worktrees,
         );
+    });
 
-        const dropped = await routes(`threads/${planId}/drop`, { reason: "not now" });
+    test("Stop and revise stops only the named task, and its messages go once across a restart", async () => {
+        // In building, a reopen is a scope change: without why it is refused, and nothing changes.
+        assert.equal(
+            (await routes(`asks/${askId}/reopen`, { gen: 1, key: "reopen-key-building" })).status,
+            400,
+        );
+        assert.equal((await planThread())?.asks[0]?.history?.length, 1);
+        assert.equal(
+            (
+                await routes(`plans/${planId}/revise`, {
+                    why: "The key moves.",
+                    tasks: ["t9"],
+                    key: "revise-key-bad",
+                })
+            ).status,
+            400,
+        );
+        assert.equal(
+            (await routes(`plans/${planId}/revise`, { why: "The key moves.", tasks: ["t1"] }))
+                .status,
+            400,
+            "a key is needed",
+        );
 
-        assert.equal(dropped.status, 200);
-        assert.equal((await planSnapshot())?.state, "dropped");
-        assert.equal((await planThread())?.state, "closed");
+        const revise = await routes(`plans/${planId}/revise`, {
+            why: "The key moves to a YubiKey.",
+            tasks: ["t1"],
+            key: "revise-key-1",
+        });
+
+        assert.equal(revise.status, 200);
+
+        const plan = (await planSnapshot()) ?? assert.fail("a plan");
+        const graph =
+            plan.graphs.find((each) => each.state === "approved") ?? assert.fail("a graph");
+        const t1 = graph.tasks.find((each) => each.id === "t1") ?? assert.fail("t1");
+        const t3 = graph.tasks.find((each) => each.id === "t3") ?? assert.fail("t3");
+
+        assert.equal(plan.state, "drafting");
+        assert.deepEqual(plan.revising?.tasks, ["t1"]);
+        assert.equal(t1.state, "stopped");
+        assert.equal(t1.attempts.at(-1)?.end?.how, "stopped");
+        // Decision 5: t3 is not named, and goes on.
+        assert.equal(t3.state, "delegated");
+        assert.equal(t3.attempts.at(-1)?.end, undefined);
+
+        // A second tap with the same key changes nothing; another scope change is refused.
+        assert.equal(
+            (
+                await routes(`plans/${planId}/revise`, {
+                    why: "The key moves to a YubiKey.",
+                    tasks: ["t1"],
+                    key: "revise-key-1",
+                })
+            ).status,
+            200,
+        );
+        assert.equal((await planSnapshot())?.revises?.length, 1);
+
+        const again = await routes(`plans/${planId}/revise`, {
+            why: "Another change.",
+            tasks: [],
+            key: "revise-key-2",
+        });
+
+        assert.equal(again.status, 409);
+        assert.match(
+            String(again.data.error ?? again.data.message ?? ""),
+            /under revision already/,
+        );
+
+        // A restart right after the commit: each message the commit made goes, and only once.
+        await stopTasks("x.desk.sweeper");
+        await stopTasks("x.desk.digest");
+        await app.close();
+        shift = 240_000;
+        app = await openApp(model, dataDir, () => Date.now() + shift);
+        await startServer();
+
+        const state = await deskSnapshot();
+        const t1Thread =
+            state?.threads[t1.attempts.at(-1)?.thread ?? ""] ?? assert.fail("t1's thread");
+        const t3Thread =
+            state?.threads[t3.attempts.at(-1)?.thread ?? ""] ?? assert.fail("t3's thread");
+        const count = async (id: ConversationId, text: string): Promise<number> =>
+            (await userTexts(id)).filter((each) => each.includes(text)).length;
+        const stop = `Stop: plan ${planId} is under revision`;
+
+        await until(
+            async () => (await count(t1Thread.session as ConversationId, stop)) >= 1,
+            "the stop to t1's session",
+            20_000,
+        );
+        await until(
+            async () => (await count(planningId!, `Plan ${planId} is under revision`)) >= 1,
+            "the news to the planning session",
+            20_000,
+        );
+        await until(
+            async () => (await count(startSource!, `${planId} plan under revision by`)) >= 1,
+            "the plan-revise news to the supervisor",
+            20_000,
+        );
+        assert.equal(await count(t1Thread.session as ConversationId, stop), 1);
+        assert.equal(await count(planningId!, `Plan ${planId} is under revision`), 1);
+        assert.equal(await count(t3Thread.session as ConversationId, stop), 0, "t3 goes on");
+    });
+
+    test("plan revise is the supervisor's or a task session's, and refused while one is in force", async () => {
+        await say(app, planningId!, "plan revise test");
+        await until(
+            async () =>
+                (await modelTexts(app, planningId!)).some((each) =>
+                    each.includes(`Only a task session of ${planId} or the supervisor revises`),
+                ),
+            "the planner's refusal",
+            20_000,
+        );
+
+        const source = await supervisor("plan-revise");
+
+        await say(app, source, "plan revise test");
+        await until(
+            async () =>
+                (await modelTexts(app, source)).some((each) =>
+                    each.includes(`Plan ${planId} is under revision already`),
+                ),
+            "the refusal while a scope change is in force",
+            20_000,
+        );
+        assert.equal((await planSnapshot())?.revises?.length, 1);
     });
 
     test("an older desk without threadOfKey is refused before any setup", async () => {
@@ -5231,5 +6147,13 @@ describe("with the Pi Pocket app", () => {
         assert.equal(found?.session, task.session);
         assert.equal(found?.address, task.address);
         assert.equal(replayDecision(found as never), "replay", "a replay starts nothing again");
+    });
+
+    test("the page drops the plan", async () => {
+        const dropped = await routes(`threads/${planId}/drop`, { reason: "not now" });
+
+        assert.equal(dropped.status, 200);
+        assert.equal((await planSnapshot())?.state, "dropped");
+        assert.equal((await planThread())?.state, "closed");
     });
 });
