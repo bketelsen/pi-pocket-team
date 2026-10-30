@@ -612,15 +612,19 @@ export const PR_CHECK_REQUIRED_PASS = "pr_check: the required checks pass.";
 /** Printed when the repository requires no checks and all checks pass. */
 export const PR_CHECK_ALL_PASS =
     "pr_check: the repository requires no checks, and all checks pass.";
-/** What `gh pr checks --required` says when the repository has no required check. */
-export const PR_CHECK_NO_REQUIRED = "no required checks reported";
+/**
+ * The grep pattern (whole line, `grep -x`) for what `gh pr checks --required` writes to stderr when the repository has
+ * no required check, for example `no required checks reported on the 'main' branch`. Check rows go to stdout, so a
+ * check name never matches.
+ */
+export const PR_CHECK_NO_REQUIRED = "no required checks reported on the .* branch";
 
 /**
  * The command for a PR check, built from validated values only: `gh pr checks` and `gh pr view`, both read only. Parts
  * are joined with ` && `, so every part must pass. A value that does not fit gives an error, never a command.
- * `required` runs `gh pr checks --required`; only when that says the repository has no required checks does it run
- * `gh pr checks` (all checks). A failing or pending required check keeps its exit code. Each pass prints a line that
- * starts with `pr_check: ` (`checkNote` reads it).
+ * `required` runs `gh pr checks --required`; only when that exits 1 and its stderr (not its stdout) says the repository
+ * has no required checks does it run `gh pr checks` (all checks). A failing or pending required check keeps its exit
+ * code. Each pass prints a line that starts with `pr_check: ` (`checkNote` reads it).
  */
 export function prCheckCommand(check: PrCheck): string | { error: string } {
     const { pr, repo, label } = check;
@@ -665,9 +669,10 @@ export function prCheckCommand(check: PrCheck): string | { error: string } {
 
     if (which === "required") {
         parts.push(
-            `{ o=$(gh pr checks${where} --required 2>&1); s=$?; printf '%s\\n' "$o"; ` +
+            `{ { e=$(gh pr checks${where} --required 2>&1 >&3); s=$?; } 3>&1; ` +
+                `[ -z "$e" ] || printf '%s\\n' "$e" >&2; ` +
                 `if [ "$s" -eq 0 ]; then echo '${PR_CHECK_REQUIRED_PASS}'; ` +
-                `elif printf '%s\\n' "$o" | grep -qF '${PR_CHECK_NO_REQUIRED}'; ` +
+                `elif [ "$s" -eq 1 ] && printf '%s\\n' "$e" | grep -qx '${PR_CHECK_NO_REQUIRED}'; ` +
                 `then gh pr checks${where} && echo '${PR_CHECK_ALL_PASS}'; ` +
                 `else (exit "$s"); fi; }`,
         );

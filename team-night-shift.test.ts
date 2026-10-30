@@ -193,7 +193,7 @@ describe("delegatedRequest", () => {
 
 /** The `required` part of the command, for a `where` such as ` 12 --repo bketelsen/x`. */
 const requiredPart = (where: string) =>
-    `{ o=$(gh pr checks${where} --required 2>&1); s=$?; printf '%s\\n' "$o"; if [ "$s" -eq 0 ]; then echo '${PR_CHECK_REQUIRED_PASS}'; elif printf '%s\\n' "$o" | grep -qF '${PR_CHECK_NO_REQUIRED}'; then gh pr checks${where} && echo '${PR_CHECK_ALL_PASS}'; else (exit "$s"); fi; }`;
+    `{ { e=$(gh pr checks${where} --required 2>&1 >&3); s=$?; } 3>&1; [ -z "$e" ] || printf '%s\\n' "$e" >&2; if [ "$s" -eq 0 ]; then echo '${PR_CHECK_REQUIRED_PASS}'; elif [ "$s" -eq 1 ] && printf '%s\\n' "$e" | grep -qx '${PR_CHECK_NO_REQUIRED}'; then gh pr checks${where} && echo '${PR_CHECK_ALL_PASS}'; else (exit "$s"); fi; }`;
 const REQ_12 = requiredPart(" 12 --repo bketelsen/x");
 const REQ_NONE = requiredPart("");
 
@@ -306,7 +306,7 @@ describe("prCheckCommand run with a fake gh", () => {
 echo "$*" >> "$FAKE_GH_LOG"
 case "$*" in
     *"pr view"*) printf '%s\\n' "$FAKE_LABELS"; exit 0 ;;
-    *--required*) printf '%s\\n' "$REQ_OUT" >&2; exit "$REQ_CODE" ;;
+    *--required*) [ -z "$REQ_OUT" ] || printf '%s\\n' "$REQ_OUT"; [ -z "$REQ_ERR" ] || printf '%s\\n' "$REQ_ERR" >&2; exit "$REQ_CODE" ;;
     *) printf '%s\\n' "$ALL_OUT"; exit "$ALL_CODE" ;;
 esac
 `,
@@ -335,6 +335,7 @@ esac
                 FAKE_GH_LOG: log,
                 FAKE_LABELS: "",
                 REQ_OUT: "",
+                REQ_ERR: "",
                 REQ_CODE: "0",
                 ALL_OUT: "",
                 ALL_CODE: "0",
@@ -352,7 +353,11 @@ esac
         return { code: result.status, out: result.stdout + result.stderr, calls };
     }
 
-    const NO_REQUIRED = { REQ_CODE: "1", REQ_OUT: PR_CHECK_NO_REQUIRED };
+    // The real diagnostic of `gh pr checks --required`: on stderr, with no check rows on stdout.
+    const NO_REQUIRED = {
+        REQ_CODE: "1",
+        REQ_ERR: "no required checks reported on the 'sheeana/router-named-worker' branch",
+    };
 
     test("required checks pass", () => {
         const r = run({ pr: 12 }, { REQ_CODE: "0", REQ_OUT: "build\tpass" });
@@ -400,6 +405,36 @@ esac
 
         assert.equal(all.code, 8);
         assert(!all.out.includes("pr_check:"));
+    });
+
+    // A check name is data on stdout: it must never start the fallback, whatever it says.
+    const TRICKY = `no required checks reported on the 'x' branch\tfail`;
+
+    test("a failing required check named like the diagnostic does not start the fallback", () => {
+        const r = run({ pr: 12 }, { REQ_CODE: "1", REQ_OUT: TRICKY });
+
+        assert.equal(r.code, 1);
+        assert(!r.out.includes("pr_check:"));
+        assert.equal(r.calls.length, 1);
+        assert(r.calls[0]?.includes("--required"));
+    });
+
+    test("a pending required check named like the diagnostic does not start the fallback", () => {
+        const r = run({ pr: 12 }, { REQ_CODE: "8", REQ_OUT: TRICKY.replace("fail", "pending") });
+
+        assert.equal(r.code, 8);
+        assert(!r.out.includes("pr_check:"));
+        assert.equal(r.calls.length, 1);
+        assert(r.calls[0]?.includes("--required"));
+    });
+
+    test("exit 1 with another stderr text does not start the fallback", () => {
+        const r = run({ pr: 12 }, { REQ_CODE: "1", REQ_ERR: "gh: authentication required" });
+
+        assert.equal(r.code, 1);
+        assert(r.out.includes("gh: authentication required"));
+        assert(!r.out.includes("pr_check:"));
+        assert.equal(r.calls.length, 1);
     });
 
     test("a label part joins after the required part", () => {
