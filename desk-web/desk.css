@@ -339,3 +339,44 @@
 .desk-other > .small {
     margin-left: 4px;
 }
+
+/* 1 plan: its sections, the text of each, and the bar that approves 1 revision. */
+
+.desk-plan-section {
+    margin: 8px 0;
+    border-bottom: 1px solid var(--line);
+}
+
+.desk-plan-section > summary {
+    padding: 6px 0;
+    cursor: pointer;
+}
+
+.desk-plan-text {
+    margin: 0 0 8px;
+    padding: 8px;
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12px;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+}
+
+.desk-plan-ask {
+    padding: 6px 0 6px 8px;
+    border-left: 2px solid var(--line);
+    margin-bottom: 8px;
+}
+
+.desk-plan-bar {
+    position: sticky;
+    bottom: 0;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 0;
+    background: var(--bg);
+    border-top: 1px solid var(--line);
+}

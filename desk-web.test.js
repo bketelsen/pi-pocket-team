@@ -1,7 +1,16 @@
 // The Desk page's queue section: rendered with stand-ins for Pocket's page tools, no browser.
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import setup, { badgeOf, groupOf, queueStatus } from "./desk-web/index.js";
+import setup, {
+    approveLabel,
+    badgeOf,
+    groupOf,
+    planAskLine,
+    planRowLine,
+    planStateLine,
+    queueStatus,
+    stillMounted,
+} from "./desk-web/index.js";
 
 const NOW = Date.now();
 
@@ -394,6 +403,13 @@ test("groupOf: an ask comes first after parked; else closed, asleep, found, Bria
     assert.equal(groupOf(threadView({})), "working");
 });
 
+test("groupOf: a plan thread shows under Needs you with an open ask, else only in the Plans section", () => {
+    assert.equal(groupOf(threadView({ origin: "plan", asks: [openAsk] })), "need");
+    assert.equal(groupOf(threadView({ origin: "plan" })), "plans");
+    assert.equal(groupOf(threadView({ origin: "plan", stale: true })), "plans");
+    assert.equal(groupOf(threadView({ origin: "plan", state: "closed" })), "closed");
+});
+
 test("badgeOf: an open ask counts, also when asleep; a plain sleeping thread does not", () => {
     const view = (threads) => ({ ...viewWith(null), threads });
 
@@ -628,4 +644,108 @@ test("a closed found thread with an open ask and a watch shows the answer contro
     assert.doesNotMatch(need, /Park|Keep|Wake/);
     assert.doesNotMatch(need, /Watch|Clear the watch|Pass the check|Fail the check/);
     assert.doesNotMatch(need, /ready to merge/);
+});
+
+// ─── The plan rows and the plan view ────────────────────────────────────────
+
+const plan = (patch = {}) => ({
+    id: "T560",
+    title: "Snow ISO signing",
+    state: "drafting",
+    rev: "3f2a9c1d4e5f60718293a4b5c6d7e8f901234567",
+    lead: "lucilla",
+    asks: 2,
+    waiting: [],
+    ...patch,
+});
+
+test("a plan row names its state, its asks and its lead", () => {
+    assert.equal(planRowLine(plan()), "drafting · 2 asks · lead lucilla");
+    assert.equal(planRowLine(plan({ asks: 1 })), "drafting · 1 ask · lead lucilla");
+    assert.equal(planRowLine(plan({ state: "building" })), "building · 2 asks · lead lucilla");
+});
+
+test("a plan in review shows its approval, and no undefined", () => {
+    assert.equal(planRowLine(plan({ state: "review" })), "review · Approve 3f2a9c1");
+    assert.equal(planRowLine(null), "");
+});
+
+test("the plan view's state line names the graph and its tasks", () => {
+    assert.equal(planStateLine(plan()), "drafting · rev 3f2a9c1 · lead lucilla · no graph");
+    assert.equal(
+        planStateLine(
+            plan({
+                state: "review",
+                graph: { version: 2, state: "draft", tasks: [{}, {}, {}, {}] },
+            }),
+        ),
+        "review · rev 3f2a9c1 · lead lucilla · graph v2: 4 tasks",
+    );
+    assert.equal(
+        planStateLine(plan({ graph: { version: 1, state: "draft", tasks: [{}] } })),
+        "drafting · rev 3f2a9c1 · lead lucilla · graph v1: 1 task",
+    );
+});
+
+test("the approve button names the revision and the graph it sends", () => {
+    assert.equal(
+        approveLabel(plan({ graph: { version: 2, state: "draft", tasks: [] } })),
+        "Approve 3f2a9c1 + graph v2",
+    );
+});
+
+test("an ask shows open, its answer, or that the write did not come", () => {
+    assert.equal(
+        planAskLine({ id: "T560b", text: "Where do the keys live?", open: true, written: false }),
+        "T560b: Where do the keys live? · open",
+    );
+    assert.equal(
+        planAskLine({
+            id: "T560b",
+            text: "Where do the keys live?",
+            open: false,
+            written: false,
+            answer: { words: "In the TPM.", by: "brian", at: NOW },
+        }),
+        "T560b: Where do the keys live? → In the TPM. (brian) · not written",
+    );
+    assert.equal(
+        planAskLine({
+            id: "T560b",
+            text: "Where do the keys live?",
+            open: false,
+            written: true,
+            answer: { words: "In the TPM.", by: "brian", at: NOW },
+        }),
+        "T560b: Where do the keys live? → In the TPM. (brian)",
+    );
+});
+
+test("a withdrawn ask says why, and no write-back waits for it", () => {
+    assert.equal(
+        planAskLine({
+            id: "T560c",
+            text: "Name the rotation period.",
+            open: false,
+            written: false,
+            resolved: { why: "Brian knows this one.", by: "odrade" },
+        }),
+        "T560c: Name the rotation period. · withdrawn: Brian knows this one.",
+    );
+    assert.equal(
+        planAskLine({
+            id: "T560c",
+            text: "Name the rotation period.",
+            open: false,
+            written: false,
+            resolved: { why: "The desk ended it." },
+        }),
+        "T560c: Name the rotation period. · resolved: The desk ended it.",
+    );
+});
+
+test("an answer that comes after the view left changes nothing", () => {
+    assert.equal(stillMounted({ gone: false }), true);
+    assert.equal(stillMounted({ gone: true }), false);
+    assert.equal(stillMounted(undefined), true);
 });

@@ -13,12 +13,23 @@ let rail = null;
 let app = null;
 
 /** The groups of the page, in the order it shows them. */
-const GROUPS = ["closed", "parked", "need", "watching", "found", "stale", "review", "working"];
+/** `plans` holds plan threads with no open ask: the Plans section shows them, so no thread section does. */
+const GROUPS = [
+    "closed",
+    "parked",
+    "need",
+    "plans",
+    "watching",
+    "found",
+    "stale",
+    "review",
+    "working",
+];
 
 /**
  * The section a thread goes in. First match: closed with no open ask, parked, an open ask (it needs Brian, and neither
  * a watch nor a found origin hides it, nor does a close: an ask filed on a thread that closed in the same step still
- * shows), asleep, found, Brian, stale, the reviewer.
+ * shows), a plan thread (the Plans section shows it), asleep, found, Brian, stale, the reviewer.
  */
 export const groupOf = (thread) => {
     if (thread.state === "closed") {
@@ -31,6 +42,10 @@ export const groupOf = (thread) => {
 
     if ((thread.asks ?? []).length > 0) {
         return "need";
+    }
+
+    if (thread.origin === "plan") {
+        return "plans";
     }
 
     if (thread.asleep) {
@@ -54,6 +69,61 @@ export const groupOf = (thread) => {
     }
 
     return "working";
+};
+
+/** Whether a view is still on the page: an answer that comes after it left changes nothing. */
+export const stillMounted = (life) => life?.gone !== true;
+
+/** A plan row's second line: its state with its asks and lead, or its approval. */
+export const planRowLine = (plan) => {
+    if (plan === undefined || plan === null) {
+        return "";
+    }
+
+    if (plan.state === "review") {
+        return `review · Approve ${String(plan.rev ?? "").slice(0, 7)}`;
+    }
+
+    const asks = plan.asks ?? 0;
+
+    return `${plan.state} · ${asks} ask${asks === 1 ? "" : "s"} · lead ${plan.lead}`;
+};
+
+/** A plan view's state line: `drafting · rev 3f2a9c1 · lead lucilla · graph v2: 4 tasks`. */
+export const planStateLine = (plan) => {
+    const graph = plan.graph;
+    const tasks = graph === undefined ? 0 : graph.tasks.length;
+
+    return [
+        plan.state,
+        `rev ${String(plan.rev ?? "").slice(0, 7)}`,
+        `lead ${plan.lead}`,
+        graph === undefined
+            ? "no graph"
+            : `graph v${graph.version}: ${tasks} task${tasks === 1 ? "" : "s"}`,
+    ].join(" · ");
+};
+
+/** The approve button's words: `Approve 3f2a9c1 + graph v2`. */
+export const approveLabel = (plan) =>
+    `Approve ${String(plan.rev ?? "").slice(0, 7)} + graph v${plan.graph?.version ?? 1}`;
+
+/** 1 ask of a plan section, as the view lists it: its words, its answer, and whether the write came back. */
+export const planAskLine = (ask) => {
+    if (ask.open) {
+        return `${ask.id}: ${ask.text} · open`;
+    }
+
+    // The desk ended it: Brian need not answer it, and no write-back waits.
+    if (ask.resolved !== undefined) {
+        const how = ask.resolved.by === undefined ? "resolved" : "withdrawn";
+
+        return `${ask.id}: ${ask.text} · ${how}: ${ask.resolved.why}`;
+    }
+
+    const answer = ask.answer === undefined ? "" : ` → ${ask.answer.words} (${ask.answer.by})`;
+
+    return `${ask.id}: ${ask.text}${answer}${ask.written ? "" : " · not written"}`;
 };
 
 /**
@@ -206,6 +276,255 @@ export default function setup(pocket) {
         ]
             .filter(Boolean)
             .join(" · ");
+
+    /**
+     * 1 plan: its sections with their asks, its graph, and Brian's approval. The approve key is made once, when the view
+     * opens, so a second tap sends the same key and the desk acts once.
+     */
+    function PlanDetail({ id, onBack, onChanged }) {
+        const [plan, setPlan] = useState(null);
+        const [dropping, setDropping] = useState(false);
+        const [why, setWhy] = useState("");
+        const [error, setError] = useState("");
+        const [busy, setBusy] = useState(false);
+        const newKey = () =>
+            `approve-${Math.random().toString(36).slice(2)}-${Date.now().toString(36)}`;
+        const [key, setKey] = useState(newKey);
+        // The view's life: an answer that comes after Brian went back changes nothing, and closes no other page.
+        const [life] = useState(() => ({ gone: false }));
+
+        const openPlan = async () => {
+            const answer = await pocket.api(`plans/${id}`);
+
+            setPlan(answer);
+
+            return answer;
+        };
+
+        useEffect(() => {
+            const abort = new AbortController();
+
+            pocket
+                .api(`plans/${id}`, undefined, { signal: abort.signal })
+                .then(setPlan, (failure) => {
+                    if (!abort.signal.aborted) {
+                        setError(failure.message);
+                    }
+                });
+
+            return () => {
+                abort.abort();
+                life.gone = true;
+            };
+        }, [id]);
+
+        const approve = async () => {
+            setBusy(true);
+            setError("");
+
+            try {
+                await pocket.api(`plans/${id}/approve`, {
+                    rev: plan.rev,
+                    graph: plan.graph?.version,
+                    key,
+                });
+
+                if (!stillMounted(life)) {
+                    return;
+                }
+
+                // The approval is done: a later approval of another revision is a new tap, with a new key.
+                setKey(newKey());
+                await onChanged();
+            } catch (failure) {
+                if (stillMounted(life)) {
+                    setError(failure.message);
+                }
+            } finally {
+                // The plan may have moved, and the desk's news may wait in the next view: load it again either way.
+                if (stillMounted(life)) {
+                    try {
+                        await openPlan();
+                    } catch {
+                        // The error above stays, and the view that is there stays too.
+                    }
+                }
+
+                if (stillMounted(life)) {
+                    setBusy(false);
+                }
+            }
+        };
+
+        /** Drop the plan: the desk refuses it while an ask is open, and says so. */
+        const drop = async () => {
+            setBusy(true);
+            setError("");
+
+            try {
+                await pocket.api(`threads/${id}/drop`, { reason: why.trim() });
+
+                // Brian went back while the drop ran: the page he is on now must not close.
+                if (!stillMounted(life)) {
+                    return;
+                }
+
+                await onChanged();
+
+                if (!stillMounted(life)) {
+                    return;
+                }
+
+                onBack();
+            } catch (failure) {
+                if (stillMounted(life)) {
+                    setError(failure.message);
+                    setBusy(false);
+                }
+            }
+        };
+
+        return html`<div class="desk">
+            <div class="desk-bar">
+                <button class="button" aria-label="Back to the desk" onClick=${onBack}>Back</button>
+                <span class="desk-id">${id}</span>
+                ${
+                    plan !== null && plan.session !== undefined
+                        ? html`<button
+                              class="button"
+                              aria-label="Chat in the planning session"
+                              onClick=${() => pocket.openConversation(plan.session)}
+                          >
+                              Chat
+                          </button>`
+                        : null
+                }
+            </div>
+            ${error ? html`<div class="error-box" role="alert">${error}</div>` : null}
+            ${
+                plan === null
+                    ? html`<${Loader} label="Opening the plan" />`
+                    : html`<article class="desk-thread">
+                          <h2>${plan.title}</h2>
+                          <p class="small muted">${planStateLine(plan)}</p>
+                          ${
+                              plan.waiting.length > 0
+                                  ? html`<p class="small">
+                                        Waiting: ${plan.waiting.join(" · ")}
+                                    </p>`
+                                  : html`<p class="small muted">Settled.</p>`
+                          }
+                          ${
+                              plan.preamble === undefined || plan.preamble === ""
+                                  ? null
+                                  : html`<pre class="desk-plan-text">${plan.preamble}</pre>`
+                          }
+                          ${plan.sections.map(
+                              (section) => html`<details class="desk-plan-section">
+                                  <summary>
+                                      ${section.heading}
+                                      ${
+                                          section.asks.length === 0
+                                              ? null
+                                              : html`<span class="desk-count">${section.asks.length}</span>`
+                                      }
+                                  </summary>
+                                  <pre class="desk-plan-text">${section.text}</pre>
+                                  ${section.asks.map(
+                                      (ask) => html`<div class="desk-plan-ask">
+                                          <div class="small">${planAskLine(ask)}</div>
+                                          ${
+                                              (ask.options ?? []).length === 0
+                                                  ? null
+                                                  : html`<div class="small muted">
+                                                        ${ask.options.join(" | ")}
+                                                    </div>`
+                                          }
+                                      </div>`,
+                                  )}
+                              </details>`,
+                          )}
+                          ${
+                              plan.graph === undefined
+                                  ? null
+                                  : html`<details class="desk-plan-section">
+                                        <summary>
+                                            ${`Task states (graph v${plan.graph.version}: ${plan.graph.tasks.length} task${plan.graph.tasks.length === 1 ? "" : "s"})`}
+                                        </summary>
+                                        <ul class="desk-list">
+                                            ${plan.graph.tasks.map(
+                                                (task) => html`<li>
+                                                    <span class="desk-id">${task.id}</span> ${task.title}
+                                                    <div class="small muted">
+                                                        ${[
+                                                            task.agent,
+                                                            task.repo,
+                                                            task.state,
+                                                            `deps: ${(task.deps ?? []).join(", ") || "none"}`,
+                                                        ]
+                                                            .filter(Boolean)
+                                                            .join(" · ")}
+                                                    </div>
+                                                </li>`,
+                                            )}
+                                        </ul>
+                                    </details>`
+                          }
+                          ${
+                              plan.state === "review" && plan.canApprove
+                                  ? html`<div class="desk-plan-bar">
+                                        <button
+                                            class="button primary"
+                                            disabled=${busy}
+                                            aria-label=${approveLabel(plan)}
+                                            onClick=${() => void approve()}
+                                        >
+                                            ${approveLabel(plan)}
+                                        </button>
+                                    </div>`
+                                  : plan.approveOff
+                                    ? html`<div class="desk-plan-bar">
+                                          <span class="small muted">${plan.approveOff}</span>
+                                      </div>`
+                                    : null
+                          }
+                          ${
+                              plan.state === "done" || plan.state === "dropped"
+                                  ? null
+                                  : dropping
+                                    ? html`<div class="desk-drop">
+                                          <input
+                                              class="desk-reason"
+                                              type="text"
+                                              placeholder="Why drop this plan?"
+                                              value=${why}
+                                              maxlength="200"
+                                              aria-label="Why drop this plan"
+                                              onInput=${(event) => setWhy(event.currentTarget.value)}
+                                          />
+                                          <div class="desk-actions">
+                                              <button
+                                                  class="button"
+                                                  disabled=${busy || why.trim() === ""}
+                                                  onClick=${() => void drop()}
+                                              >
+                                                  Drop the plan
+                                              </button>
+                                              <button class="button" onClick=${() => setDropping(false)}>
+                                                  Cancel
+                                              </button>
+                                          </div>
+                                      </div>`
+                                    : html`<div class="desk-actions">
+                                          <button class="button" onClick=${() => setDropping(true)}>
+                                              Drop
+                                          </button>
+                                      </div>`
+                          }
+                      </article>`
+            }
+        </div>`;
+    }
 
     function Detail({ id, onBack }) {
         const [thread, setThread] = useState(null);
@@ -364,6 +683,7 @@ export default function setup(pocket) {
     function Desk() {
         const [, setTick] = useState(0);
         const [openId, setOpenId] = useState(null);
+        const [planId, setPlanId] = useState(null);
         const [busy, setBusy] = useState(false);
         const [error, setError] = useState("");
         const [dropFor, setDropFor] = useState(null);
@@ -482,6 +802,14 @@ export default function setup(pocket) {
             await act(`asks/${id}/answer`, { words });
         };
 
+        if (planId !== null) {
+            return html`<${PlanDetail}
+                id=${planId}
+                onBack=${() => setPlanId(null)}
+                onChanged=${load}
+            />`;
+        }
+
         if (openId !== null) {
             return html`<${Detail} id=${openId} onBack=${() => setOpenId(null)} />`;
         }
@@ -508,6 +836,7 @@ export default function setup(pocket) {
         const others = Object.values(view?.others ?? {}).reduce((sum, count) => sum + count, 0);
         const counts = view?.counts ?? {};
         const ready = view?.ready ?? [];
+        const plans = view?.plans ?? [];
         const capInfo = view?.cap ?? { counted: 0, cap: 0, full: false, grants: 0 };
         const fresh = (thread) => thread.lastEventAt > (seenBefore ?? 0);
 
@@ -1138,12 +1467,33 @@ export default function setup(pocket) {
             ${error ? html`<div class="error-box" role="alert">${error}</div>` : null}
             ${loadError ? html`<div class="error-box" role="alert">${loadError}</div>` : null}
             ${queueSection}
+            ${section(
+                "Plans",
+                plans,
+                (plan) =>
+                    html`<li class="desk-row">
+                        <button
+                            type="button"
+                            class="desk-open"
+                            aria-label=${`Open plan ${plan.id}: ${plan.title}`}
+                            onClick=${() => setPlanId(plan.id)}
+                        >
+                            <span class="desk-line">
+                                <span class="desk-id">${plan.id}</span>
+                                <span class="desk-title">${plan.title}</span>
+                            </span>
+                            <span class="small muted">${planRowLine(plan)}</span>
+                        </button>
+                    </li>`,
+                "A plan settles its decisions and its task graph before its tasks start. Brian approves 1 revision here.",
+            )}
             ${section("Needs you", groups.need, (thread) =>
                 row(
                     thread,
                     // A closed thread (it is here for its open ask) shows the ask and its answer controls only: the
                     // watch, Attach and Drop routes do nothing on it.
-                    thread.state === "closed"
+                    // A plan thread takes no watch: its plan view has its own actions.
+                    thread.state === "closed" || thread.origin === "plan"
                         ? needDetail(thread)
                         : html`${withWatch(thread, needDetail(thread))}${thread.origin === "found" ? foundActions(thread) : null}`,
                 ),
