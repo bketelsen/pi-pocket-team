@@ -8551,8 +8551,11 @@ describe("the digest's rules", () => {
             "repair",
             "issue-urgent",
             "report-blocked",
+            "plan-approved",
+            "plan-verify",
+            "plan-revise",
         ];
-        const routine = ["report", "shift", "closed", "queue"];
+        const routine = ["report", "shift", "closed", "queue", "plan-decided"];
 
         assert.deepEqual(digestConfig(undefined), {
             minutes: 15,
@@ -12713,6 +12716,11 @@ describe("the issue digest kinds", () => {
             "issue-urgent",
             "issue-left",
             "report-blocked",
+            "plan-ready",
+            "plan-approved",
+            "plan-verify",
+            "plan-revise",
+            "plan-decided",
         ]);
     });
 

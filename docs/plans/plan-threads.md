@@ -1,6 +1,8 @@
 # Plan threads: an idea becomes a settled plan before work starts
 
-Status: design only, no code. Brian asked for it on 2026-10-30 (T547a), after Odrade's report on
+Status: PR 1, the plan and the gate, is built in this repository (sections 4, 5.1, 5.2, 5.4, 7.1, 7.2 and
+7.3, less the parts section 15 names). PR 2, decisions and delivery, and PR 3, consults, are still design only.
+Brian asked for it on 2026-10-30 (T547a), after Odrade's report on
 githubnext/chopin (`~/agents/odrade/reports/2026-10-30-chopin/README.md`, Chopin commit `3548849`). Chopin is
 MIT; this design borrows its ideas (decision records, findings, a build gate, an approved revision, a task graph,
 a whole-graph check). It copies no code. Brian decided 5 of the 8 questions in section 12 on 2026-10-30 (T548a to
@@ -649,3 +651,34 @@ view is planned (decision 1).
   its `written` marks go in 1 commit, after the bytes are in the revision store and before the file is published; a
   `pending` write finishes at the next sweep or call (section 4.4). A consult is committed as `starting` before its
   session starts (section 8).
+
+## 15. What PR 1 built, and where it differs
+
+PR 1 is built: the data model and the pure rules (section 4), the revision store and the publish (section 4.4),
+`team_delegate` with `plan` (start and 1 task), `plan` with read, write, ask, tasks, ready and list, the gate in the
+delegation commit, the answer wake-up, the digest kinds `plan-ready`, `plan-approved` and `plan-decided`, and the
+read-only plan view with Approve on the Desk page. Section comments, reopen, why, criteria and marks, `nochange`,
+`revise`, `verify`, consults and the `needs-plan` label are not built.
+
+Each line below differs from the design above, and says why.
+
+- **The secret forms are matched as tokens** (`\bghp_…`, `\bsk-…`, `\bxox…`, `-----BEGIN …`), never as plain words:
+  `sk-` alone would refuse the ordinary text `desk-web`.
+- **`Plan` gains `wake`** (`{ due?, sent }`): Brian's answers within 30 seconds go to the planning session as 1
+  message, and the stored keys make each answer wake it once, also across a restart.
+- **`plan tasks` is a desk write**: the Tasks section and the graph go in 1 commit, so a graph's `rev` is the revision
+  that carries its Tasks section, and any later write makes the draft stale, so Ready asks for `plan tasks` again.
+- **A write that names an ask it cannot settle is refused**, not partly applied: the check runs in the commit, so a
+  plan file never moves for a write the desk refused, and no ask is marked written by it.
+- **A failed start of a planning session drops its plan** (event `plan dropped: the planning session did not start`):
+  a plan with no session can never be settled, and it would hold 1 of the `plans.max` places for ever.
+- **In PR 1 the task brief says "report that to your supervisor with the evidence"**, and `verify` is refused ("The
+  verify task comes with plan verification, in a later desk version."): `plan nochange` and the whole-plan check
+  come in PR 2.
+- **`plans.root` needs `export` or its own value**: no tool takes a path, so the root is `plans.root`, else
+  `<export>/plans`, and a start with neither is refused ("Plans need a folder: set plans.root or export in
+  desk.json.").
+- **`addPlanAsk` refuses the 2 desk sections**, beside its check that the section is in the plan: an ask anchored
+  there can never be settled, and the gate would then stay open for ever.
+- **`plan ask` takes an optional `rev`**, and the plan's revision now is its default: a question is anchored to the
+  revision the caller read, and the ask needs no second read for it.
