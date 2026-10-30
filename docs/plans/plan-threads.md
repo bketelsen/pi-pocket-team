@@ -3,8 +3,8 @@
 Status: design only, no code. Brian asked for it on 2026-10-30 (T547a), after Odrade's report on
 githubnext/chopin (`~/agents/odrade/reports/2026-10-30-chopin/README.md`, Chopin commit `3548849`). Chopin is
 MIT; this design borrows its ideas (decision records, findings, a build gate, an approved revision, a task graph,
-a whole-graph check). It copies no code. Brian decided 4 of the 8 questions in section 12 on 2026-10-30 (T548a to
-T548d); the other 4 stay open.
+a whole-graph check). It copies no code. Brian decided 5 of the 8 questions in section 12 on 2026-10-30 (T548a to
+T548e); the other 3 stay open.
 
 ## 1. The gap
 
@@ -430,14 +430,16 @@ Waiting: T560b, T560c open · c3 open · k2 running
 - In `building` and later, Tasks shows each task: its state, and each attempt's thread, PRs or no-change evidence, and the
   bar shows **Stop and revise** (it asks for 1 line why, and which tasks).
 - **New plan** (top of the section): a title, Brian's 1 line, the lead (an agent picker), and an optional model from
-  the allowed list. It starts the planning session at once, as Brian.
+  the allowed list. It starts the planning session at once, as Brian. With 3 plans open, the button is off and says
+  why (decision 6).
 
 ## 7. The tools, and who may call them
 
 ### 7.1 `team_delegate` (Team): 1 new optional parameter, `plan`
 
 - `plan: { start: true }`, with `repository: "home"`: start a plan. Supervisor only, as today. The agent must have
-  `role: agent` and a home. The task text is Brian's idea and what Odrade knows. Team starts the planning session in
+  `role: agent` and a home. A start is refused while 3 plans are open (`plans.max` in `desk.json`, default 3; decision
+  6). The task text is Brian's idea and what Odrade knows. Team starts the planning session in
   the agent's home with a planning brief (section 7.4) and opens the plan thread through the desk API (`origin:
 "plan"`), in the same commit as today's `open`.
 - `plan: { id: "T560", task: "t2" }`: deliver 1 task. The desk checks section 5.2 in the commit that opens the thread,
@@ -580,31 +582,29 @@ When every task is `done`, the desk sets `verifying` and sends `plan-verify` at 
 
 ### 12.1 Decided (Brian, 2026-10-30)
 
-1. **The phone view: a Desk page plan view**, with section comments in the desk, so the gate sees them (T548a). Not
-   chosen: an HTML artifact with `data-pid` and Pocket's comments (the gate cannot read them), or both.
-2. **Consults: a Team tool starts them under the supervisor's session, read-only by a hook** (T548b), with the bounds
-   of section 8. Not chosen: a subagent with the expert's profile, or Odrade relaying each consult by hand.
-3. **The plan store: `~/agents/odrade/desk/plans/`, written only by the desk** (T548c), with the revision store of
-   section 4.4, committed with the export. Not chosen: the lead's home, or a PR in the lead's repository.
-4. **Delegation after the approval: Odrade delegates at once on `plan-approved`, inside the cap** (T548d). Not
-   chosen: the desk by itself, or a tap for each task.
+- **Decision 1, the phone view: a Desk page plan view**, with section comments in the desk, so the gate sees them
+  (T548a). Not chosen: an HTML artifact with `data-pid` and Pocket's comments (the gate cannot read them), or both.
+- **Decision 2, consults: a Team tool starts them under the supervisor's session, read-only by a hook** (T548b), with
+  the bounds of section 8. Not chosen: a subagent with the expert's profile, or Odrade relaying each consult by hand.
+- **Decision 3, the plan store: `~/agents/odrade/desk/plans/`, written only by the desk** (T548c), with the revision
+  store of section 4.4, committed with the export. Not chosen: the lead's home, or a PR in the lead's repository.
+- **Decision 4, delegation after the approval: Odrade delegates at once on `plan-approved`, inside the cap** (T548d).
+  Not chosen: the desk by itself, or a tap for each task.
+- **Decision 6, the cap: plan threads do not count; at most 3 plans are open** (T548e). Task threads and verification
+  threads count, as every delegation does. Not chosen: each plan thread counts as 1.
 
 ### 12.2 Open
 
-The recommended option is first in each list. Only decision 6 touches PR 1 (PR 1 opens plan threads, so it must
-know whether they count toward the cap). Decisions 5, 7 and 8 touch PR 2.
+These touch PR 2, not PR 1. The recommended option is first in each list.
 
-5. **A scope change.**
+- **Decision 5, a scope change.**
     - a. It stops only the tasks it names.
     - b. It stops every open task of the plan.
-6. **The cap.**
-    - a. Plan threads do not count; at most 3 plans are open.
-    - b. Each plan thread counts as 1.
-7. **The `needs-plan` label.**
+- **Decision 7, the `needs-plan` label.**
     - a. The bot creates it in the 29 repositories with Brian's word, as for the issue queue.
     - b. Brian creates it.
     - c. No label: plans start only from the page or the chat.
-8. **A reopen after the approval.**
+- **Decision 8, a reopen after the approval.**
     - a. Reopening a settled ask in `approved` or `building` is a scope change.
     - b. It is refused there.
 
