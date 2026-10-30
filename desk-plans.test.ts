@@ -71,6 +71,9 @@ import {
     startTask,
     validateGraph,
     waitingText,
+    wakeMessages,
+    wakeNext,
+    wakeUnsent,
     DeskThreads,
     planOf,
     planWriteFlow,
@@ -1335,11 +1338,11 @@ describe("ready and approve", () => {
 
         assert.equal(plan.state, "review");
         assert.equal(
-            planReadyItem(plan, plan.graphs[0] ?? assert.fail("a graph"), tick(2)).line,
+            planReadyItem(plan, plan.rev, plan.graphs[0] ?? assert.fail("a graph"), tick(2)).line,
             `[desk] T1 plan ready for Brian: rev ${plan.rev.slice(0, 7)}, graph v1 (2 tasks) · he approves on the Desk page`,
         );
         assert.equal(
-            planReadyItem(plan, plan.graphs[0] ?? assert.fail("a graph"), tick(2)).key,
+            planReadyItem(plan, plan.rev, plan.graphs[0] ?? assert.fail("a graph"), tick(2)).key,
             `plan-ready:T1:${plan.rev}`,
         );
         assert.equal(state.threads.T1?.events.at(-1)?.key, "plan-ready:ready:1");
@@ -2402,6 +2405,111 @@ describe("the plan view's parts", () => {
     });
 });
 
+// ─── The re-review's fixes ──────────────────────────────────────────────────
+
+describe("the wake's steps", () => {
+    const one = { text: "one", requestId: "r1", keys: ["answer:T1a:0"] };
+    const two = { text: "two", requestId: "r2", keys: ["answer:T1b:0"] };
+
+    test("1 step sends 1 message, so a restart sends no earlier one", () => {
+        assert.deepEqual(wakeNext([one, two], 0), { message: one, after: 1, last: false });
+
+        // The first message failed, and its keys went back in the same commit: the next step sends the second only.
+        assert.deepEqual(wakeNext([one, two], 1), { message: two, after: 2, last: true });
+        assert.equal(wakeNext([one, two], 2).message, undefined);
+        assert.equal(wakeNext([two], 0).last, true);
+    });
+
+    test("an abort gives back the keys of the messages that did not go", () => {
+        assert.deepEqual(wakeUnsent([one, two], 0), ["answer:T1a:0", "answer:T1b:0"]);
+        assert.deepEqual(wakeUnsent([one, two], 1), ["answer:T1b:0"]);
+        assert.deepEqual(wakeUnsent([one, two], 2), []);
+    });
+
+    test("an older 1-message checkpoint still reads", () => {
+        assert.deepEqual(wakeMessages({ text: "one", requestId: "r1" }), [
+            { text: "one", requestId: "r1", keys: [] },
+        ]);
+        assert.deepEqual(wakeMessages({ messages: [one] }), [one]);
+    });
+});
+
+describe("the commit's order", () => {
+    test("a refused graph version leaves the whole plan unchanged", async () => {
+        const harness = await storeHarness();
+        const rev = harness.plan.rev;
+
+        harness.plan.state = "drafting";
+        // The graph lands after the flow's snapshot, before its commit: the flow's version is then out of date.
+        draftGraph(harness.state, "T1", { key: "other", at: tick(1), rev, tasks: tasks() });
+
+        const snapshot = JSON.parse(JSON.stringify(harness.state)) as DeskState;
+        const before = JSON.parse(JSON.stringify(harness.plan)) as Plan;
+        const done = await planWriteFlow({ ...harness.io(), read: async () => snapshot }, "T1", {
+            text: "",
+            key: "t1",
+            by: "lucilla",
+            at: tick(2),
+            graph: () => ({
+                version: 1,
+                rev,
+                state: "draft",
+                at: tick(2),
+                key: "t1",
+                tasks: tasks(),
+            }),
+        });
+
+        assert.ok("error" in done);
+        assert.match(done.error, /graph changed since you read it/);
+        assert.deepEqual(JSON.parse(JSON.stringify(harness.plan)), before);
+        assert.equal(harness.plan.rev, before.rev);
+        assert.equal(harness.plan.pending, undefined);
+        assert.equal(harness.plan.revs.length, before.revs.length);
+    });
+});
+
+describe("the ready replay's result", () => {
+    test("a replayed ready returns its first rev and graph after a later write", async () => {
+        const harness = await storeHarness();
+
+        draftGraph(harness.state, "T1", {
+            key: "g",
+            at: tick(1),
+            rev: harness.plan.rev,
+            tasks: tasks(),
+        });
+
+        const first = readyPlan(harness.state, "T1", { key: "r1", at: tick(2) });
+
+        assert(!("error" in first));
+        assert.equal(harness.plan.state, "review");
+        assert.ok(first.item, "the first call has its news");
+
+        // A write takes the plan back to drafting, and its graph is still the draft of the old revision.
+        const written = await planWriteFlow(harness.io(), "T1", {
+            section: "idea",
+            text: "A change.",
+            key: "w1",
+            by: "lucilla",
+            at: tick(3),
+        });
+
+        assert(!("error" in written));
+        assert.equal(harness.plan.state, "drafting");
+
+        const before = JSON.parse(JSON.stringify(harness.plan)) as Plan;
+        const again = readyPlan(harness.state, "T1", { key: "r1", at: tick(4) });
+
+        assert(!("error" in again), "a replay is never refused");
+        assert.equal(again.replay, true);
+        assert.equal(again.rev, first.rev);
+        assert.equal(again.graph, first.graph);
+        assert.equal(again.item, undefined, "a replay sends no news");
+        assert.deepEqual(JSON.parse(JSON.stringify(harness.plan)), before);
+    });
+});
+
 // ─── With the Pi Pocket app ─────────────────────────────────────────────────
 
 const dataDir = join(root, "data");
@@ -2829,9 +2937,42 @@ describe("with the Pi Pocket app", () => {
 
         assert(before);
 
+        // A control thread of the same supervisor, with no PR and no folder work: the sweep closes it.
+        const control = await app.harness.commit(async (tx) => {
+            const state = await tx.doc(DeskThreads);
+            const opened = openThread(state, {
+                key: "x.test:control",
+                supervisor: Number(startSource),
+                agents: ["lucilla"],
+                title: "A quiet thread",
+                at: Date.now(),
+            }).thread;
+            const thread = state.threads[opened.id] ?? opened.thread;
+
+            // No session and no folder: only its own parts decide, and none is open. An ordinary thread here closes.
+            thread.state = "open";
+            delete thread.session;
+            delete thread.address;
+            thread.run = { busy: false };
+
+            return opened.id;
+        }, context);
+
+        assert.equal(
+            (await deskSnapshot())?.threads[control]?.state,
+            "open",
+            "the control thread is open before the sweep",
+        );
+
         // The plan's own supervisor sweeps: its planning session is idle and silent, which would close an ordinary
         // thread with no PR and no watch.
         await say(app, startSource!, "desk sync test");
+
+        assert.equal(
+            (await deskSnapshot())?.threads[control]?.state,
+            "closed",
+            "the control thread closes",
+        );
 
         const after = await planThread();
 

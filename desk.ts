@@ -11095,14 +11095,14 @@ export function draftGraph(
 }
 
 /** The plan-ready news for the supervisor: 1 digest item. */
-export function planReadyItem(plan: Plan, graph: TaskGraph, at: number): DigestItem {
+export function planReadyItem(plan: Plan, rev: string, graph: TaskGraph, at: number): DigestItem {
     const count = graph.tasks.length;
 
     return {
-        key: `plan-ready:${plan.thread}:${plan.rev}`,
+        key: `plan-ready:${plan.thread}:${rev}`,
         thread: plan.thread,
         kind: "plan-ready",
-        line: `[desk] ${plan.thread} plan ready for Brian: rev ${plan.rev.slice(0, 7)}, graph v${String(graph.version)} (${String(count)} task${count === 1 ? "" : "s"}) · he approves on the Desk page`,
+        line: `[desk] ${plan.thread} plan ready for Brian: rev ${rev.slice(0, 7)}, graph v${String(graph.version)} (${String(count)} task${count === 1 ? "" : "s"}) · he approves on the Desk page`,
         at,
     };
 }
@@ -11158,7 +11158,7 @@ export function readyPlan(
     state: DeskState,
     planId: string,
     request: { key: string; at: number },
-): { item?: DigestItem; replay: boolean } | { error: string } {
+): { item?: DigestItem; rev: string; graph: number; replay: boolean } | { error: string } {
     const plan = planOf(state, planId);
     const thread = plan === undefined ? undefined : threadById(state, plan.thread);
 
@@ -11166,16 +11166,11 @@ export function readyPlan(
         return { error: `There is no plan ${planId.toUpperCase()}.` };
     }
 
-    // A replay: the stored ready says what the first call did, whatever the plan's state is now.
+    // A replay: the stored ready says what the first call did, whatever the plan's state is now. It sends no news.
     const done = plan.readies?.find((each) => each.key === request.key);
 
     if (done !== undefined) {
-        const graph = plan.graphs.find((each) => each.version === done.graph);
-
-        return {
-            ...(graph === undefined ? {} : { item: planReadyItem(plan, graph, request.at) }),
-            replay: true,
-        };
+        return { rev: done.rev, graph: done.graph, replay: true };
     }
 
     if (plan.state !== "drafting") {
@@ -11213,7 +11208,12 @@ export function readyPlan(
         );
     }
 
-    return { item: planReadyItem(plan, graph, request.at), replay: false };
+    return {
+        item: planReadyItem(plan, plan.rev, graph, request.at),
+        rev: plan.rev,
+        graph: graph.version,
+        replay: false,
+    };
 }
 
 /** Recompute a graph's task states from its deps: ready with none, waiting with some. */
@@ -11493,8 +11493,44 @@ export function planWarning(
 
 /** How long the desk waits for more answers before it wakes a planning session: 30 seconds. */
 export const PLAN_WAKE_MS = 30_000;
-/** The answer keys a plan keeps, so that an answer wakes its session once. */
-const WAKE_SENT_MAX = 100;
+
+/** 1 message of a plan's answer wake-up: its text, its stable request id, and the answer keys it carries. */
+export type PlanWakeMessage = { text: string; requestId: string; keys: string[] };
+
+/** A wake-up's messages: a checkpoint from before the batches has 1 message, or none. */
+export function wakeMessages(checkpoint: {
+    messages?: readonly PlanWakeMessage[];
+    text?: string;
+    requestId?: string;
+}): PlanWakeMessage[] {
+    if (checkpoint.messages !== undefined) {
+        return [...checkpoint.messages];
+    }
+
+    return checkpoint.text === undefined
+        ? []
+        : [{ text: checkpoint.text, requestId: checkpoint.requestId ?? "", keys: [] }];
+}
+
+/**
+ * The message 1 deliver step sends, and the number after it: no message means the batch is done. A step sends 1
+ * message, so a restart after its commit sends the next one, never the one that went.
+ */
+export function wakeNext(
+    messages: readonly PlanWakeMessage[],
+    next: number,
+): { message?: PlanWakeMessage; after: number; last: boolean } {
+    const message = messages[next];
+
+    return message === undefined
+        ? { after: next, last: true }
+        : { message, after: next + 1, last: next + 1 >= messages.length };
+}
+
+/** The keys of the messages at `next` or later: the ones an abort gives back, so their answers go again. */
+export function wakeUnsent(messages: readonly PlanWakeMessage[], next: number): string[] {
+    return messages.slice(next).flatMap((each) => each.keys);
+}
 
 /** The folder of a plan's revision store: `<plans root>/.revs`. */
 const storeFolder = (root: string): string => join(root, ".revs");
@@ -11702,6 +11738,27 @@ export async function planWriteFlow(
 
     const rev = await io.writeStore(built.text);
     const done = await io.commit(async (state2, tx) => {
+        // A returned error changes nothing: every check runs before the first change, in this order.
+        const fresh = planOf(state2, plan.thread);
+        const first = fresh?.revs.find((entry) => entry.key === request.key);
+
+        // 1. A replay returns the first result at once: no version check, and no second change.
+        if (first !== undefined) {
+            return { rev: first.rev, replay: true, settled: [] };
+        }
+
+        // 2. The graph was made from the snapshot this flow read: another graph since then would take its version.
+        if (made !== undefined) {
+            const next = (fresh?.graphs.at(-1)?.version ?? 0) + 1;
+
+            if (next !== made.version) {
+                return {
+                    error: "The plan's graph changed since you read it: read the plan again, and call plan tasks again.",
+                };
+            }
+        }
+
+        // 3. The write, and 4. the change that goes with it.
         const committed = commitPlanWrite(state2, planId, {
             key: request.key,
             by: request.by,
@@ -11715,17 +11772,6 @@ export async function planWriteFlow(
 
         if ("error" in committed) {
             return committed;
-        }
-
-        // The graph was made from the snapshot this flow read: another graph since then would take its version.
-        if (made !== undefined) {
-            const next = (planOf(state2, plan.thread)?.graphs.at(-1)?.version ?? 0) + 1;
-
-            if (next !== made.version) {
-                return {
-                    error: "The plan's graph changed since you read it: read the plan again, and call plan tasks again.",
-                };
-            }
         }
 
         if (request.extra !== undefined) {
@@ -16804,12 +16850,11 @@ export default function createDesk(host: Host, web: Web) {
     // ─── The answer wake-up of a plan ─────────────────────────────────────────
 
     type PlanWakeInput = { plan: string; supervisor: number; due: number };
-    /** 1 message of a wake-up batch: its text, its stable request id, and the answer keys it carries. */
-    type PlanWakeMessage = { text: string; requestId: string; keys: string[] };
     type PlanWakeState =
         | { phase: "wait"; due: number }
         | { phase: "take" }
-        | { phase: "deliver"; to: string; messages: PlanWakeMessage[] }
+        /** The message `next` waits to go: a step sends 1 message, so a restart sends no earlier one. */
+        | { phase: "deliver"; to: string; messages: PlanWakeMessage[]; next?: number }
         /** A checkpoint from before the batches: 1 message. */
         | { phase: "deliver"; to: string; text: string; requestId: string };
 
@@ -16955,71 +17000,100 @@ export default function createDesk(host: Host, web: Web) {
                     return;
                 }
 
-                // A checkpoint from before the batches has 1 message, and no keys to give back.
-                const messages: PlanWakeMessage[] =
-                    "messages" in checkpoint
-                        ? checkpoint.messages
-                        : [{ text: checkpoint.text, requestId: checkpoint.requestId, keys: [] }];
-                const failed: PlanWakeMessage[] = [];
+                const messages = wakeMessages(checkpoint);
+                const next = "next" in checkpoint ? (checkpoint.next ?? 0) : 0;
+                const step = wakeNext(messages, next);
+                const message = step.message;
 
-                for (const message of messages) {
-                    try {
-                        await host.linkedSessions.send(
-                            task.input.supervisor as ConversationId,
-                            { to: checkpoint.to, message: message.text },
-                            message.requestId,
-                        );
-                    } catch {
-                        failed.push(message);
-                    }
+                // No message left: the batch is in, and the task ends.
+                if (message === undefined) {
+                    await runtime.commit(
+                        () => ({
+                            status: "terminal",
+                            outcome: { status: "completed", result: null },
+                        }),
+                        context,
+                    );
+
+                    return;
                 }
 
-                // A failed message gives its keys back in 1 commit, so the answers go again at the next wake-up. The
-                // batch has no due time now: the sweep starts a new one for the keys that wait.
-                for (const message of failed) {
-                    const at = runtime.now();
+                let failed = false;
 
-                    await runtime.commit(async (tx) => {
-                        const state = await tx.doc(DeskThreads);
-                        const plan = planOf(state, task.input.plan);
+                try {
+                    await host.linkedSessions.send(
+                        task.input.supervisor as ConversationId,
+                        { to: checkpoint.to, message: message.text },
+                        message.requestId,
+                    );
+                } catch {
+                    failed = true;
+                }
+
+                // 1 commit for this message: on success the next one is due; on failure its keys go back in the same
+                // commit, with the event. A restart after this commit never sends this message again.
+                await runtime.commit(async (tx) => {
+                    const state = await tx.doc(DeskThreads);
+                    const plan = planOf(state, task.input.plan);
+
+                    if (failed && plan?.wake !== undefined) {
+                        plan.wake.sent = plan.wake.sent.filter(
+                            (key) => !message.keys.includes(key),
+                        );
+                    }
+
+                    if (failed) {
                         const thread = threadById(state, task.input.plan);
-
-                        if (plan?.wake !== undefined) {
-                            plan.wake.sent = plan.wake.sent.filter(
-                                (key) => !message.keys.includes(key),
-                            );
-                        }
 
                         if (thread !== undefined) {
                             addEvent(
                                 thread,
                                 `plan-wake:${message.requestId}`,
                                 "the answer wake-up did not reach the session: it goes again",
-                                at,
+                                runtime.now(),
                             );
                         }
-                    }, context);
+                    }
 
+                    return step.last
+                        ? { status: "terminal", outcome: { status: "completed", result: null } }
+                        : {
+                              status: "running",
+                              checkpoint: {
+                                  phase: "deliver",
+                                  to: checkpoint.to,
+                                  messages,
+                                  next: step.after,
+                              },
+                          };
+                }, context);
+
+                // The notice is no work of the commit: it goes once the event is stored.
+                if (failed) {
                     host.notice(
                         "warning",
                         `The answers on plan ${task.input.plan} did not reach its session. They go again in a moment.`,
                         task.input.supervisor as ConversationId,
                     );
                 }
-
-                await runtime.commit(
-                    () => ({ status: "terminal", outcome: { status: "completed", result: null } }),
-                    context,
-                );
             },
         },
         abort: (task, runtime, context) =>
             runtime.commit(async (tx) => {
                 const state = await tx.doc(DeskThreads);
                 const plan = planOf(state, task.input.plan);
+                const checkpoint = task.state.checkpoint;
 
-                // A stopped task frees its batch: the next answer can ask for a new wake-up.
                 if (plan?.wake !== undefined) {
+                    // The messages that did not go give their keys back: their answers go again.
+                    if (checkpoint.phase === "deliver") {
+                        const next = "next" in checkpoint ? (checkpoint.next ?? 0) : 0;
+                        const unsent = wakeUnsent(wakeMessages(checkpoint), next);
+
+                        plan.wake.sent = plan.wake.sent.filter((key) => !unsent.includes(key));
+                    }
+
+                    // A stopped task frees its batch: the next answer can ask for a new wake-up.
                     delete plan.wake.due;
                 }
 
@@ -19857,7 +19931,15 @@ export default function createDesk(host: Host, web: Web) {
                 );
             }
 
-            // ready
+            // ready: a replay of this call answers from the plan's stored readies, before any other check.
+            const recorded = plan.readies?.find((each) => each.key === key);
+
+            if (recorded !== undefined) {
+                return reply(
+                    `Plan ${plan.thread} is ready for Brian: rev ${recorded.rev.slice(0, 7)}, graph v${String(recorded.graph)}.`,
+                );
+            }
+
             const draft = draftGraphFor(plan);
 
             if (draft === undefined) {
@@ -19900,7 +19982,7 @@ export default function createDesk(host: Host, web: Web) {
             await exportNow(api, context);
 
             return reply(
-                `Plan ${plan.thread} is ready for Brian: rev ${plan.rev.slice(0, 7)}, graph v${String(draft.version)}.`,
+                `Plan ${plan.thread} is ready for Brian: rev ${done.rev.slice(0, 7)}, graph v${String(done.graph)}.`,
             );
         },
     });
