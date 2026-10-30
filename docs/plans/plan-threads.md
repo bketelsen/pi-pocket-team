@@ -40,9 +40,11 @@ Odrade proposed 7 points to Brian. This design keeps their aim, and changes thes
    the lead's profile model (Opus for 9 of 11 profiles), or one that the start names from the allowed list.
 2. **The desk is the only writer of the plan file.** The planning session writes through the `plan` tool, with the
    revision it read. A stale write is refused, so a later rewrite cannot silently lose a decision (Chopin's
-   revision-guarded edits). The file lives in the desk's export folder, which the desk already commits.
-3. **The revision is the file's git blob sha**, not a commit sha. It is exact for the bytes, needs no commit, and
-   matches `git hash-object` and the blob that the export commit stores, so `git log --find-object` finds it later.
+   revision-guarded edits). Writes go one at a time, through a commit first (section 4.4). The file lives in the
+   desk's export folder.
+3. **The revision is the file's git blob sha**, not a commit sha. It is exact for the bytes and needs no commit. The
+   export commit runs at most every 10 minutes and can fail, so it is not the store: the desk keeps each revision's
+   bytes in an immutable revision store before it acknowledges the write (section 4.4).
 4. **The write-back is checked, not trusted.** An answered ask stays "not written" until a `plan write` names it. The
    gate counts it.
 5. **The gate is mechanical only where the plan is named.** `team_delegate` with `plan` is checked in the commit that
@@ -60,8 +62,10 @@ Odrade proposed 7 points to Brian. This design keeps their aim, and changes thes
 ## 4. Data model
 
 Stored data is forever: these names and meanings never change later. Everything is new optional fields beside the old
-ones, in the existing document `x.desk.threads`. No new document kind. A plan's text is in its file, not in the
-document, so the document stays small.
+ones, in the existing document `x.desk.threads`. No new document kind. A plan's text is in its file and its revision
+store, not in the document, so the document stays small. New values in old unions: `Thread.origin` gets `"plan"`;
+`DigestKind` gets `plan-ready`, `plan-approved`, `plan-verify`, `plan-revise` and `plan-decided` (section 7.4);
+`QueueSignal` gets `"plan"` (the `needs-plan` label, section 10). No old value changes meaning.
 
 ### 4.1 On the thread and the ask
 
@@ -86,21 +90,25 @@ type Ask = {
     /** Findings on this decision: consults today; at most 20. */
     findings?: string[];
     /** The planning session wrote the section back for this answer: the revision and the call's key. */
-    written?: { at: number; rev: string; key: string };
+    written?: { at: number; rev: string; key: string; gen: number };
     /** Earlier answers, oldest first: a reopen moves `answer`, `why`, `marks` and `written` here. */
     history?: {
         answer: { at: number; by: string; words: string };
         why?: { text: string; at: number; by?: string };
         marks?: Record<string, "yes" | "partly" | "no">;
-        written?: { at: number; rev: string; key: string };
+        written?: { at: number; rev: string; key: string; gen: number };
         reopened: { at: number; by: string; key: string };
     }[];
 };
 ```
 
 - `answer` keeps its meaning: the current answer. A reopen clears it and keeps the old one in `history`; the question
-  text never changes on a reopen. Every digest key of an answer gets the generation (`answer:<ask>:<history length>`),
-  so a second answer after a reopen is news again, and a replay is not.
+  text never changes on a reopen. Only an ask with `plan` can be reopened.
+- **The generation** of an ask is the length of its `history` (0 before any reopen). Every act on a plan ask names
+  the generation it saw: the page's answer and reopen send it, and `plan write` names `{ ask, gen }`. A stale
+  generation is refused ("T560b was reopened since you read it"). `written` also stores the generation it covers, and
+  every key of an answer, a wake-up or a digest item has it (`answer:<ask>:<gen>`), so a second answer after a reopen
+  is news again, and a replay is not. An ask without `plan` keeps today's behavior: no generation, no reopen.
 - `askIsOpen` does not change. The gate (section 5.2) adds "answered but not written" on its own.
 
 ### 4.2 The plan
@@ -141,7 +149,10 @@ type Plan = {
     /** The section ids in file order, as the last write left them. */
     sections: { id: string; heading: string }[];
     comments: PlanComment[];
-    /** Task graphs, newest last: 1 is the draft or the approved one; the rest are superseded. At most 10. */
+    /**
+     * Task graphs, newest last, at most 10: at most 1 `draft` and at most 1 `approved` at a time; the rest are
+     * `superseded`. A draft made during `building` waits beside the approved graph until Brian approves it.
+     */
     graphs: TaskGraph[];
     /** Brian's approvals, newest last. The last one is in force unless `revising` is set. */
     approvals: { rev: string; graph: number; at: number; by: string; key: string }[];
@@ -149,6 +160,8 @@ type Plan = {
     findings: Finding[];
     /** A scope change: no new task delegation until Brian approves a new revision. */
     revising?: { at: number; by: string; why: string; tasks: string[]; key: string };
+    /** A write that committed but is not published to the file yet (section 4.4). */
+    pending?: { key: string; from: string; rev: string; at: number };
     verification?: Verification;
 };
 
@@ -184,7 +197,7 @@ type TaskGraph = {
 };
 
 type PlanTask = {
-    id: string; // ^t[0-9]{1,3}$, or "verify"
+    id: string; // ^t[0-9]{1,3}$; "verify" is reserved (section 9) and never a graph task
     title: string; // at most 120 characters
     agent: string; // a roster id, role agent
     repo?: string; // a roster repository of that agent; absent: the agent's home
@@ -192,13 +205,23 @@ type PlanTask = {
     acceptance: string[];
     deps: string[];
     state: "waiting" | "ready" | "delegated" | "done" | "stopped";
-    thread?: string; // the task thread, once delegated
-    done?: {
+    /**
+     * Every delivery of the task, oldest first: the first one, and 1 more for each repair after a failed verification.
+     * An attempt is never removed or changed after it ends; a repair adds a new one.
+     */
+    attempts: {
+        thread: string; // the task thread
         at: number;
-        how: "merged" | "no-change";
-        pr?: string; // "owner/name#N" when merged
-        noChange?: { reason: string; evidence: string }; // at most 1000 and 5000 characters
-    };
+        /** Every PR of the thread, with its merged head oid when it merged. */
+        prs: { ref: string; head?: string }[];
+        end?: {
+            at: number;
+            how: "merged" | "no-change" | "stopped" | "failed-check";
+            noChange?: { reason: string; evidence: string }; // at most 1000 and 5000 characters
+        };
+    }[];
+    /** Carried from an older graph as done, with the planning session's reason (section 5.4). */
+    carried?: { graph: number; why: string };
 };
 
 type Consult = {
@@ -207,10 +230,12 @@ type Consult = {
     question: string; // at most 2000 characters
     ask?: string; // the decision it informs
     key: string;
+    /** A random marker, stored before the start, and the first line of the consult's first message (section 8). */
+    nonce: string;
     at: number;
     session?: number;
     address?: string; // the supervisor's address for it
-    state: "running" | "answered" | "failed" | "stopped";
+    state: "starting" | "running" | "answered" | "failed" | "stopped";
     finding?: string;
 };
 
@@ -226,13 +251,14 @@ type Finding = {
 };
 
 type Verification = {
-    thread?: string; // the verification task's thread
+    /** The verification threads, oldest first: 1 for each delegation of `verify`. */
+    threads: string[];
     rounds: {
         at: number;
         by: string; // the lead's roster id
         reviewer: string; // the reviewer model, by the cross-review skill
-        /** The merged head of each task's PR that the review read. */
-        heads: Record<string, string>;
+        /** Each task's merged heads that the review read: every attempt's merged PRs, oldest first. */
+        heads: Record<string, string[]>;
         pass: boolean;
         tasks: { task: string; pass: boolean; evidence: string }[];
         key: string;
@@ -250,6 +276,26 @@ type Verification = {
 - 2 sections belong to the desk, and the planning session cannot write them: `## Decisions <!-- s:decisions -->` (1
   line per settled ask: the question, the answer, the why, who and when) and `## Tasks <!-- s:tasks -->` (the graph
   that `plan tasks` drafted, rendered).
+- The file is a published copy. The truth is `Plan.rev` and the revision store.
+
+### 4.4 Writes, and the revision store
+
+The store is `<plans root>/.revs/<blob sha>.md`: 1 file per revision, written once (a temporary file, then a
+rename), never changed or removed while the plan is open. The export commit also commits it, later.
+
+A `plan write` (and every desk write: decisions, tasks) goes in 4 steps:
+
+1. Build the new bytes from the store's copy of `Plan.rev` (never from the file), and compute the new blob sha.
+2. Write the new bytes to the store. A store file with no commit after it is harmless: nothing names it.
+3. 1 commit: check that `Plan.rev` is still the `rev` the call read and that no `pending` is set, else refuse (a
+   stale write) and change nothing. Then set `Plan.rev`, add the entry to `revs`, set `written` on the asks it names,
+   and set `pending` with the call's key. The commit is the serial point: of 2 writes from the same revision, only the
+   first commits.
+4. Publish: copy the store file over the plan file (a temporary file, then a rename), then 1 commit clears `pending`.
+
+Recovery: a sweep, and every `plan` call, first finishes a `pending` write (step 4 again, from the store). A replay
+of the call finds its key in `revs` and returns the first result. Approve and `plan ready` are refused while `pending`
+is set. Approval and verification read the bytes from the store by revision, never from the file.
 
 ## 5. States and transitions
 
@@ -269,30 +315,59 @@ type Verification = {
 | every state but `done` | `dropped`   | "Drop" on the page, or `plan drop`                                       | Brian, Odrade                |
 
 - A drop with open asks is refused, as for every thread today (`openAskRefusal`).
-- A plan in `drafting` after a scope change keeps its done tasks. A new graph keeps a task as `done` when its id, its
-  agent and its acceptance lines did not change; every other task is new work.
+- A plan in `drafting` after a scope change keeps its done tasks only by the carry rule (section 5.4).
+- **The plan decides when its thread closes.** A plan thread closes only on `done` or `dropped`. Every other close path
+  of a desk thread refuses a plan thread or skips it: the sweep's `closeCheck` (a quiet planning session does not close
+  it), `desk watch` and `desk result` (refused: a plan has no watch), the page's close and drop routes (they become
+  `plan drop`), and `desk attach` (a plan thread cannot be merged into another thread, and no thread can be merged into
+  a plan thread). Task threads and verification threads close by today's rules; the plan reads their facts.
 
 ### 5.2 The gate
 
-The gate is clear when all of these hold. Each one that does not hold is named, on the page and in each refusal
+**Settled** means all of these hold. Each one that does not hold is named, on the page and in each refusal
 ("Waiting: T560b, T560c open · c3 open · T560a not written · k2 running"):
 
 1. no open ask on the plan thread;
-2. no answered ask without `written` (the write-back did not happen yet);
+2. no answered ask whose `written` is absent or of an older generation (the write-back did not happen yet);
 3. no comment in state `open`;
-4. no consult in state `running`;
-5. a draft graph exists for the current revision, and each task names an agent with that repository.
+4. no consult in state `starting` or `running`;
+5. no `pending` write.
 
-The gate guards 3 acts: `plan ready` (to `review`), "Approve" (Brian, who sees why it is off), and every
-`team_delegate` that names the plan. A delegation also needs: the state `approved` or `building`, no `revising`, the
-task's state `ready` (its deps are `done`), and the revision in force equal to the file's current revision.
+4 acts have their own checks, each in the commit that does the act:
+
+- **Ready** (`plan ready`, to `review`): settled; the state is `drafting`; a `draft` graph exists for `Plan.rev`, and
+  it is valid (section 5.4).
+- **Approve** (Brian's tap): settled; the state is `review`; the page's revision equals `Plan.rev`; the page's graph
+  version is the `draft` graph, drafted for `Plan.rev`. The draft becomes `approved`, and an older `approved` graph
+  becomes `superseded`.
+- **Deliver** (`team_delegate` with `plan.id` and a task id): settled; the state is `approved` or `building`; no
+  `revising`; the last approval's revision equals `Plan.rev`; the task is in the `approved` graph, in state `ready`
+  (every dep `done`); the call's agent and repository are the task's.
+- **Verify** (`team_delegate` with task `verify`): the state is `verifying`; no verification thread is open.
+  `verify` is not a graph task, and "every task is done" counts only the graph's tasks.
 
 ### 5.3 A task
 
 `waiting` (a dep is not done) → `ready` → `delegated` (the thread opened) → `done` (its PR merged, or `plan nochange`
 recorded evidence), or `stopped` (a scope change named it). One PR per task is the rule: a task thread with a second PR
 gets a thread event and a line for Odrade ("T575 has 2 PRs for 1 task"), not a block. A task that needs 2 repositories
-is 2 tasks.
+is 2 tasks. Each delegation adds an attempt; a failed verification ends the current attempt as `failed-check`, keeps
+it, and sets the task back to `ready`, so the next delegation adds a repair attempt. The task is `done` again only when
+its newest attempt ends as `merged` or `no-change`.
+
+### 5.4 A valid graph, and the carry rule
+
+`plan tasks` refuses a graph, and Ready refuses a plan, unless:
+
+- it has 1 to 30 tasks (a plan with no code has 1 check task, which ends as `no-change` with evidence);
+- the task ids are unique, and none is `verify`;
+- every dep names a task of the same graph, no task names itself, and the deps have no cycle;
+- every agent is a roster agent with `role: agent`, and every `repo` is one of that agent's repositories.
+
+**Carry.** A new graph (after a scope change) can mark a task as carried from the approved graph only when all of these
+are the same: the id, the agent, the repository, the acceptance lines, and the deps, and every dep is itself carried.
+The planning session gives a reason for each carried task (`carried.why`), and the page shows the carried tasks at
+Approve. A carried task keeps its attempts and stays `done`. Every other task is new work.
 
 ## 6. The Desk page on a phone
 
@@ -340,7 +415,7 @@ Waiting: T560b, T560c open · c3 open · k2 running
 - The sticky bar shows **Approve** only in `review`. The tap sends the revision and graph version the page shows. A
   revision or graph that changed since then gives "The plan changed since you read it" and the new view (as Pocket's
   memory approvals check what the owner saw).
-- In `building` and later, Tasks shows each task: its state, its thread, its PR, or its no-change evidence, and the
+- In `building` and later, Tasks shows each task: its state, and each attempt's thread, PRs or no-change evidence, and the
   bar shows **Stop and revise** (it asks for 1 line why, and which tasks).
 - **New plan** (top of the section): a title, Brian's 1 line, the lead (an agent picker), and an optional model from
   the allowed list. It starts the planning session at once, as Brian.
@@ -424,9 +499,16 @@ and findings as data.
   session as the source**, in the expert's home, with the expert's identity and profile model. The consult shows under
   Odrade in the session list, beside the planning session, not under it. Its spend counts on Odrade's team budget, as
   every delegation does.
-- **Read-only, mechanically.** A `beforeTool` hook (in the desk, which holds the consult list) blocks every tool in a
-  consult session except `read` and `plan` (action `finding`). After the finding, it blocks every tool. `bash` is
-  blocked, because nothing can make it read-only.
+- **Bound before it starts (fail closed).** The start returns the session id only after Pocket admitted the first
+  message, so the hook cannot wait for that id. So the desk first commits the consult as `starting` with a random
+  `nonce`, and the first line of the consult's first message is `[plan-consult <nonce>]`. The hook reads a session's
+  first user entry once (and keeps the answer in memory, by conversation id). A session whose first line has the
+  marker is a consult from its first tool call. A marker with a nonce that the desk does not know, or a consult in any
+  state (`starting`, `answered`, `failed`, `stopped`), is restricted too: a marker can only take rights away. When the
+  start returns, the desk records `session` and sets `running`.
+- **Read-only, mechanically.** In a consult session, the `beforeTool` hook (in the desk) blocks every tool except
+  `read` and `plan` (action `finding`, once, only while `running`). In every other state it blocks every tool. `bash`
+  is blocked, because nothing can make it read-only.
 - **1 answer.** The finding is the only way out: stance (`supports`, `objects` or `neutral`) and a summary. It attaches
   to the ask and wakes the planning session.
 - **Who may call.** Only the planning session of a plan in `drafting`. The target is a roster agent with `role: agent`
@@ -449,10 +531,11 @@ When every task is `done`, the desk sets `verifying` and sends `plan-verify` at 
 
 - The reviewer is picked by the family of the model that wrote most of the tasks' code; mixed with no clear primary
   author: the lead asks Brian (the skill's rule).
-- The brief holds the approved revision's text, every task's acceptance lines, the merged head of each task's PR, and
-  each no-change evidence. Over 20 files or 1500 lines, the review goes in batches.
-- The budget is the skill's: 1 review and at most 3 re-reviews. A fail sends the named tasks back to `ready`; their fix
-  tasks are new task threads. Past the budget, the plan waits on Brian (an ask).
+- The brief holds the approved revision's text (from the store), every task's acceptance lines, the merged heads of
+  every attempt's PRs, and each no-change evidence. Over 20 files or 1500 lines, the review goes in batches.
+- The budget is the skill's: 1 review and at most 3 re-reviews. A fail ends the named tasks' newest attempts as
+  `failed-check` and sends the tasks back to `ready`; their repairs are new attempts in new task threads, and the next
+  `verify` is a re-review. Past the budget, the plan waits on Brian (an ask).
 - `plan verify` records the round. A pass closes the plan thread as `verified`; the journal gets its 1 entry.
 
 ## 10. What it reuses
@@ -524,13 +607,17 @@ The MVP is 3 PRs. Each one is tested with the Pi Pocket test harness and fixture
    `plan` (start and task), the `plan` actions `read`, `write`, `ask`, `tasks`, `ready`, `list`; the gate in the
    delegation commit; the answer wake-up and the `written` check; digest kinds `plan-ready`, `plan-approved`,
    `plan-decided`; a read-only plan view on the page with **Approve**. Tests: each gate condition refuses and names
-   itself; a stale write; a write to a desk section; Approve with a changed revision; a replayed call; a restart
-   between the answer and the wake.
+   itself; a stale write; 2 writes from 1 revision (only 1 commits); a restart between each step of a write (section
+   4.4); a write to a desk section; an invalid graph (a cycle, a missing dep, `verify`, no task); Approve with a
+   changed revision or graph; Approve and Deliver while a write is pending; every other close path refused for a plan
+   thread; a replayed call; a restart between the answer and the wake.
 2. **PR 2: decisions and delivery.** Section comments, reopen, why, criteria and marks; **New plan**; `nochange`,
    `revise`, `verify`; task states from the PR facts; the whole-plan verification flow; `plan-verify` and
-   `plan-revise`; the 1-PR-per-task warning; the `needs-plan` signal.
+   `plan-revise`; the 1-PR-per-task warning; the `needs-plan` signal. Tests: a stale answer or write-back after a
+   reopen is refused; a repair keeps the earlier attempt; the carry rule refuses a changed repository or dep.
 3. **PR 3: consults.** `plan consult` and `finding`; Team's start under the supervisor; the read-only hook; the bounds
-   and the 60-minute limit; stances on the page.
+   and the 60-minute limit; stances on the page. Tests: a tool call before the start returns is blocked; an unknown
+   nonce is blocked; a second finding is refused; every tool is blocked after the finding.
 
 Later, by need: findings from web research or a codebase spike; the artifact read view (decision 1c); a criteria
 matrix for asks outside plans.
@@ -546,5 +633,6 @@ matrix for asks outside plans.
 - **Consults.** Read-only by the hook, 1 answer, bounded in number and time, no nesting. `read` can still read every
   file the server user can; that is the same as any session today.
 - **Restart safety.** Every write, wake-up and start has a stable key, as the desk's existing paths do. A plan write and
-  its `written` marks go in 1 commit; the file write happens before the commit, and a replay that finds the file at the
-  new revision commits without writing again.
+  its `written` marks go in 1 commit, after the bytes are in the revision store and before the file is published; a
+  `pending` write finishes at the next sweep or call (section 4.4). A consult is committed as `starting` before its
+  session starts (section 8).
