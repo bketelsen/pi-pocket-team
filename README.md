@@ -173,22 +173,17 @@ An agent can have a home: 1 folder of its own, such as `~/agents/duncan`, with a
 
 ## Brian's team (an example)
 
-Brian's own setup has 8 profiles: Odrade the supervisor and 7 specialists, with Dune names. They are only an example; write your own profiles as above.
+Brian's own team has Dune names. It is only an example; write your own profiles as above.
+
+The profiles in `~/.config/pi-pocket-team/agents/` are the only list of the team. This README does not copy them: a copied list drifts as agents and repositories come and go. The team has 3 roles:
+
+- **Supervisor** (`role: supervisor`): Odrade. She plans, delegates with `team_delegate`, and works the Desk. Her profile has a home and no repository.
+- **Clerk** (`role: clerk`): takes the routine desk news off the supervisor (see [Desk](#desk)). Its profile has its own `model` and a `workspace`, and no repository.
+- **Specialists** (`role: agent`): each owns 1 or more repositories and has a home under `~/agents/`.
+
+To see who owns what now, read the profiles' frontmatter, open **Your team** (each agent shows its home, its preferred model and its repositories), or read the roster in the supervisor's prompt.
 
 Selecting a person stores their identity in that conversation. It persists across restart and follows a native conversation fork. Other sessions keep their own identities. Editing a profile affects subsequent selections; reselect it to update an existing session.
-
-Current ownership:
-
-| Agent     | Repositories / workspace                                                       |
-| --------- | ------------------------------------------------------------------------------ |
-| Odrade    | Team; no repository                                                            |
-| Duncan    | frostyard/nsl, intuneme, igloo                                                 |
-| Lucilla   | frostyard/updex, repogen, incus, bootc-debian, homebrew-tap, std, clix, gchlog |
-| Murbella  | frostyard/snosi                                                                |
-| Miles Teg | bketelsen/fleet                                                                |
-| Bellonda  | bketelsen/homewiki                                                             |
-| Sheeana   | bketelsen/pi-pocket, pi-pocket-team                                            |
-| Moneo     | ~/projects/moneo (non-repository tasks)                                        |
 
 Pi Pocket sets the child's actual working directory before the first request: project instructions, relative file tools, shell commands, and folder navigation use the destination. Odrade's session is unchanged. The normal linked-session return address carries reports back across folders.
 
