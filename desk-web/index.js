@@ -74,6 +74,9 @@ export const groupOf = (thread) => {
 /** Whether a view is still on the page: an answer that comes after it left changes nothing. */
 export const stillMounted = (life) => life?.gone !== true;
 
+/** The body of a page answer: the words, and the generation of a plan ask, which the desk checks. */
+export const answerBody = (words, gen) => (typeof gen === "number" ? { words, gen } : { words });
+
 /** A plan row's second line: its state with its asks and lead, or its approval. */
 export const planRowLine = (plan) => {
     if (plan === undefined || plan === null) {
@@ -788,18 +791,18 @@ export default function setup(pocket) {
         const failCheck = (id) =>
             act(`threads/${id}/result`, { pass: false, text: resultText.trim() });
 
-        const answer = async (id) => {
+        const answer = async (id, gen) => {
             const words = (answers[id] ?? "").trim();
 
             // The page never sends an empty answer: the button waits for Brian's words.
             if (words !== "") {
-                await act(`asks/${id}/answer`, { words });
+                await act(`asks/${id}/answer`, answerBody(words, gen));
             }
         };
 
         /** A pick-one ask: the option itself is the answer. */
-        const answerWith = async (id, words) => {
-            await act(`asks/${id}/answer`, { words });
+        const answerWith = async (id, words, gen) => {
+            await act(`asks/${id}/answer`, answerBody(words, gen));
         };
 
         if (planId !== null) {
@@ -1177,7 +1180,7 @@ export default function setup(pocket) {
                                               class="button"
                                               disabled=${busy}
                                               aria-label=${`Answer ${ask.id}: ${option}`}
-                                              onClick=${() => void answerWith(ask.id, option)}
+                                              onClick=${() => void answerWith(ask.id, option, ask.gen)}
                                           >
                                               ${option}
                                           </button>`,
@@ -1200,7 +1203,7 @@ export default function setup(pocket) {
                                 class="button"
                                 disabled=${busy || (answers[ask.id] ?? "").trim() === ""}
                                 aria-label=${`Answered ${ask.id}`}
-                                onClick=${() => void answer(ask.id)}
+                                onClick=${() => void answer(ask.id, ask.gen)}
                             >
                                 Answered
                             </button>

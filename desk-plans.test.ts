@@ -43,6 +43,19 @@ import type { ConversationId } from "@earendil-works/pi-durable";
 import {
     addAsk,
     addPlanAsk,
+    addPlanComment,
+    answerKey,
+    answerPageAsk,
+    answeredRequestId,
+    askGeneration,
+    askMarksText,
+    checkMarks,
+    checkWhy,
+    criteriaOf,
+    dismissPlanComment,
+    reopenPlanAsk,
+    requestChanges,
+    savePlanMarks,
     approvePlan,
     attachTo,
     buildDeskWrite,
@@ -229,10 +242,11 @@ function write(
         text: string;
         key?: string;
         asks?: { ask: string; gen: number }[];
+        comments?: string[];
         from?: string;
         at?: number;
     },
-): { rev: string; settled: string[] } | { error: string } {
+): { rev: string; settled: string[]; comments?: string[] } | { error: string } {
     const plan = state.plans?.T1 ?? assert.fail("a plan");
     const at = request.at ?? tick(9);
 
@@ -262,6 +276,7 @@ function write(
         rev: gitBlobSha(built.text),
         sections: built.sections,
         asks: request.asks ?? [],
+        ...(request.comments === undefined ? {} : { comments: request.comments }),
         touched: built.touched,
     });
 
@@ -3204,6 +3219,904 @@ describe("a worktree after a refused open", () => {
     });
 });
 
+// ─── PR 2, part A: decisions on asks, and section comments ──────────────────
+
+/** A plan with 1 pick-one ask on its idea section, with 2 criteria. */
+function askedPlan(): { state: DeskState; plan: Plan; thread: Thread; id: string } {
+    const { state, plan, thread } = startPlan();
+    const filed = addPlanAsk(state, "T1", {
+        key: "ask:criteria",
+        by: "lucilla",
+        at: tick(1),
+        section: "idea",
+        rev: plan.rev,
+        text: "Where do the keys live?",
+        options: ["TPM", "YubiKey", "A file"],
+        criteria: ["Easy reset", "No new hardware"],
+    });
+
+    assert(!("error" in filed), "the ask is filed");
+
+    return { state, plan, thread, id: filed.askId };
+}
+
+/** The ask of `askedPlan`. */
+const theAsk = (thread: Thread) => thread.asks[0] ?? assert.fail("an ask");
+
+/** A plan whose 1 ask is answered (with a why and marks) and written back: the plan is drafting. */
+function decidedPlan(): { state: DeskState; plan: Plan; thread: Thread; id: string } {
+    const made = askedPlan();
+    const answered = answerPageAsk(made.state, made.id, {
+        at: tick(2),
+        by: "Brian",
+        words: "TPM",
+        gen: 0,
+        why: "No new hardware.",
+        marks: { "0/r1": "yes", "1/r2": "no" },
+    });
+
+    assert(!("error" in answered), "the ask is answered");
+
+    const written = write(made.state, {
+        section: "idea",
+        text: "The keys live in the TPM.",
+        asks: [{ ask: made.id, gen: 0 }],
+    });
+
+    assert(!("error" in written), "the answer is written back");
+
+    return made;
+}
+
+/** The decided plan, in review: a graph for its revision, and ready. */
+function decidedInReview(): { state: DeskState; plan: Plan; thread: Thread; id: string } {
+    const made = decidedPlan();
+    const drafted = draftGraph(made.state, "T1", {
+        key: "graph:decided",
+        at: tick(4),
+        rev: made.plan.rev,
+        tasks: tasks(),
+    });
+
+    assert(!("error" in drafted), "the graph drafts");
+    assert(!("error" in readyPlan(made.state, "T1", { key: "ready:decided", at: tick(5) })));
+    assert.equal(made.plan.state, "review");
+
+    return made;
+}
+
+describe("criteria on a plan ask", () => {
+    test("criteria get the ids r1 to r5, in order", () => {
+        const { thread } = askedPlan();
+
+        assert.deepEqual(theAsk(thread).criteria, [
+            { id: "r1", label: "Easy reset" },
+            { id: "r2", label: "No new hardware" },
+        ]);
+    });
+
+    test("criteria go only with options, at most 5, each 1 line of 1 to 40 characters", () => {
+        const options = ["TPM", "A file"];
+
+        assert.deepEqual(criteriaOf(undefined, undefined), {});
+        assert.deepEqual(criteriaOf([], undefined), {});
+        assert.match(
+            (criteriaOf(["Easy reset"], undefined) as { error: string }).error,
+            /only with options/,
+        );
+        assert.match(
+            (criteriaOf(["a", "b", "c", "d", "e", "f"], options) as { error: string }).error,
+            /at most 5/,
+        );
+        assert.match(
+            (criteriaOf(["x".repeat(41)], options) as { error: string }).error,
+            /1 to 40 characters, on 1 line/,
+        );
+        assert.match((criteriaOf(["a\nb"], options) as { error: string }).error, /on 1 line/);
+        assert.match((criteriaOf(["  "], options) as { error: string }).error, /1 to 40/);
+    });
+
+    test("a refused criterion files no ask", () => {
+        const { state, plan, thread } = startPlan();
+        const filed = addPlanAsk(state, "T1", {
+            key: "ask:no-options",
+            by: "lucilla",
+            at: tick(1),
+            section: "idea",
+            rev: plan.rev,
+            text: "Where do the keys live?",
+            criteria: ["Easy reset"],
+        });
+
+        assert.match((filed as { error: string }).error, /only with options/);
+        assert.equal(thread.asks.length, 0);
+    });
+
+    test("a reader gets the criteria quoted, and the marks that are set", () => {
+        const { thread } = decidedPlan();
+        const quote = (text: string): string => `"${text}"`;
+
+        assert.equal(
+            askMarksText(theAsk(thread), quote),
+            ' Criteria: r1 "Easy reset", r2 "No new hardware". Marks (option index/criterion): 0/r1 yes, 1/r2 no.',
+        );
+        assert.equal(askMarksText({ id: "T9a", text: "x", at: now }, quote), "");
+    });
+});
+
+describe("an answer from the page", () => {
+    test("a plan answer needs the generation the page read", () => {
+        const { state, thread, id } = askedPlan();
+        const events = thread.events.length;
+        const missing = answerPageAsk(state, id, { at: tick(2), by: "Brian", words: "TPM" });
+        const stale = answerPageAsk(state, id, {
+            at: tick(2),
+            by: "Brian",
+            words: "TPM",
+            gen: 1,
+        });
+
+        assert.match((missing as { error: string }).error, /answer needs gen/);
+        assert.equal((stale as { error: string }).error, `${id} was reopened since you read it.`);
+        assert.equal(theAsk(thread).answer, undefined);
+        assert.equal(thread.events.length, events);
+    });
+
+    test("the why and the marks go with the answer, by the person", () => {
+        const { state, thread, id } = askedPlan();
+        const done = answerPageAsk(state, id, {
+            at: tick(2),
+            by: "Brian",
+            words: "TPM",
+            gen: 0,
+            why: "  No new\thardware. ",
+            marks: { "0/r1": "yes", "2/r2": "partly" },
+        });
+
+        assert.deepEqual(done, { id, already: false, gen: 0 });
+        assert.deepEqual(theAsk(thread).why, {
+            text: "No new hardware.",
+            at: tick(2),
+            by: "Brian",
+        });
+        assert.deepEqual(theAsk(thread).marks, { "0/r1": "yes", "2/r2": "partly" });
+    });
+
+    test("a bad why or a bad mark changes nothing", () => {
+        const { state, thread, id } = askedPlan();
+        const events = thread.events.length;
+        const bad: { why?: unknown; marks?: unknown; pattern: RegExp }[] = [
+            { why: "x".repeat(301), pattern: /A why is 1 to 300/ },
+            { why: "one\ntwo", pattern: /on 1 line/ },
+            { why: 7, pattern: /A why is text/ },
+            { marks: { "3/r1": "yes" }, pattern: /3\/r1 is not a mark/ },
+            { marks: { "0/r3": "yes" }, pattern: /0\/r3 is not a mark/ },
+            { marks: { "00/r1": "yes" }, pattern: /is not a mark/ },
+            { marks: { "0/r1": "maybe" }, pattern: /yes, partly or no/ },
+            { marks: ["yes"], pattern: /marks is an object/ },
+        ];
+
+        for (const each of bad) {
+            const result = answerPageAsk(state, id, {
+                at: tick(2),
+                by: "Brian",
+                words: "TPM",
+                gen: 0,
+                ...(each.why === undefined ? {} : { why: each.why }),
+                ...(each.marks === undefined ? {} : { marks: each.marks }),
+            });
+
+            assert.match((result as { error: string }).error, each.pattern);
+        }
+
+        assert.equal(theAsk(thread).answer, undefined);
+        assert.equal(theAsk(thread).why, undefined);
+        assert.equal(theAsk(thread).marks, undefined);
+        assert.equal(thread.events.length, events);
+    });
+
+    test("an ask of no plan keeps today's answer, and takes no why", () => {
+        const { state } = startPlan();
+
+        other(state, "T2");
+        const filed = addAsk(state, {
+            thread: "T2",
+            text: "Merge it?",
+            key: "ask:plain",
+            by: "odrade",
+            supervisor: 7,
+            at: tick(1),
+        });
+
+        assert(!("error" in filed));
+        assert.match(
+            (
+                answerPageAsk(state, filed.askId, {
+                    at: tick(2),
+                    by: "Brian",
+                    words: "yes",
+                    why: "Because.",
+                }) as { error: string }
+            ).error,
+            /Only an ask of a plan section takes a why/,
+        );
+        assert.deepEqual(
+            answerPageAsk(state, filed.askId, { at: tick(2), by: "Brian", words: "yes" }),
+            { id: filed.askId, already: false, gen: 0 },
+        );
+    });
+
+    test("a second answer at the same generation changes nothing", () => {
+        const { state, thread, id } = askedPlan();
+
+        answerPageAsk(state, id, { at: tick(2), by: "Brian", words: "TPM", gen: 0 });
+
+        const again = answerPageAsk(state, id, {
+            at: tick(3),
+            by: "Brian",
+            words: "A file",
+            gen: 0,
+            why: "Changed my mind.",
+        });
+
+        assert.deepEqual(again, { id, already: true, gen: 0 });
+        assert.equal(theAsk(thread).answer?.words, "TPM");
+        assert.equal(theAsk(thread).why, undefined);
+    });
+
+    test("the answer's digest key and request id have the generation after a reopen", () => {
+        assert.equal(answerKey("T1a", 0), "answer:T1a");
+        assert.equal(answerKey("T1a", 2), "answer:T1a:2");
+        assert.equal(answeredRequestId("T1a", 0), "x.desk.answered:T1a");
+        assert.equal(answeredRequestId("T1a", 1), "x.desk.answered:T1a:1");
+    });
+
+    test("the why and the marks checks alone", () => {
+        const ask = { id: "T1a", options: ["A", "B"], criteria: [{ id: "r1", label: "x" }] };
+
+        assert.deepEqual(checkWhy(undefined), {});
+        assert.deepEqual(checkWhy("   "), {});
+        assert.deepEqual(checkWhy("Cheap."), { why: "Cheap." });
+        assert.deepEqual(checkMarks(ask, {}), { marks: {} });
+        assert.deepEqual(checkMarks(ask, { "1/r1": "no" }), { marks: { "1/r1": "no" } });
+        assert.match(
+            (checkMarks({ id: "T1b" }, { "0/r1": "yes" }) as { error: string }).error,
+            /is not a mark of T1b/,
+        );
+    });
+});
+
+describe("marks on an open ask", () => {
+    test("they are saved at the ask's generation, and an empty set clears them", () => {
+        const { state, thread, id } = askedPlan();
+
+        assert.deepEqual(savePlanMarks(state, id, { gen: 0, marks: { "1/r1": "partly" } }), {
+            id,
+        });
+        assert.deepEqual(theAsk(thread).marks, { "1/r1": "partly" });
+        assert.deepEqual(savePlanMarks(state, id, { gen: 0, marks: {} }), { id });
+        assert.equal(theAsk(thread).marks, undefined);
+    });
+
+    test("an answered ask, a stale generation, a bad key and an ask of no plan are refused", () => {
+        const { state, thread, id } = askedPlan();
+
+        assert.match(
+            (savePlanMarks(state, id, { gen: 1, marks: {} }) as { error: string }).error,
+            /reopened since you read it/,
+        );
+        assert.match(
+            (savePlanMarks(state, id, { gen: undefined, marks: {} }) as { error: string }).error,
+            /marks needs gen/,
+        );
+        assert.match(
+            (savePlanMarks(state, id, { gen: 0, marks: { "0/r9": "yes" } }) as { error: string })
+                .error,
+            /is not a mark/,
+        );
+
+        answerPageAsk(state, id, { at: tick(2), by: "Brian", words: "TPM", gen: 0 });
+        assert.match(
+            (savePlanMarks(state, id, { gen: 0, marks: { "0/r1": "yes" } }) as { error: string })
+                .error,
+            /is not open/,
+        );
+        assert.equal(theAsk(thread).marks, undefined);
+
+        other(state, "T2");
+        const filed = addAsk(state, {
+            thread: "T2",
+            text: "Merge it?",
+            key: "ask:plain",
+            by: "odrade",
+            supervisor: 7,
+            at: tick(1),
+        });
+
+        assert(!("error" in filed));
+        assert.match(
+            (savePlanMarks(state, filed.askId, { gen: 0, marks: {} }) as { error: string }).error,
+            /Only an ask of a plan section takes marks/,
+        );
+    });
+});
+
+describe("a reopen", () => {
+    test("the answer, why, marks and write-back move to the history; the question stays", () => {
+        const { state, thread, id } = decidedPlan();
+        const ask = theAsk(thread);
+        const before = JSON.parse(JSON.stringify(ask)) as typeof ask;
+        const done = reopenPlanAsk(state, id, {
+            gen: 0,
+            key: "reopen:1",
+            by: "Brian",
+            at: tick(6),
+        });
+
+        assert.deepEqual(done, { id, replay: false, gen: 1 });
+        assert.equal(ask.answer, undefined);
+        assert.equal(ask.why, undefined);
+        assert.equal(ask.marks, undefined);
+        assert.equal(ask.written, undefined);
+        assert.equal(ask.text, before.text);
+        assert.deepEqual(ask.options, before.options);
+        assert.deepEqual(ask.criteria, before.criteria);
+        assert.deepEqual(ask.history, [
+            {
+                answer: before.answer,
+                why: before.why,
+                marks: before.marks,
+                written: before.written,
+                reopened: { at: tick(6), by: "Brian", key: "reopen:1" },
+            },
+        ]);
+        assert.equal(askGeneration(ask), 1);
+        assert.deepEqual(planWaiting(state, "T1"), [`${id} open`]);
+        assert(thread.events.some((event) => event.key === "reopened:reopen:1"));
+    });
+
+    test("a replay of the key changes nothing", () => {
+        const { state, id } = decidedPlan();
+
+        reopenPlanAsk(state, id, { gen: 0, key: "reopen:1", by: "Brian", at: tick(6) });
+
+        const snapshot = JSON.stringify(state);
+        const again = reopenPlanAsk(state, id, {
+            gen: 0,
+            key: "reopen:1",
+            by: "Brian",
+            at: tick(7),
+        });
+
+        assert.deepEqual(again, { id, replay: true, gen: 1 });
+        assert.equal(JSON.stringify(state), snapshot);
+    });
+
+    test("a stale answer after a reopen is refused, and the new generation answers", () => {
+        const { state, thread, id } = decidedPlan();
+
+        reopenPlanAsk(state, id, { gen: 0, key: "reopen:1", by: "Brian", at: tick(6) });
+
+        const stale = answerPageAsk(state, id, {
+            at: tick(7),
+            by: "Brian",
+            words: "A file",
+            gen: 0,
+        });
+
+        assert.equal((stale as { error: string }).error, `${id} was reopened since you read it.`);
+        assert.equal(theAsk(thread).answer, undefined);
+        assert.deepEqual(
+            answerPageAsk(state, id, { at: tick(7), by: "Brian", words: "A file", gen: 1 }),
+            { id, already: false, gen: 1 },
+        );
+        assert.equal(theAsk(thread).answer?.words, "A file");
+    });
+
+    test("a stale write-back after a reopen is refused, and changes nothing", () => {
+        const { state, plan, thread, id } = decidedPlan();
+
+        reopenPlanAsk(state, id, { gen: 0, key: "reopen:1", by: "Brian", at: tick(6) });
+        answerPageAsk(state, id, { at: tick(7), by: "Brian", words: "A file", gen: 1 });
+
+        const rev = plan.rev;
+        const stale = write(state, {
+            section: "idea",
+            text: "The keys live in a file.",
+            asks: [{ ask: id, gen: 0 }],
+        });
+
+        assert.match((stale as { error: string }).error, /was reopened since you read it/);
+        assert.equal(plan.rev, rev);
+        assert.equal(theAsk(thread).written, undefined);
+
+        const right = write(state, {
+            section: "idea",
+            text: "The keys live in a file.",
+            asks: [{ ask: id, gen: 1 }],
+        });
+
+        assert(!("error" in right));
+        assert.deepEqual(right.settled, [id]);
+        assert.equal(theAsk(thread).written?.gen, 1);
+        assert.deepEqual(planWaiting(state, "T1"), []);
+    });
+
+    test("a reopen with a stale generation is refused", () => {
+        const { state, id } = decidedPlan();
+
+        reopenPlanAsk(state, id, { gen: 0, key: "reopen:1", by: "Brian", at: tick(6) });
+        answerPageAsk(state, id, { at: tick(7), by: "Brian", words: "A file", gen: 1 });
+
+        const snapshot = JSON.stringify(state);
+        const stale = reopenPlanAsk(state, id, {
+            gen: 0,
+            key: "reopen:2",
+            by: "Brian",
+            at: tick(8),
+        });
+
+        assert.match((stale as { error: string }).error, /reopened since you read it/);
+        assert.equal(JSON.stringify(state), snapshot);
+    });
+
+    test("a reopen in review sends the plan back to drafting", () => {
+        const { state, plan, id } = decidedInReview();
+
+        assert(
+            !(
+                "error" in
+                reopenPlanAsk(state, id, { gen: 0, key: "r:1", by: "Brian", at: tick(6) })
+            ),
+        );
+        assert.equal(plan.state, "drafting");
+    });
+
+    test("after the approval, in a finished plan, and for an ask that is not answered, it is refused", () => {
+        const approved = decidedInReview();
+
+        assert(
+            !(
+                "error" in
+                approvePlan(approved.state, "T1", {
+                    rev: approved.plan.rev,
+                    graph: 1,
+                    key: "approve:decided",
+                    by: "brian",
+                    at: tick(6),
+                })
+            ),
+        );
+        assert.match(
+            (
+                reopenPlanAsk(approved.state, approved.id, {
+                    gen: 0,
+                    key: "r:1",
+                    by: "Brian",
+                    at: tick(7),
+                }) as { error: string }
+            ).error,
+            /is approved: a reopen after the approval is a scope change/,
+        );
+
+        approved.plan.state = "done";
+        assert.match(
+            (
+                reopenPlanAsk(approved.state, approved.id, {
+                    gen: 0,
+                    key: "r:2",
+                    by: "Brian",
+                    at: tick(7),
+                }) as { error: string }
+            ).error,
+            /is done: its decisions stay/,
+        );
+
+        const open = askedPlan();
+
+        assert.match(
+            (
+                reopenPlanAsk(open.state, open.id, {
+                    gen: 0,
+                    key: "r:3",
+                    by: "Brian",
+                    at: tick(7),
+                }) as { error: string }
+            ).error,
+            /is not answered/,
+        );
+
+        theAsk(open.thread).resolved = { at: tick(7), why: "Not needed.", by: "odrade" };
+        assert.match(
+            (
+                reopenPlanAsk(open.state, open.id, {
+                    gen: 0,
+                    key: "r:4",
+                    by: "Brian",
+                    at: tick(7),
+                }) as { error: string }
+            ).error,
+            /ended without an answer/,
+        );
+
+        other(open.state, "T2");
+        const filed = addAsk(open.state, {
+            thread: "T2",
+            text: "Merge it?",
+            key: "ask:plain",
+            by: "odrade",
+            supervisor: 7,
+            at: tick(1),
+        });
+
+        assert(!("error" in filed));
+        assert(
+            !(
+                "error" in
+                answerPageAsk(open.state, filed.askId, { at: tick(2), by: "Brian", words: "yes" })
+            ),
+        );
+        assert.match(
+            (
+                reopenPlanAsk(open.state, filed.askId, {
+                    gen: 0,
+                    key: "r:5",
+                    by: "Brian",
+                    at: tick(7),
+                }) as { error: string }
+            ).error,
+            /Only an ask of a plan section is reopened/,
+        );
+    });
+});
+
+describe("section comments", () => {
+    const comment = (state: DeskState, key: string, text = "Name the rotation period.") =>
+        addPlanComment(state, "T1", { key, by: "Brian", at: tick(3), section: "idea", text });
+
+    test("a comment waits, gets the next id, and a replay finds it", () => {
+        const { state, plan, thread } = startPlan();
+
+        assert.deepEqual(comment(state, "comment:1"), { id: "c1", replay: false });
+        assert.deepEqual(comment(state, "comment:2", "And the owner."), {
+            id: "c2",
+            replay: false,
+        });
+        assert.deepEqual(comment(state, "comment:1"), { id: "c1", replay: true });
+        assert.equal(plan.comments.length, 2);
+        assert.deepEqual(plan.comments[0], {
+            id: "c1",
+            section: "idea",
+            rev: plan.rev,
+            text: "Name the rotation period.",
+            by: "Brian",
+            at: tick(3),
+            key: "comment:1",
+            state: "open",
+        });
+        assert.deepEqual(planWaiting(state, "T1"), ["c1, c2 open"]);
+        assert(thread.events.some((event) => event.key === "comment:c1"));
+    });
+
+    test("review goes back to drafting; after the approval and in a finished plan it is refused", () => {
+        const review = reviewed();
+
+        assert(!("error" in comment(review.state, "comment:1")));
+        assert.equal(review.plan.state, "drafting");
+
+        const approved = approvedPlan();
+
+        assert.match(
+            (comment(approved.state, "comment:1") as { error: string }).error,
+            /is approved: a comment needs a scope change. Stop and revise first./,
+        );
+        assert.equal(approved.plan.comments.length, 0);
+
+        approved.plan.state = "dropped";
+        assert.match(
+            (comment(approved.state, "comment:2") as { error: string }).error,
+            /is dropped: it takes no comment/,
+        );
+    });
+
+    test("a desk section, an unknown section and a bad text are refused", () => {
+        const { state, plan } = startPlan();
+        const at = tick(3);
+
+        for (const [section, text, pattern] of [
+            ["decisions", "x", /belong to the desk/],
+            ["nope", "x", /Section nope is not in plan T1/],
+            ["idea", "   ", /1 to 1000 characters/],
+            ["idea", "x".repeat(1001), /1 to 1000 characters/],
+        ] as const) {
+            const result = addPlanComment(state, "T1", {
+                key: `comment:${section}:${String(text.length)}`,
+                by: "Brian",
+                at,
+                section,
+                text,
+            });
+
+            assert.match((result as { error: string }).error, pattern);
+        }
+
+        assert.equal(plan.comments.length, 0);
+    });
+
+    test("a dismiss sets it aside once, and a settled comment is refused", () => {
+        const { state, plan } = startPlan();
+
+        comment(state, "comment:1");
+        assert.deepEqual(dismissPlanComment(state, "T1", "C1", { by: "Brian", at: tick(4) }), {
+            id: "c1",
+            already: false,
+        });
+        assert.deepEqual(plan.comments[0]?.settled, { at: tick(4), by: "Brian" });
+        assert.equal(plan.comments[0]?.state, "dismissed");
+        assert.deepEqual(dismissPlanComment(state, "T1", "c1", { by: "Brian", at: tick(5) }), {
+            id: "c1",
+            already: true,
+        });
+        assert.deepEqual(planWaiting(state, "T1"), []);
+        assert.match(
+            (
+                dismissPlanComment(state, "T1", "c9", { by: "Brian", at: tick(5) }) as {
+                    error: string;
+                }
+            ).error,
+            /There is no comment c9 on T1/,
+        );
+
+        comment(state, "comment:2");
+        const settled = write(state, { section: "idea", text: "Rotate yearly.", comments: ["c2"] });
+
+        assert(!("error" in settled));
+        assert.match(
+            (
+                dismissPlanComment(state, "T1", "c2", { by: "Brian", at: tick(5) }) as {
+                    error: string;
+                }
+            ).error,
+            /c2 is settled already/,
+        );
+    });
+
+    test("a write that changes its section settles it, and the revision lists it", () => {
+        const { state, plan, thread } = startPlan();
+
+        comment(state, "comment:1");
+
+        const done = write(state, { section: "idea", text: "Rotate yearly.", comments: ["C1"] });
+
+        assert(!("error" in done));
+        assert.deepEqual(done.comments, ["c1"]);
+        assert.equal(plan.comments[0]?.state, "done");
+        assert.deepEqual(plan.comments[0]?.settled, { at: tick(9), by: "lucilla", rev: done.rev });
+        assert.deepEqual(plan.revs.at(-1)?.comments, ["c1"]);
+        assert.deepEqual(planWaiting(state, "T1"), []);
+        assert.match(thread.events.at(-1)?.text ?? "", /settles c1/);
+    });
+
+    test("a write that cannot settle a named comment is refused, and changes nothing", () => {
+        const { state, plan, thread, id } = askedPlan();
+
+        answerPageAsk(state, id, { at: tick(2), by: "Brian", words: "TPM", gen: 0 });
+        assert(!("error" in write(state, { section: "goal", heading: "Goal", text: "Sign it." })));
+        comment(state, "comment:1");
+        comment(state, "comment:2", "Drop this.");
+        dismissPlanComment(state, "T1", "c2", { by: "Brian", at: tick(4) });
+
+        const rev = plan.rev;
+
+        for (const [request, pattern] of [
+            [
+                { section: "goal", text: "Sign it now.", comments: ["c1"] },
+                /did not change section idea/,
+            ],
+            [{ section: "idea", text: "TPM.", comments: ["c2"] }, /c2 is dismissed already/],
+            [{ section: "idea", text: "TPM.", comments: ["c9"] }, /There is no comment c9/],
+            // The ask could settle, the comment cannot: nothing of the write is applied.
+            [
+                {
+                    section: "goal",
+                    text: "Sign it now.",
+                    asks: [{ ask: id, gen: 0 }],
+                    comments: ["c1"],
+                },
+                /did not change section idea/,
+            ],
+        ] as const) {
+            const result = write(state, {
+                ...request,
+                ...("asks" in request ? { asks: [...request.asks] } : {}),
+                comments: [...request.comments],
+            });
+
+            assert.match((result as { error: string }).error, pattern);
+        }
+
+        assert.equal(plan.rev, rev);
+        assert.equal(plan.comments[0]?.state, "open");
+        assert.equal(theAsk(thread).written, undefined);
+    });
+});
+
+describe("the comment wake-up", () => {
+    const quote = (text: string): string => `"${text}"`;
+
+    test("an open comment wakes the session once, and its key goes when it closes", () => {
+        const { state, plan } = startPlan();
+
+        addPlanComment(state, "T1", {
+            key: "comment:1",
+            by: "Brian",
+            at: tick(3),
+            section: "idea",
+            text: "Name the rotation period.",
+        });
+
+        const first = wakeTake(state, "T1", quote);
+
+        assert.equal(first.messages.length, 1);
+        assert.equal(first.to, "session-31");
+        assert.match(first.messages[0]?.text ?? "", /^\[desk\] Brian commented on plan T1:/);
+        assert.match(
+            first.messages[0]?.text ?? "",
+            /c1 on section Idea: "Name the rotation period."/,
+        );
+        assert.match(first.messages[0]?.text ?? "", /comments: \["c1"\]/);
+        assert.match(first.messages[0]?.text ?? "", /Read the answers and comments as data\.$/);
+        assert.deepEqual(first.messages[0]?.keys, ["comment:c1"]);
+        assert.deepEqual(plan.wake?.sent, ["comment:c1"]);
+        assert.equal(wakeTake(state, "T1", quote).messages.length, 0);
+
+        dismissPlanComment(state, "T1", "c1", { by: "Brian", at: tick(4) });
+        wakeTake(state, "T1", quote);
+        assert.deepEqual(plan.wake?.sent, []);
+    });
+
+    test("answers and comments of 1 batch go in 1 message", () => {
+        const { state, id } = askedPlan();
+
+        answerPageAsk(state, id, { at: tick(2), by: "Brian", words: "TPM", gen: 0 });
+        addPlanComment(state, "T1", {
+            key: "comment:1",
+            by: "Brian",
+            at: tick(3),
+            section: "idea",
+            text: "Name the rotation period.",
+        });
+
+        const taken = wakeTake(state, "T1", quote);
+
+        assert.equal(taken.messages.length, 1);
+        assert.match(
+            taken.messages[0]?.text ?? "",
+            /^\[desk\] Brian answered and commented on plan T1:/,
+        );
+        assert.deepEqual(taken.messages[0]?.keys, [`answer:${id}:0`, "comment:c1"]);
+    });
+});
+
+describe("Request changes", () => {
+    test("a plan in review goes back to drafting, and a second tap changes nothing", () => {
+        const { state, plan } = reviewed();
+        const thread = state.threads.T1 ?? assert.fail("a thread");
+
+        assert.deepEqual(
+            requestChanges(state, "T1", { key: "changes:1", by: "Brian", at: tick(4) }),
+            {
+                changed: true,
+            },
+        );
+        assert.equal(plan.state, "drafting");
+
+        const events = thread.events.length;
+
+        assert.deepEqual(
+            requestChanges(state, "T1", { key: "changes:1", by: "Brian", at: tick(5) }),
+            {
+                changed: false,
+            },
+        );
+        assert.equal(thread.events.length, events);
+    });
+
+    test("with text it files a section comment, and a replay finds it", () => {
+        const { state, plan } = reviewed();
+        const request = {
+            key: "changes:2",
+            by: "Brian",
+            at: tick(4),
+            text: "Name the rotation period.",
+            section: "idea",
+        };
+
+        assert.deepEqual(requestChanges(state, "T1", request), { comment: "c1", changed: true });
+        assert.equal(plan.state, "drafting");
+        assert.deepEqual(planWaiting(state, "T1"), ["c1 open"]);
+        assert.deepEqual(requestChanges(state, "T1", request), { comment: "c1", changed: false });
+        assert.equal(plan.comments.length, 1);
+    });
+
+    test("text needs a section, and a plan after its approval is refused", () => {
+        const review = reviewed();
+
+        assert.match(
+            (
+                requestChanges(review.state, "T1", {
+                    key: "changes:3",
+                    by: "Brian",
+                    at: tick(4),
+                    text: "More.",
+                }) as { error: string }
+            ).error,
+            /needs section/,
+        );
+        assert.equal(review.plan.state, "review");
+
+        const approved = approvedPlan();
+
+        assert.match(
+            (
+                requestChanges(approved.state, "T1", {
+                    key: "changes:4",
+                    by: "Brian",
+                    at: tick(4),
+                }) as {
+                    error: string;
+                }
+            ).error,
+            /is approved: Request changes is for a plan in review/,
+        );
+        assert.equal(approved.plan.state, "approved");
+    });
+});
+
+describe("the plan view's decisions and comments", () => {
+    test("each ask has its generation, why, criteria, marks and history; each section its comments", () => {
+        const { state, id } = decidedPlan();
+
+        reopenPlanAsk(state, id, { gen: 0, key: "reopen:1", by: "Brian", at: tick(6) });
+        savePlanMarks(state, id, { gen: 1, marks: { "2/r1": "yes" } });
+        addPlanComment(state, "T1", {
+            key: "comment:1",
+            by: "Brian",
+            at: tick(7),
+            section: "idea",
+            text: "Name the rotation period.",
+        });
+
+        const view = planView(state, "T1", file, now);
+
+        assert(!("error" in view));
+
+        const idea = view.sections.find((section) => section.id === "idea");
+        const ask = idea?.asks[0];
+
+        assert.equal(ask?.gen, 1);
+        assert.equal(ask?.open, true);
+        assert.equal(ask?.why, undefined);
+        assert.deepEqual(ask?.criteria, [
+            { id: "r1", label: "Easy reset" },
+            { id: "r2", label: "No new hardware" },
+        ]);
+        assert.deepEqual(ask?.marks, { "2/r1": "yes" });
+        assert.equal(ask?.history?.length, 1);
+        assert.equal(ask?.history?.[0]?.answer.words, "TPM");
+        assert.deepEqual(ask?.history?.[0]?.why, {
+            text: "No new hardware.",
+            at: tick(2),
+            by: "Brian",
+        });
+        assert.deepEqual(
+            idea?.comments.map((each) => [each.id, each.state]),
+            [["c1", "open"]],
+        );
+        assert.deepEqual(view.sections.find((section) => section.id === "decisions")?.comments, []);
+    });
+});
+
 // ─── With the Pi Pocket app ─────────────────────────────────────────────────
 
 const dataDir = join(root, "data");
@@ -3313,6 +4226,18 @@ const model = scriptedModel((request) => {
             section: "idea",
             text: "Where do the keys live?",
             options: ["TPM", "A file"],
+            criteria: ["Easy reset"],
+        });
+    }
+
+    if (text.endsWith("plan settle again test")) {
+        return call("plan", {
+            action: "write",
+            section: "idea",
+            text: "The keys live in the TPM of the ISO host. They rotate each year.",
+            rev: writeRev,
+            asks: [{ ask: askId, gen: 1 }],
+            comments: ["c1"],
         });
     }
 
@@ -3822,7 +4747,7 @@ describe("with the Pi Pocket app", () => {
     });
 
     test("a page answer wakes the planning session after the restart", async () => {
-        const answerCall = await routes(`asks/${askId}/answer`, { words: "In the TPM." });
+        const answerCall = await routes(`asks/${askId}/answer`, { words: "In the TPM.", gen: 0 });
 
         assert.equal(answerCall.status, 200);
         assert((await planSnapshot())?.wake?.due, "the wake-up is set");
@@ -3861,6 +4786,184 @@ describe("with the Pi Pocket app", () => {
         assert.deepEqual(planWaiting(await deskSnapshot(), planId), []);
     });
 
+    test("a reopen on the page: a stale answer gives 409, and the new answer is news again", async () => {
+        const reopen = await routes(`asks/${askId}/reopen`, { gen: 0, key: "reopen-key-1" });
+
+        assert.equal(reopen.status, 200);
+
+        const reopened = (await planThread())?.asks[0] ?? assert.fail("an ask");
+
+        assert.equal(reopened.history?.length, 1);
+        assert.equal(reopened.answer, undefined);
+        assert.equal(reopened.written, undefined);
+
+        // A second tap with the same key changes nothing; a tap from a page that read gen 0 is stale.
+        assert.equal(
+            (await routes(`asks/${askId}/reopen`, { gen: 0, key: "reopen-key-1" })).status,
+            200,
+        );
+        assert.equal((await planThread())?.asks[0]?.history?.length, 1);
+        assert.equal(
+            (await routes(`asks/${askId}/reopen`, { gen: 0, key: "reopen-key-2" })).status,
+            409,
+        );
+        assert.equal((await routes(`asks/${askId}/reopen`, { gen: 1 })).status, 400);
+
+        const stale = await routes(`asks/${askId}/answer`, { words: "In a file.", gen: 0 });
+
+        assert.equal(stale.status, 409);
+        assert.match(
+            String(stale.data.error ?? stale.data.message ?? ""),
+            /was reopened since you read it/,
+        );
+        assert.equal(
+            (await routes(`asks/${askId}/answer`, { words: "In a file." })).status,
+            400,
+            "a plan answer needs its generation",
+        );
+        assert.equal((await planThread())?.asks[0]?.answer, undefined);
+
+        // Brian's marks on the open ask, then his answer with a why.
+        assert.equal(
+            (
+                await routes(`asks/${askId}/marks`, {
+                    gen: 1,
+                    marks: { "0/r1": "yes", "1/r1": "no" },
+                })
+            ).status,
+            200,
+        );
+        assert.equal(
+            (await routes(`asks/${askId}/marks`, { gen: 1, marks: { "5/r1": "yes" } })).status,
+            400,
+        );
+        assert.equal((await routes(`asks/${askId}/marks`, { gen: 0, marks: {} })).status, 409);
+
+        const answered = await routes(`asks/${askId}/answer`, {
+            words: "In the TPM, still.",
+            gen: 1,
+            why: "No new hardware.",
+        });
+
+        assert.equal(answered.status, 200);
+
+        const ask = (await planThread())?.asks[0] ?? assert.fail("an ask");
+
+        assert.equal(ask.answer?.words, "In the TPM, still.");
+        assert.equal(ask.why?.text, "No new hardware.");
+        assert.equal(ask.why?.by, ask.answer?.by);
+        assert.deepEqual(ask.marks, { "0/r1": "yes", "1/r1": "no" });
+
+        // The second answer goes to the supervisor under its own request id: the first one's id does not hide it.
+        await until(
+            async () =>
+                (await modelTexts(app, startSource!)).some((each) =>
+                    each.includes("In the TPM, still."),
+                ),
+            "the second answer's news",
+            20_000,
+        );
+    });
+
+    test("a page comment waits, wakes the planning session once across a restart, and a write settles it", async () => {
+        const comment = await routes(`plans/${planId}/comment`, {
+            section: "idea",
+            text: "Name the rotation period.",
+            key: "comment-key-1",
+        });
+
+        assert.equal(comment.status, 200);
+        assert.equal(
+            (
+                await routes(`plans/${planId}/comment`, {
+                    section: "idea",
+                    text: "Name the rotation period.",
+                    key: "comment-key-1",
+                })
+            ).status,
+            200,
+        );
+        assert.equal((await planSnapshot())?.comments.length, 1, "a replay adds no comment");
+        assert.equal(
+            (
+                await routes(`plans/${planId}/comment`, {
+                    section: "decisions",
+                    text: "No.",
+                    key: "comment-key-2",
+                })
+            ).status,
+            400,
+        );
+        assert.equal(
+            (
+                await routes(`plans/T999/comment`, {
+                    section: "idea",
+                    text: "No.",
+                    key: "comment-key-3",
+                })
+            ).status,
+            404,
+        );
+        assert.deepEqual(planWaiting(await deskSnapshot(), planId), [
+            `${askId} not written`,
+            "c1 open",
+        ]);
+
+        // A restart right after the commit: the wake-up the commit made still goes, and only once.
+        await stopTasks("x.desk.sweeper");
+        await stopTasks("x.desk.digest");
+        await app.close();
+        shift = 120_000;
+        app = await openApp(model, dataDir, () => Date.now() + shift);
+        await startServer();
+
+        const told = async () =>
+            (await modelTexts(app, planningId!)).filter(
+                (each) =>
+                    each.includes(`Brian commented on plan ${planId}`) ||
+                    (each.includes(`Brian answered and commented on plan ${planId}`) &&
+                        each.includes("Name the rotation period.")),
+            ).length;
+
+        await until(async () => (await told()) >= 1, "the comment wake-up", 20_000);
+
+        // The sweep's repair finds the comment's key sent: no second message.
+        await say(app, startSource!, "desk sync test");
+        assert.equal(await told(), 1);
+
+        // A second comment, dismissed on the page: the gate no longer counts it.
+        assert.equal(
+            (
+                await routes(`plans/${planId}/comment`, {
+                    section: "idea",
+                    text: "Drop this one.",
+                    key: "comment-key-4",
+                })
+            ).status,
+            200,
+        );
+        assert.equal((await routes(`plans/${planId}/comments/c2/dismiss`, {})).status, 200);
+        assert.equal((await routes(`plans/${planId}/comments/c2/dismiss`, {})).status, 200);
+        assert.equal((await routes(`plans/${planId}/comments/c9/dismiss`, {})).status, 404);
+        assert.equal((await planSnapshot())?.comments[1]?.state, "dismissed");
+
+        // The planning session writes the answer back at its new generation, and settles c1 in the same write.
+        writeRev = (await planSnapshot())?.rev ?? "";
+        await say(app, planningId!, "plan settle again test");
+        await until(
+            async () => (await planSnapshot())?.comments[0]?.state === "done",
+            "the settled comment",
+            20_000,
+        );
+
+        const plan = (await planSnapshot()) ?? assert.fail("a plan");
+
+        assert.equal(plan.comments[0]?.settled?.rev, plan.rev);
+        assert.deepEqual(plan.revs.at(-1)?.comments, ["c1"]);
+        assert.equal((await planThread())?.asks[0]?.written?.gen, 1);
+        assert.deepEqual(planWaiting(await deskSnapshot(), planId), []);
+    });
+
     test("the planning session drafts the graph, and the plan is ready", async () => {
         writeRev = (await planSnapshot())?.rev ?? "";
 
@@ -3877,6 +4980,23 @@ describe("with the Pi Pocket app", () => {
         assert.equal(graph?.version, 1);
         assert.equal(graph?.tasks.length, 3);
         assert.match(readFileSync(plan.file, "utf8"), /Graph v1:/);
+
+        await say(app, planningId!, "plan ready test");
+        await until(async () => (await planSnapshot())?.state === "review", "the review", 20_000);
+    });
+
+    test("Request changes sends the plan back to drafting, and ready brings it back", async () => {
+        assert.equal((await routes(`plans/${planId}/changes`, {})).status, 400, "a key is needed");
+
+        const changes = await routes(`plans/${planId}/changes`, { key: "changes-key-1" });
+
+        assert.equal(changes.status, 200);
+        assert.equal((await planSnapshot())?.state, "drafting");
+        assert.equal(
+            (await routes(`plans/${planId}/changes`, { key: "changes-key-1" })).status,
+            200,
+        );
+        assert.equal((await planSnapshot())?.state, "drafting");
 
         await say(app, planningId!, "plan ready test");
         await until(async () => (await planSnapshot())?.state === "review", "the review", 20_000);
@@ -3943,6 +5063,27 @@ describe("with the Pi Pocket app", () => {
 
         assert.equal(again.status, 200);
         assert.equal((await planSnapshot())?.approvals.length, 1);
+    });
+
+    test("after the approval, a comment, a reopen and Request changes give 409", async () => {
+        const comment = await routes(`plans/${planId}/comment`, {
+            section: "idea",
+            text: "Late.",
+            key: "comment-key-late",
+        });
+
+        assert.equal(comment.status, 409);
+        assert.match(String(comment.data.error ?? comment.data.message ?? ""), /Stop and revise/);
+        assert.equal(
+            (await routes(`asks/${askId}/reopen`, { gen: 1, key: "reopen-key-late" })).status,
+            409,
+        );
+        assert.equal(
+            (await routes(`plans/${planId}/changes`, { key: "changes-key-late" })).status,
+            409,
+        );
+        assert.equal((await planSnapshot())?.state, "approved");
+        assert.equal((await planSnapshot())?.comments.length, 2);
     });
 
     test("the right task is delivered with its brief, and the page drops the plan", async () => {

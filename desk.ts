@@ -9499,7 +9499,15 @@ export type ThreadView = {
         ready?: boolean;
     }[];
     /** Open asks; `from` is the agent that filed one in a report. */
-    asks: { id: string; text: string; at: number; options?: string[]; from?: string }[];
+    asks: {
+        id: string;
+        text: string;
+        at: number;
+        options?: string[];
+        from?: string;
+        /** A plan ask's generation: the page's answer sends it back. */
+        gen?: number;
+    }[];
     /** Answered asks, with the words that were recorded. */
     answered: { id: string; text: string; by: string; at: number; words: string }[];
     /** Asks that need no answer, with the reason: the desk resolved them, or the supervisor `by` withdrew them. */
@@ -9586,6 +9594,7 @@ export function threadView(
                 at: ask.at,
                 ...(ask.options === undefined ? {} : { options: [...ask.options] }),
                 ...(ask.from === undefined ? {} : { from: ask.from }),
+                ...(ask.plan === undefined ? {} : { gen: askGeneration(ask) }),
             })),
         answered: thread.asks
             .filter((ask) => ask.answer !== undefined)
@@ -10132,6 +10141,13 @@ const GRAPH_MAX_TASKS = 30;
 /** The most acceptance lines 1 task has, and the length of each. */
 const TASK_MAX_LINES = 8;
 const TASK_LINE = 300;
+/** The most criteria 1 plan ask has, and the length of each label. */
+const CRITERIA_MAX = 5;
+const CRITERION_LABEL = 40;
+/** Brian's why on an answer: 1 line, at most this long. */
+const WHY_MAX = 300;
+/** A section comment: at most this long. */
+const COMMENT_MAX = 1000;
 
 /** A section id: 1 to 40 characters of a-z, 0-9 and "-". */
 const SECTION_ID = /^[a-z0-9][a-z0-9-]{0,39}$/;
@@ -10774,6 +10790,23 @@ export function askContentLine(
     return `${state}, gen ${String(gen)}, ${written}${ask.answer === undefined ? "" : `. ${answer}`}`;
 }
 
+/**
+ * A plan ask's criteria and Brian's marks for a reader, after its content line: empty when it has no criteria. The
+ * labels are quoted, as data. A blank cell is not listed.
+ */
+export function askMarksText(ask: Ask, quote: (text: string) => string): string {
+    if (ask.criteria === undefined || ask.criteria.length === 0) {
+        return "";
+    }
+
+    const criteria = ask.criteria.map((each) => `${each.id} ${quote(each.label)}`).join(", ");
+    const marks = Object.entries(ask.marks ?? {})
+        .map(([key, mark]) => `${key} ${mark}`)
+        .join(", ");
+
+    return ` Criteria: ${criteria}.${marks === "" ? "" : ` Marks (option index/criterion): ${marks}.`}`;
+}
+
 /** A roster entry, as Team's `roster()` gives it: enough to check a graph's agents and repositories. */
 export type PlanRoster = { id: string; role: string; repositories?: Record<string, string> };
 
@@ -10910,12 +10943,19 @@ export type PlanWrite = {
     sections: { id: string; heading: string }[];
     /** The asks this write settles, with the generation and the answer the caller read. */
     asks: { ask: string; gen: number; at?: number }[];
+    /** The open comments this write settles: each must be on a section the write changed. */
+    comments?: string[];
     /** The planning sections the write changed. */
     touched: string[];
 };
 
-/** What a plan write did: its revision, and the asks it settled. */
-export type PlanWriteResult = { rev: string; replay: boolean; settled: string[] };
+/** What a plan write did: its revision, the asks it settled, and the comments it settled (when any). */
+export type PlanWriteResult = {
+    rev: string;
+    replay: boolean;
+    settled: string[];
+    comments?: string[];
+};
 
 /** Why a write is refused when the plan is in a state that takes no write. */
 function writeStateProblem(plan: Plan): string | undefined {
@@ -11009,7 +11049,36 @@ export function commitPlanWrite(
         settled.push(ask.id);
     }
 
+    const comments: PlanComment[] = [];
+
+    for (const named of write.comments ?? []) {
+        const comment = plan.comments.find(
+            (each) => each.id.toLowerCase() === named.trim().toLowerCase(),
+        );
+
+        if (comment === undefined) {
+            return { error: `There is no comment ${named} on ${plan.thread}.` };
+        }
+
+        if (comment.state !== "open") {
+            return {
+                error: `${comment.id} is ${comment.state === "done" ? "settled" : "dismissed"} already: name only open comments.`,
+            };
+        }
+
+        if (!write.touched.includes(comment.section)) {
+            return {
+                error: `The write did not change section ${comment.section}, the section of ${comment.id}.`,
+            };
+        }
+
+        if (!comments.includes(comment)) {
+            comments.push(comment);
+        }
+    }
+
     const old = plan.rev;
+    const settledComments = comments.map((comment) => comment.id);
 
     plan.rev = write.rev;
     plan.revs.push({
@@ -11018,6 +11087,7 @@ export function commitPlanWrite(
         by: write.by,
         key: write.key,
         ...(settled.length === 0 ? {} : { asks: settled }),
+        ...(settledComments.length === 0 ? {} : { comments: settledComments }),
     });
 
     if (plan.revs.length > PLAN_KEPT_REVS) {
@@ -11034,6 +11104,11 @@ export function commitPlanWrite(
         }
     }
 
+    for (const comment of comments) {
+        comment.state = "done";
+        comment.settled = { at: write.at, by: write.by, rev: write.rev };
+    }
+
     plan.pending = { key: write.key, from: old, rev: write.rev, at: write.at };
 
     if (plan.state === "review") {
@@ -11041,7 +11116,8 @@ export function commitPlanWrite(
     }
 
     if (thread !== undefined) {
-        const settles = settled.length === 0 ? "" : ` settles ${settled.join(", ")}`;
+        const all = [...settled, ...settledComments];
+        const settles = all.length === 0 ? "" : ` settles ${all.join(", ")}`;
 
         addEvent(
             thread,
@@ -11051,7 +11127,12 @@ export function commitPlanWrite(
         );
     }
 
-    return { rev: write.rev, replay: false, settled };
+    return {
+        rev: write.rev,
+        replay: false,
+        settled,
+        ...(settledComments.length === 0 ? {} : { comments: settledComments }),
+    };
 }
 
 /** A new ask on a plan section, as `addPlanAsk` takes it. */
@@ -11066,7 +11147,43 @@ export type PlanAskRequest = {
     rev: string;
     text: string;
     options?: string[];
+    /** Up to 5 criteria labels, only with options: they get the ids r1 to r5. */
+    criteria?: string[];
 };
+
+/** The checked criteria of a plan ask, with their ids, or why they are refused. */
+export function criteriaOf(
+    labels: readonly string[] | undefined,
+    options: readonly string[] | undefined,
+): { criteria?: { id: string; label: string }[] } | { error: string } {
+    if (labels === undefined || labels.length === 0) {
+        return {};
+    }
+
+    if (options === undefined || options.length === 0) {
+        return { error: "Criteria go only with options: a pick-one ask." };
+    }
+
+    if (labels.length > CRITERIA_MAX) {
+        return { error: `An ask has at most ${String(CRITERIA_MAX)} criteria.` };
+    }
+
+    const criteria: { id: string; label: string }[] = [];
+
+    for (const [at, label] of labels.entries()) {
+        const flat = flatLine(label);
+
+        if (/[\r\n]/.test(label) || flat === "" || flat.length > CRITERION_LABEL) {
+            return {
+                error: `Each criterion is 1 to ${String(CRITERION_LABEL)} characters, on 1 line.`,
+            };
+        }
+
+        criteria.push({ id: `r${String(at + 1)}`, label: flat });
+    }
+
+    return { criteria };
+}
 
 /** Why a plan takes no new ask or graph now, when it does not. */
 function planWriteStateProblem(plan: Plan): string | undefined {
@@ -11118,6 +11235,12 @@ export function addPlanAsk(
         return { error: `Unknown rev: ${request.rev} is not a revision of ${plan.thread}.` };
     }
 
+    const checked = criteriaOf(request.criteria, request.options);
+
+    if ("error" in checked) {
+        return checked;
+    }
+
     const filed = addAsk(state, {
         thread: plan.thread,
         planAsk: true,
@@ -11138,6 +11261,10 @@ export function addPlanAsk(
 
     if (ask !== undefined) {
         ask.plan = { section: section.id, heading: section.heading, rev: request.rev };
+
+        if (checked.criteria !== undefined) {
+            ask.criteria = checked.criteria;
+        }
     }
 
     if (plan.state === "review") {
@@ -11145,6 +11272,515 @@ export function addPlanAsk(
     }
 
     return { askId: filed.askId, replay: false };
+}
+
+// ─── Plans: decisions on asks, and section comments ─────────────────────────
+
+/** 1 mark of Brian's on a criterion of an option. */
+export type PlanMark = "yes" | "partly" | "no";
+
+/** The digest key of an answer: `answer:<ask>` before any reopen, `answer:<ask>:<gen>` after one. */
+export const answerKey = (id: string, gen: number): string =>
+    gen === 0 ? `answer:${id}` : `answer:${id}:${String(gen)}`;
+
+/** The request id of an answer's message to the supervisor: the same rule as `answerKey`. */
+export const answeredRequestId = (id: string, gen: number): string =>
+    gen === 0 ? `x.desk.answered:${id}` : `x.desk.answered:${id}:${String(gen)}`;
+
+/** The refusal of an act on a plan ask whose generation moved since the page read it. */
+export const staleAskError = (id: string): string => `${id} was reopened since you read it.`;
+
+/** Brian's why, checked: absent or empty is none; else 1 line of at most 300 characters. */
+export function checkWhy(value: unknown): { why?: string } | { error: string } {
+    if (value === undefined || value === null) {
+        return {};
+    }
+
+    if (typeof value !== "string") {
+        return { error: `A why is text: 1 to ${String(WHY_MAX)} characters, on 1 line.` };
+    }
+
+    if (/[\r\n]/.test(value) || flatLine(value).length > WHY_MAX) {
+        return { error: `A why is 1 to ${String(WHY_MAX)} characters, on 1 line.` };
+    }
+
+    const why = flatLine(value);
+
+    return why === "" ? {} : { why };
+}
+
+/**
+ * Brian's marks on a plan ask, checked: an object whose keys are `<option index>/<criterion id>` of this ask, and whose
+ * values are yes, partly or no. A missing key is a blank cell; any other key or value is refused.
+ */
+export function checkMarks(
+    ask: Pick<Ask, "id" | "options" | "criteria">,
+    value: unknown,
+): { marks: Record<string, PlanMark> } | { error: string } {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+        return {
+            error: 'marks is an object: { "<option index>/<criterion id>": yes, partly or no }.',
+        };
+    }
+
+    const options = ask.options ?? [];
+    const criteria = new Set((ask.criteria ?? []).map((each) => each.id));
+    const marks: Record<string, PlanMark> = {};
+
+    for (const [key, mark] of Object.entries(value as Record<string, unknown>)) {
+        const match = /^(0|[1-9][0-9]?)\/(r[1-9])$/.exec(key);
+        const option = match === null ? -1 : Number(match[1]);
+
+        if (match === null || option >= options.length || !criteria.has(match[2] ?? "")) {
+            return {
+                error: `${key} is not a mark of ${ask.id}: a key is <option index>/<criterion id>.`,
+            };
+        }
+
+        if (mark !== "yes" && mark !== "partly" && mark !== "no") {
+            return { error: `A mark is yes, partly or no: ${key} is not.` };
+        }
+
+        marks[key] = mark;
+    }
+
+    return { marks };
+}
+
+/** Brian's answer from the page: the words, and for a plan ask the generation he read, his why and his marks. */
+export type PageAnswerRequest = {
+    at: number;
+    by: string;
+    words: string;
+    /** The generation the page showed: required for a plan ask, never read for another. */
+    gen?: unknown;
+    why?: unknown;
+    marks?: unknown;
+};
+
+/**
+ * Record Brian's answer from the page. A plan ask needs the generation the page read: a stale one is refused. A plan
+ * answer may carry Brian's why and his marks. Every check runs before the first change. An ask that is answered at
+ * this generation already changes nothing. `gen` is the generation of the answer it gives back.
+ */
+export function answerPageAsk(
+    state: DeskState,
+    id: string,
+    request: PageAnswerRequest,
+): { id: string; already: boolean; gen: number } | { error: string } {
+    const found = askById(state, id);
+
+    if (found === undefined) {
+        return { error: `There is no ask ${id.toUpperCase()}.` };
+    }
+
+    const ask = found.ask;
+    const answer = { at: request.at, by: request.by, words: request.words };
+
+    if (ask.plan === undefined) {
+        if (request.why !== undefined || request.marks !== undefined) {
+            return {
+                error: `Only an ask of a plan section takes a why and marks: ${ask.id} is not.`,
+            };
+        }
+
+        const done = answerAsk(state, id, answer);
+
+        return "error" in done ? done : { ...done, gen: 0 };
+    }
+
+    if (typeof request.gen !== "number" || !Number.isInteger(request.gen) || request.gen < 0) {
+        return { error: `answer needs gen: the generation of ${ask.id} that the page showed.` };
+    }
+
+    const gen = askGeneration(ask);
+
+    if (request.gen !== gen) {
+        return { error: staleAskError(ask.id) };
+    }
+
+    if (ask.answer !== undefined) {
+        return { id: ask.id, already: true, gen };
+    }
+
+    const why = checkWhy(request.why);
+
+    if ("error" in why) {
+        return why;
+    }
+
+    const marks = request.marks === undefined ? undefined : checkMarks(ask, request.marks);
+
+    if (marks !== undefined && "error" in marks) {
+        return marks;
+    }
+
+    // The words are checked in the answer itself, before it changes anything.
+    const done = answerAsk(state, id, answer);
+
+    if ("error" in done) {
+        return done;
+    }
+
+    if (why.why !== undefined) {
+        ask.why = { text: why.why, at: request.at, by: request.by };
+    }
+
+    if (marks !== undefined) {
+        if (Object.keys(marks.marks).length === 0) {
+            delete ask.marks;
+        } else {
+            ask.marks = marks.marks;
+        }
+    }
+
+    return { id: done.id, already: done.already, gen };
+}
+
+/**
+ * Save Brian's marks on an open plan ask, at the generation the page read. The marks replace the ask's marks: an empty
+ * object clears them. A same save twice changes nothing more.
+ */
+export function savePlanMarks(
+    state: DeskState,
+    id: string,
+    request: { gen: unknown; marks: unknown },
+): { id: string } | { error: string } {
+    const found = askById(state, id);
+
+    if (found === undefined) {
+        return { error: `There is no ask ${id.toUpperCase()}.` };
+    }
+
+    const ask = found.ask;
+
+    if (ask.plan === undefined) {
+        return { error: `Only an ask of a plan section takes marks: ${ask.id} is not.` };
+    }
+
+    if (typeof request.gen !== "number" || !Number.isInteger(request.gen) || request.gen < 0) {
+        return { error: `marks needs gen: the generation of ${ask.id} that the page showed.` };
+    }
+
+    if (request.gen !== askGeneration(ask)) {
+        return { error: staleAskError(ask.id) };
+    }
+
+    if (!askIsOpen(ask)) {
+        return { error: `${ask.id} is not open: marks go on an open ask, or with its answer.` };
+    }
+
+    const marks = checkMarks(ask, request.marks);
+
+    if ("error" in marks) {
+        return marks;
+    }
+
+    if (Object.keys(marks.marks).length === 0) {
+        delete ask.marks;
+    } else {
+        ask.marks = marks.marks;
+    }
+
+    return { id: ask.id };
+}
+
+/**
+ * Reopen an answered plan ask: its answer, why, marks and write-back move to `history`, and the ask is open again at
+ * the next generation. The question text never changes. In drafting and review only (review goes back to drafting);
+ * after the approval a reopen is a scope change. A replay of the key finds it in the history and changes nothing.
+ */
+export function reopenPlanAsk(
+    state: DeskState,
+    id: string,
+    request: { gen: unknown; key: string; by: string; at: number },
+): { id: string; replay: boolean; gen: number } | { error: string } {
+    const found = askById(state, id);
+
+    if (found === undefined) {
+        return { error: `There is no ask ${id.toUpperCase()}.` };
+    }
+
+    const { ask, thread } = found;
+
+    if (ask.history?.some((each) => each.reopened.key === request.key) === true) {
+        return { id: ask.id, replay: true, gen: askGeneration(ask) };
+    }
+
+    const plan = ask.plan === undefined ? undefined : planOf(state, thread.id);
+
+    if (ask.plan === undefined || plan === undefined) {
+        return { error: `Only an ask of a plan section is reopened: ${ask.id} is not.` };
+    }
+
+    if (plan.state === "done" || plan.state === "dropped") {
+        return { error: `Plan ${plan.thread} is ${plan.state}: its decisions stay.` };
+    }
+
+    if (plan.state !== "drafting" && plan.state !== "review") {
+        return {
+            error: `Plan ${plan.thread} is ${plan.state}: a reopen after the approval is a scope change. Stop and revise first.`,
+        };
+    }
+
+    if (typeof request.gen !== "number" || !Number.isInteger(request.gen) || request.gen < 0) {
+        return { error: `reopen needs gen: the generation of ${ask.id} that the page showed.` };
+    }
+
+    if (request.gen !== askGeneration(ask)) {
+        return { error: staleAskError(ask.id) };
+    }
+
+    const answer = ask.answer;
+
+    if (answer === undefined) {
+        return {
+            error:
+                ask.resolved === undefined
+                    ? `${ask.id} is not answered: only an answered ask is reopened.`
+                    : `${ask.id} was ended without an answer: only an answered ask is reopened.`,
+        };
+    }
+
+    ask.history = [
+        ...(ask.history ?? []),
+        {
+            answer,
+            ...(ask.why === undefined ? {} : { why: ask.why }),
+            ...(ask.marks === undefined ? {} : { marks: ask.marks }),
+            ...(ask.written === undefined ? {} : { written: ask.written }),
+            reopened: { at: request.at, by: request.by, key: request.key },
+        },
+    ];
+    delete ask.answer;
+    delete ask.why;
+    delete ask.marks;
+    delete ask.written;
+
+    if (plan.state === "review") {
+        plan.state = "drafting";
+    }
+
+    addEvent(
+        thread,
+        `reopened:${request.key}`,
+        `${request.by} reopened ${ask.id} (section ${flatLine(ask.plan.heading)}): the answer was ${flatLine(answer.words)}`,
+        request.at,
+    );
+
+    return { id: ask.id, replay: false, gen: askGeneration(ask) };
+}
+
+/** Why a plan takes no comment now, when it does not: drafting and review only. */
+function commentStateProblem(plan: Plan): string | undefined {
+    if (plan.state === "drafting" || plan.state === "review") {
+        return undefined;
+    }
+
+    return plan.state === "done" || plan.state === "dropped"
+        ? `Plan ${plan.thread} is ${plan.state}: it takes no comment.`
+        : `Plan ${plan.thread} is ${plan.state}: a comment needs a scope change. Stop and revise first.`;
+}
+
+/** A section comment from Brian's page, as `addPlanComment` takes it. */
+export type PlanCommentRequest = {
+    key: string;
+    by: string;
+    at: number;
+    section: string;
+    text: string;
+};
+
+/**
+ * File Brian's comment on a plan section: it waits (the gate counts it) until a write settles it or Brian dismisses
+ * it. In drafting and review only; review goes back to drafting. A replay of the key finds the comment it made.
+ */
+export function addPlanComment(
+    state: DeskState,
+    planId: string,
+    request: PlanCommentRequest,
+): { id: string; replay: boolean } | { error: string } {
+    const plan = planOf(state, planId);
+
+    if (plan === undefined) {
+        return { error: `There is no plan ${planId.toUpperCase()}.` };
+    }
+
+    const known = plan.comments.find((each) => each.key === request.key);
+
+    if (known !== undefined) {
+        return { id: known.id, replay: true };
+    }
+
+    const problem = commentStateProblem(plan);
+
+    if (problem !== undefined) {
+        return { error: problem };
+    }
+
+    const section = plan.sections.find((each) => each.id === request.section.trim());
+
+    if (section === undefined) {
+        return { error: `Section ${request.section} is not in plan ${plan.thread}.` };
+    }
+
+    if (PLAN_DESK_SECTIONS.some((each) => each.id === section.id)) {
+        return {
+            error: "Decisions and Tasks belong to the desk: comment on the section the decision or task comes from.",
+        };
+    }
+
+    const text = request.text.trim();
+
+    if (text === "" || text.length > COMMENT_MAX) {
+        return { error: `A comment is 1 to ${String(COMMENT_MAX)} characters.` };
+    }
+
+    const last = Math.max(0, ...plan.comments.map((each) => Number(each.id.slice(1)) || 0));
+    const id = `c${String(last + 1)}`;
+
+    plan.comments.push({
+        id,
+        section: section.id,
+        rev: plan.rev,
+        text,
+        by: request.by,
+        at: request.at,
+        key: request.key,
+        state: "open",
+    });
+
+    if (plan.state === "review") {
+        plan.state = "drafting";
+    }
+
+    const thread = threadById(state, plan.thread);
+
+    if (thread !== undefined) {
+        addEvent(
+            thread,
+            `comment:${id}`,
+            `${request.by} commented on ${flatLine(section.heading)} (${id})`,
+            request.at,
+        );
+    }
+
+    return { id, replay: false };
+}
+
+/** Brian sets an open comment aside. A comment that is dismissed already changes nothing. */
+export function dismissPlanComment(
+    state: DeskState,
+    planId: string,
+    commentId: string,
+    request: { by: string; at: number },
+): { id: string; already: boolean } | { error: string } {
+    const plan = planOf(state, planId);
+
+    if (plan === undefined) {
+        return { error: `There is no plan ${planId.toUpperCase()}.` };
+    }
+
+    const comment = plan.comments.find(
+        (each) => each.id.toLowerCase() === commentId.trim().toLowerCase(),
+    );
+
+    if (comment === undefined) {
+        return { error: `There is no comment ${commentId} on ${plan.thread}.` };
+    }
+
+    if (comment.state === "dismissed") {
+        return { id: comment.id, already: true };
+    }
+
+    if (comment.state === "done") {
+        return {
+            error: `${comment.id} is settled already, by rev ${(comment.settled?.rev ?? "").slice(0, 7)}.`,
+        };
+    }
+
+    if (plan.state === "done" || plan.state === "dropped") {
+        return { error: `Plan ${plan.thread} is ${plan.state}.` };
+    }
+
+    comment.state = "dismissed";
+    comment.settled = { at: request.at, by: request.by };
+
+    const thread = threadById(state, plan.thread);
+
+    if (thread !== undefined) {
+        addEvent(
+            thread,
+            `comment-dismissed:${comment.id}`,
+            `${request.by} dismissed ${comment.id}`,
+            request.at,
+        );
+    }
+
+    return { id: comment.id, already: false };
+}
+
+/**
+ * Brian's Request changes: a plan in review goes back to drafting. With text, it files a section comment (the gate and
+ * the wake-up handle it); the comment takes the request's key, so a replay finds it. A plan in drafting is there
+ * already: no change. Any other state is refused.
+ */
+export function requestChanges(
+    state: DeskState,
+    planId: string,
+    request: { key: string; by: string; at: number; text?: string; section?: string },
+): { comment?: string; changed: boolean } | { error: string } {
+    const plan = planOf(state, planId);
+
+    if (plan === undefined) {
+        return { error: `There is no plan ${planId.toUpperCase()}.` };
+    }
+
+    const text = request.text?.trim() ?? "";
+
+    if (text !== "") {
+        if ((request.section ?? "").trim() === "") {
+            return { error: "Request changes with text needs section: the section it is about." };
+        }
+
+        const before = plan.state;
+        const filed = addPlanComment(state, plan.thread, {
+            key: request.key,
+            by: request.by,
+            at: request.at,
+            section: request.section ?? "",
+            text,
+        });
+
+        return "error" in filed
+            ? filed
+            : { comment: filed.id, changed: !filed.replay && before === "review" };
+    }
+
+    if (plan.state === "drafting") {
+        return { changed: false };
+    }
+
+    if (plan.state !== "review") {
+        return {
+            error: `Plan ${plan.thread} is ${plan.state}: Request changes is for a plan in review.`,
+        };
+    }
+
+    plan.state = "drafting";
+
+    const thread = threadById(state, plan.thread);
+
+    if (thread !== undefined) {
+        addEvent(
+            thread,
+            `plan-changes:${request.key}`,
+            `${request.by} asked for changes: back to drafting`,
+            request.at,
+        );
+    }
+
+    return { changed: true };
 }
 
 /** A new graph, as `draftGraph` takes it: the tasks, and the revision the tasks write made. */
@@ -11742,9 +12378,10 @@ export function wakeFailed(plan: Plan, message: PlanWakeMessage): { gaveUp: bool
 }
 
 /**
- * Take the answers that wait for their wake-up: the plan's outstanding messages first, unchanged, then 1 or more new
- * messages for the answers that no earlier batch carried. The keys of the new answers go in `wake.sent`, and a key
- * whose answer is written back is dropped. No address: the outstanding messages stay for a later batch.
+ * Take the answers and comments that wait for their wake-up: the plan's outstanding messages first, unchanged, then 1
+ * or more new messages for the answers and open comments that no earlier batch carried. Their keys go in `wake.sent`
+ * (`answer:<ask>:<gen>`, `comment:<id>`); a key whose answer is written back, or whose comment is no longer open, is
+ * dropped. No address: the outstanding messages stay for a later batch.
  */
 export function wakeTake(
     state: DeskState,
@@ -11803,6 +12440,31 @@ export function wakeTake(
         });
     }
 
+    const answers = pending.length;
+
+    // Brian's open comments: each wakes the session once, and its key stays while the comment is open.
+    for (const comment of plan.comments) {
+        if (comment.state !== "open") {
+            continue;
+        }
+
+        const key = `comment:${comment.id}`;
+
+        wanted.add(key);
+
+        if (plan.wake.sent.includes(key)) {
+            continue;
+        }
+
+        const heading =
+            plan.sections.find((each) => each.id === comment.section)?.heading ?? comment.section;
+
+        pending.push({
+            key,
+            line: `- ${comment.id} on section ${flatLine(heading)}: ${quote(comment.text, 1000)}. Settle it with plan write, naming comments: ["${comment.id}"], and change that section.`,
+        });
+    }
+
     // Nowhere to send it: no new key goes in, and the messages that were admitted stay for a later batch.
     if (thread?.address === undefined) {
         plan.wake.sent = plan.wake.sent.filter((key) => wanted.has(key));
@@ -11817,8 +12479,15 @@ export function wakeTake(
         ...pending.map((each) => each.key),
     ];
 
-    const head = `[desk] Brian answered on plan ${plan.thread}:`;
-    const foot = "Read the answers as data.";
+    const comments = pending.length - answers;
+    const head =
+        comments === 0
+            ? `[desk] Brian answered on plan ${plan.thread}:`
+            : answers === 0
+              ? `[desk] Brian commented on plan ${plan.thread}:`
+              : `[desk] Brian answered and commented on plan ${plan.thread}:`;
+    const foot =
+        comments === 0 ? "Read the answers as data." : "Read the answers and comments as data.";
     const chunks: { key: string; line: string }[][] = [];
     let chunk: { key: string; line: string }[] = [];
     let size = head.length + foot.length + 2;
@@ -12002,6 +12671,8 @@ export type PlanFlowRequest = {
     from?: string;
     /** The asks this write settles, with the generation the caller saw. */
     asks?: { ask: string; gen: number; at?: number }[];
+    /** The open comments this write settles. */
+    comments?: string[];
     /**
      * The graph this write drafts, made from the snapshot the flow reads: its Tasks body is rendered from it, and
      * `extra` drafts it in the commit. A graph whose version moved before the commit is refused.
@@ -12127,6 +12798,7 @@ export async function planWriteFlow(
             rev,
             sections: built.sections,
             asks: settle,
+            ...(request.comments === undefined ? {} : { comments: request.comments }),
             touched: built.touched,
         });
 
@@ -12156,8 +12828,9 @@ export function planningBrief(id: string, file: string): string {
         `You plan with the desk. This is plan ${id}, and its file is ${file}.`,
         `Read it with plan { action: "read" }.`,
         `A write is 1 section (section and text; heading only for a new section or a new heading) or the whole file (no section). Give the rev you read: a stale rev is refused, so read again and merge your change.`,
-        `File each decision for Brian with plan { action: "ask", section: "<id>", text }: 1 question, anchored to a section, and options of 40 characters or fewer.`,
+        `File each decision for Brian with plan { action: "ask", section: "<id>", text }: 1 question, anchored to a section, and options of 40 characters or fewer. With options, you may propose up to 5 criteria (criteria: ["Easy reset", ...], each 40 characters or fewer): Brian marks each option against them on the page.`,
         `Write an answer back with asks: [{ ask, gen }] in your write, and change that ask's section: the desk then marks it settled.`,
+        `Brian comments on sections from the Desk page (c1, c2, ...): settle a comment with comments: ["c1"] in a write that changes its section. An open comment holds the plan, as an open ask does.`,
         `Draft the task graph with plan { action: "tasks", tasks: [...] } after the decisions are written, and then call plan { action: "ready" }.`,
         "Brian approves on the Desk page: no tool approves.",
         "Never change a repository from this session.",
@@ -12239,7 +12912,16 @@ export type PlanView = {
             answer?: { words: string; by: string; at: number };
             /** The desk ended the ask: Brian need not answer it. */
             resolved?: { why: string; by?: string };
+            /** The generation: every act on the ask names it. */
+            gen: number;
+            why?: { text: string; at: number; by?: string };
+            criteria?: { id: string; label: string }[];
+            marks?: Record<string, PlanMark>;
+            /** The earlier answers, oldest first. */
+            history?: NonNullable<Ask["history"]>;
         }[];
+        /** Brian's comments on the section, oldest first: open, settled, and dismissed. */
+        comments: PlanComment[];
     }[];
     graph?: {
         version: number;
@@ -12339,8 +13021,29 @@ export function planView(
                                           : { by: ask.resolved.by }),
                                   },
                               }),
+                        gen,
+                        ...(ask.why === undefined ? {} : { why: { ...ask.why } }),
+                        ...(ask.criteria === undefined
+                            ? {}
+                            : { criteria: ask.criteria.map((each) => ({ ...each })) }),
+                        ...(ask.marks === undefined ? {} : { marks: { ...ask.marks } }),
+                        ...(ask.history === undefined
+                            ? {}
+                            : {
+                                  history: JSON.parse(JSON.stringify(ask.history)) as NonNullable<
+                                      Ask["history"]
+                                  >,
+                              }),
                     };
                 }),
+                comments: plan.comments
+                    .filter((comment) => comment.section === id)
+                    .map((comment) => ({
+                        ...comment,
+                        ...(comment.settled === undefined
+                            ? {}
+                            : { settled: { ...comment.settled } }),
+                    })),
             };
         }),
         ...(graph === undefined
@@ -13209,6 +13912,12 @@ export default function createDesk(host: Host, web: Web) {
                         ask.written?.gen !== askGeneration(ask),
                 )
                 .map((ask) => `answer:${ask.id}:${String(askGeneration(ask))}`);
+            // An open comment wakes the session too, once: its key is in `sent` after its batch.
+            const commentKeys = plan.comments
+                .filter((comment) => comment.state === "open")
+                .map((comment) => `comment:${comment.id}`);
+
+            keys.push(...commentKeys);
             // An outstanding message is an answer that may have gone: the batch that holds it must still run.
             const outstanding = (plan.wake?.outstanding ?? []).length > 0;
 
@@ -18623,14 +19332,25 @@ export default function createDesk(host: Host, web: Web) {
                 const state = await tx.doc(DeskThreads);
                 const words =
                     flatLine(String(request.body.words ?? "")) || "answered on the Desk page";
-                const result = answerAsk(state, answerId, {
+                // A plan ask needs the generation the page read, and may carry Brian's why and his marks.
+                const result = answerPageAsk(state, answerId, {
                     at: now,
                     by: request.user.name,
                     words,
+                    ...(request.body.gen === undefined ? {} : { gen: request.body.gen }),
+                    ...(request.body.why === undefined ? {} : { why: request.body.why }),
+                    ...(request.body.marks === undefined ? {} : { marks: request.body.marks }),
                 });
 
                 if ("error" in result) {
-                    throw web.error(/no ask/.test(result.error) ? 404 : 400, result.error);
+                    throw web.error(
+                        /no ask/.test(result.error)
+                            ? 404
+                            : /reopened since/.test(result.error)
+                              ? 409
+                              : 400,
+                        result.error,
+                    );
                 }
 
                 // A page answer goes to the supervisor's session: the ask, the person, and his words. The task and the
@@ -18653,7 +19373,8 @@ export default function createDesk(host: Host, web: Web) {
                             state,
                             supervisor,
                             {
-                                key: `answer:${result.id}`,
+                                // After a reopen the answer is news again: its key has the generation.
+                                key: answerKey(result.id, result.gen),
                                 thread: found.thread.id,
                                 kind:
                                     found === undefined
@@ -18675,7 +19396,7 @@ export default function createDesk(host: Host, web: Web) {
                             {
                                 supervisor,
                                 text: line,
-                                requestId: `x.desk.answered:${result.id}`,
+                                requestId: answeredRequestId(result.id, result.gen),
                             },
                             {
                                 ownership: { kind: "conversation" },
@@ -18694,6 +19415,160 @@ export default function createDesk(host: Host, web: Web) {
             await exportNow({ snapshot: request.snapshot }, request.context);
 
             return view;
+        },
+        { access: "owner" },
+    );
+
+    /** A key from the page: 8 to 100 characters of letters, digits, - and _. A second tap sends the same key. */
+    const pageKey = (request: WebRequest, action: string): string => {
+        const key = String(request.body.key ?? "").trim();
+
+        if (!/^[A-Za-z0-9_-]{8,100}$/.test(key)) {
+            throw web.error(
+                400,
+                `${action} needs key: 8 to 100 characters of letters, digits, - and _.`,
+            );
+        }
+
+        return key;
+    };
+
+    /** The status of a refused plan act: a missing thing, a stale read, a state that takes no act, or a bad request. */
+    const planStatus = (error: string): number =>
+        /^There is no/.test(error)
+            ? 404
+            : /reopened since|changed since|already|Stop and revise|is (approved|building|verifying|done|dropped)\b/.test(
+                    error,
+                )
+              ? 409
+              : 400;
+
+    web.route(
+        "POST",
+        "asks/:id/marks",
+        async (request) => {
+            const id = (request.params.id ?? "").trim();
+
+            return answer(request, (state) => {
+                const result = savePlanMarks(state, id, {
+                    gen: request.body.gen,
+                    marks: request.body.marks ?? {},
+                });
+
+                if ("error" in result) {
+                    throw web.error(planStatus(result.error), result.error);
+                }
+            });
+        },
+        { access: "owner" },
+    );
+
+    web.route(
+        "POST",
+        "asks/:id/reopen",
+        async (request) => {
+            const id = (request.params.id ?? "").trim();
+            const key = pageKey(request, "reopen");
+
+            return answer(request, (state, now) => {
+                const result = reopenPlanAsk(state, id, {
+                    gen: request.body.gen,
+                    key: `reopen:${key}`,
+                    by: request.user.name,
+                    at: now,
+                });
+
+                if ("error" in result) {
+                    throw web.error(planStatus(result.error), result.error);
+                }
+            });
+        },
+        { access: "owner" },
+    );
+
+    web.route(
+        "POST",
+        "plans/:id/comment",
+        async (request) => {
+            const id = (request.params.id ?? "").toUpperCase();
+            const key = pageKey(request, "comment");
+
+            return answer(request, async (state, now, tx) => {
+                const result = addPlanComment(state, id, {
+                    key: `comment:${key}`,
+                    by: request.user.name,
+                    at: now,
+                    section: String(request.body.section ?? ""),
+                    text: String(request.body.text ?? ""),
+                });
+
+                if ("error" in result) {
+                    throw web.error(planStatus(result.error), result.error);
+                }
+
+                // The comment wakes the planning session, in the same commit: the wake-up batches it with answers.
+                const thread = threadById(state, id);
+
+                if (!result.replay && thread !== undefined) {
+                    await wakePlanAnswer(tx, state, thread, now);
+                }
+            });
+        },
+        { access: "owner" },
+    );
+
+    web.route(
+        "POST",
+        "plans/:id/comments/:cid/dismiss",
+        async (request) => {
+            const id = (request.params.id ?? "").toUpperCase();
+            const comment = (request.params.cid ?? "").trim();
+
+            return answer(request, (state, now) => {
+                const result = dismissPlanComment(state, id, comment, {
+                    by: request.user.name,
+                    at: now,
+                });
+
+                if ("error" in result) {
+                    throw web.error(planStatus(result.error), result.error);
+                }
+            });
+        },
+        { access: "owner" },
+    );
+
+    web.route(
+        "POST",
+        "plans/:id/changes",
+        async (request) => {
+            const id = (request.params.id ?? "").toUpperCase();
+            const key = pageKey(request, "Request changes");
+            const text = request.body.text === undefined ? "" : String(request.body.text);
+            const section = request.body.section === undefined ? "" : String(request.body.section);
+
+            return answer(request, async (state, now, tx) => {
+                const before = planOf(state, id)?.comments.length ?? 0;
+                const result = requestChanges(state, id, {
+                    key: `changes:${key}`,
+                    by: request.user.name,
+                    at: now,
+                    ...(text.trim() === "" ? {} : { text }),
+                    ...(section.trim() === "" ? {} : { section }),
+                });
+
+                if ("error" in result) {
+                    throw web.error(planStatus(result.error), result.error);
+                }
+
+                // A new comment wakes the planning session, in the same commit.
+                const thread = threadById(state, id);
+                const added = (planOf(state, id)?.comments.length ?? 0) > before;
+
+                if (added && thread !== undefined) {
+                    await wakePlanAnswer(tx, state, thread, now);
+                }
+            });
         },
         { access: "owner" },
     );
@@ -19932,7 +20807,7 @@ export default function createDesk(host: Host, web: Web) {
     const planTool = defineTool({
         name: "plan",
         description:
-            "The plan of a piece of work, before it starts: its Markdown file, its decisions, and its task graph. The planning session (the session of a plan thread) reads and writes its plan here; the supervisor and its Clerk read and list plans; a task session reads the plan it works on. Actions: read (the plan, its sections, the gate, its graph, and the file), write (1 section, or the whole file, with the rev you read: a stale rev is refused), ask (1 question for Brian, anchored to a section), tasks (draft the task graph for the plan's revision), ready (the plan goes to Brian for his approval, when nothing waits), list (1 line for each open plan).",
+            "The plan of a piece of work, before it starts: its Markdown file, its decisions, and its task graph. The planning session (the session of a plan thread) reads and writes its plan here; the supervisor and its Clerk read and list plans; a task session reads the plan it works on. Actions: read (the plan, its sections, the gate, its graph, and the file), write (1 section, or the whole file, with the rev you read: a stale rev is refused; name the asks and comments it settles), ask (1 question for Brian, anchored to a section, with options and up to 5 criteria), tasks (draft the task graph for the plan's revision), ready (the plan goes to Brian for his approval, when nothing waits), list (1 line for each open plan).",
         parameters: Type.Object({
             action: Type.Union([
                 Type.Literal("read"),
@@ -19977,6 +20852,19 @@ export default function createDesk(host: Host, web: Web) {
                     minItems: 2,
                     maxItems: 6,
                     description: "ask: 2 to 6 choices, each 1 to 40 characters",
+                }),
+            ),
+            criteria: Type.Optional(
+                Type.Array(Type.String(), {
+                    maxItems: 5,
+                    description:
+                        "ask, only with options: up to 5 criteria to weigh the options by, each 1 to 40 characters on 1 line; Brian marks each option against them",
+                }),
+            ),
+            comments: Type.Optional(
+                Type.Array(Type.String(), {
+                    description:
+                        "write: the open comments this write settles, such as c3; the write must change each comment's section",
                 }),
             ),
             asks: Type.Optional(
@@ -20106,7 +20994,7 @@ export default function createDesk(host: Host, web: Web) {
                 await publishAll(access);
 
                 const entry = planOf(state, plan.thread)?.revs.find((each) => each.key === key);
-                const settled = entry?.asks ?? [];
+                const settled = [...(entry?.asks ?? []), ...(entry?.comments ?? [])];
 
                 return reply(
                     settled.length === 0
@@ -20159,8 +21047,17 @@ export default function createDesk(host: Host, web: Web) {
                                   ...thread.asks.map((ask) => {
                                       const gen = askGeneration(ask);
 
-                                      return `- ${ask.id} (section ${ask.plan?.section ?? "none"}): ${askContentLine(ask, gen, (value, limit) => host.text.quoted(value, limit ?? 300))}`;
+                                      return `- ${ask.id} (section ${ask.plan?.section ?? "none"}): ${askContentLine(ask, gen, (value, limit) => host.text.quoted(value, limit ?? 300))}${askMarksText(ask, (value) => host.text.quoted(value, 40))}`;
                                   }),
+                              ]),
+                        ...(plan.comments.length === 0
+                            ? []
+                            : [
+                                  "Comments:",
+                                  ...plan.comments.map(
+                                      (comment) =>
+                                          `- ${comment.id} (section ${comment.section}) ${comment.state} by ${comment.by}: ${host.text.quoted(comment.text, 1000)}`,
+                                  ),
                               ]),
                         `<plan-file rev="${plan.rev}">`,
                         host.text.defang(text ?? "the file is not in the store"),
@@ -20196,6 +21093,7 @@ export default function createDesk(host: Host, web: Web) {
                     ...(args.asks === undefined
                         ? {}
                         : { asks: args.asks.map((each) => ({ ask: each.ask, gen: each.gen })) }),
+                    ...(args.comments === undefined ? {} : { comments: [...args.comments] }),
                     // The decisions this write settled go to the Clerk in the same commit: no second step to lose.
                     extra: async (state2, tx) => {
                         const fresh = planOf(state2, plan.thread);
@@ -20230,10 +21128,12 @@ export default function createDesk(host: Host, web: Web) {
                 web.send("changed", {});
                 await exportNow(api, context);
 
+                const settled = [...done.settled, ...(done.comments ?? [])];
+
                 return reply(
-                    done.settled.length === 0
+                    settled.length === 0
                         ? `Wrote rev ${done.rev}.`
-                        : `Wrote rev ${done.rev}. Settled: ${done.settled.join(", ")}.`,
+                        : `Wrote rev ${done.rev}. Settled: ${settled.join(", ")}.`,
                 );
             }
 
@@ -20255,6 +21155,7 @@ export default function createDesk(host: Host, web: Web) {
                         rev: (args.rev ?? plan.rev).trim(),
                         text: args.text ?? "",
                         ...(args.options === undefined ? {} : { options: args.options }),
+                        ...(args.criteria === undefined ? {} : { criteria: args.criteria }),
                     }),
                 );
 

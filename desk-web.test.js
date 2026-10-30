@@ -2,6 +2,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import setup, {
+    answerBody,
     approveLabel,
     badgeOf,
     groupOf,
@@ -748,4 +749,10 @@ test("an answer that comes after the view left changes nothing", () => {
     assert.equal(stillMounted({ gone: false }), true);
     assert.equal(stillMounted({ gone: true }), false);
     assert.equal(stillMounted(undefined), true);
+});
+
+test("a page answer sends the generation of a plan ask, and none for another ask", () => {
+    assert.deepEqual(answerBody("TPM", 0), { words: "TPM", gen: 0 });
+    assert.deepEqual(answerBody("TPM", 2), { words: "TPM", gen: 2 });
+    assert.deepEqual(answerBody("yes", undefined), { words: "yes" });
 });
