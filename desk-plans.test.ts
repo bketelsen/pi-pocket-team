@@ -11,6 +11,7 @@ import {
     mkdtempSync,
     readFileSync,
     renameSync,
+    rmSync,
     writeFileSync,
 } from "node:fs";
 import { createServer } from "node:http";
@@ -7468,20 +7469,115 @@ before(async () => {
 
 after(async () => {
     // The fixture environment stays until the server, the app and the notes server have stopped completely: a task
-    // that runs during the close must never read the real settings, run the real gh, or read a real token. Each close
-    // runs also when an earlier one failed; then the environment goes back; then the fixture files go.
-    await runSteps([
-        () => new Promise<void>((resolve) => server?.close(() => resolve())),
-        async () => {
-            assertFixtureEnv("before the app closes");
-            await app?.close();
-            assertFixtureEnv("after the app closed");
-        },
-        () => new Promise<void>((resolve) => notesServer?.close(() => resolve())),
-        () => restoreEnv(envBefore),
-        () => cleanUp(),
-    ]);
+    // that runs during the close must never read the real settings, run the real gh, or read a real token. The
+    // environment goes back, and the fixture files go, only when the app's shutdown is confirmed.
+    await teardown({
+        closeServer: () => new Promise<void>((resolve) => server?.close(() => resolve())),
+        app,
+        check: assertFixtureEnv,
+        closeNotes: () => new Promise<void>((resolve) => notesServer?.close(() => resolve())),
+        restore: () => restoreEnv(envBefore),
+        removeFiles: () => cleanUp(),
+    });
 });
+
+/** What the teardown stops: an app (Pocket's test app), or a stand-in with the same 2 closes. */
+type Closable = {
+    close: () => Promise<void>;
+    harness?: { close: (context: never) => Promise<void> };
+};
+
+/**
+ * Shut an app down for the teardown. The diagnostic check never stops the close: its error is kept. When the app's
+ * close fails, the harness is closed on its own (Session.close joins the task invocations, then closes Storage, and
+ * gives the same promise to a second caller). `confirmed` is true only when a close resolved.
+ */
+async function shutDown(
+    target: Closable | undefined,
+    check: (when: string) => void,
+): Promise<{ confirmed: boolean; errors: unknown[] }> {
+    const errors: unknown[] = [];
+
+    if (target === undefined) {
+        return { confirmed: true, errors };
+    }
+
+    try {
+        check("before the app closes");
+    } catch (error) {
+        errors.push(error);
+    }
+
+    let confirmed = false;
+
+    try {
+        await target.close();
+        confirmed = true;
+    } catch (error) {
+        errors.push(error);
+
+        if (target.harness !== undefined) {
+            try {
+                await target.harness.close(context as never);
+                confirmed = true;
+            } catch (harnessError) {
+                errors.push(harnessError);
+            }
+        }
+    }
+
+    if (confirmed) {
+        try {
+            check("after the app closed");
+        } catch (error) {
+            errors.push(error);
+        }
+    }
+
+    return { confirmed, errors };
+}
+
+/**
+ * The file's teardown: close the server, shut the app down, close the notes server; then, only when the app's shutdown
+ * is confirmed, give the environment back and remove the fixture files. With no confirmed shutdown, the fixture
+ * environment and the files stay (a process that ends with the overrides set is safe). The first error comes back.
+ */
+async function teardown(parts: {
+    closeServer: () => Promise<void>;
+    app: Closable | undefined;
+    check: (when: string) => void;
+    closeNotes: () => Promise<void>;
+    restore: () => void;
+    removeFiles: () => void;
+}): Promise<void> {
+    const errors: unknown[] = [];
+
+    try {
+        await parts.closeServer();
+    } catch (error) {
+        errors.push(error);
+    }
+
+    const shutdown = await shutDown(parts.app, parts.check);
+
+    errors.push(...shutdown.errors);
+
+    try {
+        await parts.closeNotes();
+    } catch (error) {
+        errors.push(error);
+    }
+
+    if (shutdown.confirmed) {
+        await runSteps([parts.restore, parts.removeFiles]).catch((error: unknown) => {
+            errors.push(error);
+        });
+    }
+
+    if (errors.length > 0) {
+        throw errors[0];
+    }
+}
 
 /** The fixture environment is still set: the teardown checks it around the app's close. */
 function assertFixtureEnv(when: string): void {
@@ -9388,27 +9484,128 @@ describe("with the Pi Pocket app", () => {
 
         process.env.PI_POCKET_TEST_ORDER = "fixture";
 
-        await assert.rejects(
-            runSteps([
-                async () => {
-                    await new Promise((resolve) => setTimeout(resolve, 10));
-                    order.push(`server: ${String(process.env.PI_POCKET_TEST_ORDER)}`);
+        try {
+            await assert.rejects(
+                runSteps([
+                    async () => {
+                        await new Promise((resolve) => setTimeout(resolve, 10));
+                        order.push(`server: ${String(process.env.PI_POCKET_TEST_ORDER)}`);
 
-                    throw new Error("the server close failed");
-                },
-                async () => {
-                    await new Promise((resolve) => setTimeout(resolve, 10));
-                    order.push(`app: ${String(process.env.PI_POCKET_TEST_ORDER)}`);
-                },
-                () => {
-                    restoreEnv(saved);
-                    order.push(`restored: ${String(process.env.PI_POCKET_TEST_ORDER)}`);
-                },
-            ]),
-            /the server close failed/,
-        );
-        assert.deepEqual(order, ["server: fixture", "app: fixture", "restored: undefined"]);
-        assert.equal(process.env.PI_POCKET_TEST_ORDER, undefined);
+                        throw new Error("the server close failed");
+                    },
+                    async () => {
+                        await new Promise((resolve) => setTimeout(resolve, 10));
+                        order.push(`app: ${String(process.env.PI_POCKET_TEST_ORDER)}`);
+                    },
+                    () => {
+                        restoreEnv(saved);
+                        order.push(`restored: ${String(process.env.PI_POCKET_TEST_ORDER)}`);
+                    },
+                ]),
+                /the server close failed/,
+            );
+            assert.deepEqual(order, [
+                "server: fixture",
+                "app: fixture",
+                `restored: ${String(saved.PI_POCKET_TEST_ORDER)}`,
+            ]);
+            assert.equal(process.env.PI_POCKET_TEST_ORDER, saved.PI_POCKET_TEST_ORDER);
+        } finally {
+            restoreEnv(saved);
+        }
+    });
+
+    test("a teardown whose app close fails before the workers stop keeps the fixture environment and files", async () => {
+        const saved = { PI_POCKET_TEST_FIXTURE: process.env.PI_POCKET_TEST_FIXTURE };
+        const file = join(root, "teardown-fixture.txt");
+        const calls: string[] = [];
+        const parts = (app0: Closable, check: (when: string) => void = () => {}) => ({
+            closeServer: async () => {
+                calls.push("server");
+            },
+            app: app0,
+            check,
+            closeNotes: async () => {
+                calls.push("notes");
+            },
+            restore: () => {
+                calls.push("restore");
+                delete process.env.PI_POCKET_TEST_FIXTURE;
+            },
+            removeFiles: () => {
+                calls.push("remove");
+                rmSync(file, { force: true });
+            },
+        });
+
+        try {
+            // The app's close rejects before its workers stop, and the harness cannot be closed either.
+            process.env.PI_POCKET_TEST_FIXTURE = "fixture";
+            writeFileSync(file, "fixture");
+            await assert.rejects(
+                teardown(
+                    parts({
+                        close: () => Promise.reject(new Error("the app close failed")),
+                        harness: {
+                            close: () => Promise.reject(new Error("the harness close failed")),
+                        },
+                    }),
+                ),
+                /the app close failed/,
+            );
+            assert.deepEqual(calls, ["server", "notes"], "no restore and no removal");
+            assert.equal(
+                process.env.PI_POCKET_TEST_FIXTURE,
+                "fixture",
+                "the fixture environment stays",
+            );
+            assert.equal(existsSync(file), true, "the fixture file stays");
+
+            // The app's close rejects, and the harness closes on its own: the shutdown is confirmed, then the rest.
+            calls.length = 0;
+            await assert.rejects(
+                teardown(
+                    parts({
+                        close: () => Promise.reject(new Error("the app close failed")),
+                        harness: { close: () => Promise.resolve() },
+                    }),
+                ),
+                /the app close failed/,
+            );
+            assert.deepEqual(calls, ["server", "notes", "restore", "remove"]);
+            assert.equal(process.env.PI_POCKET_TEST_FIXTURE, undefined);
+            assert.equal(existsSync(file), false);
+
+            // The diagnostic check fails first: the close still runs, and the check's error shows after it.
+            calls.length = 0;
+            process.env.PI_POCKET_TEST_FIXTURE = "fixture";
+            writeFileSync(file, "fixture");
+
+            let closed = false;
+
+            await assert.rejects(
+                teardown(
+                    parts(
+                        {
+                            close: async () => {
+                                closed = true;
+                            },
+                        },
+                        (when) => {
+                            if (when === "before the app closes") {
+                                throw new Error("the check failed");
+                            }
+                        },
+                    ),
+                ),
+                /the check failed/,
+            );
+            assert.equal(closed, true, "the close ran");
+            assert.deepEqual(calls, ["server", "notes", "restore", "remove"]);
+        } finally {
+            restoreEnv(saved);
+            rmSync(file, { force: true });
+        }
     });
 
     test("the roster route gives the leads with a home, the supervisors, and the plan count", async () => {
