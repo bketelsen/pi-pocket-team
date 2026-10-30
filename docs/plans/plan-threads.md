@@ -736,7 +736,7 @@ Each line below differs from the design above, or settles what it left open, and
   message to the planning session: "Brian asked for changes ... ask Brian in the chat what to change." In `drafting` it
   changes nothing.
 - **`Plan.changes` keeps the last 20 done Request changes taps** (`{ key, at, by }`), in the commit of the change and
-  its message. A tap's key is checked there before the state: a late retry after a later Ready finds its key and
+  its message; a tap in `drafting`, which changes nothing, keeps its key too. A tap's key is checked there before the state: a late retry after a later Ready finds its key and
   changes nothing, where a check of the state alone would send the plan back to drafting.
 - **The page stores its keys with a prefix** (`reopen:`, `comment:`, `changes:`, `revise:`, `x.desk.plan-new:`), so 2
   routes never share a key.
@@ -757,18 +757,20 @@ Each line below differs from the design above, or settles what it left open, and
   scope change while `revising` is set is refused: Brian approves a new revision first.
 - **A scope change may name a task in any state.** A named task becomes `stopped`; its open attempt ends `stopped`; an
   attempt that ended stays as it ended. A named done task cannot be carried after that: naming it means "do it again".
-  When the newest attempt ended (merged or no-change) but its thread is still open, that thread gets the stop message
-  too, with its stable request id: its agent may still push.
+  Every thread of the named task that is still open gets the stop message, for every attempt (a merged attempt's
+  thread while its repair runs, too), each with its own stable request id: its agent may still push.
 - **A scope change names the approved graph it read** (`graph`, the approved graph version). The page's Stop and revise
-  and a reopen that is a scope change must send it; `plan revise` may. It is checked in the commit before any change,
-  and a newer approved graph gives 409 "The plan changed since you read it.": a stale tap never stops the tasks of a
-  graph that Brian did not see. A replay of a known key returns first, before this check.
+  and a reopen that is a scope change must send it, and so must `plan revise` (a late call from an old task session
+  never acts on a newer graph). It is checked in the commit before any change, and a newer approved graph gives 409
+  "The plan changed since you read it.": a stale tap never stops the tasks of a graph that Brian did not see. A replay
+  of a known key returns first, before this check.
 - **`Plan.revises` keeps the last 20 scope changes** (`{ key, at, by, why, tasks }`), because `revising` is cleared at
   the next approval and a replay must still find its key.
 - **The durable messages are a new task, `x.desk.plan-send`**: the stop to each named task's open thread and to the
   open verification thread, the revision news to the planning session, and Request changes. It is created in the act's
-  commit, sends with a request id made from the key and the target, and tries 3 times, 60 seconds apart; after that, 1
-  event on the plan thread and 1 notice. A closed thread, or one with no address, gets no message.
+  commit, sends with a request id made from the key and the target, and tries 3 times, 60 seconds apart (counted from
+  each failure, by the task clock); after that, 1 event on the plan thread and 1 notice. A closed thread, or one with
+  no address, gets no message.
 - **Approve is refused while a task of the old approved graph is delegated** ("t3 is delegated (T575): wait for its
   end, or stop it with Stop and revise"). Decision 5 lets unnamed tasks go on; this keeps 2 workers from ever doing 1
   task. Once the task is done, the next graph can carry it.
@@ -788,8 +790,8 @@ Each line below differs from the design above, or settles what it left open, and
   key `plan-tasks:<plan>:v<graph>:<ids>:<attempt count>`. No new kind is needed. While `revising` is set, the line says to wait
   for the new approval. A task that goes back to `waiting` gets only its event.
 - **The 1-PR warning is 1 event on the task thread and 1 on the plan thread, once for each ref.** The supervisor's desk
-  section shows the events: no digest item. It comes for every task thread that is still open, also after its attempt
-  ended; the ended attempt does not change. Its count is the thread's PRs now, so a ref that takes the place of another
+  section shows the events: no digest item. It comes for every task thread that is still open, for every attempt of
+  the task, also after the attempt ended; an ended attempt does not change. Its count is the thread's PRs now, so a ref that takes the place of another
   one gets its own warning at the same count.
 - **The news keys carry the approved graph's version**: `plan-tasks:<plan>:v<graph>:...` and
   `plan-verify:<plan>:round:v<graph>:<attempt count>` (and the `plan-verifying:` event), so the news of a new graph
@@ -806,8 +808,9 @@ Each line below differs from the design above, or settles what it left open, and
   so each round passes the delivery's checks. A thread that recorded its round does not block the next delivery.
   `plan verify` also checks the budget itself: after 4 failed rounds since the approval, no round is recorded.
 - **The verify brief is short and bounded**: each task's id, title, acceptance lines and its attempts' PR refs with
-  heads, in at most 7000 characters for the tasks; a task that does not fit gets 1 line that says so, and the brief
-  names the tasks it left out. The no-change reasons and evidence are not in it: `plan read` gives the verification
+  heads. Every line counts, the fixed text too, toward 12000 characters for the whole brief, a reserve of 8000 for
+  Team's wrapper under the 20000 of a start. A task that does not fit gets 1 short line; when that does not fit either,
+  the brief names it by its id only. The no-change reasons and evidence are not in it: `plan read` gives the verification
   session every attempt in full, quoted as data, and never cut. A linked-session start takes at most 20000 characters.
 - **The verify delivery goes to the lead, in its home, with no worktree**, and does not check the gate (section 5.2
   gives it its own checks). The failed rounds count from the last approval: a new approval gives a new budget.
@@ -834,6 +837,10 @@ Each line below differs from the design above, or settles what it left open, and
   start's first commit. A start whose session did not bind resumes under its key only with the same lead, title, idea,
   issue, supervisor and model; else "This key started plan T5 for lucilla: start a new plan with a new key." The desk
   checks it in the commit of the resumed open. The page makes a new key when a field of the New plan form changes.
+- **`Plan.startKey` is the fingerprint of the start's full payload** (sha256 of the full idea text, the lead, the
+  title, the issue, the supervisor and the model), stored in the first commit. A resumed start compares it, so an idea
+  that differs only after its first 200 characters is another start. `Plan.idea` stays the short text for the display.
+  A plan from before it has no fingerprint, and keeps the check of the stored fields.
 
 **The `needs-plan` label, for after the merge (decision 7).** The bot runs this with Brian's word, in the 29
 repositories of the issue queue (`issue-queue.md` section 6). `--force` makes a second run safe; it never deletes a

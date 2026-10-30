@@ -14,6 +14,7 @@ import {
     writeFileSync,
 } from "node:fs";
 import { createServer } from "node:http";
+import { createRequire, syncBuiltinESMExports } from "node:module";
 import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
 import { fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
@@ -30,6 +31,8 @@ import {
     say,
     scriptedModel,
     until,
+    home,
+    work,
 } from "./_pocket/test/helpers.ts";
 import { createHandler } from "./_pocket/src/server/http.ts";
 import {
@@ -55,6 +58,7 @@ import {
     dismissPlanComment,
     reopenPlanAsk,
     requestChanges,
+    VERIFY_BRIEF_MAX,
     planSendStep,
     planSendGaveUp,
     rewriteAsk,
@@ -3239,6 +3243,9 @@ describe("a worktree after a refused open", () => {
 
 // ─── PR 2, part A: decisions on asks, and section comments ──────────────────
 
+/** A plan's stored idea: 1 line, at most 200 characters. */
+const flatIdea = (idea: string): string => idea.replace(/\s+/g, " ").trim().slice(0, 200);
+
 /** A plan with 1 pick-one ask on its idea section, with 2 criteria. */
 function askedPlan(): { state: DeskState; plan: Plan; thread: Thread; id: string } {
     const { state, plan, thread } = startPlan();
@@ -4451,7 +4458,7 @@ describe("a scope change", () => {
         );
         assert.match(
             (withGraph("revise:none", undefined, true) as { error: string }).error,
-            /needs graph: the approved graph version that the page showed/,
+            /needs graph: the approved graph version that you read/,
         );
         assert.equal(JSON.stringify(state), snapshot, "a refused scope change changes nothing");
 
@@ -4461,10 +4468,23 @@ describe("a scope change", () => {
 
         // A replay of the key returns first, also with a graph that is stale now.
         assert.deepEqual(withGraph("revise:1", 7, true), { replay: true });
-        assert(
-            !("error" in revise(buildingPlan().state, "revise:tool", ["t1"])),
-            "the tool needs no graph",
+        // The tool's call needs graph too (it sends needGraph): a call with none is refused.
+        const toolPlan = buildingPlan();
+
+        assert.match(
+            (
+                revisePlan(toolPlan.state, "T1", {
+                    key: "revise:tool",
+                    by: "teg",
+                    at: tick(6),
+                    why: "Why.",
+                    tasks: ["t1"],
+                    needGraph: true,
+                }) as { error: string }
+            ).error,
+            /A scope change needs graph: the approved graph version that you read\./,
         );
+        assert.equal(toolPlan.plan.revising, undefined);
     });
 
     test("a closed task thread gets no message, and its attempt still ends", () => {
@@ -5944,12 +5964,13 @@ describe("review batch 2", () => {
         assert.doesNotMatch(brief, /eeeeeeeeee/, "no evidence in the brief");
         assert.match(
             brief,
-            /- t30 Task 30 x+ · lucilla in frostyard\/snow: its acceptance lines and attempts are in plan read\./,
+            /The brief has no room for the details of t\d+(, t\d+)*: read them with plan read|Left out of the brief, by id: t\d+/,
         );
-        assert.match(
-            brief,
-            /The brief has no room for the details of t\d+(, t\d+)*: read them with plan read/,
-        );
+
+        // Every task is named: in full, in a short line, or by its id.
+        for (const task of many) {
+            assert.match(brief, new RegExp(`\\b${task.id}\\b`), `${task.id} is named`);
+        }
 
         // plan read gives every attempt in full: the evidence is not cut.
         const read = planAttemptsText(graph, (text) => `"${text}"`).join("\n");
@@ -6338,6 +6359,211 @@ describe("a durable plan message (x.desk.plan-send)", () => {
         assert.match(
             state.threads.T1?.events.at(-1)?.text ?? "",
             /a desk message to session-31 did not go after 3 tries: refused 3/,
+        );
+    });
+});
+
+// ─── Re-review 1: the batch 1 findings that stayed open ──────────────────────
+
+describe("re-review 1", () => {
+    test("a Request changes in drafting keeps its key: a retry after a later Ready changes nothing", () => {
+        const { state, plan } = startPlan();
+        const request = { key: "changes:early", by: "Brian", at: tick(1) };
+
+        assert.deepEqual(requestChanges(state, "T1", request), { changed: false });
+        assert.deepEqual(
+            plan.changes?.map((each) => each.key),
+            ["changes:early"],
+        );
+
+        draftGraph(state, "T1", { key: "graph:1", at: tick(2), rev: plan.rev, tasks: tasks() });
+        assert(!("error" in readyPlan(state, "T1", { key: "ready:1", at: tick(3) })));
+        assert.equal(plan.state, "review");
+
+        const snapshot = JSON.stringify(state);
+
+        assert.deepEqual(requestChanges(state, "T1", { ...request, at: tick(4) }), {
+            changed: false,
+        });
+        assert.equal(plan.state, "review");
+        assert.equal(JSON.stringify(state), snapshot);
+    });
+
+    /** The building plan with t1 merged on T2 (T2 still open), and its repair delivered on T6. */
+    function repairing(): { state: DeskState; plan: Plan; graph: TaskGraph } {
+        const made = buildingPlan();
+
+        merged(made.graph, "t1", tick(5));
+        taskOf(made.graph, "t1").state = "ready";
+        taskThread(made.state, "T6");
+        assert(!("error" in startTask(made.state, "T1", "t1", "T6", tick(6))));
+
+        return made;
+    }
+
+    test("every open thread of a named task gets the stop, each under its own id; an ended attempt stays", () => {
+        const { state, graph } = repairing();
+        const t1 = taskOf(graph, "t1");
+        const ended = JSON.stringify(t1.attempts[0]);
+        const done = revisePlan(state, "T1", {
+            key: "revise:1",
+            by: "Brian",
+            at: tick(7),
+            why: "The key moves.",
+            tasks: ["t1"],
+        });
+
+        assert(!("error" in done) && !done.replay);
+        assert.deepEqual(
+            done.sends.map((send) => [send.to, send.requestId]),
+            [
+                ["session-T2", planSendId("T1", "revise:1", "task:t1:T2")],
+                ["session-T6", planSendId("T1", "revise:1", "task:t1:T6")],
+                ["session-31", planSendId("T1", "revise:1", "planning")],
+            ],
+        );
+        assert.equal(JSON.stringify(t1.attempts[0]), ended, "the merged attempt stays");
+        assert.deepEqual(t1.attempts[1]?.end, { at: tick(7), how: "stopped" });
+        assert.match(done.item.line, /Stopped: t1 \(T2, T6\)\./);
+    });
+
+    test("the 1-PR warning checks every open thread of a task, not only the newest attempt's", () => {
+        const { state, graph } = repairing();
+        const t1 = taskOf(graph, "t1");
+        const ended = JSON.stringify(t1.attempts[0]);
+
+        // T2's attempt merged with its PR, and T2 is still open: it gets a second PR while the repair runs on T6.
+        prOn(state, "T2", "frostyard/snow#1", "MERGED");
+        planFacts(state, "T1", tick(7));
+        prOn(state, "T2", "frostyard/snow#8", "OPEN");
+        assert.equal(planFacts(state, "T1", tick(8)).events, 2);
+        assert.equal(planFacts(state, "T1", tick(9)).events, 0, "once for each ref");
+        assert(
+            state.threads.T2?.events.some((event) => event.key === "plan-prs:T2:frostyard/snow#8"),
+        );
+        assert(
+            state.threads.T1?.events.some((event) => event.key === "plan-prs:T2:frostyard/snow#8"),
+        );
+        assert.equal(JSON.stringify(t1.attempts[0]), ended, "the ended attempt does not change");
+    });
+
+    test("the verify brief stays under 15000 characters with the longest valid values, and names every task", () => {
+        const { plan } = startPlan();
+        const agent = `agent-${"a".repeat(54)}`;
+        const repo = `frostyard-${"o".repeat(40)}/repository-${"r".repeat(80)}`;
+        const many: PlanTask[] = Array.from({ length: 30 }, (_, at) => ({
+            id: `t${String(at + 1)}`,
+            title: `T${String(at + 1)} ${"x".repeat(116)}`.slice(0, 120),
+            agent,
+            repo,
+            acceptance: Array.from(
+                { length: 8 },
+                (_, line) => `${String(line)} ${"y".repeat(298)}`,
+            ),
+            deps: [],
+            state: "done",
+            attempts: [
+                {
+                    thread: `T${String(100 + at)}`,
+                    at: tick(1),
+                    prs: [{ ref: `${repo}#${String(at + 1000)}`, head: "a".repeat(40) }],
+                    end: { at: tick(2), how: "merged" },
+                },
+            ],
+        }));
+        const graph: TaskGraph = {
+            version: 1,
+            rev: plan.rev,
+            state: "approved",
+            at: now,
+            key: "g",
+            tasks: many,
+        };
+        const brief = planVerifyBrief(plan, "x".repeat(200), graph);
+
+        assert(brief.length < 15_000, `the brief has ${String(brief.length)} characters`);
+        assert(brief.length <= VERIFY_BRIEF_MAX);
+
+        for (const task of many) {
+            assert.match(brief, new RegExp(`\\b${task.id}\\b`), `${task.id} is named`);
+        }
+
+        assert.match(
+            brief,
+            /Left out of the brief, by id: (t\d+, )*t30: read them with plan read\./,
+        );
+    });
+
+    test("a resumed start compares the fingerprint of the full payload, past the first 200 characters", () => {
+        const state = empty();
+        const idea = `${"Sign the ISO. ".repeat(20)}Keep the old key.`;
+        const text = initialPlanText("T1", "Long idea", idea);
+
+        openThread(state, {
+            key: "x.test:long",
+            supervisor: 7,
+            agents: [],
+            title: "Long idea",
+            at: now,
+            plan: { start: { idea, lead: "lucilla", root: ROOT, text, rev: gitBlobSha(text) } },
+        });
+
+        const thread = state.threads.T1 ?? assert.fail("a thread");
+        const plan = state.plans?.T1 ?? assert.fail("a plan");
+        const request = (start: string) => ({
+            key: "x.test:long",
+            supervisor: 7,
+            agents: [],
+            title: "Long idea",
+            at: now,
+            plan: { start: { idea: start, lead: "lucilla", root: ROOT, text: "", rev: "" } },
+        });
+        const other = `${"Sign the ISO. ".repeat(20)}Drop the old key.`;
+
+        assert.equal(plan.idea, flatIdea(idea), "the stored idea stays the short text");
+        assert.equal(flatIdea(other), plan.idea, "the 2 ideas share their first 200 characters");
+        assert.equal(plan.startKey?.length, 64);
+        assert.equal(planStartMismatch(state, thread, request(idea) as never), undefined);
+        assert.equal(
+            planStartMismatch(state, thread, request(other) as never),
+            "This key started plan T1 for lucilla: start a new plan with a new key.",
+        );
+
+        // A plan from before the fingerprint keeps the older check of the stored fields.
+        delete plan.startKey;
+        assert.equal(planStartMismatch(state, thread, request(other) as never), undefined);
+    });
+
+    test("a slow failed send waits 60 seconds from the failure, not from the start of the send", async () => {
+        let clock = tick(0);
+        const input = {
+            supervisor: 7,
+            to: "session-31",
+            text: "[desk] Stop.",
+            requestId: planSendId("T1", "revise:1", "planning"),
+        };
+        const step = await planSendStep(
+            { phase: "send", tries: 0 },
+            input,
+            clock,
+            async () => {
+                clock += 70_000;
+
+                throw new Error("slow refusal");
+            },
+            () => clock,
+        );
+
+        assert.deepEqual(step, {
+            kind: "retry",
+            failure: "slow refusal",
+            next: { phase: "wait", tries: 1, due: tick(130) },
+        });
+        assert(step.kind === "retry");
+        assert.equal(
+            (await planSendStep(step.next, input, tick(129), async () => {})).kind,
+            "sleep",
+            "no retry at once",
         );
     });
 });
@@ -6756,6 +6982,16 @@ const model = scriptedModel((request) => {
             plan: planId,
             why: "Another change.",
             tasks: [],
+            graph: 1,
+        });
+    }
+
+    if (text.endsWith("plan revise no graph test")) {
+        return call("plan", {
+            action: "revise",
+            plan: planId,
+            why: "A late call from an old session.",
+            tasks: [],
         });
     }
 
@@ -6904,29 +7140,91 @@ type LinkedSend = (
     key: string,
 ) => Promise<void>;
 
+/** What a send hold saw: the request ids it matched, and every other call, which went to the real send. */
+type HeldSends = { matched: string[]; others: string[]; release: () => void };
+
 /**
- * Hold the linked-session sends of the app that runs now: `gate` gets each one, with the real send, and decides. It gives
- * back the request ids it saw. The next app (after a restart) has its own sends again.
+ * Hold the linked-session sends that `match` chooses, on the class of Pocket's linked sessions, so the hold lasts across
+ * a restart (a resumed task sends before a test could patch the new app). `onMatch` gets each chosen call with the real
+ * send, and decides. Every other call goes to the real send, and is recorded. `release` gives the real send back.
  */
 function holdSends(
-    gate: (
+    match: (key: string) => boolean,
+    onMatch: (
         real: LinkedSend,
         source: ConversationId,
         request: { to: string; message: string },
         key: string,
     ) => Promise<void>,
-): string[] {
-    const sessions = app.linkedSessions as unknown as { send: LinkedSend };
-    const real = sessions.send.bind(sessions);
-    const seen: string[] = [];
-
-    sessions.send = async (source, request, key) => {
-        seen.push(key);
-
-        return gate(real, source, request, key);
+): HeldSends {
+    const proto = Object.getPrototypeOf(app.linkedSessions) as { send: LinkedSend };
+    const original = proto.send;
+    const held: HeldSends = {
+        matched: [],
+        others: [],
+        release: () => {
+            proto.send = original;
+        },
     };
 
-    return seen;
+    proto.send = async function (this: unknown, source, request, key) {
+        const real: LinkedSend = (s0, r0, k0) => original.call(this, s0, r0, k0);
+
+        if (match(key)) {
+            held.matched.push(key);
+
+            return onMatch(real, source, request, key);
+        }
+
+        held.others.push(key);
+
+        return real(source, request, key);
+    };
+
+    return held;
+}
+
+/** A send of a durable plan message (`x.desk.plan-send`), by its request id. */
+const planSendKey = (key: string): boolean => key.startsWith("x.desk.plan-send:");
+
+/**
+ * Stop the app from inside a running step (a hook of a send, or of a read after a commit): the close starts at once,
+ * and this resolves once the harness sealed admission, so the step's own progress commit can never land. It gives
+ * back the close, to wait for after the step returned (the close joins the step).
+ */
+async function stopAppInside(): Promise<{ closing: Promise<void> }> {
+    const harness = app.harness as unknown as { close: (context: unknown) => Promise<void> };
+    const original = harness.close.bind(harness);
+    let sealed = false;
+
+    harness.close = (closeContext) => {
+        sealed = true;
+
+        return original(closeContext);
+    };
+
+    const closing = app.close();
+
+    await until(async () => sealed, "the harness close", 20_000);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    return { closing };
+}
+
+/** Open the app as `openApp` does, with its server log kept: `host.notice` writes each notice there. */
+const { PocketApp } = await import("./_pocket/src/server/app.ts");
+
+async function openLogged(log: string[]): Promise<App> {
+    return (await PocketApp.open({
+        dataDir,
+        defaultCwd: work,
+        supervised: false,
+        log: (line: string) => log.push(line),
+        configureModels: (models: { registerNativeProvider: (provider: unknown) => void }) =>
+            models.registerNativeProvider(model.provider),
+        home,
+        now: () => Date.now() + shift,
+    } as never)) as App;
 }
 
 /** The messages a session got, as text: the scripted model's echo of one is no second message. */
@@ -7345,7 +7643,16 @@ describe("with the Pi Pocket app", () => {
         const answerCall = await routes(`asks/${askId}/answer`, { words: "In the TPM.", gen: 0 });
 
         assert.equal(answerCall.status, 200);
-        assert((await planSnapshot())?.wake?.due, "the wake-up is set");
+
+        const due = (await planSnapshot())?.wake?.due ?? 0;
+        const told = async () =>
+            (await userTexts(planningId!)).filter((each) =>
+                each.includes(`[desk] Brian answered on plan ${planId}`),
+            ).length;
+
+        // Before the restart: the wake-up is committed, due after now by the task clock, and no message went.
+        assert(due > Date.now() + shift, "the wake-up is due after now");
+        assert.equal(await told(), 0, "no message before the restart");
 
         // The wake waits 30 seconds: the next app run is a minute later, and its task finishes it.
         await stopTasks("x.desk.sweeper");
@@ -7355,14 +7662,8 @@ describe("with the Pi Pocket app", () => {
         app = await openApp(model, dataDir, () => Date.now() + shift);
         await startServer();
 
-        await until(
-            async () =>
-                (await modelTexts(app, planningId!)).some((each) =>
-                    each.includes(`[desk] Brian answered on plan ${planId}`),
-                ),
-            "the answer wake-up",
-            20_000,
-        );
+        await until(async () => (await told()) >= 1, "the answer wake-up", 20_000);
+        assert.equal(await told(), 1);
     });
 
     test("a write that names the ask settles it", async () => {
@@ -7624,52 +7925,59 @@ describe("with the Pi Pocket app", () => {
     test("Request changes sends the plan back to drafting, and ready brings it back", async () => {
         assert.equal((await routes(`plans/${planId}/changes`, {})).status, 400, "a key is needed");
 
-        // The send goes in, and then fails before the task's progress commit, as a crash there would: the task
-        // tries again later, under the same request id.
-        const held = holdSends(async (real, source, request, key) => {
+        // The send goes in, and the app stops inside the send's hook, before the task's progress commit: a crash
+        // between the two. The test opens the gate after its own checks.
+        let openGate: () => void = () => {};
+
+        const gate = new Promise<void>((resolve) => {
+            openGate = resolve;
+        });
+        let stopping: { closing: Promise<void> } | undefined;
+        const held = holdSends(planSendKey, async (real, source, request, key) => {
             await real(source, request, key);
 
-            if (key.startsWith("x.desk.plan-send:")) {
-                throw new Error("lost after the send");
+            if (stopping === undefined) {
+                await gate;
+                stopping = await stopAppInside();
             }
         });
-        const changes = await routes(`plans/${planId}/changes`, { key: "changes-key-1" });
 
-        assert.equal(changes.status, 200);
-        assert.equal((await planSnapshot())?.state, "drafting");
-        assert.equal(
-            (await routes(`plans/${planId}/changes`, { key: "changes-key-1" })).status,
-            200,
-        );
-        assert.equal((await planSnapshot())?.state, "drafting");
+        try {
+            const changes = await routes(`plans/${planId}/changes`, { key: "changes-key-1" });
 
-        // No text: 1 durable message tells the planning session, once for the key.
-        const told = async () =>
-            (await userTexts(planningId!)).filter((each) =>
-                each.includes(`Brian asked for changes on plan ${planId}`),
-            ).length;
+            assert.equal(changes.status, 200);
+            assert.equal((await planSnapshot())?.state, "drafting");
+            assert.equal(
+                (await routes(`plans/${planId}/changes`, { key: "changes-key-1" })).status,
+                200,
+            );
+            assert.equal((await planSnapshot())?.state, "drafting");
 
-        await until(
-            async () => held.some((key) => key.startsWith("x.desk.plan-send:")),
-            "the first try",
-            20_000,
-        );
-        await until(async () => (await told()) >= 1, "the changes message", 20_000);
+            // No text: 1 durable message tells the planning session, once for the key.
+            const told = async () =>
+                (await userTexts(planningId!)).filter((each) =>
+                    each.includes(`Brian asked for changes on plan ${planId}`),
+                ).length;
 
-        const first = held.find((key) => key.startsWith("x.desk.plan-send:")) ?? "";
+            await until(async () => held.matched.length >= 1, "the first try", 20_000);
+            await until(async () => (await told()) >= 1, "the admitted message", 20_000);
 
-        // A restart in the task's wait: the retry goes after it, with the same request id, and Pocket takes it once.
-        await stopTasks("x.desk.sweeper");
-        await stopTasks("x.desk.digest");
-        await app.close();
-        shift = 200_000;
-        app = await openApp(model, dataDir, () => Date.now() + shift);
+            // The restart, from inside the send, after Pocket admitted it and before the task's progress commit.
+            openGate();
+            await until(async () => stopping !== undefined, "the stop inside the send", 20_000);
+            await stopping?.closing;
 
-        const retried = holdSends((real, source, request, key) => real(source, request, key));
-
-        await startServer();
-        await until(async () => retried.includes(first), "the retry, under the same id", 20_000);
-        assert.equal(await told(), 1, "the session stores exactly 1 message");
+            // The same clock: a task whose progress committed would wait 60 seconds for its retry. This one never
+            // committed it, so it resumes at its send, at once, under the same request id.
+            app = await openApp(model, dataDir, () => Date.now() + shift);
+            await startServer();
+            await until(async () => held.matched.length >= 2, "the resumed send", 20_000);
+            assert.equal(held.matched[1], held.matched[0], "the same request id");
+            assert.equal(await told(), 1, "the session stores exactly 1 message");
+            assert.deepEqual(held.others, [], "no other send went in this test");
+        } finally {
+            held.release();
+        }
 
         await say(app, planningId!, "plan ready test");
         await until(async () => (await planSnapshot())?.state === "review", "the review", 20_000);
@@ -7870,11 +8178,9 @@ describe("with the Pi Pocket app", () => {
         );
         assert.equal((await planSnapshot())?.revising, undefined);
 
-        // The sends are held: Pocket admits none of them before the restart below.
-        const refused = holdSends(async (_real, _source, _request, key) => {
-            if (key.startsWith("x.desk.plan-send:")) {
-                throw new Error("held by the test");
-            }
+        // The plan sends are held: Pocket admits none of them before the restart below. Every other send goes.
+        const refused = holdSends(planSendKey, async () => {
+            throw new Error("held by the test");
         });
         const revise = await routes(`plans/${planId}/revise`, {
             why: "The key moves to a YubiKey.",
@@ -7927,13 +8233,9 @@ describe("with the Pi Pocket app", () => {
         );
 
         // Before the restart: the scope change is committed, its 2 messages were tried, and none went.
-        await until(
-            async () => refused.filter((key) => key.startsWith("x.desk.plan-send:")).length >= 2,
-            "the 2 held sends",
-            20_000,
-        );
+        await until(async () => refused.matched.length >= 2, "the 2 held sends", 20_000);
 
-        const stopKeys = [...new Set(refused.filter((key) => key.startsWith("x.desk.plan-send:")))];
+        const stopKeys = [...new Set(refused.matched)];
         const before = await deskSnapshot();
         const t1Before =
             before?.threads[t1.attempts.at(-1)?.thread ?? ""] ?? assert.fail("t1's thread");
@@ -7949,15 +8251,22 @@ describe("with the Pi Pocket app", () => {
         );
         assert.equal(await sent(planningId!, `Plan ${planId} is under revision`), 0);
 
-        // A restart between the commit and the send: each message goes after it, and only once.
+        // No other send went while the plan sends were held.
+        assert.deepEqual(refused.others, []);
+        refused.release();
+
+        // A restart between the commit and the send: each message goes after it, and only once. The new hold records
+        // the sends from the first resumed step on.
         await stopTasks("x.desk.sweeper");
         await stopTasks("x.desk.digest");
         await app.close();
         shift = 300_000;
+
+        const resent = holdSends(planSendKey, (real, source, request, key) =>
+            real(source, request, key),
+        );
+
         app = await openApp(model, dataDir, () => Date.now() + shift);
-
-        const resent = holdSends((real, source, request, key) => real(source, request, key));
-
         await startServer();
 
         const state = await deskSnapshot();
@@ -7987,10 +8296,12 @@ describe("with the Pi Pocket app", () => {
         assert.equal(await count(t1Thread.session as ConversationId, stop), 1);
         assert.equal(await count(planningId!, `Plan ${planId} is under revision`), 1);
         assert.deepEqual(
-            stopKeys.filter((key) => !resent.includes(key)),
-            [],
-            "each message went after the restart under the request id of its held try",
+            [...new Set(resent.matched)].sort(),
+            [...stopKeys].sort(),
+            "each message went after the restart under the request id of its held try, and no other plan send",
         );
+        assert.deepEqual(resent.others, [], "no other send went");
+        resent.release();
         assert.equal(await count(t3Thread.session as ConversationId, stop), 0, "t3 goes on");
     });
 
@@ -8006,6 +8317,19 @@ describe("with the Pi Pocket app", () => {
         );
 
         const source = await supervisor("plan-revise");
+
+        // The tool names the approved graph too: a call with none is refused before any change.
+        await say(app, source, "plan revise no graph test");
+        await until(
+            async () =>
+                (await modelTexts(app, source)).some((each) =>
+                    each.includes(
+                        "A scope change needs graph: the approved graph version that you read.",
+                    ),
+                ),
+            "the refusal of a call with no graph",
+            20_000,
+        );
 
         await say(app, source, "plan revise test");
         await until(
@@ -8304,37 +8628,87 @@ describe("with the Pi Pocket app", () => {
             }),
         );
 
+        // The first plan verify call stops inside itself: after its commit, at the desk's read of its settings for the
+        // export, the app stops. Its tool result never commits, so the harness runs the same call again after the
+        // restart, with the same call id and so the same key.
+        const fsp = createRequire(import.meta.url)("node:fs/promises") as {
+            readFile: (...args: unknown[]) => Promise<unknown>;
+        };
+        const readFileReal = fsp.readFile;
+        let stopping: { closing: Promise<void> } | undefined;
+        let committed: Plan | undefined;
+        let journaledAtStop: number | undefined;
+
+        fsp.readFile = async function (this: unknown, ...args: unknown[]) {
+            const inExport = (new Error().stack ?? "").includes("exportNow");
+
+            if (stopping === undefined && inExport && args[0] === configPath) {
+                const plan = await planSnapshot();
+
+                if (plan?.state === "done") {
+                    committed = plan;
+                    journaledAtStop = (await planThread())?.run.journaled;
+                    stopping = await stopAppInside();
+                }
+            }
+
+            return readFileReal.apply(this, args);
+        };
+
+        syncBuiltinESMExports();
+
         try {
-            await say(app, verify.session as ConversationId, "plan verify pass test");
+            const saying = say(
+                app,
+                verify.session as ConversationId,
+                "plan verify pass test",
+            ).catch(() => undefined);
+
+            await until(async () => stopping !== undefined, "the stop inside the call", 20_000);
+            await stopping?.closing;
+            await saying;
+
+            // At the stop: the round and the close were committed, with 1 journal item; no entry was written.
+            assert.equal(committed?.verification?.rounds.length, 1);
+            assert.equal(committed?.verification?.rounds[0]?.pass, true);
+            assert.notEqual(journaledAtStop, undefined);
+            assert.equal(markers(planId), 0, "no entry is written before the restart");
+
+            fsp.readFile = readFileReal;
+            syncBuiltinESMExports();
+
+            // The restart: the same call runs again under its own key, finds its round, and ends; the journal writes.
+            notesDown = false;
+            shift = 360_000 + 3_600_000;
+            app = await openApp(model, dataDir, () => Date.now() + shift);
+            await startServer();
             await until(
-                async () => (await planSnapshot())?.state === "done",
-                "the verified plan",
-                20_000,
+                async () =>
+                    (await modelTexts(app, verify.session as ConversationId)).some((each) =>
+                        each.includes(`Plan ${planId} is verified and done.`),
+                    ),
+                "the replayed call's result",
+                30_000,
             );
 
             const thread = (await planThread()) ?? assert.fail("the plan thread");
             const after = await deskSnapshot();
             const journaled = thread.run.journaled;
 
+            assert.equal(
+                journaled,
+                journaledAtStop,
+                "the journal marker of the first commit stays",
+            );
             assert.equal(thread.state, "closed");
             assert.equal(thread.closed?.outcome, "verified");
             assert.equal(thread.closed?.by, "desk");
-            assert.notEqual(journaled, undefined);
             assert.equal(
-                (after?.journal?.items ?? []).filter((item) => item.thread === planId).length,
+                thread.events.filter((event) => event.key.startsWith("plan-verified:")).length,
                 1,
+                "1 close",
             );
-            assert.equal(planOf(after, planId)?.verification?.rounds.length, 1);
-            assert.equal(planOf(after, planId)?.verification?.rounds[0]?.pass, true);
-            assert.equal(markers(planId), 0, "no entry is written before the restart");
-
-            // A restart after the close commit, before the write: the entry goes after it, once.
-            await stopTasks("x.desk.sweeper");
-            await app.close();
-            notesDown = false;
-            shift = 360_000 + 3_600_000;
-            app = await openApp(model, dataDir, () => Date.now() + shift);
-            await startServer();
+            assert.equal(planOf(after, planId)?.verification?.rounds.length, 1, "1 round");
             await until(async () => markers(planId) >= 1, "the journal entry", 30_000);
             await until(
                 async () =>
@@ -8369,6 +8743,8 @@ describe("with the Pi Pocket app", () => {
             );
             assert.equal(markers(planId), 1, "1 written entry");
         } finally {
+            fsp.readFile = readFileReal;
+            syncBuiltinESMExports();
             writeFileSync(
                 configPath,
                 JSON.stringify({ digest: { minutes: 0 }, cap: 100, plans: { root: plansFolder } }),
@@ -8628,6 +9004,99 @@ describe("with the Pi Pocket app", () => {
             /This key started plan T\d+ for lucilla: start a new plan with a new key\./,
         );
         assert.equal(app.sessions().length, sessions, "no session started");
+    });
+
+    test("a plan message that every try refuses ends after 3 tries, with 1 event and 1 notice, and no 4th try", async () => {
+        const state0 = await deskSnapshot();
+        const paul =
+            Object.values(state0?.plans ?? {}).find(
+                (each) => each.lead === "paul" && each.state !== "done" && each.state !== "dropped",
+            ) ?? assert.fail("paul's plan");
+
+        // The plan goes to review by hand, so Request changes (with no text) makes 1 durable message.
+        await app.harness.commit(async (tx) => {
+            const state = await tx.doc(DeskThreads);
+            const plan = state.plans?.[paul.thread] ?? assert.fail("the plan");
+
+            plan.state = "review";
+        }, context);
+
+        const held = holdSends(planSendKey, async () => {
+            throw new Error("refused by the test");
+        });
+        const log: string[] = [];
+        const notice = (line: string) =>
+            line.includes("A plan message to") && line.includes("did not go after 3 tries");
+
+        try {
+            const changes = await routes(`plans/${paul.thread}/changes`, { key: "exhaust-key-1" });
+
+            assert.equal(changes.status, 200);
+            await until(async () => held.matched.length >= 1, "try 1", 20_000);
+
+            // Tries 2 and 3: each after a restart with the task clock 61 seconds later.
+            for (const tries of [2, 3]) {
+                await stopTasks("x.desk.sweeper");
+                await stopTasks("x.desk.digest");
+                await app.close();
+                shift += 61_000;
+                app = await openLogged(log);
+                await startServer();
+                await until(
+                    async () => held.matched.length >= tries,
+                    `try ${String(tries)}`,
+                    20_000,
+                );
+            }
+
+            const key = held.matched[0] ?? "";
+            const events = async () =>
+                ((await deskSnapshot())?.threads[paul.thread]?.events ?? []).filter(
+                    (event) => event.key === `plan-send:${key}`,
+                );
+
+            await until(async () => (await events()).length >= 1, "the event", 20_000);
+            await until(async () => log.some(notice), "the notice", 20_000);
+
+            const live = async () =>
+                (await app.harness.inspect(context)).tasks.filter(
+                    (task) =>
+                        task.record.kind === "x.desk.plan-send" &&
+                        JSON.stringify(task.record).includes(key),
+                );
+
+            assert.deepEqual(
+                held.matched,
+                [key, key, key],
+                "3 tries, each with the same request id",
+            );
+            assert.equal((await events()).length, 1, "1 event on the plan thread");
+            assert.match(
+                (await events())[0]?.text ?? "",
+                /did not go after 3 tries: refused by the test/,
+            );
+            assert.equal(log.filter(notice).length, 1, "1 notice, given by host.notice");
+            await until(async () => (await live()).length === 0, "the task ends", 20_000);
+
+            // A restart, and the clock much later: no 4th try.
+            await stopTasks("x.desk.sweeper");
+            await stopTasks("x.desk.digest");
+            await app.close();
+            shift += 600_000;
+            app = await openLogged(log);
+            await startServer();
+            await new Promise((resolve) => setTimeout(resolve, 1500));
+            assert.equal(held.matched.length, 3, "no 4th try");
+            assert.equal((await live()).length, 0);
+            assert.equal(log.filter(notice).length, 1);
+            assert.deepEqual(
+                held.others.filter((each) => planSendKey(each)),
+                [],
+                "no plan send went past the hold",
+            );
+        } finally {
+            held.release();
+        }
     });
 
     test("the roster route gives the leads with a home, the supervisors, and the plan count", async () => {
