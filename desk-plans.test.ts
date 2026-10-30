@@ -3093,16 +3093,22 @@ describe("a task whose start failed", () => {
             closedThreadRefusal({ id: "T5", state: "closed", closed: { why: "done" } }, true),
             words("done"),
         );
-        // A session: a start that worked, and Pocket gives the same session back.
+        // A complete binding: a start that worked, and Pocket gives the same session back.
         assert.equal(
             closedThreadRefusal(
-                { id: "T5", state: "closed", closed: { why: "dropped" }, session: 7 },
+                { id: "T5", state: "closed", closed: { why: "dropped" }, session: 7, address: "a" },
                 true,
             ),
             undefined,
         );
         assert.equal(closedThreadRefusal({ id: "T5", state: "closed" }, false), undefined);
         assert.equal(closedThreadRefusal({ id: "T5", state: "open" }, true), undefined);
+
+        // A session without its address is no complete binding: 1 rule in both helpers, with its words.
+        const half = { id: "T5", state: "closed", closed: { why: "failed" }, session: 7 };
+
+        assert.equal(replayDecision(half), "refuse");
+        assert.equal(closedThreadRefusal(half, true), words("failed"));
     });
 
     test("a call's thread is a replay, a refusal, or work to do", () => {
@@ -4002,6 +4008,50 @@ describe("with the Pi Pocket app", () => {
         assert.equal(dropped.status, 200);
         assert.equal((await planSnapshot())?.state, "dropped");
         assert.equal((await planThread())?.state, "closed");
+    });
+
+    test("an older desk without threadOfKey is refused before any setup", async () => {
+        const source = await supervisor("plan-old-desk");
+        const desk = (globalThis as unknown as Record<symbol, Record<string, unknown> | undefined>)[
+            Symbol.for("pi-pocket-team.desk")
+        ];
+
+        assert(desk, "the desk publishes its API");
+
+        const threads = Object.keys((await deskSnapshot())?.threads ?? {}).length;
+        const worktrees = git(snowRepo, "worktree", "list")
+            .split("\n")
+            .filter((line) => line.trim() !== "").length;
+        const { threadOfKey: _dropped, ...older } = desk;
+
+        (globalThis as unknown as Record<symbol, Record<string, unknown> | undefined>)[
+            Symbol.for("pi-pocket-team.desk")
+        ] = older;
+
+        try {
+            await say(app, source, "plan deliver test");
+            await until(
+                async () =>
+                    (await modelTexts(app, source)).some((each) =>
+                        each.includes("The desk module is older than the Team module"),
+                    ),
+                "the older-desk refusal",
+                20_000,
+            );
+
+            assert.equal(Object.keys((await deskSnapshot())?.threads ?? {}).length, threads);
+            assert.equal(
+                git(snowRepo, "worktree", "list")
+                    .split("\n")
+                    .filter((line) => line.trim() !== "").length,
+                worktrees,
+                "no worktree was made",
+            );
+        } finally {
+            (globalThis as unknown as Record<symbol, Record<string, unknown> | undefined>)[
+                Symbol.for("pi-pocket-team.desk")
+            ] = desk;
+        }
     });
 
     test("the desk gives a thread by its delegation key, with the session it bound", async () => {

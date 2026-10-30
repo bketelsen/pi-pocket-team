@@ -361,11 +361,20 @@ export function worktreeInUse(sessions: readonly { cwd?: string }[], path: strin
  * cannot bring it back. A new call makes a new thread.
  */
 export function closedThreadRefusal(
-    thread: { id: string; state?: string; closed?: { why: string }; session?: number },
+    thread: {
+        id: string;
+        state?: string;
+        closed?: { why: string };
+        session?: number;
+        address?: string;
+    },
     reused: boolean,
 ): string | undefined {
-    // A closed thread with a session was a start that worked: Pocket gives back that same session, so it passes.
-    if (!reused || thread.state !== "closed" || thread.session !== undefined) {
+    // A complete binding (a session and its address) was a start that worked: Pocket gives that session back, so it
+    // passes. Any other closed thread that a call reuses is refused.
+    const bound = thread.session !== undefined && thread.address !== undefined;
+
+    if (!reused || thread.state !== "closed" || bound) {
         return undefined;
     }
 
@@ -2561,6 +2570,13 @@ export default function createTeam(host: Host, web: Web) {
              * A replay of a call whose session is bound does no setup again: no worktree, no open, no start, no bind.
              * A thread that closed before any session was bound is refused. No `threadOfKey` (an older desk): go on.
              */
+            // A desk older than this module cannot tell a replay from new work: refuse before any setup, every path.
+            if (desk !== undefined && desk.threadOfKey === undefined) {
+                throw new Error(
+                    "The desk module is older than the Team module: Brian installs both from 1 checkout (npm run install-extension), then delegates again.",
+                );
+            }
+
             const known =
                 desk?.threadOfKey === undefined
                     ? undefined
