@@ -2445,6 +2445,8 @@ export default function createTeam(host: Host, web: Web) {
             const { agent, task, repository, night_shift, plan } = args;
             const starting = plan?.start === true;
             const delivering = plan !== undefined && !starting;
+            /** The whole-plan check: the lead, in its home, with no repository and no worktree. */
+            const verifying = delivering && plan.task?.trim() === "verify";
 
             // A plan: a start (with repository home), or 1 task of an approved plan. Its rules come first: nothing
             // starts before they hold.
@@ -2500,13 +2502,29 @@ export default function createTeam(host: Host, web: Web) {
             }
 
             const persona = await find(agent);
-            // A plan start runs in the lead's home: it names no repository, so it asks for none.
-            const target = starting
-                ? {
-                      ...(persona.home === undefined ? {} : { folder: persona.home }),
-                      home: true,
-                  }
-                : taskTarget(persona, repository);
+
+            if (verifying) {
+                if (persona.home === undefined) {
+                    throw new Error(
+                        `${persona.name} has no home in its profile: the whole-plan check runs in the lead agent's home, so Brian adds home to ${persona.id}.md.`,
+                    );
+                }
+
+                if (repository !== undefined && repository !== "home") {
+                    throw new Error(
+                        `The whole-plan check runs in the lead agent's home: leave repository out, or name "home".`,
+                    );
+                }
+            }
+
+            // A plan start and the whole-plan check run in the lead's home: they name no repository, so they ask for none.
+            const target =
+                starting || verifying
+                    ? {
+                          ...(persona.home === undefined ? {} : { folder: persona.home }),
+                          home: true,
+                      }
+                    : taskTarget(persona, repository);
             const cwd = target.folder;
 
             if (persona.role === "supervisor") {
