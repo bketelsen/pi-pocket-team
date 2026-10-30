@@ -6,6 +6,7 @@ import { execFileSync } from "node:child_process";
 import {
     chmodSync,
     cpSync,
+    existsSync,
     mkdirSync,
     mkdtempSync,
     readFileSync,
@@ -31,6 +32,7 @@ import {
     until,
 } from "./_pocket/test/helpers.ts";
 import { createHandler } from "./_pocket/src/server/http.ts";
+import { closedThreadRefusal, delegationWorktree, discardRefusedWorktree } from "./team.ts";
 import type { ConversationId } from "@earendil-works/pi-durable";
 import {
     addAsk,
@@ -82,6 +84,7 @@ import {
     planLocks,
     planOf,
     planReplay,
+    planSectionsMade,
     planWriteFlow,
     publishPending,
     readStore,
@@ -399,7 +402,7 @@ describe("the plan file's text", () => {
             parsed.preamble,
             /^# T560 Snow ISO signing\n\n<!-- Written only by the desk\./,
         );
-        assert.equal(parsed.sections[0]?.body, "Sign it.");
+        assert.equal(parsed.sections[0]?.body, "> Sign it.");
         assert.equal(parsed.sections[1]?.body, "None yet.");
         assert.equal(parsed.sections[2]?.body, "No task graph yet.");
     });
@@ -2982,6 +2985,164 @@ describe("a plan whose wake-up is over", () => {
     });
 });
 
+// ─── The last review's fixes ────────────────────────────────────────────────
+
+describe("the idea's own text", () => {
+    test("an idea with a section heading and a fence stays 1 body", () => {
+        const idea = "Sign it.\n\n## Security\n\nThe keys stay in the TPM.\n\n```\na fence\n```";
+        const text = initialPlanText("T1", "Snow ISO signing", idea);
+        const parsed = parsePlanText(text);
+
+        assert.deepEqual(
+            parsed.sections.map((section) => section.id),
+            ["idea", "decisions", "tasks"],
+        );
+        assert.match(parsed.sections[0]?.body ?? "", /## Security/);
+        assert.match(parsed.sections[0]?.body ?? "", /a fence/);
+        assert.equal(parsed.sections[0]?.body.split("\n")[0], "> Sign it.");
+    });
+
+    test("a revision with a section the desk did not make cannot be approved", () => {
+        const { state } = reviewed();
+        const text = [
+            "# T1 Snow ISO signing",
+            "",
+            "## Idea <!-- s:idea -->",
+            "",
+            "Sign it.",
+            "",
+            "## Storage",
+            "",
+            "Keys.",
+            "",
+            "## Decisions <!-- s:decisions -->",
+            "",
+            "None yet.",
+            "",
+            "## Tasks <!-- s:tasks -->",
+            "",
+            "No task graph yet.",
+            "",
+        ].join("\n");
+        const view = planView(state, "T1", text, now);
+
+        assert(!("error" in view));
+        assert.equal(view.canApprove, false);
+        assert.equal(
+            view.approveOff,
+            "This revision has a section the desk did not make: the planning session must write the whole file again.",
+        );
+        assert.deepEqual(
+            view.sections.map((section) => [section.id, section.heading]),
+            [
+                ["idea", "Idea"],
+                ["", "Storage"],
+                ["decisions", "Decisions"],
+                ["tasks", "Tasks"],
+            ],
+        );
+        assert.equal(
+            planSectionsMade(parsePlanText(text).sections, [{ id: "idea", heading: "Idea" }]),
+            false,
+        );
+    });
+});
+
+describe("a task whose start failed", () => {
+    test("its attempt ends, the task is ready, and a new delivery opens a second attempt", () => {
+        const { state, graph } = approvedPlan();
+
+        other(state, "T5");
+        (state.threads.T5 ?? assert.fail("a thread")).state = "starting";
+
+        assert(!("error" in startTask(state, "T1", "t1", "T5", tick(4))));
+
+        const task = graph.tasks[0] ?? assert.fail("a task");
+
+        assert.equal(task.state, "delegated");
+
+        assert(failThread(state, "x.test:T5", "it did not start", tick(5)));
+
+        assert.deepEqual(task.attempts[0]?.end, { at: tick(5), how: "stopped" });
+        assert.equal(task.state, "ready");
+        assert.equal(
+            state.threads.T1?.events.at(-1)?.text,
+            "t1: the start of T5 failed; the task is ready again",
+        );
+
+        // A new delegation, with a new call, opens a second attempt.
+        other(state, "T6");
+        (state.threads.T6 ?? assert.fail("a thread")).state = "starting";
+
+        assert(!("error" in startTask(state, "T1", "t1", "T6", tick(6))));
+        assert.equal(task.attempts.length, 2);
+        assert.equal(task.state, "delegated");
+        assert.deepEqual(state.threads.T6?.planTask, { plan: "T1", task: "t1" });
+    });
+
+    test("a closed thread that a call reuses is refused", () => {
+        assert.equal(
+            closedThreadRefusal({ id: "T5", state: "closed", closed: { why: "failed" } }, true),
+            "This delegation's thread T5 is closed (failed): start it again with a new team_delegate call.",
+        );
+        assert.equal(
+            closedThreadRefusal({ id: "T5", state: "closed" }, true),
+            "This delegation's thread T5 is closed (failed): start it again with a new team_delegate call.",
+        );
+        assert.equal(closedThreadRefusal({ id: "T5", state: "closed" }, false), undefined);
+        assert.equal(closedThreadRefusal({ id: "T5", state: "open" }, true), undefined);
+        assert.equal(
+            closedThreadRefusal({ id: "T5", state: "closed", closed: { why: "done" } }, true),
+            undefined,
+            "a done thread is the replay of a start that worked",
+        );
+        assert.match(
+            closedThreadRefusal({ id: "T5", state: "closed", closed: { why: "dropped" } }, true) ??
+                "",
+            /closed \(dropped\)/,
+        );
+    });
+});
+
+describe("a worktree after a refused open", () => {
+    test("the worktree of the call's key goes, and one with a change stays", async () => {
+        const folder = join(root, "q3-repo");
+
+        repository(folder);
+
+        const made = await delegationWorktree(folder, { agent: "lucilla", key: "x.test:q3" });
+        const path = made?.path ?? assert.fail("a worktree");
+
+        assert.equal(made?.made, true);
+        assert.equal(existsSync(path), true);
+
+        // A restart finds the same worktree, without `made`: a refused open takes it away too.
+        const reused = await delegationWorktree(folder, { agent: "lucilla", key: "x.test:q3" });
+
+        assert.equal(reused?.made, undefined);
+        assert.equal(await discardRefusedWorktree(reused, reused?.path, async () => []), false);
+        assert.equal(existsSync(path), false);
+
+        // A worktree with a change in it stays: nothing is forced.
+        const changed = await delegationWorktree(folder, { agent: "lucilla", key: "x.test:q3b" });
+        const kept = changed?.path ?? assert.fail("a second worktree");
+
+        writeFileSync(join(kept, "mine.txt"), "a change\n");
+
+        await discardRefusedWorktree(changed, changed?.path, async () => []);
+        assert.equal(existsSync(kept), true);
+
+        // A session of this one works in it: it stays, also when it is clean.
+        const busy = await delegationWorktree(folder, { agent: "lucilla", key: "x.test:q3c" });
+
+        assert.equal(
+            await discardRefusedWorktree(busy, busy?.path, async () => [{ cwd: busy?.path ?? "" }]),
+            true,
+        );
+        assert.equal(existsSync(busy?.path ?? ""), true);
+    });
+});
+
 // ─── With the Pi Pocket app ─────────────────────────────────────────────────
 
 const dataDir = join(root, "data");
@@ -3154,6 +3315,16 @@ const model = scriptedModel((request) => {
             task: "Check the signature.",
             plan: { id: planId, task: "t3" },
             night_shift: { stop_when: "the check is done" },
+        });
+    }
+
+    if (text.endsWith("plan fence test")) {
+        return call("team_delegate", {
+            agent: "lucilla",
+            repository: "home",
+            title: "Fenced plan",
+            task: "Sign it.\n\n## Security\n\nThe keys stay in the TPM.\n\n```\na fence\n```",
+            plan: { start: true },
         });
     }
 
@@ -3471,6 +3642,35 @@ describe("with the Pi Pocket app", () => {
         );
 
         assert.equal(Object.keys((await deskSnapshot())?.plans ?? {}).length, plans);
+    });
+
+    test("an idea with a heading and a fence stays 1 section, and the view shows it", async () => {
+        const source = await supervisor("plan-fence");
+
+        await say(app, source, "plan fence test");
+
+        const state = await deskSnapshot();
+        const thread = Object.values(state?.threads ?? {}).find(
+            (each) => each.origin === "plan" && each.title === "Fenced plan",
+        );
+
+        assert(thread, "the start opened a plan thread");
+
+        const plan = planOf(state, thread.id) ?? assert.fail("a plan");
+        const text = await readStore(plansFolder, plan.rev);
+
+        assert.deepEqual(
+            parsePlanText(text).sections.map((each) => each.id),
+            ["idea", "decisions", "tasks"],
+        );
+        assert.match(parsePlanText(text).sections[0]?.body ?? "", /## Security/);
+
+        const view = planView(state, thread.id, text, Date.now());
+
+        assert(!("error" in view));
+        assert.equal(view.sections.length, 3);
+        assert.match(view.sections[0]?.text ?? "", /## Security/);
+        assert.match(view.sections[0]?.text ?? "", /a fence/);
     });
 
     test("plan tasks needs the revision it read", async () => {

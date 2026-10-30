@@ -1228,6 +1228,37 @@ export function failThread(
     thread.closed = { at, why: "failed", by: "desk" };
     addEvent(thread, "failed", `failed: ${oneLine(why)}`, at);
 
+    // A task thread whose start failed: its attempt ends, and the task is ready for a new delegation.
+    const named = thread.planTask;
+
+    if (named !== undefined) {
+        const plan = planOf(state, named.plan);
+        const graph = plan === undefined ? undefined : approvedGraphOf(plan);
+        const task = graph?.tasks.find((each) => each.id === named.task);
+        const attempt = task?.attempts.findLast((each) => each.thread === thread.id);
+
+        if (attempt !== undefined) {
+            attempt.end = { at, how: "stopped" };
+        }
+
+        if (task !== undefined && attempt !== undefined && task.attempts.at(-1) === attempt) {
+            if (task.state === "delegated") {
+                task.state = "ready";
+            }
+
+            const planThread = threadById(state, plan?.thread ?? "");
+
+            if (planThread !== undefined) {
+                addEvent(
+                    planThread,
+                    `plan-task-failed:${named.task}:${thread.id}`,
+                    `${named.task}: the start of ${thread.id} failed; the task is ready again`,
+                    at,
+                );
+            }
+        }
+    }
+
     // A plan whose planning session did not start is dropped: nothing else holds its thread.
     const plan = state.plans?.[thread.id];
 
@@ -10241,16 +10272,36 @@ export function renderPlanText(preamble: string, sections: readonly PlanSectionT
     return `${parts.join("\n\n")}\n`;
 }
 
-/** A new plan file's text: its title, the idea, and the 2 sections of the desk. */
-export function initialPlanText(id: string, title: string, idea: string): string {
-    return renderPlanText(
-        `# ${id} ${flatLine(title)}\n\n<!-- Written only by the desk. Change it with the plan tool. -->`,
-        [
-            { id: "idea", heading: "Idea", body: idea.trim() },
+/** Brian's idea as a Markdown block quote: no line of it can start a section or open a fence. */
+export function quotedIdea(idea: string): string {
+    return idea
+        .trim()
+        .split("\n")
+        .map((line) => (line.trim() === "" ? ">" : `> ${line}`))
+        .join("\n");
+}
+
+/** A new plan file's parts: its title, the idea as a quote, and the 2 sections of the desk. */
+export function initialPlanParts(
+    id: string,
+    title: string,
+    idea: string,
+): { preamble: string; sections: PlanSectionText[] } {
+    return {
+        preamble: `# ${id} ${flatLine(title)}\n\n<!-- Written only by the desk. Change it with the plan tool. -->`,
+        sections: [
+            { id: "idea", heading: "Idea", body: quotedIdea(idea) },
             { id: "decisions", heading: "Decisions", body: "None yet." },
             { id: "tasks", heading: "Tasks", body: "No task graph yet." },
         ],
-    );
+    };
+}
+
+/** A new plan file's text: its title, the idea, and the 2 sections of the desk. */
+export function initialPlanText(id: string, title: string, idea: string): string {
+    const parts = initialPlanParts(id, title, idea);
+
+    return renderPlanText(parts.preamble, parts.sections);
 }
 
 /** An ask's generation: how many answers it had before the current one. */
@@ -12131,6 +12182,29 @@ export function planTaskBrief(plan: Plan, title: string, graph: TaskGraph, task:
     ].join("\n");
 }
 
+/**
+ * Whether a revision's parsed sections are exactly the plan's own: a section the desk did not make (no id, or another
+ * id or heading) means the planning session must write the whole file again.
+ */
+export function planSectionsMade(
+    parsed: readonly { id?: string; heading: string }[],
+    sections: readonly { id: string; heading: string }[],
+): boolean {
+    return (
+        parsed.length === sections.length &&
+        parsed.every((section, at) => {
+            const made = sections[at];
+
+            return (
+                made !== undefined &&
+                section.id !== undefined &&
+                section.id === made.id &&
+                section.heading === made.heading
+            );
+        })
+    );
+}
+
 /** The page's view of 1 plan: its sections with their asks, its graph, and whether Brian can approve. */
 export type PlanView = {
     id: string;
@@ -12196,19 +12270,22 @@ export function planView(
     const draft = draftGraphFor(plan);
     const approval = plan.approvals.at(-1);
     const stored = text !== undefined;
-    const canApprove = stored && settled && plan.state === "review" && draft !== undefined;
+    const parsed = text === undefined ? { preamble: "", sections: [] } : parsePlanText(text);
+    const made = stored && planSectionsMade(parsed.sections, plan.sections);
+    const canApprove = stored && made && settled && plan.state === "review" && draft !== undefined;
     const approveOff = !stored
         ? `The revision ${plan.rev.slice(0, 7)} is not in the store: the plan cannot be approved.`
-        : waiting.length > 0
-          ? waitingText(waiting)
-          : plan.state !== "review"
-            ? approval !== undefined && plan.state !== "drafting"
-                ? `Approved by ${approval.by}: rev ${approval.rev.slice(0, 7)}, graph v${String(approval.graph)}. ${plan.thread} is ${plan.state}.`
-                : `Only a plan in review is approved: ${plan.thread} is ${plan.state}.`
-            : draft === undefined
-              ? `No draft graph for rev ${plan.rev.slice(0, 7)}: call plan tasks.`
-              : undefined;
-    const parsed = text === undefined ? { preamble: "", sections: [] } : parsePlanText(text);
+        : !made
+          ? "This revision has a section the desk did not make: the planning session must write the whole file again."
+          : waiting.length > 0
+            ? waitingText(waiting)
+            : plan.state !== "review"
+              ? approval !== undefined && plan.state !== "drafting"
+                  ? `Approved by ${approval.by}: rev ${approval.rev.slice(0, 7)}, graph v${String(approval.graph)}. ${plan.thread} is ${plan.state}.`
+                  : `Only a plan in review is approved: ${plan.thread} is ${plan.state}.`
+              : draft === undefined
+                ? `No draft graph for rev ${plan.rev.slice(0, 7)}: call plan tasks.`
+                : undefined;
 
     return {
         id: plan.thread,
@@ -12222,49 +12299,47 @@ export function planView(
         preamble: parsed.preamble,
         waiting,
         settled,
-        sections: parsed.sections
-            .filter((section) => section.id !== undefined)
-            .map((section) => {
-                const id = section.id ?? "";
-                const mine = thread.asks.filter((ask) => ask.plan?.section === id);
+        sections: parsed.sections.map((section) => {
+            const id = section.id ?? "";
+            const mine = id === "" ? [] : thread.asks.filter((ask) => ask.plan?.section === id);
 
-                return {
-                    id,
-                    heading: section.heading,
-                    text: section.body,
-                    desk: PLAN_DESK_SECTIONS.some((each) => each.id === id),
-                    asks: mine.map((ask) => {
-                        const gen = askGeneration(ask);
+            return {
+                id,
+                heading: section.heading,
+                text: section.body,
+                desk: PLAN_DESK_SECTIONS.some((each) => each.id === id),
+                asks: mine.map((ask) => {
+                    const gen = askGeneration(ask);
 
-                        return {
-                            id: ask.id,
-                            text: ask.text,
-                            ...(ask.options === undefined ? {} : { options: [...ask.options] }),
-                            open: askIsOpen(ask),
-                            written: ask.written?.gen === gen,
-                            ...(ask.answer === undefined
-                                ? {}
-                                : {
-                                      answer: {
-                                          words: ask.answer.words,
-                                          by: ask.answer.by,
-                                          at: ask.answer.at,
-                                      },
-                                  }),
-                            ...(ask.resolved === undefined
-                                ? {}
-                                : {
-                                      resolved: {
-                                          why: ask.resolved.why,
-                                          ...(ask.resolved.by === undefined
-                                              ? {}
-                                              : { by: ask.resolved.by }),
-                                      },
-                                  }),
-                        };
-                    }),
-                };
-            }),
+                    return {
+                        id: ask.id,
+                        text: ask.text,
+                        ...(ask.options === undefined ? {} : { options: [...ask.options] }),
+                        open: askIsOpen(ask),
+                        written: ask.written?.gen === gen,
+                        ...(ask.answer === undefined
+                            ? {}
+                            : {
+                                  answer: {
+                                      words: ask.answer.words,
+                                      by: ask.answer.by,
+                                      at: ask.answer.at,
+                                  },
+                              }),
+                        ...(ask.resolved === undefined
+                            ? {}
+                            : {
+                                  resolved: {
+                                      why: ask.resolved.why,
+                                      ...(ask.resolved.by === undefined
+                                          ? {}
+                                          : { by: ask.resolved.by }),
+                                  },
+                              }),
+                    };
+                }),
+            };
+        }),
         ...(graph === undefined
             ? {}
             : {
@@ -13288,7 +13363,16 @@ export default function createDesk(host: Host, web: Web) {
 
                 const id = nextThreadId(state);
                 const title = oneLine(request.title);
-                const text = initialPlanText(id, title, start.idea);
+                const parts = initialPlanParts(id, title, start.idea);
+                const text = renderPlanText(parts.preamble, parts.sections);
+
+                // The same rule as a write: the text must read back as the sections the desk made.
+                if (!sectionsMatch(parsePlanText(text), parts)) {
+                    throw new Error(
+                        "The text holds a section heading or an open code fence: write 1 section's body, or the whole file.",
+                    );
+                }
+
                 const secret = secretForm(text);
 
                 // Brian's idea is text from a chat: a secret form in it refuses the start, as a write is refused.
@@ -18105,10 +18189,20 @@ export default function createDesk(host: Host, web: Web) {
                 throw web.error(404, `There is no plan ${id}.`);
             }
 
-            if ((await readStore(planRoot(plan), plan.rev).catch(() => undefined)) === undefined) {
+            const bytes = await readStore(planRoot(plan), plan.rev).catch(() => undefined);
+
+            if (bytes === undefined) {
                 throw web.error(
                     409,
                     `The revision ${plan.rev.slice(0, 7)} is not in the store: the plan cannot be approved.`,
+                );
+            }
+
+            // A section the desk did not make: the planning session must write the whole file again.
+            if (!planSectionsMade(parsePlanText(bytes).sections, plan.sections)) {
+                throw web.error(
+                    409,
+                    "This revision has a section the desk did not make: the planning session must write the whole file again.",
                 );
             }
 

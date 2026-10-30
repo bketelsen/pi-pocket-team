@@ -9,6 +9,7 @@ import setup, {
     planRowLine,
     planStateLine,
     queueStatus,
+    stillMounted,
 } from "./desk-web/index.js";
 
 const NOW = Date.now();
@@ -741,4 +742,10 @@ test("a withdrawn ask says why, and no write-back waits for it", () => {
         }),
         "T560c: Name the rotation period. · resolved: The desk ended it.",
     );
+});
+
+test("an answer that comes after the view left changes nothing", () => {
+    assert.equal(stillMounted({ gone: false }), true);
+    assert.equal(stillMounted({ gone: true }), false);
+    assert.equal(stillMounted(undefined), true);
 });

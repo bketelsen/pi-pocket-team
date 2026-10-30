@@ -71,6 +71,9 @@ export const groupOf = (thread) => {
     return "working";
 };
 
+/** Whether a view is still on the page: an answer that comes after it left changes nothing. */
+export const stillMounted = (life) => life?.gone !== true;
+
 /** A plan row's second line: its state with its asks and lead, or its approval. */
 export const planRowLine = (plan) => {
     if (plan === undefined || plan === null) {
@@ -287,6 +290,8 @@ export default function setup(pocket) {
         const newKey = () =>
             `approve-${Math.random().toString(36).slice(2)}-${Date.now().toString(36)}`;
         const [key, setKey] = useState(newKey);
+        // The view's life: an answer that comes after Brian went back changes nothing, and closes no other page.
+        const [life] = useState(() => ({ gone: false }));
 
         const openPlan = async () => {
             const answer = await pocket.api(`plans/${id}`);
@@ -307,7 +312,10 @@ export default function setup(pocket) {
                     }
                 });
 
-            return () => abort.abort();
+            return () => {
+                abort.abort();
+                life.gone = true;
+            };
         }, [id]);
 
         const approve = async () => {
@@ -320,20 +328,31 @@ export default function setup(pocket) {
                     graph: plan.graph?.version,
                     key,
                 });
+
+                if (!stillMounted(life)) {
+                    return;
+                }
+
                 // The approval is done: a later approval of another revision is a new tap, with a new key.
                 setKey(newKey());
                 await onChanged();
             } catch (failure) {
-                setError(failure.message);
+                if (stillMounted(life)) {
+                    setError(failure.message);
+                }
             } finally {
                 // The plan may have moved, and the desk's news may wait in the next view: load it again either way.
-                try {
-                    await openPlan();
-                } catch {
-                    // The error above stays, and the view that is there stays too.
+                if (stillMounted(life)) {
+                    try {
+                        await openPlan();
+                    } catch {
+                        // The error above stays, and the view that is there stays too.
+                    }
                 }
 
-                setBusy(false);
+                if (stillMounted(life)) {
+                    setBusy(false);
+                }
             }
         };
 
@@ -344,11 +363,24 @@ export default function setup(pocket) {
 
             try {
                 await pocket.api(`threads/${id}/drop`, { reason: why.trim() });
+
+                // Brian went back while the drop ran: the page he is on now must not close.
+                if (!stillMounted(life)) {
+                    return;
+                }
+
                 await onChanged();
+
+                if (!stillMounted(life)) {
+                    return;
+                }
+
                 onBack();
             } catch (failure) {
-                setError(failure.message);
-                setBusy(false);
+                if (stillMounted(life)) {
+                    setError(failure.message);
+                    setBusy(false);
+                }
             }
         };
 

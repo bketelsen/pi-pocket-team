@@ -357,6 +357,49 @@ export function worktreeInUse(sessions: readonly { cwd?: string }[], path: strin
 }
 
 /**
+ * A desk thread this call reuses, but that is closed, takes no session: its start failed before, and the same call
+ * cannot bring it back. A new call makes a new thread.
+ */
+export function closedThreadRefusal(
+    thread: { id: string; state?: string; closed?: { why: string } },
+    reused: boolean,
+): string | undefined {
+    // A done thread is a replay of a start that worked: Pocket gives back the same session, and nothing starts again.
+    if (!reused || thread.state !== "closed" || thread.closed?.why === "done") {
+        return undefined;
+    }
+
+    return `This delegation's thread ${thread.id} is closed (${thread.closed?.why ?? "failed"}): start it again with a new team_delegate call.`;
+}
+
+/**
+ * Take away the worktree of a delegation whose desk thread did not open: a refused open proves that no desk thread holds
+ * it, whether this call made the worktree or found the one its key made before (a restart). It keeps the folder when a
+ * linked session of this one works in it, or when the list cannot be read, and it never forces.
+ */
+export async function discardRefusedWorktree(
+    worktree: DelegationWorktree | undefined,
+    where: string | undefined,
+    sessions: () => Promise<readonly { cwd?: string }[]>,
+): Promise<boolean> {
+    if (worktree?.path === undefined) {
+        return false;
+    }
+
+    const path = where ?? worktree.path;
+    const kept = await sessions().then(
+        (list) => worktreeInUse(list, path),
+        () => true,
+    );
+
+    if (!kept) {
+        await discardWorktree(worktree);
+    }
+
+    return kept;
+}
+
+/**
  * Take away a worktree and its branch that a start this call made does not need, after Pi Pocket refused that start.
  * Nothing is forced: git removes a folder only when it is unchanged, and the branch goes with `-d`; `-D` only when `-d`
  * refuses and the branch holds no commit of its own beyond its base.
@@ -1643,7 +1686,12 @@ export default function createTeam(host: Host, web: Web) {
      * The desk module's API, from a global: team.ts must not import desk.ts. A static import would keep a stale copy
      * after a reload.
      */
-    type DeskThread = { id: string; watch?: { checkOn: string; checkTime?: string } };
+    type DeskThread = {
+        id: string;
+        state?: "starting" | "open" | "parked" | "closed";
+        closed?: { why: string };
+        watch?: { checkOn: string; checkTime?: string };
+    };
     type DeskApi = {
         version: number;
         open: (
@@ -2462,6 +2510,14 @@ export default function createTeam(host: Host, web: Web) {
 
                 desk?.changed?.();
 
+                if (opened !== undefined) {
+                    const refused = closedThreadRefusal(opened.thread, opened.reused);
+
+                    if (refused !== undefined) {
+                        throw new Error(refused);
+                    }
+                }
+
                 // The owner's profile names the model, and the owner's allowed list permits it.
                 const preferred = allowedModel(persona);
                 let started: Awaited<ReturnType<typeof host.linkedSessions.start>>;
@@ -2589,21 +2645,24 @@ ${task}`,
                               context,
                           );
             } catch (error) {
-                // This call made a worktree a moment ago, and the thread never opened: take it away, so no branch or
-                // folder is left behind. Not when a session of this 1 already works in it, and not when the list cannot
+                // The thread never opened: no desk thread holds the worktree of this key, so the one this call made, or
+                // found (a restart), goes again. Not when a session of this 1 works in it, and not when the list cannot
                 // be read: then the folder stays.
-                if (worktree?.made === true) {
-                    const kept = await host.linkedSessions.list(api.conversationId).then(
-                        (sessions) => worktreeInUse(sessions, where ?? ""),
-                        () => true,
-                    );
-
-                    if (!kept) {
-                        await discardWorktree(worktree);
-                    }
-                }
+                await discardRefusedWorktree(worktree, where, () =>
+                    host.linkedSessions.list(api.conversationId),
+                );
 
                 throw error;
+            }
+
+            // A thread this call reuses, but that is closed, takes no session: its start failed before. Its worktree is
+            // the closed thread's, and the desk's sweep removes it, so it stays here.
+            if (opened !== undefined) {
+                const refused = closedThreadRefusal(opened.thread, opened.reused);
+
+                if (refused !== undefined) {
+                    throw new Error(refused);
+                }
             }
 
             // The new thread shows on the desk page at once, not at the next sweep.
