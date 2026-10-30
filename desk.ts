@@ -14139,6 +14139,126 @@ export function planSectionsMade(
     );
 }
 
+// ─── Plans: the changes since the last approval ─────────────────────────────
+
+/** 1 line of a line diff: kept, removed or added. */
+export type DiffLine = { op: " " | "-" | "+"; text: string };
+
+/** The most lines 1 section's diff gives, and the most cells the line table may have before the diff gives up. */
+export const DIFF_MAX_LINES = 200;
+const DIFF_MAX_CELLS = 4_000_000;
+
+/**
+ * A line diff of 2 texts, by the longest common subsequence of their lines: at most `max` lines out, and `cut` when
+ * there were more. 2 texts too long for the table are 1 removal and 1 addition of every line.
+ */
+export function lineDiff(
+    before: string,
+    after: string,
+    max = DIFF_MAX_LINES,
+): { lines: DiffLine[]; cut: boolean } {
+    const a = before === "" ? [] : before.split("\n");
+    const b = after === "" ? [] : after.split("\n");
+    const all: DiffLine[] = [];
+
+    if ((a.length + 1) * (b.length + 1) > DIFF_MAX_CELLS) {
+        all.push(...a.map((text) => ({ op: "-" as const, text })));
+        all.push(...b.map((text) => ({ op: "+" as const, text })));
+    } else {
+        // table[i][j]: the common lines of a[i..] and b[j..].
+        const width = b.length + 1;
+        const table = new Uint32Array((a.length + 1) * width);
+
+        for (let i = a.length - 1; i >= 0; i -= 1) {
+            for (let j = b.length - 1; j >= 0; j -= 1) {
+                table[i * width + j] =
+                    a[i] === b[j]
+                        ? (table[(i + 1) * width + j + 1] ?? 0) + 1
+                        : Math.max(table[(i + 1) * width + j] ?? 0, table[i * width + j + 1] ?? 0);
+            }
+        }
+
+        let i = 0;
+        let j = 0;
+
+        while (i < a.length || j < b.length) {
+            if (i < a.length && j < b.length && a[i] === b[j]) {
+                all.push({ op: " ", text: a[i] ?? "" });
+                i += 1;
+                j += 1;
+            } else if (
+                j < b.length &&
+                (i >= a.length ||
+                    (table[i * width + j + 1] ?? 0) >= (table[(i + 1) * width + j] ?? 0))
+            ) {
+                all.push({ op: "+", text: b[j] ?? "" });
+                j += 1;
+            } else {
+                all.push({ op: "-", text: a[i] ?? "" });
+                i += 1;
+            }
+        }
+    }
+
+    return { lines: all.slice(0, max), cut: all.length > max };
+}
+
+/** 1 section that changed since the approval: its heading now (or then, when it is gone), and its line diff. */
+export type PlanChange = {
+    id: string;
+    heading: string;
+    how: "changed" | "added" | "removed";
+    lines: DiffLine[];
+    cut: boolean;
+};
+
+/**
+ * The sections whose text differs between the approved revision and the revision now, in the order of the text now
+ * (a removed section last): the page's "Changes since the last approval". The heading counts as part of the text.
+ */
+export function planChanges(approved: string, current: string): PlanChange[] {
+    const then = parsePlanText(approved).sections;
+    const now = parsePlanText(current).sections;
+    const key = (section: PlanSectionText, at: number): string => section.id ?? `#${String(at)}`;
+    const thenById = new Map(then.map((section, at) => [key(section, at), section]));
+    const changes: PlanChange[] = [];
+    const seen = new Set<string>();
+
+    for (const [at, section] of now.entries()) {
+        const id = key(section, at);
+        const old = thenById.get(id);
+
+        seen.add(id);
+
+        const before = old === undefined ? "" : `## ${old.heading}\n${old.body}`;
+        const after = `## ${section.heading}\n${section.body}`;
+
+        if (before === after) {
+            continue;
+        }
+
+        changes.push({
+            id: section.id ?? "",
+            heading: section.heading,
+            how: old === undefined ? "added" : "changed",
+            ...lineDiff(before, after),
+        });
+    }
+
+    for (const [at, section] of then.entries()) {
+        if (!seen.has(key(section, at))) {
+            changes.push({
+                id: section.id ?? "",
+                heading: section.heading,
+                how: "removed",
+                ...lineDiff(`## ${section.heading}\n${section.body}`, ""),
+            });
+        }
+    }
+
+    return changes;
+}
+
 /** The page's view of 1 plan: its sections with their asks, its graph, and whether Brian can approve. */
 export type PlanView = {
     id: string;
@@ -14195,6 +14315,17 @@ export type PlanView = {
     revising?: { at: number; by: string; why: string; tasks: string[] };
     /** Brian can Stop and revise: the plan is approved, building or verifying, and no scope change is in force. */
     canRevise: boolean;
+    /** The graph in force, with each task's state and attempts: absent before the first approval. */
+    approvedGraph?: { version: number; tasks: PlanTask[] };
+    /** The whole-plan check: its threads, and each round's result, oldest first. */
+    verification?: Verification;
+    /** The failed rounds since the approval, and the budget: 4. */
+    budget: { failed: number; max: number };
+    /**
+     * The sections that changed since the last approval, with a line diff: absent before an approval, and when the
+     * approved revision is not in the store.
+     */
+    changes?: PlanChange[];
 };
 
 /** The page's view of 1 plan, from the state and the bytes the store keeps for its revision. */
@@ -14203,6 +14334,8 @@ export function planView(
     planId: string,
     text: string | undefined,
     now: number,
+    /** The bytes of the last approved revision, from the store: the changes since it. */
+    approvedText?: string,
 ): PlanView | { error: string } {
     const plan = planOf(state, planId);
     const thread = plan === undefined ? undefined : threadById(state, plan.thread);
@@ -14341,6 +14474,25 @@ export function planView(
                   },
               }),
         canRevise: plan.revising === undefined && SCOPE_STATES.includes(plan.state),
+        ...(approvedGraphOf(plan) === undefined
+            ? {}
+            : {
+                  approvedGraph: {
+                      version: approvedGraphOf(plan)?.version ?? 0,
+                      tasks: JSON.parse(
+                          JSON.stringify(approvedGraphOf(plan)?.tasks ?? []),
+                      ) as PlanTask[],
+                  },
+              }),
+        ...(plan.verification === undefined
+            ? {}
+            : {
+                  verification: JSON.parse(JSON.stringify(plan.verification)) as Verification,
+              }),
+        budget: { failed: failedRounds(plan), max: VERIFY_BUDGET },
+        ...(approval === undefined || approvedText === undefined || text === undefined
+            ? {}
+            : { changes: planChanges(approvedText, text) }),
     };
 }
 
@@ -15029,6 +15181,8 @@ type TeamMember = {
     name: string;
     role: TeamRole;
     repositories?: Record<string, string>;
+    /** The agent's home: a plan's lead needs one. */
+    home?: string;
 };
 
 type TeamApi = {
@@ -20356,6 +20510,39 @@ export default function createDesk(host: Host, web: Web) {
         { access: "owner" },
     );
 
+    // New plan's facts for the page: the leads (roster agents with a home), the supervisor conversations the desk
+    // knows (newest first), and how many plans are open of the most. Read only.
+    web.route(
+        "GET",
+        "roster",
+        async (request) => {
+            const team = teamApi();
+            const state = await accessOfRequest(request).read();
+            const { plans: planConfig } = await deskConfig();
+            const members = team === undefined ? [] : await team.roster();
+
+            return {
+                leads: members
+                    .filter(
+                        (member) =>
+                            member.role === "agent" &&
+                            typeof member.home === "string" &&
+                            member.home !== "",
+                    )
+                    .map((member) => ({ id: member.id, name: member.name })),
+                supervisors: boundSupervisors(state).map((each) => each.supervisor),
+                plans: {
+                    open: Object.values(state?.plans ?? {}).filter(
+                        (plan) => plan.state !== "done" && plan.state !== "dropped",
+                    ).length,
+                    max: planConfig.max,
+                },
+                startPlan: team?.startPlan !== undefined,
+            };
+        },
+        { access: "owner" },
+    );
+
     web.route(
         "GET",
         "plans/:id",
@@ -20374,7 +20561,15 @@ export default function createDesk(host: Host, web: Web) {
             }
 
             const text = await readStore(planRoot(plan), plan.rev).catch(() => undefined);
-            const view = planView(state, id, text, Date.now());
+            const approved = plan.approvals.at(-1);
+            // The approved revision's bytes, for the changes since it: none when it is the revision now.
+            const approvedText =
+                approved === undefined
+                    ? undefined
+                    : approved.rev === plan.rev
+                      ? text
+                      : await readStore(planRoot(plan), approved.rev).catch(() => undefined);
+            const view = planView(state, id, text, Date.now(), approvedText);
 
             if ("error" in view) {
                 throw web.error(404, view.error);

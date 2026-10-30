@@ -4,6 +4,28 @@ import { test } from "node:test";
 import setup, {
     answerBody,
     approveLabel,
+    attemptLine,
+    commentLine,
+    diffText,
+    forgetKey,
+    historyLine,
+    isConflict,
+    revisingLine,
+    withoutAsk,
+    keyFor,
+    markKey,
+    markText,
+    newKey,
+    newPlanBody,
+    newPlanState,
+    nextMark,
+    planAnswerBody,
+    reopenIsScope,
+    roundLine,
+    taskLine,
+    tasksSummary,
+    toggleTask,
+    withMark,
     badgeOf,
     groupOf,
     planAskLine,
@@ -318,7 +340,10 @@ test("a found thread with an open ask is under Needs you, with its ask card and 
         },
     );
 
-    const need = out.slice(out.indexOf("<h2>Needs you"), out.indexOf("</section>"));
+    const need = out.slice(
+        out.indexOf("<h2>Needs you"),
+        out.indexOf("</section>", out.indexOf("<h2>Needs you")),
+    );
 
     assert.match(need, /F2/);
     assert.match(need, /T1a · Which one\?/);
@@ -355,7 +380,10 @@ test("a watched thread with an open ask is under Needs you, with its ask card an
         },
     );
 
-    const need = out.slice(out.indexOf("<h2>Needs you"), out.indexOf("</section>"));
+    const need = out.slice(
+        out.indexOf("<h2>Needs you"),
+        out.indexOf("</section>", out.indexOf("<h2>Needs you")),
+    );
 
     assert.match(need, /T3/);
     assert.match(need, /T1a · Which one\?/);
@@ -605,7 +633,10 @@ test("a thread closed with an open ask shows in Needs you with its answer contro
         },
     );
 
-    const need = out.slice(out.indexOf("<h2>Needs you"), out.indexOf("</section>"));
+    const need = out.slice(
+        out.indexOf("<h2>Needs you"),
+        out.indexOf("</section>", out.indexOf("<h2>Needs you")),
+    );
 
     assert.match(need, /T406/);
     assert.match(need, /T406b · Keep the old blob store\?/);
@@ -636,7 +667,10 @@ test("a closed found thread with an open ask and a watch shows the answer contro
             }),
         ],
     });
-    const need = out.slice(out.indexOf("<h2>Needs you"), out.indexOf("</section>"));
+    const need = out.slice(
+        out.indexOf("<h2>Needs you"),
+        out.indexOf("</section>", out.indexOf("<h2>Needs you")),
+    );
 
     assert.match(need, /F7a · Adopt it\?/);
     assert.match(need, /aria-label=Answered F7a/);
@@ -755,4 +789,201 @@ test("a page answer sends the generation of a plan ask, and none for another ask
     assert.deepEqual(answerBody("TPM", 0), { words: "TPM", gen: 0 });
     assert.deepEqual(answerBody("TPM", 2), { words: "TPM", gen: 2 });
     assert.deepEqual(answerBody("yes", undefined), { words: "yes" });
+});
+
+// ─── Plan acts (part E) ─────────────────────────────────────────────────────
+
+test("an act's key is made once in a view, and a done act gets a new one", () => {
+    const keys = {};
+    let made = 0;
+    const make = (act) => `${act}-key-${++made}`;
+
+    assert.equal(keyFor(keys, "approve", make), "approve-key-1");
+    assert.equal(keyFor(keys, "approve", make), "approve-key-1", "a second tap sends the same key");
+    assert.equal(keyFor(keys, "comment-idea", make), "comment-idea-key-2");
+    forgetKey(keys, "approve");
+    assert.equal(keyFor(keys, "approve", make), "approve-key-3");
+    assert.match(newKey("reopen-T560b"), /^reopen-T560b-[a-z0-9]+-[a-z0-9]+$/);
+    assert.match(newKey("a b"), /^[A-Za-z0-9_-]{8,100}$/);
+});
+
+test("a 409 is a conflict: the view loads again", () => {
+    assert.equal(isConflict({ status: 409 }), true);
+    assert.equal(isConflict({ status: 400 }), false);
+    assert.equal(isConflict(undefined), false);
+});
+
+test("a marks cell goes blank, yes, partly, no, and blank again", () => {
+    assert.equal(markKey(1, "r2"), "1/r2");
+    assert.equal(nextMark(undefined), "yes");
+    assert.equal(nextMark("yes"), "partly");
+    assert.equal(nextMark("partly"), "no");
+    assert.equal(nextMark("no"), undefined);
+    assert.equal(markText(undefined), "·");
+    assert.equal(markText("partly"), "partly");
+
+    const marks = withMark({ "0/r1": "yes" }, "1/r1", "no");
+
+    assert.deepEqual(marks, { "0/r1": "yes", "1/r1": "no" });
+    assert.deepEqual(
+        withMark(marks, "0/r1", undefined),
+        { "1/r1": "no" },
+        "a blank cell is no key",
+    );
+    assert.deepEqual(withMark(undefined, "0/r1", "yes"), { "0/r1": "yes" });
+});
+
+test("a plan answer sends the generation, and a why and marks only when there are some", () => {
+    assert.deepEqual(planAnswerBody("TPM", 1, "  ", undefined), { words: "TPM", gen: 1 });
+    assert.deepEqual(planAnswerBody("TPM", 0, " No new hardware. ", { "0/r1": "yes" }), {
+        words: "TPM",
+        gen: 0,
+        why: "No new hardware.",
+        marks: { "0/r1": "yes" },
+    });
+});
+
+test("a reopen after the approval is a scope change; the task list toggles", () => {
+    assert.equal(reopenIsScope({ state: "drafting" }), false);
+    assert.equal(reopenIsScope({ state: "review" }), false);
+    assert.equal(reopenIsScope({ state: "building" }), true);
+    assert.equal(reopenIsScope({ state: "verifying" }), true);
+    assert.deepEqual(toggleTask(["t1"], "t2"), ["t1", "t2"]);
+    assert.deepEqual(toggleTask(["t1", "t2"], "t1"), ["t2"]);
+});
+
+test("New plan is off, and says why, until a supervisor, a lead and a place are there", () => {
+    const info = (patch = {}) => ({
+        startPlan: true,
+        supervisors: [42, 7],
+        leads: [{ id: "lucilla", name: "Lucilla" }],
+        plans: { open: 1, max: 3 },
+        ...patch,
+    });
+
+    assert.deepEqual(newPlanState(null), { off: "Reading the roster." });
+    assert.match(newPlanState(info({ startPlan: false })).off, /Team module is off or older/);
+    assert.match(
+        newPlanState(info({ supervisors: [] })).off,
+        /needs the supervisor's conversation/,
+    );
+    assert.equal(
+        newPlanState(info({ plans: { open: 3, max: 3 } })).off,
+        "3 plans are open (plans.max 3): a plan must finish or be dropped first.",
+    );
+    assert.match(newPlanState(info({ leads: [] })).off, /No roster agent/);
+    assert.deepEqual(newPlanState(info()), { supervisor: 42, pick: true }, "the newest supervisor");
+    assert.deepEqual(newPlanState(info(), 7), { supervisor: 7, pick: true }, "Brian's pick");
+    assert.deepEqual(newPlanState(info(), 99), { supervisor: 42, pick: true }, "an unknown pick");
+    assert.deepEqual(newPlanState(info({ supervisors: [42] })), { supervisor: 42, pick: false });
+});
+
+test("the New plan body is checked, and the model goes only when it is set", () => {
+    assert.deepEqual(
+        newPlanBody(
+            { title: " Keys ", idea: " Rotate them. ", lead: "lucilla", model: " " },
+            "k-1",
+        ),
+        { body: { title: "Keys", idea: "Rotate them.", lead: "lucilla", key: "k-1" } },
+    );
+    assert.deepEqual(
+        newPlanBody({ title: "Keys", idea: "Rotate.", lead: "lucilla", model: "a/b" }, "k-1").body
+            .model,
+        "a/b",
+    );
+    assert.match(newPlanBody({ title: "", idea: "x", lead: "l" }, "k").error, /title/);
+    assert.match(newPlanBody({ title: "t", idea: "x".repeat(201), lead: "l" }, "k").error, /idea/);
+    assert.match(newPlanBody({ title: "t", idea: "x", lead: "" }, "k").error, /lead/);
+});
+
+test("tasks, attempts, rounds, comments and diff lines read as 1 line each", () => {
+    assert.equal(
+        attemptLine({
+            thread: "T575",
+            prs: [
+                { ref: "frostyard/snow#3", head: "abcdef0123456789" },
+                { ref: "frostyard/snow#4" },
+            ],
+            end: { how: "merged" },
+        }),
+        "T575 · merged · frostyard/snow#3 at abcdef0 · frostyard/snow#4",
+    );
+    assert.equal(
+        attemptLine({
+            thread: "T576",
+            prs: [],
+            end: { how: "no-change", noChange: { reason: "It signs already.", evidence: "x" } },
+        }),
+        "T576 · no-change · no change: It signs already.",
+    );
+    assert.equal(attemptLine({ thread: "T577", prs: [] }), "T577 · open");
+    assert.equal(
+        taskLine({
+            agent: "teg",
+            repo: "frostyard/nsl",
+            state: "done",
+            deps: ["t1"],
+            carried: { why: "It merged." },
+        }),
+        "teg · frostyard/nsl · done · deps: t1 · carried: It merged.",
+    );
+    assert.equal(
+        tasksSummary({ version: 2, tasks: [{ state: "done" }, { state: "ready" }] }),
+        "Tasks (graph v2: 2 tasks, 1 done)",
+    );
+    assert.equal(
+        roundLine({
+            pass: false,
+            reviewer: "openai/gpt-6.1-sol",
+            tasks: [
+                { task: "t1", pass: true },
+                { task: "t2", pass: false },
+            ],
+        }),
+        "failed · openai/gpt-6.1-sol · failed: t2",
+    );
+    assert.equal(
+        commentLine({ id: "c3", by: "Brian", text: "Name the period.", state: "open" }),
+        "c3 Brian: Name the period.",
+    );
+    assert.equal(
+        commentLine({
+            id: "c3",
+            by: "Brian",
+            text: "x",
+            state: "done",
+            settled: { rev: "3f2a9c1d4e" },
+        }),
+        "c3 Brian: x · settled by rev 3f2a9c1",
+    );
+    assert.equal(diffText({ op: "+", text: "new" }), "+ new");
+});
+
+test("the Plans section shows New plan, off with its reason before the roster is read", async () => {
+    const out = await render({ ...viewWith(null), plans: [] });
+
+    assert.match(out, /Plans <span class="desk-count">0/);
+    assert.match(out, /New plan/);
+    assert.match(out, /Reading the roster\./);
+});
+
+test("a reopen's history, a scope change and a cleared draft read right", () => {
+    assert.equal(
+        historyLine({
+            history: [
+                { answer: { words: "TPM", by: "Brian" } },
+                { answer: { words: "A file", by: "Brian" } },
+            ],
+        }),
+        "Earlier: TPM (Brian) · A file (Brian)",
+    );
+    assert.equal(
+        revisingLine({ by: "Brian", why: "The key moves.", tasks: [] }),
+        "Under revision (Brian): The key moves. · stopped: none",
+    );
+    assert.equal(
+        revisingLine({ by: "Brian", why: "x", tasks: ["t1", "t2"] }),
+        "Under revision (Brian): x · stopped: t1, t2",
+    );
+    assert.deepEqual(withoutAsk({ T1a: { "0/r1": "yes" }, T1b: {} }, "T1a"), { T1b: {} });
 });

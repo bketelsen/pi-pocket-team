@@ -55,6 +55,8 @@ import {
     dismissPlanComment,
     reopenPlanAsk,
     requestChanges,
+    lineDiff,
+    planChanges,
     planFacts,
     planNoChange,
     recordVerify,
@@ -5516,6 +5518,100 @@ describe("the task and verify briefs", () => {
     });
 });
 
+// ─── PR 2, part E: the view's changes, tasks and checks ─────────────────────
+
+describe("the changes since the last approval", () => {
+    test("a line diff keeps, removes and adds lines by their longest common run", () => {
+        assert.deepEqual(lineDiff("a\nb\nc", "a\nx\nc"), {
+            lines: [
+                { op: " ", text: "a" },
+                { op: "+", text: "x" },
+                { op: "-", text: "b" },
+                { op: " ", text: "c" },
+            ],
+            cut: false,
+        });
+        assert.deepEqual(lineDiff("", "new"), { lines: [{ op: "+", text: "new" }], cut: false });
+        assert.deepEqual(lineDiff("same", "same").lines, [{ op: " ", text: "same" }]);
+    });
+
+    test("a long diff is cut at 200 lines, and says so", () => {
+        const after = Array.from({ length: 300 }, (_, at) => `line ${String(at)}`).join("\n");
+        const diff = lineDiff("", after);
+
+        assert.equal(diff.lines.length, 200);
+        assert.equal(diff.cut, true);
+    });
+
+    test("only the sections that changed are listed: changed, added and removed", () => {
+        const approved = renderPlanText("# T1", [
+            { id: "idea", heading: "Idea", body: "Sign it." },
+            { id: "keys", heading: "Keys", body: "In the TPM." },
+            { id: "old", heading: "Old", body: "Gone soon." },
+        ]);
+        const now = renderPlanText("# T1", [
+            { id: "idea", heading: "Idea", body: "Sign it." },
+            { id: "keys", heading: "Keys", body: "On a YubiKey." },
+            { id: "new", heading: "New", body: "Added." },
+        ]);
+        const changes = planChanges(approved, now);
+
+        assert.deepEqual(
+            changes.map((each) => [each.id, each.how]),
+            [
+                ["keys", "changed"],
+                ["new", "added"],
+                ["old", "removed"],
+            ],
+        );
+        assert(changes[0]?.lines.some((line) => line.op === "+" && line.text === "On a YubiKey."));
+        assert(changes[0]?.lines.some((line) => line.op === "-" && line.text === "In the TPM."));
+        assert.deepEqual(planChanges(now, now), []);
+    });
+
+    test("the view has the changes, the approved graph with its attempts, the checks and the budget", () => {
+        const { state, plan } = buildingPlan();
+        const approved = file;
+        const before = planView(state, "T1", file, now, approved);
+
+        assert(!("error" in before));
+        assert.deepEqual(before.changes, []);
+        assert.equal(before.approvedGraph?.version, 1);
+        assert.equal(
+            before.approvedGraph?.tasks.find((task) => task.id === "t1")?.attempts[0]?.thread,
+            "T2",
+        );
+        assert.deepEqual(before.budget, { failed: 0, max: 4 });
+        assert.equal(before.verification, undefined);
+
+        const changed = approved.replace(
+            "Sign the ISO with the TPM key.",
+            "Sign the ISO with a YubiKey.",
+        );
+        const after = planView(state, "T1", changed, now, approved);
+
+        assert(!("error" in after));
+        assert.deepEqual(
+            after.changes?.map((each) => each.id),
+            ["idea"],
+        );
+        assert.equal(planView(state, "T1", file, now) instanceof Object, true);
+        assert.equal(
+            (planView(state, "T1", file, now) as { changes?: unknown }).changes,
+            undefined,
+        );
+
+        plan.verification = { threads: ["T9"], rounds: [] };
+        assert.deepEqual(
+            (planView(state, "T1", file, now) as { verification?: unknown }).verification,
+            {
+                threads: ["T9"],
+                rounds: [],
+            },
+        );
+    });
+});
+
 // ─── With the Pi Pocket app ─────────────────────────────────────────────────
 
 const dataDir = join(root, "data");
@@ -7277,5 +7373,19 @@ describe("with the Pi Pocket app", () => {
                 Symbol.for("pi-pocket-team.team")
             ] = team;
         }
+    });
+
+    test("the roster route gives the leads with a home, the supervisors, and the plan count", async () => {
+        const roster = await routes("roster");
+
+        assert.equal(roster.status, 200);
+        assert.deepEqual((roster.data.leads as { id: string }[]).map((each) => each.id).sort(), [
+            "lucilla",
+            "paul",
+            "teg",
+        ]);
+        assert((roster.data.supervisors as number[]).length > 0, "the desk knows a supervisor");
+        assert.equal(roster.data.plans.max, 3);
+        assert.equal(roster.data.startPlan, true);
     });
 });
