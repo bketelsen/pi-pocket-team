@@ -207,7 +207,8 @@ type PlanTask = {
     state: "waiting" | "ready" | "delegated" | "done" | "stopped";
     /**
      * Every delivery of the task, oldest first: the first one, and 1 more for each repair after a failed verification.
-     * An attempt is never removed or changed after it ends; a repair adds a new one.
+     * An attempt is never removed or changed after it ends; a repair adds a new one. A failed verification does not
+     * change an attempt: the round records it (`Verification.rounds`).
      */
     attempts: {
         thread: string; // the task thread
@@ -216,7 +217,7 @@ type PlanTask = {
         prs: { ref: string; head?: string }[];
         end?: {
             at: number;
-            how: "merged" | "no-change" | "stopped" | "failed-check";
+            how: "merged" | "no-change" | "stopped";
             noChange?: { reason: string; evidence: string }; // at most 1000 and 5000 characters
         };
     }[];
@@ -291,7 +292,13 @@ A `plan write` (and every desk write: decisions, tasks) goes in 4 steps:
    stale write) and change nothing. Then set `Plan.rev`, add the entry to `revs`, set `written` on the asks it names,
    and set `pending` with the call's key. The commit is the serial point: of 2 writes from the same revision, only the
    first commits.
-4. Publish: copy the store file over the plan file (a temporary file, then a rename), then 1 commit clears `pending`.
+4. Publish, under the plan's publish lock: read `Plan.rev` and `pending` fresh; copy the store file of **that**
+   `Plan.rev` (not the caller's revision) over the plan file (a temporary file, then a rename); then 1 commit clears
+   `pending` only when its key is still the key that this publisher read.
+
+The publish lock is 1 promise chain for each plan, in the server process (Pi Pocket runs 1 process; a restart drops
+the lock with the process). So 2 publishers never overlap, and a late one publishes the newest revision, never an older
+one: the file always moves toward `Plan.rev`, and a `pending` of a newer write stays until its own revision is out.
 
 Recovery: a sweep, and every `plan` call, first finishes a `pending` write (step 4 again, from the store). A replay
 of the call finds its key in `revs` and returns the first result. Approve and `plan ready` are refused while `pending`
@@ -301,18 +308,19 @@ is set. Approval and verification read the bytes from the store by revision, nev
 
 ### 5.1 The plan
 
-| From                   | To          | When                                                                     | Who                          |
-| ---------------------- | ----------- | ------------------------------------------------------------------------ | ---------------------------- |
-| (none)                 | `drafting`  | a start: page button, `team_delegate` with `plan.start`                  | Brian, Odrade                |
-| `drafting`             | `review`    | `plan ready`, with the gate clear and a draft graph for this revision    | planning session             |
-| `review`               | `drafting`  | a write, a new ask, a new comment, or Brian's "Request changes"          | planning session, Brian      |
-| `review`               | `approved`  | "Approve" on the page, for the revision and graph version that it showed | Brian only                   |
-| `approved`             | `building`  | the first task thread opens                                              | the desk, on `team_delegate` |
-| `approved`, `building` | `drafting`  | a scope change: `plan revise`, or Brian's "Stop and revise"              | task agent, Odrade, Brian    |
-| `building`             | `verifying` | every task is `done`                                                     | the desk, in a sweep         |
-| `verifying`            | `building`  | the check failed: the failed tasks go back to `ready`                    | the desk, on `plan verify`   |
-| `verifying`            | `done`      | the check passed; the plan thread closes as `verified`                   | the desk, on `plan verify`   |
-| every state but `done` | `dropped`   | "Drop" on the page, or `plan drop`                                       | Brian, Odrade                |
+| From                   | To          | When                                                                     | Who                                         |
+| ---------------------- | ----------- | ------------------------------------------------------------------------ | ------------------------------------------- |
+| (none)                 | `drafting`  | a start: page button, `team_delegate` with `plan.start`                  | Brian, Odrade                               |
+| `drafting`             | `review`    | `plan ready`, with the gate clear and a draft graph for this revision    | planning session                            |
+| `review`               | `drafting`  | a write, a new ask, a new comment, or Brian's "Request changes"          | planning session, Brian                     |
+| `review`               | `approved`  | "Approve" on the page, for the revision and graph version that it showed | Brian only                                  |
+| `approved`             | `building`  | the first task thread opens                                              | the desk, on `team_delegate`                |
+| `approved`             | `verifying` | every task of the approved graph is already `done` (all carried)         | the desk, in the Approve commit             |
+| `approved`, `building` | `drafting`  | a scope change: `plan revise`, or Brian's "Stop and revise"              | task agent, Odrade, Brian                   |
+| `building`             | `verifying` | every task is `done`                                                     | the desk, in a sweep and on `plan nochange` |
+| `verifying`            | `building`  | the check failed: the failed tasks go back to `ready`                    | the desk, on `plan verify`                  |
+| `verifying`            | `done`      | the check passed; the plan thread closes as `verified`                   | the desk, on `plan verify`                  |
+| every state but `done` | `dropped`   | "Drop" on the page, or `plan drop`                                       | Brian, Odrade                               |
 
 - A drop with open asks is refused, as for every thread today (`openAskRefusal`).
 - A plan in `drafting` after a scope change keeps its done tasks only by the carry rule (section 5.4).
@@ -351,9 +359,9 @@ is set. Approval and verification read the bytes from the store by revision, nev
 `waiting` (a dep is not done) → `ready` → `delegated` (the thread opened) → `done` (its PR merged, or `plan nochange`
 recorded evidence), or `stopped` (a scope change named it). One PR per task is the rule: a task thread with a second PR
 gets a thread event and a line for Odrade ("T575 has 2 PRs for 1 task"), not a block. A task that needs 2 repositories
-is 2 tasks. Each delegation adds an attempt; a failed verification ends the current attempt as `failed-check`, keeps
-it, and sets the task back to `ready`, so the next delegation adds a repair attempt. The task is `done` again only when
-its newest attempt ends as `merged` or `no-change`.
+is 2 tasks. Each delegation adds an attempt. The task is `done` when its newest attempt ended as `merged` or
+`no-change`, and no failed verification round that names the task came after that attempt started. A failed round
+leaves every attempt as it was, and sets the named tasks back to `ready`, so the next delegation adds a repair attempt.
 
 ### 5.4 A valid graph, and the carry rule
 
@@ -364,10 +372,13 @@ its newest attempt ends as `merged` or `no-change`.
 - every dep names a task of the same graph, no task names itself, and the deps have no cycle;
 - every agent is a roster agent with `role: agent`, and every `repo` is one of that agent's repositories.
 
-**Carry.** A new graph (after a scope change) can mark a task as carried from the approved graph only when all of these
-are the same: the id, the agent, the repository, the acceptance lines, and the deps, and every dep is itself carried.
+**Carry.** A new graph (after a scope change) can mark a task as carried from the approved graph only when the task
+is `done` there (by the rule in section 5.3, so a task that is waiting, delegated, stopped or named by a failed round is
+not), and all of these are the same: the id, the agent, the repository, the acceptance lines, and the deps, and every
+dep is itself carried. The desk checks this; the planning session's reason does not replace it.
 The planning session gives a reason for each carried task (`carried.why`), and the page shows the carried tasks at
-Approve. A carried task keeps its attempts and stays `done`. Every other task is new work.
+Approve. A carried task keeps its attempts and stays `done`. Every other task is new work. A graph whose tasks are all
+carried goes from `approved` straight to `verifying` in the Approve commit (section 5.1).
 
 ## 6. The Desk page on a phone
 
@@ -501,9 +512,11 @@ and findings as data.
   every delegation does.
 - **Bound before it starts (fail closed).** The start returns the session id only after Pocket admitted the first
   message, so the hook cannot wait for that id. So the desk first commits the consult as `starting` with a random
-  `nonce`, and the first line of the consult's first message is `[plan-consult <nonce>]`. The hook reads a session's
-  first user entry once (and keeps the answer in memory, by conversation id). A session whose first line has the
-  marker is a consult from its first tool call. A marker with a nonce that the desk does not know, or a consult in any
+  `nonce`, and the first line of the consult's message is `[plan-consult <nonce>]`. Pocket stores that message inside
+  its own envelope (a warning line, then `<linked-session-message>`, then the message), so the marker is not the
+  entry's first line. The hook therefore searches the whole first user entry for the pattern `[plan-consult `, reads
+  it once, and keeps the answer in memory by conversation id. A session whose first entry has the marker anywhere is a
+  consult from its first tool call. A marker with a nonce that the desk does not know, or a consult in any
   state (`starting`, `answered`, `failed`, `stopped`), is restricted too: a marker can only take rights away. When the
   start returns, the desk records `session` and sets `running`.
 - **Read-only, mechanically.** In a consult session, the `beforeTool` hook (in the desk) blocks every tool except
@@ -533,8 +546,8 @@ When every task is `done`, the desk sets `verifying` and sends `plan-verify` at 
   author: the lead asks Brian (the skill's rule).
 - The brief holds the approved revision's text (from the store), every task's acceptance lines, the merged heads of
   every attempt's PRs, and each no-change evidence. Over 20 files or 1500 lines, the review goes in batches.
-- The budget is the skill's: 1 review and at most 3 re-reviews. A fail ends the named tasks' newest attempts as
-  `failed-check` and sends the tasks back to `ready`; their repairs are new attempts in new task threads, and the next
+- The budget is the skill's: 1 review and at most 3 re-reviews. A failed round names its failed tasks and sends them
+  back to `ready` (their attempts stay as they ended); their repairs are new attempts in new task threads, and the next
   `verify` is a re-review. Past the budget, the plan waits on Brian (an ask).
 - `plan verify` records the round. A pass closes the plan thread as `verified`; the journal gets its 1 entry.
 
@@ -609,14 +622,17 @@ The MVP is 3 PRs. Each one is tested with the Pi Pocket test harness and fixture
    `plan-decided`; a read-only plan view on the page with **Approve**. Tests: each gate condition refuses and names
    itself; a stale write; 2 writes from 1 revision (only 1 commits); a restart between each step of a write (section
    4.4); a write to a desk section; an invalid graph (a cycle, a missing dep, `verify`, no task); Approve with a
-   changed revision or graph; Approve and Deliver while a write is pending; every other close path refused for a plan
+   changed revision or graph; Approve and Deliver while a write is pending; 2 publishers at once, and a late publisher
+   after a newer write (the file ends at `Plan.rev`, the newer `pending` stays); every other close path refused for a plan
    thread; a replayed call; a restart between the answer and the wake.
 2. **PR 2: decisions and delivery.** Section comments, reopen, why, criteria and marks; **New plan**; `nochange`,
    `revise`, `verify`; task states from the PR facts; the whole-plan verification flow; `plan-verify` and
    `plan-revise`; the 1-PR-per-task warning; the `needs-plan` signal. Tests: a stale answer or write-back after a
-   reopen is refused; a repair keeps the earlier attempt; the carry rule refuses a changed repository or dep.
+   reopen is refused; a repair keeps the earlier attempt; the carry rule refuses a changed repository or dep, and a
+   task that is not done; an all-carried graph goes to `verifying` at Approve.
 3. **PR 3: consults.** `plan consult` and `finding`; Team's start under the supervisor; the read-only hook; the bounds
-   and the 60-minute limit; stances on the page. Tests: a tool call before the start returns is blocked; an unknown
+   and the 60-minute limit; stances on the page. Tests, with the message that a real `linkedSessions.start` stores
+   (Pocket's envelope, not a bare fixture): a tool call before the start returns is blocked; an unknown
    nonce is blocked; a second finding is refused; every tool is blocked after the finding.
 
 Later, by need: findings from web research or a codebase spike; the artifact read view (decision 1c); a criteria
