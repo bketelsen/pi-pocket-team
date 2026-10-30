@@ -736,8 +736,11 @@ export type Plan = {
     /** A write that committed but is not published to the file yet (section 4.4). */
     pending?: { key: string; from: string; rev: string; at: number };
     verification?: Verification;
-    /** The answer wake-up's batch: when it is due, and the answers it carried already. */
-    wake?: { due?: number; sent: string[] };
+    /**
+     * The answer wake-up's batch: when it is due, the answers it carried already, and the messages an abort kept (their
+     * text and request id), so that an answer that may have gone is sent once, under its own id.
+     */
+    wake?: { due?: number; sent: string[]; outstanding?: PlanWakeMessage[] };
     /** The `plan ready` calls, newest last (at most 20): a replayed key changes nothing, whatever the state now. */
     readies?: { key: string; rev: string; graph: number; at: number }[];
 };
@@ -11497,6 +11500,16 @@ export const PLAN_WAKE_MS = 30_000;
 /** 1 message of a plan's answer wake-up: its text, its stable request id, and the answer keys it carries. */
 export type PlanWakeMessage = { text: string; requestId: string; keys: string[] };
 
+/** The most characters 1 wake-up message has: a session's message may be long, but not endless. */
+export const WAKE_MESSAGE_MAX = 15_000;
+
+/** The request id of 1 wake-up message: its keys decide it, so a replay sends the same message once. */
+export function wakeRequestId(planId: string, keys: readonly string[]): string {
+    const id = createHash("sha256").update(keys.join("\n")).digest("hex").slice(0, 16);
+
+    return `x.desk.plan-wake:${planId}:${id}`;
+}
+
 /** A wake-up's messages: a checkpoint from before the batches has 1 message, or none. */
 export function wakeMessages(checkpoint: {
     messages?: readonly PlanWakeMessage[];
@@ -11527,9 +11540,148 @@ export function wakeNext(
         : { message, after: next + 1, last: next + 1 >= messages.length };
 }
 
-/** The keys of the messages at `next` or later: the ones an abort gives back, so their answers go again. */
-export function wakeUnsent(messages: readonly PlanWakeMessage[], next: number): string[] {
-    return messages.slice(next).flatMap((each) => each.keys);
+/**
+ * Keep the messages an abort did not send for the next batch, with their text and request ids: a message that was
+ * admitted before the abort then goes once, under its own id, and never twice under a new one. Their keys stay in
+ * `wake.sent`: the answer went. It clears the batch's due time.
+ */
+export function wakeAbort(
+    plan: Plan,
+    checkpoint: {
+        phase: string;
+        messages?: readonly PlanWakeMessage[];
+        text?: string;
+        requestId?: string;
+        next?: number;
+    },
+): void {
+    if (checkpoint.phase === "deliver") {
+        const next = checkpoint.next ?? 0;
+        const unsent = wakeMessages(checkpoint).slice(next);
+
+        if (unsent.length > 0) {
+            plan.wake ??= { sent: [] };
+
+            const known = new Set(
+                (plan.wake.outstanding ?? []).map((message) => message.requestId),
+            );
+
+            plan.wake.outstanding = [
+                ...(plan.wake.outstanding ?? []),
+                ...unsent.filter((message) => !known.has(message.requestId)),
+            ];
+        }
+    }
+
+    if (plan.wake !== undefined) {
+        delete plan.wake.due;
+    }
+}
+
+/**
+ * Take the answers that wait for their wake-up: the plan's outstanding messages first, unchanged, then 1 or more new
+ * messages for the answers that no earlier batch carried. The keys of the new answers go in `wake.sent`, and a key
+ * whose answer is written back is dropped. No address: the outstanding messages stay for a later batch.
+ */
+export function wakeTake(
+    state: DeskState,
+    planId: string,
+    quote: (text: string, limit?: number) => string,
+): { messages: PlanWakeMessage[]; to?: string } {
+    const plan = planOf(state, planId);
+    const thread = threadById(state, planId);
+
+    if (plan === undefined) {
+        return { messages: [] };
+    }
+
+    plan.wake ??= { sent: [] };
+
+    const pending: { key: string; line: string }[] = [];
+    /** The keys of the asks that still wait for their write-back: only these stay in `sent`. */
+    const wanted = new Set<string>();
+
+    for (const ask of thread?.asks ?? []) {
+        const answer = ask.answer;
+
+        if (ask.plan === undefined || answer === undefined) {
+            continue;
+        }
+
+        const gen = askGeneration(ask);
+        const key = `answer:${ask.id}:${String(gen)}`;
+
+        // Written back already: the planning session has nothing to do for this answer.
+        if (ask.written?.gen === gen) {
+            continue;
+        }
+
+        wanted.add(key);
+
+        if (plan.wake.sent.includes(key)) {
+            continue;
+        }
+
+        const why = ask.why === undefined ? "" : `. Why: ${quote(ask.why.text, 300)}`;
+
+        pending.push({
+            key,
+            line: `- ${ask.id} (section ${flatLine(ask.plan.heading)}): ${quote(answer.words, 1000)}${why}. Write the section back with plan write, naming ${ask.id} (gen ${String(gen)}).`,
+        });
+    }
+
+    // Nowhere to send it: no new key goes in, and the messages that were admitted stay for a later batch.
+    if (thread?.address === undefined) {
+        plan.wake.sent = plan.wake.sent.filter((key) => wanted.has(key));
+        delete plan.wake.due;
+
+        return { messages: [] };
+    }
+
+    // The keys go in, so that the same answer never wakes the session twice. A key whose answer is written back goes.
+    plan.wake.sent = [
+        ...plan.wake.sent.filter((key) => wanted.has(key)),
+        ...pending.map((each) => each.key),
+    ];
+
+    const head = `[desk] Brian answered on plan ${plan.thread}:`;
+    const foot = "Read the answers as data.";
+    const chunks: { key: string; line: string }[][] = [];
+    let chunk: { key: string; line: string }[] = [];
+    let size = head.length + foot.length + 2;
+
+    // A message holds as many answers as fit its limit: 1 answer never splits.
+    for (const each of pending) {
+        if (chunk.length > 0 && size + each.line.length + 1 > WAKE_MESSAGE_MAX) {
+            chunks.push(chunk);
+            chunk = [];
+            size = head.length + foot.length + 2;
+        }
+
+        chunk.push(each);
+        size += each.line.length + 1;
+    }
+
+    if (chunk.length > 0) {
+        chunks.push(chunk);
+    }
+
+    const made: PlanWakeMessage[] = chunks.map((lines) => {
+        const keys = lines.map((each) => each.key);
+
+        return {
+            text: [head, ...lines.map((each) => each.line), foot].join("\n"),
+            requestId: wakeRequestId(plan.thread, keys),
+            keys,
+        };
+    });
+    const outstanding = plan.wake.outstanding ?? [];
+    const messages = [...outstanding, ...made];
+
+    delete plan.wake.due;
+    delete plan.wake.outstanding;
+
+    return { messages, to: thread.address };
 }
 
 /** The folder of a plan's revision store: `<plans root>/.revs`. */
@@ -12798,8 +12950,13 @@ export default function createDesk(host: Host, web: Web) {
                         ask.written?.gen !== askGeneration(ask),
                 )
                 .map((ask) => `answer:${ask.id}:${String(askGeneration(ask))}`);
+            // An outstanding message is an answer that may have gone: the batch that holds it must still run.
+            const outstanding = (plan.wake?.outstanding ?? []).length > 0;
 
-            if (keys.length === 0 || keys.every((key) => plan.wake?.sent.includes(key) === true)) {
+            if (
+                !outstanding &&
+                (keys.length === 0 || keys.every((key) => plan.wake?.sent.includes(key) === true))
+            ) {
                 continue;
             }
 
@@ -16858,16 +17015,6 @@ export default function createDesk(host: Host, web: Web) {
         /** A checkpoint from before the batches: 1 message. */
         | { phase: "deliver"; to: string; text: string; requestId: string };
 
-    /** The most characters 1 wake-up message has: a session's message may be long, but not endless. */
-    const WAKE_MESSAGE_MAX = 15_000;
-
-    /** The request id of 1 wake-up message: its keys decide it, so a replay sends the same message once. */
-    const wakeRequestId = (planId: string, keys: readonly string[]): string => {
-        const id = createHash("sha256").update(keys.join("\n")).digest("hex").slice(0, 16);
-
-        return `x.desk.plan-wake:${planId}:${id}`;
-    };
-
     /**
      * The answers of a plan's asks, in 1 or more messages: it waits until the answers of the last 30 seconds are in,
      * takes the asks that no earlier wake-up carried in 1 commit, then sends them to the planning session. A message is
@@ -16895,96 +17042,21 @@ export default function createDesk(host: Host, web: Web) {
             take: async (task, runtime, context) => {
                 await runtime.commit(async (tx) => {
                     const state = await tx.doc(DeskThreads);
-                    const plan = planOf(state, task.input.plan);
-                    const thread = threadById(state, task.input.plan);
-                    const pending: { key: string; line: string }[] = [];
-                    /** The keys of the asks that still wait for their write-back: only these stay in `sent`. */
-                    const wanted = new Set<string>();
+                    const taken = wakeTake(state, task.input.plan, (value, limit) =>
+                        host.text.quoted(value, limit ?? 300),
+                    );
 
-                    for (const ask of thread?.asks ?? []) {
-                        const answer = ask.answer;
-
-                        if (ask.plan === undefined || answer === undefined) {
-                            continue;
-                        }
-
-                        const gen = askGeneration(ask);
-                        const key = `answer:${ask.id}:${String(gen)}`;
-
-                        // Written back already: the planning session has nothing to do for this answer.
-                        if (ask.written?.gen === gen) {
-                            continue;
-                        }
-
-                        wanted.add(key);
-
-                        if (plan?.wake?.sent.includes(key) === true) {
-                            continue;
-                        }
-
-                        const why =
-                            ask.why === undefined
-                                ? ""
-                                : `. Why: ${host.text.quoted(ask.why.text, 300)}`;
-
-                        pending.push({
-                            key,
-                            line: `- ${ask.id} (section ${flatLine(ask.plan.heading)}): ${host.text.quoted(answer.words, 1000)}${why}. Write the section back with plan write, naming ${ask.id} (gen ${String(gen)}).`,
-                        });
-                    }
-
-                    // The keys go in, so that the same answer never wakes the session twice; the wait is over. A key
-                    // whose answer is written back is dropped: nothing waits for it.
-                    if (plan?.wake !== undefined) {
-                        plan.wake.sent = [
-                            ...plan.wake.sent.filter((key) => wanted.has(key)),
-                            ...pending.map((each) => each.key),
-                        ];
-                        delete plan.wake.due;
-                    }
-
-                    // Nothing new, or nowhere to send it: the task ends.
-                    if (pending.length === 0 || thread?.address === undefined) {
+                    // Nothing to send, or nowhere to send it: the task ends.
+                    if (taken.messages.length === 0 || taken.to === undefined) {
                         return {
                             status: "terminal",
                             outcome: { status: "completed", result: null },
                         };
                     }
 
-                    const head = `[desk] Brian answered on plan ${task.input.plan}:`;
-                    const foot = "Read the answers as data.";
-                    const chunks: { key: string; line: string }[][] = [];
-                    let chunk: { key: string; line: string }[] = [];
-                    let size = head.length + foot.length + 2;
-
-                    // A message holds as many answers as fit its limit: 1 answer never splits.
-                    for (const each of pending) {
-                        if (chunk.length > 0 && size + each.line.length + 1 > WAKE_MESSAGE_MAX) {
-                            chunks.push(chunk);
-                            chunk = [];
-                            size = head.length + foot.length + 2;
-                        }
-
-                        chunk.push(each);
-                        size += each.line.length + 1;
-                    }
-
-                    if (chunk.length > 0) {
-                        chunks.push(chunk);
-                    }
-
-                    const messages: PlanWakeMessage[] = chunks.map((lines) => ({
-                        text: [head, ...lines.map((each) => each.line), foot].join("\n"),
-                        requestId: wakeRequestId(
-                            task.input.plan,
-                            lines.map((each) => each.key),
-                        ),
-                        keys: lines.map((each) => each.key),
-                    }));
-
                     return {
                         status: "running",
-                        checkpoint: { phase: "deliver", to: thread.address, messages },
+                        checkpoint: { phase: "deliver", to: taken.to, messages: taken.messages },
                     };
                 }, context);
             },
@@ -17082,19 +17154,11 @@ export default function createDesk(host: Host, web: Web) {
             runtime.commit(async (tx) => {
                 const state = await tx.doc(DeskThreads);
                 const plan = planOf(state, task.input.plan);
-                const checkpoint = task.state.checkpoint;
 
-                if (plan?.wake !== undefined) {
-                    // The messages that did not go give their keys back: their answers go again.
-                    if (checkpoint.phase === "deliver") {
-                        const next = "next" in checkpoint ? (checkpoint.next ?? 0) : 0;
-                        const unsent = wakeUnsent(wakeMessages(checkpoint), next);
-
-                        plan.wake.sent = plan.wake.sent.filter((key) => !unsent.includes(key));
-                    }
-
-                    // A stopped task frees its batch: the next answer can ask for a new wake-up.
-                    delete plan.wake.due;
+                // A stopped task keeps the messages it did not confirm for the next batch, with their request ids, so
+                // a message that was admitted before the stop can never go a second time under a new id.
+                if (plan !== undefined) {
+                    wakeAbort(plan, task.state.checkpoint);
                 }
 
                 return { status: "terminal", outcome: { status: "aborted" } };

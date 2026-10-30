@@ -71,9 +71,10 @@ import {
     startTask,
     validateGraph,
     waitingText,
+    wakeAbort,
     wakeMessages,
     wakeNext,
-    wakeUnsent,
+    wakeTake,
     DeskThreads,
     planOf,
     planWriteFlow,
@@ -2420,10 +2421,159 @@ describe("the wake's steps", () => {
         assert.equal(wakeNext([two], 0).last, true);
     });
 
-    test("an abort gives back the keys of the messages that did not go", () => {
-        assert.deepEqual(wakeUnsent([one, two], 0), ["answer:T1a:0", "answer:T1b:0"]);
-        assert.deepEqual(wakeUnsent([one, two], 1), ["answer:T1b:0"]);
-        assert.deepEqual(wakeUnsent([one, two], 2), []);
+    test("an abort keeps the messages that did not go, with their ids, and their keys stay", () => {
+        const { state, plan } = startPlan();
+
+        plan.wake = { sent: ["answer:T1a:0", "answer:T1b:0"], due: tick(9) };
+
+        wakeAbort(plan, { phase: "deliver", to: "session-a", messages: [one, two], next: 1 });
+
+        assert.deepEqual(plan.wake.outstanding, [two]);
+        assert.deepEqual(plan.wake.sent, ["answer:T1a:0", "answer:T1b:0"]);
+        assert.equal(plan.wake.due, undefined);
+
+        // A second abort of the same checkpoint adds no copy.
+        wakeAbort(plan, { phase: "deliver", to: "session-a", messages: [one, two], next: 1 });
+        assert.deepEqual(plan.wake.outstanding, [two]);
+        assert.equal(state.plans?.T1, plan);
+    });
+
+    test("a batch with an outstanding message sends it first, with its own id", () => {
+        const { state, plan, thread } = startPlan();
+        const quote = (text: string): string => `"${text}"`;
+
+        plan.state = "review";
+        addPlanAsk(state, "T1", {
+            key: "ask:1",
+            by: "lucilla",
+            at: tick(1),
+            section: "idea",
+            rev: plan.rev,
+            text: "Where do the keys live?",
+        });
+
+        const first = thread.asks[0] ?? assert.fail("an ask");
+
+        first.answer = { at: tick(2), by: "Brian", words: "A: in the TPM." };
+        assert.equal(thread.address, "session-31");
+
+        const opened = wakeTake(state, "T1", quote);
+        const message = opened.messages[0] ?? assert.fail("a message");
+
+        assert.equal(opened.messages.length, 1);
+        assert.match(message.text, /A: in the TPM\./);
+        assert.deepEqual(plan.wake?.sent, ["answer:T1a:0"]);
+
+        // The message is admitted, and the progress commit never happens: the abort keeps it as it is.
+        wakeAbort(plan, { phase: "deliver", to: "session-31", messages: [message], next: 0 });
+        assert.deepEqual(plan.wake?.outstanding, [message]);
+        assert.deepEqual(plan.wake?.sent, ["answer:T1a:0"], "the key stays: the answer went");
+
+        // Brian answers a second question.
+        addPlanAsk(state, "T1", {
+            key: "ask:2",
+            by: "lucilla",
+            at: tick(3),
+            section: "idea",
+            rev: plan.rev,
+            text: "And the second key?",
+        });
+
+        const second = thread.asks[1] ?? assert.fail("a second ask");
+
+        second.answer = { at: tick(4), by: "Brian", words: "B: in the file." };
+
+        const next = wakeTake(state, "T1", quote);
+
+        assert.equal(next.messages.length, 2);
+        assert.equal(next.messages[0]?.requestId, message.requestId);
+        assert.equal(next.messages[0]?.text, message.text);
+        assert.match(next.messages[1]?.text ?? "", /B: in the file\./);
+        assert.equal(
+            plan.wake?.outstanding,
+            undefined,
+            "the kept message went out with this batch",
+        );
+
+        // The fake send acts once for each request id, as Pocket does.
+        const admitted = new Map<string, string>();
+
+        for (const each of next.messages) {
+            if (!admitted.has(each.requestId)) {
+                admitted.set(each.requestId, each.text);
+            }
+        }
+
+        const texts = [...admitted.values()];
+
+        assert.equal(texts.filter((text) => text.includes("A: in the TPM.")).length, 1);
+        assert.equal(texts.filter((text) => text.includes("B: in the file.")).length, 1);
+    });
+
+    test("an abort before the send keeps the message, and the answer still goes once", () => {
+        const { state, plan, thread } = startPlan();
+        const quote = (text: string): string => `"${text}"`;
+
+        addPlanAsk(state, "T1", {
+            key: "ask:1",
+            by: "lucilla",
+            at: tick(1),
+            section: "idea",
+            rev: plan.rev,
+            text: "Where do the keys live?",
+        });
+
+        (thread.asks[0] ?? assert.fail("an ask")).answer = {
+            at: tick(2),
+            by: "Brian",
+            words: "A: in the TPM.",
+        };
+
+        const opened = wakeTake(state, "T1", quote);
+        const message = opened.messages[0] ?? assert.fail("a message");
+
+        // No send at all: the abort keeps it, and its key stays in `sent`.
+        wakeAbort(plan, { phase: "deliver", to: "session-31", messages: [message], next: 0 });
+        assert.deepEqual(plan.wake?.sent, ["answer:T1a:0"]);
+        assert.deepEqual(plan.wake?.outstanding, [message]);
+
+        const again = wakeTake(state, "T1", quote);
+
+        assert.equal(again.messages.length, 1);
+        assert.equal(again.messages[0]?.requestId, message.requestId);
+        assert.deepEqual(plan.wake?.sent, ["answer:T1a:0"], "the key is added no second time");
+    });
+
+    test("with no address, no answer is marked sent, and a kept message stays", () => {
+        const { state, plan, thread } = startPlan();
+        const quote = (text: string): string => `"${text}"`;
+
+        addPlanAsk(state, "T1", {
+            key: "ask:1",
+            by: "lucilla",
+            at: tick(1),
+            section: "idea",
+            rev: plan.rev,
+            text: "Where do the keys live?",
+        });
+
+        (thread.asks[0] ?? assert.fail("an ask")).answer = {
+            at: tick(2),
+            by: "Brian",
+            words: "A: in the TPM.",
+        };
+
+        const kept = { text: "kept", requestId: "x.desk.plan-wake:T1:kept", keys: [] };
+
+        plan.wake = { sent: [], outstanding: [kept], due: tick(3) };
+        delete thread.address;
+
+        const taken = wakeTake(state, "T1", quote);
+
+        assert.deepEqual(taken.messages, []);
+        assert.deepEqual(plan.wake.sent, [], "the answer waits: it did not go");
+        assert.deepEqual(plan.wake.outstanding, [kept]);
+        assert.equal(plan.wake.due, undefined);
     });
 
     test("an older 1-message checkpoint still reads", () => {
@@ -2964,8 +3114,8 @@ describe("with the Pi Pocket app", () => {
             "the control thread is open before the sweep",
         );
 
-        // The plan's own supervisor sweeps: its planning session is idle and silent, which would close an ordinary
-        // thread with no PR and no watch.
+        // The plan's own supervisor sweeps. The same sweep closes the control thread (no session, no work), and it
+        // leaves the plan thread open: a plan closes only when it is verified or dropped.
         await say(app, startSource!, "desk sync test");
 
         assert.equal(
