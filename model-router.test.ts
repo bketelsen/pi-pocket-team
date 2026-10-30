@@ -513,6 +513,51 @@ test("routeLine says a named worker won, a failure, and the mode being off", () 
     );
 });
 
+test("routeLine says a worker runs beside the router's suggestion, and a failure beside a named worker", () => {
+    const shadow = {
+        mode: "shadow" as const,
+        status: "shadow" as const,
+        kind: "implement",
+        kindConfidence: 0.82,
+        complexity: 1.8,
+        capability: 1.9,
+        deepReasoning: 0.4,
+        demand: 1.94,
+        tier: "high" as const,
+        model: "github-copilot/claude-sonnet-5.5",
+        thinking: "medium",
+        profileModel: "github-copilot/claude-opus-5.5",
+        reason: "shadow: recorded only",
+        at: NOON,
+    };
+
+    assert.equal(
+        routeLine({ ...shadow, worker: "deepseek/deepseek-flash" }),
+        "Route: high: github-copilot/claude-sonnet-5.5 (implement 1.9); named deepseek/deepseek-flash runs; shadow",
+    );
+    assert.equal(
+        routeLine({
+            mode: "shadow",
+            status: "failed",
+            worker: "deepseek/deepseek-flash",
+            reason: "Jev timed out after 3.5 s",
+            at: NOON,
+        }),
+        "Route: failed, named deepseek/deepseek-flash runs (Jev timed out after 3.5 s)",
+    );
+    assert.equal(
+        routeLine({
+            mode: "off",
+            status: "off",
+            worker: "deepseek/deepseek-flash",
+            reason: "the router's mode is off",
+            at: NOON,
+        }),
+        "Route: off (the router's mode is off); nothing changes",
+        "the off line does not change",
+    );
+});
+
 // ─── The one call ───────────────────────────────────────────────────────────
 
 /** A fake fetch that answers with `payload` and keeps what it was given. */
@@ -801,5 +846,141 @@ test("the module skips a model it cannot resolve, and a named worker needs no ca
     } finally {
         fetchStub.restore();
         router.dispose();
+    }
+});
+
+test("the module publishes version 2, and keeps `explicit` for an older team.ts", () => {
+    const router = loadRouter({ mode: "shadow", typesafeApiKey: KEY }, []);
+
+    try {
+        assert.equal(router.api.version, 2);
+        assert.equal(typeof router.api.explicit, "function");
+    } finally {
+        router.dispose();
+    }
+});
+
+test("a worker line is at most 120 characters with 2 models of 32 characters", () => {
+    const model = "github-copilot/claude-sonnet-5.5"; // 32 characters
+    const worker = "github-copilot/claude-haiku-5.5x"; // 32 characters
+    const line = routeLine({
+        mode: "shadow",
+        status: "shadow",
+        kind: "implement",
+        tier: "standard",
+        demand: 1.9,
+        model,
+        worker,
+        reason: "shadow: recorded only",
+        at: NOON,
+    });
+
+    assert.equal(model.length, 32);
+    assert.equal(worker.length, 32);
+    assert.equal(line, `Route: standard: ${model} (implement 1.9); named ${worker} runs; shadow`);
+    assert.ok(line.length <= 120, `the line has ${String(line.length)} characters`);
+
+    // A failure's reason can hold 200 characters: the worker comes first, so the desk's 120-character cut keeps it.
+    const failed = routeLine({
+        mode: "shadow",
+        status: "failed",
+        worker,
+        reason: "x".repeat(200),
+        at: NOON,
+    });
+
+    assert.ok(
+        failed.slice(0, 120).startsWith(`Route: failed, named ${worker} runs (`),
+        "the first 120 characters hold the named worker",
+    );
+});
+
+test("a named worker is routed all the same: 1 Jev call, masking as before, and the record carries the worker", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "router-worker-"));
+    const ssh = join(dir, "ssh-config");
+
+    await writeFile(ssh, "Host frostbox\n  HostName 10.0.0.9\n");
+    process.env.PI_POCKET_TEAM_SSH_CONFIG = ssh;
+    process.env.PI_POCKET_TEAM_ROUTER_CONFIG = join(dir, "missing.json");
+
+    const fetchStub = stubFetch(async () => new Response(JSON.stringify(ANSWER)));
+    const router = loadRouter({ mode: "shadow", typesafeApiKey: KEY }, [
+        "github-copilot/claude-sonnet-5.5",
+        "deepseek/deepseek-flash",
+    ]);
+
+    try {
+        const route = await router.api.route({
+            brief: "Fix frostbox at 192.168.1.4; mail me@example.com",
+            startAt: NOON,
+            profileModel: "github-copilot/claude-opus-5.5",
+            worker: "deepseek/deepseek-flash",
+        });
+        const sent = String(fetchStub.calls[0]!.init.body);
+
+        assert.equal(fetchStub.calls.length, 1, "1 Jev call");
+        assert.equal(sent.includes("frostbox"), false, "the SSH name is masked");
+        assert.equal(sent.includes("192.168"), false);
+        assert.equal(sent.includes("example.com"), false);
+        assert.equal(
+            sent.includes("deepseek/deepseek-flash"),
+            false,
+            "the worker never goes to Jev",
+        );
+        assert.equal(route.status, "shadow");
+        assert.equal(route.worker, "deepseek/deepseek-flash");
+        assert.equal(route.model, "github-copilot/claude-sonnet-5.5");
+        assert.equal(route.profileModel, "github-copilot/claude-opus-5.5");
+        assert.match(
+            route.line,
+            /^Route: high: github-copilot\/claude-sonnet-5\.5 \(implement 2\.0\); named deepseek\/deepseek-flash runs; shadow$/,
+        );
+
+        const plain = await router.api.route({ brief: "x", startAt: NOON });
+
+        assert.equal(plain.worker, undefined, "no worker named, no worker field");
+        assert.equal("worker" in plain, false);
+    } finally {
+        fetchStub.restore();
+        router.dispose();
+        delete process.env.PI_POCKET_TEAM_SSH_CONFIG;
+        delete process.env.PI_POCKET_TEAM_ROUTER_CONFIG;
+        await rm(dir, { recursive: true, force: true });
+    }
+});
+
+test("a failed or off route beside a named worker carries the worker", async () => {
+    const fetchStub = stubFetch(async () => new Response("{}", { status: 500 }));
+    const worker = "deepseek/deepseek-flash";
+
+    try {
+        const failing = loadRouter({ mode: "shadow", typesafeApiKey: KEY }, [worker]);
+        const failed = await failing.api.route({ brief: "x", startAt: NOON, worker });
+
+        assert.equal(failed.status, "failed");
+        assert.equal(failed.worker, worker);
+        assert.match(
+            failed.line,
+            /^Route: failed, named deepseek\/deepseek-flash runs \(.*500.*\)/,
+        );
+        failing.dispose();
+
+        const keyless = loadRouter({ mode: "shadow" }, [worker]);
+
+        assert.equal(
+            (await keyless.api.route({ brief: "x", startAt: NOON, worker })).worker,
+            worker,
+        );
+        keyless.dispose();
+
+        const off = loadRouter({ mode: "off", typesafeApiKey: KEY }, [worker]);
+        const none = await off.api.route({ brief: "x", startAt: NOON, worker });
+
+        assert.equal(none.status, "off");
+        assert.equal(none.worker, worker);
+        assert.equal(none.line, "Route: off (the router's mode is off); nothing changes");
+        off.dispose();
+    } finally {
+        fetchStub.restore();
     }
 });

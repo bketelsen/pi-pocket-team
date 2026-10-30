@@ -1494,6 +1494,11 @@ export default function createTeam(host: Host, web: Web) {
         model?: string;
         thinking?: string;
         profileModel?: string;
+        /**
+         * The model the supervisor named. On an `explicit` route (an older router) the router did not run. On a
+         * `shadow`, `failed` or `off` route with a `worker`, the router ran beside the named worker, and the named
+         * worker ran.
+         */
         worker?: string;
         jevModel?: string;
         jevId?: string;
@@ -1514,6 +1519,7 @@ export default function createTeam(host: Host, web: Web) {
             brief: string;
             startAt: number;
             profileModel?: string;
+            worker?: string;
         }) => Promise<ThreadRoute>;
         explicit: (request: { worker: string; profileModel?: string }) => ThreadRoute;
     };
@@ -1545,22 +1551,28 @@ export default function createTeam(host: Host, web: Web) {
     }
 
     /** A route with no suggestion: the delegation goes on as it would without the router, and the line says why. */
-    function failedRoute(reason: string, persona: Persona): ThreadRoute {
+    function failedRoute(reason: string, persona: Persona, worker?: string): ThreadRoute {
         return {
             mode: "shadow",
             status: "failed",
             ...(persona.model === undefined ? {} : { profileModel: persona.model }),
+            ...(worker === undefined ? {} : { worker }),
             reason,
             at: Date.now(),
-            line: `Route: failed (${reason}); no worker named, nothing changes`,
+            line:
+                worker === undefined
+                    ? `Route: failed (${reason}); no worker named, nothing changes`
+                    : `Route: failed, named ${worker} runs (${reason})`,
         };
     }
 
     /**
      * The model router's shadow suggestion for one night shift: a record only, never a model. A worker the supervisor
-     * named wins, and then the router does not run at all. The answer is a memo keyed by the call, so a replay reads
-     * the first answer and Jev is never asked twice. A router that throws, or takes more than 4 s, gives a `failed`
-     * route (so the audit counts it): the delegation goes on as it would without the router.
+     * named still wins and still runs: the router is asked all the same, and the route carries the `worker`, so the
+     * audit can compare the suggestion with the named worker. Only an older router (a version below 2) does not take a
+     * worker: it records `explicit` and does not run. The answer is a memo keyed by the call, for both cases, so a
+     * replay reads the first answer and Jev is never asked twice. A router that throws, or takes more than 4 s, gives
+     * a `failed` route (so the audit counts it): the delegation goes on as it would without the router.
      */
     async function shiftRoute(
         api: ToolExecutionApi,
@@ -1576,7 +1588,7 @@ export default function createTeam(host: Host, web: Web) {
         }
 
         try {
-            if (request.worker !== undefined) {
+            if (request.worker !== undefined && router.version < 2) {
                 return router.explicit({ worker: request.worker, profileModel: persona.model });
             }
 
@@ -1592,7 +1604,7 @@ export default function createTeam(host: Host, web: Web) {
             if ((await api.memo<boolean>(ROUTE_STARTED, context)) === true) {
                 return await api.memo<ThreadRoute>(
                     ROUTE_MEMO,
-                    failedRoute("interrupted by a server restart", persona),
+                    failedRoute("interrupted by a server restart", persona, request.worker),
                     context,
                 );
             }
@@ -1608,6 +1620,7 @@ export default function createTeam(host: Host, web: Web) {
                         brief,
                         startAt: request.start ?? Date.now(),
                         profileModel: persona.model,
+                        ...(request.worker === undefined ? {} : { worker: request.worker }),
                     }),
                     ROUTE_GUARD_MS,
                 );
@@ -1618,7 +1631,7 @@ export default function createTeam(host: Host, web: Web) {
             // The router's own answer, or a failure in its shape: the memo keeps either, so a replay asks nothing.
             return await api.memo<ThreadRoute>(
                 ROUTE_MEMO,
-                answer ?? failedRoute(reason, persona),
+                answer ?? failedRoute(reason, persona, request.worker),
                 context,
             );
         } catch {
@@ -2397,9 +2410,10 @@ export default function createTeam(host: Host, web: Web) {
                     ? ""
                     : " The desk is off: the watch is not set.";
 
-            // The model router's shadow suggestion for this night shift: a record only, never a model. It runs only for
-            // a night shift with no worker named (a named worker wins, and the router does not run), and only when the
-            // router module is on. Without a route, the delegation is exactly as it is without the router.
+            // The model router's shadow suggestion for this night shift: a record only, never a model. It runs for every
+            // night shift, also when the supervisor named the worker (the route then carries the `worker`, and the
+            // named worker still wins and still runs: nothing here changes the session's model or `goal.worker`), and
+            // only when the router module is on. Without a route, the delegation is exactly as it is without the router.
             const route =
                 shift === undefined || night_shift === undefined
                     ? undefined

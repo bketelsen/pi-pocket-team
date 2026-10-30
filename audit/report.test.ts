@@ -616,6 +616,31 @@ test("the metrics note the routes, with a rate only where a cell has one", () =>
 
     assert.equal(many.split(";").filter((part) => part.includes("/high")).length, 5);
 
+    // The named-worker line shows only when a route was recorded beside a named worker.
+    const stats = (count: number, success: number) => ({
+        count,
+        open: 0,
+        success,
+        notSuccess: count - success,
+        suggestionRan: 0,
+    });
+    const withNamed = (named: unknown) =>
+        renderReport(
+            baseReport({
+                metrics: { R1: { routes: 11, cells: [cell({ count: 11 })], named } },
+            }),
+        );
+
+    assert.match(
+        withNamed({ routes: 5, same: stats(2, 1), differs: stats(3, 2) }),
+        /- Routes: 11 recorded[^\n]*\n- Named workers: 5 routed beside a named worker\. Suggestion same as named: 2 \(success 1 of 2\); differs: 3 \(success 2 of 3\)\./,
+    );
+    assert.doesNotMatch(
+        withNamed({ routes: 0, same: stats(0, 0), differs: stats(0, 0) }),
+        /Named workers/,
+    );
+    assert.doesNotMatch(withNamed(undefined), /Named workers/, "an older record has no named");
+
     assert.doesNotMatch(renderReport(baseReport({ metrics: {} })), /- Routes:/);
     assert.doesNotMatch(
         renderReport(baseReport({ metrics: { R1: { routes: 0, cells: [] } } })),
