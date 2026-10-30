@@ -1,12 +1,12 @@
 # Plan threads: an idea becomes a settled plan before work starts
 
-Status: PR 1, the plan and the gate, is built in this repository (sections 4, 5.1, 5.2, 5.4, 7.1, 7.2 and
-7.3, less the parts section 15 names). PR 2, decisions and delivery, and PR 3, consults, are still design only.
+Status: PR 1, the plan and the gate, and PR 2, decisions and delivery, are built in this repository (sections 4 to
+7, 9 and 10, less consults and the parts sections 15 and 16 name). PR 3, consults, is still design only.
 Brian asked for it on 2026-10-30 (T547a), after Odrade's report on
 githubnext/chopin (`~/agents/odrade/reports/2026-10-30-chopin/README.md`, Chopin commit `3548849`). Chopin is
 MIT; this design borrows its ideas (decision records, findings, a build gate, an approved revision, a task graph,
-a whole-graph check). It copies no code. Brian decided 5 of the 8 questions in section 12 on 2026-10-30 (T548a to
-T548e); the other 3 stay open.
+a whole-graph check). It copies no code. Brian decided all 8 questions in section 12 on 2026-10-30 (T548a to
+T548e, T549d to T549f).
 
 ## 1. The gap
 
@@ -594,26 +594,23 @@ When every task is `done`, the desk sets `verifying` and sends `plan-verify` at 
   Not chosen: the desk by itself, or a tap for each task.
 - **Decision 6, the cap: plan threads do not count; at most 3 plans are open** (T548e). Task threads and verification
   threads count, as every delegation does. Not chosen: each plan thread counts as 1.
+- **Decision 5, a scope change: it stops only the tasks it names** (T549d). The other tasks go on, and their PR facts
+  still count. Not chosen: it stops every open task of the plan.
+- **Decision 7, the `needs-plan` label: the bot creates it in the 29 repositories with Brian's word, as for the issue
+  queue** (T549e). PR 2 only reads the label; the bot creates it after the merge (the command is in section 16). Not
+  chosen: Brian creates it, or no label.
+- **Decision 8, a reopen after the approval: reopening a settled ask in `approved` or `building` is a scope change**
+  (T549f), and decision 5 applies. Not chosen: a reopen is refused there.
 
 ### 12.2 Open
 
-These touch PR 2, not PR 1. The recommended option is first in each list.
-
-- **Decision 5, a scope change.**
-    - a. It stops only the tasks it names.
-    - b. It stops every open task of the plan.
-- **Decision 7, the `needs-plan` label.**
-    - a. The bot creates it in the 29 repositories with Brian's word, as for the issue queue.
-    - b. Brian creates it.
-    - c. No label: plans start only from the page or the chat.
-- **Decision 8, a reopen after the approval.**
-    - a. Reopening a settled ask in `approved` or `building` is a scope change.
-    - b. It is refused there.
+None.
 
 ## 13. Phases
 
-The MVP is 3 PRs. Each one is tested with the Pi Pocket test harness and fixtures, never Brian's data; each gets a
-`deepseek/deepseek-flash` worker from this plan and a cross-review before `ready-for-human`.
+The MVP is 3 PRs. Each one is tested with the Pi Pocket test harness and fixtures, never Brian's data; the coder is
+`github-copilot/claude-opus-5.5` (Brian, 2026-10-30), and each PR gets a cross-review by `openai/gpt-6.1-sol` before
+`ready-for-human`.
 
 1. **PR 1: the plan and the gate.** The data model (section 4), the plan file and its revision, `team_delegate` with
    `plan` (start and task), the `plan` actions `read`, `write`, `ask`, `tasks`, `ready`, `list`; the gate in the
@@ -697,3 +694,110 @@ Each line below differs from the design above, and says why.
   than a task that waits for a person (PR 2's `revise` ends it). A replay of a start that worked uses the session the
   desk bound, and never calls Pocket's start again; a replay of a thread that closed before any session was bound
   starts no session.
+
+## 16. What PR 2 built, and where it differs
+
+PR 2 is built: section comments, reopen, why, criteria and marks; Request changes; **New plan** on the Desk page;
+`plan nochange`, `plan revise` (and the page's **Stop and revise**), and `plan verify`; the task states from the PR
+facts; the whole-plan verification flow; the digest kinds `plan-verify` and `plan-revise`; the 1-PR-per-task warning;
+the `needs-plan` queue signal; and the page view of all of it. The 2 lines of section 15 about the task brief and the
+refused `verify` no longer hold: the task brief names `plan nochange`, and `verify` is delivered. Consults (PR 3) are
+not built.
+
+Each line below differs from the design above, or settles what it left open, and says why.
+
+**Asks and comments**
+
+- **Criteria get the ids `r1` to `r5`**, so a mark's key (`<option index>/<criterion id>`) never reads like a comment
+  id (`c1`) or a consult id (`k1`).
+- **The answer route takes `gen`, `why` and `marks`; `asks/:id/marks` saves marks on an open ask.** A marks save
+  replaces all the marks (an empty object clears them), so a second tap changes nothing more: it takes no key. An ask
+  with no plan section refuses `why` and `marks`. The `desk answer` action stays as it was, with no `gen`.
+- **The digest key of an answer keeps its old form at generation 0** (`answer:T560b`, `x.desk.answered:T560b`), and
+  adds `:<gen>` only after a reopen: a key that PR 1 stored then still matches its replay.
+- **The comment route is `plans/:id/comment`, and the dismiss route is `plans/:id/comments/:cid/dismiss`**, not
+  `comments/:id/dismiss`: a comment id is per plan (`c1`), so the route must name the plan. A second dismiss changes
+  nothing, so dismiss takes no key.
+- **Comments are taken in `drafting` and `review` only** (review goes back to drafting). Later, a write needs a scope
+  change first, so a comment then could never be settled: it is refused with "Stop and revise first".
+- **A write settles a comment by `comments: ["c3"]`**, and must change the comment's section, as for an ask. A write
+  that names a comment it cannot settle is refused whole.
+- **The comment wake-up is the answer wake-up.** A comment's key is `comment:<id>`; answers and comments of 30 seconds
+  go as 1 message, and the sweep repair counts open comments too.
+- **Request changes with text files a section comment** (the gate and the wake-up handle it). With no text, it sends 1
+  message to the planning session: "Brian asked for changes ... ask Brian in the chat what to change." In `drafting` it
+  changes nothing.
+- **The page stores its keys with a prefix** (`reopen:`, `comment:`, `changes:`, `revise:`, `x.desk.plan-new:`), so 2
+  routes never share a key.
+
+**Scope changes and graphs**
+
+- **A scope change is taken in `approved`, `building` and `verifying`**, and so is a reopen as a scope change (decision
+  8 names `approved` and `building`; a reopen in `verifying` is the same case, after the last task ended). A second
+  scope change while `revising` is set is refused: Brian approves a new revision first.
+- **A scope change may name a task in any state.** A named task becomes `stopped`; its open attempt ends `stopped`; an
+  attempt that ended stays as it ended. A named done task cannot be carried after that: naming it means "do it again".
+- **`Plan.revises` keeps the last 20 scope changes** (`{ key, at, by, why, tasks }`), because `revising` is cleared at
+  the next approval and a replay must still find its key.
+- **The durable messages are a new task, `x.desk.plan-send`**: the stop to each named task's open thread and to the
+  open verification thread, the revision news to the planning session, and Request changes. It is created in the act's
+  commit, sends with a request id made from the key and the target, and tries 3 times, 60 seconds apart; after that, 1
+  event on the plan thread and 1 notice. A closed thread, or one with no address, gets no message.
+- **Approve is refused while a task of the old approved graph is delegated** ("t3 is delegated (T575): wait for its
+  end, or stop it with Stop and revise"). Decision 5 lets unnamed tasks go on; this keeps 2 workers from ever doing 1
+  task. Once the task is done, the next graph can carry it.
+- **The carry rule is checked in `plan tasks`, in `plan ready`, and again at Approve**, because the old graph can change
+  after the draft (a failed round, a stopped task). `carried.why` is 1 to 300 characters on 1 line; the desk sets
+  `carried.graph`. At Approve, a carried task takes its attempts from the old graph again.
+- **An all-carried approval sends only `plan-verify`**, not `plan-approved`: nothing is left to delegate.
+
+**Delivery and verification**
+
+- **An attempt ends `merged` when at least 1 PR of its thread merged and no PR of it is open.** A PR whose state is not
+  read yet counts as open.
+- **A task thread that closes with no merged PR and no no-change** ends its attempt `stopped`, and the task is ready
+  again (waiting when a dep is not done), with 1 event. A thread that closed as `failed` keeps its task `delegated`,
+  as PR 1 decided (a failed start is an unknown outcome).
+- **Tasks that become ready reuse the kind `plan-approved`** (its meaning is "delegate the ready tasks now"), with the
+  key `plan-tasks:<plan>:<ids>:<attempt count>`. No new kind is needed. While `revising` is set, the line says to wait
+  for the new approval. A task that goes back to `waiting` gets only its event.
+- **The 1-PR warning is 1 event on the task thread and 1 on the plan thread, once for each ref.** The supervisor's desk
+  section shows the events: no digest item.
+- **`plan nochange` refuses a thread with an open PR**, and finds its replay by state (the attempt ended `no-change`).
+- **The verify delivery goes to the lead, in its home, with no worktree**, and does not check the gate (section 5.2
+  gives it its own checks). The failed rounds count from the last approval: a new approval gives a new budget.
+- **`plan verify` records `heads` as `owner/name#N@oid`**, and `by` is the lead's id. The 4th failed round since the
+  approval sends the failed tasks back to `ready` but asks for no repair: no check could verify it. The desk files the
+  budget ask, and the "Close owner/name#N?" ask after a pass, on the verification thread: a plan thread takes no ask
+  that is not a plan ask, and the plan thread closes on the pass. The verified close adds 1 event and the journal's 1
+  entry, and no `closed` digest item.
+
+**needs-plan and New plan**
+
+- **The label's name is a setting** (`queue.plan`, default `needs-plan`). An issue with the `needs-plan` signal gets the
+  plan line, also when it has other signals.
+- **`team_delegate` takes `plan.start.issue`** ("owner/name#N", an issue the queue has): the plan gets `source: "issue"`
+  and `issue`, the thread gets `issues`, and the queue item gets the thread.
+- **New plan is a conversation route, `plans/new/:conversation`**, bound to a supervisor's conversation. It calls Team's
+  optional `startPlan` (Team's API stays `version: 1`), with Pocket's human start: the start is Brian's own. 1 function
+  in `team.ts` does every plan start, so the replay and the bind are the same for the tool and the page. A desk that
+  does not take a start's source (`planSources`) gets no plan of an issue or of the page: Team refuses it.
+
+**The `needs-plan` label, for after the merge (decision 7).** The bot runs this with Brian's word, in the 29
+repositories of the issue queue (`issue-queue.md` section 6). `--force` makes a second run safe; it never deletes a
+label.
+
+```sh
+for repo in \
+  bketelsen/fleet bketelsen/homewiki bketelsen/pi-pocket-team \
+  frostyard/apt-publisher frostyard/bootc-debian frostyard/chairlift frostyard/clix \
+  frostyard/firn frostyard/first-setup frostyard/flatpak-index frostyard/frostmail \
+  frostyard/frostnotes frostyard/frostread frostyard/frostyard-org frostyard/homebrew-tap \
+  frostyard/igloo frostyard/intuneme frostyard/lab frostyard/lodge frostyard/nsl \
+  frostyard/omarchy-apps frostyard/pilothouse frostyard/porter frostyard/repogen \
+  frostyard/snosi frostyard/snowkit frostyard/std frostyard/testsuite frostyard/updex
+do
+  gh label create needs-plan --repo "$repo" --force --color 5319E7 \
+    --description "Brian: plan this first (a plan thread), then work"
+done
+```
