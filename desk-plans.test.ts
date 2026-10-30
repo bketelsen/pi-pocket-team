@@ -5791,6 +5791,26 @@ const model = scriptedModel((request) => {
         });
     }
 
+    if (text.endsWith("plan bad issue start test")) {
+        return call("team_delegate", {
+            agent: "lucilla",
+            repository: "home",
+            title: "Bad issue plan",
+            task: "Plan the fix of an issue that is not queued.",
+            plan: { start: true, issue: "frostyard/snow#99" },
+        });
+    }
+
+    if (text.endsWith("plan issue start test")) {
+        return call("team_delegate", {
+            agent: "lucilla",
+            repository: "home",
+            title: "Issue plan",
+            task: "Plan the fix of frostyard/snow#42.",
+            plan: { start: true, issue: "frostyard/snow#42" },
+        });
+    }
+
     if (text.endsWith("plan secret test")) {
         return call("team_delegate", {
             agent: "lucilla",
@@ -7070,5 +7090,192 @@ describe("with the Pi Pocket app", () => {
         assert.equal(dropped.status, 200);
         assert.equal(planOf(await deskSnapshot(), fenced.id)?.state, "dropped");
         assert.equal((await deskSnapshot())?.threads[fenced.id]?.state, "closed");
+    });
+
+    test("a plan for a queued issue links the issue, and an issue not in the queue is refused", async () => {
+        await app.harness.commit(async (tx) => {
+            const state = await tx.doc(DeskThreads);
+
+            state.issues = {
+                at: Date.now(),
+                ok: true,
+                items: [
+                    {
+                        ref: "frostyard/snow#42",
+                        title: "Sign the ISO with a YubiKey",
+                        url: "https://github.com/frostyard/snow/issues/42",
+                        urgent: false,
+                        signals: ["plan"],
+                        names: ["label needs-plan"],
+                        by: "bketelsen",
+                        at: Date.now(),
+                        latest: "plan",
+                        agent: "lucilla",
+                        threads: [],
+                        fixedBy: [],
+                    },
+                ],
+                ignored: [],
+                seen: {},
+            };
+        }, context);
+
+        const source = await supervisor("plan-issue");
+        const before = Object.keys((await deskSnapshot())?.plans ?? {}).length;
+
+        await say(app, source, "plan bad issue start test");
+        await until(
+            async () =>
+                (await modelTexts(app, source)).some((each) =>
+                    each.includes("frostyard/snow#99 is not in the issue queue"),
+                ),
+            "the refusal of an issue that is not queued",
+            20_000,
+        );
+        assert.equal(Object.keys((await deskSnapshot())?.plans ?? {}).length, before);
+
+        await say(app, source, "plan issue start test");
+
+        const state = await deskSnapshot();
+        const plan = Object.values(state?.plans ?? {}).find((each) => each.issue !== undefined);
+
+        assert(plan, "the start made a plan for the issue");
+        assert.equal(plan.source, "issue");
+        assert.equal(plan.issue, "frostyard/snow#42");
+        assert.deepEqual(state?.threads[plan.thread]?.issues, ["frostyard/snow#42"]);
+        assert.deepEqual(state?.issues?.items[0]?.threads, [plan.thread]);
+    });
+
+    test("New plan on the page: Brian's start, from the supervisor's conversation, once for its key", async () => {
+        const source = await supervisor("plan-page");
+        const body = {
+            title: "Page plan",
+            idea: "Rotate the signing key each year.",
+            lead: "lucilla",
+            key: "new-plan-key-1",
+        };
+
+        // The route's checks: the body, the model, and the conversation.
+        assert.equal(
+            (await routes(`plans/new/${String(source)}`, { ...body, title: "" })).status,
+            400,
+        );
+        assert.equal(
+            (await routes(`plans/new/${String(source)}`, { ...body, idea: "x".repeat(201) }))
+                .status,
+            400,
+        );
+        assert.equal(
+            (await routes(`plans/new/${String(source)}`, { ...body, key: "" })).status,
+            400,
+        );
+
+        const model = await routes(`plans/new/${String(source)}`, {
+            ...body,
+            key: "new-plan-key-model",
+            model: "nope/not-allowed",
+        });
+
+        assert.equal(model.status, 400);
+        assert.match(
+            String(model.data.error ?? model.data.message ?? ""),
+            /is not on the allowed list/,
+        );
+
+        const notSupervisor = await routes(`plans/new/${String(planningId)}`, {
+            ...body,
+            key: "new-plan-key-planner",
+        });
+
+        assert.equal(notSupervisor.status, 403);
+        assert.match(
+            String(notSupervisor.data.error ?? notSupervisor.data.message ?? ""),
+            /is not a supervisor's/,
+        );
+
+        const sessions = app.sessions().length;
+        const started = await routes(`plans/new/${String(source)}`, body);
+
+        assert.equal(started.status, 200);
+        assert.equal(started.data.replay, false);
+
+        const state = await deskSnapshot();
+        const plan = planOf(state, String(started.data.plan)) ?? assert.fail("the page plan");
+        const thread = state?.threads[plan.thread] ?? assert.fail("the plan thread");
+
+        assert.equal(plan.source, "page");
+        assert.equal(plan.lead, "lucilla");
+        assert.equal(plan.idea, "Rotate the signing key each year.");
+        assert.equal(thread.title, "Page plan");
+        assert.equal(thread.supervisor, Number(source));
+        assert.equal(thread.session, started.data.session);
+        assert.equal(app.cwdOf(thread.session as ConversationId), lucillaHome);
+        assert.equal(app.sessions().length, sessions + 1);
+        await until(
+            async () =>
+                (await userTexts(thread.session as ConversationId)).some((each) =>
+                    each.includes("You plan with the desk"),
+                ),
+            "the planning brief",
+            20_000,
+        );
+
+        // A second tap with the same key starts nothing again.
+        const again = await routes(`plans/new/${String(source)}`, body);
+
+        assert.equal(again.status, 200);
+        assert.equal(again.data.replay, true);
+        assert.equal(again.data.plan, started.data.plan);
+        assert.equal(app.sessions().length, sessions + 1);
+
+        // A 4th open plan is refused.
+        const open = Object.values((await deskSnapshot())?.plans ?? {}).filter(
+            (each) => each.state !== "done" && each.state !== "dropped",
+        );
+
+        assert.equal(open.length, 3);
+
+        const fourth = await routes(`plans/new/${String(source)}`, {
+            ...body,
+            key: "new-plan-key-4",
+        });
+
+        assert.equal(fourth.status, 409);
+        assert.match(String(fourth.data.error ?? fourth.data.message ?? ""), /3 plans are open/);
+        assert.equal(app.sessions().length, sessions + 1);
+    });
+
+    test("New plan is refused when the Team module has no startPlan", async () => {
+        const source = await supervisor("plan-page-old");
+        const team = (globalThis as unknown as Record<symbol, Record<string, unknown> | undefined>)[
+            Symbol.for("pi-pocket-team.team")
+        ];
+
+        assert(team, "Team publishes its API");
+
+        const { startPlan: _gone, ...older } = team;
+
+        (globalThis as unknown as Record<symbol, Record<string, unknown> | undefined>)[
+            Symbol.for("pi-pocket-team.team")
+        ] = older;
+
+        try {
+            const refused = await routes(`plans/new/${String(source)}`, {
+                title: "Old team",
+                idea: "Nothing.",
+                lead: "lucilla",
+                key: "new-plan-key-old",
+            });
+
+            assert.equal(refused.status, 409);
+            assert.match(
+                String(refused.data.error ?? refused.data.message ?? ""),
+                /older than the desk/,
+            );
+        } finally {
+            (globalThis as unknown as Record<symbol, Record<string, unknown> | undefined>)[
+                Symbol.for("pi-pocket-team.team")
+            ] = team;
+        }
     });
 });

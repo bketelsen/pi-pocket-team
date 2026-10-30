@@ -10297,6 +10297,7 @@ describe("queueConfig", () => {
             on: true,
             label: "agent-queue",
             urgent: "agent-urgent",
+            plan: "needs-plan",
             assignee: "frostyard-machines",
             by: ["bketelsen"],
             owners: ["frostyard", "bketelsen"],
@@ -10360,7 +10361,7 @@ describe("the queue's queries", () => {
         assert.match(query, /assigned: search\(type: ISSUE, first: 100, query: /);
         assert.match(
             query,
-            /"is:issue is:open archived:false user:frostyard user:bketelsen label:agent-queue,agent-urgent"/,
+            /"is:issue is:open archived:false user:frostyard user:bketelsen label:agent-queue,agent-urgent,needs-plan"/,
         );
         assert.match(
             query,
@@ -22237,5 +22238,73 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
                 removeClerk();
             }
         });
+    });
+});
+
+describe("the label needs-plan", () => {
+    test("it counts only Brian's act, as agent-queue does, and the item asks for a plan", () => {
+        const brian = judged(
+            issueNode(31, {
+                labels: ["needs-plan"],
+                events: [labelEvent("needs-plan", "bketelsen", at(2))],
+            }),
+        );
+
+        assert.deepEqual(brian.item?.signals, ["plan"]);
+        assert.deepEqual(brian.item?.names, ["label needs-plan"]);
+        assert.equal(brian.item?.by, "bketelsen");
+        assert.equal(brian.item?.latest, "plan");
+        assert.equal(brian.item?.urgent, false);
+
+        const other = judged(
+            issueNode(32, {
+                labels: ["needs-plan"],
+                events: [labelEvent("needs-plan", "someone-else", at(2))],
+            }),
+        );
+
+        assert.equal(other.item, undefined);
+        assert.deepEqual(
+            other.ignored.map((each) => [each.signal, each.actor]),
+            [["needs-plan", "someone-else"]],
+        );
+
+        // An event the read cannot find never counts as Brian.
+        assert.equal(judged(issueNode(33, { labels: ["needs-plan"] })).item, undefined);
+    });
+
+    test("the search asks for the label, and a setting renames it", () => {
+        assert.match(buildIssueQuery(QUEUE), /label:agent-queue,agent-urgent,needs-plan/);
+
+        const config = queueConfig({ plan: "plan-me" }, ["frostyard"]);
+
+        assert.equal(config.plan, "plan-me");
+        assert.match(buildIssueQuery(config), /label:agent-queue,agent-urgent,plan-me"/);
+        assert.equal(queueConfig({ plan: "no spaces allowed" }, ["frostyard"]).plan, "needs-plan");
+    });
+
+    test("its digest line and its queue row say it needs a plan, not work", () => {
+        const item = judged(
+            issueNode(31, {
+                labels: ["needs-plan"],
+                events: [labelEvent("needs-plan", "bketelsen", at(2))],
+            }),
+        ).item;
+
+        assert(item, "the issue is queued");
+        assert.equal(
+            issueLine("issue", item, "", (title) => `"${title}"`),
+            '[desk] Brian queued frostyard/snosi#31 for a plan (duncan): "Issue 31" · it needs a plan, not work: start one with team_delegate plan { start: true, issue: "frostyard/snosi#31" } · desk issues',
+        );
+
+        const state: DeskState = {
+            next: { T: 1, F: 1 },
+            threads: {},
+            grants: [],
+            seen: {},
+            issues: { at: 0, ok: true, items: [item], ignored: [], seen: {} },
+        };
+
+        assert.match(issuesText(state), /^needs a plan · frostyard\/snosi#31 · duncan/m);
     });
 });

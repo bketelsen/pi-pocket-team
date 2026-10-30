@@ -1038,7 +1038,19 @@ export type OpenRequest = {
      * builds inside the commit that opens the thread; `id` and `task` deliver 1 graph task of that plan.
      */
     plan?:
-        | { start: { idea: string; lead: string; root: string; text: string; rev: string } }
+        | {
+              start: {
+                  idea: string;
+                  lead: string;
+                  root: string;
+                  text: string;
+                  rev: string;
+                  /** Where the plan came from: the chat (the default), the Desk page, or a queued issue. */
+                  source?: "page" | "chat" | "issue";
+                  /** The queued issue that asked for the plan: its ref, as the queue spells it. */
+                  issue?: string;
+              };
+          }
         | { id: string; task: string };
     /**
      * The thread id, when the caller made a plan's file before the thread: the desk takes the id first, so that the
@@ -1136,7 +1148,8 @@ export function openThread(
             file: join(start.root, `${id}-${slug}.md`),
             lead: start.lead,
             idea: flatLine(start.idea).slice(0, PLAN_IDEA),
-            source: "chat",
+            source: start.issue === undefined ? (start.source ?? "chat") : "issue",
+            ...(start.issue === undefined ? {} : { issue: start.issue }),
             state: "drafting",
             rev: start.rev,
             revs: [{ rev: start.rev, at: request.at, by: "desk", key: request.key }],
@@ -1154,6 +1167,11 @@ export function openThread(
         state.plans ??= {};
         state.plans[id] = plan;
         addEvent(stored, "plan:started", `plan started: lead ${start.lead}`, request.at);
+
+        // The issue that asked for the plan links to its thread in the same commit.
+        if (start.issue !== undefined) {
+            linkIssue(state, stored, start.issue, request.at);
+        }
     }
 
     // The link to the queued issues is set in the commit that opens the thread: a restart finds both or none. The
@@ -6287,6 +6305,8 @@ export function ownThread(
 /** The default names of the signals, and who may make them: see `queueConfig`. */
 export const QUEUE_LABEL = "agent-queue";
 export const QUEUE_URGENT = "agent-urgent";
+/** The label that asks for a plan, not for work: Brian's act, by the same rule. */
+export const QUEUE_PLAN = "needs-plan";
 export const QUEUE_ASSIGNEE = "frostyard-machines";
 export const QUEUE_BY = "bketelsen";
 /** The most issues one search page holds: GitHub's maximum. */
@@ -6320,6 +6340,8 @@ export type QueueConfig = {
     on: boolean;
     label: string;
     urgent: string;
+    /** The label that asks for a plan: `needs-plan` by default. A config made before it has none: the default. */
+    plan?: string;
     assignee: string;
     /** The logins whose act counts. */
     by: string[];
@@ -6357,6 +6379,7 @@ export function queueConfig(raw: unknown, rosterOwners: readonly string[] = []):
     const value = (raw !== null && typeof raw === "object" && !Array.isArray(raw) ? raw : {}) as {
         label?: unknown;
         urgent?: unknown;
+        plan?: unknown;
         assignee?: unknown;
         by?: unknown;
         owners?: unknown;
@@ -6370,6 +6393,7 @@ export function queueConfig(raw: unknown, rosterOwners: readonly string[] = []):
         on: raw !== false,
         label: one(value.label, QUEUE_LABEL_NAME, QUEUE_LABEL),
         urgent: one(value.urgent, QUEUE_LABEL_NAME, QUEUE_URGENT),
+        plan: one(value.plan, QUEUE_LABEL_NAME, QUEUE_PLAN),
         assignee: one(value.assignee, QUEUE_LOGIN, QUEUE_ASSIGNEE),
         by: by === undefined || by.length === 0 ? [QUEUE_BY] : by,
         owners:
@@ -6417,6 +6441,7 @@ function checkedQueue(config: QueueConfig): QueueConfig {
     const bad =
         !QUEUE_LABEL_NAME.test(config.label) ||
         !QUEUE_LABEL_NAME.test(config.urgent) ||
+        !QUEUE_LABEL_NAME.test(config.plan ?? QUEUE_PLAN) ||
         !QUEUE_LOGIN.test(config.assignee) ||
         config.owners.length === 0 ||
         config.owners.some((owner) => !OWNER_NAME.test(owner));
@@ -6462,11 +6487,12 @@ export type QueueAlias = "labeled" | "assigned";
 /** The search text of an alias: open issues in the owners' repositories with a signal. */
 function issueSearch(config: QueueConfig, alias: QueueAlias): string {
     const { label, urgent, assignee, owners } = checkedQueue(config);
+    const plan = config.plan ?? QUEUE_PLAN;
 
     return [
         "is:issue is:open archived:false",
         ...owners.map((owner) => `user:${owner}`),
-        alias === "labeled" ? `label:${label},${urgent}` : `assignee:${assignee}`,
+        alias === "labeled" ? `label:${label},${urgent},${plan}` : `assignee:${assignee}`,
     ].join(" ");
 }
 
@@ -6822,6 +6848,15 @@ function presentSignals(
         ...(has(fact.assignees, config.assignee)
             ? [{ signal: "assigned" as const, name: config.assignee, kind: "assigned" as const }]
             : []),
+        ...(has(fact.labels, config.plan ?? QUEUE_PLAN)
+            ? [
+                  {
+                      signal: "plan" as const,
+                      name: config.plan ?? QUEUE_PLAN,
+                      kind: "label" as const,
+                  },
+              ]
+            : []),
     ];
 }
 
@@ -6852,7 +6887,7 @@ function signalsWithoutEvent(fact: IssueFact, config: QueueConfig): number {
 }
 
 /** The order that a queue entry lists its signals in. */
-const SIGNAL_ORDER: readonly QueueSignal[] = ["queue", "urgent", "assigned"];
+const SIGNAL_ORDER: readonly QueueSignal[] = ["queue", "urgent", "assigned", "plan"];
 
 /**
  * The rules for one issue. A signal counts only when the newest event that made it was done by a login in
@@ -6930,7 +6965,7 @@ export function judgeIssue(
             ).map((signal) =>
                 signal === "assigned"
                     ? "assigned"
-                    : `label ${signal === "urgent" ? config.urgent : config.label}`,
+                    : `label ${signal === "urgent" ? config.urgent : signal === "plan" ? (config.plan ?? QUEUE_PLAN) : config.label}`,
             ),
             by: newest.actor,
             at: newest.at,
@@ -7751,6 +7786,11 @@ export function issueLine(
         return `[desk] Brian dequeued ${item.ref} (${threadId}): ${title} · desk read ${threadId}`;
     }
 
+    // The label needs-plan asks for a plan, not for work: Odrade starts a plan with the issue.
+    if (item.signals.includes("plan")) {
+        return `[desk] Brian queued${kind === "issue-urgent" ? " URGENT" : ""} ${item.ref} for a plan (${owner}): ${title} · it needs a plan, not work: start one with team_delegate plan { start: true, issue: "${item.ref}" } · desk issues`;
+    }
+
     return `[desk] Brian queued${kind === "issue-urgent" ? " URGENT" : ""} ${item.ref} (${owner}): ${title} · desk issues`;
 }
 
@@ -7864,7 +7904,7 @@ export function issuesText(
                     : `${item.agent}${item.owners === undefined ? "" : ` (owned by ${String(item.owners.length)} agents)`}`;
 
             return [
-                item.urgent ? "urgent" : "queued",
+                item.urgent ? "urgent" : item.signals.includes("plan") ? "needs a plan" : "queued",
                 item.ref,
                 owner,
                 threads.length === 0 ? "not started" : threads.join(", "),
@@ -14401,6 +14441,8 @@ export type DeskApi = {
     ) => Promise<BoundSupervisor[]>;
     /** This desk knows plans. An older desk has none. */
     plans?: true;
+    /** This desk takes a plan start's `source` and `issue`. An older desk has none: Team refuses them then. */
+    planSources?: true;
     /**
      * Publish every plan whose committed write is not in its file yet. `team.ts` calls it after a plan start and before
      * a task delivery. An older desk has none: skip the call.
@@ -14997,6 +15039,25 @@ type TeamApi = {
         context: Context,
     ) => Promise<TeamMember | undefined>;
     roster: () => Promise<TeamMember[]>;
+    /** Start a plan from the page, as the person who taps (`team.ts`'s `TeamStartPlanRequest`). An older Team has none. */
+    startPlan?: (request: {
+        supervisor: number;
+        read: Pick<DocumentReader, "snapshot">;
+        commit: <T>(change: (tx: Tx) => T | Promise<T>) => Promise<T>;
+        context: Context;
+        start: (
+            request: { title: string; message: string; cwd?: string; model?: string },
+            key: string,
+        ) => Promise<{ session: ConversationId | number; address: string }>;
+        key: string;
+        lead: string;
+        title: string;
+        idea: string;
+        model?: string;
+    }) => Promise<
+        | { id: string; session: number; address: string; replay: boolean; model?: string }
+        | { error: string }
+    >;
 };
 
 const teamApi = (): TeamApi | undefined =>
@@ -15345,6 +15406,17 @@ export default function createDesk(host: Host, web: Web) {
                     );
                 }
 
+                // A plan for a queued issue: the issue must be in the queue, and the plan takes its ref as the queue
+                // spells it.
+                const issue =
+                    start.issue === undefined ? undefined : queuedIssue(state, start.issue)?.ref;
+
+                if (start.issue !== undefined && issue === undefined) {
+                    throw new Error(
+                        `${start.issue} is not in the issue queue: a plan names a queued issue as owner/name#N (desk issues lists them).`,
+                    );
+                }
+
                 await scanChatGrants(tx, state, request.supervisor, request.at);
                 lapseGrants(state, cap, request.at);
 
@@ -15384,6 +15456,8 @@ export default function createDesk(host: Host, web: Web) {
                             root: planConfig.root,
                             text,
                             rev,
+                            ...(start.source === "page" ? { source: "page" as const } : {}),
+                            ...(issue === undefined ? {} : { issue }),
                         },
                     },
                 });
@@ -15735,6 +15809,7 @@ export default function createDesk(host: Host, web: Web) {
             );
         },
         plans: true,
+        planSources: true,
         publishPlans: async (api, context) => {
             await publishAll(accessOf(api, context));
         },
@@ -21088,6 +21163,89 @@ export default function createDesk(host: Host, web: Web) {
             return view;
         },
         { access: "owner" },
+    );
+
+    // New plan: Brian starts a plan from the Desk page, bound to the supervisor's conversation. The start is his own
+    // (Pocket's person-bound start), so it is a plan from the page, not from a chat.
+    web.conversationRoute(
+        "POST",
+        "plans/new/:conversation",
+        async (request) => {
+            const team = teamApi();
+
+            if (team?.startPlan === undefined) {
+                throw web.error(
+                    409,
+                    "The Team module is off or older than the desk: Brian installs both from 1 checkout, then starts the plan again.",
+                );
+            }
+
+            const key = pageKey(request, "New plan");
+            const title = flatLine(String(request.body.title ?? ""));
+            const idea = flatLine(String(request.body.idea ?? ""));
+            const lead = String(request.body.lead ?? "").trim();
+            const model =
+                request.body.model === undefined || request.body.model === null
+                    ? ""
+                    : String(request.body.model).trim();
+
+            if (title === "" || title.length > MAX_TITLE) {
+                throw web.error(400, `A plan's title is 1 to ${String(MAX_TITLE)} characters.`);
+            }
+
+            if (idea === "" || idea.length > PLAN_IDEA) {
+                throw web.error(
+                    400,
+                    `A plan's idea is 1 line of 1 to ${String(PLAN_IDEA)} characters.`,
+                );
+            }
+
+            if (lead === "") {
+                throw web.error(400, "New plan needs lead: a roster agent with role agent.");
+            }
+
+            let started: Awaited<ReturnType<NonNullable<TeamApi["startPlan"]>>>;
+
+            try {
+                started = await team.startPlan({
+                    supervisor: Number(request.conversation.id),
+                    read: { snapshot: request.snapshot },
+                    commit: (change) => request.commit(change),
+                    context: request.context,
+                    start: (start, startKey) => request.linkedSessions.start(start, startKey),
+                    key: `x.desk.plan-new:${key}`,
+                    lead,
+                    title,
+                    idea,
+                    ...(model === "" ? {} : { model }),
+                });
+            } catch (error) {
+                const message = (error as Error).message;
+
+                throw web.error(
+                    /not a supervisor's/.test(message)
+                        ? 403
+                        : /plans are open|closed .* before a session|older than/.test(message)
+                          ? 409
+                          : 400,
+                    message,
+                );
+            }
+
+            if ("error" in started) {
+                throw web.error(502, `The planning session did not start: ${started.error}`);
+            }
+
+            web.send("changed", {});
+
+            return {
+                plan: started.id,
+                session: started.session,
+                address: started.address,
+                replay: started.replay,
+            };
+        },
+        { conversation: "conversation", access: "owner" },
     );
 
     // The page learns a seeded or found thread's session id here, from its address. Never in a model's text.
