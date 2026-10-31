@@ -24,6 +24,7 @@ const MODULES = [
     "night-shift.ts",
     "night-shift-web",
     "model-router.ts",
+    "_desk-dashboard.ts",
     "desk.ts",
     "desk-web",
     "terminal.ts",
