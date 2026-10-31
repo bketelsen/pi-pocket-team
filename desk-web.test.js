@@ -45,6 +45,8 @@ import setup, {
 } from "./desk-web/index.js";
 import {
     addDays,
+    barLayout,
+    cellText,
     COLUMNS,
     dashboardPath,
     dashboardStates,
@@ -64,6 +66,8 @@ import {
     repoChoices,
     sortRows,
     tableRows,
+    usageAvailable,
+    usageNote,
     utcDay,
     withOwner,
     withRepo,
@@ -1522,4 +1526,109 @@ test("makeDashboard registers 1 dispose with the module, and gives a component",
     assert.equal(typeof component, "function");
     assert.equal(disposes.length, 1);
     assert.doesNotThrow(() => disposes[0]());
+});
+
+/** A coverage with only the usage source the availability rule reads. */
+const usageCoverage = (status, lastGoodAt) => ({
+    sources: { usage: { status, lastGoodAt, at: 1, checkedAt: null, error: null } },
+});
+
+test("usageAvailable: never collected and a failed first read are unknown; partial and failed after a good read keep their facts", () => {
+    const never = usageCoverage("never", null);
+    const firstFailed = usageCoverage("failed", null);
+    const failedLater = usageCoverage("failed", Date.UTC(2026, 9, 29));
+    const partial = usageCoverage("partial", Date.UTC(2026, 9, 30));
+
+    assert.equal(usageAvailable(never), false);
+    assert.equal(usageAvailable(firstFailed), false);
+    assert.equal(usageAvailable(failedLater), true);
+    assert.equal(usageAvailable(partial), true);
+    assert.equal(usageAvailable(usageCoverage("ok", 1)), true);
+    assert.equal(usageAvailable(usageCoverage("stale", 1)), true);
+    assert.equal(usageAvailable(undefined), true, "an answer with no coverage hides nothing");
+
+    assert.match(usageNote(never), /never collected: tokens and cost are unknown/);
+    assert.match(
+        usageNote(firstFailed),
+        /first usage read failed: there is no good read yet, so tokens and cost are unknown/,
+    );
+    assert.match(usageNote(failedLater), /last good facts/);
+    assert.equal(usageNote(partial), null);
+
+    const words = (coverage) =>
+        dashboardStates({
+            ...stateSnapshot(),
+            coverage: {
+                ...stateSnapshot().coverage,
+                sources: { ...stateSnapshot().coverage.sources, usage: coverage.sources.usage },
+            },
+        })
+            .filter((state) => state.code === "usage-unavailable")
+            .map((state) => state.text);
+
+    assert.deepEqual(words(never), [`Usage is unavailable. ${usageNote(never)}`]);
+    assert.deepEqual(words(firstFailed), [`Usage is unavailable. ${usageNote(firstFailed)}`]);
+    assert.deepEqual(words(failedLater), [`Usage is unavailable. ${usageNote(failedLater)}`]);
+    assert.deepEqual(words(partial), []);
+});
+
+test("unknown usage: every table row shows tokens and cost as unknown, and sorts them last; known usage keeps its facts", () => {
+    const zero = metrics({ usage: { totalTokens: 0, cost: null } });
+    const some = metrics({ usage: { totalTokens: 500, cost: 0 } });
+    const rows = {
+        projects: [
+            { repo: "a/one", owner: "a", metrics: zero },
+            { repo: "a/two", owner: "a", metrics: some },
+        ],
+        owners: [{ owner: "a", metrics: some }],
+        unattributed: zero,
+    };
+    const cells = (coverage) =>
+        tableRows({ rows, coverage }, { key: "tokens", dir: "desc" }).map((row) => [
+            row.name,
+            cellText("tokens", row),
+            cellText("cost", row),
+        ]);
+
+    for (const coverage of [usageCoverage("never", null), usageCoverage("failed", null)]) {
+        assert.deepEqual(cells(coverage), [
+            ["a", null, null],
+            ["a/one", null, null],
+            ["a/two", null, null],
+            ["Unattributed", null, null],
+        ]);
+        assert.equal(
+            cellText("tokens", { metrics: zero, usageUnknown: true }),
+            null,
+            "the scope total too",
+        );
+    }
+
+    for (const coverage of [usageCoverage("failed", 1), usageCoverage("partial", 1)]) {
+        assert.deepEqual(cells(coverage), [
+            ["a", "500", "$0.00"],
+            ["a/two", "500", "$0.00"],
+            ["a/one", "0", null],
+            ["Unattributed", "0", null],
+        ]);
+    }
+
+    assert.equal(
+        cellText("open", { metrics: some, usageUnknown: true }),
+        "0",
+        "only usage goes unknown",
+    );
+});
+
+test("barLayout: 1 column for each day, and a gap that lets 1 to 366 days fit", () => {
+    assert.deepEqual(barLayout(7), { gap: 2, style: "--dash-days: 7; --dash-bar-gap: 2px" });
+    assert.deepEqual(barLayout(31), { gap: 2, style: "--dash-days: 31; --dash-bar-gap: 2px" });
+    assert.deepEqual(barLayout(90), { gap: 1, style: "--dash-days: 90; --dash-bar-gap: 1px" });
+    assert.deepEqual(barLayout(366), { gap: 0, style: "--dash-days: 366; --dash-bar-gap: 0px" });
+    assert.equal(barLayout(0).style, "--dash-days: 1; --dash-bar-gap: 2px");
+
+    // The gaps alone never take more than 92 px, whatever the range.
+    for (let days = 1; days <= 366; days += 1) {
+        assert(barLayout(days).gap * (days - 1) <= 92, String(days));
+    }
 });

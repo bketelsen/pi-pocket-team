@@ -23,10 +23,15 @@ The screenshots show the fixture of `desk-dashboard-fixture.ts` in the isolated 
   time), range refused (the route's 400 message; the last good numbers stay), collection not started, a stale source, a
   failed source, a source never read, usage unavailable, partial coverage (the backfill goes on: pending refs and
   sessions), no tracked work in the scope (the zeros are true zeros), and no eligible closures.
+- **Usage unavailable.** Tokens and cost are unknown ("—" on the cards, in the "Apart" lines, and in every table row,
+  the scope total included) when usage was never collected, or when its only read failed (no good read yet). This occurs
+  after the first collector pass, which fixes the boundary before any usage step. A partial usage source, and a failed
+  one after a good read, keep their collected facts, with a notice that they can be low.
 - **Cards**, in this order: thread completion rate, successful closures and velocity, thread cycle time, time to solve,
   current workload ("now"), tracked PRs, dated tokens, reported model cost (USD). Each card has "How is this counted?".
 - **Daily trend.** The successful closures by UTC day, as bars (each with its text for screen readers), with a summary
-  line and a "Daily table".
+  line and a "Daily table". The bars are 1 grid column for each day, so 1 to 366 days fit any width: the gap between
+  bars is 2 px up to 31 days, 1 px up to 92 days, and 0 above that.
 - **Projects.** 1 row for each repository, under its owner's subtotal row, and at the all-work scope 1 unattributed row;
   the scope total is the last row. Each column sorts (unknown values last in both directions). On a phone each row is a
   small card, with a "Sort by" control. There is no drill-down link: the operational Desk has no repository filter.
@@ -124,8 +129,19 @@ an agent and never sends a message. Each pass:
   a failed read after 15 minutes; a merged PR with all its times is not read again. A linked session's entries are read
   again at least every 6 hours, and its child conversations every 24 hours.
 - **Failures.** A failed read keeps every fact and marks its source. A rate limit (or fewer than 100 points left) stops
-  GitHub reads until the reset, or for 15 minutes. A source whose last good read is older than 75 minutes (1 hour plus 3
-  passes) is stale; GitHub is also stale when a tracked ref is overdue by that much, or when the threads source is stale.
+  GitHub reads until the reset, or for 15 minutes (`backoffUntil`).
+- **Source status** (`sourceView` and `githubView` in `_desk-metrics.ts`), checked in this order: `never` (no read yet),
+  `failed` (the last read failed), then `stale`, then `partial`, else `ok`. `STALE_MS` is 75 minutes: the 1-hour
+  heartbeat plus 3 passes.
+    - **Desk threads and usage.** Stale when the last check, `checkedAt` (else `lastGoodAt`), is older than `STALE_MS`,
+      or absent. A pass with no change still writes `checkedAt` at most once an hour (the heartbeat), so a quiet source
+      stays fresh. Partial when the source lists partial refs, is not complete, or failed in part. Usage is also partial
+      when a counted session has malformed entries, a residual mismatch, or a ledger that could not be read.
+    - **GitHub.** It writes no heartbeat when no read is due, so its age alone never makes it stale. It is stale when the
+      threads source is stale or never read (1 pass reads both), or when a tracked ref is overdue: its next read, by the
+      collector's own refresh rules and the stored facts, is due by more than `STALE_MS`. During a backoff that has not
+      ended, overdue refs do not count, and the status is at least partial. It is also partial when the source lists
+      partial refs or is not complete.
 
 ## Source gaps
 

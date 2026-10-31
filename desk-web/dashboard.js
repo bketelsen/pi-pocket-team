@@ -179,6 +179,41 @@ export const noTrackedWork = (totals) =>
     totals.timeToSolve.nowUnresolved === 0 &&
     totals.usage.sessions === 0;
 
+/**
+ * Whether the usage facts can be shown: false when usage was never collected, or when its only read failed (no good
+ * read yet). Then tokens and cost are unknown, not 0. A partial source, or a failed one after a good read, keeps its
+ * collected facts.
+ */
+export const usageAvailable = (coverage) => {
+    const usage = coverage?.sources?.usage;
+
+    if (usage === undefined || usage === null) {
+        return true;
+    }
+
+    return !(
+        usage.status === "never" ||
+        (usage.status === "failed" && (usage.lastGoodAt === null || usage.lastGoodAt === undefined))
+    );
+};
+
+/** Why usage is unknown, or what its facts are, in 1 line; null for a source that is fine. */
+export const usageNote = (coverage) => {
+    const usage = coverage?.sources?.usage;
+
+    if (usage?.status === "never") {
+        return "Usage was never collected: tokens and cost are unknown.";
+    }
+
+    if (usage?.status === "failed") {
+        return usageAvailable(coverage)
+            ? "The last usage read failed: tokens and cost are the last good facts, and can be low."
+            : "The first usage read failed: there is no good read yet, so tokens and cost are unknown.";
+    }
+
+    return null;
+};
+
 const SOURCE_NAMES = { threads: "Desk threads", github: "GitHub", usage: "Usage" };
 
 /**
@@ -248,10 +283,7 @@ export const dashboardStates = (snapshot, { error = null, rangeError = null } = 
         states.push({
             code: "usage-unavailable",
             tone: "warn",
-            text:
-                usage.status === "never"
-                    ? "Usage is unavailable: it was never collected. Tokens and cost are unknown."
-                    : "Usage is unavailable now: tokens and cost are the last good facts, and can be low.",
+            text: `Usage is unavailable. ${usageNote(coverage)}`,
         });
     }
 
@@ -318,8 +350,16 @@ export const COLUMNS = [
     },
     { key: "open", label: "Open now", value: (row) => row.metrics.workload.total },
     { key: "merged", label: "PRs merged", value: (row) => row.metrics.prs.merged },
-    { key: "tokens", label: "Tokens", value: (row) => row.metrics.usage.totalTokens },
-    { key: "cost", label: "Cost (USD)", value: (row) => row.metrics.usage.cost },
+    {
+        key: "tokens",
+        label: "Tokens",
+        value: (row) => (row.usageUnknown ? null : row.metrics.usage.totalTokens),
+    },
+    {
+        key: "cost",
+        label: "Cost (USD)",
+        value: (row) => (row.usageUnknown ? null : row.metrics.usage.cost),
+    },
 ];
 
 /** Rows in order of 1 column: unknown values last in both directions, then by name. */
@@ -350,11 +390,14 @@ export const sortRows = (rows, sort) => {
  * and projects each in the sort's order; then the unattributed row, when the scope has one.
  */
 export const tableRows = (snapshot, sort) => {
+    // Every row has the same usage availability: the usage source is 1 for all scopes.
+    const usageUnknown = !usageAvailable(snapshot.coverage);
     const projects = snapshot.rows.projects.map((row) => ({
         kind: "project",
         name: row.repo,
         owner: row.owner,
         metrics: row.metrics,
+        usageUnknown,
     }));
     const owners = sortRows(
         snapshot.rows.owners.map((row) => ({
@@ -362,6 +405,7 @@ export const tableRows = (snapshot, sort) => {
             name: row.owner,
             owner: row.owner,
             metrics: row.metrics,
+            usageUnknown,
         })),
         sort,
     );
@@ -383,10 +427,56 @@ export const tableRows = (snapshot, sort) => {
             name: "Unattributed",
             owner: "",
             metrics: snapshot.rows.unattributed,
+            usageUnknown,
         });
     }
 
     return rows;
+};
+
+/** 1 table cell's text for a column and a row: null is unknown. Tokens and cost are unknown when usage is. */
+export const cellText = (key, row) => {
+    const metrics = row.metrics;
+
+    switch (key) {
+        case "completion":
+            return metrics.completion.denominator === 0
+                ? "0 eligible"
+                : `${formatRate(metrics.completion.rate)} (${metrics.completion.success}/${metrics.completion.denominator})`;
+        case "successes":
+            return formatCount(metrics.completion.success);
+        case "cycle":
+            return formatDuration(metrics.cycleTime.medianMs);
+
+        case "solve": {
+            const solve = metrics.timeToSolve;
+
+            return solve.count === 0
+                ? "0 eligible"
+                : `${formatDuration(solve.medianMs)} / ${formatDuration(solve.p90Ms)} / ${solve.count}`;
+        }
+
+        case "open":
+            return formatCount(metrics.workload.total);
+        case "merged":
+            return formatCount(metrics.prs.merged);
+        case "tokens":
+            return row.usageUnknown ? null : formatCount(metrics.usage.totalTokens);
+        case "cost":
+            return row.usageUnknown ? null : formatMoney(metrics.usage.cost);
+        default:
+            return null;
+    }
+};
+
+/**
+ * The trend's column layout for a number of days: 1 grid column for each day, and a gap that shrinks as the days grow,
+ * so 1 to 366 days fit any width (at 0 gap, the bars touch).
+ */
+export const barLayout = (days) => {
+    const gap = days <= 31 ? 2 : days <= 92 ? 1 : 0;
+
+    return { gap, style: `--dash-days: ${Math.max(1, days)}; --dash-bar-gap: ${gap}px` };
 };
 
 /** The next sort after a tap on a column: the same column turns around; a new one starts descending, a name ascending. */
@@ -477,15 +567,9 @@ export function makeDashboard(pocket, { refreshMs = REFRESH_MS } = {}) {
     function Cards({ snapshot }) {
         const { completion, velocity, cycleTime, timeToSolve, workload, prs, usage } =
             snapshot.totals;
-        const usageSource = snapshot.coverage.sources.usage.status;
-        const usageKnown = usageSource !== "never";
+        const usageKnown = usageAvailable(snapshot.coverage);
         const known = (value) => (usageKnown ? value : null);
-        const usageNote =
-            usageSource === "failed"
-                ? "Usage read failed: these are the last good facts."
-                : usageSource === "never"
-                  ? "Usage was never collected: unknown."
-                  : null;
+        const note = usageNote(snapshot.coverage);
         const undated = usage.undated;
         const residual = undated.residual;
         const solveExcluded = Object.entries(timeToSolve.undated ?? {});
@@ -583,7 +667,7 @@ export function makeDashboard(pocket, { refreshMs = REFRESH_MS } = {}) {
                 title="Dated tokens"
                 big=${known(formatCount(usage.totalTokens))}
                 bigLabel="total"
-                note=${usageNote}
+                note=${note}
                 help=${HELP.tokens}
             >
                 <${Item} label="Input" text=${known(formatCount(usage.input))} />
@@ -604,17 +688,17 @@ export function makeDashboard(pocket, { refreshMs = REFRESH_MS } = {}) {
                 />
                 <${Item}
                     label="Apart: compaction residual tokens"
-                    text=${residual ? formatCount(residual.counters.totalTokens) : null}
+                    text=${known(residual ? formatCount(residual.counters.totalTokens) : null)}
                 />
             <//>
             <${Card}
                 id="dash-cost"
                 title="Reported model cost (USD)"
                 big=${known(formatMoney(usage.cost))}
-                note=${usageNote ?? "An estimate from recorded usage, not an invoice."}
+                note=${note ?? "An estimate from recorded usage, not an invoice."}
                 help=${HELP.cost}
                 after=${
-                    usage.zeroCostEntries > 0
+                    usageKnown && usage.zeroCostEntries > 0
                         ? html`<p class="small dash-note">
                               ${`${plural(usage.zeroCostEntries, "entry", "entries")} reported $0: subscription or provider pricing can report 0.`}
                           </p>`
@@ -630,7 +714,7 @@ export function makeDashboard(pocket, { refreshMs = REFRESH_MS } = {}) {
                 />
                 <${Item}
                     label=${`Apart: compaction residual${residual ? ` (${plural(residual.sessions, "session")})` : ""}`}
-                    text=${residual ? formatMoney(residual.counters.cost) : null}
+                    text=${known(residual ? formatMoney(residual.counters.cost) : null)}
                 />
             <//>
         </div>`;
@@ -651,7 +735,11 @@ export function makeDashboard(pocket, { refreshMs = REFRESH_MS } = {}) {
             <p class="small muted">${summary}</p>
             <div class="dash-chart">
                 <span class="dash-axis small muted" aria-hidden="true">${max}</span>
-                <ol class="dash-bars" aria-label="Successful closures by UTC day">
+                <ol
+                    class="dash-bars"
+                    style=${barLayout(daily.length).style}
+                    aria-label="Successful closures by UTC day"
+                >
                     ${daily.map(
                         (day) =>
                             html`<li class="dash-bar-item" title=${`${day.day}: ${day.successes}`}>
@@ -683,39 +771,6 @@ export function makeDashboard(pocket, { refreshMs = REFRESH_MS } = {}) {
         </section>`;
     }
 
-    /** 1 table cell's text for a column. */
-    const cellText = (key, metrics) => {
-        switch (key) {
-            case "completion":
-                return metrics.completion.denominator === 0
-                    ? "0 eligible"
-                    : `${formatRate(metrics.completion.rate)} (${metrics.completion.success}/${metrics.completion.denominator})`;
-            case "successes":
-                return formatCount(metrics.completion.success);
-            case "cycle":
-                return formatDuration(metrics.cycleTime.medianMs);
-
-            case "solve": {
-                const solve = metrics.timeToSolve;
-
-                return solve.count === 0
-                    ? "0 eligible"
-                    : `${formatDuration(solve.medianMs)} / ${formatDuration(solve.p90Ms)} / ${solve.count}`;
-            }
-
-            case "open":
-                return formatCount(metrics.workload.total);
-            case "merged":
-                return formatCount(metrics.prs.merged);
-            case "tokens":
-                return formatCount(metrics.usage.totalTokens);
-            case "cost":
-                return formatMoney(metrics.usage.cost);
-            default:
-                return null;
-        }
-    };
-
     function Table({ snapshot, sort, onSort }) {
         const rows = tableRows(snapshot, sort);
         const columns = COLUMNS;
@@ -742,7 +797,7 @@ export function makeDashboard(pocket, { refreshMs = REFRESH_MS } = {}) {
                     .slice(1)
                     .map(
                         (column) =>
-                            html`<td data-label=${column.label}><${Value} text=${cellText(column.key, each.metrics)} /></td>`,
+                            html`<td data-label=${column.label}><${Value} text=${cellText(column.key, each)} /></td>`,
                     )}
             </tr>`;
         const ariaSort = (key) =>
@@ -794,7 +849,12 @@ export function makeDashboard(pocket, { refreshMs = REFRESH_MS } = {}) {
                     ${rows.length === 0 ? html`<tr><td colspan=${columns.length} class="muted">No project in this scope.</td></tr>` : rows.map(row)}
                 </tbody>
                 <tfoot>
-                    ${row({ kind: "total", name: "Scope total", metrics: snapshot.totals })}
+                    ${row({
+                        kind: "total",
+                        name: "Scope total",
+                        metrics: snapshot.totals,
+                        usageUnknown: !usageAvailable(snapshot.coverage),
+                    })}
                 </tfoot>
             </table>
             ${

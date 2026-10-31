@@ -24,6 +24,7 @@ export const VARIANTS = [
     "stale",
     "usage-unavailable",
     "partial-usage",
+    "long",
 ] as const;
 
 export type Variant = (typeof VARIANTS)[number];
@@ -62,7 +63,8 @@ export function dashboardFixture(now: number, variant: Variant = "main"): Fixtur
     /** `days` before today, at `hour` UTC. */
     const at = (days: number, hour = 0): number => t0 - days * DAY + hour * HOUR;
     const fresh = now - 5 * 60_000;
-    const initializedAt = at(2, 3);
+    // "long": collection started 300 days ago, so a range can go back 366 days and more.
+    const initializedAt = variant === "long" ? at(300, 3) : at(2, 3);
     const boundary = initializedAt - 90 * DAY;
 
     if (variant === "not-started") {
@@ -154,6 +156,22 @@ export function dashboardFixture(now: number, variant: Variant = "main"): Fixtur
         // A start after the close: no cycle time.
         closed("T22", REPOS.snosi, at(15, 10), "done", "completed", at(15, 11)),
     ];
+
+    if (variant === "long") {
+        // 1 success every 5 days over the last year, before the main fixture's 30 days.
+        for (let days = 35; days <= 365; days += 5) {
+            threads.push(
+                closed(
+                    `T${1000 + days}`,
+                    REPOS.team,
+                    at(days, 12),
+                    "done",
+                    "completed",
+                    at(days, 6),
+                ),
+            );
+        }
+    }
 
     const pr = (ref: string, overrides: Partial<PrFact>): PrFact => {
         const [repo = "", number = "0"] = ref.split("#");

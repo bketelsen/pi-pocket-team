@@ -808,11 +808,14 @@
 }
 
 .dash-bars {
-    display: flex;
+    /* 1 grid column for each day; the component sets the day count and a gap that fits 1 to 366 days. */
+    display: grid;
     flex: 1;
-    gap: 2px;
-    align-items: flex-end;
+    grid-template-columns: repeat(var(--dash-days, 30), minmax(0, 1fr));
+    column-gap: var(--dash-bar-gap, 2px);
+    align-items: end;
     min-width: 0;
+    height: 100%;
     margin: 0;
     padding: 0;
     border-bottom: 1px solid var(--muted);
@@ -820,8 +823,8 @@
 }
 
 .dash-bar-item {
+    position: relative;
     display: flex;
-    flex: 1;
     align-items: flex-end;
     min-width: 0;
     height: 100%;

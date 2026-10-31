@@ -14,6 +14,7 @@ import {
     formatRate,
     rangeLine,
     tableRows,
+    usageAvailable,
 } from "./desk-web/dashboard.js";
 
 /** Noon UTC of 2026-10-30: "today" of the test. The preview uses the real clock; only velocity moves with it. */
@@ -325,5 +326,51 @@ describe("the preview fixture: what the screen shows", () => {
             "velocity uses the elapsed time",
         );
         assert.equal(DAY, 24 * HOUR);
+    });
+
+    test("the long variant: a valid 366-day range, with a bar for each day", () => {
+        const answer = take({ from: "2025-10-30" }, "long");
+
+        assert.equal(answer.range.days, 366);
+        assert.equal(answer.daily.length, 366);
+        assert.equal(answer.coverage.boundaryDay, "2025-10-05");
+        // The 8 of the main fixture, T10, and 1 every 5 days from 35 to 365 days ago.
+        assert.equal(answer.totals.completion.success, 8 + 1 + 67);
+        assert.equal(
+            answer.daily.reduce((sum, day) => sum + day.successes, 0),
+            76,
+        );
+        assert.equal(
+            take({}, "long").totals.completion.success,
+            8,
+            "the default range is unchanged",
+        );
+    });
+
+    test("usage availability on the fixture: a failed read after a good one keeps the facts; no good read is unknown", () => {
+        const failed = take({}, "usage-unavailable");
+
+        assert.equal(usageAvailable(failed.coverage), true);
+        assert.equal(
+            tableRows(failed, { key: "name", dir: "asc" }).every(
+                (row: { usageUnknown: boolean }) => !row.usageUnknown,
+            ),
+            true,
+        );
+
+        const fixture = dashboardFixture(NOW, "usage-unavailable");
+
+        delete fixture.usage.sources.usage!.lastGoodAt;
+
+        const first = snapshot({ ...fixture, now: NOW, query: {} });
+
+        assert(!("error" in first));
+        assert.equal(first.coverage.sources.usage.status, "failed");
+        assert.equal(usageAvailable(first.coverage), false);
+
+        const never = take({}, "not-started");
+
+        assert.equal(never.coverage.sources.usage.status, "never");
+        assert.equal(usageAvailable(never.coverage), false);
     });
 });
