@@ -509,3 +509,586 @@
 .desk-plan-bar {
     flex-wrap: wrap;
 }
+
+/* The view switch: Desk or Dashboard. A toggle with aria-pressed; the pressed one is filled. */
+.desk-tabs {
+    display: inline-flex;
+    gap: 2px;
+    margin: 0 0 12px;
+    padding: 2px;
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    background: var(--card);
+}
+
+.desk-tab {
+    padding: 6px 14px;
+    border: 0;
+    border-radius: 999px;
+    background: none;
+    color: var(--muted);
+    font: inherit;
+    font-size: 13px;
+    cursor: pointer;
+}
+
+.desk-tab[aria-pressed="true"] {
+    background: var(--accent);
+    color: var(--bg);
+    font-weight: 600;
+}
+
+.desk-tab:focus-visible,
+.dash button:focus-visible,
+.dash select:focus-visible,
+.dash input:focus-visible,
+.dash summary:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+}
+
+/* ─── The Dashboard ─────────────────────────────────────────────────────── */
+
+.dash-page {
+    padding-top: 16px;
+}
+
+.dash-tabs-wrap {
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 0 16px;
+}
+
+.desk.dash {
+    max-width: 1200px;
+    padding-top: 0;
+    overflow-wrap: anywhere;
+}
+
+/* Words for screen readers only. */
+.dash-sr {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    white-space: nowrap;
+}
+
+.dash-unknown {
+    color: var(--muted);
+}
+
+.dash-warn-word {
+    color: var(--warn);
+}
+
+.dash-controls {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px 16px;
+    align-items: flex-end;
+    margin: 12px 0;
+    padding: 12px;
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    background: var(--card);
+}
+
+.dash-scope {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    min-width: 0;
+}
+
+.dash-controls label {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    min-width: 0;
+    font-size: 12px;
+    color: var(--muted);
+}
+
+.dash-controls select,
+.dash-controls input,
+.dash-sort-phone select {
+    min-height: 34px;
+    max-width: 100%;
+    padding: 4px 8px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: var(--bg);
+    color: var(--text);
+    font: inherit;
+    font-size: 14px;
+}
+
+.dash-scope select {
+    width: 260px;
+}
+
+.dash-presets {
+    display: flex;
+    gap: 6px;
+}
+
+.dash .button[aria-pressed="true"] {
+    border-color: var(--accent);
+    box-shadow: inset 0 0 0 1px var(--accent);
+    font-weight: 600;
+}
+
+.dash-custom {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px 10px;
+    align-items: flex-end;
+    min-width: 0;
+    margin: 0;
+    padding: 8px 10px;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+}
+
+.dash-custom legend {
+    padding: 0 4px;
+    font-size: 12px;
+    color: var(--muted);
+}
+
+.dash-wide {
+    flex-basis: 100%;
+    margin: 0;
+}
+
+.dash-range {
+    flex-basis: 100%;
+    margin: 0;
+}
+
+.dash-states {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin: 0 0 12px;
+    padding: 0;
+    list-style: none;
+}
+
+.dash-state {
+    padding: 8px 10px;
+    border: 1px solid var(--line);
+    border-left-width: 4px;
+    border-radius: 8px;
+    font-size: 13px;
+}
+
+.dash-state.err {
+    border-color: var(--err);
+}
+
+.dash-state.warn {
+    border-color: var(--warn);
+}
+
+.dash-state.info {
+    border-left-color: var(--accent);
+}
+
+/* A snapshot kept after a failed refresh: still readable, visibly old. */
+.dash-body.stale {
+    opacity: 0.75;
+}
+
+.dash-cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+    gap: 10px;
+}
+
+.dash-card {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    padding: 12px;
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    background: var(--card);
+}
+
+.dash-card h3 {
+    margin: 0;
+    font-size: 13px;
+    letter-spacing: 0.02em;
+    color: var(--muted);
+}
+
+.dash-big {
+    margin: 6px 0 2px;
+    font-size: 28px;
+    font-weight: 700;
+    line-height: 1.15;
+}
+
+.dash-big-label {
+    font-size: 13px;
+    font-weight: 400;
+    color: var(--muted);
+}
+
+.dash-flag {
+    font-size: 17px;
+}
+
+.dash-note {
+    margin: 2px 0 6px;
+    color: var(--muted);
+}
+
+.dash-items {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 2px;
+    margin: 6px 0;
+    font-size: 13px;
+}
+
+.dash-item {
+    display: flex;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 2px 0;
+    border-bottom: 1px dashed var(--line);
+}
+
+.dash-item dt {
+    min-width: 0;
+    color: var(--muted);
+}
+
+.dash-item dd {
+    margin: 0;
+    overflow-wrap: normal;
+    white-space: nowrap;
+    font-variant-numeric: tabular-nums;
+    text-align: right;
+}
+
+.dash-help {
+    margin-top: auto;
+    padding-top: 6px;
+    font-size: 12px;
+}
+
+.dash-help summary {
+    color: var(--accent);
+    cursor: pointer;
+}
+
+.dash-help p {
+    margin: 6px 0 0;
+    color: var(--text);
+}
+
+.dash-chart {
+    display: flex;
+    gap: 6px;
+    align-items: stretch;
+    height: 140px;
+    padding: 8px;
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    background: var(--card);
+}
+
+.dash-axis {
+    align-self: flex-start;
+}
+
+.dash-bars {
+    display: flex;
+    flex: 1;
+    gap: 2px;
+    align-items: flex-end;
+    min-width: 0;
+    margin: 0;
+    padding: 0;
+    border-bottom: 1px solid var(--muted);
+    list-style: none;
+}
+
+.dash-bar-item {
+    display: flex;
+    flex: 1;
+    align-items: flex-end;
+    min-width: 0;
+    height: 100%;
+}
+
+.dash-bar {
+    display: block;
+    width: 100%;
+    border-radius: 3px 3px 0 0;
+    background: var(--accent);
+}
+
+/* A day with 0: a short dashed mark, not an empty gap. */
+.dash-bar.zero {
+    height: 2px;
+    border-top: 1px dashed var(--muted);
+    background: none;
+}
+
+.dash-chart-labels {
+    display: flex;
+    justify-content: space-between;
+    padding: 2px 8px 0 30px;
+}
+
+.dash-daily,
+.dash-sources {
+    border-collapse: collapse;
+    font-size: 13px;
+}
+
+.dash-daily th,
+.dash-daily td,
+.dash-sources th,
+.dash-sources td {
+    padding: 3px 8px;
+    border-bottom: 1px solid var(--line);
+    text-align: left;
+}
+
+.dash-sources {
+    width: 100%;
+    margin: 10px 0;
+}
+
+.dash-sources caption {
+    text-align: left;
+}
+
+.dash-status-word {
+    padding: 0 6px;
+    border: 1px solid var(--line);
+    border-radius: 999px;
+}
+
+.dash-status-word.ok {
+    border-color: var(--ok);
+}
+
+.dash-status-word.stale,
+.dash-status-word.partial,
+.dash-status-word.never {
+    border-color: var(--warn);
+}
+
+.dash-status-word.failed {
+    border-color: var(--err);
+}
+
+.dash-sort-phone {
+    display: none;
+    gap: 8px;
+    align-items: flex-end;
+    margin: 0 0 8px;
+}
+
+.dash-sort-phone label {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-size: 12px;
+    color: var(--muted);
+}
+
+.dash-table {
+    width: 100%;
+    table-layout: fixed;
+    border-collapse: collapse;
+    font-size: 13px;
+}
+
+.dash-table th,
+.dash-table td {
+    overflow-wrap: normal;
+    padding: 6px;
+    border-bottom: 1px solid var(--line);
+    text-align: right;
+    vertical-align: top;
+    font-variant-numeric: tabular-nums;
+}
+
+.dash-table th:first-child,
+.dash-table .dash-name {
+    width: 24%;
+    text-align: left;
+}
+
+.dash-table thead th {
+    font-weight: 400;
+    vertical-align: bottom;
+}
+
+.dash-sort {
+    padding: 2px;
+    border: 0;
+    background: none;
+    color: var(--muted);
+    font: inherit;
+    text-align: inherit;
+    cursor: pointer;
+}
+
+.dash-table th[aria-sort="ascending"] .dash-sort,
+.dash-table th[aria-sort="descending"] .dash-sort {
+    color: var(--text);
+    font-weight: 600;
+}
+
+.dash-repo {
+    display: block;
+    overflow-wrap: anywhere;
+}
+
+.dash-name {
+    font-weight: 400;
+}
+
+.dash-owner .dash-name,
+.dash-owner td,
+.dash-total th,
+.dash-total td {
+    font-weight: 700;
+}
+
+.dash-owner {
+    background: var(--card);
+}
+
+.dash-project .dash-name {
+    padding-left: 18px;
+}
+
+.dash-unattributed .dash-name {
+    font-style: italic;
+}
+
+.dash-total {
+    border-top: 2px solid var(--text);
+}
+
+.dash-sub {
+    margin: 14px 0 4px;
+    font-size: 13px;
+}
+
+.dash-limits {
+    margin: 4px 0;
+    padding-left: 18px;
+}
+
+/* Phones: stacked controls, and each table row as a small card. */
+@media (max-width: 700px) {
+    .dash-scope,
+    .dash-scope label,
+    .dash-scope select {
+        width: 100%;
+    }
+
+    .dash-cards {
+        grid-template-columns: 1fr;
+    }
+
+    .dash-sort-phone {
+        display: flex;
+    }
+
+    .dash-table,
+    .dash-table tbody,
+    .dash-table tfoot,
+    .dash-table tr,
+    .dash-table th,
+    .dash-table td {
+        display: block;
+        width: auto;
+    }
+
+    /* The sort select above the rows replaces the header row: no hidden button takes the focus. */
+    .dash-table thead {
+        display: none;
+    }
+
+    .dash-table tr {
+        margin: 0 0 8px;
+        padding: 8px 10px;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        background: var(--card);
+    }
+
+    .dash-table th,
+    .dash-table td {
+        padding: 2px 0;
+        border: 0;
+    }
+
+    .dash-table th:first-child,
+    .dash-table .dash-name,
+    .dash-project .dash-name {
+        width: auto;
+        padding: 0 0 4px;
+        font-weight: 700;
+    }
+
+    .dash-table td {
+        display: flex;
+        justify-content: space-between;
+        gap: 10px;
+        text-align: right;
+    }
+
+    .dash-table td::before {
+        content: attr(data-label);
+        color: var(--muted);
+        text-align: left;
+    }
+
+    .dash-owner {
+        border-color: var(--accent) !important;
+    }
+
+    .dash-total {
+        border: 2px solid var(--text) !important;
+    }
+
+    .dash-sources thead {
+        display: none;
+    }
+
+    .dash-sources tr,
+    .dash-sources th,
+    .dash-sources td {
+        display: block;
+    }
+
+    .dash-sources tr {
+        padding: 4px 0;
+        border-bottom: 1px solid var(--line);
+    }
+
+    .dash-sources th,
+    .dash-sources td {
+        padding: 1px 0;
+        border: 0;
+    }
+
+    .dash-sources td::before {
+        content: attr(data-label) ": ";
+        color: var(--muted);
+    }
+}

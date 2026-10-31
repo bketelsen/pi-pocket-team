@@ -276,6 +276,11 @@ export type Snapshot = {
     daily: { day: string; successes: number }[];
     rows: { projects: ProjectRow[]; owners: OwnerRow[]; unattributed: Metrics | null };
     coverage: Coverage;
+    /**
+     * Every owner and every repository with an attributed record, lowercased and sorted, whatever the scope: the
+     * page's scope choices do not shrink when a scope is picked.
+     */
+    choices: { owners: string[]; repos: string[] };
 };
 
 export type SnapshotInput = {
@@ -1234,6 +1239,12 @@ export function snapshot(input: SnapshotInput): Snapshot | { error: string } {
             unattributed: scope.kind === "all" ? reduce(unattributed, window) : null,
         },
         coverage: coverageOf(state, input.usage, now, range, totals),
+        choices: {
+            owners: [...new Set([...byRepo.keys()].map((repo) => repo.split("/")[0] ?? ""))].sort(
+                byName,
+            ),
+            repos: [...byRepo.keys()].sort(byName),
+        },
     };
 }
 
