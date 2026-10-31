@@ -50,6 +50,8 @@ import {
 } from "@earendil-works/pi-durable";
 import type { Host, Web, WebRequest } from "./_pocket.d.ts";
 import type * as DashboardModule from "./_desk-dashboard.ts";
+import type * as MetricsModule from "./_desk-metrics.ts";
+import type * as UsageModule from "./_desk-usage.ts";
 
 /**
  * The dashboard helper, loaded fresh with each load of this module: Pocket does not reload a `_` helper by itself. In
@@ -58,6 +60,16 @@ import type * as DashboardModule from "./_desk-dashboard.ts";
 const dashboard = (await import(
     new URL(`./_desk-dashboard.ts${new URL(import.meta.url).search}`, import.meta.url).href
 )) as typeof DashboardModule;
+/**
+ * The dashboard's metric reducers and its usage document, loaded the same way. The usage URL is the one the dashboard
+ * helper imports, so both get the same instance.
+ */
+const metrics = (await import(
+    new URL(`./_desk-metrics.ts${new URL(import.meta.url).search}`, import.meta.url).href
+)) as typeof MetricsModule;
+const usageDocs = (await import(
+    new URL(`./_desk-usage.ts${new URL(import.meta.url).search}`, import.meta.url).href
+)) as typeof UsageModule;
 
 /** Where another module finds this one's live API. */
 const API = Symbol.for("pi-pocket-team.desk");
@@ -22226,6 +22238,40 @@ export default function createDesk(host: Host, web: Web) {
                 Date.now(),
                 cap,
             );
+        },
+        { access: "owner" },
+    );
+
+    // The dashboard's numbers for a range and a scope: read only. It reads the 2 stored fact documents and nothing
+    // else: no commit, no task, no sweep, no GitHub call, no transcript read.
+    web.route(
+        "GET",
+        "dashboard",
+        async (request) => {
+            // 2 snapshots, but no torn state: no commit writes both documents. The usage commits only read the
+            // dashboard's `collector`, and `applyPass` writes only `x.desk.dashboard`. Each snapshot is a committed
+            // state of its own source, and each source reports its own times in `coverage.sources`.
+            const [facts, usage] = await Promise.all([
+                request.snapshot(dashboard.DeskDashboard, request.context),
+                request.snapshot(usageDocs.DeskUsage, request.context),
+            ]);
+            const answer = metrics.snapshot({
+                dashboard: facts,
+                usage,
+                now: Date.now(),
+                query: {
+                    from: request.query.get("from"),
+                    to: request.query.get("to"),
+                    owner: request.query.get("owner"),
+                    repo: request.query.get("repo"),
+                },
+            });
+
+            if ("error" in answer) {
+                throw web.error(400, answer.error);
+            }
+
+            return answer;
         },
         { access: "owner" },
     );

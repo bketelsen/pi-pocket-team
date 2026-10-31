@@ -1831,6 +1831,7 @@ describe("the collector in Pocket", () => {
             join(import.meta.dirname, "_desk-dashboard.ts"),
             join(dropIns, "_desk-dashboard.ts"),
         );
+        cpSync(join(import.meta.dirname, "_desk-metrics.ts"), join(dropIns, "_desk-metrics.ts"));
         cpSync(join(import.meta.dirname, "desk-web"), join(dropIns, "desk-web"), {
             recursive: true,
         });
