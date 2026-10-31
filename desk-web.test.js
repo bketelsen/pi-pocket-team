@@ -70,6 +70,7 @@ import {
     prEventsText,
     prUrl,
     recordsPath,
+    recordsStaleText,
     recordsStep,
     residualKnowledge,
     rowKey,
@@ -1874,8 +1875,13 @@ test("rowParts: a row has the same shape open or closed, so its button keeps the
 });
 
 test("recordsStep: a read again keeps the list shown; a failed read again marks it stale with its own time", () => {
-    const first = { threads: [{ id: "T1" }], prs: [], truncated: { threads: 0, prs: 0 } };
-    const second = { threads: [{ id: "T2" }], prs: [], truncated: { threads: 0, prs: 0 } };
+    const first = { asOf: 10, threads: [{ id: "T1" }], prs: [], truncated: { threads: 0, prs: 0 } };
+    const second = {
+        asOf: 70,
+        threads: [{ id: "T2" }],
+        prs: [],
+        truncated: { threads: 0, prs: 0 },
+    };
     const loading = recordsStep(null, { type: "start" });
 
     assert.deepEqual(loading, { status: "loading", answer: null, error: null, asOf: null });
@@ -1886,7 +1892,7 @@ test("recordsStep: a read again keeps the list shown; a failed read again marks 
         asOf: null,
     });
 
-    const done = recordsStep(loading, { type: "answer", answer: first, asOf: 10 });
+    const done = recordsStep(loading, { type: "answer", answer: first });
 
     assert.deepEqual(done, { status: "done", answer: first, error: null, asOf: 10 });
     // The next snapshot: the old list stays while it reads again.
@@ -1904,7 +1910,7 @@ test("recordsStep: a read again keeps the list shown; a failed read again marks 
         error: "HTTP 502",
         asOf: 10,
     });
-    assert.deepEqual(recordsStep(stale, { type: "answer", answer: second, asOf: 70 }), {
+    assert.deepEqual(recordsStep(stale, { type: "answer", answer: second }), {
         status: "done",
         answer: second,
         error: null,
@@ -1950,8 +1956,13 @@ const hookHost = () => {
 test("useRecords: a new snapshot with the same path reads the open drill-down again (the 60-second refresh)", async () => {
     const path = "dashboard/records?from=2026-10-01&to=2026-10-30&repo=frostyard%2Fsnosi";
     const answers = [
-        { threads: [{ id: "T1" }], prs: [], truncated: { threads: 0, prs: 0 } },
-        { threads: [{ id: "T1" }, { id: "T2" }], prs: [], truncated: { threads: 0, prs: 0 } },
+        { asOf: 10, threads: [{ id: "T1" }], prs: [], truncated: { threads: 0, prs: 0 } },
+        {
+            asOf: 70,
+            threads: [{ id: "T1" }, { id: "T2" }],
+            prs: [],
+            truncated: { threads: 0, prs: 0 },
+        },
     ];
     const calls = [];
     let fail = false;
@@ -1968,15 +1979,15 @@ test("useRecords: a new snapshot with the same path reads the open drill-down ag
 
     const mounted = new Set();
     const host = hookHost();
-    const render = (stamp, asOf) => useRecords({ ...host.hooks, api, mounted }, path, stamp, asOf);
+    const render = (stamp) => useRecords({ ...host.hooks, api, mounted }, path, stamp);
     const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
     const first = { asOf: 10 };
     const second = { asOf: 70 };
     const third = { asOf: 130 };
 
-    assert.equal(render(first, 10).status, "loading");
+    assert.equal(render(first).status, "loading");
     await settle();
-    assert.deepEqual(render(first, 10), {
+    assert.deepEqual(render(first), {
         status: "done",
         answer: answers[0],
         error: null,
@@ -1986,15 +1997,15 @@ test("useRecords: a new snapshot with the same path reads the open drill-down ag
     assert.equal(calls.length, 1);
 
     // The refresh brings a new snapshot; the path stays. The open records read again, and the old list stays meanwhile.
-    render(second, 70);
+    render(second);
     // The effect's state shows at the next render, as in Preact.
-    const reading = render(second, 70);
+    const reading = render(second);
 
     assert.equal(calls.length, 2);
     assert.equal(calls[1].path, path);
     assert.deepEqual(reading, { status: "refreshing", answer: answers[0], error: null, asOf: 10 });
     await settle();
-    assert.deepEqual(render(second, 70), {
+    assert.deepEqual(render(second), {
         status: "done",
         answer: answers[1],
         error: null,
@@ -2003,9 +2014,9 @@ test("useRecords: a new snapshot with the same path reads the open drill-down ag
 
     // A failed read again keeps the list, marked stale with the time of its own snapshot.
     fail = true;
-    render(third, 130);
+    render(third);
     await settle();
-    assert.deepEqual(render(third, 130), {
+    assert.deepEqual(render(third), {
         status: "stale",
         answer: answers[1],
         error: "HTTP 502",
@@ -2015,14 +2026,76 @@ test("useRecords: a new snapshot with the same path reads the open drill-down ag
 
     // A newer snapshot during a read aborts the older read; unmount aborts the last and leaves the module's set.
     fail = false;
-    render({ asOf: 190 }, 190);
-    render({ asOf: 250 }, 250);
+    render({ asOf: 190 });
+    render({ asOf: 250 });
     assert.equal(calls.at(-2).signal.aborted, true);
     host.unmount();
     assert.equal(calls.at(-1).signal.aborted, true);
     assert.equal(mounted.size, 0);
     await settle();
     assert.equal(host.slot.state.value.status, "refreshing", "an aborted read changes nothing");
+});
+
+test("useRecords: the list keeps the asOf of its own records answer, not the dashboard's snapshot", async () => {
+    // The records route reads at its own instant, after the dashboard's snapshot. A later stale notice must name the
+    // time of the list, not the older time of the snapshot.
+    const path = "dashboard/records?from=2026-10-01&to=2026-10-30&repo=frostyard%2Fsnosi";
+    const answer = {
+        asOf: 65,
+        threads: [{ id: "T1" }],
+        prs: [],
+        truncated: { threads: 0, prs: 0 },
+    };
+    let fail = false;
+
+    const api = async () => {
+        if (fail) {
+            throw new Error("HTTP 502");
+        }
+
+        return answer;
+    };
+
+    const host = hookHost();
+    const render = (stamp) => useRecords({ ...host.hooks, api, mounted: new Set() }, path, stamp);
+    const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
+    const snapshot = { asOf: 60 };
+    const later = { asOf: 120 };
+
+    render(snapshot);
+    await settle();
+    assert.equal(render(snapshot).asOf, 65, "the time of the records answer, not 60");
+
+    fail = true;
+    render(later);
+    await settle();
+    assert.deepEqual(render(later), {
+        status: "stale",
+        answer,
+        error: "HTTP 502",
+        asOf: 65,
+    });
+
+    // An answer with no good time shows no time, never the dashboard's.
+    assert.equal(
+        recordsStep(null, { type: "answer", answer: { ...answer, asOf: "65" } }).asOf,
+        null,
+    );
+    assert.equal(
+        recordsStep(null, { type: "answer", answer: { ...answer, asOf: Number.NaN } }).asOf,
+        null,
+    );
+});
+
+test("recordsStaleText: the notice names the time of the list, or says that it is unknown", () => {
+    assert.equal(
+        recordsStaleText("HTTP 502", Date.UTC(2026, 9, 31, 12, 5)),
+        "The threads and PRs could not be read again: HTTP 502. This list is from 2026-10-31 12:05 UTC, older than the numbers of the row.",
+    );
+    assert.equal(
+        recordsStaleText("HTTP 502", null),
+        "The threads and PRs could not be read again: HTTP 502. The time of this list is unknown: it can be older than the numbers of the row.",
+    );
 });
 
 test("residualKnowledge: the residual follows its own availability, not the dated usage's", () => {

@@ -262,12 +262,20 @@ export const residualKnowledge = (usage, coverage) => {
 
 /**
  * The next state of a drill-down's records (`useRecords`). `start`: a read begins; a list already shown stays (marked
- * as read again), and so does its stale mark. `answer`: the list for the snapshot as of `asOf`. `failure`: a list
- * already shown stays, marked stale with the error and its own `asOf`; with no list, the error shows.
+ * as read again), and so does its stale mark. `answer`: the list, as of its own `asOf` (the instant the records route
+ * read it, not the dashboard's snapshot). `failure`: a list already shown stays, marked stale with the error and its
+ * own `asOf`; with no list, the error shows.
  */
 export const recordsStep = (state, event) => {
     if (event.type === "answer") {
-        return { status: "done", answer: event.answer, error: null, asOf: event.asOf ?? null };
+        const asOf = event.answer?.asOf;
+
+        return {
+            status: "done",
+            answer: event.answer,
+            error: null,
+            asOf: typeof asOf === "number" && Number.isFinite(asOf) ? asOf : null,
+        };
     }
 
     const shown = state?.answer ?? null;
@@ -283,12 +291,23 @@ export const recordsStep = (state, event) => {
         : { status: "error", answer: null, error: event.error, asOf: null };
 };
 
+/** The words of a drill-down's stale notice: the error, and the time of the list shown (unknown when it has none). */
+export const recordsStaleText = (error, asOf) => {
+    const time = formatUtc(asOf);
+    const when =
+        time === null
+            ? "The time of this list is unknown: it can be older than the numbers of the row."
+            : `This list is from ${time}, older than the numbers of the row.`;
+
+    return `The threads and PRs could not be read again: ${error}. ${when}`;
+};
+
 /**
  * The records of 1 drill-down, as a hook. It reads `path` when it mounts, and again for each new snapshot (`stamp`):
  * the 60-second refresh keeps a row's path but can change its numbers, so its records must follow. A read aborts when
  * a newer one begins, when the drill-down unmounts, or when the module goes (`mounted` holds its stop).
  */
-export const useRecords = ({ useState, useEffect, api, mounted }, path, stamp, asOf) => {
+export const useRecords = ({ useState, useEffect, api, mounted }, path, stamp) => {
     const [state, setState] = useState(() => recordsStep(null, { type: "start" }));
 
     useEffect(() => {
@@ -304,7 +323,7 @@ export const useRecords = ({ useState, useEffect, api, mounted }, path, stamp, a
         api(path, undefined, { signal: abort.signal }).then(
             (answer) => {
                 if (!abort.signal.aborted) {
-                    setState((previous) => recordsStep(previous, { type: "answer", answer, asOf }));
+                    setState((previous) => recordsStep(previous, { type: "answer", answer }));
                 }
             },
             (failure) => {
@@ -1082,13 +1101,8 @@ export function makeDashboard(pocket, { refreshMs = REFRESH_MS } = {}) {
      * new snapshot (`stamp`), and aborts the read when it unmounts (the row closes, the selection changes, the view
      * goes) or when the module goes. While it reads again, the list shown stays; a failed read again marks it stale.
      */
-    function Records({ path, stamp, asOf, label, onOpenThread }) {
-        const state = useRecords(
-            { useState, useEffect, api: pocket.api, mounted },
-            path,
-            stamp,
-            asOf,
-        );
+    function Records({ path, stamp, label, onOpenThread }) {
+        const state = useRecords({ useState, useEffect, api: pocket.api, mounted }, path, stamp);
 
         if (state.status === "loading") {
             return html`<${Loader} label=${`Reading the threads and PRs of ${label}`} />`;
@@ -1106,7 +1120,7 @@ export function makeDashboard(pocket, { refreshMs = REFRESH_MS } = {}) {
                 ? null
                 : html`<p class="dash-state warn" role="status">
                       <strong>Stale:</strong>
-                      ${` The threads and PRs could not be read again: ${state.error}. This list is from ${formatUtc(state.asOf)}, older than the numbers of the row.`}
+                      ${` ${recordsStaleText(state.error, state.asOf)}`}
                   </p>`;
 
         const { threads, prs, truncated } = state.answer;
@@ -1203,7 +1217,6 @@ export function makeDashboard(pocket, { refreshMs = REFRESH_MS } = {}) {
                               key=${path}
                               path=${path}
                               stamp=${snapshot}
-                              asOf=${snapshot.asOf}
                               label=${rowLabel(each)}
                               onOpenThread=${onOpenThread ? (thread) => onOpenThread(key, thread) : null}
                           />
