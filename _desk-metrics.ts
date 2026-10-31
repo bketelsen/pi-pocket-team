@@ -568,6 +568,33 @@ const zeroTotals = (): Totals => ({
 /** The daily successes of a set, by UTC day "YYYY-MM-DD". */
 export type Daily = Map<string, number>;
 
+/** How a closure counts: the completion rule's cases, in its order (dropped is checked first). */
+export type ClosureKind = "success" | "abandoned" | "failed" | "dropped" | "frozen" | "unknown";
+
+/** The completion rule's case of 1 closure. */
+export function closureKind(closed: Readonly<NonNullable<ThreadFact["closed"]>>): ClosureKind {
+    if (closed.why === "dropped") {
+        return "dropped";
+    }
+
+    if (closed.why === "failed") {
+        return "failed";
+    }
+
+    if (
+        closed.why === "done" &&
+        (closed.outcome === "completed" || closed.outcome === "verified")
+    ) {
+        return "success";
+    }
+
+    if (closed.outcome === "abandoned") {
+        return "abandoned";
+    }
+
+    return closed.outcome === "frozen" ? "frozen" : "unknown";
+}
+
 /** Every metric of 1 set of facts. `daily`, when given, gets the successes by day. */
 export function reduce(facts: Readonly<Facts>, window: Window, daily?: Daily): Metrics {
     const completion: Completion = {
@@ -638,12 +665,14 @@ export function reduce(facts: Readonly<Facts>, window: Window, daily?: Daily): M
             continue;
         }
 
-        if (closed.why === "dropped") {
+        const kind = closureKind(closed);
+
+        if (kind === "dropped") {
             completion.excluded.dropped += 1;
-        } else if (closed.why === "failed") {
+        } else if (kind === "failed") {
             completion.failed += 1;
         } else if (
-            closed.why === "done" &&
+            kind === "success" &&
             (closed.outcome === "completed" || closed.outcome === "verified")
         ) {
             completion.success += 1;
@@ -661,9 +690,9 @@ export function reduce(facts: Readonly<Facts>, window: Window, daily?: Daily): M
             } else {
                 excludedTimestamps += 1;
             }
-        } else if (closed.outcome === "abandoned") {
+        } else if (kind === "abandoned") {
             completion.abandoned += 1;
-        } else if (closed.outcome === "frozen") {
+        } else if (kind === "frozen") {
             completion.excluded.frozen += 1;
         } else {
             completion.excluded.unknown += 1;
@@ -1266,6 +1295,15 @@ const limitation = (code: keyof typeof LIMITS): Limitation => ({ code, text: LIM
 
 const byName = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
 
+/** Whether a lowercased repository is in a scope: all of them, its owner's, or itself. */
+const scopeHas =
+    (scope: Scope) =>
+    (repo: string): boolean =>
+        scope.kind === "all" ||
+        (scope.kind === "owner"
+            ? repo.split("/")[0] === scope.owner.toLowerCase()
+            : repo === scope.repo.toLowerCase());
+
 /** The whole answer of `GET dashboard`, or why the query is refused (a 400). */
 export function snapshot(input: SnapshotInput): Snapshot | { error: string } {
     const { now } = input;
@@ -1280,12 +1318,7 @@ export function snapshot(input: SnapshotInput): Snapshot | { error: string } {
     const { range, scope } = parsed;
     const window: Window = range;
     const { byRepo, unattributed } = groupFacts(state, input.usage);
-    const inScope = (repo: string): boolean =>
-        scope.kind === "all" ||
-        (scope.kind === "owner"
-            ? repo.split("/")[0] === scope.owner.toLowerCase()
-            : repo === scope.repo.toLowerCase());
-    const repos = [...byRepo.keys()].filter(inScope).sort(byName);
+    const repos = [...byRepo.keys()].filter(scopeHas(scope)).sort(byName);
     const owners = new Map<string, Facts>();
     const projects: ProjectRow[] = [];
 
@@ -1430,5 +1463,224 @@ function coverageOf(
         },
         population: totals.population,
         limitations,
+    };
+}
+
+// ─── The records of 1 row ────────────────────────────────────────────────────
+
+/** The most threads, and the most PRs, in 1 answer of `GET dashboard/records`. */
+export const MAX_RECORDS = 200;
+
+/** The query of `GET dashboard/records`: the dashboard's, and `unattributed=1` for the unattributed row. */
+export type RecordsQuery = MetricsQuery & { unattributed?: string | null };
+
+/** A scope of `GET dashboard/records`: the dashboard's, or only the records with no single repository. */
+export type RecordsScope = Scope | { kind: "unattributed" };
+
+/** 1 delivery thread that a row counts: a closure in the range (with its case), or the workload now. */
+export type RecordThread = {
+    id: string;
+    repo: string | null;
+    state: ThreadFact["state"];
+    kind: ClosureKind | "now";
+    closedAt: number | null;
+    startedAt: number | null;
+    /** The thread left `x.desk.threads`: the Desk has no detail of it. */
+    gone: boolean;
+    /** The lowercased refs of its attributable PRs. */
+    prs: string[];
+};
+
+/** What a PR did in the range, each by its own GitHub time, and whether it is open now. */
+export type PrEvent = "created" | "merged" | "closed-unmerged" | "open-now";
+
+/** 1 tracked PR that a row counts. */
+export type RecordPr = {
+    ref: string;
+    repo: string;
+    number: number;
+    state: PrFact["state"] | null;
+    createdAt: number | null;
+    mergedAt: number | null;
+    closedAt: number | null;
+    events: PrEvent[];
+    threads: string[];
+};
+
+/** The answer of `GET dashboard/records`: the threads and PRs behind 1 row's counts. */
+export type Records = {
+    asOf: number;
+    range: Range;
+    scope: RecordsScope;
+    threads: RecordThread[];
+    prs: RecordPr[];
+    /** How many of each list the cap (`MAX_RECORDS`) left out. */
+    truncated: { threads: number; prs: number };
+};
+
+export type RecordsInput = Omit<SnapshotInput, "query"> & { query: RecordsQuery };
+
+const timeOrNull = (value: unknown): number | null => (dashboard.validTime(value) ? value : null);
+
+const numericId = new Intl.Collator("en", { numeric: true });
+
+/** The thread of a row's counts, or undefined when the row does not count it. The same rules as `reduce`. */
+function recordThread(fact: Readonly<ThreadFact>, window: Window): RecordThread | undefined {
+    if (fact.role !== "delivery") {
+        return undefined;
+    }
+
+    let kind: RecordThread["kind"] | undefined;
+    const closed = fact.closed;
+
+    if (fact.state === "closed" && closed !== undefined) {
+        if (inRange(closed.at, window)) {
+            kind = closureKind(closed);
+        }
+    } else if (
+        fact.goneAt === undefined &&
+        (fact.state === "starting" || fact.state === "open" || fact.state === "parked")
+    ) {
+        kind = "now";
+    }
+
+    if (kind === undefined) {
+        return undefined;
+    }
+
+    return {
+        id: fact.id,
+        repo: dashboard.isRepoName(fact.repo) ? fact.repo : null,
+        state: fact.state,
+        kind,
+        closedAt: kind === "now" ? null : timeOrNull(closed?.at),
+        startedAt: timeOrNull(fact.startedAt),
+        gone: fact.goneAt !== undefined,
+        prs: [...(fact.prs ?? [])],
+    };
+}
+
+/** The PR of a row's counts, or undefined when the row does not count it. The same rules as `reducePrs`. */
+function recordPr(fact: Readonly<PrFact>, window: Window): RecordPr | undefined {
+    if (fact.untracked === true || fact.excluded !== undefined) {
+        return undefined;
+    }
+
+    const events: PrEvent[] = [];
+
+    if (inRange(fact.createdAt, window)) {
+        events.push("created");
+    }
+
+    if (inRange(fact.mergedAt, window)) {
+        events.push("merged");
+    }
+
+    if (fact.state === "CLOSED" && inRange(fact.closedAt, window)) {
+        events.push("closed-unmerged");
+    }
+
+    if (fact.state === "OPEN") {
+        events.push("open-now");
+    }
+
+    if (events.length === 0) {
+        return undefined;
+    }
+
+    return {
+        ref: fact.ref,
+        repo: fact.repo,
+        number: fact.number,
+        state: fact.state ?? null,
+        createdAt: timeOrNull(fact.createdAt),
+        mergedAt: timeOrNull(fact.mergedAt),
+        closedAt: timeOrNull(fact.closedAt),
+        events,
+        threads: [...(fact.threads ?? [])],
+    };
+}
+
+/**
+ * The answer of `GET dashboard/records`, or why the query is refused (a 400): the delivery threads and the tracked PRs
+ * that 1 row (a repository, an owner, all tracked work, or the unattributed records) counts in the range. The same
+ * grouping, population and range rules as `snapshot`. Each list is sorted (threads by id, numeric-aware; PRs by ref)
+ * and capped at `MAX_RECORDS`.
+ */
+export function records(input: RecordsInput): Records | { error: string } {
+    const { now, query } = input;
+    const state = input.dashboard;
+    const flag = given(query.unattributed);
+
+    if (flag !== undefined && flag !== "1") {
+        return { error: "unattributed must be 1." };
+    }
+
+    if (flag === "1" && (given(query.owner) !== undefined || given(query.repo) !== undefined)) {
+        return { error: "unattributed=1 takes no owner and no repo." };
+    }
+
+    const boundary = dashboard.validTime(state?.boundary) ? state.boundary : undefined;
+    const parsed = parseQuery(query, now, boundary);
+
+    if ("error" in parsed) {
+        return parsed;
+    }
+
+    const { range } = parsed;
+    const scope: RecordsScope = flag === "1" ? { kind: "unattributed" } : parsed.scope;
+    const { byRepo, unattributed } = groupFacts(state, input.usage);
+    const groups: Facts[] = [];
+
+    if (scope.kind === "unattributed") {
+        groups.push(unattributed);
+    } else {
+        const has = scopeHas(scope);
+
+        for (const [repo, facts] of byRepo) {
+            if (has(repo)) {
+                groups.push(facts);
+            }
+        }
+
+        if (scope.kind === "all") {
+            groups.push(unattributed);
+        }
+    }
+
+    const threads: RecordThread[] = [];
+    const prs: RecordPr[] = [];
+
+    for (const facts of groups) {
+        for (const fact of facts.threads) {
+            const each = recordThread(fact, range);
+
+            if (each !== undefined) {
+                threads.push(each);
+            }
+        }
+
+        for (const fact of facts.prs) {
+            const each = recordPr(fact, range);
+
+            if (each !== undefined) {
+                prs.push(each);
+            }
+        }
+    }
+
+    threads.sort((a, b) => numericId.compare(a.id, b.id) || byName(a.id, b.id));
+    prs.sort((a, b) => byName(a.ref.toLowerCase(), b.ref.toLowerCase()) || byName(a.ref, b.ref));
+
+    return {
+        asOf: now,
+        range,
+        scope,
+        threads: threads.slice(0, MAX_RECORDS),
+        prs: prs.slice(0, MAX_RECORDS),
+        truncated: {
+            threads: Math.max(0, threads.length - MAX_RECORDS),
+            prs: Math.max(0, prs.length - MAX_RECORDS),
+        },
     };
 }

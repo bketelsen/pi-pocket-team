@@ -153,8 +153,11 @@ export function dashboardFixture(now: number, variant: Variant = "main"): Fixtur
         thread("T19", { origin: "plan", role: "coordinator", repo: REPOS.team, state: "open" }),
         thread("T20", { origin: "ask", role: "excluded", excluded: "ask-only", state: "open" }),
         thread("T21", { state: "open", startedAt: at(2) }),
-        // A start after the close: no cycle time.
-        closed("T22", REPOS.snosi, at(15, 10), "done", "completed", at(15, 11)),
+        // A start after the close: no cycle time. It left the desk since: its facts still count.
+        {
+            ...closed("T22", REPOS.snosi, at(15, 10), "done", "completed", at(15, 11)),
+            goneAt: at(1),
+        },
     ];
 
     if (variant === "long") {
@@ -397,7 +400,14 @@ export function dashboardFixture(now: number, variant: Variant = "main"): Fixtur
                 },
             },
         }),
-        // Its conversation is gone: its collected usage still counts.
+        // Not caught up yet, with no entry read: its usage is unknown, not 0. The homewiki row shows "—", and its owner's
+        // subtotal and the total are partial.
+        session(108, {
+            links: ["T12"],
+            assign: { repo: REPOS.wiki, via: 108 },
+            caughtUp: false,
+        }),
+        // Its conversation is gone: its collected usage still counts, as partial usage (the acme-labs rows).
         session(107, {
             links: ["T13"],
             assign: { repo: REPOS.widgets, via: 107 },

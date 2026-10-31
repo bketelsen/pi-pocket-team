@@ -3,9 +3,10 @@
 // screen. Nothing reads Brian's data.
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
-import { snapshot, type Snapshot } from "./_desk-metrics.ts";
+import { records, snapshot, type Records, type Snapshot } from "./_desk-metrics.ts";
 import { DAY, dashboardFixture, HOUR, REPOS, type Variant } from "./desk-dashboard-fixture.ts";
 import {
+    cellText,
     dashboardStates,
     formatCount,
     formatDuration,
@@ -13,8 +14,14 @@ import {
     formatPerWeek,
     formatRate,
     rangeLine,
+    prEventsText,
+    prUrl,
+    recordsPath,
     tableRows,
+    threadKindText,
     usageAvailable,
+    usageKnowledge,
+    usageReadLines,
 } from "./desk-web/dashboard.js";
 
 /** Noon UTC of 2026-10-30: "today" of the test. The preview uses the real clock; only velocity moves with it. */
@@ -111,7 +118,23 @@ describe("the preview fixture: what the screen shows", () => {
             ],
             [11, 8, 2, 3],
         );
-        assert.deepEqual([t.usage.sessions, t.usage.missing, t.usage.excluded.shared], [6, 1, 1]);
+        assert.deepEqual([t.usage.sessions, t.usage.missing, t.usage.excluded.shared], [7, 1, 1]);
+        // 1 gone conversation (partial) and 1 session never caught up (unknown): the total is partial, and says so.
+        assert.equal(t.usage.state, "partial");
+        assert.deepEqual(t.usage.sessionStates, { complete: 5, partial: 1, unknown: 1 });
+        assert.equal(usageKnowledge(t.usage, answer.coverage), "partial");
+        assert.deepEqual(usageReadLines(t.usage, answer.coverage), {
+            read: "partial",
+            sessions: "5 complete, 1 partial, 1 unknown",
+        });
+        assert.equal(
+            cellText("tokens", { metrics: t, coverage: answer.coverage }),
+            "9,320 (partial)",
+        );
+        assert.equal(
+            cellText("cost", { metrics: t, coverage: answer.coverage }),
+            "$0.90 (partial)",
+        );
         assert.deepEqual(t.usage.unattributed, { noRepo: 1, conflict: 1, unassigned: 0 });
         // Apart from the range total: the undated entry and the settled residual.
         assert.equal(t.usage.undated.counters.totalTokens, 12);
@@ -131,7 +154,7 @@ describe("the preview fixture: what the screen shows", () => {
             delivery: 20,
             coordinators: 1,
             excluded: { askOnly: 1, noWork: 0 },
-            gone: 0,
+            gone: 1,
         });
     });
 
@@ -170,8 +193,18 @@ describe("the preview fixture: what the screen shows", () => {
             Object.values(answer.coverage.sources).map((source) => source.status),
             ["ok", "partial", "ok"],
         );
-        assert.deepEqual(codes(answer), ["partial"]);
+        assert.deepEqual(codes(answer), ["usage-unknown", "partial"]);
         assert(answer.coverage.limitations.some((each) => each.code === "zero-cost-reported"));
+
+        const notice = dashboardStates(answer).find(
+            (state: { code: string }) => state.code === "usage-unknown",
+        );
+
+        assert.equal(notice.tone, "warn");
+        assert.equal(
+            notice.text,
+            answer.coverage.limitations.find((each) => each.code === "usage-unknown")?.text,
+        );
     });
 
     test("the project table: owner subtotals from the route, then their projects, then unattributed", () => {
@@ -210,6 +243,56 @@ describe("the preview fixture: what the screen shows", () => {
         assert.equal(by("Unattributed").completion.success, 1);
         assert.equal(by("Unattributed").usage.cost, 0.05);
         assert.equal(by("Unattributed").usage.totalTokens, 120);
+
+        // Each row's usage from its own sessions: complete, an explicit $0.00, partial, unknown, and none.
+        const usage = (name: string) => {
+            const row = rows.find((each: { name: string }) => each.name === name);
+
+            return [
+                row.metrics.usage.state,
+                usageKnowledge(row.metrics.usage, row.coverage),
+                cellText("tokens", row),
+                cellText("cost", row),
+            ];
+        };
+
+        assert.deepEqual(usage(REPOS.snosi.toLowerCase()), ["complete", "known", "6,500", "$0.75"]);
+        assert.deepEqual(usage(REPOS.long.toLowerCase()), ["complete", "known", "500", "$0.00"]);
+        assert.deepEqual(usage(REPOS.team.toLowerCase()), ["complete", "known", "1,950", null]);
+        assert.deepEqual(usage(REPOS.widgets.toLowerCase()), [
+            "partial",
+            "partial",
+            "250 (partial)",
+            "$0.10 (partial)",
+        ]);
+        assert.deepEqual(usage("acme-labs"), [
+            "partial",
+            "partial",
+            "250 (partial)",
+            "$0.10 (partial)",
+        ]);
+        assert.deepEqual(usage(REPOS.wiki.toLowerCase()), ["unknown", "unknown", null, null]);
+        assert.deepEqual(usage("bketelsen"), ["partial", "partial", "1,950 (partial)", null]);
+        assert.deepEqual(usage("frostyard"), ["complete", "known", "7,000", "$0.75"]);
+        assert.deepEqual(usage("Unattributed"), ["complete", "known", "120", "$0.05"]);
+
+        // Sorted by tokens, ascending: the partial rows by their number, the unknown homewiki row last.
+        assert.deepEqual(
+            tableRows(answer, { key: "tokens", dir: "asc" }).map(
+                (row: { name: string }) => row.name,
+            ),
+            [
+                "acme-labs",
+                REPOS.widgets.toLowerCase(),
+                "bketelsen",
+                REPOS.team.toLowerCase(),
+                REPOS.wiki.toLowerCase(),
+                "frostyard",
+                REPOS.long.toLowerCase(),
+                REPOS.snosi.toLowerCase(),
+                "Unattributed",
+            ],
+        );
 
         // Sorted by cost, descending: unknown last.
         const byCost = tableRows(answer, { key: "cost", dir: "desc" }).map(
@@ -294,22 +377,179 @@ describe("the preview fixture: what the screen shows", () => {
             "stale-source",
             "stale-source",
             "stale-source",
+            "usage-unknown",
             "partial",
         ]);
         assert.deepEqual(codes(take({}, "usage-unavailable")), [
             "failed-source",
             "usage-unavailable",
+            "usage-unknown",
             "partial",
         ]);
-        assert.deepEqual(codes(take({}, "partial-usage")), ["partial"]);
+        assert.deepEqual(codes(take({}, "partial-usage")), ["usage-unknown", "partial"]);
         assert.match(
-            dashboardStates(take({}, "partial-usage"))[0].text,
+            dashboardStates(take({}, "partial-usage"))[1].text,
             /usage: 3 sessions pending, 1 ledger unreadable/,
         );
-        assert.deepEqual(codes(take(), { error: "HTTP 500" }), ["refresh-failed", "partial"]);
+        assert.deepEqual(codes(take(), { error: "HTTP 500" }), [
+            "refresh-failed",
+            "usage-unknown",
+            "partial",
+        ]);
         assert.deepEqual(codes(null, { error: "HTTP 500" }), ["refresh-failed"]);
         assert.deepEqual(codes(take({ owner: "nobody" })), ["partial", "no-work"]);
-        assert.deepEqual(codes(take({ repo: REPOS.wiki })), ["partial", "no-closures"]);
+        assert.deepEqual(codes(take({ repo: REPOS.wiki })), [
+            "usage-unknown",
+            "partial",
+            "no-closures",
+        ]);
+        // A scope whose sessions all have a complete read has no usage notice.
+        assert.deepEqual(codes(take({ repo: REPOS.snosi })), ["partial"]);
+    });
+
+    test("the drill-down: each row's path gives the threads and PRs that the row counts", () => {
+        const answer = take();
+        const rows = tableRows(answer, { key: "name", dir: "asc" });
+
+        const drill = (name: string): Records => {
+            const row = rows.find((each: { name: string }) => each.name === name);
+            const path = recordsPath(row, answer.range);
+            const [route, search] = path.split("?");
+
+            assert.equal(route, "dashboard/records");
+
+            const fixture = dashboardFixture(NOW);
+            const result = records({
+                ...fixture,
+                now: NOW,
+                query: Object.fromEntries(new URLSearchParams(search)),
+            });
+
+            if ("error" in result) {
+                assert.fail(result.error);
+            }
+
+            return result;
+        };
+
+        const snosi = drill(REPOS.snosi.toLowerCase());
+
+        assert.deepEqual(snosi.scope, { kind: "repo", owner: "frostyard", repo: REPOS.snosi });
+        assert.deepEqual(
+            snosi.threads.map((thread) => [thread.id, thread.kind, thread.gone]),
+            [
+                ["T1", "success", false],
+                ["T2", "success", false],
+                ["T3", "abandoned", false],
+                ["T4", "failed", false],
+                ["T5", "dropped", false],
+                ["T15", "now", false],
+                ["T22", "success", true],
+            ],
+        );
+        assert.deepEqual(
+            snosi.threads.map((thread) => threadKindText(thread)),
+            [
+                "closed: success",
+                "closed: success",
+                "closed: abandoned",
+                "closed: failed",
+                "closed: dropped (excluded)",
+                "open now",
+                "closed: success",
+            ],
+        );
+        // The unread #13 has no event in the range: it is not in the list.
+        assert.deepEqual(
+            snosi.prs.map((pr) => [pr.ref, pr.events, prUrl(pr)]),
+            [
+                [
+                    `${REPOS.snosi}#10`,
+                    ["created", "merged"],
+                    `https://github.com/${REPOS.snosi}/pull/10`,
+                ],
+                [
+                    `${REPOS.snosi}#11`,
+                    ["created", "closed-unmerged"],
+                    `https://github.com/${REPOS.snosi}/pull/11`,
+                ],
+                [
+                    `${REPOS.snosi}#12`,
+                    ["created", "open-now"],
+                    `https://github.com/${REPOS.snosi}/pull/12`,
+                ],
+            ],
+        );
+        assert.equal(
+            prEventsText(snosi.prs[1]),
+            "closed · created in range, closed unmerged in range",
+        );
+        assert.deepEqual(snosi.truncated, { threads: 0, prs: 0 });
+
+        // The owner subtotal: T10 is outside 30 days, T12 has no close time, T19 is a coordinator.
+        const owner = drill("bketelsen");
+
+        assert.deepEqual(owner.scope, { kind: "owner", owner: "bketelsen" });
+        assert.deepEqual(
+            owner.threads.map((thread) => `${thread.id}:${thread.kind}`),
+            ["T9:success", "T11:success", "T16:now"],
+        );
+        assert.deepEqual(
+            owner.prs.map((pr) => `${pr.ref}:${pr.events.join("+")}`),
+            [
+                `${REPOS.team}#93:created+merged`,
+                `${REPOS.team}#94:open-now`,
+                `${REPOS.team}#95:created+merged`,
+            ],
+        );
+
+        // The unattributed row: its threads only (T20 is ask-only), and no PR.
+        const unattributed = drill("Unattributed");
+
+        assert.deepEqual(unattributed.scope, { kind: "unattributed" });
+        assert.deepEqual(
+            unattributed.threads.map((thread) => [thread.id, thread.kind, thread.repo]),
+            [
+                ["T18", "success", null],
+                ["T21", "now", null],
+            ],
+        );
+        assert.deepEqual(unattributed.prs, []);
+
+        // The scope total has no drill-down; all tracked work holds every row's records.
+        assert.equal(recordsPath({ kind: "total", name: "Scope total" }, answer.range), null);
+
+        const all = records({ ...dashboardFixture(NOW), now: NOW, query: {} });
+
+        assert(!("error" in all));
+        assert.deepEqual(
+            all.threads.map((thread) => thread.id),
+            [
+                "T1",
+                "T2",
+                "T3",
+                "T4",
+                "T5",
+                "T6",
+                "T7",
+                "T8",
+                "T9",
+                "T11",
+                "T13",
+                "T14",
+                "T15",
+                "T16",
+                "T17",
+                "T18",
+                "T21",
+                "T22",
+            ],
+        );
+        assert.deepEqual(
+            all.threads.filter((thread) => thread.kind === "now").length,
+            answer.totals.workload.total,
+            "the open-now threads are the workload",
+        );
     });
 
     test("the fixture's times stay in their days: the counts do not move during a day", () => {
@@ -351,11 +591,15 @@ describe("the preview fixture: what the screen shows", () => {
         const failed = take({}, "usage-unavailable");
 
         assert.equal(usageAvailable(failed.coverage), true);
-        assert.equal(
-            tableRows(failed, { key: "name", dir: "asc" }).every(
-                (row: { usageUnknown: boolean }) => !row.usageUnknown,
-            ),
-            true,
+        // Each row keeps its own knowledge: only the homewiki row (no complete read) is unknown.
+        assert.deepEqual(
+            tableRows(failed, { key: "name", dir: "asc" })
+                .filter(
+                    (row: { metrics: Snapshot["totals"]; coverage: Snapshot["coverage"] }) =>
+                        usageKnowledge(row.metrics.usage, row.coverage) === "unknown",
+                )
+                .map((row: { name: string }) => row.name),
+            [REPOS.wiki.toLowerCase()],
         );
 
         const fixture = dashboardFixture(NOW, "usage-unavailable");
@@ -367,6 +611,14 @@ describe("the preview fixture: what the screen shows", () => {
         assert(!("error" in first));
         assert.equal(first.coverage.sources.usage.status, "failed");
         assert.equal(usageAvailable(first.coverage), false);
+        // No good read: every row is unknown, the complete ones too.
+        assert.deepEqual(
+            [
+                ...tableRows(first, { key: "name", dir: "asc" }),
+                { metrics: first.totals, coverage: first.coverage },
+            ].map((row) => [cellText("tokens", row), cellText("cost", row)]),
+            Array.from({ length: 10 }, () => [null, null]),
+        );
 
         const never = take({}, "not-started");
 

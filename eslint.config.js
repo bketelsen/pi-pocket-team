@@ -14,6 +14,44 @@ export default [
             parser: tseslint.parser,
         },
     },
+    {
+        // The page modules run in the browser: a name that is neither declared, imported, nor a browser global is a bug
+        // (a ReferenceError at runtime), so `no-undef` checks them. The globals are listed by hand: the `globals`
+        // package is not a dependency here.
+        files: ["*-web/**/*.js"],
+        languageOptions: {
+            sourceType: "module",
+            globals: Object.fromEntries(
+                [
+                    "AbortController",
+                    "CSS",
+                    "Event",
+                    "HTMLElement",
+                    "ResizeObserver",
+                    "URL",
+                    "URLSearchParams",
+                    "cancelAnimationFrame",
+                    "clearInterval",
+                    "clearTimeout",
+                    "console",
+                    "document",
+                    "fetch",
+                    "getComputedStyle",
+                    "history",
+                    "localStorage",
+                    "location",
+                    "navigator",
+                    "requestAnimationFrame",
+                    "setInterval",
+                    "setTimeout",
+                    "window",
+                ].map((name) => [name, "readonly"]),
+            ),
+        },
+        rules: {
+            "no-undef": "error",
+        },
+    },
     prettier,
     {
         files: ["**/*.{js,mjs,cjs,ts}"],

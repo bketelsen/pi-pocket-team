@@ -541,7 +541,7 @@ export const queueStatus = (queue, clock) => {
 };
 
 export default function setup(pocket) {
-    const { html, useEffect, useState, Loader } = pocket;
+    const { html, useEffect, useRef, useState, Loader } = pocket;
 
     app = pocket;
     pocket.style("desk.css");
@@ -1462,10 +1462,21 @@ export default function setup(pocket) {
         </div>`;
     }
 
-    function Detail({ id, onBack }) {
+    /**
+     * 1 thread's detail. `backLabel` names where Back returns: the desk, or the Dashboard it came from. `focusBack`: the
+     * Back button takes the focus when the detail opens (from the Dashboard's drill-down, whose button goes away).
+     */
+    function Detail({ id, onBack, backLabel = "Back to the desk", focusBack = false }) {
         const [thread, setThread] = useState(null);
         const [reports, setReports] = useState([]);
         const [error, setError] = useState("");
+        const back = useRef(null);
+
+        useEffect(() => {
+            if (focusBack) {
+                back.current?.focus();
+            }
+        }, []);
 
         useEffect(() => {
             const abort = new AbortController();
@@ -1487,7 +1498,7 @@ export default function setup(pocket) {
 
         return html`<div class="desk">
             <div class="desk-bar">
-                <button class="button" aria-label="Back to the desk" onClick=${onBack}>Back</button>
+                <button class="button" ref=${back} aria-label=${backLabel} onClick=${onBack}>Back</button>
                 <span class="desk-id">${id}</span>
             </div>
             ${error ? html`<div class="error-box" role="alert">${error}</div>` : null}
@@ -1835,9 +1846,20 @@ export default function setup(pocket) {
         };
 
         if (tab === "dashboard") {
+            // A thread opened from the Dashboard's drill-down: Back returns to the Dashboard (the tab stays), whose
+            // module memory keeps its selection, its numbers, and the row whose button gets the focus back.
+            if (openId !== null) {
+                return html`<${Detail}
+                    id=${openId}
+                    backLabel="Back to the dashboard"
+                    focusBack=${true}
+                    onBack=${() => setOpenId(null)}
+                />`;
+            }
+
             return html`<div class="dash-page">
                 <div class="dash-tabs-wrap">${viewTabs(tab, setTab)}</div>
-                <${Dashboard} />
+                <${Dashboard} onOpenThread=${(thread) => setOpenId(thread)} />
             </div>`;
         }
 
