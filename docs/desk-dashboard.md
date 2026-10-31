@@ -91,6 +91,14 @@ module's dispose stop the timer and abort a read in flight; an answer that comes
   time, or a merge before it) is excluded as invalid. Issues with no authoritative resolving PR are undated and excluded
   by reason: `not-planned`, `no-resolving-pr`, `ambiguous`, `incomplete`, `missing`, `inaccessible`, `invalid`,
   `no-resolution`, `unread`. With no sample the card says "No eligible resolved issues". This is not thread cycle time.
+- **Resolution evidence.** Only the issue's latest close event gives a sample: a close by a merged PR, with that PR's
+  `mergedAt` (`closed-event`). After a reopen, only the latest close counts. A manual close (no closer) or a close by a
+  commit has no resolving PR (`no-resolving-pr`): earlier merged closing PRs never give a sample. When no latest close
+  event is visible, the closing references cannot show the latest resolver. They only tell the reason: a merged closing
+  PR makes the issue `ambiguous` (paging stops); a complete list with no merged PR is `no-resolving-pr`; pages left with
+  no merged PR yet is `incomplete`. A resolution that an older rule stored from 1 closing reference
+  (`closing-reference`) is no sample: each pass marks it `ambiguous` (also when a failed read, a backoff or the read
+  budget delays its read), reads it again at once, and a good read judges it by this rule.
 - **Current workload.** Delivery threads that are starting, open, or parked now (not gone), labeled "now": it is not the
   state at the end of the range.
 - **Tracked PRs.** PRs attached to, seen by, or matched by branch to Desk threads, deduplicated by `owner/name#number` in
@@ -142,6 +150,14 @@ an agent and never sends a message. Each pass:
       collector's own refresh rules and the stored facts, is due by more than `STALE_MS`. During a backoff that has not
       ended, overdue refs do not count, and the status is at least partial. It is also partial when the source lists
       partial refs or is not complete.
+    - **GitHub `partial` and `complete`** come from the whole stored state, not from the last answer only. `partial`
+      lists each ref with a stored read error, each ref of the last answer with an error in its part (also a deeper
+      error beside good data), and each earlier entry until a clean read of it. All 3 take only a tracked ref, and a PR
+      only when it is not excluded: a missing or archived PR is no coverage gap, so it never enters the list. A failure
+      of the whole read keeps the list. A ref that becomes untracked or excluded leaves it.
+      `complete` is true only when every tracked PR is excluded or read with no gap and no error, every tracked issue is
+      read with no gap, no error, and is not `incomplete` (for example at the closing page limit), and `partial` is
+      empty.
 
 ## Source gaps
 

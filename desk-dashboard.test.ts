@@ -814,7 +814,8 @@ describe("PR lifecycle", () => {
         assert.equal(doc.sources.github?.ok, false);
         assert.equal(doc.sources.github?.kind, "partial");
         assert.equal(doc.sources.github?.lastGoodAt, T0);
-        assert.deepEqual(doc.sources.github?.partial, ["a/b#1"]);
+        assert.equal(doc.sources.github?.partial, undefined, "an excluded PR is no coverage gap");
+        assert.equal(doc.sources.github?.complete, true);
         assert.equal(planReads(doc, trackedRefs(desk), T0 + OPEN_REFRESH_MS + HOUR).length, 0);
         assert.equal(
             planReads(doc, trackedRefs(desk), T0 + OPEN_REFRESH_MS + CLOSED_REFRESH_MS).length,
@@ -932,7 +933,8 @@ describe("source failures", () => {
         await pass(doc, desk, T0, graphql);
         assert.equal(doc.prs["a/b#1"]?.createdAt, T0 - DAY);
         assert.equal(doc.prs["a/b#2"]?.excluded, "missing");
-        assert.deepEqual(doc.sources.github?.partial, ["a/b#2"]);
+        assert.equal(doc.sources.github?.partial, undefined, "a missing PR is no coverage gap");
+        assert.equal(doc.sources.github?.complete, true);
     });
 
     test("applying the same pass twice gives the same document as once", () => {
@@ -960,10 +962,11 @@ describe("source failures", () => {
                             state: "CLOSED",
                             createdAt: iso(T0 - 5 * DAY),
                             closedAt: iso(T0 - DAY),
-                            timelineItems: { nodes: [{ __typename: "ClosedEvent", closer: null }] },
+                            // No visible close event, and no merged reference yet: the next page is due.
+                            timelineItems: { nodes: [] },
                             closedByPullRequestsReferences: {
                                 pageInfo: { hasNextPage: true, endCursor: "page2" },
-                                nodes: [prNode("a/b#1", T0 - 2 * DAY)],
+                                nodes: [prNode("a/b#1")],
                             },
                         },
                     },
@@ -1017,6 +1020,7 @@ describe("source failures", () => {
         applyPass(thrice, next);
         assert.deepEqual(thrice, twice);
         assert.equal(twice.issues["a/b#5"]?.closing?.pages, 2);
+        assert.equal(twice.issues["a/b#5"]?.unresolved, "ambiguous");
     });
 
     test("a failed document read fails no pass: no GitHub call, every fact stays, the next pass tries again", async () => {
@@ -1262,7 +1266,7 @@ describe("review fixes", () => {
         await answerPass(doc, desk, T0, {
             data: {
                 i0: issueNode({
-                    timelineItems: { nodes: [{ __typename: "ClosedEvent", closer: null }] },
+                    timelineItems: { nodes: [] },
                     closedByPullRequestsReferences: {
                         pageInfo: { hasNextPage: true, endCursor: "page2" },
                         nodes: [],
@@ -1411,6 +1415,209 @@ describe("review fixes", () => {
         assert.equal(doc.issues["a/b#5"]?.gaps, undefined);
         assert.equal(doc.sources.github?.complete, true);
     });
+
+    test("an issue at the closing page limit is incomplete, and the source is not complete", async () => {
+        const doc = fresh();
+        const pages: Record<string, { nodes: ClosingNode[]; next?: string }> = {};
+
+        for (let n = 2; n <= MAX_CLOSING_PAGES + 2; n += 1) {
+            pages[`page${String(n)}`] = { nodes: [], next: `page${String(n + 1)}` };
+        }
+
+        const github = fakeGitHub({
+            issues: {
+                "a/b#5": {
+                    state: "CLOSED",
+                    createdAt: T0 - 10 * DAY,
+                    closedAt: T0 - DAY,
+                    pages,
+                },
+            },
+        });
+
+        for (let n = 0; n < MAX_CLOSING_PAGES; n += 1) {
+            await pass(doc, desk, T0 + n * PASS_MS, github.graphql);
+        }
+
+        assert.equal(doc.issues["a/b#5"]?.unresolved, "incomplete");
+        assert.equal(doc.issues["a/b#5"]?.closing?.cursor, undefined);
+        assert.equal(doc.issues["a/b#5"]?.error, undefined);
+        assert.equal(doc.sources.github?.partial, undefined);
+        assert.equal(doc.sources.github?.complete, false);
+    });
+
+    for (const [kind, failing] of [
+        ["a PR", "a/b#1"],
+        ["an issue", "a/b#5"],
+    ] as const) {
+        test(`${kind} whose later read fails stays partial until a clean read of it`, async () => {
+            const doc = fresh();
+            const refs = deskOf([
+                thread("T1", { prs: { "a/b#1": link(), "a/b#2": link() }, issues: ["a/b#5"] }),
+            ]);
+            const good: World = {
+                prs: {
+                    "a/b#1": { state: "OPEN", createdAt: T0 - DAY },
+                    "a/b#2": { state: "OPEN", createdAt: T0 - DAY },
+                },
+                issues: { "a/b#5": { state: "OPEN", createdAt: T0 - DAY } },
+            };
+            const world: World = copy(good);
+            const github = fakeGitHub(world);
+
+            await pass(doc, refs, T0, github.graphql);
+            assert.equal(doc.sources.github?.complete, true);
+            assert.equal(doc.sources.github?.partial, undefined);
+
+            const t2 = T0 + OPEN_REFRESH_MS;
+
+            if (kind === "a PR") {
+                world.prs!["a/b#1"] = "FORBIDDEN";
+            } else {
+                world.issues!["a/b#5"] = "FORBIDDEN";
+            }
+
+            await pass(doc, refs, t2, github.graphql);
+            assert.deepEqual(doc.sources.github?.partial, [failing]);
+            assert.equal(doc.sources.github?.complete, false);
+
+            // A later pass reads the other refs only: the stored error keeps the ref partial.
+            const t3 = t2 + OPEN_REFRESH_MS;
+
+            assert.ok(!planReads(doc, trackedRefs(refs), t3).some((read) => read.key === failing));
+            await pass(doc, refs, t3, github.graphql);
+            assert.equal(github.calls.length, 3);
+            assert.deepEqual(doc.sources.github?.partial, [failing]);
+            assert.equal(doc.sources.github?.complete, false);
+
+            // A clean read of it.
+            Object.assign(world, copy(good));
+            await pass(doc, refs, t2 + CLOSED_REFRESH_MS, github.graphql);
+            assert.equal(doc.sources.github?.partial, undefined);
+            assert.equal(doc.sources.github?.complete, true);
+        });
+    }
+
+    test("a deeper error beside an ok PR result stays partial, also through a whole-read failure, until a clean read", async () => {
+        const doc = fresh();
+        const prs = deskOf([thread("T1", { prs: { "a/b#1": link() } })]);
+        const open = {
+            isArchived: false,
+            pullRequest: { state: "OPEN", createdAt: iso(T0 - DAY) },
+        };
+
+        await answerPass(doc, prs, T0, {
+            data: { p0: open },
+            errors: [{ type: "INTERNAL", path: ["p0", "pullRequest", "mergedAt"], message: "x" }],
+        });
+        assert.equal(doc.prs["a/b#1"]?.error, undefined, "an ok result stores no error");
+        assert.deepEqual(doc.sources.github?.partial, ["a/b#1"]);
+        assert.equal(doc.sources.github?.complete, false);
+
+        // A pass with no read keeps it.
+        const before = copy(doc);
+
+        await pass(doc, prs, T0 + PASS_MS, async () => {
+            throw new Error("no read is due");
+        });
+        assert.deepEqual(doc.sources.github, before.sources.github);
+
+        // A failure of the whole read reads nothing cleanly: the list stays.
+        await pass(doc, prs, T0 + OPEN_REFRESH_MS, async () => {
+            throw Object.assign(new Error("Command failed: gh api graphql"), {
+                stderr: "dial tcp: ECONNRESET",
+                code: 1,
+            });
+        });
+        assert.equal(doc.sources.github?.ok, false);
+        assert.deepEqual(doc.sources.github?.partial, ["a/b#1"]);
+        assert.equal(doc.sources.github?.complete, false);
+
+        await answerPass(doc, prs, T0 + OPEN_REFRESH_MS + PASS_MS, { data: { p0: open } });
+        assert.equal(doc.sources.github?.ok, true);
+        assert.equal(doc.sources.github?.partial, undefined);
+        assert.equal(doc.sources.github?.complete, true);
+    });
+
+    test("a NOT_FOUND PR is never partial; a later good read makes it follow the normal rules", async () => {
+        const doc = fresh();
+        const prs = deskOf([thread("T1", { prs: { "a/b#1": link(), "a/b#2": link() } })]);
+        const open = {
+            isArchived: false,
+            pullRequest: { state: "OPEN", createdAt: iso(T0 - DAY) },
+        };
+        const settled = () => ({
+            excluded: doc.prs["a/b#1"]?.excluded,
+            partial: doc.sources.github?.partial,
+            complete: doc.sources.github?.complete,
+        });
+        const missing = { excluded: "missing", partial: undefined, complete: true };
+
+        // Its own pass.
+        await answerPass(doc, prs, T0, {
+            data: { p0: { isArchived: false, pullRequest: null }, p1: open },
+            errors: [{ type: "NOT_FOUND", path: ["p0", "pullRequest"], message: "x" }],
+        });
+        assert.deepEqual(settled(), missing);
+
+        // A pass with no read.
+        await pass(doc, prs, T0 + PASS_MS, async () => {
+            throw new Error("no read is due");
+        });
+        assert.deepEqual(settled(), missing);
+
+        // A failure of the whole read.
+        await pass(doc, prs, T0 + OPEN_REFRESH_MS, async () => {
+            throw Object.assign(new Error("Command failed: gh api graphql"), {
+                stderr: "dial tcp: ECONNRESET",
+                code: 1,
+            });
+        });
+        assert.equal(doc.sources.github?.ok, false);
+        assert.deepEqual(settled(), missing);
+
+        // It is there again, with a deeper error: not excluded, so partial until a clean read.
+        const back = T0 + CLOSED_REFRESH_MS;
+
+        assert.deepEqual(
+            planReads(doc, trackedRefs(prs), back).map((read) => read.key),
+            ["a/b#1", "a/b#2"],
+        );
+        await answerPass(doc, prs, back, {
+            data: { p0: open, p1: open },
+            errors: [{ type: "INTERNAL", path: ["p0", "pullRequest", "mergedAt"], message: "x" }],
+        });
+        assert.deepEqual(settled(), { excluded: undefined, partial: ["a/b#1"], complete: false });
+
+        await answerPass(doc, prs, back + OPEN_REFRESH_MS, { data: { p0: open, p1: open } });
+        assert.deepEqual(settled(), { excluded: undefined, partial: undefined, complete: true });
+    });
+
+    test("a partial ref that becomes untracked leaves the list", async () => {
+        const doc = fresh();
+        const prs = deskOf([thread("T1", { prs: { "a/b#1": link(), "a/b#2": link() } })]);
+
+        await answerPass(doc, prs, T0, {
+            data: {
+                p0: { isArchived: false, pullRequest: { state: "OPEN", createdAt: iso(T0 - DAY) } },
+                p1: { isArchived: false, pullRequest: null },
+            },
+            errors: [
+                { type: "INTERNAL", path: ["p0", "pullRequest", "mergedAt"], message: "x" },
+                { type: "FORBIDDEN", path: ["p1", "pullRequest"], message: "x" },
+            ],
+        });
+        assert.deepEqual(doc.sources.github?.partial, ["a/b#1", "a/b#2"]);
+        assert.equal(doc.sources.github?.complete, false);
+
+        await pass(doc, deskOf([thread("T1")]), T0 + PASS_MS, async () => {
+            throw new Error("no read is due");
+        });
+        assert.equal(doc.prs["a/b#1"]?.untracked, true);
+        assert.equal(doc.prs["a/b#2"]?.untracked, true);
+        assert.equal(doc.sources.github?.partial, undefined);
+        assert.equal(doc.sources.github?.complete, true);
+    });
 });
 
 describe("issue resolution", () => {
@@ -1458,35 +1665,57 @@ describe("issue resolution", () => {
         assert.equal(doc.issues["a/b#5"]?.resolution?.pr, "a/b#8");
     });
 
-    test("a manual close with 2 merged closing PRs is ambiguous; with 1 it resolves", async () => {
-        const ambiguous = await resolveWith({
-            state: "CLOSED",
-            createdAt: T0 - 10 * DAY,
-            closedAt: T0 - DAY,
-            event: { type: "closed", closer: null },
-            closing: [
+    test("a manual close with 1 or 2 earlier merged closing PRs has no resolving PR", async () => {
+        for (const closing of [
+            [{ ref: "a/b#7", mergedAt: T0 - 5 * DAY }],
+            [
                 { ref: "a/b#7", mergedAt: T0 - 5 * DAY },
                 { ref: "a/b#8", mergedAt: T0 - 2 * DAY },
             ],
-        });
+        ]) {
+            const doc = await resolveWith({
+                state: "CLOSED",
+                createdAt: T0 - 10 * DAY,
+                closedAt: T0 - DAY,
+                event: { type: "closed", closer: null },
+                closing,
+                pages: { page2: { nodes: [] } },
+            });
 
-        assert.equal(ambiguous.issues["a/b#5"]?.unresolved, "ambiguous");
-        assert.equal(ambiguous.issues["a/b#5"]?.resolution, undefined);
+            assert.equal(doc.issues["a/b#5"]?.unresolved, "no-resolving-pr");
+            assert.equal(doc.issues["a/b#5"]?.resolution, undefined);
+            assert.equal(doc.issues["a/b#5"]?.closing?.cursor, undefined, "no more pages");
+        }
+    });
 
-        const one = await resolveWith({
-            state: "CLOSED",
-            createdAt: T0 - 10 * DAY,
-            closedAt: T0 - DAY,
-            event: { type: "closed", closer: null },
-            closing: [{ ref: "a/b#7", mergedAt: T0 - 5 * DAY }],
-        });
+    test("no visible close: a merged closing PR is ambiguous; none in a complete list has no resolving PR", async () => {
+        for (const event of [undefined, { type: "reopened" } as const]) {
+            const ambiguous = await resolveWith({
+                state: "CLOSED",
+                createdAt: T0 - 10 * DAY,
+                closedAt: T0 - DAY,
+                event,
+                closing: [{ ref: "a/b#7", mergedAt: T0 - 5 * DAY }],
+                pages: { page2: { nodes: [{ ref: "a/b#8", mergedAt: T0 - 2 * DAY }] } },
+            });
 
-        assert.deepEqual(one.issues["a/b#5"]?.resolution, {
-            pr: "a/b#7",
-            mergedAt: T0 - 5 * DAY,
-            evidence: "closing-reference",
-            at: T0,
-        });
+            assert.equal(ambiguous.issues["a/b#5"]?.unresolved, "ambiguous");
+            assert.equal(ambiguous.issues["a/b#5"]?.resolution, undefined);
+            assert.equal(ambiguous.issues["a/b#5"]?.closing?.cursor, undefined, "paging stops");
+            assert.equal(planReads(ambiguous, trackedRefs(desk), T0 + PASS_MS).length, 0);
+
+            const none = await resolveWith({
+                state: "CLOSED",
+                createdAt: T0 - 10 * DAY,
+                closedAt: T0 - DAY,
+                event,
+                closing: [],
+            });
+
+            assert.equal(none.issues["a/b#5"]?.unresolved, "no-resolving-pr");
+            assert.equal(none.issues["a/b#5"]?.resolution, undefined);
+            assert.equal(none.issues["a/b#5"]?.closing?.complete, true);
+        }
     });
 
     test("a manual close with no merged PR has no resolving PR", async () => {
@@ -1572,6 +1801,263 @@ describe("issue resolution", () => {
         assert.equal(doc.issues["a/b#5"]?.createdAt, T0 - 10 * DAY, "the original creation time");
     });
 
+    /** Closed by a/b#7 at T0 (a sample), then reopened (no sample): the document, the world, and the next pass time. */
+    async function reopenedAfterPr() {
+        const doc = fresh();
+        const world: World = {
+            issues: {
+                "a/b#5": {
+                    state: "CLOSED",
+                    createdAt: T0 - 10 * DAY,
+                    closedAt: T0 - DAY,
+                    event: { type: "closed", closer: { pr: "a/b#7", mergedAt: T0 - DAY } },
+                    closing: [{ ref: "a/b#7", mergedAt: T0 - DAY }],
+                },
+            },
+        };
+        const github = fakeGitHub(world);
+
+        await pass(doc, desk, T0, github.graphql);
+        assert.equal(doc.issues["a/b#5"]?.resolution?.pr, "a/b#7");
+
+        world.issues!["a/b#5"] = {
+            state: "OPEN",
+            createdAt: T0 - 10 * DAY,
+            event: { type: "reopened" },
+            closing: [{ ref: "a/b#7", mergedAt: T0 - DAY }],
+        };
+        await pass(doc, desk, T0 + CLOSED_REFRESH_MS, github.graphql);
+        assert.equal(doc.issues["a/b#5"]?.unresolved, "open");
+        assert.equal(doc.issues["a/b#5"]?.resolution, undefined);
+
+        return { doc, world, github, later: T0 + CLOSED_REFRESH_MS + OPEN_REFRESH_MS };
+    }
+
+    test("closed by a PR, reopened, then closed by hand: no resolving PR", async () => {
+        const { doc, world, github, later } = await reopenedAfterPr();
+
+        world.issues!["a/b#5"] = {
+            state: "CLOSED",
+            createdAt: T0 - 10 * DAY,
+            closedAt: later - HOUR,
+            event: { type: "closed", closer: null },
+            closing: [{ ref: "a/b#7", mergedAt: T0 - DAY }],
+        };
+        await pass(doc, desk, later, github.graphql);
+        assert.equal(doc.issues["a/b#5"]?.unresolved, "no-resolving-pr");
+        assert.equal(doc.issues["a/b#5"]?.resolution, undefined);
+    });
+
+    test("closed by PR A, reopened, then closed by PR B: B resolves it, once", async () => {
+        const { doc, world, github, later } = await reopenedAfterPr();
+
+        world.issues!["a/b#5"] = {
+            state: "CLOSED",
+            createdAt: T0 - 10 * DAY,
+            closedAt: later - HOUR,
+            event: { type: "closed", closer: { pr: "a/b#9", mergedAt: later - 2 * HOUR } },
+            closing: [
+                { ref: "a/b#7", mergedAt: T0 - DAY },
+                { ref: "a/b#9", mergedAt: later - 2 * HOUR },
+            ],
+        };
+        await pass(doc, desk, later, github.graphql);
+        assert.deepEqual(doc.issues["a/b#5"]?.resolution, {
+            pr: "a/b#9",
+            mergedAt: later - 2 * HOUR,
+            evidence: "closed-event",
+            at: later,
+        });
+        assert.equal(doc.issues["a/b#5"]?.unresolved, undefined);
+        assert.equal(doc.issues["a/b#5"]?.createdAt, T0 - 10 * DAY, "the creation time stays");
+        assert.equal(Object.keys(doc.issues).length, 1);
+    });
+
+    test("a stored closing-reference resolution is read again at once and judged by the current rule", async () => {
+        const doc = fresh();
+        const github = fakeGitHub({
+            issues: {
+                "a/b#5": {
+                    state: "CLOSED",
+                    createdAt: T0 - 10 * DAY,
+                    closedAt: T0 - DAY,
+                    event: { type: "closed", closer: null },
+                    closing: [{ ref: "a/b#7", mergedAt: T0 - 5 * DAY }],
+                },
+            },
+        });
+
+        await pass(doc, desk, T0, github.graphql);
+        assert.equal(planReads(doc, trackedRefs(desk), T0 + PASS_MS).length, 0, "not due yet");
+
+        // What the older rule stored for this issue: 1 merged closing reference before a manual close.
+        const fact = doc.issues["a/b#5"]!;
+
+        fact.resolution = {
+            pr: "a/b#7",
+            mergedAt: T0 - 5 * DAY,
+            evidence: "closing-reference",
+            at: T0,
+        };
+        delete fact.unresolved;
+
+        assert.deepEqual(
+            planReads(doc, trackedRefs(desk), T0 + PASS_MS).map((read) => [read.kind, read.why]),
+            [["issue", 1]],
+        );
+        await pass(doc, desk, T0 + PASS_MS, github.graphql);
+        assert.equal(github.calls.length, 2);
+        assert.equal(doc.issues["a/b#5"]?.resolution, undefined);
+        assert.equal(doc.issues["a/b#5"]?.unresolved, "no-resolving-pr");
+        assert.equal(planReads(doc, trackedRefs(desk), T0 + 2 * PASS_MS).length, 0);
+    });
+
+    /** A document with a resolution that the older closing-reference rule stored: read at T0, a manual close. */
+    async function legacy() {
+        const doc = fresh();
+        const github = fakeGitHub({
+            issues: {
+                "a/b#5": {
+                    state: "CLOSED",
+                    createdAt: T0 - 10 * DAY,
+                    closedAt: T0 - DAY,
+                    event: { type: "closed", closer: null },
+                    closing: [{ ref: "a/b#7", mergedAt: T0 - 5 * DAY }],
+                },
+            },
+        });
+
+        await pass(doc, desk, T0, github.graphql);
+
+        const fact = doc.issues["a/b#5"]!;
+
+        fact.resolution = {
+            pr: "a/b#7",
+            mergedAt: T0 - 5 * DAY,
+            evidence: "closing-reference",
+            at: T0,
+        };
+        delete fact.unresolved;
+
+        return { doc, github };
+    }
+
+    const legacyKept = (doc: DashboardState) => ({
+        unresolved: doc.issues["a/b#5"]?.unresolved,
+        evidence: doc.issues["a/b#5"]?.resolution?.evidence,
+    });
+    const ambiguousKept = { unresolved: "ambiguous", evidence: "closing-reference" };
+
+    test("a legacy closing-reference resolution is ambiguous while its read fails", async () => {
+        const failed = await legacy();
+
+        await pass(failed.doc, desk, T0 + PASS_MS, async () => {
+            throw Object.assign(new Error("Command failed: gh api graphql"), {
+                stderr: "dial tcp: ECONNRESET",
+                code: 1,
+            });
+        });
+        assert.equal(failed.doc.sources.github?.ok, false);
+        assert.deepEqual(legacyKept(failed.doc), ambiguousKept);
+        assert.deepEqual(
+            planReads(failed.doc, trackedRefs(desk), T0 + 2 * PASS_MS).map((read) => [
+                read.kind,
+                read.why,
+            ]),
+            [["issue", 1]],
+            "still read at once",
+        );
+
+        const unavailable = await legacy();
+
+        await answerPass(unavailable.doc, desk, T0 + PASS_MS, {
+            data: { i0: issueNode({ timelineItems: null }) },
+            errors: [{ type: "INTERNAL", path: ["i0", "issue", "timelineItems"], message: "x" }],
+        });
+        assert.equal(unavailable.doc.issues["a/b#5"]?.error, "partial");
+        assert.deepEqual(legacyKept(unavailable.doc), ambiguousKept);
+
+        // The same pass twice gives the same document.
+        const once = copy(unavailable.doc);
+        const input = { tracked: trackedRefs(desk), reads: [], now: T0 + 2 * PASS_MS };
+
+        applyPass(once, input);
+
+        const twice = copy(once);
+
+        applyPass(twice, input);
+        assert.deepEqual(twice, once);
+    });
+
+    test("a legacy closing-reference resolution is ambiguous during a backoff and when the budget defers it", async () => {
+        const backoff = await legacy();
+
+        backoff.doc.sources.github = { ...backoff.doc.sources.github, backoffUntil: T0 + DAY };
+        await pass(backoff.doc, desk, T0 + PASS_MS, backoff.github.graphql);
+        assert.equal(backoff.github.calls.length, 1, "no read during the backoff");
+        assert.deepEqual(legacyKept(backoff.doc), ambiguousKept);
+
+        // More never-read PRs than the budget: they go first, and the issue waits.
+        const deferred = await legacy();
+        const prs: Record<string, PrLink> = {};
+        const world: World = { prs: {}, issues: {} };
+
+        for (let n = 1; n <= MAX_REF_READS; n += 1) {
+            prs[`a/b#${String(100 + n)}`] = link();
+            world.prs![`a/b#${String(100 + n)}`] = { state: "OPEN", createdAt: T0 - DAY };
+        }
+
+        world.issues!["a/b#5"] = {
+            state: "CLOSED",
+            createdAt: T0 - 10 * DAY,
+            closedAt: T0 - DAY,
+            event: { type: "closed", closer: null },
+            closing: [{ ref: "a/b#7", mergedAt: T0 - 5 * DAY }],
+        };
+
+        const busy = deskOf([thread("T1", { prs, issues: ["a/b#5"] })]);
+        const github = fakeGitHub(world);
+
+        assert.ok(
+            !planReads(deferred.doc, trackedRefs(busy), T0 + PASS_MS).some(
+                (read) => read.key === "a/b#5",
+            ),
+        );
+        await pass(deferred.doc, busy, T0 + PASS_MS, github.graphql);
+        assert.equal(deferred.doc.prs["a/b#101"]?.readAt, T0 + PASS_MS);
+        assert.deepEqual(legacyKept(deferred.doc), ambiguousKept);
+
+        // The next pass reads it, and the current rule judges it.
+        await pass(deferred.doc, busy, T0 + 2 * PASS_MS, github.graphql);
+        assert.equal(deferred.doc.issues["a/b#5"]?.readAt, T0 + 2 * PASS_MS);
+        assert.equal(deferred.doc.issues["a/b#5"]?.unresolved, "no-resolving-pr");
+        assert.equal(deferred.doc.issues["a/b#5"]?.resolution, undefined);
+    });
+
+    test("a good read judges a legacy closing-reference resolution by the current rule", async () => {
+        const { doc } = await legacy();
+        const github = fakeGitHub({
+            issues: {
+                "a/b#5": {
+                    state: "CLOSED",
+                    createdAt: T0 - 10 * DAY,
+                    closedAt: T0 - DAY,
+                    event: { type: "closed", closer: { pr: "a/b#7", mergedAt: T0 - 5 * DAY } },
+                    closing: [{ ref: "a/b#7", mergedAt: T0 - 5 * DAY }],
+                },
+            },
+        });
+
+        await pass(doc, desk, T0 + PASS_MS, github.graphql);
+        assert.deepEqual(doc.issues["a/b#5"]?.resolution, {
+            pr: "a/b#7",
+            mergedAt: T0 - 5 * DAY,
+            evidence: "closed-event",
+            at: T0 + PASS_MS,
+        });
+        assert.equal(doc.issues["a/b#5"]?.unresolved, undefined);
+    });
+
     test("1 PR resolves 2 issues; 1 issue linked by 2 threads and a plan is 1 fact", async () => {
         const doc = fresh();
         const both = deskOf(
@@ -1616,8 +2102,11 @@ describe("issue resolution", () => {
             state: "CLOSED",
             createdAt: T0 - 10 * DAY,
             closedAt: T0 - DAY,
-            event: { type: "closed", closer: null },
-            closing: [{ ref: "a/b#7", mergedAt: T0 - 2 * DAY }],
+            event: { type: "closed", closer: { pr: "a/b#7", mergedAt: T0 - 2 * DAY } },
+            closing: [
+                { ref: "a/b#6", mergedAt: T0 - 3 * DAY },
+                { ref: "a/b#7", mergedAt: T0 - 2 * DAY },
+            ],
         });
 
         assert.equal(doc.issues["a/b#5"]?.resolution?.pr, "a/b#7");
@@ -1632,7 +2121,7 @@ describe("issue resolution", () => {
                     state: "CLOSED",
                     createdAt: T0 - 10 * DAY,
                     closedAt: T0 - DAY,
-                    event: { type: "closed", closer: null },
+                    // No visible close event: the closing references tell ambiguous from no resolving PR.
                     closing: [],
                     pages: { page2: { nodes: [{ ref: "a/b#7", mergedAt: T0 - 2 * DAY }] } },
                 },
@@ -1650,8 +2139,16 @@ describe("issue resolution", () => {
             [["closing", "page2"]],
         );
         await pass(doc, desk, T0 + PASS_MS, github.graphql);
-        assert.equal(doc.issues["a/b#5"]?.unresolved, undefined);
-        assert.equal(doc.issues["a/b#5"]?.resolution?.pr, "a/b#7");
+        assert.equal(
+            doc.issues["a/b#5"]?.unresolved,
+            "ambiguous",
+            "a merged reference, no visible closer",
+        );
+        assert.equal(doc.issues["a/b#5"]?.resolution, undefined);
+        assert.deepEqual(doc.issues["a/b#5"]?.closing?.merged, [
+            { ref: "a/b#7", mergedAt: T0 - 2 * DAY },
+        ]);
+        assert.equal(doc.issues["a/b#5"]?.closing?.cursor, undefined);
         assert.equal(doc.issues["a/b#5"]?.closing?.pages, 2);
         assert.equal(doc.issues["a/b#5"]?.closing?.complete, true);
         assert.match(github.calls[1] ?? "", /after: "page2"/);
@@ -1674,7 +2171,6 @@ describe("issue resolution", () => {
                     state: "CLOSED",
                     createdAt: T0 - 10 * DAY,
                     closedAt: T0 - DAY,
-                    event: { type: "closed", closer: null },
                     pages,
                 },
             },

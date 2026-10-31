@@ -99,13 +99,22 @@ export type GitHubSource = {
     kind?: FailureKind;
     /** The last read with no failure. */
     lastGoodAt?: number;
-    /** The refs whose part of the answer had an error. */
+    /**
+     * The refs with a problem in the whole stored state, sorted and unique: each ref with a stored `error`, each ref of
+     * the last answer whose part had an error (also a deeper error beside good data), and each earlier entry until a
+     * clean read of it (an ok result with no error in its part). A failure of the whole read reads nothing cleanly, so
+     * the earlier entries stay. Each of the 3 takes only a tracked ref, and a PR only when it is not excluded: a
+     * missing or archived PR, or one linked only by the window rule, is never a coverage gap. Absent: none.
+     */
     partial?: string[];
     /** No GitHub read before this time: a rate limit. */
     backoffUntil?: number;
     /** The due ref reads left after the last pass. */
     pending?: number;
-    /** Every tracked ref that is not excluded has had 1 good read. */
+    /**
+     * The whole stored state is complete: every tracked PR is excluded, or has a good read, no gaps and no error; every
+     * tracked issue has a good read, no gaps, no error, and is not `incomplete`; and `partial` is empty.
+     */
     complete?: boolean;
     /** GitHub's points left after the last read. */
     rateRemaining?: number;
@@ -213,7 +222,12 @@ export type IssueFact = {
      * `closedAt`. The source is not complete while an issue has gaps. Absent: no gap.
      */
     gaps?: string[];
-    /** The PR that resolved it (lowercased ref, maybe in another repository), its merge time, and the evidence. */
+    /**
+     * The PR that resolved it (lowercased ref, maybe in another repository), its merge time, and the evidence. Only the
+     * latest close by a merged PR (`closed-event`) gives it now. `closing-reference` is from an older rule (1 merged
+     * closing reference before the close): it is no sample now. Each pass marks such a fact `unresolved: "ambiguous"`
+     * and keeps the resolution, so the fact is read again at once and judged by the current rule.
+     */
     resolution?: {
         pr: string;
         mergedAt: number;
@@ -221,11 +235,15 @@ export type IssueFact = {
         /** When a pass found this resolution. */
         at: number;
     };
-    /** Why there is no sample. It wins over an older `resolution` that a missing or inaccessible read kept. */
+    /**
+     * Why there is no sample. It wins over an older `resolution` that a missing or inaccessible read kept, and over a
+     * stored `closing-reference` resolution (marked "ambiguous" until a good read judges it again).
+     */
     unresolved?: Unresolved;
     /**
      * The merged closing references read so far (lowercased refs with their merge time), whether every page is read,
-     * the cursor of the next page, and the pages read.
+     * the cursor of the next page, and the pages read. A cursor stays only for a closed issue with no visible latest
+     * close and no merged reference read yet: the references only tell `ambiguous` from `no-resolving-pr`.
      */
     closing?: {
         merged: { ref: string; mergedAt?: number }[];
@@ -722,6 +740,12 @@ function issueDue(
 
     if (fact.error !== undefined && fact.errorAt !== undefined) {
         return now - fact.errorAt >= retryMs(fact.error) ? { kind, why: 2 } : undefined;
+    }
+
+    // A resolution from the older closing-reference rule is no evidence now: read the issue again at once, so the
+    // current rule judges it.
+    if (fact.resolution?.evidence === "closing-reference") {
+        return { kind: "issue", why: 1 };
     }
 
     if (cursor !== undefined) {
@@ -1405,8 +1429,11 @@ function unresolved(fact: IssueFact, why: Unresolved): void {
 }
 
 /**
- * An issue's resolution from its state, its latest close, and its merged closing references. `closer` absent: the
- * latest event is not a close, or none is visible, so the closing references decide.
+ * An issue's resolution from its state and its latest close. Only the latest close by a merged PR gives a sample. A
+ * manual close (`closer` type "none") or a close by something else (a Commit) has no resolving PR: earlier merged
+ * closing references never give a sample. `closer` absent: no latest close is visible, so the closing references cannot
+ * show the latest resolver; they only tell `ambiguous` (a merged reference) from `no-resolving-pr` (a complete list with
+ * none) and `incomplete` (no merged reference read yet, and pages left).
  */
 function judgeIssue(fact: IssueFact, closer: Closer | undefined, now: number): void {
     if (fact.state === "OPEN") {
@@ -1439,7 +1466,7 @@ function judgeIssue(fact: IssueFact, closer: Closer | undefined, now: number): v
         return;
     }
 
-    if (closer?.type === "other") {
+    if (closer?.type === "other" || closer?.type === "none") {
         unresolved(fact, "no-resolving-pr");
 
         return;
@@ -1447,48 +1474,24 @@ function judgeIssue(fact: IssueFact, closer: Closer | undefined, now: number): v
 
     const closing = fact.closing;
 
-    if (closing === undefined || !closing.complete) {
-        unresolved(fact, "incomplete");
-
-        return;
-    }
-
-    if (closing.merged.length === 0) {
-        unresolved(fact, "no-resolving-pr");
-
-        return;
-    }
-
-    const closedAt = fact.closedAt;
-
-    if (
-        closedAt === undefined ||
-        fact.createdAt === undefined ||
-        closing.merged.some((pr) => pr.mergedAt === undefined)
-    ) {
-        unresolved(fact, "invalid");
-
-        return;
-    }
-
-    const before = closing.merged.filter((pr) => (pr.mergedAt ?? Infinity) <= closedAt);
-    const only = before[0];
-
-    if (before.length > 1) {
+    if ((closing?.merged.length ?? 0) > 0) {
         unresolved(fact, "ambiguous");
-    } else if (only === undefined || only.mergedAt === undefined) {
-        unresolved(fact, "no-resolving-pr");
+    } else if (closing === undefined || !closing.complete) {
+        unresolved(fact, "incomplete");
     } else {
-        resolve(fact, only.ref, only.mergedAt, "closing-reference", now);
+        unresolved(fact, "no-resolving-pr");
     }
 }
 
-/** Whether the closing references must be read to the end: a close with no visible closer. */
+/**
+ * Whether the closing references must be read on: a close with no visible latest close event, and no merged reference
+ * on the first page. A merged reference makes the issue `ambiguous` at once.
+ */
 const needsClosing = (result: Extract<ReadResult, { kind: "issue" }>): boolean =>
     result.state === "CLOSED" &&
     result.stateReason !== "NOT_PLANNED" &&
-    result.closer?.type !== "PullRequest" &&
-    result.closer?.type !== "other";
+    result.closer === undefined &&
+    result.closing.merged.length === 0;
 
 function applyIssueResult(
     fact: IssueFact,
@@ -1550,14 +1553,14 @@ function applyClosingResult(
         pages,
     };
 
-    if (result.closing.cursor !== undefined && pages < MAX_CLOSING_PAGES) {
+    if (result.closing.cursor !== undefined && merged.length === 0 && pages < MAX_CLOSING_PAGES) {
         closing.cursor = result.closing.cursor;
     }
 
     put(fact, "error", undefined);
     put(fact, "errorAt", undefined);
     put(fact, "closing", closing);
-    // A cursor is kept only for a close with no visible closer: the closing references decide.
+    // A cursor is kept only for a close with no visible latest close event, and no merged reference read yet.
     judgeIssue(fact, undefined, now);
 }
 
@@ -1716,6 +1719,15 @@ export function applyPass(draft: DashboardState, input: PassInput): void {
         }
     }
 
+    // A resolution from the older closing-reference rule is no sample: it is ambiguous until a good read judges it
+    // again (also when a failed read, a backoff or the read budget delays that read). The resolution stays, so
+    // `issueDue` plans the read at once. A good read in this pass judges it below.
+    for (const fact of Object.values(draft.issues)) {
+        if (fact.resolution?.evidence === "closing-reference" && fact.unresolved === undefined) {
+            put(fact, "unresolved", "ambiguous");
+        }
+    }
+
     for (const result of input.answer?.results ?? []) {
         if (!result.ok) {
             applyFailedRead(draft, result, now);
@@ -1760,7 +1772,6 @@ function applyGitHubSource(draft: DashboardState, input: PassInput): void {
             source.ok = false;
             source.error = failure.error;
             source.kind = failure.kind;
-            delete source.partial;
 
             if (failure.kind === "rate") {
                 source.backoffUntil = failure.resetAt ?? now + RATE_BACKOFF_MS;
@@ -1812,17 +1823,17 @@ function applyGitHubSource(draft: DashboardState, input: PassInput): void {
             }
         }
 
-        if (failure === undefined) {
-            if (answer !== undefined && answer.partial.length > 0) {
-                source.partial = [...answer.partial].sort();
-            } else {
-                delete source.partial;
-            }
-
-            if (rate !== undefined) {
-                source.rateRemaining = rate.remaining;
-            }
+        if (failure === undefined && rate !== undefined) {
+            source.rateRemaining = rate.remaining;
         }
+    }
+
+    const partial = partialRefs(draft, input);
+
+    if (partial.length > 0) {
+        source.partial = partial;
+    } else {
+        delete source.partial;
     }
 
     const tracked = input.tracked;
@@ -1830,24 +1841,91 @@ function applyGitHubSource(draft: DashboardState, input: PassInput): void {
     if (tracked !== undefined) {
         source.pending = dueReads(draft, tracked, now).length;
         source.complete =
+            partial.length === 0 &&
             Object.values(tracked.prs).every((pr) => {
                 const fact = draft.prs[pr.key];
 
                 return (
                     fact?.excluded !== undefined ||
-                    (fact?.readAt !== undefined && fact.gaps === undefined)
+                    (fact?.readAt !== undefined &&
+                        fact.gaps === undefined &&
+                        fact.error === undefined)
                 );
             }) &&
-            Object.values(tracked.issues).every(
-                (issue) =>
-                    draft.issues[issue.key]?.readAt !== undefined &&
-                    draft.issues[issue.key]?.gaps === undefined,
-            );
+            Object.values(tracked.issues).every((issue) => {
+                const fact = draft.issues[issue.key];
+
+                return (
+                    fact?.readAt !== undefined &&
+                    fact.gaps === undefined &&
+                    fact.error === undefined &&
+                    fact.unresolved !== "incomplete"
+                );
+            });
     }
 
     if (!same(draft.sources.github ?? {}, source)) {
         draft.sources.github = source;
     }
+}
+
+/**
+ * The GitHub source's partial refs from the whole stored state: each ref with a stored error; each ref of this answer
+ * whose part had an error (a deeper error can come beside an ok result, and stores no error); and each earlier entry,
+ * unless this pass read it cleanly (an ok result, and not in this answer's partial list). A failure of the whole read
+ * reads nothing cleanly. All 3 use 1 rule, after this pass applies: the ref is tracked, and a PR is not excluded (an
+ * excluded PR is never a coverage gap). Sorted and unique.
+ */
+function partialRefs(draft: Readonly<DashboardState>, input: PassInput): string[] {
+    const keys = new Set<string>();
+    const answer = input.failure === undefined ? input.answer : undefined;
+    const answered = new Set(answer?.partial ?? []);
+    const clean = new Set(
+        (answer?.results ?? [])
+            .filter((result) => result.ok && !answered.has(result.key))
+            .map((result) => result.key),
+    );
+
+    const trackedPr = (key: string): boolean => {
+        const fact = draft.prs[key];
+
+        return fact !== undefined && fact.untracked !== true && fact.excluded === undefined;
+    };
+
+    const trackedIssue = (key: string): boolean => {
+        const fact = draft.issues[key];
+
+        return fact !== undefined && fact.untracked !== true;
+    };
+
+    /** The 1 rule for every source of the list: tracked, and for a PR not excluded. */
+    const counts = (key: string): boolean => trackedPr(key) || trackedIssue(key);
+
+    for (const [key, fact] of Object.entries(draft.prs)) {
+        if (trackedPr(key) && fact.error !== undefined) {
+            keys.add(key);
+        }
+    }
+
+    for (const [key, fact] of Object.entries(draft.issues)) {
+        if (trackedIssue(key) && fact.error !== undefined) {
+            keys.add(key);
+        }
+    }
+
+    for (const key of answered) {
+        if (counts(key)) {
+            keys.add(key);
+        }
+    }
+
+    for (const key of draft.sources.github?.partial ?? []) {
+        if (counts(key) && !clean.has(key)) {
+            keys.add(key);
+        }
+    }
+
+    return [...keys].sort();
 }
 
 /** A pass that could not read its documents: the threads source failed, and every fact stays. */
