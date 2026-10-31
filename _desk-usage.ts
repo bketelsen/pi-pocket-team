@@ -401,18 +401,35 @@ export function usageLinks(
     return { sessions, shared: [...shared].sort((a, b) => a - b) };
 }
 
-/** The repository of a set of explicit links. */
+/**
+ * The repository of a set of explicit links. GitHub names are case-insensitive, so `Owner/Name` and `owner/name` are 1
+ * repository, not a conflict. Of the case variants of 1 repository, the first in code-unit order names it: the same
+ * name whatever the order of the links.
+ */
 export function assignOf(links: readonly UsageLink[], via: number): UsageAssign {
-    const repos = [
-        ...new Set(links.flatMap((link) => (link.repo === undefined ? [] : [link.repo]))),
-    ];
+    const byKey = new Map<string, string>();
+
+    for (const link of links) {
+        if (link.repo === undefined) {
+            continue;
+        }
+
+        const key = link.repo.toLowerCase();
+        const known = byKey.get(key);
+
+        if (known === undefined || link.repo < known) {
+            byKey.set(key, link.repo);
+        }
+    }
+
+    const repos = [...byKey.values()].sort();
 
     if (repos.length === 1) {
         return { repo: repos[0] ?? "", via };
     }
 
     if (repos.length > 1) {
-        return { none: "conflict", repos: repos.sort(), via };
+        return { none: "conflict", repos, via };
     }
 
     return { none: "no-repo", via };

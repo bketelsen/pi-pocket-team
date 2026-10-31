@@ -33,6 +33,7 @@ import {
 } from "@earendil-works/pi-durable";
 import {
     applyEntryPage,
+    assignOf,
     CHILD_PAGE,
     CHILD_REFRESH_MS,
     DeskUsage,
@@ -523,6 +524,101 @@ describe("links and attribution", () => {
         });
         assert.deepEqual(session(s, 13).assign, { none: "no-repo", via: 13 });
         assert.equal(totals(s, 11).totalTokens, 15, "1 session in 2 threads counts once");
+    });
+
+    test("assignOf: case variants of 1 repo agree, with 1 stable name; different repos still conflict", () => {
+        const variants = [
+            { id: "T1", repo: "frostyard/Test" },
+            { id: "T2", repo: "Frostyard/test" },
+            { id: "T3", repo: "frostyard/test" },
+            { id: "T4" },
+        ];
+
+        // The name does not depend on the order of the links.
+        for (const order of [
+            variants,
+            [...variants].reverse(),
+            [variants[2], variants[0], variants[1]],
+        ]) {
+            assert.deepEqual(assignOf(order as never, 7), { repo: "Frostyard/test", via: 7 });
+        }
+
+        assert.deepEqual(
+            assignOf(
+                [
+                    { id: "T1", repo: "a/One" },
+                    { id: "T2", repo: "A/one" },
+                    { id: "T3", repo: "a/two" },
+                    { id: "T4", repo: "a/one" },
+                ],
+                7,
+            ),
+            { none: "conflict", repos: ["A/one", "a/two"], via: 7 },
+            "2 real repos conflict, and each is named once",
+        );
+        assert.deepEqual(
+            assignOf(
+                [
+                    { id: "T1", repo: "a/one" },
+                    { id: "T2", repo: "b/one" },
+                ],
+                7,
+            ),
+            { none: "conflict", repos: ["a/one", "b/one"], via: 7 },
+            "the same name under 2 owners is 2 repos",
+        );
+        assert.deepEqual(assignOf([{ id: "T1" }], 7), { none: "no-repo", via: 7 });
+    });
+
+    test("a session in 2 threads of 1 repo with 2 cases is attributed, its child too, and a stored false conflict heals", async () => {
+        const w = world();
+        const s = store();
+
+        conversation(w, 11);
+        conversation(w, 12, {
+            owner: { conversationId: 11 as ConversationId, taskId: 1 as TaskId },
+        });
+        conversation(w, 13);
+        add(w, 11, { totalTokens: 10 });
+        add(w, 12, { totalTokens: 4 });
+        add(w, 13, { totalTokens: 2 });
+
+        const desk = deskOf([
+            thread("T1", { session: 11, repo: "Frostyard/Test" }),
+            thread("T2", { session: 11, repo: "frostyard/test" }),
+            thread("T3", { session: 13, repo: "frostyard/test" }),
+            thread("T4", { session: 13, repo: "frostyard/other" }),
+        ]);
+
+        await settle(w, s, desk);
+        assert.deepEqual(session(s, 11).assign, { repo: "Frostyard/Test", via: 11 });
+        assert.deepEqual(
+            session(s, 12).assign,
+            { repo: "Frostyard/Test", via: 11 },
+            "the child inherits",
+        );
+        assert.deepEqual(session(s, 13).assign, {
+            none: "conflict",
+            repos: ["frostyard/other", "frostyard/test"],
+            via: 13,
+        });
+
+        // A state that an older version stored: the case variants as a conflict. The next pass corrects it.
+        session(s, 11).assign = {
+            none: "conflict",
+            repos: ["Frostyard/Test", "frostyard/test"],
+            via: 11,
+        };
+        session(s, 12).assign = {
+            none: "conflict",
+            repos: ["Frostyard/Test", "frostyard/test"],
+            via: 11,
+        };
+        await pass(w, s, desk, T0);
+        assert.deepEqual(session(s, 11).assign, { repo: "Frostyard/Test", via: 11 });
+        assert.deepEqual(session(s, 12).assign, { repo: "Frostyard/Test", via: 11 });
+        assert.equal(totals(s, 11).totalTokens, 10, "the correction does not count again");
+        assert.equal(totals(s, 12).totalTokens, 4);
     });
 
     test("a coordinator's cost goes to the plan's repo, a task's to its own: no double count", async () => {
