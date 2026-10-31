@@ -888,17 +888,27 @@ Each line below differs from the design above, or settles what it left open, and
 - **The desk tries a start again, by the same key.** Pocket's start is idempotent for 1 source and 1 key: a known key
   gives the same session and address back, and the first message goes once (its request id comes from the key). A
   second try never makes a second session, and makes 1 only when the first try made none: then it is the consult's
-  own. The rules: the sweeper's sweep and `desk sync` try each `starting` consult of their supervisor whose last try
-  is at least 60 seconds old (`CONSULT_RETRY_MS`, so a slow first start is not raced), at most 10 tries in all, the
-  first one included (`CONSULT_START_TRIES`), and only inside the 60-minute limit and while the hook can read entries.
-  The title and the message are made again from the plan, the consult and its ask; Pocket uses them only when the
-  first try made no session or sent no message. A set of the start keys that run now, shared by every instance of the
-  module in the process, keeps the call's own start and a retry apart; after a restart they may meet, and then they
-  converge on 1 session, and the bind keeps the first one. Each try gives 1 event: a failed try names
-  its number and its error ("start try 2 did not finish"), and a try that worked says `runs (start try 2)`.
+  own. The sweeper's sweep and `desk sync` try the consults of their supervisor; the title and the message are made
+  again from the plan, the consult and its ask, and Pocket uses them only when no earlier try made the session or sent
+  the message. Each try gives 1 event: a failed try names its number and its error ("start try 2 did not finish"), and
+  a try that worked says `runs (start try 2)`.
+- **Every rule of a try is checked in the commit that records it** (`consultTryMode`), not only on the sweep's
+  snapshot: the hook's entry read, fewer than 10 tries in all (`CONSULT_START_TRIES`, the first one included), and
+  for a start the state `starting`, a plan that drafts, no session and the 60-minute limit. A retry also needs 60
+  seconds since the last try (`CONSULT_RETRY_MS`, so a slow start is not raced); the call's own first try has no
+  spacing rule. So 2 sweeps that picked 1 consult give it 1 try, and a candidate whose limit passes before its commit
+  gets none. A set of the start keys that run now, shared by every instance of the module in the process, keeps 2
+  tries of 1 consult apart; after a restart they may meet, and then they converge on 1 session, and the bind keeps the
+  first one.
+- **A fresh read after the try's commit can still stop the start.** A Stop, a drop or the limit can land between the
+  commit and Team's start: the start goes on only while the consult is still `starting` in a plan that drafts (a
+  recovery only while its identity is still open). Else Team gets no start, and the try gives the identity back as it
+  was before it.
 - **`Consult` gains `end` and `start`.** `end` (`{ at, why, by?, text? }`, `why` is `timeout`, `stopped` or `plan`)
   says why a consult ended with no finding; the page, `plan read` and the wake-up read it. `start` holds the last try's
-  time (`at`), the number of tries (`tries`), and the last error (`error`).
+  time (`at`), the number of tries (`tries`), the last error (`error`), and `unresolved`: a try began, so a session may
+  exist. The identity is open (`consultUnresolved`) while `unresolved` is set and the desk has no address; the bind
+  closes it.
 - **A bind after an end keeps the end.** A consult that Brian stopped, or that timed out, while its start ran records
   its session only, and stays blocked.
 
@@ -966,15 +976,23 @@ Each line below differs from the design above, or settles what it left open, and
   desk thread). The sweep leaves out 3 kinds: a bound consult's session by its address, in every state, also after its
   end; every session while a consult is `starting`, as it does while a delegation is in flight; and a session whose
   title names a consult that the desk has.
-- **The session of a thrown start is known by its identity first.** It stays `starting` (in flight), and a later try
-  under the same key binds its session and address. The title is a second guard: Team titles every consult
-  `<agent>: consult <plan> <consult>: <plan title>`, and the sweep leaves out a session whose title holds
-  `: consult T560 k3:` when plan T560 has consult k3. A linked session's list gives the sweep no session id, so the
-  sweep cannot read that session's first message itself.
-- **The limit that is left:** a found thread can come for a consult's session only when every try for 60 minutes
-  throws after Pocket made the session, and Pocket hides its title (it gives the title only when everyone who sees the
-  supervisor's session sees this one too), or a person renamed it. The consult then fails at 60 minutes with no
-  address. The hook still blocks every tool of that session, so only the cap sees it, and Odrade can close the
-  thread. A session that a person titles like a consult is left out as well.
+- **The session identity is kept apart from the consult's state.** A Stop, a drop or the limit can end a consult
+  whose start threw before the desk had its address. Its identity stays open, and the sweep tries to recover it in
+  every state, under the same start key, 60 seconds apart, within the same 10 tries, and with no 60-minute limit for
+  the recovery itself. A recovery sends the marker line and "This plan consult ended (<why>) before it started. Do
+  nothing, and do not answer." instead of the brief. When Pocket made the session before, it gives it back and sends
+  nothing, so only the address comes back; when it made none, the new session gets only that message, and the hook
+  blocks every tool there. The desk binds the session and the address, and the consult keeps its end: an ended
+  consult never runs.
+- **While an identity is open and tries are left, the consult is in flight** for found-thread discovery, in every
+  state: the sweep makes no found thread for the supervisor then, as for a delegation in flight. The title stays a
+  second guard: Team titles every consult `<agent>: consult <plan> <consult>: <plan title>`, and the sweep leaves out a
+  session whose title holds `: consult T560 k3:` when plan T560 has consult k3. A linked session's list gives the
+  sweep no session id, so it cannot read that session's first message itself.
+- **The limit that is left:** after the last of the 10 tries the protection ends. Only a start that throws on all 10
+  tries after Pocket made the session, with a hidden title (Pocket gives the title only when everyone who sees the
+  supervisor's session sees this one too) or a title a person changed, can still become a found thread. The hook
+  still blocks every tool of that session, so only the cap sees it, and Odrade can close the thread. A session that a
+  person titles like a consult is left out as well.
 - **A dropped or verified plan stops its open consults** (`stopped`, `end.why: "plan"`), with 1 event each, and no
   wake-up: the plan wakes no session then.
