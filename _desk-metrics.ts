@@ -156,9 +156,9 @@ export type UsageMetrics = UsageRangeSum & {
      * What the range sums know. Each counted session is complete (read, caught up, not dirty: no ledger change since
      * the last read, no malformed entry, not missing, no error, no residual mismatch or unavailable ledger), partial
      * (not complete, but with at least 1 valid entry), or unknown (not complete, and no valid entry). "none": no counted
-     * session (the sums are 0). "unknown": every counted session is unknown: each range sum field is null, not 0. "partial": at least 1 counted session is partial or
-     * unknown, and at least 1 is not unknown: the sums are the known subtotal. "complete": every counted session is
-     * complete. A scope's state comes from its own raw sessions, never from the states of its rows.
+     * session (the sums are 0). "unknown": every counted session is unknown: each range sum field is null, not 0.
+     * "partial": at least 1 counted session is partial or unknown, and at least 1 is not unknown: the sums are the known
+     * subtotal. "complete": every counted session is complete. A scope's state comes from its own raw sessions, never from the states of its rows.
      */
     state: UsageKnowledge;
     /** The counted sessions by their own usage knowledge. */
