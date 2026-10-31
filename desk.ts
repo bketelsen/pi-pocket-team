@@ -49,6 +49,15 @@ import {
     type Tx,
 } from "@earendil-works/pi-durable";
 import type { Host, Web, WebRequest } from "./_pocket.d.ts";
+import type * as DashboardModule from "./_desk-dashboard.ts";
+
+/**
+ * The dashboard helper, loaded fresh with each load of this module: Pocket does not reload a `_` helper by itself. In
+ * tests this module has no query, so a test's static import of `./_desk-dashboard.ts` gets the same instance.
+ */
+const dashboard = (await import(
+    new URL(`./_desk-dashboard.ts${new URL(import.meta.url).search}`, import.meta.url).href
+)) as typeof DashboardModule;
 
 /** Where another module finds this one's live API. */
 const API = Symbol.for("pi-pocket-team.desk");
@@ -20589,6 +20598,12 @@ export default function createDesk(host: Host, web: Web) {
         }
     };
 
+    /** The dashboard's collector: 1 task, which reads `x.desk.threads` and GitHub, and writes `x.desk.dashboard`. */
+    const Collector = dashboard.defineCollector({
+        deskDoc: DeskThreads,
+        gh: () => process.env.PI_POCKET_DESK_GH ?? "gh",
+    });
+
     type SweeperInput = { supervisor: number };
     type SweeperState = { phase: "sweep" } | { phase: "sleep"; until: number };
 
@@ -20620,9 +20635,19 @@ export default function createDesk(host: Host, web: Web) {
 
                 await runtime.commit(async (tx) => {
                     const state = await tx.doc(DeskThreads);
+                    // Read before any table write of this commit: Durable refuses a table read after one. The dashboard
+                    // never fails a sweep: a failed read is unknown, and an unknown answer starts no collector.
+                    let collectorLive: boolean | undefined;
+
+                    try {
+                        collectorLive = await dashboard.collectorLive(tx);
+                    } catch {
+                        collectorLive = undefined;
+                    }
 
                     await applySweep(tx, state, Number(supervisor), facts);
                     await startMissingSweepers(tx);
+
                     // Entries that wait with no writer (the journal was off, then on again): a writer starts again.
                     await resumeJournal(tx, Number(supervisor));
 
@@ -20716,6 +20741,19 @@ export default function createDesk(host: Host, web: Web) {
                                     : { address: thread.address }),
                             });
                         }
+                    }
+
+                    // The dashboard's collector, after every table read of this commit (a task is a table write): it
+                    // only reads the threads, and it starts no agent.
+                    try {
+                        await dashboard.ensureCollector(
+                            tx,
+                            Number(supervisor),
+                            Collector,
+                            collectorLive,
+                        );
+                    } catch {
+                        // The next sweep tries again.
                     }
 
                     const open = Object.values(state.threads).some(
@@ -24552,6 +24590,9 @@ export default function createDesk(host: Host, web: Web) {
             if (args.action === "sync") {
                 const facts = await gather(supervisor as ConversationId, api, Date.now(), context);
                 const result = await api.commit(async (tx) => {
+                    // As in the sweep: read first, start last, and a failure is no failed sync. A desk with only
+                    // closed threads has no sweeper: a sync starts the dashboard's collector.
+                    const live = await dashboard.collectorLive(tx).catch(() => undefined);
                     const swept = await applySweep(
                         tx,
                         await tx.doc(DeskThreads),
@@ -24562,6 +24603,9 @@ export default function createDesk(host: Host, web: Web) {
                     await startMissingSweepers(tx);
                     // Entries that wait with no writer: a sync starts one too, also with no open thread.
                     await resumeJournal(tx, supervisor);
+                    await dashboard
+                        .ensureCollector(tx, supervisor, Collector, live)
+                        .catch(() => undefined);
 
                     return swept;
                 }, context);
@@ -25566,7 +25610,7 @@ export default function createDesk(host: Host, web: Web) {
         name: "desk",
         tools: [tool, planTool],
         hooks: [consultGuard, noTeamReport, noClerkMerge, reminder],
-        tasks: [Sweeper, Notify, Digest, Journal, PlanWake, PlanSendTask],
+        tasks: [Sweeper, Notify, Digest, Journal, PlanWake, PlanSendTask, Collector],
         sections: [
             // Only a supervisor's session gets it. No clock text: the section changes when the desk changes.
             section("desk", async (input, context) => {
