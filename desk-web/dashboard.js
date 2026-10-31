@@ -243,6 +243,88 @@ export const usageText = (text, knowledge) =>
           ? `${text}${PARTIAL_MARK}`
           : text;
 
+/**
+ * What a scope knows of its compaction residual, apart from its dated usage: the reducer keeps the settled residuals of
+ * the counted sessions whatever their dated usage knows, so a scope whose dated usage is unknown can still have one.
+ * "unknown" when the source has no good read (`usageAvailable`) or no counted session has a settled residual
+ * (`undated.residual` is null); "partial" when a counted session's residual did not settle (a mismatch, or a ledger that
+ * could not be read): the sum lacks it; else "known".
+ */
+export const residualKnowledge = (usage, coverage) => {
+    if (!usageAvailable(coverage) || !usage?.undated?.residual) {
+        return "unknown";
+    }
+
+    const residuals = usage.residuals ?? {};
+
+    return (residuals.mismatch ?? 0) + (residuals.unavailable ?? 0) > 0 ? "partial" : "known";
+};
+
+/**
+ * The next state of a drill-down's records (`useRecords`). `start`: a read begins; a list already shown stays (marked
+ * as read again), and so does its stale mark. `answer`: the list for the snapshot as of `asOf`. `failure`: a list
+ * already shown stays, marked stale with the error and its own `asOf`; with no list, the error shows.
+ */
+export const recordsStep = (state, event) => {
+    if (event.type === "answer") {
+        return { status: "done", answer: event.answer, error: null, asOf: event.asOf ?? null };
+    }
+
+    const shown = state?.answer ?? null;
+
+    if (event.type === "start") {
+        return shown
+            ? { ...state, status: "refreshing" }
+            : { status: "loading", answer: null, error: null, asOf: null };
+    }
+
+    return shown
+        ? { ...state, status: "stale", error: event.error }
+        : { status: "error", answer: null, error: event.error, asOf: null };
+};
+
+/**
+ * The records of 1 drill-down, as a hook. It reads `path` when it mounts, and again for each new snapshot (`stamp`):
+ * the 60-second refresh keeps a row's path but can change its numbers, so its records must follow. A read aborts when
+ * a newer one begins, when the drill-down unmounts, or when the module goes (`mounted` holds its stop).
+ */
+export const useRecords = ({ useState, useEffect, api, mounted }, path, stamp, asOf) => {
+    const [state, setState] = useState(() => recordsStep(null, { type: "start" }));
+
+    useEffect(() => {
+        const abort = new AbortController();
+
+        const stop = () => {
+            abort.abort();
+            mounted.delete(stop);
+        };
+
+        mounted.add(stop);
+        setState((previous) => recordsStep(previous, { type: "start" }));
+        api(path, undefined, { signal: abort.signal }).then(
+            (answer) => {
+                if (!abort.signal.aborted) {
+                    setState((previous) => recordsStep(previous, { type: "answer", answer, asOf }));
+                }
+            },
+            (failure) => {
+                if (!abort.signal.aborted) {
+                    setState((previous) =>
+                        recordsStep(previous, {
+                            type: "failure",
+                            error: failure?.message ?? String(failure),
+                        }),
+                    );
+                }
+            },
+        );
+
+        return stop;
+    }, [path, stamp]);
+
+    return state;
+};
+
 /** A usage field of a table row, for sorting: null (sorts last) when the row's usage is unknown. */
 export const usageValue = (row, field) =>
     usageKnowledge(row.metrics.usage, row.coverage) === "unknown"
@@ -734,6 +816,9 @@ export function makeDashboard(pocket, { refreshMs = REFRESH_MS } = {}) {
               : null;
         const undated = usage.undated;
         const residual = undated.residual;
+        // The residual has its own knowledge: it can be known when the dated usage is unknown.
+        const residualKnown = (value) =>
+            usageText(value, residualKnowledge(usage, snapshot.coverage));
         const solveExcluded = Object.entries(timeToSolve.undated ?? {});
 
         return html`<div class="dash-cards">
@@ -851,7 +936,7 @@ export function makeDashboard(pocket, { refreshMs = REFRESH_MS } = {}) {
                 />
                 <${Item}
                     label="Apart: compaction residual tokens"
-                    text=${known(residual ? formatCount(residual.counters.totalTokens) : null)}
+                    text=${residualKnown(residual ? formatCount(residual.counters.totalTokens) : null)}
                 />
             <//>
             <${Card}
@@ -879,7 +964,7 @@ export function makeDashboard(pocket, { refreshMs = REFRESH_MS } = {}) {
                 />
                 <${Item}
                     label=${`Apart: compaction residual${residual ? ` (${plural(residual.sessions, "session")})` : ""}`}
-                    text=${known(residual ? formatMoney(residual.counters.cost) : null)}
+                    text=${residualKnown(residual ? formatMoney(residual.counters.cost) : null)}
                 />
             <//>
         </div>`;
@@ -993,41 +1078,17 @@ export function makeDashboard(pocket, { refreshMs = REFRESH_MS } = {}) {
             : null;
 
     /**
-     * The threads and PRs behind 1 row: it reads `dashboard/records` when it mounts, and aborts the read when it
-     * unmounts (the row closes, the selection changes, the view goes) or when the module goes.
+     * The threads and PRs behind 1 row (`useRecords`): it reads `dashboard/records` when it mounts and again for each
+     * new snapshot (`stamp`), and aborts the read when it unmounts (the row closes, the selection changes, the view
+     * goes) or when the module goes. While it reads again, the list shown stays; a failed read again marks it stale.
      */
-    function Records({ path, label, onOpenThread }) {
-        const [state, setState] = useState({ status: "loading", answer: null, error: null });
-
-        useEffect(() => {
-            const abort = new AbortController();
-
-            const stop = () => {
-                abort.abort();
-                mounted.delete(stop);
-            };
-
-            mounted.add(stop);
-            setState({ status: "loading", answer: null, error: null });
-            pocket.api(path, undefined, { signal: abort.signal }).then(
-                (answer) => {
-                    if (!abort.signal.aborted) {
-                        setState({ status: "done", answer, error: null });
-                    }
-                },
-                (failure) => {
-                    if (!abort.signal.aborted) {
-                        setState({
-                            status: "error",
-                            answer: null,
-                            error: failure?.message ?? String(failure),
-                        });
-                    }
-                },
-            );
-
-            return stop;
-        }, [path]);
+    function Records({ path, stamp, asOf, label, onOpenThread }) {
+        const state = useRecords(
+            { useState, useEffect, api: pocket.api, mounted },
+            path,
+            stamp,
+            asOf,
+        );
 
         if (state.status === "loading") {
             return html`<${Loader} label=${`Reading the threads and PRs of ${label}`} />`;
@@ -1039,33 +1100,48 @@ export function makeDashboard(pocket, { refreshMs = REFRESH_MS } = {}) {
             </p>`;
         }
 
+        const reading = state.status === "refreshing";
+        const stale =
+            state.error === null
+                ? null
+                : html`<p class="dash-state warn" role="status">
+                      <strong>Stale:</strong>
+                      ${` The threads and PRs could not be read again: ${state.error}. This list is from ${formatUtc(state.asOf)}, older than the numbers of the row.`}
+                  </p>`;
+
         const { threads, prs, truncated } = state.answer;
+        const list =
+            threads.length === 0 && prs.length === 0
+                ? html`<p class="small muted" role="status">
+                      No thread and no PR of ${label} in this range, and none open now.
+                  </p>`
+                : html`<h3 class="dash-sub">${`Threads (${threads.length + truncated.threads})`}</h3>
+                      ${
+                          threads.length === 0
+                              ? html`<p class="small muted">No thread.</p>`
+                              : html`<ul class="dash-record-list">
+                                    ${threads.map((thread) => recordThread(thread, onOpenThread))}
+                                </ul>`
+                      }
+                      ${more(truncated.threads, "thread")}
+                      <h3 class="dash-sub">${`Tracked PRs (${prs.length + truncated.prs})`}</h3>
+                      ${
+                          prs.length === 0
+                              ? html`<p class="small muted">No tracked PR.</p>`
+                              : html`<ul class="dash-record-list">
+                                    ${prs.map(recordPr)}
+                                </ul>`
+                      }
+                      ${more(truncated.prs, "PR")}`;
 
-        if (threads.length === 0 && prs.length === 0) {
-            return html`<p class="small muted" role="status">
-                No thread and no PR of ${label} in this range, and none open now.
-            </p>`;
-        }
-
-        return html`<div class="dash-records">
-            <h3 class="dash-sub">${`Threads (${threads.length + truncated.threads})`}</h3>
-            ${
-                threads.length === 0
-                    ? html`<p class="small muted">No thread.</p>`
-                    : html`<ul class="dash-record-list">
-                          ${threads.map((thread) => recordThread(thread, onOpenThread))}
-                      </ul>`
-            }
-            ${more(truncated.threads, "thread")}
-            <h3 class="dash-sub">${`Tracked PRs (${prs.length + truncated.prs})`}</h3>
-            ${
-                prs.length === 0
-                    ? html`<p class="small muted">No tracked PR.</p>`
-                    : html`<ul class="dash-record-list">
-                          ${prs.map(recordPr)}
-                      </ul>`
-            }
-            ${more(truncated.prs, "PR")}
+        // The list shown stays while it reads again, so the focus in it stays; the stale mark stays too.
+        return html`<div
+            class="dash-records"
+            aria-busy=${reading ? "true" : "false"}
+            data-records=${state.status}
+            data-as-of=${state.asOf ?? ""}
+        >
+            ${stale}${list}
         </div>`;
     }
 
@@ -1126,6 +1202,8 @@ export function makeDashboard(pocket, { refreshMs = REFRESH_MS } = {}) {
                           <${Records}
                               key=${path}
                               path=${path}
+                              stamp=${snapshot}
+                              asOf=${snapshot.asOf}
                               label=${rowLabel(each)}
                               onOpenThread=${onOpenThread ? (thread) => onOpenThread(key, thread) : null}
                           />

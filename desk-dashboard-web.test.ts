@@ -14,6 +14,7 @@ import {
     formatPerWeek,
     formatRate,
     rangeLine,
+    residualKnowledge,
     prEventsText,
     prUrl,
     recordsPath,
@@ -22,6 +23,7 @@ import {
     usageAvailable,
     usageKnowledge,
     usageReadLines,
+    usageText,
 } from "./desk-web/dashboard.js";
 
 /** Noon UTC of 2026-10-30: "today" of the test. The preview uses the real clock; only velocity moves with it. */
@@ -387,6 +389,7 @@ describe("the preview fixture: what the screen shows", () => {
             "partial",
         ]);
         assert.deepEqual(codes(take({}, "partial-usage")), ["usage-unknown", "partial"]);
+        assert.deepEqual(codes(take({}, "residual-only")), ["usage-unknown", "partial"]);
         assert.match(
             dashboardStates(take({}, "partial-usage"))[1].text,
             /usage: 3 sessions pending, 1 ledger unreadable/,
@@ -624,5 +627,67 @@ describe("the preview fixture: what the screen shows", () => {
 
         assert.equal(never.coverage.sources.usage.status, "never");
         assert.equal(usageAvailable(never.coverage), false);
+    });
+    test("residual-only: the dated usage is unknown, and the settled residual shows by its own knowledge", () => {
+        const answer = take({}, "residual-only");
+        const usage = answer.totals.usage;
+
+        const residualOf = (scope: Snapshot["totals"]["usage"], coverage: Snapshot["coverage"]) => {
+            const knowledge = residualKnowledge(scope, coverage);
+            const counters = scope.undated.residual?.counters;
+
+            return [
+                usageText(counters ? formatCount(counters.totalTokens) : null, knowledge),
+                usageText(counters ? formatMoney(counters.cost) : null, knowledge),
+            ];
+        };
+
+        // Every counted session is unknown: the dated sums are null, and the cards show "—".
+        assert.equal(usage.state, "unknown");
+        assert.equal(usage.totalTokens, null);
+        assert.equal(usage.cost, null);
+        assert.deepEqual(usage.sessionStates, { complete: 0, partial: 0, unknown: 7 });
+        assert.equal(usageKnowledge(usage, answer.coverage), "unknown");
+        // The reducer keeps the settled residual of session 103: the card shows it, not "—".
+        assert.deepEqual(usage.undated.residual, {
+            sessions: 1,
+            counters: {
+                input: 50,
+                output: 5,
+                cacheRead: 0,
+                cacheWrite: 0,
+                totalTokens: 55,
+                cost: 0.02,
+            },
+        });
+        assert.equal(residualKnowledge(usage, answer.coverage), "known");
+        assert.deepEqual(residualOf(usage, answer.coverage), ["55", "$0.02"]);
+
+        // The pi-pocket-team row holds session 103; a row with no settled residual stays unknown.
+        const team = take({ repo: REPOS.team }, "residual-only");
+        const snosi = take({ repo: REPOS.snosi }, "residual-only");
+
+        assert.equal(usageKnowledge(team.totals.usage, team.coverage), "unknown");
+        assert.deepEqual(residualOf(team.totals.usage, team.coverage), ["55", "$0.02"]);
+        assert.deepEqual(residualOf(snosi.totals.usage, snosi.coverage), [null, null]);
+
+        // A ledger that could not be read marks the residual partial; no good read makes it unknown.
+        const partial = take({}, "partial-usage");
+
+        assert.equal(partial.totals.usage.residuals.unavailable, 1);
+        assert.deepEqual(residualOf(partial.totals.usage, partial.coverage), [
+            "55 (partial)",
+            "$0.02 (partial)",
+        ]);
+
+        const fixture = dashboardFixture(NOW, "residual-only");
+
+        fixture.usage.sources.usage = { at: NOW, ok: false, error: "refused", complete: false };
+
+        const failed = snapshot({ ...fixture, now: NOW, query: {} });
+
+        assert(!("error" in failed));
+        assert.equal(usageAvailable(failed.coverage), false);
+        assert.deepEqual(residualOf(failed.totals.usage, failed.coverage), [null, null]);
     });
 });

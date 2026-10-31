@@ -70,6 +70,8 @@ import {
     prEventsText,
     prUrl,
     recordsPath,
+    recordsStep,
+    residualKnowledge,
     rowKey,
     rowParts,
     tableRows,
@@ -79,6 +81,7 @@ import {
     usageNote,
     usageReadLines,
     usageText,
+    useRecords,
     utcDay,
     withOwner,
     withRepo,
@@ -1868,4 +1871,203 @@ test("rowParts: a row has the same shape open or closed, so its button keeps the
     assert.equal(closed[1], null, "a hole that keeps the slot of the drill-down");
     assert.equal(open[1], drill);
     assert.deepEqual(rowParts(line, undefined), [line, null]);
+});
+
+test("recordsStep: a read again keeps the list shown; a failed read again marks it stale with its own time", () => {
+    const first = { threads: [{ id: "T1" }], prs: [], truncated: { threads: 0, prs: 0 } };
+    const second = { threads: [{ id: "T2" }], prs: [], truncated: { threads: 0, prs: 0 } };
+    const loading = recordsStep(null, { type: "start" });
+
+    assert.deepEqual(loading, { status: "loading", answer: null, error: null, asOf: null });
+    assert.deepEqual(recordsStep(loading, { type: "failure", error: "HTTP 500" }), {
+        status: "error",
+        answer: null,
+        error: "HTTP 500",
+        asOf: null,
+    });
+
+    const done = recordsStep(loading, { type: "answer", answer: first, asOf: 10 });
+
+    assert.deepEqual(done, { status: "done", answer: first, error: null, asOf: 10 });
+    // The next snapshot: the old list stays while it reads again.
+    const again = recordsStep(done, { type: "start" });
+
+    assert.deepEqual(again, { status: "refreshing", answer: first, error: null, asOf: 10 });
+
+    const stale = recordsStep(again, { type: "failure", error: "HTTP 502" });
+
+    assert.deepEqual(stale, { status: "stale", answer: first, error: "HTTP 502", asOf: 10 });
+    // Read again once more: the stale mark stays until a good answer.
+    assert.deepEqual(recordsStep(stale, { type: "start" }), {
+        status: "refreshing",
+        answer: first,
+        error: "HTTP 502",
+        asOf: 10,
+    });
+    assert.deepEqual(recordsStep(stale, { type: "answer", answer: second, asOf: 70 }), {
+        status: "done",
+        answer: second,
+        error: null,
+        asOf: 70,
+    });
+});
+
+/** 1 component's hooks, enough for `useRecords`: state with updaters, and 1 effect run again when its deps change. */
+const hookHost = () => {
+    const slot = { state: undefined, deps: null, cleanup: null };
+
+    return {
+        slot,
+        unmount: () => slot.cleanup?.(),
+        hooks: {
+            useState: (initial) => {
+                if (slot.state === undefined) {
+                    slot.state = { value: typeof initial === "function" ? initial() : initial };
+                }
+
+                return [
+                    slot.state.value,
+                    (next) => {
+                        slot.state.value =
+                            typeof next === "function" ? next(slot.state.value) : next;
+                    },
+                ];
+            },
+            useEffect: (effect, deps) => {
+                if (
+                    slot.deps === null ||
+                    deps.some((dep, index) => !Object.is(dep, slot.deps[index]))
+                ) {
+                    slot.cleanup?.();
+                    slot.deps = deps;
+                    slot.cleanup = effect();
+                }
+            },
+        },
+    };
+};
+
+test("useRecords: a new snapshot with the same path reads the open drill-down again (the 60-second refresh)", async () => {
+    const path = "dashboard/records?from=2026-10-01&to=2026-10-30&repo=frostyard%2Fsnosi";
+    const answers = [
+        { threads: [{ id: "T1" }], prs: [], truncated: { threads: 0, prs: 0 } },
+        { threads: [{ id: "T1" }, { id: "T2" }], prs: [], truncated: { threads: 0, prs: 0 } },
+    ];
+    const calls = [];
+    let fail = false;
+
+    const api = async (each, body, { signal }) => {
+        calls.push({ path: each, signal });
+
+        if (fail) {
+            throw new Error("HTTP 502");
+        }
+
+        return answers[Math.min(calls.length - 1, answers.length - 1)];
+    };
+
+    const mounted = new Set();
+    const host = hookHost();
+    const render = (stamp, asOf) => useRecords({ ...host.hooks, api, mounted }, path, stamp, asOf);
+    const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
+    const first = { asOf: 10 };
+    const second = { asOf: 70 };
+    const third = { asOf: 130 };
+
+    assert.equal(render(first, 10).status, "loading");
+    await settle();
+    assert.deepEqual(render(first, 10), {
+        status: "done",
+        answer: answers[0],
+        error: null,
+        asOf: 10,
+    });
+    // The same snapshot again (any other render): no new read.
+    assert.equal(calls.length, 1);
+
+    // The refresh brings a new snapshot; the path stays. The open records read again, and the old list stays meanwhile.
+    render(second, 70);
+    // The effect's state shows at the next render, as in Preact.
+    const reading = render(second, 70);
+
+    assert.equal(calls.length, 2);
+    assert.equal(calls[1].path, path);
+    assert.deepEqual(reading, { status: "refreshing", answer: answers[0], error: null, asOf: 10 });
+    await settle();
+    assert.deepEqual(render(second, 70), {
+        status: "done",
+        answer: answers[1],
+        error: null,
+        asOf: 70,
+    });
+
+    // A failed read again keeps the list, marked stale with the time of its own snapshot.
+    fail = true;
+    render(third, 130);
+    await settle();
+    assert.deepEqual(render(third, 130), {
+        status: "stale",
+        answer: answers[1],
+        error: "HTTP 502",
+        asOf: 70,
+    });
+    assert.equal(mounted.size, 1, "1 read at a time");
+
+    // A newer snapshot during a read aborts the older read; unmount aborts the last and leaves the module's set.
+    fail = false;
+    render({ asOf: 190 }, 190);
+    render({ asOf: 250 }, 250);
+    assert.equal(calls.at(-2).signal.aborted, true);
+    host.unmount();
+    assert.equal(calls.at(-1).signal.aborted, true);
+    assert.equal(mounted.size, 0);
+    await settle();
+    assert.equal(host.slot.state.value.status, "refreshing", "an aborted read changes nothing");
+});
+
+test("residualKnowledge: the residual follows its own availability, not the dated usage's", () => {
+    const residual = { sessions: 1, counters: { totalTokens: 55, cost: 0.02 } };
+    const ok = { sources: { usage: { status: "ok", lastGoodAt: 1 } } };
+    const scope = (patch = {}) => ({
+        state: "unknown",
+        totalTokens: null,
+        residuals: { settled: 1, pending: 0, mismatch: 0, unavailable: 0, absent: 6 },
+        undated: { counters: {}, residual },
+        ...patch,
+    });
+
+    assert.equal(usageKnowledge(scope(), ok), "unknown");
+    assert.equal(
+        residualKnowledge(scope(), ok),
+        "known",
+        "every counted session unknown: the residual stays",
+    );
+    assert.equal(residualKnowledge(scope({ state: "complete" }), ok), "known");
+    assert.equal(
+        residualKnowledge(
+            scope({
+                residuals: { settled: 1, pending: 0, mismatch: 1, unavailable: 0, absent: 0 },
+            }),
+            ok,
+        ),
+        "partial",
+    );
+    assert.equal(
+        residualKnowledge(
+            scope({
+                residuals: { settled: 1, pending: 0, mismatch: 0, unavailable: 1, absent: 0 },
+            }),
+            ok,
+        ),
+        "partial",
+    );
+    assert.equal(
+        residualKnowledge(scope({ undated: { counters: {}, residual: null } }), ok),
+        "unknown",
+    );
+    assert.equal(
+        residualKnowledge(scope(), { sources: { usage: { status: "never", lastGoodAt: null } } }),
+        "unknown",
+    );
+    assert.equal(residualKnowledge(null, ok), "unknown");
 });
