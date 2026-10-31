@@ -8,9 +8,16 @@
 //   /preview-login            sign in as the owner
 //   /preview-fixture?name=N   seed variant N again (main, empty, not-started, stale, usage-unavailable, partial-usage)
 //   /preview-fail?on=1|0      make `GET dashboard` fail with a 500, or not
-//   /preview-delay?ms=N       hold each `GET dashboard` answer N ms (the loading state)
+//   /preview-fail-records?on=1|0
+//                             make `GET dashboard/records` (the drill-down) fail with a 500, or not
+//   /preview-delay?ms=N       hold each `GET dashboard` and `GET dashboard/records` answer N ms (the loading states)
 //   /preview-module?on=0|1    turn the preview's Desk module off (its browser module goes) or on again
 //   /preview-count            how many `GET dashboard` requests came
+//
+// `GET /api/x/desk/threads/<id>` answers here for the fixture's threads, so the drill-down can open the Desk's thread
+// detail: a small answer of the shape `Detail` reads, made from the fixture's thread and PR facts. A thread the fixture
+// does not have, or one gone from the desk, is a 404, as on the desk. `x.desk.threads` stays empty: no sweep or
+// collector starts, and nothing changes the fixture.
 import {
     cleanUp,
     context,
@@ -27,7 +34,12 @@ import { createHandler } from "./_pocket/src/server/http.ts";
 import { setAuthCookie } from "./_pocket/src/server/auth.ts";
 import { DeskDashboard } from "./_desk-dashboard.ts";
 import { DeskUsage } from "./_desk-usage.ts";
-import { dashboardFixture, VARIANTS, type Variant } from "./desk-dashboard-fixture.ts";
+import {
+    dashboardFixture,
+    type Fixture,
+    VARIANTS,
+    type Variant,
+} from "./desk-dashboard-fixture.ts";
 
 const fakeGh = join(root, "preview-gh");
 const agents = join(root, "preview-agents");
@@ -56,9 +68,14 @@ await app.setExtensionEnabled(owner(app), "desk.ts", true);
 
 const session = await newSession(app);
 
+/** The variant seeded last: the thread details answer from it. */
+let seeded: Variant = "main";
+
 /** Replace both documents with 1 variant of the fixture, at the real clock. */
 const seed = async (variant: Variant): Promise<void> => {
     const fixture = dashboardFixture(Date.now(), variant);
+
+    seeded = variant;
 
     await app.harness.commit(async (tx) => {
         const dashboard = (await tx.doc(DeskDashboard)) as unknown as Record<string, unknown>;
@@ -79,7 +96,44 @@ const seed = async (variant: Variant): Promise<void> => {
 
 await seed("main");
 
+/**
+ * The answer of `GET threads/<id>` for 1 fixture thread, in the shape `Detail` reads, or undefined: no such thread, or
+ * gone from the desk. Its PRs are the fixture's PR facts that name the thread.
+ */
+const threadDetail = (fixture: Fixture, id: string): object | undefined => {
+    const fact = Object.values(fixture.dashboard.threads).find((each) => each.id === id);
+
+    if (fact === undefined || fact.goneAt !== undefined) {
+        return undefined;
+    }
+
+    const prs = Object.values(fixture.dashboard.prs)
+        .filter((pr) => pr.threads.includes(id) || fact.prs.includes(pr.ref.toLowerCase()))
+        .map((pr) => ({
+            ref: pr.ref,
+            url: `https://github.com/${pr.repo}/pull/${String(pr.number)}`,
+            state: pr.state ?? "",
+            via: pr.via[0] ?? "",
+        }));
+
+    return {
+        thread: {
+            id,
+            title: `Fixture thread ${id} (preview)`,
+            repo: fact.repo ?? "",
+            state: fact.state,
+            next: fact.state === "closed" ? "nothing: closed" : "the preview has no next step",
+            open: [],
+            prs,
+            asks: [],
+            events: [],
+        },
+        reports: [],
+    };
+};
+
 let fail = false;
+let failRecords = false;
 let delay = 0;
 let count = 0;
 const host = "127.0.0.2";
@@ -125,6 +179,13 @@ const server = createServer((req, res) => {
         return;
     }
 
+    if (url.pathname === "/preview-fail-records") {
+        failRecords = url.searchParams.get("on") === "1";
+        text(res, 200, `fail records ${String(failRecords)}`);
+
+        return;
+    }
+
     if (url.pathname === "/preview-delay") {
         delay = Math.max(0, Number(url.searchParams.get("ms")) || 0);
         text(res, 200, `delay ${String(delay)}`);
@@ -165,6 +226,41 @@ const server = createServer((req, res) => {
 
             return;
         }
+    }
+
+    if (url.pathname === "/api/x/desk/dashboard/records") {
+        if (failRecords) {
+            res.writeHead(500, { "content-type": "application/json" });
+            res.end(JSON.stringify({ error: "preview: the records read failed on purpose" }));
+
+            return;
+        }
+
+        if (delay > 0) {
+            setTimeout(() => void handler(req, res), delay);
+
+            return;
+        }
+    }
+
+    const detail = /^\/api\/x\/desk\/threads\/([^/]+)$/.exec(url.pathname);
+
+    if (req.method === "GET" && detail !== null) {
+        const answer = threadDetail(
+            dashboardFixture(Date.now(), seeded),
+            decodeURIComponent(detail[1] ?? ""),
+        );
+
+        res.writeHead(answer === undefined ? 404 : 200, { "content-type": "application/json" });
+        res.end(
+            JSON.stringify(
+                answer ?? {
+                    error: `preview: there is no thread ${detail[1] ?? ""} in the fixture`,
+                },
+            ),
+        );
+
+        return;
     }
 
     void handler(req, res);

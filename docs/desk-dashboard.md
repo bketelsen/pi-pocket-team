@@ -2,14 +2,16 @@
 
 The Desk page has 2 views: **Desk**, the operational inbox (the default each time the page opens), and **Dashboard**, the
 numbers of Desk-tracked work for 1 range and 1 scope. Both are owner-only. The Dashboard only reads: it has no control
-that changes a thread, and opening it starts no collection. It calls 1 route, `GET /api/x/desk/dashboard`, which reads 2
-stored documents and nothing else (no GitHub call, no transcript read, no commit, no task).
+that changes a thread, and opening it starts no collection. It calls 2 routes, `GET /api/x/desk/dashboard` (the numbers)
+and `GET /api/x/desk/dashboard/records` (the drill-down of 1 row). Each reads the same 2 stored documents and nothing
+else (no GitHub call, no transcript read, no commit, no task).
 
 ![The Dashboard on a desktop](desk-dashboard-shots/desktop.png)
 
 ![The Dashboard on a phone](desk-dashboard-shots/phone.png)
 
-The screenshots show the fixture of `desk-dashboard-fixture.ts` in the isolated preview (`npm run preview-desk`).
+The screenshots show the fixture of `desk-dashboard-fixture.ts` in the isolated preview (`npm run preview-desk`). The
+phone one shows the bketelsen owner row with partial tokens, an unknown cost ("—"), and its open drill-down.
 
 ## The screen
 
@@ -21,12 +23,25 @@ The screenshots show the fixture of `desk-dashboard-fixture.ts` in the isolated 
 - **Status line.** The snapshot time (`asOf`, UTC), the coverage status, and the count of notices.
 - **Notices**, each a separate line with its own words: refresh failed (the last good numbers stay, dimmed, with their
   time), range refused (the route's 400 message; the last good numbers stay), collection not started, a stale source, a
-  failed source, a source never read, usage unavailable, partial coverage (the backfill goes on: pending refs and
-  sessions), no tracked work in the scope (the zeros are true zeros), and no eligible closures.
-- **Usage unavailable.** Tokens and cost are unknown ("—" on the cards, in the "Apart" lines, and in every table row,
-  the scope total included) when usage was never collected, or when its only read failed (no good read yet). This occurs
-  after the first collector pass, which fixes the boundary before any usage step. A partial usage source, and a failed
-  one after a good read, keep their collected facts, with a notice that they can be low.
+  failed source, a source never read, usage unavailable, usage unknown or partial (the answer's `usage-unknown`
+  limitation, with its words: some counted sessions have no complete read), partial coverage (the backfill goes on:
+  pending refs and sessions), no tracked work in the scope (the zeros are true zeros), and no eligible closures.
+- **Usage unavailable, unknown, or partial.** Each table row, the scope total, and the token and cost cards show usage
+  by their own `usage.state` (`usageKnowledge` in `desk-web/dashboard.js`):
+    - "—" (unknown, never 0) when the row's state is `unknown` (its counted sessions have no complete read and no valid
+      entry: the route gives null sums), and in every row, the scope total included, when usage was never collected or
+      its only read failed (no good read yet). The last case occurs after the first collector pass, which fixes the
+      boundary before any usage step.
+    - The value with "(partial)" in its text (so a screen reader says it too), such as "6,500 (partial)", when the state
+      is `partial`: some counted sessions have no complete read, so the value is the known part and can be low. It
+      sorts by its number; unknown sorts last.
+    - The value as it is when the state is `complete`: an explicit 0 stays "0" or "$0.00". With `none` (no counted
+      session) tokens are a true 0; a cost that no entry reported stays "—".
+    - The cards: the token and cost cards also show the usage read (complete, partial, unknown, none) and the counted
+      sessions by state ("2 complete, 1 partial, 1 unknown"). Their detail and "Apart" lines follow the same rule; the
+      session counts follow only the source's availability.
+    - The source: a partial usage source, and a failed one after a good read, keep their collected facts, with a notice
+      that they can be low.
 - **Cards**, in this order: thread completion rate, successful closures and velocity, thread cycle time, time to solve,
   current workload ("now"), tracked PRs, dated tokens, reported model cost (USD). Each card has "How is this counted?".
 - **Daily trend.** The successful closures by UTC day, as bars (each with its text for screen readers), with a summary
@@ -34,7 +49,16 @@ The screenshots show the fixture of `desk-dashboard-fixture.ts` in the isolated 
   bars is 2 px up to 31 days, 1 px up to 92 days, and 0 above that.
 - **Projects.** 1 row for each repository, under its owner's subtotal row, and at the all-work scope 1 unattributed row;
   the scope total is the last row. Each column sorts (unknown values last in both directions). On a phone each row is a
-  small card, with a "Sort by" control. There is no drill-down link: the operational Desk has no repository filter.
+  small card, with a "Sort by" control.
+- **Drill-down.** Each project row, owner subtotal row, and the unattributed row has a "Threads and PRs" button
+  (`aria-expanded`, `aria-controls`). It opens a row under it (1 row at a time) that reads `GET dashboard/records` for
+  that row's scope and the range shown: the delivery threads the row counts (each closure in the range with its case,
+  and the workload now) and its tracked PRs (each with its events in the range and its state), at most 200 of each,
+  with the count left out. The read shows its loading, error, and empty states, and aborts when the row closes, the
+  selection changes, or the view goes. A thread opens the Desk's own thread detail (`threads/:id`, owner-only, as on
+  the Desk); its Back button ("Back to the dashboard") returns to the Dashboard with the same selection and numbers,
+  the same row open, and the focus on that row's button. A thread gone from the desk shows its id and "gone from the
+  desk", with no button. A PR links to its GitHub page, built from its validated repository and number.
 - **Coverage and definitions.** The coverage status, the recovery boundary, the first day a range can start, the source
   table (status, last good read, last check, error), the progress counts, the population rule, the time rules, and the
   limitations that the answer lists.
@@ -45,6 +69,27 @@ eligible closure (completion) or no resolved issue (time to solve).
 The view reads once when it opens, then every 60 seconds while it is mounted and the browser tab is visible. A tab that
 comes back to view reads at once when the last read is older than that. Switching to Desk, closing the page, and the
 module's dispose stop the timer and abort a read in flight; an answer that comes after that changes nothing.
+
+## The drill-down route
+
+`GET /api/x/desk/dashboard/records` (owner-only) takes the query of `GET dashboard` (`from`, `to`, `owner`, `repo`), or
+`unattributed=1` with no owner and no repository (else a 400, as for a bad range). It reads `x.desk.dashboard` and
+`x.desk.usage` with `request.snapshot`, as `GET dashboard` does, and nothing else: it collects nothing, calls no GitHub,
+reads no transcript, commits nothing, and starts no task. `records` in `_desk-metrics.ts` groups the facts and selects
+them by the same population and range rules as the numbers. The answer is `{ asOf, range, scope, threads, prs,
+truncated }`:
+
+- `threads`: each delivery thread whose latest closure has a valid time in the range (`kind`: `success`, `abandoned`,
+  `failed`, `dropped`, `frozen`, or `unknown`), and each one starting, open or parked now and not gone (`kind: "now"`),
+  with `id`, `repo` (or null), `state`, `closedAt`, `startedAt`, `gone`, and `prs`. No coordinator, no excluded thread.
+  Sorted by id, numeric-aware.
+- `prs`: each tracked PR (not untracked, not excluded) with `createdAt`, `mergedAt`, or a `CLOSED` `closedAt` in the
+  range, or open now, with `ref`, `repo`, `number`, `state`, the 3 times, `events` (`created`, `merged`,
+  `closed-unmerged`, `open-now`), and `threads`. Sorted by ref. The unattributed scope has none: a PR always has a
+  repository.
+- `truncated`: each list stops at 200 entries (`MAX_RECORDS`); `{ threads, prs }` counts the entries left out.
+
+The all-work scope includes the unattributed threads, as its numbers do.
 
 ## Time
 
@@ -198,7 +243,8 @@ There is no automatic purge, and the dashboard never changes `x.desk.threads`. T
 1. Read the notices and the "Coverage and definitions" section: a stale, failed or partial source, pending refs or
    sessions, and the limitations explain most gaps. Wait for the backfill to finish.
 2. Compare 1 scope and range with the facts: `GET /api/x/desk/dashboard?from=…&to=…&repo=…` gives the same answer as JSON,
-   with every count that the screen shows.
+   with every count that the screen shows. `GET /api/x/desk/dashboard/records` with the same query (or
+   `unattributed=1`, alone) lists the threads and PRs behind those counts.
 
 A reset, when one is ever needed, must keep the operational desk: only `x.desk.dashboard` and `x.desk.usage` are the
 dashboard's, and both are rebuilt from `x.desk.threads`, GitHub, and the sessions. A reset would clear those 2
@@ -207,7 +253,11 @@ days before its first pass, and history before it is gone for good. No tool or r
 
 ## Tests
 
-`desk-metrics.test.ts` covers the reducers, the route, and `choices`. `desk-dashboard-web.test.ts` runs `snapshot()` on
-the preview fixture and checks the exact numbers the screen shows, with the page's own helpers. `desk-web.test.js` covers
-the page's helpers: formats (unknown versus 0), the query path, the scope choices, sorting, the table rows, the states,
-and the default view.
+`desk-metrics.test.ts` covers the reducers, `records` (each closure kind, the workload now, gone, excluded and
+coordinator threads, PR events, the scopes, the cap and `truncated`), both routes (owner-only, the 400s, and no `gh`
+call, no document change and no task during a GET), and `choices`. `desk-dashboard-web.test.ts` runs `snapshot()` and
+`records()` on the preview fixture (its rows hold complete usage with an explicit $0.00, partial usage, and unknown
+usage) and checks the exact numbers and words the screen shows, with the page's own helpers. `desk-web.test.js` covers
+the page's helpers: formats (unknown versus 0), the query path, the scope choices, sorting, the table rows, the usage
+knowledge of each row (`usageKnowledge`, `usageText`, `usageReadLines`), the states, the drill-down helpers
+(`recordsPath`, `prUrl`, the words), and the default view.

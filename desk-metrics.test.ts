@@ -28,9 +28,11 @@ import {
 } from "./_desk-dashboard.ts";
 import { DeskUsage, type Counters, type SessionUsage, type UsageState } from "./_desk-usage.ts";
 import {
+    MAX_RECORDS,
     median,
     nearestRank,
     parseQuery,
+    records,
     reduce,
     snapshot,
     sourceView,
@@ -38,6 +40,8 @@ import {
     type Facts,
     type Metrics,
     type MetricsQuery,
+    type Records,
+    type RecordsQuery,
     type Snapshot,
     type Window,
 } from "./_desk-metrics.ts";
@@ -1777,6 +1781,252 @@ describe("time to solve", () => {
 
 // ─── Sources ─────────────────────────────────────────────────────────────────
 
+describe("records: the threads and PRs behind a row", () => {
+    const list = (
+        query: RecordsQuery = OCTOBER,
+        dashboard: DashboardState = mainDashboard(),
+    ): Records => {
+        const answer = records({ dashboard, usage: mainUsage(), now: NOW, query });
+
+        if ("error" in answer) {
+            assert.fail(answer.error);
+        }
+
+        return answer;
+    };
+
+    const ids = (answer: Records): string[] =>
+        answer.threads.map((thread) => `${thread.id}:${thread.kind}`);
+    const refs = (answer: Records): string[] =>
+        answer.prs.map((pr) => `${pr.ref}:${pr.events.join("+")}`);
+
+    test("all tracked work: each closure kind in the range, the workload now, unattributed included", () => {
+        const answer = list();
+
+        assert.deepEqual(answer.scope, { kind: "all" });
+        assert.equal(answer.asOf, NOW);
+        assert.equal(answer.range.from, "2026-10-01");
+        // Not T15 (open, but gone), T17 (coordinator), T18 and T19 (excluded), T20 (undated), T21 (before the range).
+        assert.deepEqual(ids(answer), [
+            "T1:success",
+            "T2:success",
+            "T3:failed",
+            "T4:success",
+            "T5:abandoned",
+            "T6:abandoned",
+            "T7:abandoned",
+            "T8:success",
+            "T9:dropped",
+            "T10:frozen",
+            "T11:unknown",
+            "T12:now",
+            "T13:now",
+            "T14:now",
+            "T16:success",
+        ]);
+        assert.deepEqual(answer.threads[0], {
+            id: "T1",
+            repo: "a/one",
+            state: "closed",
+            kind: "success",
+            closedAt: oct(2, 10),
+            startedAt: oct(1, 10),
+            gone: false,
+            prs: [],
+        });
+        assert.deepEqual(answer.threads.at(-1), {
+            id: "T16",
+            repo: null,
+            state: "closed",
+            kind: "success",
+            closedAt: oct(8),
+            startedAt: oct(8) - HOUR,
+            gone: false,
+            prs: [],
+        });
+        assert.deepEqual(
+            answer.threads.find((thread) => thread.id === "T13"),
+            {
+                id: "T13",
+                repo: "b/three",
+                state: "parked",
+                kind: "now",
+                closedAt: null,
+                startedAt: null,
+                gone: false,
+                prs: [],
+            },
+        );
+        // Not untracked a/one#8, excluded a/two#4 and b/three#5, nor b/three#6 (no event, not open).
+        assert.deepEqual(refs(answer), [
+            "a/one#1:created+merged",
+            "a/one#2:closed-unmerged",
+            "a/two#3:created+open-now",
+            "b/three#7:merged",
+        ]);
+        assert.deepEqual(answer.prs[0], {
+            ref: "a/one#1",
+            repo: "a/one",
+            number: 1,
+            state: "MERGED",
+            createdAt: oct(2),
+            mergedAt: oct(3),
+            closedAt: oct(3),
+            events: ["created", "merged"],
+            threads: ["T1"],
+        });
+        assert.equal(answer.prs[3]?.createdAt, null, "a gap stays null, never the fetch time");
+        assert.deepEqual(answer.truncated, { threads: 0, prs: 0 });
+    });
+
+    test("the lists match the row's counts", () => {
+        const numbers = take();
+        const answer = list();
+        const closures = answer.threads.filter((thread) => thread.kind !== "now");
+        const t = numbers.totals;
+
+        assert.equal(
+            closures.filter((thread) => thread.kind === "success").length,
+            t.completion.success,
+        );
+        assert.equal(
+            closures.filter((thread) => ["success", "abandoned", "failed"].includes(thread.kind))
+                .length,
+            t.completion.denominator,
+        );
+        assert.equal(
+            answer.threads.filter((thread) => thread.kind === "now").length,
+            t.workload.total,
+        );
+        assert.equal(answer.prs.filter((pr) => pr.events.includes("merged")).length, t.prs.merged);
+        assert.equal(
+            answer.prs.filter((pr) => pr.events.includes("created")).length,
+            t.prs.created,
+        );
+        assert.equal(
+            answer.prs.filter((pr) => pr.events.includes("open-now")).length,
+            t.prs.openNow,
+        );
+    });
+
+    test("scopes: a repository in any case, an owner, and the unattributed row", () => {
+        const repo = list({ ...OCTOBER, repo: "A/One" });
+
+        assert.deepEqual(repo.scope, { kind: "repo", owner: "A", repo: "A/One" });
+        assert.deepEqual(ids(repo), ["T1:success", "T2:success", "T3:failed"]);
+        assert.deepEqual(refs(repo), ["a/one#1:created+merged", "a/one#2:closed-unmerged"]);
+
+        const owner = list({ ...OCTOBER, owner: "a" });
+
+        assert.deepEqual(
+            owner.threads.map((thread) => thread.id),
+            ["T1", "T2", "T3", "T4", "T5", "T6", "T7"],
+        );
+        assert.deepEqual(
+            owner.prs.map((pr) => pr.ref),
+            ["a/one#1", "a/one#2", "a/two#3"],
+        );
+
+        const unattributed = list({ ...OCTOBER, unattributed: "1" });
+
+        assert.deepEqual(unattributed.scope, { kind: "unattributed" });
+        assert.deepEqual(ids(unattributed), ["T16:success"]);
+        assert.deepEqual(unattributed.prs, [], "a PR always has a repository");
+
+        const nobody = list({ ...OCTOBER, owner: "nobody" });
+
+        assert.deepEqual([nobody.threads, nobody.prs], [[], []]);
+    });
+
+    test("a gone thread keeps its closure, marked gone; an open gone thread is no workload", () => {
+        const dashboard = mainDashboard();
+
+        dashboard.threads.t22 = {
+            ...closed("T22", "b/three", oct(9), "done", "completed"),
+            prs: ["b/three#7"],
+            goneAt: oct(20),
+        };
+
+        const answer = list({ ...OCTOBER, repo: "b/three" }, dashboard);
+
+        assert.deepEqual(
+            answer.threads.map((thread) => [thread.id, thread.kind, thread.gone]),
+            [
+                ["T8", "success", false],
+                ["T9", "dropped", false],
+                ["T10", "frozen", false],
+                ["T11", "unknown", false],
+                ["T12", "now", false],
+                ["T13", "now", false],
+                ["T14", "now", false],
+                ["T22", "success", true],
+            ],
+        );
+        assert.deepEqual(answer.threads.at(-1)?.prs, ["b/three#7"]);
+        assert(!answer.threads.some((thread) => thread.id === "T15"));
+    });
+
+    test("the range: a closure or a PR event outside it is left out", () => {
+        const september = list({ from: "2026-09-01", to: "2026-09-30" });
+
+        assert.deepEqual(ids(september), ["T12:now", "T13:now", "T14:now", "T21:success"]);
+        assert.deepEqual(refs(september), ["a/one#2:created", "a/two#3:open-now"]);
+    });
+
+    test("each list is sorted and stops at MAX_RECORDS; truncated counts the rest", () => {
+        const dashboard = fresh();
+
+        dashboard.boundary = BOUNDARY;
+
+        for (let n = 1; n <= MAX_RECORDS + 5; n += 1) {
+            dashboard.threads[`t${n}`] = closed(`T${n}`, "c/cap", oct(2), "done", "completed");
+        }
+
+        for (let n = 1; n <= MAX_RECORDS + 30; n += 1) {
+            dashboard.prs[`c/cap#${n}`] = pr(`c/cap#${n}`, { state: "OPEN" });
+        }
+
+        const answer = list(OCTOBER, dashboard);
+
+        assert.equal(answer.threads.length, MAX_RECORDS);
+        assert.equal(answer.prs.length, MAX_RECORDS);
+        assert.deepEqual(answer.truncated, { threads: 5, prs: 30 });
+        assert.deepEqual(
+            answer.threads.slice(0, 3).map((thread) => thread.id),
+            ["T1", "T2", "T3"],
+            "numeric-aware: T2 before T10",
+        );
+        assert.equal(answer.threads.at(-1)?.id, `T${MAX_RECORDS}`);
+        assert.deepEqual(
+            answer.prs.slice(0, 3).map((each) => each.ref),
+            ["c/cap#1", "c/cap#10", "c/cap#100"],
+        );
+    });
+
+    test("refusals: the dashboard's, and unattributed with a scope or another value", () => {
+        const refuse = (query: RecordsQuery): string => {
+            const answer = records({
+                dashboard: mainDashboard(),
+                usage: undefined,
+                now: NOW,
+                query,
+            });
+
+            assert("error" in answer, JSON.stringify(query));
+
+            return answer.error;
+        };
+
+        assert.match(refuse({ from: "2026-02-30" }), /from is not a real date/);
+        assert.match(refuse({ from: "2026-10-20", to: "2026-10-10" }), /from must not be after to/);
+        assert.match(refuse({ repo: "nope" }), /repo must be a repository name/);
+        assert.match(refuse({ unattributed: "1", repo: "a/one" }), /takes no owner and no repo/);
+        assert.match(refuse({ unattributed: "1", owner: "a" }), /takes no owner and no repo/);
+        assert.match(refuse({ unattributed: "yes" }), /unattributed must be 1/);
+        assert.deepEqual(list({ ...OCTOBER, unattributed: "" }).scope, { kind: "all" });
+    });
+});
+
 describe("source states", () => {
     test("never, failed, stale, partial, ok", () => {
         const old = NOW - STALE_MS - 1;
@@ -2181,6 +2431,69 @@ describe("GET dashboard in Pocket", () => {
         assert.equal(readFileSync(ghCalls, "utf8"), callsBefore, "no gh call");
         assert.equal(JSON.stringify(await docs()), docsBefore, "no document changed");
         assert.deepEqual(await tasks(), tasksBefore, "no task started");
+    });
+
+    test("dashboard/records: the threads and PRs of a row; no gh call, no document change, no task", async () => {
+        const docs = async () => [
+            await app.harness.snapshot(DeskDashboard, context),
+            await app.harness.snapshot(DeskUsage, context),
+            await app.harness.snapshot(DeskThreads, context),
+        ];
+        const tasks = async () =>
+            (await app.harness.inspect(context)).tasks
+                .map((task) => `${task.record.kind}:${task.record.id}`)
+                .sort();
+        const docsBefore = JSON.stringify(await docs());
+        const tasksBefore = await tasks();
+        const callsBefore = readFileSync(ghCalls, "utf8");
+        const all = await get("dashboard/records");
+        const data = all.data as unknown as Records;
+
+        assert.equal(all.status, 200, JSON.stringify(all.data));
+        assert.deepEqual(data.scope, { kind: "all" });
+        assert.deepEqual(
+            data.threads.map((thread) => `${thread.id}:${thread.kind}`),
+            ["T1:success", "T2:success", "T3:abandoned"],
+        );
+        assert.deepEqual(
+            data.prs.map((each) => [each.ref, each.events]),
+            [["a/one#1", ["created", "merged"]]],
+        );
+        assert.deepEqual(data.truncated, { threads: 0, prs: 0 });
+
+        const repo = (await get("dashboard/records?repo=b/two")).data as unknown as Records;
+
+        assert.deepEqual(
+            repo.threads.map((thread) => thread.id),
+            ["T3"],
+        );
+        assert.deepEqual(repo.prs, []);
+
+        const unattributed = await get("dashboard/records?unattributed=1");
+
+        assert.equal(unattributed.status, 200);
+        assert.deepEqual((unattributed.data as unknown as Records).threads, []);
+
+        assert.equal(readFileSync(ghCalls, "utf8"), callsBefore, "no gh call");
+        assert.equal(JSON.stringify(await docs()), docsBefore, "no document changed");
+        assert.deepEqual(await tasks(), tasksBefore, "no task started");
+    });
+
+    test("dashboard/records: only the owner; a bad range or unattributed with a scope is a 400", async () => {
+        assert.equal((await get("dashboard/records", null)).status, 401);
+        assert.equal((await get("dashboard/records", viewer)).status, 404);
+
+        const feb = await get("dashboard/records?from=2026-02-30");
+
+        assert.equal(feb.status, 400);
+        assert.match(JSON.stringify(feb.data), /from is not a real date: 2026-02-30/);
+        assert.equal((await get("dashboard/records?to=2999-01-01")).status, 400);
+
+        const both = await get("dashboard/records?unattributed=1&repo=a/one");
+
+        assert.equal(both.status, 400);
+        assert.match(JSON.stringify(both.data), /takes no owner and no repo/);
+        assert.equal((await get("dashboard/records?unattributed=1&owner=a")).status, 400);
     });
 
     test("no token, and a viewer, are refused", async () => {

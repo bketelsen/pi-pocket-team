@@ -65,9 +65,20 @@ import {
     rangeLine,
     repoChoices,
     sortRows,
+    MAX_RECORDS,
+    PARTIAL_MARK,
+    prEventsText,
+    prUrl,
+    recordsPath,
+    rowKey,
+    rowParts,
     tableRows,
+    threadKindText,
     usageAvailable,
+    usageKnowledge,
     usageNote,
+    usageReadLines,
+    usageText,
     utcDay,
     withOwner,
     withRepo,
@@ -1572,9 +1583,9 @@ test("usageAvailable: never collected and a failed first read are unknown; parti
     assert.deepEqual(words(partial), []);
 });
 
-test("unknown usage: every table row shows tokens and cost as unknown, and sorts them last; known usage keeps its facts", () => {
-    const zero = metrics({ usage: { totalTokens: 0, cost: null } });
-    const some = metrics({ usage: { totalTokens: 500, cost: 0 } });
+test("no good usage read: every table row shows tokens and cost as unknown, and sorts them last; a good read keeps the facts", () => {
+    const zero = metrics({ usage: { totalTokens: 0, cost: null, state: "none" } });
+    const some = metrics({ usage: { totalTokens: 500, cost: 0, state: "complete" } });
     const rows = {
         projects: [
             { repo: "a/one", owner: "a", metrics: zero },
@@ -1597,11 +1608,8 @@ test("unknown usage: every table row shows tokens and cost as unknown, and sorts
             ["a/two", null, null],
             ["Unattributed", null, null],
         ]);
-        assert.equal(
-            cellText("tokens", { metrics: zero, usageUnknown: true }),
-            null,
-            "the scope total too",
-        );
+        assert.equal(cellText("tokens", { metrics: some, coverage }), null, "the scope total too");
+        assert.equal(cellText("open", { metrics: some, coverage }), "0", "only usage goes unknown");
     }
 
     for (const coverage of [usageCoverage("failed", 1), usageCoverage("partial", 1)]) {
@@ -1612,11 +1620,196 @@ test("unknown usage: every table row shows tokens and cost as unknown, and sorts
             ["Unattributed", "0", null],
         ]);
     }
+});
+
+test("usageKnowledge: each row's own state, with the source's availability as an extra rule", () => {
+    const good = usageCoverage("ok", 1);
+    const never = usageCoverage("never", null);
+    const firstFailed = usageCoverage("failed", null);
+
+    assert.equal(usageKnowledge({ state: "complete" }, good), "known");
+    assert.equal(usageKnowledge({ state: "none" }, good), "known");
+    assert.equal(usageKnowledge({ state: "partial" }, good), "partial");
+    assert.equal(usageKnowledge({ state: "unknown" }, good), "unknown");
+    assert.equal(
+        usageKnowledge({ state: "complete" }, undefined),
+        "known",
+        "no coverage hides nothing",
+    );
+    assert.equal(usageKnowledge(undefined, good), "unknown");
+
+    for (const coverage of [never, firstFailed]) {
+        for (const state of ["complete", "partial", "unknown", "none"]) {
+            assert.equal(
+                usageKnowledge({ state }, coverage),
+                "unknown",
+                `${state} with no good read`,
+            );
+        }
+    }
+
+    assert.equal(usageText("6,500", "known"), "6,500");
+    assert.equal(usageText("6,500", "partial"), `6,500${PARTIAL_MARK}`);
+    assert.equal(usageText("6,500", "partial"), "6,500 (partial)");
+    assert.equal(usageText("6,500", "unknown"), null);
+    assert.equal(usageText(null, "partial"), null, "an unknown cost stays unknown, not partial");
+    assert.equal(usageText("$0.00", "known"), "$0.00", "an explicit 0 stays 0");
+
+    assert.deepEqual(
+        usageReadLines(
+            { state: "partial", sessionStates: { complete: 2, partial: 1, unknown: 3 } },
+            good,
+        ),
+        { read: "partial", sessions: "2 complete, 1 partial, 3 unknown" },
+    );
+    assert.deepEqual(
+        usageReadLines(
+            { state: "none", sessionStates: { complete: 0, partial: 0, unknown: 0 } },
+            good,
+        ),
+        { read: "none", sessions: "0 complete, 0 partial, 0 unknown" },
+    );
+    assert.equal(usageReadLines({ state: "complete" }, never).read, "unknown");
+    assert.equal(usageReadLines({}, good).sessions, null);
+});
+
+test("per-row usage: unknown is a dash and sorts last, partial is marked and sorts by its number, 0 stays 0", () => {
+    const coverage = usageCoverage("ok", 1);
+    const row = (name, usage) => ({
+        kind: "project",
+        name,
+        owner: "a",
+        coverage,
+        metrics: metrics({ usage }),
+    });
+    const rows = [
+        row("a/complete", { state: "complete", totalTokens: 300, cost: 0 }),
+        row("a/partial", { state: "partial", totalTokens: 6500, cost: 0.75 }),
+        row("a/unknown", { state: "unknown", totalTokens: null, cost: null }),
+        row("a/none", { state: "none", totalTokens: 0, cost: null }),
+        row("a/partial-no-cost", { state: "partial", totalTokens: 10, cost: null }),
+    ];
+    const texts = rows.map((each) => [each.name, cellText("tokens", each), cellText("cost", each)]);
+
+    assert.deepEqual(texts, [
+        ["a/complete", "300", "$0.00"],
+        ["a/partial", "6,500 (partial)", "$0.75 (partial)"],
+        ["a/unknown", null, null],
+        ["a/none", "0", null],
+        ["a/partial-no-cost", "10 (partial)", null],
+    ]);
+
+    const names = (sort) => sortRows(rows, sort).map((each) => each.name);
+
+    assert.deepEqual(names({ key: "tokens", dir: "desc" }), [
+        "a/partial",
+        "a/complete",
+        "a/partial-no-cost",
+        "a/none",
+        "a/unknown",
+    ]);
+    assert.deepEqual(names({ key: "tokens", dir: "asc" }), [
+        "a/none",
+        "a/partial-no-cost",
+        "a/complete",
+        "a/partial",
+        "a/unknown",
+    ]);
+    assert.deepEqual(names({ key: "cost", dir: "asc" }), [
+        "a/complete",
+        "a/partial",
+        "a/none",
+        "a/partial-no-cost",
+        "a/unknown",
+    ]);
+
+    // The same rows with no good read: every usage value is unknown.
+    const lost = rows.map((each) => ({ ...each, coverage: usageCoverage("never", null) }));
+
+    assert(
+        lost.every((each) => cellText("tokens", each) === null && cellText("cost", each) === null),
+    );
+    assert.deepEqual(
+        tableRows(
+            {
+                coverage,
+                rows: {
+                    projects: [{ repo: "a/x", owner: "a", metrics: rows[1].metrics }],
+                    owners: [{ owner: "a", metrics: rows[2].metrics }],
+                    unattributed: rows[3].metrics,
+                },
+            },
+            { key: "name", dir: "asc" },
+        ).map((each) => cellText("tokens", each)),
+        [null, "6,500 (partial)", "0"],
+        "each row from its own usage: the unknown owner, the partial project, the unattributed none",
+    );
+});
+
+test("dashboardStates: the usage-unknown limitation is a notice with its own words", () => {
+    const text =
+        "Some counted sessions have no complete usage read: their usage is unknown or partial, not 0.";
+    const snapshot = stateSnapshot();
+
+    snapshot.coverage.limitations = [
+        { code: "tracked-work-only", text: "Only Desk-tracked work counts." },
+        { code: "usage-unknown", text },
+    ];
+
+    assert.deepEqual(dashboardStates(snapshot), [{ code: "usage-unknown", tone: "warn", text }]);
+    snapshot.coverage.limitations = [{ code: "tracked-work-only", text: "x" }];
+    assert.deepEqual(dashboardStates(snapshot), []);
+});
+
+test("the drill-down: the records path of each row kind, the PR link, and the words", () => {
+    const range = { from: "2026-10-01", to: "2026-10-30" };
 
     assert.equal(
-        cellText("open", { metrics: some, usageUnknown: true }),
-        "0",
-        "only usage goes unknown",
+        recordsPath({ kind: "project", name: "frostyard/snosi", owner: "frostyard" }, range),
+        "dashboard/records?from=2026-10-01&to=2026-10-30&repo=frostyard%2Fsnosi",
+    );
+    assert.equal(
+        recordsPath({ kind: "owner", name: "frostyard", owner: "frostyard" }, range),
+        "dashboard/records?from=2026-10-01&to=2026-10-30&owner=frostyard",
+    );
+    assert.equal(
+        recordsPath({ kind: "unattributed", name: "Unattributed", owner: "" }, range),
+        "dashboard/records?from=2026-10-01&to=2026-10-30&unattributed=1",
+    );
+    assert.equal(recordsPath({ kind: "total", name: "Scope total" }, range), null);
+    assert.equal(rowKey({ kind: "project", name: "a/b" }), "project:a/b");
+    assert.notEqual(rowKey({ kind: "owner", name: "a" }), rowKey({ kind: "project", name: "a" }));
+    assert.equal(MAX_RECORDS, 200);
+
+    assert.equal(prUrl({ repo: "a/b.c", number: 7 }), "https://github.com/a/b.c/pull/7");
+    assert.equal(prUrl({ repo: "a/b/../c", number: 7 }), null);
+    assert.equal(prUrl({ repo: "javascript:alert(1)", number: 7 }), null);
+    assert.equal(prUrl({ repo: "a/b", number: 0 }), null);
+    assert.equal(prUrl({ repo: "a/b", number: 1.5 }), null);
+    assert.equal(prUrl({ repo: "a/b", number: "7" }), null);
+    assert.equal(prUrl(undefined), null);
+
+    assert.equal(threadKindText({ kind: "now", state: "parked" }), "parked now");
+    assert.equal(threadKindText({ kind: "success", state: "closed" }), "closed: success");
+    assert.equal(threadKindText({ kind: "abandoned", state: "closed" }), "closed: abandoned");
+    assert.equal(threadKindText({ kind: "failed", state: "closed" }), "closed: failed");
+    assert.equal(
+        threadKindText({ kind: "dropped", state: "closed" }),
+        "closed: dropped (excluded)",
+    );
+    assert.equal(threadKindText({ kind: "frozen", state: "closed" }), "closed: frozen (excluded)");
+    assert.equal(
+        threadKindText({ kind: "unknown", state: "closed" }),
+        "closed: unknown outcome (excluded)",
+    );
+    assert.equal(
+        prEventsText({ state: "MERGED", events: ["created", "merged"] }),
+        "merged · created in range, merged in range",
+    );
+    assert.equal(prEventsText({ state: "OPEN", events: ["open-now"] }), "open · open now");
+    assert.equal(
+        prEventsText({ state: null, events: ["closed-unmerged"] }),
+        "not read · closed unmerged in range",
     );
 });
 
@@ -1631,4 +1824,48 @@ test("barLayout: 1 column for each day, and a gap that lets 1 to 366 days fit", 
     for (let days = 1; days <= 366; days += 1) {
         assert(barLayout(days).gap * (days - 1) <= 92, String(days));
     }
+});
+
+test("lint: an undefined name in a page module is an error (no-undef), and browser globals are known", async () => {
+    // `npm run lint` runs this config: a name that only another component declares (a ReferenceError at runtime) fails.
+    const { ESLint } = await import("eslint");
+    const eslint = new ESLint({ cwd: import.meta.dirname });
+
+    for (const file of ["desk-web/index.js", "desk-web/dashboard.js", "team-web/index.js"]) {
+        const config = await eslint.calculateConfigForFile(file);
+
+        assert.equal(config.rules["no-undef"]?.[0], 2, file);
+    }
+
+    const [bad] = await eslint.lintText(
+        "export const view = (html) => html`<button aria-label=${backLabel}>Back</button>`;\n",
+        { filePath: "desk-web/probe.js" },
+    );
+
+    assert.deepEqual(
+        bad.messages.map((message) => [message.ruleId, message.message]),
+        [["no-undef", "'backLabel' is not defined."]],
+    );
+
+    const [good] = await eslint.lintText(
+        "export const later = () => {\n    const abort = new AbortController();\n\n    setTimeout(() => abort.abort(), 0);\n\n    return document.title;\n};\n",
+        { filePath: "desk-web/probe.js" },
+    );
+
+    assert.deepEqual(good.messages, []);
+});
+
+test("rowParts: a row has the same shape open or closed, so its button keeps the focus", () => {
+    const line = { type: "tr", key: "row" };
+    const drill = { type: "tr", key: "records" };
+    const closed = rowParts(line, null);
+    const open = rowParts(line, drill);
+
+    assert.equal(closed.length, 2);
+    assert.equal(open.length, 2);
+    assert.equal(closed[0], line, "the row first, closed");
+    assert.equal(open[0], line, "the row first, open: the same slot, so it is not mounted again");
+    assert.equal(closed[1], null, "a hole that keeps the slot of the drill-down");
+    assert.equal(open[1], drill);
+    assert.deepEqual(rowParts(line, undefined), [line, null]);
 });

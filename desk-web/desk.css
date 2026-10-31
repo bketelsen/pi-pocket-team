@@ -540,6 +540,7 @@
 
 .desk-tab:focus-visible,
 .dash button:focus-visible,
+.dash a:focus-visible,
 .dash select:focus-visible,
 .dash input:focus-visible,
 .dash summary:focus-visible {
@@ -776,6 +777,15 @@
     text-align: right;
 }
 
+/* A long value, such as the sessions by usage read: it wraps, and its label keeps its words whole. */
+.dash-item dd.dash-wrap {
+    white-space: normal;
+}
+
+.dash-item:has(.dash-wrap) dt {
+    flex: none;
+}
+
 .dash-help {
     margin-top: auto;
     padding-top: 6px;
@@ -990,6 +1000,71 @@
     font-size: 13px;
 }
 
+/* A partial usage value: the word "(partial)" is in the text, the color only adds to it. */
+.dash-partial {
+    color: var(--warn);
+    font-size: 0.9em;
+}
+
+/* A row's drill-down: its button under the name, and the threads and PRs in a row of their own below it. */
+.dash-drill {
+    display: inline-block;
+    margin-top: 2px;
+    padding: 2px 0;
+    border: 0;
+    background: none;
+    color: var(--accent);
+    font: inherit;
+    font-size: 12px;
+    font-weight: 400;
+    text-align: left;
+    text-decoration: underline;
+    cursor: pointer;
+}
+
+.dash-drill[aria-expanded="true"] {
+    font-weight: 600;
+}
+
+.dash-table .dash-drill-cell {
+    padding: 8px 10px 12px;
+    background: var(--card);
+    text-align: left;
+    font-variant-numeric: normal;
+}
+
+.dash-records .dash-sub:first-child {
+    margin-top: 0;
+}
+
+.dash-record-list {
+    margin: 0;
+    padding-left: 18px;
+}
+
+.dash-record-list li {
+    margin: 4px 0;
+    overflow-wrap: anywhere;
+}
+
+.dash-thread-link {
+    margin-right: 6px;
+    padding: 2px 6px;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    background: var(--bg, transparent);
+    color: var(--accent);
+    font: inherit;
+    font-family: ui-monospace, monospace;
+    cursor: pointer;
+}
+
+.dash-record-list .desk-id,
+.dash-record-list .mono,
+.dash-record-list a {
+    margin-right: 6px;
+}
+
 .dash-limits {
     margin: 4px 0;
     padding-left: 18px;
@@ -1063,6 +1138,27 @@
 
     .dash-owner {
         border-color: var(--accent) !important;
+    }
+
+    /* The drill-down below a row card: 1 block, left aligned, with no column label. */
+    .dash-table .dash-drill-row {
+        margin-top: -6px;
+        border-style: dashed;
+    }
+
+    .dash-table td.dash-drill-cell {
+        display: block;
+        padding: 0;
+        text-align: left;
+    }
+
+    .dash-table td.dash-drill-cell::before {
+        content: none;
+    }
+
+    .dash-drill {
+        padding: 6px 0;
+        font-size: 13px;
     }
 
     .dash-total {

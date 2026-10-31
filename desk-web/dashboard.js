@@ -214,6 +214,56 @@ export const usageNote = (coverage) => {
     return null;
 };
 
+/**
+ * What 1 row (or the scope total) knows of its usage, from its own `metrics.usage` and the source's availability:
+ * "unknown" when the source has no good read (`usageAvailable`) or the row's state is "unknown" (its range sums are
+ * null); "partial" when some of its counted sessions have no complete read (the sums are the known part, and can be
+ * low); else "known" ("complete", or "none": no counted session, a true 0).
+ */
+export const usageKnowledge = (usage, coverage) => {
+    if (!usageAvailable(coverage) || usage === null || usage === undefined) {
+        return "unknown";
+    }
+
+    if (usage.state === "unknown") {
+        return "unknown";
+    }
+
+    return usage.state === "partial" ? "partial" : "known";
+};
+
+/** The words that mark a partial usage value, in the text itself: a screen reader says them too. */
+export const PARTIAL_MARK = " (partial)";
+
+/** A usage value's text for a knowledge: null (unknown) for "unknown", marked for "partial", else as it is. */
+export const usageText = (text, knowledge) =>
+    knowledge === "unknown" || text === null || text === undefined
+        ? null
+        : knowledge === "partial"
+          ? `${text}${PARTIAL_MARK}`
+          : text;
+
+/** A usage field of a table row, for sorting: null (sorts last) when the row's usage is unknown. */
+export const usageValue = (row, field) =>
+    usageKnowledge(row.metrics.usage, row.coverage) === "unknown"
+        ? null
+        : (row.metrics.usage?.[field] ?? null);
+
+/**
+ * The usage read of a scope for its cards: its state (complete, partial, unknown, none) and its counted sessions by
+ * their own state. A source with no good read is unknown, whatever the state says.
+ */
+export const usageReadLines = (usage, coverage) => {
+    const states = usage?.sessionStates;
+
+    return {
+        read: usageAvailable(coverage) ? (usage?.state ?? null) : "unknown",
+        sessions: states
+            ? `${states.complete} complete, ${states.partial} partial, ${states.unknown} unknown`
+            : null,
+    };
+};
+
 const SOURCE_NAMES = { threads: "Desk threads", github: "GitHub", usage: "Usage" };
 
 /**
@@ -287,6 +337,13 @@ export const dashboardStates = (snapshot, { error = null, rangeError = null } = 
         });
     }
 
+    // Some counted sessions have no complete read: their tokens and cost are unknown or partial, not 0.
+    const usageUnknown = (coverage.limitations ?? []).find((each) => each.code === "usage-unknown");
+
+    if (usageUnknown) {
+        states.push({ code: "usage-unknown", tone: "warn", text: usageUnknown.text });
+    }
+
     const progress = coverage.progress;
     const partial = [];
 
@@ -353,12 +410,12 @@ export const COLUMNS = [
     {
         key: "tokens",
         label: "Tokens",
-        value: (row) => (row.usageUnknown ? null : row.metrics.usage.totalTokens),
+        value: (row) => usageValue(row, "totalTokens"),
     },
     {
         key: "cost",
         label: "Cost (USD)",
-        value: (row) => (row.usageUnknown ? null : row.metrics.usage.cost),
+        value: (row) => usageValue(row, "cost"),
     },
 ];
 
@@ -387,17 +444,17 @@ export const sortRows = (rows, sort) => {
 
 /**
  * The table's body rows: each owner's subtotal (from `rows.owners`, never computed here), then its projects, owners
- * and projects each in the sort's order; then the unattributed row, when the scope has one.
+ * and projects each in the sort's order; then the unattributed row, when the scope has one. Each row keeps the
+ * snapshot's coverage: its usage knowledge comes from its own `metrics.usage` and the source's availability.
  */
 export const tableRows = (snapshot, sort) => {
-    // Every row has the same usage availability: the usage source is 1 for all scopes.
-    const usageUnknown = !usageAvailable(snapshot.coverage);
+    const coverage = snapshot.coverage;
     const projects = snapshot.rows.projects.map((row) => ({
         kind: "project",
         name: row.repo,
         owner: row.owner,
         metrics: row.metrics,
-        usageUnknown,
+        coverage,
     }));
     const owners = sortRows(
         snapshot.rows.owners.map((row) => ({
@@ -405,7 +462,7 @@ export const tableRows = (snapshot, sort) => {
             name: row.owner,
             owner: row.owner,
             metrics: row.metrics,
-            usageUnknown,
+            coverage,
         })),
         sort,
     );
@@ -427,14 +484,17 @@ export const tableRows = (snapshot, sort) => {
             name: "Unattributed",
             owner: "",
             metrics: snapshot.rows.unattributed,
-            usageUnknown,
+            coverage,
         });
     }
 
     return rows;
 };
 
-/** 1 table cell's text for a column and a row: null is unknown. Tokens and cost are unknown when usage is. */
+/**
+ * 1 table cell's text for a column and a row: null is unknown. Tokens and cost follow the row's own usage knowledge
+ * (`usageKnowledge`): unknown is null, partial is marked "(partial)", and an explicit 0 stays 0.
+ */
 export const cellText = (key, row) => {
     const metrics = row.metrics;
 
@@ -461,13 +521,88 @@ export const cellText = (key, row) => {
         case "merged":
             return formatCount(metrics.prs.merged);
         case "tokens":
-            return row.usageUnknown ? null : formatCount(metrics.usage.totalTokens);
+            return usageText(
+                formatCount(metrics.usage.totalTokens),
+                usageKnowledge(metrics.usage, row.coverage),
+            );
         case "cost":
-            return row.usageUnknown ? null : formatMoney(metrics.usage.cost);
+            return usageText(
+                formatMoney(metrics.usage.cost),
+                usageKnowledge(metrics.usage, row.coverage),
+            );
         default:
             return null;
     }
 };
+
+// ─── The drill-down ──────────────────────────────────────────────────────────
+
+/** The most threads, and the most PRs, that `GET dashboard/records` gives: the rest is counted in `truncated`. */
+export const MAX_RECORDS = 200;
+
+/** A table row's key: its kind and its name. 1 row is open at a time. */
+export const rowKey = (row) => `${row.kind}:${row.name}`;
+
+/**
+ * The children of 1 table row, open or closed: always the row first, then its drill-down row or null. The shape never
+ * changes, so opening or closing a drill-down does not mount the row again: its button keeps the focus.
+ */
+export const rowParts = (line, drill) => [line, drill ?? null];
+
+/**
+ * The route path of a row's threads and PRs, for the range of the numbers shown: a project by its repository, an
+ * owner subtotal by its owner, the unattributed row by `unattributed=1`. Null for a row with no drill-down (the total).
+ */
+export const recordsPath = (row, range) => {
+    const params = new URLSearchParams({ from: range.from, to: range.to });
+
+    if (row.kind === "project") {
+        params.set("repo", row.name);
+    } else if (row.kind === "owner") {
+        params.set("owner", row.owner);
+    } else if (row.kind === "unattributed") {
+        params.set("unattributed", "1");
+    } else {
+        return null;
+    }
+
+    return `dashboard/records?${params.toString()}`;
+};
+
+const REPO = /^[A-Za-z0-9][A-Za-z0-9_.-]*\/[A-Za-z0-9][A-Za-z0-9_.-]*$/;
+
+/** A PR's GitHub page, from its validated repository and number; null when either is not valid. */
+export const prUrl = (pr) =>
+    typeof pr?.repo === "string" &&
+    REPO.test(pr.repo) &&
+    Number.isSafeInteger(pr.number) &&
+    pr.number > 0
+        ? `https://github.com/${pr.repo}/pull/${pr.number}`
+        : null;
+
+const KIND_WORDS = {
+    success: "closed: success",
+    abandoned: "closed: abandoned",
+    failed: "closed: failed",
+    dropped: "closed: dropped (excluded)",
+    frozen: "closed: frozen (excluded)",
+    unknown: "closed: unknown outcome (excluded)",
+};
+
+/** How a row counts a thread, in words: its closure's case in the range, or its state now. */
+export const threadKindText = (thread) =>
+    thread.kind === "now" ? `${thread.state} now` : (KIND_WORDS[thread.kind] ?? thread.kind);
+
+const EVENT_WORDS = {
+    created: "created in range",
+    merged: "merged in range",
+    "closed-unmerged": "closed unmerged in range",
+    "open-now": "open now",
+};
+
+/** A PR's state and its events, in words: "merged · created in range, merged in range". */
+export const prEventsText = (pr) =>
+    `${(pr.state ?? "not read").toLowerCase()} · ${pr.events.map((event) => EVENT_WORDS[event] ?? event).join(", ")}`;
 
 /**
  * The trend's column layout for a number of days: 1 grid column for each day, and a gap that shrinks as the days grow,
@@ -508,14 +643,22 @@ export const HELP = {
 // ─── The view ────────────────────────────────────────────────────────────────
 
 /** What the module keeps between 2 openings of the view, in memory only: no browser storage. */
-const memory = { selection: defaultSelection(), snapshot: null, sort: { key: "name", dir: "asc" } };
+const memory = {
+    selection: defaultSelection(),
+    snapshot: null,
+    sort: { key: "name", dir: "asc" },
+    /** The key of the row whose drill-down is open, or null. */
+    openRow: null,
+    /** The row whose drill-down opened a thread: its button gets the focus back when the view mounts again. */
+    focusRow: null,
+};
 
 /**
  * The Dashboard component for this module's `pocket`. Each mounted view reads at once, then every `refreshMs` while
  * the tab is visible; it stops its timer and aborts its read when it unmounts, and when the module goes.
  */
 export function makeDashboard(pocket, { refreshMs = REFRESH_MS } = {}) {
-    const { html, useEffect, useRef, useState, Loader } = pocket;
+    const { html, Fragment, useEffect, useRef, useState, Loader } = pocket;
     /** The stop functions of the mounted views: the module's dispose runs them. */
     const mounted = new Set();
 
@@ -525,13 +668,17 @@ export function makeDashboard(pocket, { refreshMs = REFRESH_MS } = {}) {
         }
     });
 
-    /** A value, or a dash that a screen reader reads as "unknown". */
+    /** A value, or a dash that a screen reader reads as "unknown". A partial value keeps its mark in its text. */
     const Value = ({ text }) =>
         text === null || text === undefined
             ? html`<span class="dash-unknown" title="unknown"
                   ><span aria-hidden="true">—</span><span class="dash-sr">unknown</span></span
               >`
-            : html`<span>${text}</span>`;
+            : typeof text === "string" && text.endsWith(PARTIAL_MARK)
+              ? html`<span
+                    >${text.slice(0, -PARTIAL_MARK.length)}<span class="dash-partial">${PARTIAL_MARK}</span></span
+                >`
+              : html`<span>${text}</span>`;
 
     const Help = ({ text }) =>
         html`<details class="dash-help">
@@ -540,10 +687,10 @@ export function makeDashboard(pocket, { refreshMs = REFRESH_MS } = {}) {
         </details>`;
 
     /** 1 line of the card's detail list: a label and a value. */
-    const Item = ({ label, text }) =>
+    const Item = ({ label, text, wrap = false }) =>
         html`<div class="dash-item">
             <dt>${label}</dt>
-            <dd><${Value} text=${text} /></dd>
+            <dd class=${wrap ? "dash-wrap" : undefined}><${Value} text=${text} /></dd>
         </div>`;
 
     const Card = ({ id, title, big, bigLabel, flag, children, help, note, after }) =>
@@ -568,8 +715,23 @@ export function makeDashboard(pocket, { refreshMs = REFRESH_MS } = {}) {
         const { completion, velocity, cycleTime, timeToSolve, workload, prs, usage } =
             snapshot.totals;
         const usageKnown = usageAvailable(snapshot.coverage);
-        const known = (value) => (usageKnown ? value : null);
+        // The totals' own usage knowledge: unknown is "—", partial is marked in the text.
+        const knowledge = usageKnowledge(usage, snapshot.coverage);
+        const partial = knowledge === "partial";
+        const known = (value) => usageText(value, knowledge);
+        // Session counts are known whenever the source has a good read: only the usage sums follow the knowledge.
+        const counted = (value) => (usageKnown ? value : null);
+        const read = usageReadLines(usage, snapshot.coverage);
+        // A new copy for each card: 1 rendered node never goes in 2 places.
+        const readItems = () =>
+            html`<${Item} label="Usage read" text=${read.read} />
+                <${Item} label="Sessions" text=${read.sessions} wrap=${true} />`;
         const note = usageNote(snapshot.coverage);
+        const partialNote = partial
+            ? "Partial: some counted sessions have no complete read, so the values are the known part, and can be low."
+            : knowledge === "unknown" && usageKnown
+              ? "Unknown: no counted session has a complete read or a valid entry."
+              : null;
         const undated = usage.undated;
         const residual = undated.residual;
         const solveExcluded = Object.entries(timeToSolve.undated ?? {});
@@ -665,22 +827,23 @@ export function makeDashboard(pocket, { refreshMs = REFRESH_MS } = {}) {
             <${Card}
                 id="dash-tokens"
                 title="Dated tokens"
-                big=${known(formatCount(usage.totalTokens))}
-                bigLabel="total"
-                note=${note}
+                big=${knowledge === "unknown" ? null : formatCount(usage.totalTokens)}
+                bigLabel=${partial ? `total${PARTIAL_MARK}` : "total"}
+                note=${note ?? partialNote}
                 help=${HELP.tokens}
             >
+                ${readItems()}
                 <${Item} label="Input" text=${known(formatCount(usage.input))} />
                 <${Item} label="Output" text=${known(formatCount(usage.output))} />
                 <${Item} label="Cache read" text=${known(formatCount(usage.cacheRead))} />
                 <${Item} label="Cache write" text=${known(formatCount(usage.cacheWrite))} />
                 <${Item} label="Entries" text=${known(formatCount(usage.entries))} />
-                <${Item} label="Sessions counted" text=${known(formatCount(usage.sessions))} />
-                <${Item} label="Sessions gone (kept)" text=${known(formatCount(usage.missing))} />
-                <${Item} label="Excluded: shared sessions" text=${known(formatCount(usage.excluded.shared))} />
+                <${Item} label="Sessions counted" text=${counted(formatCount(usage.sessions))} />
+                <${Item} label="Sessions gone (kept)" text=${counted(formatCount(usage.missing))} />
+                <${Item} label="Excluded: shared sessions" text=${counted(formatCount(usage.excluded.shared))} />
                 <${Item}
                     label="Unattributed: conflict / no repository"
-                    text=${known(`${usage.unattributed.conflict} / ${usage.unattributed.noRepo + usage.unattributed.unassigned}`)}
+                    text=${counted(`${usage.unattributed.conflict} / ${usage.unattributed.noRepo + usage.unattributed.unassigned}`)}
                 />
                 <${Item}
                     label="Apart: undated tokens"
@@ -694,17 +857,19 @@ export function makeDashboard(pocket, { refreshMs = REFRESH_MS } = {}) {
             <${Card}
                 id="dash-cost"
                 title="Reported model cost (USD)"
-                big=${known(formatMoney(usage.cost))}
-                note=${note ?? "An estimate from recorded usage, not an invoice."}
+                big=${knowledge === "unknown" ? null : formatMoney(usage.cost)}
+                bigLabel=${partial && !isUnknown(usage.cost) ? PARTIAL_MARK.trim() : null}
+                note=${note ?? partialNote ?? "An estimate from recorded usage, not an invoice."}
                 help=${HELP.cost}
                 after=${
-                    usageKnown && usage.zeroCostEntries > 0
+                    knowledge !== "unknown" && usage.zeroCostEntries > 0
                         ? html`<p class="small dash-note">
                               ${`${plural(usage.zeroCostEntries, "entry", "entries")} reported $0: subscription or provider pricing can report 0.`}
                           </p>`
                         : null
                 }
             >
+                ${readItems()}
                 <${Item} label="Entries with a cost" text=${known(formatCount(usage.costEntries))} />
                 <${Item} label="Entries that reported $0" text=${known(formatCount(usage.zeroCostEntries))} />
                 <${Item} label="Entries with no cost (unknown)" text=${known(formatCount(usage.unknownCostEntries))} />
@@ -771,28 +936,182 @@ export function makeDashboard(pocket, { refreshMs = REFRESH_MS } = {}) {
         </section>`;
     }
 
-    function Table({ snapshot, sort, onSort }) {
+    /** 1 thread of a drill-down: a button to its Desk detail, or its id when it is gone from the desk. */
+    const recordThread = (thread, onOpenThread) =>
+        html`<li key=${thread.id}>
+            ${
+                thread.gone || !onOpenThread
+                    ? html`<span class="desk-id">${thread.id}</span>`
+                    : html`<button
+                          type="button"
+                          class="dash-thread-link"
+                          aria-label=${`Open thread ${thread.id}`}
+                          onClick=${() => onOpenThread(thread.id)}
+                      >
+                          ${thread.id}
+                      </button>`
+            }
+            <span class="small">
+                ${[
+                    threadKindText(thread),
+                    thread.gone ? "gone from the desk" : "",
+                    thread.repo ?? "no repository",
+                    thread.closedAt === null ? "" : `closed ${formatUtc(thread.closedAt)}`,
+                    thread.prs.length > 0 ? `PRs: ${thread.prs.join(", ")}` : "",
+                ]
+                    .filter(Boolean)
+                    .join(" · ")}
+            </span>
+        </li>`;
+
+    /** 1 PR of a drill-down: a link to GitHub, with its state and its events in words. */
+    const recordPr = (pr) => {
+        const url = prUrl(pr);
+
+        return html`<li key=${pr.ref}>
+            ${
+                url
+                    ? html`<a class="desk-link" href=${url} target="_blank" rel="noopener">${pr.ref}</a>`
+                    : html`<span class="mono">${pr.ref}</span>`
+            }
+            <span class="small">
+                ${[
+                    prEventsText(pr),
+                    pr.threads.length > 0 ? `threads: ${pr.threads.join(", ")}` : "",
+                ]
+                    .filter(Boolean)
+                    .join(" · ")}
+            </span>
+        </li>`;
+    };
+
+    const more = (count, word) =>
+        count > 0
+            ? html`<p class="small muted">
+                  ${`${plural(count, `more ${word}`, `more ${word}s`)} not shown: the list stops at ${MAX_RECORDS}.`}
+              </p>`
+            : null;
+
+    /**
+     * The threads and PRs behind 1 row: it reads `dashboard/records` when it mounts, and aborts the read when it
+     * unmounts (the row closes, the selection changes, the view goes) or when the module goes.
+     */
+    function Records({ path, label, onOpenThread }) {
+        const [state, setState] = useState({ status: "loading", answer: null, error: null });
+
+        useEffect(() => {
+            const abort = new AbortController();
+
+            const stop = () => {
+                abort.abort();
+                mounted.delete(stop);
+            };
+
+            mounted.add(stop);
+            setState({ status: "loading", answer: null, error: null });
+            pocket.api(path, undefined, { signal: abort.signal }).then(
+                (answer) => {
+                    if (!abort.signal.aborted) {
+                        setState({ status: "done", answer, error: null });
+                    }
+                },
+                (failure) => {
+                    if (!abort.signal.aborted) {
+                        setState({
+                            status: "error",
+                            answer: null,
+                            error: failure?.message ?? String(failure),
+                        });
+                    }
+                },
+            );
+
+            return stop;
+        }, [path]);
+
+        if (state.status === "loading") {
+            return html`<${Loader} label=${`Reading the threads and PRs of ${label}`} />`;
+        }
+
+        if (state.status === "error") {
+            return html`<p class="dash-state err" role="alert">
+                <strong>Error:</strong> The threads and PRs could not be read: ${state.error}
+            </p>`;
+        }
+
+        const { threads, prs, truncated } = state.answer;
+
+        if (threads.length === 0 && prs.length === 0) {
+            return html`<p class="small muted" role="status">
+                No thread and no PR of ${label} in this range, and none open now.
+            </p>`;
+        }
+
+        return html`<div class="dash-records">
+            <h3 class="dash-sub">${`Threads (${threads.length + truncated.threads})`}</h3>
+            ${
+                threads.length === 0
+                    ? html`<p class="small muted">No thread.</p>`
+                    : html`<ul class="dash-record-list">
+                          ${threads.map((thread) => recordThread(thread, onOpenThread))}
+                      </ul>`
+            }
+            ${more(truncated.threads, "thread")}
+            <h3 class="dash-sub">${`Tracked PRs (${prs.length + truncated.prs})`}</h3>
+            ${
+                prs.length === 0
+                    ? html`<p class="small muted">No tracked PR.</p>`
+                    : html`<ul class="dash-record-list">
+                          ${prs.map(recordPr)}
+                      </ul>`
+            }
+            ${more(truncated.prs, "PR")}
+        </div>`;
+    }
+
+    /** The words for a row's name: its repository, its owner's subtotal, the unattributed row, or the total. */
+    const rowLabel = (row) =>
+        row.kind === "owner"
+            ? `${row.name} (owner subtotal)`
+            : row.kind === "unattributed"
+              ? "Unattributed (no single repository)"
+              : row.kind === "total"
+                ? "Scope total"
+                : row.name;
+
+    function Table({ snapshot, sort, onSort, openRow, onToggle, onOpenThread }) {
         const rows = tableRows(snapshot, sort);
         const columns = COLUMNS;
 
-        const nameCell = (row) => {
-            const label =
-                row.kind === "owner"
-                    ? `${row.name} (owner subtotal)`
-                    : row.kind === "unattributed"
-                      ? "Unattributed (no single repository)"
-                      : row.kind === "total"
-                        ? "Scope total"
-                        : row.name;
+        const nameCell = (row, drill) => {
+            const label = rowLabel(row);
 
             return html`<th scope="row" class="dash-name" data-label="Project">
                 <span class="dash-repo" title=${label}>${label}</span>
+                ${
+                    drill
+                        ? html`<button
+                              type="button"
+                              class="dash-drill"
+                              data-row=${drill.key}
+                              aria-expanded=${drill.open ? "true" : "false"}
+                              aria-controls=${drill.id}
+                              onClick=${() => onToggle(drill.open ? null : drill.key)}
+                          >
+                              Threads and PRs<span class="dash-sr">${` of ${label}`}</span>
+                          </button>`
+                        : null
+                }
             </th>`;
         };
 
-        const row = (each) =>
-            html`<tr class=${`dash-row dash-${each.kind}`}>
-                ${nameCell(each)}
+        const row = (each) => {
+            const key = rowKey(each);
+            const path = recordsPath(each, snapshot.range);
+            const open = path !== null && openRow === key;
+            const id = `dash-drill-${key}`;
+            const line = html`<tr class=${`dash-row dash-${each.kind}`} key="row">
+                ${nameCell(each, path === null ? null : { key, open, id })}
                 ${columns
                     .slice(1)
                     .map(
@@ -800,6 +1119,24 @@ export function makeDashboard(pocket, { refreshMs = REFRESH_MS } = {}) {
                             html`<td data-label=${column.label}><${Value} text=${cellText(column.key, each)} /></td>`,
                     )}
             </tr>`;
+
+            const drill = open
+                ? html`<tr class="dash-drill-row" id=${id} key="records">
+                      <td colspan=${columns.length} class="dash-drill-cell">
+                          <${Records}
+                              key=${path}
+                              path=${path}
+                              label=${rowLabel(each)}
+                              onOpenThread=${onOpenThread ? (thread) => onOpenThread(key, thread) : null}
+                          />
+                      </td>
+                  </tr>`
+                : null;
+
+            // 1 keyed Fragment for each row, open or closed: its row keeps its node (and the button its focus).
+            return html`<${Fragment} key=${key}>${rowParts(line, drill)}</${Fragment}>`;
+        };
+
         const ariaSort = (key) =>
             sort.key === key ? (sort.dir === "asc" ? "ascending" : "descending") : "none";
 
@@ -853,7 +1190,7 @@ export function makeDashboard(pocket, { refreshMs = REFRESH_MS } = {}) {
                         kind: "total",
                         name: "Scope total",
                         metrics: snapshot.totals,
-                        usageUnknown: !usageAvailable(snapshot.coverage),
+                        coverage: snapshot.coverage,
                     })}
                 </tfoot>
             </table>
@@ -870,7 +1207,10 @@ export function makeDashboard(pocket, { refreshMs = REFRESH_MS } = {}) {
             }
             <p class="small muted">
                 "0 eligible": no eligible closure (completion), or no resolved issue (time to solve), in the range.
-                "—": unknown, such as a cost that no entry reported.
+                "—": unknown, such as a cost that no entry reported, or the usage of a row whose counted sessions have
+                no complete read. "(partial)": some counted sessions of the row have no complete usage read, so the
+                value is the known part, and can be low. "Threads and PRs" lists the Desk threads and the tracked PRs
+                that a row counts in the range: a thread opens its Desk detail, and Back returns here.
             </p>
         </section>`;
     }
@@ -937,8 +1277,13 @@ export function makeDashboard(pocket, { refreshMs = REFRESH_MS } = {}) {
         </section>`;
     }
 
-    function Dashboard() {
+    /**
+     * The view. `onOpenThread(id)`, when given, opens the Desk's thread detail: the drill-down's thread buttons call
+     * it, and the view keeps the row, so the row's drill-down button gets the focus back when the view mounts again.
+     */
+    function Dashboard({ onOpenThread } = {}) {
         const [selection, setSelection] = useState(() => ({ ...memory.selection }));
+        const [openRow, setOpenRowState] = useState(memory.openRow);
         const [snapshot, setSnapshot] = useState(memory.snapshot);
         const [error, setError] = useState(null);
         const [rangeError, setRangeError] = useState(null);
@@ -1052,10 +1397,38 @@ export function makeDashboard(pocket, { refreshMs = REFRESH_MS } = {}) {
             current.timer = setInterval(tick, refreshMs);
             void read(current.selection);
 
+            // Back from a thread's detail: the drill-down button of the same row gets the focus again.
+            const focusRow = memory.focusRow;
+
+            memory.focusRow = null;
+
+            if (focusRow !== null) {
+                setTimeout(() => {
+                    if (!current.gone) {
+                        [...document.querySelectorAll(".dash-drill")]
+                            .find((button) => button.dataset.row === focusRow)
+                            ?.focus();
+                    }
+                }, 0);
+            }
+
             return stop;
         }, []);
 
+        /** Open 1 row's drill-down (a key), or close it (null): the other row closes, and its read aborts. */
+        const setOpenRow = (key) => {
+            memory.openRow = key;
+            setOpenRowState(key);
+        };
+
+        const openThread = (key, id) => {
+            memory.focusRow = key;
+            onOpenThread?.(id);
+        };
+
         const pick = (next) => {
+            // A new selection is a new scope or range: the open drill-down closes, and its read aborts.
+            setOpenRow(null);
             setSelection(next);
             setRangeError(null);
             void read(next);
@@ -1204,7 +1577,14 @@ export function makeDashboard(pocket, { refreshMs = REFRESH_MS } = {}) {
                       : html`<div class=${error ? "dash-body stale" : "dash-body"}>
                             <${Cards} snapshot=${snapshot} />
                             <${Trend} snapshot=${snapshot} />
-                            <${Table} snapshot=${snapshot} sort=${sort} onSort=${setSort} />
+                            <${Table}
+                                snapshot=${snapshot}
+                                sort=${sort}
+                                onSort=${setSort}
+                                openRow=${openRow}
+                                onToggle=${setOpenRow}
+                                onOpenThread=${onOpenThread ? openThread : null}
+                            />
                             <${CoverageSection} snapshot=${snapshot} />
                         </div>`
             }

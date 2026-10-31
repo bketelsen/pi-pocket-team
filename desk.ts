@@ -22276,6 +22276,39 @@ export default function createDesk(host: Host, web: Web) {
         { access: "owner" },
     );
 
+    // The threads and PRs behind 1 dashboard row, for its drill-down: read only, as `GET dashboard`. The same query
+    // (`from`, `to`, `owner`, `repo`), or `unattributed=1` for the unattributed row. It reads the same 2 documents and
+    // nothing else: no commit, no task, no sweep, no GitHub call, no transcript read.
+    web.route(
+        "GET",
+        "dashboard/records",
+        async (request) => {
+            const [facts, usage] = await Promise.all([
+                request.snapshot(dashboard.DeskDashboard, request.context),
+                request.snapshot(usageDocs.DeskUsage, request.context),
+            ]);
+            const answer = metrics.records({
+                dashboard: facts,
+                usage,
+                now: Date.now(),
+                query: {
+                    from: request.query.get("from"),
+                    to: request.query.get("to"),
+                    owner: request.query.get("owner"),
+                    repo: request.query.get("repo"),
+                    unattributed: request.query.get("unattributed"),
+                },
+            });
+
+            if ("error" in answer) {
+                throw web.error(400, answer.error);
+            }
+
+            return answer;
+        },
+        { access: "owner" },
+    );
+
     web.route(
         "GET",
         "threads/:id",
