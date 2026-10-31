@@ -592,25 +592,40 @@ describe("the consult bounds", () => {
         assert.equal(consultTry(state, "T1", "k1", now + CONSULT_RETRY_MS, FIRST)?.mode, "start");
     });
 
-    test("a start needs the entry read seen; a recovery needs it not missing", () => {
+    test("every try needs the entry read seen: a start and a recovery alike", () => {
         const { state } = drafting();
 
         consult(state, { agents: ["teg", "paul"] });
-        assert.equal(
-            consultTry(state, "T1", "k1", now, { first: true, entryRead: "unknown" }),
-            undefined,
-        );
+
+        for (const entryRead of ["unknown", "missing"] as const) {
+            assert.equal(
+                consultTry(state, "T1", "k1", now, { first: true, entryRead }),
+                undefined,
+                `a start, ${entryRead}`,
+            );
+        }
+
         consultTry(state, "T1", "k2", now, FIRST);
         consultStartFailed(state, "T1", "k2", "broke", now);
         stopConsult(state, "T1", "k2", { by: "brian", at: now });
-        assert.deepEqual(consultRetries(state, 7, minutes(2), "unknown"), [
+
+        // A recovery can make a new session: with no entry read seen, it waits.
+        for (const entryRead of ["unknown", "missing"] as const) {
+            assert.deepEqual(consultRetries(state, 7, minutes(2), entryRead), [], entryRead);
+            assert.equal(
+                consultTry(state, "T1", "k2", minutes(2), { first: false, entryRead }),
+                undefined,
+                `a recovery, ${entryRead}`,
+            );
+        }
+
+        assert.equal(planOf(state, "T1")?.consults[1]?.start?.tries, 1);
+        assert.equal(consultInFlight(planOf(state, "T1")!.consults[1]!, minutes(2)), true);
+        // Seen: the start of k1 (no try yet) and the recovery of k2 may go.
+        assert.deepEqual(consultRetries(state, 7, minutes(2), "available"), [
+            { plan: "T1", consult: "k1", mode: "start" },
             { plan: "T1", consult: "k2", mode: "recover" },
         ]);
-        assert.deepEqual(consultRetries(state, 7, minutes(2), "missing"), []);
-        assert.equal(
-            consultTry(state, "T1", "k2", minutes(2), { first: false, entryRead: "unknown" })?.mode,
-            "recover",
-        );
     });
 
     test("a try whose start did not run gives the identity back as it was", () => {
@@ -1438,6 +1453,15 @@ function stubDesk() {
                 )
             )?.block,
         plan,
+        /** The desk tool of this instance, in a session. */
+        desk: (args: object, conversationId: number) =>
+            extension.tools
+                .find((each) => each.name === "desk")!
+                .execute(
+                    args,
+                    api(conversationId, "task-desk", `call-${crypto.randomUUID()}`),
+                    context,
+                ),
         restore: () => {
             shared[Symbol.for("pi-pocket-team.desk")] = saved;
         },
@@ -2883,6 +2907,29 @@ describe("with the Pi Pocket app", () => {
         }, context);
     }
 
+    /**
+     * Whether a supervisor's sweeper swept after `at` (app clock), and its sweep is over: it sleeps again until a later
+     * time (its tries run after the sweep's commit, so only the sleep says that they ended).
+     */
+    async function sweptAfter(supervisor: number, at: number): Promise<boolean> {
+        const live = await app.harness.inspect(context);
+
+        return live.tasks.some((task) => {
+            const record = task.record as unknown as {
+                kind: string;
+                input?: { supervisor?: number };
+                state?: { status?: string; until?: number };
+            };
+
+            return (
+                record.kind === "x.desk.sweeper" &&
+                record.input?.supervisor === supervisor &&
+                record.state?.status === "sleeping" &&
+                (record.state.until ?? 0) > at
+            );
+        });
+    }
+
     const consult2 = async (id: string) =>
         planOf(await deskSnapshot(), plan2)?.consults.find((each) => each.id === id) ??
         assert.fail(`consult ${id} of plan 2`);
@@ -2904,6 +2951,16 @@ describe("with the Pi Pocket app", () => {
             ) ?? assert.fail("plan 2 started");
 
         plan2 = thread.id;
+
+        // The plan start's sweep of supervisor 2 ends first: its clock is ahead, so a sweep that is still running
+        // could try the consult below at once.
+        const started = Date.now() + shift;
+
+        await until(
+            () => sweptAfter(Number(supervisor2), started),
+            "the first sweep of supervisor 2",
+            20_000,
+        );
 
         const hidden = hideTitles("all");
         let address = "";
@@ -2946,8 +3003,44 @@ describe("with the Pi Pocket app", () => {
 
             const sessions = app.sessions().length;
 
-            // 11 minutes later, after a restart: the sleeping sweeper sweeps, stays, and recovers the identity.
+            // 11 minutes later, after a restart: the sleeping sweeper sweeps at once. The new module instance has seen
+            // no hook call yet (its entry read is unknown), so it tries nothing, and it stays: the consult is in flight.
             await restartLater();
+
+            const restarted = Date.now() + shift;
+
+            await until(
+                () => sweptAfter(Number(supervisor2), restarted),
+                "the sweep after the restart",
+                20_000,
+            );
+
+            const cold = await consult2("k1");
+
+            assert.equal(cold.address, undefined, "a cold instance makes no recovery try");
+            assert.equal(cold.start?.tries, 1);
+            assert.equal(
+                consultsPending(await deskSnapshot(), Number(supervisor2), restarted),
+                true,
+            );
+            assert(
+                (await deskSnapshot())?.sweepers?.[String(Number(supervisor2))] !== undefined,
+                "the sweeper stayed",
+            );
+
+            // A hook call shows the entry read. A lost sweeper: the page's look (startMissingSweepers, as after a
+            // restart) starts one for a supervisor with no open thread, and its sweep recovers the identity.
+            await runTool(supervisor2, "desk", { action: "list" });
+            await stopTasks("x.desk.sweeper");
+            assert.equal(
+                (await deskSnapshot())?.sweepers?.[String(Number(supervisor2))],
+                undefined,
+            );
+            assert.equal((await routes("threads")).status, 200);
+            assert(
+                (await deskSnapshot())?.sweepers?.[String(Number(supervisor2))] !== undefined,
+                "a sweeper started",
+            );
             await until(
                 async () => (await consult2("k1")).address !== undefined,
                 "the recovery",
@@ -2958,31 +3051,8 @@ describe("with the Pi Pocket app", () => {
 
             assert.equal(k1.state, "stopped");
             assert.equal(k1.address, address);
+            assert.equal(k1.start?.tries, 2);
             assert.equal(app.sessions().length, sessions, "no second session");
-            assert(
-                (await deskSnapshot())?.sweepers?.[String(Number(supervisor2))] !== undefined,
-                "the sweeper stayed in the sweep that recovered it",
-            );
-
-            // A lost sweeper: the desk has none for supervisor 2, and a new identity to recover. The page's look
-            // (startMissingSweepers, as after a restart) starts one, and it recovers the identity.
-            await stopTasks("x.desk.sweeper");
-            assert.equal(
-                (await deskSnapshot())?.sweepers?.[String(Number(supervisor2))],
-                undefined,
-            );
-            await openIdentity("k2", 1);
-            assert.equal((await routes("threads")).status, 200);
-            assert(
-                (await deskSnapshot())?.sweepers?.[String(Number(supervisor2))] !== undefined,
-                "a sweeper started",
-            );
-            await until(
-                async () => (await consult2("k2")).address !== undefined,
-                "the second recovery",
-                20_000,
-            );
-            assert.equal((await consult2("k2")).state, "stopped");
         } finally {
             hidden.restore();
         }
@@ -3007,9 +3077,10 @@ describe("with the Pi Pocket app", () => {
         });
 
         try {
-            // 9 tries are spent: the sweep's try is the 10th and last.
+            // 9 tries are spent: the sweep's try is the 10th and last. A new sweeper sweeps at once.
             await openIdentity("k3", CONSULT_START_TRIES - 1);
-            await restartLater();
+            await stopTasks("x.desk.sweeper");
+            assert.equal((await routes("threads")).status, 200);
             await until(async () => held !== "", "the 10th try's session", 20_000);
 
             const during = await consult2("k3");
@@ -3042,5 +3113,50 @@ describe("with the Pi Pocket app", () => {
             slow.restore();
             hidden.restore();
         }
+    });
+
+    test("with no entry read seen, no recovery runs: a cold desk instance, and a hook api with no commit", async () => {
+        await openIdentity("k4", 1);
+
+        const wrapped = wrapStart((real, ...args) => real(...args));
+        const desk = stubDesk();
+
+        try {
+            // A cold instance: no hook call yet. Its sync makes no try.
+            await desk.desk({ action: "sync" }, Number(supervisor2));
+            assert.deepEqual(wrapped.calls, []);
+
+            // A hook api with no commit: the hook lets the unbound call run, and sets the flag to missing. No
+            // recovery runs, so no unbound session can come of it.
+            assert.equal(
+                await desk.block(
+                    Number(supervisor2),
+                    "bash",
+                    {},
+                    undefined,
+                    desk.typed(Number(supervisor2)),
+                ),
+                undefined,
+            );
+            await desk.desk({ action: "sync" }, Number(supervisor2));
+            assert.deepEqual(wrapped.calls, []);
+
+            const k4 = await consult2("k4");
+
+            assert.equal(k4.start?.tries, 1);
+            assert.equal(k4.address, undefined);
+            assert.equal(consultUnresolved(k4), true);
+        } finally {
+            wrapped.restore();
+            desk.restore();
+        }
+
+        // Clean up: its tries are spent, so it holds nothing.
+        await app.harness.commit(async (tx) => {
+            const plan = planOf(await tx.doc(DeskThreads), plan2) ?? assert.fail("plan 2");
+            const k4 = plan.consults.find((each) => each.id === "k4") ?? assert.fail("k4");
+
+            k4.start = { at: Date.now(), tries: CONSULT_START_TRIES, unresolved: true };
+        }, context);
     });
 });

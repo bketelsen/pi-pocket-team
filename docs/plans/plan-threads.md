@@ -901,11 +901,11 @@ Each line below differs from the design above, or settles what it left open, and
   gets none. A set of the start keys that run now, shared by every instance of the module in the process, keeps 2
   tries of 1 consult apart; after a restart they may meet, and then they converge on 1 session, and the bind keeps the
   first one.
-- **A recovery needs the entry read only not `missing`.** After a restart the flag is `unknown` until a hook call, and
-  the sweeper's first sweep comes before any. A recovery sends only the short message to an ended consult, Pocket
-  sends nothing to a session it made before, and the bind holds a new session by its ended state; the hook still reads
-  the first entry of an unbound session whenever its `api` has a commit. A start, which sends the brief, still needs
-  `available`.
+- **Every try needs the hook's entry read seen (`available`), a recovery too.** A try can make a new session when no
+  earlier try made one, and before its bind only the entry read holds that session: with no commit in the hook's
+  `api`, a tool call there would find no bound consult and run, and the "Do nothing" message is an instruction, not a
+  guard. After a restart the flag is `unknown` until the hook's first call, so the sweep tries nothing then; the
+  consult stays in flight, and its sweeper stays and tries again at a later sweep.
 - **A fresh read after the try's commit can still stop the start.** A Stop, a drop or the limit can land between the
   commit and Team's start: the start goes on only while the consult is still `starting` in a plan that drafts (a
   recovery only while its identity is still open). Else Team gets no start, and the try gives the identity back as it
@@ -1007,11 +1007,13 @@ Each line below differs from the design above, or settles what it left open, and
   runs, keeps its sweeper also with no open thread or watch (a dropped last plan), and `startSweeper` and
   `startMissingSweepers` start one for it (the page's look, and every sweep). The sweeper sleeps its 10 minutes as
   before, so the tries of a recovery come about 10 minutes apart.
-- **The limit that is left (a decision for Brian):** the protection ends after the last of the 10 tries, once its
-  result is committed (or its 10-minute hold has passed). Pocket's public API has no lookup of a start key, so only a
-  start that throws on all 10 tries after Pocket made the session, with a hidden title (Pocket gives the title only
-  when everyone who sees the supervisor's session sees this one too) or a title a person changed, can still become a
-  found thread, and it counts toward the cap. The hook still blocks every tool of that session, and Odrade can close
-  the thread. A session that a person titles like a consult is left out as well.
+- **The limit that is left (a decision for Brian):** a recovery that is exhausted or expired with no committed binding
+  ends the protection from found-thread discovery. Pocket's public API has no lookup of a start key, so the desk then
+  has no other way to know the session. Examples: all 10 tries throw after Pocket made the session; the last try runs
+  past its 10-minute hold and succeeds later; or Pocket's start succeeds, but the commit of the bind fails or is cut
+  off, and no try is left. Such a session can become a found thread when its title is hidden (Pocket gives the title
+  only when everyone who sees the supervisor's session sees this one too) or a person changed it, and it then counts
+  toward the cap. The hook still blocks every tool of that session: the exception is only about the found thread and
+  the cap, and Odrade can close the thread. A session that a person titles like a consult is left out as well.
 - **A dropped or verified plan stops its open consults** (`stopped`, `end.why: "plan"`), with 1 event each, and no
   wake-up: the plan wakes no session then.

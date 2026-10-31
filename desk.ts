@@ -15637,10 +15637,10 @@ export type ConsultTryMode = "start" | "recover";
 /**
  * The try a consult takes now, or why it takes none. Every rule is here, so the sweep's choice and the commit of the
  * try check the same: fewer than 10 tries, and 60 seconds since the last try, except for the call's very first try
- * (`first`, and no try stored: a replay after a recorded try waits its 60 seconds); for a start, the hook's entry read
- * (`available`), the state `starting`, a plan that drafts, no session and the 60-minute limit; for a recovery, an ended
- * consult whose identity is open, and an entry read that is not `missing` (a recovery's message is the short one to
- * an ended consult, and the bind holds it by its state).
+ * (`first`, and no try stored: a replay after a recorded try waits its 60 seconds), and the hook's entry read seen
+ * (`available`): a try can make a new session, and before its bind only the entry read holds it. For a start also the
+ * state `starting`, a plan that drafts, no session and the 60-minute limit; for a recovery, an ended consult whose
+ * identity is open.
  */
 export function consultTryMode(
     plan: Plan,
@@ -15653,21 +15653,19 @@ export function consultTryMode(
         (request.first && tries === 0) ||
         now - (consult.start?.at ?? consult.at) >= CONSULT_RETRY_MS;
 
-    if (tries >= CONSULT_START_TRIES || !spaced) {
+    if (tries >= CONSULT_START_TRIES || !spaced || request.entryRead !== "available") {
         return undefined;
     }
 
     if (consult.state === "starting") {
-        return request.entryRead === "available" &&
-            plan.state === "drafting" &&
+        return plan.state === "drafting" &&
             consult.session === undefined &&
             now - consult.at < CONSULT_LIMIT_MS
             ? "start"
             : undefined;
     }
 
-    return request.entryRead !== "missing" &&
-        !request.first &&
+    return !request.first &&
         (consult.state === "failed" || consult.state === "stopped") &&
         consultUnresolved(consult)
         ? "recover"
@@ -23726,7 +23724,7 @@ export default function createDesk(host: Host, web: Web) {
     /**
      * The sweep's tries: each consult of this supervisor that `consultRetries` names (a start that did not finish, or
      * an ended consult whose identity is open) gets 1 more try under its key; the try's commit checks the rules again.
-     * A start needs the hook's entry read seen (`available`); a recovery needs it not `missing` (`consultTryMode`).
+     * Every try needs the hook's entry read seen (`available`, `consultTryMode`): a try can make a new session.
      */
     const retryConsults = async (
         access: PlanPublish,
@@ -23734,11 +23732,11 @@ export default function createDesk(host: Host, web: Web) {
         supervisor: number,
         now: () => number,
     ): Promise<number> => {
-        if (entryRead === "missing" || teamApi()?.startConsult === undefined) {
+        // Every try needs the entry read seen (`available`): after a restart the sweep waits for the hook's first call.
+        if (entryRead !== "available" || teamApi()?.startConsult === undefined) {
             return 0;
         }
 
-        // A start needs the entry read seen (`available`); a recovery needs it not `missing`.
         const due = consultRetries(await access.read(), supervisor, now(), entryRead);
 
         for (const each of due) {
