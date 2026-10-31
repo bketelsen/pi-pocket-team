@@ -1,7 +1,7 @@
 # Plan threads: an idea becomes a settled plan before work starts
 
-Status: PR 1, the plan and the gate, and PR 2, decisions and delivery, are built in this repository (sections 4 to
-7, 9 and 10, less consults and the parts sections 15 and 16 name). PR 3, consults, is still design only.
+Status: PR 1, the plan and the gate, PR 2, decisions and delivery, and PR 3, consults, are built in this repository
+(sections 4 to 10, less the parts sections 15, 16 and 17 name).
 Brian asked for it on 2026-10-30 (T547a), after Odrade's report on
 githubnext/chopin (`~/agents/odrade/reports/2026-10-30-chopin/README.md`, Chopin commit `3548849`). Chopin is
 MIT; this design borrows its ideas (decision records, findings, a build gate, an approved revision, a task graph,
@@ -860,3 +860,160 @@ do
     --description "Brian: plan this first (a plan thread), then work"
 done
 ```
+
+## 17. What PR 3 built, and where it differs
+
+PR 3 is built: `plan consult` and `plan finding`; Team's `startConsult`, which starts each consult under the
+supervisor's session; the read-only hook; the bounds, the 60-minute limit and the page's **Stop**; the consults and the
+stances on the plan view; and the consults and findings in `plan read`.
+
+Each line below differs from the design above, or settles what it left open, and says why.
+
+**The call and its bounds**
+
+- **The settings are `plans.consults: { running, total }`** in `desk.json`: `running` 1 to 10 (default 3), `total` 1
+  to 20 (default 8), and `running` never more than `total`. A bad value gives its default, as `plans.max` does. 20 at
+  most keeps every ask under its 20 findings.
+- **1 bad agent refuses the whole call**: a duplicate, the lead, a supervisor or a Clerk (by role), no home, or an id
+  that is not on the roster. A panel is 1 decision of the planning session, so it starts whole or not at all.
+- **`ask` must be a plan ask of this plan**, in any state: a finding on a settled ask still informs a reopen.
+- **`Consult.key` is the call's key** (`plan:<task>:<call>`), the same for every consult of 1 call: a replay finds them
+  all by it, and adds nothing. **The start key is `x.desk.consult:<plan>:<consult>`**, 1 for each consult. Pocket keeps
+  a start's record by source and key, so a replay of a consult that is still `starting` gets the same session back.
+- **A thrown start is an unknown outcome**, as PR 1 decided for task threads (section 15): Pocket may have made the
+  session, and may have sent its first message. The consult stays `starting`, with the error and 1 event; the hook
+  blocks its session, the sweep treats it as in flight, and the gate waits for it. The call does not fail: its reply
+  lists each consult's outcome (`k2 (teg): running`, or that its start did not finish and the desk tries it again), so
+  1 failure in a panel of 3 leaves the other 2 running.
+- **The desk tries a start again, by the same key.** Pocket's start is idempotent for 1 source and 1 key: a known key
+  gives the same session and address back, and the first message goes once (its request id comes from the key). A
+  second try never makes a second session, and makes 1 only when the first try made none: then it is the consult's
+  own. The sweeper's sweep and `desk sync` try the consults of their supervisor; the title and the message are made
+  again from the plan, the consult and its ask, and Pocket uses them only when no earlier try made the session or sent
+  the message. Each try gives 1 event: a failed try names its number and its error ("start try 2 did not finish"), and
+  a try that worked says `runs (start try 2)`.
+- **Every rule of a try is checked in the commit that records it** (`consultTryMode`), not only on the sweep's
+  snapshot: fewer than 10 tries in all (`CONSULT_START_TRIES`, the first one included), and 60 seconds since the last
+  try (`CONSULT_RETRY_MS`, so a slow start is not raced). Only the call's very first try has no spacing rule: the call
+  and no try stored yet. A replay of the call after a recorded try waits its 60 seconds as a retry does. A start also
+  needs the state `starting`, a plan that drafts, no session, the 60-minute limit, and the hook's entry read seen
+  (`available`). So 2 sweeps that picked 1 consult give it 1 try, and a candidate whose limit passes before its commit
+  gets none. A set of the start keys that run now, shared by every instance of the module in the process, keeps 2
+  tries of 1 consult apart; after a restart they may meet, and then they converge on 1 session, and the bind keeps the
+  first one.
+- **Every try needs the hook's entry read seen (`available`), a recovery too.** A try can make a new session when no
+  earlier try made one, and before its bind only the entry read holds that session: with no commit in the hook's
+  `api`, a tool call there would find no bound consult and run, and the "Do nothing" message is an instruction, not a
+  guard. After a restart the flag is `unknown` until the hook's first call, so the sweep tries nothing then; the
+  consult stays in flight, and its sweeper stays and tries again at a later sweep.
+- **A fresh read after the try's commit can still stop the start.** A Stop, a drop or the limit can land between the
+  commit and Team's start: the start goes on only while the consult is still `starting` in a plan that drafts (a
+  recovery only while its identity is still open). Else Team gets no start, and the try gives the identity back as it
+  was before it.
+- **`Consult` gains `end` and `start`.** `end` (`{ at, why, by?, text? }`, `why` is `timeout`, `stopped` or `plan`)
+  says why a consult ended with no finding; the page, `plan read` and the wake-up read it. `start` holds the last try's
+  time (`at`), the number of tries (`tries`), the last error (`error`), and `unresolved`: a try began, so a session may
+  exist. The identity is open (`consultUnresolved`) while `unresolved` is set and the desk has no address; the bind
+  closes it.
+- **A bind after an end keeps the end.** A consult that Brian stopped, or that timed out, while its start ran records
+  its session only, and stays blocked.
+
+**Team's start**
+
+- **`startConsult` is a new optional member of Team's API** (it stays `version: 1`). It checks that the source is a
+  supervisor's session, and that the agent has role `agent` and a home; it starts with the agent's allowed profile
+  model, or with Pocket's own rule when that model is not allowed. It binds the identity after the start returns, as
+  every other Team start does: the identity text is in the first message already.
+- **The supervisor's plan mode refuses the start**: that is Pocket's rule for a linked start from a session in plan
+  mode. The consult stays `starting` with Pocket's words, the desk tries it again, and it fails at 60 minutes if plan
+  mode stays on.
+- **Team's identity text tells the session to report with `team_message`.** The hook blocks it, and the desk's brief
+  says that every tool but `read` and `plan finding` is blocked. The identity text is shared by every Team start, so it
+  stays as it is.
+
+**The hook**
+
+- **The hook checks the typed path first.** It reads the desk's state with `snapshot` (Pocket's typed hook API), and a
+  session that a consult is bound to is held by that consult's state. This path needs no entry read, so a bound
+  consult stays read-only whatever a later pi-durable gives the hook.
+- **A failed state read lets the marker decide.** The desk wrote the marker into every bound consult's first message,
+  so with a commit the hook reads the marker (cached, or read now): no marker is no consult, and the call runs; a
+  marker blocks the call with "Try again in a moment.", so a bound consult never runs free on a read error. A failed
+  entry read blocks too, and so does an `api` with no commit: then the hook cannot tell. So an ordinary session is
+  blocked only when both reads fail, and the next call reads again.
+- **Only the window before the bind reads the first entry, through its `api`'s commit.** Pocket's hook API type has
+  only `snapshot`, and no read of entries; pi-durable gives the hook the tool task's runtime, whose commit has
+  `tx.scanEntries`. The commit only reads, and changes nothing.
+- **An `api` with no commit lets an unbound session run.** The hook runs on every tool call of every session of the
+  team: blocking all of them because the read is gone would stop the whole team. The hook then sets a flag in the
+  module's instance (`entryRead: "missing"`), and `plan consult` starts no consult while it is set: "This Pocket gives
+  the desk hook no entry read, so a consult cannot be held read-only before its bind: no consult starts." So no
+  consult can run unheld before its bind.
+- **`plan consult` also refuses while the flag is unknown**: the hook has not run in this module instance yet. The
+  hook runs before every model-issued call, `plan consult` too, so in a live call the flag is known. Only a replay
+  after a restart runs no hook; it is refused, and the consults of that call stay `starting` (their start may have
+  begun): the sweep tries them again once the hook has run, or they fail at 60 minutes. No probe is used: the tool's own `api` is not the hook's, so a probe
+  there would not tell what the hook can do.
+- **A read that fails (the commit is there, and it throws) blocks the call** with "Try the call again in a moment.",
+  and keeps nothing.
+- **Only the desk's form of the marker counts**: `[plan-consult ` and 32 hex characters, anywhere in the first entry.
+  A text that talks about consults (a brief, a doc, Brian's idea) then never blocks a session, and no other form could
+  name a consult of the desk.
+- **The cache is a map in the module's instance**, by conversation id. A read error, or a session with no `pi.user`
+  entry yet, keeps nothing, so the next call reads again. A reload or a restart reads again.
+- **An unbound session is touched only with the marker.** There, a running consult's 2 tools pass only in its own
+  bound session.
+- **`plan read` is blocked in a consult**, and so is every nested call, `read` too: the brief gives the plan file's
+  path, and `read` is enough. A consult of a plan that is done or dropped is blocked whatever its own state.
+
+**The finding and the end**
+
+- **The wake-up keys are `finding:<id>` and `consult-end:<id>`**, in the answer wake-up. A finding's key stays in
+  `wake.sent` for good. A batch with consult news only starts `[desk] Consult news on plan T560:`; a mixed batch starts
+  `[desk] News on plan T560:`; a batch of answers and comments keeps its old words.
+- **A consult that times out, or that Brian stops, wakes the planning session** with 1 line. A start that did not
+  finish in 60 minutes times out too, and its line says so. A single thrown try does not wake it: the call gave its
+  outcome, and the desk tries again.
+- **The 60-minute limit runs in the sweep, by the sweep's clock**: the sweeper's task clock, or the time of a page
+  sweep or of `desk sync`. It counts from the consult's `at`, so a start that hangs counts too.
+- **Stop is `plans/:id/consults/:kid/stop`**, owner only, with no key: a second tap finds the consult stopped and gets
+  409, as an answered or failed one does; an unknown consult gets 404.
+- **A consult's session never becomes a found thread**, so it never counts toward the cap (section 8: a consult is no
+  desk thread). The sweep leaves out 3 kinds: a bound consult's session by its address, in every state, also after its
+  end; every session while a consult is `starting`, as it does while a delegation is in flight; and a session whose
+  title names a consult that the desk has.
+- **The session identity is kept apart from the consult's state.** A Stop, a drop or the limit can end a consult
+  whose start threw before the desk had its address. Its identity stays open, and the sweep tries to recover it in
+  every state, under the same start key, 60 seconds apart, within the same 10 tries, and with no 60-minute limit for
+  the recovery itself. A recovery sends the marker line and "This plan consult ended (<why>) before it started. Do
+  nothing, and do not answer." instead of the brief. When Pocket made the session before, it gives it back and sends
+  nothing, so only the address comes back; when it made none, the new session gets only that message, and the hook
+  blocks every tool there. The desk binds the session and the address, and the consult keeps its end: an ended
+  consult never runs.
+- **While an identity is open and tries are left, the consult is in flight** for found-thread discovery, in every
+  state: the sweep makes no found thread for the supervisor then, as for a delegation in flight. Only the consults of
+  the sweep's own supervisor count. The title stays a second guard: Team titles every consult
+  `<agent>: consult <plan> <consult>: <plan title>`, and the sweep leaves out a session whose title holds
+  `: consult T560 k3:` when plan T560 has consult k3. A linked session's list gives the sweep no session id, so it
+  cannot read that session's first message itself.
+- **A try that runs keeps the pause, the 10th too.** A try counts at its start, so the count alone would end the pause
+  while the last try still runs. The try's commit sets `start.pending`, and its result (the bind, the error, or a
+  skipped start) clears it; while it is set, the consult stays in flight. The mark is restart-safe by a time bound
+  (`CONSULT_TRY_HOLD_MS`, 10 minutes from the try's `at`): a try whose process died holds the pause no longer. A stored
+  mark was chosen over the process-wide set of running keys, because another instance of the module and a sweep after
+  a restart see it too. A Pocket start takes seconds, so 10 minutes leaves room.
+- **A consult in flight keeps its supervisor's sweeper.** A sweep is the only thing that tries a start again or
+  recovers an identity, so a supervisor with a `starting` consult, or an open identity with tries left, or a try that
+  runs, keeps its sweeper also with no open thread or watch (a dropped last plan), and `startSweeper` and
+  `startMissingSweepers` start one for it (the page's look, and every sweep). The sweeper sleeps its 10 minutes as
+  before, so the tries of a recovery come about 10 minutes apart.
+- **A known limit, accepted by Brian (T591a, 2026-10-30):** a recovery that is exhausted or expired with no committed binding
+  ends the protection from found-thread discovery. Pocket's public API has no lookup of a start key, so the desk then
+  has no other way to know the session. Examples: all 10 tries throw after Pocket made the session; the last try runs
+  past its 10-minute hold and succeeds later; or Pocket's start succeeds, but the commit of the bind fails or is cut
+  off, and no try is left. Such a session can become a found thread when its title is hidden (Pocket gives the title
+  only when everyone who sees the supervisor's session sees this one too) or a person changed it, and it then counts
+  toward the cap. The hook still blocks every tool of that session: the exception is only about the found thread and
+  the cap, and Odrade can close the thread. A session that a person titles like a consult is left out as well.
+- **A dropped or verified plan stops its open consults** (`stopped`, `end.why: "plan"`), with 1 event each, and no
+  wake-up: the plan wakes no session then.
