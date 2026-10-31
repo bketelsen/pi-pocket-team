@@ -42,7 +42,12 @@ import createDesk, {
     DeskThreads,
     dropPlan,
     endOpenConsults,
-    failConsultStart,
+    consultRetries,
+    consultStartFailed,
+    consultStartKey,
+    consultTry,
+    CONSULT_RETRY_MS,
+    CONSULT_START_TRIES,
     firstUserText,
     gitBlobSha,
     isCounted,
@@ -323,7 +328,7 @@ describe("the consult bounds", () => {
         assert.equal(planOf(state, "T1")?.consults.length, 2);
     });
 
-    test("the gate waits for a consult that starts or runs, and not for a failed start", () => {
+    test("a thrown start is an unknown outcome: the consult stays starting, and the gate waits for it", () => {
         const { state } = drafting();
         const added = consult(state, { agents: ["teg", "paul"] });
 
@@ -333,21 +338,67 @@ describe("the consult bounds", () => {
             ["k1 starting", "k2 starting"],
         );
 
+        consultTry(state, "T1", "k1", now);
         bindConsult(state, "T1", "k1", { session: 41, address: "session-41", at: now });
-        failConsultStart(state, "T1", "k2", "The model is not allowed.", now);
+        consultTry(state, "T1", "k2", now);
+        consultStartFailed(state, "T1", "k2", "The model is not allowed.", now);
 
         assert.deepEqual(
             planWaiting(state, "T1").filter((each) => each.startsWith("k")),
-            ["k1 running"],
+            ["k1 running", "k2 starting"],
         );
 
         const k2 = planOf(state, "T1")?.consults[1];
 
-        assert.equal(k2?.state, "failed");
-        assert.equal(k2?.end?.why, "start");
+        assert.equal(k2?.state, "starting");
+        assert.deepEqual(k2?.start, { at: now, tries: 1, error: "The model is not allowed." });
+        assert.equal(k2?.end, undefined);
         assert.match(
             state.threads.T1?.events.map((each) => each.text).join("\n") ?? "",
-            /consult k2 \(paul\) did not start: The model is not allowed\./,
+            /consult k2 \(paul\): start try 1 did not finish: The model is not allowed\.; the desk tries again/,
+        );
+        assert.match(
+            state.threads.T1?.events.map((each) => each.text).join("\n") ?? "",
+            /consult k1 \(teg\) runs \(start try 1\)/,
+        );
+        assert.equal(consultStartKey("T1", "k2"), "x.desk.consult:T1:k2");
+        // A try of a consult that is no longer starting records nothing.
+        assert.equal(consultTry(state, "T1", "k1", now), undefined);
+    });
+
+    test("the sweep's retries: 60 seconds apart, at most 10 tries, inside the 60-minute limit, by supervisor", () => {
+        const { state } = drafting();
+
+        consult(state, { agents: ["teg"] });
+        consultTry(state, "T1", "k1", now);
+        consultStartFailed(state, "T1", "k1", "busy", now);
+
+        assert.deepEqual(consultRetries(state, 7, now + CONSULT_RETRY_MS - 1), []);
+        assert.deepEqual(consultRetries(state, 7, now + CONSULT_RETRY_MS), [
+            { plan: "T1", consult: "k1" },
+        ]);
+        assert.deepEqual(
+            consultRetries(state, 8, now + CONSULT_RETRY_MS),
+            [],
+            "another supervisor's plan",
+        );
+
+        // The spacing counts from the last try, not from the consult's start.
+        consultTry(state, "T1", "k1", minutes(5));
+        assert.deepEqual(consultRetries(state, 7, minutes(5) + CONSULT_RETRY_MS - 1), []);
+        assert.equal(planOf(state, "T1")?.consults[0]?.start?.tries, 2);
+
+        // At most 10 tries, and none at or after the 60-minute limit.
+        planOf(state, "T1")!.consults[0]!.start = { at: now, tries: CONSULT_START_TRIES };
+        assert.deepEqual(consultRetries(state, 7, minutes(10)), []);
+        planOf(state, "T1")!.consults[0]!.start = { at: now, tries: 3 };
+        assert.deepEqual(consultRetries(state, 7, now + CONSULT_LIMIT_MS), []);
+
+        // The limit fails it, and says that its start did not finish.
+        assert.deepEqual(timeoutConsults(state, "T1", now + CONSULT_LIMIT_MS), ["k1"]);
+        assert.match(
+            state.threads.T1?.events.map((each) => each.text).join("\n") ?? "",
+            /consult k1 \(teg\) failed: its start did not finish in 60 minutes \(3 tries\)/,
         );
     });
 
@@ -539,11 +590,15 @@ describe("the end of a consult", () => {
                 ["failed", "timeout"],
             ],
         );
-        assert.equal(
-            state.threads.T1?.events.filter((each) =>
-                each.text.includes("no finding after 60 minutes"),
-            ).length,
-            2,
+        // k1 never bound: its start did not finish; k2 ran with no finding.
+        assert.deepEqual(
+            state.threads.T1?.events
+                .filter((each) => each.key.startsWith("consult-end:"))
+                .map((each) => each.text),
+            [
+                "consult k1 (teg) failed: its start did not finish in 60 minutes (0 tries)",
+                "consult k2 (paul) failed: no finding after 60 minutes",
+            ],
         );
         assert.deepEqual(
             consultWakeLines(plan, (text) => text).map((each) => each.key),
@@ -1019,6 +1074,34 @@ function wrapStart(
             proto.start = original;
         },
     };
+}
+
+type LinkedList = (source: ConversationId) => Promise<{ address: string; title?: string }[]>;
+
+/** Pocket's list, as for a session that not everyone sees: no title, folder, busy or archived for these addresses. */
+function hideTitles(addresses: readonly string[]): { restore: () => void } {
+    const proto = Object.getPrototypeOf(app.linkedSessions) as { list: LinkedList };
+    const original = proto.list;
+
+    proto.list = async function (this: unknown, source) {
+        return (await original.call(this, source)).map((each) =>
+            addresses.includes(each.address) ? { address: each.address } : each,
+        );
+    };
+
+    return {
+        restore: () => {
+            proto.list = original;
+        },
+    };
+}
+
+/** A consult of the test's plan in a document draft. */
+function consultOfId(state: DeskState, id: string) {
+    return (
+        planOf(state, planId)?.consults.find((each) => each.id === id) ??
+        assert.fail(`consult ${id}`)
+    );
 }
 
 /**
@@ -1511,8 +1594,8 @@ describe("with the Pi Pocket app", () => {
             wrapped.restore();
         }
 
-        // A start that throws after its session started: the consult fails, the hook keeps its session blocked, and
-        // the gate does not wait for it.
+        // A start that throws after its session started: an unknown outcome. The consult stays starting, the hook
+        // keeps its session blocked, and the gate waits for it.
         let thrownSession: ConversationId | undefined;
         const throwing = wrapStart(async (real, ...args) => {
             const started = await real(...args);
@@ -1533,27 +1616,90 @@ describe("with the Pi Pocket app", () => {
 
             assert.match(
                 out.output[0]?.text ?? "",
-                /k3 \(irulan\): did not start: the start broke after the session began/,
+                /k3 \(irulan\): its start did not finish \(the start broke after the session began\); the desk tries it again/,
             );
+            assert.match(out.output[0]?.text ?? "", /A start that did not finish stays starting/);
+        } finally {
+            throwing.restore();
+        }
 
+        try {
             const k3 = await consultNow("k3");
 
-            assert.equal(k3.state, "failed");
-            assert.equal(k3.end?.why, "start");
+            assert.equal(k3.state, "starting");
             assert.equal(k3.session, undefined);
+            assert.equal(k3.address, undefined);
+            assert.equal(k3.start?.tries, 1);
             assert.deepEqual(
                 planWaiting(await deskSnapshot(), planId).filter((each) => each.startsWith("k3")),
-                [],
+                ["k3 starting"],
             );
             assert(thrownSession !== undefined, "the session began");
             assert.match(
                 (await desk.block(Number(thrownSession), "read")) ?? "",
-                /k3\) is failed: every tool is blocked/,
+                /k3\) is still starting/,
             );
         } finally {
-            throwing.restore();
             desk.restore();
         }
+    });
+
+    test("the sweep tries the start again: no found thread with a hidden title, then 1 session, bound by address", async () => {
+        assert(thrownAddress !== "", "the thrown start began a session");
+
+        assert.equal((await consultNow("k3")).state, "starting");
+
+        const sessions = app.sessions().length;
+        const hidden = hideTitles([thrownAddress]);
+        const wrapped = wrapStart((real, ...args) => real(...args));
+        const foundFor = async (address: string) =>
+            Object.values((await deskSnapshot())?.threads ?? {}).filter(
+                (each) => each.origin === "found" && each.address === address,
+            );
+
+        try {
+            // Pocket gives no title for this session now: the starting consult is in flight, and no found thread comes.
+            // The last try is less than 60 seconds old: no try yet.
+            await runTool(supervisorId, "desk", { action: "sync" });
+            assert.deepEqual(wrapped.calls, []);
+            assert.deepEqual(await foundFor(thrownAddress), []);
+
+            // 61 seconds later (the last try's time moves back): the sync tries again under the same key.
+            await app.harness.commit(async (tx) => {
+                const k3 = consultOfId(await tx.doc(DeskThreads), "k3");
+
+                k3.start = { ...(k3.start ?? { tries: 1 }), at: Date.now() - 61_000 };
+            }, context);
+            await runTool(supervisorId, "desk", { action: "sync" });
+            assert.deepEqual(wrapped.calls, [`x.desk.consult:${planId}:k3`]);
+
+            const k3 = await consultNow("k3");
+            const first = (await userTexts(k3.session as unknown as ConversationId)).filter(
+                (each) => each.includes("[plan-consult "),
+            );
+
+            assert.equal(k3.state, "running");
+            assert.equal(k3.address, thrownAddress);
+            assert.equal(k3.start?.tries, 2);
+            assert.equal(app.sessions().length, sessions, "no second session");
+            assert.equal(first.length, 1, "no second first message");
+            assert.match(
+                (await deskSnapshot())?.threads[planId]?.events
+                    .map((each) => each.text)
+                    .join("\n") ?? "",
+                /consult k3 \(irulan\) runs \(start try 2\)/,
+            );
+
+            // Bound by its address: still no found thread, with no title.
+            await runTool(supervisorId, "desk", { action: "sync" });
+            assert.deepEqual(await foundFor(thrownAddress), []);
+        } finally {
+            wrapped.restore();
+            hidden.restore();
+        }
+
+        // k3 stops here: the next tests count the consults that run.
+        assert.equal((await routes(`plans/${planId}/consults/k3/stop`, {})).status, 200);
     });
 
     test("the bounds of plans.consults in desk.json, and Team without startConsult", async () => {
@@ -1670,7 +1816,7 @@ describe("with the Pi Pocket app", () => {
             [
                 ["k1", "answered", false],
                 ["k2", "stopped", false],
-                ["k3", "failed", false],
+                ["k3", "stopped", false],
             ],
         );
         assert.deepEqual(
@@ -1919,7 +2065,7 @@ describe("with the Pi Pocket app", () => {
             );
         }
 
-        assert.equal(k3.address, undefined, "the thrown start bound no address");
+        assert.equal(k3.address, thrownAddress, "the retry bound the thrown start's session");
 
         const counted = async () =>
             Object.values((await deskSnapshot())?.threads ?? {}).filter((each) =>
@@ -2000,5 +2146,71 @@ describe("with the Pi Pocket app", () => {
         );
         assert.equal((await found()).length, before.found);
         assert.equal(await counted(), before.counted);
+    });
+
+    test("a start that keeps throwing is tried again 1 minute apart, and fails at 60 minutes", async () => {
+        const sessions = app.sessions().length;
+        // Every try throws before Pocket makes a session.
+        const throwing = wrapStart(async () => {
+            throw new Error("the model cannot be used now");
+        });
+
+        try {
+            await runTool(planningId, "plan", {
+                action: "consult",
+                agents: ["irulan"],
+                question: "Does the key survive a firmware update?",
+            });
+
+            const k6 = await consultNow("k6");
+
+            assert.equal(k6.state, "starting");
+            assert.equal(k6.start?.tries, 1);
+            assert.deepEqual(throwing.calls, [`x.desk.consult:${planId}:k6`]);
+
+            // Too soon: no try.
+            await runTool(supervisorId, "desk", { action: "sync" });
+            assert.equal(throwing.calls.length, 1);
+
+            // 61 seconds after the last try: 1 more try, which throws too, with its event.
+            await app.harness.commit(async (tx) => {
+                const consult = consultOfId(await tx.doc(DeskThreads), "k6");
+
+                consult.start = { ...(consult.start ?? { tries: 1 }), at: Date.now() - 61_000 };
+            }, context);
+            await runTool(supervisorId, "desk", { action: "sync" });
+            assert.equal(throwing.calls.length, 2);
+            assert.equal((await consultNow("k6")).start?.tries, 2);
+            assert.match(
+                (await deskSnapshot())?.threads[planId]?.events
+                    .map((each) => each.text)
+                    .join("\n") ?? "",
+                /consult k6 \(irulan\): start try 2 did not finish: the model cannot be used now; the desk tries again/,
+            );
+
+            // 60 minutes after its start: it fails, and no more try runs.
+            await app.harness.commit(async (tx) => {
+                const consult = consultOfId(await tx.doc(DeskThreads), "k6");
+
+                consult.at = Date.now() - 61 * 60_000;
+                consult.start = { ...(consult.start ?? { tries: 2 }), at: Date.now() - 61_000 };
+            }, context);
+            await runTool(supervisorId, "desk", { action: "sync" });
+
+            const failed = await consultNow("k6");
+
+            assert.equal(failed.state, "failed");
+            assert.equal(failed.end?.why, "timeout");
+            assert.equal(throwing.calls.length, 2);
+            assert.match(
+                (await deskSnapshot())?.threads[planId]?.events
+                    .map((each) => each.text)
+                    .join("\n") ?? "",
+                /consult k6 \(irulan\) failed: its start did not finish in 60 minutes \(2 tries\)/,
+            );
+            assert.equal(app.sessions().length, sessions, "no session was made");
+        } finally {
+            throwing.restore();
+        }
     });
 });

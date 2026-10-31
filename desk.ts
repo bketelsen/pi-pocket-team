@@ -664,10 +664,15 @@ export type Consult = {
     state: "starting" | "running" | "answered" | "failed" | "stopped";
     finding?: string;
     /**
-     * How a consult ended with no finding: its start threw (`start`), it had no finding 60 minutes after `at`
-     * (`timeout`), Brian stopped it (`stopped`), or its plan ended (`plan`). Absent for a consult that runs or answered.
+     * How a consult ended with no finding: no finding (or no start) 60 minutes after `at` (`timeout`), Brian stopped
+     * it (`stopped`), or its plan ended (`plan`). Absent for a consult that starts, runs or answered.
      */
-    end?: { at: number; why: "start" | "timeout" | "stopped" | "plan"; by?: string; text?: string };
+    end?: { at: number; why: "timeout" | "stopped" | "plan"; by?: string; text?: string };
+    /**
+     * The tries of its start: the last try's time, how many, and the last error. A start that throws is an unknown
+     * outcome: the consult stays `starting`, and the sweep tries again under the same key.
+     */
+    start?: { at: number; tries: number; error?: string };
 };
 
 /** One answer from a consult. Stored data: never rename a field. */
@@ -14279,7 +14284,7 @@ export function consultWakeLines(
             key: `consult-end:${consult.id}`,
             line:
                 why === "timeout"
-                    ? `- consult ${consult.id} (${consult.agent}${on}) failed: no finding after 60 minutes. Ask again with plan consult, or go on without it.`
+                    ? `- consult ${consult.id} (${consult.agent}${on}) failed: ${consult.session === undefined ? "its start did not finish" : "no finding"} after 60 minutes. Ask again with plan consult, or go on without it.`
                     : `- consult ${consult.id} (${consult.agent}${on}) was stopped by ${consult.end?.by ?? "Brian"}: no finding comes from it.`,
         });
     }
@@ -14327,6 +14332,20 @@ export const planRoot = (plan: Plan): string => dirname(plan.file);
 
 /** Where every instance of this module in the process finds the 1 plan lock map. */
 const PLAN_LOCKS = Symbol.for("pi-pocket-team.desk.plan-locks");
+
+const CONSULT_STARTS = Symbol.for("pi-pocket-team.desk.consult-starts");
+
+/**
+ * The consult start keys whose start runs now, shared by every instance of this module in the process: the call and
+ * the sweep (of an old or a new instance) never start 1 consult at the same time here.
+ */
+export function consultStarts(): Set<string> {
+    const shared = globalThis as unknown as Record<symbol, Set<string> | undefined>;
+
+    shared[CONSULT_STARTS] ??= new Set<string>();
+
+    return shared[CONSULT_STARTS];
+}
 
 /**
  * The plan publish locks: 1 promise chain for each plan, shared by every instance of this module in the process. Pocket
@@ -15490,7 +15509,7 @@ export function bindConsult(
             addEvent(
                 thread,
                 `consult-running:${consult.id}`,
-                `consult ${consult.id} (${consult.agent}) runs`,
+                `consult ${consult.id} (${consult.agent}) runs${consult.start === undefined ? "" : ` (start try ${String(consult.start.tries)})`}`,
                 binding.at,
             );
         }
@@ -15510,17 +15529,19 @@ function endConsult(
         return false;
     }
 
+    const started = consult.state === "running";
+
     consult.state = end.why === "stopped" || end.why === "plan" ? "stopped" : "failed";
     consult.end = { ...end };
 
     const text =
-        end.why === "start"
-            ? `did not start: ${flatLine(end.text ?? "").slice(0, 300)}`
-            : end.why === "timeout"
-              ? "failed: no finding after 60 minutes"
-              : end.why === "stopped"
-                ? `stopped by ${end.by ?? "Brian"}`
-                : `stopped: plan ${plan.thread} is ${plan.state}`;
+        end.why === "timeout"
+            ? started
+                ? "failed: no finding after 60 minutes"
+                : `failed: its start did not finish in 60 minutes (${String(consult.start?.tries ?? 0)} tries)`
+            : end.why === "stopped"
+              ? `stopped by ${end.by ?? "Brian"}`
+              : `stopped: plan ${plan.thread} is ${plan.state}`;
 
     if (thread !== undefined) {
         addEvent(
@@ -15534,8 +15555,47 @@ function endConsult(
     return true;
 }
 
-/** A consult whose start threw: `failed`, with 1 event. A session that may have started stays blocked by the hook. */
-export function failConsultStart(
+/** The tries a consult's start gets: 10, the first one included. */
+export const CONSULT_START_TRIES = 10;
+
+/** The least time between 2 tries of a consult's start: 60 seconds, so a slow start is not raced. */
+export const CONSULT_RETRY_MS = 60_000;
+
+/** The start key of a consult: Pocket gives the same session back for it, and sends its first message once. */
+export const consultStartKey = (planId: string, consultId: string): string =>
+    `x.desk.consult:${planId}:${consultId}`;
+
+/**
+ * Record 1 try of a consult's start, before the start: its time and its count. Undefined: the consult is no longer
+ * `starting` (it ended, or a start bound it), so no start runs.
+ */
+export function consultTry(
+    state: DeskState,
+    planId: string,
+    consultId: string,
+    at: number,
+): Consult | undefined {
+    const consult = consultOf(planOf(state, planId), consultId);
+
+    if (consult === undefined || consult.state !== "starting") {
+        return undefined;
+    }
+
+    consult.start = {
+        at,
+        tries: (consult.start?.tries ?? 0) + 1,
+        ...(consult.start?.error === undefined ? {} : { error: consult.start.error }),
+    };
+
+    return consultCopy(consult);
+}
+
+/**
+ * A start that threw is an unknown outcome: Pocket may have made the session, and may have sent its first message. The
+ * consult stays `starting` (the hook blocks its session, and the sweep treats it as in flight), with the error and 1
+ * event; the sweep tries again under the same key.
+ */
+export function consultStartFailed(
     state: DeskState,
     planId: string,
     consultId: string,
@@ -15549,9 +15609,60 @@ export function failConsultStart(
         return undefined;
     }
 
-    endConsult(plan, threadById(state, plan.thread), consult, { at, why: "start", text: why });
+    const tries = consult.start?.tries ?? 1;
+    const error = flatLine(why).slice(0, 300);
+
+    if (consult.state === "starting") {
+        consult.start = { at: consult.start?.at ?? at, tries, error };
+    }
+
+    const thread = threadById(state, plan.thread);
+
+    if (thread !== undefined) {
+        addEvent(
+            thread,
+            `consult-try:${consult.id}:${String(tries)}`,
+            `consult ${consult.id} (${consult.agent}): start try ${String(tries)} did not finish: ${error}${tries < CONSULT_START_TRIES ? "; the desk tries again" : "; no more tries: it fails at 60 minutes"}`,
+            at,
+        );
+    }
 
     return consultCopy(consult);
+}
+
+/**
+ * The consults whose start the sweep tries again now: `starting`, of a plan of this supervisor, the last try at least
+ * 60 seconds ago, fewer than 10 tries, and still inside the 60-minute limit.
+ */
+export function consultRetries(
+    state: Readonly<DeskState> | undefined,
+    supervisor: number,
+    now: number,
+): { plan: string; consult: string }[] {
+    const due: { plan: string; consult: string }[] = [];
+
+    for (const plan of Object.values(state?.plans ?? {})) {
+        if (
+            threadById(state, plan.thread)?.supervisor !== supervisor ||
+            plan.state !== "drafting"
+        ) {
+            continue;
+        }
+
+        for (const consult of plan.consults ?? []) {
+            if (
+                consult.state === "starting" &&
+                consult.session === undefined &&
+                now - (consult.start?.at ?? consult.at) >= CONSULT_RETRY_MS &&
+                (consult.start?.tries ?? 0) < CONSULT_START_TRIES &&
+                now - consult.at < CONSULT_LIMIT_MS
+            ) {
+                due.push({ plan: plan.thread, consult: consult.id });
+            }
+        }
+    }
+
+    return due;
 }
 
 /** Brian stops 1 consult from the page: only a `starting` or `running` one. */
@@ -20575,6 +20686,32 @@ export default function createDesk(host: Host, web: Web) {
                     // A failed publish is no failed sweep: the next call or sweep tries again.
                 }
 
+                // A consult whose start did not finish: 1 more try under its key, at most 1 a minute.
+                try {
+                    await retryConsults(
+                        accessOfTask(runtime, context),
+                        {
+                            read: runtime,
+                            commit: async <T>(change: (tx: Tx) => T | Promise<T>): Promise<T> => {
+                                let out: T | undefined;
+
+                                await runtime.commit(async (tx) => {
+                                    out = await change(tx);
+
+                                    return undefined;
+                                }, context);
+
+                                return out as T;
+                            },
+                            context,
+                        },
+                        Number(supervisor),
+                        () => runtime.now(),
+                    );
+                } catch {
+                    // The next sweep tries again: the consult is still starting.
+                }
+
                 web.send("changed", {});
                 await exportNow(runtime, context);
             },
@@ -23293,6 +23430,129 @@ export default function createDesk(host: Host, web: Web) {
         },
     });
 
+    /** What Team's consult start needs of its caller: a read, a commit that gives its value back, and a context. */
+    type ConsultStartDeps = {
+        read: Pick<DocumentReader, "snapshot">;
+        commit: <T>(change: (tx: Tx) => T | Promise<T>) => Promise<T>;
+        context: Context;
+    };
+
+    /**
+     * 1 try of 1 consult's start, from the `plan consult` call or from the sweep: 1 commit records the try, then Team
+     * starts it under its stable key, then 1 commit binds it (`running`), or records the error and keeps it `starting`.
+     * The start keys that run now in this process are in a shared set, so the call and the sweep never start 1 consult
+     * at once here; under the same key Pocket gives the same session back anyway, and the bind keeps the first one.
+     * Gives the consult's line for a reply.
+     */
+    const startOneConsult = async (
+        access: PlanPublish,
+        deps: ConsultStartDeps,
+        planId: string,
+        consultId: string,
+        now: () => number,
+    ): Promise<string> => {
+        const startConsult = teamApi()?.startConsult;
+        const key = consultStartKey(planId, consultId);
+        const running = consultStarts();
+        const before = consultOf(planOf(await access.read(), planId), consultId);
+        const name = `${consultId} (${before?.agent ?? "?"})`;
+
+        if (startConsult === undefined) {
+            return `${name}: starting (the Team module cannot start it now)`;
+        }
+
+        if (running.has(key)) {
+            return `${name}: starting (a start of it runs now)`;
+        }
+
+        running.add(key);
+
+        try {
+            let tried: Consult | undefined;
+
+            await access.commit((state) => {
+                tried = consultTry(state, planId, consultId, now());
+            });
+
+            const state = await access.read();
+            const plan = planOf(state, planId);
+            const thread = threadById(state, planId);
+            const consult = consultOf(plan, consultId);
+
+            // Only a consult that is still starting starts: any other state is its answer.
+            if (
+                tried === undefined ||
+                plan === undefined ||
+                thread?.supervisor === undefined ||
+                consult === undefined
+            ) {
+                return `${name}: ${consult?.state ?? "gone"}`;
+            }
+
+            const ask = consult.ask === undefined ? undefined : askById(state, consult.ask)?.ask;
+            const quote = (value: string, limit?: number) => host.text.quoted(value, limit ?? 300);
+            let started: { session: number; address: string };
+
+            try {
+                started = await startConsult({
+                    supervisor: thread.supervisor,
+                    read: deps.read,
+                    commit: deps.commit,
+                    context: deps.context,
+                    agent: consult.agent,
+                    title: consultTitle(plan, consult, thread.title),
+                    message: consultBrief(plan, thread.title, consult, ask, quote),
+                    key,
+                });
+            } catch (error) {
+                const why = (error as Error).message;
+
+                await access.commit((state2) => {
+                    consultStartFailed(state2, planId, consultId, why, now());
+                });
+
+                return `${name}: its start did not finish (${flatLine(why).slice(0, 300)}); the desk tries it again`;
+            }
+
+            let bound: Consult | undefined;
+
+            await access.commit((state2) => {
+                bound = bindConsult(state2, planId, consultId, {
+                    session: Number(started.session),
+                    address: started.address,
+                    at: now(),
+                });
+            });
+
+            return `${name}: ${bound?.state ?? "running"}`;
+        } finally {
+            running.delete(key);
+        }
+    };
+
+    /**
+     * The sweep's retries: each consult of this supervisor that is still `starting`, whose last try is 60 seconds old,
+     * gets 1 more try under its key. Only while the hook can read entries: before its bind, only that holds a consult.
+     */
+    const retryConsults = async (
+        access: PlanPublish,
+        deps: ConsultStartDeps,
+        supervisor: number,
+        now: () => number,
+    ): Promise<number> => {
+        if (entryRead !== "available" || teamApi()?.startConsult === undefined) {
+            return 0;
+        }
+
+        const due = consultRetries(await access.read(), supervisor, now());
+
+        for (const each of due) {
+            await startOneConsult(access, deps, each.plan, each.consult, now);
+        }
+
+        return due.length;
+    };
+
     /** The commands a Clerk never runs: a merge, an approval, a review, a tag, a release, or a force-push. */
     const CLERK_FORBIDDEN =
         /\bgh\s+pr\s+(?:merge|review)\b|\bgh\s+release\b|\bgit\s+tag\b|\bgit\s+push\b[^\n]*(?:--force-with-lease|--force|-f)\b/;
@@ -24118,6 +24378,14 @@ export default function createDesk(host: Host, web: Web) {
                     api.commit(change, context),
                 );
 
+                // A consult whose start did not finish: 1 more try under its key, at most 1 a minute.
+                await retryConsults(
+                    accessOf(api, context),
+                    { read: api, commit: (change) => api.commit(change, context), context },
+                    Number(supervisor),
+                    () => Date.now(),
+                );
+
                 web.send("changed", {});
                 await exportNow(api, context);
 
@@ -24543,23 +24811,14 @@ export default function createDesk(host: Host, web: Web) {
 
                 // Before its bind, only the hook's entry read holds a consult read-only. The hook runs before every
                 // model-issued call, this one too, so the flag is known here; a replay after a restart runs no hook,
-                // and is refused too. The consults that call recorded and that are still starting fail, so the gate
-                // does not wait 60 minutes for them.
+                // and is refused too. The consults that call recorded stay starting: their start may have begun, so
+                // the sweep tries them again once the hook has run, or they fail at the 60-minute limit.
                 if (entryRead !== "available") {
-                    const why =
+                    throw new Error(
                         entryRead === "missing"
                             ? "This Pocket gives the desk hook no entry read, so a consult cannot be held read-only before its bind: no consult starts."
-                            : "The desk's consult hook has not run in this module yet, so the desk cannot tell whether it can hold a consult read-only before its bind: no consult starts. Call plan consult again.";
-
-                    await access.commit((state2) => {
-                        for (const each of planOf(state2, plan.thread)?.consults ?? []) {
-                            if (each.key === key && each.state === "starting") {
-                                failConsultStart(state2, plan.thread, each.id, why, Date.now());
-                            }
-                        }
-                    });
-
-                    throw new Error(why);
+                            : "The desk's consult hook has not run in this module yet, so the desk cannot tell whether it can hold a consult read-only before its bind: no consult starts. Call plan consult again.",
+                    );
                 }
 
                 const startConsult = team?.startConsult;
@@ -24604,68 +24863,31 @@ export default function createDesk(host: Host, web: Web) {
 
                 web.send("changed", {});
 
-                const quote = (value: string, limit?: number) =>
-                    host.text.quoted(value, limit ?? 300);
                 const lines: string[] = [];
 
+                // Each consult that is still starting starts now (again, on a replay, under the same key: Pocket gives
+                // the same session back for a known key, and sends its first message once).
                 for (const each of added.consults) {
-                    const now = await access.read();
-                    const planNow = planOf(now, plan.thread);
-                    const consult = consultOf(planNow, each.id);
-
-                    // Only a consult that is still starting starts (again, on a replay, under the same key: Pocket
-                    // gives the same session back for a known key). Any other state is its answer.
-                    if (
-                        planNow === undefined ||
-                        consult === undefined ||
-                        consult.state !== "starting"
-                    ) {
-                        lines.push(`${each.id} (${each.agent}): ${consult?.state ?? "gone"}`);
-                        continue;
-                    }
-
-                    const askNow =
-                        consult.ask === undefined ? undefined : askById(now, consult.ask)?.ask;
-                    let started: { session: number; address: string };
-
-                    try {
-                        started = await startConsult({
-                            supervisor,
-                            read: api,
-                            commit: (change) => api.commit(change, context),
-                            context,
-                            agent: consult.agent,
-                            title: consultTitle(planNow, consult, thread.title),
-                            message: consultBrief(planNow, thread.title, consult, askNow, quote),
-                            key: `x.desk.consult:${plan.thread}:${consult.id}`,
-                        });
-                    } catch (error) {
-                        const why = (error as Error).message;
-
-                        // A thrown start fails the consult: a session that did start stays blocked by the hook.
-                        await access.commit((state2) => {
-                            failConsultStart(state2, plan.thread, consult.id, why, Date.now());
-                        });
-                        lines.push(`${consult.id} (${consult.agent}): did not start: ${why}`);
-                        continue;
-                    }
-
-                    const bound = await access.commit((state2) =>
-                        bindConsult(state2, plan.thread, consult.id, {
-                            session: Number(started.session),
-                            address: started.address,
-                            at: Date.now(),
-                        }),
+                    lines.push(
+                        await startOneConsult(
+                            access,
+                            {
+                                read: api,
+                                commit: (change) => api.commit(change, context),
+                                context,
+                            },
+                            plan.thread,
+                            each.id,
+                            () => Date.now(),
+                        ),
                     );
-
-                    lines.push(`${consult.id} (${consult.agent}): ${bound?.state ?? "running"}`);
                 }
 
                 web.send("changed", {});
                 await exportNow(api, context);
 
                 return reply(
-                    `Consults on plan ${plan.thread}: ${lines.join("; ")}. Each running consult answers once with a finding; the desk wakes you with each finding, and with a consult that fails after ${String(CONSULT_LIMIT_MS / 60_000)} minutes.`,
+                    `Consults on plan ${plan.thread}: ${lines.join("; ")}. Each running consult answers once with a finding; the desk wakes you with each finding, and with a consult that fails after ${String(CONSULT_LIMIT_MS / 60_000)} minutes. A start that did not finish stays starting: the desk tries it again under the same key (at most ${String(CONSULT_START_TRIES)} tries, 1 a minute at most), and it fails if it does not run in ${String(CONSULT_LIMIT_MS / 60_000)} minutes.`,
                 );
             }
 
