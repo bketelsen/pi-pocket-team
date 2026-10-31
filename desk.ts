@@ -23122,12 +23122,32 @@ export default function createDesk(host: Host, web: Web) {
     const consultMarks = new Map<number, string[]>();
 
     /**
-     * The nonces of a session's first message, read once. The hook's `api` is the tool task's runtime: its commit
-     * reads the entries (`tx.scanEntries`), and writes nothing. Undefined: the session has no message yet, so nothing is
-     * kept, and the next call reads again.
+     * Whether the hook can read a session's entries: `available` when its `api` has a commit, `missing` when it has
+     * none (a later pi-durable may give the hook only its typed reads), `unknown` before the hook's first call in this
+     * module instance. `plan consult` starts a consult only while it is `available`: before its bind, only the entry
+     * read can hold a consult's session read-only.
+     */
+    let entryRead: "unknown" | "available" | "missing" = "unknown";
+
+    /** The commit of the hook's `api`, when it has one: the tool task's runtime has it, Pocket's hook type does not. */
+    const entryCommit = (api: object) => {
+        const commit = (api as { commit?: unknown }).commit;
+
+        return typeof commit === "function"
+            ? (commit as (
+                  change: (tx: Tx) => Promise<undefined>,
+                  context: Context,
+              ) => Promise<void>)
+            : undefined;
+    };
+
+    /**
+     * The nonces of a session's first message, read once with `commit`, which reads the entries (`tx.scanEntries`) and
+     * writes nothing. Undefined: the session has no message yet, so nothing is kept, and the next call reads again.
      */
     const consultNoncesOf = async (
         api: { conversationId: ConversationId },
+        commit: NonNullable<ReturnType<typeof entryCommit>>,
         context: Context,
     ): Promise<string[] | undefined> => {
         const session = Number(api.conversationId);
@@ -23137,21 +23157,17 @@ export default function createDesk(host: Host, web: Web) {
             return known;
         }
 
-        const runtime = api as {
-            commit?: (change: (tx: Tx) => Promise<undefined>, context: Context) => Promise<void>;
-        };
-
-        if (typeof runtime.commit !== "function") {
-            throw new Error("The hook cannot read the session's entries.");
-        }
-
         let text: string | undefined;
 
-        await runtime.commit(async (tx) => {
-            text = await firstUserText(tx, api.conversationId);
+        await commit.call(
+            api,
+            async (tx) => {
+                text = await firstUserText(tx, api.conversationId);
 
-            return undefined;
-        }, context);
+                return undefined;
+            },
+            context,
+        );
 
         if (text === undefined) {
             return undefined;
@@ -23164,18 +23180,52 @@ export default function createDesk(host: Host, web: Web) {
         return nonces;
     };
 
+    const STATE_BLOCK =
+        "This session is a plan consult, and the desk could not read its state: the call is blocked. Try again in a moment.";
+
     /**
-     * A plan consult is read-only (section 8 of docs/plans/plan-threads.md): a session whose first message holds the
-     * desk's marker may call only `read`, and `plan` with action `finding`, and only while its consult runs. A marker
-     * can only take rights away. A session with no marker is not touched. This hook fails closed: an error while it
-     * reads the first message blocks the call (and is not kept), and an error after the marker was found blocks too.
+     * A plan consult is read-only (section 8 of docs/plans/plan-threads.md): it may call only `read`, and `plan` with
+     * action `finding`, and only while it runs. 2 steps:
+     * 1. The typed path: a session that a consult is bound to (`consultOfSession` on the desk's state) is held by its
+     *    consult's state. It needs no entry read.
+     * 2. The window before the bind: the desk's marker in the session's first message makes it a consult. A marker can
+     *    only take rights away; a session with no marker is not touched.
+     * An `api` with no commit cannot read entries at all: an unbound session then runs, and `plan consult` starts no
+     * consult (`entryRead`). A read that fails blocks the call with "try again", and is not kept.
      */
     const consultGuard = hook(ToolTask, {
         beforeTool: async (call, api, context) => {
+            const session = Number(api.conversationId);
+            const commit = entryCommit(api);
+
+            entryRead = commit === undefined ? "missing" : "available";
+
+            let state: DeskState | undefined;
+            let stateFailed = false;
+
+            try {
+                state = await api.snapshot(DeskThreads, context);
+            } catch {
+                stateFailed = true;
+            }
+
+            // 1. A bound consult is held by its state, whatever the entry read can do.
+            if (!stateFailed && consultOfSession(state, session) !== undefined) {
+                const block = consultBlock(call, session, [], state);
+
+                return block === undefined ? undefined : { block };
+            }
+
+            // No entry read in this Pocket: an unbound session runs, and no consult starts (see `plan consult`).
+            if (commit === undefined) {
+                return undefined;
+            }
+
+            // 2. The window before the bind: the marker of the first message.
             let nonces: string[] | undefined;
 
             try {
-                nonces = await consultNoncesOf(api, context);
+                nonces = await consultNoncesOf(api, commit, context);
             } catch {
                 return {
                     block: "The desk could not read this session's first message, so it cannot tell whether this session is a plan consult. Try the call again in a moment.",
@@ -23186,16 +23236,13 @@ export default function createDesk(host: Host, web: Web) {
                 return undefined;
             }
 
-            try {
-                const state = await api.snapshot(DeskThreads, context);
-                const block = consultBlock(call, Number(api.conversationId), nonces, state);
-
-                return block === undefined ? undefined : { block };
-            } catch {
-                return {
-                    block: "This session is a plan consult, and the desk could not read its state: the call is blocked. Try again in a moment.",
-                };
+            if (stateFailed) {
+                return { block: STATE_BLOCK };
             }
+
+            const block = consultBlock(call, session, nonces, state);
+
+            return block === undefined ? undefined : { block };
         },
     });
 
@@ -24445,6 +24492,27 @@ export default function createDesk(host: Host, web: Web) {
                     throw new Error(
                         "A consult session starts no consult: answer with plan finding, once.",
                     );
+                }
+
+                // Before its bind, only the hook's entry read holds a consult read-only. The hook runs before every
+                // model-issued call, this one too, so the flag is known here; a replay after a restart runs no hook,
+                // and is refused too. The consults that call recorded and that are still starting fail, so the gate
+                // does not wait 60 minutes for them.
+                if (entryRead !== "available") {
+                    const why =
+                        entryRead === "missing"
+                            ? "This Pocket gives the desk hook no entry read, so a consult cannot be held read-only before its bind: no consult starts."
+                            : "The desk's consult hook has not run in this module yet, so the desk cannot tell whether it can hold a consult read-only before its bind: no consult starts. Call plan consult again.";
+
+                    await access.commit((state2) => {
+                        for (const each of planOf(state2, plan.thread)?.consults ?? []) {
+                            if (each.key === key && each.state === "starting") {
+                                failConsultStart(state2, plan.thread, each.id, why, Date.now());
+                            }
+                        }
+                    });
+
+                    throw new Error(why);
                 }
 
                 const startConsult = team?.startConsult;

@@ -1077,6 +1077,13 @@ function stubDesk() {
         snapshot: (...args: unknown[]) => Reflect.apply(app.harness.snapshot, app.harness, args),
         commit,
     });
+    /** A hook `api` with Pocket's typed reads only: no commit, so no entry read. */
+    const typed = (conversationId: number) => ({
+        conversationId,
+        taskId: "task-hook",
+        callId: "call-hook",
+        snapshot: (...args: unknown[]) => Reflect.apply(app.harness.snapshot, app.harness, args),
+    });
     const guard =
         extension.hooks[0]?.handlers.beforeTool ?? assert.fail("the consult hook is first");
     const plan = (args: object, conversationId: number, taskId: string, callId: string) =>
@@ -1086,6 +1093,7 @@ function stubDesk() {
 
     return {
         api,
+        typed,
         /** The block of 1 call in a session, or undefined. */
         block: async (
             session: number,
@@ -1490,6 +1498,8 @@ describe("with the Pi Pocket app", () => {
                 question: "Is the key rotation yearly?",
             };
 
+            // The hook runs before the call, as it does before every model-issued call: the entry read is there.
+            assert.equal(await desk.block(Number(planningId), "plan", args), undefined);
             await desk.plan(args, Number(planningId), "task-replay", "call-1");
             await desk.plan(args, Number(planningId), "task-replay", "call-1");
             assert.deepEqual(wrapped.calls, [`x.desk.consult:${planId}:k2`]);
@@ -1710,5 +1720,90 @@ describe("with the Pi Pocket app", () => {
             20_000,
         );
         assert.equal(consultOfSession(await deskSnapshot(), 999_999)?.consult.id, "k4");
+    });
+
+    test("with no entry read: a bound consult is still held, an unbound session runs, and no consult starts", async () => {
+        const k1 = await consultNow("k1");
+        const k2 = await consultNow("k2");
+        const count = (await planSnapshot()).consults.length;
+        const unknown = stubDesk();
+
+        try {
+            // A desk whose hook has not run yet starts no consult.
+            await assert.rejects(
+                unknown.plan(
+                    { action: "consult", agents: ["irulan"], question: "Before the hook?" },
+                    Number(planningId),
+                    "task-unknown",
+                    "call-1",
+                ),
+                /The desk's consult hook has not run in this module yet/,
+            );
+        } finally {
+            unknown.restore();
+        }
+
+        const desk = stubDesk();
+
+        try {
+            const typed = (session: number) => desk.typed(session);
+
+            // The typed path: a bound consult is held by its state, with no commit on the api.
+            assert.match(
+                (await desk.block(
+                    k1.session ?? 0,
+                    "read",
+                    {},
+                    undefined,
+                    typed(k1.session ?? 0),
+                )) ?? "",
+                /k1\) gave its finding \(f1\): every tool is blocked now/,
+            );
+            assert.match(
+                (await desk.block(
+                    k2.session ?? 0,
+                    "bash",
+                    {},
+                    undefined,
+                    typed(k2.session ?? 0),
+                )) ?? "",
+                /k2\) is stopped: every tool is blocked/,
+            );
+            // An unbound session with no marker runs.
+            assert.equal(
+                await desk.block(
+                    Number(supervisorId),
+                    "bash",
+                    {},
+                    undefined,
+                    typed(Number(supervisorId)),
+                ),
+                undefined,
+            );
+            assert.equal(
+                await desk.block(
+                    Number(planningId),
+                    "plan",
+                    {},
+                    undefined,
+                    typed(Number(planningId)),
+                ),
+                undefined,
+            );
+
+            // The flag is set: plan consult starts nothing.
+            await assert.rejects(
+                desk.plan(
+                    { action: "consult", agents: ["irulan"], question: "With no entry read?" },
+                    Number(planningId),
+                    "task-typed",
+                    "call-1",
+                ),
+                /This Pocket gives the desk hook no entry read, so a consult cannot be held read-only before its bind: no consult starts\./,
+            );
+            assert.equal((await planSnapshot()).consults.length, count);
+        } finally {
+            desk.restore();
+        }
     });
 });

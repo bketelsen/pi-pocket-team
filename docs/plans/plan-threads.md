@@ -880,9 +880,9 @@ Each line below differs from the design above, or settles what it left open, and
 - **`Consult.key` is the call's key** (`plan:<task>:<call>`), the same for every consult of 1 call: a replay finds them
   all by it, and adds nothing. **The start key is `x.desk.consult:<plan>:<consult>`**, 1 for each consult. Pocket keeps
   a start's record by source and key, so a replay of a consult that is still `starting` gets the same session back.
-- **A thrown start does not fail the call.** The reply lists each consult's outcome (`k2 (teg): running`, or `did not
-start: <why>`): 1 failure in a panel of 3 leaves the other 2 running. The failed consult gets `end.why: "start"` and
-  1 event, and the gate does not wait for it.
+- **A thrown start does not fail the call.** The reply lists each consult's outcome: `k2 (teg): running`, or
+  `k2 (teg): did not start: <why>`. 1 failure in a panel of 3 leaves the other 2 running. The failed consult gets
+  `end.why: "start"` and 1 event, and the gate does not wait for it.
 - **`Consult` gains `end`** (`{ at, why, by?, text? }`, `why` is `start`, `timeout`, `stopped` or `plan`): why a
   consult ended with no finding. The page, `plan read` and the wake-up read it.
 - **A bind after an end keeps the end.** A consult that Brian stopped, or that timed out, while its start ran records
@@ -902,17 +902,31 @@ start: <why>`): 1 failure in a panel of 3 leaves the other 2 running. The failed
 
 **The hook**
 
-- **The hook reads the first entry through its `api`'s commit.** Pocket's hook API type has only `snapshot`, and no
-  read of entries; pi-durable gives the hook the tool task's runtime, whose commit has `tx.scanEntries`. The commit
-  only reads, and changes nothing. An `api` with no commit is a read error.
+- **The hook checks the typed path first.** It reads the desk's state with `snapshot` (Pocket's typed hook API), and a
+  session that a consult is bound to is held by that consult's state. This path needs no entry read, so a bound
+  consult stays read-only whatever a later pi-durable gives the hook.
+- **Only the window before the bind reads the first entry, through its `api`'s commit.** Pocket's hook API type has
+  only `snapshot`, and no read of entries; pi-durable gives the hook the tool task's runtime, whose commit has
+  `tx.scanEntries`. The commit only reads, and changes nothing.
+- **An `api` with no commit lets an unbound session run.** The hook runs on every tool call of every session of the
+  team: blocking all of them because the read is gone would stop the whole team. The hook then sets a flag in the
+  module's instance (`entryRead: "missing"`), and `plan consult` starts no consult while it is set: "This Pocket gives
+  the desk hook no entry read, so a consult cannot be held read-only before its bind: no consult starts." So no
+  consult can run unheld before its bind.
+- **`plan consult` also refuses while the flag is unknown**: the hook has not run in this module instance yet. The
+  hook runs before every model-issued call, `plan consult` too, so in a live call the flag is known. Only a replay
+  after a restart runs no hook; it is refused, and the consults of that call that are still `starting` fail at once,
+  so the gate does not wait 60 minutes for them. No probe is used: the tool's own `api` is not the hook's, so a probe
+  there would not tell what the hook can do.
+- **A read that fails (the commit is there, and it throws) blocks the call** with "Try the call again in a moment.",
+  and keeps nothing.
 - **Only the desk's form of the marker counts**: `[plan-consult ` and 32 hex characters, anywhere in the first entry.
   A text that talks about consults (a brief, a doc, Brian's idea) then never blocks a session, and no other form could
   name a consult of the desk.
 - **The cache is a map in the module's instance**, by conversation id. A read error, or a session with no `pi.user`
   entry yet, keeps nothing, so the next call reads again. A reload or a restart reads again.
-- **The hook acts only on a session with the marker.** There, the consult bound to the session wins over one named by
-  a nonce, and a running consult's 2 tools pass only in its own bound session. An error after the marker was found
-  (the desk's state) blocks too.
+- **An unbound session is touched only with the marker.** There, a running consult's 2 tools pass only in its own
+  bound session. A state read that failed blocks a session with the marker, and lets a session without one run.
 - **`plan read` is blocked in a consult**, and so is every nested call, `read` too: the brief gives the plan file's
   path, and `read` is enough. A consult of a plan that is done or dropped is blocked whatever its own state.
 
@@ -923,8 +937,8 @@ start: <why>`): 1 failure in a panel of 3 leaves the other 2 running. The failed
   `[desk] News on plan T560:`; a batch of answers and comments keeps its old words.
 - **A consult that times out, or that Brian stops, wakes the planning session** with 1 line. A thrown start does not:
   the call that started it gave its error.
-- **The 60-minute limit runs in the sweep, by the sweep's clock** (the sweeper's task clock, or the time of a `desk
-sync` or page sweep), from the consult's `at`: a start that hangs counts too.
+- **The 60-minute limit runs in the sweep, by the sweep's clock**: the sweeper's task clock, or the time of a page
+  sweep or of `desk sync`. It counts from the consult's `at`, so a start that hangs counts too.
 - **Stop is `plans/:id/consults/:kid/stop`**, owner only, with no key: a second tap finds the consult stopped and gets
   409, as an answered or failed one does; an unknown consult gets 404.
 - **A dropped or verified plan stops its open consults** (`stopped`, `end.why: "plan"`), with 1 event each, and no
