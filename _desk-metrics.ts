@@ -153,10 +153,10 @@ export type UsageKnowledge = "complete" | "partial" | "unknown" | "none";
 
 export type UsageMetrics = UsageRangeSum & {
     /**
-     * What the range sums know. Each counted session is complete (read, caught up, no malformed entry, not missing, no
-     * error, no residual mismatch or unavailable ledger), partial (not complete, but with at least 1 valid entry), or
-     * unknown (not complete, and no valid entry). "none": no counted session (the sums are 0). "unknown": every counted
-     * session is unknown: each range sum field is null, not 0. "partial": at least 1 counted session is partial or
+     * What the range sums know. Each counted session is complete (read, caught up, not dirty: no ledger change since
+     * the last read, no malformed entry, not missing, no error, no residual mismatch or unavailable ledger), partial
+     * (not complete, but with at least 1 valid entry), or unknown (not complete, and no valid entry). "none": no counted
+     * session (the sums are 0). "unknown": every counted session is unknown: each range sum field is null, not 0. "partial": at least 1 counted session is partial or
      * unknown, and at least 1 is not unknown: the sums are the known subtotal. "complete": every counted session is
      * complete. A scope's state comes from its own raw sessions, never from the states of its rows.
      */
@@ -760,15 +760,17 @@ function reducePrs(prs: readonly PrFact[], window: Window): PrMetrics {
 const entriesOf = (counters: Readonly<Counters> | undefined): number => num(counters?.entries);
 
 /**
- * What 1 counted session knows of its usage. A gap: never read, not caught up, malformed entries, its conversation
- * gone, a failed page, or a residual mismatch or unavailable ledger. With a gap, a session with at least 1 valid entry
- * (any day, undated, or before the boundary) is partial, and one with none is unknown: its 0 is no recorded 0.
+ * What 1 counted session knows of its usage. A gap: never read, not caught up, its ledger changed since the last read
+ * (`dirty`: its stored entries lack the new usage), malformed entries, its conversation gone, a failed page, or a
+ * residual mismatch or unavailable ledger. With a gap, a session with at least 1 valid entry (any day, undated, or
+ * before the boundary) is partial, and one with none is unknown: its 0 is no recorded 0.
  */
 function sessionKnowledge(session: Readonly<SessionUsage>): "complete" | "partial" | "unknown" {
     const residual = session.residual?.state;
     const gap =
         session.scannedAt === undefined ||
         session.caughtUp !== true ||
+        session.dirty === true ||
         num(session.skipped?.malformed) > 0 ||
         session.missingAt !== undefined ||
         session.error !== undefined ||
@@ -1245,7 +1247,7 @@ const LIMITS = {
     "usage-gaps":
         "Some counted sessions have malformed entries, a ledger mismatch, or a ledger that could not be read: their usage is incomplete.",
     "usage-unknown":
-        "Some counted sessions have no complete usage read (not read yet, gone, failed, or only malformed entries): their usage is unknown or partial, not 0.",
+        "Some counted sessions have no complete usage read (not read yet, changed since the last read, gone, failed, or only malformed entries): their usage is unknown or partial, not 0.",
     "zero-cost-reported":
         "Some entries report a cost of exactly 0: subscription or provider pricing can report 0.",
     "partial-first-day":

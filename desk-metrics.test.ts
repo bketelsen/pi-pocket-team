@@ -1361,7 +1361,7 @@ describe("usage", () => {
             answer.coverage.limitations.find((each) => each.code === "usage-unknown"),
             {
                 code: "usage-unknown",
-                text: "Some counted sessions have no complete usage read (not read yet, gone, failed, or only malformed entries): their usage is unknown or partial, not 0.",
+                text: "Some counted sessions have no complete usage read (not read yet, changed since the last read, gone, failed, or only malformed entries): their usage is unknown or partial, not 0.",
             },
         );
         assert(
@@ -1376,6 +1376,7 @@ describe("usage", () => {
             { scannedAt: undefined, caughtUp: true },
             { scannedAt: oct(29), caughtUp: false },
             { scannedAt: oct(29) },
+            { ...READ, dirty: true, residual: { state: "pending" } },
             { ...READ, skipped: { malformed: 1 } },
             { ...READ, missingAt: oct(20) },
             { ...READ, error: "read failed", errorAt: oct(20) },
@@ -1425,6 +1426,43 @@ describe("usage", () => {
             }).state,
             "complete",
         );
+    });
+
+    test("a dirty session (its ledger changed since the last read) is a gap; a clean pending one is not", () => {
+        const window = windowOf("2026-10-01", "2026-10-29");
+        const usageOf = (overrides: Partial<SessionUsage>) =>
+            reduce(factsOf({ sessions: [session(1, { ...READ, ...overrides })] }), window).usage;
+        const dirty = { dirty: true, residual: { state: "pending" } } as const;
+
+        const none = usageOf(dirty);
+
+        assert.equal(none.state, "unknown");
+        assert.deepEqual(none.sessionStates, { complete: 0, partial: 0, unknown: 1 });
+        assert.deepEqual(sums(none), NULL_SUMS);
+
+        const some = usageOf({ ...dirty, days: oneEntry() });
+
+        assert.equal(some.state, "partial");
+        assert.deepEqual(some.sessionStates, { complete: 0, partial: 1, unknown: 0 });
+        assert.deepEqual(sums(some), {
+            entries: 1,
+            input: 10,
+            output: 5,
+            cacheRead: 0,
+            cacheWrite: 0,
+            totalTokens: 15,
+            cost: 0.5,
+            costEntries: 1,
+            zeroCostEntries: 0,
+            unknownCostEntries: 0,
+        });
+
+        const clean = usageOf({ residual: { state: "pending" }, days: oneEntry() });
+
+        assert.equal(clean.state, "complete");
+        assert.equal(clean.totalTokens, 15);
+        assert.equal(usageOf({ residual: { state: "pending" } }).entries, 0);
+        assert.equal(usageOf({ residual: { state: "pending" } }).state, "complete");
     });
 
     test("known and unknown sessions: the known sums stay exact, the state is partial", () => {
