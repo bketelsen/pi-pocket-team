@@ -48,6 +48,7 @@ import {
     type DashboardState,
     type Read,
 } from "./_desk-dashboard.ts";
+import { DeskUsage } from "./_desk-usage.ts";
 import { DeskThreads, SWEEP_SLEEP_MS, type DeskState, type PrLink, type Thread } from "./desk.ts";
 
 // ─── Fixtures ────────────────────────────────────────────────────────────────
@@ -1825,6 +1826,7 @@ describe("the collector in Pocket", () => {
             recursive: true,
         });
         cpSync(join(import.meta.dirname, "desk.ts"), join(dropIns, "desk.ts"));
+        cpSync(join(import.meta.dirname, "_desk-usage.ts"), join(dropIns, "_desk-usage.ts"));
         cpSync(
             join(import.meta.dirname, "_desk-dashboard.ts"),
             join(dropIns, "_desk-dashboard.ts"),
@@ -1990,6 +1992,12 @@ describe("the collector in Pocket", () => {
             );
             assert.equal(doc?.sources.github?.pending, 1);
             assert.equal(doc?.sources.github?.complete, false);
+
+            // The boundary was fixed at the first pass: this pass ran the usage step, which a failing gh does not touch.
+            const usage = await app.harness.snapshot(DeskUsage, context);
+
+            assert.equal(usage?.sources.usage?.ok, true);
+            assert.equal(usage?.sources.usage?.boundary, doc?.boundary);
         } finally {
             process.env.PI_POCKET_DESK_GH = fakeGh;
         }
