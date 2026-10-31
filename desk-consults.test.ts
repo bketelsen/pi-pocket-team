@@ -1501,6 +1501,7 @@ before(async () => {
     // The dashboard helper that desk.ts imports.
     cpSync(join(import.meta.dirname, "_desk-usage.ts"), join(dropIns, "_desk-usage.ts"));
     cpSync(join(import.meta.dirname, "_desk-dashboard.ts"), join(dropIns, "_desk-dashboard.ts"));
+    cpSync(join(import.meta.dirname, "_desk-metrics.ts"), join(dropIns, "_desk-metrics.ts"));
     cpSync(join(import.meta.dirname, "desk-web"), join(dropIns, "desk-web"), { recursive: true });
     writeFileSync(fixturePath, JSON.stringify({ data: { viewer: { login: "github-viewer" } } }));
     writeFileSync(fakeGh, `#!/bin/sh\ncat ${JSON.stringify(fixturePath)}\n`, { mode: 0o755 });
