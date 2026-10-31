@@ -9,7 +9,8 @@
  * number of facts.
  *
  * All times are epoch milliseconds (UTC). A range is inclusive at its start and exclusive at its end. Unknown is null,
- * never 0.
+ * never 0: a usage scope whose counted sessions all have no complete read (`UsageMetrics.state` "unknown") has null
+ * range sums, and an explicit recorded 0 stays 0.
  *
  * Pocket does not load this file as a module: the `_` prefix keeps it out. `desk.ts` imports it.
  */
@@ -144,7 +145,24 @@ export type UsageSum = {
     unknownCostEntries: number;
 };
 
-export type UsageMetrics = UsageSum & {
+/** The range sum fields of `UsageMetrics`: null when the scope's usage is unknown. */
+type UsageRangeSum = { [K in keyof UsageSum]: UsageSum[K] | null };
+
+/** What the counted sessions of a scope know of their usage. */
+export type UsageKnowledge = "complete" | "partial" | "unknown" | "none";
+
+export type UsageMetrics = UsageRangeSum & {
+    /**
+     * What the range sums know. Each counted session is complete (read, caught up, no malformed entry, not missing, no
+     * error, no residual mismatch or unavailable ledger), partial (not complete, but with at least 1 valid entry), or
+     * unknown (not complete, and no valid entry). "none": no counted session (the sums are 0). "unknown": every counted
+     * session is unknown: each range sum field is null, not 0. "partial": at least 1 counted session is partial or
+     * unknown, and at least 1 is not unknown: the sums are the known subtotal. "complete": every counted session is
+     * complete. A scope's state comes from its own raw sessions, never from the states of its rows.
+     */
+    state: UsageKnowledge;
+    /** The counted sessions by their own usage knowledge. */
+    sessionStates: { complete: number; partial: number; unknown: number };
     /** The sessions that count. */
     sessions: number;
     /** Sessions that do not count. */
@@ -738,10 +756,60 @@ function reducePrs(prs: readonly PrFact[], window: Window): PrMetrics {
     return metrics;
 }
 
+/** The entries of a counters record, 0 when it is absent. */
+const entriesOf = (counters: Readonly<Counters> | undefined): number => num(counters?.entries);
+
+/**
+ * What 1 counted session knows of its usage. A gap: never read, not caught up, malformed entries, its conversation
+ * gone, a failed page, or a residual mismatch or unavailable ledger. With a gap, a session with at least 1 valid entry
+ * (any day, undated, or before the boundary) is partial, and one with none is unknown: its 0 is no recorded 0.
+ */
+function sessionKnowledge(session: Readonly<SessionUsage>): "complete" | "partial" | "unknown" {
+    const residual = session.residual?.state;
+    const gap =
+        session.scannedAt === undefined ||
+        session.caughtUp !== true ||
+        num(session.skipped?.malformed) > 0 ||
+        session.missingAt !== undefined ||
+        session.error !== undefined ||
+        residual === "mismatch" ||
+        residual === "unavailable";
+
+    if (!gap) {
+        return "complete";
+    }
+
+    let entries = entriesOf(session.undated) + entriesOf(session.before);
+
+    for (const models of Object.values(session.days ?? {})) {
+        for (const counters of Object.values(models ?? {})) {
+            entries += entriesOf(counters);
+        }
+    }
+
+    return entries > 0 ? "partial" : "unknown";
+}
+
+/** The state of a scope from the counts of its counted sessions. */
+function usageKnowledge(states: Readonly<UsageMetrics["sessionStates"]>): UsageKnowledge {
+    const { complete, partial, unknown } = states;
+
+    if (complete + partial + unknown === 0) {
+        return "none";
+    }
+
+    if (complete + partial === 0) {
+        return "unknown";
+    }
+
+    return partial + unknown > 0 ? "partial" : "complete";
+}
+
 function reduceUsage(sessions: readonly SessionUsage[], window: Window): UsageMetrics {
     const sum = emptySum();
     const undated = emptySum();
     const residual = zeroTotals();
+    const sessionStates = { complete: 0, partial: 0, unknown: 0 };
     const metrics = {
         sessions: 0,
         excluded: { shared: 0, unlinked: 0 },
@@ -766,6 +834,7 @@ function reduceUsage(sessions: readonly SessionUsage[], window: Window): UsageMe
         }
 
         metrics.sessions += 1;
+        sessionStates[sessionKnowledge(session)] += 1;
 
         if (session.missingAt !== undefined) {
             metrics.missing += 1;
@@ -821,8 +890,27 @@ function reduceUsage(sessions: readonly SessionUsage[], window: Window): UsageMe
         }
     }
 
+    const state = usageKnowledge(sessionStates);
+    const range: UsageRangeSum =
+        state === "unknown"
+            ? {
+                  entries: null,
+                  input: null,
+                  output: null,
+                  cacheRead: null,
+                  cacheWrite: null,
+                  totalTokens: null,
+                  cost: null,
+                  costEntries: null,
+                  zeroCostEntries: null,
+                  unknownCostEntries: null,
+              }
+            : sum;
+
     return {
-        ...sum,
+        ...range,
+        state,
+        sessionStates,
         ...metrics,
         undated: {
             counters: undated,
@@ -848,6 +936,13 @@ function reduceIssues(issues: readonly IssueFact[], window: Window): TimeToSolve
 
     for (const fact of issues) {
         if (fact.untracked === true) {
+            continue;
+        }
+
+        // A ref gone or out of reach keeps its reason, even when an older read stored it as open.
+        if (fact.unresolved === "missing" || fact.unresolved === "inaccessible") {
+            undated(fact.unresolved);
+
             continue;
         }
 
@@ -1149,6 +1244,8 @@ const LIMITS = {
         "Reported model cost is an estimate from recorded usage, not an invoice or a subscription charge.",
     "usage-gaps":
         "Some counted sessions have malformed entries, a ledger mismatch, or a ledger that could not be read: their usage is incomplete.",
+    "usage-unknown":
+        "Some counted sessions have no complete usage read (not read yet, gone, failed, or only malformed entries): their usage is unknown or partial, not 0.",
     "zero-cost-reported":
         "Some entries report a cost of exactly 0: subscription or provider pricing can report 0.",
     "partial-first-day":
@@ -1288,7 +1385,11 @@ function coverageOf(
         limitations.push(limitation("usage-gaps"));
     }
 
-    if (totals.usage.zeroCostEntries > 0) {
+    if (totals.usage.state === "unknown" || totals.usage.state === "partial") {
+        limitations.push(limitation("usage-unknown"));
+    }
+
+    if ((totals.usage.zeroCostEntries ?? 0) > 0) {
         limitations.push(limitation("zero-cost-reported"));
     }
 
