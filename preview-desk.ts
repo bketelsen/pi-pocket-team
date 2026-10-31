@@ -6,7 +6,8 @@
 //
 // Routes beside the app's own, for the checks:
 //   /preview-login            sign in as the owner
-//   /preview-fixture?name=N   seed variant N again (main, empty, not-started, stale, usage-unavailable, partial-usage)
+//   /preview-fixture?name=N   seed variant N again (main, empty, not-started, stale, usage-unavailable, partial-usage,
+//                            residual-only, long)
 //   /preview-fail?on=1|0      make `GET dashboard` fail with a 500, or not
 //   /preview-fail-records?on=1|0
 //                             make `GET dashboard/records` (the drill-down) fail with a 500, or not

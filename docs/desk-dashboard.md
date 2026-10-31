@@ -55,7 +55,8 @@ phone one shows the bketelsen owner row with partial tokens, an unknown cost ("�
   that row's scope and the range shown: the delivery threads the row counts (each closure in the range with its case,
   and the workload now) and its tracked PRs (each with its events in the range and its state), at most 200 of each,
   with the count left out. The read shows its loading, error, and empty states, and aborts when the row closes, the
-  selection changes, or the view goes. A thread opens the Desk's own thread detail (`threads/:id`, owner-only, as on
+  selection changes, or the view goes. Each new snapshot (the 60-second refresh) reads an open drill-down again: the
+  list shown stays while it reads (`aria-busy`), and a failed read again keeps it, marked stale with its own time. A thread opens the Desk's own thread detail (`threads/:id`, owner-only, as on
   the Desk); its Back button ("Back to the dashboard") returns to the Dashboard with the same selection and numbers,
   the same row open, and the focus on that row's button. A thread gone from the desk shows its id and "gone from the
   desk", with no button. A PR links to its GitHub page, built from its validated repository and number.
@@ -162,7 +163,10 @@ The all-work scope includes the unattributed threads, as its numbers do.
   reported a cost shows "—", not $0.00.
 - **Apart from the range totals.** Usage with no valid date (`undated`), and the settled compaction residual: the
   difference between a session's `pi.usage` ledger and the sum of its own entries (compaction summaries have no entry and
-  no date). Both show on the token and cost cards as "Apart", never in a range total and never spread over days.
+  no date). Both show on the token and cost cards as "Apart", never in a range total and never spread over days. The
+  residual has its own knowledge (`residualKnowledge`): it shows whenever a counted session has a settled residual, also
+  when the dated usage is unknown; it is "(partial)" when a counted session has a residual mismatch or a ledger that
+  could not be read, and "—" when no counted session has a settled residual or the usage source has no good read.
 
 ## Collection and backfill
 
@@ -259,5 +263,6 @@ call, no document change and no task during a GET), and `choices`. `desk-dashboa
 `records()` on the preview fixture (its rows hold complete usage with an explicit $0.00, partial usage, and unknown
 usage) and checks the exact numbers and words the screen shows, with the page's own helpers. `desk-web.test.js` covers
 the page's helpers: formats (unknown versus 0), the query path, the scope choices, sorting, the table rows, the usage
-knowledge of each row (`usageKnowledge`, `usageText`, `usageReadLines`), the states, the drill-down helpers
-(`recordsPath`, `prUrl`, the words), and the default view.
+knowledge of each row (`usageKnowledge`, `usageText`, `usageReadLines`), the residual's own knowledge
+(`residualKnowledge`), the states, the drill-down helpers (`recordsPath`, `prUrl`, the words, and `recordsStep` and
+`useRecords`: an open drill-down reads again for each new snapshot), and the default view.

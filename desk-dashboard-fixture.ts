@@ -24,6 +24,7 @@ export const VARIANTS = [
     "stale",
     "usage-unavailable",
     "partial-usage",
+    "residual-only",
     "long",
 ] as const;
 
@@ -482,6 +483,19 @@ export function dashboardFixture(now: number, variant: Variant = "main"): Fixtur
 
         if (ledgerless !== undefined) {
             ledgerless.residual = { state: "unavailable", why: "the ledger could not be read" };
+        }
+    }
+
+    if (variant === "residual-only") {
+        // Each counted session changed since its last read and keeps no entry: its dated usage is unknown. The settled
+        // compaction residual of session 103 stays: it is known apart from the dated usage.
+        for (const each of Object.values(usage.sessions)) {
+            if (each.shared !== true) {
+                each.dirty = true;
+                delete each.days;
+                delete each.undated;
+                delete each.before;
+            }
         }
     }
 
