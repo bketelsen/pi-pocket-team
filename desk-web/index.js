@@ -399,6 +399,37 @@ export const commentLine = (comment) => {
     return `${comment.id} ${comment.by}: ${comment.text}${how}`;
 };
 
+/** How a consult ended with no finding, in a few words. */
+const consultEndText = (end) =>
+    end === undefined
+        ? ""
+        : end.why === "timeout"
+          ? "no finding after 60 min"
+          : end.why === "stopped"
+            ? `stopped by ${end.by ?? "Brian"}`
+            : end.why === "plan"
+              ? "the plan ended"
+              : "did not start";
+
+/** 1 consult, in 1 line: its id, its agent, its state, its ask, its age, and its finding or end. */
+export const consultLine = (consult) =>
+    [
+        `${consult.id} ${consult.agent}`,
+        consult.state,
+        consult.ask === undefined ? "" : `on ${consult.ask}`,
+        `${Math.max(0, Math.round((consult.age ?? 0) / 60000))} min`,
+        consult.finding === undefined ? "" : `finding ${consult.finding}`,
+        consultEndText(consult.end),
+    ]
+        .filter((part) => part !== "")
+        .join(" · ");
+
+/** The findings on 1 ask, in 1 line: "Findings: lucilla supports · teg objects", or "" with none. */
+export const findingsLine = (findings) =>
+    (findings ?? []).length === 0
+        ? ""
+        : `Findings: ${findings.map((finding) => `${finding.agent} ${finding.stance}`).join(" · ")}`;
+
 /** 1 line of a diff, as the Changes fold shows it. */
 export const diffText = (line) => `${line.op} ${line.text}`;
 
@@ -768,6 +799,10 @@ export default function setup(pocket) {
         const dismiss = (comment) =>
             run(undefined, `plans/${id}/comments/${comment.id}/dismiss`, {});
 
+        // A stop takes no key: a second tap finds the consult stopped, and the desk gives 409.
+        const stopConsult = (consult) =>
+            run(undefined, `plans/${id}/consults/${consult.id}/stop`, {});
+
         const requestChanges = async () => {
             const text = changesText.trim();
             const payload = text === "" ? {} : { text, section: changesSection, rev: plan.rev };
@@ -890,6 +925,19 @@ export default function setup(pocket) {
                 (ask.history ?? []).length === 0
                     ? null
                     : html`<div class="small muted">${historyLine(ask)}</div>`
+            }
+            ${
+                (ask.findings ?? []).length === 0
+                    ? null
+                    : html`<div class="desk-plan-findings">
+                          <div class="small">${findingsLine(ask.findings)}</div>
+                          ${ask.findings.map(
+                              (finding) =>
+                                  html`<div class="small muted">
+                                      ${finding.id} ${finding.agent} ${finding.stance}: ${finding.summary}
+                                  </div>`,
+                          )}
+                      </div>`
             }
             ${matrix(ask)}
             ${
@@ -1158,6 +1206,44 @@ export default function setup(pocket) {
                         ${section.asks.map(askCard)} ${commentsOf(section)}
                     </details>`;
                 })}
+                ${
+                    (plan.consults ?? []).length === 0
+                        ? null
+                        : html`<details class="desk-plan-section" open=${plan.consults.some((each) => each.canStop)}>
+                              <summary>Consults (${plan.consults.length})</summary>
+                              <ul class="desk-list">
+                                  ${plan.consults.map((consult) => {
+                                      const finding = (plan.findings ?? []).find(
+                                          (each) => each.id === consult.finding,
+                                      );
+
+                                      return html`<li class="desk-plan-consult">
+                                          <div class="small">${consultLine(consult)}</div>
+                                          <div class="small muted">${consult.question}</div>
+                                          ${
+                                              finding === undefined
+                                                  ? null
+                                                  : html`<div class="small">
+                                                        ${finding.stance}: ${finding.summary}
+                                                    </div>`
+                                          }
+                                          ${
+                                              consult.canStop
+                                                  ? html`<button
+                                                        class="button"
+                                                        disabled=${busy}
+                                                        aria-label=${`Stop ${consult.id}`}
+                                                        onClick=${() => void stopConsult(consult)}
+                                                    >
+                                                        Stop
+                                                    </button>`
+                                                  : null
+                                          }
+                                      </li>`;
+                                  })}
+                              </ul>
+                          </details>`
+                }
                 ${
                     changes.length === 0
                         ? null

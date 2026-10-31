@@ -878,7 +878,32 @@ export type TeamApi = {
      * `plan.start`, bound to the supervisor's conversation. An older Team has none: the desk then refuses the route.
      */
     startPlan?: (request: TeamStartPlanRequest) => Promise<TeamStartPlanResult>;
+    /**
+     * Start 1 plan consult for the desk's `plan consult`: a linked session of a roster agent, in its home, with its
+     * identity and its allowed profile model, under the supervisor's session (the planning session is linked, and
+     * Pocket refuses a start from a linked session). It throws when the start fails. An older Team has none: the desk
+     * then refuses `plan consult`.
+     */
+    startConsult?: (request: TeamStartConsultRequest) => Promise<TeamStartConsultResult>;
 };
+
+/** A plan consult from the desk: the supervisor's session is the source, and the desk's message carries its marker. */
+export type TeamStartConsultRequest = {
+    supervisor: number;
+    read: Pick<DocumentReader, "snapshot">;
+    commit: <T>(change: (tx: Tx) => T | Promise<T>) => Promise<T>;
+    context: Context;
+    /** The roster id of the expert: role agent, with a home. */
+    agent: string;
+    title: string;
+    /** The desk's message: its first line is the consult's marker. */
+    message: string;
+    /** The start's key: the same key gives the same session back. */
+    key: string;
+};
+
+/** What a consult start did: its session and the supervisor's address for it. */
+export type TeamStartConsultResult = { session: number; address: string; model?: string };
 
 /** A New plan from the desk page: the route's conversation is the supervisor's, and the start is the person's own. */
 export type TeamStartPlanRequest = {
@@ -1974,6 +1999,64 @@ export default function createTeam(host: Host, web: Web) {
                     ...(request.model === undefined ? {} : { model: request.model }),
                 },
             );
+        },
+        startConsult: async (request) => {
+            const supervisor = request.supervisor as ConversationId;
+            const identity = await resolveIdentity(
+                request.read,
+                supervisor,
+                request.context,
+                directory,
+            );
+
+            // The source must be the supervisor's own session: never a linked one, never another agent's.
+            if (identity.persona?.role !== "supervisor") {
+                throw new Error(
+                    `Conversation ${String(request.supervisor)} is not a supervisor's: a consult starts under the plan's supervisor.`,
+                );
+            }
+
+            const persona = (await roster(directory)).find((agent) => agent.id === request.agent);
+
+            if (persona === undefined) {
+                throw new Error(
+                    `${request.agent} is not on the team: a consult goes to a roster agent.`,
+                );
+            }
+
+            if (persona.role !== "agent") {
+                throw new Error(
+                    `${persona.name} is a ${persona.role}: a consult goes to a roster agent with role agent.`,
+                );
+            }
+
+            if (persona.home === undefined) {
+                throw new Error(
+                    `${persona.name} has no home in its profile: a consult runs in the agent's home, so Brian adds home to ${persona.id}.md.`,
+                );
+            }
+
+            const model = allowedModel(persona);
+            const started = await host.linkedSessions.start(
+                supervisor,
+                {
+                    title: `${persona.name}: consult ${request.title}`.slice(0, 120),
+                    message: taskText(persona, request.message),
+                    cwd: persona.home,
+                    ...(model === undefined ? {} : { model }),
+                },
+                request.key,
+            );
+
+            await request.commit(async (tx) => {
+                (await tx.doc(Identity, started.session as ConversationId)).persona ??= persona;
+            });
+
+            return {
+                session: Number(started.session),
+                address: started.address,
+                ...(model === undefined ? {} : { model }),
+            };
         },
     };
     const sharedTeam = globalThis as unknown as Record<symbol, TeamApi | undefined>;

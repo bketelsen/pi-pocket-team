@@ -6,6 +6,8 @@ import setup, {
     approveLabel,
     attemptLine,
     commentLine,
+    consultLine,
+    findingsLine,
     diffText,
     forgetKey,
     historyLine,
@@ -964,6 +966,52 @@ test("tasks, attempts, rounds, comments and diff lines read as 1 line each", () 
         "c3 Brian: x · settled by rev 3f2a9c1",
     );
     assert.equal(diffText({ op: "+", text: "new" }), "+ new");
+});
+
+test("a consult and the findings of an ask, in 1 line each", () => {
+    assert.equal(
+        consultLine({ id: "k2", agent: "teg", state: "running", ask: "T5b", age: 12 * 60000 }),
+        "k2 teg · running · on T5b · 12 min",
+    );
+    assert.equal(
+        consultLine({
+            id: "k1",
+            agent: "lucilla",
+            state: "answered",
+            age: 30000,
+            finding: "f1",
+        }),
+        "k1 lucilla · answered · 1 min · finding f1",
+    );
+    assert.equal(
+        consultLine({
+            id: "k3",
+            agent: "paul",
+            state: "failed",
+            age: 61 * 60000,
+            end: { why: "timeout" },
+        }),
+        "k3 paul · failed · 61 min · no finding after 60 min",
+    );
+    assert.equal(
+        consultLine({
+            id: "k4",
+            agent: "paul",
+            state: "stopped",
+            age: 0,
+            end: { why: "stopped", by: "brian" },
+        }),
+        "k4 paul · stopped · 0 min · stopped by brian",
+    );
+    assert.equal(
+        findingsLine([
+            { agent: "lucilla", stance: "supports" },
+            { agent: "teg", stance: "objects" },
+        ]),
+        "Findings: lucilla supports · teg objects",
+    );
+    assert.equal(findingsLine([]), "");
+    assert.equal(findingsLine(undefined), "");
 });
 
 test("the Plans section shows New plan, off with its reason before the roster is read", async () => {

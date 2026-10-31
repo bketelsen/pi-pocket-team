@@ -1,7 +1,7 @@
 # Plan threads: an idea becomes a settled plan before work starts
 
-Status: PR 1, the plan and the gate, and PR 2, decisions and delivery, are built in this repository (sections 4 to
-7, 9 and 10, less consults and the parts sections 15 and 16 name). PR 3, consults, is still design only.
+Status: PR 1, the plan and the gate, PR 2, decisions and delivery, and PR 3, consults, are built in this repository
+(sections 4 to 10, less the parts sections 15, 16 and 17 name).
 Brian asked for it on 2026-10-30 (T547a), after Odrade's report on
 githubnext/chopin (`~/agents/odrade/reports/2026-10-30-chopin/README.md`, Chopin commit `3548849`). Chopin is
 MIT; this design borrows its ideas (decision records, findings, a build gate, an approved revision, a task graph,
@@ -860,3 +860,72 @@ do
     --description "Brian: plan this first (a plan thread), then work"
 done
 ```
+
+## 17. What PR 3 built, and where it differs
+
+PR 3 is built: `plan consult` and `plan finding`; Team's `startConsult`, which starts each consult under the
+supervisor's session; the read-only hook; the bounds, the 60-minute limit and the page's **Stop**; the consults and the
+stances on the plan view; and the consults and findings in `plan read`.
+
+Each line below differs from the design above, or settles what it left open, and says why.
+
+**The call and its bounds**
+
+- **The settings are `plans.consults: { running, total }`** in `desk.json`: `running` 1 to 10 (default 3), `total` 1
+  to 20 (default 8), and `running` never more than `total`. A bad value gives its default, as `plans.max` does. 20 at
+  most keeps every ask under its 20 findings.
+- **1 bad agent refuses the whole call**: a duplicate, the lead, a supervisor or a Clerk (by role), no home, or an id
+  that is not on the roster. A panel is 1 decision of the planning session, so it starts whole or not at all.
+- **`ask` must be a plan ask of this plan**, in any state: a finding on a settled ask still informs a reopen.
+- **`Consult.key` is the call's key** (`plan:<task>:<call>`), the same for every consult of 1 call: a replay finds them
+  all by it, and adds nothing. **The start key is `x.desk.consult:<plan>:<consult>`**, 1 for each consult. Pocket keeps
+  a start's record by source and key, so a replay of a consult that is still `starting` gets the same session back.
+- **A thrown start does not fail the call.** The reply lists each consult's outcome (`k2 (teg): running`, or `did not
+start: <why>`): 1 failure in a panel of 3 leaves the other 2 running. The failed consult gets `end.why: "start"` and
+  1 event, and the gate does not wait for it.
+- **`Consult` gains `end`** (`{ at, why, by?, text? }`, `why` is `start`, `timeout`, `stopped` or `plan`): why a
+  consult ended with no finding. The page, `plan read` and the wake-up read it.
+- **A bind after an end keeps the end.** A consult that Brian stopped, or that timed out, while its start ran records
+  its session only, and stays blocked.
+
+**Team's start**
+
+- **`startConsult` is a new optional member of Team's API** (it stays `version: 1`). It checks that the source is a
+  supervisor's session, and that the agent has role `agent` and a home; it starts with the agent's allowed profile
+  model, or with Pocket's own rule when that model is not allowed. It binds the identity after the start returns, as
+  every other Team start does: the identity text is in the first message already.
+- **The supervisor's plan mode refuses the start**: that is Pocket's rule for a linked start from a session in plan
+  mode. The consult then fails with Pocket's words.
+- **Team's identity text tells the session to report with `team_message`.** The hook blocks it, and the desk's brief
+  says that every tool but `read` and `plan finding` is blocked. The identity text is shared by every Team start, so it
+  stays as it is.
+
+**The hook**
+
+- **The hook reads the first entry through its `api`'s commit.** Pocket's hook API type has only `snapshot`, and no
+  read of entries; pi-durable gives the hook the tool task's runtime, whose commit has `tx.scanEntries`. The commit
+  only reads, and changes nothing. An `api` with no commit is a read error.
+- **Only the desk's form of the marker counts**: `[plan-consult ` and 32 hex characters, anywhere in the first entry.
+  A text that talks about consults (a brief, a doc, Brian's idea) then never blocks a session, and no other form could
+  name a consult of the desk.
+- **The cache is a map in the module's instance**, by conversation id. A read error, or a session with no `pi.user`
+  entry yet, keeps nothing, so the next call reads again. A reload or a restart reads again.
+- **The hook acts only on a session with the marker.** There, the consult bound to the session wins over one named by
+  a nonce, and a running consult's 2 tools pass only in its own bound session. An error after the marker was found
+  (the desk's state) blocks too.
+- **`plan read` is blocked in a consult**, and so is every nested call, `read` too: the brief gives the plan file's
+  path, and `read` is enough. A consult of a plan that is done or dropped is blocked whatever its own state.
+
+**The finding and the end**
+
+- **The wake-up keys are `finding:<id>` and `consult-end:<id>`**, in the answer wake-up. A finding's key stays in
+  `wake.sent` for good. A batch with consult news only starts `[desk] Consult news on plan T560:`; a mixed batch starts
+  `[desk] News on plan T560:`; a batch of answers and comments keeps its old words.
+- **A consult that times out, or that Brian stops, wakes the planning session** with 1 line. A thrown start does not:
+  the call that started it gave its error.
+- **The 60-minute limit runs in the sweep, by the sweep's clock** (the sweeper's task clock, or the time of a `desk
+sync` or page sweep), from the consult's `at`: a start that hangs counts too.
+- **Stop is `plans/:id/consults/:kid/stop`**, owner only, with no key: a second tap finds the consult stopped and gets
+  409, as an answered or failed one does; an unknown consult gets 404.
+- **A dropped or verified plan stops its open consults** (`stopped`, `end.why: "plan"`), with 1 event each, and no
+  wake-up: the plan wakes no session then.
