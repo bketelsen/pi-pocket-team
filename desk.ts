@@ -671,9 +671,10 @@ export type Consult = {
     /**
      * The tries of its start: the last try's time, how many, and the last error. A start that throws is an unknown
      * outcome: the consult stays `starting`, and the sweep tries again under the same key. `unresolved`: a try began,
-     * so a session may exist; it goes when the desk has the session's address (`consultUnresolved`).
+     * so a session may exist; it goes when the desk has the session's address (`consultUnresolved`). `pending`: the
+     * last try began and its result is not committed yet (`consultTryActive`, held at most 10 minutes from `at`).
      */
-    start?: { at: number; tries: number; error?: string; unresolved?: true };
+    start?: { at: number; tries: number; error?: string; unresolved?: true; pending?: true };
 };
 
 /** One answer from a consult. Stored data: never rename a field. */
@@ -15508,6 +15509,7 @@ export function bindConsult(
     // The identity is known now: the sweep stops its tries, and leaves the session out by its address.
     if (consult.start !== undefined) {
         delete consult.start.unresolved;
+        delete consult.start.pending;
     }
 
     // An ended consult whose session a recovery found: it keeps its end, and never runs.
@@ -15590,46 +15592,84 @@ export const consultStartKey = (planId: string, consultId: string): string =>
 export const consultUnresolved = (consult: Consult): boolean =>
     consult.start?.unresolved === true && consult.address === undefined;
 
-/** Whether a consult keeps the sweep from making found threads: it starts, or its identity is open with tries left. */
-export const consultInFlight = (consult: Consult): boolean =>
+/**
+ * How long a try that began keeps a consult in flight with no result: 10 minutes. A try whose result is not committed
+ * (its start runs, or its process died) holds the pause of found-thread discovery for this long after its `start.at`,
+ * the last try too; then a dead try holds nothing more.
+ */
+export const CONSULT_TRY_HOLD_MS = 10 * 60_000;
+
+/** Whether a try of a consult began and has no result yet, inside its hold. */
+export const consultTryActive = (consult: Consult, now: number): boolean =>
+    consult.start?.pending === true && now - consult.start.at < CONSULT_TRY_HOLD_MS;
+
+/**
+ * Whether a consult keeps the sweep from making found threads, and keeps its supervisor's sweeper: it starts, or its
+ * identity is open with tries left, or a try of it runs (the 10th too, until its result is committed).
+ */
+export const consultInFlight = (consult: Consult, now: number): boolean =>
     consult.state === "starting" ||
-    (consultUnresolved(consult) && (consult.start?.tries ?? 0) < CONSULT_START_TRIES);
+    (consultUnresolved(consult) &&
+        ((consult.start?.tries ?? 0) < CONSULT_START_TRIES || consultTryActive(consult, now)));
+
+/** Whether a supervisor has a consult in flight: its sweeper must stay, and its found-thread discovery waits. */
+export function consultsPending(
+    state: Readonly<DeskState> | undefined,
+    supervisor: number,
+    now: number,
+): boolean {
+    return Object.values(state?.plans ?? {}).some(
+        (plan) =>
+            threadById(state, plan.thread)?.supervisor === supervisor &&
+            (plan.consults ?? []).some((consult) => consultInFlight(consult, now)),
+    );
+}
+
+/**
+ * What the hook knows of its entry read in this module instance: `available`, `unknown` (no hook call yet), or
+ * `missing` (its `api` has no commit).
+ */
+export type EntryRead = "available" | "unknown" | "missing";
 
 /** What 1 try does: `start` sends the brief to a consult that starts; `recover` finds an ended consult's session. */
 export type ConsultTryMode = "start" | "recover";
 
 /**
  * The try a consult takes now, or why it takes none. Every rule is here, so the sweep's choice and the commit of the
- * try check the same: the hook's entry read; for a start, the state `starting`, a plan that drafts, no session, the
- * 60-minute limit and fewer than 10 tries, and for a retry (not the call's first try) 60 seconds since the last try;
- * for a recovery, an ended consult whose identity is open, fewer than 10 tries, and 60 seconds since the last try.
+ * try check the same: fewer than 10 tries, and 60 seconds since the last try, except for the call's very first try
+ * (`first`, and no try stored: a replay after a recorded try waits its 60 seconds); for a start, the hook's entry read
+ * (`available`), the state `starting`, a plan that drafts, no session and the 60-minute limit; for a recovery, an ended
+ * consult whose identity is open, and an entry read that is not `missing` (a recovery's message is the short one to
+ * an ended consult, and the bind holds it by its state).
  */
 export function consultTryMode(
     plan: Plan,
     consult: Consult,
     now: number,
-    request: { first: boolean; entryRead: boolean },
+    request: { first: boolean; entryRead: EntryRead },
 ): ConsultTryMode | undefined {
     const tries = consult.start?.tries ?? 0;
-    const spaced = now - (consult.start?.at ?? consult.at) >= CONSULT_RETRY_MS;
+    const spaced =
+        (request.first && tries === 0) ||
+        now - (consult.start?.at ?? consult.at) >= CONSULT_RETRY_MS;
 
-    if (!request.entryRead || tries >= CONSULT_START_TRIES) {
+    if (tries >= CONSULT_START_TRIES || !spaced) {
         return undefined;
     }
 
     if (consult.state === "starting") {
-        return plan.state === "drafting" &&
+        return request.entryRead === "available" &&
+            plan.state === "drafting" &&
             consult.session === undefined &&
-            now - consult.at < CONSULT_LIMIT_MS &&
-            (request.first || spaced)
+            now - consult.at < CONSULT_LIMIT_MS
             ? "start"
             : undefined;
     }
 
-    return !request.first &&
+    return request.entryRead !== "missing" &&
+        !request.first &&
         (consult.state === "failed" || consult.state === "stopped") &&
-        consultUnresolved(consult) &&
-        spaced
+        consultUnresolved(consult)
         ? "recover"
         : undefined;
 }
@@ -15644,7 +15684,7 @@ export function consultTry(
     planId: string,
     consultId: string,
     at: number,
-    request: { first: boolean; entryRead: boolean },
+    request: { first: boolean; entryRead: EntryRead },
 ): { consult: Consult; mode: ConsultTryMode; before: boolean } | undefined {
     const plan = planOf(state, planId);
     const consult = consultOf(plan, consultId);
@@ -15666,6 +15706,7 @@ export function consultTry(
         tries: (consult.start?.tries ?? 0) + 1,
         ...(consult.start?.error === undefined ? {} : { error: consult.start.error }),
         unresolved: true,
+        pending: true,
     };
 
     return { consult: consultCopy(consult), mode, before };
@@ -15680,8 +15721,12 @@ export function consultTrySkipped(
 ): void {
     const consult = consultOf(planOf(state, planId), consultId);
 
-    if (consult?.start !== undefined && !before) {
-        delete consult.start.unresolved;
+    if (consult?.start !== undefined) {
+        delete consult.start.pending;
+
+        if (!before) {
+            delete consult.start.unresolved;
+        }
     }
 }
 
@@ -15708,6 +15753,7 @@ export function consultStartFailed(
     const tries = consult.start?.tries ?? 1;
     const error = flatLine(why).slice(0, 300);
 
+    // The try's result is in: it holds the pause no more (no `pending`).
     consult.start = { at: consult.start?.at ?? at, tries, error, unresolved: true };
 
     const thread = threadById(state, plan.thread);
@@ -15739,7 +15785,7 @@ export function consultRetries(
     state: Readonly<DeskState> | undefined,
     supervisor: number,
     now: number,
-    entryRead = true,
+    entryRead: EntryRead = "available",
 ): { plan: string; consult: string; mode: ConsultTryMode }[] {
     const due: { plan: string; consult: string; mode: ConsultTryMode }[] = [];
 
@@ -20107,9 +20153,7 @@ export default function createDesk(host: Host, web: Web) {
         // consult that is still starting is in flight the same way.
         const inFlight =
             open.some((thread) => thread.state === "starting") ||
-            Object.values(state.plans ?? {}).some((plan) =>
-                (plan.consults ?? []).some(consultInFlight),
-            );
+            consultsPending(state, supervisor, now);
 
         for (const session of facts.sessions ?? []) {
             if (
@@ -20686,7 +20730,10 @@ export default function createDesk(host: Host, web: Web) {
                         quietWatched(state, Number(supervisor), runtime.now()) ||
                         readyWatched(state, Number(supervisor), runtime.now());
 
-                    if (!open && !watched) {
+                    // A consult in flight (a start, or an identity to recover) keeps the sweeper: only a sweep tries it.
+                    const consulting = consultsPending(state, Number(supervisor), runtime.now());
+
+                    if (!open && !watched && !consulting) {
                         if (
                             state.sweepers?.[String(Number(supervisor))] === String(runtime.taskId)
                         ) {
@@ -20875,11 +20922,13 @@ export default function createDesk(host: Host, web: Web) {
         );
 
         // A closed done thread that a supervisor's message woke is watched for 24 hours: a report after the wake opens
-        // it, and a sweeper must be there to see it. A ready PR on a recently closed thread needs one too.
+        // it, and a sweeper must be there to see it. A ready PR on a recently closed thread needs one too, and so does a
+        // consult in flight (a start, or an identity to recover): only a sweep tries it.
         if (
             !open &&
             !quietWatched(state, supervisor, Date.now()) &&
-            !readyWatched(state, supervisor, Date.now())
+            !readyWatched(state, supervisor, Date.now()) &&
+            !consultsPending(state, supervisor, Date.now())
         ) {
             return;
         }
@@ -20916,10 +20965,14 @@ export default function createDesk(host: Host, web: Web) {
         for (const thread of Object.values(state.threads)) {
             const supervisor = thread.supervisor;
 
+            // A consult in flight (a start, or an identity to recover) keeps a sweeper too: only a sweep tries it, also
+            // after its plan ended.
             if (
                 supervisor !== undefined &&
                 !supervisors.has(supervisor) &&
-                (quietWatched(state, supervisor, now) || readyWatched(state, supervisor, now))
+                (quietWatched(state, supervisor, now) ||
+                    readyWatched(state, supervisor, now) ||
+                    consultsPending(state, supervisor, now))
             ) {
                 supervisors.add(supervisor);
             }
@@ -23412,7 +23465,7 @@ export default function createDesk(host: Host, web: Web) {
      * module instance. `plan consult` starts a consult only while it is `available`: before its bind, only the entry
      * read can hold a consult's session read-only.
      */
-    let entryRead: "unknown" | "available" | "missing" = "unknown";
+    let entryRead: EntryRead = "unknown";
 
     /** The commit of the hook's `api`, when it has one: the tool task's runtime has it, Pocket's hook type does not. */
     const entryCommit = (api: object) => {
@@ -23588,7 +23641,7 @@ export default function createDesk(host: Host, web: Web) {
             await access.commit((state) => {
                 tried = consultTry(state, planId, consultId, now(), {
                     first,
-                    entryRead: entryRead === "available",
+                    entryRead,
                 });
             });
 
@@ -23673,7 +23726,7 @@ export default function createDesk(host: Host, web: Web) {
     /**
      * The sweep's tries: each consult of this supervisor that `consultRetries` names (a start that did not finish, or
      * an ended consult whose identity is open) gets 1 more try under its key; the try's commit checks the rules again.
-     * Only while the hook can read entries: before its bind, only that holds a consult's session.
+     * A start needs the hook's entry read seen (`available`); a recovery needs it not `missing` (`consultTryMode`).
      */
     const retryConsults = async (
         access: PlanPublish,
@@ -23681,11 +23734,12 @@ export default function createDesk(host: Host, web: Web) {
         supervisor: number,
         now: () => number,
     ): Promise<number> => {
-        if (entryRead !== "available" || teamApi()?.startConsult === undefined) {
+        if (entryRead === "missing" || teamApi()?.startConsult === undefined) {
             return 0;
         }
 
-        const due = consultRetries(await access.read(), supervisor, now());
+        // A start needs the entry read seen (`available`); a recovery needs it not `missing`.
+        const due = consultRetries(await access.read(), supervisor, now(), entryRead);
 
         for (const each of due) {
             await startOneConsult(access, deps, each.plan, each.consult, now, false);

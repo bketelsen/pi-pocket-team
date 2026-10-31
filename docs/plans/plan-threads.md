@@ -893,13 +893,19 @@ Each line below differs from the design above, or settles what it left open, and
   the message. Each try gives 1 event: a failed try names its number and its error ("start try 2 did not finish"), and
   a try that worked says `runs (start try 2)`.
 - **Every rule of a try is checked in the commit that records it** (`consultTryMode`), not only on the sweep's
-  snapshot: the hook's entry read, fewer than 10 tries in all (`CONSULT_START_TRIES`, the first one included), and
-  for a start the state `starting`, a plan that drafts, no session and the 60-minute limit. A retry also needs 60
-  seconds since the last try (`CONSULT_RETRY_MS`, so a slow start is not raced); the call's own first try has no
-  spacing rule. So 2 sweeps that picked 1 consult give it 1 try, and a candidate whose limit passes before its commit
+  snapshot: fewer than 10 tries in all (`CONSULT_START_TRIES`, the first one included), and 60 seconds since the last
+  try (`CONSULT_RETRY_MS`, so a slow start is not raced). Only the call's very first try has no spacing rule: the call
+  and no try stored yet. A replay of the call after a recorded try waits its 60 seconds as a retry does. A start also
+  needs the state `starting`, a plan that drafts, no session, the 60-minute limit, and the hook's entry read seen
+  (`available`). So 2 sweeps that picked 1 consult give it 1 try, and a candidate whose limit passes before its commit
   gets none. A set of the start keys that run now, shared by every instance of the module in the process, keeps 2
   tries of 1 consult apart; after a restart they may meet, and then they converge on 1 session, and the bind keeps the
   first one.
+- **A recovery needs the entry read only not `missing`.** After a restart the flag is `unknown` until a hook call, and
+  the sweeper's first sweep comes before any. A recovery sends only the short message to an ended consult, Pocket
+  sends nothing to a session it made before, and the bind holds a new session by its ended state; the hook still reads
+  the first entry of an unbound session whenever its `api` has a commit. A start, which sends the brief, still needs
+  `available`.
 - **A fresh read after the try's commit can still stop the start.** A Stop, a drop or the limit can land between the
   commit and Team's start: the start goes on only while the consult is still `starting` in a plan that drafts (a
   recovery only while its identity is still open). Else Team gets no start, and the try gives the identity back as it
@@ -985,14 +991,27 @@ Each line below differs from the design above, or settles what it left open, and
   blocks every tool there. The desk binds the session and the address, and the consult keeps its end: an ended
   consult never runs.
 - **While an identity is open and tries are left, the consult is in flight** for found-thread discovery, in every
-  state: the sweep makes no found thread for the supervisor then, as for a delegation in flight. The title stays a
-  second guard: Team titles every consult `<agent>: consult <plan> <consult>: <plan title>`, and the sweep leaves out a
-  session whose title holds `: consult T560 k3:` when plan T560 has consult k3. A linked session's list gives the
-  sweep no session id, so it cannot read that session's first message itself.
-- **The limit that is left:** after the last of the 10 tries the protection ends. Only a start that throws on all 10
-  tries after Pocket made the session, with a hidden title (Pocket gives the title only when everyone who sees the
-  supervisor's session sees this one too) or a title a person changed, can still become a found thread. The hook
-  still blocks every tool of that session, so only the cap sees it, and Odrade can close the thread. A session that a
-  person titles like a consult is left out as well.
+  state: the sweep makes no found thread for the supervisor then, as for a delegation in flight. Only the consults of
+  the sweep's own supervisor count. The title stays a second guard: Team titles every consult
+  `<agent>: consult <plan> <consult>: <plan title>`, and the sweep leaves out a session whose title holds
+  `: consult T560 k3:` when plan T560 has consult k3. A linked session's list gives the sweep no session id, so it
+  cannot read that session's first message itself.
+- **A try that runs keeps the pause, the 10th too.** A try counts at its start, so the count alone would end the pause
+  while the last try still runs. The try's commit sets `start.pending`, and its result (the bind, the error, or a
+  skipped start) clears it; while it is set, the consult stays in flight. The mark is restart-safe by a time bound
+  (`CONSULT_TRY_HOLD_MS`, 10 minutes from the try's `at`): a try whose process died holds the pause no longer. A stored
+  mark was chosen over the process-wide set of running keys, because another instance of the module and a sweep after
+  a restart see it too. A Pocket start takes seconds, so 10 minutes leaves room.
+- **A consult in flight keeps its supervisor's sweeper.** A sweep is the only thing that tries a start again or
+  recovers an identity, so a supervisor with a `starting` consult, or an open identity with tries left, or a try that
+  runs, keeps its sweeper also with no open thread or watch (a dropped last plan), and `startSweeper` and
+  `startMissingSweepers` start one for it (the page's look, and every sweep). The sweeper sleeps its 10 minutes as
+  before, so the tries of a recovery come about 10 minutes apart.
+- **The limit that is left (a decision for Brian):** the protection ends after the last of the 10 tries, once its
+  result is committed (or its 10-minute hold has passed). Pocket's public API has no lookup of a start key, so only a
+  start that throws on all 10 tries after Pocket made the session, with a hidden title (Pocket gives the title only
+  when everyone who sees the supervisor's session sees this one too) or a title a person changed, can still become a
+  found thread, and it counts toward the cap. The hook still blocks every tool of that session, and Odrade can close
+  the thread. A session that a person titles like a consult is left out as well.
 - **A dropped or verified plan stops its open consults** (`stopped`, `end.why: "plan"`), with 1 event each, and no
   wake-up: the plan wakes no session then.
