@@ -43,12 +43,19 @@ export const MAX_LEDGER_CHECKS = 50;
 export const USAGE_ERROR_RETRY_MS = 15 * 60_000;
 /** A session's child conversations are looked for again after this long, also when the session did not change. */
 export const CHILD_REFRESH_MS = 24 * 3600_000;
+/**
+ * A caught-up session's entries are read again after this long, whatever its ledger says: new usage is collected also
+ * while its ledger cannot be read.
+ */
+export const ENTRY_REFRESH_MS = 6 * 3600_000;
 /** A pass with no change writes `checkedAt` only when the stored value is older than this. */
 export const USAGE_HEARTBEAT_MS = 3600_000;
 /** A residual cost above `-COST_EPSILON` counts as 0 or more: the 2 sums add the same costs in another order. */
 export const COST_EPSILON = 1e-6;
 
 const DAY_MS = 24 * 3600_000;
+/** Why a residual is unavailable. */
+const LEDGER_UNREAD = "the ledger could not be read";
 /** The kind of `AssistantEntry` (`pi.assistant`): generation writes every assistant entry with it. */
 const ASSISTANT = AssistantEntry.kind;
 
@@ -187,7 +194,15 @@ export type UsageSource = {
     checkedAt?: number;
     /** The linked sessions with work left. */
     pending?: number;
-    /** Every linked session that is not shared or missing has caught up and has a complete child discovery. */
+    /**
+     * The linked sessions that caught up but whose ledger could not be read (`residual.state` "unavailable"): a
+     * coverage gap. Absent on a status from before the field.
+     */
+    ledgerUnavailable?: number;
+    /**
+     * Every linked session that is not shared or missing has caught up, has a complete child discovery, and has a
+     * ledger that could be read.
+     */
     complete?: boolean;
     /** A copy of the dashboard's boundary. */
     boundary?: number;
@@ -749,8 +764,9 @@ export function applyEntryPage(
     put(session, "dirty", undefined);
 
     if (context.ledger === undefined) {
-        put(session, "ledger", undefined);
-        put(session, "residual", { state: "unavailable", why: "the ledger could not be read" });
+        // The stored ledger stays: a later check that can read the ledger compares with it, and a changed one makes
+        // the session dirty.
+        put(session, "residual", { state: "unavailable", why: LEDGER_UNREAD });
     } else if (
         counted ||
         session.residual === undefined ||
@@ -775,6 +791,28 @@ export type ChildPage = {
     /** The next page's cursor. */
     next?: Cursor;
 };
+
+/** Whether `id` is `ancestor` or has it among its parents. The walk stops at a session seen before. */
+function descends(draft: Readonly<UsageState>, id: number, ancestor: number): boolean {
+    const seen = new Set<number>();
+    let at: SessionUsage | undefined = draft.sessions?.[String(id)];
+
+    if (id === ancestor) {
+        return true;
+    }
+
+    while (at?.parent !== undefined && !seen.has(at.id)) {
+        seen.add(at.id);
+
+        if (at.parent === ancestor) {
+            return true;
+        }
+
+        at = draft.sessions?.[String(at.parent)];
+    }
+
+    return false;
+}
 
 /**
  * Apply 1 page of child conversations: each child not in the tree yet gets a record with this session as its parent
@@ -808,8 +846,19 @@ export function applyChildPage(
     for (const child of page.children) {
         const key = String(child.id);
 
-        if (child.id !== id && validId(child.id) && draft.sessions[key] === undefined) {
+        if (child.id === id || !validId(child.id)) {
+            continue;
+        }
+
+        const found = draft.sessions[key];
+
+        if (found === undefined) {
             draft.sessions[key] = { id: child.id, parent: id, root: session.root ?? id };
+        } else if (found.parent === undefined && !descends(draft, id, child.id)) {
+            // A session that has its own link and is also a child: the edge is kept, so it inherits when its own
+            // link goes. An existing parent stays, and no edge makes a cycle.
+            found.parent = id;
+            found.root = session.root ?? id;
         }
     }
 
@@ -966,7 +1015,9 @@ export function residualOf(session: Readonly<SessionUsage>, ledger: Totals): Res
 
 /**
  * Apply the ledger checks: a ledger that is not the stored one makes the session dirty (it is read again); the same
- * ledger settles the residual. A ledger that could not be read (undefined) changes nothing.
+ * ledger settles the residual. A ledger that could not be read (undefined) makes the residual unavailable, and keeps
+ * the stored ledger and every count; the first such check also makes the session dirty, and later ones leave the
+ * reads to `ENTRY_REFRESH_MS`, so sessions whose ledgers keep failing do not take every page of each pass.
  */
 export function applyChecks(
     draft: UsageState,
@@ -975,12 +1026,16 @@ export function applyChecks(
     for (const [id, ledger] of ledgers) {
         const session = draft.sessions?.[String(id)];
 
-        if (
-            session === undefined ||
-            !active(session) ||
-            session.caughtUp !== true ||
-            ledger === undefined
-        ) {
+        if (session === undefined || !active(session) || session.caughtUp !== true) {
+            continue;
+        }
+
+        if (ledger === undefined) {
+            if (session.residual?.state !== "unavailable") {
+                put(session, "dirty", true);
+            }
+
+            put(session, "residual", { state: "unavailable", why: LEDGER_UNREAD });
             continue;
         }
 
@@ -1012,8 +1067,8 @@ function childrenDue(session: Readonly<SessionUsage>, now: number): boolean {
 }
 
 /**
- * Every due page of work, in order: a new link (never read), an unfinished scan, a dirty session, child discovery, an
- * error past its retry time. Ties: the lower id first. A session whose page failed waits `USAGE_ERROR_RETRY_MS`.
+ * Every due page of work, in order: a new link (never read), an unfinished scan, a dirty session, child discovery, a
+ * scan older than `ENTRY_REFRESH_MS`, an error past its retry time. Ties: the lower id first. A session whose page failed waits `USAGE_ERROR_RETRY_MS`.
  */
 export function dueWork(state: Readonly<UsageState> | undefined, now: number): Work[] {
     const work: Work[] = [];
@@ -1037,8 +1092,10 @@ export function dueWork(state: Readonly<UsageState> | undefined, now: number): W
             work.push({ kind: "scan", id: session.id, why: 2 });
         } else if (childrenDue(session, now)) {
             work.push({ kind: "children", id: session.id, why: 3 });
-        } else if (failed) {
+        } else if (now - session.scannedAt >= ENTRY_REFRESH_MS) {
             work.push({ kind: "scan", id: session.id, why: 4 });
+        } else if (failed) {
+            work.push({ kind: "scan", id: session.id, why: 5 });
         }
     }
 
@@ -1060,9 +1117,22 @@ function hasWork(session: Readonly<SessionUsage>): boolean {
     );
 }
 
+/** `list` turned by `slot` steps of `take`, so that successive slots go round the whole list. */
+function rotate<T>(list: readonly T[], slot: number, take: number): T[] {
+    if (list.length === 0 || take <= 0) {
+        return [];
+    }
+
+    const offset = (((Math.floor(slot) * take) % list.length) + list.length) % list.length;
+
+    return [...list.slice(offset), ...list.slice(0, offset)].slice(0, take);
+}
+
 /**
- * The sessions to check against their ledgers: every session that caught up in this pass, then, at most
- * `MAX_LEDGER_CHECKS`: the caught-up sessions with no settled check first, then the rest round-robin from `slot`.
+ * The sessions to check against their ledgers: every session that caught up in this pass, then at most
+ * `MAX_LEDGER_CHECKS` more, from 2 groups that each get half of it: the caught-up sessions with no settled check
+ * (pending, unavailable, or never checked), and the rest. A half that 1 group does not use goes to the other. Each
+ * group turns by `slot`, so every session is checked within a few passes.
  */
 export function planChecks(
     state: Readonly<UsageState> | undefined,
@@ -1075,18 +1145,17 @@ export function planChecks(
         )
         .sort(byNumber);
     const open = sessions.filter(
-        (session) => session.residual === undefined || session.residual.state === "pending",
+        (session) => session.residual === undefined || session.residual.state !== "settled",
     );
-    const rest = sessions.filter((session) => !open.includes(session));
-    const offset =
-        rest.length === 0
-            ? 0
-            : (((Math.floor(slot) * MAX_LEDGER_CHECKS) % rest.length) + rest.length) % rest.length;
-    const rotated = [...rest.slice(offset), ...rest.slice(0, offset)];
+    const rest = sessions.filter((session) => session.residual?.state === "settled");
+    const half = Math.ceil(MAX_LEDGER_CHECKS / 2);
+    const openTake = Math.min(open.length, Math.max(half, MAX_LEDGER_CHECKS - rest.length));
+    const restTake = Math.min(rest.length, MAX_LEDGER_CHECKS - openTake);
 
     return [
         ...[...caught].sort((a, b) => a - b),
-        ...[...open, ...rotated].slice(0, MAX_LEDGER_CHECKS).map((session) => session.id),
+        ...rotate(open, slot, openTake).map((session) => session.id),
+        ...rotate(rest, slot, restTake).map((session) => session.id),
     ];
 }
 
@@ -1102,7 +1171,10 @@ export function applyUsageSource(
     const { now, boundary } = input;
     const linked = Object.values(draft.sessions ?? {}).filter(active);
     const pending = linked.filter(hasWork).length;
-    const complete = pending === 0;
+    const ledgerUnavailable = linked.filter(
+        (session) => session.caughtUp === true && session.residual?.state === "unavailable",
+    ).length;
+    const complete = pending === 0 && ledgerUnavailable === 0;
     const old = draft.sources.usage;
 
     if (
@@ -1111,6 +1183,7 @@ export function applyUsageSource(
         !old.ok ||
         old.error !== undefined ||
         old.pending !== pending ||
+        old.ledgerUnavailable !== ledgerUnavailable ||
         old.complete !== complete ||
         old.boundary !== boundary
     ) {
@@ -1120,6 +1193,7 @@ export function applyUsageSource(
             lastGoodAt: now,
             checkedAt: now,
             pending,
+            ledgerUnavailable,
             complete,
             boundary,
         };

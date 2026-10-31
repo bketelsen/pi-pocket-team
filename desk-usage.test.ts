@@ -33,14 +33,17 @@ import {
 } from "@earendil-works/pi-durable";
 import {
     applyEntryPage,
+    CHILD_PAGE,
     CHILD_REFRESH_MS,
     DeskUsage,
     ENTRY_PAGE,
+    ENTRY_REFRESH_MS,
     ledgerOf,
     MAX_LEDGER_CHECKS,
     MAX_SESSION_PAGES,
     ownTotals,
     planChecks,
+    relink,
     usageLinks,
     usagePass,
     USAGE_ERROR_RETRY_MS,
@@ -130,6 +133,8 @@ type World = {
     childScans: number[];
     /** A scan of these throws. */
     failing: Set<number>;
+    /** A ledger read of these throws. */
+    ledgerFails: Set<number>;
     /** Runs at each scan: a test aborts or changes the world here. */
     onScan?: (id: number) => void;
 };
@@ -142,6 +147,7 @@ const world = (): World => ({
     scans: [],
     childScans: [],
     failing: new Set(),
+    ledgerFails: new Set(),
 });
 
 function conversation(w: World, id: number, extra: Partial<ConversationRecord> = {}): void {
@@ -334,6 +340,10 @@ function fakeDeps(w: World, s: Store, signal?: AbortSignal): UsageDeps {
     return {
         readUsage: async () => copy(s.doc),
         readLedger: async (id) => {
+            if (w.ledgerFails.has(id)) {
+                throw new Error("the ledger read failed");
+            }
+
             const ledger = w.ledgers.get(id);
 
             return ledger === undefined ? undefined : copy(ledger);
@@ -427,6 +437,23 @@ function byRepo(doc: UsageState): Record<string, number> {
     return sums;
 }
 
+/** The cost by repository of every active session's own totals. */
+function costByRepo(doc: UsageState): Record<string, number> {
+    const sums: Record<string, number> = {};
+
+    for (const each of Object.values(doc.sessions)) {
+        if (each.shared === true || each.unlinkedAt !== undefined || each.assign === undefined) {
+            continue;
+        }
+
+        const repo = "repo" in each.assign ? each.assign.repo : `(${each.assign.none})`;
+
+        sums[repo] = (sums[repo] ?? 0) + ownTotals(each).cost;
+    }
+
+    return sums;
+}
+
 // ─── Links and attribution ───────────────────────────────────────────────────
 
 describe("links and attribution", () => {
@@ -508,9 +535,9 @@ describe("links and attribution", () => {
             owner: { conversationId: 20 as ConversationId, taskId: 1 as TaskId },
         });
         conversation(w, 22);
-        add(w, 20, { totalTokens: 100 });
-        add(w, 21, { totalTokens: 40 });
-        add(w, 22, { totalTokens: 7 });
+        add(w, 20, { totalTokens: 100, cost: 1.5 });
+        add(w, 21, { totalTokens: 40, cost: 0.25 });
+        add(w, 22, { totalTokens: 7, cost: 0.125 });
 
         const desk = deskOf(
             [
@@ -527,8 +554,14 @@ describe("links and attribution", () => {
         await settle(w, s, desk);
         assert.equal(threadFacts(desk).T10?.role, "coordinator");
         assert.deepEqual(byRepo(s.doc), { "a/plan": 107, "a/task": 40 });
-        assert.deepEqual(session(s, 21).assign, { repo: "a/task", via: 21 });
-        assert.equal(session(s, 21).parent, undefined, "a linked session is no child");
+        // The coordinator and its consult go to the plan's repo; the task to its own; each cost once.
+        assert.deepEqual(costByRepo(s.doc), { "a/plan": 1.625, "a/task": 0.25 });
+        assert.deepEqual(
+            session(s, 21).assign,
+            { repo: "a/task", via: 21 },
+            "its own link decides",
+        );
+        assert.equal(session(s, 21).parent, 20, "the ownership edge is kept");
     });
 
     test("supervisor and Clerk sessions are never read or charged, also when a thread links them", async () => {
@@ -596,10 +629,66 @@ describe("links and attribution", () => {
             undefined,
             "a session in the tree keeps its first parent",
         );
-        assert.equal(session(s, 5).parent, undefined);
+        assert.equal(session(s, 5).parent, 4, "a linked child keeps its edge");
         assert.deepEqual(session(s, 3).assign, { repo: "a/root", via: 1 });
         assert.deepEqual(session(s, 5).assign, { repo: "a/own", via: 5 });
         assert.deepEqual(byRepo(s.doc), { "a/root": 10, "a/own": 5 });
+    });
+
+    test("a stored parent cycle ends: unlinked with no linked session, and inherited with 1", () => {
+        const cycle = (): UsageState => ({
+            sessions: {
+                "1": { id: 1, parent: 2 },
+                "2": { id: 2, parent: 1 },
+                "3": { id: 3, parent: 2 },
+            },
+            sources: {},
+        });
+        const none = cycle();
+
+        relink(none, { sessions: {}, shared: [] }, T0);
+
+        for (const id of ["1", "2", "3"]) {
+            assert.equal(none.sessions[id]?.unlinkedAt, T0);
+            assert.equal(none.sessions[id]?.assign, undefined);
+        }
+
+        const one = cycle();
+
+        relink(one, { sessions: { "1": [{ id: "T1", repo: "a/b" }] }, shared: [] }, T0);
+        assert.deepEqual(one.sessions["1"]?.assign, { repo: "a/b", via: 1 });
+        assert.deepEqual(one.sessions["2"]?.assign, { repo: "a/b", via: 1 });
+        assert.deepEqual(one.sessions["3"]?.assign, { repo: "a/b", via: 1 });
+        assert.equal(one.sessions["3"]?.unlinkedAt, undefined);
+    });
+
+    test("a linked child keeps its ownership edge, and inherits its parent when its own link goes", async () => {
+        const w = world();
+        const s = store();
+
+        conversation(w, 1);
+        conversation(w, 2, { owner: { conversationId: 1 as ConversationId, taskId: 1 as TaskId } });
+        add(w, 1);
+        add(w, 2);
+
+        await settle(
+            w,
+            s,
+            deskOf([
+                thread("T1", { session: 1, repo: "a/one" }),
+                thread("T2", { session: 2, repo: "a/two" }),
+            ]),
+        );
+        assert.equal(session(s, 2).parent, 1);
+        assert.equal(session(s, 2).root, 1);
+        assert.equal(session(s, 1).parent, undefined);
+        assert.deepEqual(session(s, 2).assign, { repo: "a/two", via: 2 }, "its own link decides");
+
+        await pass(w, s, deskOf([thread("T1", { session: 1, repo: "a/one" })]), T0 + PASS_MS);
+        assert.equal(session(s, 2).unlinkedAt, undefined);
+        assert.equal(session(s, 2).links, undefined);
+        assert.deepEqual(session(s, 2).assign, { repo: "a/one", via: 1 });
+        assert.deepEqual(byRepo(s.doc), { "a/one": 30 });
     });
 });
 
@@ -885,6 +974,106 @@ describe("pages, replays and failures", () => {
         assert.equal(session(s, 1).residual?.state, "settled");
     });
 
+    test("more than 100 children: discovery pages share the 10-page limit, resume, and count each child once", async () => {
+        const w = world();
+        const s = store();
+        const count = CHILD_PAGE + 50;
+        const parent = 1;
+
+        conversation(w, parent);
+        add(w, parent, { totalTokens: 1000 });
+
+        for (let index = 0; index < count; index++) {
+            const id = 10 + index;
+
+            conversation(w, id, {
+                owner: { conversationId: parent as ConversationId, taskId: 1 as TaskId },
+            });
+            add(w, id, { totalTokens: 15 });
+        }
+
+        const desk = deskOf([thread("T1", { session: parent, repo: "a/b" })]);
+
+        // Pass 1: the parent's entries, the first child page (committed), then the new children's scans.
+        const first = await pass(w, s, desk);
+
+        assert.equal(first.pages, MAX_SESSION_PAGES);
+        assert.equal(w.childScans.length, 1);
+        assert.equal(session(s, parent).children?.complete, false);
+        assert.deepEqual(session(s, parent).children?.cursor, { after: 10 + CHILD_PAGE - 1 });
+        assert.equal(Object.keys(s.doc.sessions).length, 1 + CHILD_PAGE);
+        assert.equal(s.doc.sources.usage?.complete, false);
+
+        // The second page is read in a later pass, from the stored cursor.
+        let passes = 1;
+
+        while (session(s, parent).children?.complete !== true) {
+            const result = await pass(w, s, desk, T0 + passes * PASS_MS);
+
+            assert.equal(result.pages <= MAX_SESSION_PAGES, true);
+            passes += 1;
+            assert.equal(passes < 40, true, "discovery ends");
+        }
+
+        assert.equal(w.childScans.filter((id) => id === parent).length, 2);
+        await settle(w, s, desk, T0 + passes * PASS_MS, 40);
+        assert.equal(Object.keys(s.doc.sessions).length, 1 + count);
+
+        for (let index = 0; index < count; index++) {
+            const child = session(s, 10 + index);
+
+            assert.equal(child.parent, parent);
+            assert.equal(
+                totals(s, child.id).totalTokens,
+                15,
+                `child ${String(child.id)} counts once`,
+            );
+            assert.deepEqual(child.assign, { repo: "a/b", via: parent });
+        }
+
+        assert.deepEqual(byRepo(s.doc), { "a/b": 1000 + 15 * count });
+        assert.equal(s.doc.sources.usage?.complete, true);
+    });
+
+    test("a pass cut off after a committed child page resumes from its cursor", async () => {
+        const w = world();
+        const cut = store();
+        const clean = store();
+
+        conversation(w, 1);
+        add(w, 1);
+
+        for (let index = 0; index < CHILD_PAGE + 5; index++) {
+            conversation(w, 10 + index, {
+                owner: { conversationId: 1 as ConversationId, taskId: 1 as TaskId },
+            });
+            add(w, 10 + index);
+        }
+
+        const desk = deskOf([thread("T1", { session: 1 })]);
+        const stop = new AbortController();
+
+        // The first child page commits; the next scan is cut off.
+        w.onScan = (id) => {
+            if (id !== 1) {
+                stop.abort(new Error("restart"));
+
+                throw new Error("restart");
+            }
+        };
+
+        await assert.rejects(pass(w, cut, desk, T0, stop.signal), /restart/);
+        w.onScan = undefined;
+        assert.equal(session(cut, 1).children?.complete, false);
+        assert.deepEqual(session(cut, 1).children?.cursor, { after: 10 + CHILD_PAGE - 1 });
+        assert.equal(Object.keys(cut.doc.sessions).length, 1 + CHILD_PAGE);
+        assert.equal(session(cut, 10).scannedAt, undefined);
+        await settle(w, cut, desk, T0, 40);
+        await settle(w, clean, desk, T0, 40);
+        assert.deepEqual(cut.doc.sessions, clean.doc.sessions);
+        assert.equal(Object.keys(cut.doc.sessions).length, 1 + CHILD_PAGE + 5);
+    });
+
     test("the same page applied twice counts once", () => {
         const w = world();
 
@@ -1096,6 +1285,201 @@ describe("coverage and the ledger", () => {
         assert.equal(totals(s, 1).totalTokens, 30);
     });
 
+    test("a ledger that cannot be read makes a visible gap, and new usage is still collected", async () => {
+        const w = world();
+        const s = store();
+
+        conversation(w, 1);
+        add(w, 1);
+
+        const desk = deskOf([thread("T1", { session: 1 })]);
+
+        await settle(w, s, desk);
+
+        const ledger = copy(session(s, 1).ledger);
+
+        // The ledger read fails from now on; new usage comes.
+        w.ledgerFails.add(1);
+        add(w, 1);
+        await pass(w, s, desk, T0 + PASS_MS);
+        assert.deepEqual(session(s, 1).residual, {
+            state: "unavailable",
+            why: "the ledger could not be read",
+        });
+        assert.equal(session(s, 1).dirty, true);
+        assert.deepEqual(session(s, 1).ledger, ledger, "the stored ledger stays");
+        assert.equal(s.doc.sources.usage?.complete, false);
+
+        // The next pass reads the entries again, without a ledger.
+        await pass(w, s, desk, T0 + 2 * PASS_MS);
+        assert.equal(totals(s, 1).totalTokens, 30);
+        assert.equal(session(s, 1).dirty, undefined);
+        assert.equal(session(s, 1).residual?.state, "unavailable");
+        assert.equal(s.doc.sources.usage?.ledgerUnavailable, 1);
+        assert.equal(s.doc.sources.usage?.complete, false);
+
+        // Later checks that fail do not make it dirty again: the entry refresh reads it.
+        add(w, 1);
+        await pass(w, s, desk, T0 + 3 * PASS_MS);
+        assert.equal(session(s, 1).dirty, undefined);
+        assert.equal(totals(s, 1).totalTokens, 30);
+        await pass(w, s, desk, T0 + 2 * PASS_MS + ENTRY_REFRESH_MS);
+        assert.equal(totals(s, 1).totalTokens, 45, "the refresh collects it");
+
+        // The ledger can be read again: the session settles, and the source is complete.
+        w.ledgerFails.clear();
+        await settle(w, s, desk, T0 + 3 * PASS_MS + ENTRY_REFRESH_MS);
+        assert.equal(session(s, 1).residual?.state, "settled");
+        assert.equal(s.doc.sources.usage?.ledgerUnavailable, 0);
+        assert.equal(s.doc.sources.usage?.complete, true);
+    });
+
+    test("a caught-up session is read again after ENTRY_REFRESH_MS, whatever its ledger says", async () => {
+        const w = world();
+        const s = store();
+
+        conversation(w, 1);
+        add(w, 1);
+
+        const desk = deskOf([thread("T1", { session: 1 })]);
+
+        await settle(w, s, desk);
+        // Usage the ledger does not show: no check finds it, only the refresh.
+        add(w, 1, { ledger: false });
+        await pass(w, s, desk, T0 + ENTRY_REFRESH_MS - PASS_MS);
+        assert.equal(totals(s, 1).totalTokens, 15);
+        await pass(w, s, desk, T0 + ENTRY_REFRESH_MS);
+        assert.equal(totals(s, 1).totalTokens, 30);
+        assert.equal(session(s, 1).scannedAt, T0 + ENTRY_REFRESH_MS);
+    });
+
+    test("pending sessions whose ledgers keep failing do not starve the others", async () => {
+        const w = world();
+        const s = store();
+        const threads: Thread[] = [];
+
+        for (let id = 1; id <= 80; id++) {
+            conversation(w, id);
+            add(w, id);
+            threads.push(thread(`T${String(id)}`, { session: id }));
+        }
+
+        const desk = deskOf(threads);
+
+        await settle(w, s, desk, T0, 40);
+
+        // 60 sessions are pending, and their ledger reads fail; 20 are settled.
+        for (let id = 1; id <= 60; id++) {
+            session(s, id).residual = { state: "pending" };
+            w.ledgerFails.add(id);
+        }
+
+        const checked = new Set<number>();
+
+        for (let slot = 0; slot < 4; slot++) {
+            const plan = planChecks(s.doc, new Set(), slot);
+
+            assert.equal(plan.length <= MAX_LEDGER_CHECKS, true);
+            assert.equal(new Set(plan).size, plan.length);
+            assert.equal(
+                plan.filter((id) => id > 60).length >= 20,
+                true,
+                "the settled group gets its share",
+            );
+
+            for (const id of plan) {
+                checked.add(id);
+            }
+        }
+
+        assert.equal(checked.size, 80, "every session is checked within a few passes");
+
+        // The same in passes: the failing reads make them unavailable, and the settled ones are still checked.
+        const reads: number[] = [];
+        const deps = fakeDeps(w, s);
+        const read = deps.readLedger;
+
+        deps.readLedger = async (id) => {
+            reads.push(id);
+
+            return read(id);
+        };
+
+        for (let index = 0; index < 3; index++) {
+            const now = T0 + (index + 1) * PASS_MS;
+
+            reads.length = 0;
+            await usagePass(deps, {
+                desk,
+                facts: threadFacts(desk),
+                boundary: BOUNDARY,
+                now,
+                slot: index,
+            });
+            // At most: 1 read before each page's session, then the sessions that caught up, then the 50 checks.
+            assert.equal(reads.length <= MAX_LEDGER_CHECKS + 2 * MAX_SESSION_PAGES, true);
+            assert.equal(
+                reads.some((id) => id > 60),
+                true,
+            );
+        }
+    });
+
+    test("a generation between the ledger read and the check: pending, then exact totals", async () => {
+        const w = world();
+        const s = store();
+
+        conversation(w, 1);
+        add(w, 1, { totalTokens: 15, cost: 0.5 });
+
+        const desk = deskOf([thread("T1", { session: 1 })]);
+        const deps = fakeDeps(w, s);
+        const read = deps.readLedger;
+        let generated = false;
+
+        // The first ledger read is the one before the scan: a generation commits right after it.
+        deps.readLedger = async (id) => {
+            const ledger = await read(id);
+
+            if (!generated) {
+                generated = true;
+                add(w, 1, { totalTokens: 20, cost: 0.25 });
+            }
+
+            return ledger;
+        };
+
+        const input = (now: number) => ({
+            desk,
+            facts: threadFacts(desk),
+            boundary: BOUNDARY,
+            now,
+            slot: 0,
+        });
+
+        await usagePass(deps, input(T0));
+        assert.equal(totals(s, 1).totalTokens, 35, "the scan read the new request");
+        assert.equal(session(s, 1).dirty, true);
+        assert.deepEqual(session(s, 1).residual, { state: "pending" });
+        assert.equal(session(s, 1).ledger?.totalTokens, 15, "the ledger read before the scan");
+        assert.equal(s.doc.sources.usage?.complete, false);
+
+        await usagePass(deps, input(T0 + PASS_MS));
+        assert.deepEqual(totals(s, 1), {
+            input: 20,
+            output: 10,
+            cacheRead: 0,
+            cacheWrite: 0,
+            totalTokens: 35,
+            cost: 0.75,
+        });
+        assert.deepEqual(session(s, 1).residual, {
+            state: "settled",
+            counters: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: 0 },
+        });
+        assert.equal(s.doc.sources.usage?.complete, true);
+    });
+
     test("a gone conversation keeps its data and is a coverage gap", async () => {
         const w = world();
         const s = store();
@@ -1260,10 +1644,12 @@ describe("the usage step in a collector pass", () => {
         assert.deepEqual(desk, deskBefore);
     });
 
-    test("a failing usage step never fails the GitHub part; an abort still throws", async () => {
+    test("a failing usage step never fails the GitHub part", async () => {
         const w = world();
         const s = store();
-        const desk = deskOf([thread("T1", { session: 1 })]);
+        const desk = deskOf([
+            thread("T1", { session: 1, prs: { "frostyard/test#7": { via: "seen" } } }),
+        ]);
         const dashboard: DashboardState = {
             threads: {},
             prs: {},
@@ -1273,6 +1659,7 @@ describe("the usage step in a collector pass", () => {
             boundary: BOUNDARY,
         };
         const deps = fakeDeps(w, s);
+        const queries: string[] = [];
 
         deps.readUsage = async () => {
             throw new Error("no usage document");
@@ -1282,18 +1669,67 @@ describe("the usage step in a collector pass", () => {
             readDesk: async () => copy(desk),
             readDashboard: async () => copy(dashboard),
             now: () => T0,
-            graphql: async () => ({ stdout: "{}" }),
+            graphql: async (query) => {
+                queries.push(query);
+
+                return {
+                    stdout: JSON.stringify({
+                        data: {
+                            rateLimit: { remaining: 4000, resetAt: "2026-10-30T01:00:00Z" },
+                            p0: {
+                                isArchived: false,
+                                pullRequest: {
+                                    state: "MERGED",
+                                    createdAt: "2026-10-01T10:00:00Z",
+                                    mergedAt: "2026-10-02T10:00:00Z",
+                                    closedAt: "2026-10-02T10:00:00Z",
+                                },
+                            },
+                        },
+                    }),
+                };
+            },
             commit: async (apply) => apply(dashboard),
             usage: deps,
         });
-        assert.equal(dashboard.sources.threads?.ok, true);
+        assert.equal(queries.length, 1, "the GraphQL call ran");
+        assert.match(queries[0] ?? "", /pullRequest\(number: 7\)/);
         assert.equal(s.doc.sources.usage?.ok, false);
+        assert.equal(s.doc.sources.usage?.error, "no usage document");
+        assert.equal(dashboard.sources.threads?.ok, true);
+        assert.equal(dashboard.sources.github?.ok, true);
 
+        const fact = dashboard.prs["frostyard/test#7"];
+
+        assert.equal(fact?.state, "MERGED");
+        assert.equal(fact?.createdAt, Date.UTC(2026, 9, 1, 10));
+        assert.equal(fact?.mergedAt, Date.UTC(2026, 9, 2, 10));
+        assert.equal(fact?.closedAt, Date.UTC(2026, 9, 2, 10));
+        assert.equal(fact?.readAt, T0);
+    });
+
+    test("an abort during the usage step still throws, and the GitHub part does not run", async () => {
+        const w = world();
+        const s = store();
+        const desk = deskOf([
+            thread("T1", { session: 1, prs: { "frostyard/test#7": { via: "seen" } } }),
+        ]);
+        const dashboard: DashboardState = {
+            threads: {},
+            prs: {},
+            issues: {},
+            sources: {},
+            initializedAt: T0,
+            boundary: BOUNDARY,
+        };
+        const before = copy(dashboard);
+        const deps = fakeDeps(w, s);
         const stop = new AbortController();
-
-        stop.abort(new Error("stop"));
+        let calls = 0;
 
         deps.readUsage = async () => {
+            stop.abort(new Error("stop"));
+
             throw new Error("stop");
         };
 
@@ -1302,13 +1738,20 @@ describe("the usage step in a collector pass", () => {
                 readDesk: async () => copy(desk),
                 readDashboard: async () => copy(dashboard),
                 now: () => T0,
-                graphql: async () => ({ stdout: "{}" }),
+                graphql: async () => {
+                    calls += 1;
+
+                    return { stdout: "{}" };
+                },
                 commit: async (apply) => apply(dashboard),
                 usage: deps,
                 signal: stop.signal,
             }),
             /stop/,
         );
+        assert.equal(calls, 0);
+        assert.deepEqual(dashboard, before);
+        assert.equal(s.doc.sources.usage, undefined, "an abort records no failure");
     });
 });
 
