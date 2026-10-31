@@ -215,10 +215,18 @@ function mainDashboard(): DashboardState {
     };
 }
 
+/** A session read to its end: with no other gap, its usage is complete. */
+const READ = { scannedAt: oct(29), caughtUp: true } as const;
+
+/**
+ * The main usage: sessions 1, 3, 6 and 7 are read to their end (complete), session 2 is missing (partial: it has
+ * entries), and session 8 has a residual mismatch and no entry (unknown).
+ */
 function mainUsage(): UsageState {
     return {
         sessions: {
             "1": session(1, {
+                ...READ,
                 assign: { repo: "a/one", via: 1 },
                 days: {
                     "2026-10-01": {
@@ -280,6 +288,7 @@ function mainUsage(): UsageState {
             }),
             // An explicit zero cost.
             "3": session(3, {
+                ...READ,
                 assign: { repo: "a/two", via: 3 },
                 days: {
                     "2026-10-11": {
@@ -304,6 +313,7 @@ function mainUsage(): UsageState {
                 days: { "2026-10-01": { "p/x": counters({ entries: 7, input: 700 }) } },
             }),
             "6": session(6, {
+                ...READ,
                 assign: { none: "conflict", repos: ["a/one", "b/three"], via: 6 },
                 days: {
                     "2026-10-02": {
@@ -318,6 +328,7 @@ function mainUsage(): UsageState {
                 },
             }),
             "7": session(7, {
+                ...READ,
                 assign: { none: "no-repo", via: 7 },
                 days: {
                     "2026-10-03": { "p/x": counters({ entries: 1, input: 6, totalTokens: 6 }) },
@@ -466,6 +477,8 @@ describe("the main fixture", () => {
             costEntries: 4,
             zeroCostEntries: 1,
             unknownCostEntries: 4,
+            state: "partial",
+            sessionStates: { complete: 4, partial: 1, unknown: 1 },
             sessions: 6,
             excluded: { shared: 1, unlinked: 1 },
             missing: 1,
@@ -641,7 +654,12 @@ describe("the main fixture", () => {
         assert.equal(answer.totals.prs.openNow, 0);
         assert.deepEqual(answer.totals.prs.coverage, { unread: 1, errored: 1, gaps: 1 });
         assert.equal(answer.totals.usage.cost, null, "no entry reported a cost");
-        assert.equal(answer.totals.usage.entries, 0);
+        assert.equal(
+            answer.totals.usage.entries,
+            null,
+            "session 8 has a gap and no entry: unknown",
+        );
+        assert.equal(answer.totals.usage.state, "unknown");
         assert.deepEqual(answer.totals.usage.excluded, { shared: 0, unlinked: 1 });
         assert.equal(answer.totals.usage.undated.residual, null, "a mismatch is not settled");
         assert.equal(answer.totals.usage.residuals.mismatch, 1);
@@ -1169,7 +1187,7 @@ describe("usage", () => {
         assert.equal(metrics.usage.undated.counters.entries, 0);
     });
 
-    test("a malformed-entry session: no tokens, its counts, no residual, a partial source", () => {
+    test("a session with only malformed entries: unknown usage (null, not 0), its counts, no residual, a partial source", () => {
         const answer = take(OCTOBER, fresh(), {
             sessions: {
                 "4": session(4, {
@@ -1192,9 +1210,11 @@ describe("usage", () => {
         });
         const usage = answer.totals.usage;
 
-        assert.equal(usage.entries, 0);
-        assert.equal(usage.totalTokens, 0);
+        assert.equal(usage.entries, null, "only malformed entries: unknown, not 0");
+        assert.equal(usage.totalTokens, null);
         assert.equal(usage.cost, null);
+        assert.equal(usage.state, "unknown");
+        assert.deepEqual(usage.sessionStates, { complete: 0, partial: 0, unknown: 1 });
         assert.deepEqual(usage.skipped, {
             inherited: 0,
             imported: 0,
@@ -1268,6 +1288,337 @@ describe("usage", () => {
         });
         assert.equal(answer.rows.unattributed?.usage.input, 3);
         assert.deepEqual(answer.rows.projects, []);
+    });
+
+    /** The range sum fields of a usage scope, in 1 object. */
+    const sums = (usage: Metrics["usage"]) => ({
+        entries: usage.entries,
+        input: usage.input,
+        output: usage.output,
+        cacheRead: usage.cacheRead,
+        cacheWrite: usage.cacheWrite,
+        totalTokens: usage.totalTokens,
+        cost: usage.cost,
+        costEntries: usage.costEntries,
+        zeroCostEntries: usage.zeroCostEntries,
+        unknownCostEntries: usage.unknownCostEntries,
+    });
+    const NULL_SUMS = {
+        entries: null,
+        input: null,
+        output: null,
+        cacheRead: null,
+        cacheWrite: null,
+        totalTokens: null,
+        cost: null,
+        costEntries: null,
+        zeroCostEntries: null,
+        unknownCostEntries: null,
+    };
+    const okUsageSource = (): UsageState["sources"] => ({
+        usage: { at: NOW, ok: true, lastGoodAt: NOW, checkedAt: NOW, pending: 0, complete: true },
+    });
+    /** 1 entry on 2026-10-05: 10 input, 5 output, 15 tokens, a cost of 0.5. */
+    const oneEntry = (): SessionUsage["days"] => ({
+        "2026-10-05": {
+            m: counters({
+                entries: 1,
+                input: 10,
+                output: 5,
+                totalTokens: 15,
+                cost: 0.5,
+                costEntries: 1,
+            }),
+        },
+    });
+
+    test("every counted session unknown: each range sum is null, not 0, with its limitation", () => {
+        const answer = take(OCTOBER, fresh(), {
+            sessions: {
+                // Gone, with no entry collected.
+                "1": session(1, { assign: { repo: "a/b", via: 1 }, ...READ, missingAt: oct(20) }),
+                // Never read.
+                "2": session(2, { assign: { repo: "a/b", via: 2 } }),
+                // Only malformed entries.
+                "3": session(3, {
+                    assign: { repo: "a/b", via: 3 },
+                    ...READ,
+                    skipped: { malformed: 2 },
+                }),
+            },
+            sources: okUsageSource(),
+        });
+        const usage = answer.totals.usage;
+
+        assert.deepEqual(sums(usage), NULL_SUMS);
+        assert.equal(usage.state, "unknown");
+        assert.deepEqual(usage.sessionStates, { complete: 0, partial: 0, unknown: 3 });
+        assert.equal(usage.sessions, 3);
+        assert.equal(usage.missing, 1);
+        assert.deepEqual(sums(project(answer, "a/b").usage), NULL_SUMS);
+        assert.equal(project(answer, "a/b").usage.state, "unknown");
+        assert.deepEqual(
+            answer.coverage.limitations.find((each) => each.code === "usage-unknown"),
+            {
+                code: "usage-unknown",
+                text: "Some counted sessions have no complete usage read (not read yet, changed since the last read, gone, failed, or only malformed entries): their usage is unknown or partial, not 0.",
+            },
+        );
+        assert(
+            !answer.coverage.limitations.some((each) => each.code === "zero-cost-reported"),
+            "a null zero-cost count is no zero cost",
+        );
+    });
+
+    test("each gap without an entry is unknown; an entry anywhere makes it partial", () => {
+        const window = windowOf("2026-10-01", "2026-10-29");
+        const gaps: Partial<SessionUsage>[] = [
+            { scannedAt: undefined, caughtUp: true },
+            { scannedAt: oct(29), caughtUp: false },
+            { scannedAt: oct(29) },
+            { ...READ, dirty: true, residual: { state: "pending" } },
+            { ...READ, skipped: { malformed: 1 } },
+            { ...READ, missingAt: oct(20) },
+            { ...READ, error: "read failed", errorAt: oct(20) },
+            { ...READ, residual: { state: "mismatch", why: "x" } },
+            { ...READ, residual: { state: "unavailable" } },
+        ];
+        const stateOf = (overrides: Partial<SessionUsage>) =>
+            reduce(factsOf({ sessions: [session(1, overrides)] }), window).usage;
+
+        for (const gap of gaps) {
+            const label = JSON.stringify(gap);
+
+            assert.equal(stateOf(gap).state, "unknown", label);
+            assert.equal(stateOf(gap).entries, null, label);
+
+            // An entry out of the range, undated, or before the boundary is still a valid entry.
+            for (const entry of [
+                { days: { "2026-09-01": { m: counters({ entries: 1, input: 9 }) } } },
+                { undated: counters({ entries: 1, input: 9 }) },
+                { before: counters({ entries: 1, input: 9 }) },
+            ]) {
+                const usage = stateOf({ ...gap, ...entry });
+
+                assert.equal(usage.state, "partial", `${label} ${JSON.stringify(entry)}`);
+                assert.deepEqual(usage.sessionStates, { complete: 0, partial: 1, unknown: 0 });
+                assert.equal(usage.entries, 0, "the known range subtotal: nothing in the range");
+            }
+        }
+
+        // No gap: complete. Pending and absent residuals are no gap.
+        assert.equal(stateOf({ ...READ }).state, "complete");
+        assert.equal(stateOf({ ...READ, residual: { state: "pending" } }).state, "complete");
+        assert.equal(
+            stateOf({
+                ...READ,
+                residual: {
+                    state: "settled",
+                    counters: {
+                        input: 0,
+                        output: 0,
+                        cacheRead: 0,
+                        cacheWrite: 0,
+                        totalTokens: 0,
+                        cost: 0,
+                    },
+                },
+            }).state,
+            "complete",
+        );
+    });
+
+    test("a dirty session (its ledger changed since the last read) is a gap; a clean pending one is not", () => {
+        const window = windowOf("2026-10-01", "2026-10-29");
+        const usageOf = (overrides: Partial<SessionUsage>) =>
+            reduce(factsOf({ sessions: [session(1, { ...READ, ...overrides })] }), window).usage;
+        const dirty = { dirty: true, residual: { state: "pending" } } as const;
+
+        const none = usageOf(dirty);
+
+        assert.equal(none.state, "unknown");
+        assert.deepEqual(none.sessionStates, { complete: 0, partial: 0, unknown: 1 });
+        assert.deepEqual(sums(none), NULL_SUMS);
+
+        const some = usageOf({ ...dirty, days: oneEntry() });
+
+        assert.equal(some.state, "partial");
+        assert.deepEqual(some.sessionStates, { complete: 0, partial: 1, unknown: 0 });
+        assert.deepEqual(sums(some), {
+            entries: 1,
+            input: 10,
+            output: 5,
+            cacheRead: 0,
+            cacheWrite: 0,
+            totalTokens: 15,
+            cost: 0.5,
+            costEntries: 1,
+            zeroCostEntries: 0,
+            unknownCostEntries: 0,
+        });
+
+        const clean = usageOf({ residual: { state: "pending" }, days: oneEntry() });
+
+        assert.equal(clean.state, "complete");
+        assert.equal(clean.totalTokens, 15);
+        assert.equal(usageOf({ residual: { state: "pending" } }).entries, 0);
+        assert.equal(usageOf({ residual: { state: "pending" } }).state, "complete");
+    });
+
+    test("known and unknown sessions: the known sums stay exact, the state is partial", () => {
+        const answer = take(OCTOBER, fresh(), {
+            sessions: {
+                "1": session(1, { assign: { repo: "a/b", via: 1 }, ...READ, days: oneEntry() }),
+                "2": session(2, { assign: { repo: "a/b", via: 2 } }),
+            },
+            sources: okUsageSource(),
+        });
+        const usage = answer.totals.usage;
+
+        assert.deepEqual(sums(usage), {
+            entries: 1,
+            input: 10,
+            output: 5,
+            cacheRead: 0,
+            cacheWrite: 0,
+            totalTokens: 15,
+            cost: 0.5,
+            costEntries: 1,
+            zeroCostEntries: 0,
+            unknownCostEntries: 0,
+        });
+        assert.equal(usage.state, "partial");
+        assert.deepEqual(usage.sessionStates, { complete: 1, partial: 0, unknown: 1 });
+        assert(answer.coverage.limitations.some((each) => each.code === "usage-unknown"));
+    });
+
+    test("a partial session: caught up, with entries and malformed ones", () => {
+        const window = windowOf("2026-10-01", "2026-10-29");
+        const usage = reduce(
+            factsOf({
+                sessions: [session(1, { ...READ, days: oneEntry(), skipped: { malformed: 1 } })],
+            }),
+            window,
+        ).usage;
+
+        assert.equal(usage.state, "partial");
+        assert.deepEqual(usage.sessionStates, { complete: 0, partial: 1, unknown: 0 });
+        assert.equal(usage.entries, 1);
+        assert.equal(usage.totalTokens, 15);
+        assert.equal(usage.cost, 0.5);
+    });
+
+    test("an explicit 0 stays 0: a clean read with zero counters, or with no entry, is complete", () => {
+        const window = windowOf("2026-10-01", "2026-10-29");
+        const usageOf = (overrides: Partial<SessionUsage>) =>
+            reduce(factsOf({ sessions: [session(1, { ...READ, ...overrides })] }), window).usage;
+        const zero = usageOf({
+            days: {
+                "2026-10-05": {
+                    m: counters({ entries: 2, costEntries: 2, cost: 0, zeroCostEntries: 2 }),
+                },
+            },
+        });
+
+        assert.equal(zero.state, "complete");
+        assert.deepEqual(zero.sessionStates, { complete: 1, partial: 0, unknown: 0 });
+        assert.deepEqual(sums(zero), {
+            entries: 2,
+            input: 0,
+            output: 0,
+            cacheRead: 0,
+            cacheWrite: 0,
+            totalTokens: 0,
+            cost: 0,
+            costEntries: 2,
+            zeroCostEntries: 2,
+            unknownCostEntries: 0,
+        });
+
+        const empty = usageOf({});
+
+        assert.equal(empty.state, "complete");
+        assert.deepEqual(sums(empty), {
+            entries: 0,
+            input: 0,
+            output: 0,
+            cacheRead: 0,
+            cacheWrite: 0,
+            totalTokens: 0,
+            cost: null,
+            costEntries: 0,
+            zeroCostEntries: 0,
+            unknownCostEntries: 0,
+        });
+    });
+
+    test("no counted session: none, with zeros", () => {
+        const window = windowOf("2026-10-01", "2026-10-29");
+        const usage = reduce(
+            factsOf({
+                sessions: [
+                    session(1, { shared: true }),
+                    session(2, { unlinkedAt: oct(20), days: oneEntry() }),
+                ],
+            }),
+            window,
+        ).usage;
+
+        assert.equal(usage.state, "none");
+        assert.deepEqual(usage.sessionStates, { complete: 0, partial: 0, unknown: 0 });
+        assert.equal(usage.sessions, 0);
+        assert.deepEqual(sums(usage), {
+            entries: 0,
+            input: 0,
+            output: 0,
+            cacheRead: 0,
+            cacheWrite: 0,
+            totalTokens: 0,
+            cost: null,
+            costEntries: 0,
+            zeroCostEntries: 0,
+            unknownCostEntries: 0,
+        });
+
+        const answer = take(OCTOBER, fresh(), { sessions: {}, sources: okUsageSource() });
+
+        assert.equal(answer.totals.usage.state, "none");
+        assert(!answer.coverage.limitations.some((each) => each.code === "usage-unknown"));
+    });
+
+    test("rows and totals: each state comes from its own raw sessions", () => {
+        const answer = take(OCTOBER, fresh(), {
+            sessions: {
+                // x/known: complete. x/gone and u/gone: unknown only.
+                "1": session(1, { assign: { repo: "x/known", via: 1 }, ...READ, days: oneEntry() }),
+                "2": session(2, { assign: { repo: "x/gone", via: 2 } }),
+                "3": session(3, { assign: { repo: "u/gone", via: 3 }, ...READ, missingAt: oct(9) }),
+            },
+            sources: okUsageSource(),
+        });
+
+        assert.deepEqual(sums(project(answer, "x/gone").usage), NULL_SUMS);
+        assert.equal(project(answer, "x/gone").usage.state, "unknown");
+        assert.equal(project(answer, "x/known").usage.state, "complete");
+        assert.equal(project(answer, "x/known").usage.totalTokens, 15);
+        assert.deepEqual(sums(ownerRow(answer, "u").usage), NULL_SUMS);
+        assert.equal(ownerRow(answer, "u").usage.state, "unknown");
+        assert.equal(ownerRow(answer, "x").usage.state, "partial");
+        assert.equal(ownerRow(answer, "x").usage.totalTokens, 15);
+        assert.deepEqual(ownerRow(answer, "x").usage.sessionStates, {
+            complete: 1,
+            partial: 0,
+            unknown: 1,
+        });
+
+        const usage = answer.totals.usage;
+
+        assert.equal(usage.state, "partial");
+        assert.deepEqual(usage.sessionStates, { complete: 1, partial: 0, unknown: 2 });
+        assert.equal(usage.entries, 1);
+        assert.equal(usage.totalTokens, 15);
+        assert.equal(usage.cost, 0.5);
+        assert.equal(answer.rows.unattributed?.usage.state, "none");
     });
 });
 
@@ -1388,6 +1739,39 @@ describe("time to solve", () => {
         assert.equal(answer.totals.timeToSolve.medianMs, 6.5 * HOUR);
         assert.equal(answer.totals.timeToSolve.p90Ms, 200 * HOUR);
         assert.equal(answer.totals.timeToSolve.count, 6);
+    });
+
+    test("a missing or inaccessible issue keeps its reason, even with a stored OPEN state", () => {
+        const dashboard = fresh();
+
+        const add = (ref: string, overrides: Partial<IssueFact>): void => {
+            dashboard.issues[ref] = issue(ref, { createdAt: oct(1), ...overrides });
+        };
+
+        add("a/b#1", { state: "OPEN", unresolved: "missing" });
+        add("a/b#2", { state: "OPEN", unresolved: "inaccessible" });
+        add("a/b#3", { state: "OPEN" });
+        add("c/d#1", { unresolved: "open" });
+        add("c/d#2", { state: "CLOSED", unresolved: "open" });
+
+        const answer = take(OCTOBER, dashboard);
+        const repo = project(answer, "a/b").timeToSolve;
+
+        assert.equal(repo.nowUnresolved, 1, "only the readable open issue");
+        assert.deepEqual(repo.undated, { missing: 1, inaccessible: 1 });
+        assert.equal(project(answer, "c/d").timeToSolve.nowUnresolved, 2);
+        assert.deepEqual(project(answer, "c/d").timeToSolve.undated, {});
+        assert.equal(ownerRow(answer, "a").timeToSolve.nowUnresolved, 1);
+        assert.deepEqual(ownerRow(answer, "a").timeToSolve.undated, {
+            missing: 1,
+            inaccessible: 1,
+        });
+
+        const all = answer.totals.timeToSolve;
+
+        assert.equal(all.nowUnresolved, 3);
+        assert.deepEqual(all.undated, { missing: 1, inaccessible: 1 });
+        assert.equal(all.count, 0);
     });
 });
 
@@ -1592,7 +1976,8 @@ describe("source states", () => {
     test("fresh sources: ok, and the standing limitations", () => {
         const usage = mainUsage();
 
-        // Session 8 has a mismatch residual: a usage gap. Without it, every source is ok.
+        // Session 8 has a mismatch residual: a usage gap. Without it, every source is ok. Session 2 is missing: its
+        // usage is partial, with its limitation.
         delete usage.sessions["8"];
 
         const answer = take(OCTOBER, mainDashboard(), usage);
@@ -1611,6 +1996,7 @@ describe("source states", () => {
                 "dated-model-usage-only",
                 "undated-residual",
                 "cost-not-invoice",
+                "usage-unknown",
                 "zero-cost-reported",
             ],
         );
