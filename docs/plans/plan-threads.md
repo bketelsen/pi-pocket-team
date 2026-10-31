@@ -905,9 +905,11 @@ Each line below differs from the design above, or settles what it left open, and
 - **The hook checks the typed path first.** It reads the desk's state with `snapshot` (Pocket's typed hook API), and a
   session that a consult is bound to is held by that consult's state. This path needs no entry read, so a bound
   consult stays read-only whatever a later pi-durable gives the hook.
-- **A failed state read blocks every call**, with "Try again in a moment.", before any other step. Only a state read
-  that worked shows that no consult is bound to a session, so a bound consult never runs free on a read error. A
-  failed read is short; the next call reads again.
+- **A failed state read lets the marker decide.** The desk wrote the marker into every bound consult's first message,
+  so with a commit the hook reads the marker (cached, or read now): no marker is no consult, and the call runs; a
+  marker blocks the call with "Try again in a moment.", so a bound consult never runs free on a read error. A failed
+  entry read blocks too, and so does an `api` with no commit: then the hook cannot tell. So an ordinary session is
+  blocked only when both reads fail, and the next call reads again.
 - **Only the window before the bind reads the first entry, through its `api`'s commit.** Pocket's hook API type has
   only `snapshot`, and no read of entries; pi-durable gives the hook the tool task's runtime, whose commit has
   `tx.scanEntries`. The commit only reads, and changes nothing.

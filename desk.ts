@@ -23226,8 +23226,10 @@ export default function createDesk(host: Host, web: Web) {
      * 2. The window before the bind: the desk's marker in the session's first message makes it a consult. A marker can
      *    only take rights away; a session with no marker is not touched.
      * An `api` with no commit cannot read entries at all: an unbound session then runs, and `plan consult` starts no
-     * consult (`entryRead`). A read that fails blocks the call with "try again", and is not kept; so does a failed read
-     * of the desk's state, because only a state read that worked shows that no consult is bound to the session.
+     * consult (`entryRead`). A read that fails blocks the call with "try again", and is not kept.
+     * A failed read of the desk's state: every bound consult's first message holds the marker (the desk wrote it), so
+     * the entry read decides. No marker: no consult, and the call runs. A marker, a failed entry read, or no entry read
+     * at all: the call is blocked with "try again". So an ordinary session is blocked only when both reads fail.
      */
     const consultGuard = hook(ToolTask, {
         beforeTool: async (call, api, context) => {
@@ -23238,11 +23240,24 @@ export default function createDesk(host: Host, web: Web) {
 
             let state: DeskState | undefined;
 
-            // Only a state read that worked shows that no consult is bound to this session: a failed one blocks.
             try {
                 state = await api.snapshot(DeskThreads, context);
             } catch {
-                return { block: STATE_BLOCK };
+                // The state cannot say whether a consult is bound here. The desk wrote the marker into every bound
+                // consult's first message, so the marker decides; with no entry read either, the hook cannot tell.
+                if (commit === undefined) {
+                    return { block: STATE_BLOCK };
+                }
+
+                try {
+                    const marked = await consultNoncesOf(api, commit, context);
+
+                    return marked === undefined || marked.length === 0
+                        ? undefined
+                        : { block: STATE_BLOCK };
+                } catch {
+                    return { block: STATE_BLOCK };
+                }
             }
 
             // 1. A bound consult is held by its state, whatever the entry read can do.

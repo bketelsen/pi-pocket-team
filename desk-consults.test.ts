@@ -1813,57 +1813,91 @@ describe("with the Pi Pocket app", () => {
         }
     });
 
-    test("a failed state read blocks: a bound consult never runs free, with or without the entry read", async () => {
+    test("a failed state read: the marker decides, and only 2 failed reads block an ordinary session", async () => {
         const k1 = await consultNow("k1");
         const session = k1.session ?? 0;
         const desk = stubDesk();
-        const broken = (withCommit: boolean) => ({
-            conversationId: session,
+        const broken = (
+            conversationId: number,
+            commit?: (change: never, ctx: never) => Promise<unknown>,
+        ) => ({
+            conversationId,
             taskId: "task-hook",
             callId: "call-hook",
             snapshot: () => Promise.reject(new Error("the state is busy")),
-            ...(withCommit
-                ? { commit: (change: never, ctx: never) => app.harness.commit(change, ctx) }
-                : {}),
+            ...(commit === undefined ? {} : { commit }),
         });
+        const harnessCommit = (change: never, ctx: never) => app.harness.commit(change, ctx);
 
         try {
-            for (const withCommit of [false, true]) {
-                for (const name of ["bash", "write", "read"]) {
-                    assert.match(
-                        (await desk.block(session, name, {}, undefined, broken(withCommit))) ?? "",
-                        /could not read its state.*Try again in a moment/,
-                        `${name}, commit ${String(withCommit)}`,
-                    );
-                }
+            // (a) commit present, no marker: no consult, so the call runs (the supervisor and the planning session).
+            for (const id of [Number(supervisorId), Number(planningId)]) {
+                assert.equal(
+                    await desk.block(id, "bash", {}, undefined, broken(id, harnessCommit)),
+                    undefined,
+                );
             }
 
-            // An unbound session is blocked too while the state cannot be read: nothing shows that it is no consult.
-            assert.match(
-                (await desk.block(Number(supervisorId), "bash", {}, undefined, {
-                    ...broken(false),
-                    conversationId: Number(supervisorId),
-                })) ?? "",
-                /could not read its state/,
-            );
+            // (b) commit present, the marker of a bound consult: blocked (a fresh read first, then the cached one).
+            for (const name of ["bash", "write", "read"]) {
+                assert.match(
+                    (await desk.block(
+                        session,
+                        name,
+                        {},
+                        undefined,
+                        broken(session, harnessCommit),
+                    )) ?? "",
+                    /could not read its state.*Try again in a moment/,
+                    name,
+                );
+            }
 
-            // A later read that works: the consult's state decides, with no commit too.
+            // (c) no commit: the hook cannot tell, so the call is blocked, a consult's and an ordinary session's.
+            for (const id of [session, Number(supervisorId)]) {
+                assert.match(
+                    (await desk.block(id, "bash", {}, undefined, broken(id))) ?? "",
+                    /could not read its state.*Try again in a moment/,
+                );
+            }
+        } finally {
+            desk.restore();
+        }
+
+        // Both reads fail (a fresh desk: nothing cached): an ordinary session is blocked too.
+        const fresh = stubDesk();
+
+        try {
+            const failing = () => Promise.reject(new Error("storage is busy"));
+
             assert.match(
-                (await desk.block(session, "bash", {}, undefined, desk.typed(session))) ?? "",
-                /k1\) gave its finding \(f1\): every tool is blocked now/,
-            );
-            assert.equal(
-                await desk.block(
+                (await fresh.block(
                     Number(supervisorId),
                     "bash",
                     {},
                     undefined,
-                    desk.typed(Number(supervisorId)),
+                    broken(Number(supervisorId), failing),
+                )) ?? "",
+                /could not read its state/,
+            );
+
+            // A later state read that works: the consult's state decides, with no commit too.
+            assert.match(
+                (await fresh.block(session, "bash", {}, undefined, fresh.typed(session))) ?? "",
+                /k1\) gave its finding \(f1\): every tool is blocked now/,
+            );
+            assert.equal(
+                await fresh.block(
+                    Number(supervisorId),
+                    "bash",
+                    {},
+                    undefined,
+                    fresh.typed(Number(supervisorId)),
                 ),
                 undefined,
             );
         } finally {
-            desk.restore();
+            fresh.restore();
         }
     });
 
