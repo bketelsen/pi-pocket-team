@@ -19472,18 +19472,6 @@ export default function createDesk(host: Host, web: Web) {
                     await applySweep(tx, state, Number(supervisor), facts);
                     await startMissingSweepers(tx);
 
-                    // The dashboard's collector: it only reads the threads, and it starts no agent.
-                    try {
-                        await dashboard.ensureCollector(
-                            tx,
-                            Number(supervisor),
-                            Collector,
-                            collectorLive,
-                        );
-                    } catch {
-                        // The next sweep tries again.
-                    }
-
                     // Entries that wait with no writer (the journal was off, then on again): a writer starts again.
                     await resumeJournal(tx, Number(supervisor));
 
@@ -19577,6 +19565,19 @@ export default function createDesk(host: Host, web: Web) {
                                     : { address: thread.address }),
                             });
                         }
+                    }
+
+                    // The dashboard's collector, after every table read of this commit (a task is a table write): it
+                    // only reads the threads, and it starts no agent.
+                    try {
+                        await dashboard.ensureCollector(
+                            tx,
+                            Number(supervisor),
+                            Collector,
+                            collectorLive,
+                        );
+                    } catch {
+                        // The next sweep tries again.
                     }
 
                     const open = Object.values(state.threads).some(
@@ -23053,6 +23054,9 @@ export default function createDesk(host: Host, web: Web) {
             if (args.action === "sync") {
                 const facts = await gather(supervisor as ConversationId, api, Date.now(), context);
                 const result = await api.commit(async (tx) => {
+                    // As in the sweep: read first, start last, and a failure is no failed sync. A desk with only
+                    // closed threads has no sweeper: a sync starts the dashboard's collector.
+                    const live = await dashboard.collectorLive(tx).catch(() => undefined);
                     const swept = await applySweep(
                         tx,
                         await tx.doc(DeskThreads),
@@ -23063,6 +23067,9 @@ export default function createDesk(host: Host, web: Web) {
                     await startMissingSweepers(tx);
                     // Entries that wait with no writer: a sync starts one too, also with no open thread.
                     await resumeJournal(tx, supervisor);
+                    await dashboard
+                        .ensureCollector(tx, supervisor, Collector, live)
+                        .catch(() => undefined);
 
                     return swept;
                 }, context);

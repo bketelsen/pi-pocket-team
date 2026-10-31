@@ -48,7 +48,7 @@ import {
     type DashboardState,
     type Read,
 } from "./_desk-dashboard.ts";
-import { DeskThreads, type DeskState, type PrLink, type Thread } from "./desk.ts";
+import { DeskThreads, SWEEP_SLEEP_MS, type DeskState, type PrLink, type Thread } from "./desk.ts";
 
 // ─── Fixtures ────────────────────────────────────────────────────────────────
 
@@ -693,7 +693,8 @@ describe("the answer", () => {
             ok: false,
             error: "no answer",
         });
-        assert.deepEqual(answer.partial, ["a/b#2", "a/b#3"]);
+        assert.deepEqual(answer.partial, ["a/b#2", "a/b#3", "a/b#4"], "every failed read");
+        assert.deepEqual(answer.errors, []);
         assert.deepEqual(answer.rate, { remaining: 4000, resetAt: Date.UTC(2026, 9, 30, 1) });
     });
 
@@ -808,11 +809,10 @@ describe("PR lifecycle", () => {
         assert.equal(fact?.error, "NOT_FOUND");
         assert.equal(fact?.createdAt, T0 - DAY);
         assert.equal(fact?.readAt, T0, "the last good read stays");
-        assert.equal(
-            doc.sources.github?.ok,
-            true,
-            "a missing ref is a partial answer, not a failure",
-        );
+        // The only read failed: no success, and the last good read time stays.
+        assert.equal(doc.sources.github?.ok, false);
+        assert.equal(doc.sources.github?.kind, "partial");
+        assert.equal(doc.sources.github?.lastGoodAt, T0);
         assert.deepEqual(doc.sources.github?.partial, ["a/b#1"]);
         assert.equal(planReads(doc, trackedRefs(desk), T0 + OPEN_REFRESH_MS + HOUR).length, 0);
         assert.equal(
@@ -1159,6 +1159,258 @@ describe("source failures", () => {
 });
 
 // ─── Issue resolution ────────────────────────────────────────────────────────
+
+// ─── Review fixes: unavailable relationships, failed answers, lifecycle gaps ─
+
+/** 1 pass whose GitHub answer is `json`. */
+const answerPass = (doc: DashboardState, desk: DeskState, now: number, json: unknown) =>
+    pass(doc, desk, now, async () => ({ stdout: JSON.stringify(json) }));
+
+/** A full issue node: a close by a merged PR, and 1 page of closing references. */
+const issueNode = (overrides: Record<string, unknown> = {}) => ({
+    isArchived: false,
+    issue: {
+        state: "CLOSED",
+        stateReason: "COMPLETED",
+        createdAt: iso(T0 - 10 * DAY),
+        closedAt: iso(T0 - DAY),
+        timelineItems: {
+            nodes: [{ __typename: "ClosedEvent", closer: prNode("a/b#7", T0 - DAY) }],
+        },
+        closedByPullRequestsReferences: {
+            pageInfo: { hasNextPage: false, endCursor: null },
+            nodes: [prNode("a/b#7", T0 - DAY)],
+        },
+        ...overrides,
+    },
+});
+
+describe("review fixes", () => {
+    const desk = deskOf([thread("T1", { issues: ["a/b#5"] })]);
+
+    /** A document with a resolved issue, read at T0. */
+    async function resolved(): Promise<DashboardState> {
+        const doc = fresh();
+
+        await answerPass(doc, desk, T0, { data: { i0: issueNode() } });
+        assert.equal(doc.issues["a/b#5"]?.resolution?.pr, "a/b#7");
+
+        return doc;
+    }
+
+    const kept = (doc: DashboardState) => {
+        const fact = doc.issues["a/b#5"];
+
+        return {
+            resolution: fact?.resolution,
+            unresolved: fact?.unresolved,
+            closing: fact?.closing,
+        };
+    };
+
+    for (const [name, answer] of [
+        [
+            "a nested error on timelineItems",
+            {
+                data: { i0: issueNode({ timelineItems: null }) },
+                errors: [
+                    { type: "INTERNAL", path: ["i0", "issue", "timelineItems"], message: "x" },
+                ],
+            },
+        ],
+        [
+            "a nested error on the closing list",
+            {
+                data: { i0: issueNode({ closedByPullRequestsReferences: null }) },
+                errors: [
+                    {
+                        type: "INTERNAL",
+                        path: ["i0", "issue", "closedByPullRequestsReferences"],
+                        message: "x",
+                    },
+                ],
+            },
+        ],
+        [
+            "a missing closing field",
+            { data: { i0: issueNode({ closedByPullRequestsReferences: undefined }) } },
+        ],
+        [
+            "a closing list with no pageInfo",
+            { data: { i0: issueNode({ closedByPullRequestsReferences: { nodes: [] } }) } },
+        ],
+    ] as const) {
+        test(`${name} is an unavailable read: the stored resolution stays`, async () => {
+            const doc = await resolved();
+            const before = kept(doc);
+            const now = T0 + CLOSED_REFRESH_MS;
+
+            await answerPass(doc, desk, now, answer);
+            assert.deepEqual(kept(doc), before);
+            assert.equal(doc.issues["a/b#5"]?.error, "partial");
+            assert.equal(doc.issues["a/b#5"]?.errorAt, now);
+            assert.equal(doc.issues["a/b#5"]?.readAt, T0, "no good read");
+            assert.equal(planReads(doc, trackedRefs(desk), now + ERROR_RETRY_MS - 1).length, 0);
+            assert.equal(planReads(doc, trackedRefs(desk), now + ERROR_RETRY_MS).length, 1);
+        });
+    }
+
+    test("a closing page that is not there keeps the cursor and the pages read", async () => {
+        const doc = fresh();
+
+        await answerPass(doc, desk, T0, {
+            data: {
+                i0: issueNode({
+                    timelineItems: { nodes: [{ __typename: "ClosedEvent", closer: null }] },
+                    closedByPullRequestsReferences: {
+                        pageInfo: { hasNextPage: true, endCursor: "page2" },
+                        nodes: [],
+                    },
+                }),
+            },
+        });
+
+        const before = kept(doc);
+
+        assert.equal(before.closing?.cursor, "page2");
+        await answerPass(doc, desk, T0 + PASS_MS, {
+            data: { c0: { issue: { closedByPullRequestsReferences: null } } },
+            errors: [{ path: ["c0", "issue", "closedByPullRequestsReferences"], message: "x" }],
+        });
+        assert.deepEqual(kept(doc), before);
+        assert.equal(doc.issues["a/b#5"]?.error, "partial");
+        assert.deepEqual(
+            planReads(doc, trackedRefs(desk), T0 + PASS_MS + ERROR_RETRY_MS).map((read) => [
+                read.kind,
+                read.cursor,
+            ]),
+            [["closing", "page2"]],
+        );
+    });
+
+    test("an answer in which no read worked is no success: lastGoodAt stays", async () => {
+        const doc = fresh();
+        const prs = deskOf([thread("T1", { prs: { "a/b#1": link(), "a/b#2": link() } })]);
+        const good = {
+            data: {
+                p0: { isArchived: false, pullRequest: { state: "OPEN", createdAt: iso(T0 - DAY) } },
+                p1: { isArchived: false, pullRequest: { state: "OPEN", createdAt: iso(T0 - DAY) } },
+            },
+        };
+
+        await answerPass(doc, prs, T0, good);
+        assert.equal(doc.sources.github?.lastGoodAt, T0);
+
+        // No alias error at all, and no data: each read fails, and each is in `partial`.
+        const later = T0 + OPEN_REFRESH_MS;
+
+        await answerPass(doc, prs, later, { data: { p0: null, p1: null } });
+        assert.equal(doc.sources.github?.ok, false);
+        assert.equal(doc.sources.github?.kind, "partial");
+        assert.equal(doc.sources.github?.at, later);
+        assert.equal(doc.sources.github?.lastGoodAt, T0);
+        assert.deepEqual(doc.sources.github?.partial, ["a/b#1", "a/b#2"]);
+        assert.equal(doc.prs["a/b#1"]?.createdAt, T0 - DAY, "the facts stay");
+
+        // An error with no alias path, and no read worked: its line is the source's error.
+        await answerPass(doc, prs, later + ERROR_RETRY_MS, {
+            data: null,
+            errors: [{ message: "Something went wrong while executing your query." }],
+        });
+        assert.equal(doc.sources.github?.ok, false);
+        assert.equal(doc.sources.github?.error, "Something went wrong while executing your query.");
+        assert.equal(doc.sources.github?.lastGoodAt, T0);
+    });
+
+    test("an error with no alias path beside a good read: ok, and its line is kept", async () => {
+        const doc = fresh();
+        const prs = deskOf([thread("T1", { prs: { "a/b#1": link() } })]);
+
+        await answerPass(doc, prs, T0, {
+            data: {
+                p0: { isArchived: false, pullRequest: { state: "OPEN", createdAt: iso(T0 - DAY) } },
+            },
+            errors: [{ message: "A field is deprecated." }, { path: ["other"], message: "Odd." }],
+        });
+        assert.equal(doc.sources.github?.ok, true);
+        assert.equal(doc.sources.github?.lastGoodAt, T0);
+        assert.equal(doc.sources.github?.error, "A field is deprecated.");
+        assert.equal(doc.sources.github?.kind, "partial");
+        assert.equal(doc.sources.github?.partial, undefined);
+    });
+
+    test("a merged PR with a missing lifecycle time has gaps, and is read again once a day", async () => {
+        const doc = fresh();
+        const prs = deskOf([thread("T1", { prs: { "a/b#1": link() } })]);
+        const merged = (closedAt: string | null) => ({
+            data: {
+                p0: {
+                    isArchived: false,
+                    pullRequest: {
+                        state: "MERGED",
+                        createdAt: iso(T0 - 3 * DAY),
+                        mergedAt: iso(T0 - DAY),
+                        closedAt,
+                    },
+                },
+            },
+        });
+
+        await answerPass(doc, prs, T0, merged(null));
+        assert.deepEqual(doc.prs["a/b#1"]?.gaps, ["closedAt"]);
+        assert.equal(doc.sources.github?.complete, false);
+        assert.equal(planReads(doc, trackedRefs(prs), T0 + CLOSED_REFRESH_MS - 1).length, 0);
+        assert.equal(planReads(doc, trackedRefs(prs), T0 + CLOSED_REFRESH_MS)[0]?.why, 5);
+
+        await answerPass(doc, prs, T0 + CLOSED_REFRESH_MS, merged(iso(T0 - DAY)));
+        assert.equal(doc.prs["a/b#1"]?.gaps, undefined);
+        assert.equal(doc.sources.github?.complete, true);
+        assert.equal(planReads(doc, trackedRefs(prs), T0 + 30 * DAY).length, 0, "final now");
+    });
+
+    test("the lifecycle times each state needs", async () => {
+        const doc = fresh();
+        const prs = deskOf([
+            thread("T1", { prs: { "a/b#1": link(), "a/b#2": link(), "a/b#3": link() } }),
+        ]);
+
+        await answerPass(doc, prs, T0, {
+            data: {
+                p0: { isArchived: false, pullRequest: { state: "OPEN", createdAt: null } },
+                p1: {
+                    isArchived: false,
+                    pullRequest: { state: "CLOSED", createdAt: iso(T0 - DAY), closedAt: null },
+                },
+                p2: {
+                    isArchived: false,
+                    pullRequest: {
+                        state: "MERGED",
+                        createdAt: null,
+                        mergedAt: null,
+                        closedAt: iso(T0 - DAY),
+                    },
+                },
+            },
+        });
+        assert.deepEqual(doc.prs["a/b#1"]?.gaps, ["createdAt"]);
+        assert.deepEqual(doc.prs["a/b#2"]?.gaps, ["closedAt"]);
+        assert.deepEqual(doc.prs["a/b#3"]?.gaps, ["createdAt", "mergedAt"]);
+    });
+
+    test("a closed issue with no creation or close time has gaps, and the source is not complete", async () => {
+        const doc = fresh();
+
+        await answerPass(doc, desk, T0, {
+            data: { i0: issueNode({ createdAt: null, closedAt: null }) },
+        });
+        assert.deepEqual(doc.issues["a/b#5"]?.gaps, ["createdAt", "closedAt"]);
+        assert.equal(doc.sources.github?.complete, false);
+
+        await answerPass(doc, desk, T0 + CLOSED_REFRESH_MS, { data: { i0: issueNode() } });
+        assert.equal(doc.issues["a/b#5"]?.gaps, undefined);
+        assert.equal(doc.sources.github?.complete, true);
+    });
+});
 
 describe("issue resolution", () => {
     const desk = deskOf([thread("T1", { issues: ["a/b#5"] })]);
@@ -1626,7 +1878,7 @@ describe("the collector in Pocket", () => {
         cleanUp();
     });
 
-    test("a sweep starts 1 collector, and a second sweep adds none", async () => {
+    test("a sync starts 1 collector, and a second sync and its sweeper add none", async () => {
         const folder = join(root, "dashboard-supervisor");
 
         mkdirSync(folder, { recursive: true });
@@ -1740,6 +1992,118 @@ describe("the collector in Pocket", () => {
             assert.equal(doc?.sources.github?.complete, false);
         } finally {
             process.env.PI_POCKET_DESK_GH = fakeGh;
+        }
+    });
+
+    test("a sweep that sends an Odrade repair with a session scan also starts the collector", async () => {
+        const source = supervisorId;
+
+        assert(source !== undefined, "the first test's supervisor");
+
+        const folder = join(root, "dashboard-agent");
+
+        mkdirSync(folder, { recursive: true });
+
+        // A thread session with no cached return address: the repair loop scans its entries.
+        const agent = await newSession(app, folder);
+
+        await say(app, source, "desk sync test");
+        await until(
+            async () =>
+                (await liveTasks("x.desk.sweeper")).some(
+                    (task) => task.record.state.status === "sleeping",
+                ),
+            "the sweeper's sleep",
+            20_000,
+        );
+        // No collector: the next sweep starts one, in the same commit as the repair's scan.
+        await stopKind(COLLECTOR_TASK);
+
+        const key = "repair:frostyard/test#9:h1:CONFLICTING";
+
+        await app.harness.commit(async (tx) => {
+            const state = await tx.doc(DeskThreads);
+
+            state.threads.T5 = thread("T5", {
+                supervisor: Number(source),
+                session: Number(agent),
+                startedAt: Date.now(),
+                asks: [{ id: "T5a", text: "Which one?", at: Date.now() }],
+                prs: {
+                    "frostyard/test#9": link({
+                        via: "attached",
+                        state: "OPEN",
+                        head: "h1",
+                        mergeable: "CONFLICTING",
+                    }),
+                },
+                run: {
+                    repairs: { [key]: { at: Date.now(), to: "odrade", why: "cap", sent: false } },
+                },
+            });
+        }, context);
+        assert.equal((await dashboardDoc())?.collector, undefined);
+        await restartApp(shift + SWEEP_SLEEP_MS + 60_000);
+        await until(
+            async () => typeof (await deskDoc())?.threads.T5?.run.sweptAt === "number",
+            "the sweep",
+            20_000,
+        );
+        await until(async () => (await dashboardDoc())?.collector !== undefined, "the collector");
+        assert.equal((await liveTasks(COLLECTOR_TASK)).length, 1);
+        assert.equal((await liveTasks("x.desk.sweeper")).length, 1, "the sweeper did not fault");
+        await stopKind("x.desk.sweeper");
+        await stopKind(COLLECTOR_TASK);
+    });
+
+    test("a desk with only closed threads: desk sync starts 1 collector", async () => {
+        const source = supervisorId;
+
+        assert(source !== undefined, "the first test's supervisor");
+        await stopKind("x.desk.sweeper");
+        await stopKind(COLLECTOR_TASK);
+
+        const reopen: string[] = [];
+
+        await app.harness.commit(async (tx) => {
+            const state = await tx.doc(DeskThreads);
+
+            for (const each of Object.values(state.threads)) {
+                if (each.state !== "closed") {
+                    reopen.push(each.id);
+                    each.state = "closed";
+                    each.closed = { at: Date.now(), why: "dropped", by: "desk" };
+                }
+            }
+        }, context);
+
+        try {
+            assert.equal((await dashboardDoc())?.collector, undefined);
+            await say(app, source, "desk sync test");
+            await until(
+                async () => (await dashboardDoc())?.collector !== undefined,
+                "the collector",
+            );
+            assert.equal((await liveTasks(COLLECTOR_TASK)).length, 1);
+            assert.equal(
+                (await liveTasks("x.desk.sweeper")).length,
+                0,
+                "no open thread: no sweeper",
+            );
+        } finally {
+            await stopKind(COLLECTOR_TASK);
+            await app.harness.commit(async (tx) => {
+                const state = await tx.doc(DeskThreads);
+
+                for (const id of reopen) {
+                    const each = state.threads[id];
+
+                    if (each !== undefined && id === "T1") {
+                        each.state = "open";
+                        delete each.closed;
+                    }
+                }
+            }, context);
         }
     });
 

@@ -80,8 +80,9 @@ export type SourceStatus = {
 export type GitHubSource = {
     /** The last pass that read GitHub. Absent: no pass read GitHub yet. */
     at?: number;
-    /** Whether that read worked. */
+    /** Whether that read worked: false also when no requested ref read worked (kind "partial"). */
     ok?: boolean;
+    /** Why it failed, or, with `ok` true, an error of the answer that belongs to no ref: 1 line. */
     error?: string;
     kind?: FailureKind;
     /** The last read with no failure. */
@@ -161,6 +162,12 @@ export type PrFact = {
     errorAt?: number;
     /** When a pass saw the PR open again after it was closed. */
     reopenedAt?: number;
+    /**
+     * The lifecycle times its state needs that the stored facts lack: OPEN needs `createdAt`; MERGED needs `createdAt`,
+     * `mergedAt` and `closedAt`; CLOSED needs `createdAt` and `closedAt`. A PR with gaps is read again after
+     * `CLOSED_REFRESH_MS`, also when it is merged, and the source is not complete. Absent: no gap.
+     */
+    gaps?: string[];
     /** No thread links it any more: it is not read again. */
     untracked?: true;
 };
@@ -189,6 +196,11 @@ export type IssueFact = {
     createdAt?: number;
     closedAt?: number;
     readAt?: number;
+    /**
+     * The times its state needs that the stored facts lack: OPEN needs `createdAt`; CLOSED needs `createdAt` and
+     * `closedAt`. The source is not complete while an issue has gaps. Absent: no gap.
+     */
+    gaps?: string[];
     /** The PR that resolved it (lowercased ref, maybe in another repository), its merge time, and the evidence. */
     resolution?: {
         pr: string;
@@ -671,8 +683,13 @@ function prDue(
         return age >= CLOSED_REFRESH_MS ? 5 : undefined;
     }
 
-    // MERGED is final, unless the desk says OPEN (above). No state with a read: the read gave nothing; read again.
-    return fact.state === undefined && age >= ERROR_RETRY_MS ? 2 : undefined;
+    // MERGED is final, unless the desk says OPEN (above), or a lifecycle time is missing: then once a day.
+    if (fact.state === "MERGED") {
+        return (fact.gaps?.length ?? 0) > 0 && age >= CLOSED_REFRESH_MS ? 5 : undefined;
+    }
+
+    // No state with a read: the read gave nothing; read again.
+    return age >= ERROR_RETRY_MS ? 2 : undefined;
 }
 
 /** An issue's read kind and order class now, or undefined when it is not due. */
@@ -893,10 +910,12 @@ export type ReadResult =
 export type Answer = {
     results: ReadResult[];
     rate?: { remaining: number; resetAt?: number };
-    /** The refs whose part of the answer had an error. */
+    /** The refs whose part of the answer had an error, and every ref whose read failed. */
     partial: string[];
     /** GitHub said RATE_LIMITED. */
     rateLimited: boolean;
+    /** The errors with no alias path (they belong to no read), 1 line each. */
+    errors: string[];
 };
 
 const record = (value: unknown): Record<string, unknown> | undefined =>
@@ -917,6 +936,10 @@ function prRefOf(node: Record<string, unknown> | undefined): string | undefined 
 
     return splitRef(ref) === undefined ? undefined : ref.toLowerCase();
 }
+
+/** Whether a closing-reference list is there: its `nodes` array and its `pageInfo`. */
+const closingList = (value: unknown): boolean =>
+    Array.isArray(record(value)?.nodes) && record(record(value)?.pageInfo) !== undefined;
 
 function closingPage(value: unknown): ClosingPage {
     const list = record(value);
@@ -1002,9 +1025,22 @@ export function parseAnswer(json: unknown, reads: readonly Read[]): Answer {
     const partial: string[] = [];
     let rateLimited = false;
 
+    const aliases = new Set(reads.map((read, index) => aliasOf(read, index)));
+    const unscoped: string[] = [];
+
     for (const raw of errors) {
-        if (record(raw)?.type === "RATE_LIMITED") {
+        const error = record(raw);
+
+        if (error?.type === "RATE_LIMITED") {
             rateLimited = true;
+        }
+
+        const path = error?.path;
+
+        if (!Array.isArray(path) || typeof path[0] !== "string" || !aliases.has(path[0])) {
+            const text = typeof error?.message === "string" ? line(error.message) : "";
+
+            unscoped.push(text === "" ? "GitHub gave an error" : text);
         }
     }
 
@@ -1024,7 +1060,16 @@ export function parseAnswer(json: unknown, reads: readonly Read[]): Answer {
             }
 
             results.push(result);
+
+            if (!partial.includes(read.key)) {
+                partial.push(read.key);
+            }
         };
+
+        // A relationship read with an error under its alias, or with a list that is not there, is unavailable: never
+        // an empty one. The stored relationship facts stay, and the read waits `ERROR_RETRY_MS`.
+        const unavailable = (): void =>
+            fail(own.some((error) => error?.type === "RATE_LIMITED") ? "RATE_LIMITED" : "partial");
 
         if (own.length > 0 && !partial.includes(read.key)) {
             partial.push(read.key);
@@ -1085,6 +1130,12 @@ export function parseAnswer(json: unknown, reads: readonly Read[]): Answer {
         }
 
         if (read.kind === "closing") {
+            if (own.length > 0 || !closingList(node.closedByPullRequestsReferences)) {
+                unavailable();
+
+                return;
+            }
+
             results.push({
                 kind: "closing",
                 key: read.key,
@@ -1092,6 +1143,16 @@ export function parseAnswer(json: unknown, reads: readonly Read[]): Answer {
                 cursor: read.cursor ?? "",
                 closing: closingPage(node.closedByPullRequestsReferences),
             });
+
+            return;
+        }
+
+        if (
+            own.length > 0 ||
+            !closingList(node.closedByPullRequestsReferences) ||
+            !Array.isArray(record(node.timelineItems)?.nodes)
+        ) {
+            unavailable();
 
             return;
         }
@@ -1132,7 +1193,7 @@ export function parseAnswer(json: unknown, reads: readonly Read[]): Answer {
     });
 
     const rate = record(data.rateLimit);
-    const parsed: Answer = { results, partial, rateLimited };
+    const parsed: Answer = { results, partial, rateLimited, errors: unscoped };
 
     if (typeof rate?.remaining === "number" && Number.isFinite(rate.remaining)) {
         const resetAt = parseTime(rate.resetAt);
@@ -1252,6 +1313,25 @@ function reopenPr(fact: PrFact, now: number): void {
     put(fact, "reopenedAt", now);
 }
 
+/** The lifecycle times each state needs. */
+const NEEDED: Record<string, readonly ("createdAt" | "mergedAt" | "closedAt")[]> = {
+    OPEN: ["createdAt"],
+    MERGED: ["createdAt", "mergedAt", "closedAt"],
+    CLOSED: ["createdAt", "closedAt"],
+};
+
+/** The names of the times a fact's state needs and lacks, or undefined when none is missing. */
+export function gapsOf(fact: {
+    state?: string;
+    createdAt?: number;
+    mergedAt?: number;
+    closedAt?: number;
+}): string[] | undefined {
+    const gaps = (NEEDED[fact.state ?? ""] ?? []).filter((name) => fact[name] === undefined);
+
+    return gaps.length === 0 ? undefined : gaps;
+}
+
 function applyPrResult(
     fact: PrFact,
     result: Extract<ReadResult, { kind: "pr" }>,
@@ -1282,6 +1362,7 @@ function applyPrResult(
         result.state === "MERGED" ? (result.mergedAt ?? fact.mergedAt) : undefined,
     );
     put(fact, "closedAt", result.state === "OPEN" ? undefined : (result.closedAt ?? fact.closedAt));
+    put(fact, "gaps", gapsOf(fact));
 }
 
 /** Set an issue's resolution, keeping the stored one (and its time) when it says the same. */
@@ -1413,6 +1494,7 @@ function applyIssueResult(
     }
 
     put(fact, "closedAt", result.state === "CLOSED" ? result.closedAt : undefined);
+    put(fact, "gaps", gapsOf(fact));
 
     // Each issue read starts the closing references again from page 1.
     const closing: NonNullable<IssueFact["closing"]> = {
@@ -1680,14 +1762,36 @@ function applyGitHubSource(draft: DashboardState, input: PassInput): void {
                 rate?.resetAt !== undefined && rate.resetAt > now
                     ? rate.resetAt
                     : now + RATE_BACKOFF_MS;
+        } else if (answer?.results.some((result) => result.ok) !== true) {
+            // No requested read worked: no success, and `lastGoodAt` stays.
+            const failed = answer?.results.find((result) => !result.ok);
+
+            source.at = now;
+            source.ok = false;
+            source.kind = "partial";
+            source.error =
+                answer?.errors[0] ??
+                (failed !== undefined && !failed.ok
+                    ? `no read worked: ${failed.error}`
+                    : "no read worked");
+            delete source.backoffUntil;
         } else {
             source.at = now;
             source.ok = true;
             source.lastGoodAt = now;
-            delete source.error;
-            delete source.kind;
             delete source.backoffUntil;
 
+            // An error that belongs to no read: the answer is partial, and its line stays.
+            if (answer.errors.length > 0) {
+                source.error = answer.errors[0];
+                source.kind = "partial";
+            } else {
+                delete source.error;
+                delete source.kind;
+            }
+        }
+
+        if (failure === undefined && source.backoffUntil === undefined) {
             if (rate !== undefined && rate.remaining < RATE_FLOOR) {
                 source.backoffUntil =
                     rate.resetAt !== undefined && rate.resetAt > now
@@ -1717,10 +1821,15 @@ function applyGitHubSource(draft: DashboardState, input: PassInput): void {
             Object.values(tracked.prs).every((pr) => {
                 const fact = draft.prs[pr.key];
 
-                return fact?.excluded !== undefined || fact?.readAt !== undefined;
+                return (
+                    fact?.excluded !== undefined ||
+                    (fact?.readAt !== undefined && fact.gaps === undefined)
+                );
             }) &&
             Object.values(tracked.issues).every(
-                (issue) => draft.issues[issue.key]?.readAt !== undefined,
+                (issue) =>
+                    draft.issues[issue.key]?.readAt !== undefined &&
+                    draft.issues[issue.key]?.gaps === undefined,
             );
     }
 
