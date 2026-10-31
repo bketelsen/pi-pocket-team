@@ -17,6 +17,7 @@
         "_desk-usage.ts",
         "_desk-dashboard.ts",
         "_desk-metrics.ts",
+        "desk-dashboard-fixture.ts",
         "desk.ts",
         "terminal.ts"
     ]

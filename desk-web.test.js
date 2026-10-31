@@ -43,6 +43,35 @@ import setup, {
     queueStatus,
     stillMounted,
 } from "./desk-web/index.js";
+import {
+    addDays,
+    barLayout,
+    cellText,
+    COLUMNS,
+    dashboardPath,
+    dashboardStates,
+    defaultSelection,
+    formatCount,
+    formatDuration,
+    formatMoney,
+    formatPerWeek,
+    formatRate,
+    formatUtc,
+    isUnknown,
+    makeDashboard,
+    nextSort,
+    noTrackedWork,
+    ownerChoices,
+    rangeLine,
+    repoChoices,
+    sortRows,
+    tableRows,
+    usageAvailable,
+    usageNote,
+    utcDay,
+    withOwner,
+    withRepo,
+} from "./desk-web/dashboard.js";
 
 const NOW = Date.now();
 
@@ -1214,4 +1243,392 @@ test("a 409 on the plan's Drop loads the plan again, and the error says so and s
         ok: true,
     });
     assert.equal(ok.calls.length, 1, "a done drop loads nothing here");
+});
+
+// ─── The Dashboard view's helpers ────────────────────────────────────────────
+
+test("the operational view is the default: the page opens on Desk, with the Dashboard 1 tap away", async () => {
+    const out = await render(viewWith(null));
+
+    assert.match(out, /role="group" aria-label="Desk view"/);
+    assert.match(out, /data-tab="desk" aria-pressed=true onClick=\[fn\] > Desk </);
+    assert.match(out, /data-tab="dashboard" aria-pressed=false onClick=\[fn\] > Dashboard </);
+    assert.match(out, /<h1>Desk<\/h1>/);
+    assert.doesNotMatch(out, /dash-controls/);
+});
+
+test("unknown is never 0: each format gives null for unknown, and a real 0 for 0", () => {
+    for (const value of [null, undefined, NaN, Infinity]) {
+        assert.equal(isUnknown(value), true);
+        assert.equal(formatCount(value), null);
+        assert.equal(formatRate(value), null);
+        assert.equal(formatDuration(value), null);
+        assert.equal(formatMoney(value), null);
+        assert.equal(formatPerWeek(value), null);
+        assert.equal(formatUtc(value), null);
+    }
+
+    assert.equal(isUnknown(0), false);
+    assert.equal(formatCount(0), "0");
+    assert.equal(formatCount(9320), "9,320");
+    assert.equal(formatRate(0), "0%");
+    assert.equal(formatRate(0.8), "80%");
+    assert.equal(formatRate(2 / 3), "66.7%");
+    assert.equal(formatDuration(0), "0 min");
+    assert.equal(formatDuration(45 * 60_000), "45 min");
+    assert.equal(formatDuration(9 * 3600_000), "9 h");
+    assert.equal(formatDuration(47.5 * 3600_000), "47.5 h");
+    assert.equal(formatDuration(129 * 3600_000), "5.4 d");
+    assert.equal(formatMoney(0), "$0.00");
+    assert.equal(formatMoney(0.001), "$0.0010");
+    assert.equal(formatMoney(0.9), "$0.90");
+    assert.equal(formatMoney(1234.5), "$1,234.50");
+    assert.equal(formatPerWeek(8 / (29.5 / 7)), "1.9");
+    assert.equal(formatPerWeek(2), "2");
+    assert.equal(formatUtc(Date.UTC(2026, 9, 30, 12, 5)), "2026-10-30 12:05 UTC");
+    assert.equal(utcDay(Date.UTC(2026, 9, 30, 23, 59)), "2026-10-30");
+    assert.equal(addDays("2026-03-01", -1), "2026-02-28");
+    assert.equal(addDays("2026-10-30", -29), "2026-10-01");
+});
+
+test("dashboardPath: a preset sends its first day, never before the boundary's day; custom sends both", () => {
+    const today = "2026-10-30";
+
+    assert.equal(dashboardPath(defaultSelection(), today), "dashboard?from=2026-10-01");
+    assert.equal(
+        dashboardPath({ ...defaultSelection(), preset: 7 }, today, "2026-08-01"),
+        "dashboard?from=2026-10-24",
+    );
+    assert.equal(
+        dashboardPath({ ...defaultSelection(), preset: 90 }, today, "2026-08-15"),
+        "dashboard?from=2026-08-15",
+    );
+    assert.equal(
+        dashboardPath(
+            {
+                preset: "custom",
+                from: "2026-10-20",
+                to: "2026-10-10",
+                owner: "frostyard",
+                repo: "",
+            },
+            today,
+            "2026-08-15",
+        ),
+        "dashboard?from=2026-10-20&to=2026-10-10&owner=frostyard",
+        "the route judges a custom range",
+    );
+    assert.equal(
+        dashboardPath({ ...defaultSelection(), owner: "a", repo: "a/b" }, today),
+        "dashboard?from=2026-10-01&owner=a&repo=a%2Fb",
+    );
+});
+
+test("the scope: an owner drops another owner's repository; a repository brings its owner; choices stay", () => {
+    const choices = { owners: ["a", "b"], repos: ["a/one", "a/two", "b/three"] };
+    const base = defaultSelection();
+
+    assert.deepEqual(withOwner({ ...base, owner: "a", repo: "a/one" }, "b"), {
+        ...base,
+        owner: "b",
+        repo: "",
+    });
+    assert.deepEqual(withOwner({ ...base, owner: "a", repo: "a/one" }, "a"), {
+        ...base,
+        owner: "a",
+        repo: "a/one",
+    });
+    assert.deepEqual(withOwner({ ...base, owner: "a", repo: "a/one" }, ""), base);
+    assert.deepEqual(withRepo(base, "b/three"), { ...base, owner: "b", repo: "b/three" });
+    assert.deepEqual(withRepo({ ...base, owner: "b", repo: "b/three" }, ""), {
+        ...base,
+        owner: "b",
+    });
+    assert.deepEqual(repoChoices(choices, base), choices.repos);
+    assert.deepEqual(repoChoices(choices, { ...base, owner: "a" }), ["a/one", "a/two"]);
+    assert.deepEqual(ownerChoices(choices, base), ["a", "b"]);
+    // A chosen value that a later snapshot no longer lists stays offered.
+    assert.deepEqual(repoChoices(choices, { ...base, owner: "a", repo: "a/gone" }), [
+        "a/one",
+        "a/two",
+        "a/gone",
+    ]);
+    assert.deepEqual(ownerChoices(choices, { ...base, owner: "c" }), ["a", "b", "c"]);
+    assert.deepEqual(repoChoices(undefined, base), []);
+});
+
+/** A metric set with only the fields the table and the states read. */
+const metrics = (patch = {}) => ({
+    completion: { rate: null, success: 0, denominator: 0, ...patch.completion },
+    cycleTime: { medianMs: null, ...patch.cycleTime },
+    timeToSolve: { medianMs: null, p90Ms: null, count: 0, nowUnresolved: 0, ...patch.timeToSolve },
+    workload: { total: 0, ...patch.workload },
+    prs: { merged: 0, tracked: 0, ...patch.prs },
+    usage: { totalTokens: 0, cost: null, sessions: 0, ...patch.usage },
+    population: { delivery: 0, coordinators: 0, ...patch.population },
+});
+
+test("sortRows: by a column either way, unknown last both ways, then by name", () => {
+    const rows = [
+        { name: "b", metrics: metrics({ usage: { cost: 2 } }) },
+        { name: "a", metrics: metrics({ usage: { cost: null } }) },
+        { name: "c", metrics: metrics({ usage: { cost: 0 } }) },
+        { name: "d", metrics: metrics({ usage: { cost: 2 } }) },
+    ];
+    const names = (sort) => sortRows(rows, sort).map((row) => row.name);
+
+    assert.deepEqual(names({ key: "cost", dir: "asc" }), ["c", "b", "d", "a"]);
+    assert.deepEqual(names({ key: "cost", dir: "desc" }), ["b", "d", "c", "a"]);
+    assert.deepEqual(names({ key: "name", dir: "desc" }), ["d", "c", "b", "a"]);
+    assert.deepEqual(names({ key: "nope", dir: "asc" }), ["a", "b", "c", "d"]);
+    assert.deepEqual(nextSort({ key: "cost", dir: "desc" }, "cost"), { key: "cost", dir: "asc" });
+    assert.deepEqual(nextSort({ key: "cost", dir: "asc" }, "tokens"), {
+        key: "tokens",
+        dir: "desc",
+    });
+    assert.deepEqual(nextSort({ key: "cost", dir: "asc" }, "name"), { key: "name", dir: "asc" });
+    assert.equal(COLUMNS[0].key, "name");
+});
+
+test("tableRows: each owner's subtotal from the answer (never computed), its projects, then unattributed", () => {
+    const owner = metrics({ completion: { rate: 0.5, success: 1, denominator: 2 } });
+    const snapshot = {
+        rows: {
+            projects: [
+                { repo: "b/x", owner: "b", metrics: metrics({ workload: { total: 1 } }) },
+                { repo: "a/y", owner: "a", metrics: metrics({ workload: { total: 3 } }) },
+                { repo: "a/z", owner: "a", metrics: metrics({ workload: { total: 5 } }) },
+            ],
+            owners: [
+                { owner: "a", metrics: owner },
+                { owner: "b", metrics: metrics({ workload: { total: 9 } }) },
+            ],
+            unattributed: metrics(),
+        },
+    };
+    const rows = tableRows(snapshot, { key: "open", dir: "desc" });
+
+    assert.deepEqual(
+        rows.map((row) => `${row.kind}:${row.name}`),
+        [
+            "owner:b",
+            "project:b/x",
+            "owner:a",
+            "project:a/z",
+            "project:a/y",
+            "unattributed:Unattributed",
+        ],
+    );
+    assert.equal(rows[2].metrics, owner, "the route's own subtotal, as it is");
+    assert.equal(
+        tableRows(
+            { rows: { ...snapshot.rows, unattributed: null } },
+            { key: "name", dir: "asc" },
+        ).at(-1).kind,
+        "project",
+    );
+});
+
+/** A snapshot with only the fields the states read. */
+const stateSnapshot = (patch = {}) => {
+    const source = (status) => ({ status, at: 1, lastGoodAt: 1, checkedAt: 1, error: null });
+
+    return {
+        asOf: Date.UTC(2026, 9, 30, 12),
+        totals:
+            patch.totals ??
+            metrics({ population: { delivery: 2 }, completion: { denominator: 2 } }),
+        coverage: {
+            status: patch.status ?? "started",
+            sources: {
+                threads: source(patch.threads ?? "ok"),
+                github: source(patch.github ?? "ok"),
+                usage: { ...source(patch.usage ?? "ok"), error: patch.usageError ?? null },
+            },
+            progress: {
+                github: { pending: 0, complete: patch.githubComplete ?? true, overdue: 0 },
+                usage: { pending: 2, complete: patch.usageComplete ?? true, ledgerUnavailable: 0 },
+            },
+        },
+    };
+};
+
+test("dashboardStates: each state is distinct, and a good snapshot has none", () => {
+    const codes = (snapshot, options) =>
+        dashboardStates(snapshot, options).map((state) => state.code);
+
+    assert.deepEqual(codes(stateSnapshot()), []);
+    assert.deepEqual(codes(null), [], "loading: no snapshot and no error");
+    assert.deepEqual(codes(null, { error: "HTTP 502" }), ["refresh-failed"]);
+    assert.deepEqual(codes(stateSnapshot({ status: "not started" })), ["not-started"]);
+    assert.deepEqual(codes(stateSnapshot({ threads: "stale" })), ["stale-source"]);
+    assert.deepEqual(codes(stateSnapshot({ github: "failed" })), ["failed-source"]);
+    assert.deepEqual(codes(stateSnapshot({ github: "never" })), ["never-source"]);
+    assert.deepEqual(codes(stateSnapshot({ usage: "never" })), ["usage-unavailable"]);
+    assert.deepEqual(codes(stateSnapshot({ usage: "failed" })), [
+        "failed-source",
+        "usage-unavailable",
+    ]);
+    assert.deepEqual(codes(stateSnapshot({ usageComplete: false })), ["partial"]);
+    assert.deepEqual(codes(stateSnapshot({ githubComplete: false })), ["partial"]);
+    assert.deepEqual(codes(stateSnapshot({ totals: metrics() })), ["no-work"]);
+    assert.equal(noTrackedWork(metrics()), true);
+    assert.equal(noTrackedWork(metrics({ usage: { sessions: 1 } })), false);
+    assert.deepEqual(codes(stateSnapshot({ totals: metrics({ population: { delivery: 1 } }) })), [
+        "no-closures",
+    ]);
+    assert.deepEqual(
+        codes(stateSnapshot(), { error: "HTTP 500", rangeError: "from must not be after to." }),
+        ["bad-range", "refresh-failed"],
+    );
+
+    const [failed] = dashboardStates(stateSnapshot(), { error: "HTTP 500" });
+
+    assert.match(failed.text, /stale: they are from 2026-10-30 12:00 UTC/);
+    assert.equal(failed.tone, "err");
+    assert.match(
+        dashboardStates(stateSnapshot({ usageComplete: false }))[0].text,
+        /usage: 2 sessions pending/,
+    );
+});
+
+test("rangeLine names the range, a partial today, a clamp, and the scope", () => {
+    const line = (range, scope) => rangeLine({ asOf: Date.UTC(2026, 9, 30, 12), range, scope });
+
+    assert.equal(
+        line(
+            { from: "2026-10-01", to: "2026-10-30", days: 30, partialToday: true, clamped: false },
+            { kind: "all" },
+        ),
+        "Showing 2026-10-01 to 2026-10-30 UTC (30 days), today up to 2026-10-30 12:00 UTC · all tracked work",
+    );
+    assert.equal(
+        line(
+            { from: "2026-10-01", to: "2026-10-01", days: 1, partialToday: false, clamped: true },
+            { kind: "repo", owner: "a", repo: "a/b" },
+        ),
+        "Showing 2026-10-01 to 2026-10-01 UTC (1 day), moved to the recovery boundary's day · repository a/b",
+    );
+});
+
+test("makeDashboard registers 1 dispose with the module, and gives a component", () => {
+    const disposes = [];
+    const component = makeDashboard({
+        html,
+        useState: (value) => [value, () => {}],
+        useEffect: () => {},
+        useRef: (value) => ({ current: value }),
+        Loader: () => "",
+        api: async () => assert.fail("no read without a mount"),
+        onDispose: (dispose) => disposes.push(dispose),
+    });
+
+    assert.equal(typeof component, "function");
+    assert.equal(disposes.length, 1);
+    assert.doesNotThrow(() => disposes[0]());
+});
+
+/** A coverage with only the usage source the availability rule reads. */
+const usageCoverage = (status, lastGoodAt) => ({
+    sources: { usage: { status, lastGoodAt, at: 1, checkedAt: null, error: null } },
+});
+
+test("usageAvailable: never collected and a failed first read are unknown; partial and failed after a good read keep their facts", () => {
+    const never = usageCoverage("never", null);
+    const firstFailed = usageCoverage("failed", null);
+    const failedLater = usageCoverage("failed", Date.UTC(2026, 9, 29));
+    const partial = usageCoverage("partial", Date.UTC(2026, 9, 30));
+
+    assert.equal(usageAvailable(never), false);
+    assert.equal(usageAvailable(firstFailed), false);
+    assert.equal(usageAvailable(failedLater), true);
+    assert.equal(usageAvailable(partial), true);
+    assert.equal(usageAvailable(usageCoverage("ok", 1)), true);
+    assert.equal(usageAvailable(usageCoverage("stale", 1)), true);
+    assert.equal(usageAvailable(undefined), true, "an answer with no coverage hides nothing");
+
+    assert.match(usageNote(never), /never collected: tokens and cost are unknown/);
+    assert.match(
+        usageNote(firstFailed),
+        /first usage read failed: there is no good read yet, so tokens and cost are unknown/,
+    );
+    assert.match(usageNote(failedLater), /last good facts/);
+    assert.equal(usageNote(partial), null);
+
+    const words = (coverage) =>
+        dashboardStates({
+            ...stateSnapshot(),
+            coverage: {
+                ...stateSnapshot().coverage,
+                sources: { ...stateSnapshot().coverage.sources, usage: coverage.sources.usage },
+            },
+        })
+            .filter((state) => state.code === "usage-unavailable")
+            .map((state) => state.text);
+
+    assert.deepEqual(words(never), [`Usage is unavailable. ${usageNote(never)}`]);
+    assert.deepEqual(words(firstFailed), [`Usage is unavailable. ${usageNote(firstFailed)}`]);
+    assert.deepEqual(words(failedLater), [`Usage is unavailable. ${usageNote(failedLater)}`]);
+    assert.deepEqual(words(partial), []);
+});
+
+test("unknown usage: every table row shows tokens and cost as unknown, and sorts them last; known usage keeps its facts", () => {
+    const zero = metrics({ usage: { totalTokens: 0, cost: null } });
+    const some = metrics({ usage: { totalTokens: 500, cost: 0 } });
+    const rows = {
+        projects: [
+            { repo: "a/one", owner: "a", metrics: zero },
+            { repo: "a/two", owner: "a", metrics: some },
+        ],
+        owners: [{ owner: "a", metrics: some }],
+        unattributed: zero,
+    };
+    const cells = (coverage) =>
+        tableRows({ rows, coverage }, { key: "tokens", dir: "desc" }).map((row) => [
+            row.name,
+            cellText("tokens", row),
+            cellText("cost", row),
+        ]);
+
+    for (const coverage of [usageCoverage("never", null), usageCoverage("failed", null)]) {
+        assert.deepEqual(cells(coverage), [
+            ["a", null, null],
+            ["a/one", null, null],
+            ["a/two", null, null],
+            ["Unattributed", null, null],
+        ]);
+        assert.equal(
+            cellText("tokens", { metrics: zero, usageUnknown: true }),
+            null,
+            "the scope total too",
+        );
+    }
+
+    for (const coverage of [usageCoverage("failed", 1), usageCoverage("partial", 1)]) {
+        assert.deepEqual(cells(coverage), [
+            ["a", "500", "$0.00"],
+            ["a/two", "500", "$0.00"],
+            ["a/one", "0", null],
+            ["Unattributed", "0", null],
+        ]);
+    }
+
+    assert.equal(
+        cellText("open", { metrics: some, usageUnknown: true }),
+        "0",
+        "only usage goes unknown",
+    );
+});
+
+test("barLayout: 1 column for each day, and a gap that lets 1 to 366 days fit", () => {
+    assert.deepEqual(barLayout(7), { gap: 2, style: "--dash-days: 7; --dash-bar-gap: 2px" });
+    assert.deepEqual(barLayout(31), { gap: 2, style: "--dash-days: 31; --dash-bar-gap: 2px" });
+    assert.deepEqual(barLayout(90), { gap: 1, style: "--dash-days: 90; --dash-bar-gap: 1px" });
+    assert.deepEqual(barLayout(366), { gap: 0, style: "--dash-days: 366; --dash-bar-gap: 0px" });
+    assert.equal(barLayout(0).style, "--dash-days: 1; --dash-bar-gap: 2px");
+
+    // The gaps alone never take more than 92 px, whatever the range.
+    for (let days = 1; days <= 366; days += 1) {
+        assert(barLayout(days).gap * (days - 1) <= 92, String(days));
+    }
 });

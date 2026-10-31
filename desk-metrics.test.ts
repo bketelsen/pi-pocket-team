@@ -664,6 +664,31 @@ describe("the main fixture", () => {
         assert.equal(answer.totals.completion.rate, null);
         assert.equal(answer.totals.usage.cost, null);
     });
+
+    test("choices: every attributed owner and repository, the same in every scope", () => {
+        const all = take();
+
+        assert.deepEqual(all.choices.owners, [
+            ...new Set(all.rows.projects.map((row) => row.owner)),
+        ]);
+        assert.deepEqual(
+            all.choices.repos,
+            all.rows.projects.map((row) => row.repo),
+        );
+
+        for (const query of [
+            { ...OCTOBER, owner: "A" },
+            { ...OCTOBER, repo: "B/Three" },
+            { ...OCTOBER, repo: "c/none" },
+            { from: "2026-10-29", to: "2026-10-29" },
+        ]) {
+            assert.deepEqual(take(query).choices, all.choices, JSON.stringify(query));
+        }
+
+        // Unattributed records add no choice; with no facts, there is none.
+        assert(all.choices.repos.every((repo) => repo.includes("/")));
+        assert.deepEqual(take(OCTOBER, null, null).choices, { owners: [], repos: [] });
+    });
 });
 
 // ─── Threads ─────────────────────────────────────────────────────────────────

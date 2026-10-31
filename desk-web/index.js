@@ -1,6 +1,8 @@
 // The Desk page: Brian's inbox for the work the team runs in the background. Phone first, one column. Everything here
 // is owner-only: the page, its routes, and the rail badge.
 
+import { makeDashboard } from "./dashboard.js";
+
 export const pocketApi = 1;
 
 const LISTENERS = new Set();
@@ -543,6 +545,9 @@ export default function setup(pocket) {
 
     app = pocket;
     pocket.style("desk.css");
+
+    // The owner-only Dashboard view: the page is owner-only, and so is its route.
+    const Dashboard = makeDashboard(pocket);
 
     const time = (at) => new Date(at).toLocaleString();
 
@@ -1611,8 +1616,41 @@ export default function setup(pocket) {
         </div>`;
     }
 
+    /**
+     * The 2 views of the page: the operational desk (the default each time the page opens) and the Dashboard. Each
+     * view draws its own copy of the switch, so the pressed button gets the focus back after a switch.
+     */
+    const switchTo = (setTab, next) => {
+        setTab(next);
+        setTimeout(() => document.querySelector(`.desk-tab[data-tab="${next}"]`)?.focus(), 0);
+    };
+
+    const viewTabs = (tab, setTab) =>
+        html`<div class="desk-tabs" role="group" aria-label="Desk view">
+            <button
+                type="button"
+                class="desk-tab"
+                data-tab="desk"
+                aria-pressed=${tab === "desk" ? "true" : "false"}
+                onClick=${() => switchTo(setTab, "desk")}
+            >
+                Desk
+            </button>
+            <button
+                type="button"
+                class="desk-tab"
+                data-tab="dashboard"
+                aria-pressed=${tab === "dashboard" ? "true" : "false"}
+                onClick=${() => switchTo(setTab, "dashboard")}
+            >
+                Dashboard
+            </button>
+        </div>`;
+
     function Desk() {
         const [, setTick] = useState(0);
+        // The Dashboard replaces the sections only while it shows: the desk's own state and listeners stay.
+        const [tab, setTab] = useState("desk");
         const [openId, setOpenId] = useState(null);
         const [planId, setPlanId] = useState(null);
         const [busy, setBusy] = useState(false);
@@ -1795,6 +1833,13 @@ export default function setup(pocket) {
                 setBusy(false);
             }
         };
+
+        if (tab === "dashboard") {
+            return html`<div class="dash-page">
+                <div class="dash-tabs-wrap">${viewTabs(tab, setTab)}</div>
+                <${Dashboard} />
+            </div>`;
+        }
 
         if (planId !== null) {
             return html`<${PlanDetail}
@@ -2483,6 +2528,7 @@ export default function setup(pocket) {
                     </div>`;
 
         return html`<div class="desk">
+            ${viewTabs(tab, setTab)}
             <header class="desk-head">
                 <h1>Desk</h1>
                 <p class="small muted">
