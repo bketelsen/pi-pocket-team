@@ -100,10 +100,11 @@ export type GitHubSource = {
     /** The last read with no failure. */
     lastGoodAt?: number;
     /**
-     * The refs with a problem in the whole stored state, sorted and unique: each tracked ref with a stored `error` (a PR
-     * only when it is not excluded), each ref of the last answer whose part had an error (also a deeper error beside
-     * good data), and each earlier entry that is still tracked until a clean read of it (an ok result with no error in
-     * its part). A failure of the whole read reads nothing cleanly, so the earlier entries stay. Absent: none.
+     * The refs with a problem in the whole stored state, sorted and unique: each ref with a stored `error`, each ref of
+     * the last answer whose part had an error (also a deeper error beside good data), and each earlier entry until a
+     * clean read of it (an ok result with no error in its part). A failure of the whole read reads nothing cleanly, so
+     * the earlier entries stay. Each of the 3 takes only a tracked ref, and a PR only when it is not excluded: a
+     * missing or archived PR, or one linked only by the window rule, is never a coverage gap. Absent: none.
      */
     partial?: string[];
     /** No GitHub read before this time: a rate limit. */
@@ -224,7 +225,8 @@ export type IssueFact = {
     /**
      * The PR that resolved it (lowercased ref, maybe in another repository), its merge time, and the evidence. Only the
      * latest close by a merged PR (`closed-event`) gives it now. `closing-reference` is from an older rule (1 merged
-     * closing reference before the close): such a fact is read again at once and judged by the current rule.
+     * closing reference before the close): it is no sample now. Each pass marks such a fact `unresolved: "ambiguous"`
+     * and keeps the resolution, so the fact is read again at once and judged by the current rule.
      */
     resolution?: {
         pr: string;
@@ -233,7 +235,10 @@ export type IssueFact = {
         /** When a pass found this resolution. */
         at: number;
     };
-    /** Why there is no sample. It wins over an older `resolution` that a missing or inaccessible read kept. */
+    /**
+     * Why there is no sample. It wins over an older `resolution` that a missing or inaccessible read kept, and over a
+     * stored `closing-reference` resolution (marked "ambiguous" until a good read judges it again).
+     */
     unresolved?: Unresolved;
     /**
      * The merged closing references read so far (lowercased refs with their merge time), whether every page is read,
@@ -1714,6 +1719,15 @@ export function applyPass(draft: DashboardState, input: PassInput): void {
         }
     }
 
+    // A resolution from the older closing-reference rule is no sample: it is ambiguous until a good read judges it
+    // again (also when a failed read, a backoff or the read budget delays that read). The resolution stays, so
+    // `issueDue` plans the read at once. A good read in this pass judges it below.
+    for (const fact of Object.values(draft.issues)) {
+        if (fact.resolution?.evidence === "closing-reference" && fact.unresolved === undefined) {
+            put(fact, "unresolved", "ambiguous");
+        }
+    }
+
     for (const result of input.answer?.results ?? []) {
         if (!result.ok) {
             applyFailedRead(draft, result, now);
@@ -1856,10 +1870,11 @@ function applyGitHubSource(draft: DashboardState, input: PassInput): void {
 }
 
 /**
- * The GitHub source's partial refs from the whole stored state: each tracked ref with a stored error (a PR only when it
- * is not excluded); each ref of this answer whose part had an error (a deeper error can come beside an ok result, and
- * stores no error); and each earlier entry that is still tracked, unless this pass read it cleanly (an ok result, and
- * not in this answer's partial list). A failure of the whole read reads nothing cleanly. Sorted and unique.
+ * The GitHub source's partial refs from the whole stored state: each ref with a stored error; each ref of this answer
+ * whose part had an error (a deeper error can come beside an ok result, and stores no error); and each earlier entry,
+ * unless this pass read it cleanly (an ok result, and not in this answer's partial list). A failure of the whole read
+ * reads nothing cleanly. All 3 use 1 rule, after this pass applies: the ref is tracked, and a PR is not excluded (an
+ * excluded PR is never a coverage gap). Sorted and unique.
  */
 function partialRefs(draft: Readonly<DashboardState>, input: PassInput): string[] {
     const keys = new Set<string>();
@@ -1883,6 +1898,9 @@ function partialRefs(draft: Readonly<DashboardState>, input: PassInput): string[
         return fact !== undefined && fact.untracked !== true;
     };
 
+    /** The 1 rule for every source of the list: tracked, and for a PR not excluded. */
+    const counts = (key: string): boolean => trackedPr(key) || trackedIssue(key);
+
     for (const [key, fact] of Object.entries(draft.prs)) {
         if (trackedPr(key) && fact.error !== undefined) {
             keys.add(key);
@@ -1896,11 +1914,13 @@ function partialRefs(draft: Readonly<DashboardState>, input: PassInput): string[
     }
 
     for (const key of answered) {
-        keys.add(key);
+        if (counts(key)) {
+            keys.add(key);
+        }
     }
 
     for (const key of draft.sources.github?.partial ?? []) {
-        if ((trackedPr(key) || trackedIssue(key)) && !clean.has(key)) {
+        if (counts(key) && !clean.has(key)) {
             keys.add(key);
         }
     }

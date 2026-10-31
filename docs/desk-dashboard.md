@@ -97,7 +97,8 @@ module's dispose stop the timer and abort a read in flight; an answer that comes
   event is visible, the closing references cannot show the latest resolver. They only tell the reason: a merged closing
   PR makes the issue `ambiguous` (paging stops); a complete list with no merged PR is `no-resolving-pr`; pages left with
   no merged PR yet is `incomplete`. A resolution that an older rule stored from 1 closing reference
-  (`closing-reference`) is read again at once and judged by this rule.
+  (`closing-reference`) is no sample: each pass marks it `ambiguous` (also when a failed read, a backoff or the read
+  budget delays its read), reads it again at once, and a good read judges it by this rule.
 - **Current workload.** Delivery threads that are starting, open, or parked now (not gone), labeled "now": it is not the
   state at the end of the range.
 - **Tracked PRs.** PRs attached to, seen by, or matched by branch to Desk threads, deduplicated by `owner/name#number` in
@@ -150,9 +151,10 @@ an agent and never sends a message. Each pass:
       ended, overdue refs do not count, and the status is at least partial. It is also partial when the source lists
       partial refs or is not complete.
     - **GitHub `partial` and `complete`** come from the whole stored state, not from the last answer only. `partial`
-      lists each tracked ref with a stored read error (a PR only when it is not excluded), each ref of the last answer
-      with an error in its part (also a deeper error beside good data), and each earlier entry that is still tracked
-      until a clean read of it. A failure of the whole read keeps the list. A ref that becomes untracked leaves it.
+      lists each ref with a stored read error, each ref of the last answer with an error in its part (also a deeper
+      error beside good data), and each earlier entry until a clean read of it. All 3 take only a tracked ref, and a PR
+      only when it is not excluded: a missing or archived PR is no coverage gap, so it never enters the list. A failure
+      of the whole read keeps the list. A ref that becomes untracked or excluded leaves it.
       `complete` is true only when every tracked PR is excluded or read with no gap and no error, every tracked issue is
       read with no gap, no error, and is not `incomplete` (for example at the closing page limit), and `partial` is
       empty.
