@@ -439,6 +439,19 @@
     overflow-wrap: anywhere;
 }
 
+.desk-plan-findings,
+.desk-plan-consult {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding: 4px 0;
+    overflow-wrap: anywhere;
+}
+
+.desk-plan-consult .button {
+    align-self: flex-start;
+}
+
 .desk-plan-tasks {
     display: flex;
     flex-direction: column;
