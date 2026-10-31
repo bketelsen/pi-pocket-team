@@ -1037,6 +1037,7 @@ describe("the journal at the desk", () => {
         });
         cpSync(join(import.meta.dirname, "desk.ts"), join(dropIns, "desk.ts"));
         // The dashboard helper that desk.ts imports.
+        cpSync(join(import.meta.dirname, "_desk-usage.ts"), join(dropIns, "_desk-usage.ts"));
         cpSync(
             join(import.meta.dirname, "_desk-dashboard.ts"),
             join(dropIns, "_desk-dashboard.ts"),

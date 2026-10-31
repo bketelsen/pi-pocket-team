@@ -2,7 +2,8 @@
  * The dashboard's sources: facts about the desk's threads, the PRs they track, and the issues they work on, kept in
  * `x.desk.dashboard`. A collector task reads `x.desk.threads` (it never writes it), reads GitHub for the tracked refs
  * that are due, at most `MAX_REF_READS` in 1 query, and then writes what changed in 1 commit. It sleeps `PASS_MS`
- * between passes.
+ * between passes. Before the GitHub call, a pass runs the usage step of `_desk-usage.ts` (`x.desk.usage`): its own
+ * small commits, which never write `x.desk.dashboard`.
  *
  * Pocket does not load this file as a module: the `_` prefix keeps it out. `desk.ts` imports it, and gives it what it
  * needs at run time (the threads' document token, the `gh` path), so this file never imports `desk.ts` at run time.
@@ -15,12 +16,23 @@ import { promisify } from "node:util";
 import {
     defineDoc,
     defineTask,
+    UsageDoc,
     type ConversationId,
     type SessionDocToken,
     type TaskId,
     type Tx,
 } from "@earendil-works/pi-durable";
 import type { CloseOutcome, DeskState, PrLink, Thread } from "./desk.ts";
+import type * as UsageModule from "./_desk-usage.ts";
+
+/**
+ * The usage helper, loaded fresh with each load of this module, as `desk.ts` loads this one: Pocket does not reload a
+ * `_` helper by itself. In tests this module has no query, so a test's static import of `./_desk-usage.ts` gets the
+ * same instance.
+ */
+const usage = (await import(
+    new URL(`./_desk-usage.ts${new URL(import.meta.url).search}`, import.meta.url).href
+)) as typeof UsageModule;
 
 // ─── Limits ──────────────────────────────────────────────────────────────────
 
@@ -1872,11 +1884,17 @@ export type PassDeps = {
     /** The collector's task id: a pass of another collector reads nothing, and its commit ends it. */
     owner?: string;
     signal?: AbortSignal;
+    /**
+     * The usage step's reads and commits: absent, no usage step. It runs after the document reads and before the GitHub
+     * call, once the boundary is fixed. Its failure never fails the GitHub part; an abort still throws.
+     */
+    usage?: UsageModule.UsageDeps;
 };
 
 /**
- * 1 collection pass: read `x.desk.threads` (a snapshot, outside the commit), plan the due reads, make at most 1 GitHub
- * call, then 1 commit. No call when nothing is due or during a backoff. It gives back the number of reads that went.
+ * 1 collection pass: read `x.desk.threads` (a snapshot, outside the commit), run the usage step (when `deps.usage` is
+ * given and the boundary is fixed), plan the due reads, make at most 1 GitHub call, then 1 commit. No call when nothing
+ * is due or during a backoff. It gives back the number of reads that went.
  */
 export async function collectPass(deps: PassDeps): Promise<number> {
     let dashboard: Readonly<DashboardState> | undefined;
@@ -1909,6 +1927,28 @@ export async function collectPass(deps: PassDeps): Promise<number> {
     const now = deps.now();
     const threads = desk === undefined ? undefined : threadFacts(desk);
     const tracked = desk === undefined ? undefined : trackedRefs(desk);
+    const boundary = dashboard?.boundary;
+
+    if (
+        deps.usage !== undefined &&
+        desk !== undefined &&
+        threads !== undefined &&
+        boundary !== undefined
+    ) {
+        try {
+            await usage.usagePass(
+                { ...deps.usage, signal: deps.usage.signal ?? deps.signal },
+                { desk, facts: threads, boundary, now, slot: Math.floor(now / PASS_MS) },
+            );
+        } catch (error) {
+            if (deps.signal?.aborted === true || deps.usage.signal?.aborted === true) {
+                throw error;
+            }
+
+            // The usage step records its own failures: anything else it throws leaves the GitHub part to run.
+        }
+    }
+
     const reads = tracked === undefined ? [] : planReads(dashboard, tracked, now);
     let answer: Answer | undefined;
     let failure: PassFailure | undefined;
@@ -1982,6 +2022,30 @@ export function defineCollector(options: {
                         }),
                     owner: id,
                     signal: runtime.signal,
+                    usage: {
+                        readUsage: () => runtime.snapshot(usage.DeskUsage, context),
+                        readLedger: (conversation) =>
+                            runtime.snapshot(UsageDoc, conversation as ConversationId, context),
+                        // Each usage commit checks that this task still owns collection, else it changes nothing.
+                        // It leaves the task's state as it is: the pass's last commit sets the sleep.
+                        commit: async (change) => {
+                            let owned = false;
+
+                            await runtime.commit(async (tx) => {
+                                if ((await tx.doc(DeskDashboard)).collector !== id) {
+                                    return undefined;
+                                }
+
+                                owned = true;
+                                await change(tx, await tx.doc(usage.DeskUsage));
+
+                                return undefined;
+                            }, context);
+
+                            return owned;
+                        },
+                        signal: runtime.signal,
+                    },
                     commit: (apply) =>
                         runtime.commit(async (tx) => {
                             const draft = await tx.doc(DeskDashboard);
