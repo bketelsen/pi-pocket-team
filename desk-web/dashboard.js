@@ -291,6 +291,17 @@ export const recordsStep = (state, event) => {
         : { status: "error", answer: null, error: event.error, asOf: null };
 };
 
+/** The words of a drill-down's stale notice: the error, and the time of the list shown (unknown when it has none). */
+export const recordsStaleText = (error, asOf) => {
+    const time = formatUtc(asOf);
+    const when =
+        time === null
+            ? "The time of this list is unknown: it can be older than the numbers of the row."
+            : `This list is from ${time}, older than the numbers of the row.`;
+
+    return `The threads and PRs could not be read again: ${error}. ${when}`;
+};
+
 /**
  * The records of 1 drill-down, as a hook. It reads `path` when it mounts, and again for each new snapshot (`stamp`):
  * the 60-second refresh keeps a row's path but can change its numbers, so its records must follow. A read aborts when
@@ -1109,7 +1120,7 @@ export function makeDashboard(pocket, { refreshMs = REFRESH_MS } = {}) {
                 ? null
                 : html`<p class="dash-state warn" role="status">
                       <strong>Stale:</strong>
-                      ${` The threads and PRs could not be read again: ${state.error}. This list is from ${formatUtc(state.asOf)}, older than the numbers of the row.`}
+                      ${` ${recordsStaleText(state.error, state.asOf)}`}
                   </p>`;
 
         const { threads, prs, truncated } = state.answer;

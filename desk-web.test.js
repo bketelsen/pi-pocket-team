@@ -70,6 +70,7 @@ import {
     prEventsText,
     prUrl,
     recordsPath,
+    recordsStaleText,
     recordsStep,
     residualKnowledge,
     rowKey,
@@ -2083,6 +2084,17 @@ test("useRecords: the list keeps the asOf of its own records answer, not the das
     assert.equal(
         recordsStep(null, { type: "answer", answer: { ...answer, asOf: Number.NaN } }).asOf,
         null,
+    );
+});
+
+test("recordsStaleText: the notice names the time of the list, or says that it is unknown", () => {
+    assert.equal(
+        recordsStaleText("HTTP 502", Date.UTC(2026, 9, 31, 12, 5)),
+        "The threads and PRs could not be read again: HTTP 502. This list is from 2026-10-31 12:05 UTC, older than the numbers of the row.",
+    );
+    assert.equal(
+        recordsStaleText("HTTP 502", null),
+        "The threads and PRs could not be read again: HTTP 502. The time of this list is unknown: it can be older than the numbers of the row.",
     );
 });
 
