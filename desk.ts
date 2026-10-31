@@ -15870,6 +15870,26 @@ export function consultBlock(
     return `A consult is read-only: it may call only read, and plan with action finding (once). ${call.name === "plan" ? `plan ${String(action)}` : call.name} is blocked.`;
 }
 
+/** The words a consult's session title holds: Team's title is `<agent>: consult <plan> <consult>: <plan title>`. */
+const CONSULT_TITLE = /: consult (T\d+) (k\d+):/;
+
+/** The title the desk gives a consult's start: Team puts the agent's name and "consult" before it. */
+export const consultTitle = (plan: Plan, consult: Consult, title: string): string =>
+    `${plan.thread} ${consult.id}: ${title}`;
+
+/**
+ * Whether a linked session's title names a consult the desk has: the session of a start that threw has no address on
+ * the desk, so the sweep knows it only by the title Team gave it. A title that a person changed is not known.
+ */
+export function consultTitled(
+    state: Readonly<DeskState> | undefined,
+    title: string | undefined,
+): boolean {
+    const match = title === undefined ? null : CONSULT_TITLE.exec(title);
+
+    return match !== null && consultOf(planOf(state, match[1] ?? ""), match[2] ?? "") !== undefined;
+}
+
 /** The view of a plan's consults: agent, state, ask, age, and whether Brian can stop it. */
 export type ConsultView = {
     id: string;
@@ -19850,15 +19870,30 @@ export default function createDesk(host: Host, web: Web) {
             addresses.add(clerk.address);
         }
 
-        // A delegation in flight has a thread, but not its address yet: do not mistake its session for hidden work.
-        const inFlight = open.some((thread) => thread.state === "starting");
+        // A consult is no desk thread: its session never becomes a found thread, in any state (section 8).
+        for (const plan of Object.values(state.plans ?? {})) {
+            for (const consult of plan.consults ?? []) {
+                if (consult.address !== undefined) {
+                    addresses.add(consult.address);
+                }
+            }
+        }
+
+        // A delegation in flight has a thread, but not its address yet: do not mistake its session for hidden work. A
+        // consult that is still starting is in flight the same way.
+        const inFlight =
+            open.some((thread) => thread.state === "starting") ||
+            Object.values(state.plans ?? {}).some((plan) =>
+                (plan.consults ?? []).some((consult) => consult.state === "starting"),
+            );
 
         for (const session of facts.sessions ?? []) {
             if (
                 inFlight ||
                 baseline.sessions.includes(session.address) ||
                 session.archived ||
-                addresses.has(session.address)
+                addresses.has(session.address) ||
+                consultTitled(state, session.title)
             ) {
                 continue;
             }
@@ -23181,7 +23216,7 @@ export default function createDesk(host: Host, web: Web) {
     };
 
     const STATE_BLOCK =
-        "This session is a plan consult, and the desk could not read its state: the call is blocked. Try again in a moment.";
+        "The desk could not read its state, so it cannot tell whether this session is a plan consult: the call is blocked. Try again in a moment.";
 
     /**
      * A plan consult is read-only (section 8 of docs/plans/plan-threads.md): it may call only `read`, and `plan` with
@@ -23191,7 +23226,8 @@ export default function createDesk(host: Host, web: Web) {
      * 2. The window before the bind: the desk's marker in the session's first message makes it a consult. A marker can
      *    only take rights away; a session with no marker is not touched.
      * An `api` with no commit cannot read entries at all: an unbound session then runs, and `plan consult` starts no
-     * consult (`entryRead`). A read that fails blocks the call with "try again", and is not kept.
+     * consult (`entryRead`). A read that fails blocks the call with "try again", and is not kept; so does a failed read
+     * of the desk's state, because only a state read that worked shows that no consult is bound to the session.
      */
     const consultGuard = hook(ToolTask, {
         beforeTool: async (call, api, context) => {
@@ -23201,16 +23237,16 @@ export default function createDesk(host: Host, web: Web) {
             entryRead = commit === undefined ? "missing" : "available";
 
             let state: DeskState | undefined;
-            let stateFailed = false;
 
+            // Only a state read that worked shows that no consult is bound to this session: a failed one blocks.
             try {
                 state = await api.snapshot(DeskThreads, context);
             } catch {
-                stateFailed = true;
+                return { block: STATE_BLOCK };
             }
 
             // 1. A bound consult is held by its state, whatever the entry read can do.
-            if (!stateFailed && consultOfSession(state, session) !== undefined) {
+            if (consultOfSession(state, session) !== undefined) {
                 const block = consultBlock(call, session, [], state);
 
                 return block === undefined ? undefined : { block };
@@ -23234,10 +23270,6 @@ export default function createDesk(host: Host, web: Web) {
 
             if (nonces === undefined || nonces.length === 0) {
                 return undefined;
-            }
-
-            if (stateFailed) {
-                return { block: STATE_BLOCK };
             }
 
             const block = consultBlock(call, session, nonces, state);
@@ -24588,7 +24620,7 @@ export default function createDesk(host: Host, web: Web) {
                             commit: (change) => api.commit(change, context),
                             context,
                             agent: consult.agent,
-                            title: `${plan.thread} ${consult.id}: ${thread.title}`,
+                            title: consultTitle(planNow, consult, thread.title),
                             message: consultBrief(planNow, thread.title, consult, askNow, quote),
                             key: `x.desk.consult:${plan.thread}:${consult.id}`,
                         });

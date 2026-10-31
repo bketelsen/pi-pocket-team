@@ -905,6 +905,9 @@ Each line below differs from the design above, or settles what it left open, and
 - **The hook checks the typed path first.** It reads the desk's state with `snapshot` (Pocket's typed hook API), and a
   session that a consult is bound to is held by that consult's state. This path needs no entry read, so a bound
   consult stays read-only whatever a later pi-durable gives the hook.
+- **A failed state read blocks every call**, with "Try again in a moment.", before any other step. Only a state read
+  that worked shows that no consult is bound to a session, so a bound consult never runs free on a read error. A
+  failed read is short; the next call reads again.
 - **Only the window before the bind reads the first entry, through its `api`'s commit.** Pocket's hook API type has
   only `snapshot`, and no read of entries; pi-durable gives the hook the tool task's runtime, whose commit has
   `tx.scanEntries`. The commit only reads, and changes nothing.
@@ -926,7 +929,7 @@ Each line below differs from the design above, or settles what it left open, and
 - **The cache is a map in the module's instance**, by conversation id. A read error, or a session with no `pi.user`
   entry yet, keeps nothing, so the next call reads again. A reload or a restart reads again.
 - **An unbound session is touched only with the marker.** There, a running consult's 2 tools pass only in its own
-  bound session. A state read that failed blocks a session with the marker, and lets a session without one run.
+  bound session.
 - **`plan read` is blocked in a consult**, and so is every nested call, `read` too: the brief gives the plan file's
   path, and `read` is enough. A consult of a plan that is done or dropped is blocked whatever its own state.
 
@@ -941,5 +944,17 @@ Each line below differs from the design above, or settles what it left open, and
   sweep or of `desk sync`. It counts from the consult's `at`, so a start that hangs counts too.
 - **Stop is `plans/:id/consults/:kid/stop`**, owner only, with no key: a second tap finds the consult stopped and gets
   409, as an answered or failed one does; an unknown consult gets 404.
+- **A consult's session never becomes a found thread**, so it never counts toward the cap (section 8: a consult is no
+  desk thread). The sweep leaves out 3 kinds: a bound consult's session by its address, in every state, also after its
+  end; every session while a consult is `starting`, as it does while a delegation is in flight; and a session whose
+  title names a consult that the desk has.
+- **The session of a start that threw is known by its title.** The desk never got its address, and a linked session's
+  list gives the sweep no session id, so the sweep cannot read the session's first message. Team titles every consult
+  `<agent>: consult <plan> <consult>: <plan title>`, and the sweep leaves out a session whose title holds
+  `: consult T560 k3:` when plan T560 has consult k3. The limits: a person who renames that session makes it a found
+  thread (the hook still blocks its tools, so only the cap sees it; Odrade can close it); Pocket gives the title only
+  when everyone who sees the supervisor's session sees this one too; and a session that a person titles so is left out
+  as well. A second start under the same key could give the session back, but it would also send the first message
+  again, or make a new session when the first start threw before it made one, so the desk does not retry.
 - **A dropped or verified plan stops its open consults** (`stopped`, `end.why: "plan"`), with 1 event each, and no
   wake-up: the plan wakes no session then.

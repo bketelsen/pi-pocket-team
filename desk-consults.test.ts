@@ -45,6 +45,7 @@ import createDesk, {
     failConsultStart,
     firstUserText,
     gitBlobSha,
+    isCounted,
     initialPlanText,
     newConsultNonce,
     openThread,
@@ -871,6 +872,8 @@ let supervisorId: ConversationId;
 let planId = "";
 let planningId: ConversationId;
 let askId = "";
+/** The address of the session whose start threw (k3): the desk never bound it. */
+let thrownAddress = "";
 let server: ReturnType<typeof createServer> | undefined;
 let routes: (
     path: string,
@@ -1512,7 +1515,10 @@ describe("with the Pi Pocket app", () => {
         // the gate does not wait for it.
         let thrownSession: ConversationId | undefined;
         const throwing = wrapStart(async (real, ...args) => {
-            thrownSession = (await real(...args)).session;
+            const started = await real(...args);
+
+            thrownSession = started.session;
+            thrownAddress = started.address;
 
             throw new Error("the start broke after the session began");
         });
@@ -1805,5 +1811,160 @@ describe("with the Pi Pocket app", () => {
         } finally {
             desk.restore();
         }
+    });
+
+    test("a failed state read blocks: a bound consult never runs free, with or without the entry read", async () => {
+        const k1 = await consultNow("k1");
+        const session = k1.session ?? 0;
+        const desk = stubDesk();
+        const broken = (withCommit: boolean) => ({
+            conversationId: session,
+            taskId: "task-hook",
+            callId: "call-hook",
+            snapshot: () => Promise.reject(new Error("the state is busy")),
+            ...(withCommit
+                ? { commit: (change: never, ctx: never) => app.harness.commit(change, ctx) }
+                : {}),
+        });
+
+        try {
+            for (const withCommit of [false, true]) {
+                for (const name of ["bash", "write", "read"]) {
+                    assert.match(
+                        (await desk.block(session, name, {}, undefined, broken(withCommit))) ?? "",
+                        /could not read its state.*Try again in a moment/,
+                        `${name}, commit ${String(withCommit)}`,
+                    );
+                }
+            }
+
+            // An unbound session is blocked too while the state cannot be read: nothing shows that it is no consult.
+            assert.match(
+                (await desk.block(Number(supervisorId), "bash", {}, undefined, {
+                    ...broken(false),
+                    conversationId: Number(supervisorId),
+                })) ?? "",
+                /could not read its state/,
+            );
+
+            // A later read that works: the consult's state decides, with no commit too.
+            assert.match(
+                (await desk.block(session, "bash", {}, undefined, desk.typed(session))) ?? "",
+                /k1\) gave its finding \(f1\): every tool is blocked now/,
+            );
+            assert.equal(
+                await desk.block(
+                    Number(supervisorId),
+                    "bash",
+                    {},
+                    undefined,
+                    desk.typed(Number(supervisorId)),
+                ),
+                undefined,
+            );
+        } finally {
+            desk.restore();
+        }
+    });
+
+    test("a consult's session never becomes a found thread, and the cap does not change", async () => {
+        const supervisorKey = String(Number(supervisorId));
+        const baseline = (await deskSnapshot())?.baseline?.[supervisorKey];
+        const k1 = await consultNow("k1");
+        const k2 = await consultNow("k2");
+        const k3 = await consultNow("k3");
+
+        // The baseline was made before the consults started: they are not in it.
+        assert(baseline !== undefined, "the supervisor has a baseline");
+        assert(thrownAddress !== "", "the thrown start began a session");
+
+        for (const address of [k1.address, k2.address, thrownAddress]) {
+            assert(
+                address !== undefined && !baseline.sessions.includes(address),
+                "not in the baseline",
+            );
+        }
+
+        assert.equal(k3.address, undefined, "the thrown start bound no address");
+
+        const counted = async () =>
+            Object.values((await deskSnapshot())?.threads ?? {}).filter((each) =>
+                isCounted(each, Date.now()),
+            ).length;
+        const found = async () =>
+            Object.values((await deskSnapshot())?.threads ?? {}).filter(
+                (each) => each.origin === "found",
+            );
+        const consultFound = async (addresses: readonly string[]) =>
+            (await found()).filter((each) => addresses.includes(each.address ?? ""));
+
+        // The earlier syncs already ran with k1, k2 and k3 there.
+        await runTool(supervisorId, "desk", { action: "sync" });
+        assert.deepEqual(
+            await consultFound([k1.address ?? "", k2.address ?? "", thrownAddress]),
+            [],
+        );
+
+        const before = { counted: await counted(), found: (await found()).length };
+
+        // A consult that is still starting: its session is there, and the desk has no address for it yet.
+        let release: () => void = () => {};
+
+        const gate = new Promise<void>((resolve) => {
+            release = resolve;
+        });
+        let startingAddress = "";
+        // Its title names no consult here, so only the in-flight rule keeps it from the found threads.
+        const wrapped = wrapStart(async (real, source, request, key) => {
+            const started = await real(source, { ...request, title: "A plain title" }, key);
+
+            startingAddress = started.address;
+            await gate;
+
+            return started;
+        });
+
+        try {
+            const consulting = runTool(planningId, "plan", {
+                action: "consult",
+                agents: ["paul"],
+                question: "Is the key in the TPM of every host?",
+            });
+
+            await until(
+                async () => startingAddress !== "",
+                "the starting consult's session",
+                20_000,
+            );
+            assert.equal((await consultNow("k5")).state, "starting");
+
+            await runTool(supervisorId, "desk", { action: "sync" });
+            assert.deepEqual(await consultFound([startingAddress]), [], "a starting consult");
+
+            release();
+            await consulting;
+        } finally {
+            release();
+            wrapped.restore();
+        }
+
+        const k5 = await consultNow("k5");
+
+        assert.equal(k5.state, "running");
+        assert.equal(k5.address, startingAddress);
+
+        // Bound (running, answered, stopped) and thrown: none is found, and the cap counts the same.
+        await runTool(supervisorId, "desk", { action: "sync" });
+        assert.deepEqual(
+            await consultFound([
+                k1.address ?? "",
+                k2.address ?? "",
+                thrownAddress,
+                startingAddress,
+            ]),
+            [],
+        );
+        assert.equal((await found()).length, before.found);
+        assert.equal(await counted(), before.counted);
     });
 });
