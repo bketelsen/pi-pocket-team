@@ -22248,6 +22248,9 @@ export default function createDesk(host: Host, web: Web) {
         "GET",
         "dashboard",
         async (request) => {
+            // 2 snapshots, but no torn state: no commit writes both documents. The usage commits only read the
+            // dashboard's `collector`, and `applyPass` writes only `x.desk.dashboard`. Each snapshot is a committed
+            // state of its own source, and each source reports its own times in `coverage.sources`.
             const [facts, usage] = await Promise.all([
                 request.snapshot(dashboard.DeskDashboard, request.context),
                 request.snapshot(usageDocs.DeskUsage, request.context),

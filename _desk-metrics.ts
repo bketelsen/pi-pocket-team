@@ -17,6 +17,7 @@ import type * as DashboardModule from "./_desk-dashboard.ts";
 import type {
     DashboardState,
     FailureKind,
+    GitHubSource,
     IssueFact,
     PrFact,
     ThreadFact,
@@ -58,7 +59,12 @@ export type Range = {
     /** Inclusive UTC dates. */
     from: string;
     to: string;
-    /** Midnight UTC of `from`. */
+    /** Midnight UTC of `from`: the first day of the labels and of `daily`. */
+    dayStart: number;
+    /**
+     * The effective start: midnight UTC of `from`, or the recovery boundary when it is later. Every event selection
+     * and the elapsed time of velocity use it. Usage goes by day: it holds only times at or after the boundary.
+     */
     start: number;
     /** The next midnight after `to`, or `asOf` when that is earlier. Exclusive. */
     end: number;
@@ -147,12 +153,39 @@ export type UsageMetrics = UsageSum & {
     missing: number;
     /** Counted sessions with no repository. */
     unattributed: { noRepo: number; conflict: number; unassigned: number };
-    /** Outside the range totals: usage with no date, and the settled compaction residuals. */
+    /** The summed `skipped` counts of the counted sessions: entries not counted, or subsets not valid. */
+    skipped: UsageSkipped;
+    /** The counted sessions by their residual state: `absent` has no ledger check yet. */
+    residuals: ResidualCounts;
+    /**
+     * Outside the range totals: usage with no date, and the sum of the settled compaction residuals with their session
+     * count. `residual` is null when no counted session has a settled residual: unknown, not 0.
+     */
     undated: {
         counters: UsageSum;
-        residual: { sessions: number; counters: Totals };
+        residual: { sessions: number; counters: Totals } | null;
     };
 };
+
+export type UsageSkipped = {
+    inherited: number;
+    imported: number;
+    malformed: number;
+    reasoning: number;
+    cacheWrite1h: number;
+};
+
+export type ResidualCounts = {
+    settled: number;
+    pending: number;
+    mismatch: number;
+    unavailable: number;
+    absent: number;
+};
+
+/** A usage scope with a coverage gap: malformed entries, a residual mismatch, or a ledger that could not be read. */
+export const usageGaps = (usage: Readonly<UsageMetrics>): boolean =>
+    usage.skipped.malformed > 0 || usage.residuals.mismatch > 0 || usage.residuals.unavailable > 0;
 
 export type UndatedReason =
     | "not-planned"
@@ -220,7 +253,8 @@ export type Coverage = {
         usage: SourceView;
     };
     progress: {
-        github: { pending: number | null; complete: boolean | null };
+        /** `overdue`: tracked refs whose next read is due by more than `STALE_MS`, from the stored facts. */
+        github: { pending: number | null; complete: boolean | null; overdue: number };
         usage: {
             pending: number | null;
             complete: boolean | null;
@@ -407,7 +441,8 @@ export function parseQuery(
         range: {
             from: dayOf(fromAt),
             to: dayOf(toAt),
-            start: fromAt,
+            dayStart: fromAt,
+            start: boundary === undefined ? fromAt : Math.max(fromAt, boundary),
             end: Math.min(toAt + DAY_MS, now),
             days,
             partialToday: toAt === todayAt,
@@ -707,6 +742,8 @@ function reduceUsage(sessions: readonly SessionUsage[], window: Window): UsageMe
         excluded: { shared: 0, unlinked: 0 },
         missing: 0,
         unattributed: { noRepo: 0, conflict: 0, unassigned: 0 },
+        skipped: { inherited: 0, imported: 0, malformed: 0, reasoning: 0, cacheWrite1h: 0 },
+        residuals: { settled: 0, pending: 0, mismatch: 0, unavailable: 0, absent: 0 },
     };
     let residuals = 0;
 
@@ -749,7 +786,24 @@ function reduceUsage(sessions: readonly SessionUsage[], window: Window): UsageMe
 
         addCounters(undated, session.undated);
 
-        if (session.residual?.state === "settled" && session.residual.counters !== undefined) {
+        for (const key of Object.keys(metrics.skipped) as (keyof UsageSkipped)[]) {
+            metrics.skipped[key] += num(session.skipped?.[key]);
+        }
+
+        const state = session.residual?.state;
+
+        if (
+            state === "settled" ||
+            state === "pending" ||
+            state === "mismatch" ||
+            state === "unavailable"
+        ) {
+            metrics.residuals[state] += 1;
+        } else {
+            metrics.residuals.absent += 1;
+        }
+
+        if (state === "settled" && session.residual?.counters !== undefined) {
             const counters = session.residual.counters;
 
             residuals += 1;
@@ -765,7 +819,10 @@ function reduceUsage(sessions: readonly SessionUsage[], window: Window): UsageMe
     return {
         ...sum,
         ...metrics,
-        undated: { counters: undated, residual: { sessions: residuals, counters: residual } },
+        undated: {
+            counters: undated,
+            residual: residuals === 0 ? null : { sessions: residuals, counters: residual },
+        },
     };
 }
 
@@ -929,21 +986,33 @@ type AnySource = {
     checkedAt?: number;
     partial?: string[];
     complete?: boolean;
-    pending?: number;
 };
 
 /**
  * A source's view and its status: never, failed, stale, partial, or ok, in that order. Stale: the last good read is
- * older than `STALE_MS`. `ageless`: the source writes no heartbeat when it has nothing to read (GitHub with no due
- * read), so its age makes it stale only while it has reads pending.
+ * older than `STALE_MS`. GitHub has its own rule: `githubView`.
  */
-export function sourceView(
-    source: Readonly<AnySource> | undefined,
-    now: number,
-    ageless = false,
-): SourceView {
-    const view: SourceView = {
-        status: "ok",
+export function sourceView(source: Readonly<AnySource> | undefined, now: number): SourceView {
+    const view = baseView(source);
+    const checked = source?.checkedAt ?? source?.lastGoodAt;
+
+    if (view.status !== "ok") {
+        return view;
+    }
+
+    if (checked === undefined || now - checked > STALE_MS) {
+        view.status = "stale";
+    } else if (partialSource(source)) {
+        view.status = "partial";
+    }
+
+    return view;
+}
+
+/** The fields of a source's view; status never, failed, or ok. */
+function baseView(source: Readonly<AnySource> | undefined): SourceView {
+    return {
+        status: source?.at === undefined ? "never" : source.ok !== true ? "failed" : "ok",
         at: source?.at ?? null,
         ok: source?.ok ?? null,
         kind: source?.kind ?? null,
@@ -951,22 +1020,111 @@ export function sourceView(
         lastGoodAt: source?.lastGoodAt ?? null,
         checkedAt: source?.checkedAt ?? null,
     };
-    const checked = source?.checkedAt ?? source?.lastGoodAt;
+}
 
-    if (source === undefined || source.at === undefined) {
-        view.status = "never";
-    } else if (source.ok !== true) {
-        view.status = "failed";
-    } else if (
-        (checked === undefined || now - checked > STALE_MS) &&
-        !(ageless && source.pending === 0)
-    ) {
+const partialSource = (source: Readonly<AnySource> | undefined): boolean =>
+    (source?.partial?.length ?? 0) > 0 || source?.complete === false || source?.kind === "partial";
+
+/**
+ * When the collector's rules make a tracked ref due again, from the stored facts only (the same rules as `prDue` and
+ * `issueDue` in `_desk-dashboard.ts`), or undefined when it is not due again (a merged PR with no gap). A ref never
+ * read and with no error is due from the last GitHub read, or from the first pass.
+ */
+function nextReadAt(
+    fact: Readonly<PrFact> | Readonly<IssueFact>,
+    lastCollection: number | undefined,
+): number | undefined {
+    if (fact.readAt === undefined && fact.errorAt === undefined) {
+        return lastCollection;
+    }
+
+    if (fact.error !== undefined && fact.errorAt !== undefined) {
+        // A missing or forbidden ref waits as a closed one does.
+        return (
+            fact.errorAt +
+            (fact.error === "NOT_FOUND" || fact.error === "FORBIDDEN"
+                ? dashboard.CLOSED_REFRESH_MS
+                : dashboard.ERROR_RETRY_MS)
+        );
+    }
+
+    const readAt = fact.readAt ?? fact.errorAt ?? 0;
+
+    if ("closing" in fact && fact.closing?.cursor !== undefined) {
+        return readAt;
+    }
+
+    if ("github" in fact && fact.github === "frozen") {
+        return readAt + dashboard.CLOSED_REFRESH_MS;
+    }
+
+    if (fact.state === "OPEN") {
+        return readAt + dashboard.OPEN_REFRESH_MS;
+    }
+
+    if (fact.state === "CLOSED") {
+        return readAt + dashboard.CLOSED_REFRESH_MS;
+    }
+
+    if (fact.state === "MERGED") {
+        return (fact.gaps?.length ?? 0) > 0 ? readAt + dashboard.CLOSED_REFRESH_MS : undefined;
+    }
+
+    return readAt + dashboard.ERROR_RETRY_MS;
+}
+
+/** The tracked refs (not excluded, not untracked) whose next read is due by more than `STALE_MS`. */
+export function overdueRefs(state: Readonly<DashboardState> | undefined, now: number): number {
+    const lastCollection = state?.sources.github?.at ?? state?.initializedAt;
+    let overdue = 0;
+
+    const count = (fact: Readonly<PrFact> | Readonly<IssueFact>): void => {
+        const due = nextReadAt(fact, lastCollection);
+
+        if (due !== undefined && now - due > STALE_MS) {
+            overdue += 1;
+        }
+    };
+
+    for (const fact of Object.values(state?.prs ?? {})) {
+        if (fact.untracked !== true && fact.excluded === undefined) {
+            count(fact);
+        }
+    }
+
+    for (const fact of Object.values(state?.issues ?? {})) {
+        if (fact.untracked !== true) {
+            count(fact);
+        }
+    }
+
+    return overdue;
+}
+
+/**
+ * The GitHub source's view. GitHub writes no heartbeat when no read is due, so its age alone does not make it stale.
+ * Stale: the threads source is stale or never read (1 pass reads both), or a tracked ref is overdue. During a valid
+ * backoff, overdue refs do not count, and the status is at least partial.
+ */
+export function githubView(
+    source: Readonly<GitHubSource> | undefined,
+    threads: Readonly<SourceView>,
+    overdue: number,
+    now: number,
+): SourceView {
+    const view = baseView(source);
+
+    if (view.status !== "ok") {
+        return view;
+    }
+
+    const backoff = source?.backoffUntil !== undefined && source.backoffUntil > now;
+
+    if (threads.status === "stale" || threads.status === "never") {
         view.status = "stale";
-    } else if (
-        (source.partial?.length ?? 0) > 0 ||
-        source.complete === false ||
-        source.kind === "partial"
-    ) {
+    } else if (!backoff && overdue > 0) {
+        view.status = "stale";
+    } else if (backoff || partialSource(source)) {
         view.status = "partial";
     }
 
@@ -984,6 +1142,8 @@ const LIMITS = {
         "Compaction and other undated usage cannot go into a day: it is shown apart, outside the range totals.",
     "cost-not-invoice":
         "Reported model cost is an estimate from recorded usage, not an invoice or a subscription charge.",
+    "usage-gaps":
+        "Some counted sessions have malformed entries, a ledger mismatch, or a ledger that could not be read: their usage is incomplete.",
     "zero-cost-reported":
         "Some entries report a cost of exactly 0: subscription or provider pricing can report 0.",
     "partial-first-day":
@@ -1056,7 +1216,7 @@ export function snapshot(input: SnapshotInput): Snapshot | { error: string } {
     const totals = reduce(all, window, counts);
     const daily: Snapshot["daily"] = [];
 
-    for (let day = range.start; day < range.start + range.days * DAY_MS; day += DAY_MS) {
+    for (let day = range.dayStart; day < range.dayStart + range.days * DAY_MS; day += DAY_MS) {
         const key = dayOf(day);
 
         daily.push({ day: key, successes: counts.get(key) ?? 0 });
@@ -1087,10 +1247,23 @@ function coverageOf(
     const boundary = dashboard.validTime(state?.boundary) ? state.boundary : undefined;
     const github = state?.sources.github;
     const usageSource = usageState?.sources.usage;
+    const threads = sourceView(state?.sources.threads, now);
+    const overdue = overdueRefs(state, now);
+    const usage = sourceView(usageSource, now);
+    const gaps = usageGaps(totals.usage);
+
+    // Malformed entries, a residual mismatch, or a ledger that could not be read: the usage is partial.
+    if (gaps && usage.status === "ok") {
+        usage.status = "partial";
+    }
+
     const sources: Coverage["sources"] = {
-        threads: sourceView(state?.sources.threads, now),
-        github: { ...sourceView(github, now, true), backoffUntil: github?.backoffUntil ?? null },
-        usage: sourceView(usageSource, now),
+        threads,
+        github: {
+            ...githubView(github, threads, overdue, now),
+            backoffUntil: github?.backoffUntil ?? null,
+        },
+        usage,
     };
     const limitations: Limitation[] = [
         limitation("latest-known-outcomes"),
@@ -1099,6 +1272,10 @@ function coverageOf(
         limitation("undated-residual"),
         limitation("cost-not-invoice"),
     ];
+
+    if (gaps) {
+        limitations.push(limitation("usage-gaps"));
+    }
 
     if (totals.usage.zeroCostEntries > 0) {
         limitations.push(limitation("zero-cost-reported"));
@@ -1125,7 +1302,11 @@ function coverageOf(
         initializedAt: state?.initializedAt ?? null,
         sources,
         progress: {
-            github: { pending: github?.pending ?? null, complete: github?.complete ?? null },
+            github: {
+                pending: github?.pending ?? null,
+                complete: github?.complete ?? null,
+                overdue,
+            },
             usage: {
                 pending: usageSource?.pending ?? null,
                 complete: usageSource?.complete ?? null,

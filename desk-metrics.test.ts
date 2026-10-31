@@ -19,6 +19,7 @@ import { createHandler } from "./_pocket/src/server/http.ts";
 import {
     CHECK_HEARTBEAT_MS,
     DeskDashboard,
+    OPEN_REFRESH_MS,
     PASS_MS,
     type DashboardState,
     type IssueFact,
@@ -177,19 +178,19 @@ function mainDashboard(): DashboardState {
                 state: "CLOSED",
                 createdAt: Date.UTC(2026, 8, 1),
                 closedAt: oct(10),
-                readAt: oct(29),
+                readAt: NOW - HOUR,
             }),
             pr("a/one#8", { state: "OPEN", createdAt: oct(2), readAt: oct(2), untracked: true }),
-            pr("a/two#3", { state: "OPEN", createdAt: oct(15), readAt: oct(29) }),
+            pr("a/two#3", { state: "OPEN", createdAt: oct(15), readAt: NOW - 10 * 60_000 }),
             pr("a/two#4", { state: "OPEN", createdAt: oct(2), excluded: "window" }),
             pr("b/three#5", { excluded: "missing", github: "missing", error: "NOT_FOUND" }),
-            pr("b/three#6", { error: "FORBIDDEN", errorAt: oct(29) }),
+            pr("b/three#6", { error: "FORBIDDEN", errorAt: NOW - HOUR }),
             // Merged in the range; its createdAt is a gap; readAt is in the range but is not a lifecycle time.
             pr("b/three#7", {
                 state: "MERGED",
                 mergedAt: oct(20),
                 closedAt: oct(20),
-                readAt: oct(25),
+                readAt: T0 + HOUR,
                 gaps: ["createdAt"],
             }),
         ]),
@@ -240,6 +241,7 @@ function mainUsage(): UsageState {
                         "p/x": counters({ entries: 1, input: 1000, totalTokens: 1000 }),
                     },
                 },
+                skipped: { inherited: 2, imported: 1, reasoning: 1, cacheWrite1h: 1 },
                 before: counters({
                     entries: 9,
                     input: 9999,
@@ -416,6 +418,7 @@ describe("the main fixture", () => {
         assert.deepEqual(answer.range, {
             from: "2026-10-01",
             to: "2026-10-30",
+            dayStart: oct(1),
             start: oct(1),
             end: NOW,
             days: 30,
@@ -467,6 +470,8 @@ describe("the main fixture", () => {
             excluded: { shared: 1, unlinked: 1 },
             missing: 1,
             unattributed: { noRepo: 1, conflict: 1, unassigned: 0 },
+            skipped: { inherited: 2, imported: 1, malformed: 0, reasoning: 1, cacheWrite1h: 1 },
+            residuals: { settled: 1, pending: 0, mismatch: 1, unavailable: 0, absent: 4 },
             undated: {
                 counters: {
                     entries: 1,
@@ -638,7 +643,8 @@ describe("the main fixture", () => {
         assert.equal(answer.totals.usage.cost, null, "no entry reported a cost");
         assert.equal(answer.totals.usage.entries, 0);
         assert.deepEqual(answer.totals.usage.excluded, { shared: 0, unlinked: 1 });
-        assert.equal(answer.totals.usage.undated.residual.sessions, 0, "a mismatch is not settled");
+        assert.equal(answer.totals.usage.undated.residual, null, "a mismatch is not settled");
+        assert.equal(answer.totals.usage.residuals.mismatch, 1);
         assert.deepEqual(answer.totals.timeToSolve, {
             medianMs: 72 * HOUR,
             p90Ms: 72 * HOUR,
@@ -794,6 +800,42 @@ describe("ranges", () => {
         assert.equal(answer.totals.velocity.perWeek, 7);
     });
 
+    test("on the boundary's day, the range starts at the boundary instant", () => {
+        const boundary = T0 + 10 * HOUR;
+        const dashboardState = fresh();
+
+        dashboardState.boundary = boundary;
+        // Before the boundary: out. After it: in.
+        dashboardState.threads.T1 = closed("T1", "a/b", T0 + 9 * HOUR, "done", "completed");
+        dashboardState.threads.T2 = closed("T2", "a/b", T0 + 11 * HOUR, "done", "completed");
+        dashboardState.prs["a/b#1"] = pr("a/b#1", { state: "OPEN", createdAt: T0 + 9 * HOUR });
+        dashboardState.issues["a/b#2"] = issue("a/b#2", resolved(T0, T0 + 9 * HOUR));
+
+        const answer = take({ from: "2026-10-30", to: "2026-10-30" }, dashboardState);
+
+        assert.equal(answer.range.from, "2026-10-30");
+        assert.equal(answer.range.dayStart, T0);
+        assert.equal(answer.range.start, boundary);
+        assert.equal(answer.range.end, NOW);
+        assert.equal(answer.totals.completion.success, 1);
+        // 1 success in 2 hours: 84 a week.
+        assert.equal(answer.totals.velocity.perWeek, 84);
+        assert.equal(answer.totals.prs.created, 0);
+        assert.equal(answer.totals.timeToSolve.count, 0);
+        assert.deepEqual(answer.daily, [{ day: "2026-10-30", successes: 1 }]);
+        assert(answer.coverage.limitations.some((each) => each.code === "partial-first-day"));
+
+        // A closure exactly at the boundary is in.
+        dashboardState.threads.T3 = closed("T3", "a/b", boundary, "done", "completed");
+        assert.equal(
+            take({ from: "2026-10-30", to: "2026-10-30" }, dashboardState).totals.completion
+                .success,
+            2,
+        );
+        // A day after the boundary's day starts at midnight.
+        assert.equal(take({ from: "2026-10-29" }, fresh()).range.start, oct(29));
+    });
+
     test("an empty interval (today at midnight) has no velocity", () => {
         const answer = take({ from: "2026-10-30", to: "2026-10-30" }, fresh(), null, T0);
 
@@ -888,6 +930,7 @@ describe("ranges", () => {
             range: {
                 from: "2026-10-01",
                 to: "2026-10-30",
+                dayStart: oct(1),
                 start: oct(1),
                 end: NOW,
                 days: 30,
@@ -926,7 +969,7 @@ describe("zero, unknown, and empty", () => {
         assert.equal(answer.coverage.sources.github.status, "never");
         assert.equal(answer.coverage.sources.usage.status, "never");
         assert.deepEqual(answer.coverage.progress, {
-            github: { pending: null, complete: null },
+            github: { pending: null, complete: null, overdue: 0 },
             usage: { pending: null, complete: null, ledgerUnavailable: null },
         });
         assert(answer.daily.every((day) => day.successes === 0));
@@ -1101,6 +1144,86 @@ describe("usage", () => {
         assert.equal(metrics.usage.undated.counters.entries, 0);
     });
 
+    test("a malformed-entry session: no tokens, its counts, no residual, a partial source", () => {
+        const answer = take(OCTOBER, fresh(), {
+            sessions: {
+                "4": session(4, {
+                    assign: { repo: "a/b", via: 4 },
+                    skipped: { malformed: 3 },
+                    residual: { state: "mismatch", why: "3 malformed entries" },
+                    caughtUp: true,
+                }),
+            },
+            sources: {
+                usage: {
+                    at: NOW,
+                    ok: true,
+                    lastGoodAt: NOW,
+                    checkedAt: NOW,
+                    pending: 0,
+                    complete: true,
+                },
+            },
+        });
+        const usage = answer.totals.usage;
+
+        assert.equal(usage.entries, 0);
+        assert.equal(usage.totalTokens, 0);
+        assert.equal(usage.cost, null);
+        assert.deepEqual(usage.skipped, {
+            inherited: 0,
+            imported: 0,
+            malformed: 3,
+            reasoning: 0,
+            cacheWrite1h: 0,
+        });
+        assert.deepEqual(usage.residuals, {
+            settled: 0,
+            pending: 0,
+            mismatch: 1,
+            unavailable: 0,
+            absent: 0,
+        });
+        assert.equal(usage.undated.residual, null);
+        assert.equal(answer.coverage.sources.usage.status, "partial");
+        assert.equal(answer.coverage.sources.usage.ok, true);
+        assert.deepEqual(
+            answer.coverage.limitations.find((each) => each.code === "usage-gaps"),
+            {
+                code: "usage-gaps",
+                text: "Some counted sessions have malformed entries, a ledger mismatch, or a ledger that could not be read: their usage is incomplete.",
+            },
+        );
+        assert.deepEqual(project(answer, "a/b").usage.skipped, usage.skipped);
+    });
+
+    test("an unavailable ledger is a gap; pending and absent residuals are not", () => {
+        const usageOf = (state: "pending" | "unavailable" | undefined): UsageState => ({
+            sessions: {
+                "4": session(4, {
+                    assign: { repo: "a/b", via: 4 },
+                    ...(state === undefined ? {} : { residual: { state } }),
+                }),
+            },
+            sources: {
+                usage: { at: NOW, ok: true, lastGoodAt: NOW, checkedAt: NOW, complete: true },
+            },
+        });
+        const status = (state: "pending" | "unavailable" | undefined) =>
+            take(OCTOBER, fresh(), usageOf(state)).coverage.sources.usage.status;
+
+        assert.equal(status("unavailable"), "partial");
+        assert.equal(status("pending"), "ok");
+        assert.equal(status(undefined), "ok");
+        assert.deepEqual(take(OCTOBER, fresh(), usageOf(undefined)).totals.usage.residuals, {
+            settled: 0,
+            pending: 0,
+            mismatch: 0,
+            unavailable: 0,
+            absent: 1,
+        });
+    });
+
     test("unassigned sessions are unattributed, with their own count", () => {
         const answer = take(OCTOBER, fresh(), {
             sessions: {
@@ -1270,15 +1393,123 @@ describe("source states", () => {
             sourceView({ at: NOW, ok: true, lastGoodAt: NOW, complete: false }, NOW).status,
             "partial",
         );
-        // GitHub writes no heartbeat when no read is due: its age makes it stale only with reads pending.
+    });
+
+    /** The main fixture with 1 tracked open PR read at `readAt`, the threads source checked at `threadsAt`. */
+    function github(readAt: number, threadsAt = NOW): Snapshot {
+        const dashboard = fresh();
+
+        dashboard.boundary = BOUNDARY;
+        dashboard.initializedAt = NOW - 30 * DAY;
+        dashboard.prs["a/b#1"] = pr("a/b#1", { state: "OPEN", createdAt: oct(1), readAt });
+        dashboard.sources = {
+            threads: { at: threadsAt, ok: true, lastGoodAt: threadsAt, checkedAt: threadsAt },
+            // A stored `pending: 0` from an old pass: it must not hide an overdue ref.
+            github: { at: readAt, ok: true, lastGoodAt: readAt, pending: 0, complete: true },
+        };
+
+        return take(OCTOBER, dashboard, null);
+    }
+
+    test("GitHub: an overdue ref makes it stale, whatever the stored pending says", () => {
+        const old = github(NOW - 2 * DAY);
+
+        assert.equal(old.coverage.sources.github.status, "stale");
+        assert.equal(old.coverage.progress.github.overdue, 1);
+        assert.equal(old.coverage.progress.github.pending, 0);
+
+        const recent = github(NOW - 10 * 60_000);
+
+        assert.equal(recent.coverage.sources.github.status, "ok");
+        assert.equal(recent.coverage.progress.github.overdue, 0);
+        // Due by exactly STALE_MS: not yet overdue; 1 ms more: overdue.
+        const edge = NOW - OPEN_REFRESH_MS - STALE_MS;
+
+        assert.equal(github(edge).coverage.progress.github.overdue, 0);
+        assert.equal(github(edge - 1).coverage.progress.github.overdue, 1);
+    });
+
+    test("GitHub: a stale or never-read threads source makes it stale; a backoff makes it partial", () => {
+        const staleThreads = github(NOW - 10 * 60_000, NOW - DAY);
+
+        assert.equal(staleThreads.coverage.sources.threads.status, "stale");
+        assert.equal(staleThreads.coverage.sources.github.status, "stale");
+
+        const answer = github(NOW - 2 * DAY);
+        const dashboardState = fresh();
+
+        dashboardState.prs["a/b#1"] = pr("a/b#1", { state: "OPEN", readAt: NOW - 2 * DAY });
+        dashboardState.sources = {
+            github: { at: NOW, ok: true, lastGoodAt: NOW, pending: 0, complete: true },
+        };
+        assert.equal(answer.coverage.sources.github.status, "stale");
         assert.equal(
-            sourceView({ at: old, ok: true, lastGoodAt: old, pending: 0 }, NOW, true).status,
-            "ok",
-        );
-        assert.equal(
-            sourceView({ at: old, ok: true, lastGoodAt: old, pending: 2 }, NOW, true).status,
+            take(OCTOBER, dashboardState, null).coverage.sources.github.status,
             "stale",
+            "the threads source was never read",
         );
+
+        // During a valid backoff, overdue refs do not count, and the status is at least partial.
+        dashboardState.sources.threads = { at: NOW, ok: true, lastGoodAt: NOW, checkedAt: NOW };
+        dashboardState.sources.github = {
+            at: NOW,
+            ok: true,
+            lastGoodAt: NOW,
+            pending: 0,
+            backoffUntil: NOW + HOUR,
+        };
+        assert.equal(take(OCTOBER, dashboardState, null).coverage.sources.github.status, "partial");
+        // A backoff that ended: overdue counts again.
+        dashboardState.sources.github.backoffUntil = NOW - 1;
+        assert.equal(take(OCTOBER, dashboardState, null).coverage.sources.github.status, "stale");
+    });
+
+    test("GitHub: when each kind of ref is due again", () => {
+        const at = NOW - 2 * DAY;
+        const dashboardState = fresh();
+        const overdue = (): number =>
+            take(OCTOBER, dashboardState, null).coverage.progress.github.overdue;
+
+        dashboardState.initializedAt = NOW - 30 * DAY;
+        dashboardState.sources = {
+            threads: { at: NOW, ok: true, lastGoodAt: NOW, checkedAt: NOW },
+            github: { at: NOW, ok: true, lastGoodAt: NOW, pending: 0 },
+        };
+        // Not due again: merged with no gap; excluded; untracked.
+        dashboardState.prs["a/b#1"] = pr("a/b#1", { state: "MERGED", readAt: at - 30 * DAY });
+        dashboardState.prs["a/b#2"] = pr("a/b#2", { state: "OPEN", excluded: "window" });
+        dashboardState.prs["a/b#3"] = pr("a/b#3", { state: "OPEN", readAt: at, untracked: true });
+        // Never read, and the last GitHub read is fresh: not overdue.
+        dashboardState.issues["a/b#4"] = issue("a/b#4");
+        // Closed, read 1 day and 1 hour ago: due 1 hour ago, within STALE_MS.
+        dashboardState.issues["a/b#5"] = issue("a/b#5", {
+            state: "CLOSED",
+            readAt: NOW - DAY - HOUR,
+        });
+        // A forbidden ref waits a day: read 23 hours ago, not due.
+        dashboardState.prs["a/b#6"] = pr("a/b#6", { error: "FORBIDDEN", errorAt: NOW - 23 * HOUR });
+        assert.equal(overdue(), 0);
+        // A network error waits ERROR_RETRY_MS.
+        dashboardState.prs["a/b#7"] = pr("a/b#7", { error: "network", errorAt: NOW - 2 * HOUR });
+        assert.equal(overdue(), 1);
+        // Merged with a gap, read 2 days ago.
+        dashboardState.prs["a/b#8"] = pr("a/b#8", {
+            state: "MERGED",
+            readAt: at,
+            gaps: ["createdAt"],
+        });
+        assert.equal(overdue(), 2);
+        // An open issue read 2 days ago.
+        dashboardState.issues["a/b#9"] = issue("a/b#9", { state: "OPEN", readAt: at });
+        assert.equal(overdue(), 3);
+        // The last GitHub read is old: the never-read issue is overdue too.
+        dashboardState.sources.github = {
+            at: NOW - DAY,
+            ok: true,
+            lastGoodAt: NOW - DAY,
+            pending: 0,
+        };
+        assert.equal(overdue(), 4);
     });
 
     test("a failed source keeps its last good facts, and the answer says so", () => {
@@ -1321,18 +1552,25 @@ describe("source states", () => {
         assert.equal(sources.threads.error, "the read failed");
         assert.equal(sources.threads.kind, "other");
         assert.equal(sources.threads.lastGoodAt, NOW - DAY);
-        assert.equal(sources.github.status, "stale");
+        // 11 overdue refs (the tracked issues, never read, and the last GitHub read is a day old), but a valid backoff:
+        // partial.
+        assert.equal(sources.github.status, "partial");
         assert.equal(sources.github.backoffUntil, NOW + HOUR);
         assert.equal(sources.usage.status, "partial");
         assert.deepEqual(progress, {
-            github: { pending: 3, complete: false },
+            github: { pending: 3, complete: false, overdue: 11 },
             usage: { pending: 2, complete: false, ledgerUnavailable: 1 },
         });
         assert(answer.coverage.limitations.some((each) => each.code === "incomplete-sources"));
     });
 
     test("fresh sources: ok, and the standing limitations", () => {
-        const answer = take();
+        const usage = mainUsage();
+
+        // Session 8 has a mismatch residual: a usage gap. Without it, every source is ok.
+        delete usage.sessions["8"];
+
+        const answer = take(OCTOBER, mainDashboard(), usage);
 
         assert.equal(answer.coverage.status, "started");
         assert.equal(answer.coverage.boundary, BOUNDARY);
@@ -1352,6 +1590,13 @@ describe("source states", () => {
             ],
         );
         assert(answer.coverage.limitations.every((each) => each.text.length > 0));
+        assert.equal(answer.coverage.progress.github.overdue, 0);
+
+        // With session 8: a usage gap makes the stored "ok" partial, with its limitation.
+        const gap = take();
+
+        assert.equal(gap.coverage.sources.usage.status, "partial");
+        assert(gap.coverage.limitations.some((each) => each.code === "usage-gaps"));
     });
 });
 
