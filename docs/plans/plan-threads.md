@@ -1007,7 +1007,7 @@ Each line below differs from the design above, or settles what it left open, and
   runs, keeps its sweeper also with no open thread or watch (a dropped last plan), and `startSweeper` and
   `startMissingSweepers` start one for it (the page's look, and every sweep). The sweeper sleeps its 10 minutes as
   before, so the tries of a recovery come about 10 minutes apart.
-- **The limit that is left (a decision for Brian):** a recovery that is exhausted or expired with no committed binding
+- **A known limit, accepted by Brian (T591a, 2026-10-30):** a recovery that is exhausted or expired with no committed binding
   ends the protection from found-thread discovery. Pocket's public API has no lookup of a start key, so the desk then
   has no other way to know the session. Examples: all 10 tries throw after Pocket made the session; the last try runs
   past its 10-minute hold and succeeds later; or Pocket's start succeeds, but the commit of the bind fails or is cut
