@@ -69,6 +69,7 @@ import {
     lineDiff,
     planChanges,
     planFacts,
+    mergedHeads,
     planNoChange,
     recordVerify,
     failedRounds,
@@ -5179,6 +5180,23 @@ describe("the PR facts of a task thread", () => {
                 (event) => event.text === "t1 merged: T2 (frostyard/snow#1)",
             ),
         );
+    });
+
+    test("a merged PR with no known head ends the attempt with its ref and no head", () => {
+        const { state, graph } = buildingPlan();
+
+        prOn(state, "T2", "frostyard/snow#1", "MERGED");
+        // A partial GitHub answer: the merge, with no head commit (`updatePrs` sets "", never an older head).
+        state.threads.T2!.prs["frostyard/snow#1"]!.head = "";
+
+        planFacts(state, "T1", tick(10));
+
+        const t1 = taskOf(graph, "t1");
+
+        assert.equal(t1.state, "done");
+        assert.deepEqual(t1.attempts[0]?.end, { at: tick(10), how: "merged" });
+        assert.deepEqual(t1.attempts[0]?.prs, [{ ref: "frostyard/snow#1" }], "no head is taken");
+        assert.deepEqual(mergedHeads(graph).t1, []);
     });
 
     test("a replayed sweep adds no second event and no second item", () => {
