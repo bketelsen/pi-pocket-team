@@ -13429,13 +13429,10 @@ export function planFacts(
         const links = attempt.prs.map((pr) => thread.prs[pr.ref]);
         const merged = links.some((link) => link?.state === "MERGED");
         const open = links.some((link) => prOpen(link));
-        // A merged PR whose head a read did not give yet (a partial GitHub answer): the attempt waits for a read with
-        // the head, so the whole-plan check gets the head that merged.
-        const headless = links.some(
-            (link) => link?.state === "MERGED" && (link.head === undefined || link.head === ""),
-        );
 
-        if (merged && !open && !headless) {
+        // A merged PR with no known head (a partial GitHub answer) ends the attempt with its ref and no head: the whole-plan
+        // check then names the ref only, never an older head.
+        if (merged && !open) {
             attempt.end = { at: now, how: "merged" };
             task.state = "done";
             changed = true;
