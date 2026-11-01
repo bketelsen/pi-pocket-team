@@ -5474,6 +5474,28 @@ describe("unreadyReason", () => {
         );
     });
 
+    test("a read with no head, or a label with no head and no time, never says a commit came", () => {
+        // A partial GitHub answer: the PR came with a null commit node (2026-11-01, 13 labels removed at once).
+        assert.equal(
+            unreadyReason(labeled(), factOf({ head: "", headAt: 0, checks: "" })),
+            undefined,
+        );
+        // A label recorded by such a read: the head the next read gives is not new by itself.
+        assert.equal(unreadyReason(labeled(1000, ""), factOf()), undefined);
+        // ...but a head commit dated after the label still is.
+        assert.equal(
+            unreadyReason(labeled(1000, ""), factOf({ headAt: 2000 })),
+            "a new commit came after the label",
+        );
+        // A label time that is not known yet (0) dates nothing.
+        assert.equal(unreadyReason(labeled(0), factOf({ headAt: 2000 })), undefined);
+        assert.equal(
+            unreadyReason(labeled(0), factOf({ head: "h2", headAt: 2000 })),
+            "a new commit came after the label",
+            "a new head oid is proof without a time",
+        );
+    });
+
     test("no label, a closed PR, and a draft PR give nothing", () => {
         assert.equal(
             unreadyReason({ via: "attached", state: "OPEN" }, factOf({ head: "h2", headAt: 2000 })),
@@ -5568,6 +5590,108 @@ describe("planUnready", () => {
         assert.equal(planUnready(parked, pushed(), 100), 0);
         assert.deepEqual(unreadyOf(parked), {});
         assert.equal(parked.events.length, 0);
+    });
+
+    test("a partial read with a null commit node keeps the label, the head and the checks (regression)", () => {
+        // The sweep of 2026-11-01 01:46:28Z: GitHub gave every PR with no commit, and the desk took the empty head for a
+        // new commit on 13 labeled PRs. No commit came after the label: the label must stay.
+        const one = thread({
+            prs: {
+                [ref]: {
+                    via: "attached",
+                    state: "OPEN",
+                    next: "brian",
+                    head: "h1",
+                    checks: "SUCCESS",
+                    failing: [],
+                    ready: { at: Date.parse("2026-11-01T01:37:20Z"), head: "h1" },
+                },
+            },
+        });
+        const partial = parseGitHub({
+            data: {
+                p0: {
+                    nameWithOwner: "frostyard/test",
+                    isArchived: false,
+                    pullRequest: {
+                        number: 7,
+                        state: "OPEN",
+                        isDraft: false,
+                        mergeable: "MERGEABLE",
+                        labels: { nodes: [{ name: READY_LABEL }] },
+                        commits: { nodes: [null] },
+                        timelineItems: {
+                            nodes: [
+                                { createdAt: "2026-11-01T01:37:20Z", label: { name: READY_LABEL } },
+                            ],
+                        },
+                    },
+                },
+            },
+            errors: [
+                {
+                    path: ["p0", "pullRequest", "commits", "nodes", 0, "commit"],
+                    message: "Something went wrong while executing your query.",
+                },
+            ],
+        });
+
+        assert.equal(partial.prs[ref]?.head, "", "the read has no head");
+
+        const now = Date.parse("2026-11-01T01:46:28Z");
+
+        updatePrs(one, partial, now);
+
+        assert.equal(planUnready(one, partial, now), 0);
+        assert.deepEqual(unreadyOf(one), {});
+        assert.deepEqual(one.prs[ref]?.ready, {
+            at: Date.parse("2026-11-01T01:37:20Z"),
+            head: "h1",
+        });
+        assert.equal(one.prs[ref]?.head, "h1", "the link keeps its known head");
+        assert.equal(one.prs[ref]?.checks, "SUCCESS", "and its known checks");
+        assert.equal(one.prs[ref]?.next, "brian");
+
+        // The next full read with the same head: still nothing.
+        const full = githubOf([
+            prFact({
+                head: "h1",
+                headAt: Date.parse("2026-11-01T01:12:39Z"),
+                ready: true,
+                readyAt: Date.parse("2026-11-01T01:37:20Z"),
+            }),
+        ]);
+
+        updatePrs(one, full, now + 60_000);
+        assert.equal(planUnready(one, full, now + 60_000), 0);
+    });
+
+    test("a label recorded by a read with no head gets the head of the next read, and no event", () => {
+        const one = thread({ prs: { [ref]: { via: "seen", state: "OPEN", head: "h1" } } });
+        const labelAt = 1000;
+
+        updatePrs(
+            one,
+            githubOf([prFact({ head: "", checks: "", ready: true, readyAt: labelAt })]),
+            1500,
+        );
+        assert.deepEqual(one.prs[ref]?.ready, { at: labelAt, head: "" });
+
+        const events = one.events.length;
+        const full = githubOf([prFact({ head: "h1", headAt: 500, ready: true, readyAt: labelAt })]);
+
+        assert.equal(updatePrs(one, full, 2000), 0);
+        assert.equal(one.events.length, events);
+        assert.deepEqual(one.prs[ref]?.ready, { at: labelAt, head: "h1" });
+        assert.equal(planUnready(one, full, 2000), 0);
+
+        // A push after that is still seen.
+        const pushedLater = githubOf([
+            prFact({ head: "h2", headAt: 3000, ready: true, readyAt: labelAt }),
+        ]);
+
+        updatePrs(one, pushedLater, 3500);
+        assert.equal(planUnready(one, pushedLater, 3500), 1);
     });
 
     test("a clean PR, a PR GitHub does not give, and a PR with no label get nothing", () => {

@@ -211,7 +211,8 @@ export type PrLink = {
     draft?: boolean;
     /**
      * The label `ready-for-human` was on the PR: `at` is when GitHub says it was added (the sweep's `now` when that is
-     * unknown), and `head` is the head oid the desk saw first with the label. Absent: no label.
+     * unknown), and `head` is the head oid the desk saw first with the label: "" when that read gave no head, and the
+     * next read with a head fills it in. Absent: no label.
      */
     ready?: { at: number; head: string };
     /**
@@ -3843,6 +3844,7 @@ export function unreadyOf(thread: Thread): Record<string, UnreadyEntry> {
  * Why the label `ready-for-human` must come off 1 PR, in the order the desk checks: a new commit after the label, a
  * failing check, a review that requests changes after the label, a comment marked blocking after the label. Undefined
  * when the label is not on the PR, when the PR is not open, when it is a draft, and when nothing came after the label.
+ * A read with no head commit never says that a commit came: an unknown head is not a new one.
  */
 export function unreadyReason(link: PrLink, fact: PrFact): string | undefined {
     const ready = link.ready;
@@ -3851,7 +3853,14 @@ export function unreadyReason(link: PrLink, fact: PrFact): string | undefined {
         return undefined;
     }
 
-    if (ready.head !== fact.head || fact.headAt > ready.at) {
+    // A new commit needs proof from GitHub: a head oid now that differs from the one the desk recorded with the label, or
+    // a head commit that GitHub dates after a known label time. A read with no head (a partial answer: GitHub gave the
+    // PR with a null commit node) proves nothing, and neither does a label recorded with no head.
+    if (
+        fact.head !== "" &&
+        ((ready.head !== "" && ready.head !== fact.head) ||
+            (ready.at > 0 && fact.headAt > ready.at))
+    ) {
         return "a new commit came after the label";
     }
 
@@ -5784,9 +5793,13 @@ export function updatePrs(thread: Thread, github: GitHubFacts, now: number): num
 
         link.readAt = now;
 
+        // A read with no head commit (a partial GitHub answer: a null commit node) knows nothing of the head or its checks:
+        // the link keeps what the last read with a head said, and the next actor follows those checks.
+        const commitRead = fact.head !== "";
+        const checks = commitRead ? fact.checks : (link.checks ?? fact.checks);
         const archived = fact.archived || github.repos[fact.repo]?.archived === true;
         const state = archived ? "FROZEN" : fact.state;
-        const next = archived ? "none" : prNext(fact);
+        const next = archived ? "none" : prNext({ ...fact, checks });
 
         if (link.state !== state) {
             link.state = state;
@@ -5807,11 +5820,14 @@ export function updatePrs(thread: Thread, github: GitHubFacts, now: number): num
         link.title = fact.title;
         link.url = fact.url;
         link.review = fact.review;
-        link.checks = fact.checks;
         link.mergeable = fact.mergeable;
-        link.head = fact.head;
-        link.failing = [...fact.failing];
         link.draft = fact.isDraft;
+
+        if (commitRead) {
+            link.checks = fact.checks;
+            link.head = fact.head;
+            link.failing = [...fact.failing];
+        }
 
         // The label `ready-for-human`: seen, added again (a new label time), or gone.
         if (fact.ready) {
@@ -5836,6 +5852,10 @@ export function updatePrs(thread: Thread, github: GitHubFacts, now: number): num
                 ) {
                     events += 1;
                 }
+            } else if (known.head === "" && commitRead) {
+                // The label was recorded by a read with no head: the first read with one fills it in. A commit after the
+                // label still shows by its date.
+                known.head = fact.head;
             }
         } else if (link.ready !== undefined) {
             delete link.ready;
@@ -13397,7 +13417,7 @@ export function planFacts(
         for (const pr of attempt.prs) {
             const link = thread.prs[pr.ref];
 
-            if (link?.state === "MERGED" && link.head !== undefined) {
+            if (link?.state === "MERGED" && link.head !== undefined && link.head !== "") {
                 pr.head = link.head;
             }
         }
