@@ -14402,6 +14402,36 @@ export const planRoot = (plan: Plan): string => dirname(plan.file);
 /** Where every instance of this module in the process finds the 1 plan lock map. */
 const PLAN_LOCKS = Symbol.for("pi-pocket-team.desk.plan-locks");
 
+const EXPORT_QUEUE = Symbol.for("pi-pocket-team.desk.export-queue");
+
+/**
+ * The holder of the export's steps: 1 promise chain, shared by every instance of this module in the process. Pocket
+ * starts a new module before the old one's cleanup, so a new export must wait behind an old one's chain; the holder is
+ * made once, never replaced, and never deleted.
+ */
+export function exportSteps(): { tail: Promise<void> } {
+    const shared = globalThis as unknown as Record<symbol, { tail: Promise<void> } | undefined>;
+
+    shared[EXPORT_QUEUE] ??= { tail: Promise.resolve() };
+
+    return shared[EXPORT_QUEUE];
+}
+
+/**
+ * Run `step` after the export steps that are queued already, and give back its own promise. The next step waits for
+ * this one with its error caught, so 1 failure does not stop it, and this caller still gets the error.
+ */
+export function queueExport(
+    steps: { tail: Promise<void> },
+    step: () => Promise<void>,
+): Promise<void> {
+    const run = steps.tail.then(step);
+
+    steps.tail = run.catch(() => undefined);
+
+    return run;
+}
+
 const CONSULT_STARTS = Symbol.for("pi-pocket-team.desk.consult-starts");
 
 /**
@@ -18545,11 +18575,20 @@ export default function createDesk(host: Host, web: Web) {
                 }
             }
 
-            await writeChanged(config.export, exportFiles(state, reports, Date.now(), config.cap));
+            const folder = config.export;
+            const commit = config.exportCommit === true;
+            const files = exportFiles(state, reports, Date.now(), config.cap);
 
-            if (config.exportCommit === true) {
-                await commitExport(config.export);
-            }
+            // The file writes and the commit are 1 step of the queue: the next export writes after this one committed,
+            // in this instance or in another one. A failed step does not stop the next one, and the notice below still
+            // comes from this export's own step.
+            await queueExport(exportSteps(), async () => {
+                await writeChanged(folder, files);
+
+                if (commit) {
+                    await commitExport(folder);
+                }
+            });
         } catch (error) {
             noteExport(`The desk export did not write: ${(error as Error).message}`);
         }
@@ -18557,60 +18596,48 @@ export default function createDesk(host: Host, web: Web) {
 
     /** When the export's last commit try ran: at most 1 in each `EXPORT_COMMIT_MS`. */
     let exportCommitAt = 0;
-    /** The commit that runs now: a second export waits for it, so 2 never run git at once. */
-    let exportCommitting: Promise<void> = Promise.resolve();
 
     /**
      * Commit the export folder's changes, and only them: `git add -A -- .`, then `git commit -- .` in the folder, so a
      * file that someone else staged elsewhere in the checkout stays staged and out of this commit. At most once in
      * `EXPORT_COMMIT_MS`: a change in between goes with the next try. Nothing changed is no commit. A git that another
      * process holds (`index.lock`) waits for the next try with no notice; any other failure gives the hourly notice.
+     *
+     * The caller runs this in a step of `exportSteps()`, so no export writes the folder while this reads it.
      */
-    const commitExport = (folder: string): Promise<void> => {
+    const commitExport = async (folder: string): Promise<void> => {
         const at = Date.now();
 
         if (at - exportCommitAt < EXPORT_COMMIT_MS) {
-            return exportCommitting;
+            return;
         }
 
         exportCommitAt = at;
-        exportCommitting = exportCommitting.then(async () => {
-            try {
-                const { stdout } = await run(
-                    "git",
-                    ["-C", folder, "status", "--porcelain", "--", "."],
-                    GIT_OPTIONS,
-                );
 
-                if (stdout.trim() === "") {
-                    return;
-                }
+        try {
+            const { stdout } = await run(
+                "git",
+                ["-C", folder, "status", "--porcelain", "--", "."],
+                GIT_OPTIONS,
+            );
 
-                await run("git", ["-C", folder, "add", "-A", "--", "."], GIT_OPTIONS);
-                await run(
-                    "git",
-                    [
-                        "-C",
-                        folder,
-                        "commit",
-                        "--quiet",
-                        "--message",
-                        EXPORT_COMMIT_MESSAGE,
-                        "--",
-                        ".",
-                    ],
-                    GIT_OPTIONS,
-                );
-            } catch (error) {
-                const reason = gitReason(error);
-
-                if (!reason.includes("index.lock")) {
-                    noteExport(`The desk export did not commit: ${reason}`);
-                }
+            if (stdout.trim() === "") {
+                return;
             }
-        });
 
-        return exportCommitting;
+            await run("git", ["-C", folder, "add", "-A", "--", "."], GIT_OPTIONS);
+            await run(
+                "git",
+                ["-C", folder, "commit", "--quiet", "--message", EXPORT_COMMIT_MESSAGE, "--", "."],
+                GIT_OPTIONS,
+            );
+        } catch (error) {
+            const reason = gitReason(error);
+
+            if (!reason.includes("index.lock")) {
+                noteExport(`The desk export did not commit: ${reason}`);
+            }
+        }
     };
 
     /** Why a GitHub read failed, in one line of 200 characters at most. */

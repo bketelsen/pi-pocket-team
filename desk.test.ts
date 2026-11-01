@@ -43,6 +43,7 @@ import {
     DeskReports,
     DeskThreads,
     EXPORT_COMMIT_MESSAGE,
+    exportSteps,
     failThread,
     listText,
     openThread,
@@ -207,6 +208,7 @@ import {
     partOfMarked,
     planIssues,
     queueConfig,
+    queueExport,
     queuedRefsIn,
     signalNames,
     relinkIssues,
@@ -15105,6 +15107,145 @@ describe("the desk in a Pi Pocket", () => {
         }
     });
 
+    test("an export waits for the export commit that runs: no file in the folder changes under git", async () => {
+        const checkout = join(root, "export-queue");
+        const folder = join(checkout, "desk");
+        const git = (...args: string[]) =>
+            execFileSync("git", ["-C", checkout, ...args], { encoding: "utf8" });
+        const state = (name: string) => readFileSync(join(checkout, ".git", name), "utf8");
+
+        mkdirSync(folder, { recursive: true });
+        git("init", "--quiet");
+        git("config", "user.email", "desk@example.test");
+        git("config", "user.name", "Desk Test");
+        git("config", "commit.gpgsign", "false");
+        // The commit runs this checkout's own hook, whatever a global hooks path says.
+        git("config", "core.hooksPath", ".git/hooks");
+        writeFileSync(
+            configPath,
+            JSON.stringify({ digest: { minutes: 0 }, cap: 100, export: folder }),
+        );
+
+        try {
+            // The test before this one used the commit window of `EXPORT_COMMIT_MS`, so this app starts again: the
+            // commit below must be the first of its own window.
+            await restartApp(0);
+
+            const a = await delegated("export-queue-a");
+            const b = await delegated("export-queue-b");
+
+            // The commit's hook reads the folder, then holds git in it until the test writes `.git/release`, and reads
+            // the folder again: a write in between is the race. Its files live in `.git`, so the commit does not see
+            // them.
+            writeFileSync(
+                join(checkout, ".git/hooks/pre-commit"),
+                [
+                    "#!/bin/sh",
+                    "ls -a desk > .git/before",
+                    "cat desk/* >> .git/before",
+                    "touch .git/started",
+                    "turns=0",
+                    'while [ ! -f .git/release ] && [ "$turns" -lt 400 ]; do',
+                    "    sleep 0.05",
+                    "    turns=$((turns + 1))",
+                    "done",
+                    "ls -a desk > .git/after",
+                    "cat desk/* >> .git/after",
+                    "",
+                ].join("\n"),
+                { mode: 0o755 },
+            );
+            writeFileSync(
+                configPath,
+                JSON.stringify({
+                    digest: { minutes: 0 },
+                    cap: 100,
+                    export: folder,
+                    exportCommit: true,
+                }),
+            );
+
+            // A's change starts the export that commits. It is not awaited yet.
+            await app.harness.commit(async (tx) => {
+                (await tx.doc(DeskThreads)).threads[a.thread.id]!.title = "A changed title";
+            }, context);
+            const first = say(app, a.source, "desk sync test");
+
+            await until(
+                () => existsSync(join(checkout, ".git/started")),
+                "the commit in the export folder",
+                20_000,
+            );
+
+            // B's export now waits in the queue, which every instance of the module shares: its own step is behind the
+            // step of the commit that reads the folder.
+            const held = exportSteps().tail;
+
+            await app.harness.commit(async (tx) => {
+                (await tx.doc(DeskThreads)).threads[b.thread.id]!.title = "B changed title";
+            }, context);
+            const second = say(app, b.source, "desk sync test");
+
+            await until(() => exportSteps().tail !== held, "B's export step in the queue", 20_000);
+
+            assert(
+                readdirSync(folder).every((name) => !name.endsWith(".tmp")),
+                "no temp file while git reads the folder",
+            );
+            assert(
+                !readFileSync(join(folder, "threads.md"), "utf8").includes("B changed title"),
+                "B's write waits for the commit",
+            );
+
+            writeFileSync(join(checkout, ".git/release"), "");
+            await first;
+            await second;
+
+            await until(
+                () => existsSync(join(checkout, ".git/after")),
+                "the commit's second read of the folder",
+                20_000,
+            );
+            await until(
+                () => {
+                    try {
+                        return git("log", "--format=%s").includes(EXPORT_COMMIT_MESSAGE);
+                    } catch {
+                        return false;
+                    }
+                },
+                "the export's commit",
+                20_000,
+            );
+
+            assert.equal(
+                state("after"),
+                state("before"),
+                "no export wrote into the folder while git ran",
+            );
+            assert(
+                git("show", "--name-only", "--format=", "HEAD")
+                    .trim()
+                    .split("\n")
+                    .every((file) => !file.endsWith(".tmp")),
+                "no temp file is in the commit",
+            );
+            // The write that waited went in after the commit.
+            assert.match(readFileSync(join(folder, "threads.md"), "utf8"), /B changed title/);
+        } finally {
+            writeFileSync(configPath, JSON.stringify({ digest: { minutes: 0 }, cap: 100 }));
+
+            // A failed test must never leave the hook of the commit waiting.
+            try {
+                writeFileSync(join(checkout, ".git/release"), "");
+            } catch {
+                // The checkout is not there: nothing waits.
+            }
+
+            rmSync(checkout, { recursive: true, force: true });
+        }
+    });
+
     test("no export in the config writes nothing, and a missing folder does not fail", async () => {
         const folder = join(root, "export-none");
 
@@ -22503,5 +22644,52 @@ describe("a needs-plan label on an issue that is queued already", () => {
         assert.equal(first.news.length, 1);
         assert.equal(first.news[0]?.plan, undefined);
         assert.equal(first.queue.planSeen?.["frostyard/snosi#42"], ms(3));
+    });
+});
+
+describe("the export queue across a module reload", () => {
+    test("every instance of the module finds the 1 holder", () => {
+        assert.equal(exportSteps(), exportSteps(), "1 holder for the whole process");
+        assert.equal(typeof exportSteps().tail.then, "function", "the holder's chain is a promise");
+    });
+
+    test("a step of a new instance waits for the step that runs", async () => {
+        const order: string[] = [];
+
+        let release = (): void => {};
+
+        const gate = new Promise<void>((resolve) => {
+            release = resolve;
+        });
+        const firstRun = queueExport(exportSteps(), async () => {
+            order.push("first");
+            await gate;
+            order.push("the first step ended");
+        });
+        const secondRun = queueExport(exportSteps(), async () => {
+            order.push("second");
+        });
+
+        await until(() => order.length === 1, "the first step to start", 20_000);
+        assert.deepEqual(order, ["first"], "the second step waits for the first");
+
+        release();
+        await firstRun;
+        await secondRun;
+        assert.deepEqual(order, ["first", "the first step ended", "second"]);
+    });
+
+    test("a step that throws rejects to its own caller, and the next step still runs", async () => {
+        const failed = queueExport(exportSteps(), () =>
+            Promise.reject(new Error("the write failed")),
+        );
+        let ran = false;
+        const next = queueExport(exportSteps(), async () => {
+            ran = true;
+        });
+
+        await assert.rejects(failed, /the write failed/);
+        await next;
+        assert.equal(ran, true, "the step after a failed one runs");
     });
 });
