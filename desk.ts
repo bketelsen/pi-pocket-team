@@ -14356,6 +14356,36 @@ export const planRoot = (plan: Plan): string => dirname(plan.file);
 /** Where every instance of this module in the process finds the 1 plan lock map. */
 const PLAN_LOCKS = Symbol.for("pi-pocket-team.desk.plan-locks");
 
+const EXPORT_QUEUE = Symbol.for("pi-pocket-team.desk.export-queue");
+
+/**
+ * The holder of the export's steps: 1 promise chain, shared by every instance of this module in the process. Pocket
+ * starts a new module before the old one's cleanup, so a new export must wait behind an old one's chain; the holder is
+ * made once, never replaced, and never deleted.
+ */
+export function exportSteps(): { tail: Promise<void> } {
+    const shared = globalThis as unknown as Record<symbol, { tail: Promise<void> } | undefined>;
+
+    shared[EXPORT_QUEUE] ??= { tail: Promise.resolve() };
+
+    return shared[EXPORT_QUEUE];
+}
+
+/**
+ * Run `step` after the export steps that are queued already, and give back its own promise. The next step waits for
+ * this one with its error caught, so 1 failure does not stop it, and this caller still gets the error.
+ */
+export function queueExport(
+    steps: { tail: Promise<void> },
+    step: () => Promise<void>,
+): Promise<void> {
+    const run = steps.tail.then(step);
+
+    steps.tail = run.catch(() => undefined);
+
+    return run;
+}
+
 const CONSULT_STARTS = Symbol.for("pi-pocket-team.desk.consult-starts");
 
 /**
@@ -18288,18 +18318,17 @@ export default function createDesk(host: Host, web: Web) {
             const folder = config.export;
             const commit = config.exportCommit === true;
             const files = exportFiles(state, reports, Date.now(), config.cap);
-            // The file writes and the commit are 1 step of the queue: the next export writes after this one committed.
-            const step = exportQueue.then(async () => {
+
+            // The file writes and the commit are 1 step of the queue: the next export writes after this one committed,
+            // in this instance or in another one. A failed step does not stop the next one, and the notice below still
+            // comes from this export's own step.
+            await queueExport(exportSteps(), async () => {
                 await writeChanged(folder, files);
 
                 if (commit) {
                     await commitExport(folder);
                 }
             });
-
-            // A failed step does not stop the next one, and the notice below still comes from this export's own step.
-            exportQueue = step.catch(() => undefined);
-            await step;
         } catch (error) {
             noteExport(`The desk export did not write: ${(error as Error).message}`);
         }
@@ -18307,11 +18336,6 @@ export default function createDesk(host: Host, web: Web) {
 
     /** When the export's last commit try ran: at most 1 in each `EXPORT_COMMIT_MS`. */
     let exportCommitAt = 0;
-    /**
-     * The export's steps run 1 at a time: its file writes and its commit, so git never reads the folder while a write
-     * is in it.
-     */
-    let exportQueue: Promise<void> = Promise.resolve();
 
     /**
      * Commit the export folder's changes, and only them: `git add -A -- .`, then `git commit -- .` in the folder, so a
@@ -18319,7 +18343,7 @@ export default function createDesk(host: Host, web: Web) {
      * `EXPORT_COMMIT_MS`: a change in between goes with the next try. Nothing changed is no commit. A git that another
      * process holds (`index.lock`) waits for the next try with no notice; any other failure gives the hourly notice.
      *
-     * The caller runs this inside `exportQueue`, so no export writes the folder while this reads it.
+     * The caller runs this in a step of `exportSteps()`, so no export writes the folder while this reads it.
      */
     const commitExport = async (folder: string): Promise<void> => {
         const at = Date.now();
