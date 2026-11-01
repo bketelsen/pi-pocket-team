@@ -338,6 +338,11 @@ test("drop-in identities, named delegation, HTTP permissions, replay and restart
         assert.equal(app.cwdOf(id), work);
         // A specialist can't create a second layer of agents.
         await say(app, child, "delegate test");
+        // A specialist's linked task names the asks of team_message, not the built-in ask tool, for Brian's decisions.
+        assert.match(
+            requestContext,
+            /In a linked task, never call the built-in `ask` tool: its card waits only in this session, and the desk does not see it\. Put the decision in the asks of team_message\./,
+        );
         assert.match(
             (await modelTexts(app, child)).join("\n"),
             /Only a session assigned a supervisor/,

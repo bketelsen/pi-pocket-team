@@ -2615,6 +2615,7 @@ export default function createNightShift(host: Host, web: Web) {
                     `Say DONE only when the stop condition holds.${goal.check === undefined ? "" : ` Then \`${goal.check}\` runs in the working directory, and it must pass too.`}`,
                     "Say BLOCKED when you cannot go on without a person: plan mode is on, Lancet Guard or a person refused a call, or a sign-in or credential is missing. Lancet Guard and plan mode apply as always: never work around them.",
                     "Do not ask questions and wait for an answer: nobody reads them until the morning. Make reasonable choices, and note them.",
+                    "Never call the built-in `ask` tool in a round: its card waits for a person, and the round waits with it, past the deadline. Write each decision for Brian in text instead: in your summary when the shift stops (in its ASKS FOR BRIAN line, when it asks for one), or in the asks of team_message when your task allows it.",
                 ].join("\n");
             }),
         ],
