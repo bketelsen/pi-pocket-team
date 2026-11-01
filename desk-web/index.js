@@ -532,6 +532,7 @@ export const badgeOf = (next) => {
 const publish = (next) => {
     view = next;
     loadError = null;
+    firstReadFailed = false;
     planSessions = planSessionsOf(next);
 
     if (rail !== null) {
@@ -555,12 +556,18 @@ export const planSessionsOf = (next) =>
 
 /**
  * What the Plan panel needs now. Before the first view (`known` false) the module does not know the planning sessions:
- * the panel is there ("add" once, then "keep"), so a panel that Pocket kept open across a reload finds its spec. After
- * it: "add" when the session is a plan's and the panel is not there, "remove" when the session is not a plan's and the
- * panel is there, else "keep": the same spec is never added again.
+ * while the first read runs, the panel is there ("add" once, then "keep"), so a panel that Pocket kept open across a
+ * reload finds its spec. When a read failed and there is still no view (`failed`), the panel goes ("remove", then
+ * "keep"): it must not stay in every session; the Desk page shows the error, and a good view adds it again. After the
+ * first view: "add" when the session is a plan's and the panel is not there, "remove" when the session is not a plan's
+ * and the panel is there, else "keep": the same spec is never added again.
  */
-export const panelStep = (added, wanted, known = true) => {
+export const panelStep = (added, wanted, known = true, failed = false) => {
     if (!known) {
+        if (failed) {
+            return added ? "remove" : "keep";
+        }
+
         return added ? "keep" : "add";
     }
 
@@ -621,9 +628,40 @@ export const newestReads = ({ abort = true } = {}) => {
 };
 
 /**
+ * The reads of 1 plan view, newest only (`newestReads`): `open()` reads the plan. `show(answer, first)` gets the newest
+ * answer, `first` when no plan showed before. `showError(message)` gets the newest read's error only while no plan
+ * shows: a failed refresh keeps the plan that is there. So a first read that a `changed` read aborted, and a new read
+ * that fails, still show the error, never a loader for ever. `stop` drops the reads in flight.
+ */
+export const planReader = (read, show, showError) => {
+    const reads = newestReads();
+    let shown = false;
+
+    return {
+        open: () =>
+            reads.run(
+                read,
+                (answer) => {
+                    const first = !shown;
+
+                    shown = true;
+                    show(answer, first);
+                },
+                (failure) => {
+                    if (!shown) {
+                        showError(failure.message);
+                    }
+                },
+            ),
+        stop: () => reads.stop(),
+    };
+};
+
+/**
  * Add the Plan panel when the conversation (the one the tab shows, or `target`) is a planning session, and remove it
  * when it is not. A panel of ours that shows closes first, so no empty panel stays. Before the first view the panel
- * stays added (`panelStep`): a panel kept open across a reload must find its spec, and shows a loader or the error.
+ * stays added while the first read runs (`panelStep`): a panel kept open across a reload must find its spec, and shows
+ * a loader. A failed read with no view yet removes it.
  */
 const syncPanel = (target = shownConversation) => {
     if (planPanelSpec === null) {
@@ -634,6 +672,7 @@ const syncPanel = (target = shownConversation) => {
         planPanel !== null,
         target !== null && planSessions.has(target),
         view !== null,
+        firstReadFailed,
     );
 
     if (step === "add") {
@@ -676,6 +715,8 @@ const openInDesk = (next) => {
 
 /** The threads reads: only the newest one publishes its view, or its error. A read is not aborted: it sweeps too. */
 let threadReads = newestReads({ abort: false });
+/** A threads read failed, and no view came yet: the Plan panel goes until a good view. */
+let firstReadFailed = false;
 
 /**
  * Read the threads view, and publish it when no newer read started since: an older answer never replaces a newer view
@@ -694,6 +735,12 @@ const load = async () => {
             },
             (failure) => {
                 loadError = failure.message;
+
+                if (view === null) {
+                    firstReadFailed = true;
+                    syncPanel();
+                }
+
                 notify();
             },
         );
@@ -736,6 +783,7 @@ export default function setup(pocket) {
     loadError = null;
     planSessions = new Map();
     threadReads = newestReads({ abort: false });
+    firstReadFailed = false;
     planPanelSpec = null;
     planPanel = null;
     shownConversation = null;
@@ -863,42 +911,43 @@ export default function setup(pocket) {
         // What the fields hold now, for after a send: only the text that was sent is cleared.
         const [live] = useState(() => ({ comment: "", changes: "" }));
 
-        // Every read of the plan (the first, after an act, at a `changed` event) goes through 1 run: only the newest
-        // read's answer shows, and a new read aborts the one before it.
-        const [reads] = useState(() => newestReads());
+        // Every read of the plan (the first, after an act, at a `changed` event, Retry) goes through 1 reader: only the
+        // newest read's answer shows, a new read aborts the one before it, and its error shows while no plan shows.
+        const planId = useRef(id);
 
-        /** Read the plan again; the view takes the answer only when it is the newest read. */
-        const openPlan = () =>
-            reads.run(
-                (signal) => pocket.api(`plans/${id}`, undefined, { signal }),
-                (answer) => {
+        planId.current = id;
+
+        const [reader] = useState(() =>
+            planReader(
+                (signal) => pocket.api(`plans/${planId.current}`, undefined, { signal }),
+                (answer, first) => {
                     if (stillMounted(life)) {
                         setPlan(answer);
+
+                        // The error of a failed first read goes when the plan shows; an act's error stays.
+                        if (first) {
+                            setError("");
+                        }
                     }
                 },
-            );
+                (message) => {
+                    if (stillMounted(life)) {
+                        setError(message);
+                    }
+                },
+            ),
+        );
+
+        /** Read the plan again; the view takes the answer only when it is the newest read. */
+        const openPlan = () => reader.open();
 
         useEffect(() => {
-            reads
-                .run(
-                    (signal) => pocket.api(`plans/${id}`, undefined, { signal }),
-                    (answer) => {
-                        if (stillMounted(life)) {
-                            setPlan(answer);
-                        }
-                    },
-                    (failure) => {
-                        if (stillMounted(life)) {
-                            setError(failure.message);
-                        }
-                    },
-                )
-                .catch(() => {
-                    // The newest read shows its error above; an older one's error is dropped.
-                });
+            openPlan().catch(() => {
+                // The newest read shows its error; an older one's error is dropped.
+            });
 
             return () => {
-                reads.stop();
+                reader.stop();
                 life.gone = true;
             };
         }, [id]);
@@ -1467,8 +1516,25 @@ export default function setup(pocket) {
         if (plan === null) {
             return html`<div class=${shell}>
                 ${bar}
-                ${error ? html`<div class="error-box" role="alert">${error}</div>` : null}
-                <${Loader} label="Opening the plan" />
+                ${
+                    error
+                        ? html`<div class="error-box" role="alert">${error}</div>
+                              <div class="desk-actions">
+                                  <button
+                                      type="button"
+                                      class="button"
+                                      onClick=${() => {
+                                          setError("");
+                                          openPlan().catch(() => {
+                                              // The newest read shows its error again.
+                                          });
+                                      }}
+                                  >
+                                      Retry
+                                  </button>
+                              </div>`
+                        : html`<${Loader} label="Opening the plan" />`
+                }
             </div>`;
         }
 
@@ -2073,20 +2139,10 @@ export default function setup(pocket) {
             };
         }, []);
 
-        // Before the first view: a loader, or the failed read with Retry. The panel waits for the planning sessions.
+        // Before the first view, while the first read runs: a loader. A failed read with no view removes the panel, and
+        // the Desk page shows the error.
         if (view === null) {
-            return html`<div class="desk desk-in-panel">
-                ${
-                    loadError === null
-                        ? html`<${Loader} label="Reading the desk" />`
-                        : html`<div class="error-box" role="alert">${loadError}</div>
-                              <div class="desk-actions">
-                                  <button type="button" class="button" onClick=${() => void load()}>
-                                      Retry
-                                  </button>
-                              </div>`
-                }
-            </div>`;
+            return html`<div class="desk desk-in-panel"><${Loader} label="Reading the desk" /></div>`;
         }
 
         const id = shownConversation === null ? undefined : planSessions.get(shownConversation);

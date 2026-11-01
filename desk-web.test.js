@@ -45,6 +45,7 @@ import setup, {
     completedLines,
     panelStep,
     newestReads,
+    planReader,
     planEnded,
     planSessionsOf,
     stepLine,
@@ -2188,6 +2189,65 @@ test("panelStep: before the first view the panel is added at once and kept; afte
     assert.equal(panelStep(true, true, true), "keep");
 });
 
+test("panelStep: a failed read with no view yet removes the panel once; a good view decides again", () => {
+    // Before the first read ends: added and kept.
+    assert.equal(panelStep(false, false, false, false), "add");
+    assert.equal(panelStep(true, false, false, false), "keep");
+    // The first read failed: removed, and kept out while there is no view.
+    assert.equal(panelStep(true, false, false, true), "remove");
+    assert.equal(panelStep(true, true, false, true), "remove");
+    assert.equal(panelStep(false, true, false, true), "keep");
+    // A good read: in a planning session it comes again; in a plain session it stays out.
+    assert.equal(panelStep(false, true, true, false), "add");
+    assert.equal(panelStep(false, false, true, false), "keep");
+});
+
+test("planReader: a changed read aborts the first read and fails: the error shows; a failed refresh keeps the plan", async () => {
+    const shown = [];
+    const errors = [];
+    const answers = [];
+    const signals = [];
+    const reader = planReader(
+        (signal) => {
+            const answer = deferred();
+
+            answers.push(answer);
+            signals.push(signal);
+
+            return answer.promise;
+        },
+        (plan, first) => shown.push(`${plan}${first ? " first" : ""}`),
+        (message) => errors.push(message),
+    );
+
+    // The first read, then a changed event's read, which aborts it.
+    const first = reader.open().catch((failure) => failure.message);
+    const changed = reader.open().catch((failure) => failure.message);
+
+    assert.equal(signals[0].aborted, true);
+    answers[0].reject(new Error("aborted"));
+    answers[1].reject(new Error("The plan read failed."));
+    assert.equal(await first, "aborted");
+    assert.equal(await changed, "The plan read failed.");
+    assert.deepEqual(errors, ["The plan read failed."], "the error shows: no loader for ever");
+    assert.deepEqual(shown, []);
+
+    // Retry: the plan shows, the first time.
+    const retry = reader.open();
+
+    answers[2].resolve("T1 v1");
+    await retry;
+    assert.deepEqual(shown, ["T1 v1 first"]);
+
+    // A refresh that fails while the plan shows: no error, the plan stays.
+    const refresh = reader.open().catch(() => "failed");
+
+    answers[3].reject(new Error("A refresh failed."));
+    await refresh;
+    assert.deepEqual(errors, ["The plan read failed."]);
+    assert.deepEqual(shown, ["T1 v1 first"]);
+});
+
 /** A promise and its resolve and reject: an answer that comes when the test says. */
 const deferred = () => {
     let resolve;
@@ -2423,26 +2483,47 @@ test("the Plan panel is added at once, before the first view; after it, a plain 
     );
 });
 
-test("a first read that fails keeps the restored panel, with the error and Retry; a loader before any answer", async () => {
-    const answer = deferred();
-    let calls = 0;
-    const { log, drawPanel } = await withPanels(null, 31, () => {
-        calls += 1;
+test("a failed first read removes the panel; a good read adds it again in a planning session only", async () => {
+    const planning = { ...viewWith(null), plans: [], planSessions: [{ plan: "T1", session: 31 }] };
+    const answers = [];
 
-        return answer.promise;
-    });
+    const run = async (conversation) => {
+        answers.length = 0;
 
-    assert.match(drawPanel(), /<\[fn\] label="Reading the desk" \/>/, "the Loader");
+        const made = await withPanels(null, conversation, () => {
+            const answer = deferred();
 
-    answer.reject(new Error("The desk is out of reach."));
-    await new Promise((resolve) => setTimeout(resolve, 10));
+            answers.push(answer);
 
-    const out = drawPanel();
+            return answer.promise;
+        });
 
-    assert.deepEqual(log, [ADDED], "the panel stays: no view says the session is not a plan's");
-    assert.match(out, /role="alert">The desk is out of reach\./);
-    assert.match(out, /> Retry </);
-    assert.equal(calls, 1);
+        // The first read runs: the panel is there, with a loader.
+        assert.deepEqual(made.log, [ADDED]);
+        assert.match(made.drawPanel(), /<\[fn\] label="Reading the desk" \/>/, "the Loader");
+
+        answers[0].reject(new Error("The desk is out of reach."));
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        assert.deepEqual(made.log, [ADDED, "close", "remove"], "a failed first read removes it");
+
+        // The next change reads again, and the view comes.
+        made.changed();
+        answers[1].resolve(planning);
+        await new Promise((resolve) => setTimeout(resolve, 10));
+
+        return made.log;
+    };
+
+    assert.deepEqual(
+        await run(31),
+        [ADDED, "close", "remove", ADDED],
+        "added again beside a planning session",
+    );
+    assert.deepEqual(
+        await run(7),
+        [ADDED, "close", "remove"],
+        "not added again in a plain session",
+    );
 });
 
 test("2 thread reads that finish in reverse order: the newer view stays, and the panel stays", async () => {
