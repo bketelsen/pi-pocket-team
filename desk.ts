@@ -5827,6 +5827,10 @@ export function updatePrs(thread: Thread, github: GitHubFacts, now: number): num
             link.checks = fact.checks;
             link.head = fact.head;
             link.failing = [...fact.failing];
+        } else if (fact.state !== "OPEN") {
+            // A merged or closed PR read with no head: the head it ended at is unknown, and the last one the desk saw may
+            // be older. A plan attempt must not take that one as the merged head.
+            link.head = "";
         }
 
         // The label `ready-for-human`: seen, added again (a new label time), or gone.
@@ -13425,8 +13429,13 @@ export function planFacts(
         const links = attempt.prs.map((pr) => thread.prs[pr.ref]);
         const merged = links.some((link) => link?.state === "MERGED");
         const open = links.some((link) => prOpen(link));
+        // A merged PR whose head a read did not give yet (a partial GitHub answer): the attempt waits for a read with
+        // the head, so the whole-plan check gets the head that merged.
+        const headless = links.some(
+            (link) => link?.state === "MERGED" && (link.head === undefined || link.head === ""),
+        );
 
-        if (merged && !open) {
+        if (merged && !open && !headless) {
             attempt.end = { at: now, how: "merged" };
             task.state = "done";
             changed = true;

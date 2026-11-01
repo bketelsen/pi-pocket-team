@@ -5666,6 +5666,19 @@ describe("planUnready", () => {
         assert.equal(planUnready(one, full, now + 60_000), 0);
     });
 
+    test("a merged or closed PR read with no head has an unknown head, not the last one seen", () => {
+        for (const state of ["MERGED", "CLOSED"] as const) {
+            const one = thread({
+                prs: { [ref]: { via: "seen", state: "OPEN", head: "h1", checks: "SUCCESS" } },
+            });
+
+            updatePrs(one, githubOf([prFact({ state, head: "", checks: "" })]), 100);
+
+            assert.equal(one.prs[ref]?.state, state);
+            assert.equal(one.prs[ref]?.head, "", `${state}: h1 may not be the head it ended at`);
+        }
+    });
+
     test("a label recorded by a read with no head gets the head of the next read, and no event", () => {
         const one = thread({ prs: { [ref]: { via: "seen", state: "OPEN", head: "h1" } } });
         const labelAt = 1000;

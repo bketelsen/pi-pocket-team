@@ -5181,6 +5181,32 @@ describe("the PR facts of a task thread", () => {
         );
     });
 
+    test("a merged PR with no known head keeps the attempt open until a read gives the head", () => {
+        const { state, graph } = buildingPlan();
+
+        prOn(state, "T2", "frostyard/snow#1", "MERGED");
+        // A partial GitHub answer: the merge, with no head commit.
+        state.threads.T2!.prs["frostyard/snow#1"]!.head = "";
+
+        planFacts(state, "T1", tick(10));
+
+        const t1 = taskOf(graph, "t1");
+
+        assert.notEqual(t1.state, "done");
+        assert.equal(t1.attempts[0]?.end, undefined);
+        assert.equal(t1.attempts[0]?.prs[0]?.head, undefined, "no head is taken");
+
+        // The next read gives the head that merged.
+        state.threads.T2!.prs["frostyard/snow#1"]!.head = `2${"0".repeat(39)}`;
+        planFacts(state, "T1", tick(11));
+
+        assert.equal(t1.state, "done");
+        assert.deepEqual(t1.attempts[0]?.end, { at: tick(11), how: "merged" });
+        assert.deepEqual(t1.attempts[0]?.prs, [
+            { ref: "frostyard/snow#1", head: `2${"0".repeat(39)}` },
+        ]);
+    });
+
     test("a replayed sweep adds no second event and no second item", () => {
         const { state } = buildingPlan();
 
