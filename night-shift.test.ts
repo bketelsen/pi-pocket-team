@@ -931,6 +931,7 @@ describe("workers", () => {
         assert.equal(goal.worker, "faux/faux-2");
         assert.equal(goal.rounds[0]?.worker, "faux/faux-2");
         assert.match(sectionRequest, /give execution to subagents on `faux\/faux-2`/);
+        assert.match(sectionRequest, /Never call the built-in `ask` tool in a round/);
         assert.match(statusCard(goal, Date.now()), /Worker: faux\/faux-2/);
 
         const plain = await session("worker-plain");
