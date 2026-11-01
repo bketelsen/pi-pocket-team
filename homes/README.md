@@ -2,8 +2,8 @@
 
 `homes/seed.mjs` makes and updates the home folder of each named agent: `~/agents/<id>/`, a local git
 repository with no remote. The profile in `~/.config/pi-pocket-team/agents/<id>.md` names the folder
-with `home:` (`/var/home/bjk/projects/odrade/reports/2026-10-27-agent-homes/README.md`, sections 3
-and 4). A profile with no `home:` is listed and skipped.
+with `home:` (`~/agents/odrade/reports/2026-10-27-agent-homes/README.md`, sections 3 and 4). A
+profile with no `home:` is listed and skipped.
 
 For each home it makes the folder, writes `AGENTS.md` (the charter copy, the repositories table and
 the rules), makes `notes/`, `plans/` and `reports/` with a `.gitkeep` each, writes a `.gitignore`, and

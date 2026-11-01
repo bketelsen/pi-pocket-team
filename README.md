@@ -115,7 +115,7 @@ Alice makes the web front end small and fast.
 
 ## Repository ownership
 
-Odrade owns the team and has no assigned repository. Her current folder is independent of the specialists' working folders. Repository mappings are read fresh for each delegation, so existing Odrade conversations see edits without reselecting her identity.
+Odrade owns the team. Her profile names a home, `~/agents/odrade`, and no repository. Her current folder is independent of the specialists' working folders. Repository mappings are read fresh for each delegation, so existing Odrade conversations see edits without reselecting her identity.
 
 An agent's Markdown frontmatter can contain:
 
@@ -129,7 +129,7 @@ repositories:
 Odrade calls `team_delegate` with `agent: "duncan"` and `repository: "frostyard/nsl"`. A single owned repository is selected automatically; with multiple repositories the tool requires a name from the map. The Team panel has the same choices and shows the destination folder before starting. The tool's optional `title` names the desk thread and the linked session; without it, the task's first non-empty line is the title, without a leading `Task:`, `Goal:`, or `Title:`. `repository: "home"` starts the task in the agent's own home; see [Agent homes](#agent-homes).
 When the folder is the top of a git work tree, each delegation gets its own worktree beside the main checkout, at `<checkout>--<agent>-<slug>` on branch `<agent>/<slug>`, so 2 jobs in 1 repository share no folder and no branch. When the worktree cannot be made, the delegation works in the main checkout, and the tool result and the task say so in 1 sentence.
 
-For non-repository work, `workspace: ~/projects/moneo` supplies a working folder. An agent with neither repositories nor a workspace inherits the source folder. All mapped paths are absolute or begin with `~/` and must exist when a task starts; delegation does not silently clone or create folders.
+For non-repository work, a `workspace` supplies a working folder: the Clerk's profile has `workspace: ~/agents/odrade`. An agent with neither repositories nor a workspace inherits the source folder. All mapped paths are absolute or begin with `~/` and must exist when a task starts; delegation does not silently clone or create folders.
 
 The tool takes an optional `night_shift` object, `{ objective?, stop_when, start?, until?, for?, max?, worker?, pr_check? }`: the linked session then runs a night-shift goal in rounds and reports back to Odrade's session when it stops. A night shift from the tool cannot have a free check command. `pr_check` is the only check it takes: a structured PR check, and the module builds the `gh` command. `worker` is the provider/model for subagents, such as `github-copilot/claude-sonnet-5.5`; it must be in the owner's allowed list for subagents. See [Delegated night shifts](#delegated-night-shifts).
 
