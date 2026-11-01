@@ -14968,6 +14968,113 @@ describe("the desk in a Pi Pocket", () => {
         }
     });
 
+    test("an export waits for the export commit that runs: no file in the folder changes under git", async () => {
+        const checkout = join(root, "export-queue");
+        const folder = join(checkout, "desk");
+        const git = (...args: string[]) =>
+            execFileSync("git", ["-C", checkout, ...args], { encoding: "utf8" });
+        const state = (name: string) => readFileSync(join(checkout, ".git", name), "utf8");
+
+        mkdirSync(folder, { recursive: true });
+        git("init", "--quiet");
+        git("config", "user.email", "desk@example.test");
+        git("config", "user.name", "Desk Test");
+        git("config", "commit.gpgsign", "false");
+        // The commit runs this checkout's own hook, whatever a global hooks path says.
+        git("config", "core.hooksPath", ".git/hooks");
+        writeFileSync(
+            configPath,
+            JSON.stringify({ digest: { minutes: 0 }, cap: 100, export: folder }),
+        );
+
+        try {
+            // The test before this one used the commit window of `EXPORT_COMMIT_MS`, so this app starts again: the
+            // commit below must be the first of its own window.
+            await restartApp(0);
+
+            const a = await delegated("export-queue-a");
+            const b = await delegated("export-queue-b");
+
+            // The commit's hook reads the folder, holds git in it for 1.5 seconds, and reads it again: a write in
+            // between is the race. Its files live in `.git`, so the commit does not see them.
+            writeFileSync(
+                join(checkout, ".git/hooks/pre-commit"),
+                [
+                    "#!/bin/sh",
+                    "ls -a desk > .git/before",
+                    "cat desk/* >> .git/before",
+                    "touch .git/started",
+                    "sleep 1.5",
+                    "ls -a desk > .git/after",
+                    "cat desk/* >> .git/after",
+                    "",
+                ].join("\n"),
+                { mode: 0o755 },
+            );
+            writeFileSync(
+                configPath,
+                JSON.stringify({
+                    digest: { minutes: 0 },
+                    cap: 100,
+                    export: folder,
+                    exportCommit: true,
+                }),
+            );
+
+            // A's change starts the export that commits. It is not awaited yet.
+            await app.harness.commit(async (tx) => {
+                (await tx.doc(DeskThreads)).threads[a.thread.id]!.title = "A changed title";
+            }, context);
+            const first = say(app, a.source, "desk sync test");
+
+            await until(
+                () => existsSync(join(checkout, ".git/started")),
+                "the commit in the export folder",
+                20_000,
+            );
+
+            // B's change now: its export waits for the commit that reads the folder.
+            await app.harness.commit(async (tx) => {
+                (await tx.doc(DeskThreads)).threads[b.thread.id]!.title = "B changed title";
+            }, context);
+            await say(app, b.source, "desk sync test");
+            await first;
+
+            await until(
+                () => existsSync(join(checkout, ".git/after")),
+                "the commit's second read of the folder",
+                20_000,
+            );
+            await until(
+                () => {
+                    try {
+                        return git("log", "--format=%s").includes(EXPORT_COMMIT_MESSAGE);
+                    } catch {
+                        return false;
+                    }
+                },
+                "the export's commit",
+                20_000,
+            );
+
+            assert.equal(
+                state("after"),
+                state("before"),
+                "no export wrote into the folder while git ran",
+            );
+            assert(
+                git("show", "--name-only", "--format=", "HEAD")
+                    .trim()
+                    .split("\n")
+                    .every((file) => !file.endsWith(".tmp")),
+                "no temp file is in the commit",
+            );
+        } finally {
+            writeFileSync(configPath, JSON.stringify({ digest: { minutes: 0 }, cap: 100 }));
+            rmSync(checkout, { recursive: true, force: true });
+        }
+    });
+
     test("no export in the config writes nothing, and a missing folder does not fail", async () => {
         const folder = join(root, "export-none");
 

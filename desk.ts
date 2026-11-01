@@ -18285,11 +18285,21 @@ export default function createDesk(host: Host, web: Web) {
                 }
             }
 
-            await writeChanged(config.export, exportFiles(state, reports, Date.now(), config.cap));
+            const folder = config.export;
+            const commit = config.exportCommit === true;
+            const files = exportFiles(state, reports, Date.now(), config.cap);
+            // The file writes and the commit are 1 step of the queue: the next export writes after this one committed.
+            const step = exportQueue.then(async () => {
+                await writeChanged(folder, files);
 
-            if (config.exportCommit === true) {
-                await commitExport(config.export);
-            }
+                if (commit) {
+                    await commitExport(folder);
+                }
+            });
+
+            // A failed step does not stop the next one, and the notice below still comes from this export's own step.
+            exportQueue = step.catch(() => undefined);
+            await step;
         } catch (error) {
             noteExport(`The desk export did not write: ${(error as Error).message}`);
         }
@@ -18297,60 +18307,53 @@ export default function createDesk(host: Host, web: Web) {
 
     /** When the export's last commit try ran: at most 1 in each `EXPORT_COMMIT_MS`. */
     let exportCommitAt = 0;
-    /** The commit that runs now: a second export waits for it, so 2 never run git at once. */
-    let exportCommitting: Promise<void> = Promise.resolve();
+    /**
+     * The export's steps run 1 at a time: its file writes and its commit, so git never reads the folder while a write
+     * is in it.
+     */
+    let exportQueue: Promise<void> = Promise.resolve();
 
     /**
      * Commit the export folder's changes, and only them: `git add -A -- .`, then `git commit -- .` in the folder, so a
      * file that someone else staged elsewhere in the checkout stays staged and out of this commit. At most once in
      * `EXPORT_COMMIT_MS`: a change in between goes with the next try. Nothing changed is no commit. A git that another
      * process holds (`index.lock`) waits for the next try with no notice; any other failure gives the hourly notice.
+     *
+     * The caller runs this inside `exportQueue`, so no export writes the folder while this reads it.
      */
-    const commitExport = (folder: string): Promise<void> => {
+    const commitExport = async (folder: string): Promise<void> => {
         const at = Date.now();
 
         if (at - exportCommitAt < EXPORT_COMMIT_MS) {
-            return exportCommitting;
+            return;
         }
 
         exportCommitAt = at;
-        exportCommitting = exportCommitting.then(async () => {
-            try {
-                const { stdout } = await run(
-                    "git",
-                    ["-C", folder, "status", "--porcelain", "--", "."],
-                    GIT_OPTIONS,
-                );
 
-                if (stdout.trim() === "") {
-                    return;
-                }
+        try {
+            const { stdout } = await run(
+                "git",
+                ["-C", folder, "status", "--porcelain", "--", "."],
+                GIT_OPTIONS,
+            );
 
-                await run("git", ["-C", folder, "add", "-A", "--", "."], GIT_OPTIONS);
-                await run(
-                    "git",
-                    [
-                        "-C",
-                        folder,
-                        "commit",
-                        "--quiet",
-                        "--message",
-                        EXPORT_COMMIT_MESSAGE,
-                        "--",
-                        ".",
-                    ],
-                    GIT_OPTIONS,
-                );
-            } catch (error) {
-                const reason = gitReason(error);
-
-                if (!reason.includes("index.lock")) {
-                    noteExport(`The desk export did not commit: ${reason}`);
-                }
+            if (stdout.trim() === "") {
+                return;
             }
-        });
 
-        return exportCommitting;
+            await run("git", ["-C", folder, "add", "-A", "--", "."], GIT_OPTIONS);
+            await run(
+                "git",
+                ["-C", folder, "commit", "--quiet", "--message", EXPORT_COMMIT_MESSAGE, "--", "."],
+                GIT_OPTIONS,
+            );
+        } catch (error) {
+            const reason = gitReason(error);
+
+            if (!reason.includes("index.lock")) {
+                noteExport(`The desk export did not commit: ${reason}`);
+            }
+        }
     };
 
     /** Why a GitHub read failed, in one line of 200 characters at most. */
