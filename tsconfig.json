@@ -18,6 +18,7 @@
         "_desk-dashboard.ts",
         "_desk-metrics.ts",
         "desk-dashboard-fixture.ts",
+        "desk-plans-fixture.ts",
         "desk.ts",
         "terminal.ts"
     ]

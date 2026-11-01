@@ -42,6 +42,12 @@ import setup, {
     planStateLine,
     queueStatus,
     stillMounted,
+    completedLines,
+    panelStep,
+    planEnded,
+    planSessionsOf,
+    stepLine,
+    stepStateText,
 } from "./desk-web/index.js";
 import {
     addDays,
@@ -141,8 +147,9 @@ const render = async (view, onBadge = () => {}) => {
 
     setup({
         html,
-        useState: (value) => [value, () => {}],
+        useState: (value) => [typeof value === "function" ? value() : value, () => {}],
         useEffect: () => {},
+        useRef: () => ({ current: null }),
         Loader: () => "",
         style() {},
         api: async () => view,
@@ -2143,4 +2150,172 @@ test("residualKnowledge: the residual follows its own availability, not the date
         "unknown",
     );
     assert.equal(residualKnowledge(null, ok), "unknown");
+});
+
+// ─── The Plan panel, the stepper and the completed plans ─────────────────────
+
+test("planSessionsOf: each planning session gives its plan; an older view gives none", () => {
+    const sessions = planSessionsOf({
+        planSessions: [
+            { plan: "T1", session: 31 },
+            { plan: "T4", session: 40 },
+        ],
+    });
+
+    assert.equal(sessions.get(31), "T1");
+    assert.equal(sessions.get(40), "T4");
+    assert.equal(sessions.get(7), undefined);
+    assert.equal(planSessionsOf({}).size, 0);
+    assert.equal(planSessionsOf(null).size, 0);
+});
+
+test("panelStep: add once, remove once, and keep when nothing changed", () => {
+    assert.equal(panelStep(false, true), "add");
+    assert.equal(panelStep(true, true), "keep");
+    assert.equal(panelStep(true, false), "remove");
+    assert.equal(panelStep(false, false), "keep");
+});
+
+test("the stepper's words: each state for a screen reader, and a step's detail with its day", () => {
+    assert.equal(stepStateText("done"), "done");
+    assert.equal(stepStateText("current"), "current");
+    assert.equal(stepStateText("todo"), "not reached");
+
+    const day = (at) => `day ${at}`;
+
+    assert.equal(stepLine({ detail: "rev 3f2a9c1", at: 5 }, day), "rev 3f2a9c1 · day 5");
+    assert.equal(stepLine({ detail: "2/4 tasks done" }, day), "2/4 tasks done");
+    assert.equal(stepLine({ at: 9 }, day), "day 9");
+    assert.equal(stepLine({}, day), "");
+});
+
+test("planEnded: a done or dropped plan takes no act", () => {
+    assert.equal(planEnded({ state: "done" }), true);
+    assert.equal(planEnded({ state: "dropped" }), true);
+    assert.equal(planEnded({ state: "verifying" }), false);
+    assert.equal(planEnded(null), false);
+});
+
+test("completedLines: the lead and the days, the rounds and the tasks", () => {
+    const day = (at) => `d${at}`;
+
+    assert.deepEqual(
+        completedLines(
+            {
+                id: "T5",
+                title: "Sign the ISO",
+                lead: "lucilla",
+                outcome: "verified",
+                startedAt: 1,
+                approvedAt: 2,
+                endedAt: 3,
+                rounds: 2,
+                failed: 1,
+                tasks: { done: 4, total: 4 },
+            },
+            day,
+        ),
+        [
+            "lead lucilla · started d1 · approved d2 · ended d3",
+            "2 verify rounds (1 failed) · 4/4 tasks",
+        ],
+    );
+    assert.deepEqual(
+        completedLines(
+            {
+                id: "T6",
+                title: "Old idea",
+                lead: "teg",
+                outcome: "dropped",
+                startedAt: 1,
+                rounds: 1,
+                failed: 0,
+            },
+            day,
+        ),
+        ["lead teg · started d1 · not approved", "1 verify round (0 failed) · no approved graph"],
+    );
+});
+
+test("the Plans section shows the Completed plans button with its count", async () => {
+    const out = await render({ ...viewWith(null), plans: [], plansDone: 3 });
+
+    assert.match(out, /Completed plans \(3\)/);
+
+    const older = await render({ ...viewWith(null), plans: [] });
+
+    assert.match(older, /Completed plans \(0\)/);
+});
+
+/** Set the module up with panels: the panels it adds and removes, and the conversation listener it gives. */
+const withPanels = async (view, conversation) => {
+    const log = [];
+
+    let listener = () => {};
+
+    setup({
+        html,
+        useState: (value) => [typeof value === "function" ? value() : value, () => {}],
+        useEffect: () => {},
+        useRef: () => ({ current: null }),
+        Loader: () => "",
+        style() {},
+        api: async () => view,
+        page() {},
+        rail: () => ({ update() {} }),
+        on: () => () => {},
+        onDispose() {},
+        panel(spec) {
+            log.push(`add ${spec.id} ${spec.title} ${spec.wide} ${spec.icon}`);
+
+            return { update() {}, remove: () => log.push("remove") };
+        },
+        closePanel: () => log.push("close"),
+        openPanel: (id) => log.push(`open ${id}`),
+        openConversation: (id) => log.push(`conversation ${id}`),
+        onConversation(next) {
+            listener = next;
+            next(conversation);
+
+            return () => {};
+        },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    return { log, show: (id) => listener(id) };
+};
+
+test("the Plan panel is added only beside a planning session, once, and goes when another session shows", async () => {
+    const view = { ...viewWith(null), plans: [], planSessions: [{ plan: "T1", session: 31 }] };
+    const { log, show } = await withPanels(view, 31);
+
+    assert.deepEqual(log, ["add plan Plan true file"]);
+
+    // The same session again, and a second planning session's view: the same spec is not added again.
+    show(31);
+    assert.deepEqual(log, ["add plan Plan true file"]);
+
+    show(7);
+    assert.deepEqual(log, ["add plan Plan true file", "close", "remove"]);
+
+    show(null);
+    assert.deepEqual(log, ["add plan Plan true file", "close", "remove"]);
+
+    show(31);
+    assert.deepEqual(log, [
+        "add plan Plan true file",
+        "close",
+        "remove",
+        "add plan Plan true file",
+    ]);
+});
+
+test("an app with no panels adds none, and the page still draws", async () => {
+    const out = await render({
+        ...viewWith(null),
+        plans: [],
+        planSessions: [{ plan: "T1", session: 31 }],
+    });
+
+    assert.match(out, /Plans <span class="desk-count">0/);
 });

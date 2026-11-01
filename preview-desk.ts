@@ -1,11 +1,15 @@
-// Isolated browser preview of the Desk's Dashboard: Pocket's test harness (temporary data, test credentials, a fake
-// model), only `desk.ts` on, and the facts of `desk-dashboard-fixture.ts`. Nothing reads Brian's data or GitHub.
+// Isolated browser preview of the Desk: its Dashboard and its plans. Pocket's test harness (temporary data, test
+// credentials, a fake model), only `desk.ts` on, the facts of `desk-dashboard-fixture.ts`, and the plans of
+// `desk-plans-fixture.ts` (drafting, building, verifying, done, dropped), each with a planning session of its own that
+// holds 1 short exchange. Nothing reads Brian's data or GitHub.
 //
 // The collector never runs here, so it cannot overwrite the fixture: it starts only from a desk sweep or `desk sync`,
-// and the desk has no thread, so no sweeper starts. The fake `gh` also fails every call.
+// and no thread of the desk has a supervisor, so no sweeper starts. The fake `gh` also fails every call.
 //
 // Routes beside the app's own, for the checks:
-//   /preview-login            sign in as the owner
+//   /preview-login            sign in as the owner, in the preview's first session
+//   /preview-login?plan=N     sign in, in the planning session of plan N (T101 to T105): the Plan panel's place
+//   /preview-plans?on=0|1     take the fixture's plans and their threads out of the desk, or seed them again
 //   /preview-fixture?name=N   seed variant N again (main, empty, not-started, stale, usage-unavailable, partial-usage,
 //                            residual-only, long)
 //   /preview-fail?on=1|0      make `GET dashboard` fail with a 500, or not
@@ -15,10 +19,10 @@
 //   /preview-module?on=0|1    turn the preview's Desk module off (its browser module goes) or on again
 //   /preview-count            how many `GET dashboard` requests came
 //
-// `GET /api/x/desk/threads/<id>` answers here for the fixture's threads, so the drill-down can open the Desk's thread
-// detail: a small answer of the shape `Detail` reads, made from the fixture's thread and PR facts. A thread the fixture
-// does not have, or one gone from the desk, is a 404, as on the desk. `x.desk.threads` stays empty: no sweep or
-// collector starts, and nothing changes the fixture.
+// `GET /api/x/desk/threads/<id>` answers here for the dashboard fixture's threads, so the drill-down can open the
+// Desk's thread detail: a small answer of the shape `Detail` reads, made from the fixture's thread and PR facts. A
+// thread gone from the desk is a 404, as on the desk. Any other id goes to the desk itself: the plans' threads are
+// there (T101 and up, apart from the dashboard fixture's ids).
 import {
     cleanUp,
     context,
@@ -26,8 +30,10 @@ import {
     openApp,
     owner,
     root,
+    say,
     scriptedModel,
 } from "./_pocket/test/helpers.ts";
+import { fauxAssistantMessage, fauxText } from "@earendil-works/pi-ai/providers/faux";
 import { cpSync, mkdirSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { join } from "node:path";
@@ -41,6 +47,8 @@ import {
     VARIANTS,
     type Variant,
 } from "./desk-dashboard-fixture.ts";
+import { DeskThreads, writeStore } from "./desk.ts";
+import { FIXTURE_PLANS, plansFixture } from "./desk-plans-fixture.ts";
 
 const fakeGh = join(root, "preview-gh");
 const agents = join(root, "preview-agents");
@@ -63,11 +71,64 @@ for (const file of ["desk.ts", "_desk-usage.ts", "_desk-dashboard.ts", "_desk-me
 
 cpSync(join(import.meta.dirname, "desk-web"), join(extensions, "desk-web"), { recursive: true });
 
-const app = await openApp(scriptedModel());
+// The planning sessions' 1 answer: a planning session's words, so the chat beside the Plan panel shows something.
+const app = await openApp(
+    scriptedModel(() =>
+        fauxAssistantMessage([
+            fauxText(
+                "I wrote the Approach section. The plan waits for your answer on its open ask; then I draft the task graph.",
+            ),
+        ]),
+    ),
+);
+
+const session = await newSession(app);
+const plansFolder = join(root, "preview-plans");
+
+// Each plan's planning session, with 1 exchange: made before the desk is on, so no desk hook sees them.
+const planSessions: number[] = [];
+
+for (const id of FIXTURE_PLANS) {
+    const planSession = await newSession(app);
+
+    await say(
+        app,
+        planSession,
+        `Plan ${id}: write the Approach section, and ask me what you need.`,
+    );
+    planSessions.push(planSession);
+}
 
 await app.setExtensionEnabled(owner(app), "desk.ts", true);
 
-const session = await newSession(app);
+/** Put the fixture's plans, their threads and their texts in the desk; or take them out (`on` false). */
+const seedPlans = async (on: boolean): Promise<void> => {
+    const fixture = plansFixture(Date.now(), plansFolder, planSessions);
+
+    for (const text of fixture.texts) {
+        await writeStore(plansFolder, text);
+    }
+
+    await app.harness.commit(async (tx) => {
+        const state = await tx.doc(DeskThreads);
+
+        for (const id of Object.keys(fixture.threads)) {
+            delete state.threads[id];
+        }
+
+        for (const id of Object.keys(fixture.plans)) {
+            delete state.plans?.[id];
+        }
+
+        if (on) {
+            Object.assign(state.threads, fixture.threads);
+            state.plans = { ...state.plans, ...fixture.plans };
+            state.next = { ...state.next, T: Math.max(state.next.T, 130) };
+        }
+    }, context);
+};
+
+await seedPlans(true);
 
 /** The variant seeded last: the thread details answer from it. */
 let seeded: Variant = "main";
@@ -149,9 +210,24 @@ const server = createServer((req, res) => {
     const url = new URL(req.url ?? "/", `http://${host}`);
 
     if (url.pathname === "/preview-login") {
+        const plan = FIXTURE_PLANS.indexOf(
+            (url.searchParams.get("plan") ?? "").toUpperCase() as (typeof FIXTURE_PLANS)[number],
+        );
+
         setAuthCookie(req, res, app.config.ownerToken);
-        res.writeHead(302, { location: `/s/${session}` });
+        res.writeHead(302, { location: `/s/${plan === -1 ? session : planSessions[plan]}` });
         res.end();
+
+        return;
+    }
+
+    if (url.pathname === "/preview-plans") {
+        const on = url.searchParams.get("on") !== "0";
+
+        void seedPlans(on).then(
+            () => text(res, 200, `plans ${on ? "seeded" : "gone"}`),
+            (error: unknown) => text(res, 500, String(error)),
+        );
 
         return;
     }
@@ -246,7 +322,17 @@ const server = createServer((req, res) => {
 
     const detail = /^\/api\/x\/desk\/threads\/([^/]+)$/.exec(url.pathname);
 
-    if (req.method === "GET" && detail !== null) {
+    const fixtureIds = new Set(
+        Object.values(dashboardFixture(Date.now(), seeded).dashboard.threads).map(
+            (each) => each.id,
+        ),
+    );
+
+    if (
+        req.method === "GET" &&
+        detail !== null &&
+        fixtureIds.has(decodeURIComponent(detail[1] ?? ""))
+    ) {
         const answer = threadDetail(
             dashboardFixture(Date.now(), seeded),
             decodeURIComponent(detail[1] ?? ""),

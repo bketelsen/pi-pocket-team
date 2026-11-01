@@ -9939,6 +9939,8 @@ export type PlanRow = {
     asks: number;
     graph?: { version: number; state: TaskGraph["state"]; tasks: number };
     waiting: string[];
+    /** The planning session's conversation id, when the plan's thread has one: the page's Plan and chat opens it. */
+    session?: number;
 };
 
 export type ThreadsView = {
@@ -9957,6 +9959,13 @@ export type ThreadsView = {
     ready: ReadyPr[];
     /** The open plans, oldest first: the page's Plans section. */
     plans: PlanRow[];
+    /**
+     * Every plan whose thread has a planning session (open, done and dropped), oldest first: the page shows its Plan panel
+     * beside these conversations only.
+     */
+    planSessions: { plan: string; session: number }[];
+    /** How many plans are done or dropped: the page's Completed plans button shows the count. */
+    plansDone: number;
     counts: {
         open: number;
         brian: number;
@@ -10067,8 +10076,19 @@ export function threadsView(
                               },
                           }),
                     waiting: planWaiting(state, plan.thread),
+                    ...(thread?.session === undefined ? {} : { session: thread.session }),
                 };
             }),
+        planSessions: [...Object.values(state?.plans ?? {})]
+            .sort((a, b) => idNumber(a.thread) - idNumber(b.thread))
+            .flatMap((plan) => {
+                const session = threads[plan.thread]?.session;
+
+                return session === undefined ? [] : [{ plan: plan.thread, session }];
+            }),
+        plansDone: Object.values(state?.plans ?? {}).filter(
+            (plan) => plan.state === "done" || plan.state === "dropped",
+        ).length,
         cap: (() => {
             const view = capView(state, cap, now);
 
@@ -15007,7 +15027,220 @@ export type PlanView = {
     consults: ConsultView[];
     /** Every finding of the plan, oldest first. */
     findings: Finding[];
+    /** The plan's steps, from its stored state only: the page's stepper. */
+    progress: PlanProgress;
 };
+
+/** 1 step of a plan's life, as the page's stepper shows it. */
+export type PlanStep = {
+    id: "draft" | "review" | "approved" | "building" | "verifying" | "done" | "dropped";
+    label: string;
+    /** done: the plan passed it; current: the plan is in it; todo: the plan did not reach it. */
+    state: "done" | "current" | "todo";
+    /** A short fact of the step, from a stored field: "rev 3f2a9c1", "2/4 tasks done". */
+    detail?: string;
+    /** When the plan reached the step, from a stored time. */
+    at?: number;
+};
+
+/** A plan's steps in order, and how it ended, when it ended. */
+export type PlanProgress = { steps: PlanStep[]; ended?: "done" | "dropped" };
+
+/** The step of each plan state. */
+const STEP_OF: Record<PlanState, PlanStep["id"]> = {
+    drafting: "draft",
+    review: "review",
+    approved: "approved",
+    building: "building",
+    verifying: "verifying",
+    done: "done",
+    dropped: "dropped",
+};
+
+/** The steps of a plan, in order. A dropped plan ends on Dropped, not on Done. */
+const STEP_LABELS: readonly { id: PlanStep["id"]; label: string }[] = [
+    { id: "draft", label: "Draft" },
+    { id: "review", label: "Review" },
+    { id: "approved", label: "Approved" },
+    { id: "building", label: "Building" },
+    { id: "verifying", label: "Verifying" },
+    { id: "done", label: "Done" },
+];
+
+/** The approved graph's tasks: how many are done, how many there are, and how many stopped. */
+function graphCounts(plan: Plan): { done: number; total: number; stopped: number } | undefined {
+    const graph = approvedGraphOf(plan);
+
+    return graph === undefined
+        ? undefined
+        : {
+              done: graph.tasks.filter((task) => task.state === "done").length,
+              total: graph.tasks.length,
+              stopped: graph.tasks.filter((task) => task.state === "stopped").length,
+          };
+}
+
+/**
+ * The steps of 1 plan, for the page's stepper: Draft, Review, Approved, Building, Verifying, and Done (or Dropped). It
+ * reads stored fields only, and never guesses. A live plan passed each step before the step of its state, is in that
+ * step, and did not reach the later ones; a done plan is in Done, which counts as reached. A dropped plan passed a step
+ * only by stored evidence: a ready call for Review, an approval for Approved, an attempt of a task of the last approved
+ * graph for Building, and a verification thread for Verifying. Draft is always passed, and Dropped is the current step.
+ * A step that the plan passed or is in gets its detail and its time; a step it did not reach gets none. Draft names
+ * its open asks, its open comments when there are some, and a scope change in force.
+ */
+export function planProgress(plan: Plan, thread: Thread | undefined): PlanProgress {
+    const ready = (plan.readies ?? []).at(-1);
+    const approval = plan.approvals.at(-1);
+    const counts = graphCounts(plan);
+    const rounds = plan.verification?.rounds.length ?? 0;
+    const closedAt = thread?.closed?.at;
+    const asks = thread === undefined ? 0 : openAskIds(thread).length;
+    const comments = plan.comments.filter((comment) => comment.state === "open").length;
+
+    /** The facts of 1 step, from stored fields. */
+    const factsOf = (id: PlanStep["id"], state: PlanStep["state"]): Partial<PlanStep> => {
+        switch (id) {
+            case "draft":
+                return {
+                    ...(state === "current"
+                        ? {
+                              detail: [
+                                  counted(asks, "open ask"),
+                                  ...(comments === 0 ? [] : [counted(comments, "open comment")]),
+                                  ...(plan.revising === undefined ? [] : ["revising"]),
+                              ].join(" · "),
+                          }
+                        : {}),
+                    ...(thread === undefined ? {} : { at: thread.startedAt }),
+                };
+            case "review":
+                return ready === undefined
+                    ? {}
+                    : { detail: `rev ${ready.rev.slice(0, 7)}`, at: ready.at };
+            case "approved":
+                return approval === undefined
+                    ? {}
+                    : {
+                          detail: `rev ${approval.rev.slice(0, 7)} · graph v${String(approval.graph)}`,
+                          at: approval.at,
+                      };
+            case "building":
+                return counts === undefined
+                    ? {}
+                    : {
+                          detail: [
+                              `${String(counts.done)}/${String(counts.total)} tasks done`,
+                              ...(counts.stopped === 0
+                                  ? []
+                                  : [`${String(counts.stopped)} stopped`]),
+                          ].join(" · "),
+                      };
+            case "verifying":
+                return {
+                    detail: [
+                        rounds === 0 ? "no round yet" : `round ${String(rounds)}`,
+                        `${String(failedRounds(plan))} of ${String(VERIFY_BUDGET)} failed`,
+                    ].join(" · "),
+                };
+            default:
+                return closedAt === undefined ? {} : { at: closedAt };
+        }
+    };
+
+    /** 1 step with its state: a step the plan did not reach has no facts. */
+    const step = (
+        each: { id: PlanStep["id"]; label: string },
+        state: PlanStep["state"],
+    ): PlanStep => ({
+        id: each.id,
+        label: each.label,
+        state,
+        ...(state === "todo" ? {} : factsOf(each.id, state)),
+    });
+
+    if (plan.state === "dropped") {
+        const reached: Record<string, boolean> = {
+            draft: true,
+            review: (plan.readies ?? []).length > 0,
+            approved: plan.approvals.length > 0,
+            building: (approvedGraphOf(plan)?.tasks ?? []).some((task) => task.attempts.length > 0),
+            verifying: (plan.verification?.threads ?? []).length > 0,
+        };
+
+        return {
+            steps: [
+                ...STEP_LABELS.filter((each) => each.id !== "done").map((each) =>
+                    step(each, reached[each.id] === true ? "done" : "todo"),
+                ),
+                step({ id: "dropped", label: "Dropped" }, "current"),
+            ],
+            ended: "dropped",
+        };
+    }
+
+    const at = STEP_LABELS.findIndex((each) => each.id === STEP_OF[plan.state]);
+
+    return {
+        steps: STEP_LABELS.map((each, index) =>
+            step(each, index < at ? "done" : index === at ? "current" : "todo"),
+        ),
+        ...(plan.state === "done" ? { ended: "done" as const } : {}),
+    };
+}
+
+/** 1 plan that is done or dropped, as the page's Completed plans list shows it. */
+export type CompletedPlan = {
+    id: string;
+    title: string;
+    lead: string;
+    outcome: "verified" | "dropped";
+    /** When its thread started. */
+    startedAt: number;
+    /** Brian's last approval, when there is one. */
+    approvedAt?: number;
+    /** When its thread closed, when it did. */
+    endedAt?: number;
+    /** The whole-plan rounds, and the failed ones since the last approval. */
+    rounds: number;
+    failed: number;
+    /** The approved graph's tasks, when a graph was approved. */
+    tasks?: { done: number; total: number };
+    /** The planning session's conversation id. */
+    session?: number;
+};
+
+/** The plans that are done or dropped, the newest end first: the page's Completed plans list. Read only. */
+export function completedPlans(state: Readonly<DeskState> | undefined): CompletedPlan[] {
+    return Object.values(state?.plans ?? {})
+        .filter((plan) => plan.state === "done" || plan.state === "dropped")
+        .map((plan): CompletedPlan => {
+            const thread = threadById(state, plan.thread);
+            const approval = plan.approvals.at(-1);
+            const counts = graphCounts(plan);
+
+            return {
+                id: plan.thread,
+                title: thread?.title ?? "",
+                lead: plan.lead,
+                outcome: plan.state === "done" ? "verified" : "dropped",
+                startedAt: thread?.startedAt ?? 0,
+                ...(approval === undefined ? {} : { approvedAt: approval.at }),
+                ...(thread?.closed === undefined ? {} : { endedAt: thread.closed.at }),
+                rounds: plan.verification?.rounds.length ?? 0,
+                failed: failedRounds(plan),
+                ...(counts === undefined
+                    ? {}
+                    : { tasks: { done: counts.done, total: counts.total } }),
+                ...(thread?.session === undefined ? {} : { session: thread.session }),
+            };
+        })
+        .sort(
+            (a, b) =>
+                (b.endedAt ?? -Infinity) - (a.endedAt ?? -Infinity) ||
+                idNumber(b.id) - idNumber(a.id),
+        );
+}
 
 /** The page's view of 1 plan, from the state and the bytes the store keeps for its revision. */
 export function planView(
@@ -15207,6 +15440,7 @@ export function planView(
             canStop: consult.state === "starting" || consult.state === "running",
         })),
         findings: (plan.findings ?? []).map((finding) => ({ ...finding })),
+        progress: planProgress(plan, thread),
     };
 }
 
@@ -22373,6 +22607,17 @@ export default function createDesk(host: Host, web: Web) {
                 startPlan: team?.startPlan !== undefined,
             };
         },
+        { access: "owner" },
+    );
+
+    // The plans that are done or dropped, the newest end first: the page's Completed plans list. Read only: no commit,
+    // no sweep, no publish. Its fixed part wins over `plans/:id`.
+    web.route(
+        "GET",
+        "plans/completed",
+        async (request) => ({
+            plans: completedPlans(await request.snapshot(DeskThreads, request.context)),
+        }),
         { access: "owner" },
     );
 

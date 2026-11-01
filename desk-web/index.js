@@ -13,6 +13,21 @@ let seenBefore = null;
 let rail = null;
 /** The running module's `pocket`: the shared loader is called from effects and events too. */
 let app = null;
+/**
+ * The planning sessions: conversation id → plan id, from the threads view. The Plan panel shows only beside these
+ * conversations.
+ */
+let planSessions = new Map();
+/** The conversation that the tab shows, from `onConversation`. */
+let shownConversation = null;
+/** The Plan panel while it is added (what `pocket.panel` gave), or null. */
+let planPanel = null;
+/** The Plan panel's spec, made in `setup`: null when the app has no panels. */
+let planPanelSpec = null;
+/** What the Desk page opens next, from the panel's Open in Desk: `{ plan }` or `{ thread }`, or null. */
+let deskNext = null;
+/** The listeners of the `changed` event: each Plan panel reloads its plan. */
+const CHANGED = new Set();
 
 /** The groups of the page, in the order it shows them. */
 /** `plans` holds plan threads with no open ask: the Plans section shows them, so no thread section does. */
@@ -435,6 +450,40 @@ export const findingsLine = (findings) =>
 /** 1 line of a diff, as the Changes fold shows it. */
 export const diffText = (line) => `${line.op} ${line.text}`;
 
+/** Whether a plan ended: a done or dropped plan takes no act, so its view shows none. */
+export const planEnded = (plan) => plan?.state === "done" || plan?.state === "dropped";
+
+/** A step's state for a screen reader: the stepper shows it only as a marker. */
+export const stepStateText = (state) =>
+    state === "done" ? "done" : state === "current" ? "current" : "not reached";
+
+/** A step's small line: its detail and its day, `rev 3f2a9c1 · Oct 31`, or "" with neither. */
+export const stepLine = (step, day) =>
+    [step.detail ?? "", step.at === undefined ? "" : day(step.at)]
+        .filter((part) => part !== "")
+        .join(" · ");
+
+/**
+ * The 2 lines of 1 completed plan's row, under its id, title and outcome: its lead and its days (started, approved,
+ * ended); its verify rounds and its tasks. `day` formats a time.
+ */
+export const completedLines = (plan, day) => [
+    [
+        `lead ${plan.lead}`,
+        `started ${day(plan.startedAt)}`,
+        plan.approvedAt === undefined ? "not approved" : `approved ${day(plan.approvedAt)}`,
+        plan.endedAt === undefined ? "" : `ended ${day(plan.endedAt)}`,
+    ]
+        .filter((part) => part !== "")
+        .join(" · "),
+    [
+        `${plan.rounds} verify round${plan.rounds === 1 ? "" : "s"} (${plan.failed} failed)`,
+        plan.tasks === undefined
+            ? "no approved graph"
+            : `${plan.tasks.done}/${plan.tasks.total} task${plan.tasks.total === 1 ? "" : "s"}`,
+    ].join(" · "),
+];
+
 /**
  * The rail badge: the threads that need Brian, and the PRs ready to merge. A thread that is not parked counts when it
  * has an open ask, also when it is asleep or closed; else it counts when it is not closed or asleep and it needs Brian or
@@ -483,14 +532,82 @@ export const badgeOf = (next) => {
 const publish = (next) => {
     view = next;
     loadError = null;
+    planSessions = planSessionsOf(next);
 
     if (rail !== null) {
         rail.update({ badge: badgeOf(next) || null });
     }
 
+    syncPanel();
+    notify();
+};
+
+/** Every view of the module draws again: the desk, and the Plan panel. */
+const notify = () => {
     for (const listener of LISTENERS) {
         listener();
     }
+};
+
+/** The planning sessions of a threads view: conversation id → plan id. An older view has none. */
+export const planSessionsOf = (next) =>
+    new Map((next?.planSessions ?? []).map((each) => [each.session, each.plan]));
+
+/**
+ * What the Plan panel needs now: "add" when the session is a plan's and the panel is not there, "remove" when the
+ * session is not a plan's and the panel is there, else "keep": the same spec is never added again.
+ */
+export const panelStep = (added, wanted) =>
+    wanted && !added ? "add" : !wanted && added ? "remove" : "keep";
+
+/**
+ * Add the Plan panel when the conversation (the one the tab shows, or `target`) is a planning session, and remove it
+ * when it is not. A panel of ours that shows closes first, so no empty panel stays. It waits for the first view: before
+ * it, the module does not know the planning sessions, and a panel kept open across a reload must stay.
+ */
+const syncPanel = (target = shownConversation) => {
+    if (planPanelSpec === null || view === null) {
+        return;
+    }
+
+    const step = panelStep(planPanel !== null, target !== null && planSessions.has(target));
+
+    if (step === "add") {
+        planPanel = app.panel(planPanelSpec);
+    } else if (step === "remove") {
+        app.closePanel();
+        planPanel.remove();
+        planPanel = null;
+    }
+};
+
+/**
+ * Plan and chat: the planning session, with the Plan panel beside it. The panel is added before the session opens, so
+ * `openPanel` finds it. An app with no panels opens the session only.
+ */
+const openPlanAndChat = (planId, session) => {
+    if (planPanelSpec === null) {
+        app.openConversation(session);
+
+        return;
+    }
+
+    if (!planSessions.has(session)) {
+        planSessions.set(session, planId);
+    }
+
+    // The session to come: a view that loads before the app says it opened must keep the panel.
+    shownConversation = session;
+    syncPanel(session);
+    app.openConversation(session);
+    app.openPanel("plan");
+};
+
+/** Open the Desk page on 1 plan or 1 thread: the page takes `deskNext` when it draws. */
+const openInDesk = (next) => {
+    deskNext = next;
+    notify();
+    app.openPage("desk");
 };
 
 const load = async () => {
@@ -507,9 +624,7 @@ const load = async () => {
     } catch (failure) {
         loadError = failure.message;
 
-        for (const listener of LISTENERS) {
-            listener();
-        }
+        notify();
 
         return null;
     }
@@ -544,6 +659,10 @@ export default function setup(pocket) {
     const { html, useEffect, useRef, useState, Loader } = pocket;
 
     app = pocket;
+    // A new setup starts with no panel: the panel of an older setup went with it.
+    planPanelSpec = null;
+    planPanel = null;
+    shownConversation = null;
     pocket.style("desk.css");
 
     // The owner-only Dashboard view: the page is owner-only, and so is its route.
@@ -589,13 +708,59 @@ export default function setup(pocket) {
             .filter(Boolean)
             .join(" · ");
 
+    /** A day, short, for the stepper and the completed list: "Oct 31". */
+    const day = (at) => new Date(at).toLocaleDateString([], { month: "short", day: "numeric" });
+
+    /**
+     * The plan's steps, under its title: 1 item each, a filled marker for a step it passed or is in, an empty one for a
+     * step it did not reach, and a line between them. A screen reader hears each step's state.
+     */
+    const stepper = (progress) =>
+        progress === undefined
+            ? null
+            : html`<ol
+                  class=${`desk-stepper${progress.ended === undefined ? "" : ` ended-${progress.ended}`}`}
+                  aria-label="Plan progress"
+              >
+                  ${progress.steps.map((step) => {
+                      const line = stepLine(step, day);
+
+                      return html`<li
+                          class=${`desk-step ${step.state} step-${step.id}`}
+                          aria-current=${step.state === "current" ? "step" : undefined}
+                          title=${step.at === undefined ? undefined : time(step.at)}
+                      >
+                          <span class="desk-step-mark" aria-hidden="true"></span>
+                          <span class="desk-step-label"
+                              >${step.label}<span class="desk-hidden">: ${stepStateText(step.state)}</span></span
+                          >
+                          ${line === "" ? null : html`<span class="desk-step-detail">${line}</span>`}
+                      </li>`;
+                  })}
+              </ol>`;
+
     /**
      * 1 plan: its sections with their asks and comments, the changes since the approval, its tasks and checks, and
      * Brian's acts. Each act's key is made once in this view, so a second tap sends the same key and the desk acts once.
      * A 409 means the page read an older plan: the view loads again, and the error stays.
+     *
+     * `mode` "panel" is the Plan panel beside the planning session: no Back, but Open in Desk, and the plan loads again
+     * at each `changed` event. `backLabel` names where Back returns. `focusHeading`: the title takes the focus when the
+     * plan first shows (from the completed list, whose row goes away).
      */
-    function PlanDetail({ id, onBack, onChanged, onOpenThread }) {
+    function PlanDetail({
+        id,
+        onBack,
+        onChanged,
+        onOpenThread,
+        mode = "page",
+        backLabel = "Back to the desk",
+        focusHeading = false,
+    }) {
+        const panel = mode === "panel";
         const [plan, setPlan] = useState(null);
+        const heading = useRef(null);
+        const [focused] = useState(() => ({ done: false }));
         const [error, setError] = useState("");
         const [busy, setBusy] = useState(false);
         // The view's own key store: 1 key for each act, until the act is done.
@@ -648,6 +813,47 @@ export default function setup(pocket) {
                 life.gone = true;
             };
         }, [id]);
+
+        // The panel follows the desk: each `changed` event reads the plan again, and the last read is aborted.
+        useEffect(() => {
+            if (!panel) {
+                return undefined;
+            }
+
+            let abort = null;
+
+            const reload = () => {
+                abort?.abort();
+                abort = new AbortController();
+
+                const signal = abort.signal;
+
+                pocket.api(`plans/${id}`, undefined, { signal }).then(
+                    (answer) => {
+                        if (!signal.aborted && stillMounted(life)) {
+                            setPlan(answer);
+                        }
+                    },
+                    () => {
+                        // The plan that is there stays: the next change reads it again.
+                    },
+                );
+            };
+
+            CHANGED.add(reload);
+
+            return () => {
+                CHANGED.delete(reload);
+                abort?.abort();
+            };
+        }, [id, panel]);
+
+        useEffect(() => {
+            if (focusHeading && plan !== null && !focused.done) {
+                focused.done = true;
+                heading.current?.focus();
+            }
+        }, [plan]);
 
         /**
          * 1 act: its route, its body, and the act's name for its key. A done act forgets its key; a refused one keeps it,
@@ -723,9 +929,27 @@ export default function setup(pocket) {
 
             await onChanged();
 
-            if (stillMounted(life)) {
-                onBack();
+            if (!stillMounted(life)) {
+                return;
             }
+
+            // The panel stays beside the session: it shows the dropped plan.
+            if (panel) {
+                setDropping(false);
+                setDropWhy("");
+
+                try {
+                    await openPlan();
+                } catch {
+                    // The view that is there stays.
+                }
+
+                setBusy(false);
+
+                return;
+            }
+
+            onBack();
         };
 
         const answerAsk = async (ask, words) => {
@@ -889,7 +1113,7 @@ export default function setup(pocket) {
                                         <button
                                             type="button"
                                             class=${`desk-mark ${mark ?? "blank"}`}
-                                            disabled=${busy || !ask.open}
+                                            disabled=${busy || !ask.open || planEnded(plan)}
                                             aria-label=${`${option}, ${criterion.label}: ${mark ?? "blank"}`}
                                             onClick=${() =>
                                                 setMarks({
@@ -910,7 +1134,7 @@ export default function setup(pocket) {
                     </tbody>
                 </table>
                 ${
-                    ask.open
+                    ask.open && !planEnded(plan)
                         ? html`<button
                               class="button"
                               disabled=${busy}
@@ -946,7 +1170,7 @@ export default function setup(pocket) {
             }
             ${matrix(ask)}
             ${
-                ask.open
+                ask.open && !planEnded(plan)
                     ? html`${
                           (ask.options ?? []).length === 0
                               ? null
@@ -1057,7 +1281,7 @@ export default function setup(pocket) {
             (each) => html`<div class="desk-plan-comment small">
                 <span>${commentLine(each)}</span>
                 ${
-                    each.state === "open"
+                    each.state === "open" && !planEnded(plan)
                         ? html`<button
                               class="button"
                               disabled=${busy}
@@ -1136,12 +1360,39 @@ export default function setup(pocket) {
             )}
         </ul>`;
 
+        /** The bar: Back, or in the panel Open in Desk; and Plan and chat when the plan has a session. */
+        const bar = html`<div class="desk-bar">
+            ${
+                panel
+                    ? null
+                    : html`<button class="button" aria-label=${backLabel} onClick=${onBack}>Back</button>`
+            }
+            <span class="desk-id">${id}</span>
+            ${
+                panel
+                    ? html`<button
+                          class="button"
+                          aria-label=${`Open in Desk: plan ${id}`}
+                          onClick=${() => openInDesk({ plan: id })}
+                      >
+                          Open in Desk
+                      </button>`
+                    : plan?.session !== undefined
+                      ? html`<button
+                            class="button"
+                            aria-label="Plan and chat: open the planning session with the plan beside it"
+                            onClick=${() => openPlanAndChat(id, plan.session)}
+                        >
+                            Plan and chat
+                        </button>`
+                      : null
+            }
+        </div>`;
+        const shell = panel ? "desk desk-in-panel" : "desk";
+
         if (plan === null) {
-            return html`<div class="desk">
-                <div class="desk-bar">
-                    <button class="button" aria-label="Back to the desk" onClick=${onBack}>Back</button>
-                    <span class="desk-id">${id}</span>
-                </div>
+            return html`<div class=${shell}>
+                ${bar}
                 ${error ? html`<div class="error-box" role="alert">${error}</div>` : null}
                 <${Loader} label="Opening the plan" />
             </div>`;
@@ -1155,25 +1406,12 @@ export default function setup(pocket) {
         const changes = plan.changes ?? [];
         const writable = plan.sections.filter((section) => !section.desk);
 
-        return html`<div class="desk">
-            <div class="desk-bar">
-                <button class="button" aria-label="Back to the desk" onClick=${onBack}>Back</button>
-                <span class="desk-id">${id}</span>
-                ${
-                    plan.session !== undefined
-                        ? html`<button
-                              class="button"
-                              aria-label="Chat in the planning session"
-                              onClick=${() => pocket.openConversation(plan.session)}
-                          >
-                              Chat
-                          </button>`
-                        : null
-                }
-            </div>
+        return html`<div class=${shell}>
+            ${bar}
             ${error ? html`<div class="error-box" role="alert">${error}</div>` : null}
             <article class="desk-thread">
-                <h2>${plan.title}</h2>
+                <h2 ref=${heading} tabindex="-1">${plan.title}</h2>
+                ${stepper(plan.progress)}
                 <p class="small muted">${planStateLine(plan)}</p>
                 ${
                     plan.revising === undefined
@@ -1658,6 +1896,127 @@ export default function setup(pocket) {
             </button>
         </div>`;
 
+    /**
+     * The plans that are done or dropped, the newest end first: 1 button each, which opens the plan. The heading takes
+     * the focus when the list opens; when it comes back from a plan (`focusId`), that plan's row takes it.
+     */
+    function CompletedPlans({ onBack, onOpen, focusId }) {
+        const [plans, setPlans] = useState(null);
+        const [error, setError] = useState("");
+        const heading = useRef(null);
+        const [rows] = useState(() => ({}));
+        const [focused] = useState(() => ({ done: false }));
+
+        useEffect(() => {
+            const abort = new AbortController();
+
+            pocket.api("plans/completed", undefined, { signal: abort.signal }).then(
+                (answer) => setPlans(answer.plans ?? []),
+                (failure) => {
+                    if (!abort.signal.aborted) {
+                        setError(failure.message);
+                    }
+                },
+            );
+
+            return () => abort.abort();
+        }, []);
+
+        useEffect(() => {
+            if (focusId === undefined) {
+                heading.current?.focus();
+            }
+        }, []);
+
+        // The row of the plan Brian came back from, once the list is there; the heading when that plan is gone.
+        useEffect(() => {
+            if (focusId !== undefined && !focused.done && (plans !== null || error !== "")) {
+                focused.done = true;
+                (rows[focusId] ?? heading.current)?.focus();
+            }
+        }, [plans, error]);
+
+        return html`<div class="desk">
+            <div class="desk-bar">
+                <button class="button" aria-label="Back to the desk" onClick=${onBack}>Back</button>
+            </div>
+            <h2 class="desk-completed-head" ref=${heading} tabindex="-1">Completed plans</h2>
+            <p class="small muted">The plans that are done or dropped, the newest end first.</p>
+            ${error ? html`<div class="error-box" role="alert">${error}</div>` : null}
+            ${
+                plans === null
+                    ? error
+                        ? null
+                        : html`<${Loader} label="Reading the completed plans" />`
+                    : plans.length === 0
+                      ? html`<p class="muted">No plan is done or dropped yet.</p>`
+                      : html`<ul class="desk-rows">
+                            ${plans.map((plan) => {
+                                const [days, work] = completedLines(plan, day);
+
+                                return html`<li class="desk-row">
+                                    <button
+                                        type="button"
+                                        class="desk-open"
+                                        ref=${(node) => {
+                                            rows[plan.id] = node ?? undefined;
+                                        }}
+                                        aria-label=${`Open plan ${plan.id}: ${plan.title}, ${plan.outcome}`}
+                                        onClick=${() => onOpen(plan.id)}
+                                    >
+                                        <span class="desk-line">
+                                            <span class="desk-id">${plan.id}</span>
+                                            <span class="desk-title">${plan.title}</span>
+                                            <span
+                                                class=${`desk-outcome ${plan.outcome}`}
+                                                >${plan.outcome}</span
+                                            >
+                                        </span>
+                                        <span class="small muted">${days}</span>
+                                        <span class="small muted">${work}</span>
+                                    </button>
+                                </li>`;
+                            })}
+                        </ul>`
+            }
+        </div>`;
+    }
+
+    /**
+     * The Plan panel beside a planning session: the plan of the session that the tab shows, in the panel's compact form.
+     * It draws again when the session or the desk's view changes.
+     */
+    function PlanPanel({ close }) {
+        const [, setTick] = useState(0);
+
+        useEffect(() => {
+            const update = () => setTick((tick) => tick + 1);
+
+            LISTENERS.add(update);
+
+            return () => {
+                LISTENERS.delete(update);
+            };
+        }, []);
+
+        const id = shownConversation === null ? undefined : planSessions.get(shownConversation);
+
+        if (id === undefined) {
+            return html`<div class="desk desk-in-panel">
+                <p class="muted">This session is not the planning session of a plan.</p>
+            </div>`;
+        }
+
+        return html`<${PlanDetail}
+            key=${id}
+            id=${id}
+            mode="panel"
+            onBack=${close}
+            onChanged=${load}
+            onOpenThread=${(thread) => openInDesk({ thread })}
+        />`;
+    }
+
     function Desk() {
         const [, setTick] = useState(0);
         // The Dashboard replaces the sections only while it shows: the desk's own state and listeners stay.
@@ -1683,6 +2042,36 @@ export default function setup(pocket) {
         const [planForm, setPlanForm] = useState({ title: "", idea: "", lead: "", model: "" });
         const [pickedSupervisor, setPickedSupervisor] = useState(null);
         const [planKeys] = useState({});
+        // Completed plans: the list shows; a plan opened from it returns to it, and its row gets the focus back.
+        const [completedOpen, setCompletedOpen] = useState(false);
+        const [planFromList, setPlanFromList] = useState(false);
+        const [completedFocus, setCompletedFocus] = useState(undefined);
+        const completedButton = useRef(null);
+        // The Completed plans button gets the focus back when the list closes.
+        const [refocus] = useState(() => ({ completed: false }));
+
+        // After each draw: the plan or thread that the Plan panel's Open in Desk asked for, and the focus back.
+        useEffect(() => {
+            if (deskNext !== null) {
+                const next = deskNext;
+
+                deskNext = null;
+                setTab("desk");
+
+                if (next.plan !== undefined) {
+                    setPlanFromList(false);
+                    setPlanId(next.plan);
+                } else if (next.thread !== undefined) {
+                    setPlanId(null);
+                    setOpenId(next.thread);
+                }
+            }
+
+            if (refocus.completed && completedButton.current) {
+                refocus.completed = false;
+                completedButton.current.focus();
+            }
+        });
 
         /** The roster's leads and the known supervisors: New plan reads them again after each start. */
         const loadPlanInfo = async () => {
@@ -1865,8 +2254,18 @@ export default function setup(pocket) {
 
         if (planId !== null) {
             return html`<${PlanDetail}
+                key=${planId}
                 id=${planId}
-                onBack=${() => setPlanId(null)}
+                backLabel=${planFromList ? "Back to the completed plans" : "Back to the desk"}
+                focusHeading=${planFromList}
+                onBack=${() => {
+                    if (planFromList) {
+                        setCompletedFocus(planId);
+                        setPlanFromList(false);
+                    }
+
+                    setPlanId(null);
+                }}
                 onChanged=${load}
                 onOpenThread=${(thread) => {
                     setPlanId(null);
@@ -1877,6 +2276,21 @@ export default function setup(pocket) {
 
         if (openId !== null) {
             return html`<${Detail} id=${openId} onBack=${() => setOpenId(null)} />`;
+        }
+
+        if (completedOpen) {
+            return html`<${CompletedPlans}
+                focusId=${completedFocus}
+                onBack=${() => {
+                    refocus.completed = true;
+                    setCompletedOpen(false);
+                    setCompletedFocus(undefined);
+                }}
+                onOpen=${(id) => {
+                    setPlanFromList(true);
+                    setPlanId(id);
+                }}
+            />`;
         }
 
         if (view === null && loadError === null) {
@@ -2627,6 +3041,19 @@ export default function setup(pocket) {
                     here.
                 </p>
                 ${newPlanForm}
+                <div class="desk-actions">
+                    <button
+                        type="button"
+                        class="button"
+                        ref=${completedButton}
+                        onClick=${() => {
+                            setCompletedFocus(undefined);
+                            setCompletedOpen(true);
+                        }}
+                    >
+                        Completed plans (${view?.plansDone ?? 0})
+                    </button>
+                </div>
                 ${
                     plans.length === 0
                         ? null
@@ -2713,6 +3140,33 @@ export default function setup(pocket) {
     pocket.page({ id: "desk", title: "Desk", component: Desk });
     rail = pocket.rail({ id: "desk", title: "Desk", icon: "grid", page: "desk" });
 
+    // The Plan panel, beside a planning session only: an app from before panels (0.19.0) or before onConversation
+    // (0.20.0) has none, and Plan and chat opens the session alone.
+    if (typeof pocket.panel === "function" && typeof pocket.onConversation === "function") {
+        planPanelSpec = {
+            id: "plan",
+            title: "Plan",
+            icon: "file",
+            wide: true,
+            component: PlanPanel,
+        };
+        pocket.onDispose(
+            pocket.onConversation((conversation) => {
+                shownConversation = conversation;
+                syncPanel();
+                notify();
+            }),
+        );
+    }
+
     void load();
-    pocket.onDispose(pocket.on("changed", () => void load()));
+    pocket.onDispose(
+        pocket.on("changed", () => {
+            void load();
+
+            for (const reload of CHANGED) {
+                reload();
+            }
+        }),
+    );
 }
