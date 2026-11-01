@@ -93,6 +93,9 @@ import {
     gitBlobSha,
     initialPlanText,
     planView,
+    planProgress,
+    completedPlans,
+    threadsView,
     isCounted,
     newestGraph,
     nextActor,
@@ -143,6 +146,7 @@ import {
     type TaskGraph,
     type Thread,
 } from "./desk.ts";
+import { FIXTURE_PLANS, plansFixture } from "./desk-plans-fixture.ts";
 
 // ─── A plan to work on ──────────────────────────────────────────────────────
 
@@ -6665,6 +6669,387 @@ describe("the changes since the last approval", () => {
 
 // ─── With the Pi Pocket app ─────────────────────────────────────────────────
 
+// ─── The stepper's steps, and the completed plans ───────────────────────────
+
+describe("a plan's progress", () => {
+    /** Each step as `id:state`, in order. */
+    const states = (plan: Plan, thread: Thread | undefined): string[] =>
+        planProgress(plan, thread).steps.map((step) => `${step.id}:${step.state}`);
+
+    const stepOf = (plan: Plan, thread: Thread | undefined, id: string) =>
+        planProgress(plan, thread).steps.find((step) => step.id === id) ??
+        assert.fail(`a step ${id}`);
+
+    const live = (current: number): string[] =>
+        ["draft", "review", "approved", "building", "verifying", "done"].map(
+            (id, index) =>
+                `${id}:${index < current ? "done" : index === current ? "current" : "todo"}`,
+        );
+
+    test("a drafting plan is in Draft, with its open asks and comments, and its revision", () => {
+        const { state, plan, thread } = startPlan();
+
+        assert.deepEqual(states(plan, thread), live(0));
+        assert.equal(planProgress(plan, thread).ended, undefined);
+        assert.deepEqual(stepOf(plan, thread, "draft"), {
+            id: "draft",
+            label: "Draft",
+            state: "current",
+            detail: "0 open asks",
+            at: now,
+        });
+        // A step the plan did not reach has no facts.
+        assert.deepEqual(stepOf(plan, thread, "review"), {
+            id: "review",
+            label: "Review",
+            state: "todo",
+        });
+
+        assert(
+            !(
+                "error" in
+                addPlanAsk(state, "T1", {
+                    key: "ask:progress",
+                    by: "lucilla",
+                    at: tick(1),
+                    section: "idea",
+                    rev: plan.rev,
+                    text: "Where do the keys live?",
+                })
+            ),
+        );
+        assert(
+            !(
+                "error" in
+                addPlanComment(state, "T1", {
+                    key: "comment:progress",
+                    by: "Brian",
+                    at: tick(2),
+                    section: "idea",
+                    text: "Name the rotation period.",
+                    rev: plan.rev,
+                })
+            ),
+        );
+        plan.revising = { at: tick(3), by: "brian", why: "A new key.", tasks: [], key: "r" };
+
+        assert.equal(
+            stepOf(plan, thread, "draft").detail,
+            "1 open ask · 1 open comment · revising",
+        );
+    });
+
+    test("review, approved and building each pass the steps before them, with their stored facts", () => {
+        const review = reviewed();
+        const reviewThread = review.state.threads.T1;
+
+        assert.deepEqual(states(review.plan, reviewThread), live(1));
+        assert.deepEqual(stepOf(review.plan, reviewThread, "review"), {
+            id: "review",
+            label: "Review",
+            state: "current",
+            detail: `rev ${review.plan.rev.slice(0, 7)}`,
+            at: tick(2),
+        });
+        assert.equal(stepOf(review.plan, reviewThread, "draft").detail, undefined);
+        assert.equal(stepOf(review.plan, reviewThread, "draft").at, now);
+
+        const approved = approvedPlan();
+        const approvedThread = approved.state.threads.T1;
+
+        assert.deepEqual(states(approved.plan, approvedThread), live(2));
+        assert.deepEqual(stepOf(approved.plan, approvedThread, "approved"), {
+            id: "approved",
+            label: "Approved",
+            state: "current",
+            detail: `rev ${approved.plan.rev.slice(0, 7)} · graph v1`,
+            at: tick(3),
+        });
+
+        const building = buildingPlan();
+        const buildingThread = building.state.threads.T1;
+
+        assert.deepEqual(states(building.plan, buildingThread), live(3));
+        assert.equal(stepOf(building.plan, buildingThread, "building").detail, "0/3 tasks done");
+        merged(building.graph, "t1", tick(5));
+        assert.equal(stepOf(building.plan, buildingThread, "building").detail, "1/3 tasks done");
+        taskOf(building.graph, "t3").state = "stopped";
+        assert.equal(
+            stepOf(building.plan, buildingThread, "building").detail,
+            "1/3 tasks done · 1 stopped",
+        );
+    });
+
+    test("verifying names its round and the failed rounds of the budget; done is reached with its close", () => {
+        const { state, plan, graph } = buildingPlan();
+        const thread = state.threads.T1;
+
+        for (const id of ["t1", "t2", "t3"]) {
+            taskOf(graph, id).attempts.push({ thread: "T9", at: tick(5), prs: [] });
+            merged(graph, id, tick(6));
+        }
+
+        plan.state = "verifying";
+        plan.verification = { threads: ["T5"], rounds: [] };
+        assert.deepEqual(states(plan, thread), live(4));
+        assert.equal(stepOf(plan, thread, "verifying").detail, "no round yet · 0 of 4 failed");
+
+        plan.verification.rounds.push({
+            at: tick(20),
+            by: "lucilla",
+            reviewer: "openai/gpt-6.1-sol",
+            heads: {},
+            pass: false,
+            tasks: [{ task: "t1", pass: false, evidence: "It does not meet its acceptance." }],
+            key: "verify:1",
+        });
+        assert.equal(stepOf(plan, thread, "verifying").detail, "round 1 · 1 of 4 failed");
+        assert.equal(stepOf(plan, thread, "building").detail, "3/3 tasks done");
+
+        plan.state = "done";
+        assert(thread, "the plan thread");
+        thread.state = "closed";
+        thread.closed = { at: tick(30), why: "done", by: "desk", outcome: "verified" };
+
+        const progress = planProgress(plan, thread);
+
+        assert.equal(progress.ended, "done");
+        assert.deepEqual(states(plan, thread), live(5));
+        assert.deepEqual(stepOf(plan, thread, "done"), {
+            id: "done",
+            label: "Done",
+            state: "current",
+            at: tick(30),
+        });
+    });
+
+    test("a dropped plan passed only the steps that its stored state proves, and ends on Dropped", () => {
+        const fresh = startPlan();
+
+        assert(!("error" in dropPlan(fresh.state, "T1", { by: "brian", why: "no", at: tick(9) })));
+        assert.deepEqual(states(fresh.plan, fresh.thread), [
+            "draft:done",
+            "review:todo",
+            "approved:todo",
+            "building:todo",
+            "verifying:todo",
+            "dropped:current",
+        ]);
+        assert.equal(planProgress(fresh.plan, fresh.thread).ended, "dropped");
+        assert.deepEqual(stepOf(fresh.plan, fresh.thread, "dropped"), {
+            id: "dropped",
+            label: "Dropped",
+            state: "current",
+            at: tick(9),
+        });
+
+        // A ready call, an approval and an attempt are evidence; no verification thread is none.
+        const building = buildingPlan();
+        const thread = building.state.threads.T1;
+
+        assert(
+            !("error" in dropPlan(building.state, "T1", { by: "brian", why: "no", at: tick(9) })),
+        );
+        assert.deepEqual(states(building.plan, thread), [
+            "draft:done",
+            "review:done",
+            "approved:done",
+            "building:done",
+            "verifying:todo",
+            "dropped:current",
+        ]);
+        assert.equal(stepOf(building.plan, thread, "building").detail, "0/3 tasks done");
+
+        building.plan.verification = { threads: ["T5"], rounds: [] };
+        assert.equal(stepOf(building.plan, thread, "verifying").state, "done");
+
+        // An approval with no attempt: Building is not reached.
+        const approved = approvedPlan();
+
+        assert(
+            !("error" in dropPlan(approved.state, "T1", { by: "brian", why: "no", at: tick(9) })),
+        );
+        assert.deepEqual(states(approved.plan, approved.state.threads.T1).slice(0, 4), [
+            "draft:done",
+            "review:done",
+            "approved:done",
+            "building:todo",
+        ]);
+    });
+
+    test("the plan view carries the progress", () => {
+        const { state, plan, thread } = startPlan();
+        const view = planView(state, "T1", file, now);
+
+        assert(!("error" in view), "the view");
+        assert.deepEqual(view.progress, planProgress(plan, thread));
+    });
+});
+
+describe("the completed plans, and the planning sessions of the view", () => {
+    /** 1 desk with 4 plans: T1 drafting, T2 verified, T3 dropped from drafting, T4 dropped while it built. */
+    function desk(): DeskState {
+        const { state } = startPlan();
+
+        const add = (
+            id: string,
+            made: { state: DeskState },
+            change: (plan: Plan, thread: Thread) => void,
+        ) => {
+            const plan = structuredClone(made.state.plans?.T1 ?? assert.fail("a plan"));
+            const thread = structuredClone(made.state.threads.T1 ?? assert.fail("a thread"));
+
+            plan.thread = id;
+            thread.id = id;
+            thread.title = `Plan ${id}`;
+            thread.session = 30 + Number(id.slice(1));
+            change(plan, thread);
+            state.plans = { ...state.plans, [id]: plan };
+            state.threads[id] = thread;
+        };
+
+        const verified = buildingPlan();
+
+        for (const task of verified.graph.tasks) {
+            task.attempts.push({ thread: "T9", at: tick(5), prs: [] });
+            merged(verified.graph, task.id, tick(6));
+        }
+
+        add("T2", verified, (plan, thread) => {
+            plan.state = "done";
+            plan.verification = {
+                threads: ["T8", "T9"],
+                rounds: [false, true].map((pass, index) => ({
+                    at: tick(20 + index),
+                    by: "lucilla",
+                    reviewer: "openai/gpt-6.1-sol",
+                    heads: {},
+                    pass,
+                    tasks: [],
+                    key: `verify:${String(index)}`,
+                })),
+            };
+            thread.state = "closed";
+            thread.closed = { at: tick(30), why: "done", by: "desk", outcome: "verified" };
+        });
+
+        const fresh = startPlan();
+
+        assert(!("error" in dropPlan(fresh.state, "T1", { by: "brian", why: "no", at: tick(40) })));
+        add("T3", fresh, () => {});
+
+        const built = buildingPlan();
+
+        assert(!("error" in dropPlan(built.state, "T1", { by: "brian", why: "no", at: tick(35) })));
+        add("T4", built, (_plan, thread) => {
+            delete thread.session;
+        });
+
+        return state;
+    }
+
+    test("completedPlans: done and dropped plans, the newest end first, with their days, rounds and tasks", () => {
+        assert.deepEqual(completedPlans(desk()), [
+            {
+                id: "T3",
+                title: "Plan T3",
+                lead: "lucilla",
+                outcome: "dropped",
+                startedAt: now,
+                endedAt: tick(40),
+                rounds: 0,
+                failed: 0,
+                session: 33,
+            },
+            {
+                id: "T4",
+                title: "Plan T4",
+                lead: "lucilla",
+                outcome: "dropped",
+                startedAt: now,
+                approvedAt: tick(3),
+                endedAt: tick(35),
+                rounds: 0,
+                failed: 0,
+                tasks: { done: 0, total: 3 },
+            },
+            {
+                id: "T2",
+                title: "Plan T2",
+                lead: "lucilla",
+                outcome: "verified",
+                startedAt: now,
+                approvedAt: tick(3),
+                endedAt: tick(30),
+                rounds: 2,
+                failed: 1,
+                tasks: { done: 3, total: 3 },
+                session: 32,
+            },
+        ]);
+        assert.deepEqual(completedPlans(undefined), []);
+        assert.deepEqual(completedPlans(startPlan().state), []);
+    });
+
+    test("threadsView: each open row has its session; every plan with a session maps it; the done count", () => {
+        const view = threadsView(desk(), tick(50));
+
+        assert.deepEqual(
+            view.plans.map((row) => [row.id, row.session]),
+            [["T1", 31]],
+        );
+        assert.deepEqual(view.planSessions, [
+            { plan: "T1", session: 31 },
+            { plan: "T2", session: 32 },
+            { plan: "T3", session: 33 },
+        ]);
+        assert.equal(view.plansDone, 3);
+
+        const none = threadsView(undefined, now);
+
+        assert.deepEqual(none.planSessions, []);
+        assert.equal(none.plansDone, 0);
+    });
+});
+
+describe("the preview's plans", () => {
+    test("each fixture plan gives a view from its own text, with the steps of its state", () => {
+        const fixture = plansFixture(now, ROOT, [41, 42, 43, 44, 45]);
+        const state: DeskState = { ...empty(), threads: fixture.threads, plans: fixture.plans };
+        const texts = new Map(fixture.texts.map((text) => [gitBlobSha(text), text]));
+        const current = (id: string) =>
+            planProgress(fixture.plans[id] ?? assert.fail(id), fixture.threads[id])
+                .steps.filter((step) => step.state === "current")
+                .map((step) => `${step.id}${step.detail === undefined ? "" : ` ${step.detail}`}`);
+
+        for (const id of FIXTURE_PLANS) {
+            const plan = fixture.plans[id] ?? assert.fail(`plan ${id}`);
+            const view = planView(state, id, texts.get(plan.rev), now);
+
+            assert(!("error" in view), `the view of ${id}`);
+            assert.equal(view.sections.length, 5, `${id} shows its 5 sections`);
+            assert.notEqual(
+                view.approveOff,
+                "This revision has a section the desk did not make: the planning session must write the whole file again.",
+            );
+        }
+
+        assert.deepEqual(current("T101"), ["draft 1 open ask"]);
+        assert.deepEqual(current("T102"), ["building 2/4 tasks done"]);
+        assert.deepEqual(current("T103"), ["verifying round 1 · 1 of 4 failed"]);
+        assert.deepEqual(current("T104"), ["done"]);
+        assert.deepEqual(current("T105"), ["dropped"]);
+        assert.deepEqual(
+            completedPlans(state).map((each) => `${each.id} ${each.outcome}`),
+            ["T105 dropped", "T104 verified"],
+        );
+        assert.deepEqual(
+            threadsView(state, now).planSessions.map((each) => each.session),
+            [41, 42, 43, 44, 45],
+        );
+    });
+});
+
 const dataDir = join(root, "data");
 const definitions = join(root, "agents");
 const snowRepo = join(root, "snow");
@@ -9030,6 +9415,48 @@ describe("with the Pi Pocket app", () => {
         assert.equal(dropped.status, 200);
         assert.equal(planOf(await deskSnapshot(), fenced.id)?.state, "dropped");
         assert.equal((await deskSnapshot())?.threads[fenced.id]?.state, "closed");
+    });
+
+    test("GET plans/completed lists the done and dropped plans, the newest end first, and changes nothing", async () => {
+        const before = JSON.stringify(await deskSnapshot());
+        const completed = await routes("plans/completed");
+
+        assert.equal(completed.status, 200);
+
+        const plans = completed.data.plans as {
+            id: string;
+            outcome: string;
+            endedAt?: number;
+            session?: number;
+        }[];
+        const state = await deskSnapshot();
+
+        assert.deepEqual(
+            plans.map((each) => each.id).sort(),
+            Object.values(state?.plans ?? {})
+                .filter((plan) => plan.state === "done" || plan.state === "dropped")
+                .map((plan) => plan.thread)
+                .sort(),
+        );
+        assert(
+            plans.some((each) => each.outcome === "dropped"),
+            "the dropped plan is there",
+        );
+
+        for (const [index, each] of plans.entries()) {
+            assert.equal(
+                each.outcome,
+                state?.plans?.[each.id]?.state === "done" ? "verified" : "dropped",
+            );
+            assert.equal(each.endedAt, state?.threads[each.id]?.closed?.at);
+            assert.equal(each.session, state?.threads[each.id]?.session);
+
+            if (index > 0) {
+                assert((plans[index - 1]?.endedAt ?? 0) >= (each.endedAt ?? 0), "newest end first");
+            }
+        }
+
+        assert.equal(JSON.stringify(await deskSnapshot()), before, "the read changed nothing");
     });
 
     test("a plan for a queued issue links the issue, and an issue not in the queue is refused", async () => {

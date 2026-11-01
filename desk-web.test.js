@@ -42,6 +42,14 @@ import setup, {
     planStateLine,
     queueStatus,
     stillMounted,
+    completedLines,
+    panelStep,
+    newestReads,
+    planReader,
+    planEnded,
+    planSessionsOf,
+    stepLine,
+    stepStateText,
 } from "./desk-web/index.js";
 import {
     addDays,
@@ -141,8 +149,9 @@ const render = async (view, onBadge = () => {}) => {
 
     setup({
         html,
-        useState: (value) => [value, () => {}],
+        useState: (value) => [typeof value === "function" ? value() : value, () => {}],
         useEffect: () => {},
+        useRef: () => ({ current: null }),
         Loader: () => "",
         style() {},
         api: async () => view,
@@ -2143,4 +2152,438 @@ test("residualKnowledge: the residual follows its own availability, not the date
         "unknown",
     );
     assert.equal(residualKnowledge(null, ok), "unknown");
+});
+
+// ─── The Plan panel, the stepper and the completed plans ─────────────────────
+
+test("planSessionsOf: each planning session gives its plan; an older view gives none", () => {
+    const sessions = planSessionsOf({
+        planSessions: [
+            { plan: "T1", session: 31 },
+            { plan: "T4", session: 40 },
+        ],
+    });
+
+    assert.equal(sessions.get(31), "T1");
+    assert.equal(sessions.get(40), "T4");
+    assert.equal(sessions.get(7), undefined);
+    assert.equal(planSessionsOf({}).size, 0);
+    assert.equal(planSessionsOf(null).size, 0);
+});
+
+test("panelStep: add once, remove once, and keep when nothing changed", () => {
+    assert.equal(panelStep(false, true), "add");
+    assert.equal(panelStep(true, true), "keep");
+    assert.equal(panelStep(true, false), "remove");
+    assert.equal(panelStep(false, false), "keep");
+});
+
+test("panelStep: before the first view the panel is added at once and kept; after it, a plain session removes it", () => {
+    // No view yet: the planning sessions are not known, so the panel is there whatever the session.
+    assert.equal(panelStep(false, false, false), "add");
+    assert.equal(panelStep(false, true, false), "add");
+    assert.equal(panelStep(true, false, false), "keep");
+    assert.equal(panelStep(true, true, false), "keep");
+    // The first view came: the rule of the planning sessions.
+    assert.equal(panelStep(true, false, true), "remove");
+    assert.equal(panelStep(true, true, true), "keep");
+});
+
+test("panelStep: a failed read with no view yet removes the panel once; a good view decides again", () => {
+    // Before the first read ends: added and kept.
+    assert.equal(panelStep(false, false, false, false), "add");
+    assert.equal(panelStep(true, false, false, false), "keep");
+    // The first read failed: removed, and kept out while there is no view.
+    assert.equal(panelStep(true, false, false, true), "remove");
+    assert.equal(panelStep(true, true, false, true), "remove");
+    assert.equal(panelStep(false, true, false, true), "keep");
+    // A good read: in a planning session it comes again; in a plain session it stays out.
+    assert.equal(panelStep(false, true, true, false), "add");
+    assert.equal(panelStep(false, false, true, false), "keep");
+});
+
+test("planReader: a changed read aborts the first read and fails: the error shows; a failed refresh keeps the plan", async () => {
+    const shown = [];
+    const errors = [];
+    const answers = [];
+    const signals = [];
+    const reader = planReader(
+        (signal) => {
+            const answer = deferred();
+
+            answers.push(answer);
+            signals.push(signal);
+
+            return answer.promise;
+        },
+        (plan, first) => shown.push(`${plan}${first ? " first" : ""}`),
+        (message) => errors.push(message),
+    );
+
+    // The first read, then a changed event's read, which aborts it.
+    const first = reader.open().catch((failure) => failure.message);
+    const changed = reader.open().catch((failure) => failure.message);
+
+    assert.equal(signals[0].aborted, true);
+    answers[0].reject(new Error("aborted"));
+    answers[1].reject(new Error("The plan read failed."));
+    assert.equal(await first, "aborted");
+    assert.equal(await changed, "The plan read failed.");
+    assert.deepEqual(errors, ["The plan read failed."], "the error shows: no loader for ever");
+    assert.deepEqual(shown, []);
+
+    // Retry: the plan shows, the first time.
+    const retry = reader.open();
+
+    answers[2].resolve("T1 v1");
+    await retry;
+    assert.deepEqual(shown, ["T1 v1 first"]);
+
+    // A refresh that fails while the plan shows: no error, the plan stays.
+    const refresh = reader.open().catch(() => "failed");
+
+    answers[3].reject(new Error("A refresh failed."));
+    await refresh;
+    assert.deepEqual(errors, ["The plan read failed."]);
+    assert.deepEqual(shown, ["T1 v1 first"]);
+});
+
+/** A promise and its resolve and reject: an answer that comes when the test says. */
+const deferred = () => {
+    let resolve;
+    let reject;
+    const promise = new Promise((yes, no) => {
+        resolve = yes;
+        reject = no;
+    });
+
+    return { promise, resolve, reject };
+};
+
+test("newestReads: the first read finishes last, and the view keeps the newer answer", async () => {
+    const reads = newestReads();
+    const shown = [];
+    const first = deferred();
+    const second = deferred();
+    const signals = [];
+
+    const read = (answer) => (signal) => {
+        signals.push(signal);
+
+        return answer.promise;
+    };
+
+    const one = reads.run(read(first), (plan) => shown.push(plan));
+    const two = reads.run(read(second), (plan) => shown.push(plan));
+
+    assert.equal(signals[0].aborted, true, "a new read aborts the one before it");
+    second.resolve("newer");
+    assert.equal(await two, "newer");
+    first.resolve("older");
+    assert.equal(await one, "older", "the read gives its own answer back");
+    assert.deepEqual(shown, ["newer"]);
+});
+
+test("newestReads: only the newest read's error shows, and stop drops a read in flight", async () => {
+    const reads = newestReads({ abort: false });
+    const shown = [];
+    const errors = [];
+    const first = deferred();
+    const second = deferred();
+    const signals = [];
+    const run = (answer) =>
+        reads
+            .run(
+                (signal) => {
+                    signals.push(signal);
+
+                    return answer.promise;
+                },
+                (view) => shown.push(view),
+                (failure) => errors.push(failure.message),
+            )
+            .catch(() => "failed");
+
+    const one = run(first);
+    const two = run(second);
+
+    assert.equal(signals[0].aborted, false, "a threads read is not aborted");
+    second.resolve("newer");
+    first.reject(new Error("older failed"));
+    assert.equal(await one, "failed");
+    await two;
+    assert.deepEqual(shown, ["newer"]);
+    assert.deepEqual(errors, [], "the older read's error is dropped");
+
+    const third = deferred();
+    const three = run(third);
+
+    third.reject(new Error("newest failed"));
+    await three;
+    assert.deepEqual(errors, ["newest failed"]);
+
+    const fourth = deferred();
+    const four = run(fourth);
+
+    reads.stop();
+    fourth.resolve("late");
+    await four;
+    assert.deepEqual(shown, ["newer"], "a read that stop dropped shows nothing");
+});
+
+test("the stepper's words: each state for a screen reader, and a step's detail with its day", () => {
+    assert.equal(stepStateText("done"), "done");
+    assert.equal(stepStateText("current"), "current");
+    assert.equal(stepStateText("todo"), "not reached");
+
+    const day = (at) => `day ${at}`;
+
+    assert.equal(stepLine({ detail: "rev 3f2a9c1", at: 5 }, day), "rev 3f2a9c1 · day 5");
+    assert.equal(stepLine({ detail: "2/4 tasks done" }, day), "2/4 tasks done");
+    assert.equal(stepLine({ at: 9 }, day), "day 9");
+    assert.equal(stepLine({}, day), "");
+});
+
+test("planEnded: a done or dropped plan takes no act", () => {
+    assert.equal(planEnded({ state: "done" }), true);
+    assert.equal(planEnded({ state: "dropped" }), true);
+    assert.equal(planEnded({ state: "verifying" }), false);
+    assert.equal(planEnded(null), false);
+});
+
+test("completedLines: the lead and the days, the rounds and the tasks", () => {
+    const day = (at) => `d${at}`;
+
+    assert.deepEqual(
+        completedLines(
+            {
+                id: "T5",
+                title: "Sign the ISO",
+                lead: "lucilla",
+                outcome: "verified",
+                startedAt: 1,
+                approvedAt: 2,
+                endedAt: 3,
+                rounds: 2,
+                failed: 1,
+                tasks: { done: 4, total: 4 },
+            },
+            day,
+        ),
+        [
+            "lead lucilla · started d1 · approved d2 · ended d3",
+            "2 verify rounds (1 failed) · 4/4 tasks",
+        ],
+    );
+    assert.deepEqual(
+        completedLines(
+            {
+                id: "T6",
+                title: "Old idea",
+                lead: "teg",
+                outcome: "dropped",
+                startedAt: 1,
+                rounds: 1,
+                failed: 0,
+            },
+            day,
+        ),
+        ["lead teg · started d1 · not approved", "1 verify round (0 failed) · no approved graph"],
+    );
+});
+
+test("the Plans section shows the Completed plans button with its count", async () => {
+    const out = await render({ ...viewWith(null), plans: [], plansDone: 3 });
+
+    assert.match(out, /Completed plans \(3\)/);
+
+    const older = await render({ ...viewWith(null), plans: [] });
+
+    assert.match(older, /Completed plans \(0\)/);
+});
+
+/** Set the module up with panels: the panels it adds and removes, and the conversation listener it gives. */
+const withPanels = async (view, conversation, api = async () => view) => {
+    const log = [];
+    const panels = [];
+
+    let listener = () => {};
+
+    let changed = () => {};
+
+    setup({
+        html,
+        useState: (value) => [typeof value === "function" ? value() : value, () => {}],
+        useEffect: () => {},
+        useRef: () => ({ current: null }),
+        Loader: () => "",
+        style() {},
+        api,
+        page() {},
+        rail: () => ({ update() {} }),
+        on: (name, handler) => {
+            if (name === "changed") {
+                changed = handler;
+            }
+
+            return () => {};
+        },
+        onDispose() {},
+        conversationId: () => conversation,
+        panel(spec) {
+            panels.push(spec);
+            log.push(`add ${spec.id} ${spec.title} ${spec.wide} ${spec.icon}`);
+
+            return { update() {}, remove: () => log.push("remove") };
+        },
+        closePanel: () => log.push("close"),
+        openPanel: (id) => log.push(`open ${id}`),
+        openConversation: (id) => log.push(`conversation ${id}`),
+        onConversation(next) {
+            listener = next;
+            next(conversation);
+
+            return () => {};
+        },
+    });
+
+    const atSetup = [...log];
+
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    return {
+        log,
+        atSetup,
+        show: (id) => listener(id),
+        changed: () => changed(),
+        drawPanel: () => String(panels.at(-1).component({ close() {} })).replace(/\s+/g, " "),
+    };
+};
+
+const ADDED = "add plan Plan true file";
+
+test("the Plan panel is added at once, before the first view; after it, a plain session removes it", async () => {
+    const view = { ...viewWith(null), plans: [], planSessions: [{ plan: "T1", session: 31 }] };
+    const plain = await withPanels(view, 7);
+
+    assert.deepEqual(plain.atSetup, [ADDED], "added before the first view");
+    assert.deepEqual(
+        plain.log,
+        [ADDED, "close", "remove"],
+        "the first view removes it from a plain session",
+    );
+
+    const planning = await withPanels(view, 31);
+
+    assert.deepEqual(planning.atSetup, [ADDED]);
+    assert.deepEqual(
+        planning.log,
+        [ADDED],
+        "kept beside the planning session, and not added again",
+    );
+});
+
+test("a failed first read removes the panel; a good read adds it again in a planning session only", async () => {
+    const planning = { ...viewWith(null), plans: [], planSessions: [{ plan: "T1", session: 31 }] };
+    const answers = [];
+
+    const run = async (conversation) => {
+        answers.length = 0;
+
+        const made = await withPanels(null, conversation, () => {
+            const answer = deferred();
+
+            answers.push(answer);
+
+            return answer.promise;
+        });
+
+        // The first read runs: the panel is there, with a loader.
+        assert.deepEqual(made.log, [ADDED]);
+        assert.match(made.drawPanel(), /<\[fn\] label="Reading the desk" \/>/, "the Loader");
+
+        answers[0].reject(new Error("The desk is out of reach."));
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        assert.deepEqual(made.log, [ADDED, "close", "remove"], "a failed first read removes it");
+
+        // The next change reads again, and the view comes.
+        made.changed();
+        answers[1].resolve(planning);
+        await new Promise((resolve) => setTimeout(resolve, 10));
+
+        return made.log;
+    };
+
+    assert.deepEqual(
+        await run(31),
+        [ADDED, "close", "remove", ADDED],
+        "added again beside a planning session",
+    );
+    assert.deepEqual(
+        await run(7),
+        [ADDED, "close", "remove"],
+        "not added again in a plain session",
+    );
+});
+
+test("2 thread reads that finish in reverse order: the newer view stays, and the panel stays", async () => {
+    const reads = [];
+    const newer = { ...viewWith(null), plans: [], planSessions: [{ plan: "T1", session: 31 }] };
+    const older = { ...viewWith(null), plans: [], planSessions: [] };
+    const { log, changed, drawPanel } = await withPanels(null, 31, (path) => {
+        const answer = deferred();
+
+        reads.push({ path, answer });
+
+        return answer.promise;
+    });
+
+    // The first read (from setup) waits; a change starts a second read.
+    changed();
+    assert.deepEqual(
+        reads.map((each) => each.path),
+        ["threads", "threads"],
+    );
+    reads[1].answer.resolve(newer);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    reads[0].answer.resolve(older);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    assert.deepEqual(log, [ADDED], "the older view did not remove the panel");
+    assert.match(drawPanel(), /id=T1 mode="panel"/, "the panel shows the plan of the newer view");
+});
+
+test("the Plan panel is added only beside a planning session, once, and goes when another session shows", async () => {
+    const view = { ...viewWith(null), plans: [], planSessions: [{ plan: "T1", session: 31 }] };
+    const { log, show } = await withPanels(view, 31);
+
+    assert.deepEqual(log, ["add plan Plan true file"]);
+
+    // The same session again, and a second planning session's view: the same spec is not added again.
+    show(31);
+    assert.deepEqual(log, ["add plan Plan true file"]);
+
+    show(7);
+    assert.deepEqual(log, ["add plan Plan true file", "close", "remove"]);
+
+    show(null);
+    assert.deepEqual(log, ["add plan Plan true file", "close", "remove"]);
+
+    show(31);
+    assert.deepEqual(log, [
+        "add plan Plan true file",
+        "close",
+        "remove",
+        "add plan Plan true file",
+    ]);
+});
+
+test("an app with no panels adds none, and the page still draws", async () => {
+    const out = await render({
+        ...viewWith(null),
+        plans: [],
+        planSessions: [{ plan: "T1", session: 31 }],
+    });
+
+    assert.match(out, /Plans <span class="desk-count">0/);
 });
