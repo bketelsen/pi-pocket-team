@@ -554,23 +554,87 @@ export const planSessionsOf = (next) =>
     new Map((next?.planSessions ?? []).map((each) => [each.session, each.plan]));
 
 /**
- * What the Plan panel needs now: "add" when the session is a plan's and the panel is not there, "remove" when the
- * session is not a plan's and the panel is there, else "keep": the same spec is never added again.
+ * What the Plan panel needs now. Before the first view (`known` false) the module does not know the planning sessions:
+ * the panel is there ("add" once, then "keep"), so a panel that Pocket kept open across a reload finds its spec. After
+ * it: "add" when the session is a plan's and the panel is not there, "remove" when the session is not a plan's and the
+ * panel is there, else "keep": the same spec is never added again.
  */
-export const panelStep = (added, wanted) =>
-    wanted && !added ? "add" : !wanted && added ? "remove" : "keep";
+export const panelStep = (added, wanted, known = true) => {
+    if (!known) {
+        return added ? "keep" : "add";
+    }
+
+    return wanted && !added ? "add" : !wanted && added ? "remove" : "keep";
+};
+
+/**
+ * A run of reads where only the newest counts: each `run(read, apply, fail)` starts 1 read, `read(signal)`. At its end,
+ * `apply` gets the answer, or `fail` the error, only when no newer read started since; an older read's answer or error
+ * is dropped, so it never replaces a newer one. With `abort`, a new read aborts the one before it. `run` gives back the
+ * read's own answer, or throws its error, either way. `stop` drops every read in flight.
+ */
+export const newestReads = ({ abort = true } = {}) => {
+    let last = 0;
+    let controller = null;
+
+    return {
+        async run(read, apply, fail) {
+            last += 1;
+
+            const mine = last;
+
+            if (abort) {
+                controller?.abort();
+            }
+
+            controller = new AbortController();
+
+            const signal = controller.signal;
+            const newest = () => mine === last && !signal.aborted;
+
+            try {
+                const answer = await read(signal);
+
+                if (newest()) {
+                    apply(answer);
+                }
+
+                return answer;
+            } catch (failure) {
+                if (newest()) {
+                    fail?.(failure);
+                }
+
+                throw failure;
+            }
+        },
+        stop() {
+            last += 1;
+
+            if (abort) {
+                controller?.abort();
+            }
+
+            controller = null;
+        },
+    };
+};
 
 /**
  * Add the Plan panel when the conversation (the one the tab shows, or `target`) is a planning session, and remove it
- * when it is not. A panel of ours that shows closes first, so no empty panel stays. It waits for the first view: before
- * it, the module does not know the planning sessions, and a panel kept open across a reload must stay.
+ * when it is not. A panel of ours that shows closes first, so no empty panel stays. Before the first view the panel
+ * stays added (`panelStep`): a panel kept open across a reload must find its spec, and shows a loader or the error.
  */
 const syncPanel = (target = shownConversation) => {
-    if (planPanelSpec === null || view === null) {
+    if (planPanelSpec === null) {
         return;
     }
 
-    const step = panelStep(planPanel !== null, target !== null && planSessions.has(target));
+    const step = panelStep(
+        planPanel !== null,
+        target !== null && planSessions.has(target),
+        view !== null,
+    );
 
     if (step === "add") {
         planPanel = app.panel(planPanelSpec);
@@ -610,22 +674,30 @@ const openInDesk = (next) => {
     app.openPage("desk");
 };
 
+/** The threads reads: only the newest one publishes its view, or its error. A read is not aborted: it sweeps too. */
+let threadReads = newestReads({ abort: false });
+
+/**
+ * Read the threads view, and publish it when no newer read started since: an older answer never replaces a newer view
+ * (or removes the Plan panel from a planning session). Gives back this read's view, or null when it failed.
+ */
 const load = async () => {
     try {
-        const next = await app.api("threads");
+        return await threadReads.run(
+            () => app.api("threads"),
+            (next) => {
+                if (seenBefore === null) {
+                    seenBefore = next.seen ?? 0;
+                }
 
-        if (seenBefore === null) {
-            seenBefore = next.seen ?? 0;
-        }
-
-        publish(next);
-
-        return next;
-    } catch (failure) {
-        loadError = failure.message;
-
-        notify();
-
+                publish(next);
+            },
+            (failure) => {
+                loadError = failure.message;
+                notify();
+            },
+        );
+    } catch {
         return null;
     }
 };
@@ -659,7 +731,11 @@ export default function setup(pocket) {
     const { html, useEffect, useRef, useState, Loader } = pocket;
 
     app = pocket;
-    // A new setup starts with no panel: the panel of an older setup went with it.
+    // A new setup starts with no view and no panel: those of an older setup went with it.
+    view = null;
+    loadError = null;
+    planSessions = new Map();
+    threadReads = newestReads({ abort: false });
     planPanelSpec = null;
     planPanel = null;
     shownConversation = null;
@@ -787,64 +863,62 @@ export default function setup(pocket) {
         // What the fields hold now, for after a send: only the text that was sent is cleared.
         const [live] = useState(() => ({ comment: "", changes: "" }));
 
-        const openPlan = async () => {
-            const answer = await pocket.api(`plans/${id}`);
+        // Every read of the plan (the first, after an act, at a `changed` event) goes through 1 run: only the newest
+        // read's answer shows, and a new read aborts the one before it.
+        const [reads] = useState(() => newestReads());
 
-            if (stillMounted(life)) {
-                setPlan(answer);
-            }
-
-            return answer;
-        };
+        /** Read the plan again; the view takes the answer only when it is the newest read. */
+        const openPlan = () =>
+            reads.run(
+                (signal) => pocket.api(`plans/${id}`, undefined, { signal }),
+                (answer) => {
+                    if (stillMounted(life)) {
+                        setPlan(answer);
+                    }
+                },
+            );
 
         useEffect(() => {
-            const abort = new AbortController();
-
-            pocket
-                .api(`plans/${id}`, undefined, { signal: abort.signal })
-                .then(setPlan, (failure) => {
-                    if (!abort.signal.aborted) {
-                        setError(failure.message);
-                    }
+            reads
+                .run(
+                    (signal) => pocket.api(`plans/${id}`, undefined, { signal }),
+                    (answer) => {
+                        if (stillMounted(life)) {
+                            setPlan(answer);
+                        }
+                    },
+                    (failure) => {
+                        if (stillMounted(life)) {
+                            setError(failure.message);
+                        }
+                    },
+                )
+                .catch(() => {
+                    // The newest read shows its error above; an older one's error is dropped.
                 });
 
             return () => {
-                abort.abort();
+                reads.stop();
                 life.gone = true;
             };
         }, [id]);
 
-        // The panel follows the desk: each `changed` event reads the plan again, and the last read is aborted.
+        // The panel follows the desk: each `changed` event reads the plan again.
         useEffect(() => {
             if (!panel) {
                 return undefined;
             }
 
-            let abort = null;
-
             const reload = () => {
-                abort?.abort();
-                abort = new AbortController();
-
-                const signal = abort.signal;
-
-                pocket.api(`plans/${id}`, undefined, { signal }).then(
-                    (answer) => {
-                        if (!signal.aborted && stillMounted(life)) {
-                            setPlan(answer);
-                        }
-                    },
-                    () => {
-                        // The plan that is there stays: the next change reads it again.
-                    },
-                );
+                openPlan().catch(() => {
+                    // The plan that is there stays: the next change reads it again.
+                });
             };
 
             CHANGED.add(reload);
 
             return () => {
                 CHANGED.delete(reload);
-                abort?.abort();
             };
         }, [id, panel]);
 
@@ -1999,6 +2073,22 @@ export default function setup(pocket) {
             };
         }, []);
 
+        // Before the first view: a loader, or the failed read with Retry. The panel waits for the planning sessions.
+        if (view === null) {
+            return html`<div class="desk desk-in-panel">
+                ${
+                    loadError === null
+                        ? html`<${Loader} label="Reading the desk" />`
+                        : html`<div class="error-box" role="alert">${loadError}</div>
+                              <div class="desk-actions">
+                                  <button type="button" class="button" onClick=${() => void load()}>
+                                      Retry
+                                  </button>
+                              </div>`
+                }
+            </div>`;
+        }
+
         const id = shownConversation === null ? undefined : planSessions.get(shownConversation);
 
         if (id === undefined) {
@@ -3150,6 +3240,9 @@ export default function setup(pocket) {
             wide: true,
             component: PlanPanel,
         };
+        shownConversation = pocket.conversationId?.() ?? null;
+        // At once, before the first view: a Plan panel that Pocket kept open across a reload finds its spec.
+        syncPanel();
         pocket.onDispose(
             pocket.onConversation((conversation) => {
                 shownConversation = conversation;

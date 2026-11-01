@@ -44,6 +44,7 @@ import setup, {
     stillMounted,
     completedLines,
     panelStep,
+    newestReads,
     planEnded,
     planSessionsOf,
     stepLine,
@@ -2176,6 +2177,100 @@ test("panelStep: add once, remove once, and keep when nothing changed", () => {
     assert.equal(panelStep(false, false), "keep");
 });
 
+test("panelStep: before the first view the panel is added at once and kept; after it, a plain session removes it", () => {
+    // No view yet: the planning sessions are not known, so the panel is there whatever the session.
+    assert.equal(panelStep(false, false, false), "add");
+    assert.equal(panelStep(false, true, false), "add");
+    assert.equal(panelStep(true, false, false), "keep");
+    assert.equal(panelStep(true, true, false), "keep");
+    // The first view came: the rule of the planning sessions.
+    assert.equal(panelStep(true, false, true), "remove");
+    assert.equal(panelStep(true, true, true), "keep");
+});
+
+/** A promise and its resolve and reject: an answer that comes when the test says. */
+const deferred = () => {
+    let resolve;
+    let reject;
+    const promise = new Promise((yes, no) => {
+        resolve = yes;
+        reject = no;
+    });
+
+    return { promise, resolve, reject };
+};
+
+test("newestReads: the first read finishes last, and the view keeps the newer answer", async () => {
+    const reads = newestReads();
+    const shown = [];
+    const first = deferred();
+    const second = deferred();
+    const signals = [];
+
+    const read = (answer) => (signal) => {
+        signals.push(signal);
+
+        return answer.promise;
+    };
+
+    const one = reads.run(read(first), (plan) => shown.push(plan));
+    const two = reads.run(read(second), (plan) => shown.push(plan));
+
+    assert.equal(signals[0].aborted, true, "a new read aborts the one before it");
+    second.resolve("newer");
+    assert.equal(await two, "newer");
+    first.resolve("older");
+    assert.equal(await one, "older", "the read gives its own answer back");
+    assert.deepEqual(shown, ["newer"]);
+});
+
+test("newestReads: only the newest read's error shows, and stop drops a read in flight", async () => {
+    const reads = newestReads({ abort: false });
+    const shown = [];
+    const errors = [];
+    const first = deferred();
+    const second = deferred();
+    const signals = [];
+    const run = (answer) =>
+        reads
+            .run(
+                (signal) => {
+                    signals.push(signal);
+
+                    return answer.promise;
+                },
+                (view) => shown.push(view),
+                (failure) => errors.push(failure.message),
+            )
+            .catch(() => "failed");
+
+    const one = run(first);
+    const two = run(second);
+
+    assert.equal(signals[0].aborted, false, "a threads read is not aborted");
+    second.resolve("newer");
+    first.reject(new Error("older failed"));
+    assert.equal(await one, "failed");
+    await two;
+    assert.deepEqual(shown, ["newer"]);
+    assert.deepEqual(errors, [], "the older read's error is dropped");
+
+    const third = deferred();
+    const three = run(third);
+
+    third.reject(new Error("newest failed"));
+    await three;
+    assert.deepEqual(errors, ["newest failed"]);
+
+    const fourth = deferred();
+    const four = run(fourth);
+
+    reads.stop();
+    fourth.resolve("late");
+    await four;
+    assert.deepEqual(shown, ["newer"], "a read that stop dropped shows nothing");
+});
+
 test("the stepper's words: each state for a screen reader, and a step's detail with its day", () => {
     assert.equal(stepStateText("done"), "done");
     assert.equal(stepStateText("current"), "current");
@@ -2248,10 +2343,13 @@ test("the Plans section shows the Completed plans button with its count", async 
 });
 
 /** Set the module up with panels: the panels it adds and removes, and the conversation listener it gives. */
-const withPanels = async (view, conversation) => {
+const withPanels = async (view, conversation, api = async () => view) => {
     const log = [];
+    const panels = [];
 
     let listener = () => {};
+
+    let changed = () => {};
 
     setup({
         html,
@@ -2260,12 +2358,20 @@ const withPanels = async (view, conversation) => {
         useRef: () => ({ current: null }),
         Loader: () => "",
         style() {},
-        api: async () => view,
+        api,
         page() {},
         rail: () => ({ update() {} }),
-        on: () => () => {},
+        on: (name, handler) => {
+            if (name === "changed") {
+                changed = handler;
+            }
+
+            return () => {};
+        },
         onDispose() {},
+        conversationId: () => conversation,
         panel(spec) {
+            panels.push(spec);
             log.push(`add ${spec.id} ${spec.title} ${spec.wide} ${spec.icon}`);
 
             return { update() {}, remove: () => log.push("remove") };
@@ -2280,10 +2386,91 @@ const withPanels = async (view, conversation) => {
             return () => {};
         },
     });
+
+    const atSetup = [...log];
+
     await new Promise((resolve) => setTimeout(resolve, 20));
 
-    return { log, show: (id) => listener(id) };
+    return {
+        log,
+        atSetup,
+        show: (id) => listener(id),
+        changed: () => changed(),
+        drawPanel: () => String(panels.at(-1).component({ close() {} })).replace(/\s+/g, " "),
+    };
 };
+
+const ADDED = "add plan Plan true file";
+
+test("the Plan panel is added at once, before the first view; after it, a plain session removes it", async () => {
+    const view = { ...viewWith(null), plans: [], planSessions: [{ plan: "T1", session: 31 }] };
+    const plain = await withPanels(view, 7);
+
+    assert.deepEqual(plain.atSetup, [ADDED], "added before the first view");
+    assert.deepEqual(
+        plain.log,
+        [ADDED, "close", "remove"],
+        "the first view removes it from a plain session",
+    );
+
+    const planning = await withPanels(view, 31);
+
+    assert.deepEqual(planning.atSetup, [ADDED]);
+    assert.deepEqual(
+        planning.log,
+        [ADDED],
+        "kept beside the planning session, and not added again",
+    );
+});
+
+test("a first read that fails keeps the restored panel, with the error and Retry; a loader before any answer", async () => {
+    const answer = deferred();
+    let calls = 0;
+    const { log, drawPanel } = await withPanels(null, 31, () => {
+        calls += 1;
+
+        return answer.promise;
+    });
+
+    assert.match(drawPanel(), /<\[fn\] label="Reading the desk" \/>/, "the Loader");
+
+    answer.reject(new Error("The desk is out of reach."));
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    const out = drawPanel();
+
+    assert.deepEqual(log, [ADDED], "the panel stays: no view says the session is not a plan's");
+    assert.match(out, /role="alert">The desk is out of reach\./);
+    assert.match(out, /> Retry </);
+    assert.equal(calls, 1);
+});
+
+test("2 thread reads that finish in reverse order: the newer view stays, and the panel stays", async () => {
+    const reads = [];
+    const newer = { ...viewWith(null), plans: [], planSessions: [{ plan: "T1", session: 31 }] };
+    const older = { ...viewWith(null), plans: [], planSessions: [] };
+    const { log, changed, drawPanel } = await withPanels(null, 31, (path) => {
+        const answer = deferred();
+
+        reads.push({ path, answer });
+
+        return answer.promise;
+    });
+
+    // The first read (from setup) waits; a change starts a second read.
+    changed();
+    assert.deepEqual(
+        reads.map((each) => each.path),
+        ["threads", "threads"],
+    );
+    reads[1].answer.resolve(newer);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    reads[0].answer.resolve(older);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    assert.deepEqual(log, [ADDED], "the older view did not remove the panel");
+    assert.match(drawPanel(), /id=T1 mode="panel"/, "the panel shows the plan of the newer view");
+});
 
 test("the Plan panel is added only beside a planning session, once, and goes when another session shows", async () => {
     const view = { ...viewWith(null), plans: [], planSessions: [{ plan: "T1", session: 31 }] };
