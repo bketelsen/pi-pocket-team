@@ -743,6 +743,140 @@ test("a closed found thread with an open ask and a watch shows the answer contro
     assert.doesNotMatch(need, /ready to merge/);
 });
 
+/**
+ * Render the page with hooks that keep their state, and with the handlers it gives: `act(pattern, event)` calls the
+ * handler whose template text, up to it, matches `pattern`, and draws the page again.
+ */
+const interactive = async (view) => {
+    let page;
+    const states = [];
+    let index = 0;
+    let handlers = [];
+    const flat = (value) =>
+        Array.isArray(value)
+            ? value.map(flat).join("")
+            : typeof value === "function"
+              ? "[fn]"
+              : value === null || value === undefined
+                ? ""
+                : String(value);
+    const capture = (strings, ...values) =>
+        strings.reduce((out, text, at) => {
+            const before = out + text;
+
+            if (at < values.length && typeof values[at] === "function") {
+                handlers.push({ before, handler: values[at] });
+            }
+
+            return before + (at < values.length ? flat(values[at]) : "");
+        }, "");
+
+    setup({
+        html: capture,
+        useState: (initial) => {
+            const slot = index;
+
+            index += 1;
+
+            if (!(slot in states)) {
+                states[slot] = typeof initial === "function" ? initial() : initial;
+            }
+
+            return [
+                states[slot],
+                (next) => {
+                    states[slot] = typeof next === "function" ? next(states[slot]) : next;
+                },
+            ];
+        },
+        useEffect: () => {},
+        useRef: () => ({ current: null }),
+        Loader: () => "",
+        style() {},
+        api: async () => view,
+        page: (each) => {
+            page = each;
+        },
+        rail: () => ({ update: () => {} }),
+        on: () => () => {},
+        onDispose() {},
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    const draw = () => {
+        index = 0;
+        handlers = [];
+
+        return page.component().replace(/\s+/g, " ");
+    };
+
+    let out = draw();
+
+    return {
+        out: () => out,
+        act: (pattern, event = {}) => {
+            const found = handlers.find((each) => pattern.test(each.before));
+
+            assert(found !== undefined, `a handler for ${String(pattern)}`);
+            found.handler(event);
+            out = draw();
+        },
+    };
+};
+
+test("Closed in the last 7 days: a thread closed as done has Watch with its form; a plan, a dropped one and a failed one have none", async () => {
+    const closed = (id, patch = {}) =>
+        threadView({
+            id,
+            title: `Closed ${id}`,
+            state: "closed",
+            next: "none",
+            closed: { at: NOW - 1000, why: "done", by: "odrade", outcome: "completed" },
+            ...patch,
+        });
+    const page = await interactive({
+        ...viewWith(null),
+        threads: [
+            closed("T5", {
+                watch: {
+                    checkOn: "2026-10-01",
+                    check: "an old check",
+                    setBy: "odrade",
+                    due: true,
+                    result: { pass: true, by: "odrade", text: "gone" },
+                },
+            }),
+            closed("T6", { origin: "plan" }),
+            closed("T7", { closed: { at: NOW - 1000, why: "dropped", by: "brian" } }),
+            closed("T8", { closed: { at: NOW - 1000, why: "failed", by: "desk" } }),
+        ],
+    });
+
+    assert.match(page.out(), /Closed in the last 7 days \(4\)/);
+    assert.doesNotMatch(page.out(), /aria-label=Watch T5/, "the section is shut");
+
+    page.act(/class="desk-closed"\s+onToggle=$/, { currentTarget: { open: true } });
+
+    const part = page.out().slice(page.out().indexOf("Closed in the last 7 days"));
+
+    assert.match(part, /aria-label=Watch T5/, "a thread closed as done takes a watch");
+    assert.doesNotMatch(part, /aria-label=Watch T6/, "a plan thread has no watch");
+    assert.doesNotMatch(part, /aria-label=Watch T7/, "a dropped thread has no watch");
+    assert.doesNotMatch(part, /aria-label=Watch T8/, "a failed thread has no watch");
+    assert.doesNotMatch(part, /Clear the watch|Pass the check|Fail the check/);
+    assert.doesNotMatch(part, /Set the watch on T5/, "the form waits for the tap");
+
+    page.act(/aria-label=Watch T5\s+onClick=$/);
+
+    const open = page.out().slice(page.out().indexOf("Closed in the last 7 days"));
+
+    assert.match(open, /aria-label=The check's date for T5/);
+    assert.match(open, /aria-label=The check's time for T5 \(optional\)/);
+    assert.match(open, /aria-label=The check for T5/);
+    assert.match(open, /aria-label=Set the watch on T5/);
+    assert.doesNotMatch(open, /Clear the watch|Pass the check|Fail the check/);
+});
+
 // ─── The plan rows and the plan view ────────────────────────────────────────
 
 const plan = (patch = {}) => ({

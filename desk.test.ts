@@ -3407,6 +3407,171 @@ describe("the watch's rules", () => {
         );
     });
 
+    test("setWatch reopens a thread closed as done in the last 7 days: it sleeps, and a replay changes nothing", () => {
+        const at = on("2026-10-22");
+        const done = thread({
+            state: "closed",
+            closed: { at: at - 6 * DAY, why: "done", by: "sweep", outcome: "completed" },
+            run: {
+                busy: false,
+                reportedUserEntry: 5,
+                lastUserEntry: 5,
+                next: "none",
+                quietReopen: { at: at - DAY, entry: 9 },
+                quietWake: { at: at - DAY, entry: 9 },
+            },
+        });
+
+        assert.equal(reopenable(done, at), true);
+        assert.deepEqual(
+            setWatch(done, {
+                checkOn: "2026-11-01",
+                check: "the blob sweep",
+                by: "odrade",
+                key: "call-r",
+                at,
+            }),
+            { changed: true, reopened: true },
+        );
+        assert.equal(done.state, "open");
+        assert.equal(done.closed, undefined);
+        assert.equal(done.run.quietReopen, undefined);
+        assert.equal(done.run.quietWake, undefined);
+        assert.deepEqual(
+            done.events.map((event) => [event.key, event.text]),
+            [
+                ["reopened:watch:call-r", "reopened: watch set by odrade"],
+                ["watch:set:call-r", "watch: check on 2026-11-01 by odrade: the blob sweep"],
+            ],
+        );
+        assert.equal(done.watch?.checkOn, "2026-11-01");
+        assert.equal(asleep(done, at), true);
+        assert.equal(isCounted(done, at), false);
+        assert.equal(isStale(done, at + 5 * DAY), false, "a sleeping thread is never stale");
+        assert.equal(nextActor(done), "none");
+        assert.equal(done.run.next, "none");
+
+        // The same key again, after the reopen: nothing changes.
+        const events = done.events.length;
+
+        assert.deepEqual(
+            setWatch(done, {
+                checkOn: "2w",
+                check: "another",
+                by: "odrade",
+                key: "call-r",
+                at: at + 1000,
+            }),
+            { changed: false },
+        );
+        assert.equal(done.events.length, events);
+        assert.equal(done.watch?.checkOn, "2026-11-01");
+
+        // The pass closes it again as done, verified.
+        recordResult(done, {
+            pass: true,
+            text: "the blobs are gone",
+            by: "odrade",
+            key: "r-1",
+            at: on("2026-11-01"),
+            closedBy: "desk",
+        });
+        assert.equal(done.state, "closed");
+        assert.deepEqual(done.closed, {
+            at: on("2026-11-01"),
+            why: "done",
+            by: "desk",
+            outcome: "verified",
+        });
+
+        // A fail keeps the reopened thread open, and it counts again.
+        const failing = thread({
+            state: "closed",
+            closed: { at: at - DAY, why: "done", by: "sweep", outcome: "completed" },
+        });
+
+        setWatch(failing, {
+            checkOn: "2026-11-01",
+            check: "the blob sweep",
+            by: "duncan",
+            key: "call-f",
+            at,
+        });
+        recordResult(failing, {
+            pass: false,
+            text: "2 blobs remain",
+            by: "duncan",
+            key: "f-1",
+            at: on("2026-11-01"),
+            closedBy: "desk",
+        });
+        assert.equal(failing.state, "open");
+        assert.equal(failing.closed, undefined);
+        assert.equal(isCounted(failing, on("2026-11-01")), true);
+    });
+
+    test("setWatch on a closed thread: a bad request leaves it closed, and only a done one of the last 7 days opens", () => {
+        const at = on("2026-10-22");
+        const closedAs = (
+            why: "done" | "dropped" | "failed",
+            ago: number,
+            patch: Partial<Thread> = {},
+        ) => thread({ state: "closed", closed: { at: at - ago, why, by: "sweep" }, ...patch });
+        const request = (patch: Partial<Parameters<typeof setWatch>[1]> = {}) => ({
+            checkOn: "2026-11-01",
+            check: "the blob sweep",
+            by: "odrade",
+            key: "k",
+            at,
+            ...patch,
+        });
+
+        // A bad check, or a date in the past: the thread stays closed, with no event.
+        for (const bad of [
+            request({ check: "  " }),
+            request({ check: "x".repeat(201) }),
+            request({ checkOn: "2026-01-01" }),
+            request({ checkOn: "soon" }),
+        ]) {
+            const done = closedAs("done", DAY);
+            const before = structuredClone(done);
+
+            assert.match(errorOf(setWatch(done, bad)), /./);
+            assert.deepEqual(done, before, "nothing changed");
+        }
+
+        assert.equal(
+            errorOf(setWatch(closedAs("dropped", DAY), request())),
+            "Thread T1 closed as dropped: only a thread closed as done in the last 7 days can take a watch.",
+        );
+        assert.equal(
+            errorOf(setWatch(closedAs("failed", DAY), request())),
+            "Thread T1 closed as failed: only a thread closed as done in the last 7 days can take a watch.",
+        );
+
+        const old = closedAs("done", 7 * DAY + 1);
+        const before = structuredClone(old);
+
+        assert.equal(
+            errorOf(setWatch(old, request())),
+            "Thread T1 closed as done more than 7 days ago: only a thread closed as done in the last 7 days can take a watch.",
+        );
+        assert.deepEqual(old, before);
+        assert.equal(
+            (setWatch(closedAs("done", 7 * DAY), request()) as { reopened?: true }).reopened,
+            true,
+            "7 days is still in",
+        );
+        assert.match(
+            errorOf(setWatch(closedAs("done", DAY, { origin: "plan" }), request())),
+            /is a plan thread: a plan has no watch/,
+        );
+        assert.match(
+            errorOf(setWatch(thread({ state: "parked" }), request())),
+            /is parked: a watch is set on an open thread only/,
+        );
+    });
+
     test("clearWatch removes it once, and no watch is no change", () => {
         const fresh = watched();
 
@@ -16985,6 +17150,84 @@ describe("the desk in a Pi Pocket", () => {
                 assert.equal((await call(path, body, guest.token)).status, 404, path);
             }
         });
+
+        test("a page watch reopens a thread closed as done under Watching, and a dropped thread answers 400", async () => {
+            const { thread } = await delegated("page-watch-reopen");
+
+            await until(
+                async () =>
+                    typeof (await deskState())?.threads[thread.id]?.run.sweptAt === "number",
+                "the first sweep",
+                20_000,
+            );
+
+            const checkOn = daysFromToday(7);
+
+            // Closed as done just now, with an old watch that passed: the same date and check are no double tap.
+            await app.harness.commit(async (tx) => {
+                const stored = (await tx.doc(DeskThreads)).threads[thread.id]!;
+
+                stored.state = "closed";
+                stored.closed = { at: Date.now(), why: "done", by: "desk", outcome: "verified" };
+                stored.run.next = "none";
+                stored.watch = {
+                    checkOn,
+                    check: "the blob sweep",
+                    setAt: 1,
+                    setBy: "brian",
+                    key: "page:watch:1",
+                    result: { at: 2, by: "brian", pass: true, text: "gone", key: "page:result:2" },
+                };
+            }, context);
+
+            const watched = await call(`threads/${thread.id}/watch`, {
+                checkOn,
+                check: "the blob sweep",
+            });
+
+            assert.equal(watched.status, 200);
+
+            const stored = (await deskState())?.threads[thread.id];
+
+            assert.equal(stored?.state, "open");
+            assert.equal(stored?.closed, undefined);
+            assert.equal(stored?.watch?.result, undefined, "a new watch");
+            assert.match(stored?.watch?.key ?? "", /^page:watch:/);
+            assert.equal(
+                stored?.events.some(
+                    (event) =>
+                        event.key === `reopened:watch:${stored.watch?.key}` &&
+                        event.text === "reopened: watch set by brian",
+                ),
+                true,
+            );
+            assert.equal(asleep(stored!, Date.now()), true);
+
+            const row = watched.data.threads.find((each: { id: string }) => each.id === thread.id);
+
+            assert.equal(row.state, "open");
+            assert.equal(row.asleep, true, "the page puts it under Watching");
+            assert(watched.data.counts.watching >= 1, "the header counts it");
+
+            // A thread closed as dropped takes no watch: 400, and it stays closed.
+            await app.harness.commit(async (tx) => {
+                const each = (await tx.doc(DeskThreads)).threads[thread.id]!;
+
+                each.state = "closed";
+                each.closed = { at: Date.now(), why: "dropped", by: "brian" };
+                delete each.watch;
+            }, context);
+
+            const refused = await call(`threads/${thread.id}/watch`, {
+                checkOn,
+                check: "the blob sweep",
+            });
+
+            assert.equal(refused.status, 400);
+            assert.match(JSON.stringify(refused.data), /closed as dropped/);
+            assert.equal((await deskState())?.threads[thread.id]?.state, "closed");
+            assert.equal((await deskState())?.threads[thread.id]?.watch, undefined);
+        });
     });
 
     describe("watches", () => {
@@ -17379,6 +17622,64 @@ describe("the desk in a Pi Pocket", () => {
             assert.match(
                 (await modelTexts(app, plain)).join("\n"),
                 /A watch needs a session with a named identity/,
+            );
+        });
+
+        test("desk watch reopens a thread closed as done, for the supervisor and the owning agent, and refuses a dropped one", async () => {
+            await stopSweepers();
+            const { source, linked, thread } = await delegated("watch-reopen");
+            const closeAs = (why: "done" | "dropped") =>
+                app.harness.commit(async (tx) => {
+                    const each = (await tx.doc(DeskThreads)).threads[thread.id]!;
+
+                    each.state = "closed";
+                    each.closed = { at: Date.now(), why, by: "desk" };
+                    each.run.next = "none";
+                    delete each.watch;
+                }, context);
+            const reply = new RegExp(
+                `Watching ${thread.id}: check on \\d{4}-\\d{2}-\\d{2}\\. ${thread.id} closed as done; it is open again, asleep, and does not count toward the cap until then\\.`,
+            );
+
+            watchThreadId = thread.id;
+
+            // The supervisor.
+            await closeAs("done");
+            await say(app, source, "desk watch test");
+
+            let stored = (await deskState())?.threads[thread.id];
+
+            assert.equal(stored?.state, "open");
+            assert.equal(stored?.closed, undefined);
+            assert.equal(stored?.watch?.setBy, "odrade");
+            assert.equal(asleep(stored!, Date.now()), true);
+            assert.equal(isCounted(stored!, Date.now()), false);
+            assert.equal(
+                stored?.events.filter((event) => event.key.startsWith("reopened:watch:")).length,
+                1,
+            );
+            assert.match((await modelTexts(app, source)).join("\n"), reply);
+
+            // The owning agent, on its own thread.
+            await closeAs("done");
+            await say(app, linked, "watch own thread test");
+            stored = (await deskState())?.threads[thread.id];
+            assert.equal(stored?.state, "open");
+            assert.equal(stored?.watch?.setBy, "duncan");
+            assert.equal(asleep(stored!, Date.now()), true);
+            assert.match((await modelTexts(app, linked)).join("\n"), reply);
+
+            // A dropped thread is refused, and stays closed.
+            await closeAs("dropped");
+            await say(app, source, "desk watch test");
+            stored = (await deskState())?.threads[thread.id];
+            assert.equal(stored?.state, "closed");
+            assert.equal(stored?.watch, undefined);
+            assert.match(
+                (await modelTexts(app, source)).join("\n"),
+                new RegExp(
+                    `Thread ${thread.id} closed as dropped: only a thread closed as done in the last 7 days can take a watch\\.`,
+                ),
             );
         });
 
