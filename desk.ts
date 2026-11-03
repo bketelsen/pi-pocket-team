@@ -367,7 +367,9 @@ export type Thread = {
      * sweep found a supervisor message that woke a done thread, and kept it closed: `at` is the sweep's time, `entry`
      * the session's newest user entry before that message; a report, folder work or a PR after the wake opens the thread
      * again, see `quietTrigger`), and `journaled` (when the thread's 1 journal entry went into the queue: a thread that
-     * reopens and closes again gets no second entry).
+     * reopens and closes again gets no second entry), and `watchKeys` (the replay key of every watch set on the thread, in
+     * order, never removed: a replayed `desk watch` with one of them changes nothing; absent for a thread from before
+     * the field).
      */
     run: Record<string, JsonValue>;
     /** The last 50; `key` makes an event unique. */
@@ -1897,6 +1899,13 @@ export type WatchRequest = {
     at: number;
 };
 
+/** The keys of every watch set on a thread (`run.watchKeys`): none for a thread from before the field. */
+function watchKeysOf(thread: Thread): string[] {
+    const keys = thread.run.watchKeys;
+
+    return Array.isArray(keys) ? keys.filter((key): key is string => typeof key === "string") : [];
+}
+
 /**
  * Why a closed thread cannot take a watch: only a thread closed as done in the last 7 days can (`reopenable`).
  * Undefined when it can.
@@ -1941,10 +1950,13 @@ export function setWatch(
         return { changed: false };
     }
 
-    // A replay of a watch that a later watch replaced, a clear removed, or a close ended: its set event is still there,
-    // so it sets nothing and reopens nothing. A thread keeps its last 50 events (`KEPT_EVENTS`): a replay older than
-    // those is not seen.
-    if (thread.events.some((event) => event.key === `watch:set:${request.key}`)) {
+    // A replay of a watch that a later watch replaced, a clear removed, or a close ended: its key is in `run.watchKeys`,
+    // so it sets nothing and reopens nothing. A thread from before that field has only its set event, in the last 50
+    // events (`KEPT_EVENTS`).
+    if (
+        watchKeysOf(thread).includes(request.key) ||
+        thread.events.some((event) => event.key === `watch:set:${request.key}`)
+    ) {
         return { changed: false };
     }
 
@@ -1988,7 +2000,9 @@ export function setWatch(
         );
     }
 
-    // A new watch replaces the old one: no wake, and no result, from the one it replaces.
+    // A new watch replaces the old one: no wake, and no result, from the one it replaces. Its key stays in
+    // `run.watchKeys` for good, so a replay of it changes nothing, also after the events moved on.
+    thread.run.watchKeys = [...watchKeysOf(thread), request.key];
     thread.watch = {
         checkOn: when.checkOn,
         ...(when.checkTime === undefined ? {} : { checkTime: when.checkTime }),

@@ -3606,7 +3606,7 @@ describe("the watch's rules", () => {
         assert.equal(done.closed?.outcome, "abandoned", "a closed PR comes before verified");
     });
 
-    test("a replayed setWatch changes nothing after a later watch, a clear, a pass, or a sweep's close", () => {
+    test("a replayed setWatch changes nothing after a later watch, a clear, a pass, a sweep's close, or 50 later events", () => {
         const at = on("2026-10-22");
         const first = {
             checkOn: "2026-11-01",
@@ -3636,6 +3636,34 @@ describe("the watch's rules", () => {
         setWatch(replaced, { ...first, checkOn: "2026-11-05", key: "call-B" });
         assert.equal(replaced.watch?.key, "call-B");
         unchanged(replaced);
+        assert.deepEqual(replaced.run.watchKeys, ["call-A", "call-B"]);
+
+        // 60 later events push A's set event out of the last 50: its key in run.watchKeys still holds the replay.
+        const evicted = closedDone();
+
+        setWatch(evicted, first);
+        setWatch(evicted, { ...first, checkOn: "2026-11-05", key: "call-B" });
+
+        for (let index = 0; index < 60; index += 1) {
+            evicted.events.push({ at: at + index, key: `note:${String(index)}`, text: "a note" });
+        }
+
+        evicted.events.splice(0, evicted.events.length - 50);
+        assert.equal(
+            evicted.events.some((event) => event.key === "watch:set:call-A"),
+            false,
+            "the set event is gone",
+        );
+        unchanged(evicted);
+        assert.equal(evicted.watch?.key, "call-B");
+
+        // A thread from before run.watchKeys: its set event still holds the replay.
+        const older = closedDone();
+
+        setWatch(older, first);
+        setWatch(older, { ...first, checkOn: "2026-11-05", key: "call-B" });
+        delete older.run.watchKeys;
+        unchanged(older);
 
         // A reopens; a clear removes the watch; a replay of A sets none.
         const cleared = closedDone();
@@ -17846,7 +17874,9 @@ describe("the desk in a Pi Pocket", () => {
             );
             assert.match((await modelTexts(app, source)).join("\n"), reply);
 
-            // The owning agent, on its own thread.
+            // The owning agent, on its own thread. The reopen started a sweeper: it stops first, so no sweep reopens the
+            // closed thread for its busy session before the watch does.
+            await stopSweepers();
             await closeAs("done");
             await say(app, linked, "watch own thread test");
             stored = (await deskState())?.threads[thread.id];
@@ -17856,6 +17886,7 @@ describe("the desk in a Pi Pocket", () => {
             assert.match((await modelTexts(app, linked)).join("\n"), reply);
 
             // A dropped thread is refused, and stays closed.
+            await stopSweepers();
             await closeAs("dropped");
             await say(app, source, "desk watch test");
             stored = (await deskState())?.threads[thread.id];
