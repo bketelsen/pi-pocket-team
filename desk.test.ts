@@ -3572,6 +3572,107 @@ describe("the watch's rules", () => {
         );
     });
 
+    test("a pass on a reopened thread with a PR closed unmerged closes it as done (abandoned)", () => {
+        const at = on("2026-10-22");
+        const done = thread({
+            state: "closed",
+            closed: { at: at - DAY, why: "done", by: "sweep", outcome: "abandoned" },
+            prs: prs("CLOSED"),
+        });
+
+        assert.equal(
+            (
+                setWatch(done, {
+                    checkOn: "2026-11-01",
+                    check: "the blob sweep",
+                    by: "odrade",
+                    key: "call-a",
+                    at,
+                }) as { reopened?: true }
+            ).reopened,
+            true,
+        );
+        assert.equal(done.state, "open");
+        recordResult(done, {
+            pass: true,
+            text: "the blobs are gone",
+            by: "odrade",
+            key: "r-a",
+            at: on("2026-11-01"),
+            closedBy: "desk",
+        });
+        assert.equal(done.state, "closed");
+        assert.equal(done.closed?.why, "done");
+        assert.equal(done.closed?.outcome, "abandoned", "a closed PR comes before verified");
+    });
+
+    test("a replayed setWatch changes nothing after a later watch, a clear, a pass, or a sweep's close", () => {
+        const at = on("2026-10-22");
+        const first = {
+            checkOn: "2026-11-01",
+            check: "the blob sweep",
+            by: "odrade",
+            key: "call-A",
+            at,
+        };
+        const replay = { ...first, checkOn: "2w", check: "replayed", at: at + 1000 };
+        const closedDone = () =>
+            thread({
+                state: "closed",
+                closed: { at: at - DAY, why: "done", by: "sweep", outcome: "completed" },
+            });
+
+        const unchanged = (each: Thread) => {
+            const before = structuredClone(each);
+
+            assert.deepEqual(setWatch(each, replay), { changed: false });
+            assert.deepEqual(each, before, "nothing changed");
+        };
+
+        // A reopens; B replaces the watch; a replay of A keeps B.
+        const replaced = closedDone();
+
+        setWatch(replaced, first);
+        setWatch(replaced, { ...first, checkOn: "2026-11-05", key: "call-B" });
+        assert.equal(replaced.watch?.key, "call-B");
+        unchanged(replaced);
+
+        // A reopens; a clear removes the watch; a replay of A sets none.
+        const cleared = closedDone();
+
+        setWatch(cleared, first);
+        clearWatch(cleared, "brian", "tap-1", at + 10);
+        assert.equal(cleared.watch, undefined);
+        unchanged(cleared);
+
+        // A reopens; B replaces it; B passes and the thread closes again: a replay of A does not reopen it.
+        const passed = closedDone();
+
+        setWatch(passed, first);
+        setWatch(passed, { ...first, checkOn: "2026-11-05", key: "call-B" });
+        recordResult(passed, {
+            pass: true,
+            text: "gone",
+            by: "odrade",
+            key: "r-B",
+            at: at + 20,
+            closedBy: "desk",
+        });
+        assert.equal(passed.state, "closed");
+        unchanged(passed);
+
+        // A reopens; a clear removes the watch, and the sweep closes the thread as done: a replay of A stays closed.
+        const swept = closedDone();
+
+        setWatch(swept, first);
+        clearWatch(swept, "brian", "tap-1", at + 10);
+        assert.equal(closeCheck(swept, facts(at + 20)).close, true, "the sweep would close it");
+        swept.state = "closed";
+        swept.closed = { at: at + 20, why: "done", by: "sweep", outcome: closeOutcome(swept) };
+        unchanged(swept);
+        assert.equal(swept.state, "closed");
+    });
+
     test("clearWatch removes it once, and no watch is no change", () => {
         const fresh = watched();
 
@@ -14092,6 +14193,49 @@ describe("the desk in a Pi Pocket", () => {
         }
     });
 
+    test("desk watch on a thread that closed as done opens it again, and starts the sweeper", async () => {
+        const source = await supervisor("watch-reopen-sweeper");
+        let id = "";
+
+        await app.harness.commit(async (tx) => {
+            const state = await tx.doc(DeskThreads);
+            const opened = openThread(state, {
+                key: "x.test.watch-reopen-sweeper",
+                supervisor: Number(source),
+                agents: ["duncan"],
+                repo: "frostyard/test",
+                title: "A closed task to watch",
+                at: Date.now(),
+            });
+
+            id = opened.thread.id;
+            state.threads[id]!.state = "closed";
+            state.threads[id]!.closed = { at: Date.now(), why: "done", by: "sweep" };
+            delete state.sweepers?.[String(Number(source))];
+        }, context);
+
+        assert.equal(await sweepers(source), 0, "every thread of the supervisor is closed");
+        assert.equal((await deskState())?.sweepers?.[String(Number(source))], undefined);
+
+        try {
+            watchThreadId = id;
+            await say(app, source, "desk watch test");
+
+            const stored = (await deskState())?.threads[id];
+
+            assert.equal(stored?.state, "open");
+            assert.equal(asleep(stored!, Date.now()), true);
+            assert.equal(
+                typeof (await deskState())?.sweepers?.[String(Number(source))],
+                "string",
+                "the record of the sweeper",
+            );
+            assert.equal(await sweepers(source), 1, "the reopen started the sweeper");
+        } finally {
+            await quiet([]);
+        }
+    });
+
     test("an ask by another supervisor on a closed thread starts the sweeper of the thread's supervisor", async () => {
         const owner = await supervisor("ask-owner");
         const caller = await supervisor("ask-caller");
@@ -17227,6 +17371,48 @@ describe("the desk in a Pi Pocket", () => {
             assert.match(JSON.stringify(refused.data), /closed as dropped/);
             assert.equal((await deskState())?.threads[thread.id]?.state, "closed");
             assert.equal((await deskState())?.threads[thread.id]?.watch, undefined);
+        });
+
+        test("a page watch that reopens a closed thread starts its supervisor's sweeper", async () => {
+            const source = await supervisor("page-watch-sweeper");
+            let id = "";
+
+            await app.harness.commit(async (tx) => {
+                const state = await tx.doc(DeskThreads);
+                const opened = openThread(state, {
+                    key: "x.test.page-watch-sweeper",
+                    supervisor: Number(source),
+                    agents: ["duncan"],
+                    repo: "frostyard/test",
+                    title: "A closed task to watch on the page",
+                    at: Date.now(),
+                });
+
+                id = opened.thread.id;
+                state.threads[id]!.state = "closed";
+                state.threads[id]!.closed = { at: Date.now(), why: "done", by: "sweep" };
+                delete state.sweepers?.[String(Number(source))];
+            }, context);
+
+            assert.equal(await sweepers(source), 0, "every thread of the supervisor is closed");
+
+            try {
+                const watched = await call(`threads/${id}/watch`, {
+                    checkOn: daysFromToday(7),
+                    check: "the blob sweep",
+                });
+
+                assert.equal(watched.status, 200);
+                assert.equal((await deskState())?.threads[id]?.state, "open");
+                assert.equal(
+                    typeof (await deskState())?.sweepers?.[String(Number(source))],
+                    "string",
+                    "the record of the sweeper",
+                );
+                assert.equal(await sweepers(source), 1, "the reopen started the sweeper");
+            } finally {
+                await quiet([]);
+            }
         });
     });
 

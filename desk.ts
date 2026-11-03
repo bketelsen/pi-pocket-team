@@ -1941,6 +1941,13 @@ export function setWatch(
         return { changed: false };
     }
 
+    // A replay of a watch that a later watch replaced, a clear removed, or a close ended: its set event is still there,
+    // so it sets nothing and reopens nothing. A thread keeps its last 50 events (`KEPT_EVENTS`): a replay older than
+    // those is not seen.
+    if (thread.events.some((event) => event.key === `watch:set:${request.key}`)) {
+        return { changed: false };
+    }
+
     const closed = thread.state === "closed";
 
     if (closed) {
@@ -22962,7 +22969,7 @@ export default function createDesk(host: Host, web: Web) {
                 );
             }
 
-            return answer(request, (state, now) => {
+            return answer(request, async (state, now, tx) => {
                 const thread = threadById(state, id);
 
                 if (thread === undefined) {
@@ -22995,6 +23002,12 @@ export default function createDesk(host: Host, web: Web) {
 
                 if ("error" in set) {
                     throw web.error(400, set.error);
+                }
+
+                // The watch opened a closed thread again: its supervisor's sweeper may have ended with the last open
+                // thread, and only a sweep records the wake on the check date.
+                if (set.reopened === true && thread.supervisor !== undefined) {
+                    await startSweeper(tx, thread.supervisor);
                 }
             });
         },
@@ -24745,6 +24758,12 @@ export default function createDesk(host: Host, web: Web) {
 
                         if ("error" in set) {
                             return set;
+                        }
+
+                        // The watch opened a closed thread again: its supervisor's sweeper may have ended with the last
+                        // open thread, and only a sweep records the wake on the check date.
+                        if (set.reopened === true && thread.supervisor !== undefined) {
+                            await startSweeper(tx, thread.supervisor);
                         }
 
                         // The supervisor's watch is a decision about the thread's newest report: no escalation for it.
