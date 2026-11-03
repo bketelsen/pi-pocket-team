@@ -2782,6 +2782,25 @@ export default function setup(pocket) {
 
         const withWatch = (thread, actions) => html`${actions}${watchActions(thread)}`;
 
+        /**
+         * A thread closed as done in the last 7 days can take a watch: the desk opens it again, asleep, under Watching.
+         * Watch only: a closed thread has no watch to clear, pass, or fail. A plan thread has no watch.
+         */
+        const closedActions = (thread) =>
+            thread.closed?.why === "done" && thread.origin !== "plan"
+                ? html`<div class="desk-actions">
+                          <button
+                              class="button"
+                              disabled=${busy}
+                              aria-label=${`Watch ${thread.id}`}
+                              onClick=${() => setWatchFor(watchFor === thread.id ? null : thread.id)}
+                          >
+                              Watch
+                          </button>
+                      </div>
+                      ${watchField(thread)}`
+                : null;
+
         const needDetail = (thread) =>
             html`<div class="desk-need">
                 ${thread.asks.map(
@@ -3269,7 +3288,7 @@ export default function setup(pocket) {
                           ${
                               closedOpen
                                   ? html`<ul class="desk-rows">
-                                        ${groups.closed.map((thread) => row(thread, null))}
+                                        ${groups.closed.map((thread) => row(thread, closedActions(thread)))}
                                     </ul>`
                                   : null
                           }

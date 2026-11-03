@@ -367,7 +367,9 @@ export type Thread = {
      * sweep found a supervisor message that woke a done thread, and kept it closed: `at` is the sweep's time, `entry`
      * the session's newest user entry before that message; a report, folder work or a PR after the wake opens the thread
      * again, see `quietTrigger`), and `journaled` (when the thread's 1 journal entry went into the queue: a thread that
-     * reopens and closes again gets no second entry).
+     * reopens and closes again gets no second entry), and `watchKeys` (the replay key of every watch set on the thread, in
+     * order, never removed: a replayed `desk watch` with one of them changes nothing; absent for a thread from before
+     * the field).
      */
     run: Record<string, JsonValue>;
     /** The last 50; `key` makes an event unique. */
@@ -1897,14 +1899,46 @@ export type WatchRequest = {
     at: number;
 };
 
+/** The keys of every watch set on a thread (`run.watchKeys`): none for a thread from before the field. */
+function watchKeysOf(thread: Thread): string[] {
+    const keys = thread.run.watchKeys;
+
+    return Array.isArray(keys) ? keys.filter((key): key is string => typeof key === "string") : [];
+}
+
 /**
- * Put a watch on an open thread, or replace the one it has. A replay, with the same key, changes nothing, so a
- * replayed "7d" keeps the date it first resolved. The caller checks its own rules first when it must.
+ * Why a closed thread cannot take a watch: only a thread closed as done in the last 7 days can (`reopenable`).
+ * Undefined when it can.
+ */
+function closedWatchRefusal(thread: Thread, now: number): string | undefined {
+    if (reopenable(thread, now)) {
+        return undefined;
+    }
+
+    const rule = "only a thread closed as done in the last 7 days can take a watch.";
+    const why = thread.closed?.why;
+
+    if (why === "dropped" || why === "failed") {
+        return `Thread ${thread.id} closed as ${why}: ${rule}`;
+    }
+
+    if (why === "done") {
+        return `Thread ${thread.id} closed as done more than 7 days ago: ${rule}`;
+    }
+
+    return `Thread ${thread.id} is closed: ${rule}`;
+}
+
+/**
+ * Put a watch on an open thread, or replace the one it has. A thread closed as done in the last 7 days opens again
+ * for it, as the sweep's reopen does, and sleeps until the check: `reopened` says so. A replay, with the same key,
+ * changes nothing, so a replayed "7d" keeps the date it first resolved. The caller checks its own rules first when it
+ * must.
  */
 export function setWatch(
     thread: Thread,
     request: WatchRequest,
-): { error: string } | { changed: boolean } {
+): { error: string } | { changed: boolean; reopened?: true } {
     if (thread.origin === "plan") {
         return {
             error: `${thread.id} is a plan thread: a plan has no watch. It closes when it is verified or dropped.`,
@@ -1916,7 +1950,25 @@ export function setWatch(
         return { changed: false };
     }
 
-    if (thread.state !== "open" && thread.state !== "starting") {
+    // A replay of a watch that a later watch replaced, a clear removed, or a close ended: its key is in `run.watchKeys`,
+    // so it sets nothing and reopens nothing. A thread from before that field has only its set event, in the last 50
+    // events (`KEPT_EVENTS`).
+    if (
+        watchKeysOf(thread).includes(request.key) ||
+        thread.events.some((event) => event.key === `watch:set:${request.key}`)
+    ) {
+        return { changed: false };
+    }
+
+    const closed = thread.state === "closed";
+
+    if (closed) {
+        const refusal = closedWatchRefusal(thread, request.at);
+
+        if (refusal !== undefined) {
+            return { error: refusal };
+        }
+    } else if (thread.state !== "open" && thread.state !== "starting") {
         return {
             error: `Thread ${thread.id} is ${thread.state}: a watch is set on an open thread only.`,
         };
@@ -1934,7 +1986,23 @@ export function setWatch(
         return when;
     }
 
-    // A new watch replaces the old one: no wake, and no result, from the one it replaces.
+    // Every check passed: a closed done thread opens again, as the sweep's reopen and the attach reopen do.
+    if (closed) {
+        thread.state = "open";
+        delete thread.closed;
+        delete thread.run.quietReopen;
+        delete thread.run.quietWake;
+        addEvent(
+            thread,
+            `reopened:watch:${request.key}`,
+            `reopened: watch set by ${request.by}`,
+            request.at,
+        );
+    }
+
+    // A new watch replaces the old one: no wake, and no result, from the one it replaces. Its key stays in
+    // `run.watchKeys` for good, so a replay of it changes nothing, also after the events moved on.
+    thread.run.watchKeys = [...watchKeysOf(thread), request.key];
     thread.watch = {
         checkOn: when.checkOn,
         ...(when.checkTime === undefined ? {} : { checkTime: when.checkTime }),
@@ -1949,6 +2017,13 @@ export function setWatch(
         `watch: check on ${when.checkTime === undefined ? when.checkOn : `${when.checkOn} ${when.checkTime}`} by ${request.by}: ${check}`,
         request.at,
     );
+
+    if (closed) {
+        // The watch sleeps: the next actor is the one the sweep would give the reopened thread.
+        thread.run.next = nextActor(thread);
+
+        return { changed: true, reopened: true };
+    }
 
     return { changed: true };
 }
@@ -22908,7 +22983,7 @@ export default function createDesk(host: Host, web: Web) {
                 );
             }
 
-            return answer(request, (state, now) => {
+            return answer(request, async (state, now, tx) => {
                 const thread = threadById(state, id);
 
                 if (thread === undefined) {
@@ -22916,11 +22991,13 @@ export default function createDesk(host: Host, web: Web) {
                 }
 
                 // A double tap: the same date, time, and check change nothing, also just after the due instant. The
-                // syntax is read first, without the past check: only a new watch must be in the future.
+                // syntax is read first, without the past check: only a new watch must be in the future. A closed thread's
+                // watch is an old one that passed: the same date and check on it reopen the thread, as a new watch.
                 const when = parseCheckWhen(checkOn, now, true);
 
                 if (
                     !("error" in when) &&
+                    thread.state !== "closed" &&
                     thread.watch !== undefined &&
                     thread.watch.checkOn === when.checkOn &&
                     thread.watch.checkTime === when.checkTime &&
@@ -22939,6 +23016,12 @@ export default function createDesk(host: Host, web: Web) {
 
                 if ("error" in set) {
                     throw web.error(400, set.error);
+                }
+
+                // The watch opened a closed thread again: its supervisor's sweeper may have ended with the last open
+                // thread, and only a sweep records the wake on the check date.
+                if (set.reopened === true && thread.supervisor !== undefined) {
+                    await startSweeper(tx, thread.supervisor);
                 }
             });
         },
@@ -24206,7 +24289,7 @@ export default function createDesk(host: Host, web: Web) {
     const tool = defineTool({
         name: "desk",
         description:
-            "The desk of threads for work the team runs in the background. A supervisor session can use every action; a Clerk can use list, read, sync, attach, detach, watch, result, send, and issues for its supervisor's threads; an agent session can use read, watch, and result on its own thread only. Actions: list (one line per open thread), read (one thread in full), sync (observe the threads now, with linked sessions, Night shift, git, and GitHub), seed (import a seed.json file one time), attach (put a PR, a queued issue, or all of another thread's work, on one thread), detach (take a PR off a thread for good: the sweep does not attach or find it again; only attach brings it back), own (mark a found PR thread as Brian's own: it closes, and no sweep finds its PR again), ask (file a question for Brian on a thread, or on a new one; never for a plain merge: Ready to merge on the Desk page lists those), rewrite (give an open ask new words, and new options or none: an agent's ask is filed as it wrote it, so make it clear for Brian), withdraw (end an open ask that Brian need not answer, with words saying why, or with into to merge it into another open ask), answer (record Brian's words for an ask), watch (set a dated check on a thread: it sleeps until that date, and does not count toward the cap), result (record that check's pass, which closes the thread, or its fail, which opens it again: a pass is refused while the thread has an open ask), send (send 1 message from the supervisor's session to a thread's agent), issues (read the issues Brian queued on GitHub: read only).",
+            "The desk of threads for work the team runs in the background. A supervisor session can use every action; a Clerk can use list, read, sync, attach, detach, watch, result, send, and issues for its supervisor's threads; an agent session can use read, watch, and result on its own thread only. Actions: list (one line per open thread), read (one thread in full), sync (observe the threads now, with linked sessions, Night shift, git, and GitHub), seed (import a seed.json file one time), attach (put a PR, a queued issue, or all of another thread's work, on one thread), detach (take a PR off a thread for good: the sweep does not attach or find it again; only attach brings it back), own (mark a found PR thread as Brian's own: it closes, and no sweep finds its PR again), ask (file a question for Brian on a thread, or on a new one; never for a plain merge: Ready to merge on the Desk page lists those), rewrite (give an open ask new words, and new options or none: an agent's ask is filed as it wrote it, so make it clear for Brian), withdraw (end an open ask that Brian need not answer, with words saying why, or with into to merge it into another open ask), answer (record Brian's words for an ask), watch (set a dated check on a thread: it sleeps until that date, and does not count toward the cap; a thread closed as done in the last 7 days opens again for it, and sleeps), result (record that check's pass, which closes the thread, or its fail, which opens it again: a pass is refused while the thread has an open ask), send (send 1 message from the supervisor's session to a thread's agent), issues (read the issues Brian queued on GitHub: read only).",
         parameters: Type.Object({
             action: Type.Union([
                 Type.Literal("list"),
@@ -24691,6 +24774,12 @@ export default function createDesk(host: Host, web: Web) {
                             return set;
                         }
 
+                        // The watch opened a closed thread again: its supervisor's sweeper may have ended with the last
+                        // open thread, and only a sweep records the wake on the check date.
+                        if (set.reopened === true && thread.supervisor !== undefined) {
+                            await startSweeper(tx, thread.supervisor);
+                        }
+
                         // The supervisor's watch is a decision about the thread's newest report: no escalation for it.
                         if (set.changed && persona.role === "supervisor") {
                             markHandled(thread, { at, by: persona.name, act: "watch" });
@@ -24699,9 +24788,11 @@ export default function createDesk(host: Host, web: Web) {
                         const date = thread.watch === undefined ? "" : watchWhen(thread.watch);
 
                         return {
-                            text: set.changed
-                                ? `Watching ${thread.id}: check on ${date}. It does not count toward the cap until then.`
-                                : `${thread.id} is watched already: check on ${date}. Nothing changed.`,
+                            text: !set.changed
+                                ? `${thread.id} is watched already: check on ${date}. Nothing changed.`
+                                : set.reopened === true
+                                  ? `Watching ${thread.id}: check on ${date}. ${thread.id} closed as done; it is open again, asleep, and does not count toward the cap until then.`
+                                  : `Watching ${thread.id}: check on ${date}. It does not count toward the cap until then.`,
                         };
                     }
 
