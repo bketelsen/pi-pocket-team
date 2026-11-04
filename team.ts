@@ -1833,6 +1833,14 @@ export default function createTeam(host: Host, web: Web) {
          * skip the call.
          */
         route?: (tx: Tx, key: string, route: ThreadRoute) => Promise<void>;
+        /**
+         * Record a delegation that `open` refused because the desk is full (its error has `deskFull: true`), in a commit
+         * of its own after the throw. A replay of the same key adds nothing. An older desk has none: skip the call.
+         */
+        refused?: (
+            tx: Tx,
+            request: { key: string; supervisor: number; title: string; at: number },
+        ) => Promise<void>;
         file: (
             tx: Tx,
             session: ConversationId,
@@ -3129,6 +3137,30 @@ export default function createTeam(host: Host, web: Web) {
                               context,
                           );
             } catch (error) {
+                // A full desk: the refusal rolled back with the open's commit, so a commit of its own records it, and
+                // the Desk page offers "Allow 1" while it waits. A failure here is swallowed: the model must see the
+                // refusal. An older desk has no `refused`: skip it.
+                if (
+                    desk?.refused !== undefined &&
+                    (error as { deskFull?: unknown } | undefined)?.deskFull === true
+                ) {
+                    try {
+                        await api.commit(
+                            async (tx) =>
+                                desk.refused?.(tx, {
+                                    key,
+                                    supervisor: Number(api.conversationId),
+                                    title,
+                                    at: Date.now(),
+                                }),
+                            context,
+                        );
+                        desk.changed?.();
+                    } catch {
+                        // The refusal is what the model must see.
+                    }
+                }
+
                 // The thread never opened. A desk thread may still hold the folder (a starting one, an older one): it
                 // keeps its worktree then. Only when the desk says no, the worktree of this key goes, made or found.
                 if (!(await deskHolds(where))) {

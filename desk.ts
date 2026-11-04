@@ -414,6 +414,33 @@ export type Grant = {
     expires: number;
 };
 
+/**
+ * One delegation the cap refused: `team_delegate` met a full desk and no usable OK. The page offers "Allow 1" only
+ * while one waits. Stored data: never rename a field.
+ */
+export type Refusal = {
+    /** The latest refusal of this work. */
+    at: number;
+    /** The supervisor's conversation id. */
+    supervisor: number;
+    title: string;
+    /** The delegation key of the latest refusal: a replay of it adds nothing. */
+    key: string;
+    /**
+     * The earlier delegation keys of the same work (the same supervisor and title), oldest first: a replay of one adds
+     * nothing either, and a thread that opens with one ends the wait. Absent until a second refusal merges in.
+     */
+    keys?: string[];
+    /** When an OK served it: 1 OK serves 1 refusal, the oldest first. */
+    served?: number;
+    /** The key of the OK that served it. */
+    servedBy?: string;
+    /** When the desk dropped below the cap while it waited: the work can be delegated without an OK. */
+    cleared?: number;
+    /** When a thread opened with its key. */
+    opened?: number;
+};
+
 /** One kind of desk news for the digest. Stored data: never rename a kind. */
 export type DigestKind =
     | "report"
@@ -564,6 +591,8 @@ export type DeskState = {
     seen: Record<string, number>;
     /** Each supervisor's newest `pi.user` entry looked at for "desk ok", by conversation id. */
     grantCursor?: Record<string, number>;
+    /** The delegations the cap refused, oldest first, at most `REFUSALS_MAX`. Absent until the first refusal. */
+    refusals?: Refusal[];
     /** Each supervisor's live sweeper task id, by conversation id. */
     sweepers?: Record<string, string>;
     /** When the desk began: a PR older than this enters only through the seed. Set at the seed, else at the first sweep. */
@@ -8742,7 +8771,83 @@ export type CapView = {
     full: boolean;
     /** The usable OKs: not used, not lapsed, and not expired. */
     grants: Grant[];
+    /** How many refused delegations wait for an OK: 0 when the desk is not full. */
+    waiting: number;
 };
+
+/** The most refusals the desk keeps. */
+const REFUSALS_MAX = 50;
+
+/** Whether a refusal still waits for an OK: not served, not cleared, not opened, and not older than 24 hours. */
+function refusalWaits(refusal: Readonly<Refusal>, now: number): boolean {
+    return (
+        refusal.served === undefined &&
+        refusal.cleared === undefined &&
+        refusal.opened === undefined &&
+        now - refusal.at < GRANT_MS
+    );
+}
+
+/** Whether a refusal holds a delegation key: its latest key, or an earlier one of the same work. */
+function refusalHasKey(refusal: Readonly<Refusal>, key: string): boolean {
+    return refusal.key === key || (refusal.keys ?? []).includes(key);
+}
+
+/** The refusals that wait for an OK, oldest first. */
+export function waitingRefusals(state: Readonly<DeskState> | undefined, now: number): Refusal[] {
+    return (state?.refusals ?? [])
+        .filter((refusal) => refusalWaits(refusal, now))
+        .sort((a, b) => a.at - b.at || a.key.localeCompare(b.key));
+}
+
+/**
+ * Record a delegation the cap refused, once per key: a replay of the same key adds nothing. A refusal of the same
+ * supervisor and title that still waits is the same work: it moves to this key and time, and no second one waits.
+ * A desk that is not full, or a key that has a thread, records nothing. Returns whether it changed the state.
+ */
+export function recordRefusal(
+    state: DeskState,
+    cap: number,
+    request: { key: string; supervisor: number; title: string; at: number },
+): boolean {
+    if (
+        (state.refusals ?? []).some((refusal) => refusalHasKey(refusal, request.key)) ||
+        findThread(state, request.key) !== undefined ||
+        !capView(state, cap, request.at).full
+    ) {
+        return false;
+    }
+
+    const title = oneLine(request.title);
+    const same = (state.refusals ?? []).find(
+        (refusal) =>
+            refusal.supervisor === request.supervisor &&
+            refusal.title === title &&
+            refusalWaits(refusal, request.at),
+    );
+
+    if (same !== undefined) {
+        // The earlier key stays: a replay of it must not add a new refusal after this one is served.
+        same.keys = [...(same.keys ?? []), same.key];
+        same.at = request.at;
+        same.key = request.key;
+
+        return true;
+    }
+
+    const refusals = (state.refusals ??= []);
+
+    refusals.push({ at: request.at, supervisor: request.supervisor, title, key: request.key });
+
+    // The oldest go first: a refusal that no longer waits goes before one that waits.
+    while (refusals.length > REFUSALS_MAX) {
+        const done = refusals.findIndex((refusal) => !refusalWaits(refusal, request.at));
+
+        refusals.splice(done === -1 ? 0 : done, 1);
+    }
+
+    return true;
+}
 
 /** The cap's view: how many threads count, and which OKs are usable now. */
 export function capView(state: Readonly<DeskState> | undefined, cap: number, now: number): CapView {
@@ -8752,17 +8857,29 @@ export function capView(state: Readonly<DeskState> | undefined, cap: number, now
     const grants = (state?.grants ?? []).filter(
         (grant) => grant.usedBy === undefined && grant.lapsed === undefined && grant.expires > now,
     );
+    const full = counted >= cap;
 
-    return { counted, cap, full: counted >= cap, grants };
+    return {
+        counted,
+        cap,
+        full,
+        grants,
+        waiting: full ? waitingRefusals(state, now).length : 0,
+    };
 }
 
 /**
  * Lapse the OKs that no longer fit: an OK is for a full desk. When the desk drops below the cap, an unused OK lapses,
- * so OKs never pile up silently. Returns how many it lapsed.
+ * so OKs never pile up silently, and a refused delegation that waits clears: it can be delegated without an OK.
+ * Returns how many OKs it lapsed.
  */
 export function lapseGrants(state: DeskState, cap: number, now: number): number {
     if (capView(state, cap, now).full) {
         return 0;
+    }
+
+    for (const refusal of waitingRefusals(state, now)) {
+        refusal.cleared = now;
     }
 
     let lapsed = 0;
@@ -8823,13 +8940,23 @@ export function personAndBody(content: unknown): { person?: string; body: string
     return { person: AUTOMATED.test(body) ? undefined : (from?.[1] ?? "A person"), body };
 }
 
-/** Add an OK once per key: a scan of the same entry adds nothing. */
-function addGrant(state: DeskState, grant: Grant): boolean {
+/**
+ * Add an OK once per key: a scan of the same entry adds nothing. A new OK serves the oldest refused delegation that
+ * waits: 1 OK serves 1 refusal.
+ */
+export function addGrant(state: DeskState, grant: Grant): boolean {
     if (state.grants.some((each) => each.key === grant.key)) {
         return false;
     }
 
     state.grants.push(grant);
+
+    const oldest = waitingRefusals(state, grant.at)[0];
+
+    if (oldest !== undefined) {
+        oldest.served = grant.at;
+        oldest.servedBy = grant.key;
+    }
 
     return true;
 }
@@ -10474,7 +10601,7 @@ export type ThreadsView = {
     /** The issues Brian queued, from the last queue read; null before any read. */
     issues: IssuesView | null;
     /** The cap: how many threads count, and how many OKs wait. */
-    cap: { counted: number; cap: number; full: boolean; grants: number };
+    cap: { counted: number; cap: number; full: boolean; grants: number; waiting: number };
     /** The PRs with the label `ready-for-human`: Brian merges them from this page. */
     ready: ReadyPr[];
     /** The open plans, oldest first: the page's Plans section. */
@@ -10617,6 +10744,7 @@ export function threadsView(
                 cap: view.cap,
                 full: view.full,
                 grants: view.grants.length,
+                waiting: view.waiting,
             };
         })(),
         counts,
@@ -17035,6 +17163,15 @@ export type DeskApi = {
     fail: (tx: Tx, key: string, why: string, at: number) => Promise<void>;
     /** Record the model router's suggestion, once: a replay changes nothing. */
     route: (tx: Tx, key: string, route: ThreadRoute) => Promise<void>;
+    /**
+     * Record a delegation that `open` refused because the desk is full (its error has `deskFull: true`). `open`
+     * rolls back with its commit, so the caller records the refusal in a commit of its own after the throw. A replay
+     * of the same key adds nothing. Optional: an older desk has none, and a caller then skips the call.
+     */
+    refused?: (
+        tx: Tx,
+        request: { key: string; supervisor: number; title: string; at: number },
+    ) => Promise<void>;
     file: (
         tx: Tx,
         session: ConversationId,
@@ -18141,10 +18278,20 @@ export default function createDesk(host: Host, web: Web) {
                 )[0];
 
                 if (grant === undefined) {
-                    throw new Error(deskFullText(state, view, request.at));
+                    // The mark lets team record the refusal in a commit of its own: this commit rolls back.
+                    throw Object.assign(new Error(deskFullText(state, view, request.at)), {
+                        deskFull: true,
+                    });
                 }
 
                 grant.usedBy = request.key;
+            }
+
+            // A refusal of this key does not wait any more: its thread opens now.
+            for (const refusal of state.refusals ?? []) {
+                if (refusalHasKey(refusal, request.key) && refusal.opened === undefined) {
+                    refusal.opened = request.at;
+                }
             }
 
             const opened = openThread(state, request);
@@ -18201,6 +18348,11 @@ export default function createDesk(host: Host, web: Web) {
         },
         route: async (tx, key, route) => {
             routeThread(await tx.doc(DeskThreads), key, route);
+        },
+        refused: async (tx, request) => {
+            const { cap } = await deskConfig();
+
+            recordRefusal(await tx.doc(DeskThreads), cap, request);
         },
         fail: async (tx, key, why, at) => {
             const state = await tx.doc(DeskThreads);
@@ -24004,25 +24156,38 @@ export default function createDesk(host: Host, web: Web) {
                     );
                 }
 
+                const tapKeys: string[] = [];
+
                 for (let index = 1; index <= count; index += 1) {
+                    const key = `tap:${String(now)}:${String(index)}`;
+
+                    tapKeys.push(key);
                     addGrant(state, {
                         at: now,
                         by: request.user.name,
                         via: "tap",
-                        key: `tap:${String(now)}:${String(index)}`,
+                        key,
                         expires: now + GRANT_MS,
                     });
                 }
 
                 // The tap wakes each supervisor with counted threads at once: never through the digest, because an OK
-                // is only useful while the desk is full. The request id makes a rerun after a restart act once.
+                // is only useful while the desk is full. The supervisor of each refusal this tap served is woken too:
+                // its delegation waited, and it may have no counted thread. The request id makes a rerun act once.
                 const supervisors = [
-                    ...new Set(
-                        Object.values(state.threads)
+                    ...new Set([
+                        ...Object.values(state.threads)
                             .filter((thread) => isCounted(thread, now))
                             .map((thread) => thread.supervisor)
                             .filter((supervisor): supervisor is number => supervisor !== undefined),
-                    ),
+                        ...(state.refusals ?? [])
+                            .filter(
+                                (refusal) =>
+                                    refusal.servedBy !== undefined &&
+                                    tapKeys.includes(refusal.servedBy),
+                            )
+                            .map((refusal) => refusal.supervisor),
+                    ]),
                 ].sort((a, b) => a - b);
                 const text = grantText(request.user.name, count, before);
 
@@ -24910,7 +25075,7 @@ export default function createDesk(host: Host, web: Web) {
                 const snapshot = await api.snapshot(DeskThreads, context);
                 const view = capView(snapshot, cap, Date.now());
                 const waiting = view.grants.length;
-                const first = `Counted: ${String(view.counted)} of ${String(view.cap)}${waiting === 0 ? "" : ` (${String(waiting)} extra allowed)`}`;
+                const first = `Counted: ${String(view.counted)} of ${String(view.cap)}${waiting === 0 ? "" : ` (${String(waiting)} extra allowed)`}${view.waiting === 0 ? "" : ` (${view.waiting === 1 ? "1 delegation waits" : `${String(view.waiting)} delegations wait`})`}`;
 
                 const queued = issuesSummary(snapshot);
 

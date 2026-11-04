@@ -104,7 +104,7 @@ const viewWith = (issues) => ({
     seen: 0,
     others: {},
     github: null,
-    cap: { counted: 0, cap: 12, full: false, grants: 0 },
+    cap: { counted: 0, cap: 12, full: false, grants: 0, waiting: 0 },
     counts: {},
     issues,
 });
@@ -341,18 +341,52 @@ test("no other PR: no count and no section", async () => {
     assert.doesNotMatch(out, /desk-others/);
 });
 
-test("a full desk says Allow 1 tells Odrade, and how many extra OKs wait", async () => {
+test("a full desk with a refused delegation says Allow 1 tells Odrade, and how many extra OKs wait", async () => {
     const out = await render({
         ...viewWith(null),
-        cap: { counted: 13, cap: 12, full: true, grants: 2 },
+        cap: { counted: 13, cap: 12, full: true, grants: 2, waiting: 1 },
     });
 
     assert.match(
         out,
-        /The desk is full: 13 of 12 count\. Allow 1 lets Odrade open 1 more thread, and tells her to delegate the work that waited\./,
+        /The desk is full: 13 of 12 count\. 1 delegation waits\. Allow 1 lets Odrade open 1 more thread, and tells her to delegate the work that waited\./,
     );
     assert.match(out, /2 extra allowed/);
     assert.match(out, /> Allow 1 /);
+    assert.doesNotMatch(out, /nothing waits/);
+});
+
+test("a full desk with 2 refused delegations says 2 wait", async () => {
+    const out = await render({
+        ...viewWith(null),
+        cap: { counted: 12, cap: 12, full: true, grants: 0, waiting: 2 },
+    });
+
+    assert.match(out, /The desk is full: 12 of 12 count\. 2 delegations wait\./);
+    assert.match(out, /> Allow 1 /);
+    assert.doesNotMatch(out, /extra allowed/);
+});
+
+test("a full desk where nothing waits shows a quiet line and no Allow 1", async () => {
+    const out = await render({
+        ...viewWith(null),
+        cap: { counted: 12, cap: 12, full: true, grants: 0, waiting: 0 },
+    });
+
+    assert.match(out, /12 of 12 count; nothing waits/);
+    assert.doesNotMatch(out, /Allow 1/);
+    assert.doesNotMatch(out, /The desk is full/);
+    assert.doesNotMatch(out, /class="desk-full"/);
+});
+
+test("a full desk from an older server, with no waiting count, shows no Allow 1", async () => {
+    const out = await render({
+        ...viewWith(null),
+        cap: { counted: 13, cap: 12, full: true, grants: 1 },
+    });
+
+    assert.match(out, /13 of 12 count; nothing waits · 1 extra allowed/);
+    assert.doesNotMatch(out, /Allow 1/);
 });
 
 test("a desk with room shows no banner", async () => {
