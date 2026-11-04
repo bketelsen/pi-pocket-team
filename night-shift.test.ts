@@ -32,9 +32,8 @@ import {
     parseArgs,
     parseVerdict,
     personOf,
-    repeatedFailure,
+    nextFailures,
     roundMessage,
-    type RoundRecord,
     standing,
     statusCard,
     SUBAGENT_WAIT_MS,
@@ -969,46 +968,18 @@ describe("workers", () => {
 });
 
 describe("check command and status together", () => {
-    test("check fingerprints and repeated failures follow the 3-failure rule", () => {
+    test("check fingerprints and failure streaks follow the 3-failure rule", () => {
         const failed = (tail: string, code = 1, cutOff?: true): CheckResult => ({
             passed: false,
             code,
             tail,
             cutOff,
         });
-        const round = (n: number, check?: CheckResult): RoundRecord => ({
-            n,
-            verdict: "done",
-            reason: "check",
-            at: 0,
-            check,
-        });
 
         assert.equal(checkFingerprint(failed("same failure")), "exit 1: same failure");
         assert.equal(checkFingerprint(undefined), undefined);
         assert.equal(checkFingerprint({ passed: true, code: 0, tail: "ok" }), undefined);
         assert.equal(checkFingerprint(failed("cut off", -1, true)), undefined);
-
-        assert.equal(
-            repeatedFailure([
-                round(1, failed("same failure")),
-                round(2, failed("same failure")),
-                round(3, failed("same failure")),
-            ]),
-            "exit 1: same failure",
-        );
-        assert.equal(
-            repeatedFailure([round(1, failed("same failure")), round(2, failed("same failure"))]),
-            undefined,
-        );
-        assert.equal(
-            repeatedFailure([
-                round(1, failed("failure a")),
-                round(2, failed("failure b")),
-                round(3, failed("failure c")),
-            ]),
-            undefined,
-        );
 
         const first = failed("2026-11-04T12:34:56Z build 350ms 12:34 abc1234 42");
         const second = failed("2026-11-05T09:10:11Z build 2.5s 09:10 def5678 99");
@@ -1019,35 +990,37 @@ describe("check command and status together", () => {
             "exit 1: error in auth",
             "a word after a clock time stays",
         );
-        assert.equal(
-            repeatedFailure([round(1, first), round(2, second), round(3, first)]),
-            checkFingerprint(first),
+        assert.notEqual(
+            checkFingerprint(failed("error defaced")),
+            checkFingerprint(failed("error facade1")),
         );
+        assert.equal(checkFingerprint(failed("abc1234")), checkFingerprint(failed("def5678")));
 
+        let streak = nextFailures(undefined, failed("same failure"), 1);
+
+        assert.deepEqual(streak, {
+            fingerprint: "exit 1: same failure",
+            count: 1,
+            round: 1,
+        });
+        streak = nextFailures(streak, failed("same failure"), 20);
+        streak = nextFailures(streak, failed("same failure"), 40);
+
+        assert.deepEqual(streak, {
+            fingerprint: "exit 1: same failure",
+            count: 3,
+            round: 40,
+        });
+        assert.deepEqual(nextFailures(streak, failed("different failure"), 41), {
+            fingerprint: "exit 1: different failure",
+            count: 1,
+            round: 41,
+        });
+        assert.equal(nextFailures(streak, failed("same failure"), 40), streak);
+        assert.equal(nextFailures(streak, failed("cut off", -1, true), 42), streak);
+        assert.equal(nextFailures(streak, { passed: true, code: 0, tail: "ok" }, 42), undefined);
         assert.equal(
-            repeatedFailure([
-                round(1, failed("same failure")),
-                round(2, failed("same failure", -1, true)),
-                round(3, failed("same failure")),
-                round(4, failed("same failure")),
-            ]),
-            "exit 1: same failure",
-        );
-        assert.equal(
-            repeatedFailure([
-                round(1, failed("same failure")),
-                round(2, undefined),
-                round(3, failed("same failure")),
-                round(4, failed("same failure")),
-            ]),
-            "exit 1: same failure",
-        );
-        assert.equal(
-            repeatedFailure([
-                round(1, failed("same failure")),
-                round(2, failed("same failure")),
-                round(3, { passed: true, code: 0, tail: "ok" }),
-            ]),
+            nextFailures(streak, failed("build\tpending\t1m\thttps://example.test/build"), 42),
             undefined,
         );
     });

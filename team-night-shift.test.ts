@@ -459,8 +459,8 @@ describe("checkFingerprint with gh pr checks rows", () => {
             "test\tfail\t2.5s\thttps://example.test/test/999\ttest failed\nbuild\tfail\t3m\thttps://example.test/build/888\tfailed",
         );
 
-        assert.equal(checkFingerprint(first), "checks failed: build, test");
-        assert.equal(checkFingerprint(second), "checks failed: build, test");
+        assert.equal(checkFingerprint(first), 'checks failed: ["build","test"]');
+        assert.equal(checkFingerprint(second), 'checks failed: ["build","test"]');
         assert.equal(checkFingerprint(first), checkFingerprint(second));
     });
 
@@ -471,12 +471,35 @@ describe("checkFingerprint with gh pr checks rows", () => {
         assert.notEqual(checkFingerprint(first), checkFingerprint(second));
     });
 
+    test("a label check failure after passing rows has a normalized fingerprint", () => {
+        const first = failed(
+            `build\tpass\t1m2s\thttps://example.test/build/123\tbuild passed\n${PR_CHECK_REQUIRED_PASS}\nlabel ready-for-human is missing`,
+        );
+        const second = failed(
+            `build\tpass\t2.5s\thttps://example.test/build/999\tbuild passed\n${PR_CHECK_REQUIRED_PASS}\nlabel ready-for-human is missing`,
+        );
+
+        assert.equal(checkFingerprint(first), checkFingerprint(second));
+        assert.notEqual(checkFingerprint(first), undefined);
+    });
+
+    test("check names cannot collide through the join format", () => {
+        assert.notEqual(
+            checkFingerprint(failed("lint, test\tfail\t1m\thttps://example.test/a\tfailed")),
+            checkFingerprint(
+                failed(
+                    "lint\tfail\t1m\thttps://example.test/a\tfailed\ntest\tfail\t1m\thttps://example.test/b\tfailed",
+                ),
+            ),
+        );
+    });
+
     test("pending rows are not failures", () => {
         assert.equal(
             checkFingerprint(failed("build\tpending\t1m\thttps://example.test/build\twaiting")),
             undefined,
         );
-        assert.equal(
+        assert.notEqual(
             checkFingerprint(failed("build\tskipping\t1m\thttps://example.test/build\tskipped")),
             undefined,
         );

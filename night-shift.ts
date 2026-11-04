@@ -125,14 +125,23 @@ export function checkFingerprint(check: CheckResult | undefined): string | undef
         });
 
     if (ghRows.length > 0) {
-        const names = new Set(
-            ghRows
-                .filter((parts) => ["fail", "cancel"].includes(parts[1]?.trim()))
-                .map((parts) => parts[0]?.trim())
-                .filter((name): name is string => name !== undefined && name !== ""),
-        );
+        const failed = ghRows.filter((parts) => ["fail", "cancel"].includes(parts[1]?.trim()));
 
-        return names.size === 0 ? undefined : `checks failed: ${[...names].sort().join(", ")}`;
+        if (failed.length > 0) {
+            const names = new Set(
+                failed
+                    .map((parts) => parts[0]?.trim())
+                    .filter((name): name is string => name !== undefined && name !== ""),
+            );
+
+            return names.size === 0
+                ? undefined
+                : `checks failed: ${JSON.stringify([...names].sort())}`;
+        }
+
+        if (ghRows.some((parts) => parts[1]?.trim() === "pending")) {
+            return undefined;
+        }
     }
 
     // Simple normalization: remove timestamps and times, durations, hex ids, and other digit runs.
@@ -146,7 +155,7 @@ export function checkFingerprint(check: CheckResult | undefined): string | undef
                 )
                 .replace(/\b(?:[01]?\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:\.\d+)?)?\b/g, "")
                 .replace(/\b(?:\d+(?:\.\d+)?(?:ms|h|m|s))+\b/gi, "#")
-                .replace(/\b[0-9a-f]{7,}\b/gi, "#")
+                .replace(/\b(?=(?:[a-f]*\d){2})[0-9a-f]{7,}\b/gi, "#")
                 .replace(/\d+/g, "#")
                 .replace(/\s+/g, " ")
                 .trim(),
@@ -157,40 +166,37 @@ export function checkFingerprint(check: CheckResult | undefined): string | undef
     return `exit ${check.code}: ${lines.join(" / ")}`;
 }
 
-/** The newest same failure repeated `times` times, ignoring rounds without checks and cut-off checks. */
-export function repeatedFailure(
-    rounds: readonly RoundRecord[],
-    times = SAME_FAILURES,
-): string | undefined {
-    if (!Number.isSafeInteger(times) || times < 1) {
+export type FailureStreak = { fingerprint: string; count: number; round: number };
+
+/** Update a goal's streak without changing it for a replay or a cut-off check. */
+export function nextFailures(
+    previous: FailureStreak | undefined,
+    check: CheckResult,
+    n: number,
+): FailureStreak | undefined {
+    if (check.cutOff) {
+        return previous;
+    }
+
+    if (check.passed) {
         return undefined;
     }
 
-    const fingerprints: string[] = [];
+    const fingerprint = checkFingerprint(check);
 
-    for (let index = rounds.length - 1; index >= 0; index -= 1) {
-        const check = rounds[index]?.check;
-
-        if (check === undefined || check.cutOff) {
-            continue;
-        }
-
-        const fingerprint = checkFingerprint(check);
-
-        if (fingerprint === undefined) {
-            return undefined;
-        }
-
-        fingerprints.push(fingerprint);
-
-        if (fingerprints.length === times) {
-            return fingerprints.every((each) => each === fingerprints[0])
-                ? fingerprints[0]
-                : undefined;
-        }
+    if (fingerprint === undefined) {
+        return undefined;
     }
 
-    return undefined;
+    if (previous?.round === n) {
+        return previous;
+    }
+
+    if (previous?.fingerprint === fingerprint) {
+        return { fingerprint, count: previous.count + 1, round: n };
+    }
+
+    return { fingerprint, count: 1, round: n };
 }
 
 export type Goal = {
@@ -224,6 +230,11 @@ export type Goal = {
     /** The newest entry looked at for people's messages. */
     seen: number;
     rounds: RoundRecord[];
+    /**
+     * The run of the same failed check (`nextFailures`), kept here because `rounds` keeps only the newest 30. Added
+     * later: an older goal has none, and starts a new run. Absent: no run.
+     */
+    failures?: FailureStreak;
     /** The task that drives the goal now; another task that finds this changed stops. */
     driver?: string;
     endedAt?: number;
@@ -2068,12 +2079,18 @@ export default function createNightShift(host: Host, web: Web) {
                         round.check = check;
                     }
 
-                    if (!check.passed) {
-                        const fingerprint = repeatedFailure(goal.rounds);
+                    const failures = nextFailures(goal.failures, check, n);
 
-                        if (fingerprint !== undefined) {
+                    if (failures === undefined) {
+                        delete goal.failures;
+                    } else {
+                        goal.failures = failures;
+                    }
+
+                    if (!check.passed) {
+                        if (goal.failures !== undefined && goal.failures.count >= SAME_FAILURES) {
                             const detail =
-                                `the same check failure came ${SAME_FAILURES} times in a row: ${fingerprint}`.slice(
+                                `the same check failure came ${SAME_FAILURES} times in a row: ${goal.failures.fingerprint}`.slice(
                                     0,
                                     300,
                                 );
