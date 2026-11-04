@@ -68,7 +68,10 @@ export function selectPairs(pairs) {
 
 const metricsKey = (check) => check.replace("?", "");
 
-/** The metrics of a check as the model sees them: Q1's day record (a long PR list) is left out. */
+/**
+ * The metrics of a check as the model sees them: Q1's day record (a long PR list), its review-round thread list and
+ * its stop list are left out.
+ */
 const metricsOf = (metrics, key) => {
     const value = metrics[key];
 
@@ -77,6 +80,18 @@ const metricsOf = (metrics, key) => {
     }
 
     const { day: _day, ...rest } = value;
+
+    if (rest.rounds && typeof rest.rounds === "object") {
+        const { threads: _threads, ...rounds } = rest.rounds;
+
+        rest.rounds = rounds;
+    }
+
+    if (rest.stops && typeof rest.stops === "object") {
+        const { goals: _goals, ...stops } = rest.stops;
+
+        rest.stops = stops;
+    }
 
     return rest;
 };

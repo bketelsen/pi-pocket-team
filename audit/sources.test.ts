@@ -8,9 +8,9 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { isCrossReviewSpawn } from "./checks.mjs";
-import { HOUR } from "./common.mjs";
+import { DAY, HOUR } from "./common.mjs";
 import { NOW } from "./fixtures/builders.mjs";
-import { SESSION_T1, SUPERVISOR, createFixtureDb } from "./fixtures/pocket-db.mjs";
+import { SESSION_T1, SESSION_T2, SUPERVISOR, createFixtureDb } from "./fixtures/pocket-db.mjs";
 import {
     GH_CAP,
     checkGhArgs,
@@ -20,10 +20,13 @@ import {
     loadDesk,
     loadDecided,
     loadGithub,
+    loadGoalStops,
+    loadReviewCalls,
     Q1_MAX_CALLS,
     makeGh,
     makeGit,
     openPocket,
+    readFlakyScan,
     readHomes,
     readOdrade,
 } from "./sources.mjs";
@@ -1302,4 +1305,321 @@ test("loadDecided: a partial or doubtful answer is never complete", () => {
         assert.match(result.reason!, reason, name);
         assert.equal(result.calls, 1, name);
     }
+});
+
+// ---------- Q1: review calls, goal stops and the flaky scan ----------
+
+/** Add rows to the fixture database of `setup` (the test's own copy). */
+function addRows(pocketDir: string, fill: (db: DatabaseSync) => void) {
+    const db = new DatabaseSync(path.join(pocketDir, "pocket.sqlite"));
+
+    fill(db);
+    db.close();
+}
+
+const insertEntry = (
+    db: DatabaseSync,
+    id: number,
+    conversation: number,
+    at: number,
+    content: object[],
+) =>
+    db
+        .prepare(
+            "insert into entries (id, conversation_id, head, commit_seq, record) values (?,?,?,?,?)",
+        )
+        .run(
+            id,
+            conversation,
+            null,
+            id,
+            JSON.stringify({
+                kind: "pi.assistant",
+                model: [{ role: "assistant", content, timestamp: at }],
+            }),
+        );
+
+const STOP_WHY = "Pi is blocked: the same check failure came 3 times in a row: FAIL token=abc";
+
+test("loadReviewCalls gives spawn and send rows, and skips other actions and rows older than since", () => {
+    const { pocketDir } = setup();
+
+    addRows(pocketDir, (db) => {
+        insertEntry(db, 100, SUPERVISOR, NOW - 30 * 60_000, [
+            {
+                type: "toolCall",
+                id: "c9",
+                name: "subagent",
+                arguments: { action: "send", name: "audit", message: "Look again" },
+            },
+            {
+                type: "toolCall",
+                id: "c10",
+                name: "subagent",
+                arguments: { action: "list" },
+            },
+        ]);
+    });
+
+    const db = openPocket(path.join(pocketDir, "pocket.sqlite"));
+    const all = loadReviewCalls(db, NOW - 30 * DAY);
+    const recent = loadReviewCalls(db, NOW - 10 * DAY);
+
+    db.close();
+
+    assert.deepEqual(
+        all.map((call: { c: number; action: string; name: string }) => [
+            call.c,
+            call.action,
+            call.name,
+        ]),
+        [
+            [SUPERVISOR, "spawn", "w"],
+            [SUPERVISOR, "spawn", "audit"],
+            [SESSION_T1, "spawn", "old"],
+            [SUPERVISOR, "send", "audit"],
+        ],
+    );
+    // A spawn row is a spawn as `spawnRows` makes it: the reviewer is a cross-review.
+    assert.equal(isCrossReviewSpawn(all[1]), true);
+    assert.equal(all[1].brief.length, 300);
+    assert.equal(all[1].model, "other/model");
+    // A send row keeps no message text.
+    assert.deepEqual(all[3], {
+        id: 100,
+        c: SUPERVISOR,
+        at: NOW - 30 * 60_000,
+        action: "send",
+        name: "audit",
+    });
+    // The 20-day-old spawn is older than 10 days.
+    assert.deepEqual(
+        recent.map((call: { name: string }) => call.name),
+        ["w", "audit", "audit"],
+    );
+});
+
+test("loadGoalStops finds a 3-failure stop that a later goal wrote over, in a retired document too", () => {
+    const { pocketDir } = setup();
+    const endedAt = NOW - 2 * DAY;
+
+    addRows(pocketDir, (db) => {
+        db.prepare(
+            "insert into documents (id, kind, family, key_value, scope_kind, owner_id, created_at, retired_at, record) values (?,?,?,?,?,?,?,?,?)",
+        ).run(
+            6,
+            JSON.stringify("x.night-shift.goal"),
+            0,
+            "",
+            "conversation",
+            SESSION_T2,
+            1,
+            NOW - DAY,
+            "{}",
+        );
+
+        let seq = 100;
+        const revision = (kind: string, value: unknown) =>
+            db
+                .prepare(
+                    "insert into document_revisions (document_id, seq, kind, version, content) values (?,?,?,?,?)",
+                )
+                .run(6, (seq += 1), kind, 1, JSON.stringify(value));
+
+        revision("base", {
+            goal: { id: "g2", status: "running", setAt: NOW - 3 * DAY, rounds: [] },
+        });
+        revision("delta", [
+            ["s", ["goal", "rounds"], [{ n: 1, verdict: "continue", at: NOW - 3 * DAY + 60_000 }]],
+        ]);
+        revision("delta", [
+            ["s", ["goal", "status"], "ended"],
+            ["s", ["goal", "reason"], "blocked"],
+            ["s", ["goal", "why"], STOP_WHY],
+            ["s", ["goal", "failures"], { count: 3, fingerprint: "FAIL token=abc" }],
+            ["s", ["goal", "endedAt"], endedAt],
+        ]);
+        // A new goal writes over g2.
+        revision("delta", [
+            ["s", ["goal"], { id: "g3", status: "running", setAt: NOW - DAY, rounds: [] }],
+        ]);
+        revision("delta", [["s", ["goal", "status"], "ended"]]);
+        // A stop with the same words but no endedAt: its last round's time; then a goal with no id.
+        revision("delta", [
+            [
+                "s",
+                ["goal"],
+                {
+                    id: "g4",
+                    status: "summary",
+                    reason: "blocked",
+                    why: STOP_WHY,
+                    setAt: NOW - 20 * 60_000,
+                    rounds: [{ n: 1, at: NOW - 10 * 60_000 }],
+                },
+            ],
+        ]);
+        revision("delta", [["s", ["goal"], { status: "idle" }]]);
+    });
+
+    const db = openPocket(path.join(pocketDir, "pocket.sqlite"));
+    const stops = loadGoalStops(db);
+
+    db.close();
+
+    // The fixture's own goal g1 is blocked with another detail: not a stop.
+    assert.deepEqual(stops, [
+        { session: SESSION_T2, id: "g2", at: endedAt },
+        { session: SESSION_T2, id: "g4", at: NOW - 10 * 60_000 },
+    ]);
+    assert.ok(!JSON.stringify(stops).includes("token"));
+});
+
+test("loadData reads the review calls and the goal stops; no flaky scan is null, not an error", () => {
+    const { pocketDir, odradeDir, homesDir, run } = setup();
+    const data = loadData({
+        pocketDir,
+        odradeDir,
+        homesDir,
+        now: NOW,
+        hours: 24,
+        useGithub: false,
+        run,
+    });
+
+    assert.equal(data.sourceErrors.reviews, undefined);
+    assert.equal(data.sourceErrors.goalHistory, undefined);
+    assert.equal(data.sourceErrors.flakyScan, undefined);
+    // 30 days: the 20-day-old spawn is in; the 8-day `spawns` leave it out.
+    assert.deepEqual(
+        data.reviewCalls.map((call: { name: string }) => call.name),
+        ["w", "audit", "old"],
+    );
+    assert.equal(data.spawns.length, 2);
+    // The fixture's goal is blocked with another detail.
+    assert.deepEqual(data.goalStops, []);
+    assert.equal(data.flakyScan, null);
+
+    // With no database, the 2 database sources fail by name.
+    const root = tmp();
+    const none = loadData({
+        pocketDir: path.join(root, "nowhere"),
+        odradeDir: path.join(root, "nowhere"),
+        homesDir: path.join(root, "nowhere"),
+        now: NOW,
+        hours: 24,
+        useGithub: false,
+        run: () => "",
+    });
+
+    assert.ok(none.sourceErrors.reviews);
+    assert.ok(none.sourceErrors.goalHistory);
+    assert.equal(none.sourceErrors.flakyScan, undefined);
+    assert.deepEqual(none.reviewCalls, []);
+    assert.deepEqual(none.goalStops, []);
+    assert.equal(none.flakyScan, null);
+});
+
+/** A flaky-scan file as the core spec writes it. */
+const scanFile = (over: object = {}) => ({
+    schema_version: 1,
+    generated_at: "2026-10-20T10:00:00.000Z",
+    window: { from: "2026-10-13", to: "2026-10-20T10:00:00.000Z" },
+    apply: false,
+    repos: [
+        {
+            repo: "acme/widgets",
+            owner: "irulan",
+            runs: 40,
+            rerunAttempts: 3,
+            error: null,
+            flaky: [],
+        },
+        {
+            repo: "acme/broken",
+            owner: null,
+            runs: null,
+            rerunAttempts: null,
+            error: "HTTP 404",
+            flaky: [],
+        },
+        {
+            repo: "acme/odd",
+            owner: null,
+            runs: 2,
+            rerunAttempts: 5,
+            error: "a write failed",
+            flaky: [],
+        },
+        { repo: "acme/calm", owner: "teg", runs: 9, rerunAttempts: 0, error: null, flaky: [] },
+        { repo: "acme/bad", owner: "teg", runs: 9, rerunAttempts: -1, error: null, flaky: [] },
+    ],
+    ...over,
+});
+
+const writeScan = (odradeDir: string, folder: string, content: unknown) => {
+    fs.mkdirSync(path.join(odradeDir, "reports", folder), { recursive: true });
+    fs.writeFileSync(
+        path.join(odradeDir, "reports", folder, "scan.json"),
+        typeof content === "string" ? content : JSON.stringify(content),
+    );
+};
+
+test("readFlakyScan reads the newest scan; an error or a bad count is null, never 0", () => {
+    const dir = tmp();
+
+    assert.equal(readFlakyScan(dir), null, "no reports folder");
+    fs.mkdirSync(path.join(dir, "reports", "2026-10-22-daily-audit"), { recursive: true });
+    assert.equal(readFlakyScan(dir), null, "no scan folder");
+
+    writeScan(dir, "2026-10-13-flaky-scan", scanFile({ generated_at: "old", repos: [] }));
+    writeScan(dir, "2026-10-20-flaky-scan", scanFile());
+    // A newer folder with no scan.json is skipped.
+    fs.mkdirSync(path.join(dir, "reports", "2026-10-21-flaky-scan"));
+
+    assert.deepEqual(readFlakyScan(dir), {
+        file: "reports/2026-10-20-flaky-scan/scan.json",
+        generatedAt: "2026-10-20T10:00:00.000Z",
+        window: { from: "2026-10-13", to: "2026-10-20T10:00:00.000Z" },
+        repos: {
+            "acme/widgets": 3,
+            "acme/broken": null,
+            "acme/odd": null,
+            "acme/calm": 0,
+            "acme/bad": null,
+        },
+    });
+});
+
+test("readFlakyScan: invalid JSON, schema_version 2 or no repos list is a source error", () => {
+    const bad = (content: unknown) => {
+        const dir = tmp();
+
+        writeScan(dir, "2026-10-20-flaky-scan", content);
+
+        return dir;
+    };
+
+    assert.throws(() => readFlakyScan(bad("{ nope")), /not valid JSON/);
+    assert.throws(() => readFlakyScan(bad(scanFile({ schema_version: 2 }))), /schema_version 2/);
+    assert.throws(() => readFlakyScan(bad(scanFile({ repos: undefined }))), /no repos list/);
+
+    // Through loadData, the reason goes to `sourceErrors.flakyScan`, and the scan stays null.
+    const { pocketDir, odradeDir, homesDir, run } = setup();
+
+    writeScan(odradeDir, "2026-10-20-flaky-scan", scanFile({ schema_version: 2 }));
+
+    const data = loadData({
+        pocketDir,
+        odradeDir,
+        homesDir,
+        now: NOW,
+        hours: 24,
+        useGithub: false,
+        run,
+    });
+
+    assert.match(data.sourceErrors.flakyScan, /schema_version 2, not 1/);
+    assert.equal(data.flakyScan, null);
+    assert.equal(data.sourceErrors.odrade, undefined);
 });

@@ -292,6 +292,45 @@ const unique = (list) => [...new Set(list)];
 
 const plural = (count, word, many = `${word}s`) => `${count} ${count === 1 ? word : many}`;
 
+/** Q1's lines after decided acceptance: review rounds, 3-failure stops and CI reruns. */
+const q1Lines = (q1) => {
+    const lines = [];
+    const { rounds, stops, ciReruns } = q1;
+
+    if (rounds) {
+        const t = rounds.totals;
+
+        lines.push(
+            rounds.available
+                ? `- Review rounds (30 days): ${plural(t.threads, "thread")}, median ${t.median ?? "n/a"}, P90 ${t.p90 ?? "n/a"}.`
+                : `- Review rounds: not available (${rounds.reason}).`,
+        );
+    }
+
+    if (stops) {
+        lines.push(
+            stops.available
+                ? `- 3-failure stops: ${stops.totals.stops} in 30 days, ${stops.totals.last7} in the last 7 days.`
+                : `- 3-failure stops: not available (${stops.reason}).`,
+        );
+    }
+
+    if (ciReruns) {
+        const values = Object.values(ciReruns.repos ?? {}).filter((value) => value !== null);
+        const sum = values.reduce((total, value) => total + value, 0);
+
+        lines.push(
+            ciReruns.available
+                ? `- CI reruns: ${sum} in ${plural(values.length, "repository", "repositories")} (${ciReruns.file}).`
+                : ciReruns.reason === "no flaky scan"
+                  ? "- CI reruns: no flaky scan."
+                  : `- CI reruns: not available (${ciReruns.reason}).`,
+        );
+    }
+
+    return lines;
+};
+
 const metricLines = (metrics, github) => {
     const lines = [];
     const a1 = metrics.A1;
@@ -412,6 +451,7 @@ const metricLines = (metrics, github) => {
         lines.push(
             `- Decided acceptance (${q1.window.days} days, ${q1.window.covered} covered): ${t.acceptance ?? "n/a"}, merged ${t.merged}, closed unmerged ${t.closedUnmerged}, reverted ${t.reverted}. Today's record: ${plural(day.prs.length, "PR")}${day.complete ? "" : ` (day record incomplete: ${day.reason})`}.`,
         );
+        lines.push(...q1Lines(q1));
     }
 
     lines.push(

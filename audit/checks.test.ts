@@ -33,6 +33,8 @@ import {
     checkJ1,
     checkQ1,
     checkR1,
+    Q1_ROUND_THRESHOLDS,
+    Q1_STOP_THRESHOLDS,
     inDeepseekPeak,
     makeFinding,
     runChecks,
@@ -2303,4 +2305,419 @@ test("Q1: runChecks runs it last, with the date and the earlier days of its ctx"
     assert.equal(result.metrics.Q1.window.covered, 3);
     assert.equal(result.metrics.Q1.totals.merged, 1);
     assert.equal(result.skipped.Q1, undefined);
+});
+
+// ---------- Q1: review rounds, 3-failure stops and CI reruns ----------
+
+let reviewCallId = 0;
+
+type ReviewCall = {
+    id: number;
+    c: number;
+    at: number;
+    action: string;
+    name: string;
+    model?: string | null;
+    tools?: string[] | null;
+    review?: boolean;
+    brief?: string;
+};
+
+/** A cross-review spawn: the tools `read` and `bash`, and "review" in the brief. */
+const reviewerSpawn = (c: number, at: number, name = "reviewer"): ReviewCall => ({
+    id: (reviewCallId += 1),
+    c,
+    at,
+    action: "spawn",
+    name,
+    model: "other/model",
+    tools: ["read", "bash"],
+    review: true,
+    brief: "Review the change set",
+});
+
+/** A coder spawn: not a cross-review. */
+const coderSpawn = (c: number, at: number, name = "coder"): ReviewCall => ({
+    id: (reviewCallId += 1),
+    c,
+    at,
+    action: "spawn",
+    name,
+    model: "deepseek/deepseek-flash",
+    tools: ["read", "bash", "edit", "write"],
+    review: false,
+    brief: "Write the code",
+});
+
+const sendTo = (c: number, at: number, name: string): ReviewCall => ({
+    id: (reviewCallId += 1),
+    c,
+    at,
+    action: "send",
+    name,
+});
+
+/** `n` rounds in session `c`, the last one at `at`: 1 reviewer spawn, then `n - 1` sends to it, 1 minute apart. */
+const roundsOf = (c: number, n: number, at: number) =>
+    Array.from({ length: n }, (_, k) =>
+        k === 0
+            ? reviewerSpawn(c, at - (n - 1) * MINUTE)
+            : sendTo(c, at - (n - 1 - k) * MINUTE, "reviewer"),
+    );
+
+/** Desk threads T1 to Tn of acme/widgets and irulan, each with its rounds; `times[i]` is thread i's last round. */
+const roundThreads = (rounds: number[], times: number[], over: object = {}) => {
+    const threads = rounds.map((_, i) => thread(`T${i + 1}`, over));
+    const calls = rounds.flatMap((n, i) => roundsOf(threads[i]!.session, n, times[i]!));
+
+    return { threads: threadMap(...threads), reviewCalls: calls };
+};
+
+/** `count` merged PRs of acme/widgets by irulan, 1 a day: Q1's acceptance rows for the gate of 8 decided PRs. */
+const decidedDays = (count: number) => q1Ctx(earlierDays(count, (i) => [q1Pr(i)]));
+
+test("Q1 rounds: a reviewer spawn and 2 sends are 3 rounds; coder calls, old calls and calls with no thread do not count", () => {
+    const t1 = thread("T1");
+    const t2 = thread("T2");
+    const reviewCalls = [
+        reviewerSpawn(t1.session, ago(2 * DAY)),
+        coderSpawn(t1.session, ago(2 * DAY) + MINUTE),
+        sendTo(t1.session, ago(2 * DAY) + HOUR, "reviewer"),
+        sendTo(t1.session, ago(2 * DAY) + 2 * HOUR, "coder"),
+        sendTo(t1.session, ago(2 * DAY) + 3 * HOUR, "reviewer"),
+        // A send to a name with no spawn does not count.
+        sendTo(t1.session, ago(2 * DAY) + 4 * HOUR, "nobody"),
+        // T2: the reviewer spawn is 31 days old; the spawn and the send to it do not count.
+        reviewerSpawn(t2.session, ago(31 * DAY)),
+        sendTo(t2.session, ago(DAY), "reviewer"),
+        // A session with no desk thread.
+        reviewerSpawn(999, ago(DAY)),
+        sendTo(999, ago(DAY) + MINUTE, "reviewer"),
+    ];
+    const result = checkQ1(
+        emptyData({ decided: todayEmpty, threads: threadMap(t1, t2), reviewCalls }),
+        q1Ctx([]),
+    );
+    const rounds = result.metrics.rounds;
+
+    assert.equal(rounds.available, true);
+    assert.deepEqual(rounds.thresholds, Q1_ROUND_THRESHOLDS);
+    assert.deepEqual(rounds.threads, [
+        {
+            id: "T1",
+            repo: "acme/widgets",
+            agent: "irulan",
+            rounds: 3,
+            at: new Date(ago(2 * DAY) + 3 * HOUR).toISOString().slice(0, 16) + "Z",
+        },
+    ]);
+    assert.deepEqual(rounds.totals, {
+        threads: 1,
+        median: 3,
+        p90: 3,
+        recent: { threads: 1, median: 3 },
+        before: { threads: 0, median: null },
+    });
+    assert.deepEqual(Object.keys(rounds.repos), ["acme/widgets"]);
+    assert.deepEqual(Object.keys(rounds.agents), ["irulan"]);
+});
+
+test("Q1 rounds: a session with 2 threads gives each call to the thread with the latest start at or before it", () => {
+    const old = thread("T1", { session: 500, startedAt: ago(20 * DAY), repo: "acme/old" });
+    const now = thread("T2", { session: 500, startedAt: ago(5 * DAY), repo: "acme/new" });
+    const reviewCalls = [
+        reviewerSpawn(500, ago(10 * DAY)),
+        sendTo(500, ago(4 * DAY), "reviewer"),
+        sendTo(500, ago(3 * DAY), "reviewer"),
+    ];
+    const result = checkQ1(
+        emptyData({ decided: todayEmpty, threads: threadMap(old, now), reviewCalls }),
+        q1Ctx([]),
+    );
+
+    assert.deepEqual(
+        result.metrics.rounds.threads.map((item: { id: string; rounds: number }) => [
+            item.id,
+            item.rounds,
+        ]),
+        [
+            ["T1", 1],
+            ["T2", 2],
+        ],
+    );
+});
+
+test("Q1 rounds: rounds [1, 2, 3, 4, 10] give median 3 and P90 10; a row with no thread has median null", () => {
+    const times = [1, 2, 3, 4, 5].map((n) => ago(n * DAY));
+    const result = checkQ1(
+        emptyData({ decided: todayEmpty, ...roundThreads([1, 2, 3, 4, 10], times) }),
+        q1Ctx([]),
+    );
+    const row = {
+        threads: 5,
+        median: 3,
+        p90: 10,
+        recent: { threads: 5, median: 3 },
+        before: { threads: 0, median: null },
+    };
+
+    assert.deepEqual(result.metrics.rounds.totals, row);
+    assert.deepEqual(result.metrics.rounds.repos, { "acme/widgets": row });
+    assert.deepEqual(result.metrics.rounds.agents, { irulan: row });
+    // No decided PRs: no finding.
+    assert.deepEqual(result.findings, []);
+});
+
+test("Q1 rounds finding: a median of 3 or more with 8 decided PRs; none with 7; none for unattributed", () => {
+    const times = [1, 2, 3, 4, 5].map((n) => ago(n * DAY));
+    const data = (over: object = {}) =>
+        emptyData({ decided: todayEmpty, ...roundThreads([1, 2, 3, 4, 10], times, over) });
+    const result = checkQ1(data(), decidedDays(8));
+
+    assert.deepEqual(ids(result).sort(), ["Q1:rounds:agent:irulan", "Q1:rounds:repo:acme/widgets"]);
+
+    const repo = result.findings.find((f) => f.id === "Q1:rounds:repo:acme/widgets")!;
+
+    assert.equal(repo.severity, "medium");
+    assert.equal(
+        repo.text,
+        "Review rounds of acme/widgets have a median of 3 and a P90 of 10 over 5 desk threads in 30 days",
+    );
+    assert.equal(repo.cases, 5);
+    assert.deepEqual(repo.evidence, [
+        "desk/T1.md 1 rounds",
+        "desk/T2.md 2 rounds",
+        "desk/T3.md 3 rounds",
+        "desk/T4.md 4 rounds",
+        "desk/T5.md 10 rounds",
+    ]);
+    assert.equal(repo.lastSeen, new Date(ago(DAY)).toISOString().slice(0, 16) + "Z");
+    assert.match(
+        result.findings.find((f) => f.id === "Q1:rounds:agent:irulan")!.text,
+        /^Review rounds of agent irulan have a median of 3/,
+    );
+
+    // 7 decided PRs: under the gate.
+    assert.deepEqual(ids(checkQ1(data(), decidedDays(7))), []);
+
+    // The same rounds with no repository and no agent are unattributed: no finding, though the acceptance rows have
+    // 8 decided PRs of `unattributed`.
+    const unattributed = checkQ1(
+        data({ repo: undefined, agents: [] }),
+        q1Ctx(
+            earlierDays(8, (i) => [q1Pr(i, { ref: `acme/widgets#${i}`, agent: "unattributed" })]),
+        ),
+    );
+
+    assert.deepEqual(Object.keys(unattributed.metrics.rounds.repos), ["unattributed"]);
+    assert.deepEqual(Object.keys(unattributed.metrics.rounds.agents), ["unattributed"]);
+    assert.deepEqual(ids(unattributed), []);
+});
+
+test("Q1 rise finding: recent [3, 3] against [1, 2, 2] before gives only the rise findings; a rise of 0.5 gives none", () => {
+    const times = [ago(DAY), ago(2 * DAY), ago(10 * DAY), ago(12 * DAY), ago(14 * DAY)];
+    const result = checkQ1(
+        emptyData({ decided: todayEmpty, ...roundThreads([3, 3, 1, 2, 2], times) }),
+        decidedDays(8),
+    );
+
+    assert.equal(result.metrics.rounds.totals.median, 2);
+    assert.deepEqual(result.metrics.rounds.totals.recent, { threads: 2, median: 3 });
+    assert.deepEqual(result.metrics.rounds.totals.before, { threads: 3, median: 2 });
+    assert.deepEqual(ids(result).sort(), [
+        "Q1:rounds-rise:agent:irulan",
+        "Q1:rounds-rise:repo:acme/widgets",
+    ]);
+
+    const rise = result.findings.find((f) => f.id === "Q1:rounds-rise:repo:acme/widgets")!;
+
+    assert.equal(rise.severity, "medium");
+    assert.equal(
+        rise.text,
+        "Review rounds of acme/widgets rose: a median of 3 over 2 desk threads in the last 7 days, against 2 over 3 in the 23 days before",
+    );
+    assert.deepEqual(rise.evidence, ["desk/T1.md 3 rounds", "desk/T2.md 3 rounds"]);
+    assert.equal(rise.cases, 2);
+
+    // Recent [2, 3]: a median of 2.5, 0.5 above 2.
+    const small = checkQ1(
+        emptyData({ decided: todayEmpty, ...roundThreads([2, 3, 1, 2, 2], times) }),
+        decidedDays(8),
+    );
+
+    assert.equal(small.metrics.rounds.totals.recent.median, 2.5);
+    assert.deepEqual(ids(small), []);
+});
+
+test("Q1 stops: 2 stops of 1 repository in 7 days are a finding; with 1 older than 7 days, none", () => {
+    const t1 = thread("T1");
+    const stops = (ages: number[]) =>
+        ages.map((age, i) => ({ session: t1.session, id: `g${i + 1}`, at: ago(age) }));
+    const result = checkQ1(
+        emptyData({
+            decided: todayEmpty,
+            threads: threadMap(t1),
+            goalStops: [
+                ...stops([DAY, 3 * DAY]),
+                // A stop in a session with no thread: unattributed repository, the session's agent.
+                { session: 900, id: "g9", at: ago(2 * DAY) },
+                { session: 900, id: "g10", at: ago(3 * DAY) },
+                // Older than 30 days: not counted.
+                { session: t1.session, id: "g0", at: ago(31 * DAY) },
+            ],
+            agentOf: { 900: "teg" },
+        }),
+        q1Ctx([]),
+    );
+
+    assert.deepEqual(ids(result), ["Q1:stops:repo:acme/widgets"]);
+
+    const finding = result.findings[0]!;
+
+    assert.equal(finding.severity, "medium");
+    assert.equal(finding.cases, 2);
+    assert.match(finding.text, /^2 night-shift goals of acme\/widgets stopped in the last 7 days/);
+    assert.deepEqual(finding.evidence, [
+        `${new Date(ago(3 * DAY)).toISOString().slice(0, 16)}Z goal g2 in session ${t1.session} desk/T1.md`,
+        `${new Date(ago(DAY)).toISOString().slice(0, 16)}Z goal g1 in session ${t1.session} desk/T1.md`,
+    ]);
+
+    const stopsMetrics = result.metrics.stops;
+
+    assert.equal(stopsMetrics.available, true);
+    assert.deepEqual(stopsMetrics.thresholds, Q1_STOP_THRESHOLDS);
+    assert.deepEqual(stopsMetrics.totals, { stops: 4, last7: 4 });
+    assert.deepEqual(stopsMetrics.repos, {
+        "acme/widgets": { stops: 2, last7: 2 },
+        unattributed: { stops: 2, last7: 2 },
+    });
+    assert.deepEqual(stopsMetrics.agents, {
+        irulan: { stops: 2, last7: 2 },
+        teg: { stops: 2, last7: 2 },
+    });
+    assert.deepEqual(
+        stopsMetrics.goals.map((goal: { id: string; thread: string | null }) => [
+            goal.id,
+            goal.thread,
+        ]),
+        [
+            ["g10", null],
+            ["g2", "T1"],
+            ["g9", null],
+            ["g1", "T1"],
+        ],
+    );
+
+    const older = checkQ1(
+        emptyData({
+            decided: todayEmpty,
+            threads: threadMap(t1),
+            goalStops: stops([DAY, 8 * DAY]),
+        }),
+        q1Ctx([]),
+    );
+
+    assert.deepEqual(older.metrics.stops.totals, { stops: 2, last7: 1 });
+    assert.deepEqual(ids(older), []);
+});
+
+test("Q1 CI reruns: the scan's values, null for a repository with no value, and never 0 with no scan", () => {
+    const data = (flakyScan: unknown) => emptyData({ decided: todayEmpty, flakyScan });
+    // Acceptance rows for acme/widgets and acme/other.
+    const days = q1Ctx(
+        earlierDays(2, (i) => [i === 1 ? q1Pr(1) : q1Pr(2, { ref: "acme/other#2" })]),
+    );
+    const scan = {
+        file: "reports/2026-10-20-flaky-scan/scan.json",
+        generatedAt: "2026-10-20T10:00:00.000Z",
+        window: { from: "2026-10-13", to: "2026-10-20T10:00:00.000Z" },
+        repos: { "acme/widgets": 0, "acme/broken": null, "acme/busy": 7 },
+    };
+    const result = checkQ1(data(scan), days);
+
+    assert.deepEqual(result.metrics.ciReruns, {
+        available: true,
+        file: scan.file,
+        generatedAt: scan.generatedAt,
+        window: scan.window,
+        repos: { "acme/broken": null, "acme/busy": 7, "acme/other": null, "acme/widgets": 0 },
+    });
+    assert.deepEqual(result.findings, []);
+
+    assert.deepEqual(checkQ1(data(null), days).metrics.ciReruns, {
+        available: false,
+        reason: "no flaky scan",
+        repos: { "acme/other": null, "acme/widgets": null },
+    });
+});
+
+test("Q1: a source error of each new source leaves the acceptance metrics and findings as they were", () => {
+    const prs = [...caseB()];
+    const times = [1, 2, 3, 4, 5].map((n) => ago(n * DAY));
+    const base = () =>
+        emptyData({
+            decided: todayEmpty,
+            ...roundThreads([1, 2, 3, 4, 10], times),
+            goalStops: [
+                { session: 101, id: "g1", at: ago(DAY) },
+                { session: 101, id: "g2", at: ago(2 * DAY) },
+            ],
+            flakyScan: { file: "f", generatedAt: null, window: null, repos: { "acme/widgets": 2 } },
+        });
+    const days = q1Ctx(earlierDays(25, spread(prs)));
+    const clean = checkQ1(base(), days);
+    const failed = checkQ1(
+        {
+            ...base(),
+            sourceErrors: { reviews: "boom 1", goalHistory: "boom 2", flakyScan: "boom 3" },
+        },
+        days,
+    );
+
+    const acceptance = (result: ReturnType<typeof checkQ1>) => {
+        const { rounds: _r, stops: _s, ciReruns: _c, ...rest } = result.metrics;
+
+        return rest;
+    };
+
+    // The clean run has every kind of finding.
+    assert.deepEqual(ids(clean).sort(), [
+        "Q1:agent:irulan",
+        "Q1:repo:acme/widgets",
+        "Q1:rounds:agent:irulan",
+        "Q1:rounds:repo:acme/widgets",
+        "Q1:stops:repo:acme/widgets",
+    ]);
+    assert.deepEqual(ids(failed).sort(), ["Q1:agent:irulan", "Q1:repo:acme/widgets"]);
+    assert.deepEqual(
+        failed.findings,
+        clean.findings.filter((f) => !/^Q1:(rounds|stops)/.test(f.id)),
+    );
+    assert.deepEqual(acceptance(failed), acceptance(clean));
+    assert.deepEqual(failed.metrics.rounds, { available: false, reason: "boom 1" });
+    assert.deepEqual(failed.metrics.stops, { available: false, reason: "boom 2" });
+    assert.deepEqual(failed.metrics.ciReruns, { available: false, reason: "boom 3" });
+
+    // runChecks still runs Q1: the new sources are not in its needs.
+    const run = runChecks(
+        { ...base(), sourceErrors: { reviews: "x", goalHistory: "y", flakyScan: "z" } },
+        days,
+    );
+
+    assert.equal(run.skipped.Q1, undefined);
+    assert.equal(run.metrics.Q1.totals.acceptance, 0.6);
+
+    // Data from before these sources existed has no keys: each part says "no data".
+    const old = { ...base() } as Record<string, unknown>;
+
+    delete old.reviewCalls;
+    delete old.goalStops;
+    delete old.flakyScan;
+
+    const before = checkQ1(old as ReturnType<typeof emptyData>, days);
+
+    assert.deepEqual(acceptance(before), acceptance(clean));
+    assert.deepEqual(before.metrics.rounds, { available: false, reason: "no data" });
+    assert.deepEqual(before.metrics.stops, { available: false, reason: "no data" });
+    assert.deepEqual(before.metrics.ciReruns, { available: false, reason: "no data" });
 });

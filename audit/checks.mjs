@@ -2048,11 +2048,378 @@ function revertedRefs(prs) {
     return reverted;
 }
 
+/** Q1's review-round thresholds: first guesses, to tune after 2 weeks of records (plan T801, "Gap 1"). */
+export const Q1_ROUND_THRESHOLDS = { median: 3, rise: 1, recentDays: 7, windowDays: 30 };
+/** Q1's 3-failure stop thresholds: `min` stops of 1 repository in the last `days` days. */
+export const Q1_STOP_THRESHOLDS = { min: 2, days: 7 };
+
+const UNATTRIBUTED = "unattributed";
+
+const byThreadId = (a, b) => String(a).localeCompare(String(b), "en", { numeric: true });
+
+/** A new Q1 part that cannot be judged: its source failed, or the data has no such key. */
+const q1Unavailable = (data, source, key) => {
+    if (data.sourceErrors?.[source]) {
+        return { available: false, reason: data.sourceErrors[source] };
+    }
+
+    return data[key] === undefined ? { available: false, reason: "no data" } : undefined;
+};
+
+/**
+ * The desk thread of a session at a time: the only thread of that session, or of 2 or more, the one with the latest
+ * `startedAt` at or before `at`. Undefined when there is none.
+ */
+function q1ThreadAt(data, session, at) {
+    const list = Object.values(data.threads ?? {}).filter(
+        (thread) => thread.session !== undefined && thread.session === session,
+    );
+
+    if (list.length <= 1) {
+        return list[0];
+    }
+
+    return list
+        .filter((thread) => typeof thread.startedAt === "number" && thread.startedAt <= at)
+        .sort((a, b) => b.startedAt - a.startedAt || byThreadId(a.id, b.id))[0];
+}
+
+const q1RepoOf = (thread) =>
+    typeof thread?.repo === "string" && thread.repo !== "" ? thread.repo : UNATTRIBUTED;
+
+const q1AgentOf = (thread) => {
+    const agent = Array.isArray(thread?.agents) ? thread.agents[0] : undefined;
+
+    return typeof agent === "string" && agent !== "" ? agent : undefined;
+};
+
+/** The nearest-rank 90th percentile, or null. */
+const p90 = (values) => {
+    if (values.length === 0) {
+        return null;
+    }
+
+    const sorted = [...values].sort((a, b) => a - b);
+
+    return sorted[Math.ceil(0.9 * sorted.length) - 1];
+};
+
+const medianOrNull = (values) => (values.length === 0 ? null : median(values));
+
+/** 1 row of review rounds: `list` holds `{ rounds, at }` of each thread. */
+function roundRow(list, now) {
+    const recentFrom = now - Q1_ROUND_THRESHOLDS.recentDays * DAY;
+    const from = now - Q1_ROUND_THRESHOLDS.windowDays * DAY;
+    const recent = list.filter((item) => item.at >= recentFrom);
+    const before = list.filter((item) => item.at < recentFrom && item.at >= from);
+    const rounds = (items) => items.map((item) => item.rounds);
+
+    return {
+        threads: list.length,
+        median: medianOrNull(rounds(list)),
+        p90: p90(rounds(list)),
+        recent: { threads: recent.length, median: medianOrNull(rounds(recent)) },
+        before: { threads: before.length, median: medianOrNull(rounds(before)) },
+    };
+}
+
+const sortedKeys = (rows) =>
+    Object.fromEntries(Object.entries(rows).sort((a, b) => a[0].localeCompare(b[0])));
+
+/**
+ * Q1's review rounds per desk thread, from 30 days of `subagent` spawn and send calls. A cross-review spawn is 1
+ * round; a send is 1 round when the latest earlier spawn of that name in the same session is a cross-review spawn.
+ * Each call goes to the desk thread of its session (`q1ThreadAt`); a call with no thread does not count.
+ */
+function q1Rounds(data, ctx) {
+    const unavailable = q1Unavailable(data, "reviews", "reviewCalls");
+
+    if (unavailable) {
+        return { metrics: unavailable, items: [] };
+    }
+
+    const from = ctx.now - Q1_ROUND_THRESHOLDS.windowDays * DAY;
+    const calls = (Array.isArray(data.reviewCalls) ? data.reviewCalls : [])
+        .filter((call) => typeof call?.at === "number" && call.at >= from)
+        .map((call, index) => ({ call, index }))
+        .sort((a, b) => a.call.at - b.call.at || a.call.id - b.call.id || a.index - b.index)
+        .map((item) => item.call);
+    const latestSpawn = new Map();
+    const byThread = new Map();
+
+    for (const call of calls) {
+        const key = `${call.c}\u0000${call.name}`;
+        let round = false;
+
+        if (call.action === "spawn") {
+            round = isCrossReviewSpawn(call);
+            latestSpawn.set(key, round);
+        } else if (call.action === "send") {
+            round = latestSpawn.get(key) === true;
+        }
+
+        if (!round) {
+            continue;
+        }
+
+        const thread = q1ThreadAt(data, call.c, call.at);
+
+        if (!thread) {
+            continue;
+        }
+
+        const item = byThread.get(thread.id) ?? {
+            id: thread.id,
+            repo: q1RepoOf(thread),
+            agent: q1AgentOf(thread) ?? UNATTRIBUTED,
+            rounds: 0,
+            at: 0,
+        };
+
+        item.rounds += 1;
+        item.at = Math.max(item.at, call.at);
+        byThread.set(thread.id, item);
+    }
+
+    const items = [...byThread.values()].sort((a, b) => byThreadId(a.id, b.id));
+
+    const group = (field) => {
+        const lists = {};
+
+        for (const item of items) {
+            (lists[item[field]] ??= []).push(item);
+        }
+
+        return sortedKeys(
+            Object.fromEntries(
+                Object.entries(lists).map(([name, list]) => [name, roundRow(list, ctx.now)]),
+            ),
+        );
+    };
+
+    return {
+        metrics: {
+            available: true,
+            thresholds: { ...Q1_ROUND_THRESHOLDS },
+            totals: roundRow(items, ctx.now),
+            repos: group("repo"),
+            agents: group("agent"),
+            threads: items.map((item) => ({
+                id: item.id,
+                repo: item.repo,
+                agent: item.agent,
+                rounds: item.rounds,
+                at: iso(item.at),
+            })),
+        },
+        items,
+    };
+}
+
+/** Q1's review-round findings: a high median, and a rise of the last 7 days, gated by 8 decided PRs. */
+function roundFindings(rounds, acceptance, ctx) {
+    if (!rounds.metrics.available) {
+        return [];
+    }
+
+    const findings = [];
+    const recentFrom = ctx.now - Q1_ROUND_THRESHOLDS.recentDays * DAY;
+    const evidence = (list) => list.map((item) => `desk/${item.id}.md ${item.rounds} rounds`);
+    const newest = (list) => Math.max(...list.map((item) => item.at));
+    const t = Q1_ROUND_THRESHOLDS;
+
+    for (const [kind, field, rows, decided] of [
+        ["repo", "repo", rounds.metrics.repos, acceptance.repos],
+        ["agent", "agent", rounds.metrics.agents, acceptance.agents],
+    ]) {
+        for (const [name, row] of Object.entries(rows)) {
+            if (name === UNATTRIBUTED || (decided[name]?.decided ?? 0) < Q1_THRESHOLDS.minDecided) {
+                continue;
+            }
+
+            const label = kind === "repo" ? name : `agent ${name}`;
+            const list = rounds.items.filter((item) => item[field] === name);
+
+            if (row.median !== null && row.median >= t.median) {
+                findings.push(
+                    makeFinding({
+                        check: "Q1",
+                        subject: `rounds:${kind}:${name}`,
+                        severity: "medium",
+                        text: `Review rounds of ${label} have a median of ${row.median} and a P90 of ${row.p90} over ${row.threads} desk thread${row.threads === 1 ? "" : "s"} in ${t.windowDays} days`,
+                        evidence: evidence(list),
+                        lastSeen: newest(list),
+                        cases: row.threads,
+                    }),
+                );
+            }
+
+            if (
+                row.recent.threads >= 1 &&
+                row.before.threads >= 1 &&
+                row.recent.median - row.before.median >= t.rise
+            ) {
+                const recent = list.filter((item) => item.at >= recentFrom);
+
+                findings.push(
+                    makeFinding({
+                        check: "Q1",
+                        subject: `rounds-rise:${kind}:${name}`,
+                        severity: "medium",
+                        text: `Review rounds of ${label} rose: a median of ${row.recent.median} over ${row.recent.threads} desk thread${row.recent.threads === 1 ? "" : "s"} in the last ${t.recentDays} days, against ${row.before.median} over ${row.before.threads} in the ${t.windowDays - t.recentDays} days before`,
+                        evidence: evidence(recent),
+                        lastSeen: newest(recent),
+                        cases: row.recent.threads,
+                    }),
+                );
+            }
+        }
+    }
+
+    return findings;
+}
+
+/** Q1's 3-failure stops of the last 30 days, per repository and per agent; 2 in 7 days for 1 repository is medium. */
+function q1Stops(data, ctx) {
+    const unavailable = q1Unavailable(data, "goalHistory", "goalStops");
+
+    if (unavailable) {
+        return { metrics: unavailable, findings: [] };
+    }
+
+    const from = ctx.now - 30 * DAY;
+    const last7From = ctx.now - Q1_STOP_THRESHOLDS.days * DAY;
+    const goals = (Array.isArray(data.goalStops) ? data.goalStops : [])
+        .filter((stop) => typeof stop?.at === "number" && stop.at >= from)
+        .map((stop) => {
+            const thread = q1ThreadAt(data, stop.session, stop.at);
+
+            return {
+                id: String(stop.id),
+                session: stop.session,
+                thread: thread?.id ?? null,
+                repo: q1RepoOf(thread),
+                agent: q1AgentOf(thread) ?? data.agentOf?.[stop.session] ?? UNATTRIBUTED,
+                at: stop.at,
+            };
+        })
+        .sort((a, b) => a.at - b.at || a.id.localeCompare(b.id));
+    const zero = () => ({ stops: 0, last7: 0 });
+    const totals = zero();
+    const repos = {};
+    const agents = {};
+
+    for (const goal of goals) {
+        for (const row of [
+            totals,
+            (repos[goal.repo] ??= zero()),
+            (agents[goal.agent] ??= zero()),
+        ]) {
+            row.stops += 1;
+            row.last7 += goal.at >= last7From ? 1 : 0;
+        }
+    }
+
+    const findings = [];
+
+    for (const [repo, row] of Object.entries(sortedKeys(repos))) {
+        if (repo === UNATTRIBUTED || row.last7 < Q1_STOP_THRESHOLDS.min) {
+            continue;
+        }
+
+        const recent = goals.filter((goal) => goal.repo === repo && goal.at >= last7From);
+
+        findings.push(
+            makeFinding({
+                check: "Q1",
+                subject: `stops:repo:${repo}`,
+                severity: "medium",
+                text: `${row.last7} night-shift goals of ${repo} stopped in the last ${Q1_STOP_THRESHOLDS.days} days because the same check failure came 3 times in a row (${row.stops} in 30 days)`,
+                evidence: recent.map(
+                    (goal) =>
+                        `${iso(goal.at)} goal ${goal.id} in session ${goal.session}${goal.thread === null ? "" : ` desk/${goal.thread}.md`}`,
+                ),
+                lastSeen: Math.max(...recent.map((goal) => goal.at)),
+                cases: row.last7,
+            }),
+        );
+    }
+
+    return {
+        metrics: {
+            available: true,
+            thresholds: { ...Q1_STOP_THRESHOLDS },
+            totals,
+            repos: sortedKeys(repos),
+            agents: sortedKeys(agents),
+            goals: goals.map((goal) => ({ ...goal, at: iso(goal.at) })),
+        },
+        findings,
+    };
+}
+
+const isRerunCount = (value) => Number.isInteger(value) && value >= 0;
+
+/**
+ * Q1's CI reruns per repository, from the newest flaky-test scan: 1 key for each repository of the scan and of Q1's
+ * acceptance rows. A repository with no scan value is `null`, never 0. No findings.
+ */
+function q1CiReruns(data, acceptanceRepos) {
+    const unavailable = q1Unavailable(data, "flakyScan", "flakyScan");
+
+    if (unavailable) {
+        return unavailable;
+    }
+
+    const scan = data.flakyScan;
+    const names = new Set(Object.keys(acceptanceRepos));
+
+    if (scan === null) {
+        return {
+            available: false,
+            reason: "no flaky scan",
+            repos: sortedKeys(Object.fromEntries([...names].map((repo) => [repo, null]))),
+        };
+    }
+
+    const scanned = scan.repos ?? {};
+
+    Object.keys(scanned).forEach((repo) => names.add(repo));
+
+    return {
+        available: true,
+        file: scan.file ?? null,
+        generatedAt: scan.generatedAt ?? null,
+        window: scan.window ?? null,
+        repos: sortedKeys(
+            Object.fromEntries(
+                [...names].map((repo) => [
+                    repo,
+                    isRerunCount(scanned[repo]) ? scanned[repo] : null,
+                ]),
+            ),
+        ),
+    };
+}
+
+/** Run 1 new Q1 part; a part that throws is unavailable, and the acceptance part still stands. */
+const q1Part = (fn, fallback) => {
+    try {
+        return fn();
+    } catch (error) {
+        return fallback(`failed: ${String(error?.message ?? error).split("\n")[0]}`);
+    }
+};
+
 /**
  * Q1: decided acceptance. Each run records the PRs it saw decided (merged, or closed unmerged); the last 30 complete
  * records are summed, 1 PR per ref, and acceptance is `(merged − reverted) / decided`, per repository and per agent.
  * A medium finding for a repository or an agent with 8 or more decided PRs, 25 or more covered days, and an
  * acceptance under 0.75. `unattributed` makes no finding.
+ *
+ * Beside it, in keys of their own: review rounds per desk thread (`rounds`), 3-failure stops of night-shift goals
+ * (`stops`) and CI reruns from the newest flaky-test scan (`ciReruns`). A new part whose source failed is
+ * `{ available: false, reason }` and makes no finding; the acceptance part runs all the same.
  */
 export function checkQ1(data, ctx) {
     const date = ctx.date ?? newYorkDate(ctx.now);
@@ -2165,6 +2532,25 @@ export function checkQ1(data, ctx) {
         }
     }
 
+    const repoRows = sorted(repos);
+    const agentRows = sorted(agents);
+    const unavailable = (reason) => ({ available: false, reason });
+    const rounds = q1Part(
+        () => q1Rounds(data, ctx),
+        (reason) => ({ metrics: unavailable(reason), items: [] }),
+    );
+    const roundsFound = q1Part(
+        () => roundFindings(rounds, { repos: repoRows, agents: agentRows }, ctx),
+        () => [],
+    );
+    const stops = q1Part(
+        () => q1Stops(data, ctx),
+        (reason) => ({ metrics: unavailable(reason), findings: [] }),
+    );
+    const ciReruns = q1Part(() => q1CiReruns(data, repoRows), unavailable);
+
+    findings.push(...roundsFound, ...stops.findings);
+
     return {
         findings,
         metrics: {
@@ -2172,8 +2558,11 @@ export function checkQ1(data, ctx) {
             window: { from: first, to: date, days: Q1_DAYS, covered },
             thresholds: { ...Q1_THRESHOLDS },
             totals,
-            repos: sorted(repos),
-            agents: sorted(agents),
+            repos: repoRows,
+            agents: agentRows,
+            rounds: rounds.metrics,
+            stops: stops.metrics,
+            ciReruns,
         },
     };
 }

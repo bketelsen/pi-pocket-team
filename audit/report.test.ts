@@ -849,3 +849,57 @@ test("summaryText: the summary, or None with the real reason, never undefined", 
     );
     assert.equal(summaryText({ used: false }), "None. LLM text not used.");
 });
+
+test("Q1's lines: review rounds, 3-failure stops and CI reruns follow decided acceptance", () => {
+    const q1 = (over: object = {}) => ({
+        day: { complete: true, prs: [] },
+        window: { days: 30, covered: 26 },
+        totals: { merged: 9, closedUnmerged: 1, reverted: 1, decided: 10, acceptance: 0.8 },
+        rounds: {
+            available: true,
+            totals: {
+                threads: 5,
+                median: 3,
+                p90: 10,
+                recent: { threads: 5, median: 3 },
+                before: { threads: 0, median: null },
+            },
+        },
+        stops: { available: true, totals: { stops: 3, last7: 2 } },
+        ciReruns: {
+            available: true,
+            file: "reports/2026-10-20-flaky-scan/scan.json",
+            repos: { "acme/widgets": 3, "acme/busy": 4, "acme/broken": null },
+        },
+        ...over,
+    });
+    const lines = renderReport(baseReport({ metrics: { Q1: q1() } })).split("\n");
+    const at = lines.findIndex((line) => line.startsWith("- Decided acceptance"));
+
+    assert.ok(at >= 0);
+    assert.deepEqual(lines.slice(at + 1, at + 4), [
+        "- Review rounds (30 days): 5 threads, median 3, P90 10.",
+        "- 3-failure stops: 3 in 30 days, 2 in the last 7 days.",
+        "- CI reruns: 7 in 2 repositories (reports/2026-10-20-flaky-scan/scan.json).",
+    ]);
+
+    const missing = renderReport(
+        baseReport({
+            metrics: {
+                Q1: q1({
+                    rounds: { available: false, reason: "no such table" },
+                    stops: { available: false, reason: "no such table" },
+                    ciReruns: {
+                        available: false,
+                        reason: "no flaky scan",
+                        repos: { "acme/w": null },
+                    },
+                }),
+            },
+        }),
+    );
+
+    assert.match(missing, /- Review rounds: not available \(no such table\)\./);
+    assert.match(missing, /- 3-failure stops: not available \(no such table\)\./);
+    assert.match(missing, /- CI reruns: no flaky scan\./);
+});

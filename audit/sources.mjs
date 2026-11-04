@@ -497,6 +497,119 @@ function spawnRows(db, where, params) {
     return out;
 }
 
+/**
+ * Q1's review rounds: every `subagent` call with the action `spawn` or `send` from `since` on, oldest first. A row is
+ * `{ id, c, at, action, name }`; a spawn row also has `model`, `tools`, `review` and `brief`, as `spawnRows` makes
+ * them (so `isCrossReviewSpawn` reads it). No message text is kept but the first 300 characters of a spawn's brief.
+ */
+export function loadReviewCalls(db, since) {
+    const out = [];
+
+    for (const row of db
+        .prepare(`${SPAWN_SQL}${ts} >= ? and record like '%"name":"subagent"%' order by id`)
+        .all(since)) {
+        const entry = parseEntry(row);
+
+        for (const part of entry.model[0].content ?? []) {
+            const action = part.arguments?.action;
+
+            if (
+                part.type !== "toolCall" ||
+                part.name !== "subagent" ||
+                (action !== "spawn" && action !== "send")
+            ) {
+                continue;
+            }
+
+            const call = {
+                id: row.id,
+                c: row.c,
+                at: entry.model[0].timestamp,
+                action,
+                name: typeof part.arguments.name === "string" ? part.arguments.name : null,
+            };
+
+            if (action === "spawn") {
+                Object.assign(call, {
+                    model: typeof part.arguments.model === "string" ? part.arguments.model : null,
+                    tools: Array.isArray(part.arguments.tools)
+                        ? part.arguments.tools.filter((tool) => typeof tool === "string")
+                        : null,
+                    review:
+                        typeof part.arguments.message === "string" &&
+                        /review/i.test(part.arguments.message),
+                    brief:
+                        typeof part.arguments.message === "string"
+                            ? part.arguments.message.slice(0, 300)
+                            : "",
+                });
+            }
+
+            out.push(call);
+        }
+    }
+
+    return out;
+}
+
+/** The detail that Night shift writes in `why` when the same check failure stops a goal (pi-pocket-team#108). */
+const SAME_FAILURE_STOP = /the same check failure came \d+ times in a row/;
+
+/**
+ * Q1's 3-failure stops. The goal document holds 1 goal per session, and a new goal writes over the old one: so every
+ * revision of every `x.night-shift.goal` document (retired ones too) is walked from the first one, and the newest
+ * state seen of each goal id is that goal's last state. A goal stopped `blocked` with the same-failure detail is 1
+ * stop: `{ session, id, at }`. Neither `why` nor the failure fingerprint is kept.
+ */
+export function loadGoalStops(db) {
+    const revisions = db.prepare(
+        "select kind, content from document_revisions where document_id=? order by seq",
+    );
+    const stops = [];
+
+    for (const doc of docsOfKind(db, "x.night-shift.goal", { retired: true })) {
+        const last = new Map();
+        let value;
+
+        for (const row of revisions.all(doc.id)) {
+            const content = JSON.parse(row.content);
+
+            value = row.kind === "base" ? content : apply(value, content);
+
+            const goal = value?.goal;
+
+            if (!goal || typeof goal !== "object" || goal.id === undefined || goal.id === null) {
+                continue;
+            }
+
+            const rounds = Array.isArray(goal.rounds) ? goal.rounds : [];
+            const lastRound = rounds.at(-1);
+
+            // Copies of plain values only: a later `apply` cannot change them.
+            last.set(String(goal.id), {
+                id: String(goal.id),
+                stop:
+                    goal.reason === "blocked" &&
+                    typeof goal.why === "string" &&
+                    SAME_FAILURE_STOP.test(goal.why),
+                endedAt: typeof goal.endedAt === "number" ? goal.endedAt : undefined,
+                roundAt: typeof lastRound?.at === "number" ? lastRound.at : undefined,
+                setAt: typeof goal.setAt === "number" ? goal.setAt : undefined,
+            });
+        }
+
+        for (const goal of last.values()) {
+            const at = goal.endedAt ?? goal.roundAt ?? goal.setAt;
+
+            if (goal.stop && at !== undefined) {
+                stops.push({ session: doc.owner_id, id: goal.id, at });
+            }
+        }
+    }
+
+    return stops.sort((a, b) => a.at - b.at || a.id.localeCompare(b.id));
+}
+
 /** The user entries of the sessions that checks A1 and A2 read: the threads' sessions and their supervisors. */
 function loadUserEntries(db, threads) {
     const conversations = new Set();
@@ -854,6 +967,89 @@ export function readOdrade(dir, git) {
     return { readme, reports, dirty, lastCommitAt: Number.isNaN(last) ? null : last };
 }
 
+// ---------- The flaky-test scan (Q1's CI reruns) ----------
+
+const FLAKY_FOLDER = /^\d{4}-\d{2}-\d{2}.*-flaky-scan$/;
+
+/**
+ * The newest flaky-test scan (core spec `docs/specs/flaky-test-scan.md`): `reports/<date>…-flaky-scan/scan.json` under
+ * Odrade's folder, the greatest folder name that holds a `scan.json`. `null` when there is none. A file that is not
+ * valid JSON, has another `schema_version` than 1, or has no `repos` list throws. Returns
+ * `{ file, generatedAt, window, repos: { [repo]: rerunAttempts } }`; a repository with an `error`, or whose
+ * `rerunAttempts` is not a whole number of 0 or more, is `null`, never `0`. Never written.
+ */
+export function readFlakyScan(odradeDir) {
+    const reports = path.join(odradeDir, "reports");
+    let names;
+
+    try {
+        names = fs.readdirSync(reports);
+    } catch (error) {
+        if (error?.code === "ENOENT") {
+            return null;
+        }
+
+        throw error;
+    }
+
+    const folder = names
+        .filter((name) => FLAKY_FOLDER.test(name))
+        .sort()
+        .reverse()
+        .find((name) => fs.existsSync(path.join(reports, name, "scan.json")));
+
+    if (folder === undefined) {
+        return null;
+    }
+
+    const file = `reports/${folder}/scan.json`;
+    let scan;
+
+    try {
+        scan = JSON.parse(fs.readFileSync(path.join(odradeDir, file), "utf8"));
+    } catch {
+        throw new Error(`${file} is not valid JSON`);
+    }
+
+    if (scan?.schema_version !== 1) {
+        throw new Error(`${file} has schema_version ${scan?.schema_version}, not 1`);
+    }
+
+    if (!Array.isArray(scan.repos)) {
+        throw new Error(`${file} has no repos list`);
+    }
+
+    const repos = {};
+
+    for (const entry of scan.repos) {
+        if (typeof entry?.repo !== "string" || entry.repo === "") {
+            continue;
+        }
+
+        const value = entry.rerunAttempts;
+
+        repos[entry.repo] =
+            (entry.error === null || entry.error === undefined) &&
+            Number.isInteger(value) &&
+            value >= 0
+                ? value
+                : null;
+    }
+
+    return {
+        file,
+        generatedAt: typeof scan.generated_at === "string" ? scan.generated_at : null,
+        window:
+            scan.window && typeof scan.window === "object"
+                ? {
+                      from: typeof scan.window.from === "string" ? scan.window.from : null,
+                      to: typeof scan.window.to === "string" ? scan.window.to : null,
+                  }
+                : null,
+        repos,
+    };
+}
+
 // ---------- The agents' homes ----------
 
 /** A folder's real path, or its absolute path when it does not exist. */
@@ -976,6 +1172,9 @@ export function loadData({
         homes: [],
         github: undefined,
         decided: undefined,
+        reviewCalls: [],
+        goalStops: [],
+        flakyScan: null,
         sourceErrors,
     };
 
@@ -1002,6 +1201,8 @@ export function loadData({
             "entries",
             "costs",
             "routes",
+            "reviews",
+            "goalHistory",
         ]) {
             sourceErrors[name] = message;
         }
@@ -1030,6 +1231,9 @@ export function loadData({
             data.spawns = loadSpawns(db, horizon);
         });
         attempt("costs", () => (data.costRows = loadCosts(db, horizon)));
+        // Q1's review rounds and 3-failure stops: 30 days of spawn and send calls, and every goal revision.
+        attempt("reviews", () => (data.reviewCalls = loadReviewCalls(db, now - 30 * DAY)));
+        attempt("goalHistory", () => (data.goalStops = loadGoalStops(db)));
         db.close();
     }
 
@@ -1069,6 +1273,10 @@ export function loadData({
     });
     attempt("homes", () => {
         data.homes = readHomes(homesDir, git, { exclude: [odradeDir] });
+    });
+    // Q1's CI reruns: the newest flaky-test scan in Odrade's reports. No scan is `null`, not an error.
+    attempt("flakyScan", () => {
+        data.flakyScan = readFlakyScan(odradeDir);
     });
 
     return data;
