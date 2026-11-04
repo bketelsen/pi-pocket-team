@@ -668,6 +668,180 @@ export function loadGithub(data, { gh, now, since }) {
     return { botPrs, prs, checkRuns, autoDelete };
 }
 
+// ---------- Q1: decided PRs ----------
+
+/** The most `gh` calls of Q1's search, in 1 run (all owner groups share them). */
+export const Q1_MAX_CALLS = 4;
+/** At most this many owners in 1 search text; more owners make more groups. */
+export const Q1_GROUP = 4;
+/** GitHub's search gives at most 1000 results for 1 query. */
+const SEARCH_LIMIT = 1000;
+
+/** A time as GitHub's search reads it: `2026-10-23T14:00:00+00:00`. */
+export const searchTime = (ms) => `${new Date(ms).toISOString().slice(0, 19)}+00:00`;
+
+const ownerOfRepo = (repo) => /^([\w.-]+)\/[\w.-]+/.exec(String(repo ?? ""))?.[1];
+
+/** The owners of every repository on the desk (any thread state) and of the bot's PRs, sorted, each once. */
+export function decidedOwners(data) {
+    const owners = new Set();
+
+    const add = (repo) => {
+        const owner = ownerOfRepo(repo);
+
+        if (owner) {
+            owners.add(owner);
+        }
+    };
+
+    for (const thread of Object.values(data.threads ?? {})) {
+        add(thread.repo);
+        Object.keys(thread.prs ?? {}).forEach(add);
+    }
+
+    (data.github?.botPrs ?? []).forEach(add);
+
+    return [...owners].sort();
+}
+
+const DECIDED_NODE =
+    "... on PullRequest { number url title body mergedAt closedAt author { login } repository { nameWithOwner } }";
+
+/** A search node Q1 can use: a PR with its number, its repository and its close time. */
+const isDecidedNode = (node) =>
+    Boolean(node) &&
+    typeof node === "object" &&
+    typeof node.number === "number" &&
+    typeof node.repository?.nameWithOwner === "string" &&
+    typeof node.closedAt === "string";
+
+/**
+ * Q1's source: the PRs of the desk's owners that GitHub closed (merged or not) from 1 hour before `since` (the search
+ * index lags) to `now`. 1 GraphQL search a page, 100 nodes a page, at most `Q1_MAX_CALLS` calls for all owner groups.
+ * Returns `{ from, until, complete, reason?, calls, nodes }`; `complete: false` says why, and partial data is never
+ * judged.
+ */
+export function loadDecided(data, { gh, now, since }) {
+    const fromMs = since - HOUR;
+    const result = {
+        from: new Date(fromMs).toISOString(),
+        until: new Date(now).toISOString(),
+        complete: true,
+        calls: 0,
+        nodes: [],
+    };
+    const owners = decidedOwners(data);
+    const startCalls = gh.state.calls;
+
+    const stop = (reason) => {
+        result.complete = false;
+        result.reason = reason;
+    };
+
+    if (owners.length === 0) {
+        stop("no repository owners on the desk");
+    }
+
+    const groups = [];
+
+    for (let start = 0; start < owners.length; start += Q1_GROUP) {
+        groups.push(owners.slice(start, start + Q1_GROUP));
+    }
+
+    groups: for (const group of groups) {
+        const text = `is:pr is:closed closed:${searchTime(fromMs)}..${searchTime(now)} ${group
+            .map((owner) => `user:${owner}`)
+            .join(" ")}`;
+        let cursor = null;
+
+        for (;;) {
+            if (result.calls >= Q1_MAX_CALLS) {
+                stop(`the search needs more than ${Q1_MAX_CALLS} calls`);
+
+                break groups;
+            }
+
+            if (gh.state.capReached) {
+                stop("GitHub call cap reached");
+
+                break groups;
+            }
+
+            const after = cursor === null ? "" : `, after: ${JSON.stringify(cursor)}`;
+            const failuresBefore = gh.state.failures;
+            const out = gh.graphql(
+                `{ search(query: ${JSON.stringify(text)}, type: ISSUE, first: 100${after}) { issueCount pageInfo { hasNextPage endCursor } nodes { ${DECIDED_NODE} } } }`,
+            );
+
+            result.calls = gh.state.calls - startCalls;
+
+            if (gh.state.capReached && out === "") {
+                stop("GitHub call cap reached");
+
+                break groups;
+            }
+
+            // A failed call can still print JSON (`makeGh` keeps its stdout): it is never trusted.
+            if (gh.state.failures > failuresBefore) {
+                stop("a search call failed");
+
+                break groups;
+            }
+
+            const answer = json(out, {});
+
+            // GitHub can send `data` with top-level `errors`: a partial answer.
+            if (Array.isArray(answer?.errors) && answer.errors.length > 0) {
+                stop("a search returned errors");
+
+                break groups;
+            }
+
+            const search = answer?.data?.search;
+
+            if (!search || typeof search !== "object" || !Array.isArray(search.nodes)) {
+                stop("a search returned no data");
+
+                break groups;
+            }
+
+            if (typeof search.issueCount === "number" && search.issueCount > SEARCH_LIMIT) {
+                stop(`more than ${SEARCH_LIMIT} results`);
+
+                break groups;
+            }
+
+            if (typeof search.pageInfo?.hasNextPage !== "boolean") {
+                stop("a search page had no page info");
+
+                break groups;
+            }
+
+            if (!search.nodes.every(isDecidedNode)) {
+                stop("a search returned a node that is not a whole PR");
+
+                break groups;
+            }
+
+            result.nodes.push(...search.nodes);
+
+            if (!search.pageInfo.hasNextPage) {
+                break;
+            }
+
+            cursor = search.pageInfo.endCursor;
+
+            if (typeof cursor !== "string" || cursor === "") {
+                stop("a page had no cursor to the next one");
+
+                break groups;
+            }
+        }
+    }
+
+    return result;
+}
+
 // ---------- Odrade's notes ----------
 
 /** The notes folder: its index, its reports, its uncommitted files and its last commit. Never written. */
@@ -801,6 +975,7 @@ export function loadData({
         odrade: undefined,
         homes: [],
         github: undefined,
+        decided: undefined,
         sourceErrors,
     };
 
@@ -867,6 +1042,17 @@ export function loadData({
     } else {
         attempt("github", () => {
             data.github = loadGithub(data, { gh, now, since });
+        });
+    }
+
+    // Q1's search comes after `loadGithub`, with the same `gh`: it shares the cap of 40 calls.
+    if (!useGithub) {
+        sourceErrors.decided = "disabled by --no-github";
+    } else if (sourceErrors.desk) {
+        sourceErrors.decided = "needs the desk threads";
+    } else {
+        attempt("decided", () => {
+            data.decided = loadDecided(data, { gh, now, since });
         });
     }
 

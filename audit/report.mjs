@@ -64,6 +64,14 @@ export function ownerOf(check) {
         return { component: "Odrade's notes", owner: "Odrade", size: "S" };
     }
 
+    if (group === "Q") {
+        return {
+            component: "the repository's PR flow and its agent's briefs",
+            owner: "the repository's owner agent; Odrade (muster)",
+            size: "S–M",
+        };
+    }
+
     return { component: "models and briefs", owner: "Brian decides, Odrade proposes", size: "M" };
 }
 
@@ -393,6 +401,17 @@ const metricLines = (metrics, github) => {
                 `- Named workers: ${named.routes} routed beside a named worker. Suggestion same as named: ${named.same.count} (success ${named.same.success} of ${named.same.count}); differs: ${named.differs.count} (success ${named.differs.success} of ${named.differs.count}).`,
             );
         }
+    }
+
+    const q1 = metrics.Q1;
+
+    if (q1) {
+        const t = q1.totals;
+        const day = q1.day;
+
+        lines.push(
+            `- Decided acceptance (${q1.window.days} days, ${q1.window.covered} covered): ${t.acceptance ?? "n/a"}, merged ${t.merged}, closed unmerged ${t.closedUnmerged}, reverted ${t.reverted}. Today's record: ${plural(day.prs.length, "PR")}${day.complete ? "" : ` (day record incomplete: ${day.reason})`}.`,
+        );
     }
 
     lines.push(

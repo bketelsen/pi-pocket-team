@@ -31,6 +31,7 @@ import {
     checkI2,
     checkI3,
     checkJ1,
+    checkQ1,
     checkR1,
     inDeepseekPeak,
     makeFinding,
@@ -1875,7 +1876,7 @@ test("runChecks: every check has an entry, and a missing source skips its checks
     const data = emptyData({ sourceErrors: { github: "disabled by --no-github" } });
     const result = runChecks(data, ctx);
 
-    assert.equal(CHECKS.length, 26);
+    assert.equal(CHECKS.length, 27);
     // R1 reads the router's records on the desk threads, and the goals beside them.
     assert.deepEqual(
         CHECKS.find(([id]) => id === "R1"),
@@ -1930,4 +1931,376 @@ test("runChecks: a database that cannot be read skips the checks that need it", 
 
     assert.match(result.skipped.A4!, /source unavailable: entries: no such table/);
     assert.ok(!("I1" in result.skipped));
+});
+
+// ---------- Q. Quality metrics ----------
+
+const Q1_DATE = "2026-10-23";
+
+/** The date `n` days before the run's date. */
+const daysBefore = (n: number) =>
+    new Date(Date.parse(`${Q1_DATE}T00:00:00Z`) - n * DAY).toISOString().slice(0, 10);
+
+type Q1Pr = {
+    ref: string;
+    state: "merged" | "closed";
+    at: string;
+    agent: string;
+    author: string;
+    title: string;
+    reverts?: string[];
+    revertsTitle?: string;
+};
+
+/** 1 PR of a Q1 day record. */
+const q1Pr = (n: number, over: Partial<Q1Pr> = {}): Q1Pr => ({
+    ref: `acme/widgets#${n}`,
+    state: "merged",
+    at: new Date(NOW - 2 * DAY + n * HOUR).toISOString(),
+    agent: "irulan",
+    author: "frostyard-machines",
+    title: `Change ${n}`,
+    ...over,
+});
+
+const q1Record = (prs: Q1Pr[], complete = true) => ({
+    from: "2026-10-01T00:00:00.000Z",
+    until: "2026-10-02T00:00:00.000Z",
+    complete,
+    ...(complete ? {} : { reason: "a search returned no data" }),
+    calls: 1,
+    // An incomplete record may hold PRs: they are never summed.
+    prs,
+});
+
+/**
+ * Earlier days as `loadEarlier` gives them: day `i` (1 to `count`) is `i` days before the run, oldest first. `prsOf`
+ * gives a day's PRs.
+ */
+const earlierDays = (count: number, prsOf: (i: number) => Q1Pr[] = () => []) =>
+    Array.from({ length: count }, (_, index) => count - index).map((i) => ({
+        date: daysBefore(i),
+        json: { findings: [], metrics: { Q1: { day: q1Record(prsOf(i)) } } },
+    }));
+
+/** Today's source: complete, with no PR. */
+const todayEmpty = { from: "x", until: "y", complete: true, calls: 1, nodes: [] };
+
+/** Spread PRs over the earlier days: PR `k` goes to day `k`. */
+const spread = (prs: Q1Pr[]) => (i: number) => prs.filter((_, k) => k + 1 === i);
+
+/** Case (b): 6 merged originals, 3 merged reverts (body, title, both), 1 closed unmerged. */
+const caseB = () => [
+    ...[1, 2, 3, 4, 5, 6].map((n) => q1Pr(n)),
+    q1Pr(7, { title: "Undo the first change", reverts: ["acme/widgets#1"] }),
+    q1Pr(8, { title: 'Revert "Change 2"', revertsTitle: "Change 2" }),
+    q1Pr(9, {
+        title: 'Revert "Change 3"',
+        revertsTitle: "Change 3",
+        reverts: ["acme/widgets#3"],
+    }),
+    q1Pr(10, { state: "closed" }),
+];
+
+const q1Ctx = (earlier: object[]) => ({ ...ctx, date: Q1_DATE, earlier });
+
+test("Q1 (a): 10 decided, 1 reverted, 1 closed unmerged over 26 days: acceptance 0.8, no finding", () => {
+    const prs = [
+        ...[1, 2, 3, 4, 5, 6, 7, 8].map((n) => q1Pr(n)),
+        q1Pr(9, { title: "Undo change 3", reverts: ["acme/widgets#3"] }),
+    ];
+    // The closed PR is today's, from the search, on a desk thread of irulan's.
+    const data = emptyData({
+        threads: threadMap(thread("T5", { prs: { "acme/widgets#10": { via: "seen" } } })),
+        decided: {
+            ...todayEmpty,
+            nodes: [
+                {
+                    number: 10,
+                    url: "https://github.com/acme/widgets/pull/10",
+                    title: "Change 10",
+                    body: "Some body",
+                    mergedAt: null,
+                    closedAt: new Date(NOW - HOUR).toISOString(),
+                    author: { login: "frostyard-machines" },
+                    repository: { nameWithOwner: "acme/widgets" },
+                },
+            ],
+        },
+    });
+    const result = checkQ1(data, q1Ctx(earlierDays(25, spread(prs))));
+
+    assert.deepEqual(result.findings, []);
+    assert.equal(result.metrics.window.covered, 26);
+    assert.deepEqual(result.metrics.window, {
+        from: "2026-09-24",
+        to: Q1_DATE,
+        days: 30,
+        covered: 26,
+    });
+    assert.deepEqual(result.metrics.thresholds, { minDecided: 8, minCovered: 25, below: 0.75 });
+    const row = { merged: 9, closedUnmerged: 1, reverted: 1, decided: 10, acceptance: 0.8 };
+
+    assert.deepEqual(result.metrics.totals, row);
+    assert.deepEqual(result.metrics.repos, { "acme/widgets": row });
+    assert.deepEqual(result.metrics.agents, { irulan: row });
+    assert.equal(result.metrics.day.prs.length, 1);
+    assert.equal(result.metrics.day.prs[0].agent, "irulan");
+});
+
+test("Q1 (b): 6 originals, 3 reverts by body, title and both, 1 closed over 26 days: 0.6, a finding for the repo and the agent", () => {
+    // 10 closed PRs of another repository with no desk thread: `unattributed` makes no finding, its repository does.
+    const other = Array.from({ length: 10 }, (_, i) =>
+        q1Pr(i + 1, { ref: `acme/other#${i + 1}`, state: "closed", agent: "unattributed" }),
+    );
+    const prs = [...caseB(), ...other];
+    const data = emptyData({ decided: todayEmpty });
+    const result = checkQ1(data, q1Ctx(earlierDays(25, spread(prs))));
+
+    assert.deepEqual(ids(result).sort(), [
+        "Q1:agent:irulan",
+        "Q1:repo:acme/other",
+        "Q1:repo:acme/widgets",
+    ]);
+
+    const repo = result.findings.find((f) => f.id === "Q1:repo:acme/widgets")!;
+    const agent = result.findings.find((f) => f.id === "Q1:agent:irulan")!;
+
+    assert.equal(repo.severity, "medium");
+    assert.equal(
+        repo.text,
+        "Decided acceptance of acme/widgets is 0.6 over 30 days: merged 9, closed unmerged 1, reverted 3 (26 of 30 days covered)",
+    );
+    assert.equal(repo.cases, 4);
+    assert.deepEqual(
+        repo.evidence.map((line) => line.split(" ")[0]),
+        [1, 10, 2, 3].map((n) => `https://github.com/acme/widgets/pull/${n}`),
+    );
+    // The newest case: the closed PR #10.
+    assert.equal(
+        repo.lastSeen,
+        new Date(NOW - 2 * DAY + 10 * HOUR).toISOString().slice(0, 16) + "Z",
+    );
+    assert.equal(agent.severity, "medium");
+    assert.equal(agent.cases, 4);
+    assert.match(agent.text, /^Decided acceptance of agent irulan is 0\.6 over 30 days/);
+    assert.deepEqual(result.metrics.repos["acme/widgets"], {
+        merged: 9,
+        closedUnmerged: 1,
+        reverted: 3,
+        decided: 10,
+        acceptance: 0.6,
+    });
+    assert.deepEqual(result.metrics.agents.unattributed, {
+        merged: 0,
+        closedUnmerged: 10,
+        reverted: 0,
+        decided: 10,
+        acceptance: 0,
+    });
+    assert.deepEqual(result.metrics.totals, {
+        merged: 9,
+        closedUnmerged: 11,
+        reverted: 3,
+        decided: 20,
+        acceptance: 0.3,
+    });
+});
+
+test("Q1 (c): case (b) with 24 covered days makes no finding", () => {
+    const result = checkQ1(
+        emptyData({ decided: todayEmpty }),
+        q1Ctx(earlierDays(23, spread(caseB()))),
+    );
+
+    assert.equal(result.metrics.window.covered, 24);
+    assert.equal(result.metrics.totals.acceptance, 0.6);
+    assert.deepEqual(result.findings, []);
+});
+
+test("Q1 (d): 7 decided PRs below 0.75 over 30 days make no finding", () => {
+    const prs = [
+        ...[1, 2, 3, 4].map((n) => q1Pr(n)),
+        ...[5, 6, 7].map((n) => q1Pr(n, { state: "closed" })),
+    ];
+    const result = checkQ1(emptyData({ decided: todayEmpty }), q1Ctx(earlierDays(29, spread(prs))));
+
+    assert.equal(result.metrics.window.covered, 30);
+    assert.equal(result.metrics.totals.decided, 7);
+    assert.equal(result.metrics.totals.acceptance, 0.57);
+    assert.deepEqual(result.findings, []);
+});
+
+test("Q1 (e): days older than 29 days and incomplete days are not summed or covered; a ref in 2 days counts once", () => {
+    const earlier = [
+        // 30 days before: outside the window.
+        {
+            date: daysBefore(30),
+            json: { findings: [], metrics: { Q1: { day: q1Record([q1Pr(1)]) } } },
+        },
+        // 29 days before: the first day of the window.
+        {
+            date: daysBefore(29),
+            json: { findings: [], metrics: { Q1: { day: q1Record([q1Pr(2)]) } } },
+        },
+        // Incomplete: not summed, not covered.
+        {
+            date: daysBefore(10),
+            json: { findings: [], metrics: { Q1: { day: q1Record([q1Pr(3)], false) } } },
+        },
+        // A day with no Q1 record at all (the run before Q1 existed).
+        { date: daysBefore(8), json: { findings: [] } },
+        // #4 is in 2 days: closed, then merged; the newest record wins.
+        {
+            date: daysBefore(6),
+            json: {
+                findings: [],
+                metrics: { Q1: { day: q1Record([q1Pr(4, { state: "closed" })]) } },
+            },
+        },
+        {
+            date: daysBefore(5),
+            json: { findings: [], metrics: { Q1: { day: q1Record([q1Pr(4)]) } } },
+        },
+    ];
+    const result = checkQ1(emptyData({ decided: todayEmpty }), q1Ctx(earlier));
+
+    // Today, 29 days before, 6 and 5 days before.
+    assert.equal(result.metrics.window.covered, 4);
+    assert.deepEqual(result.metrics.totals, {
+        merged: 2,
+        closedUnmerged: 0,
+        reverted: 0,
+        decided: 2,
+        acceptance: 1,
+    });
+});
+
+test("Q1 (f): a source error gives an incomplete day with no PRs, and the earlier days still sum", () => {
+    const data = emptyData({ sourceErrors: { decided: "disabled by --no-github" } });
+    const result = checkQ1(
+        data,
+        q1Ctx(earlierDays(3, () => [q1Pr(1), q1Pr(2, { state: "closed" })])),
+    );
+
+    assert.deepEqual(result.metrics.day, {
+        from: null,
+        until: null,
+        complete: false,
+        reason: "disabled by --no-github",
+        calls: 0,
+        prs: [],
+    });
+    assert.equal(result.metrics.window.covered, 3);
+    assert.deepEqual(result.metrics.totals, {
+        merged: 1,
+        closedUnmerged: 1,
+        reverted: 0,
+        decided: 2,
+        acceptance: 0.5,
+    });
+
+    // An incomplete source keeps no PRs either, and does not count today.
+    const partial = checkQ1(
+        emptyData({
+            decided: {
+                ...todayEmpty,
+                complete: false,
+                reason: "more than 1000 results",
+                nodes: [{}],
+            },
+        }),
+        q1Ctx([]),
+    );
+
+    assert.equal(partial.metrics.day.complete, false);
+    assert.equal(partial.metrics.day.reason, "more than 1000 results");
+    assert.deepEqual(partial.metrics.day.prs, []);
+    assert.equal(partial.metrics.window.covered, 0);
+    assert.equal(partial.metrics.totals.acceptance, null);
+});
+
+test("Q1: the day record keeps no body, reads the revert fields of merged PRs only, and attributes by desk thread", () => {
+    const node = (number: number, over: object = {}) => ({
+        number,
+        url: `https://github.com/acme/widgets/pull/${number}`,
+        title: `Change ${number}`,
+        body: "",
+        mergedAt: "2026-10-23T12:00:00Z",
+        closedAt: "2026-10-23T12:00:00Z",
+        author: { login: "brian" },
+        repository: { nameWithOwner: "acme/widgets" },
+        ...over,
+    });
+    const data = emptyData({
+        threads: threadMap(
+            thread("T10", { agents: ["teg"], prs: { "acme/widgets#1": {} } }),
+            thread("T2", { agents: [], prs: { "acme/widgets#1": {} } }),
+            thread("T3", { agents: ["lucilla"], prs: { "acme/widgets#1": {} } }),
+        ),
+        decided: {
+            ...todayEmpty,
+            nodes: [
+                node(1, { body: "Reverts acme/widgets#7\n\nReverts acme/gadgets#2 and a secret" }),
+                node(2, { title: 'Revert "Revert "Change 7""' }),
+                node(3, {
+                    mergedAt: null,
+                    title: 'Revert "Change 8"',
+                    body: "Reverts acme/widgets#8",
+                }),
+                // The same ref twice in one search (the 1-hour overlap): 1 PR.
+                node(3, {
+                    mergedAt: null,
+                    title: 'Revert "Change 8"',
+                    body: "Reverts acme/widgets#8",
+                }),
+            ],
+        },
+    });
+    const day = checkQ1(data, q1Ctx([])).metrics.day;
+
+    assert.equal(day.complete, true);
+    assert.deepEqual(day.prs, [
+        {
+            ref: "acme/widgets#1",
+            state: "merged",
+            at: "2026-10-23T12:00:00Z",
+            // T2 has no agent; T3 comes before T10.
+            agent: "lucilla",
+            author: "brian",
+            title: "Change 1",
+            reverts: ["acme/widgets#7", "acme/gadgets#2"],
+        },
+        {
+            ref: "acme/widgets#2",
+            state: "merged",
+            at: "2026-10-23T12:00:00Z",
+            agent: "unattributed",
+            author: "brian",
+            title: 'Revert "Revert "Change 7""',
+            revertsTitle: 'Revert "Change 7"',
+        },
+        {
+            ref: "acme/widgets#3",
+            state: "closed",
+            at: "2026-10-23T12:00:00Z",
+            agent: "unattributed",
+            author: "brian",
+            title: 'Revert "Change 8"',
+        },
+    ]);
+    assert.ok(!JSON.stringify(day).includes("secret"));
+});
+
+test("Q1: runChecks runs it last, with the date and the earlier days of its ctx", () => {
+    assert.deepEqual(CHECKS.at(-1), ["Q1", checkQ1, ["desk"]]);
+
+    const result = runChecks(
+        emptyData({ decided: todayEmpty }),
+        q1Ctx(earlierDays(2, () => [q1Pr(1)])),
+    );
+
+    assert.equal(result.metrics.Q1.window.covered, 3);
+    assert.equal(result.metrics.Q1.totals.merged, 1);
+    assert.equal(result.skipped.Q1, undefined);
 });

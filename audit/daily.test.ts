@@ -578,3 +578,151 @@ test("main: a summary that the checks drop shows their reason in the Summary sec
     // The proposal still stands.
     assert.match(readme, /1\. \*\*Stop the reopen churn\*\*/);
 });
+
+test("main: Q1 reads the earlier days' records, stores today's, and the run still writes exactly 2 files", async () => {
+    const t = setup();
+
+    // A fresh day folder: only the audit's own files come in.
+    fs.rmSync(t.outDir, { recursive: true });
+
+    // Yesterday's record: 1 merged and 1 closed PR of a complete day.
+    const yesterday = path.join(t.reports, "2026-10-22-daily-audit", "findings.json");
+
+    fs.writeFileSync(
+        yesterday,
+        JSON.stringify({
+            findings: [],
+            metrics: {
+                Q1: {
+                    day: {
+                        from: "2026-10-21T13:00:00.000Z",
+                        until: "2026-10-22T14:00:00.000Z",
+                        complete: true,
+                        calls: 1,
+                        prs: [
+                            {
+                                ref: "acme/w#7",
+                                state: "merged",
+                                at: "2026-10-22T09:00:00Z",
+                                agent: "irulan",
+                                author: "frostyard-machines",
+                                title: "Change 7",
+                            },
+                            {
+                                ref: "acme/w#8",
+                                state: "closed",
+                                at: "2026-10-22T10:00:00Z",
+                                agent: "irulan",
+                                author: "frostyard-machines",
+                                title: "Change 8",
+                            },
+                        ],
+                    },
+                },
+            },
+        }),
+    );
+
+    const ghCalls: string[][] = [];
+
+    const run = (command: string, args: string[]) => {
+        if (command !== "gh") {
+            return t.run(command, args);
+        }
+
+        ghCalls.push(args);
+
+        if (args[0] === "search") {
+            return JSON.stringify([
+                { repository: { nameWithOwner: "acme/w" }, number: 9, url: "u" },
+            ]);
+        }
+
+        const query = args.find((arg) => arg.startsWith("query=")) ?? "";
+
+        if (query.includes("search(")) {
+            return JSON.stringify({
+                data: {
+                    search: {
+                        issueCount: 1,
+                        pageInfo: { hasNextPage: false, endCursor: null },
+                        nodes: [
+                            {
+                                number: 9,
+                                url: "https://github.com/acme/w/pull/9",
+                                title: 'Revert "Change 7"',
+                                body: "Reverts acme/w#7",
+                                mergedAt: new Date(NOW - HOUR).toISOString(),
+                                closedAt: new Date(NOW - HOUR).toISOString(),
+                                author: { login: "frostyard-machines" },
+                                repository: { nameWithOwner: "acme/w" },
+                            },
+                        ],
+                    },
+                },
+            });
+        }
+
+        return JSON.stringify({ data: { p0: { pullRequest: null } } });
+    };
+
+    await main(["--no-llm", "--out-dir", t.outDir], {
+        env: t.env,
+        now: NOW,
+        run,
+        log: () => undefined,
+    });
+
+    const json = JSON.parse(fs.readFileSync(path.join(t.outDir, "findings.json"), "utf8"));
+    const readme = fs.readFileSync(path.join(t.outDir, "README.md"), "utf8");
+
+    assert.deepEqual(fs.readdirSync(t.outDir).sort(), ["README.md", "findings.json"]);
+    assert.equal(json.skipped.Q1, undefined);
+    assert.equal(json.metrics.Q1.day.complete, true);
+    assert.deepEqual(
+        json.metrics.Q1.day.prs.map((pr: { ref: string; reverts?: string[] }) => [
+            pr.ref,
+            pr.reverts,
+        ]),
+        [["acme/w#9", ["acme/w#7"]]],
+    );
+    assert.ok(!JSON.stringify(json).includes("Reverts acme"));
+    // Yesterday and today are covered; today's revert reverts yesterday's merge.
+    assert.equal(json.metrics.Q1.window.covered, 2);
+    assert.deepEqual(json.metrics.Q1.totals, {
+        merged: 2,
+        closedUnmerged: 1,
+        reverted: 1,
+        decided: 3,
+        acceptance: 0.33,
+    });
+    // Q1's 1 search is in the run's GitHub calls: search prs, 1 PR query, and Q1.
+    assert.equal(json.github.calls, 3);
+    assert.equal(ghCalls.length, 3);
+    assert.match(
+        readme,
+        /- Decided acceptance \(30 days, 2 covered\): 0\.33, merged 2, closed unmerged 1, reverted 1\. Today's record: 1 PR\./,
+    );
+});
+
+test("main --no-github: Q1's day record is incomplete and says why", async () => {
+    const t = setup();
+
+    await main(["--no-github", "--no-llm", "--out-dir", t.outDir], {
+        env: t.env,
+        now: NOW,
+        run: t.run,
+        log: () => undefined,
+    });
+
+    const json = JSON.parse(fs.readFileSync(path.join(t.outDir, "findings.json"), "utf8"));
+    const readme = fs.readFileSync(path.join(t.outDir, "README.md"), "utf8");
+
+    assert.equal(json.metrics.Q1.day.complete, false);
+    assert.equal(json.metrics.Q1.day.reason, "disabled by --no-github");
+    assert.equal(json.metrics.Q1.window.covered, 0);
+    assert.match(
+        readme,
+        /Today's record: 0 PRs \(day record incomplete: disabled by --no-github\)\./,
+    );
+});

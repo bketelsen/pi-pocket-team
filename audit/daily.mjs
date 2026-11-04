@@ -133,8 +133,9 @@ export async function main(
         useGithub: options.github,
         ...(run ? { run } : {}),
     });
-    const result = runChecks(data, ctx);
+    // The earlier days come first: Q1 sums their day records.
     const earlier = loadEarlier(outDir, date);
+    const result = runChecks(data, { ...ctx, date, earlier });
     const findings = annotate(result.findings, earlier, data.installed, ctx.now);
     const llm = await runLlm({
         ranked: findings.filter((finding) => !finding.maybeFixed),

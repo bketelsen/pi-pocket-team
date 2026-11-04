@@ -18,7 +18,9 @@ import {
     foldDocument,
     loadData,
     loadDesk,
+    loadDecided,
     loadGithub,
+    Q1_MAX_CALLS,
     makeGh,
     makeGit,
     openPocket,
@@ -161,7 +163,10 @@ test("loadData reads every source into one plain object", () => {
         run,
     });
 
-    assert.deepEqual(data.sourceErrors, { github: "disabled by --no-github" });
+    assert.deepEqual(data.sourceErrors, {
+        github: "disabled by --no-github",
+        decided: "disabled by --no-github",
+    });
     assert.deepEqual(Object.keys(data.threads).sort(), ["T1", "T2", "T3"]);
     assert.equal(data.events.length, 7);
     assert.deepEqual(data.agentOf, { 10: "odrade" });
@@ -772,7 +777,10 @@ test("a missing homes folder gives an empty list, not a source error", () => {
     assert.deepEqual(data.homes, []);
     assert.equal(data.sourceErrors.homes, undefined);
     // The checks that need the homes still run, on no homes.
-    assert.deepEqual(data.sourceErrors, { github: "disabled by --no-github" });
+    assert.deepEqual(data.sourceErrors, {
+        github: "disabled by --no-github",
+        decided: "disabled by --no-github",
+    });
 });
 
 // ---------- GitHub data ----------
@@ -971,4 +979,327 @@ test("loadData notes when the GitHub call cap was reached", () => {
     assert.equal(data.githubCalls.calls, 40);
     assert.equal(data.githubCalls.capReached, true);
     assert.equal(data.githubCalls.note, "GitHub call cap reached");
+});
+
+// ---------- Q1: decided PRs ----------
+
+/** A decided PR as the search gives it. */
+const searchNode = (repo: string, number: number, merged = true) => ({
+    number,
+    url: `https://github.com/${repo}/pull/${number}`,
+    title: `Change ${number}`,
+    body: "",
+    mergedAt: merged ? new Date(NOW - HOUR).toISOString() : null,
+    closedAt: new Date(NOW - HOUR).toISOString(),
+    author: { login: "frostyard-machines" },
+    repository: { nameWithOwner: repo },
+});
+
+/**
+ * A fake `gh` that serves Q1's search in `pages` pages of 1 node each; page `n` answers `after: "c<n-1>"`. Every call
+ * goes through `makeGh`, so its read-only check runs.
+ */
+function fakeSearch(pages: number, issueCount = pages) {
+    const queries: string[] = [];
+
+    const run = (_: string, args: string[]) => {
+        const query = (args.find((arg) => arg.startsWith("query=")) ?? "").slice("query=".length);
+
+        queries.push(query);
+
+        const after = /after: "c(\d+)"/.exec(query);
+        const page = after ? Number(after[1]) + 1 : 1;
+
+        return JSON.stringify({
+            data: {
+                search: {
+                    issueCount,
+                    pageInfo: { hasNextPage: page < pages, endCursor: `c${page}` },
+                    nodes: [searchNode("acme/w", page, page % 2 === 1)],
+                },
+            },
+        });
+    };
+
+    return { queries, run };
+}
+
+/** A desk with 2 owners: `acme` (a thread's repository, in a closed thread) and `beta` (an attached PR). */
+const decidedDesk = {
+    threads: {
+        T1: { id: "T1", state: "closed", repo: "acme/w", prs: {} },
+        T2: { id: "T2", state: "open", prs: { "beta/x#4": {} } },
+    },
+    github: { botPrs: ["acme/z#1"] },
+};
+
+test("loadDecided: 1 search with the owners, is:closed and the window in +00:00; pages follow endCursor", () => {
+    const fake = fakeSearch(2);
+    const gh = makeGh(fake.run);
+    const result = loadDecided(decidedDesk, { gh, now: NOW, since: NOW - 24 * HOUR });
+
+    assert.equal(fake.queries.length, 2);
+    assert.equal(result.calls, 2);
+    assert.equal(result.complete, true);
+    assert.equal(result.reason, undefined);
+    assert.deepEqual(
+        result.nodes.map((node: { number: number }) => node.number),
+        [1, 2],
+    );
+    // The search text: 1 hour before `since` (the index lags) to now, with no milliseconds.
+    const text =
+        "is:pr is:closed closed:2026-10-22T13:00:00+00:00..2026-10-23T14:00:00+00:00 user:acme user:beta";
+
+    assert.ok(
+        fake.queries[0]!.includes(
+            `search(query: ${JSON.stringify(text)}, type: ISSUE, first: 100)`,
+        ),
+    );
+    assert.ok(fake.queries[1]!.includes(`first: 100, after: "c1")`));
+    assert.match(fake.queries[0]!, /issueCount pageInfo \{ hasNextPage endCursor \}/);
+    assert.match(
+        fake.queries[0]!,
+        /mergedAt closedAt author \{ login \} repository \{ nameWithOwner \}/,
+    );
+    assert.equal(result.from, new Date(NOW - 25 * HOUR).toISOString());
+    assert.equal(result.until, new Date(NOW).toISOString());
+});
+
+test("loadDecided: 5 pages give exactly 4 calls and an incomplete result", () => {
+    const fake = fakeSearch(5);
+    const gh = makeGh(fake.run);
+    const result = loadDecided(decidedDesk, { gh, now: NOW, since: NOW - 24 * HOUR });
+
+    assert.equal(Q1_MAX_CALLS, 4);
+    assert.equal(fake.queries.length, 4);
+    assert.equal(gh.state.calls, 4);
+    assert.equal(result.calls, 4);
+    assert.equal(result.complete, false);
+    assert.match(result.reason!, /more than 4 calls/);
+});
+
+test("loadDecided: more than 1000 results, no data, or no owners give an incomplete result", () => {
+    const many = loadDecided(decidedDesk, {
+        gh: makeGh(fakeSearch(1, 1001).run),
+        now: NOW,
+        since: NOW - 24 * HOUR,
+    });
+
+    assert.equal(many.complete, false);
+    assert.match(many.reason!, /more than 1000 results/);
+
+    const broken = loadDecided(decidedDesk, {
+        gh: makeGh(() => "{}"),
+        now: NOW,
+        since: NOW - 24 * HOUR,
+    });
+
+    assert.equal(broken.complete, false);
+    assert.equal(broken.reason, "a search returned no data");
+    assert.equal(broken.calls, 1);
+
+    const calls: string[][] = [];
+    const none = loadDecided(
+        { threads: {} },
+        {
+            gh: makeGh((_, args) => (calls.push(args), "")),
+            now: NOW,
+            since: NOW - 24 * HOUR,
+        },
+    );
+
+    assert.equal(none.complete, false);
+    assert.equal(none.calls, 0);
+    assert.equal(calls.length, 0);
+});
+
+test("loadDecided: more than 4 owners make groups of 4 that share the 4 calls; the cap stops it", () => {
+    const threads = Object.fromEntries(
+        ["a", "b", "c", "d", "e"].map((owner, i) => [
+            `T${i}`,
+            { id: `T${i}`, state: "open", repo: `${owner}/r`, prs: {} },
+        ]),
+    );
+    const fake = fakeSearch(1);
+    const result = loadDecided({ threads }, { gh: makeGh(fake.run), now: NOW, since: NOW - HOUR });
+
+    assert.equal(fake.queries.length, 2);
+    assert.ok(fake.queries[0]!.includes('user:a user:b user:c user:d", type'));
+    assert.ok(fake.queries[1]!.includes('+00:00 user:e", type'));
+    assert.equal(result.complete, true);
+
+    // The run's 40 calls are spent: Q1 makes none, and says why.
+    const gh = makeGh(fake.run, 0);
+    const capped = loadDecided({ threads }, { gh, now: NOW, since: NOW - HOUR });
+
+    assert.equal(capped.complete, false);
+    assert.equal(capped.reason, "GitHub call cap reached");
+    assert.equal(capped.calls, 0);
+});
+
+test("loadData: Q1's search comes after loadGithub with the same gh, and its calls count in the total", () => {
+    const { pocketDir, odradeDir, homesDir } = setup();
+    const order: string[] = [];
+    const data = loadData({
+        pocketDir,
+        odradeDir,
+        homesDir,
+        now: NOW,
+        hours: 24,
+        useGithub: true,
+        run: (command, args) => {
+            if (command !== "gh") {
+                return args.includes("log") ? new Date(NOW).toISOString() : "";
+            }
+
+            checkGhArgs(args);
+
+            if (args[0] === "search") {
+                order.push("search prs");
+
+                return JSON.stringify([
+                    { repository: { nameWithOwner: "acme/w" }, number: 1, url: "u" },
+                ]);
+            }
+
+            const query = args.find((arg) => arg.startsWith("query=")) ?? "";
+
+            if (query.includes("search(")) {
+                order.push("q1");
+
+                return JSON.stringify({
+                    data: {
+                        search: {
+                            issueCount: 1,
+                            pageInfo: { hasNextPage: false, endCursor: null },
+                            nodes: [searchNode("acme/w", 1)],
+                        },
+                    },
+                });
+            }
+
+            order.push("graphql");
+
+            return JSON.stringify({ data: { p0: { pullRequest: null } } });
+        },
+    });
+
+    assert.deepEqual(order, ["search prs", "graphql", "q1"]);
+    assert.equal(data.sourceErrors.decided, undefined);
+    assert.equal(data.decided.complete, true);
+    assert.equal(data.decided.calls, 1);
+    assert.equal(data.githubCalls.calls, 3);
+});
+
+test("loadData: without the desk, Q1 has a source error and makes no call", () => {
+    const { pocketDir, odradeDir, homesDir } = setup();
+    const db = new DatabaseSync(path.join(pocketDir, "pocket.sqlite"));
+
+    db.exec("delete from documents where kind='\"x.desk.threads\"'");
+    db.close();
+
+    const calls: string[][] = [];
+    const data = loadData({
+        pocketDir,
+        odradeDir,
+        homesDir,
+        now: NOW,
+        hours: 24,
+        useGithub: true,
+        run: (command, args) => {
+            if (command === "gh") {
+                calls.push(args);
+            }
+
+            return args.includes("log") ? new Date(NOW).toISOString() : "";
+        },
+    });
+
+    assert.equal(data.sourceErrors.decided, "needs the desk threads");
+    assert.equal(data.decided, undefined);
+    assert.equal(calls.length, 0);
+});
+
+/** Q1 on 1 page that `answer` gives, through `makeGh`. */
+const decidedFrom = (answer: (args: string[]) => string) =>
+    loadDecided(decidedDesk, {
+        gh: makeGh((_, args) => answer(args)),
+        now: NOW,
+        since: NOW - 24 * HOUR,
+    });
+
+/** 1 search page: `over` replaces parts of it. */
+const searchPage = (over: Record<string, unknown> = {}) => ({
+    data: {
+        search: {
+            issueCount: 1,
+            pageInfo: { hasNextPage: false, endCursor: "c1" },
+            nodes: [searchNode("acme/w", 1)],
+            ...over,
+        },
+    },
+});
+
+test("loadDecided: a good page is complete", () => {
+    const result = decidedFrom(() => JSON.stringify(searchPage()));
+
+    assert.equal(result.complete, true);
+    assert.equal(result.reason, undefined);
+    assert.equal(result.nodes.length, 1);
+});
+
+test("loadDecided: a partial or doubtful answer is never complete", () => {
+    const { closedAt: _closedAt, ...noClosedAt } = searchNode("acme/w", 2);
+    const cases: [string, (args: string[]) => string, RegExp][] = [
+        [
+            "data with errors",
+            () => JSON.stringify({ ...searchPage(), errors: [{ message: "timeout" }] }),
+            /returned errors/,
+        ],
+        [
+            "a null node",
+            () => JSON.stringify(searchPage({ nodes: [searchNode("acme/w", 1), null] })),
+            /not a whole PR/,
+        ],
+        [
+            "a node without closedAt",
+            () => JSON.stringify(searchPage({ nodes: [noClosedAt] })),
+            /not a whole PR/,
+        ],
+        [
+            "a node without its repository",
+            () =>
+                JSON.stringify(
+                    searchPage({ nodes: [{ ...searchNode("acme/w", 3), repository: null }] }),
+                ),
+            /not a whole PR/,
+        ],
+        [
+            "pageInfo missing",
+            () => JSON.stringify(searchPage({ pageInfo: undefined })),
+            /page info/,
+        ],
+        [
+            "hasNextPage not a boolean",
+            () => JSON.stringify(searchPage({ pageInfo: { hasNextPage: "no", endCursor: null } })),
+            /page info/,
+        ],
+        [
+            "a call that throws with valid JSON on stdout",
+            () => {
+                throw Object.assign(new Error("gh: exit 1"), {
+                    stdout: JSON.stringify(searchPage()),
+                });
+            },
+            /call failed/,
+        ],
+    ];
+
+    for (const [name, answer, reason] of cases) {
+        const result = decidedFrom(answer);
+
+        assert.equal(result.complete, false, name);
+        assert.match(result.reason!, reason, name);
+        assert.equal(result.calls, 1, name);
+    }
 });

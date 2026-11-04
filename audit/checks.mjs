@@ -1,6 +1,7 @@
 // The daily audit's checks. Each one is a pure function of `(data, ctx)` and returns `{ findings, metrics }`.
 //
-// `data` is the plain object that `sources.mjs` builds; `ctx` is `{ now, since, hours }`. A check reads nothing and
+// `data` is the plain object that `sources.mjs` builds; `ctx` is `{ now, since, hours }`, and for `runChecks` also
+// `date` and `earlier` (the earlier days' JSON, which Q1 sums). A check reads nothing and
 // writes nothing. `runChecks` runs every check in a try/catch: a check that throws, or whose source is missing, goes
 // to `skipped`, and the run goes on. See docs/plans/daily-audit.md, Section 4.
 import {
@@ -14,6 +15,7 @@ import {
     money,
     iso,
     median,
+    newYorkDate,
     quote,
     refsIn,
     safeLine,
@@ -1894,6 +1896,288 @@ export function checkR1(data, ctx) {
     return { findings: [], metrics: { routes, cells: list, named } };
 }
 
+// ---------- Q. Quality metrics ----------
+
+/** Q1's thresholds: first guesses, to tune after 2 weeks of records (plan T801, "Gap 1"). */
+export const Q1_THRESHOLDS = { minDecided: 8, minCovered: 25, below: 0.75 };
+/** Q1 sums this many days, today included. */
+const Q1_DAYS = 30;
+
+const REVERTS_REF = /\bReverts ([\w.-]+\/[\w.-]+)#(\d+)/g;
+const REVERT_TITLE = /^Revert "(.*)"$/s;
+
+/** The date `days` days after `date` (`YYYY-MM-DD`; negative goes back). */
+const shiftDate = (date, days) =>
+    new Date(Date.parse(`${date}T00:00:00Z`) + days * DAY).toISOString().slice(0, 10);
+
+const repoOfRef = (ref) => ref.split("#")[0];
+
+/** The agent of each PR ref on the desk: `agents[0]` of a thread that holds it, threads by id, agents first. */
+function prAgents(threads) {
+    const byRef = new Map();
+    const list = Object.values(threads ?? {}).sort((a, b) =>
+        String(a.id).localeCompare(String(b.id), "en", { numeric: true }),
+    );
+
+    for (const thread of list) {
+        for (const ref of Object.keys(thread.prs ?? {})) {
+            const agent = Array.isArray(thread.agents) ? thread.agents[0] : undefined;
+
+            if (typeof agent === "string" && agent !== "" && !byRef.has(ref)) {
+                byRef.set(ref, agent);
+            }
+        }
+    }
+
+    return byRef;
+}
+
+/** 1 PR of Q1's day record, from 1 search node. No body is kept. */
+function decidedPr(node, agents) {
+    const ref = `${node.repository.nameWithOwner}#${node.number}`;
+    const merged = Boolean(node.mergedAt);
+    const title = String(node.title ?? "");
+    const out = {
+        ref,
+        state: merged ? "merged" : "closed",
+        at: node.closedAt ?? node.mergedAt ?? null,
+        agent: agents.get(ref) ?? "unattributed",
+        author: node.author?.login ?? null,
+        title,
+    };
+
+    if (merged) {
+        const reverts = [
+            ...new Set(
+                [...String(node.body ?? "").matchAll(REVERTS_REF)].map((m) => `${m[1]}#${m[2]}`),
+            ),
+        ];
+        const revertsTitle = REVERT_TITLE.exec(title)?.[1];
+
+        if (reverts.length > 0) {
+            out.reverts = reverts;
+        }
+
+        if (revertsTitle !== undefined) {
+            out.revertsTitle = revertsTitle;
+        }
+    }
+
+    return out;
+}
+
+/** Today's record for Q1: the PRs the run saw decided, or `complete: false` and why. */
+function q1Day(data) {
+    const error = data.sourceErrors?.decided;
+    const source = data.decided;
+
+    if (error || !source) {
+        return {
+            from: source?.from ?? null,
+            until: source?.until ?? null,
+            complete: false,
+            reason: error ?? "no data",
+            calls: source?.calls ?? 0,
+            prs: [],
+        };
+    }
+
+    const day = {
+        from: source.from,
+        until: source.until,
+        complete: source.complete === true,
+        ...(source.complete === true ? {} : { reason: source.reason ?? "incomplete" }),
+        calls: source.calls ?? 0,
+        prs: [],
+    };
+
+    // Partial data is never judged, and never kept.
+    if (day.complete) {
+        const agents = prAgents(data.threads);
+        const byRef = new Map();
+
+        for (const node of source.nodes ?? []) {
+            const pr = decidedPr(node, agents);
+
+            byRef.set(pr.ref, pr);
+        }
+
+        day.prs = [...byRef.values()].sort((a, b) => a.ref.localeCompare(b.ref));
+    }
+
+    return day;
+}
+
+const zeroQ1Row = () => ({
+    merged: 0,
+    closedUnmerged: 0,
+    reverted: 0,
+    decided: 0,
+    acceptance: null,
+});
+
+/** The unrounded acceptance of a row, or null. */
+const q1Rate = (row) => (row.decided === 0 ? null : (row.merged - row.reverted) / row.decided);
+
+/** The refs of the merged PRs that a merged revert PR in the set reverts. */
+function revertedRefs(prs) {
+    const merged = prs.filter((pr) => pr.state === "merged");
+    const byRef = new Map(merged.map((pr) => [pr.ref, pr]));
+    const reverted = new Set();
+
+    for (const revert of merged) {
+        if (revert.reverts?.length > 0) {
+            for (const ref of revert.reverts) {
+                if (ref !== revert.ref && byRef.has(ref)) {
+                    reverted.add(ref);
+                }
+            }
+        } else if (typeof revert.revertsTitle === "string") {
+            for (const pr of merged) {
+                if (
+                    pr.ref !== revert.ref &&
+                    repoOfRef(pr.ref) === repoOfRef(revert.ref) &&
+                    pr.title === revert.revertsTitle
+                ) {
+                    reverted.add(pr.ref);
+                }
+            }
+        }
+    }
+
+    return reverted;
+}
+
+/**
+ * Q1: decided acceptance. Each run records the PRs it saw decided (merged, or closed unmerged); the last 30 complete
+ * records are summed, 1 PR per ref, and acceptance is `(merged − reverted) / decided`, per repository and per agent.
+ * A medium finding for a repository or an agent with 8 or more decided PRs, 25 or more covered days, and an
+ * acceptance under 0.75. `unattributed` makes no finding.
+ */
+export function checkQ1(data, ctx) {
+    const date = ctx.date ?? newYorkDate(ctx.now);
+    const first = shiftDate(date, -(Q1_DAYS - 1));
+    const last = shiftDate(date, -1);
+    const day = q1Day(data);
+    const records = (ctx.earlier ?? [])
+        .filter(
+            (earlier) =>
+                earlier.date >= first &&
+                earlier.date <= last &&
+                earlier.json?.metrics?.Q1?.day?.complete === true,
+        )
+        .sort((a, b) => a.date.localeCompare(b.date))
+        .map((earlier) => earlier.json.metrics.Q1.day);
+
+    if (day.complete) {
+        records.push(day);
+    }
+
+    // 1 PR per ref; the newest record wins.
+    const byRef = new Map();
+
+    for (const record of records) {
+        for (const pr of Array.isArray(record.prs) ? record.prs : []) {
+            if (typeof pr?.ref === "string") {
+                byRef.set(pr.ref, pr);
+            }
+        }
+    }
+
+    const prs = [...byRef.values()];
+    const reverted = revertedRefs(prs);
+    const totals = zeroQ1Row();
+    const repos = {};
+    const agents = {};
+    const casesOf = new Map();
+
+    for (const pr of prs) {
+        const repo = repoOfRef(pr.ref);
+        const agent = typeof pr.agent === "string" ? pr.agent : "unattributed";
+        const rows = [totals, (repos[repo] ??= zeroQ1Row()), (agents[agent] ??= zeroQ1Row())];
+        const keys = [`repo:${repo}`, `agent:${agent}`];
+
+        for (const row of rows) {
+            row[pr.state === "merged" ? "merged" : "closedUnmerged"] += 1;
+            row.decided += 1;
+            row.reverted += reverted.has(pr.ref) ? 1 : 0;
+        }
+
+        if (pr.state !== "merged" || reverted.has(pr.ref)) {
+            keys.forEach((key) => casesOf.set(key, [...(casesOf.get(key) ?? []), pr]));
+        }
+    }
+
+    const sorted = (rows) =>
+        Object.fromEntries(Object.entries(rows).sort((a, b) => a[0].localeCompare(b[0])));
+
+    const round = (row) => {
+        const rate = q1Rate(row);
+
+        row.acceptance = rate === null ? null : Math.round(rate * 100) / 100;
+
+        return row;
+    };
+
+    [totals, ...Object.values(repos), ...Object.values(agents)].forEach(round);
+
+    const covered = records.length;
+    const findings = [];
+
+    const judge = (subject, label, row) => {
+        const rate = q1Rate(row);
+
+        if (
+            row.decided < Q1_THRESHOLDS.minDecided ||
+            covered < Q1_THRESHOLDS.minCovered ||
+            rate === null ||
+            rate >= Q1_THRESHOLDS.below
+        ) {
+            return;
+        }
+
+        const cases = (casesOf.get(subject) ?? []).sort((a, b) => a.ref.localeCompare(b.ref));
+        const times = cases.map((pr) => Date.parse(pr.at)).filter((ms) => !Number.isNaN(ms));
+
+        findings.push(
+            makeFinding({
+                check: "Q1",
+                subject,
+                severity: "medium",
+                text: `Decided acceptance of ${label} is ${row.acceptance} over ${Q1_DAYS} days: merged ${row.merged}, closed unmerged ${row.closedUnmerged}, reverted ${row.reverted} (${covered} of ${Q1_DAYS} days covered)`,
+                evidence: cases.map(
+                    (pr) =>
+                        `${prUrl(pr.ref)} ${pr.state === "merged" ? "reverted" : "closed unmerged"}`,
+                ),
+                lastSeen: times.length > 0 ? Math.max(...times) : undefined,
+                cases: row.closedUnmerged + row.reverted,
+            }),
+        );
+    };
+
+    for (const [repo, row] of Object.entries(sorted(repos))) {
+        judge(`repo:${repo}`, repo, row);
+    }
+
+    for (const [agent, row] of Object.entries(sorted(agents))) {
+        if (agent !== "unattributed") {
+            judge(`agent:${agent}`, `agent ${agent}`, row);
+        }
+    }
+
+    return {
+        findings,
+        metrics: {
+            day,
+            window: { from: first, to: date, days: Q1_DAYS, covered },
+            thresholds: { ...Q1_THRESHOLDS },
+            totals,
+            repos: sorted(repos),
+            agents: sorted(agents),
+        },
+    };
+}
+
 // ---------- The registry ----------
 
 /** Each check, with the sources it needs. A source that is in `data.sourceErrors` skips the check. */
@@ -1924,6 +2208,7 @@ export const CHECKS = [
     ["I3", checkI3, ["homes"]],
     ["J1", checkJ1, ["desk", "costs"]],
     ["R1", checkR1, ["desk", "goals", "routes"]],
+    ["Q1", checkQ1, ["desk"]],
 ];
 
 /**

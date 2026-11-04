@@ -68,6 +68,19 @@ export function selectPairs(pairs) {
 
 const metricsKey = (check) => check.replace("?", "");
 
+/** The metrics of a check as the model sees them: Q1's day record (a long PR list) is left out. */
+const metricsOf = (metrics, key) => {
+    const value = metrics[key];
+
+    if (key !== "Q1" || !value || typeof value !== "object") {
+        return value;
+    }
+
+    const { day: _day, ...rest } = value;
+
+    return rest;
+};
+
 /** The prompt text for some findings and pairs. */
 export function buildContent(findings, metrics, pairs) {
     const used = {};
@@ -76,7 +89,7 @@ export function buildContent(findings, metrics, pairs) {
         const key = metricsKey(finding.check);
 
         if (metrics[key] !== undefined) {
-            used[key] = metrics[key];
+            used[key] = metricsOf(metrics, key);
         }
     }
 
@@ -150,7 +163,7 @@ function allowedNumbers(findings, metrics) {
             finding.evidence ?? [],
             finding.cases,
             finding.waste ?? 0,
-            ...(metrics ? [metrics[metricsKey(finding.check)] ?? {}] : []),
+            ...(metrics ? [metricsOf(metrics, metricsKey(finding.check)) ?? {}] : []),
         ]) {
             for (const number of allNumbers(value)) {
                 allowed.add(number);
