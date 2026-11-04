@@ -2466,7 +2466,12 @@ export default function setup(pocket) {
         const counts = view?.counts ?? {};
         const ready = view?.ready ?? [];
         const plans = view?.plans ?? [];
-        const capInfo = view?.cap ?? { counted: 0, cap: 0, full: false, grants: 0 };
+        const capInfo = view?.cap ?? { counted: 0, cap: 0, full: false, grants: 0, waiting: 0 };
+        // Refused delegations that wait for an OK: "Allow 1" shows only while 1 waits.
+        const waitingCount = capInfo.waiting ?? 0;
+        const fullText = `The desk is full: ${capInfo.counted} of ${capInfo.cap} count. ${
+            waitingCount === 1 ? "1 delegation waits" : `${waitingCount} delegations wait`
+        }. Allow 1 lets Odrade open 1 more thread, and tells her to delegate the work that waited.`;
         const fresh = (thread) => thread.lastEventAt > (seenBefore ?? 0);
 
         /** One line of a row's facts: its repository, its next actor, its check, and its age. */
@@ -3158,12 +3163,19 @@ export default function setup(pocket) {
                         : null
                 }
                 ${
-                    capInfo.full
+                    capInfo.full && waitingCount === 0
+                        ? html`<p class="small muted desk-full-quiet" role="status">
+                              ${capInfo.counted} of ${capInfo.cap} count; nothing waits${
+                                  capInfo.grants > 0 ? ` · ${capInfo.grants} extra allowed` : ""
+                              }
+                          </p>`
+                        : null
+                }
+                ${
+                    capInfo.full && waitingCount > 0
                         ? html`<div class="desk-full" role="status">
                               <p>
-                                  The desk is full: ${capInfo.counted} of ${capInfo.cap} count. Allow 1
-                                  lets Odrade open 1 more thread, and tells her to delegate the work
-                                  that waited.
+                                  ${fullText}
                               </p>
                               <div class="desk-actions">
                                   <button

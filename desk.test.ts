@@ -197,6 +197,9 @@ import {
     joinIssueFact,
     judgeIssue,
     lapseGrants,
+    addGrant,
+    recordRefusal,
+    waitingRefusals,
     linkIssue,
     mergeQueue,
     mergeAskFor,
@@ -9255,6 +9258,120 @@ describe("the cap", () => {
         assert.deepEqual(capView(state, 2, 1000).grants, []);
     });
 
+    /** A refused delegation of supervisor 1. */
+    const refusal = (key: string, at: number, title = `Work ${key}`) => ({
+        key,
+        supervisor: 1,
+        title,
+        at,
+    });
+
+    test("a full desk with no refusal waits for nothing: the view says 0", () => {
+        const state = deskOf();
+
+        placed(state, 100);
+
+        assert.equal(capView(state, 1, 1000).full, true);
+        assert.equal(capView(state, 1, 1000).waiting, 0);
+        assert.deepEqual(threadsView(state, 1000, 1).cap, {
+            counted: 1,
+            cap: 1,
+            full: true,
+            grants: 0,
+            waiting: 0,
+        });
+    });
+
+    test("recordRefusal records 1 refusal on a full desk, and the view says 1 waits", () => {
+        const state = deskOf();
+
+        placed(state, 100);
+
+        assert.equal(recordRefusal(state, 1, refusal("r1", 1000)), true);
+        assert.deepEqual(state.refusals, [
+            { at: 1000, supervisor: 1, title: "Work r1", key: "r1" },
+        ]);
+        assert.equal(capView(state, 1, 1000).waiting, 1);
+        assert.equal(threadsView(state, 1000, 1).cap.waiting, 1);
+    });
+
+    test("recordRefusal adds nothing for a replay of the same key, the same work again, room, or a thread", () => {
+        const state = deskOf();
+
+        placed(state, 100);
+        recordRefusal(state, 1, refusal("r1", 1000));
+
+        // A replay of the same key adds nothing.
+        assert.equal(recordRefusal(state, 1, refusal("r1", 1500)), false);
+        assert.equal(state.refusals?.length, 1);
+        assert.equal(state.refusals?.[0]?.at, 1000);
+
+        // The same supervisor and title again is the same work: it moves to the new key, and 1 waits.
+        assert.equal(recordRefusal(state, 1, refusal("r2", 2000, "Work r1")), true);
+        assert.deepEqual(state.refusals, [
+            { at: 2000, supervisor: 1, title: "Work r1", key: "r2" },
+        ]);
+        assert.equal(capView(state, 1, 2000).waiting, 1);
+
+        // A desk with room records nothing, and a key with a thread records nothing.
+        assert.equal(recordRefusal(state, 5, refusal("r3", 2000)), false);
+        assert.equal(recordRefusal(state, 1, refusal("k-100", 2000)), false);
+        assert.equal(state.refusals?.length, 1);
+    });
+
+    test("a grant serves the oldest waiting refusal: 1 OK serves 1, and the other still waits", () => {
+        const state = deskOf();
+
+        placed(state, 100);
+        recordRefusal(state, 1, refusal("r1", 1000));
+        recordRefusal(state, 1, refusal("r2", 1100));
+        assert.equal(capView(state, 1, 1200).waiting, 2);
+
+        assert.equal(
+            addGrant(state, { at: 1200, by: "Brian", via: "tap", key: "tap:1", expires: 99_999 }),
+            true,
+        );
+        assert.equal(state.refusals?.find((one) => one.key === "r1")?.served, 1200);
+        assert.equal(state.refusals?.find((one) => one.key === "r1")?.servedBy, "tap:1");
+        assert.deepEqual(
+            waitingRefusals(state, 1200).map((one) => one.key),
+            ["r2"],
+        );
+        assert.equal(threadsView(state, 1200, 1).cap.waiting, 1);
+
+        // The same grant key again adds no grant and serves nothing.
+        assert.equal(
+            addGrant(state, { at: 1300, by: "Brian", via: "tap", key: "tap:1", expires: 99_999 }),
+            false,
+        );
+        assert.equal(capView(state, 1, 1300).waiting, 1);
+
+        addGrant(state, { at: 1400, by: "Brian", via: "chat", key: "chat:9:1", expires: 99_999 });
+        assert.equal(capView(state, 1, 1400).waiting, 0);
+        assert.equal(threadsView(state, 1400, 1).cap.waiting, 0);
+    });
+
+    test("a refusal clears when the desk drops below the cap, and expires after 24 hours", () => {
+        const state = deskOf();
+
+        placed(state, 100);
+        recordRefusal(state, 1, refusal("r1", 1000));
+
+        // Still full: nothing clears.
+        lapseGrants(state, 1, 2000);
+        assert.equal(state.refusals?.[0]?.cleared, undefined);
+        assert.equal(capView(state, 1, 2000).waiting, 1);
+
+        // A refusal older than 24 hours does not wait.
+        assert.equal(capView(state, 1, 1000 + DAY).waiting, 0);
+
+        // Below the cap: the refusal clears, and stays cleared when the desk is full again.
+        assert.equal(lapseGrants(state, 2, 3000), 0, "the return value counts only OKs");
+        assert.equal(state.refusals?.[0]?.cleared, 3000);
+        assert.equal(capView(state, 1, 3000).waiting, 0);
+        assert.equal(threadsView(state, 3000, 1).cap.waiting, 0);
+    });
+
     test("grantText says how many threads Brian allowed over the cap", () => {
         assert.equal(
             grantText("Brian", 1, { counted: 13, cap: 12 }),
@@ -11369,6 +11486,7 @@ async function clearGrants(): Promise<void> {
         state.grants = state.grants.filter(
             (grant) => grant.usedBy !== undefined || grant.expires <= now,
         );
+        state.refusals = [];
     }, context);
 }
 
@@ -17523,10 +17641,50 @@ describe("the desk in a Pi Pocket", () => {
                     return opened.thread.id;
                 }, context);
 
+                // A full desk with no refused delegation: nothing waits. (The view reads the state: GET threads would
+                // sweep, and the sweep would move the filler.)
+                assert.equal(capView(await deskState(), 1, Date.now()).waiting, 0);
+
+                // A refused delegation waits, through the published API that team calls after a refusal.
+                const desk = (
+                    globalThis as unknown as Record<
+                        symbol,
+                        {
+                            refused?: (
+                                tx: unknown,
+                                request: {
+                                    key: string;
+                                    supervisor: number;
+                                    title: string;
+                                    at: number;
+                                },
+                            ) => Promise<void>;
+                        }
+                    >
+                )[Symbol.for("pi-pocket-team.desk")]!;
+                const refusedOne = {
+                    key: `x.test.grant-refused:${String(at)}`,
+                    supervisor: Number(source),
+                    title: "Refused",
+                    at,
+                };
+
+                await app.harness.commit(async (tx) => desk.refused?.(tx, refusedOne), context);
+                await app.harness.commit(async (tx) => desk.refused?.(tx, refusedOne), context);
+                assert.equal(
+                    ((await deskState())?.refusals ?? []).filter(
+                        (one) => one.key === refusedOne.key,
+                    ).length,
+                    1,
+                    "a replay adds no second refusal",
+                );
+                assert.equal(capView(await deskState(), 1, Date.now()).waiting, 1);
+
                 const granted = await call("grant", { count: 1 });
 
                 assert.equal(granted.status, 200);
                 assert.equal(granted.data.cap.grants, 1, "1 more usable OK");
+                assert.equal(granted.data.cap.waiting, 0, "the tap served the refusal");
 
                 // The tap wakes the supervisor at once, with its own [desk] message.
                 const tapMessage =
@@ -20589,6 +20747,14 @@ describe("the desk in a Pi Pocket", () => {
         );
         assert.equal(app.sessions().length, sessions, "no linked session started");
 
+        // The refusal is stored in a commit of its own: the page offers "Allow 1" while it waits.
+        const refusals = (await deskState())?.refusals ?? [];
+
+        assert.equal(refusals.length, 1, "1 refusal is stored");
+        assert.equal(refusals[0]?.supervisor, Number(source));
+        assert.match(refusals[0]?.key ?? "", /^x\.team\.delegate:/);
+        assert.equal(capView(await deskState(), DEFAULT_CAP, Date.now()).waiting, 1);
+
         // A linked session's "desk ok" is not a person's message.
         await say(app, source, "start linked test");
         const linked = app.sessions().find((session) => session.linkedFrom?.id === Number(source));
@@ -20608,9 +20774,21 @@ describe("the desk in a Pi Pocket", () => {
             /The desk is full: \d+ of 12 threads count\./,
         );
 
+        // The same work refused again still waits as 1 delegation.
+        assert.equal(capView(await deskState(), DEFAULT_CAP, Date.now()).waiting, 1);
+
         // Brian's own "desk ok" gives 1 OK, and the next delegation uses it.
         await say(app, source, "desk ok");
         await say(app, source, "desk delegate test");
+
+        // The OK served the refusal: nothing waits, and the page offers no "Allow 1".
+        assert.equal(capView(await deskState(), DEFAULT_CAP, Date.now()).waiting, 0);
+        assert.equal(
+            ((await deskState())?.refusals ?? []).filter(
+                (one) => one.served === undefined && one.supervisor === Number(source),
+            ).length,
+            0,
+        );
 
         const opened = Object.values((await deskState())?.threads ?? {})
             .filter(
