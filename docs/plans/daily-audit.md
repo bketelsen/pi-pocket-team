@@ -124,11 +124,11 @@ positives (marked †).
 
 ### H. GitHub
 
-| Id  | Check                                                                                                                      | Kind | A finding when              |
-| --- | -------------------------------------------------------------------------------------------------------------------------- | ---- | --------------------------- |
-| H1  | Merged bot PRs whose head branch still exists 1 h after the merge, and each repository's `delete_branch_on_merge`.         | D    | 1 or more (medium at 5)     |
-| H2  | Bot PRs on no desk thread.                                                                                                 | D    | 1 or more                   |
-| H3  | Bot PRs with a commit whose check rollup is `FAILURE` or `ERROR` (first-pass CI), and open bot PRs with no event for 48 h. | D    | rate above 20%; any idle PR |
+| Id  | Check                                                                                                                                                                                                                                   | Kind | A finding when              |
+| --- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---- | --------------------------- |
+| H1  | Merged bot PRs whose head branch still exists 1 h after the merge, and each repository's `delete_branch_on_merge`.                                                                                                                      | D    | 1 or more (medium at 5)     |
+| H2  | Bot PRs on no desk thread.                                                                                                                                                                                                              | D    | 1 or more                   |
+| H3  | Bot PRs with a commit whose check rollup is `FAILURE` or `ERROR` (first-pass CI), and open bot PRs with no event for 48 h. Metrics split the failing ones: red then fixed (merged, green head), red at merge (merged, red head), other. | D    | rate above 20%; any idle PR |
 
 ### I. Odrade's notes
 

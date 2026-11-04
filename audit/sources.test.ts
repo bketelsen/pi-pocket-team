@@ -861,6 +861,13 @@ test("loadGithub: 1 search, 1 query per 40 PRs, check runs of each repair, 1 set
     // 45 bot PRs + 1 attached PR = 46 refs: 2 GraphQL queries.
     assert.equal(Object.keys(result.prs).length, 46);
     assert.equal(fake.seen.filter((args) => args[1] === "graphql").length, 2);
+    assert.ok(
+        fake.seen.some(
+            (args) =>
+                args[1] === "graphql" &&
+                (args.find((arg) => arg.startsWith("query=")) ?? "").includes("headRefOid"),
+        ),
+    );
     assert.deepEqual(result.checkRuns["acme/w0@abc123"], [
         { name: "Build", conclusion: "failure" },
     ]);

@@ -719,6 +719,36 @@ test("totalsOf counts the threads touched in the window, the bot PRs and the fai
     );
 });
 
+test("the H3 metrics line includes the split and preserves the old form without it", () => {
+    const split = renderReport(
+        baseReport({
+            metrics: {
+                H3: {
+                    botPrs: 70,
+                    withAFailingCommit: 21,
+                    redThenFixed: 12,
+                    redAtMerge: 3,
+                    redOther: 6,
+                    idle: 2,
+                },
+            },
+        }),
+    );
+
+    assert.match(split, /21 with a failing commit \(12 red then fixed, 3 red at merge, 6 other\)/);
+
+    const old = renderReport(
+        baseReport({
+            metrics: {
+                H3: { botPrs: 70, withAFailingCommit: 21, idle: 2 },
+            },
+        }),
+    );
+
+    assert.match(old, /- Bot PRs: 70, 21 with a failing commit, 2 idle\./);
+    assert.doesNotMatch(old, /red then fixed/);
+});
+
 test("the metrics lines use the singular for 1", () => {
     const one = renderReport(
         baseReport({

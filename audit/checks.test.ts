@@ -1385,6 +1385,74 @@ test("H3: an error rollup counts; fewer than 5 PRs are too few to judge", () => 
     assert.deepEqual(ids(checkH3(batch(2, 4), ctx)), []);
 });
 
+test("H3: failing bot PRs split into red then fixed, red at merge, and other", () => {
+    const data = emptyData({
+        github: github({
+            "acme/widgets#1": pr({
+                state: "MERGED",
+                headRefOid: "success",
+                commits: {
+                    totalCount: 2,
+                    nodes: [
+                        { commit: { oid: "failure", statusCheckRollup: { state: "FAILURE" } } },
+                        { commit: { oid: "success", statusCheckRollup: { state: "SUCCESS" } } },
+                    ],
+                },
+            }),
+            "acme/widgets#2": pr({
+                state: "MERGED",
+                headRefOid: "red-head",
+                commits: {
+                    totalCount: 1,
+                    nodes: [
+                        { commit: { oid: "red-head", statusCheckRollup: { state: "FAILURE" } } },
+                    ],
+                },
+            }),
+            "acme/widgets#3": rollupPr("ERROR"),
+            "acme/widgets#4": pr({
+                state: "MERGED",
+                headRefOid: "green",
+                commits: {
+                    totalCount: 1,
+                    nodes: [{ commit: { oid: "green", statusCheckRollup: { state: "SUCCESS" } } }],
+                },
+            }),
+        }),
+    });
+
+    const metrics = checkH3(data, ctx).metrics;
+
+    assert.equal(metrics.redThenFixed, 1);
+    assert.equal(metrics.redAtMerge, 1);
+    assert.equal(metrics.redOther, 1);
+    assert.equal(metrics.withAFailingCommit, 3);
+    assert.deepEqual(metrics.redAtMergePrs, ["acme/widgets#2"]);
+});
+
+test("H3: a headRefOid that matches no commit is head unknown and counts as other", () => {
+    const data = emptyData({
+        github: github({
+            "acme/widgets#1": pr({
+                state: "MERGED",
+                headRefOid: "missing",
+                commits: {
+                    totalCount: 1,
+                    nodes: [{ commit: { oid: "red", statusCheckRollup: { state: "FAILURE" } } }],
+                },
+            }),
+        }),
+    });
+
+    const metrics = checkH3(data, ctx).metrics;
+
+    assert.equal(metrics.redThenFixed, 0);
+    assert.equal(metrics.redAtMerge, 0);
+    assert.equal(metrics.redOther, 1);
+    assert.equal(metrics.withAFailingCommit, 1);
+    assert.deepEqual(metrics.redAtMergePrs, []);
+});
+
 test("H3: an open bot PR with no update for 48 h is idle; 47 h is not", () => {
     const idle = (hours: number) =>
         emptyData({

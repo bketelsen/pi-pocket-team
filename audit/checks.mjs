@@ -1433,8 +1433,29 @@ export function checkH2(data) {
 }
 
 /**
+ * The head commit's node of a PR: the node of `headRefOid`, else the last node when every commit came. `null` when it
+ * is not known (a PR with more than 50 commits).
+ */
+function headCommit(pr) {
+    const nodes = pr.commits?.nodes ?? [];
+
+    if (typeof pr.headRefOid === "string") {
+        return nodes.find((node) => node.commit?.oid === pr.headRefOid) ?? null;
+    }
+
+    const totalCount = pr.commits?.totalCount;
+
+    if ((totalCount === undefined || totalCount === nodes.length) && nodes.length > 0) {
+        return nodes[nodes.length - 1];
+    }
+
+    return null;
+}
+
+/**
  * H3: more than 20% of the bot PRs had a commit whose check rollup is FAILURE or ERROR (with 5 PRs or more), and
- * open bot PRs with no update for 48 h.
+ * open bot PRs with no update for 48 h. The metrics split the PRs with a failing commit (measurement only): red then
+ * fixed (merged, green head), red at merge (merged, failing head), and other (not merged, or head unknown or pending).
  */
 export function checkH3(data, ctx) {
     const prs = botList(data);
@@ -1444,6 +1465,26 @@ export function checkH3(data, ctx) {
             ["FAILURE", "ERROR"].includes(node.commit?.statusCheckRollup?.state),
         ),
     );
+    let redThenFixed = 0;
+    let redAtMerge = 0;
+    let redOther = 0;
+    const redAtMergePrs = [];
+
+    for (const { ref, pr } of red) {
+        const headState =
+            pr.state === "MERGED" ? headCommit(pr)?.commit?.statusCheckRollup?.state : undefined;
+
+        if (headState === "FAILURE" || headState === "ERROR") {
+            redAtMerge += 1;
+            redAtMergePrs.push(ref);
+        } else if (headState === "SUCCESS") {
+            // The PR is in `red`, and its head is green: the failing commit came before the head.
+            redThenFixed += 1;
+        } else {
+            redOther += 1;
+        }
+    }
+
     const idle = prs.filter(
         ({ pr }) =>
             pr.state === "OPEN" && pr.updatedAt && ctx.now - Date.parse(pr.updatedAt) >= 48 * HOUR,
@@ -1488,6 +1529,10 @@ export function checkH3(data, ctx) {
             botPrs: prs.length,
             states,
             withAFailingCommit: red.length,
+            redThenFixed,
+            redAtMerge,
+            redOther,
+            redAtMergePrs,
             failingRate: Math.round(rate * 100) / 100,
             idle: idle.length,
         },
