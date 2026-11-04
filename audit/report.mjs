@@ -406,9 +406,15 @@ const metricLines = (metrics, github) => {
     }
 
     if (metrics.H3) {
-        lines.push(
-            `- Bot PRs: ${metrics.H3.botPrs}, ${metrics.H3.withAFailingCommit} with a failing commit, ${metrics.H3.idle} idle.`,
-        );
+        if (typeof metrics.H3.redThenFixed === "number") {
+            lines.push(
+                `- Bot PRs: ${metrics.H3.botPrs}, ${metrics.H3.withAFailingCommit} with a failing commit (${metrics.H3.redThenFixed} red then fixed, ${metrics.H3.redAtMerge} red at merge, ${metrics.H3.redOther} other), ${metrics.H3.idle} idle.`,
+            );
+        } else {
+            lines.push(
+                `- Bot PRs: ${metrics.H3.botPrs}, ${metrics.H3.withAFailingCommit} with a failing commit, ${metrics.H3.idle} idle.`,
+            );
+        }
     }
 
     if (metrics.J1) {

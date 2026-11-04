@@ -662,7 +662,7 @@ const json = (text, fallback) => {
     }
 };
 
-const PR_QUERY = `state createdAt updatedAt mergedAt closedAt headRefName url author { login }
+const PR_QUERY = `state createdAt updatedAt mergedAt closedAt headRefName headRefOid url author { login }
     headRef { name }
     commits(first: 50) { totalCount nodes { commit { oid statusCheckRollup { state } } } }`;
 
