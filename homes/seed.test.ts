@@ -40,12 +40,14 @@ function gitEnvironment(extraConfig = "") {
         fs.mkdirSync(folder);
     }
 
-    // The identity sits where a user's does: `$HOME/.gitconfig`, the normal global config.
+    // The identity sits where a user's does: `$HOME/.gitconfig`, the normal global config. Auto maintenance and auto
+    // gc are off: a test's `git commit` can start them in the background, and their `.git/objects/maintenance.lock`
+    // then shows up in a snapshot taken before the seed runs (flaky in CI, PR #111).
     const config = path.join(home, ".gitconfig");
 
     fs.writeFileSync(
         config,
-        `[user]\n\tname = Seed test\n\temail = seed@example.invalid\n${extraConfig}`,
+        `[user]\n\tname = Seed test\n\temail = seed@example.invalid\n[maintenance]\n\tauto = false\n[gc]\n\tauto = 0\n${extraConfig}`,
     );
 
     // Every inherited `GIT_` variable goes, and then the test's own come in: nothing of this machine's git is used.
@@ -188,6 +190,20 @@ function seed(t, over = {}) {
 
     return { result, logs };
 }
+
+test("the test git runs no background maintenance, so no lock file lands in a snapshot", () => {
+    for (const env of [gitEnv, gitEnvironment("[core]\n\tfsync = none\n")]) {
+        const read = (key) =>
+            execFileSync("git", ["config", "--global", "--get", key], {
+                encoding: "utf8",
+                env,
+                cwd: env.HOME,
+            }).trim();
+
+        assert.equal(read("maintenance.auto"), "false");
+        assert.equal(read("gc.auto"), "0");
+    }
+});
 
 test("the seed makes a home with 1 commit, every folder and no remote", () => {
     const t = setup();
