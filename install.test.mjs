@@ -2,7 +2,7 @@
 // target that is empty or half written.
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { readFileSync, watch } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, relative } from "node:path";
@@ -13,6 +13,56 @@ import { install } from "./install.mjs";
 const run = promisify(execFile);
 const FILES = ["team.ts", "team-web/index.js"];
 const made = [];
+
+const TEST_FILE = /\.test\.(?:ts|mts|js|mjs)$/;
+
+/** Test files missing from the first `node --test` section of the script. */
+export function missingTests(files, script) {
+    const testSection = script.split(/\s*&&\s*/).find((section) => {
+        const tokens = section.trim().split(/\s+/);
+
+        return tokens[0] === "node" && tokens[1] === "--test";
+    });
+
+    const named = testSection
+        ? new Set(testSection.trim().split(/\s+/).slice(2).filter(Boolean))
+        : new Set();
+
+    return [...new Set(files)].filter((file) => TEST_FILE.test(file) && !named.has(file)).sort();
+}
+
+/** Repository test files, without hidden folders or symlinked dependencies. */
+export async function listTestFiles(root = import.meta.dirname) {
+    const found = [];
+
+    async function walk(folder) {
+        for (const entry of await readdir(folder, { withFileTypes: true })) {
+            if (entry.isSymbolicLink()) {
+                continue;
+            }
+
+            const path = join(folder, entry.name);
+
+            if (entry.isDirectory()) {
+                if (
+                    entry.name.startsWith(".") ||
+                    entry.name === "node_modules" ||
+                    entry.name === "_pocket"
+                ) {
+                    continue;
+                }
+
+                await walk(path);
+            } else if (entry.isFile() && TEST_FILE.test(entry.name)) {
+                found.push(relative(root, path).replaceAll("\\", "/"));
+            }
+        }
+    }
+
+    await walk(root);
+
+    return found.sort();
+}
 
 /** A fresh temporary folder, removed when the tests end. */
 async function folder() {
@@ -249,4 +299,53 @@ test("the command line writes the files, then reports them up to date", async ()
     const second = await run(process.execPath, [script], { env });
 
     assert.match(second.stdout, /^Up to date in /m);
+});
+
+test("the test script names every repository test file", async () => {
+    const packageJson = JSON.parse(
+        await readFile(join(import.meta.dirname, "package.json"), "utf8"),
+    );
+    const testFiles = await listTestFiles();
+    const missing = missingTests(testFiles, packageJson.scripts.test);
+
+    assert.ok(
+        testFiles.length > 0,
+        `checked 0 test files; the guard must find repository test files`,
+    );
+    assert.ok(
+        testFiles.length >= 20,
+        `checked only ${testFiles.length} test files; expected at least 20`,
+    );
+    assert.deepEqual(
+        missing,
+        [],
+        `Checked ${testFiles.length} test files. Missing from the test script; add them to the "test" script: ${missing.join(", ")}`,
+    );
+});
+
+test("missingTests uses test-section whole tokens", () => {
+    assert.deepEqual(
+        missingTests(
+            ["desk.test.ts", "desk-web.test.ts", "only-check.test.ts", "notes.txt"],
+            "node --test desk-web.test.ts && node --check only-check.test.ts",
+        ),
+        ["desk.test.ts", "only-check.test.ts"],
+    );
+});
+
+test("listTestFiles skips dependency, hidden, and symlink folders", async () => {
+    const root = await folder();
+
+    await put(root, "nested/real.test.ts", "test");
+    await put(root, "node_modules/dependency.test.ts", "test");
+    await put(root, ".hidden/secret.test.ts", "test");
+
+    const outside = await folder();
+
+    await put(outside, "linked.test.ts", "test");
+
+    // Symlinks are intentionally omitted even if they point to a test file.
+    await symlink(join(outside, "linked.test.ts"), join(root, "linked.test.ts"));
+
+    assert.deepEqual(await listTestFiles(root), ["nested/real.test.ts"]);
 });
