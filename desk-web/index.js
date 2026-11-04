@@ -818,13 +818,17 @@ export default function setup(pocket) {
     const watchWhen = (watch) =>
         watch.checkTime ? `${watch.checkOn} ${watch.checkTime}` : watch.checkOn;
 
+    /** A watch's date and its event, when it has one: "2026-10-26 or on pr:owner/name#12 merged". */
+    const watchUntil = (watch) =>
+        watch.on ? `${watchWhen(watch)} or on ${watch.on}` : watchWhen(watch);
+
     /** One line about a thread's watch, for the detail view. */
     const watchLine = (watch) =>
         [
-            watchWhen(watch),
+            watchUntil(watch),
             watch.check,
             `set by ${watch.setBy}`,
-            watch.due ? "due" : "",
+            watch.due ? (watch.onFired ? `due (${watch.onFired})` : "due") : "",
             watch.result
                 ? `${watch.result.pass ? "passed" : "failed"} by ${watch.result.by}: ${watch.result.text}`
                 : "",
@@ -2471,9 +2475,9 @@ export default function setup(pocket) {
                 thread.repo,
                 `next: ${thread.next}`,
                 thread.watch && thread.watch.due
-                    ? `due: ${thread.watch.check}`
+                    ? `due: ${thread.watch.check}${thread.watch.onFired ? ` (${thread.watch.onFired})` : ""}`
                     : thread.asleep && thread.watch
-                      ? `check on ${watchWhen(thread.watch)}`
+                      ? `check on ${watchUntil(thread.watch)}`
                       : "",
                 thread.stale ? "stale" : "",
             ]

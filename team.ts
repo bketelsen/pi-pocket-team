@@ -1798,7 +1798,7 @@ export default function createTeam(host: Host, web: Web) {
                 cwd?: string;
                 title: string;
                 at: number;
-                watch?: { checkOn: string; check: string; by: string };
+                watch?: { checkOn: string; check: string; by: string; on?: string };
                 /** The delegation's task text: the desk links the queued issues named in it. */
                 task?: string;
                 /** A plan start (the desk makes its file), or 1 task of an approved plan. */
@@ -2659,7 +2659,7 @@ export default function createTeam(host: Host, web: Web) {
     const delegate = defineTool({
         name: "team_delegate",
         description:
-            "Supervisor only: give a self-contained task to a named agent in their repository folder. Choose a repository from the roster if the agent owns more than one. Runs on the agent's profile model when the owner allows it for subagents, otherwise on your model (the roster shows each agent's model); thinking is yours, or the nearest level the model has. Returns an address without waiting for completion. With night_shift, the linked session runs a night-shift goal in rounds, and its report comes back here by itself when it stops. A night shift takes no free check command, and team_delegate refuses one. It can take pr_check instead: a structured PR check that runs gh pr checks and gh pr view, read only, in the linked session's folder after Pi says DONE, and must pass. With watch, the desk thread sleeps until the check's date: it does not count toward the cap, and a check result closes it. With plan, start a plan (plan.start with repository home: a planning session in the lead agent's home) or deliver 1 task of an approved plan (plan.id and plan.task).",
+            "Supervisor only: give a self-contained task to a named agent in their repository folder. Choose a repository from the roster if the agent owns more than one. Runs on the agent's profile model when the owner allows it for subagents, otherwise on your model (the roster shows each agent's model); thinking is yours, or the nearest level the model has. Returns an address without waiting for completion. With night_shift, the linked session runs a night-shift goal in rounds, and its report comes back here by itself when it stops. A night shift takes no free check command, and team_delegate refuses one. It can take pr_check instead: a structured PR check that runs gh pr checks and gh pr view, read only, in the linked session's folder after Pi says DONE, and must pass. With watch, the desk thread sleeps until the check's date: it does not count toward the cap, and a check result closes it. With watch.on, an event (a thread closes, a PR merges, gets a label or a review) makes the check due before its date. With plan, start a plan (plan.start with repository home: a planning session in the lead agent's home) or deliver 1 task of an approved plan (plan.id and plan.task).",
         parameters: Type.Object({
             agent: Type.String(),
             task: Type.String({ minLength: 1, maxLength: 6000 }),
@@ -2796,6 +2796,12 @@ export default function createTeam(host: Host, web: Web) {
                         description:
                             "The check for the desk thread, one line: what to look at on that date",
                     }),
+                    on: Type.Optional(
+                        Type.String({
+                            description:
+                                "An event that makes the check due before its date: closed:T14, pr:owner/name#12 merged, pr:owner/name#12 reviewed, or pr:owner/name#12 labelled:<label>",
+                        }),
+                    ),
                 }),
             ),
         }),
@@ -3114,6 +3120,9 @@ export default function createTeam(host: Host, web: Web) {
                                                     checkOn: args.watch.check_on,
                                                     check: args.watch.check,
                                                     by: identity?.persona?.id ?? supervisor,
+                                                    ...(args.watch.on === undefined
+                                                        ? {}
+                                                        : { on: args.watch.on }),
                                                 },
                                             }),
                                   }),

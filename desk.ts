@@ -223,6 +223,19 @@ export type PrLink = {
     readAt?: number;
 };
 
+/**
+ * The event of a watch (`Watch.on`), parsed when the watch is set. Stored data: never rename a field or change what it
+ * means. Only the parsed form is stored; `watchOnText` gives the normalized text back (`closed:T14`,
+ * `pr:owner/name#12 merged`, `pr:owner/name#12 reviewed`, `pr:owner/name#12 labelled:ready`).
+ * - `closed`: `thread` (an id such as "T14") closes, for any reason: done, dropped, or failed.
+ * - `pr`: the PR `ref` ("owner/name#12") merges (`merged`), gets a review submitted at or after the watch's `setAt`
+ *   (`reviewed`), or has the label `label` (`labelled`). A PR that closes unmerged fires each `pr` event too.
+ */
+export type WatchOn =
+    | { kind: "closed"; thread: string }
+    | { kind: "pr"; ref: string; event: "merged" | "reviewed" }
+    | { kind: "pr"; ref: string; event: "labelled"; label: string };
+
 /** One dated check on a thread. Stored data: never rename a field or change what it means. */
 export type Watch = {
     /** "2026-10-29": a day on the server's clock, in local time. */
@@ -242,6 +255,16 @@ export type Watch = {
     /** When the desk recorded the wake: due, and no result yet. */
     dueAt?: number;
     result?: { at: number; by: string; pass: boolean; text: string; key: string };
+    /**
+     * An event that makes the watch due before its date (`WatchOn`): the watch is due at the event or at the date,
+     * whichever comes first. Absent: a dated watch only, as before the field.
+     */
+    on?: WatchOn;
+    /**
+     * How the event happened, in words ("PR owner/name#12 merged"), when the event, not the date, made the watch due.
+     * Set once, with `dueAt`. Absent when the date made it due, or nothing did yet.
+     */
+    onFired?: string;
 };
 
 /**
@@ -1090,8 +1113,11 @@ export type OpenRequest = {
     worktree?: { path: string; branch: string; checkout: string };
     title: string;
     at: number;
-    /** A dated check, set with the thread: `team_delegate`'s `watch`. */
-    watch?: { checkOn: string; check: string; by: string };
+    /**
+     * A dated check, set with the thread: `team_delegate`'s `watch`. `on` is its optional event (`parseWatchOn`): the
+     * watch is due at the event or at the date, whichever comes first.
+     */
+    watch?: { checkOn: string; check: string; by: string; on?: string };
     /** The delegation's task text: every queued issue whose ref or URL is in it links to the new thread. */
     task?: string;
     /**
@@ -1229,6 +1255,16 @@ export function openThread(
             throw new Error(when.error);
         }
 
+        const on =
+            // The new thread is not in the state yet: `closed:` with its own id is an unknown thread, and refused.
+            request.watch.on === undefined
+                ? undefined
+                : parseWatchOn(request.watch.on, state, request.id);
+
+        if (on !== undefined && "error" in on) {
+            throw new Error(on.error);
+        }
+
         watch = {
             checkOn: when.checkOn,
             ...(when.checkTime === undefined ? {} : { checkTime: when.checkTime }),
@@ -1236,6 +1272,7 @@ export function openThread(
             setAt: request.at,
             setBy: request.watch.by,
             key: request.key,
+            ...(on === undefined ? {} : { on }),
         };
     }
 
@@ -1271,7 +1308,7 @@ export function openThread(
         addEvent(
             thread,
             `watch:set:${watch.key}`,
-            `watch: check on ${watchWhen(watch)} by ${watch.setBy}: ${watch.check}`,
+            `watch: check on ${watchWhen(watch)}${watchOnWords(watch)} by ${watch.setBy}: ${watch.check}`,
             request.at,
         );
     }
@@ -1845,10 +1882,14 @@ function openWatch(thread: Thread): Watch | undefined {
 /** One line about a watch: its date, its check, who set it, the wake, and the result. */
 function watchText(watch: Watch): string {
     return [
-        watchWhen(watch),
+        `${watchWhen(watch)}${watchOnWords(watch)}`,
         watch.check,
         `set by ${watch.setBy}`,
-        ...(watch.dueAt === undefined ? [] : [`due ${iso(watch.dueAt)}`]),
+        ...(watch.dueAt === undefined
+            ? []
+            : [
+                  `due ${iso(watch.dueAt)}${watch.onFired === undefined ? "" : ` (${watch.onFired})`}`,
+              ]),
         ...(watch.result === undefined
             ? []
             : [
@@ -1857,33 +1898,314 @@ function watchText(watch: Watch): string {
     ].join(" · ");
 }
 
+/**
+ * Whether a watch's time has come: its date, or its event when the sweep recorded it (`dueAt` on a watch with `on`).
+ * A watch with no `on` is due at its date only, as before the field.
+ */
+export function watchReached(
+    watch: Pick<Watch, "checkOn" | "checkTime" | "on" | "dueAt">,
+    now: number,
+): boolean {
+    return now >= watchDueAt(watch) || (watch.on !== undefined && watch.dueAt !== undefined);
+}
+
 /** A watched thread before its check time: it does not count toward the cap, and it is never stale. */
 export function asleep(thread: Thread, now: number): boolean {
     const watch = openWatch(thread);
 
-    return watch !== undefined && now < watchDueAt(watch);
+    return watch !== undefined && !watchReached(watch, now);
 }
 
-/** A watched thread at or after its check time, with no result yet: the desk wakes it. */
+/** A watched thread at or after its check time or its recorded event, with no result yet: the desk wakes it. */
 export function isDue(thread: Thread, now: number): boolean {
     const watch = openWatch(thread);
 
-    return watch !== undefined && now >= watchDueAt(watch);
+    return watch !== undefined && watchReached(watch, now);
+}
+
+/** What the sweep knows when it looks for a watch's event: every thread on the desk, and the GitHub read. */
+export type WatchFacts = {
+    threads: Readonly<Record<string, Thread>>;
+    github?: GitHubFacts | undefined;
+};
+
+const WATCH_ON_HELP =
+    "A watch's on is closed:T14, pr:owner/name#12 merged, pr:owner/name#12 reviewed, or pr:owner/name#12 labelled:<label>";
+const WATCH_ON_CLOSED = /^closed:\s*#?([A-Za-z][0-9]+)$/i;
+const WATCH_ON_PR = /^pr:\s*(\S+)\s+(merged|reviewed|label(?:l)?ed:\s*(.*))$/i;
+
+/** The largest PR number a GraphQL `Int` argument takes: a larger one makes GitHub refuse the whole query. */
+export const GITHUB_INT_MAX = 2147483647;
+
+/**
+ * The most open `pr:` watches on the desk (`pendingPrWatch`): each one is pinned in the sweep's 1 GitHub read, with
+ * its labels and reviews. `setWatch` and `openThread` refuse 1 more, and the sweep pins at most this many
+ * (`prWatchPins`), so a stored excess never breaks the read.
+ */
+export const MAX_PR_WATCHES = 20;
+
+/** A PR ref that may go into the sweep's query: owner/name#N, with N from 1 to `GITHUB_INT_MAX`. */
+function watchRefOk(ref: string): boolean {
+    const match = REF.exec(ref);
+
+    return match !== null && isRepoName(match[1] ?? "") && Number(match[2]) <= GITHUB_INT_MAX;
+}
+
+/** A `pr:` watch that still waits for its event: no result, not due, on a thread that is not closed. */
+function pendingPrWatch(thread: Thread): boolean {
+    const watch = thread.watch;
+
+    return (
+        thread.state !== "closed" &&
+        watch?.on?.kind === "pr" &&
+        watch.result === undefined &&
+        watch.dueAt === undefined
+    );
 }
 
 /**
- * Record the wake of a due watch in the sweep's commit: `dueAt`, and 1 event. A second call writes nothing, so a
- * sweep that runs again adds no second event. True only when it changed something.
+ * Why `self` cannot take 1 more `pr:` watch: `MAX_PR_WATCHES` other threads have one open already. Undefined when it
+ * can. The thread's own watch does not count: a new watch replaces it.
  */
-export function wakeWatch(thread: Thread, now: number): boolean {
+function prWatchRefusal(
+    state: Readonly<DeskState> | undefined,
+    self: string | undefined,
+): string | undefined {
+    const others = Object.values(state?.threads ?? {}).filter(
+        (thread) => thread.id !== self && pendingPrWatch(thread),
+    ).length;
+
+    return others < MAX_PR_WATCHES
+        ? undefined
+        : `The desk has ${String(others)} open pr: watches, the most it reads (${String(MAX_PR_WATCHES)}). Set a dated watch, or a closed: watch, or clear a pr: watch first.`;
+}
+
+/**
+ * The PRs that the open `pr:` watches wait for, for the sweep to pin: a watch on a thread that is not closed (a parked
+ * thread keeps its watch, and is pinned too) with no result and no wake, and a ref that may go into a query (a bad stored ref is skipped). The oldest `setAt` first, at
+ * most `MAX_PR_WATCHES` refs. A watch that is not pinned gets no event from this read: its date stays the fallback.
+ */
+export function prWatchPins(threads: Iterable<Thread>): string[] {
+    const waiting = [...threads]
+        .filter(
+            (thread) =>
+                pendingPrWatch(thread) &&
+                thread.watch?.on?.kind === "pr" &&
+                watchRefOk(thread.watch.on.ref),
+        )
+        .sort((a, b) => (a.watch?.setAt ?? 0) - (b.watch?.setAt ?? 0) || a.id.localeCompare(b.id));
+    const refs: string[] = [];
+
+    for (const thread of waiting) {
+        const on = thread.watch?.on;
+        const ref = on?.kind === "pr" ? on.ref : "";
+
+        if (refs.length >= MAX_PR_WATCHES) {
+            break;
+        }
+
+        if (!refs.some((each) => each.toLowerCase() === ref.toLowerCase())) {
+            refs.push(ref);
+        }
+    }
+
+    return refs;
+}
+
+/**
+ * Parse a watch's event text (`WatchOn`): `closed:T14`, `pr:owner/name#12 merged`, `pr:owner/name#12 reviewed`, or
+ * `pr:owner/name#12 labelled:<label>` (also `labeled:`). `closed:` takes a thread on the desk that is not `self`, the
+ * watched thread. A target that is closed already, or a PR that merged already, is no error: the next sweep fires the
+ * watch. A `pr:` ref takes a number from 1 to `GITHUB_INT_MAX`, and a new `pr:` watch is refused when the desk has
+ * `MAX_PR_WATCHES` open ones on other threads (`state`).
+ */
+export function parseWatchOn(
+    text: string,
+    state: Readonly<DeskState> | undefined,
+    self: string | undefined,
+): WatchOn | { error: string } {
+    const plain = flatLine(text);
+
+    if (plain === "") {
+        return { error: `${WATCH_ON_HELP}. It is empty.` };
+    }
+
+    const closed = WATCH_ON_CLOSED.exec(plain);
+
+    if (closed !== null) {
+        const id = (closed[1] ?? "").toUpperCase();
+
+        if (self !== undefined && id === self.toUpperCase()) {
+            return { error: `A watch on ${id} cannot wait for ${id} itself to close.` };
+        }
+
+        if (threadById(state, id) === undefined) {
+            return { error: `There is no thread ${id} on the desk: the watch cannot wait for it.` };
+        }
+
+        return { kind: "closed", thread: id };
+    }
+
+    const pr = WATCH_ON_PR.exec(plain);
+
+    if (pr === null) {
+        return { error: `${WATCH_ON_HELP}. Not: ${plain}` };
+    }
+
+    const ref = pr[1] ?? "";
+
+    if (!REF.test(ref) || !isRepoName(repoOf(ref))) {
+        return { error: `${ref} is not a PR ref. A PR ref is owner/name#12.` };
+    }
+
+    if (!watchRefOk(ref)) {
+        return {
+            error: `${ref} is not a PR ref: a PR number is 1 to ${String(GITHUB_INT_MAX)}.`,
+        };
+    }
+
+    // The sweep reads each open pr: watch's PR: the desk holds at most `MAX_PR_WATCHES` of them.
+    const full = prWatchRefusal(state, self);
+
+    if (full !== undefined) {
+        return { error: full };
+    }
+
+    const word = (pr[2] ?? "").toLowerCase();
+
+    if (word === "merged" || word === "reviewed") {
+        return { kind: "pr", ref, event: word };
+    }
+
+    const label = (pr[3] ?? "").trim();
+
+    if (label === "" || label.length > 50) {
+        return { error: "A watch's label is 1 to 50 characters: pr:owner/name#12 labelled:ready." };
+    }
+
+    return { kind: "pr", ref, event: "labelled", label };
+}
+
+/** A watch's event as text: `closed:T14`, `pr:owner/name#12 merged`, or `pr:owner/name#12 labelled:ready`. */
+export function watchOnText(on: WatchOn): string {
+    if (on.kind === "closed") {
+        return `closed:${on.thread}`;
+    }
+
+    return on.event === "labelled"
+        ? `pr:${on.ref} labelled:${on.label}`
+        : `pr:${on.ref} ${on.event}`;
+}
+
+/** " or on <event>" after a watch's date, or "" for a watch with no event. */
+function watchOnWords(watch: Pick<Watch, "on">): string {
+    return watch.on === undefined ? "" : ` or on ${watchOnText(watch.on)}`;
+}
+
+/** A PR's facts in the GitHub read: the pinned read first, then its repository's open list. The ref's case is free. */
+function prFactOf(github: GitHubFacts, ref: string): PrFact | undefined {
+    const lower = ref.toLowerCase();
+
+    return (
+        github.prs[ref] ??
+        Object.values(github.prs).find((pr) => pr.ref.toLowerCase() === lower) ??
+        Object.values(github.repos)
+            .flatMap((repo) => repo.open)
+            .find((pr) => pr.ref.toLowerCase() === lower)
+    );
+}
+
+/**
+ * Whether a watch's event happened, in words ("PR owner/name#12 merged"), or undefined. A `closed` target fires when
+ * it is closed, for any reason; a `pr` target fires on its event, and also when it closed unmerged ("closed
+ * unmerged"), so a person looks. A PR that the read did not give, or a target that is gone, has not happened: the date
+ * stays the fallback.
+ */
+export function watchOnFired(
+    watch: Pick<Watch, "on" | "setAt">,
+    facts: WatchFacts,
+): string | undefined {
+    const on = watch.on;
+
+    if (on === undefined) {
+        return undefined;
+    }
+
+    if (on.kind === "closed") {
+        const target = Object.hasOwn(facts.threads, on.thread)
+            ? facts.threads[on.thread]
+            : undefined;
+
+        if (target === undefined || target.state !== "closed") {
+            return undefined;
+        }
+
+        const why = target.closed?.why ?? "closed";
+        const outcome = target.closed?.outcome;
+
+        return `${target.id} closed as ${why}${outcome === undefined ? "" : ` (${outcome})`}`;
+    }
+
+    const pr = facts.github === undefined ? undefined : prFactOf(facts.github, on.ref);
+
+    if (pr === undefined) {
+        return undefined;
+    }
+
+    if (pr.state === "CLOSED") {
+        return `PR ${on.ref} closed unmerged`;
+    }
+
+    if (on.event === "merged") {
+        return pr.state === "MERGED" ? `PR ${on.ref} merged` : undefined;
+    }
+
+    if (on.event === "reviewed") {
+        return (pr.reviewedAt ?? 0) >= watch.setAt && (pr.reviewedAt ?? 0) > 0
+            ? `PR ${on.ref} got a review`
+            : undefined;
+    }
+
+    if (on.event !== "labelled") {
+        return undefined;
+    }
+
+    const label = on.label.toLowerCase();
+
+    return (pr.labels ?? []).some((name) => name.toLowerCase() === label)
+        ? `PR ${on.ref} has the label ${on.label}`
+        : undefined;
+}
+
+/**
+ * Record the wake of a due watch in the sweep's commit: `dueAt`, and 1 event. The date gives the event
+ * `watch:<when>:due`; an event that came first (`watchOnFired`, from `facts`) gives `watch:on:<watch key>` and sets
+ * `onFired`. Either way `dueAt` is set once: a second call writes nothing, so a sweep that runs again adds no second
+ * event. True only when it changed something.
+ */
+export function wakeWatch(thread: Thread, now: number, facts?: WatchFacts): boolean {
     const watch = openWatch(thread);
 
-    if (watch === undefined || watch.dueAt !== undefined || now < watchDueAt(watch)) {
+    if (watch === undefined || watch.dueAt !== undefined) {
+        return false;
+    }
+
+    if (now >= watchDueAt(watch)) {
+        watch.dueAt = now;
+        addEvent(thread, `watch:${watchWhen(watch)}:due`, `due: ${watch.check}`, now);
+
+        return true;
+    }
+
+    const fired = facts === undefined ? undefined : watchOnFired(watch, facts);
+
+    if (fired === undefined) {
         return false;
     }
 
     watch.dueAt = now;
-    addEvent(thread, `watch:${watchWhen(watch)}:due`, `due: ${watch.check}`, now);
+    watch.onFired = fired;
+    addEvent(thread, `watch:on:${watch.key}`, `due: ${watch.check} (${fired})`, now);
 
     return true;
 }
@@ -1897,6 +2219,8 @@ export type WatchRequest = {
     /** The replay key of the call or tap: the same key changes nothing. */
     key: string;
     at: number;
+    /** The watch's event text (`parseWatchOn`), or absent for a dated watch only. */
+    on?: string;
 };
 
 /** The keys of every watch set on a thread (`run.watchKeys`): none for a thread from before the field. */
@@ -1933,11 +2257,12 @@ function closedWatchRefusal(thread: Thread, now: number): string | undefined {
  * Put a watch on an open thread, or replace the one it has. A thread closed as done in the last 7 days opens again
  * for it, as the sweep's reopen does, and sleeps until the check: `reopened` says so. A replay, with the same key,
  * changes nothing, so a replayed "7d" keeps the date it first resolved. The caller checks its own rules first when it
- * must.
+ * must. `request.on` adds an event (`parseWatchOn`); a `closed:` event needs `state`, to find its target thread.
  */
 export function setWatch(
     thread: Thread,
     request: WatchRequest,
+    state?: Readonly<DeskState>,
 ): { error: string } | { changed: boolean; reopened?: true } {
     if (thread.origin === "plan") {
         return {
@@ -1986,6 +2311,16 @@ export function setWatch(
         return when;
     }
 
+    // The event, checked like the date: a `closed:` target must be a thread on the desk (`state`), and not this one.
+    const on =
+        request.on === undefined || request.on.trim() === ""
+            ? undefined
+            : parseWatchOn(request.on, state, thread.id);
+
+    if (on !== undefined && "error" in on) {
+        return on;
+    }
+
     // Every check passed: a closed done thread opens again, as the sweep's reopen and the attach reopen do.
     if (closed) {
         thread.state = "open";
@@ -2010,11 +2345,12 @@ export function setWatch(
         setAt: request.at,
         setBy: request.by,
         key: request.key,
+        ...(on === undefined ? {} : { on }),
     };
     addEvent(
         thread,
         `watch:set:${request.key}`,
-        `watch: check on ${when.checkTime === undefined ? when.checkOn : `${when.checkOn} ${when.checkTime}`} by ${request.by}: ${check}`,
+        `watch: check on ${when.checkTime === undefined ? when.checkOn : `${when.checkOn} ${when.checkTime}`}${on === undefined ? "" : ` or on ${watchOnText(on)}`} by ${request.by}: ${check}`,
         request.at,
     );
 
@@ -3272,9 +3608,9 @@ export function closeCheck(thread: Thread, facts: CloseFacts): { close: boolean;
 
         if (watch.result === undefined) {
             open.push(
-                facts.now >= watchDueAt(watch)
+                watchReached(watch, facts.now)
                     ? `watch is due: ${watch.check}`
-                    : `watch: check on ${watchWhen(watch)}`,
+                    : `watch: check on ${watchWhen(watch)}${watchOnWords(watch)}`,
             );
         } else if (!watch.result.pass) {
             open.push(`watch failed: ${watch.result.text}`);
@@ -5067,6 +5403,20 @@ export type PrFact = {
      */
     body?: string;
     closing?: { total: number; refs: string[] };
+    /**
+     * The names of its labels, as GitHub gave them: a watch's `labelled` event reads them. A watched pin reads up to
+     * 100 (`PR_WATCH`); every other read, the first 20. Absent: not read.
+     */
+    labels?: string[];
+    /** GitHub has more labels than `labels` holds: a label that is not in it is not known to be absent. */
+    labelsCut?: true;
+    /**
+     * When its newest submitted review came, from the latest review of each reviewer (`latestReviews`): a watch's
+     * `reviewed` event reads it. 0 when none; absent when the read did not ask (only a watched pin does).
+     */
+    reviewedAt?: number;
+    /** GitHub has more reviewers than the read gave: a review not in it is not known to be absent. */
+    reviewsCut?: true;
 };
 
 /** One linked issue, read by number: its state, and the merged PRs that closed it. */
@@ -5155,6 +5505,14 @@ const PR_DETAIL =
     "reviews(last: 20) { nodes { state submittedAt body } } " +
     "comments(last: 20) { nodes { createdAt body } }";
 
+/**
+ * What a PR that a `pr:` watch waits for adds (`prWatchPins`): up to 100 labels with their count (`watchLabels`), and
+ * the latest submitted review of each reviewer with their count. Only those pins ask: the other reads stay as they were.
+ */
+const PR_WATCH =
+    "watchLabels: labels(first: 100) { totalCount nodes { name } } " +
+    "latestReviews(first: 100) { totalCount nodes { submittedAt } }";
+
 /** What a merged PR of a thread with a linked issue adds: its body, and the issues it closes (`partial` class). */
 const PR_CLOSING =
     "body closingIssuesReferences(first: 10) { totalCount nodes { number repository { nameWithOwner } } }";
@@ -5165,16 +5523,21 @@ const ISSUE_PINNED =
 
 /**
  * The one GraphQL query of a sweep: the viewer, each repository's open PRs, each attached PR by number, and each
- * linked issue by number (`iN`). `detail` names the attached PRs that also give their body and the issues they close.
- * Every owner, name, and number is checked first: nothing else goes into the query.
+ * linked issue by number (`iN`). `detail` names the attached PRs that also give their body and the issues they close;
+ * `watched` names the pinned PRs that also give their labels and latest reviews (`PR_WATCH`). Every owner, name, and
+ * number is checked first: nothing else goes into the query.
  */
 export function buildQuery(
     repos: string[],
     prs: string[],
     issues: string[] = [],
     detail: string[] = [],
+    watched: string[] = [],
 ): string {
     const lines = ["query {", "  viewer { login }"];
+    // GitHub gives each PR back under its canonical name, so 2 pins that differ only in case become 1 fact: each of them
+    // asks for the watch fields, or the one without them could replace the one with them.
+    const watchedRefs = new Set(watched.map((ref) => ref.toLowerCase()));
 
     for (const [index, repo] of [...new Set(repos)].entries()) {
         const { owner, name } = splitRepo(repo);
@@ -5200,7 +5563,7 @@ export function buildQuery(
             `  p${String(index)}: repository(owner: ${JSON.stringify(owner)}, name: ${JSON.stringify(name)}) {`,
             "    nameWithOwner",
             "    isArchived",
-            `    pullRequest(number: ${String(number)}) { ${PR_DETAIL}${detail.includes(ref) ? ` ${PR_CLOSING}` : ""} }`,
+            `    pullRequest(number: ${String(number)}) { ${PR_DETAIL}${detail.includes(ref) ? ` ${PR_CLOSING}` : ""}${watchedRefs.has(ref.toLowerCase()) ? ` ${PR_WATCH}` : ""} }`,
             "  }",
         );
     }
@@ -5333,12 +5696,60 @@ function prFact(
             feedback: feedbackOf(node),
             failing: failingChecks(contexts?.nodes),
             archived,
+            ...watchLabelsOf(node),
+            ...reviewedOf(node),
             ...closingOf(node),
         },
         ...(total === undefined || total <= read
             ? {}
             : { incomplete: checksIncompleteLine(ref, read, total) }),
     };
+}
+
+/**
+ * A PR node's labels for a watch: the full list a watched pin read (`watchLabels`, up to 100, with `labelsCut` when
+ * GitHub has more), else the first 20 of the list every read has.
+ */
+function watchLabelsOf(node: Record<string, unknown>): Pick<PrFact, "labels" | "labelsCut"> {
+    const all = node.watchLabels as { totalCount?: unknown; nodes?: unknown } | null | undefined;
+
+    if (all === null || typeof all !== "object" || !Array.isArray(all.nodes)) {
+        return { labels: labelsOf(node) };
+    }
+
+    const labels = labelsOf({ labels: all });
+
+    return typeof all.totalCount === "number" && all.totalCount > labels.length
+        ? { labels, labelsCut: true }
+        : { labels };
+}
+
+/**
+ * When a PR node's newest submitted review came (`reviewedAt`), from `latestReviews`: the latest review of each
+ * reviewer that is not pending, so a review submitted later is always in it, whenever it was created. `reviewsCut`
+ * when GitHub has more reviewers than the read. Nothing when the read did not ask (only a watched pin does).
+ */
+function reviewedOf(node: Record<string, unknown>): Pick<PrFact, "reviewedAt" | "reviewsCut"> {
+    const reviews = node.latestReviews as
+        { totalCount?: unknown; nodes?: unknown } | null | undefined;
+
+    if (reviews === null || typeof reviews !== "object" || !Array.isArray(reviews.nodes)) {
+        return {};
+    }
+
+    let newest = 0;
+
+    for (const one of reviews.nodes) {
+        const review = one as { submittedAt?: unknown } | null | undefined;
+
+        if (review !== null && typeof review === "object") {
+            newest = Math.max(newest, milliseconds(review.submittedAt));
+        }
+    }
+
+    return typeof reviews.totalCount === "number" && reviews.totalCount > reviews.nodes.length
+        ? { reviewedAt: newest, reviewsCut: true }
+        : { reviewedAt: newest };
 }
 
 /** A PR node's body and closing issues, when the read asked for them. */
@@ -9506,7 +9917,7 @@ function threadFile(
         const watch = thread.watch;
 
         lines.push(
-            `- Watch: ${watchWhen(watch)} · ${md(watch.check)} · set by ${md(watch.setBy)}${watch.dueAt === undefined ? "" : ` · due ${iso(watch.dueAt)}`}${watch.result === undefined ? "" : ` · ${watch.result.pass ? "passed" : "failed"} (${md(watch.result.by)}) · ${iso(watch.result.at)} · ${md(watch.result.text)}`}`,
+            `- Watch: ${watchWhen(watch)}${md(watchOnWords(watch))} · ${md(watch.check)} · set by ${md(watch.setBy)}${watch.dueAt === undefined ? "" : ` · due ${iso(watch.dueAt)}${watch.onFired === undefined ? "" : ` (${md(watch.onFired)})`}`}${watch.result === undefined ? "" : ` · ${watch.result.pass ? "passed" : "failed"} (${md(watch.result.by)}) · ${iso(watch.result.at)} · ${md(watch.result.text)}`}`,
         );
     }
 
@@ -9671,7 +10082,7 @@ export function exportFiles(
 
         for (const thread of list) {
             lines.push(
-                `- **${thread.id}** ${md(thread.title)} · ${thread.repo === undefined ? "no repo" : md(thread.repo)} · next: ${nextActor(thread)}${title === "Watching" && thread.watch !== undefined ? ` · watch: ${watchWhen(thread.watch)}` : ""}`,
+                `- **${thread.id}** ${md(thread.title)} · ${thread.repo === undefined ? "no repo" : md(thread.repo)} · next: ${nextActor(thread)}${title === "Watching" && thread.watch !== undefined ? ` · watch: ${watchWhen(thread.watch)}${md(watchOnWords(thread.watch))}` : ""}`,
             );
 
             for (const [ref, pr] of Object.entries(thread.prs).sort(([a], [b]) =>
@@ -9888,6 +10299,10 @@ export type ThreadView = {
         setBy: string;
         due: boolean;
         result?: { pass: boolean; text: string; by: string; at: number };
+        /** Its event as text (`watchOnText`): "pr:owner/name#12 merged". Absent: a dated watch only. */
+        on?: string;
+        /** How the event happened, when it made the watch due: "PR owner/name#12 merged". */
+        onFired?: string;
     };
     /** A watched thread before its date: it does not count, and it is not stale. */
     asleep: boolean;
@@ -9994,6 +10409,12 @@ export function threadView(
                       check: thread.watch.check,
                       setBy: thread.watch.setBy,
                       due: isDue(thread, now),
+                      ...(thread.watch.on === undefined
+                          ? {}
+                          : { on: watchOnText(thread.watch.on) }),
+                      ...(thread.watch.onFired === undefined
+                          ? {}
+                          : { onFired: thread.watch.onFired }),
                       ...(thread.watch.result === undefined
                           ? {}
                           : {
@@ -10263,7 +10684,9 @@ export function listText(state: Readonly<DeskState> | undefined, now = Date.now(
                     `next: ${nextActor(thread)}`,
                     ...(isStale(thread, now) ? ["stale"] : []),
                     ...(asleep(thread, now)
-                        ? [`watch: ${thread.watch === undefined ? "" : watchWhen(thread.watch)}`]
+                        ? [
+                              `watch: ${thread.watch === undefined ? "" : `${watchWhen(thread.watch)}${watchOnWords(thread.watch)}`}`,
+                          ]
                         : []),
                     thread.repo ?? "no repo",
                     thread.agents.join(", ") || "nobody",
@@ -10278,7 +10701,7 @@ export function listText(state: Readonly<DeskState> | undefined, now = Date.now(
                   "Watching:",
                   ...watching.map(
                       (thread) =>
-                          `${thread.watch === undefined ? "" : watchWhen(thread.watch)} · ${thread.id} · ${thread.repo ?? "no repo"} · ${thread.watch?.check ?? ""}`,
+                          `${thread.watch === undefined ? "" : `${watchWhen(thread.watch)}${watchOnWords(thread.watch)}`} · ${thread.id} · ${thread.repo ?? "no repo"} · ${thread.watch?.check ?? ""}`,
                   ),
               ]),
         ...waiting,
@@ -18873,6 +19296,7 @@ export default function createDesk(host: Host, web: Web) {
         prs: string[],
         issues: string[] = [],
         detail: string[] = [],
+        watched: string[] = [],
     ): Promise<{ facts?: GitHubFacts; error?: string }> {
         if (repos.length === 0 && prs.length === 0 && issues.length === 0) {
             return {};
@@ -18885,7 +19309,7 @@ export default function createDesk(host: Host, web: Web) {
         let facts: GitHubFacts;
 
         try {
-            const { stdout } = await ask(buildQuery(wanted, pinned, issues, detail));
+            const { stdout } = await ask(buildQuery(wanted, pinned, issues, detail, watched));
 
             facts = parseGitHub(JSON.parse(stdout));
         } catch (error) {
@@ -19595,11 +20019,22 @@ export default function createDesk(host: Host, web: Web) {
             }
         }
 
+        // A watch that waits for a PR's event: that PR is pinned too, read by number in the same 1 read, also when no
+        // thread holds it, with all its labels and the latest review of each reviewer. Its repository is not listed: it
+        // attributes nothing, and only the watch reads the facts. At most `MAX_PR_WATCHES`, the oldest first; a bad
+        // stored ref is skipped.
+        const watched = prWatchPins(open);
+
+        for (const ref of watched) {
+            pinned.add(ref);
+        }
+
         const githubRead = await readGitHub(
             [...repositories],
             [...pinned],
             [...pinnedIssues],
             [...detail],
+            watched,
         );
         const { authors, ownAuthors, queue: queueRaw } = await deskConfig();
         // The issue queue: its own read, after the PR read. A failure of one never touches the other.
@@ -20391,8 +20826,9 @@ export default function createDesk(host: Host, web: Web) {
         }
 
         for (const thread of open) {
-            // A due watch records its wake here, once: a second sweep adds no second event.
-            if (wakeWatch(thread, now)) {
+            // A due watch records its wake here, once: a second sweep adds no second event. Its event, when it has
+            // one, may come first: a target thread that closed, or a PR in this sweep's GitHub read.
+            if (wakeWatch(thread, now, { threads: state.threads, github: facts.github })) {
                 events += 1;
             }
 
@@ -24289,7 +24725,7 @@ export default function createDesk(host: Host, web: Web) {
     const tool = defineTool({
         name: "desk",
         description:
-            "The desk of threads for work the team runs in the background. A supervisor session can use every action; a Clerk can use list, read, sync, attach, detach, watch, result, send, and issues for its supervisor's threads; an agent session can use read, watch, and result on its own thread only. Actions: list (one line per open thread), read (one thread in full), sync (observe the threads now, with linked sessions, Night shift, git, and GitHub), seed (import a seed.json file one time), attach (put a PR, a queued issue, or all of another thread's work, on one thread), detach (take a PR off a thread for good: the sweep does not attach or find it again; only attach brings it back), own (mark a found PR thread as Brian's own: it closes, and no sweep finds its PR again), ask (file a question for Brian on a thread, or on a new one; never for a plain merge: Ready to merge on the Desk page lists those), rewrite (give an open ask new words, and new options or none: an agent's ask is filed as it wrote it, so make it clear for Brian), withdraw (end an open ask that Brian need not answer, with words saying why, or with into to merge it into another open ask), answer (record Brian's words for an ask), watch (set a dated check on a thread: it sleeps until that date, and does not count toward the cap; a thread closed as done in the last 7 days opens again for it, and sleeps), result (record that check's pass, which closes the thread, or its fail, which opens it again: a pass is refused while the thread has an open ask), send (send 1 message from the supervisor's session to a thread's agent), issues (read the issues Brian queued on GitHub: read only).",
+            "The desk of threads for work the team runs in the background. A supervisor session can use every action; a Clerk can use list, read, sync, attach, detach, watch, result, send, and issues for its supervisor's threads; an agent session can use read, watch, and result on its own thread only. Actions: list (one line per open thread), read (one thread in full), sync (observe the threads now, with linked sessions, Night shift, git, and GitHub), seed (import a seed.json file one time), attach (put a PR, a queued issue, or all of another thread's work, on one thread), detach (take a PR off a thread for good: the sweep does not attach or find it again; only attach brings it back), own (mark a found PR thread as Brian's own: it closes, and no sweep finds its PR again), ask (file a question for Brian on a thread, or on a new one; never for a plain merge: Ready to merge on the Desk page lists those), rewrite (give an open ask new words, and new options or none: an agent's ask is filed as it wrote it, so make it clear for Brian), withdraw (end an open ask that Brian need not answer, with words saying why, or with into to merge it into another open ask), answer (record Brian's words for an ask), watch (set a dated check on a thread: it sleeps until that date, or until its optional on event, and does not count toward the cap; a thread closed as done in the last 7 days opens again for it, and sleeps), result (record that check's pass, which closes the thread, or its fail, which opens it again: a pass is refused while the thread has an open ask), send (send 1 message from the supervisor's session to a thread's agent), issues (read the issues Brian queued on GitHub: read only).",
         parameters: Type.Object({
             action: Type.Union([
                 Type.Literal("list"),
@@ -24363,6 +24799,12 @@ export default function createDesk(host: Host, web: Web) {
                 Type.String({
                     description:
                         "watch: the check's date as 2026-10-29, 2026-10-29 09:00 (local time, the server's zone), or a span from today: 7d, 2w, 1m, optionally with a time (1d 09:00)",
+                }),
+            ),
+            on: Type.Optional(
+                Type.String({
+                    description:
+                        "watch: an event that makes the check due before its date: closed:T14, pr:owner/name#12 merged, pr:owner/name#12 reviewed, or pr:owner/name#12 labelled:<label>",
                 }),
             ),
             pass: Type.Optional(
@@ -24762,13 +25204,18 @@ export default function createDesk(host: Host, web: Web) {
                     }
 
                     if (args.action === "watch") {
-                        const set = setWatch(thread, {
-                            checkOn: args.check_on ?? "",
-                            check: args.text ?? "",
-                            by: persona.id,
-                            key,
-                            at,
-                        });
+                        const set = setWatch(
+                            thread,
+                            {
+                                checkOn: args.check_on ?? "",
+                                check: args.text ?? "",
+                                by: persona.id,
+                                key,
+                                at,
+                                ...(args.on === undefined ? {} : { on: args.on }),
+                            },
+                            state,
+                        );
 
                         if ("error" in set) {
                             return set;
@@ -24785,7 +25232,10 @@ export default function createDesk(host: Host, web: Web) {
                             markHandled(thread, { at, by: persona.name, act: "watch" });
                         }
 
-                        const date = thread.watch === undefined ? "" : watchWhen(thread.watch);
+                        const date =
+                            thread.watch === undefined
+                                ? ""
+                                : `${watchWhen(thread.watch)}${watchOnWords(thread.watch)}`;
 
                         return {
                             text: !set.changed
