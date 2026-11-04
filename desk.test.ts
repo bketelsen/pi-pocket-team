@@ -4909,6 +4909,25 @@ describe("a watch's event (on)", () => {
         );
     });
 
+    test("buildQuery asks the watch fields for every pin of a watched PR, whatever its case", () => {
+        // GitHub answers both under 1 canonical ref: the one without the fields, read last, would replace the other.
+        const query = buildQuery(
+            [],
+            ["frostyard/test#9", "Frostyard/Test#9"],
+            [],
+            [],
+            ["frostyard/test#9"],
+        );
+        const pins = query.split("\n").filter((line) => line.includes("pullRequest(number: 9)"));
+
+        assert.equal(pins.length, 2);
+
+        for (const line of pins) {
+            assert.match(line, /watchLabels: labels\(first: 100\)/);
+            assert.match(line, /latestReviews\(first: 100\)/);
+        }
+    });
+
     test("parseWatchOn refuses a PR number out of the GraphQL Int range", () => {
         const state = empty();
 
@@ -4959,15 +4978,13 @@ describe("a watch's event (on)", () => {
         assert.equal(new Set(pins).size, MAX_PR_WATCHES);
         assert(!pins.includes("frostyard/test#1"), "the newest watches wait: their date stays");
 
-        // A parked, closed, due, or decided watch is not pinned.
-        const none = [
-            prWatcher("T300", 1, "frostyard/test#300", { state: "parked" }),
-            prWatcher("T301", 1, "frostyard/test#301", { state: "closed" }),
-        ];
+        // A closed thread's watch, and a due one, are not pinned; a parked thread keeps its watch, and is pinned.
+        const parked = prWatcher("T300", 1, "frostyard/test#300", { state: "parked" });
+        const closed = prWatcher("T301", 1, "frostyard/test#301", { state: "closed" });
         const due = prWatcher("T302", 1, "frostyard/test#302");
 
         due.watch!.dueAt = 5;
-        assert.deepEqual(prWatchPins([...none, due]), []);
+        assert.deepEqual(prWatchPins([parked, closed, due]), ["frostyard/test#300"]);
     });
 
     test("setWatch and openThread refuse a new pr: watch at the limit; a replacement and a closed: watch are allowed", () => {

@@ -1981,15 +1981,14 @@ function prWatchRefusal(
 }
 
 /**
- * The PRs that the open `pr:` watches wait for, for the sweep to pin: a watch on an open or starting thread with no
- * result and no wake, and a ref that may go into a query (a bad stored ref is skipped). The oldest `setAt` first, at
+ * The PRs that the open `pr:` watches wait for, for the sweep to pin: a watch on a thread that is not closed (a parked
+ * thread keeps its watch, and is pinned too) with no result and no wake, and a ref that may go into a query (a bad stored ref is skipped). The oldest `setAt` first, at
  * most `MAX_PR_WATCHES` refs. A watch that is not pinned gets no event from this read: its date stays the fallback.
  */
 export function prWatchPins(threads: Iterable<Thread>): string[] {
     const waiting = [...threads]
         .filter(
             (thread) =>
-                (thread.state === "open" || thread.state === "starting") &&
                 pendingPrWatch(thread) &&
                 thread.watch?.on?.kind === "pr" &&
                 watchRefOk(thread.watch.on.ref),
@@ -5536,6 +5535,9 @@ export function buildQuery(
     watched: string[] = [],
 ): string {
     const lines = ["query {", "  viewer { login }"];
+    // GitHub gives each PR back under its canonical name, so 2 pins that differ only in case become 1 fact: each of them
+    // asks for the watch fields, or the one without them could replace the one with them.
+    const watchedRefs = new Set(watched.map((ref) => ref.toLowerCase()));
 
     for (const [index, repo] of [...new Set(repos)].entries()) {
         const { owner, name } = splitRepo(repo);
@@ -5561,7 +5563,7 @@ export function buildQuery(
             `  p${String(index)}: repository(owner: ${JSON.stringify(owner)}, name: ${JSON.stringify(name)}) {`,
             "    nameWithOwner",
             "    isArchived",
-            `    pullRequest(number: ${String(number)}) { ${PR_DETAIL}${detail.includes(ref) ? ` ${PR_CLOSING}` : ""}${watched.includes(ref) ? ` ${PR_WATCH}` : ""} }`,
+            `    pullRequest(number: ${String(number)}) { ${PR_DETAIL}${detail.includes(ref) ? ` ${PR_CLOSING}` : ""}${watchedRefs.has(ref.toLowerCase()) ? ` ${PR_WATCH}` : ""} }`,
             "  }",
         );
     }
