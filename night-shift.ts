@@ -155,6 +155,12 @@ export function checkFingerprint(check: CheckResult | undefined): string | undef
                 )
                 .replace(/\b(?:[01]?\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:\.\d+)?)?\b/g, "")
                 .replace(/\b(?:\d+(?:\.\d+)?(?:ms|h|m|s))+\b/gi, "#")
+                // A hex id after a word that names one (`commit abcdef1`, `sha=…`), whatever its digits; elsewhere only
+                // with 2 digits or more, so a word such as `defaced` stays.
+                .replace(
+                    /\b(commit|sha|head|ref|rev|revision|oid|hash|id)(\s*[:=#@]?\s*)[0-9a-f]{7,64}\b/gi,
+                    "$1$2#",
+                )
                 .replace(/\b(?=(?:[a-f]*\d){2})[0-9a-f]{7,}\b/gi, "#")
                 .replace(/\d+/g, "#")
                 .replace(/\s+/g, " ")

@@ -990,6 +990,21 @@ describe("check command and status together", () => {
             "exit 1: error in auth",
             "a word after a clock time stays",
         );
+        assert.equal(
+            checkFingerprint(failed("commit abcdefa failed")),
+            checkFingerprint(failed("commit abcdef1 failed")),
+            "an id after a word that names one: 0 or 1 digits",
+        );
+        assert.equal(
+            checkFingerprint(failed("commit abcdef1 failed")),
+            checkFingerprint(failed("commit abc1234 failed")),
+            "an id after a word that names one: 1 or more digits",
+        );
+        assert.equal(
+            checkFingerprint(failed("sha=abcdef1 mismatch")),
+            checkFingerprint(failed("sha=0123abc mismatch")),
+        );
+        assert.equal(checkFingerprint(failed("commit abcdef1 failed")), "exit 1: commit # failed");
         assert.notEqual(
             checkFingerprint(failed("error defaced")),
             checkFingerprint(failed("error facade1")),
