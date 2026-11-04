@@ -808,3 +808,37 @@ test("Q1: the model never gets the day record, and its numbers are not allowed; 
     assert.equal(summary("10 PRs were decided.").summary, "10 PRs were decided.");
     assert.equal(summary("PR 9137 was merged.").summary, "");
 });
+
+test("Q1: the model never gets the review-round thread list or the stop list; their totals stay", () => {
+    const q1 = makeFinding({
+        check: "Q1",
+        subject: "rounds:repo:acme/widgets",
+        severity: "medium",
+        text: "Review rounds of acme/widgets have a median of 3 and a P90 of 10 over 5 desk threads in 30 days",
+        cases: 5,
+    });
+    const q1Metrics = {
+        Q1: {
+            day: { complete: true, calls: 1, prs: [] },
+            rounds: {
+                available: true,
+                totals: { threads: 5, median: 3, p90: 10 },
+                threads: [{ id: "T7741", repo: "acme/widgets", agent: "irulan", rounds: 10 }],
+            },
+            stops: {
+                available: true,
+                totals: { stops: 2, last7: 2 },
+                goals: [{ id: "goal-8812", session: 4471, thread: null }],
+            },
+        },
+    };
+    const fit = fitInput([q1], q1Metrics, []);
+
+    assert.ok(!fit.content.includes("T7741"));
+    assert.ok(!fit.content.includes("goal-8812"));
+    assert.ok(fit.content.includes('"p90":10'));
+    assert.ok(fit.content.includes('"last7":2'));
+    // The metrics passed in are not changed.
+    assert.equal(q1Metrics.Q1.rounds.threads.length, 1);
+    assert.equal(q1Metrics.Q1.stops.goals.length, 1);
+});

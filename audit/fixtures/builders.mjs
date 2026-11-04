@@ -27,6 +27,9 @@ export function emptyData(over = {}) {
         odrade: { readme: "", reports: [], dirty: [], lastCommitAt: NOW - HOUR },
         homes: [],
         github: { botPrs: [], prs: {}, checkRuns: {}, autoDelete: {} },
+        reviewCalls: [],
+        goalStops: [],
+        flakyScan: null,
         sourceErrors: {},
         ...over,
     };
