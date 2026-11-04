@@ -126,6 +126,14 @@ test("the owner and the size come from the fixed table, by check", () => {
     assert.match(ownerOf("H1").component, /repository settings/);
 });
 
+test("Q1's owner is the repository's owner agent, and Odrade at muster", () => {
+    assert.deepEqual(ownerOf("Q1"), {
+        component: "the repository's PR flow and its agent's briefs",
+        owner: "the repository's owner agent; Odrade (muster)",
+        size: "S–M",
+    });
+});
+
 // ---------- Maybe fixed ----------
 
 test("maybe fixed: the last case is not newer than the live module's install plus 10 min", () => {

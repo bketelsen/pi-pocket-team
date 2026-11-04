@@ -767,3 +767,44 @@ test("a run with a huge input still calls the model once, within the cap, and re
     assert.ok(llm.inputCut.findings > 0);
     assert.ok(llm.estimateTokens <= MAX_INPUT_TOKENS);
 });
+
+test("Q1: the model never gets the day record, and its numbers are not allowed; the 30-day rows are", () => {
+    const q1 = makeFinding({
+        check: "Q1",
+        subject: "repo:acme/widgets",
+        severity: "medium",
+        text: "Decided acceptance of acme/widgets is 0.6 over 30 days: merged 9, closed unmerged 1, reverted 3 (26 of 30 days covered)",
+        cases: 4,
+    });
+    const q1Metrics = {
+        Q1: {
+            day: {
+                complete: true,
+                calls: 1,
+                prs: [{ ref: "acme/widgets#9137", title: "Day record title", state: "merged" }],
+            },
+            window: { from: "2026-09-24", to: "2026-10-23", days: 30, covered: 26 },
+            totals: { merged: 9, closedUnmerged: 1, reverted: 3, decided: 10, acceptance: 0.6 },
+        },
+    };
+    const fit = fitInput([q1], q1Metrics, []);
+
+    assert.ok(!fit.content.includes("Day record title"));
+    assert.ok(!fit.content.includes("9137"));
+    assert.ok(!fit.content.includes('"day"'));
+    assert.ok(fit.content.includes('"covered":26'));
+    // The metrics passed in are not changed.
+    assert.equal(q1Metrics.Q1.day.prs.length, 1);
+
+    const summary = (text: string) =>
+        validateAnswer(
+            {
+                summary: text,
+                proposals: [{ title: "t", text: "Acceptance is 0.6.", cites: [q1.id] }],
+            },
+            { findings: [q1], metrics: q1Metrics, pairs: [] },
+        );
+
+    assert.equal(summary("10 PRs were decided.").summary, "10 PRs were decided.");
+    assert.equal(summary("PR 9137 was merged.").summary, "");
+});
