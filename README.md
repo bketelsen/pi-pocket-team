@@ -11,6 +11,8 @@ Drop-in extensions for [Pi Pocket](https://github.com/TannerMidd/pi-pocket), wri
 | **Desk**         | `desk.ts`, `desk-web/`               | One thread for each piece of work the team runs in the background: opened by `team_delegate`, listed and read by a supervisor session, seeded once from a `seed.json` triage file, given its agents' reports, observed by a sweep that closes it when every part is closed, tied to the PRs in its repository, held to a cap, carrying the asks to Brian, shown on an owner-only page, copied to a git folder, woken by a dated check, and planned before it starts (parts 1–10). |
 | **Terminal**     | `terminal.ts`, `terminal-web/`       | The "Terminal" rail page: an interactive login shell as the server's user, in a folder you pick, drawn by the vendored xterm.js. Output by 1 long poll for each tab (25 s at most), input and resize by small POSTs, the shell on a Python pty helper. Owner-only; keys go straight to the shell, where Lancet Guard and Pi do not see them.                                                                                                                                      |
 
+Direction: every change here follows [docs/beacon.md](docs/beacon.md): collect as much as we can, analyze it in the daily audit, and act on the numbers to compare prompts, models and policies.
+
 ## Requirements
 
 - Pi Pocket v0.21.0 or later (Pi Durable 1.4: `runtime.sleepUntil` and `checkpointWhen`). It includes the linked-session working directory (PR #112) that Team delegation needs.

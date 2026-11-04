@@ -2,6 +2,7 @@
 
 This is Brian's extension project: drop-in modules for his running Pi Pocket server. See README.md for what each module does.
 
+- **Direction:** read [docs/beacon.md](docs/beacon.md) (collect, analyze, act). A change that adds a module, a route, a prompt or a model choice says in its PR what it records, and where the audit reads it.
 - **Modules:** Team (`team.ts`, `team-web/`), Homewiki (`homewiki.ts`, `homewiki-web/`), Night shift (`night-shift.ts`, `night-shift-web/`), Model router (`model-router.ts`), Desk (`desk.ts`, `desk-web/`), and Terminal (`terminal.ts`, `terminal-web/`). A new module also goes in `MODULES` in `install.mjs`, the `test` script in `package.json`, and `files` in `tsconfig.json`.
 - **Docs:** Pi Pocket's extension docs start at `_pocket/docs/extensions.md`; the exact types are `_pocket.d.ts` (a link into the checkout). Read the guide your change needs before writing it.
 - **Test before install, every time.** Run `npm test` (node --test, plus `node --check` of the browser modules), `npm run typecheck`, and `npm run lint` (`npm run format` fixes it) before every commit and every install.
