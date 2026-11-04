@@ -70,10 +70,17 @@ const gitEnv = gitEnvironment();
  * A runner for the seed: real git, with `env`, and the environment the seed passes laid over it. Every child starts
  * in a temporary folder (`cwd`), never in the checkout that the tests run from.
  */
+/**
+ * Git with no background maintenance or gc, on the command line: the seed's own environment sets `GIT_CONFIG_GLOBAL`
+ * to `/dev/null`, so the test config file does not reach its commits. A background run leaves
+ * `.git/objects/maintenance.lock` in a snapshot (flaky in CI, PR #111).
+ */
+const NO_BACKGROUND_GIT = ["-c", "maintenance.auto=false", "-c", "gc.auto=0"];
+
 const makeRun =
     (env = gitEnv, cwd = env.HOME) =>
     (command, args, options = {}) =>
-        execFileSync(command, args, {
+        execFileSync(command, command === "git" ? [...NO_BACKGROUND_GIT, ...args] : args, {
             encoding: "utf8",
             stdio: ["ignore", "pipe", "pipe"],
             env: { ...env, ...(options.env ?? {}) },
@@ -84,7 +91,7 @@ const gitRun = makeRun();
 
 /** 1 git command's stdout, trimmed, in the isolated environment, started in a temporary folder. */
 const git = (folder, args) =>
-    execFileSync("git", ["-C", folder, ...args], {
+    execFileSync("git", [...NO_BACKGROUND_GIT, "-C", folder, ...args], {
         encoding: "utf8",
         env: gitEnv,
         cwd: gitEnv.HOME,
@@ -192,17 +199,19 @@ function seed(t, over = {}) {
 }
 
 test("the test git runs no background maintenance, so no lock file lands in a snapshot", () => {
-    for (const env of [gitEnv, gitEnvironment("[core]\n\tfsync = none\n")]) {
-        const read = (key) =>
-            execFileSync("git", ["config", "--global", "--get", key], {
-                encoding: "utf8",
-                env,
-                cwd: env.HOME,
-            }).trim();
+    const read = (run, key, env) =>
+        run("git", ["config", "--get", key], env === undefined ? {} : { env }).trim();
 
-        assert.equal(read("maintenance.auto"), "false");
-        assert.equal(read("gc.auto"), "0");
+    for (const env of [gitEnv, gitEnvironment("[core]\n\tfsync = none\n")]) {
+        // The test's own commands, and the seed's, whose environment drops the test config file.
+        for (const over of [undefined, cleanGitEnv(env)]) {
+            assert.equal(read(makeRun(env), "maintenance.auto", over), "false");
+            assert.equal(read(makeRun(env), "gc.auto", over), "0");
+        }
     }
+
+    // The helper that sets up and reads repositories.
+    assert.equal(git(gitEnv.HOME, ["config", "--get", "maintenance.auto"]), "false");
 });
 
 test("the seed makes a home with 1 commit, every folder and no remote", () => {
