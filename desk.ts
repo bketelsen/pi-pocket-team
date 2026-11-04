@@ -1934,11 +1934,91 @@ const WATCH_ON_HELP =
 const WATCH_ON_CLOSED = /^closed:\s*#?([A-Za-z][0-9]+)$/i;
 const WATCH_ON_PR = /^pr:\s*(\S+)\s+(merged|reviewed|label(?:l)?ed:\s*(.*))$/i;
 
+/** The largest PR number a GraphQL `Int` argument takes: a larger one makes GitHub refuse the whole query. */
+export const GITHUB_INT_MAX = 2147483647;
+
+/**
+ * The most open `pr:` watches on the desk (`pendingPrWatch`): each one is pinned in the sweep's 1 GitHub read, with
+ * its labels and reviews. `setWatch` and `openThread` refuse 1 more, and the sweep pins at most this many
+ * (`prWatchPins`), so a stored excess never breaks the read.
+ */
+export const MAX_PR_WATCHES = 20;
+
+/** A PR ref that may go into the sweep's query: owner/name#N, with N from 1 to `GITHUB_INT_MAX`. */
+function watchRefOk(ref: string): boolean {
+    const match = REF.exec(ref);
+
+    return match !== null && isRepoName(match[1] ?? "") && Number(match[2]) <= GITHUB_INT_MAX;
+}
+
+/** A `pr:` watch that still waits for its event: no result, not due, on a thread that is not closed. */
+function pendingPrWatch(thread: Thread): boolean {
+    const watch = thread.watch;
+
+    return (
+        thread.state !== "closed" &&
+        watch?.on?.kind === "pr" &&
+        watch.result === undefined &&
+        watch.dueAt === undefined
+    );
+}
+
+/**
+ * Why `self` cannot take 1 more `pr:` watch: `MAX_PR_WATCHES` other threads have one open already. Undefined when it
+ * can. The thread's own watch does not count: a new watch replaces it.
+ */
+function prWatchRefusal(
+    state: Readonly<DeskState> | undefined,
+    self: string | undefined,
+): string | undefined {
+    const others = Object.values(state?.threads ?? {}).filter(
+        (thread) => thread.id !== self && pendingPrWatch(thread),
+    ).length;
+
+    return others < MAX_PR_WATCHES
+        ? undefined
+        : `The desk has ${String(others)} open pr: watches, the most it reads (${String(MAX_PR_WATCHES)}). Set a dated watch, or a closed: watch, or clear a pr: watch first.`;
+}
+
+/**
+ * The PRs that the open `pr:` watches wait for, for the sweep to pin: a watch on an open or starting thread with no
+ * result and no wake, and a ref that may go into a query (a bad stored ref is skipped). The oldest `setAt` first, at
+ * most `MAX_PR_WATCHES` refs. A watch that is not pinned gets no event from this read: its date stays the fallback.
+ */
+export function prWatchPins(threads: Iterable<Thread>): string[] {
+    const waiting = [...threads]
+        .filter(
+            (thread) =>
+                (thread.state === "open" || thread.state === "starting") &&
+                pendingPrWatch(thread) &&
+                thread.watch?.on?.kind === "pr" &&
+                watchRefOk(thread.watch.on.ref),
+        )
+        .sort((a, b) => (a.watch?.setAt ?? 0) - (b.watch?.setAt ?? 0) || a.id.localeCompare(b.id));
+    const refs: string[] = [];
+
+    for (const thread of waiting) {
+        const on = thread.watch?.on;
+        const ref = on?.kind === "pr" ? on.ref : "";
+
+        if (refs.length >= MAX_PR_WATCHES) {
+            break;
+        }
+
+        if (!refs.some((each) => each.toLowerCase() === ref.toLowerCase())) {
+            refs.push(ref);
+        }
+    }
+
+    return refs;
+}
+
 /**
  * Parse a watch's event text (`WatchOn`): `closed:T14`, `pr:owner/name#12 merged`, `pr:owner/name#12 reviewed`, or
  * `pr:owner/name#12 labelled:<label>` (also `labeled:`). `closed:` takes a thread on the desk that is not `self`, the
  * watched thread. A target that is closed already, or a PR that merged already, is no error: the next sweep fires the
- * watch.
+ * watch. A `pr:` ref takes a number from 1 to `GITHUB_INT_MAX`, and a new `pr:` watch is refused when the desk has
+ * `MAX_PR_WATCHES` open ones on other threads (`state`).
  */
 export function parseWatchOn(
     text: string,
@@ -1977,6 +2057,19 @@ export function parseWatchOn(
 
     if (!REF.test(ref) || !isRepoName(repoOf(ref))) {
         return { error: `${ref} is not a PR ref. A PR ref is owner/name#12.` };
+    }
+
+    if (!watchRefOk(ref)) {
+        return {
+            error: `${ref} is not a PR ref: a PR number is 1 to ${String(GITHUB_INT_MAX)}.`,
+        };
+    }
+
+    // The sweep reads each open pr: watch's PR: the desk holds at most `MAX_PR_WATCHES` of them.
+    const full = prWatchRefusal(state, self);
+
+    if (full !== undefined) {
+        return { error: full };
     }
 
     const word = (pr[2] ?? "").toLowerCase();
@@ -5311,13 +5404,20 @@ export type PrFact = {
      */
     body?: string;
     closing?: { total: number; refs: string[] };
-    /** The names of its labels, as GitHub gave them: a watch's `labelled` event reads them. Absent: not read. */
-    labels?: string[];
     /**
-     * When its newest submitted review came: a watch's `reviewed` event reads it. 0 when none; absent when the read did
-     * not ask for the reviews (only a pinned read does).
+     * The names of its labels, as GitHub gave them: a watch's `labelled` event reads them. A watched pin reads up to
+     * 100 (`PR_WATCH`); every other read, the first 20. Absent: not read.
+     */
+    labels?: string[];
+    /** GitHub has more labels than `labels` holds: a label that is not in it is not known to be absent. */
+    labelsCut?: true;
+    /**
+     * When its newest submitted review came, from the latest review of each reviewer (`latestReviews`): a watch's
+     * `reviewed` event reads it. 0 when none; absent when the read did not ask (only a watched pin does).
      */
     reviewedAt?: number;
+    /** GitHub has more reviewers than the read gave: a review not in it is not known to be absent. */
+    reviewsCut?: true;
 };
 
 /** One linked issue, read by number: its state, and the merged PRs that closed it. */
@@ -5406,6 +5506,14 @@ const PR_DETAIL =
     "reviews(last: 20) { nodes { state submittedAt body } } " +
     "comments(last: 20) { nodes { createdAt body } }";
 
+/**
+ * What a PR that a `pr:` watch waits for adds (`prWatchPins`): up to 100 labels with their count (`watchLabels`), and
+ * the latest submitted review of each reviewer with their count. Only those pins ask: the other reads stay as they were.
+ */
+const PR_WATCH =
+    "watchLabels: labels(first: 100) { totalCount nodes { name } } " +
+    "latestReviews(first: 100) { totalCount nodes { submittedAt } }";
+
 /** What a merged PR of a thread with a linked issue adds: its body, and the issues it closes (`partial` class). */
 const PR_CLOSING =
     "body closingIssuesReferences(first: 10) { totalCount nodes { number repository { nameWithOwner } } }";
@@ -5416,14 +5524,16 @@ const ISSUE_PINNED =
 
 /**
  * The one GraphQL query of a sweep: the viewer, each repository's open PRs, each attached PR by number, and each
- * linked issue by number (`iN`). `detail` names the attached PRs that also give their body and the issues they close.
- * Every owner, name, and number is checked first: nothing else goes into the query.
+ * linked issue by number (`iN`). `detail` names the attached PRs that also give their body and the issues they close;
+ * `watched` names the pinned PRs that also give their labels and latest reviews (`PR_WATCH`). Every owner, name, and
+ * number is checked first: nothing else goes into the query.
  */
 export function buildQuery(
     repos: string[],
     prs: string[],
     issues: string[] = [],
     detail: string[] = [],
+    watched: string[] = [],
 ): string {
     const lines = ["query {", "  viewer { login }"];
 
@@ -5451,7 +5561,7 @@ export function buildQuery(
             `  p${String(index)}: repository(owner: ${JSON.stringify(owner)}, name: ${JSON.stringify(name)}) {`,
             "    nameWithOwner",
             "    isArchived",
-            `    pullRequest(number: ${String(number)}) { ${PR_DETAIL}${detail.includes(ref) ? ` ${PR_CLOSING}` : ""} }`,
+            `    pullRequest(number: ${String(number)}) { ${PR_DETAIL}${detail.includes(ref) ? ` ${PR_CLOSING}` : ""}${watched.includes(ref) ? ` ${PR_WATCH}` : ""} }`,
             "  }",
         );
     }
@@ -5584,7 +5694,7 @@ function prFact(
             feedback: feedbackOf(node),
             failing: failingChecks(contexts?.nodes),
             archived,
-            labels: labelsOf(node),
+            ...watchLabelsOf(node),
             ...reviewedOf(node),
             ...closingOf(node),
         },
@@ -5594,11 +5704,34 @@ function prFact(
     };
 }
 
-/** When a PR node's newest submitted review came (`reviewedAt`), when the read asked for the reviews. */
-function reviewedOf(node: Record<string, unknown>): Pick<PrFact, "reviewedAt"> {
-    const reviews = node.reviews as { nodes?: unknown } | null | undefined;
+/**
+ * A PR node's labels for a watch: the full list a watched pin read (`watchLabels`, up to 100, with `labelsCut` when
+ * GitHub has more), else the first 20 of the list every read has.
+ */
+function watchLabelsOf(node: Record<string, unknown>): Pick<PrFact, "labels" | "labelsCut"> {
+    const all = node.watchLabels as { totalCount?: unknown; nodes?: unknown } | null | undefined;
 
-    if (!Array.isArray(reviews?.nodes)) {
+    if (all === null || typeof all !== "object" || !Array.isArray(all.nodes)) {
+        return { labels: labelsOf(node) };
+    }
+
+    const labels = labelsOf({ labels: all });
+
+    return typeof all.totalCount === "number" && all.totalCount > labels.length
+        ? { labels, labelsCut: true }
+        : { labels };
+}
+
+/**
+ * When a PR node's newest submitted review came (`reviewedAt`), from `latestReviews`: the latest review of each
+ * reviewer that is not pending, so a review submitted later is always in it, whenever it was created. `reviewsCut`
+ * when GitHub has more reviewers than the read. Nothing when the read did not ask (only a watched pin does).
+ */
+function reviewedOf(node: Record<string, unknown>): Pick<PrFact, "reviewedAt" | "reviewsCut"> {
+    const reviews = node.latestReviews as
+        { totalCount?: unknown; nodes?: unknown } | null | undefined;
+
+    if (reviews === null || typeof reviews !== "object" || !Array.isArray(reviews.nodes)) {
         return {};
     }
 
@@ -5612,7 +5745,9 @@ function reviewedOf(node: Record<string, unknown>): Pick<PrFact, "reviewedAt"> {
         }
     }
 
-    return { reviewedAt: newest };
+    return typeof reviews.totalCount === "number" && reviews.totalCount > reviews.nodes.length
+        ? { reviewedAt: newest, reviewsCut: true }
+        : { reviewedAt: newest };
 }
 
 /** A PR node's body and closing issues, when the read asked for them. */
@@ -19159,6 +19294,7 @@ export default function createDesk(host: Host, web: Web) {
         prs: string[],
         issues: string[] = [],
         detail: string[] = [],
+        watched: string[] = [],
     ): Promise<{ facts?: GitHubFacts; error?: string }> {
         if (repos.length === 0 && prs.length === 0 && issues.length === 0) {
             return {};
@@ -19171,7 +19307,7 @@ export default function createDesk(host: Host, web: Web) {
         let facts: GitHubFacts;
 
         try {
-            const { stdout } = await ask(buildQuery(wanted, pinned, issues, detail));
+            const { stdout } = await ask(buildQuery(wanted, pinned, issues, detail, watched));
 
             facts = parseGitHub(JSON.parse(stdout));
         } catch (error) {
@@ -19882,19 +20018,13 @@ export default function createDesk(host: Host, web: Web) {
         }
 
         // A watch that waits for a PR's event: that PR is pinned too, read by number in the same 1 read, also when no
-        // thread holds it. Its repository is not listed: it attributes nothing, and only the watch reads the facts.
-        for (const thread of open) {
-            const watch = thread.watch;
+        // thread holds it, with all its labels and the latest review of each reviewer. Its repository is not listed: it
+        // attributes nothing, and only the watch reads the facts. At most `MAX_PR_WATCHES`, the oldest first; a bad
+        // stored ref is skipped.
+        const watched = prWatchPins(open);
 
-            if (
-                watch?.on?.kind === "pr" &&
-                watch.result === undefined &&
-                watch.dueAt === undefined &&
-                REF.test(watch.on.ref) &&
-                isRepoName(repoOf(watch.on.ref))
-            ) {
-                pinned.add(watch.on.ref);
-            }
+        for (const ref of watched) {
+            pinned.add(ref);
         }
 
         const githubRead = await readGitHub(
@@ -19902,6 +20032,7 @@ export default function createDesk(host: Host, web: Web) {
             [...pinned],
             [...pinnedIssues],
             [...detail],
+            watched,
         );
         const { authors, ownAuthors, queue: queueRaw } = await deskConfig();
         // The issue queue: its own read, after the PR read. A failure of one never touches the other.

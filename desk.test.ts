@@ -147,6 +147,8 @@ import {
     setWatch,
     wakeWatch,
     parseWatchOn,
+    prWatchPins,
+    MAX_PR_WATCHES,
     watchOnText,
     watchOnFired,
     watchReached,
@@ -4709,7 +4711,7 @@ describe("a watch's event (on)", () => {
         );
     });
 
-    test("parseGitHub gives a PR's labels, and the newest submitted review of a pinned read", () => {
+    test("parseGitHub gives a PR's labels, and the latest submitted review of each reviewer of a watched pin", () => {
         const facts = parseGitHub({
             data: {
                 viewer: { login: "github-viewer" },
@@ -4720,12 +4722,24 @@ describe("a watch's event (on)", () => {
                         number: 9,
                         state: "OPEN",
                         labels: { nodes: [{ name: "bug" }, { name: "ready-for-human" }] },
-                        reviews: {
+                        latestReviews: {
+                            totalCount: 2,
                             nodes: [
-                                { state: "COMMENTED", submittedAt: "2026-10-20T10:00:00Z" },
-                                { state: "APPROVED", submittedAt: "2026-10-21T10:00:00Z" },
-                                { state: "PENDING", submittedAt: null },
+                                { submittedAt: "2026-10-21T10:00:00Z" },
+                                { submittedAt: "2026-10-20T10:00:00Z" },
                             ],
+                        },
+                    },
+                },
+                p1: {
+                    nameWithOwner: "frostyard/test",
+                    isArchived: false,
+                    pullRequest: {
+                        number: 10,
+                        state: "OPEN",
+                        // A read that did not ask for the latest reviews: no review time, whatever `reviews` says.
+                        reviews: {
+                            nodes: [{ state: "APPROVED", submittedAt: "2026-10-21T10:00:00Z" }],
                         },
                     },
                 },
@@ -4734,7 +4748,307 @@ describe("a watch's event (on)", () => {
         const pr = facts.prs["frostyard/test#9"];
 
         assert.deepEqual(pr?.labels, ["bug", "ready-for-human"]);
+        assert.equal(pr?.labelsCut, undefined);
         assert.equal(pr?.reviewedAt, Date.parse("2026-10-21T10:00:00Z"));
+        assert.equal(pr?.reviewsCut, undefined);
+        assert.equal(facts.prs["frostyard/test#10"]?.reviewedAt, undefined);
+    });
+
+    test("pr: reviewed fires on a review created before the watch and submitted after it", () => {
+        const set = Date.parse("2026-10-22T12:00:00Z");
+        const one = thread({ id: "T1" });
+
+        setWatch(one, {
+            checkOn: "2099-11-01",
+            check: "the review",
+            by: "odrade",
+            key: "watch-review",
+            at: set,
+            on: "pr:frostyard/test#9 reviewed",
+        });
+
+        // 20 newer-created reviews, all submitted before the watch, fill `reviews(last: 20)`. The older-created review,
+        // a draft submitted after the watch, is only in `latestReviews`: it is its author's latest.
+        const facts = parseGitHub({
+            data: {
+                viewer: { login: "github-viewer" },
+                p0: {
+                    nameWithOwner: "frostyard/test",
+                    isArchived: false,
+                    pullRequest: {
+                        number: 9,
+                        state: "OPEN",
+                        reviews: {
+                            nodes: Array.from({ length: 20 }, () => ({
+                                state: "COMMENTED",
+                                submittedAt: "2026-10-21T10:00:00Z",
+                            })),
+                        },
+                        latestReviews: {
+                            totalCount: 2,
+                            nodes: [
+                                { submittedAt: "2026-10-21T10:00:00Z" },
+                                { submittedAt: "2026-10-23T09:00:00Z" },
+                            ],
+                        },
+                    },
+                },
+            },
+        });
+
+        assert.equal(wakeWatch(one, set + DAY, { threads: {}, github: facts }), true);
+        assert.equal(one.watch?.onFired, "PR frostyard/test#9 got a review");
+    });
+
+    test("a cut list of reviewers is marked, and fires only on a review it shows", () => {
+        const facts = parseGitHub({
+            data: {
+                viewer: { login: "github-viewer" },
+                p0: {
+                    nameWithOwner: "frostyard/test",
+                    isArchived: false,
+                    pullRequest: {
+                        number: 9,
+                        state: "OPEN",
+                        latestReviews: {
+                            totalCount: 101,
+                            nodes: [{ submittedAt: "2026-10-21T10:00:00Z" }],
+                        },
+                    },
+                },
+            },
+        });
+        const pr = facts.prs["frostyard/test#9"];
+
+        assert.equal(pr?.reviewsCut, true);
+        assert.equal(
+            watchOnFired(
+                {
+                    setAt: Date.parse("2026-10-22T00:00:00Z"),
+                    on: { kind: "pr", ref: "frostyard/test#9", event: "reviewed" },
+                },
+                { threads: {}, github: facts },
+            ),
+            undefined,
+            "the date stays the fallback",
+        );
+    });
+
+    test("a watched pin reads every label: a watched label after the 20th fires", () => {
+        const names = Array.from({ length: 25 }, (_, index) => `label-${String(index + 1)}`);
+        const pinned = (watchLabels: unknown) =>
+            parseGitHub({
+                data: {
+                    viewer: { login: "github-viewer" },
+                    p0: {
+                        nameWithOwner: "frostyard/test",
+                        isArchived: false,
+                        pullRequest: {
+                            number: 9,
+                            state: "OPEN",
+                            labels: { nodes: names.slice(0, 20).map((name) => ({ name })) },
+                            ...(watchLabels === undefined ? {} : { watchLabels }),
+                        },
+                    },
+                },
+            });
+        const watch = {
+            setAt: 1,
+            on: {
+                kind: "pr" as const,
+                ref: "frostyard/test#9",
+                event: "labelled" as const,
+                label: "label-25",
+            },
+        };
+
+        // The list every read has stops at 20: the 25th label is not in it.
+        assert.equal(watchOnFired(watch, { threads: {}, github: pinned(undefined) }), undefined);
+
+        const full = pinned({ totalCount: 25, nodes: names.map((name) => ({ name })) });
+
+        assert.equal(full.prs["frostyard/test#9"]?.labels?.length, 25);
+        assert.equal(full.prs["frostyard/test#9"]?.labelsCut, undefined);
+        assert.equal(
+            watchOnFired(watch, { threads: {}, github: full }),
+            "PR frostyard/test#9 has the label label-25",
+        );
+
+        // More than 100 labels: the list is cut, and a label it does not show does not fire.
+        const cut = pinned({
+            totalCount: 130,
+            nodes: names.slice(0, 24).map((name) => ({ name })),
+        });
+
+        assert.equal(cut.prs["frostyard/test#9"]?.labelsCut, true);
+        assert.equal(watchOnFired(watch, { threads: {}, github: cut }), undefined);
+    });
+
+    test("buildQuery asks every label and the latest reviews only for a watched pin", () => {
+        const query = buildQuery(
+            ["frostyard/list"],
+            ["frostyard/test#7", "frostyard/test#9"],
+            [],
+            [],
+            ["frostyard/test#9"],
+        );
+        const lines = query.split("\n");
+        const watched = lines.find((line) => line.includes("pullRequest(number: 9)")) ?? "";
+        const other = lines.find((line) => line.includes("pullRequest(number: 7)")) ?? "";
+
+        assert.match(
+            watched,
+            /watchLabels: labels\(first: 100\) \{ totalCount nodes \{ name \} \} latestReviews\(first: 100\) \{ totalCount nodes \{ submittedAt \} \}/,
+        );
+        assert.doesNotMatch(other, /watchLabels|latestReviews/);
+        assert.equal(
+            lines.filter((line) => line.includes("watchLabels") || line.includes("latestReviews"))
+                .length,
+            1,
+            "the repository list stays as it was",
+        );
+    });
+
+    test("parseWatchOn refuses a PR number out of the GraphQL Int range", () => {
+        const state = empty();
+
+        assert.match(
+            JSON.stringify(parseWatchOn("pr:frostyard/test#2147483648 merged", state, "T1")),
+            /frostyard\/test#2147483648 is not a PR ref: a PR number is 1 to 2147483647/,
+        );
+        assert.deepEqual(parseWatchOn("pr:frostyard/test#2147483647 merged", state, "T1"), {
+            kind: "pr",
+            ref: "frostyard/test#2147483647",
+            event: "merged",
+        });
+    });
+
+    test("prWatchPins skips a bad stored ref, and pins at most MAX_PR_WATCHES, the oldest first", () => {
+        const prWatcher = (id: string, setAt: number, ref: string, patch: Partial<Thread> = {}) =>
+            thread({
+                id,
+                key: `k-${id}`,
+                watch: {
+                    checkOn: "2099-11-01",
+                    check: "c",
+                    setAt,
+                    setBy: "odrade",
+                    key: `w-${id}`,
+                    on: { kind: "pr", ref, event: "merged" },
+                },
+                ...patch,
+            });
+        const big = prWatcher("T1", 1, "frostyard/test#2147483648");
+        const bad = prWatcher("T2", 2, "not a ref");
+
+        assert.deepEqual(prWatchPins([big, bad]), [], "a stored ref out of range is skipped");
+
+        // 25 watches on other PRs, set in reverse order, and the same PR twice: the 20 oldest refs, each once.
+        const many = Array.from({ length: 25 }, (_, index) =>
+            prWatcher(
+                `T${String(100 + index)}`,
+                1000 - index,
+                `frostyard/test#${String(index + 1)}`,
+            ),
+        );
+        const twice = prWatcher("T200", 1, "frostyard/test#25");
+        const pins = prWatchPins([big, bad, ...many, twice]);
+
+        assert.equal(pins.length, MAX_PR_WATCHES);
+        assert.equal(pins[0], "frostyard/test#25", "the oldest first, and once");
+        assert.equal(new Set(pins).size, MAX_PR_WATCHES);
+        assert(!pins.includes("frostyard/test#1"), "the newest watches wait: their date stays");
+
+        // A parked, closed, due, or decided watch is not pinned.
+        const none = [
+            prWatcher("T300", 1, "frostyard/test#300", { state: "parked" }),
+            prWatcher("T301", 1, "frostyard/test#301", { state: "closed" }),
+        ];
+        const due = prWatcher("T302", 1, "frostyard/test#302");
+
+        due.watch!.dueAt = 5;
+        assert.deepEqual(prWatchPins([...none, due]), []);
+    });
+
+    test("setWatch and openThread refuse a new pr: watch at the limit; a replacement and a closed: watch are allowed", () => {
+        const state = empty();
+
+        for (let index = 1; index <= MAX_PR_WATCHES; index += 1) {
+            const id = `T${String(index)}`;
+            const one = thread({ id, key: `k-${id}` });
+
+            state.threads[id] = one;
+            assert.deepEqual(
+                setWatch(
+                    one,
+                    {
+                        checkOn: "2099-11-01",
+                        check: "c",
+                        by: "odrade",
+                        key: `w-${id}`,
+                        at: on("2026-10-22"),
+                        on: `pr:frostyard/test#${String(index)} merged`,
+                    },
+                    state,
+                ),
+                { changed: true },
+            );
+        }
+
+        const extra = thread({ id: "T50", key: "k-50" });
+
+        state.threads.T50 = extra;
+        const request = {
+            checkOn: "2099-11-01",
+            check: "c",
+            by: "odrade",
+            key: "w-50",
+            at: on("2026-10-22"),
+            on: "pr:frostyard/test#50 merged",
+        };
+
+        assert.match(
+            JSON.stringify(setWatch(extra, request, state)),
+            /The desk has 20 open pr: watches, the most it reads \(20\)/,
+        );
+        assert.equal(extra.watch, undefined);
+        assert.equal(extra.run.watchKeys, undefined, "a refusal records no key");
+
+        // A thread that has one of the 20 replaces it: the count stays.
+        assert.deepEqual(
+            setWatch(
+                state.threads.T1!,
+                { ...request, key: "w-1b", on: "pr:frostyard/test#51 reviewed" },
+                state,
+            ),
+            { changed: true },
+        );
+        // A closed: watch, or a dated one, is no pr: watch.
+        assert.deepEqual(setWatch(extra, { ...request, on: "closed:T1" }, state), {
+            changed: true,
+        });
+
+        assert.throws(
+            () =>
+                openThread(state, {
+                    key: "k-delegated",
+                    supervisor: 1,
+                    agents: ["duncan"],
+                    title: "One more",
+                    at: on("2026-10-22"),
+                    watch: {
+                        checkOn: "2099-11-01",
+                        check: "c",
+                        by: "odrade",
+                        on: "pr:frostyard/test#60 merged",
+                    },
+                }),
+            /The desk has 20 open pr: watches/,
+        );
+
+        // A watch that came due frees its place.
+        state.threads.T2!.watch!.dueAt = on("2026-10-23");
+        assert.deepEqual(setWatch(extra, { ...request, key: "w-50c" }, state), { changed: true });
     });
 });
 
@@ -20739,7 +21053,7 @@ describe("the desk in a Pi Pocket", () => {
             writeFileSync(fixturePath, JSON.stringify(merged));
             writeFileSync(
                 fakeGh,
-                `#!/bin/sh\ncase "$*" in\n  *"pullRequest(number: 9)"*) cat ${JSON.stringify(fixturePath)} ;;\n  *) printf '%s' '{"data":{"viewer":{"login":"github-viewer"}}}' ;;\nesac\n`,
+                `#!/bin/sh\ncase "$*" in\n  *"pullRequest(number: 9)"*"latestReviews"*) cat ${JSON.stringify(fixturePath)} ;;\n  *) printf '%s' '{"data":{"viewer":{"login":"github-viewer"}}}' ;;\nesac\n`,
             );
             chmodSync(fakeGh, 0o755);
             process.env.PI_POCKET_DESK_GH = fakeGh;
