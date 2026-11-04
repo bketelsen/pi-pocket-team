@@ -286,11 +286,14 @@ A person's message during the wait does not cancel the goal: messages written th
 | all rounds used                                 | ended; summary                                                        |
 | the deadline passed (checked before each round) | ended; summary                                                        |
 | Pi says BLOCKED                                 | ended; summary                                                        |
+| the same check failure comes 3 times in a row   | ended as blocked; summary                                             |
 | a person writes in the session                  | **paused**, with a notice; no summary (the person is there); `resume` |
 | plan mode is on                                 | paused; `resume` after plan mode is off                               |
 | Stop, or `/night-shift stop`                    | ended; no summary                                                     |
 | a spend limit (Pocket's `heldBack`)             | ended; no summary (Pi may not start)                                  |
 | a round gets no answer (a model error)          | ended, with the error                                                 |
+
+The same check failure 3 times in a row ends the goal as `blocked`, with the summary, so a line does not spend its rounds on 1 red check. The reason says `the same check failure came 3 times in a row:` and the failure. A failure's fingerprint is the sorted names of the failing or cancelled checks when the output has `gh pr checks` rows (as `pr_check` gives), and otherwise the exit code and the last 10 lines of output, with dates, clock times, durations, hex ids and other numbers taken out. Only the check records count: a round with no check (CONTINUE) is skipped, a check cut off by a restart is skipped, and a pass, or only pending checks, starts the count again.
 
 The summary is one more message after the last round: what Pi did, what is left, and why it stopped. A round that runs at the deadline finishes; no round starts after it. A person's message is any `pi.user` message that is not one of the module's own and not known as automated (`[via …]` from linked sessions, PiP, webhooks and watches; `[scheduled]`; subagent reports; Done when's `[goal]`): when unsure, it pauses.
 

@@ -22,15 +22,19 @@ import { fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi
 import { type ConversationId, LiveDoc, type TaskId } from "@earendil-works/pi-durable";
 import { SubagentsDoc } from "./_pocket/src/server/docs.ts";
 import {
+    checkFingerprint,
     deepseekStart,
     DEFAULT_ROUNDS,
+    type CheckResult,
     type Goal,
     GoalDoc,
     nextClockTime,
     parseArgs,
     parseVerdict,
     personOf,
+    repeatedFailure,
     roundMessage,
+    type RoundRecord,
     standing,
     statusCard,
     SUBAGENT_WAIT_MS,
@@ -540,6 +544,9 @@ const route: FauxResponseStep = async (request, options) => {
             }
 
             return say(n === 3 ? "STATUS: DONE: all three" : "STATUS: CONTINUE: more");
+        case "scenario-repeat-failure":
+        case "scenario-different-failure":
+            return say("STATUS: DONE: the stop condition is held");
         case "scenario-check":
             // Round 1: not done. Round 2: says DONE too early. Round 3: makes the check pass.
             if (n === 3) {
@@ -962,6 +969,116 @@ describe("workers", () => {
 });
 
 describe("check command and status together", () => {
+    test("check fingerprints and repeated failures follow the 3-failure rule", () => {
+        const failed = (tail: string, code = 1, cutOff?: true): CheckResult => ({
+            passed: false,
+            code,
+            tail,
+            cutOff,
+        });
+        const round = (n: number, check?: CheckResult): RoundRecord => ({
+            n,
+            verdict: "done",
+            reason: "check",
+            at: 0,
+            check,
+        });
+
+        assert.equal(checkFingerprint(failed("same failure")), "exit 1: same failure");
+        assert.equal(checkFingerprint(undefined), undefined);
+        assert.equal(checkFingerprint({ passed: true, code: 0, tail: "ok" }), undefined);
+        assert.equal(checkFingerprint(failed("cut off", -1, true)), undefined);
+
+        assert.equal(
+            repeatedFailure([
+                round(1, failed("same failure")),
+                round(2, failed("same failure")),
+                round(3, failed("same failure")),
+            ]),
+            "exit 1: same failure",
+        );
+        assert.equal(
+            repeatedFailure([round(1, failed("same failure")), round(2, failed("same failure"))]),
+            undefined,
+        );
+        assert.equal(
+            repeatedFailure([
+                round(1, failed("failure a")),
+                round(2, failed("failure b")),
+                round(3, failed("failure c")),
+            ]),
+            undefined,
+        );
+
+        const first = failed("2026-11-04T12:34:56Z build 350ms 12:34 abc1234 42");
+        const second = failed("2026-11-05T09:10:11Z build 2.5s 09:10 def5678 99");
+
+        assert.equal(checkFingerprint(first), checkFingerprint(second));
+        assert.equal(
+            checkFingerprint(failed("12:30 error in auth")),
+            "exit 1: error in auth",
+            "a word after a clock time stays",
+        );
+        assert.equal(
+            repeatedFailure([round(1, first), round(2, second), round(3, first)]),
+            checkFingerprint(first),
+        );
+
+        assert.equal(
+            repeatedFailure([
+                round(1, failed("same failure")),
+                round(2, failed("same failure", -1, true)),
+                round(3, failed("same failure")),
+                round(4, failed("same failure")),
+            ]),
+            "exit 1: same failure",
+        );
+        assert.equal(
+            repeatedFailure([
+                round(1, failed("same failure")),
+                round(2, undefined),
+                round(3, failed("same failure")),
+                round(4, failed("same failure")),
+            ]),
+            "exit 1: same failure",
+        );
+        assert.equal(
+            repeatedFailure([
+                round(1, failed("same failure")),
+                round(2, failed("same failure")),
+                round(3, { passed: true, code: 0, tail: "ok" }),
+            ]),
+            undefined,
+        );
+    });
+
+    test("the same failed check stops after round 3", async () => {
+        const id = await session("repeat-failure");
+
+        await command(
+            id,
+            "max 6 check `echo same failure; exit 1`: scenario-repeat-failure; stop when never",
+        );
+        const goal = await settled(id);
+
+        assert.equal(goal.reason, "blocked");
+        assert.equal(goal.round, 3);
+        assert.match(goal.why ?? "", /same check failure came 3 times/);
+    });
+
+    test("different failed check output does not stop as blocked", async () => {
+        const id = await session("different-failure");
+
+        await command(
+            id,
+            'max 6 check `printf x >> runs.txt; n=$(wc -c < runs.txt); r=$((n % 3)); if [ "$r" -eq 1 ]; then echo a; elif [ "$r" -eq 2 ]; then echo b; else echo c; fi; exit 1`: scenario-different-failure; stop when never',
+        );
+        const goal = await settled(id);
+
+        assert.notEqual(goal.reason, "blocked");
+        assert.equal(goal.reason, "max-rounds");
+    });
+
     test("DONE ends it only when the check passes; the check runs only after DONE", async () => {
         const id = await session("check");
         const folder = join(root, "check");

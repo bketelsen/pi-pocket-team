@@ -21,6 +21,9 @@
  *
  * State is one document per conversation, `x.night-shift.goal`. It is stored data: never rename it or change what a
  * field means.
+ *
+ * The same check failure `SAME_FAILURES` times in a row (by `checkFingerprint`) stops a goal as `blocked`, with a
+ * detail: no new stop reason, because the reason is stored data.
  */
 import { createHash, randomUUID } from "node:crypto";
 import type { Context } from "@earendil-works/chord";
@@ -47,6 +50,7 @@ import type { CommandContext, Host, Web } from "./_pocket.d.ts";
 
 export const DEFAULT_ROUNDS = 20;
 export const MAX_ROUNDS = 100;
+export const SAME_FAILURES = 3;
 /** The longest a deadline can be from now. */
 const MAX_HOURS = 24;
 const MAX_COMMAND = 2000;
@@ -102,6 +106,92 @@ export type RoundRecord = {
     /** The provider/model that executed this round's subagents, when the goal set one. */
     worker?: string;
 };
+
+/** A short, stable summary of a failed check. Times and transient output do not make separate failures. */
+export function checkFingerprint(check: CheckResult | undefined): string | undefined {
+    if (check === undefined || check.passed || check.cutOff) {
+        return undefined;
+    }
+
+    const ghRows = check.tail
+        .split("\n")
+        .map((line) => line.split("\t"))
+        .filter((parts) => {
+            if (parts.length < 4) {
+                return false;
+            }
+
+            return ["pass", "fail", "pending", "skipping", "cancel"].includes(parts[1]?.trim());
+        });
+
+    if (ghRows.length > 0) {
+        const names = new Set(
+            ghRows
+                .filter((parts) => ["fail", "cancel"].includes(parts[1]?.trim()))
+                .map((parts) => parts[0]?.trim())
+                .filter((name): name is string => name !== undefined && name !== ""),
+        );
+
+        return names.size === 0 ? undefined : `checks failed: ${[...names].sort().join(", ")}`;
+    }
+
+    // Simple normalization: remove timestamps and times, durations, hex ids, and other digit runs.
+    const lines = check.tail
+        .split("\n")
+        .map((line) =>
+            line
+                .replace(
+                    /\b\d{4}-\d{2}-\d{2}[T ][0-2]\d:[0-5]\d(?::[0-5]\d(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?\b/gi,
+                    "",
+                )
+                .replace(/\b(?:[01]?\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:\.\d+)?)?\b/g, "")
+                .replace(/\b(?:\d+(?:\.\d+)?(?:ms|h|m|s))+\b/gi, "#")
+                .replace(/\b[0-9a-f]{7,}\b/gi, "#")
+                .replace(/\d+/g, "#")
+                .replace(/\s+/g, " ")
+                .trim(),
+        )
+        .filter((line) => line !== "")
+        .slice(-10);
+
+    return `exit ${check.code}: ${lines.join(" / ")}`;
+}
+
+/** The newest same failure repeated `times` times, ignoring rounds without checks and cut-off checks. */
+export function repeatedFailure(
+    rounds: readonly RoundRecord[],
+    times = SAME_FAILURES,
+): string | undefined {
+    if (!Number.isSafeInteger(times) || times < 1) {
+        return undefined;
+    }
+
+    const fingerprints: string[] = [];
+
+    for (let index = rounds.length - 1; index >= 0; index -= 1) {
+        const check = rounds[index]?.check;
+
+        if (check === undefined || check.cutOff) {
+            continue;
+        }
+
+        const fingerprint = checkFingerprint(check);
+
+        if (fingerprint === undefined) {
+            return undefined;
+        }
+
+        fingerprints.push(fingerprint);
+
+        if (fingerprints.length === times) {
+            return fingerprints.every((each) => each === fingerprints[0])
+                ? fingerprints[0]
+                : undefined;
+        }
+    }
+
+    return undefined;
+}
 
 export type Goal = {
     id: string;
@@ -1979,6 +2069,21 @@ export default function createNightShift(host: Host, web: Web) {
                     }
 
                     if (!check.passed) {
+                        const fingerprint = repeatedFailure(goal.rounds);
+
+                        if (fingerprint !== undefined) {
+                            const detail =
+                                `the same check failure came ${SAME_FAILURES} times in a row: ${fingerprint}`.slice(
+                                    0,
+                                    300,
+                                );
+                            const state = stopIn(goal, "blocked", detail, runtime.now());
+
+                            seen.goal = copy(goal);
+
+                            return state;
+                        }
+
                         return next({ phase: "decide" });
                     }
 
