@@ -426,6 +426,11 @@ export type Refusal = {
     title: string;
     /** The delegation key of the latest refusal: a replay of it adds nothing. */
     key: string;
+    /**
+     * The earlier delegation keys of the same work (the same supervisor and title), oldest first: a replay of one adds
+     * nothing either, and a thread that opens with one ends the wait. Absent until a second refusal merges in.
+     */
+    keys?: string[];
     /** When an OK served it: 1 OK serves 1 refusal, the oldest first. */
     served?: number;
     /** The key of the OK that served it. */
@@ -8783,6 +8788,11 @@ function refusalWaits(refusal: Readonly<Refusal>, now: number): boolean {
     );
 }
 
+/** Whether a refusal holds a delegation key: its latest key, or an earlier one of the same work. */
+function refusalHasKey(refusal: Readonly<Refusal>, key: string): boolean {
+    return refusal.key === key || (refusal.keys ?? []).includes(key);
+}
+
 /** The refusals that wait for an OK, oldest first. */
 export function waitingRefusals(state: Readonly<DeskState> | undefined, now: number): Refusal[] {
     return (state?.refusals ?? [])
@@ -8801,7 +8811,7 @@ export function recordRefusal(
     request: { key: string; supervisor: number; title: string; at: number },
 ): boolean {
     if (
-        (state.refusals ?? []).some((refusal) => refusal.key === request.key) ||
+        (state.refusals ?? []).some((refusal) => refusalHasKey(refusal, request.key)) ||
         findThread(state, request.key) !== undefined ||
         !capView(state, cap, request.at).full
     ) {
@@ -8817,6 +8827,8 @@ export function recordRefusal(
     );
 
     if (same !== undefined) {
+        // The earlier key stays: a replay of it must not add a new refusal after this one is served.
+        same.keys = [...(same.keys ?? []), same.key];
         same.at = request.at;
         same.key = request.key;
 
@@ -18277,7 +18289,7 @@ export default function createDesk(host: Host, web: Web) {
 
             // A refusal of this key does not wait any more: its thread opens now.
             for (const refusal of state.refusals ?? []) {
-                if (refusal.key === request.key && refusal.opened === undefined) {
+                if (refusalHasKey(refusal, request.key) && refusal.opened === undefined) {
                     refusal.opened = request.at;
                 }
             }
@@ -24144,25 +24156,38 @@ export default function createDesk(host: Host, web: Web) {
                     );
                 }
 
+                const tapKeys: string[] = [];
+
                 for (let index = 1; index <= count; index += 1) {
+                    const key = `tap:${String(now)}:${String(index)}`;
+
+                    tapKeys.push(key);
                     addGrant(state, {
                         at: now,
                         by: request.user.name,
                         via: "tap",
-                        key: `tap:${String(now)}:${String(index)}`,
+                        key,
                         expires: now + GRANT_MS,
                     });
                 }
 
                 // The tap wakes each supervisor with counted threads at once: never through the digest, because an OK
-                // is only useful while the desk is full. The request id makes a rerun after a restart act once.
+                // is only useful while the desk is full. The supervisor of each refusal this tap served is woken too:
+                // its delegation waited, and it may have no counted thread. The request id makes a rerun act once.
                 const supervisors = [
-                    ...new Set(
-                        Object.values(state.threads)
+                    ...new Set([
+                        ...Object.values(state.threads)
                             .filter((thread) => isCounted(thread, now))
                             .map((thread) => thread.supervisor)
                             .filter((supervisor): supervisor is number => supervisor !== undefined),
-                    ),
+                        ...(state.refusals ?? [])
+                            .filter(
+                                (refusal) =>
+                                    refusal.servedBy !== undefined &&
+                                    tapKeys.includes(refusal.servedBy),
+                            )
+                            .map((refusal) => refusal.supervisor),
+                    ]),
                 ].sort((a, b) => a - b);
                 const text = grantText(request.user.name, count, before);
 

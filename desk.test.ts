@@ -9309,7 +9309,7 @@ describe("the cap", () => {
         // The same supervisor and title again is the same work: it moves to the new key, and 1 waits.
         assert.equal(recordRefusal(state, 1, refusal("r2", 2000, "Work r1")), true);
         assert.deepEqual(state.refusals, [
-            { at: 2000, supervisor: 1, title: "Work r1", key: "r2" },
+            { at: 2000, supervisor: 1, title: "Work r1", key: "r2", keys: ["r1"] },
         ]);
         assert.equal(capView(state, 1, 2000).waiting, 1);
 
@@ -9317,6 +9317,25 @@ describe("the cap", () => {
         assert.equal(recordRefusal(state, 5, refusal("r3", 2000)), false);
         assert.equal(recordRefusal(state, 1, refusal("k-100", 2000)), false);
         assert.equal(state.refusals?.length, 1);
+    });
+
+    test("a merged refusal keeps its earlier key: a replay of it after a grant adds nothing", () => {
+        const state = deskOf();
+
+        placed(state, 100);
+        recordRefusal(state, 1, refusal("a", 1000, "Same work"));
+        recordRefusal(state, 1, refusal("b", 1100, "Same work"));
+        assert.equal(state.refusals?.length, 1);
+        assert.equal(capView(state, 1, 1100).waiting, 1);
+
+        addGrant(state, { at: 1200, by: "Brian", via: "tap", key: "tap:a", expires: 99_999 });
+        assert.equal(capView(state, 1, 1200).waiting, 0);
+
+        // A replay of the earlier key A: nothing new waits.
+        assert.equal(recordRefusal(state, 1, refusal("a", 1300, "Same work")), false);
+        assert.equal(state.refusals?.length, 1);
+        assert.equal(capView(state, 1, 1300).waiting, 0);
+        assert.deepEqual(state.refusals?.[0]?.keys, ["a"]);
     });
 
     test("a grant serves the oldest waiting refusal: 1 OK serves 1, and the other still waits", () => {
@@ -10474,7 +10493,7 @@ const linkedAddressOf = (request: unknown): string =>
 let lastDeskSection = "";
 
 /** Pi, scripted: the supervisor delegates, and the desk is used by the words of each test. */
-const model = scriptedModel((request) => {
+const script: Parameters<typeof scriptedModel>[0] = (request) => {
     const { role, text } = lastText(request as never);
     const sectioned = (
         request as { messages: readonly { sections?: Record<string, string> }[] }
@@ -10947,7 +10966,13 @@ const model = scriptedModel((request) => {
     }
 
     return answer(`echo: ${text.slice(0, 40)}`);
-});
+};
+
+const model = scriptedModel(script);
+
+// The helper queues 1000 responses, and this file's turns (each [desk] message to a supervisor takes 1) use almost all
+// of them: 1000 more, so a new test does not make a later one fail with "No more faux responses queued".
+model.appendResponses(Array.from({ length: 1000 }, () => script!));
 
 const dataDir = join(root, "data");
 const definitions = join(root, "agents");
@@ -17727,6 +17752,106 @@ describe("the desk in a Pi Pocket", () => {
             }
         });
 
+        test("POST grant also tells the supervisor of a refusal it served, with no counted thread", async () => {
+            // Supervisor B owns the counted thread; supervisor A has only 1 refused delegation.
+            const owner = await supervisor("page-grant-owner");
+            const refused = await supervisor("page-grant-refused");
+            const at = Date.now();
+            let filler = "";
+
+            writeFileSync(configPath, JSON.stringify({ digest: { minutes: 0 }, cap: 1 }));
+            await clearGrants();
+
+            try {
+                filler = await app.harness.commit(async (tx) => {
+                    const state = await tx.doc(DeskThreads);
+                    const opened = openThread(state, {
+                        key: `x.test.grant-owner:${String(at)}`,
+                        supervisor: Number(owner),
+                        agents: ["duncan"],
+                        repo: "frostyard/test",
+                        title: "Fill",
+                        at,
+                    });
+
+                    state.threads[opened.thread.id]!.state = "open";
+                    state.threads[opened.thread.id]!.run.next = "agent";
+
+                    return opened.thread.id;
+                }, context);
+
+                const desk = (
+                    globalThis as unknown as Record<
+                        symbol,
+                        {
+                            refused?: (
+                                tx: unknown,
+                                request: {
+                                    key: string;
+                                    supervisor: number;
+                                    title: string;
+                                    at: number;
+                                },
+                            ) => Promise<void>;
+                        }
+                    >
+                )[Symbol.for("pi-pocket-team.desk")]!;
+
+                await app.harness.commit(
+                    async (tx) =>
+                        desk.refused?.(tx, {
+                            key: `x.test.grant-refused:${String(at)}`,
+                            supervisor: Number(refused),
+                            title: "Waited",
+                            at,
+                        }),
+                    context,
+                );
+                assert.equal(
+                    Object.values((await deskState())?.threads ?? {}).some(
+                        (thread) =>
+                            thread.supervisor === Number(refused) && isCounted(thread, Date.now()),
+                    ),
+                    false,
+                    "A has no counted thread",
+                );
+                assert.equal(capView(await deskState(), 1, Date.now()).waiting, 1);
+
+                const granted = await call("grant", { count: 1 });
+
+                assert.equal(granted.status, 200);
+                assert.equal(granted.data.cap.waiting, 0, "the tap served A's refusal");
+
+                const tapMessage =
+                    /\[desk\] [^"]+ allowed 1 more thread over the cap \(\d+ of 1 count\)\. Delegate the work that waited now, with team_delegate\./;
+
+                await until(
+                    async () => tapMessage.test((await modelTexts(app, refused)).join("\n")),
+                    "the tap's [desk] message at the supervisor whose delegation waited",
+                    20_000,
+                );
+                await until(
+                    async () => tapMessage.test((await modelTexts(app, owner)).join("\n")),
+                    "the tap's [desk] message at the supervisor with the counted thread",
+                    20_000,
+                );
+            } finally {
+                await app.harness.commit(async (tx) => {
+                    const state = await tx.doc(DeskThreads);
+
+                    state.grants = state.grants.filter(
+                        (grant) => !(grant.via === "tap" && grant.at >= at),
+                    );
+
+                    if (state.threads[filler] !== undefined) {
+                        state.threads[filler].state = "closed";
+                        state.threads[filler].closed = { at: Date.now(), why: "done", by: "brian" };
+                    }
+                }, context);
+                writeFileSync(configPath, JSON.stringify({ digest: { minutes: 0 }, cap: 100 }));
+            }
+        });
+
         test("an ask on a closed thread shows in the view, also when old, and Brian can answer it", async () => {
             const source = await supervisor("page-closed-ask");
             let threadId = "";
@@ -20889,6 +21014,24 @@ describe("the desk in a Pi Pocket", () => {
                 /The desk is full/,
             );
 
+            // The refusal of this key, then a later refusal of the same work: 1 refusal waits, with this key as an
+            // earlier key.
+            await app.harness.commit(async (tx) => {
+                const state = await tx.doc(DeskThreads);
+
+                recordRefusal(state, 1, { key, supervisor: Number(source), title: "Capped", at });
+                recordRefusal(state, 1, {
+                    key: `${key}:later`,
+                    supervisor: Number(source),
+                    title: "Capped",
+                    at: at + 1,
+                });
+            }, context);
+            assert.deepEqual(
+                waitingRefusals(await deskState(), at + 2).map((one) => [one.key, one.keys]),
+                [[`${key}:later`, [key]]],
+            );
+
             // A tap OK opens it, and is marked used.
             await app.harness.commit(async (tx) => {
                 const state = await tx.doc(DeskThreads);
@@ -20905,6 +21048,11 @@ describe("the desk in a Pi Pocket", () => {
             const opened = await app.harness.commit((tx) => api.open(tx, request), context);
 
             assert.equal(opened.reused, false);
+            assert.deepEqual(
+                waitingRefusals(await deskState(), at + 2),
+                [],
+                "a thread that opens with an earlier key ends the wait",
+            );
 
             const stored = (await deskState())?.threads[opened.thread.id];
 
