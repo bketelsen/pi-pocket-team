@@ -146,6 +146,10 @@ import {
     recordResult,
     setWatch,
     wakeWatch,
+    parseWatchOn,
+    watchOnText,
+    watchOnFired,
+    watchReached,
     FOUND_FOLDER_DELAY_MS,
     grantText,
     hasOpenAsk,
@@ -4218,6 +4222,519 @@ describe("the watch's rules", () => {
             files[`${sleeping.id}.md`] ?? "",
             /- Watch: 2026-12-01 · the blob sweep · set by odrade/,
         );
+    });
+});
+
+describe("a watch's event (on)", () => {
+    /** A desk with T1 (the watched thread) and T2 (the target), both open. */
+    const pair = (): DeskState => ({
+        ...empty(),
+        threads: { T1: watched({ id: "T1" }), T2: thread({ id: "T2", key: "k-2" }) },
+    });
+
+    /** T1 with a watch until 2026-11-01, set at noon of 2026-10-22, that also waits for `on`. */
+    const waiting = (text: string, state = pair()): Thread => {
+        const one = thread({ id: "T1" });
+
+        state.threads.T1 = one;
+        const set = setWatch(
+            one,
+            {
+                checkOn: "2026-11-01",
+                check: "the blob sweep",
+                by: "odrade",
+                key: "watch-on-1",
+                at: on("2026-10-22"),
+                on: text,
+            },
+            state,
+        );
+
+        assert.deepEqual(set, { changed: true });
+
+        return one;
+    };
+
+    const merged = () => prFact({ ref: "frostyard/test#9", number: 9, state: "MERGED" });
+
+    test("parseWatchOn reads each kind, and watchOnText gives the normalized text back", () => {
+        const state = pair();
+
+        assert.deepEqual(parseWatchOn(" closed:t2 ", state, "T1"), {
+            kind: "closed",
+            thread: "T2",
+        });
+        assert.deepEqual(parseWatchOn("pr:frostyard/test#9 merged", state, "T1"), {
+            kind: "pr",
+            ref: "frostyard/test#9",
+            event: "merged",
+        });
+        assert.deepEqual(parseWatchOn("pr:frostyard/test#9  Reviewed", state, "T1"), {
+            kind: "pr",
+            ref: "frostyard/test#9",
+            event: "reviewed",
+        });
+        assert.deepEqual(parseWatchOn("pr:frostyard/test#9 labeled:ready-for-human", state, "T1"), {
+            kind: "pr",
+            ref: "frostyard/test#9",
+            event: "labelled",
+            label: "ready-for-human",
+        });
+
+        for (const text of [
+            "closed:T2",
+            "pr:frostyard/test#9 merged",
+            "pr:frostyard/test#9 reviewed",
+            "pr:frostyard/test#9 labelled:good first issue",
+        ]) {
+            const parsed = parseWatchOn(text, state, "T1");
+
+            assert(!("error" in parsed), text);
+            assert.equal(watchOnText(parsed), text);
+        }
+    });
+
+    test("parseWatchOn refuses bad text, a bad ref, an unknown thread, the watched thread, and an empty label", () => {
+        const state = pair();
+
+        const refusal = (text: string) => {
+            const parsed = parseWatchOn(text, state, "T1");
+
+            return "error" in parsed ? parsed.error : "";
+        };
+
+        assert.match(refusal(""), /closed:T14, pr:owner\/name#12 merged.*empty/);
+        assert.match(refusal("when T2 ends"), /A watch's on is closed:T14.*Not: when T2 ends/);
+        assert.match(refusal("pr:frostyard/test#9 approved"), /A watch's on is/);
+        assert.match(refusal("pr:frostyard/test#9"), /A watch's on is/);
+        assert.match(refusal("pr:frostyard#9 merged"), /frostyard#9 is not a PR ref/);
+        assert.match(refusal("pr:frostyard/test#0 merged"), /is not a PR ref/);
+        assert.match(refusal("closed:T99"), /There is no thread T99 on the desk/);
+        assert.match(refusal("closed:T1"), /cannot wait for T1 itself/);
+        assert.match(refusal("pr:frostyard/test#9 labelled:"), /label is 1 to 50 characters/);
+        assert.match(refusal(`pr:frostyard/test#9 labelled:${"x".repeat(51)}`), /1 to 50/);
+    });
+
+    test("setWatch stores the parsed event, shows it in its event, and a replay changes nothing", () => {
+        const state = pair();
+        const one = waiting("pr:frostyard/test#9 merged", state);
+
+        assert.deepEqual(one.watch, {
+            checkOn: "2026-11-01",
+            check: "the blob sweep",
+            setAt: on("2026-10-22"),
+            setBy: "odrade",
+            key: "watch-on-1",
+            on: { kind: "pr", ref: "frostyard/test#9", event: "merged" },
+        });
+        assert.equal(
+            one.events.at(-1)?.text,
+            "watch: check on 2026-11-01 or on pr:frostyard/test#9 merged by odrade: the blob sweep",
+        );
+
+        const events = one.events.length;
+        const replay = setWatch(
+            one,
+            {
+                checkOn: "2026-11-02",
+                check: "another",
+                by: "odrade",
+                key: "watch-on-1",
+                at: on("2026-10-23"),
+                on: "closed:T2",
+            },
+            state,
+        );
+
+        assert.deepEqual(replay, { changed: false });
+        assert.equal(one.events.length, events, "a replayed call adds no event");
+        assert.deepEqual(one.watch?.on, { kind: "pr", ref: "frostyard/test#9", event: "merged" });
+    });
+
+    test("setWatch refuses a bad on, and leaves the thread as it was: a closed one stays closed", () => {
+        const state = pair();
+        const open = thread({ id: "T1" });
+
+        state.threads.T1 = open;
+        assert.match(
+            JSON.stringify(
+                setWatch(
+                    open,
+                    {
+                        checkOn: "2026-11-01",
+                        check: "c",
+                        by: "odrade",
+                        key: "bad-1",
+                        at: on("2026-10-22"),
+                        on: "closed:T7",
+                    },
+                    state,
+                ),
+            ),
+            /There is no thread T7/,
+        );
+        assert.equal(open.watch, undefined);
+        assert.deepEqual(open.events, []);
+        assert.equal(open.run.watchKeys, undefined);
+
+        // `closed:` needs the desk to find its target: no state, no target.
+        assert.match(
+            JSON.stringify(
+                setWatch(open, {
+                    checkOn: "2026-11-01",
+                    check: "c",
+                    by: "odrade",
+                    key: "bad-2",
+                    at: on("2026-10-22"),
+                    on: "closed:T2",
+                }),
+            ),
+            /There is no thread T2/,
+        );
+
+        const shut = thread({
+            id: "T1",
+            state: "closed",
+            closed: { at: on("2026-10-21"), why: "done", by: "sweep" },
+        });
+
+        state.threads.T1 = shut;
+        assert.match(
+            JSON.stringify(
+                setWatch(
+                    shut,
+                    {
+                        checkOn: "2026-11-01",
+                        check: "c",
+                        by: "odrade",
+                        key: "bad-3",
+                        at: on("2026-10-22"),
+                        on: "pr:nope merged",
+                    },
+                    state,
+                ),
+            ),
+            /nope is not a PR ref/,
+        );
+        assert.equal(shut.state, "closed", "a refused watch opens nothing");
+        assert.equal(shut.watch, undefined);
+    });
+
+    test("closed: fires when the target closes, for any reason, once, with how it closed", () => {
+        for (const [closed, words] of [
+            [
+                { at: 5, why: "done", by: "sweep", outcome: "completed" },
+                "T2 closed as done (completed)",
+            ],
+            [{ at: 5, why: "dropped", by: "desk" }, "T2 closed as dropped"],
+            [{ at: 5, why: "failed", by: "sweep" }, "T2 closed as failed"],
+        ] as const) {
+            const state = pair();
+            const one = waiting("closed:T2", state);
+            const facts = { threads: state.threads };
+
+            assert.equal(wakeWatch(one, on("2026-10-23"), facts), false, "T2 is open");
+            assert.equal(asleep(one, on("2026-10-23")), true);
+
+            state.threads.T2!.state = "closed";
+            state.threads.T2!.closed = { ...closed };
+            assert.equal(watchOnFired(one.watch!, facts), words);
+            assert.equal(wakeWatch(one, on("2026-10-24"), facts), true);
+            assert.equal(one.watch?.dueAt, on("2026-10-24"));
+            assert.equal(one.watch?.onFired, words);
+            assert.equal(one.events.at(-1)?.key, "watch:on:watch-on-1");
+            assert.equal(one.events.at(-1)?.text, `due: the blob sweep (${words})`);
+            assert.equal(isDue(one, on("2026-10-24")), true, "due before its date");
+            assert.equal(asleep(one, on("2026-10-24")), false, "it counts again");
+            assert.equal(nextActor(one), "odrade");
+
+            // A second sweep, and the date later: no second event, and `dueAt` stays.
+            const events = one.events.length;
+
+            assert.equal(wakeWatch(one, on("2026-10-25"), facts), false);
+            assert.equal(wakeWatch(one, on("2026-11-01"), facts), false);
+            assert.equal(one.events.length, events);
+            assert.equal(one.watch?.dueAt, on("2026-10-24"));
+        }
+    });
+
+    test("closed: on a target that is closed already fires at the next sweep", () => {
+        const state = pair();
+
+        state.threads.T2!.state = "closed";
+        state.threads.T2!.closed = { at: 5, why: "dropped", by: "desk" };
+
+        const one = waiting("closed:T2", state);
+
+        assert.equal(wakeWatch(one, on("2026-10-22"), { threads: state.threads }), true);
+        assert.equal(one.watch?.onFired, "T2 closed as dropped");
+    });
+
+    test("pr: merged fires on the merge; a PR closed unmerged fires each pr kind, and says so", () => {
+        const one = waiting("pr:frostyard/test#9 merged");
+        const open = prFact({ ref: "frostyard/test#9", number: 9 });
+
+        assert.equal(
+            wakeWatch(one, on("2026-10-23"), { threads: {}, github: githubOf([open]) }),
+            false,
+            "an open PR",
+        );
+        assert.equal(wakeWatch(one, on("2026-10-23"), { threads: {} }), false, "no GitHub read");
+        assert.equal(
+            wakeWatch(one, on("2026-10-23"), { threads: {}, github: githubOf([]) }),
+            false,
+            "a PR the read did not give",
+        );
+
+        const github: GitHubFacts = { ...githubOf([]), prs: { "frostyard/test#9": merged() } };
+
+        assert.equal(wakeWatch(one, on("2026-10-24"), { threads: {}, github }), true);
+        assert.equal(one.watch?.onFired, "PR frostyard/test#9 merged");
+        assert.equal(one.events.at(-1)?.text, "due: the blob sweep (PR frostyard/test#9 merged)");
+
+        const shut = prFact({ ref: "frostyard/test#9", number: 9, state: "CLOSED" });
+
+        for (const text of [
+            "pr:frostyard/test#9 merged",
+            "pr:frostyard/test#9 reviewed",
+            "pr:frostyard/test#9 labelled:ready-for-human",
+        ]) {
+            const watcher = waiting(text);
+
+            assert.equal(
+                wakeWatch(watcher, on("2026-10-24"), {
+                    threads: {},
+                    github: { ...githubOf([]), prs: { "frostyard/test#9": shut } },
+                }),
+                true,
+                text,
+            );
+            assert.equal(watcher.watch?.onFired, "PR frostyard/test#9 closed unmerged");
+        }
+    });
+
+    test("pr: labelled fires when the PR has the label, in any case", () => {
+        const one = waiting("pr:Frostyard/Test#9 labelled:Ready-For-Human");
+        const without = prFact({ ref: "frostyard/test#9", number: 9, labels: ["bug"] });
+        const labelled = prFact({
+            ref: "frostyard/test#9",
+            number: 9,
+            labels: ["bug", "ready-for-human"],
+        });
+
+        assert.equal(
+            wakeWatch(one, on("2026-10-23"), { threads: {}, github: githubOf([without]) }),
+            false,
+        );
+        assert.equal(
+            wakeWatch(one, on("2026-10-23"), { threads: {}, github: githubOf([labelled]) }),
+            true,
+            "the open list of its repository is read too",
+        );
+        assert.equal(one.watch?.onFired, "PR Frostyard/Test#9 has the label Ready-For-Human");
+    });
+
+    test("pr: reviewed fires on a review submitted at or after the watch was set", () => {
+        const one = waiting("pr:frostyard/test#9 reviewed");
+        const pinned = (reviewedAt?: number): GitHubFacts => ({
+            ...githubOf([]),
+            prs: {
+                "frostyard/test#9": prFact({
+                    ref: "frostyard/test#9",
+                    number: 9,
+                    ...(reviewedAt === undefined ? {} : { reviewedAt }),
+                }),
+            },
+        });
+
+        assert.equal(wakeWatch(one, on("2026-10-23"), { threads: {}, github: pinned() }), false);
+        assert.equal(wakeWatch(one, on("2026-10-23"), { threads: {}, github: pinned(0) }), false);
+        assert.equal(
+            wakeWatch(one, on("2026-10-23"), {
+                threads: {},
+                github: pinned(on("2026-10-22") - 1),
+            }),
+            false,
+            "a review before the watch",
+        );
+        assert.equal(
+            wakeWatch(one, on("2026-10-23"), { threads: {}, github: pinned(on("2026-10-22")) }),
+            true,
+        );
+        assert.equal(one.watch?.onFired, "PR frostyard/test#9 got a review");
+    });
+
+    test("the date is the fallback: a watch whose event never comes is due on its date, with the date's key", () => {
+        const one = waiting("pr:frostyard/test#9 merged");
+        const github = githubOf([prFact({ ref: "frostyard/test#9", number: 9 })]);
+
+        assert.equal(wakeWatch(one, on("2026-10-31"), { threads: {}, github }), false);
+        assert.equal(isDue(one, on("2026-10-31")), false);
+        assert.equal(wakeWatch(one, on("2026-11-01"), { threads: {}, github }), true);
+        assert.equal(one.events.at(-1)?.key, "watch:2026-11-01:due");
+        assert.equal(one.events.at(-1)?.text, "due: the blob sweep");
+        assert.equal(one.watch?.onFired, undefined);
+
+        // The event after the date adds nothing: the watch is due once.
+        const events = one.events.length;
+
+        assert.equal(
+            wakeWatch(one, on("2026-11-02"), {
+                threads: {},
+                github: { ...githubOf([]), prs: { "frostyard/test#9": merged() } },
+            }),
+            false,
+        );
+        assert.equal(one.events.length, events);
+    });
+
+    test("an old dated watch with no on ignores the facts, and wakes on its date as before", () => {
+        const old = watched();
+        const state: DeskState = {
+            ...empty(),
+            threads: { T1: old, T2: thread({ id: "T2", state: "closed" }) },
+        };
+        const facts = {
+            threads: state.threads,
+            github: { ...githubOf([]), prs: { "frostyard/test#9": merged() } },
+        };
+
+        assert.equal(watchOnFired(old.watch!, facts), undefined);
+        assert.equal(wakeWatch(old, on("2026-10-31"), facts), false);
+        assert.equal(asleep(old, on("2026-10-31")), true);
+        assert.equal(wakeWatch(old, on("2026-11-01"), facts), true);
+        assert.equal(old.events.at(-1)?.key, "watch:2026-11-01:due");
+
+        // A `dueAt` alone does not make an old watch due before its date: only a watch with `on` reads it.
+        assert.equal(
+            watchReached({ checkOn: "2026-11-01", dueAt: on("2026-10-30") }, on("2026-10-30")),
+            false,
+        );
+        assert.equal(
+            watchReached(
+                {
+                    checkOn: "2026-11-01",
+                    dueAt: on("2026-10-30"),
+                    on: { kind: "closed", thread: "T2" },
+                },
+                on("2026-10-30"),
+            ),
+            true,
+        );
+    });
+
+    test("openThread stores a delegated watch's event, and refuses a bad one", () => {
+        const state = pair();
+        const opened = openThread(state, {
+            key: "k-on",
+            supervisor: 1,
+            agents: ["duncan"],
+            title: "With an event",
+            at: on("2026-10-22"),
+            watch: {
+                checkOn: "2026-11-01",
+                check: "the blob sweep",
+                by: "odrade",
+                on: "closed:T2",
+            },
+        });
+
+        assert.deepEqual(opened.thread.watch?.on, { kind: "closed", thread: "T2" });
+        assert.match(
+            opened.thread.events.at(-1)?.text ?? "",
+            /check on 2026-11-01 or on closed:T2/,
+        );
+
+        const next = state.next.T;
+
+        assert.throws(
+            () =>
+                openThread(state, {
+                    key: "k-on-bad",
+                    supervisor: 1,
+                    agents: ["duncan"],
+                    title: "With a bad event",
+                    at: on("2026-10-22"),
+                    watch: { checkOn: "2026-11-01", check: "c", by: "odrade", on: "pr:x merged" },
+                }),
+            /x is not a PR ref/,
+        );
+        assert.equal(state.next.T, next, "no thread id is spent");
+    });
+
+    test("readText, the export and desk list show the event, and how it fired", () => {
+        const state = deskOf();
+        const target = placed(state, 50);
+        const one = placed(state, 100);
+
+        assert.deepEqual(
+            setWatch(
+                one,
+                {
+                    checkOn: "2026-12-01",
+                    check: "the blob sweep",
+                    by: "odrade",
+                    key: "k-1",
+                    at: on("2026-10-22"),
+                    on: `closed:${target.id}`,
+                },
+                state,
+            ),
+            { changed: true },
+        );
+        assert.match(
+            readText(state, one.id) ?? "",
+            new RegExp(`Watch: 2026-12-01 or on closed:${target.id} · the blob sweep`),
+        );
+        assert.match(
+            listText(state, 12, on("2026-10-23")),
+            new RegExp(`2026-12-01 or on closed:${target.id} · ${one.id}`),
+        );
+
+        target.state = "closed";
+        target.closed = { at: on("2026-10-23"), why: "dropped", by: "desk" };
+        wakeWatch(one, on("2026-10-24"), { threads: state.threads });
+        assert.match(
+            readText(state, one.id) ?? "",
+            new RegExp(`due [^·]*\\(${target.id} closed as dropped\\)`),
+        );
+
+        const files = exportFiles(state, {}, on("2026-10-24"), 12);
+
+        assert.match(
+            files[`${one.id}.md`] ?? "",
+            new RegExp(
+                `- Watch: 2026-12-01 or on closed:${target.id} · the blob sweep · set by odrade · due [^·]*\\(${target.id} closed as dropped\\)`,
+            ),
+        );
+    });
+
+    test("parseGitHub gives a PR's labels, and the newest submitted review of a pinned read", () => {
+        const facts = parseGitHub({
+            data: {
+                viewer: { login: "github-viewer" },
+                p0: {
+                    nameWithOwner: "frostyard/test",
+                    isArchived: false,
+                    pullRequest: {
+                        number: 9,
+                        state: "OPEN",
+                        labels: { nodes: [{ name: "bug" }, { name: "ready-for-human" }] },
+                        reviews: {
+                            nodes: [
+                                { state: "COMMENTED", submittedAt: "2026-10-20T10:00:00Z" },
+                                { state: "APPROVED", submittedAt: "2026-10-21T10:00:00Z" },
+                                { state: "PENDING", submittedAt: null },
+                            ],
+                        },
+                    },
+                },
+            },
+        });
+        const pr = facts.prs["frostyard/test#9"];
+
+        assert.deepEqual(pr?.labels, ["bug", "ready-for-human"]);
+        assert.equal(pr?.reviewedAt, Date.parse("2026-10-21T10:00:00Z"));
     });
 });
 
@@ -20110,6 +20627,159 @@ describe("the desk in a Pi Pocket", () => {
             ).length,
             1,
         );
+    });
+
+    test("desk watch with on: the sweep reads a watched PR that no thread holds, and its merge makes the watch due once", async () => {
+        await stopSweepers();
+        const { source, thread } = await delegated("watch-on-pr");
+
+        await until(
+            async () => typeof (await deskState())?.threads[thread.id]?.run.sweptAt === "number",
+            "the first sweep",
+            20_000,
+        );
+
+        const stubWeb = {
+            conversationRoute() {},
+            route() {},
+            client() {},
+            command() {},
+            send() {},
+            onDispose() {},
+            error: (status: number, message: string) =>
+                Object.assign(new Error(message), { status }),
+        };
+        const stubHost = {
+            requesterOf: () => owner(app).id,
+            text: { defang: (value: string) => value, quoted: () => "" },
+            notice() {},
+            linkedSessions: {},
+        };
+        const shared = globalThis as unknown as Record<symbol, unknown>;
+        const saved = shared[Symbol.for("pi-pocket-team.desk")];
+        const extension = createDesk(stubHost as never, stubWeb as never) as unknown as {
+            tools: {
+                name: string;
+                execute: (args: object, api: object, context: unknown) => Promise<unknown>;
+            }[];
+        };
+        const tool = extension.tools.find((each) => each.name === "desk")!;
+        const api = (callId: string) => ({
+            conversationId: source,
+            taskId: "task-watch-on",
+            callId,
+            snapshot: (...args: unknown[]) =>
+                Reflect.apply(app.harness.snapshot, app.harness, args),
+            commit: (change: never, ctx: never) => app.harness.commit(change, ctx),
+        });
+        const watch = (callId: string, on: string) =>
+            tool.execute(
+                {
+                    action: "watch",
+                    thread: thread.id,
+                    check_on: "2099-03-04",
+                    text: "the merge landed",
+                    on,
+                },
+                api(callId),
+                context,
+            );
+
+        try {
+            // A bad event is refused, and sets nothing.
+            await assert.rejects(
+                watch("call-bad", "pr:frostyard/test#9 approved"),
+                /A watch's on is closed:T14/,
+            );
+            assert.equal((await deskState())?.threads[thread.id]?.watch, undefined);
+
+            const reply = JSON.stringify(await watch("call-1", "pr:frostyard/test#9 merged"));
+
+            assert.match(reply, /check on 2099-03-04 or on pr:frostyard\/test#9 merged/);
+            assert.deepEqual((await deskState())?.threads[thread.id]?.watch?.on, {
+                kind: "pr",
+                ref: "frostyard/test#9",
+                event: "merged",
+            });
+
+            // The same call again, as a restart replays it: nothing changes.
+            assert.match(JSON.stringify(await watch("call-1", "closed:T1")), /watched already/);
+        } finally {
+            shared[Symbol.for("pi-pocket-team.desk")] = saved;
+        }
+
+        const set = (await deskState())?.threads[thread.id];
+        const key = set?.watch?.key ?? "";
+
+        assert.deepEqual(set?.prs, {}, "no thread holds the PR");
+        assert.equal(asleep(set!, Date.now()), true);
+
+        // A fake `gh` that gives the merged PR only to a query that reads it by number.
+        const merged = {
+            data: {
+                viewer: { login: "github-viewer" },
+                p0: {
+                    nameWithOwner: "frostyard/test",
+                    isArchived: false,
+                    pullRequest: {
+                        number: 9,
+                        title: "A fix",
+                        url: "https://github.com/frostyard/test/pull/9",
+                        state: "MERGED",
+                        mergedAt: "2026-10-20T10:00:00Z",
+                        author: { login: "someone-else" },
+                    },
+                },
+            },
+        };
+
+        const restartPinned = async (by: number) => {
+            await app.close();
+            shift = by;
+            writeFileSync(fixturePath, JSON.stringify(merged));
+            writeFileSync(
+                fakeGh,
+                `#!/bin/sh\ncase "$*" in\n  *"pullRequest(number: 9)"*) cat ${JSON.stringify(fixturePath)} ;;\n  *) printf '%s' '{"data":{"viewer":{"login":"github-viewer"}}}' ;;\nesac\n`,
+            );
+            chmodSync(fakeGh, 0o755);
+            process.env.PI_POCKET_DESK_GH = fakeGh;
+            process.env.PI_POCKET_DESK_CONFIG = configPath;
+            app = await openApp(model, dataDir, () => Date.now() + shift);
+        };
+
+        const fired = async () =>
+            ((await deskState())?.threads[thread.id]?.events ?? []).filter(
+                (event) => event.key === `watch:on:${key}`,
+            );
+
+        try {
+            await quiet([thread.id]);
+            await restartPinned(SWEEP_SLEEP_MS + 60_000);
+            await sweptAfter(thread, set?.run.sweptAt);
+            await until(async () => (await fired()).length === 1, "the event's wake", 20_000);
+
+            const due = (await deskState())?.threads[thread.id];
+
+            assert.equal(typeof due?.watch?.dueAt, "number");
+            assert.equal(due?.watch?.onFired, "PR frostyard/test#9 merged");
+            assert.equal(
+                (await fired())[0]?.text,
+                "due: the merge landed (PR frostyard/test#9 merged)",
+            );
+            assert.equal(isDue(due!, Date.now() + shift), true, "due long before its date");
+
+            // A second sweep sees the same merge: no second event, and `dueAt` stays.
+            await restartPinned(SWEEP_SLEEP_MS * 2 + 120_000);
+            await sweptAfter(thread, due?.run.sweptAt);
+
+            const again = (await deskState())?.threads[thread.id];
+
+            assert.equal((await fired()).length, 1);
+            assert.equal(again?.watch?.dueAt, due?.watch?.dueAt);
+        } finally {
+            await quiet([]);
+            await restartApp(0);
+        }
     });
 
     describe("the digest", () => {

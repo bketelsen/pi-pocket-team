@@ -475,6 +475,48 @@ test("a watch with a time shows the time in its row; one without shows the date 
     assert.match(out, /check on 2026-12-02(?! \d)/);
 });
 
+test("a watch with an event shows it beside the date, and a due one says how the event fired", async () => {
+    const out = await render({
+        ...viewWith(null),
+        threads: [
+            threadView({
+                id: "T3",
+                title: "Sleeping T3",
+                asleep: true,
+                watch: {
+                    checkOn: "2026-12-01",
+                    check: "the blob sweep",
+                    setBy: "odrade",
+                    due: false,
+                    on: "pr:frostyard/test#12 merged",
+                },
+            }),
+            threadView({
+                id: "T4",
+                title: "Due T4",
+                watch: {
+                    checkOn: "2026-12-02",
+                    check: "the label check",
+                    setBy: "odrade",
+                    due: true,
+                    on: "closed:T9",
+                    onFired: "T9 closed as dropped",
+                },
+            }),
+            threadView({
+                id: "T5",
+                title: "Sleeping T5",
+                asleep: true,
+                watch: { checkOn: "2026-12-03", check: "old", setBy: "odrade", due: false },
+            }),
+        ],
+    });
+
+    assert.match(out, /check on 2026-12-01 or on pr:frostyard\/test#12 merged/);
+    assert.match(out, /due: the label check \(T9 closed as dropped\)/);
+    assert.match(out, /check on 2026-12-03(?! or)/, "a dated watch shows its date only");
+});
+
 test("groupOf: an ask comes first after parked; else closed, asleep, found, Brian, stale, the reviewer", () => {
     assert.equal(groupOf(threadView({ state: "closed" })), "closed");
     assert.equal(
