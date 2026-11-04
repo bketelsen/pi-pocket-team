@@ -286,11 +286,14 @@ A person's message during the wait does not cancel the goal: messages written th
 | all rounds used                                 | ended; summary                                                        |
 | the deadline passed (checked before each round) | ended; summary                                                        |
 | Pi says BLOCKED                                 | ended; summary                                                        |
+| the same check failure comes 3 times in a row   | ended as blocked; summary                                             |
 | a person writes in the session                  | **paused**, with a notice; no summary (the person is there); `resume` |
 | plan mode is on                                 | paused; `resume` after plan mode is off                               |
 | Stop, or `/night-shift stop`                    | ended; no summary                                                     |
 | a spend limit (Pocket's `heldBack`)             | ended; no summary (Pi may not start)                                  |
 | a round gets no answer (a model error)          | ended, with the error                                                 |
+
+The same check failure 3 times in a row ends the goal as `blocked`, with the summary. The streak stays in the goal, outside the newest 30 round records. A fingerprint is the sorted failing `gh pr checks` names, or normalized output for a label failure or another check. A label failure after passing rows counts; only pending rows do not count. A cut-off check does not change the streak, and a pass or check with no fingerprint resets it.
 
 The summary is one more message after the last round: what Pi did, what is left, and why it stopped. A round that runs at the deadline finishes; no round starts after it. A person's message is any `pi.user` message that is not one of the module's own and not known as automated (`[via …]` from linked sessions, PiP, webhooks and watches; `[scheduled]`; subagent reports; Done when's `[goal]`): when unsure, it pauses.
 

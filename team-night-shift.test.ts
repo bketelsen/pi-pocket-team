@@ -32,6 +32,7 @@ import { after, before, describe, test } from "node:test";
 import { fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import type { ConversationId } from "@earendil-works/pi-durable";
 import {
+    checkFingerprint,
     checkNote,
     delegatedRequest,
     type Goal,
@@ -444,6 +445,64 @@ esac
         assert.equal(run(check, { FAKE_LABELS: "bug\nready-for-human" }).code, 0);
         // A failing required part never reaches the label.
         assert.equal(run(check, { REQ_CODE: "1", FAKE_LABELS: "ready-for-human" }).code, 1);
+    });
+});
+
+describe("checkFingerprint with gh pr checks rows", () => {
+    const failed = (tail: string) => ({ passed: false, code: 1, tail });
+
+    test("same failing names ignore elapsed and URL differences", () => {
+        const first = failed(
+            "build\tfail\t1m2s\thttps://example.test/build/123\tfailed\ntest\tfail\t350ms\thttps://example.test/test/456\ttest failed",
+        );
+        const second = failed(
+            "test\tfail\t2.5s\thttps://example.test/test/999\ttest failed\nbuild\tfail\t3m\thttps://example.test/build/888\tfailed",
+        );
+
+        assert.equal(checkFingerprint(first), 'checks failed: ["build","test"]');
+        assert.equal(checkFingerprint(second), 'checks failed: ["build","test"]');
+        assert.equal(checkFingerprint(first), checkFingerprint(second));
+    });
+
+    test("different failing names give different fingerprints", () => {
+        const first = failed("build\tfail\t1m\thttps://example.test/build\tfailed");
+        const second = failed("lint\tcancel\t1m\thttps://example.test/lint\tcancelled");
+
+        assert.notEqual(checkFingerprint(first), checkFingerprint(second));
+    });
+
+    test("a label check failure after passing rows has a normalized fingerprint", () => {
+        const first = failed(
+            `build\tpass\t1m2s\thttps://example.test/build/123\tbuild passed\n${PR_CHECK_REQUIRED_PASS}\nlabel ready-for-human is missing`,
+        );
+        const second = failed(
+            `build\tpass\t2.5s\thttps://example.test/build/999\tbuild passed\n${PR_CHECK_REQUIRED_PASS}\nlabel ready-for-human is missing`,
+        );
+
+        assert.equal(checkFingerprint(first), checkFingerprint(second));
+        assert.notEqual(checkFingerprint(first), undefined);
+    });
+
+    test("check names cannot collide through the join format", () => {
+        assert.notEqual(
+            checkFingerprint(failed("lint, test\tfail\t1m\thttps://example.test/a\tfailed")),
+            checkFingerprint(
+                failed(
+                    "lint\tfail\t1m\thttps://example.test/a\tfailed\ntest\tfail\t1m\thttps://example.test/b\tfailed",
+                ),
+            ),
+        );
+    });
+
+    test("pending rows are not failures", () => {
+        assert.equal(
+            checkFingerprint(failed("build\tpending\t1m\thttps://example.test/build\twaiting")),
+            undefined,
+        );
+        assert.notEqual(
+            checkFingerprint(failed("build\tskipping\t1m\thttps://example.test/build\tskipped")),
+            undefined,
+        );
     });
 });
 

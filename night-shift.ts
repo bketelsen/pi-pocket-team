@@ -21,6 +21,9 @@
  *
  * State is one document per conversation, `x.night-shift.goal`. It is stored data: never rename it or change what a
  * field means.
+ *
+ * The same check failure `SAME_FAILURES` times in a row (by `checkFingerprint`) stops a goal as `blocked`, with a
+ * detail: no new stop reason, because the reason is stored data.
  */
 import { createHash, randomUUID } from "node:crypto";
 import type { Context } from "@earendil-works/chord";
@@ -47,6 +50,7 @@ import type { CommandContext, Host, Web } from "./_pocket.d.ts";
 
 export const DEFAULT_ROUNDS = 20;
 export const MAX_ROUNDS = 100;
+export const SAME_FAILURES = 3;
 /** The longest a deadline can be from now. */
 const MAX_HOURS = 24;
 const MAX_COMMAND = 2000;
@@ -103,6 +107,104 @@ export type RoundRecord = {
     worker?: string;
 };
 
+/** A short, stable summary of a failed check. Times and transient output do not make separate failures. */
+export function checkFingerprint(check: CheckResult | undefined): string | undefined {
+    if (check === undefined || check.passed || check.cutOff) {
+        return undefined;
+    }
+
+    const ghRows = check.tail
+        .split("\n")
+        .map((line) => line.split("\t"))
+        .filter((parts) => {
+            if (parts.length < 4) {
+                return false;
+            }
+
+            return ["pass", "fail", "pending", "skipping", "cancel"].includes(parts[1]?.trim());
+        });
+
+    if (ghRows.length > 0) {
+        const failed = ghRows.filter((parts) => ["fail", "cancel"].includes(parts[1]?.trim()));
+
+        if (failed.length > 0) {
+            const names = new Set(
+                failed
+                    .map((parts) => parts[0]?.trim())
+                    .filter((name): name is string => name !== undefined && name !== ""),
+            );
+
+            return names.size === 0
+                ? undefined
+                : `checks failed: ${JSON.stringify([...names].sort())}`;
+        }
+
+        if (ghRows.some((parts) => parts[1]?.trim() === "pending")) {
+            return undefined;
+        }
+    }
+
+    // Simple normalization: remove timestamps and times, durations, hex ids, and other digit runs.
+    const lines = check.tail
+        .split("\n")
+        .map((line) =>
+            line
+                .replace(
+                    /\b\d{4}-\d{2}-\d{2}[T ][0-2]\d:[0-5]\d(?::[0-5]\d(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?\b/gi,
+                    "",
+                )
+                .replace(/\b(?:[01]?\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:\.\d+)?)?\b/g, "")
+                .replace(/\b(?:\d+(?:\.\d+)?(?:ms|h|m|s))+\b/gi, "#")
+                // A hex id after a word that names one (`commit abcdef1`, `sha=…`), whatever its digits; elsewhere only
+                // with 2 digits or more, so a word such as `defaced` stays.
+                .replace(
+                    /\b(commit|sha|head|ref|rev|revision|oid|hash|id)(\s*[:=#@]?\s*)[0-9a-f]{7,64}\b/gi,
+                    "$1$2#",
+                )
+                .replace(/\b(?=(?:[a-f]*\d){2})[0-9a-f]{7,}\b/gi, "#")
+                .replace(/\d+/g, "#")
+                .replace(/\s+/g, " ")
+                .trim(),
+        )
+        .filter((line) => line !== "")
+        .slice(-10);
+
+    return `exit ${check.code}: ${lines.join(" / ")}`;
+}
+
+export type FailureStreak = { fingerprint: string; count: number; round: number };
+
+/** Update a goal's streak without changing it for a replay or a cut-off check. */
+export function nextFailures(
+    previous: FailureStreak | undefined,
+    check: CheckResult,
+    n: number,
+): FailureStreak | undefined {
+    if (check.cutOff) {
+        return previous;
+    }
+
+    if (check.passed) {
+        return undefined;
+    }
+
+    const fingerprint = checkFingerprint(check);
+
+    if (fingerprint === undefined) {
+        return undefined;
+    }
+
+    if (previous?.round === n) {
+        return previous;
+    }
+
+    if (previous?.fingerprint === fingerprint) {
+        return { fingerprint, count: previous.count + 1, round: n };
+    }
+
+    return { fingerprint, count: 1, round: n };
+}
+
 export type Goal = {
     id: string;
     objective: string;
@@ -134,6 +236,11 @@ export type Goal = {
     /** The newest entry looked at for people's messages. */
     seen: number;
     rounds: RoundRecord[];
+    /**
+     * The run of the same failed check (`nextFailures`), kept here because `rounds` keeps only the newest 30. Added
+     * later: an older goal has none, and starts a new run. Absent: no run.
+     */
+    failures?: FailureStreak;
     /** The task that drives the goal now; another task that finds this changed stops. */
     driver?: string;
     endedAt?: number;
@@ -1978,7 +2085,28 @@ export default function createNightShift(host: Host, web: Web) {
                         round.check = check;
                     }
 
+                    const failures = nextFailures(goal.failures, check, n);
+
+                    if (failures === undefined) {
+                        delete goal.failures;
+                    } else {
+                        goal.failures = failures;
+                    }
+
                     if (!check.passed) {
+                        if (goal.failures !== undefined && goal.failures.count >= SAME_FAILURES) {
+                            const detail =
+                                `the same check failure came ${SAME_FAILURES} times in a row: ${goal.failures.fingerprint}`.slice(
+                                    0,
+                                    300,
+                                );
+                            const state = stopIn(goal, "blocked", detail, runtime.now());
+
+                            seen.goal = copy(goal);
+
+                            return state;
+                        }
+
                         return next({ phase: "decide" });
                     }
 
