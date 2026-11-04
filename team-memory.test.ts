@@ -342,10 +342,11 @@ test("agent memory: identity gate, pending vs approved in the prompt, across fol
         // The identity gate: a plain session's call is refused, and it gets no agent lessons in its prompt.
         const plain = await newSession(app, work);
 
-        assert.match(
-            await said(plain, "mem add: Plain sessions keep nothing."),
-            /works only in a session with a named identity/,
-        );
+        const refused = await said(plain, "mem add: Plain sessions keep nothing.");
+
+        assert.match(refused, /works only in a session with a named identity/);
+        assert.match(refused, /Put a lesson about this repository in the repository by a PR/);
+        assert.doesNotMatch(refused, /Use the memory tool for this project's lessons/);
         assert.deepEqual((await call("memory")).data, {
             agents: {},
             pending: 0,
@@ -372,7 +373,17 @@ test("agent memory: identity gate, pending vs approved in the prompt, across fol
             /Lessons for Duncan Idaho, across all Duncan Idaho's repositories \(team_memory\)\. None yet\./,
         );
         assert.doesNotMatch(section(), /keeps PRs small/);
-        assert.match(section(), /memory tool with scope project/);
+        // Repository lessons go in the repository, plan T801 t11.
+        assert.match(
+            section(),
+            /A lesson about one repository \(how to build or test it, a gotcha in its code, a review finding\) goes in that repository by a PR: a test that fails without the fix, an AGENTS\.md rule, or a line in its \.memory\/corrections\.jsonl\./,
+        );
+        assert.match(
+            section(),
+            /The memory tool with scope project keeps only facts of this machine/,
+        );
+        assert.doesNotMatch(section(), /A fact about one repository/);
+        assert.doesNotMatch(section(), /goes in the memory tool with scope project/);
         assert.doesNotMatch(section(), /As supervisor/);
 
         // Approve what you saw: a stale look is refused.
