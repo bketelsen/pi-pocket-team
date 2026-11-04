@@ -172,7 +172,7 @@ Q1's limits:
 - The thresholds of review rounds (median 3, rise 1, 7 recent days of 30) and of 3-failure stops (2 in 7 days) are
   first guesses too (`Q1_ROUND_THRESHOLDS`, `Q1_STOP_THRESHOLDS`).
 - A 3-failure stop is known by the words of its `why` (pi-pocket-team#108): other words in a later Night shift are
-  missed. The `why` and the failure fingerprint are not kept.
+  missed. Only a goal whose last state is `status: "ended"` counts: a goal in its summary round is not a stop yet. The `why` and the failure fingerprint are not kept.
 - CI reruns are only as new as the newest weekly flaky scan; with no scan, every repository is `null`.
 
 ## 5. Where the LLM is needed, and nowhere else

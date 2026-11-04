@@ -1444,14 +1444,14 @@ test("loadGoalStops finds a 3-failure stop that a later goal wrote over, in a re
             ["s", ["goal"], { id: "g3", status: "running", setAt: NOW - DAY, rounds: [] }],
         ]);
         revision("delta", [["s", ["goal", "status"], "ended"]]);
-        // A stop with the same words but no endedAt: its last round's time; then a goal with no id.
+        // An older ended stop with the same words but no endedAt: its last round's time; then a goal with no id.
         revision("delta", [
             [
                 "s",
                 ["goal"],
                 {
                     id: "g4",
-                    status: "summary",
+                    status: "ended",
                     reason: "blocked",
                     why: STOP_WHY,
                     setAt: NOW - 20 * 60_000,
@@ -1473,6 +1473,115 @@ test("loadGoalStops finds a 3-failure stop that a later goal wrote over, in a re
         { session: SESSION_T2, id: "g4", at: NOW - 10 * 60_000 },
     ]);
     assert.ok(!JSON.stringify(stops).includes("token"));
+});
+
+test("loadGoalStops: a 3-failure goal in its summary round is not a stop; after the summary it ends, and is 1", () => {
+    const { pocketDir } = setup();
+    const endedAt = NOW - HOUR;
+    const summary = {
+        id: "g5",
+        status: "summary",
+        reason: "blocked",
+        why: STOP_WHY,
+        setAt: NOW - 3 * HOUR,
+        rounds: [{ n: 3, at: NOW - 2 * HOUR }],
+    };
+    let seq = 200;
+
+    const fill = (db: DatabaseSync, value: unknown, kind = "delta") =>
+        db
+            .prepare(
+                "insert into document_revisions (document_id, seq, kind, version, content) values (?,?,?,?,?)",
+            )
+            .run(7, (seq += 1), kind, 1, JSON.stringify(value));
+
+    addRows(pocketDir, (db) => {
+        db.prepare(
+            "insert into documents (id, kind, family, key_value, scope_kind, owner_id, created_at, record) values (?,?,?,?,?,?,?,?)",
+        ).run(7, JSON.stringify("x.night-shift.goal"), 0, "", "conversation", SESSION_T2, 1, "{}");
+        fill(
+            db,
+            { goal: { id: "g5", status: "running", setAt: NOW - 3 * HOUR, rounds: [] } },
+            "base",
+        );
+        fill(db, [["s", ["goal"], summary]]);
+    });
+
+    const read = () => {
+        const db = openPocket(path.join(pocketDir, "pocket.sqlite"));
+        const stops = loadGoalStops(db);
+
+        db.close();
+
+        return stops;
+    };
+
+    // The last state is the summary round: reason and why are set, but the goal has not ended.
+    assert.deepEqual(read(), []);
+
+    addRows(pocketDir, (db) => {
+        fill(db, [
+            ["s", ["goal", "status"], "ended"],
+            ["s", ["goal", "endedAt"], endedAt],
+        ]);
+    });
+
+    assert.deepEqual(read(), [{ session: SESSION_T2, id: "g5", at: endedAt }]);
+});
+
+test("loadGoalStops: a second base resets the value; the stop before it and the goal after it are both found", () => {
+    const { pocketDir } = setup();
+    const firstEnd = NOW - 5 * DAY;
+    const secondRound = NOW - 2 * DAY;
+    let seq = 300;
+
+    addRows(pocketDir, (db) => {
+        const fill = (value: unknown, kind = "delta") =>
+            db
+                .prepare(
+                    "insert into document_revisions (document_id, seq, kind, version, content) values (?,?,?,?,?)",
+                )
+                .run(8, (seq += 1), kind, 1, JSON.stringify(value));
+
+        db.prepare(
+            "insert into documents (id, kind, family, key_value, scope_kind, owner_id, created_at, record) values (?,?,?,?,?,?,?,?)",
+        ).run(8, JSON.stringify("x.night-shift.goal"), 0, "", "conversation", SESSION_T2, 1, "{}");
+        // First base, then deltas: g6 ends as a 3-failure stop, with an endedAt.
+        fill({ goal: { id: "g6", status: "running", setAt: NOW - 6 * DAY, rounds: [] } }, "base");
+        fill([
+            ["s", ["goal", "status"], "ended"],
+            ["s", ["goal", "reason"], "blocked"],
+            ["s", ["goal", "why"], STOP_WHY],
+            ["s", ["goal", "endedAt"], firstEnd],
+        ]);
+        // Second base: g7 with no endedAt. If the value did not reset, g6's endedAt would be its time.
+        fill(
+            {
+                goal: {
+                    id: "g7",
+                    status: "running",
+                    setAt: NOW - 3 * DAY,
+                    rounds: [{ n: 1, at: secondRound }],
+                },
+            },
+            "base",
+        );
+        fill([
+            ["s", ["goal", "status"], "ended"],
+            ["s", ["goal", "reason"], "blocked"],
+            ["s", ["goal", "why"], STOP_WHY],
+        ]);
+    });
+
+    const db = openPocket(path.join(pocketDir, "pocket.sqlite"));
+    const stops = loadGoalStops(db);
+
+    db.close();
+
+    assert.deepEqual(stops, [
+        { session: SESSION_T2, id: "g6", at: firstEnd },
+        { session: SESSION_T2, id: "g7", at: secondRound },
+    ]);
 });
 
 test("loadData reads the review calls and the goal stops; no flaky scan is null, not an error", () => {

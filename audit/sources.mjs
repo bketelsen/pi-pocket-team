@@ -558,8 +558,10 @@ const SAME_FAILURE_STOP = /the same check failure came \d+ times in a row/;
 /**
  * Q1's 3-failure stops. The goal document holds 1 goal per session, and a new goal writes over the old one: so every
  * revision of every `x.night-shift.goal` document (retired ones too) is walked from the first one, and the newest
- * state seen of each goal id is that goal's last state. A goal stopped `blocked` with the same-failure detail is 1
- * stop: `{ session, id, at }`. Neither `why` nor the failure fingerprint is kept.
+ * state seen of each goal id is that goal's last state. A goal whose last state is `status: "ended"`,
+ * `reason: "blocked"` and the same-failure detail is 1 stop: `{ session, id, at }`. A goal in its summary round
+ * (`status: "summary"`) is not a stop yet: Night shift sets `reason` and `why` before the summary, and `endedAt` and
+ * `status: "ended"` only after it. Neither `why` nor the failure fingerprint is kept.
  */
 export function loadGoalStops(db) {
     const revisions = db.prepare(
@@ -589,6 +591,7 @@ export function loadGoalStops(db) {
             last.set(String(goal.id), {
                 id: String(goal.id),
                 stop:
+                    goal.status === "ended" &&
                     goal.reason === "blocked" &&
                     typeof goal.why === "string" &&
                     SAME_FAILURE_STOP.test(goal.why),

@@ -2422,6 +2422,34 @@ test("Q1 rounds: a reviewer spawn and 2 sends are 3 rounds; coder calls, old cal
     assert.deepEqual(Object.keys(rounds.agents), ["irulan"]);
 });
 
+test("Q1 rounds: a send goes by the latest spawn of its name; a non-review spawn that reuses the name stops the count", () => {
+    const t1 = thread("T1");
+    const rounds = (reviewCalls: ReviewCall[]) =>
+        checkQ1(
+            emptyData({ decided: todayEmpty, threads: threadMap(t1), reviewCalls }),
+            q1Ctx([]),
+        ).metrics.rounds.threads.map((item: { rounds: number }) => item.rounds);
+
+    // A cross-review spawn (1 round), then a coder spawn with the same name: the send goes to the coder.
+    assert.deepEqual(
+        rounds([
+            reviewerSpawn(t1.session, ago(DAY)),
+            coderSpawn(t1.session, ago(DAY) + MINUTE, "reviewer"),
+            sendTo(t1.session, ago(DAY) + 2 * MINUTE, "reviewer"),
+        ]),
+        [1],
+    );
+    // The reverse order: the latest spawn is the cross-review, so its spawn and the send are 2 rounds.
+    assert.deepEqual(
+        rounds([
+            coderSpawn(t1.session, ago(DAY), "reviewer"),
+            reviewerSpawn(t1.session, ago(DAY) + MINUTE),
+            sendTo(t1.session, ago(DAY) + 2 * MINUTE, "reviewer"),
+        ]),
+        [2],
+    );
+});
+
 test("Q1 rounds: a session with 2 threads gives each call to the thread with the latest start at or before it", () => {
     const old = thread("T1", { session: 500, startedAt: ago(20 * DAY), repo: "acme/old" });
     const now = thread("T2", { session: 500, startedAt: ago(5 * DAY), repo: "acme/new" });
