@@ -14,7 +14,8 @@ const run = promisify(execFile);
 const FILES = ["team.ts", "team-web/index.js"];
 const made = [];
 
-const TEST_FILE = /\.test\.(?:ts|mts|js|mjs)$/;
+/** A test file, in each form Node runs: .js, .mjs, .cjs, .ts, .mts and .cts. */
+const TEST_FILE = /\.test\.[cm]?[jt]s$/;
 
 /** Test files missing from the first `node --test` section of the script. */
 export function missingTests(files, script) {
@@ -331,12 +332,22 @@ test("missingTests uses test-section whole tokens", () => {
         ),
         ["desk.test.ts", "only-check.test.ts"],
     );
+    assert.deepEqual(
+        missingTests(
+            ["a.test.js", "b.test.mjs", "c.test.cjs", "d.test.ts", "e.test.mts", "f.test.cts"],
+            "node --test a.test.js",
+        ),
+        ["b.test.mjs", "c.test.cjs", "d.test.ts", "e.test.mts", "f.test.cts"],
+        "every form Node runs is a test file",
+    );
 });
 
 test("listTestFiles skips dependency, hidden, and symlink folders", async () => {
     const root = await folder();
 
     await put(root, "nested/real.test.ts", "test");
+    await put(root, "nested/common.test.cjs", "test");
+    await put(root, "typed.test.cts", "test");
     await put(root, "node_modules/dependency.test.ts", "test");
     await put(root, ".hidden/secret.test.ts", "test");
 
@@ -347,5 +358,9 @@ test("listTestFiles skips dependency, hidden, and symlink folders", async () => 
     // Symlinks are intentionally omitted even if they point to a test file.
     await symlink(join(outside, "linked.test.ts"), join(root, "linked.test.ts"));
 
-    assert.deepEqual(await listTestFiles(root), ["nested/real.test.ts"]);
+    assert.deepEqual(await listTestFiles(root), [
+        "nested/common.test.cjs",
+        "nested/real.test.ts",
+        "typed.test.cts",
+    ]);
 });
