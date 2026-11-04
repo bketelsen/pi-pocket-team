@@ -707,6 +707,14 @@ export function decidedOwners(data) {
 const DECIDED_NODE =
     "... on PullRequest { number url title body mergedAt closedAt author { login } repository { nameWithOwner } }";
 
+/** A search node Q1 can use: a PR with its number, its repository and its close time. */
+const isDecidedNode = (node) =>
+    Boolean(node) &&
+    typeof node === "object" &&
+    typeof node.number === "number" &&
+    typeof node.repository?.nameWithOwner === "string" &&
+    typeof node.closedAt === "string";
+
 /**
  * Q1's source: the PRs of the desk's owners that GitHub closed (merged or not) from 1 hour before `since` (the search
  * index lags) to `now`. 1 GraphQL search a page, 100 nodes a page, at most `Q1_MAX_CALLS` calls for all owner groups.
@@ -760,6 +768,7 @@ export function loadDecided(data, { gh, now, since }) {
             }
 
             const after = cursor === null ? "" : `, after: ${JSON.stringify(cursor)}`;
+            const failuresBefore = gh.state.failures;
             const out = gh.graphql(
                 `{ search(query: ${JSON.stringify(text)}, type: ISSUE, first: 100${after}) { issueCount pageInfo { hasNextPage endCursor } nodes { ${DECIDED_NODE} } } }`,
             );
@@ -772,7 +781,23 @@ export function loadDecided(data, { gh, now, since }) {
                 break groups;
             }
 
-            const search = json(out, {})?.data?.search;
+            // A failed call can still print JSON (`makeGh` keeps its stdout): it is never trusted.
+            if (gh.state.failures > failuresBefore) {
+                stop("a search call failed");
+
+                break groups;
+            }
+
+            const answer = json(out, {});
+
+            // GitHub can send `data` with top-level `errors`: a partial answer.
+            if (Array.isArray(answer?.errors) && answer.errors.length > 0) {
+                stop("a search returned errors");
+
+                break groups;
+            }
+
+            const search = answer?.data?.search;
 
             if (!search || typeof search !== "object" || !Array.isArray(search.nodes)) {
                 stop("a search returned no data");
@@ -786,13 +811,21 @@ export function loadDecided(data, { gh, now, since }) {
                 break groups;
             }
 
-            result.nodes.push(
-                ...search.nodes.filter(
-                    (node) => node && typeof node.number === "number" && node.repository,
-                ),
-            );
+            if (typeof search.pageInfo?.hasNextPage !== "boolean") {
+                stop("a search page had no page info");
 
-            if (search.pageInfo?.hasNextPage !== true) {
+                break groups;
+            }
+
+            if (!search.nodes.every(isDecidedNode)) {
+                stop("a search returned a node that is not a whole PR");
+
+                break groups;
+            }
+
+            result.nodes.push(...search.nodes);
+
+            if (!search.pageInfo.hasNextPage) {
                 break;
             }
 

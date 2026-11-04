@@ -1219,3 +1219,87 @@ test("loadData: without the desk, Q1 has a source error and makes no call", () =
     assert.equal(data.decided, undefined);
     assert.equal(calls.length, 0);
 });
+
+/** Q1 on 1 page that `answer` gives, through `makeGh`. */
+const decidedFrom = (answer: (args: string[]) => string) =>
+    loadDecided(decidedDesk, {
+        gh: makeGh((_, args) => answer(args)),
+        now: NOW,
+        since: NOW - 24 * HOUR,
+    });
+
+/** 1 search page: `over` replaces parts of it. */
+const searchPage = (over: Record<string, unknown> = {}) => ({
+    data: {
+        search: {
+            issueCount: 1,
+            pageInfo: { hasNextPage: false, endCursor: "c1" },
+            nodes: [searchNode("acme/w", 1)],
+            ...over,
+        },
+    },
+});
+
+test("loadDecided: a good page is complete", () => {
+    const result = decidedFrom(() => JSON.stringify(searchPage()));
+
+    assert.equal(result.complete, true);
+    assert.equal(result.reason, undefined);
+    assert.equal(result.nodes.length, 1);
+});
+
+test("loadDecided: a partial or doubtful answer is never complete", () => {
+    const { closedAt: _closedAt, ...noClosedAt } = searchNode("acme/w", 2);
+    const cases: [string, (args: string[]) => string, RegExp][] = [
+        [
+            "data with errors",
+            () => JSON.stringify({ ...searchPage(), errors: [{ message: "timeout" }] }),
+            /returned errors/,
+        ],
+        [
+            "a null node",
+            () => JSON.stringify(searchPage({ nodes: [searchNode("acme/w", 1), null] })),
+            /not a whole PR/,
+        ],
+        [
+            "a node without closedAt",
+            () => JSON.stringify(searchPage({ nodes: [noClosedAt] })),
+            /not a whole PR/,
+        ],
+        [
+            "a node without its repository",
+            () =>
+                JSON.stringify(
+                    searchPage({ nodes: [{ ...searchNode("acme/w", 3), repository: null }] }),
+                ),
+            /not a whole PR/,
+        ],
+        [
+            "pageInfo missing",
+            () => JSON.stringify(searchPage({ pageInfo: undefined })),
+            /page info/,
+        ],
+        [
+            "hasNextPage not a boolean",
+            () => JSON.stringify(searchPage({ pageInfo: { hasNextPage: "no", endCursor: null } })),
+            /page info/,
+        ],
+        [
+            "a call that throws with valid JSON on stdout",
+            () => {
+                throw Object.assign(new Error("gh: exit 1"), {
+                    stdout: JSON.stringify(searchPage()),
+                });
+            },
+            /call failed/,
+        ],
+    ];
+
+    for (const [name, answer, reason] of cases) {
+        const result = decidedFrom(answer);
+
+        assert.equal(result.complete, false, name);
+        assert.match(result.reason!, reason, name);
+        assert.equal(result.calls, 1, name);
+    }
+});
