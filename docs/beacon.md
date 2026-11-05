@@ -98,8 +98,9 @@ What exists today:
   GitHub calls, inside the cap of 40 and with no compare: at most 8 PR queries of 40 PRs, then at most 4 blob queries
   of at most 150 object lookups a run, newest first; the rest stay pending for the next run.
   A PR with an error on its alias, or with no whole file list, stays pending, never final. `blockers.guards` names
-  each kind of failed GitHub call (no GitHub text). The calls of 7 days before the window are read too
-  (`REVIEW_LOOKBACK_DAYS`): a spawn there still sets the round and the PR of a send or an answer in the window.
+  each kind of failed or partial GitHub answer (no GitHub text), and `pending` counts every `ref@head` with no final
+  result yet. All earlier review calls are read, with no lower time limit: a spawn of any age still sets the round
+  and the PR of a send or an answer in the window.
 - **F3** compares a subagent's model with the brief's worker. **J1** gives spend per day, agent and thread.
 - **P1** (pi-pocket-team#119): plan tool friction, per planning session and in sum: `plan` calls, refused calls, the
   rate (null at 0 calls), refusals with 1 of 6 targeted texts (`targetedBy` counts each text), and source reads. Only a

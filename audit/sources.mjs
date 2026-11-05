@@ -12,8 +12,6 @@ import { apply } from "@earendil-works/chord/delta";
 import { DAY, HOUR, branchLeft, refsIn } from "./common.mjs";
 import {
     ANSWER,
-    REVIEW_LOOKBACK_DAYS,
-    REVIEW_WINDOW_DAYS,
     blockingItems,
     guardCacheOf,
     headIn,
@@ -1243,23 +1241,32 @@ function ghAnswer(gh, query, label, errors) {
     const failures = gh.state.failures;
     const out = gh.graphql(query);
 
-    if (gh.state.capReached && out === "") {
+    const capped = gh.state.capReached && out === "";
+    const failed = gh.state.failures > failures;
+
+    if (capped) {
         errors.add("GitHub call cap reached");
-    } else if (gh.state.failures > failures) {
+    } else if (failed) {
         errors.add(`${label} failed`);
     }
 
     const answer = json(out, {});
     const list = Array.isArray(answer?.errors) ? answer.errors : [];
+    const data =
+        answer?.data && typeof answer.data === "object" && !Array.isArray(answer.data)
+            ? answer.data
+            : null;
 
     if (list.length > 0) {
         errors.add(`${label} returned errors`);
     }
 
-    return {
-        data: answer?.data && typeof answer.data === "object" ? answer.data : null,
-        errors: list,
-    };
+    // A call that ends well with invalid JSON, a non-object or no `data`.
+    if (data === null && !capped && !failed && list.length === 0) {
+        errors.add(`${label} returned no data`);
+    }
+
+    return { data, errors: list };
 }
 
 /** The top-level aliases that GraphQL errors name; `all` when an error has no path. */
@@ -1340,7 +1347,7 @@ function blobQuery(batch) {
  * The guards of 1 blob query's keys, from its answer. A key whose aliases are missing, or that an error names (or an
  * error with no path), gets no result: it stays pending.
  */
-function guardsOfAnswer(batch, aliases, answer) {
+function guardsOfAnswer(batch, aliases, answer, kinds) {
     const data = answer?.data && typeof answer.data === "object" ? answer.data : null;
     const errors = Array.isArray(answer?.errors) ? answer.errors : [];
     const badRepos = new Set();
@@ -1370,14 +1377,14 @@ function guardsOfAnswer(batch, aliases, answer) {
             ...key.files.flatMap((_, j) => [`k${index}h${j}`, `k${index}f${j}`]),
         ];
 
-        if (
-            allBad ||
-            badRepos.has(alias) ||
-            badKeys.has(`${alias}:${index}`) ||
-            !repo ||
-            typeof repo !== "object" ||
-            !names.every((name) => name in repo)
-        ) {
+        if (allBad || badRepos.has(alias) || badKeys.has(`${alias}:${index}`)) {
+            return;
+        }
+
+        if (!repo || typeof repo !== "object" || !names.every((name) => name in repo)) {
+            // No error names it, and the answer has no place for it.
+            kinds.add("blob query missed a key");
+
             return;
         }
 
@@ -1406,7 +1413,9 @@ function guardsOfAnswer(batch, aliases, answer) {
  * `BLOCKER_MAX_QUERIES` queries a run, newest keys first. Keys that do not fit, or whose answer is missing, stay
  * pending: the next run tries again. A closed PR is final with no lookup. A PR node is used only when no error names
  * its alias and its file list is whole (`isWholePr`); else its keys stay pending, never final. Returns
- * `{ prs, guards, calls, pending, errors }`: `errors` names each kind of failed call once, with no text from GitHub.
+ * `{ prs, guards, calls, pending, errors }`: `pending` counts every distinct `ref@head` with no final result yet
+ * (not cached, no result this run), whatever deferred it; `errors` names each kind of failed or partial call once,
+ * with no text from GitHub.
  */
 export function loadBlockerGuards(data, { gh, now, cache = {} }) {
     const startCalls = gh.state.calls;
@@ -1422,13 +1431,10 @@ export function loadBlockerGuards(data, { gh, now, cache = {} }) {
     ];
     const nodes = {};
     const errors = new Set();
-    // The refs that were asked for and got no whole node: their keys stay pending.
-    const unread = new Set();
     // `checkGhArgs` refuses a whole query with such a word: 1 such repository name must not stop the others.
     const refused = wanted.filter((ref) => READ_ONLY_REFUSED.test(ref));
 
     if (refused.length > 0) {
-        refused.forEach((ref) => unread.add(ref));
         errors.add("repository name refused by the read-only gh");
     }
 
@@ -1457,12 +1463,19 @@ export function loadBlockerGuards(data, { gh, now, cache = {} }) {
             const alias = `p${index}`;
             const node = result.data?.[alias]?.pullRequest;
 
-            if (badAliases.all || badAliases.names.has(alias) || !node) {
-                unread.add(ref);
+            // A ref with no whole node is not in `nodes`: its keys stay pending.
+            if (badAliases.all || badAliases.names.has(alias)) {
+                return;
+            }
+
+            if (!node) {
+                // No error names it: GitHub left it out. With no data at all, `ghAnswer` named that.
+                if (result.data !== null) {
+                    errors.add("PR query missed a PR");
+                }
             } else if (isWholePr(node)) {
                 nodes[ref] = node;
             } else {
-                unread.add(ref);
                 errors.add("PR query returned an incomplete PR");
             }
         });
@@ -1481,7 +1494,6 @@ export function loadBlockerGuards(data, { gh, now, cache = {} }) {
 
     const guards = {};
     const keys = [];
-    const unreadKeys = new Set();
     const tooMany = { final: true, state: "merged", guarded: null, reason: "too many files" };
 
     for (const point of newest) {
@@ -1493,18 +1505,13 @@ export function loadBlockerGuards(data, { gh, now, cache = {} }) {
             point.head === null ||
             isFinal(point) ||
             key in guards ||
-            keys.some((item) => item.key === key) ||
-            unreadKeys.has(key)
+            keys.some((item) => item.key === key)
         ) {
             continue;
         }
 
+        // A PR not read this run (not asked, an error, not whole) or still open: its key stays pending.
         if (!node) {
-            // A PR asked for that came back with an error, or not whole: its key stays pending.
-            if (unread.has(point.ref)) {
-                unreadKeys.add(key);
-            }
-
             continue;
         }
 
@@ -1557,18 +1564,13 @@ export function loadBlockerGuards(data, { gh, now, cache = {} }) {
         }
     }
 
-    let pending = unreadKeys.size;
-
     batches.forEach((batch, index) => {
         if (index >= BLOCKER_MAX_QUERIES) {
-            pending += batch.keys.length;
-
             return;
         }
 
         if (gh.state.capReached) {
             errors.add("GitHub call cap reached");
-            pending += batch.keys.length;
 
             return;
         }
@@ -1578,16 +1580,24 @@ export function loadBlockerGuards(data, { gh, now, cache = {} }) {
             batch.keys,
             query.aliases,
             ghAnswer(gh, query.text, "blob query", errors),
+            errors,
         );
 
         for (const key of batch.keys) {
             if (found.has(key.key)) {
                 guards[key.key] = found.get(key.key);
-            } else {
-                pending += 1;
             }
         }
     });
+
+    // Every distinct key with no final result yet, whatever deferred it: the PR slice, the cap, the query limit, a
+    // failed or partial answer, an unread PR, or a PR that is still open.
+    const pending = new Set(
+        points
+            .filter((point) => point.ref !== null && point.head !== null && !isFinal(point))
+            .map((point) => `${point.ref}@${point.head}`)
+            .filter((key) => !(key in guards)),
+    ).size;
 
     return { prs, guards, calls: gh.state.calls - startCalls, pending, errors: [...errors] };
 }
@@ -1877,15 +1887,9 @@ export function loadData({
         });
         attempt("costs", () => (data.costRows = loadCosts(db, horizon)));
         // Q1's review rounds and 3-failure stops: spawn and send calls, answers of 30 days, and every goal revision.
-        // The calls of 7 days before the window too: a spawn there sets the round and the PR of a send in it.
-        attempt(
-            "reviews",
-            () =>
-                (data.reviewCalls = loadReviewCalls(
-                    db,
-                    now - (REVIEW_WINDOW_DAYS + REVIEW_LOOKBACK_DAYS) * DAY,
-                )),
-        );
+        // Every earlier call, with no lower time limit: a spawn of any age sets the round and the PR of a send or an
+        // answer in the window. Q1's per-thread rounds keep their own 30-day filter.
+        attempt("reviews", () => (data.reviewCalls = loadReviewCalls(db, 0)));
         attempt(
             "reviewAnswers",
             () => (data.reviewAnswers = loadReviewAnswers(db, now - 30 * DAY)),

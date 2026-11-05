@@ -5,11 +5,6 @@ import { DAY } from "./common.mjs";
 
 /** The window of `prRounds` and `blockers`, in days. */
 export const REVIEW_WINDOW_DAYS = 30;
-/**
- * The audit loads the review calls of this many days before the window too: a spawn before the window still names
- * the reviewer and the PR of a send or an answer in the window.
- */
-export const REVIEW_LOOKBACK_DAYS = 7;
 
 /**
  * A cross-review reviewer (Brian's cross-review policy): a read-only subagent with exactly the tools `read` and
@@ -193,7 +188,7 @@ export function callPr(call, data, owners = ownersOf(data)) {
 }
 
 /**
- * Every loaded review call (the window and its lookback), oldest first, each with `round` (a cross-review spawn, or a
+ * Every loaded review call (all history: the audit loads them with no lower time limit), oldest first, each with `round` (a cross-review spawn, or a
  * send whose name's latest spawn in that session was one), `pr` (`callPr`; a send with no PR of its own takes the PR
  * of the latest earlier call to the same name in the same session) and `head` (the call's own). No window filter
  * here: a spawn before the window still sets the round and the PR of a later send.
@@ -232,7 +227,7 @@ function reviewCalls(data) {
 
 /**
  * The cross-review rounds of the window, oldest first: `{ ref, head, at, session, reviewer }`; `ref` may be null. The
- * calls of the lookback set the rounds and the PRs, and are not counted.
+ * earlier calls set the rounds and the PRs, and are not counted.
  */
 export function reviewRounds(data, ctx) {
     const from = ctx.now - REVIEW_WINDOW_DAYS * DAY;
@@ -257,7 +252,7 @@ export function reviewRounds(data, ctx) {
  */
 export function reviewPoints(data, ctx) {
     const from = ctx.now - REVIEW_WINDOW_DAYS * DAY;
-    // The answers of the window join to every loaded call, the lookback's too.
+    // The answers of the window join to every loaded call, the earlier ones too.
     const calls = reviewCalls(data);
     const answers = (Array.isArray(data.reviewAnswers) ? data.reviewAnswers : []).filter(
         (answer) => typeof answer?.at === "number" && answer.at >= from,

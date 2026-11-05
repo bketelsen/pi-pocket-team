@@ -7,7 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
-import { isCrossReviewSpawn } from "./checks.mjs";
+import { checkQ1, isCrossReviewSpawn } from "./checks.mjs";
 import { DAY, HOUR } from "./common.mjs";
 import { NOW } from "./fixtures/builders.mjs";
 import { SESSION_T1, SESSION_T2, SUPERVISOR, createFixtureDb } from "./fixtures/pocket-db.mjs";
@@ -2449,7 +2449,8 @@ test("loadBlockerGuards: at most 150 lookups a query and 4 queries a run, and 8 
     assert.equal(Object.keys(result.prs).length, 320);
     assert.ok(!("acme/w#10" in result.prs));
     assert.deepEqual(queries.map(lookupsIn), [150, 150, 150, 150]);
-    assert.equal(result.pending, 120);
+    // 120 keys wait for a blob query, and the 10 oldest PRs were not read: 130 keys with no result.
+    assert.equal(result.pending, 130);
     assert.equal(result.calls, 12);
     assert.deepEqual(
         Object.keys(result.guards)
@@ -2491,12 +2492,48 @@ test("loadBlockerGuards: a key that an error names, or a call with no data, stay
     // Keys newest first: k0 is PR 3 (an error names it), k1 is PR 2 (an alias is missing), k2 is PR 1.
     assert.deepEqual(Object.keys(result.guards), [`acme/w#1@${SHA_A}`]);
     assert.equal(result.pending, 2);
+    assert.deepEqual(result.errors.sort(), [
+        "blob query missed a key",
+        "blob query returned errors",
+    ]);
 
+    // A call that ends well with no object: no data. Every key stays pending.
     const failed = guardGh(files, {}, () => "");
     const none = loadBlockerGuards(points, { gh: failed.gh, now: NOW });
 
     assert.deepEqual(none.guards, {});
     assert.equal(none.pending, 3);
+    assert.deepEqual(none.errors, ["blob query returned no data"]);
+
+    // The same for the PR query: no `data`, or a PR that the answer leaves out with no error.
+    const noData = guardGh(files, {}, undefined, () => ({ message: "ok" }));
+    const unreadPrs = loadBlockerGuards(points, { gh: noData.gh, now: NOW });
+
+    assert.deepEqual(unreadPrs.prs, {});
+    assert.equal(unreadPrs.pending, 3);
+    assert.deepEqual(unreadPrs.errors, ["PR query returned no data"]);
+
+    const missed = guardGh(files, {}, undefined, (data) => {
+        delete data.p1;
+
+        return { data };
+    });
+    const some = loadBlockerGuards(points, { gh: missed.gh, now: NOW });
+
+    // PR 2 (alias p1) is left out; PR 3 and PR 1 are read and judged.
+    assert.deepEqual(Object.keys(some.prs).sort(), ["acme/w#1", "acme/w#3"]);
+    assert.equal(Object.keys(some.guards).length, 2);
+    assert.equal(some.pending, 1);
+    assert.deepEqual(some.errors, ["PR query missed a PR"]);
+
+    // Invalid JSON with exit status 0.
+    const invalid = loadBlockerGuards(points, {
+        gh: makeGh(() => "not json {"),
+        now: NOW,
+    });
+
+    assert.equal(invalid.pending, 3);
+    assert.deepEqual(invalid.errors, ["PR query returned no data"]);
 });
 
 test("loadBlockerGuards: a cached final result needs no call; a closed PR is final with no lookup", () => {
@@ -2545,7 +2582,8 @@ test("loadBlockerGuards: more than 100 PR files is final with no verdict; an ope
     assert.deepEqual(queries, []);
     assert.equal(result.prs["acme/w#2"]!.state, "open");
     assert.equal(result.prs["acme/w#3"]!.state, "merged");
-    assert.equal(result.pending, 0);
+    // The open PR's key has no result yet: it is pending. PR 3 has no head: no key.
+    assert.equal(result.pending, 1);
 });
 
 test("loadBlockerGuards: a PR that GitHub cannot find fails the call; the other PRs of the query still count", () => {
@@ -2588,8 +2626,8 @@ test("loadBlockerGuards: a PR that GitHub cannot find fails the call; the other 
     assert.equal(gh.state.failures, 1);
     assert.deepEqual(Object.keys(result.prs), ["acme/w#9"]);
     assert.equal(result.prs["acme/w#9"]!.state, "open");
-    // PR 8's key stays pending, and the failure is named with no text from GitHub.
-    assert.equal(result.pending, 1);
+    // PR 8's key (not found) and PR 9's key (still open) have no result yet; the failure is named with no GitHub text.
+    assert.equal(result.pending, 2);
     assert.deepEqual(result.errors, ["PR query failed", "PR query returned errors"]);
 });
 
@@ -2682,13 +2720,14 @@ test("loadBlockerGuards: a failed blob query and the call cap are named in error
     assert.deepEqual(two.errors, ["GitHub call cap reached"]);
 });
 
-test("loadData: the review calls of 7 days before the 30-day window are loaded too", () => {
+test("loadData: all earlier review calls are loaded, with no lower time limit", () => {
     const { pocketDir, odradeDir, homesDir, run } = setup();
 
     addRows(pocketDir, (db) => {
         for (const [id, days] of [
             [400, 36],
-            [401, 38],
+            [401, 60],
+            [402, 400],
         ]) {
             insertEntry(db, id, SUPERVISOR, NOW - days * DAY, [
                 {
@@ -2718,6 +2757,101 @@ test("loadData: the review calls of 7 days before the 30-day window are loaded t
 
     assert.deepEqual(
         data.reviewCalls.map((call: { name: string }) => call.name),
-        ["w", "audit", "old", "s36"],
+        ["w", "audit", "old", "s36", "s60", "s400"],
+    );
+});
+
+test("loadBlockerGuards: when the shared cap is reached before it starts, every uncached key is pending and the cap is named", () => {
+    const { seen, gh } = guardGh(() => ({ state: "MERGED", files: prFiles("a.test.ts") }));
+
+    // 41 calls: the 41st meets the cap of 40.
+    for (let i = 0; i < 41; i += 1) {
+        gh.api("repos/acme/w");
+    }
+
+    const before = seen.length;
+    const cache = { [`acme/w#1@${SHA_A}`]: { final: true, guarded: true } };
+    const result = loadBlockerGuards(
+        blockerData([
+            { n: 1, minutes: 30 },
+            { n: 2, minutes: 20 },
+            { n: 3, minutes: 10 },
+        ]),
+        { gh, now: NOW, cache },
+    );
+
+    assert.equal(gh.state.capReached, true);
+    assert.equal(seen.length, before);
+    assert.deepEqual(result.guards, {});
+    // PR 1's key is cached final: only PR 2 and PR 3 are pending.
+    assert.equal(result.pending, 2);
+    assert.deepEqual(result.errors, ["GitHub call cap reached"]);
+});
+
+test("loadData and Q1: a spawn 60 days ago with a send and a blocking answer 29 days ago gives 1 round and the points", () => {
+    const { pocketDir, odradeDir, homesDir, run } = setup();
+    const tool = (args: object) => [
+        { type: "toolCall", id: "x", name: "subagent", arguments: args },
+    ];
+
+    addRows(pocketDir, (db) => {
+        db.prepare(
+            "insert into document_revisions (document_id, seq, kind, version, content) values (?,?,?,?,?)",
+        ).run(1, 10_000, "delta", 1, JSON.stringify([["s", ["threads", "T1", "repo"], "acme/w"]]));
+        insertEntry(
+            db,
+            500,
+            SESSION_T1,
+            NOW - 60 * DAY,
+            tool({
+                action: "spawn",
+                name: "rv",
+                tools: ["read", "bash"],
+                message: `Cross-review acme/w#5 at head ${SHA_A}.`,
+            }),
+        );
+        insertEntry(
+            db,
+            501,
+            SESSION_T1,
+            NOW - 29 * DAY,
+            tool({ action: "send", name: "rv", message: `Re-review at head ${SHA_B}.` }),
+        );
+        insertUser(
+            db,
+            502,
+            SESSION_T1,
+            NOW - 29 * DAY + 60_000,
+            "[subagent rv answered] **Not ready.**\n1. **Medium · Blocking: yes**",
+        );
+    });
+
+    const data = loadData({
+        pocketDir,
+        odradeDir,
+        homesDir,
+        now: NOW,
+        hours: 24,
+        useGithub: false,
+        run,
+    });
+    const q1 = checkQ1(data, { now: NOW, since: NOW - DAY, hours: 24, earlier: [] }).metrics;
+
+    assert.deepEqual(q1.prRounds.prs, [
+        {
+            ref: "acme/w#5",
+            rounds: 1,
+            heads: 1,
+            first: new Date(NOW - 29 * DAY).toISOString().slice(0, 16) + "Z",
+            last: new Date(NOW - 29 * DAY).toISOString().slice(0, 16) + "Z",
+        },
+    ]);
+    assert.deepEqual(
+        q1.blockers.points.map((point: { ref: string; head: string; item: string }) => [
+            point.ref,
+            point.head,
+            point.item,
+        ]),
+        [["acme/w#5", SHA_B, "1"]],
     );
 });

@@ -318,7 +318,7 @@ test("reviewRounds and reviewPoints: a spawn before the 30-day window still sets
         ],
     });
 
-    // 1 round in the window: the send. The spawn is in the lookback and is not counted.
+    // 1 round in the window: the send. The spawn is before the window and is not counted.
     assert.deepEqual(reviewRounds(data, { now: NOW }), [
         {
             ref: "acme/widgets#4",
@@ -342,5 +342,43 @@ test("reviewRounds and reviewPoints: a spawn before the 30-day window still sets
             ["acme/widgets#4", SHA_B, "1"],
             ["acme/widgets#4", SHA_B, "2"],
         ],
+    );
+});
+
+test("reviewRounds and reviewPoints: a spawn 60 days ago still sets the round and the PR of a send and an answer 29 days ago", () => {
+    const data = emptyData({
+        threads: threadMap(t1),
+        reviewCalls: [
+            spawn(1, ago(60 * DAY), { refs: ["acme/widgets#4"], head: SHA_A }),
+            send(2, ago(29 * DAY), { head: SHA_C }),
+        ],
+        reviewAnswers: [
+            {
+                id: 3,
+                c: t1.session,
+                at: ago(29 * DAY) + MINUTE,
+                name: "rv",
+                ready: false,
+                items: ["1"],
+            },
+        ],
+    });
+
+    assert.deepEqual(
+        reviewRounds(data, { now: NOW }).map((round: { ref: string; head: string }) => [
+            round.ref,
+            round.head,
+        ]),
+        [["acme/widgets#4", SHA_C]],
+    );
+    assert.deepEqual(
+        reviewPoints(data, { now: NOW }).points.map(
+            (point: { ref: string; head: string; item: string }) => [
+                point.ref,
+                point.head,
+                point.item,
+            ],
+        ),
+        [["acme/widgets#4", SHA_C, "1"]],
     );
 });
