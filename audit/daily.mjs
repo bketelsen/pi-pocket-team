@@ -124,6 +124,8 @@ export async function main(
     );
     const ctx = { now, since: now - options.hours * HOUR, hours: options.hours };
 
+    // The earlier days come first: Q1 sums their day records, and their final guard results need no GitHub call.
+    const earlier = loadEarlier(outDir, date);
     const data = loadData({
         pocketDir,
         odradeDir,
@@ -131,10 +133,9 @@ export async function main(
         now,
         hours: options.hours,
         useGithub: options.github,
+        earlier,
         ...(run ? { run } : {}),
     });
-    // The earlier days come first: Q1 sums their day records.
-    const earlier = loadEarlier(outDir, date);
     const result = runChecks(data, { ...ctx, date, earlier });
     const findings = annotate(result.findings, earlier, data.installed, ctx.now);
     const llm = await runLlm({
