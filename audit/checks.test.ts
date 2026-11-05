@@ -362,7 +362,7 @@ test("errorLine masks a whole word of 7 to 40 hex characters, and leaves other w
     );
     // 6 hex characters, 41, a hex run inside a word, a thread id and a plain word stay.
     assert.equal(errorLine("abc123 at T857, x133209fy"), "abc123 at T<n>, x133209fy");
-    assert.equal(errorLine("a".repeat(41)), "a".repeat(41));
+    assert.equal(errorLine(`${"a".repeat(40)}1`), `${"a".repeat(40)}1`);
     // A word of a to f only has no digit: it is not a rev.
     assert.equal(errorLine("the page was defaced"), "the page was defaced");
     // The subjects of the A4 tests above do not change.
