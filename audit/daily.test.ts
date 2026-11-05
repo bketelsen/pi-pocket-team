@@ -5,11 +5,12 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { HOUR } from "./common.mjs";
 import { defaultOdradeDir, main, parseArgs } from "./daily.mjs";
 import { NOW } from "./fixtures/builders.mjs";
-import { createFixtureDb } from "./fixtures/pocket-db.mjs";
+import { SESSION_T1, createFixtureDb } from "./fixtures/pocket-db.mjs";
 
 /** Every file under a folder, with its hash. */
 function snapshot(dir: string): Record<string, string> {
@@ -725,4 +726,192 @@ test("main --no-github: Q1's day record is incomplete and says why", async () =>
         readme,
         /Today's record: 0 PRs \(day record incomplete: disabled by --no-github\)\./,
     );
+});
+
+test("main: a final guard of a blocking point in an earlier findings.json makes no GitHub call again", async () => {
+    const t = setup();
+    const head = "a".repeat(40);
+    const final = "b".repeat(40);
+    const db = new DatabaseSync(path.join(t.pocketDir, "pocket.sqlite"));
+    const insert = (id: number, conversation: number, record: object) =>
+        db
+            .prepare(
+                "insert into entries (id, conversation_id, head, commit_seq, record) values (?,?,?,?,?)",
+            )
+            .run(id, conversation, null, id, JSON.stringify(record));
+
+    // T1 works in acme/w; its session spawns a reviewer of acme/w#5 at a head, and gets 1 blocking point back.
+    db.prepare(
+        "insert into document_revisions (document_id, seq, kind, version, content) values (?,?,?,?,?)",
+    ).run(1, 10_000, "delta", 1, JSON.stringify([["s", ["threads", "T1", "repo"], "acme/w"]]));
+    insert(9001, SESSION_T1, {
+        kind: "pi.assistant",
+        model: [
+            {
+                role: "assistant",
+                content: [
+                    {
+                        type: "toolCall",
+                        id: "x1",
+                        name: "subagent",
+                        arguments: {
+                            action: "spawn",
+                            name: "rv",
+                            tools: ["read", "bash"],
+                            message: `Cross-review acme/w#5 at head ${head}.`,
+                        },
+                    },
+                ],
+                timestamp: NOW - 3 * HOUR,
+            },
+        ],
+    });
+    insert(9002, SESSION_T1, {
+        kind: "pi.user",
+        model: [
+            {
+                role: "user",
+                content:
+                    "[subagent rv answered] **Not ready.**\n1. **Medium · Blocking: yes** — `a.ts:1`",
+                timestamp: NOW - 2 * HOUR,
+            },
+        ],
+    });
+    db.close();
+
+    const ghCalls: string[][] = [];
+
+    const run = (command: string, args: string[]) => {
+        if (command !== "gh") {
+            return t.run(command, args);
+        }
+
+        ghCalls.push(args);
+
+        if (args[0] === "search") {
+            return "[]";
+        }
+
+        const query = args.find((arg) => arg.startsWith("query=")) ?? "";
+
+        // The blob query: the head exists, the test file is new, and 1 corrections line is added.
+        if (query.includes("object(")) {
+            return JSON.stringify({
+                data: {
+                    r0: {
+                        k0: { oid: head },
+                        k0h0: null,
+                        k0f0: { oid: "t1" },
+                        k0h1: { oid: "c1", text: "{}\n" },
+                        k0f1: { oid: "c2", text: '{}\n{"a":1}\n' },
+                    },
+                },
+            });
+        }
+
+        if (query.includes("search(")) {
+            return JSON.stringify({
+                data: {
+                    search: {
+                        issueCount: 0,
+                        pageInfo: { hasNextPage: false, endCursor: null },
+                        nodes: [],
+                    },
+                },
+            });
+        }
+
+        return JSON.stringify({
+            data: {
+                p0: {
+                    pullRequest: {
+                        state: "MERGED",
+                        mergedAt: new Date(NOW - HOUR).toISOString(),
+                        closedAt: new Date(NOW - HOUR).toISOString(),
+                        headRefOid: final,
+                        files: {
+                            totalCount: 3,
+                            nodes: [
+                                { path: "a.ts", additions: 1 },
+                                { path: "a.test.ts", additions: 3 },
+                                { path: ".memory/corrections.jsonl", additions: 1 },
+                            ],
+                        },
+                    },
+                },
+            },
+        });
+    };
+
+    const isGuardCall = (args: string[]) =>
+        args.some((arg) => arg.includes("headRefOid files") || arg.includes("object("));
+
+    // The first day reads the PR, then looks up its files at the reviewed head and at the final head.
+    fs.rmSync(t.outDir, { recursive: true });
+    await main(["--no-llm", "--out-dir", t.outDir], {
+        env: t.env,
+        now: NOW,
+        run,
+        log: () => undefined,
+    });
+
+    const first = JSON.parse(fs.readFileSync(path.join(t.outDir, "findings.json"), "utf8"));
+
+    assert.deepEqual(ghCalls.filter(isGuardCall).length, 2);
+    assert.ok(
+        ghCalls.some((args) =>
+            args.some((arg) => arg.includes(`object(expression: "${final}:a.test.ts")`)),
+        ),
+    );
+    assert.ok(!ghCalls.some((args) => args[1]!.includes("compare")));
+    assert.deepEqual(
+        first.metrics.Q1.blockers.points.map(
+            (point: { ref: string; head: string; item: string; state: string; guard: object }) => [
+                point.ref,
+                point.head,
+                point.item,
+                point.state,
+                point.guard,
+            ],
+        ),
+        [
+            [
+                "acme/w#5",
+                head,
+                "1",
+                "merged",
+                {
+                    final: true,
+                    state: "merged",
+                    guarded: true,
+                    test: true,
+                    agentsRule: false,
+                    corrections: 1,
+                    namesPr: false,
+                },
+            ],
+        ],
+    );
+    assert.equal(first.metrics.Q1.prRounds.totals.prs, 1);
+
+    // The next day reads the first day's findings.json: the final guard needs no call.
+    ghCalls.length = 0;
+
+    const next = path.join(t.reports, "2026-10-24-daily-audit");
+
+    await main(["--no-llm", "--date", "2026-10-24", "--out-dir", next], {
+        env: t.env,
+        now: NOW,
+        run,
+        log: () => undefined,
+    });
+
+    const second = JSON.parse(fs.readFileSync(path.join(next, "findings.json"), "utf8"));
+
+    assert.deepEqual(ghCalls.filter(isGuardCall), []);
+    assert.deepEqual(
+        second.metrics.Q1.blockers.points[0].guard,
+        first.metrics.Q1.blockers.points[0].guard,
+    );
+    assert.equal(second.metrics.Q1.blockers.totals.evaluated, 1);
 });

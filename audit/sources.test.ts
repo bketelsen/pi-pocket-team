@@ -19,9 +19,15 @@ import {
     loadData,
     loadDesk,
     loadDecided,
+    BLOCKER_LOOKUPS,
+    BLOCKER_MAX_PR_QUERIES,
+    BLOCKER_MAX_QUERIES,
+    guardOf,
+    loadBlockerGuards,
     loadGithub,
     loadGoalStops,
     loadPlanSessions,
+    loadReviewAnswers,
     loadReviewCalls,
     Q1_MAX_CALLS,
     makeGh,
@@ -170,6 +176,7 @@ test("loadData reads every source into one plain object", () => {
     assert.deepEqual(data.sourceErrors, {
         github: "disabled by --no-github",
         decided: "disabled by --no-github",
+        blockerGuards: "disabled by --no-github",
     });
     assert.deepEqual(Object.keys(data.threads).sort(), ["T1", "T2", "T3"]);
     assert.equal(data.events.length, 7);
@@ -986,6 +993,7 @@ test("a missing homes folder gives an empty list, not a source error", () => {
     assert.deepEqual(data.sourceErrors, {
         github: "disabled by --no-github",
         decided: "disabled by --no-github",
+        blockerGuards: "disabled by --no-github",
     });
 });
 
@@ -1601,6 +1609,9 @@ test("loadReviewCalls gives spawn and send rows, and skips other actions and row
         at: NOW - 30 * 60_000,
         action: "send",
         name: "audit",
+        refs: [],
+        bare: [],
+        head: null,
     });
     // The 20-day-old spawn is older than 10 days.
     assert.deepEqual(
@@ -1941,4 +1952,655 @@ test("readFlakyScan: invalid JSON, schema_version 2 or no repos list is a source
     assert.match(data.sourceErrors.flakyScan, /schema_version 2, not 1/);
     assert.equal(data.flakyScan, null);
     assert.equal(data.sourceErrors.odrade, undefined);
+});
+
+// ---------- Q1: review calls with their PRs, reviewer answers and the guards of blocking points ----------
+
+const SHA_A = "a".repeat(40);
+const SHA_B = "b".repeat(40);
+
+const insertUser = (
+    db: DatabaseSync,
+    id: number,
+    conversation: number,
+    at: number,
+    content: string | object[],
+) =>
+    db
+        .prepare(
+            "insert into entries (id, conversation_id, head, commit_seq, record) values (?,?,?,?,?)",
+        )
+        .run(
+            id,
+            conversation,
+            null,
+            id,
+            JSON.stringify({ kind: "pi.user", model: [{ role: "user", content, timestamp: at }] }),
+        );
+
+test("loadReviewCalls: each spawn and send has the refs, bare numbers and head of its whole message", () => {
+    const { pocketDir } = setup();
+
+    addRows(pocketDir, (db) => {
+        insertEntry(db, 200, SUPERVISOR, NOW - 10 * 60_000, [
+            {
+                type: "toolCall",
+                id: "c20",
+                name: "subagent",
+                arguments: {
+                    action: "spawn",
+                    name: "rv",
+                    tools: ["read", "bash"],
+                    // The PR and the head sit after the 300 characters of the brief.
+                    message: `${"y".repeat(320)}\nRepository: acme/widgets, PR #12\nHead: ${SHA_A}`,
+                },
+            },
+            {
+                type: "toolCall",
+                id: "c21",
+                name: "subagent",
+                arguments: {
+                    action: "send",
+                    name: "rv",
+                    message: `Re-review PR #12 and PR 13 at ${SHA_A}..${SHA_B}`,
+                },
+            },
+        ]);
+    });
+
+    const db = openPocket(path.join(pocketDir, "pocket.sqlite"));
+    const calls = loadReviewCalls(db, NOW - 30 * DAY).filter(
+        (call: { id: number }) => call.id === 200,
+    );
+
+    db.close();
+
+    assert.deepEqual(
+        calls.map((call: { action: string; refs: string[]; bare: number[]; head: string }) => [
+            call.action,
+            call.refs,
+            call.bare,
+            call.head,
+        ]),
+        [
+            ["spawn", ["acme/widgets#12"], [], SHA_A],
+            ["send", [], [12, 13], SHA_B],
+        ],
+    );
+    assert.equal(calls[0].brief.length, 300);
+    assert.ok(!JSON.stringify(calls[1]).includes("Re-review"));
+});
+
+test("loadReviewAnswers: answers of subagents with their verdict and blocking items, and no text", () => {
+    const { pocketDir } = setup();
+
+    addRows(pocketDir, (db) => {
+        insertUser(
+            db,
+            301,
+            SUPERVISOR,
+            NOW - 5 * 60_000,
+            "[subagent rv answered, no reply needed] **Not ready.**\n1. **Medium · Blocking: yes** — `a.ts:3`",
+        );
+        insertUser(db, 300, SESSION_T1, NOW - 6 * 60_000, [
+            { type: "text", text: "[from: Brian] [subagent rv2 answered]" },
+            { type: "text", text: "**A1 — Low; blocking: yes**\nReady after A1." },
+        ]);
+        // Not an answer: the mark is not at the start.
+        insertUser(db, 302, SUPERVISOR, NOW - 4 * 60_000, "Quote: [subagent rv answered] Ready");
+        // Older than since.
+        insertUser(db, 303, SUPERVISOR, NOW - 40 * DAY, "[subagent rv answered] Ready");
+    });
+
+    const db = openPocket(path.join(pocketDir, "pocket.sqlite"));
+    const answers = loadReviewAnswers(db, NOW - 30 * DAY);
+
+    db.close();
+
+    assert.deepEqual(answers, [
+        { id: 300, c: SESSION_T1, at: NOW - 6 * 60_000, name: "rv2", ready: true, items: ["A1"] },
+        { id: 301, c: SUPERVISOR, at: NOW - 5 * 60_000, name: "rv", ready: false, items: ["1"] },
+    ]);
+});
+
+test("loadData: the reviewer answers are a source; with no database it fails by name", () => {
+    const { pocketDir, odradeDir, homesDir, run } = setup();
+    const data = loadData({
+        pocketDir,
+        odradeDir,
+        homesDir,
+        now: NOW,
+        hours: 24,
+        useGithub: false,
+        run,
+    });
+
+    assert.equal(data.sourceErrors.reviewAnswers, undefined);
+    assert.deepEqual(data.reviewAnswers, []);
+    assert.equal(data.blockerGuards, undefined);
+    assert.deepEqual(data.blockerCache, {});
+
+    const root = tmp();
+    const none = loadData({
+        pocketDir: path.join(root, "nowhere"),
+        odradeDir: path.join(root, "nowhere"),
+        homesDir: path.join(root, "nowhere"),
+        now: NOW,
+        hours: 24,
+        useGithub: false,
+        run: () => "",
+    });
+
+    assert.ok(none.sourceErrors.reviewAnswers);
+    assert.deepEqual(none.reviewAnswers, []);
+});
+
+/** 1 reviewer spawn naming `acme/w#N` at `head`, and its answer with 1 blocking point, `n` minutes before NOW. */
+function blockerData(points: { n: number; head?: string | null; minutes?: number }[]) {
+    const threads = {
+        T1: { id: "T1", repo: "acme/w", session: 101, startedAt: NOW - 3 * DAY, prs: {} },
+    };
+    const reviewCalls = points.map((point, i) => ({
+        id: i + 1,
+        c: 101,
+        at: NOW - (point.minutes ?? 100 - i) * 60_000 - 1000,
+        action: "spawn",
+        name: `rv${point.n}`,
+        tools: ["read", "bash"],
+        review: true,
+        brief: "Review",
+        refs: [`acme/w#${point.n}`],
+        bare: [],
+        head: point.head === undefined ? SHA_A : point.head,
+    }));
+    const reviewAnswers = points.map((point, i) => ({
+        id: 1000 + i,
+        c: 101,
+        at: NOW - (point.minutes ?? 100 - i) * 60_000,
+        name: `rv${point.n}`,
+        ready: false,
+        items: ["1"],
+    }));
+
+    return { threads, reviewCalls, reviewAnswers };
+}
+
+type PrNode = {
+    state: string;
+    headRefOid?: string;
+    files?: { totalCount: number; nodes: { path: string; additions: number }[] };
+};
+
+type Blob = { oid: string; text?: string | null; isTruncated?: boolean };
+
+/**
+ * A fake GitHub for `loadBlockerGuards`: 1 PR node per PR number, the commits it has, and the blobs by `sha:path`.
+ * It answers a PR query and a blob query by their aliases; `answer` can change a blob answer.
+ */
+function guardGh(
+    nodes: (number: number) => PrNode,
+    world: { commits?: string[]; blobs?: Record<string, Blob> } = {},
+    answer: (data: Record<string, Record<string, unknown>>, query: string) => unknown = (data) => ({
+        data,
+    }),
+) {
+    const seen: string[][] = [];
+    const commits = new Set(world.commits ?? [SHA_A, SHA_B]);
+    const blobs = world.blobs ?? {};
+    const queries: string[] = [];
+
+    const run = (_: string, args: string[]) => {
+        seen.push(args);
+
+        const query = (args.find((arg) => arg.startsWith("query=")) ?? "").slice(6);
+
+        if (args[1] !== "graphql") {
+            throw new Error(`no such call: ${args.join(" ")}`);
+        }
+
+        if (query.includes("pullRequest(")) {
+            const data: Record<string, unknown> = {};
+
+            for (const match of query.matchAll(
+                /(p\d+): repository\([^)]*\) \{ pullRequest\(number: (\d+)\)/g,
+            )) {
+                data[match[1]!] = {
+                    pullRequest: {
+                        mergedAt: null,
+                        closedAt: null,
+                        headRefOid: SHA_B,
+                        files: { totalCount: 0, nodes: [] },
+                        ...nodes(Number(match[2])),
+                    },
+                };
+            }
+
+            return JSON.stringify({ data });
+        }
+
+        queries.push(query);
+
+        const data: Record<string, Record<string, unknown>> = {};
+
+        for (const line of query.replace(/^\{ /, "").replace(/ \}$/, "").split("\n")) {
+            const repo = /^(r\d+): repository\(/.exec(line)![1]!;
+
+            data[repo] = {};
+
+            for (const match of line.matchAll(
+                /(k\d+(?:[hf]\d+)?): object\((oid|expression): "([^"]*)"\)/g,
+            )) {
+                data[repo][match[1]!] =
+                    match[2] === "oid"
+                        ? commits.has(match[3]!)
+                            ? { oid: match[3] }
+                            : null
+                        : (blobs[match[3]!] ?? null);
+            }
+        }
+
+        return JSON.stringify(answer(data, query));
+    };
+
+    return { seen, queries, gh: makeGh(run) };
+}
+
+const prFiles = (...paths: string[]) => ({
+    totalCount: paths.length,
+    nodes: paths.map((file) => ({ path: file, additions: 1 })),
+});
+
+const lookupsIn = (query: string) => (query.match(/: object\(/g) ?? []).length;
+
+test("loadBlockerGuards: 1 PR query, then 1 blob query with the candidates at the reviewed and the final head", () => {
+    const { seen, queries, gh } = guardGh(
+        () => ({
+            state: "MERGED",
+            files: prFiles("src/a.ts", "src/a.test.ts", ".memory/corrections.jsonl"),
+        }),
+        {
+            blobs: {
+                [`${SHA_B}:src/a.test.ts`]: { oid: "t2" },
+                [`${SHA_A}:.memory/corrections.jsonl`]: { oid: "c1", text: '{"old":1}\n' },
+                [`${SHA_B}:.memory/corrections.jsonl`]: {
+                    oid: "c2",
+                    text: '{"old":1}\n{"pr":"w#4","rule":"x"}\n',
+                },
+            },
+        },
+    );
+    const result = loadBlockerGuards(blockerData([{ n: 4 }]), { gh, now: NOW, cache: {} });
+
+    assert.equal(seen.length, 2);
+    assert.match(
+        seen[0]!.find((arg) => arg.startsWith("query="))!,
+        /p0: repository\(owner: "acme", name: "w"\) \{ pullRequest\(number: 4\) \{ state mergedAt closedAt headRefOid files\(first: 100\) \{ totalCount nodes \{ path additions \} \} \} \}/,
+    );
+    // No compare call: 1 alias for the repository, the head, and each candidate at H and at F.
+    assert.ok(!seen.some((args) => args[1]!.includes("compare")));
+    assert.equal(
+        queries[0],
+        `{ r0: repository(owner: "acme", name: "w") { k0: object(oid: "${SHA_A}") { oid } ` +
+            `k0h0: object(expression: "${SHA_A}:src/a.test.ts") { oid } ` +
+            `k0f0: object(expression: "${SHA_B}:src/a.test.ts") { oid } ` +
+            `k0h1: object(expression: "${SHA_A}:.memory/corrections.jsonl") { oid ... on Blob { text isTruncated } } ` +
+            `k0f1: object(expression: "${SHA_B}:.memory/corrections.jsonl") { oid ... on Blob { text isTruncated } } } }`,
+    );
+    assert.deepEqual(result, {
+        prs: { "acme/w#4": { state: "merged", mergedAt: null, closedAt: null, head: SHA_B } },
+        guards: {
+            [`acme/w#4@${SHA_A}`]: {
+                final: true,
+                state: "merged",
+                guarded: true,
+                test: true,
+                agentsRule: false,
+                corrections: 1,
+                namesPr: true,
+            },
+        },
+        calls: 2,
+        pending: 0,
+    });
+});
+
+test("loadBlockerGuards: an unchanged or deleted test file does not count; a changed AGENTS.md does", () => {
+    const { gh } = guardGh(
+        () => ({
+            state: "MERGED",
+            files: prFiles("tests/same.py", "tests/gone.py", "docs/AGENTS.md", "README.md"),
+        }),
+        {
+            blobs: {
+                [`${SHA_A}:tests/same.py`]: { oid: "s1" },
+                [`${SHA_B}:tests/same.py`]: { oid: "s1" },
+                [`${SHA_A}:tests/gone.py`]: { oid: "g1" },
+                [`${SHA_A}:docs/AGENTS.md`]: { oid: "a1" },
+                [`${SHA_B}:docs/AGENTS.md`]: { oid: "a2" },
+            },
+        },
+    );
+    const result = loadBlockerGuards(blockerData([{ n: 4 }]), { gh, now: NOW });
+
+    // No corrections file in the PR: not guarded.
+    assert.deepEqual(result.guards[`acme/w#4@${SHA_A}`], {
+        final: true,
+        state: "merged",
+        guarded: false,
+        test: false,
+        agentsRule: true,
+        corrections: 0,
+        namesPr: false,
+    });
+});
+
+test("guardOf: the added corrections lines are a multiset of non-empty lines; a missing text or head has no verdict", () => {
+    const head = { oid: SHA_A };
+    const log = (atHead: Blob | null, atFinal: Blob | null) => ({
+        path: ".memory/corrections.jsonl",
+        test: false,
+        agents: false,
+        corrections: true,
+        atHead,
+        atFinal,
+    });
+    const test1 = {
+        path: "a_test.go",
+        test: true,
+        agents: false,
+        corrections: false,
+        atHead: null,
+        atFinal: { oid: "n" },
+    };
+
+    assert.deepEqual(
+        guardOf("acme/w#7", {
+            head,
+            files: [
+                test1,
+                log(
+                    { oid: "1", text: "a\na\nb\n" },
+                    { oid: "2", text: "a\na\na\nb\n\n  \nacme/w#7 c\n" },
+                ),
+            ],
+        }),
+        {
+            final: true,
+            state: "merged",
+            guarded: true,
+            test: true,
+            agentsRule: false,
+            corrections: 2,
+            namesPr: true,
+        },
+    );
+    // A new corrections file: every line is added; `other/w#7` names another PR.
+    assert.deepEqual(
+        guardOf("acme/w#7", { head, files: [log(null, { oid: "2", text: "other/w#7\n" })] }),
+        {
+            final: true,
+            state: "merged",
+            guarded: false,
+            test: false,
+            agentsRule: false,
+            corrections: 1,
+            namesPr: false,
+        },
+    );
+
+    // A changed corrections file with no text, or a truncated one.
+    for (const atFinal of [
+        { oid: "2", text: null },
+        { oid: "2", text: "x\n", isTruncated: true },
+    ]) {
+        assert.deepEqual(
+            guardOf("acme/w#7", { head, files: [test1, log({ oid: "1", text: "" }, atFinal)] }),
+            {
+                final: true,
+                state: "merged",
+                guarded: null,
+                test: true,
+                agentsRule: false,
+                corrections: null,
+                namesPr: null,
+                reason: "corrections text missing",
+            },
+        );
+    }
+
+    // An unchanged corrections file needs no text.
+    assert.equal(
+        guardOf("acme/w#7", { head, files: [log({ oid: "1" }, { oid: "1" })] }).corrections,
+        0,
+    );
+    assert.deepEqual(guardOf("acme/w#7", { head: null, files: [test1] }), {
+        final: true,
+        state: "merged",
+        guarded: null,
+        reason: "head not found",
+    });
+});
+
+test("loadBlockerGuards: a reviewed head that GitHub does not have is final with no verdict", () => {
+    const { gh } = guardGh(() => ({ state: "MERGED", files: prFiles("x.test.ts") }), {
+        commits: [SHA_B],
+    });
+    const result = loadBlockerGuards(blockerData([{ n: 4 }]), { gh, now: NOW });
+
+    assert.deepEqual(result.guards[`acme/w#4@${SHA_A}`], {
+        final: true,
+        state: "merged",
+        guarded: null,
+        reason: "head not found",
+    });
+});
+
+test("loadBlockerGuards: no candidate file, or no commit after the head, is final with no blob query", () => {
+    const { queries, gh } = guardGh((n) =>
+        n === 1
+            ? { state: "MERGED", files: prFiles("src/a.ts", "README.md") }
+            : { state: "MERGED", headRefOid: SHA_A, files: prFiles("src/a.test.ts") },
+    );
+    const result = loadBlockerGuards(
+        blockerData([
+            { n: 1, minutes: 20 },
+            { n: 2, minutes: 10 },
+        ]),
+        { gh, now: NOW },
+    );
+    const none = {
+        final: true,
+        state: "merged",
+        guarded: false,
+        test: false,
+        agentsRule: false,
+        corrections: 0,
+        namesPr: false,
+    };
+
+    assert.deepEqual(queries, []);
+    assert.deepEqual(result.guards, {
+        [`acme/w#1@${SHA_A}`]: none,
+        [`acme/w#2@${SHA_A}`]: none,
+    });
+    assert.equal(result.calls, 1);
+});
+
+test("loadBlockerGuards: at most 150 lookups a query and 4 queries a run, and 8 PR queries, newest first", () => {
+    const { seen, queries, gh } = guardGh(() => ({
+        state: "MERGED",
+        files: prFiles("a.test.ts"),
+    }));
+    // 330 PRs; PR 330 is the newest point. Each key needs 3 lookups: 50 keys a query.
+    const numbers = Array.from({ length: 330 }, (_, i) => i + 1);
+    const result = loadBlockerGuards(blockerData(numbers.map((n) => ({ n, minutes: 1000 - n }))), {
+        gh,
+        now: NOW,
+    });
+    const prQueries = seen.filter((args) => args.some((arg) => arg.includes("pullRequest(")));
+
+    assert.equal(BLOCKER_LOOKUPS, 150);
+    assert.equal(BLOCKER_MAX_QUERIES, 4);
+    assert.equal(BLOCKER_MAX_PR_QUERIES, 8);
+    assert.equal(prQueries.length, 8);
+    // The 10 oldest PRs are not read this run.
+    assert.equal(Object.keys(result.prs).length, 320);
+    assert.ok(!("acme/w#10" in result.prs));
+    assert.deepEqual(queries.map(lookupsIn), [150, 150, 150, 150]);
+    assert.equal(result.pending, 120);
+    assert.equal(result.calls, 12);
+    assert.deepEqual(
+        Object.keys(result.guards)
+            .map((key) => Number(key.split("#")[1]!.split("@")[0]))
+            .sort((a, b) => a - b),
+        numbers.slice(130),
+    );
+    // A key that does not fit in the rest of a query starts the next one.
+    const big = guardGh(() => ({
+        state: "MERGED",
+        files: prFiles(...Array.from({ length: 40 }, (_, i) => `t/test_${i}.py`)),
+    }));
+
+    loadBlockerGuards(
+        blockerData([
+            { n: 1, minutes: 30 },
+            { n: 2, minutes: 20 },
+            { n: 3, minutes: 10 },
+        ]),
+        { gh: big.gh, now: NOW },
+    );
+    assert.deepEqual(big.queries.map(lookupsIn), [81, 81, 81]);
+});
+
+test("loadBlockerGuards: a key that an error names, or a call with no data, stays pending", () => {
+    const files = () => ({ state: "MERGED", files: prFiles("a.test.ts") });
+    const partial = guardGh(files, {}, (data) => {
+        delete data.r0!.k1f0;
+
+        return { data, errors: [{ path: ["r0", "k0h0"], message: "boom" }] };
+    });
+    const points = blockerData([
+        { n: 1, minutes: 30 },
+        { n: 2, minutes: 20 },
+        { n: 3, minutes: 10 },
+    ]);
+    const result = loadBlockerGuards(points, { gh: partial.gh, now: NOW });
+
+    // Keys newest first: k0 is PR 3 (an error names it), k1 is PR 2 (an alias is missing), k2 is PR 1.
+    assert.deepEqual(Object.keys(result.guards), [`acme/w#1@${SHA_A}`]);
+    assert.equal(result.pending, 2);
+
+    const failed = guardGh(files, {}, () => "");
+    const none = loadBlockerGuards(points, { gh: failed.gh, now: NOW });
+
+    assert.deepEqual(none.guards, {});
+    assert.equal(none.pending, 3);
+});
+
+test("loadBlockerGuards: a cached final result needs no call; a closed PR is final with no lookup", () => {
+    const cached = guardGh(() => ({ state: "MERGED", files: prFiles("a.test.ts") }));
+    const cache = { [`acme/w#4@${SHA_A}`]: { final: true, guarded: true } };
+    const none = loadBlockerGuards(blockerData([{ n: 4 }]), { gh: cached.gh, now: NOW, cache });
+
+    assert.equal(cached.seen.length, 0);
+    assert.deepEqual(none, { prs: {}, guards: {}, calls: 0, pending: 0 });
+
+    const closed = guardGh(() => ({ state: "CLOSED", files: prFiles("a.test.ts") }));
+    const result = loadBlockerGuards(blockerData([{ n: 5 }]), { gh: closed.gh, now: NOW });
+
+    assert.equal(closed.seen.length, 1);
+    assert.deepEqual(result.guards, {
+        [`acme/w#5@${SHA_A}`]: { final: true, state: "closed", guarded: null },
+    });
+    assert.equal(result.prs["acme/w#5"]!.state, "closed");
+});
+
+test("loadBlockerGuards: more than 100 PR files is final with no verdict; an open PR or no head gives no result", () => {
+    const { queries, gh } = guardGh((n) =>
+        n === 1
+            ? { state: "MERGED", files: { totalCount: 101, nodes: [] } }
+            : n === 2
+              ? { state: "OPEN" }
+              : { state: "MERGED", files: prFiles("a.test.ts") },
+    );
+    const result = loadBlockerGuards(
+        blockerData([
+            { n: 1, minutes: 30 },
+            { n: 2, minutes: 20 },
+            { n: 3, head: null, minutes: 10 },
+        ]),
+        { gh, now: NOW },
+    );
+
+    assert.deepEqual(result.guards, {
+        [`acme/w#1@${SHA_A}`]: {
+            final: true,
+            state: "merged",
+            guarded: null,
+            reason: "too many files",
+        },
+    });
+    assert.deepEqual(queries, []);
+    assert.equal(result.prs["acme/w#2"]!.state, "open");
+    assert.equal(result.prs["acme/w#3"]!.state, "merged");
+    assert.equal(result.pending, 0);
+});
+
+test("loadBlockerGuards: a PR that GitHub cannot find fails the call; the other PRs of the query still count", () => {
+    const run = (_: string, args: string[]) => {
+        if (args.some((arg) => arg.includes("pullRequest("))) {
+            const error = new Error("gh: Could not resolve to a PullRequest") as Error & {
+                stdout: string;
+            };
+
+            error.stdout = JSON.stringify({
+                data: {
+                    p0: { pullRequest: { state: "OPEN", headRefOid: SHA_B } },
+                    p1: { pullRequest: null },
+                },
+                errors: [{ type: "NOT_FOUND" }],
+            });
+
+            throw error;
+        }
+
+        return "";
+    };
+
+    const gh = makeGh(run);
+    // PR 9 is the newer point: it comes first in the query.
+    const result = loadBlockerGuards(
+        blockerData([
+            { n: 8, minutes: 20 },
+            { n: 9, minutes: 10 },
+        ]),
+        { gh, now: NOW },
+    );
+
+    assert.equal(gh.state.failures, 1);
+    assert.deepEqual(Object.keys(result.prs), ["acme/w#9"]);
+    assert.equal(result.prs["acme/w#9"]!.state, "open");
+});
+
+test("loadBlockerGuards: a key over 150 lookups, or a path the read-only gh refuses, is final with no query", () => {
+    const { queries, gh } = guardGh((n) =>
+        n === 1
+            ? {
+                  state: "MERGED",
+                  files: prFiles(...Array.from({ length: 75 }, (_, i) => `t/${i}.test.ts`)),
+              }
+            : { state: "MERGED", files: prFiles("tests/mutation.test.ts") },
+    );
+    const result = loadBlockerGuards(
+        blockerData([
+            { n: 1, minutes: 20 },
+            { n: 2, minutes: 10 },
+        ]),
+        { gh, now: NOW },
+    );
+
+    assert.deepEqual(queries, []);
+    assert.equal(result.guards[`acme/w#1@${SHA_A}`]!.reason, "too many files");
+    assert.equal(result.guards[`acme/w#2@${SHA_A}`]!.reason, "path refused by the read-only gh");
+    assert.equal(result.guards[`acme/w#2@${SHA_A}`]!.guarded, null);
 });

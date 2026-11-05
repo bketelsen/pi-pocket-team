@@ -20,6 +20,15 @@ import {
     refsIn,
     safeLine,
 } from "./common.mjs";
+import {
+    REVIEW_WINDOW_DAYS,
+    isCrossReviewSpawn,
+    reviewPoints,
+    reviewRounds,
+    threadAt as q1ThreadAt,
+} from "./reviews.mjs";
+
+export { isCrossReviewSpawn };
 
 // ---------- Helpers ----------
 
@@ -1209,22 +1218,6 @@ export const inDeepseekPeak = (ms) => {
     return (hour >= 1 && hour < 4) || (hour >= 6 && hour < 10);
 };
 
-/**
- * A cross-review reviewer (Brian's cross-review policy): a read-only subagent with exactly the tools `read` and
- * `bash`, whose name or brief says "review". It runs on another model family by design.
- */
-export function isCrossReviewSpawn(spawn) {
-    const tools = spawn.tools;
-
-    return (
-        Array.isArray(tools) &&
-        tools.length === 2 &&
-        tools.includes("read") &&
-        tools.includes("bash") &&
-        (spawn.review === true || /review/i.test(`${spawn.name ?? ""} ${spawn.brief ?? ""}`))
-    );
-}
-
 /** F3: a subagent on a model other than the brief's worker, and a DeepSeek worker that starts in its peak. */
 export function checkF3(data, ctx) {
     const findings = [];
@@ -2118,24 +2111,6 @@ const q1Unavailable = (data, source, key) => {
     return data[key] === undefined ? { available: false, reason: "no data" } : undefined;
 };
 
-/**
- * The desk thread of a session at a time: the only thread of that session, or of 2 or more, the one with the latest
- * `startedAt` at or before `at`. Undefined when there is none.
- */
-function q1ThreadAt(data, session, at) {
-    const list = Object.values(data.threads ?? {}).filter(
-        (thread) => thread.session !== undefined && thread.session === session,
-    );
-
-    if (list.length <= 1) {
-        return list[0];
-    }
-
-    return list
-        .filter((thread) => typeof thread.startedAt === "number" && thread.startedAt <= at)
-        .sort((a, b) => b.startedAt - a.startedAt || byThreadId(a.id, b.id))[0];
-}
-
 const q1RepoOf = (thread) =>
     typeof thread?.repo === "string" && thread.repo !== "" ? thread.repo : UNATTRIBUTED;
 
@@ -2454,6 +2429,175 @@ function q1CiReruns(data, acceptanceRepos) {
     };
 }
 
+const round2 = (value) => Math.round(value * 100) / 100;
+
+/**
+ * Q1's cross-review rounds per PR, from the session records (the session method; the PR-text method is elsewhere).
+ * A round is a cross-review spawn, or a send to a name whose latest spawn in that session was one (as `rounds`). The
+ * PR of a round is the first desk-owner ref its message names, else its bare PR number in its desk thread's
+ * repository; a send with none takes the PR of the latest earlier call to that name. Per PR: `rounds`, `heads` (the
+ * distinct reviewed heads), `first` and `last`. `totals.rounds` counts the rounds with a PR, `unattributed` those
+ * without one. No findings.
+ */
+function q1PrRounds(data, ctx) {
+    const unavailable = q1Unavailable(data, "reviews", "reviewCalls");
+
+    if (unavailable) {
+        return unavailable;
+    }
+
+    const byRef = new Map();
+    let unattributed = 0;
+
+    for (const round of reviewRounds(data, ctx)) {
+        if (round.ref === null) {
+            unattributed += 1;
+            continue;
+        }
+
+        const row = byRef.get(round.ref) ?? {
+            ref: round.ref,
+            rounds: 0,
+            heads: new Set(),
+            first: round.at,
+            last: round.at,
+        };
+
+        row.rounds += 1;
+        row.first = Math.min(row.first, round.at);
+        row.last = Math.max(row.last, round.at);
+
+        if (round.head !== null) {
+            row.heads.add(round.head);
+        }
+
+        byRef.set(round.ref, row);
+    }
+
+    const rows = [...byRef.values()].sort((a, b) => a.ref.localeCompare(b.ref));
+    const counts = rows.map((row) => row.rounds);
+    const sum = counts.reduce((total, count) => total + count, 0);
+
+    return {
+        available: true,
+        method: "sessions",
+        windowDays: REVIEW_WINDOW_DAYS,
+        totals: {
+            prs: rows.length,
+            rounds: sum,
+            mean: rows.length === 0 ? null : round2(sum / rows.length),
+            median: medianOrNull(counts),
+            p90: p90(counts),
+            atLeast3: counts.filter((count) => count >= 3).length,
+            unattributed,
+        },
+        prs: rows.map((row) => ({
+            ref: row.ref,
+            rounds: row.rounds,
+            heads: row.heads.size,
+            first: iso(row.first),
+            last: iso(row.last),
+        })),
+    };
+}
+
+/** The state of a PR for a blocking point: from this run's GitHub read, else from a cached guard. */
+function pointState(ref, prs, guard) {
+    if (ref === null) {
+        return "unknown";
+    }
+
+    const state = prs[ref]?.state;
+
+    if (state === "open" || state === "merged" || state === "closed") {
+        return state;
+    }
+
+    if (guard?.state === "closed" || guard?.state === "merged") {
+        return guard.state;
+    }
+
+    return "unknown";
+}
+
+/**
+ * Q1's blocking points of cross-review answers ("Blocker to guard"): every blocking item of an answer, with the PR
+ * and the reviewed head of the review call it answers, the PR's state, and its guard: whether, from the reviewed head
+ * to the PR's final head, a test or an `AGENTS.md` file of the PR changed and `.memory/corrections.jsonl` got lines
+ * (`loadBlockerGuards`, or a final result of an earlier day). Without GitHub, the points still show, with state `unknown`. No findings.
+ */
+function q1Blockers(data, ctx) {
+    const unavailable =
+        q1Unavailable(data, "reviews", "reviewCalls") ??
+        q1Unavailable(data, "reviewAnswers", "reviewAnswers");
+
+    if (unavailable) {
+        return unavailable;
+    }
+
+    const found = reviewPoints(data, ctx);
+    const guards = { ...(data.blockerCache ?? {}), ...(data.blockerGuards?.guards ?? {}) };
+    const prs = data.blockerGuards?.prs ?? {};
+    const totals = {
+        answers: found.answers,
+        points: found.points.length,
+        attributed: 0,
+        ambiguous: 0,
+        noPr: 0,
+        noHead: 0,
+        open: 0,
+        merged: 0,
+        closed: 0,
+        pending: 0,
+        evaluated: 0,
+        guarded: 0,
+        test: 0,
+        agentsRule: 0,
+        corrections: 0,
+        namesPr: 0,
+        rate: null,
+        unparsed: found.unparsed,
+    };
+    const points = found.points.map((point) => {
+        const guard =
+            point.ref !== null && point.head !== null
+                ? (guards[`${point.ref}@${point.head}`] ?? null)
+                : null;
+        const state = pointState(point.ref, prs, guard);
+
+        if (point.ref !== null) {
+            totals.attributed += 1;
+        } else if (point.ambiguous) {
+            totals.ambiguous += 1;
+        } else {
+            totals.noPr += 1;
+        }
+
+        totals.noHead += point.head === null ? 1 : 0;
+
+        if (state !== "unknown") {
+            totals[state] += 1;
+        }
+
+        if (guard?.final === true && typeof guard.guarded === "boolean") {
+            totals.evaluated += 1;
+            totals.guarded += guard.guarded ? 1 : 0;
+            totals.test += guard.test === true ? 1 : 0;
+            totals.agentsRule += guard.agentsRule === true ? 1 : 0;
+            totals.corrections += guard.corrections > 0 ? 1 : 0;
+            totals.namesPr += guard.namesPr === true ? 1 : 0;
+        } else if (state === "merged" && point.head !== null && guard?.final !== true) {
+            totals.pending += 1;
+        }
+
+        return { ...point, at: iso(point.at), state, guard };
+    });
+
+    totals.rate = totals.evaluated === 0 ? null : round2(totals.guarded / totals.evaluated);
+
+    return { available: true, windowDays: REVIEW_WINDOW_DAYS, totals, points };
+}
+
 /** Run 1 new Q1 part; a part that throws is unavailable, and the acceptance part still stands. */
 const q1Part = (fn, fallback) => {
     try {
@@ -2470,7 +2614,8 @@ const q1Part = (fn, fallback) => {
  * acceptance under 0.75. `unattributed` makes no finding.
  *
  * Beside it, in keys of their own: review rounds per desk thread (`rounds`), 3-failure stops of night-shift goals
- * (`stops`) and CI reruns from the newest flaky-test scan (`ciReruns`). A new part whose source failed is
+ * (`stops`), CI reruns from the newest flaky-test scan (`ciReruns`), cross-review rounds per PR (`prRounds`) and the
+ * blocking points of cross-review answers with their guards (`blockers`). A new part whose source failed is
  * `{ available: false, reason }` and makes no finding; the acceptance part runs all the same.
  */
 export function checkQ1(data, ctx) {
@@ -2600,6 +2745,8 @@ export function checkQ1(data, ctx) {
         (reason) => ({ metrics: unavailable(reason), findings: [] }),
     );
     const ciReruns = q1Part(() => q1CiReruns(data, repoRows), unavailable);
+    const prRounds = q1Part(() => q1PrRounds(data, ctx), unavailable);
+    const blockers = q1Part(() => q1Blockers(data, ctx), unavailable);
 
     findings.push(...roundsFound, ...stops.findings);
 
@@ -2615,6 +2762,8 @@ export function checkQ1(data, ctx) {
             rounds: rounds.metrics,
             stops: stops.metrics,
             ciReruns,
+            prRounds,
+            blockers,
         },
     };
 }

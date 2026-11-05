@@ -2833,7 +2833,14 @@ test("Q1: a source error of each new source leaves the acceptance metrics and fi
     );
 
     const acceptance = (result: ReturnType<typeof checkQ1>) => {
-        const { rounds: _r, stops: _s, ciReruns: _c, ...rest } = result.metrics;
+        const {
+            rounds: _r,
+            stops: _s,
+            ciReruns: _c,
+            prRounds: _p,
+            blockers: _b,
+            ...rest
+        } = result.metrics;
 
         return rest;
     };
@@ -3007,4 +3014,255 @@ test("P1: a missing planning-session source skips P1 by name", () => {
 
     assert.match(result.skipped.P1!, /source unavailable: planSessions: needs the desk threads/);
     assert.equal(result.metrics.P1, undefined);
+});
+
+// ---------- Q1: cross-review rounds per PR and blocking points ----------
+
+const HEAD_A = "a".repeat(40);
+const HEAD_B = "b".repeat(40);
+
+/** A review call with the PRs and the head its message names. */
+const named = (
+    call: ReviewCall,
+    refs: string[] = [],
+    bare: number[] = [],
+    head: string | null = null,
+) => ({ ...call, refs, bare, head });
+
+test("Q1 prRounds: rounds per PR from the session records; a send takes the PR of the call before it", () => {
+    const t1 = thread("T1");
+    const s = t1.session;
+    const at = ago(2 * DAY);
+    const reviewCalls = [
+        named(reviewerSpawn(s, at), ["acme/widgets#4", "stranger/x#1"], [], HEAD_A),
+        // A send with no PR of its own takes acme/widgets#4; its head is its own.
+        named(sendTo(s, at + MINUTE, "reviewer"), [], [], HEAD_B),
+        named(sendTo(s, at + 2 * MINUTE, "reviewer")),
+        // A bare number goes to the repository of the session's desk thread.
+        named(reviewerSpawn(s, at + 3 * MINUTE, "rv5"), [], [5]),
+        // A coder call names a PR and is no round.
+        named(coderSpawn(s, at + 4 * MINUTE), ["acme/widgets#6"]),
+        // A round with no PR: unattributed.
+        named(reviewerSpawn(s, at + 5 * MINUTE, "rv0")),
+        // Older than 30 days.
+        named(reviewerSpawn(s, ago(31 * DAY), "old"), ["acme/widgets#7"]),
+    ];
+    const result = checkQ1(
+        emptyData({ decided: todayEmpty, threads: threadMap(t1), reviewCalls }),
+        q1Ctx([]),
+    );
+
+    assert.deepEqual(result.metrics.prRounds, {
+        available: true,
+        method: "sessions",
+        windowDays: 30,
+        totals: {
+            prs: 2,
+            rounds: 4,
+            mean: 2,
+            median: 2,
+            p90: 3,
+            atLeast3: 1,
+            unattributed: 1,
+        },
+        prs: [
+            {
+                ref: "acme/widgets#4",
+                rounds: 3,
+                heads: 2,
+                first: "2026-10-21T14:00Z",
+                last: "2026-10-21T14:02Z",
+            },
+            {
+                ref: "acme/widgets#5",
+                rounds: 1,
+                heads: 0,
+                first: "2026-10-21T14:03Z",
+                last: "2026-10-21T14:03Z",
+            },
+        ],
+    });
+    // No finding comes from it.
+    assert.deepEqual(ids(result), []);
+});
+
+test("Q1 blockers: points of answers with their PR, head, state and guard; ambiguous and unmatched answers", () => {
+    const t1 = thread("T1");
+    const s = t1.session;
+    const at = ago(DAY);
+    const reviewCalls = [
+        named(reviewerSpawn(s, at, "rv4"), ["acme/widgets#4"], [], HEAD_A),
+        named(reviewerSpawn(s, at, "rv5"), ["acme/widgets#5"], [], HEAD_A),
+        // 2 desk-owner refs: ambiguous.
+        named(reviewerSpawn(s, at, "both"), ["acme/widgets#4", "acme/widgets#5"], [], HEAD_A),
+        named(reviewerSpawn(s, at, "rv8"), ["acme/widgets#8"]),
+        named(coderSpawn(s, at, "coder"), ["acme/widgets#4"], [], HEAD_A),
+    ];
+    const answer = (id: number, name: string, items: string[], ready: boolean | null = false) => ({
+        id,
+        c: s,
+        at: at + id * MINUTE,
+        name,
+        ready,
+        items,
+    });
+    const reviewAnswers = [
+        answer(1, "rv4", ["1", "2"]),
+        answer(2, "rv5", ["A1"]),
+        answer(3, "both", ["1"]),
+        answer(4, "rv8", ["#1"]),
+        // A "Not ready" answer with no item it can read.
+        answer(5, "rv4", []),
+        // The coder's answer, and an answer with no review call: skipped.
+        answer(6, "coder", ["1"]),
+        answer(7, "nobody", ["1"]),
+        { ...answer(8, "rv4", ["9"]), c: 999 },
+    ];
+    const guard = {
+        final: true,
+        state: "merged",
+        guarded: true,
+        test: true,
+        agentsRule: false,
+        corrections: 1,
+        namesPr: false,
+    };
+    const cached = { final: true, state: "closed", guarded: null };
+    const data = emptyData({
+        decided: todayEmpty,
+        threads: threadMap(t1),
+        reviewCalls,
+        reviewAnswers,
+        blockerCache: { [`acme/widgets#5@${HEAD_A}`]: cached },
+        blockerGuards: {
+            prs: {
+                "acme/widgets#4": { state: "merged", mergedAt: null, closedAt: null, head: HEAD_B },
+                "acme/widgets#8": { state: "open", mergedAt: null, closedAt: null, head: HEAD_B },
+            },
+            guards: { [`acme/widgets#4@${HEAD_A}`]: guard },
+            calls: 2,
+            pending: 0,
+        },
+    });
+    const blockers = checkQ1(data, q1Ctx([])).metrics.blockers;
+    const base = { session: s, at: "", reviewer: "" };
+
+    assert.equal(blockers.available, true);
+    assert.equal(blockers.windowDays, 30);
+    assert.deepEqual(
+        blockers.points.map((point: typeof base & Record<string, unknown>) => ({
+            ...point,
+            ...base,
+        })),
+        [
+            {
+                ...base,
+                ref: "acme/widgets#4",
+                head: HEAD_A,
+                item: "1",
+                answer: 1,
+                state: "merged",
+                guard,
+            },
+            {
+                ...base,
+                ref: "acme/widgets#4",
+                head: HEAD_A,
+                item: "2",
+                answer: 1,
+                state: "merged",
+                guard,
+            },
+            {
+                ...base,
+                ref: "acme/widgets#5",
+                head: HEAD_A,
+                item: "A1",
+                answer: 2,
+                state: "closed",
+                guard: cached,
+            },
+            {
+                ...base,
+                ref: null,
+                head: HEAD_A,
+                item: "1",
+                answer: 3,
+                ambiguous: true,
+                refs: ["acme/widgets#4", "acme/widgets#5"],
+                state: "unknown",
+                guard: null,
+            },
+            {
+                ...base,
+                ref: "acme/widgets#8",
+                head: null,
+                item: "#1",
+                answer: 4,
+                state: "open",
+                guard: null,
+            },
+        ],
+    );
+    assert.equal(blockers.points[0].at, "2026-10-22T14:01Z");
+    assert.equal(blockers.points[0].reviewer, "rv4");
+    assert.deepEqual(blockers.totals, {
+        answers: 5,
+        points: 5,
+        attributed: 4,
+        ambiguous: 1,
+        noPr: 0,
+        noHead: 1,
+        open: 1,
+        merged: 2,
+        closed: 1,
+        pending: 0,
+        evaluated: 2,
+        guarded: 2,
+        test: 2,
+        agentsRule: 0,
+        corrections: 2,
+        namesPr: 0,
+        rate: 1,
+        unparsed: 1,
+    });
+    assert.deepEqual(ids(checkQ1(data, q1Ctx([]))), []);
+
+    // Without GitHub: the points stay, the state is unknown, and a cached guard still applies.
+    const offline = checkQ1(
+        {
+            ...data,
+            blockerGuards: undefined,
+            sourceErrors: { blockerGuards: "disabled by --no-github" },
+        },
+        q1Ctx([]),
+    ).metrics.blockers;
+
+    assert.equal(offline.available, true);
+    assert.deepEqual(
+        offline.points.map((point: { state: string; guard: object | null }) => [
+            point.state,
+            point.guard,
+        ]),
+        [
+            ["unknown", null],
+            ["unknown", null],
+            ["closed", cached],
+            ["unknown", null],
+            ["unknown", null],
+        ],
+    );
+    assert.equal(offline.totals.rate, null);
+
+    // A merged PR with no guard yet is pending; the answers source failing makes the part unavailable.
+    const pending = checkQ1(
+        { ...data, blockerGuards: { ...data.blockerGuards, guards: {} } },
+        q1Ctx([]),
+    ).metrics.blockers;
+
+    assert.equal(pending.totals.pending, 2);
+    assert.deepEqual(
+        checkQ1({ ...data, sourceErrors: { reviewAnswers: "boom" } }, q1Ctx([])).metrics.blockers,
+        { available: false, reason: "boom" },
+    );
 });

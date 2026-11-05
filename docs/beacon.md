@@ -51,6 +51,9 @@ What exists today:
 | Each day's findings and metrics                                                                | `findings.json` of the daily audit, 1 folder per day                                              |
 | `plan` tool calls and refusals of each planning session (pi-pocket-team#119)                   | Pocket's entries; `loadPlanSessions` in `audit/sources.mjs` keeps 600 characters of a refusal     |
 | Tool calls of a planning session that name `desk.ts` or `pi-pocket/src` (source reads)         | Pocket's entries; `loadPlanSessions` keeps the tool name only, no argument text                   |
+| PR refs and reviewed head of each `subagent` spawn and send                                    | Pocket's entries; `loadReviewCalls` keeps the refs, the PR numbers and the head SHA, no text      |
+| Reviewer answers: the verdict (`Ready`, `Not ready`) and the labels of the blocking items      | Pocket's entries; `loadReviewAnswers` in `audit/sources.mjs` keeps no answer text                 |
+| Guard of each blocking point: test, `AGENTS.md` rule, corrections line after the reviewed head | `metrics.Q1.blockers.points[].guard` in `findings.json`; a final result is not fetched again      |
 
 Gaps:
 
@@ -61,7 +64,9 @@ Gaps:
 - **Router coverage.** A route is recorded only for a delegated night shift, not for other delegations.
 - **Wall time and rounds are partial.** A goal keeps only its newest 30 rounds (`KEPT_ROUNDS`), and a new goal in the
   same session writes over the old one. A thread keeps only its newest 50 events.
-- **Cross-review verdict.** Spawns and sends are recorded, but `Ready` or `Not ready` is only text in a transcript.
+- **Cross-review verdict.** Partly closed: the audit parses each reviewer answer for its verdict and its blocking
+  items (`loadReviewAnswers`). The parse reads free text: an answer in a format it does not know gives no item (Q1
+  counts a `Not ready` answer with no item as `unparsed`), and no module records the verdict as a field.
 - **Tool errors.** The audit reads errors of the team tools and the `plan` tool only (`loadToolErrors`), not of every
   tool.
 - **Outcome after merge.** Reverts are found by PR title and body (Q1). Nothing links a later fix PR to the PR it
@@ -85,6 +90,13 @@ What exists today:
 - **Q1** (T801): decided acceptance, `(merged − reverted) / decided`, per repository and per agent, over 30 days. A
   finding needs 8 or more decided PRs and 25 or more covered days. T801 t12 added review rounds per thread (median and
   P90), 3-failure stops (2 in 7 days per repository), and CI reruns from the flaky-test scan.
+- **Q1 `prRounds` and `blockers`** (measurement only, no finding): cross-review rounds per PR from the session
+  records (`rounds`, `heads`, mean, median, P90, PRs with 3 or more rounds, rounds with no PR), and every blocking
+  point of a reviewer answer with its PR, its reviewed head, the PR's state and its guard: a test or an `AGENTS.md`
+  file of the PR's own diff that is new or changed at the final head against the reviewed head, and the
+  `.memory/corrections.jsonl` lines added between them. `rate` is guarded points over evaluated points, null at 0.
+  GitHub calls, inside the cap of 40 and with no compare: at most 8 PR queries of 40 PRs, then at most 4 blob queries
+  of at most 150 object lookups a run, newest first; the rest stay pending for the next run.
 - **F3** compares a subagent's model with the brief's worker. **J1** gives spend per day, agent and thread.
 - **P1** (pi-pocket-team#119): plan tool friction, per planning session and in sum: `plan` calls, refused calls, the
   rate (null at 0 calls), refusals with 1 of 6 targeted texts (`targetedBy` counts each text), and source reads. Only a

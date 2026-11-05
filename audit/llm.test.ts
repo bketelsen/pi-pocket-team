@@ -830,6 +830,16 @@ test("Q1: the model never gets the review-round thread list or the stop list; th
                 totals: { stops: 2, last7: 2 },
                 goals: [{ id: "goal-8812", session: 4471, thread: null }],
             },
+            prRounds: {
+                available: true,
+                totals: { prs: 1, rounds: 4, atLeast3: 1 },
+                prs: [{ ref: "acme/widgets#5531", rounds: 4 }],
+            },
+            blockers: {
+                available: true,
+                totals: { points: 1, evaluated: 0, unparsed: 0 },
+                points: [{ ref: "acme/widgets#5532", item: "A1" }],
+            },
         },
     };
     const fit = fitInput([q1], q1Metrics, []);
@@ -838,7 +848,14 @@ test("Q1: the model never gets the review-round thread list or the stop list; th
     assert.ok(!fit.content.includes("goal-8812"));
     assert.ok(fit.content.includes('"p90":10'));
     assert.ok(fit.content.includes('"last7":2'));
+    // The per-PR round list and the blocking-point list stay out too; their totals stay.
+    assert.ok(!fit.content.includes("5531"));
+    assert.ok(!fit.content.includes("5532"));
+    assert.ok(fit.content.includes('"atLeast3":1'));
+    assert.ok(fit.content.includes('"evaluated":0'));
     // The metrics passed in are not changed.
     assert.equal(q1Metrics.Q1.rounds.threads.length, 1);
     assert.equal(q1Metrics.Q1.stops.goals.length, 1);
+    assert.equal(q1Metrics.Q1.prRounds.prs.length, 1);
+    assert.equal(q1Metrics.Q1.blockers.points.length, 1);
 });

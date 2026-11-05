@@ -10,6 +10,15 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { apply } from "@earendil-works/chord/delta";
 import { DAY, HOUR, branchLeft, refsIn } from "./common.mjs";
+import {
+    ANSWER,
+    blockingItems,
+    guardCacheOf,
+    headIn,
+    prRefsIn,
+    reviewPoints,
+    verdictIn,
+} from "./reviews.mjs";
 
 export const BOT = "frostyard-machines";
 /** The most `gh` calls a run may make. */
@@ -585,8 +594,10 @@ function spawnRows(db, where, params) {
 
 /**
  * Q1's review rounds: every `subagent` call with the action `spawn` or `send` from `since` on, oldest first. A row is
- * `{ id, c, at, action, name }`; a spawn row also has `model`, `tools`, `review` and `brief`, as `spawnRows` makes
- * them (so `isCrossReviewSpawn` reads it). No message text is kept but the first 300 characters of a spawn's brief.
+ * `{ id, c, at, action, name, refs, bare, head }`; a spawn row also has `model`, `tools`, `review` and `brief`, as
+ * `spawnRows` makes them (so `isCrossReviewSpawn` reads it). `refs` and `bare` are the PRs the whole message names
+ * (`prRefsIn`), `head` the reviewed head it names (`headIn`). No message text is kept but the first 300 characters of
+ * a spawn's brief.
  */
 export function loadReviewCalls(db, since) {
     const out = [];
@@ -607,12 +618,18 @@ export function loadReviewCalls(db, since) {
                 continue;
             }
 
+            const message =
+                typeof part.arguments.message === "string" ? part.arguments.message : "";
+            const { refs, bare } = prRefsIn(message);
             const call = {
                 id: row.id,
                 c: row.c,
                 at: entry.model[0].timestamp,
                 action,
                 name: typeof part.arguments.name === "string" ? part.arguments.name : null,
+                refs,
+                bare,
+                head: headIn(message),
             };
 
             if (action === "spawn") {
@@ -636,6 +653,39 @@ export function loadReviewCalls(db, since) {
     }
 
     return out;
+}
+
+/**
+ * The answers of subagents from `since` on, by id: user entries that start with `[subagent NAME answered`. A row is
+ * `{ id, c, at, name, ready, items }`: the verdict (`verdictIn`) and the labels of the blocking points
+ * (`blockingItems`). No answer text is kept.
+ */
+export function loadReviewAnswers(db, since) {
+    const out = [];
+
+    for (const row of db
+        .prepare(
+            `select id, conversation_id c, record from entries where json_extract(record,'$.kind')='pi.user'
+             and ${ts} >= ? and record like '%[subagent %answered%' order by id`,
+        )
+        .all(since)) {
+        const entry = parseEntry(row);
+        const text = textOf(entry);
+        const name = ANSWER.exec(text)?.[1];
+
+        if (name !== undefined) {
+            out.push({
+                id: row.id,
+                c: row.c,
+                at: entry.model[0].timestamp,
+                name,
+                ready: verdictIn(text),
+                items: blockingItems(text),
+            });
+        }
+    }
+
+    return out.sort((a, b) => a.id - b.id);
 }
 
 /** The detail that Night shift writes in `why` when the same check failure stops a goal (pi-pocket-team#108). */
@@ -1044,6 +1094,392 @@ export function loadDecided(data, { gh, now, since }) {
     return result;
 }
 
+// ---------- Q1: guards of blocking review points ----------
+
+/** At most this many PR state queries (40 PRs each) of `loadBlockerGuards` in 1 run. */
+export const BLOCKER_MAX_PR_QUERIES = 8;
+/** At most this many object lookups in 1 blob query. */
+export const BLOCKER_LOOKUPS = 150;
+/** At most this many blob queries in 1 run. */
+export const BLOCKER_MAX_QUERIES = 4;
+/** At most this many files of a PR are read; a PR with more is "too many files". */
+const BLOCKER_PR_FILES = 100;
+const CORRECTIONS_FILE = ".memory/corrections.jsonl";
+
+/** The words that `checkGhArgs` refuses in a `gh` argument. */
+const READ_ONLY_REFUSED = /\b(mutation|subscription)\b/i;
+
+const BLOCKER_PR_QUERY =
+    "state mergedAt closedAt headRefOid files(first: 100) { totalCount nodes { path additions } }";
+
+const TEST_PATHS = [
+    /(^|\/)(tests?|__tests__|spec|testdata)\//,
+    /[._-](test|spec)\.[^/]+$/,
+    /(^|\/)test_[^/]+\.py$/,
+    /_test\.go$/,
+];
+
+/**
+ * The files of a PR's own diff that can guard a blocking point: test files, `AGENTS.md` files (any folder) and
+ * `.memory/corrections.jsonl`. Each is `{ path, test, agents, corrections }`.
+ */
+export function guardCandidates(prFiles) {
+    return [
+        ...new Set(prFiles.map((file) => file?.path).filter((path) => typeof path === "string")),
+    ]
+        .map((path) => ({
+            path,
+            test: TEST_PATHS.some((pattern) => pattern.test(path)),
+            agents: /(^|\/)AGENTS\.md$/.test(path),
+            corrections: path === CORRECTIONS_FILE,
+        }))
+        .filter((file) => file.test || file.agents || file.corrections);
+}
+
+const escapeRegExp = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/** The non-empty lines of a text. */
+const linesOf = (text) =>
+    String(text)
+        .split("\n")
+        .map((line) => line.replace(/\r$/, ""))
+        .filter((line) => line.trim() !== "");
+
+/** The lines of `after` that are not in `before`, as a multiset: a line 2 times after and 1 time before is 1 line. */
+function addedLines(before, after) {
+    const counts = new Map();
+
+    for (const line of linesOf(before)) {
+        counts.set(line, (counts.get(line) ?? 0) + 1);
+    }
+
+    return linesOf(after).filter((line) => {
+        const left = counts.get(line) ?? 0;
+
+        counts.set(line, left - 1);
+
+        return left <= 0;
+    });
+}
+
+/** The text of a blob lookup: "" with no blob, null when GitHub gave no whole text. */
+const blobText = (blob) =>
+    blob === null || blob === undefined
+        ? ""
+        : typeof blob.text === "string" && blob.isTruncated !== true
+          ? blob.text
+          : null;
+
+/**
+ * The guard of 1 blocking point, from blob lookups at the reviewed head H and the PR's final head F. `lookup` is
+ * `{ head, files }`: `head` is GitHub's object of H (null when GitHub does not have it); each file is a candidate of
+ * `guardCandidates` with `atHead` and `atFinal`, the blob at H and at F (`{ oid, text?, isTruncated? }`, or null with
+ * no blob). A file changed when it has a blob at F with another oid than at H (no blob at H: a new file); a deleted
+ * file did not change. `corrections` counts the non-empty lines at F that are not at H.
+ */
+export function guardOf(ref, { head, files }) {
+    if (!head) {
+        return { final: true, state: "merged", guarded: null, reason: "head not found" };
+    }
+
+    const changed = (file) =>
+        Boolean(file.atFinal) && (!file.atHead || file.atHead.oid !== file.atFinal.oid);
+    const test = files.some((file) => file.test && changed(file));
+    const agentsRule = files.some((file) => file.agents && changed(file));
+    const log = files.find((file) => file.corrections && changed(file));
+    let corrections = 0;
+    let namesPr = false;
+
+    if (log) {
+        const before = blobText(log.atHead);
+        const after = blobText(log.atFinal);
+
+        if (before === null || after === null) {
+            return {
+                final: true,
+                state: "merged",
+                guarded: null,
+                test,
+                agentsRule,
+                corrections: null,
+                namesPr: null,
+                reason: "corrections text missing",
+            };
+        }
+
+        const lines = addedLines(before, after);
+        const [, owner, name, number] = /^([^/]+)\/([^#]+)#(\d+)$/.exec(ref) ?? [];
+
+        corrections = lines.length;
+
+        if (name !== undefined) {
+            const mention = new RegExp(
+                `(?<![\\w./-])(?:${escapeRegExp(owner)}\\/)?${escapeRegExp(name)}#${number}(?!\\d)`,
+                "i",
+            );
+
+            namesPr = lines.some((line) => mention.test(line));
+        }
+    }
+
+    return {
+        final: true,
+        state: "merged",
+        guarded: (test || agentsRule) && corrections > 0,
+        test,
+        agentsRule,
+        corrections,
+        namesPr,
+    };
+}
+
+/** The object lookups of 1 key in 1 blob query: H, and each candidate at H and at F. */
+const lookupCount = (key) => 1 + 2 * key.files.length;
+
+/** 1 blob query: 1 `repository` alias per repository, and in it the lookups of each key. */
+function blobQuery(batch) {
+    const repos = new Map();
+
+    batch.forEach((key, index) => {
+        const lines = [`k${index}: object(oid: ${JSON.stringify(key.head)}) { oid }`];
+
+        key.files.forEach((file, j) => {
+            const blob = file.corrections ? " ... on Blob { text isTruncated }" : "";
+
+            for (const [mark, sha] of [
+                ["h", key.head],
+                ["f", key.final],
+            ]) {
+                lines.push(
+                    `k${index}${mark}${j}: object(expression: ${JSON.stringify(`${sha}:${file.path}`)}) { oid${blob} }`,
+                );
+            }
+        });
+
+        const repo = key.ref.split("#")[0];
+
+        repos.set(repo, [...(repos.get(repo) ?? []), ...lines]);
+    });
+
+    const aliases = new Map();
+    const parts = [...repos.entries()].map(([repo, lines], n) => {
+        const [owner, name] = repo.split("/");
+
+        aliases.set(repo, `r${n}`);
+
+        return `r${n}: repository(owner: ${JSON.stringify(owner)}, name: ${JSON.stringify(name)}) { ${lines.join(" ")} }`;
+    });
+
+    return { text: `{ ${parts.join("\n")} }`, aliases };
+}
+
+/**
+ * The guards of 1 blob query's keys, from its answer. A key whose aliases are missing, or that an error names (or an
+ * error with no path), gets no result: it stays pending.
+ */
+function guardsOfAnswer(batch, aliases, answer) {
+    const data = answer?.data && typeof answer.data === "object" ? answer.data : null;
+    const errors = Array.isArray(answer?.errors) ? answer.errors : [];
+    const badRepos = new Set();
+    const badKeys = new Set();
+    let allBad = data === null;
+
+    for (const error of errors) {
+        const path = Array.isArray(error?.path) ? error.path : [];
+        const index = /^k(\d+)(?:[hf]\d+)?$/.exec(String(path[1] ?? ""))?.[1];
+
+        if (path.length === 0) {
+            allBad = true;
+        } else if (index === undefined) {
+            badRepos.add(path[0]);
+        } else {
+            badKeys.add(`${path[0]}:${index}`);
+        }
+    }
+
+    const out = new Map();
+
+    batch.forEach((key, index) => {
+        const alias = aliases.get(key.ref.split("#")[0]);
+        const repo = data?.[alias];
+        const names = [
+            `k${index}`,
+            ...key.files.flatMap((_, j) => [`k${index}h${j}`, `k${index}f${j}`]),
+        ];
+
+        if (
+            allBad ||
+            badRepos.has(alias) ||
+            badKeys.has(`${alias}:${index}`) ||
+            !repo ||
+            typeof repo !== "object" ||
+            !names.every((name) => name in repo)
+        ) {
+            return;
+        }
+
+        out.set(
+            key.key,
+            guardOf(key.ref, {
+                head: repo[`k${index}`],
+                files: key.files.map((file, j) => ({
+                    ...file,
+                    atHead: repo[`k${index}h${j}`],
+                    atFinal: repo[`k${index}f${j}`],
+                })),
+            }),
+        );
+    });
+
+    return out;
+}
+
+/**
+ * The guards of Q1's blocking points ("Blocker to guard"). The points come from `reviewPoints`; a point whose
+ * `ref@head` has a final result in `cache` (earlier days) needs no call. Step 1: the other PRs, newest points first,
+ * 40 to a GraphQL query, at most `BLOCKER_MAX_PR_QUERIES` queries: their state and their files. Step 2: for each
+ * merged `(ref, head)`, the candidate files of the PR's own diff (`guardCandidates`) are looked up at the reviewed
+ * head and at the final head, with no compare call: at most `BLOCKER_LOOKUPS` object lookups a query, at most
+ * `BLOCKER_MAX_QUERIES` queries a run, newest keys first. Keys that do not fit, or whose answer is missing, stay
+ * pending: the next run tries again. A closed PR is final with no lookup. Returns `{ prs, guards, calls, pending }`.
+ */
+export function loadBlockerGuards(data, { gh, now, cache = {} }) {
+    const startCalls = gh.state.calls;
+    const { points } = reviewPoints(data, { now });
+    const newest = [...points].reverse();
+    const isFinal = (point) => cache[`${point.ref}@${point.head}`]?.final === true;
+    const refs = [
+        ...new Set(
+            newest
+                .filter((point) => point.ref !== null && !(point.head !== null && isFinal(point)))
+                .map((point) => point.ref),
+        ),
+    ].slice(0, 40 * BLOCKER_MAX_PR_QUERIES);
+    const nodes = {};
+
+    for (let start = 0; start < refs.length && !gh.state.capReached; start += 40) {
+        const chunk = refs.slice(start, start + 40);
+        const parts = chunk.map((ref, index) => {
+            const [, owner, name, number] = /^([^/]+)\/([^#]+)#(\d+)$/.exec(ref);
+
+            return `p${index}: repository(owner: ${JSON.stringify(owner)}, name: ${JSON.stringify(name)}) { pullRequest(number: ${number}) { ${BLOCKER_PR_QUERY} } }`;
+        });
+        const answer = json(gh.graphql(`{ ${parts.join("\n")} }`), {});
+
+        // A PR that GitHub cannot find is null with an error beside it, and `gh` fails: the other PRs still count.
+        chunk.forEach((ref, index) => {
+            const node = answer.data?.[`p${index}`]?.pullRequest;
+
+            if (node && typeof node.state === "string") {
+                nodes[ref] = node;
+            }
+        });
+    }
+
+    const prs = {};
+
+    for (const [ref, node] of Object.entries(nodes)) {
+        prs[ref] = {
+            state: node.state.toLowerCase(),
+            mergedAt: node.mergedAt ?? null,
+            closedAt: node.closedAt ?? null,
+            head: node.headRefOid ?? null,
+        };
+    }
+
+    const guards = {};
+    const keys = [];
+    const tooMany = { final: true, state: "merged", guarded: null, reason: "too many files" };
+
+    for (const point of newest) {
+        const key = `${point.ref}@${point.head}`;
+        const node = nodes[point.ref];
+
+        if (
+            point.ref === null ||
+            point.head === null ||
+            !node ||
+            isFinal(point) ||
+            key in guards ||
+            keys.some((item) => item.key === key)
+        ) {
+            continue;
+        }
+
+        if (node.state === "CLOSED") {
+            guards[key] = { final: true, state: "closed", guarded: null };
+            continue;
+        }
+
+        if (node.state !== "MERGED" || typeof node.headRefOid !== "string") {
+            continue;
+        }
+
+        const prFiles = Array.isArray(node.files?.nodes) ? node.files.nodes : [];
+        const files = guardCandidates(prFiles);
+
+        if (node.files?.totalCount > BLOCKER_PR_FILES) {
+            guards[key] = tooMany;
+        } else if (point.head === node.headRefOid || files.length === 0) {
+            // No commit after the reviewed head, or no file that can guard: nothing to look up.
+            guards[key] = guardOf(point.ref, { head: { oid: point.head }, files: [] });
+        } else {
+            const item = { key, ref: point.ref, head: point.head, final: node.headRefOid, files };
+
+            if (lookupCount(item) > BLOCKER_LOOKUPS) {
+                guards[key] = tooMany;
+            } else if (files.some((file) => READ_ONLY_REFUSED.test(file.path))) {
+                // `checkGhArgs` refuses a query with these words: such a path cannot be looked up.
+                guards[key] = {
+                    final: true,
+                    state: "merged",
+                    guarded: null,
+                    reason: "path refused by the read-only gh",
+                };
+            } else {
+                keys.push(item);
+            }
+        }
+    }
+
+    // Newest keys first, in order: a key that does not fit starts the next query.
+    const batches = [];
+
+    for (const key of keys) {
+        const last = batches.at(-1);
+
+        if (last && last.size + lookupCount(key) <= BLOCKER_LOOKUPS) {
+            last.keys.push(key);
+            last.size += lookupCount(key);
+        } else {
+            batches.push({ keys: [key], size: lookupCount(key) });
+        }
+    }
+
+    let pending = 0;
+
+    batches.forEach((batch, index) => {
+        if (index >= BLOCKER_MAX_QUERIES || gh.state.capReached) {
+            pending += batch.keys.length;
+
+            return;
+        }
+
+        const query = blobQuery(batch.keys);
+        const found = guardsOfAnswer(batch.keys, query.aliases, json(gh.graphql(query.text), {}));
+
+        for (const key of batch.keys) {
+            if (found.has(key.key)) {
+                guards[key.key] = found.get(key.key);
+            } else {
+                pending += 1;
+            }
+        }
+    });
+
+    return { prs, guards, calls: gh.state.calls - startCalls, pending };
+}
+
 // ---------- Odrade's notes ----------
 
 /** The notes folder: its index, its reports, its uncommitted files and its last commit. Never written. */
@@ -1227,7 +1663,8 @@ export function readHomes(dir, git, { exclude = [] } = {}) {
  * Load every source into one plain object. A source that cannot be read goes to `sourceErrors` by name, and the
  * checks that need it are skipped.
  *
- * Options: `pocketDir`, `odradeDir`, `homesDir`, `now`, `hours`, `useGithub`, `run` (a process runner, for tests).
+ * Options: `pocketDir`, `odradeDir`, `homesDir`, `now`, `hours`, `useGithub`, `run` (a process runner, for tests),
+ * `earlier` (the earlier days' JSON, as `loadEarlier` gives it: their final guard results need no GitHub call).
  */
 export function loadData({
     pocketDir,
@@ -1237,6 +1674,7 @@ export function loadData({
     hours,
     useGithub,
     run = defaultRun,
+    earlier = [],
 }) {
     const since = now - hours * HOUR;
     // J1 compares the window with the 7 days before it.
@@ -1262,6 +1700,9 @@ export function loadData({
         github: undefined,
         decided: undefined,
         reviewCalls: [],
+        reviewAnswers: [],
+        blockerGuards: undefined,
+        blockerCache: guardCacheOf(earlier),
         goalStops: [],
         flakyScan: null,
         planSessions: [],
@@ -1292,6 +1733,7 @@ export function loadData({
             "costs",
             "routes",
             "reviews",
+            "reviewAnswers",
             "goalHistory",
             "planSessions",
         ]) {
@@ -1324,6 +1766,10 @@ export function loadData({
         attempt("costs", () => (data.costRows = loadCosts(db, horizon)));
         // Q1's review rounds and 3-failure stops: 30 days of spawn and send calls, and every goal revision.
         attempt("reviews", () => (data.reviewCalls = loadReviewCalls(db, now - 30 * DAY)));
+        attempt(
+            "reviewAnswers",
+            () => (data.reviewAnswers = loadReviewAnswers(db, now - 30 * DAY)),
+        );
         attempt("goalHistory", () => (data.goalStops = loadGoalStops(db)));
 
         // P1's planning sessions come from the desk's plan threads: without the desk, they are unknown, not none.
@@ -1358,6 +1804,17 @@ export function loadData({
     } else {
         attempt("decided", () => {
             data.decided = loadDecided(data, { gh, now, since });
+        });
+    }
+
+    // Q1's guards of blocking review points, after the search, with the same `gh` and its cap.
+    if (!useGithub) {
+        sourceErrors.blockerGuards = "disabled by --no-github";
+    } else if (sourceErrors.desk) {
+        sourceErrors.blockerGuards = "needs the desk threads";
+    } else {
+        attempt("blockerGuards", () => {
+            data.blockerGuards = loadBlockerGuards(data, { gh, now, cache: data.blockerCache });
         });
     }
 

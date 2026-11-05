@@ -28,6 +28,7 @@ export function emptyData(over = {}) {
         homes: [],
         github: { botPrs: [], prs: {}, checkRuns: {}, autoDelete: {} },
         reviewCalls: [],
+        reviewAnswers: [],
         goalStops: [],
         flakyScan: null,
         planSessions: [],
