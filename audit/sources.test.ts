@@ -27,6 +27,7 @@ import {
     makeGh,
     makeGit,
     openPocket,
+    readFlakyKeys,
     readFlakyScan,
     readHomes,
     readOdrade,
@@ -1679,8 +1680,8 @@ test("loadGoalStops finds a 3-failure stop that a later goal wrote over, in a re
 
     // The fixture's own goal g1 is blocked with another detail: not a stop.
     assert.deepEqual(stops, [
-        { session: SESSION_T2, id: "g2", at: endedAt },
-        { session: SESSION_T2, id: "g4", at: NOW - 10 * 60_000 },
+        { session: SESSION_T2, id: "g2", at: endedAt, checks: [], checksFrom: null },
+        { session: SESSION_T2, id: "g4", at: NOW - 10 * 60_000, checks: [], checksFrom: null },
     ]);
     assert.ok(!JSON.stringify(stops).includes("token"));
 });
@@ -1736,7 +1737,9 @@ test("loadGoalStops: a 3-failure goal in its summary round is not a stop; after 
         ]);
     });
 
-    assert.deepEqual(read(), [{ session: SESSION_T2, id: "g5", at: endedAt }]);
+    assert.deepEqual(read(), [
+        { session: SESSION_T2, id: "g5", at: endedAt, checks: [], checksFrom: null },
+    ]);
 });
 
 test("loadGoalStops: a second base resets the value; the stop before it and the goal after it are both found", () => {
@@ -1789,9 +1792,274 @@ test("loadGoalStops: a second base resets the value; the stop before it and the 
     db.close();
 
     assert.deepEqual(stops, [
-        { session: SESSION_T2, id: "g6", at: firstEnd },
-        { session: SESSION_T2, id: "g7", at: secondRound },
+        { session: SESSION_T2, id: "g6", at: firstEnd, checks: [], checksFrom: null },
+        { session: SESSION_T2, id: "g7", at: secondRound, checks: [], checksFrom: null },
     ]);
+});
+
+/** Add 1 goal document with its revisions to the fixture database. */
+function addGoalDoc(pocketDir: string, docId: number, revisions: [string, unknown][]) {
+    addRows(pocketDir, (db) => {
+        db.prepare(
+            "insert into documents (id, kind, family, key_value, scope_kind, owner_id, created_at, record) values (?,?,?,?,?,?,?,?)",
+        ).run(
+            docId,
+            JSON.stringify("x.night-shift.goal"),
+            0,
+            "",
+            "conversation",
+            SESSION_T2,
+            1,
+            "{}",
+        );
+
+        revisions.forEach(([kind, value], i) =>
+            db
+                .prepare(
+                    "insert into document_revisions (document_id, seq, kind, version, content) values (?,?,?,?,?)",
+                )
+                .run(docId, 1000 + docId * 10 + i, kind, 1, JSON.stringify(value)),
+        );
+    });
+}
+
+const readStops = (pocketDir: string) => {
+    const db = openPocket(path.join(pocketDir, "pocket.sqlite"));
+    const stops = loadGoalStops(db);
+
+    db.close();
+
+    return stops;
+};
+
+test("loadGoalStops keeps the goal's stopChecks as plain values, and drops bad entries and fields", () => {
+    const { pocketDir } = setup();
+    const endedAt = NOW - DAY;
+
+    addGoalDoc(pocketDir, 9, [
+        ["base", { goal: { id: "g8", status: "running", setAt: NOW - 2 * DAY, rounds: [] } }],
+        [
+            "delta",
+            [
+                ["s", ["goal", "status"], "ended"],
+                ["s", ["goal", "reason"], "blocked"],
+                ["s", ["goal", "why"], STOP_WHY],
+                [
+                    "s",
+                    ["goal", "failures"],
+                    { count: 3, round: 3, fingerprint: 'checks failed: ["Lint","Race Detection"]' },
+                ],
+                [
+                    "s",
+                    ["goal", "stopChecks"],
+                    [
+                        { name: "Lint", repo: "acme/widgets", run: 41, job: 126 },
+                        { name: "Race Detection", repo: "not a repo", run: 2 ** 60, job: "7" },
+                        { name: "" },
+                        { repo: "acme/widgets" },
+                    ],
+                ],
+                ["s", ["goal", "endedAt"], endedAt],
+            ],
+        ],
+    ]);
+
+    const stops = readStops(pocketDir);
+
+    assert.deepEqual(stops, [
+        {
+            session: SESSION_T2,
+            id: "g8",
+            at: endedAt,
+            checks: [
+                { name: "Lint", repo: "acme/widgets", run: 41, job: 126 },
+                { name: "Race Detection" },
+            ],
+            checksFrom: "record",
+        },
+    ]);
+    assert.ok(!JSON.stringify(stops).includes("token"));
+});
+
+test("loadGoalStops: with no stopChecks, the job names come from a `checks failed:` fingerprint", () => {
+    const { pocketDir } = setup();
+    const stop = (id: string) => [
+        ["s", ["goal"], { id, status: "running", setAt: NOW - 3 * DAY, rounds: [] }],
+    ];
+    const ended = (at: number, fingerprint: unknown) => [
+        ["s", ["goal", "status"], "ended"],
+        ["s", ["goal", "reason"], "blocked"],
+        ["s", ["goal", "why"], STOP_WHY],
+        ["s", ["goal", "failures"], { count: 3, round: 3, fingerprint }],
+        ["s", ["goal", "endedAt"], at],
+    ];
+
+    addGoalDoc(pocketDir, 10, [
+        ["base", {}],
+        ["delta", stop("g11")],
+        ["delta", ended(NOW - 3 * DAY, 'checks failed: ["Race Detection","build"]')],
+        ["delta", stop("g12")],
+        ["delta", ended(NOW - 2 * DAY, "exit 1: FAIL token=abc")],
+        ["delta", stop("g13")],
+        ["delta", ended(NOW - DAY, "checks failed: {nope")],
+    ]);
+
+    assert.deepEqual(readStops(pocketDir), [
+        {
+            session: SESSION_T2,
+            id: "g11",
+            at: NOW - 3 * DAY,
+            checks: [{ name: "Race Detection" }, { name: "build" }],
+            checksFrom: "fingerprint",
+        },
+        { session: SESSION_T2, id: "g12", at: NOW - 2 * DAY, checks: [], checksFrom: null },
+        { session: SESSION_T2, id: "g13", at: NOW - DAY, checks: [], checksFrom: null },
+    ]);
+});
+
+/** A flaky entry of a scan, as the core spec writes it. */
+const flakyEntry = (key: string, job: string, jobIds: number[], over: object = {}) => ({
+    key,
+    workflow: "ci.yml",
+    job,
+    test: `Test ${job}`,
+    events: jobIds.map((id) => ({
+        run_id: 1,
+        attempt: 1,
+        job_id: id,
+        sha: "0".repeat(40),
+        date: "2026-10-10T00:00:00Z",
+        url: `https://github.com/acme/widgets/actions/runs/1/job/${id}`,
+    })),
+    ...over,
+});
+
+test("readFlakyKeys joins the keys of the scans in the window; an older scan is left out", () => {
+    const dir = tmp();
+    const since = NOW - 30 * DAY;
+
+    assert.equal(readFlakyKeys(dir, since), null, "no reports folder");
+    fs.mkdirSync(path.join(dir, "reports", "2026-10-22-daily-audit"), { recursive: true });
+    assert.equal(readFlakyKeys(dir, since), null, "no scan folder");
+
+    // Older than the window (NOW is 2026-10-23, so the window starts 2026-09-23).
+    writeScan(
+        dir,
+        "2026-09-20-flaky-scan",
+        scanFile({
+            repos: [
+                { repo: "acme/old", error: null, flaky: [flakyEntry("acme/old/k", "old", [1])] },
+            ],
+        }),
+    );
+    assert.equal(readFlakyKeys(dir, since), null, "no scan in the window");
+
+    writeScan(
+        dir,
+        "2026-10-13-flaky-scan",
+        scanFile({
+            repos: [
+                {
+                    repo: "acme/widgets",
+                    error: null,
+                    flaky: [
+                        flakyEntry("acme/widgets/ci.yml/race/TestRace", "race", [5, 3], {
+                            test: "old name",
+                        }),
+                        { workflow: "no key" },
+                    ],
+                },
+            ],
+        }),
+    );
+    writeScan(
+        dir,
+        "2026-10-20-flaky-scan",
+        scanFile({
+            repos: [
+                {
+                    repo: "acme/widgets",
+                    error: null,
+                    flaky: [
+                        flakyEntry("acme/widgets/ci.yml/race/TestRace", "race", [5, 9]),
+                        flakyEntry("acme/widgets/ci.yml/lint/TestLint", "lint", [], {
+                            events: [{ job_id: 2 ** 60 }, { job_id: "8" }, {}],
+                        }),
+                    ],
+                },
+                { repo: "acme/calm", error: null, flaky: [] },
+            ],
+        }),
+    );
+    // A folder in the window with no scan.json is skipped.
+    fs.mkdirSync(path.join(dir, "reports", "2026-10-21-flaky-scan"));
+
+    assert.deepEqual(readFlakyKeys(dir, since), {
+        files: [
+            "reports/2026-10-13-flaky-scan/scan.json",
+            "reports/2026-10-20-flaky-scan/scan.json",
+        ],
+        keys: [
+            {
+                key: "acme/widgets/ci.yml/lint/TestLint",
+                repo: "acme/widgets",
+                workflow: "ci.yml",
+                job: "lint",
+                test: "Test lint",
+                jobIds: [],
+                file: "reports/2026-10-20-flaky-scan/scan.json",
+            },
+            {
+                key: "acme/widgets/ci.yml/race/TestRace",
+                repo: "acme/widgets",
+                workflow: "ci.yml",
+                job: "race",
+                test: "Test race",
+                jobIds: [3, 5, 9],
+                file: "reports/2026-10-20-flaky-scan/scan.json",
+            },
+        ],
+    });
+});
+
+test("readFlakyKeys: a bad scan in the window throws, and loadData names the source", () => {
+    const dir = tmp();
+
+    writeScan(dir, "2026-10-13-flaky-scan", scanFile());
+    writeScan(dir, "2026-10-20-flaky-scan", scanFile({ schema_version: 2 }));
+    assert.throws(() => readFlakyKeys(dir, NOW - 30 * DAY), /schema_version 2/);
+
+    const invalid = tmp();
+
+    writeScan(invalid, "2026-10-20-flaky-scan", "{ nope");
+    assert.throws(() => readFlakyKeys(invalid, NOW - 30 * DAY), /not valid JSON/);
+
+    // A bad scan older than the window is not read.
+    const old = tmp();
+
+    writeScan(old, "2026-09-01-flaky-scan", "{ nope");
+    writeScan(old, "2026-10-20-flaky-scan", scanFile());
+    assert.deepEqual(readFlakyKeys(old, NOW - 30 * DAY), {
+        files: ["reports/2026-10-20-flaky-scan/scan.json"],
+        keys: [],
+    });
+
+    const { pocketDir, odradeDir, homesDir, run } = setup();
+
+    writeScan(odradeDir, "2026-10-20-flaky-scan", scanFile({ repos: undefined }));
+
+    const data = loadData({
+        pocketDir,
+        odradeDir,
+        homesDir,
+        now: NOW,
+        hours: 24,
+        useGithub: false,
+        run,
+    });
+
+    assert.match(data.sourceErrors.flakyKeys, /no repos list/);
+    assert.equal(data.flakyKeys, null);
 });
 
 test("loadData reads the review calls and the goal stops; no flaky scan is null, not an error", () => {
@@ -1809,6 +2077,8 @@ test("loadData reads the review calls and the goal stops; no flaky scan is null,
     assert.equal(data.sourceErrors.reviews, undefined);
     assert.equal(data.sourceErrors.goalHistory, undefined);
     assert.equal(data.sourceErrors.flakyScan, undefined);
+    assert.equal(data.sourceErrors.flakyKeys, undefined);
+    assert.equal(data.flakyKeys, null);
     // 30 days: the 20-day-old spawn is in; the 8-day `spawns` leave it out.
     assert.deepEqual(
         data.reviewCalls.map((call: { name: string }) => call.name),
