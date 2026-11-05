@@ -2501,6 +2501,10 @@ describe("a plan write by edits", () => {
             refused.error,
             "edit 1: oldText is in the file 3 times: give more text to make it unique.",
         );
+        // 2 matches that overlap count too: "aa" is in "aaa" 2 times.
+        assert.deepEqual(applyPlanEdits("aaa", [{ oldText: "aa", newText: "x" }], "the file"), {
+            error: "edit 1: oldText is in the file 2 times: give more text to make it unique.",
+        });
     });
 
     test("2 edits that overlap are refused, by their numbers", async () => {
