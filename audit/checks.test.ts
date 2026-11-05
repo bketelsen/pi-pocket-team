@@ -9,6 +9,7 @@ import {
     checkA2,
     checkA3,
     checkA4,
+    errorLine,
     checkA5,
     checkB1,
     checkB2,
@@ -32,10 +33,12 @@ import {
     checkI3,
     checkJ1,
     checkQ1,
+    checkP1,
     checkR1,
     Q1_ROUND_THRESHOLDS,
     Q1_STOP_THRESHOLDS,
     inDeepseekPeak,
+    PLAN_TARGETED,
     makeFinding,
     runChecks,
 } from "./checks.mjs";
@@ -313,6 +316,60 @@ test("A4: refusals and other tools are not counted", () => {
 
     assert.deepEqual(ids(checkA4(emptyData({ toolErrors: [refusal(1), refusal(2)] }), ctx)), []);
     assert.deepEqual(ids(checkA4(emptyData({ toolErrors: [bash(1), bash(2)] }), ctx)), []);
+});
+
+test("A4: the same plan tool error twice makes a finding", () => {
+    const error = (id: number) => ({
+        id,
+        c: 13,
+        tool: "plan",
+        at: ago(id * HOUR),
+        isError: true,
+        text: "<harness>\n[error] Plan T857 has no draft graph for rev 133209f: call plan tasks first.\n</harness>",
+    });
+    const result = checkA4(emptyData({ toolErrors: [error(1), error(2)] }), ctx);
+
+    assert.equal(result.findings.length, 1);
+    assert.equal(result.findings[0]!.cases, 2);
+    assert.match(result.findings[0]!.text, /^2× plan: Plan T<n> has no draft graph/);
+    assert.deepEqual(ids(checkA4(emptyData({ toolErrors: [error(1)] }), ctx)), []);
+});
+
+test("A4: the same refusal with 2 revs is 1 finding with 2 cases", () => {
+    const error = (id: number, rev: string) => ({
+        id,
+        c: 13,
+        tool: "plan",
+        at: ago(id * HOUR),
+        isError: true,
+        text: `<harness>\n[error] Plan T857 has no draft graph for rev ${rev}: call plan tasks first.\n</harness>`,
+    });
+    const result = checkA4(
+        emptyData({ toolErrors: [error(1, "133209f"), error(2, "2a31779")] }),
+        ctx,
+    );
+
+    assert.equal(result.findings.length, 1);
+    assert.equal(result.findings[0]!.cases, 2);
+    assert.equal(result.findings[0]!.id, "A4:plan-plan-t-n-has-no-draft-graph-for-rev-rev-cal");
+    assert.match(result.findings[0]!.text, /for rev <rev>: call plan tasks first/);
+});
+
+test("errorLine masks a whole word of 7 to 40 hex characters, and leaves other words as they are", () => {
+    assert.equal(
+        errorLine("rev 133209f and a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"),
+        "rev <rev> and <rev>",
+    );
+    // 6 hex characters, 41, a hex run inside a word, a thread id and a plain word stay.
+    assert.equal(errorLine("abc123 at T857, x133209fy"), "abc123 at T<n>, x133209fy");
+    assert.equal(errorLine(`${"a".repeat(40)}1`), `${"a".repeat(40)}1`);
+    // A word of a to f only has no digit: it is not a rev.
+    assert.equal(errorLine("the page was defaced"), "the page was defaced");
+    // The subjects of the A4 tests above do not change.
+    assert.equal(
+        errorLine("<harness>\n[error] Cannot ask on T5: it is closed.\n</harness>"),
+        "Cannot ask on T<n>: it is closed.",
+    );
 });
 
 test("A5: a thread closed failed is a finding; closed done is not", () => {
@@ -1946,7 +2003,12 @@ test("runChecks: every check has an entry, and a missing source skips its checks
     const data = emptyData({ sourceErrors: { github: "disabled by --no-github" } });
     const result = runChecks(data, ctx);
 
-    assert.equal(CHECKS.length, 27);
+    assert.equal(CHECKS.length, 28);
+    // P1 reads the desk's plan threads and their planning sessions.
+    assert.deepEqual(
+        CHECKS.find(([id]) => id === "P1"),
+        ["P1", checkP1, ["desk", "planSessions"]],
+    );
     // R1 reads the router's records on the desk threads, and the goals beside them.
     assert.deepEqual(
         CHECKS.find(([id]) => id === "R1"),
@@ -2816,4 +2878,133 @@ test("Q1: a source error of each new source leaves the acceptance metrics and fi
     assert.deepEqual(before.metrics.rounds, { available: false, reason: "no data" });
     assert.deepEqual(before.metrics.stops, { available: false, reason: "no data" });
     assert.deepEqual(before.metrics.ciReruns, { available: false, reason: "no data" });
+});
+
+// ---------- P. Planning sessions ----------
+
+const planResult = (id: number, at: number, text = "") => ({
+    id,
+    at,
+    isError: text !== "",
+    text,
+});
+const sourceRead = (id: number, at: number, tool = "bash") => ({ id, at, tool });
+
+test("P1: calls, refusals, targeted refusals and source reads per planning session, and their sum", () => {
+    const data = emptyData({
+        agentOf: { 13: "duncan" },
+        planSessions: [
+            {
+                thread: "T4",
+                session: 13,
+                results: [
+                    planResult(1, ago(4 * HOUR)),
+                    planResult(
+                        2,
+                        ago(3 * HOUR),
+                        "[error] Plan T4 has no draft graph for rev abc1234: call plan tasks first.",
+                    ),
+                    planResult(
+                        3,
+                        ago(3 * HOUR),
+                        "[error] Task t1 names a/b, which is not a repository of irulan.",
+                    ),
+                    planResult(
+                        4,
+                        ago(2 * HOUR),
+                        "[error] Each option is 1 to 40 characters, on one line.",
+                    ),
+                    // Outside the window: not counted.
+                    planResult(5, ago(30 * HOUR), "[error] tasks needs rev: the full revision."),
+                ],
+                sourceReads: [sourceRead(6, ago(2 * HOUR)), sourceRead(7, ago(HOUR), "read")],
+            },
+            {
+                thread: "T5",
+                session: 14,
+                results: [planResult(8, ago(HOUR)), planResult(9, ago(HOUR))],
+                sourceReads: [],
+            },
+        ],
+    });
+    const result = checkP1(data, ctx);
+    const [t4, t5] = result.metrics.sessions;
+
+    assert.equal(t4.thread, "T4");
+    assert.equal(t4.agent, "duncan");
+    assert.equal(t4.calls, 4);
+    assert.equal(t4.refused, 3);
+    assert.equal(t4.rate, 0.75);
+    assert.equal(t4.targeted, 2);
+    assert.equal(t4.targetedBy["no draft graph for rev"], 1);
+    assert.equal(t4.targetedBy["is not a repository of"], 1);
+    assert.equal(t4.targetedBy["tasks needs rev"], 0);
+    assert.equal(t4.sourceReads, 2);
+    assert.deepEqual([t5.calls, t5.refused, t5.rate, t5.targeted, t5.sourceReads], [2, 0, 0, 0, 0]);
+    assert.deepEqual(
+        { ...result.metrics.total, targetedBy: undefined },
+        {
+            sessions: 2,
+            calls: 6,
+            refused: 3,
+            rate: 0.5,
+            targeted: 2,
+            targetedBy: undefined,
+            sourceReads: 2,
+        },
+    );
+
+    // 1 low finding for the session that read the source; none for the rate.
+    assert.deepEqual(ids(result), ["P1:T4"]);
+    assert.equal(result.findings[0]!.severity, "low");
+    assert.equal(result.findings[0]!.cases, 2);
+    assert.match(
+        result.findings[0]!.text,
+        /T4 \(duncan\): its planning session read the source 2 times/,
+    );
+});
+
+test("P1: each of the 6 targeted texts is counted once; a session with nothing in the window is left out", () => {
+    const results = PLAN_TARGETED.map((text, index) =>
+        planResult(index + 1, ago(HOUR), `[error] x ${text} y`),
+    );
+    const data = emptyData({
+        planSessions: [
+            { thread: "T4", session: 13, results, sourceReads: [] },
+            {
+                thread: "T6",
+                session: 15,
+                results: [planResult(9, ago(30 * HOUR))],
+                sourceReads: [],
+            },
+        ],
+    });
+    const result = checkP1(data, ctx);
+
+    assert.equal(PLAN_TARGETED.length, 6);
+    assert.equal(result.metrics.total.targeted, 6);
+    assert.ok(Object.values(result.metrics.total.targetedBy).every((count) => count === 1));
+    assert.deepEqual(
+        result.metrics.sessions.map((item: { thread: string }) => item.thread),
+        ["T4"],
+    );
+    assert.deepEqual(ids(result), []);
+});
+
+test("P1: no planning session gives 0 calls and a null rate, not 0", () => {
+    const result = checkP1(emptyData(), ctx);
+
+    assert.deepEqual(result.metrics.sessions, []);
+    assert.equal(result.metrics.total.calls, 0);
+    assert.equal(result.metrics.total.rate, null);
+});
+
+test("P1: a missing planning-session source skips P1 by name", () => {
+    const result = runChecks(
+        emptyData({ sourceErrors: { planSessions: "needs the desk threads" } }),
+        ctx,
+    );
+
+    assert.match(result.skipped.P1!, /source unavailable: planSessions: needs the desk threads/);
+    assert.equal(result.metrics.P1, undefined);
 });

@@ -49,6 +49,8 @@ What exists today:
 | Subagent spawns and sends: model, name, tools, brief                                           | Pocket's entries; `audit/sources.mjs` keeps 300 characters of a brief                             |
 | Finished work: 1 entry per thread closed done (`completed`, `verified`), when `journal` is set | PocketJournal: the `x.desk.journal` task writes it to frostnotes (`docs/plans/pocket-journal.md`) |
 | Each day's findings and metrics                                                                | `findings.json` of the daily audit, 1 folder per day                                              |
+| `plan` tool calls and refusals of each planning session (pi-pocket-team#119)                   | Pocket's entries; `loadPlanSessions` in `audit/sources.mjs` keeps 600 characters of a refusal     |
+| Tool calls of a planning session that name `desk.ts` or `pi-pocket/src` (source reads)         | Pocket's entries; `loadPlanSessions` keeps the tool name only, no argument text                   |
 
 Gaps:
 
@@ -60,7 +62,8 @@ Gaps:
 - **Wall time and rounds are partial.** A goal keeps only its newest 30 rounds (`KEPT_ROUNDS`), and a new goal in the
   same session writes over the old one. A thread keeps only its newest 50 events.
 - **Cross-review verdict.** Spawns and sends are recorded, but `Ready` or `Not ready` is only text in a transcript.
-- **Tool errors.** The audit reads errors of the team tools only (`loadToolErrors`), not of every tool.
+- **Tool errors.** The audit reads errors of the team tools and the `plan` tool only (`loadToolErrors`), not of every
+  tool.
 - **Outcome after merge.** Reverts are found by PR title and body (Q1). Nothing links a later fix PR to the PR it
   fixes.
 
@@ -72,7 +75,7 @@ and 1 model call of at most $0.50 a day (`audit/llm.mjs`).
 
 What exists today:
 
-- **Checks A1 to J1, R1 and Q1** (`audit/checks.mjs`), each a finding with a severity, cases and evidence. A check
+- **Checks A1 to J1, P1, R1 and Q1** (`audit/checks.mjs`), each a finding with a severity, cases and evidence. A check
   whose source fails is skipped and named; the run goes on.
 - **Day compare.** `findings.json` of earlier days gives "new", "repeating 3+ days" and "gone" (`compareDays`).
 - **Maybe fixed.** A finding whose last case is older than the install of its module (`desk.ts` or `night-shift.ts`)
@@ -83,6 +86,10 @@ What exists today:
   finding needs 8 or more decided PRs and 25 or more covered days. T801 t12 added review rounds per thread (median and
   P90), 3-failure stops (2 in 7 days per repository), and CI reruns from the flaky-test scan.
 - **F3** compares a subagent's model with the brief's worker. **J1** gives spend per day, agent and thread.
+- **P1** (pi-pocket-team#119): plan tool friction, per planning session and in sum: `plan` calls, refused calls, the
+  rate (null at 0 calls), refusals with 1 of 6 targeted texts (`targetedBy` counts each text), and source reads. Only a
+  session with a source read is a finding (low); the rate is a metric for the hypothesis review. **A4** counts repeated
+  `plan` errors too.
 - **The Desk dashboard** (`_desk-metrics.ts`): completion, velocity, cycle time, PR counts and usage sums, per
   repository and owner, with unknown kept as unknown, not 0.
 

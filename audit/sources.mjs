@@ -16,8 +16,22 @@ export const BOT = "frostyard-machines";
 export const GH_CAP = 40;
 /** The live modules whose install time the report compares with a finding's last case. */
 export const MODULE_FILES = ["desk.ts", "team.ts", "night-shift.ts"];
-/** The tools whose errors check A4 reads. */
-export const TEAM_TOOLS = ["desk", "team", "team_delegate", "team_message", "team_sessions"];
+/** The tools whose errors check A4 reads. `plan` is the desk's plan tool (pi-pocket-team#119, M1 and M3). */
+export const TEAM_TOOLS = [
+    "desk",
+    "team",
+    "team_delegate",
+    "team_message",
+    "team_sessions",
+    "plan",
+];
+/** A tool call whose arguments name one of these reads the desk's or Pocket's source (pi-pocket-team#119, M2). */
+export const SOURCE_READ_MARKS = ["desk.ts", "pi-pocket/src"];
+/**
+ * The tools of a source read, as the entries name them. A `plan`, `desk` or `team_message` call whose text names
+ * `desk.ts` writes about the source; it does not read it.
+ */
+export const SOURCE_READ_TOOLS = ["bash", "read"];
 
 // ---------- Process runner ----------
 
@@ -407,6 +421,78 @@ function loadToolErrors(db, since) {
                 text: textOf(entry).slice(0, 600),
             };
         });
+}
+
+/**
+ * The planning sessions: the `session` of each desk thread with `origin: "plan"` (a consult or task thread is not
+ * one). For each session, from `since` on: every `plan` tool result (`{ id, at, isError, text }`; `text` is the
+ * first 600 characters of a refusal, "" for a result that is no error), and every `bash` or `read` call whose arguments
+ * name `desk.ts` or `pi-pocket/src` (`{ id, at, tool }`, no argument text kept). A session with neither in the
+ * window is left out. Sorted by thread id.
+ */
+export function loadPlanSessions(db, threads, since) {
+    const bySession = new Map();
+
+    for (const thread of Object.values(threads)) {
+        if (
+            thread?.origin === "plan" &&
+            typeof thread.session === "number" &&
+            !bySession.has(thread.session)
+        ) {
+            bySession.set(thread.session, thread.id);
+        }
+    }
+
+    const results = db.prepare(
+        `select id, record from entries where conversation_id=? and json_extract(record,'$.kind')='pi.tool-result'
+         and ${ts} >= ? and json_extract(record,'$.model[0].toolName')='plan' order by id`,
+    );
+    const marks = SOURCE_READ_MARKS.map(() => "record like ?").join(" or ");
+    const reads = db.prepare(
+        `select id, record from entries where conversation_id=? and json_extract(record,'$.kind')='pi.assistant'
+         and ${ts} >= ? and (${marks}) order by id`,
+    );
+    const out = [];
+
+    for (const [session, thread] of bySession) {
+        const planResults = results.all(session, since).map((row) => {
+            const entry = parseEntry(row);
+            const isError = entry.model[0].isError === true;
+
+            return {
+                id: row.id,
+                at: entry.model[0].timestamp,
+                isError,
+                text: isError ? textOf(entry).slice(0, 600) : "",
+            };
+        });
+        const sourceReads = [];
+
+        for (const row of reads.all(session, since, ...SOURCE_READ_MARKS.map((m) => `%${m}%`))) {
+            const entry = parseEntry(row);
+
+            for (const part of entry.model[0].content ?? []) {
+                const args =
+                    part.type === "toolCall" && SOURCE_READ_TOOLS.includes(part.name)
+                        ? JSON.stringify(part.arguments ?? {})
+                        : "";
+
+                if (SOURCE_READ_MARKS.some((mark) => args.includes(mark))) {
+                    sourceReads.push({
+                        id: row.id,
+                        at: entry.model[0].timestamp,
+                        tool: String(part.name),
+                    });
+                }
+            }
+        }
+
+        if (planResults.length > 0 || sourceReads.length > 0) {
+            out.push({ thread, session, results: planResults, sourceReads });
+        }
+    }
+
+    return out.sort((a, b) => a.thread.localeCompare(b.thread, "en", { numeric: true }));
 }
 
 const COST_SQL = `select conversation_id c, ${ts} at, json_extract(record,'$.model[0].usage.cost.total') cost
@@ -1178,6 +1264,7 @@ export function loadData({
         reviewCalls: [],
         goalStops: [],
         flakyScan: null,
+        planSessions: [],
         sourceErrors,
     };
 
@@ -1206,6 +1293,7 @@ export function loadData({
             "routes",
             "reviews",
             "goalHistory",
+            "planSessions",
         ]) {
             sourceErrors[name] = message;
         }
@@ -1237,6 +1325,16 @@ export function loadData({
         // Q1's review rounds and 3-failure stops: 30 days of spawn and send calls, and every goal revision.
         attempt("reviews", () => (data.reviewCalls = loadReviewCalls(db, now - 30 * DAY)));
         attempt("goalHistory", () => (data.goalStops = loadGoalStops(db)));
+
+        // P1's planning sessions come from the desk's plan threads: without the desk, they are unknown, not none.
+        if (sourceErrors.desk) {
+            sourceErrors.planSessions = "needs the desk threads";
+        } else {
+            attempt("planSessions", () => {
+                data.planSessions = loadPlanSessions(db, data.threads, since);
+            });
+        }
+
         db.close();
     }
 

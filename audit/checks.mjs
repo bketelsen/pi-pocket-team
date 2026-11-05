@@ -86,11 +86,16 @@ const threadOfSession = (data, session) =>
 
 const agentName = (data, session) => data.agentOf[session] ?? "?";
 
-/** The first line of a tool error, with the harness tags and thread ids taken out. */
-const errorLine = (text) =>
+/**
+ * The first line of a tool error, with the harness tags, thread ids and revs taken out. A rev is a whole word of 7 to
+ * 40 hex characters (a commit or a plan revision).
+ */
+export const errorLine = (text) =>
     text
         .replace(/<\/?harness>|\[error\]/g, "")
         .replace(/\b[TF]\d+[a-z]?\b/g, "T<n>")
+        // A rev has at least 1 digit: a plain word of a to f only (such as "defaced") stays.
+        .replace(/\b(?=[0-9a-f]*[0-9])[0-9a-f]{7,40}\b/g, "<rev>")
         .trim()
         .split("\n")[0]
         .slice(0, 160);
@@ -351,7 +356,7 @@ export function checkA3(data, ctx) {
     };
 }
 
-/** A4: the same error of a desk or team tool 2 or more times. */
+/** A4: the same error of a desk, team or plan tool 2 or more times. */
 export function checkA4(data, ctx) {
     const inWindow = windowOf(ctx);
     const per = new Map();
@@ -361,7 +366,9 @@ export function checkA4(data, ctx) {
             !error.isError ||
             !inWindow(error.at) ||
             error.text.includes("The desk is full") ||
-            !["desk", "team", "team_delegate", "team_message", "team_sessions"].includes(error.tool)
+            !["desk", "team", "team_delegate", "team_message", "team_sessions", "plan"].includes(
+                error.tool,
+            )
         ) {
             continue;
         }
@@ -2612,6 +2619,111 @@ export function checkQ1(data, ctx) {
     };
 }
 
+// ---------- P. Planning sessions ----------
+
+/**
+ * The 6 refusal texts of the `plan` tool that the fixes of pi-pocket-team#119 target (its metric M1). Each one
+ * names the refusal in `desk.ts` at 7ed9ab5.
+ */
+export const PLAN_TARGETED = [
+    "belong to the desk",
+    "is not a repository of",
+    "read it: this session holds no",
+    "may run at once",
+    "tasks needs rev",
+    "no draft graph for rev",
+];
+
+/** `part / whole`, 3 places; null when `whole` is 0. */
+const rateOf = (part, whole) => (whole === 0 ? null : Math.round((part / whole) * 1000) / 1000);
+
+/** The P1 numbers of some `plan` results and source reads. */
+function planNumbers(results, sourceReads) {
+    const refusals = results.filter((result) => result.isError);
+    const targetedBy = Object.fromEntries(PLAN_TARGETED.map((text) => [text, 0]));
+    let targeted = 0;
+
+    for (const refusal of refusals) {
+        const text = PLAN_TARGETED.find((each) => refusal.text.includes(each));
+
+        if (text !== undefined) {
+            targeted += 1;
+            targetedBy[text] += 1;
+        }
+    }
+
+    return {
+        calls: results.length,
+        refused: refusals.length,
+        rate: rateOf(refusals.length, results.length),
+        targeted,
+        targetedBy,
+        sourceReads: sourceReads.length,
+    };
+}
+
+/**
+ * P1: plan tool friction (pi-pocket-team#119, metrics M1 to M3). For each planning session (the session of a desk
+ * thread with `origin: "plan"`) with a `plan` call or a source read in the window: the `plan` calls, the refused
+ * ones, the rate (null at 0 calls), the refusals with 1 of the 6 targeted texts, and the tool calls that name
+ * `desk.ts` or `pi-pocket/src`; then the sum. A session that read the source is 1 low finding. The rate makes no
+ * finding: the hypothesis review reads the numbers.
+ */
+export function checkP1(data, ctx) {
+    const inWindow = windowOf(ctx);
+    const findings = [];
+    const sessions = [];
+    const all = { results: [], sourceReads: [] };
+
+    for (const item of data.planSessions) {
+        const results = item.results.filter((result) => inWindow(result.at));
+        const sourceReads = item.sourceReads.filter((read) => inWindow(read.at));
+
+        if (results.length === 0 && sourceReads.length === 0) {
+            continue;
+        }
+
+        all.results.push(...results);
+        all.sourceReads.push(...sourceReads);
+        sessions.push({
+            thread: item.thread,
+            session: item.session,
+            agent: agentName(data, item.session),
+            ...planNumbers(results, sourceReads),
+        });
+
+        if (sourceReads.length > 0) {
+            findings.push(
+                makeFinding({
+                    check: "P1",
+                    subject: item.thread,
+                    severity: "low",
+                    text: `${item.thread} (${agentName(data, item.session)}): its planning session read the source ${sourceReads.length} ${sourceReads.length === 1 ? "time" : "times"} (desk.ts or pi-pocket/src)`,
+                    evidence: [
+                        `desk/${item.thread}.md`,
+                        ...sourceReads.map(
+                            (read) => `${iso(read.at)} ${read.tool}, entry ${read.id}`,
+                        ),
+                    ],
+                    lastSeen: Math.max(...sourceReads.map((read) => read.at)),
+                    cases: sourceReads.length,
+                }),
+            );
+        }
+    }
+
+    return {
+        findings,
+        metrics: {
+            sessions,
+            total: {
+                sessions: sessions.length,
+                ...planNumbers(all.results, all.sourceReads),
+            },
+        },
+    };
+}
+
 // ---------- The registry ----------
 
 /** Each check, with the sources it needs. A source that is in `data.sourceErrors` skips the check. */
@@ -2642,6 +2754,7 @@ export const CHECKS = [
     ["I3", checkI3, ["homes"]],
     ["J1", checkJ1, ["desk", "costs"]],
     ["R1", checkR1, ["desk", "goals", "routes"]],
+    ["P1", checkP1, ["desk", "planSessions"]],
     ["Q1", checkQ1, ["desk"]],
 ];
 
