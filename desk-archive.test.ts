@@ -12,6 +12,7 @@ import {
     archivePending,
     archiveRestores,
     archivesOf,
+    deskArchived,
     SWEEP_MIN_AGE_MS,
     unarchiveKey,
     type ArchiveBinding,
@@ -101,7 +102,7 @@ const consult = (overrides: Partial<Plan["consults"][number]> = {}): Plan["consu
 /** Facts in which every binding passes: in the list, idle, no shift, no schedule, every folder clean. */
 const okFacts = (bindings: readonly ArchiveBinding[]): ArchiveFacts => ({
     sessions: bindings.map((each) => ({ address: each.address, busy: false, archived: false })),
-    subagents: {},
+    subagents: Object.fromEntries(bindings.map((each) => [String(each.session), false])),
     shifts: Object.fromEntries(bindings.map((each) => [String(each.session), null])),
     schedules: Object.fromEntries(bindings.map((each) => [String(each.session), 0])),
     folders: Object.fromEntries(
@@ -416,6 +417,21 @@ describe("the archive's facts step", () => {
         );
     });
 
+    test("F2: an unknown subagent read keeps the session (fail closed)", () => {
+        assert.equal(
+            decide(oneBinding(), (facts) => {
+                facts.subagents = {};
+            }),
+            "busy-unknown",
+        );
+        assert.equal(
+            decide(oneBinding(), (facts) => {
+                delete facts.subagents;
+            }),
+            "busy-unknown",
+        );
+    });
+
     test("F3: a running night shift keeps its session", () => {
         const binding = oneBinding();
 
@@ -640,6 +656,78 @@ describe("the archive's pending and reopen work", () => {
             [],
             "a closed thread stays archived",
         );
+    });
+
+    test("the pass's own check of a pending entry keeps it bound (keepPending)", () => {
+        const one = thread();
+
+        one.run.archives = {
+            [String(one.session)]: { at: 1, by: "auto", key: "k", state: "pending" },
+        };
+        assert.equal(
+            archiveBindings(stateOf([one]), SUP, NOW, "sweep", { keepPending: true }).bindings[0]
+                ?.session,
+            one.session,
+        );
+    });
+
+    test("deskArchived: a done entry with no restored, on any thread", () => {
+        const one = thread();
+        const other = thread({ session: one.session, state: "open" });
+
+        delete other.closed;
+        assert.equal(deskArchived(stateOf([one, other]), one.session!), false, "no entry");
+
+        one.run.archives = {
+            [String(one.session)]: { at: 1, by: "auto", key: "k", state: "done" },
+        };
+        assert.equal(deskArchived(stateOf([one, other]), one.session!), true);
+
+        one.run.archives = {
+            [String(one.session)]: { at: 1, by: "auto", key: "k", state: "pending" },
+        };
+        assert.equal(deskArchived(stateOf([one, other]), one.session!), false, "pending");
+
+        one.run.archives = {
+            [String(one.session)]: { at: 1, by: "auto", key: "k", state: "done", restored: 2 },
+        };
+        assert.equal(deskArchived(stateOf([one, other]), one.session!), false, "restored");
+    });
+
+    test("a shared session comes back when any thread bound to it reopens", () => {
+        const recording = thread();
+        const reopened = thread({ session: recording.session, state: "open" });
+        const key = archiveKey(recording.id, recording.session!, 5);
+
+        delete reopened.closed;
+        recording.run.archives = {
+            [String(recording.session)]: { at: 1, by: "auto", key, state: "done" },
+        };
+
+        const work = archiveRestores(stateOf([recording, reopened]), SUP, [
+            { address: recording.address!, archived: true },
+        ]);
+
+        assert.equal(work.length, 1);
+        assert.equal(work[0]?.thread, recording.id, "the entry's thread records it");
+        assert.equal(work[0]?.key, unarchiveKey(key));
+        assert.deepEqual(work[0]?.reopened, [reopened.id]);
+    });
+
+    test("a consult's session comes back when its plan thread reopens", () => {
+        const planThread = thread({ origin: "plan", state: "open" });
+        const key = archiveKey(planThread.id, 5001, 5);
+
+        delete planThread.closed;
+        planThread.run.archives = { "5001": { at: 1, by: "sweep", key, state: "done" } };
+
+        const state = stateOf([planThread], {
+            plans: { [planThread.id]: planOf(planThread.id, "building", [consult()]) },
+        });
+        const work = archiveRestores(state, SUP, [{ address: "session-k1", archived: true }]);
+
+        assert.equal(work[0]?.address, "session-k1");
+        assert.deepEqual(work[0]?.reopened, [planThread.id]);
     });
 
     test("the event says what was checked", () => {

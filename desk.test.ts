@@ -34,7 +34,7 @@ import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
 import { fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import { defineDoc, type ConversationId, LiveDoc, type TaskId } from "@earendil-works/pi-durable";
-import { SubagentsDoc } from "./_pocket/src/server/docs.ts";
+import { ScheduleDoc, SubagentsDoc } from "./_pocket/src/server/docs.ts";
 import {
     acceptsOpen,
     askAnswerKind,
@@ -24381,7 +24381,15 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
             const listed = new Map<string, { address: string; busy: boolean; archived: boolean }>();
             const calls: { source: number; to: string; archived?: boolean; key: string }[] = [];
             const results = new Map<string, { archived: boolean; repeating: number }>();
-            const control: { refuse?: string } = {};
+            const control: {
+                refuse?: string;
+                /** A refusal for the calls that bring a session back only. */
+                refuseBack?: string;
+                /** A read of the tool's api: a promise replaces Pocket's read, undefined passes it on. */
+                snapshot?: (doc: string, conversationId: unknown) => Promise<unknown> | undefined;
+            } = {};
+            /** Each list read: the archived state of each address, as that read gave it. */
+            const reads: Record<string, boolean>[] = [];
             const stubWeb = {
                 conversationRoute() {},
                 route() {},
@@ -24407,6 +24415,10 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
 
                 if (control.refuse !== undefined) {
                     throw new Error(control.refuse);
+                }
+
+                if (request.archived === false && control.refuseBack !== undefined) {
+                    throw new Error(control.refuseBack);
                 }
 
                 const had = results.get(key);
@@ -24436,7 +24448,15 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
                 notice() {},
                 linkedSessions: {
                     send: async () => {},
-                    list: async () => [...listed.values()].map((each) => ({ ...each })),
+                    list: async () => {
+                        reads.push(
+                            Object.fromEntries(
+                                [...listed.values()].map((each) => [each.address, each.archived]),
+                            ),
+                        );
+
+                        return [...listed.values()].map((each) => ({ ...each }));
+                    },
                     ...(options.archive === false ? {} : { archive }),
                 },
             };
@@ -24462,7 +24482,10 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
                             taskId: "task-archive",
                             callId: `call-${String(calls_)}`,
                             snapshot: (...rest: unknown[]) =>
-                                Reflect.apply(app.harness.snapshot, app.harness, rest),
+                                control.snapshot?.(
+                                    (rest[0] as { definition: { kind: string } }).definition.kind,
+                                    rest[1],
+                                ) ?? Reflect.apply(app.harness.snapshot, app.harness, rest),
                             commit: (change: never, ctx: never) => app.harness.commit(change, ctx),
                         },
                         context,
@@ -24476,6 +24499,7 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
             return {
                 listed,
                 calls,
+                reads,
                 archive,
                 /** The keys the host acted on: a repeat of a key does not act again. */
                 acts: () => results.size,
@@ -24684,51 +24708,66 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
 
                 await setArchive({ since: Date.now() - 10 * DAY });
 
-                const one = await closedThread(source, stub, 2 * DAY);
-                const closedAt = (await threadOf(one.id))?.closed?.at;
-                const key = `x.desk.archive:${one.id}:${String(one.session)}:${String(closedAt)}`;
+                const keyOf = async (one: { id: string; session: number }) =>
+                    `x.desk.archive:${one.id}:${String(one.session)}:${String((await threadOf(one.id))?.closed?.at)}`;
+
+                const pending = async (one: { id: string; session: number }, key: string) => {
+                    await app.harness.commit(async (tx) => {
+                        (await tx.doc(DeskThreads)).threads[one.id]!.run.archives = {
+                            [String(one.session)]: {
+                                at: Date.now(),
+                                by: "auto",
+                                key,
+                                state: "pending",
+                            },
+                        };
+                    }, context);
+                };
+
+                // A pass committed `pending`, then stopped before its call.
+                const before = await closedThread(source, stub, 2 * DAY);
+                const beforeKey = await keyOf(before);
+
+                await pending(before, beforeKey);
 
                 // A pass committed `pending` and called, then stopped before its `done` commit.
-                await app.harness.commit(async (tx) => {
-                    const thread = (await tx.doc(DeskThreads)).threads[one.id]!;
+                const acted = await closedThread(source, stub, 2 * DAY);
+                const actedKey = await keyOf(acted);
 
-                    thread.run.archives = {
-                        [String(one.session)]: {
-                            at: Date.now(),
-                            by: "auto",
-                            key,
-                            state: "pending",
-                        },
-                    };
-                }, context);
-                // The interrupted pass's call: the host acted on the key.
-                await stub.archive(Number(source), { to: one.address }, key);
-                assert.equal(stub.acts(), 1);
+                await pending(acted, actedKey);
+                await stub.archive(Number(source), { to: acted.address }, actedKey);
                 await stub.sync(source);
-
-                const stored = await threadOf(one.id);
-                const entry = (stored?.run.archives as Record<string, Record<string, unknown>>)[
-                    String(one.session)
-                ];
 
                 assert.deepEqual(
                     stub.calls.map((each) => each.key),
-                    [key, key],
-                    "the next pass calls again with the same key",
+                    [actedKey, beforeKey],
+                    "1 call with the pending key; none again for the session the host archived",
                 );
-                assert.equal(stub.acts(), 1, "the host acted once");
-                assert.equal(entry?.state, "done");
-                assert(
-                    stored?.events.some(
-                        (event) =>
-                            event.key === `archived:${key}` &&
-                            /^session archived \(auto\): closed 2d ago; finished after an interrupted pass$/.test(
-                                event.text,
-                            ),
-                    ),
-                );
+                assert.equal(stub.acts(), 2, "the host acted once for each key");
 
-                // The session is archived now: no further call.
+                for (const [one, key] of [
+                    [before, beforeKey],
+                    [acted, actedKey],
+                ] as const) {
+                    const stored = await threadOf(one.id);
+                    const entry = (stored?.run.archives as Record<string, Record<string, unknown>>)[
+                        String(one.session)
+                    ];
+
+                    assert.equal(entry?.state, "done");
+                    assert.equal(stub.listed.get(one.address)?.archived, true);
+                    assert(
+                        stored?.events.some(
+                            (event) =>
+                                event.key === `archived:${key}` &&
+                                /^session archived \(auto\): closed 2d ago; finished after an interrupted pass$/.test(
+                                    event.text,
+                                ),
+                        ),
+                    );
+                }
+
+                // The sessions are archived now: no further call.
                 await stub.sync(source);
                 assert.equal(stub.calls.length, 2);
             } finally {
@@ -24850,6 +24889,340 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
                 assert.equal((await threadOf(later.id))?.run.archives, undefined);
             } finally {
                 writeFileSync(configPath, JSON.stringify({ digest: { minutes: 0 }, cap: 100 }));
+                stub.restore();
+            }
+        });
+
+        /** A desk-archived session of a thread with a merged PR, then the thread opens again by a tool, not a sweep. */
+        const reopenedByTool = async (name: string, stub: ReturnType<typeof archiveDesk>) => {
+            const source = await supervisor(name);
+
+            // A clean read: the fixture holds no PR, so the link keeps its state.
+            writeFileSync(
+                fixturePath,
+                JSON.stringify({ data: { viewer: { login: "github-viewer" } } }),
+            );
+            await setArchive({ since: Date.now() - 10 * DAY });
+
+            const one = await closedThread(source, stub, 2 * DAY, (thread) => {
+                thread.repo = "frostyard/test";
+                thread.prs["frostyard/test#7"] = { via: "seen", state: "MERGED" };
+            });
+
+            await stub.sync(source);
+            assert.equal(stub.listed.get(one.address)?.archived, true, "the auto pass archived it");
+
+            // No watch, no ask: only the session and the close-out hold it open.
+            await app.harness.commit(async (tx) => {
+                const thread = (await tx.doc(DeskThreads)).threads[one.id]!;
+
+                thread.state = "open";
+                delete thread.closed;
+            }, context);
+
+            return { source, one };
+        };
+
+        test("a desk-archived session counts as not archived for a reopened thread: it stays open, with its close-out due", async () => {
+            const stub = archiveDesk();
+
+            try {
+                const { source, one } = await reopenedByTool("archive-mask", stub);
+
+                // The session cannot come back now: the sweep reads it archived.
+                stub.control.refuseBack = "Pi is in plan mode";
+                await stub.sync(source);
+
+                const after = await threadOf(one.id);
+
+                assert.equal(stub.listed.get(one.address)?.archived, true);
+                assert.equal(after?.state, "open", "the next sweep does not close it");
+                assert.equal(after?.run.archived, false);
+                assert.equal(
+                    closeoutKey(after!),
+                    `closeout:${after!.key}:frostyard/test#7`,
+                    "the close-out wake-up goes",
+                );
+            } finally {
+                stub.restore();
+            }
+        });
+
+        test("a sweep brings a desk-archived session back before its reads: the reopened thread stays open, with its close-out due", async () => {
+            const stub = archiveDesk();
+
+            try {
+                const { source, one } = await reopenedByTool("archive-early", stub);
+
+                stub.reads.length = 0;
+                await stub.sync(source);
+
+                const after = await threadOf(one.id);
+
+                assert.equal(
+                    stub.reads.filter((read) => read[one.address] === true).length,
+                    1,
+                    "only the first read saw it archived: the sweep's own read sees it back",
+                );
+                assert.equal(stub.listed.get(one.address)?.archived, false, "the session is back");
+                assert.equal(after?.state, "open");
+                assert.equal(after?.run.archived, false);
+                assert.equal(closeoutKey(after!), `closeout:${after!.key}:frostyard/test#7`);
+            } finally {
+                stub.restore();
+            }
+        });
+
+        test("a pending entry that a rule now forbids is withdrawn with no call: a schedule, a busy session, an open ask", async () => {
+            const stub = archiveDesk();
+
+            try {
+                const source = await supervisor("archive-withdrawn");
+
+                await setArchive({ since: Date.now() - 10 * DAY });
+
+                const scheduled = await closedThread(source, stub, 2 * DAY);
+                const busy = await closedThread(source, stub, 2 * DAY);
+                const asked = await closedThread(source, stub, 2 * DAY, (thread) => {
+                    thread.asks = [{ id: `${thread.id}a`, text: "which one?", at: 1 }];
+                });
+
+                for (const one of [scheduled, busy, asked]) {
+                    await app.harness.commit(async (tx) => {
+                        const thread = (await tx.doc(DeskThreads)).threads[one.id]!;
+
+                        thread.run.archives = {
+                            [String(one.session)]: {
+                                at: Date.now(),
+                                by: "auto",
+                                key: `x.desk.archive:${one.id}:${String(one.session)}:${String(thread.closed?.at)}`,
+                                state: "pending",
+                            },
+                        };
+                    }, context);
+                }
+
+                await app.harness.commit(async (tx) => {
+                    (await tx.doc(ScheduleDoc, scheduled.session as ConversationId)).items.s1 = {
+                        id: "s1",
+                        text: "a check",
+                        content: "a check",
+                        next: Date.now() + DAY,
+                        zone: "UTC",
+                        createdAt: Date.now(),
+                        runs: 0,
+                        taskId: "task-none" as TaskId,
+                    };
+                }, context);
+                stub.listed.get(busy.address)!.busy = true;
+                await stub.sync(source);
+
+                assert.equal(stub.calls.length, 0, "no call");
+
+                for (const [one, reason] of [
+                    [scheduled, "schedule"],
+                    [busy, "busy"],
+                    [asked, "open-ask"],
+                ] as const) {
+                    const stored = await threadOf(one.id);
+
+                    assert.deepEqual(stored?.run.archives, {}, reason);
+                    assert(
+                        stored?.events.some(
+                            (event) => event.text === `archive withdrawn: ${reason}`,
+                        ),
+                        reason,
+                    );
+                }
+            } finally {
+                stub.restore();
+            }
+        });
+
+        test("a pending entry whose thread reopened is finished and restored in the same pass", async () => {
+            const stub = archiveDesk();
+
+            try {
+                const source = await supervisor("archive-reread");
+                const one = await closedThread(source, stub, 3 * DAY);
+                const key = `x.desk.archive:${one.id}:${String(one.session)}:${String((await threadOf(one.id))?.closed?.at)}`;
+
+                // A pass committed `pending` and called; then the thread opened again before its `done` commit.
+                await app.harness.commit(async (tx) => {
+                    const thread = (await tx.doc(DeskThreads)).threads[one.id]!;
+
+                    thread.run.archives = {
+                        [String(one.session)]: {
+                            at: Date.now(),
+                            by: "sweep",
+                            key,
+                            state: "pending",
+                        },
+                    };
+                    thread.state = "open";
+                    delete thread.closed;
+                }, context);
+                await stub.archive(Number(source), { to: one.address }, key);
+                await stub.tool({ action: "archive" }, Number(source));
+                // 1 pass: `desk archive` with apply.
+                await stub.tool({ action: "archive", apply: true }, Number(source));
+
+                const entry = (
+                    (await threadOf(one.id))?.run.archives as Record<
+                        string,
+                        Record<string, unknown>
+                    >
+                )[String(one.session)];
+
+                assert.equal(entry?.state, "done");
+                assert.equal(typeof entry?.restored, "number", "restored in the same pass");
+                assert.equal(stub.listed.get(one.address)?.archived, false);
+                assert.deepEqual(
+                    stub.calls.map((each) => each.archived),
+                    [undefined, false],
+                    "no second archive call, and 1 call that brings it back",
+                );
+            } finally {
+                stub.restore();
+            }
+        });
+
+        test("the archive's folder reads are strict: a folder it cannot read and a broken git give folder-unknown", async () => {
+            const stub = archiveDesk();
+            const base = join(root, "archive-folders");
+            const locked = join(base, "locked");
+            const broken = join(base, "broken");
+            const plain = join(base, "plain");
+            const asRoot = process.getuid?.() === 0;
+
+            mkdirSync(locked, { recursive: true });
+            mkdirSync(broken, { recursive: true });
+            mkdirSync(plain, { recursive: true });
+            writeFileSync(join(broken, ".git"), `gitdir: ${join(base, "no-such-git-dir")}\n`);
+
+            try {
+                const source = await supervisor("archive-folders");
+
+                for (const folder of [
+                    ...(asRoot ? [] : [locked]),
+                    broken,
+                    plain,
+                    join(base, "gone"),
+                ]) {
+                    await closedThread(source, stub, 3 * DAY, (thread) => {
+                        thread.cwd = folder;
+                    });
+                }
+
+                // A folder with no read permission: git cannot enter it. Root reads it anyway, so root skips this part.
+                chmodSync(locked, 0o000);
+
+                const text = await stub.tool({ action: "archive" }, Number(source));
+                const unknown = asRoot ? 1 : 2;
+
+                assert.match(text, /^Archive dry run: 2 sessions can be archived/);
+                assert.match(text, new RegExp(`Skipped: folder-unknown ${String(unknown)}\\.`));
+            } finally {
+                chmodSync(locked, 0o755);
+                stub.restore();
+            }
+        });
+
+        test("a subagent read that fails keeps the session: busy-unknown", async () => {
+            const stub = archiveDesk();
+
+            try {
+                const source = await supervisor("archive-subagents");
+                const registry = await closedThread(source, stub, 3 * DAY);
+                const child = await closedThread(source, stub, 3 * DAY);
+                const childId = 987_654_321;
+
+                stub.control.snapshot = (kind, id) => {
+                    if (kind === "pocket.subagents" && Number(id) === registry.session) {
+                        return Promise.reject(new Error("the registry read failed"));
+                    }
+
+                    if (kind === "pocket.subagents" && Number(id) === child.session) {
+                        return Promise.resolve({
+                            agents: { a: { conversationId: childId } },
+                            reporters: {},
+                        });
+                    }
+
+                    if (kind === LiveDoc.definition.kind && Number(id) === childId) {
+                        return Promise.reject(new Error("the child read failed"));
+                    }
+
+                    return undefined;
+                };
+
+                const text = await stub.tool({ action: "archive" }, Number(source));
+
+                assert.match(text, /^Archive dry run: 0 sessions can be archived/);
+                assert.match(text, /Skipped: busy-unknown 2\./);
+            } finally {
+                stub.restore();
+            }
+        });
+
+        test("a shared session comes back when another thread bound to it reopens", async () => {
+            const stub = archiveDesk();
+
+            try {
+                const source = await supervisor("archive-shared");
+                const recording = await closedThread(source, stub, 3 * DAY);
+                const other = await closedThread(source, stub, 3 * DAY);
+                const key = `x.desk.archive:${recording.id}:${String(recording.session)}:5`;
+
+                stub.listed.delete(other.address);
+                stub.listed.get(recording.address)!.archived = true;
+                await app.harness.commit(async (tx) => {
+                    const state = await tx.doc(DeskThreads);
+                    const b = state.threads[recording.id]!;
+                    const a = state.threads[other.id]!;
+
+                    b.run.archives = {
+                        [String(recording.session)]: { at: 1, by: "sweep", key, state: "done" },
+                    };
+                    // A: the same session, open again; a watch keeps it open through the sweep.
+                    a.session = recording.session;
+                    a.address = recording.address;
+                    a.state = "open";
+                    delete a.closed;
+                    a.watch = {
+                        checkOn: "2099-01-01",
+                        check: "a later check",
+                        setAt: Date.now(),
+                        setBy: "brian",
+                        key: "x.test.archive-shared",
+                    };
+                }, context);
+                await stub.sync(source);
+
+                assert.deepEqual(
+                    stub.calls.map((each) => each.key),
+                    [`x.desk.unarchive:${recording.id}:${String(recording.session)}:5`],
+                );
+                assert.equal(stub.listed.get(recording.address)?.archived, false);
+
+                const b = await threadOf(recording.id);
+                const a = await threadOf(other.id);
+                const entry = (b?.run.archives as Record<string, Record<string, unknown>>)[
+                    String(recording.session)
+                ];
+
+                assert.equal(typeof entry?.restored, "number", "restored on the recording entry");
+                assert(
+                    a?.events.some(
+                        (event) => event.text === "session brought back: the thread reopened",
+                    ),
+                );
+                assert(
+                    b?.events.some(
+                        (event) => event.text === `session brought back: ${other.id} reopened`,
+                    ),
+                );
+            } finally {
                 stub.restore();
             }
         });

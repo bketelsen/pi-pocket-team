@@ -19,7 +19,7 @@
  */
 import { execFile } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { access, mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { access, lstat, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 import { promisify } from "node:util";
@@ -393,7 +393,9 @@ export type Thread = {
      * reopens and closes again gets no second entry), and `watchKeys` (the replay key of every watch set on the thread, in
      * order, never removed: a replayed `desk watch` with one of them changes nothing; absent for a thread from before
      * the field), and `archives` (by session id, `ArchiveEntry`: the archives the desk began or did of the thread's
-     * session, or of its plan's consults' sessions; absent until the first).
+     * session, or of its plan's consults' sessions; absent until the first). `archived` is false for a thread that is not
+     * closed when the desk archived its session and did not bring it back yet (`deskArchived`): the archive pass brings it
+     * back, and until then the thread keeps its session hold and its close-out.
      */
     run: Record<string, JsonValue>;
     /** The last 50; `key` makes an event unique. */
@@ -991,6 +993,18 @@ async function subagentsBusy(
     conversationId: ConversationId,
     context: Context,
 ): Promise<boolean> {
+    return (await subagentsBusyOrUnknown(read, conversationId, context)) ?? false;
+}
+
+/**
+ * The strict read of `subagentsBusy`, for the archive pass: undefined when Pocket's registry, or a subagent's
+ * conversation, cannot be read. The archive then keeps the session (`busy-unknown`).
+ */
+async function subagentsBusyOrUnknown(
+    read: Pick<DocumentReader, "snapshot">,
+    conversationId: ConversationId,
+    context: Context,
+): Promise<boolean | undefined> {
     try {
         const registry = await read.snapshot(SubagentsDoc, conversationId, context);
 
@@ -1012,7 +1026,7 @@ async function subagentsBusy(
 
         return false;
     } catch {
-        return false;
+        return undefined;
     }
 }
 
@@ -3845,13 +3859,15 @@ export type ArchiveSkipReason =
     | "archived"
     | "restored-by-person"
     | "busy"
+    | "busy-unknown"
     | "night-shift"
     | "night-shift-unknown"
     | "schedule"
     | "schedule-unknown"
     | "folder-unknown"
     | "folder-dirty"
-    | "folder-unpushed";
+    | "folder-unpushed"
+    | "unbound";
 
 /** One session the rules skipped, and why. */
 export type ArchiveSkip = { session: number; thread?: string; reason: ArchiveSkipReason };
@@ -3897,7 +3913,7 @@ export type ArchiveFolderFact = {
 export type ArchiveFacts = {
     /** The supervisor's linked sessions, by address. */
     sessions?: { address: string; busy: boolean; archived: boolean }[];
-    /** By session id: a subagent of the session still works. */
+    /** By session id: a subagent of the session still works. A missing key: the read failed (fail closed). */
     subagents?: Record<string, boolean>;
     /** By session id: the Night shift goal's status, or null for no goal. */
     shifts: Record<string, string | null>;
@@ -3962,6 +3978,7 @@ export function archiveBindings(
     supervisor: number,
     now: number,
     mode: ArchiveMode,
+    options: { keepPending?: boolean } = {},
 ): { bindings: ArchiveBinding[]; skips: ArchiveSkip[] } {
     const threads = Object.values(state?.threads ?? {});
     const supervisors = new Set(
@@ -4120,8 +4137,9 @@ export function archiveBindings(
 
         const entries = all.map((thread) => archivesOf(thread)[String(session)]);
 
-        // A call that began and did not end: the pass finishes it with its own key.
-        if (entries.some((each) => each?.state === "pending")) {
+        // A call that began and did not end: the pass finishes it with its own key. The pass's own check of a pending
+        // entry keeps it (`keepPending`), so the rules decide that call again.
+        if (options.keepPending !== true && entries.some((each) => each?.state === "pending")) {
             skip("pending");
             continue;
         }
@@ -4200,9 +4218,14 @@ export function archiveDecide(
             continue;
         }
 
-        // F2: idle, with no working subagent.
+        // F2: idle, with no working subagent; an unknown subagent read fails closed.
         if (fact.busy || facts.subagents?.[key] === true) {
             skip("busy");
+            continue;
+        }
+
+        if (!Object.hasOwn(facts.subagents ?? {}, key)) {
+            skip("busy-unknown");
             continue;
         }
 
@@ -4315,38 +4338,82 @@ export function archivePending(
     return out;
 }
 
+/** The threads bound to a session: each thread with that `session`, and each plan thread with a consult of it. */
+export function threadsOfSession(
+    state: Readonly<DeskState> | undefined,
+    session: number,
+): Thread[] {
+    const found = Object.values(state?.threads ?? {}).filter(
+        (thread) => thread.session === session,
+    );
+
+    for (const plan of Object.values(state?.plans ?? {})) {
+        const thread = state?.threads[plan.thread];
+
+        if (
+            thread !== undefined &&
+            !found.includes(thread) &&
+            plan.consults.some((consult) => consult.session === session)
+        ) {
+            found.push(thread);
+        }
+    }
+
+    return found;
+}
+
 /**
- * The sessions to bring back: a thread of `supervisor` that is open again (not `closed`), with a `done` entry the desk
- * did not restore yet, whose session the list shows archived. Each has the key that brings it back (`unarchiveKey`).
+ * Whether the desk archived a session and did not bring it back: some thread has a `done` entry for it with no
+ * `restored`. The sweep counts such a session as not archived for a thread that is not closed, so a thread that opened
+ * again keeps its session hold and its close-out until the archive pass brings the session back.
+ */
+export function deskArchived(state: Readonly<DeskState> | undefined, session: number): boolean {
+    return Object.values(state?.threads ?? {}).some((thread) => {
+        const entry = archivesOf(thread)[String(session)];
+
+        return entry?.state === "done" && entry.restored === undefined;
+    });
+}
+
+/** One session to bring back: the archive's work, and the threads bound to the session that are open again. */
+export type ArchiveRestore = ArchiveWork & { reopened: string[] };
+
+/**
+ * The sessions to bring back, by session: a `done` entry the desk did not restore yet, on a thread of `supervisor`,
+ * whose session the list shows archived, when any thread bound to that session (`threadsOfSession`) is not closed. Each
+ * has the key that brings it back (`unarchiveKey`), and the open threads.
  */
 export function archiveRestores(
     state: Readonly<DeskState> | undefined,
     supervisor: number,
     sessions: readonly { address: string; archived: boolean }[],
-): ArchiveWork[] {
+): ArchiveRestore[] {
     const archived = new Set(sessions.filter((each) => each.archived).map((each) => each.address));
-    const out: ArchiveWork[] = [];
+    const out: ArchiveRestore[] = [];
 
     for (const thread of Object.values(state?.threads ?? {})) {
-        if (thread.supervisor !== supervisor || thread.state === "closed") {
+        if (thread.supervisor !== supervisor) {
             continue;
         }
 
         for (const [session, entry] of Object.entries(archivesOf(thread))) {
-            const address = archiveAddress(state, thread, Number(session));
+            if (entry.state !== "done" || entry.restored !== undefined) {
+                continue;
+            }
 
-            if (
-                entry.state === "done" &&
-                entry.restored === undefined &&
-                address !== undefined &&
-                archived.has(address)
-            ) {
+            const address = archiveAddress(state, thread, Number(session));
+            const reopened = threadsOfSession(state, Number(session))
+                .filter((each) => each.state !== "closed")
+                .map((each) => each.id);
+
+            if (address !== undefined && archived.has(address) && reopened.length > 0) {
                 out.push({
                     thread: thread.id,
                     session: Number(session),
                     address,
                     key: unarchiveKey(entry.key),
                     entry,
+                    reopened,
                 });
             }
         }
@@ -19990,9 +20057,54 @@ export default function createDesk(host: Host, web: Web) {
     };
 
     /**
+     * A folder's counts for the archive, read strictly: "gone" only when `lstat` fails with `ENOENT` or `ENOTDIR`; "not
+     * git" (null) only when `git rev-parse --git-dir` fails with git's own "not a git repository (or any of the parent
+     * directories)" or "(or any parent up to mount point …)", in the C locale; else `statusOf`, whose "gone" or "not
+     * git" after this probe is unknown. Any other failure is unknown (undefined): the archive keeps the session
+     * (`folder-unknown`). A broken `.git` file says "not a git repository: <path>", which is unknown too. `statusOf`
+     * stays as it is for its other callers.
+     */
+    const archiveFolder = async (
+        folder: string,
+        options: { heads?: ReadonlySet<string>; branch?: string },
+    ): Promise<ArchiveFolderFact | null | undefined> => {
+        try {
+            await lstat(folder);
+        } catch (error) {
+            const code = (error as NodeJS.ErrnoException).code;
+
+            return code === "ENOENT" || code === "ENOTDIR"
+                ? { dirty: 0, ahead: undefined, gone: true }
+                : undefined;
+        }
+
+        try {
+            await run("git", ["-C", folder, "rev-parse", "--git-dir"], {
+                timeout: 10_000,
+                maxBuffer: 1024 * 1024,
+                encoding: "utf8",
+                env: { ...process.env, LC_ALL: "C" },
+            });
+        } catch (error) {
+            const stderr = (error as { stderr?: unknown }).stderr;
+
+            return typeof stderr === "string" &&
+                /not a git repository \(or any (?:of the parent directories|parent up to mount point )/.test(
+                    stderr,
+                )
+                ? null
+                : undefined;
+        }
+
+        const fact = await statusOf(folder, options);
+
+        return fact === null || fact.gone === true ? undefined : fact;
+    };
+
+    /**
      * The facts the rules read for the bindings that may still be archived (in the list, and not archived yet): working
-     * subagents, Night shift goals, schedules and folders. A read that fails leaves no key, so the rule skips the
-     * session.
+     * subagents, Night shift goals, schedules and folders. Every read is strict: a read that fails leaves no key, so the
+     * rule skips the session.
      */
     const archiveFacts = async (
         state: Readonly<DeskState> | undefined,
@@ -20011,6 +20123,7 @@ export default function createDesk(host: Host, web: Web) {
         const open = new Set(sessions.filter((each) => !each.archived).map((each) => each.address));
         const nightShift = nightShiftApi();
         const heads = knownHeads(Object.values(state?.threads ?? {}));
+        const readFolders = new Set<string>();
 
         for (const binding of bindings) {
             if (!open.has(binding.address)) {
@@ -20019,8 +20132,11 @@ export default function createDesk(host: Host, web: Web) {
 
             const key = String(binding.session);
             const id = binding.session as ConversationId;
+            const busy = await subagentsBusyOrUnknown(read, id, context);
 
-            facts.subagents![key] = await subagentsBusy(read, id, context);
+            if (busy !== undefined) {
+                facts.subagents![key] = busy;
+            }
 
             if (nightShift !== undefined) {
                 try {
@@ -20038,12 +20154,18 @@ export default function createDesk(host: Host, web: Web) {
                 // Not readable: no key, and the session stays.
             }
 
-            if (binding.folder !== undefined && !Object.hasOwn(facts.folders, binding.folder)) {
+            if (binding.folder !== undefined && !readFolders.has(binding.folder)) {
+                readFolders.add(binding.folder);
+
                 try {
-                    facts.folders[binding.folder] = await statusOf(binding.folder, {
+                    const fact = await archiveFolder(binding.folder, {
                         heads,
                         ...(binding.branch === undefined ? {} : { branch: binding.branch }),
                     });
+
+                    if (fact !== undefined) {
+                        facts.folders[binding.folder] = fact;
+                    }
                 } catch {
                     // Not readable: no key, and the session stays.
                 }
@@ -20057,7 +20179,9 @@ export default function createDesk(host: Host, web: Web) {
     type ArchivePass = {
         archived: ArchiveCandidate[];
         failed: { thread: string; session: number; error: string }[];
-        restored: ArchiveWork[];
+        restored: ArchiveRestore[];
+        /** The pending entries it withdrew, with the rule that now forbids the archive. */
+        withdrawn: { thread: string; session: number; reason: ArchiveSkipReason }[];
         /** The bindings' and the facts' skips of this pass. */
         skips: ArchiveSkip[];
     };
@@ -20065,12 +20189,14 @@ export default function createDesk(host: Host, web: Web) {
     /**
      * One archive pass for `supervisor` (`mode` auto: the sweeper and `desk sync`; sweep: `desk archive` with `apply`, for
      * the sessions in `only`). Every read and every call happens outside a commit, and the records follow the repair
-     * order: a pass first finishes the `pending` entries with their own keys, then brings back the sessions of threads
-     * that reopened, then commits new `pending` entries, calls, and commits `done` with 1 event each. A refused call
-     * leaves 1 event and no entry. The auto pass sets `state.archive.since` at its first run, and archives nothing then.
-     * `newArchives` false (`archive.auto` off): steps 1 and 2 still run, so a session that `desk archive` archived comes
-     * back when its thread reopens, and its pending entry ends; no `since`, and no new archive. Undefined: this Pi Pocket
-     * has no archive call, or the list is not readable; nothing changed.
+     * order. Step 1 finishes the `pending` entries: the rules decide each one again (its mode, fresh facts); a rule that
+     * forbids it now ends it as `done` when the list shows the session archived (the call acted before a stop), else
+     * removes it with 1 event `archive withdrawn: <reason>` and no call; else the pass calls again with its key, which
+     * acts once. Step 2 brings back the sessions of reopened threads. Step 3 commits new `pending` entries, calls, and
+     * commits `done` with 1 event each. The pass reads the desk and the list again after each step that committed. A
+     * refused call leaves 1 event and no entry. The auto pass sets `state.archive.since` at its first run, and archives
+     * nothing then. `newArchives` false (`archive.auto` off), and `early` (the run before a sweep's reads): steps 1 and 2
+     * only, no `since`. Undefined: this Pi Pocket has no archive call, or the list is not readable; nothing changed.
      */
     const sweepArchivesNow = async (
         supervisor: number,
@@ -20078,18 +20204,23 @@ export default function createDesk(host: Host, web: Web) {
         now: number,
         context: Context,
         commit: (change: (tx: Tx) => Promise<undefined>) => Promise<unknown>,
-        options: { mode: ArchiveMode; only?: ReadonlySet<number>; newArchives?: boolean } = {
+        options: {
+            mode: ArchiveMode;
+            only?: ReadonlySet<number>;
+            newArchives?: boolean;
+            early?: boolean;
+        } = {
             mode: "auto",
         },
     ): Promise<ArchivePass | undefined> => {
-        const newArchives = options.newArchives !== false;
+        const newArchives = options.newArchives !== false && options.early !== true;
         const archive = archiveCall();
 
         if (archive === undefined) {
             return undefined;
         }
 
-        const state = await read.snapshot(DeskThreads, context);
+        let state = await read.snapshot(DeskThreads, context);
 
         // The first auto pass: the time from which threads that close are this pass's; older ones are the sweep's.
         if (newArchives && options.mode === "auto" && state?.archive?.since === undefined) {
@@ -20106,7 +20237,7 @@ export default function createDesk(host: Host, web: Web) {
             return undefined;
         }
 
-        const sessions = await archiveList(supervisor);
+        let sessions = await archiveList(supervisor);
 
         // F1: no list, nothing at all.
         if (sessions === undefined) {
@@ -20114,16 +20245,66 @@ export default function createDesk(host: Host, web: Web) {
         }
 
         const source = supervisor as ConversationId;
-        const result: ArchivePass = { archived: [], failed: [], restored: [], skips: [] };
+        const result: ArchivePass = {
+            archived: [],
+            failed: [],
+            restored: [],
+            withdrawn: [],
+            skips: [],
+        };
 
-        type Outcome = { work: ArchiveWork; error?: string };
+        /** Read the desk and the list again after a commit: a later step decides on what is true now. */
+        const reread = async (): Promise<boolean> => {
+            state = await read.snapshot(DeskThreads, context);
+            sessions = await archiveList(supervisor);
 
-        // 1. The calls that began and did not end: again, with the same key, which acts once.
-        const finished: Outcome[] = [];
+            return sessions !== undefined;
+        };
+
+        // 1. The calls that began and did not end: the rules again, then the same key, which acts once.
+        type Finished = {
+            work: ArchiveWork;
+            error?: string;
+            /** A rule forbids the archive now, and the session is not archived: no call. */
+            withdrawn?: ArchiveSkipReason;
+        };
+        const finished: Finished[] = [];
 
         for (const work of archivePending(state, supervisor)) {
             if (work.address === undefined) {
                 finished.push({ work, error: "the session has no address" });
+                continue;
+            }
+
+            const { bindings, skips } = archiveBindings(state, supervisor, now, work.entry.by, {
+                keepPending: true,
+            });
+            const binding = bindings.find((each) => each.session === work.session);
+            let reason: ArchiveSkipReason | undefined =
+                binding === undefined
+                    ? (skips.find((each) => each.session === work.session)?.reason ?? "unbound")
+                    : undefined;
+
+            if (binding !== undefined) {
+                const decided = archiveDecide(
+                    [binding],
+                    await archiveFacts(state, [binding], sessions, read, context),
+                );
+
+                reason =
+                    decided.archive.length === 1
+                        ? undefined
+                        : (decided.skips[0]?.reason ?? "unbound");
+            }
+
+            if (reason !== undefined) {
+                // The call acted before the stop: the session is archived, so the entry ends as done.
+                if (sessions.find((each) => each.address === work.address)?.archived === true) {
+                    finished.push({ work });
+                } else {
+                    finished.push({ work, withdrawn: reason });
+                }
+
                 continue;
             }
 
@@ -20139,7 +20320,7 @@ export default function createDesk(host: Host, web: Web) {
             await commit(async (tx) => {
                 const doc = await tx.doc(DeskThreads);
 
-                for (const { work, error } of finished) {
+                for (const { work, error, withdrawn } of finished) {
                     const thread = threadById(doc, work.thread);
                     const entries = thread === undefined ? {} : archivesOf(thread);
                     const entry = entries[String(work.session)];
@@ -20152,18 +20333,38 @@ export default function createDesk(host: Host, web: Web) {
                         continue;
                     }
 
-                    if (error !== undefined) {
+                    if (error !== undefined || withdrawn !== undefined) {
                         const left = { ...entries };
 
                         delete left[String(work.session)];
                         thread.run.archives = left as unknown as JsonValue;
-                        addEvent(
-                            thread,
-                            `archive-failed:${work.key}`,
-                            `archive failed: ${error}`.slice(0, MAX_LINE),
-                            now,
-                        );
-                        result.failed.push({ thread: work.thread, session: work.session, error });
+
+                        if (withdrawn !== undefined) {
+                            addEvent(
+                                thread,
+                                `archive-withdrawn:${work.key}`,
+                                `archive withdrawn: ${withdrawn}`,
+                                now,
+                            );
+                            result.withdrawn.push({
+                                thread: work.thread,
+                                session: work.session,
+                                reason: withdrawn,
+                            });
+                        } else {
+                            addEvent(
+                                thread,
+                                `archive-failed:${work.key}`,
+                                `archive failed: ${error}`.slice(0, MAX_LINE),
+                                now,
+                            );
+                            result.failed.push({
+                                thread: work.thread,
+                                session: work.session,
+                                error: error!,
+                            });
+                        }
+
                         continue;
                     }
 
@@ -20194,10 +20395,14 @@ export default function createDesk(host: Host, web: Web) {
 
                 return undefined;
             });
+
+            if (!(await reread())) {
+                return result;
+            }
         }
 
         // 2. The sessions of threads that opened again: back from the archive, once for each archive.
-        const restores: Outcome[] = [];
+        const restores: { work: ArchiveRestore; error?: string }[] = [];
 
         for (const work of archiveRestores(state, supervisor, sessions)) {
             try {
@@ -20235,20 +20440,41 @@ export default function createDesk(host: Host, web: Web) {
                         ...entries,
                         [String(work.session)]: { ...entry, restored: now },
                     } as unknown as JsonValue;
+                    // The event goes on the recording thread and on each thread bound to the session that reopened.
                     addEvent(
                         thread,
                         `unarchived:${work.key}`,
-                        "session brought back: the thread reopened",
+                        work.reopened.includes(thread.id)
+                            ? "session brought back: the thread reopened"
+                            : `session brought back: ${work.reopened.join(", ")} reopened`,
                         now,
                     );
+
+                    for (const id of work.reopened) {
+                        const reopened = threadById(doc, id);
+
+                        if (reopened !== undefined && reopened !== thread) {
+                            addEvent(
+                                reopened,
+                                `unarchived:${work.key}`,
+                                "session brought back: the thread reopened",
+                                now,
+                            );
+                        }
+                    }
+
                     result.restored.push(work);
                 }
 
                 return undefined;
             });
+
+            if (!(await reread())) {
+                return result;
+            }
         }
 
-        // 3. New archives: the rules, then pending, the call, and done. Off with `archive.auto` false.
+        // 3. New archives: the rules, then pending, the call, and done. Off with `archive.auto` false, and early.
         if (!newArchives) {
             return result;
         }
@@ -20415,6 +20641,28 @@ export default function createDesk(host: Host, web: Web) {
             });
         } catch {
             // The next sweep tries again: a pending entry keeps its key.
+        }
+    };
+
+    /**
+     * The archive pass's steps 1 and 2 (pending entries, and the sessions of reopened threads) before a sweep reads the
+     * list: a thread that opened again by a tool or the page sees its session back in that read. A failure never fails
+     * the sweep.
+     */
+    const earlyArchive = async (
+        supervisor: number,
+        read: Reader,
+        now: number,
+        context: Context,
+        commit: (change: (tx: Tx) => Promise<undefined>) => Promise<unknown>,
+    ): Promise<void> => {
+        try {
+            await sweepArchives(supervisor, read, now, context, commit, {
+                mode: "auto",
+                early: true,
+            });
+        } catch {
+            // The full pass after the sweep's commit tries again.
         }
     };
 
@@ -22167,16 +22415,20 @@ export default function createDesk(host: Host, web: Web) {
                     }
                 }
 
-                if (thread.run.archived !== session.archived) {
-                    thread.run.archived = session.archived;
+                // A session the desk archived is not archived for a thread that opened again: it keeps the session
+                // hold, the close-out and the agent's repair route until the archive pass brings the session back.
+                const archived =
+                    session.archived &&
+                    !(typeof thread.session === "number" && deskArchived(state, thread.session));
+
+                if (thread.run.archived !== archived) {
+                    thread.run.archived = archived;
 
                     if (
                         addEvent(
                             thread,
-                            `archived:${String(session.archived)}:${String(now)}`,
-                            session.archived
-                                ? "the session is archived"
-                                : "the session is not archived",
+                            `archived:${String(archived)}:${String(now)}`,
+                            archived ? "the session is archived" : "the session is not archived",
                             now,
                         )
                     ) {
@@ -23197,6 +23449,12 @@ export default function createDesk(host: Host, web: Web) {
         phases: {
             sweep: async (task, runtime, context) => {
                 const supervisor = task.input.supervisor as ConversationId;
+
+                // Before the reads: a session the desk archived comes back for a thread that opened again.
+                await earlyArchive(Number(supervisor), runtime, runtime.now(), context, (change) =>
+                    runtime.commit(change, context),
+                );
+
                 const facts = await gather(supervisor, runtime, runtime.now(), context);
                 // The threads that closed out in the commit below: their agents hear about it after the commit, so a
                 // restart before the send loses nothing (the next sweep finds them again, because `run.closeout` is
@@ -27447,6 +27705,11 @@ export default function createDesk(host: Host, web: Web) {
             }
 
             if (args.action === "sync") {
+                // Before the reads: a session the desk archived comes back for a thread that opened again.
+                await earlyArchive(Number(supervisor), api, Date.now(), context, (change) =>
+                    api.commit(change, context),
+                );
+
                 const facts = await gather(supervisor as ConversationId, api, Date.now(), context);
                 const result = await api.commit(async (tx) => {
                     // As in the sweep: read first, start last, and a failure is no failed sync. A desk with only
