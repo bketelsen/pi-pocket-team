@@ -21,6 +21,7 @@ import {
     loadDecided,
     loadGithub,
     loadGoalStops,
+    loadPlanSessions,
     loadReviewCalls,
     Q1_MAX_CALLS,
     makeGh,
@@ -204,11 +205,18 @@ test("loadData reads every source into one plain object", () => {
     assert.equal(data.userEntries[SESSION_T1].length, 1);
     assert.match(data.userEntries[SESSION_T1][0].text, /^\[via linked session session-aaa\]/);
 
-    // Tool errors: the team tools only, with the desk-full refusal; a bash error is left out.
+    // Tool errors: the team tools and the plan tool only, with the desk-full refusal; a bash error is left out.
     assert.deepEqual(data.toolErrors.map((error: { tool: string }) => error.tool).sort(), [
+        "plan",
         "team_delegate",
         "team_message",
     ]);
+    assert.match(
+        data.toolErrors.find((error: { tool: string }) => error.tool === "plan").text,
+        /tasks needs rev/,
+    );
+    // The fixture desk has no plan thread: no planning session, and no source error.
+    assert.deepEqual(data.planSessions, []);
     assert.ok(data.toolErrors.every((error: { isError: boolean }) => error.isError));
 
     // Cost rows from 8 days back; the row from 40 days ago is left out.
@@ -289,6 +297,201 @@ test("the routes source reads a routed thread's session with no time limit", () 
         [[SESSION_T1, "old/model"]],
         "the spawn from 20 days back is loaded",
     );
+});
+
+/**
+ * The fixture database with a plan thread T4 (planning session 13) added by a desk delta, and entries of session 13:
+ * 3 `plan` results (2 refused, 1 with a targeted text), 1 `plan` result before the window, 2 tool calls that read the
+ * source, 1 `read` of another file, and a `plan`, a `desk` and a `team_message` call that name the source. Session
+ * 12 (T2, no plan thread) gets a `plan` refusal and a source read too.
+ */
+function setupPlan() {
+    const base = setup();
+    const db = new DatabaseSync(path.join(base.pocketDir, "pocket.sqlite"));
+    const seq = db.prepare("select max(seq) s from document_revisions").get().s + 1;
+
+    db.prepare(
+        "insert into document_revisions (document_id, seq, kind, version, content) values (1, ?, 'delta', 1, ?)",
+    ).run(
+        seq,
+        JSON.stringify([
+            [
+                "s",
+                ["threads", "T4"],
+                {
+                    id: "T4",
+                    origin: "plan",
+                    state: "open",
+                    supervisor: SUPERVISOR,
+                    session: 13,
+                    startedAt: NOW - 5 * HOUR,
+                    lastEventAt: NOW - HOUR,
+                    prs: {},
+                    asks: [],
+                    run: {},
+                    events: [],
+                },
+            ],
+        ]),
+    );
+
+    let id = db.prepare("select max(id) i from entries").get().i;
+
+    const entry = (conversation: number, record: object) => {
+        id += 1;
+        db.prepare(
+            "insert into entries (id, conversation_id, head, commit_seq, record) values (?,?,?,?,?)",
+        ).run(id, conversation, null, id, JSON.stringify(record));
+    };
+
+    const result = (conversation: number, at: number, text: string, isError: boolean) =>
+        entry(conversation, {
+            kind: "pi.tool-result",
+            model: [
+                {
+                    role: "toolResult",
+                    toolName: "plan",
+                    isError,
+                    content: [{ type: "text", text }],
+                    timestamp: at,
+                },
+            ],
+        });
+    const calls = (conversation: number, at: number, parts: object[]) =>
+        entry(conversation, {
+            kind: "pi.assistant",
+            model: [{ role: "assistant", content: parts, timestamp: at }],
+        });
+
+    result(13, NOW - 4 * HOUR, "Plan T4: rev abc", false);
+    result(
+        13,
+        NOW - 3 * HOUR,
+        "[error] Plan T4 has no draft graph for rev abc1234: call plan tasks first.",
+        true,
+    );
+    result(13, NOW - 2 * HOUR, "[error] Each option is 1 to 40 characters, on one line.", true);
+    result(13, NOW - 30 * HOUR, "[error] tasks needs rev: before the window.", true);
+    calls(13, NOW - 2 * HOUR, [
+        {
+            type: "toolCall",
+            id: "a",
+            name: "bash",
+            arguments: { command: "grep -n plan ~/pi-pocket-team/desk.ts" },
+        },
+        {
+            type: "toolCall",
+            id: "b",
+            name: "read",
+            arguments: { path: "/x/pi-pocket/src/server/memory.ts" },
+        },
+        { type: "toolCall", id: "c", name: "read", arguments: { path: "/x/README.md" } },
+        { type: "text", text: "desk.ts in plain text is no tool call" },
+        // A plan write, a desk call and a report that name the source write about it: no source read.
+        {
+            type: "toolCall",
+            id: "e",
+            name: "plan",
+            arguments: { action: "write", text: "Change desk.ts and pi-pocket/src/server." },
+        },
+        { type: "toolCall", id: "f", name: "desk", arguments: { action: "ask", text: "desk.ts?" } },
+        { type: "toolCall", id: "g", name: "team_message", arguments: { message: "read desk.ts" } },
+    ]);
+    result(12, NOW - 2 * HOUR, "[error] tasks needs rev: in a session that plans nothing.", true);
+    calls(12, NOW - 2 * HOUR, [
+        { type: "toolCall", id: "d", name: "bash", arguments: { command: "cat desk.ts" } },
+    ]);
+    db.close();
+
+    return base;
+}
+
+test("planning sessions: the plan results and source reads of a plan thread's session, in the window", () => {
+    const { pocketDir, odradeDir, homesDir, run } = setupPlan();
+    const data = loadData({
+        pocketDir,
+        odradeDir,
+        homesDir,
+        now: NOW,
+        hours: 24,
+        useGithub: false,
+        run,
+    });
+
+    assert.equal(data.sourceErrors.planSessions, undefined);
+    assert.equal(data.threads.T4.origin, "plan");
+    // Only T4's session: T2's session 12 is no planning session, though it has a plan refusal and a source read.
+    assert.deepEqual(
+        data.planSessions.map((item: { thread: string; session: number }) => [
+            item.thread,
+            item.session,
+        ]),
+        [["T4", 13]],
+    );
+
+    const [t4] = data.planSessions;
+
+    // The result from 30 h back is outside the window.
+    assert.deepEqual(
+        t4.results.map((item: { isError: boolean }) => item.isError),
+        [false, true, true],
+    );
+    assert.equal(t4.results[0].text, "");
+    assert.match(t4.results[1].text, /no draft graph for rev/);
+    assert.deepEqual(
+        t4.sourceReads.map((read: { tool: string }) => read.tool),
+        ["bash", "read"],
+    );
+    // No argument text is kept.
+    assert.deepEqual(Object.keys(t4.sourceReads[0]).sort(), ["at", "id", "tool"]);
+    // Only the bash and read calls count: the plan write, the desk call and the report that name desk.ts do not.
+    assert.ok(
+        t4.sourceReads.every((read: { tool: string }) => ["bash", "read"].includes(read.tool)),
+    );
+});
+
+test("planning sessions: loadPlanSessions skips a plan thread with no session, and a session with nothing in the window", () => {
+    const { pocketDir } = setupPlan();
+    const db = openPocket(path.join(pocketDir, "pocket.sqlite"));
+    const threads = {
+        T4: { id: "T4", origin: "plan", session: 13 },
+        T5: { id: "T5", origin: "plan" },
+        T6: { id: "T6", origin: "plan", session: SESSION_T1 },
+        T7: { id: "T7", origin: "delegate", session: SESSION_T2 },
+    };
+
+    assert.deepEqual(
+        loadPlanSessions(db, threads, NOW - 24 * HOUR).map(
+            (item: { thread: string }) => item.thread,
+        ),
+        ["T4"],
+    );
+    // From 2 h back, only the second refusal and the source reads remain.
+    const [late] = loadPlanSessions(db, threads, NOW - 2 * HOUR);
+
+    assert.equal(late.results.length, 1);
+    assert.equal(late.sourceReads.length, 2);
+    db.close();
+});
+
+test("planning sessions: without the desk, the source is unknown, not empty", () => {
+    const { pocketDir, odradeDir, homesDir, run } = setupPlan();
+    const db = new DatabaseSync(path.join(pocketDir, "pocket.sqlite"));
+
+    db.exec("delete from documents where kind='\"x.desk.threads\"'");
+    db.close();
+
+    const data = loadData({
+        pocketDir,
+        odradeDir,
+        homesDir,
+        now: NOW,
+        hours: 24,
+        useGithub: false,
+        run,
+    });
+
+    assert.equal(data.sourceErrors.planSessions, "needs the desk threads");
 });
 
 test("loadData reads the install time of a live module", () => {

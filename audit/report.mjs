@@ -64,6 +64,14 @@ export function ownerOf(check) {
         return { component: "Odrade's notes", owner: "Odrade", size: "S" };
     }
 
+    if (group === "P") {
+        return {
+            component: "the `plan` tool and the planning brief in `desk.ts`",
+            owner: "Sheeana",
+            size: "S",
+        };
+    }
+
     if (group === "Q") {
         return {
             component: "the repository's PR flow and its agent's briefs",
@@ -81,7 +89,7 @@ export function moduleOf(check) {
         return "night-shift.ts";
     }
 
-    return "ABCDE".includes(check[0]) ? "desk.ts" : undefined;
+    return "ABCDEP".includes(check[0]) ? "desk.ts" : undefined;
 }
 
 // ---------- Rank, maybe fixed ----------
@@ -446,6 +454,14 @@ const metricLines = (metrics, github) => {
                 `- Named workers: ${named.routes} routed beside a named worker. Suggestion same as named: ${named.same.count} (success ${named.same.success} of ${named.same.count}); differs: ${named.differs.count} (success ${named.differs.success} of ${named.differs.count}).`,
             );
         }
+    }
+
+    const p1 = metrics.P1?.total;
+
+    if (p1) {
+        lines.push(
+            `- Plan tool: ${plural(p1.calls, "call")} in ${plural(p1.sessions, "planning session")}, ${p1.refused} refused (rate ${p1.rate ?? "n/a"}), ${p1.targeted} with a targeted text, ${plural(p1.sourceReads, "source read")}.`,
+        );
     }
 
     const q1 = metrics.Q1;

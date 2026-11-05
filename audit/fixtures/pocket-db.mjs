@@ -325,6 +325,14 @@ export function createFixtureDb(file, now) {
         "The desk is full: 12 of 12 threads count.",
         true,
     );
+    // A refusal of the desk's plan tool: the audit counts it (pi-pocket-team#119). T2 is no plan thread.
+    toolResult(
+        SESSION_T2,
+        now - 3 * HOUR,
+        "plan",
+        '<harness>\n[error] tasks needs rev: the full revision you read with plan { action: "read" }.\n</harness>',
+        true,
+    );
     toolResult(SESSION_T2, now - 3 * HOUR, "bash", "[error] the desk is nothing", true);
     toolResult(SESSION_T2, now - 3 * HOUR, "desk", "fine", false);
 
