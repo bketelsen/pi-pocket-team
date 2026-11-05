@@ -73,6 +73,7 @@ import {
     planNoChange,
     recordVerify,
     failedRounds,
+    planningBrief,
     planTaskBrief,
     planVerifyBrief,
     revisePlan,
@@ -1196,6 +1197,15 @@ describe("a task graph", () => {
         assert.match(validateGraph(bad, ROSTER) ?? "", /not a repository of lucilla/);
     });
 
+    test("the repository refusal says to leave repo out for a new repository or host work", () => {
+        const bad = [{ ...(tasks()[0] ?? assert.fail("a task")), repo: "frostyard/nsl" }];
+
+        assert.match(
+            validateGraph(bad, ROSTER) ?? "",
+            /not a repository of lucilla\. Leave repo out for a repository that is not made yet, or for host work: the task then runs in the agent's home\.$/,
+        );
+    });
+
     test("bad acceptance lines are refused", () => {
         const none = [{ ...(tasks()[0] ?? assert.fail("a task")), acceptance: [] }];
 
@@ -1413,6 +1423,16 @@ describe("ready and approve", () => {
         const refused = readyPlan(state, "T1", { key: "ready:1", at: tick(1) });
 
         assert.match((refused as { error: string }).error, /no draft graph for rev/);
+    });
+
+    test("the no-draft-graph refusal says that a write makes a new rev", () => {
+        const { state } = startPlan();
+        const refused = readyPlan(state, "T1", { key: "ready:1", at: tick(1) });
+
+        assert.match(
+            (refused as { error: string }).error,
+            /call plan tasks first\. A write after plan tasks makes a new rev: call plan tasks again with it\.$/,
+        );
     });
 
     test("a replayed ready finds its stored call after a later event", () => {
@@ -5743,6 +5763,19 @@ describe("the whole-plan check", () => {
 });
 
 describe("the task and verify briefs", () => {
+    test("the planning brief files asks after the section, and names the rev of plan tasks", () => {
+        const brief = planningBrief("T1", "/plans/T1.md");
+
+        assert.match(
+            brief,
+            /^Write the section first, and give the open question in words, with no ask id\. Then file it with plan ask\. Decisions lists each settled answer by its ask id, so your sections do not need the id\.$/m,
+        );
+        assert.match(
+            brief,
+            /plan \{ action: "tasks", rev, tasks: \[\.\.\.\] \}.*tasks needs the rev you read\. A write after plan tasks makes a new rev: call plan tasks again with it before plan ready\.$/m,
+        );
+    });
+
     test("the task brief names plan nochange", () => {
         const { plan, graph } = buildingPlan();
 

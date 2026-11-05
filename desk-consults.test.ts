@@ -225,6 +225,18 @@ describe("the consult bounds", () => {
         );
     });
 
+    test("the running limit refusal says to consult again after a finding", () => {
+        const { state, ask } = drafting();
+
+        assert(
+            !("error" in consult(state, { agents: ["teg", "paul", "irulan"], ask, key: "k:1" })),
+        );
+        assert.match(
+            errorOf(consult(state, { agents: ["teg"], key: "k:2" })),
+            /wait for a finding, or ask fewer agents\. The desk wakes you with each finding: then call plan consult again for the agents that did not start\.$/,
+        );
+    });
+
     test("at most 3 run at once, and 8 in all, by default", () => {
         const { state, ask } = drafting();
         const first = consult(state, { agents: ["teg", "paul", "irulan"], ask, key: "k:1" });
@@ -1389,6 +1401,7 @@ function stubDesk() {
     const extension = createDesk(stubHost as never, stubWeb as never) as unknown as {
         tools: {
             name: string;
+            parameters: unknown;
             execute: (args: object, api: object, context: unknown) => Promise<unknown>;
         }[];
         hooks: {
@@ -1453,6 +1466,19 @@ function stubDesk() {
                 )
             )?.block,
         plan,
+        /** The parameters of this instance's plan tool, as the model sees them. */
+        planParameters: () =>
+            extension.tools.find((each) => each.name === "plan")!.parameters as {
+                properties: Record<
+                    string,
+                    {
+                        description?: string;
+                        items?: {
+                            anyOf: { properties?: Record<string, { description?: string }> }[];
+                        };
+                    }
+                >;
+            },
         /** The desk tool of this instance, in a session. */
         desk: (args: object, conversationId: number) =>
             extension.tools
@@ -1626,6 +1652,26 @@ describe("with the Pi Pocket app", () => {
             /<linked-session-message>\n[\s\S]*Named identity for this Pi Pocket session/,
         );
         assert.deepEqual(consultNonces(text), [k1.nonce]);
+    });
+
+    test("the plan tool's rev and repo texts give the next step", () => {
+        const desk = stubDesk();
+
+        try {
+            const { properties } = desk.planParameters();
+            const task = properties.tasks?.items?.anyOf[0]?.properties ?? assert.fail("a task");
+
+            assert.match(
+                properties.rev?.description ?? "",
+                /^write, tasks: the full rev you read .*; each write makes a new rev, so call tasks again after a write$/,
+            );
+            assert.match(
+                task.repo?.description ?? "",
+                /absent: the agent's home \(leave it out for a repository that is not made yet, or for host work\)/,
+            );
+        } finally {
+            desk.restore();
+        }
     });
 
     test("in running, read and plan finding pass, and every other tool is blocked", async () => {
