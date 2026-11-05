@@ -11839,7 +11839,7 @@ export function validateGraph(
         }
 
         if (task.repo !== undefined && (agent.repositories?.[task.repo] ?? "") === "") {
-            return `Task ${task.id} names ${task.repo}, which is not a repository of ${task.agent}.`;
+            return `Task ${task.id} names ${task.repo}, which is not a repository of ${task.agent}. Leave repo out for a repository that is not made yet, or for host work: the task then runs in the agent's home.`;
         }
 
         if (task.acceptance.length < 1 || task.acceptance.length > TASK_MAX_LINES) {
@@ -13430,7 +13430,7 @@ export function readyPlan(
 
     if (graph === undefined) {
         return {
-            error: `Plan ${plan.thread} has no draft graph for rev ${plan.rev.slice(0, 7)}: call plan tasks first.`,
+            error: `Plan ${plan.thread} has no draft graph for rev ${plan.rev.slice(0, 7)}: call plan tasks first. A write after plan tasks that changes the file makes a new rev: call plan tasks again with it.`,
         };
     }
 
@@ -15334,9 +15334,10 @@ export function planningBrief(id: string, file: string): string {
         `Read it with plan { action: "read" }.`,
         `A write is 1 section (section and text; heading only for a new section or a new heading) or the whole file (no section). Give the rev you read: a stale rev is refused, so read again and merge your change.`,
         `File each decision for Brian with plan { action: "ask", section: "<id>", text }: 1 question, anchored to a section, and options of 40 characters or fewer. With options, you may propose up to 5 criteria (criteria: ["Easy reset", ...], each 40 characters or fewer): Brian marks each option against them on the page.`,
+        "Write the section first, and give the open question in words, with no ask id. Then file it with plan ask. Decisions lists each settled answer by its ask id, so your sections do not need the id.",
         `Write an answer back with asks: [{ ask, gen }] in your write, and change that ask's section: the desk then marks it settled.`,
         `Brian comments on sections from the Desk page (c1, c2, ...): settle a comment with comments: ["c1"] in a write that changes its section. An open comment holds the plan, as an open ask does.`,
-        `Draft the task graph with plan { action: "tasks", tasks: [...] } after the decisions are written, and then call plan { action: "ready" }.`,
+        `Draft the task graph with plan { action: "tasks", rev, tasks: [...] } after the decisions are written, and then call plan { action: "ready" }. tasks needs the rev you read. A write after plan tasks that changes the file makes a new rev: call plan tasks again with it before plan ready.`,
         "After a scope change, a task that is done in the approved graph and stays the same (id, agent, repository, acceptance lines and deps, and each dep carried too) is carried: give it carried: { why } in plan tasks. It keeps its work and stays done. Every other task is new work.",
         `To hear an expert while the plan drafts, call plan { action: "consult", agents: ["teg"], question, ask: "<ask id>" }: 1 to 3 other agents, each in a read-only session of its own. Each answers once with a finding (supports, objects or neutral); the desk wakes you with it, and a running consult holds the plan.`,
         "Brian approves on the Desk page: no tool approves.",
@@ -16349,7 +16350,7 @@ export function addConsults(
 
     if (active.length + ids.length > request.limits.running) {
         return {
-            error: `${String(active.length)} consult${active.length === 1 ? " runs" : "s run"} on ${plan.thread} now${active.length === 0 ? "" : ` (${active.map((each) => each.id).join(", ")})`}, and at most ${String(request.limits.running)} may run at once (plans.consults.running): wait for a finding, or ask fewer agents.`,
+            error: `${String(active.length)} consult${active.length === 1 ? " runs" : "s run"} on ${plan.thread} now${active.length === 0 ? "" : ` (${active.map((each) => each.id).join(", ")})`}, and at most ${String(request.limits.running)} may run at once (plans.consults.running): wait for a finding, or ask fewer agents. The desk wakes you with each finding: then call plan consult again for the agents that did not start.`,
         };
     }
 
@@ -25813,7 +25814,7 @@ export default function createDesk(host: Host, web: Web) {
             rev: Type.Optional(
                 Type.String({
                     description:
-                        "write: the full rev you read with read, 40 hex characters; a stale rev is refused, so read again and merge your change",
+                        "write, tasks: the full rev you read with read, 40 hex characters; a stale rev is refused, so read again and merge your change; a write that changes the file makes a new rev, so call tasks again after it",
                 }),
             ),
             section: Type.Optional(
@@ -25941,7 +25942,7 @@ export default function createDesk(host: Host, web: Web) {
                             repo: Type.Optional(
                                 Type.String({
                                     description:
-                                        "a repository of that agent; absent: the agent's home",
+                                        "a repository of that agent; absent: the agent's home (leave it out for a repository that is not made yet, or for host work)",
                                 }),
                             ),
                             acceptance: Type.Array(Type.String(), {
@@ -26646,7 +26647,7 @@ export default function createDesk(host: Host, web: Web) {
 
             if (draft === undefined) {
                 throw new Error(
-                    `Plan ${plan.thread} has no draft graph for rev ${plan.rev.slice(0, 7)}: call plan tasks first.`,
+                    `Plan ${plan.thread} has no draft graph for rev ${plan.rev.slice(0, 7)}: call plan tasks first. A write after plan tasks that changes the file makes a new rev: call plan tasks again with it.`,
                 );
             }
 
