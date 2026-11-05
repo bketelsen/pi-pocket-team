@@ -393,9 +393,10 @@ export type Thread = {
      * reopens and closes again gets no second entry), and `watchKeys` (the replay key of every watch set on the thread, in
      * order, never removed: a replayed `desk watch` with one of them changes nothing; absent for a thread from before
      * the field), and `archives` (by session id, `ArchiveEntry`: the archives the desk began or did of the thread's
-     * session, or of its plan's consults' sessions; absent until the first). `archived` is false for a thread that is not
-     * closed when the desk archived its session and did not bring it back yet (`deskArchived`): the archive pass brings it
-     * back, and until then the thread keeps its session hold and its close-out.
+     * session, or of its plan's consults' sessions; absent until the first). `archived` is false, in every thread state, when
+     * the desk archived its session or may have (a `pending` entry, or a `done` entry with no `restored`: `deskArchived`,
+     * `archivedFact`): the archive pass brings it back, and until then a thread that opened again keeps its session hold,
+     * its close-out and its agent's repair route.
      */
     run: Record<string, JsonValue>;
     /** The last 50; `key` makes an event unique. */
@@ -4363,16 +4364,31 @@ export function threadsOfSession(
 }
 
 /**
- * Whether the desk archived a session and did not bring it back: some thread has a `done` entry for it with no
- * `restored`. The sweep counts such a session as not archived for a thread that is not closed, so a thread that opened
- * again keeps its session hold and its close-out until the archive pass brings the session back.
+ * Whether the desk archived a session, or may have, and did not bring it back: some thread has a `pending` entry for it
+ * (the call may have acted before a stop), or a `done` entry with no `restored`. The sweep counts such a session as not
+ * archived in every thread state (`archivedFact`), so a thread that opened again keeps its session hold, its close-out
+ * and its agent's repair route until the archive pass brings the session back.
  */
 export function deskArchived(state: Readonly<DeskState> | undefined, session: number): boolean {
     return Object.values(state?.threads ?? {}).some((thread) => {
         const entry = archivesOf(thread)[String(session)];
 
-        return entry?.state === "done" && entry.restored === undefined;
+        return (
+            entry?.state === "pending" || (entry?.state === "done" && entry.restored === undefined)
+        );
     });
+}
+
+/**
+ * The `archived` fact that the sweep copies into a thread's `run.archived`: the list's fact, but false for a session
+ * the desk archived (`deskArchived`). Every place that copies the fact uses it, for every thread state.
+ */
+export function archivedFact(
+    state: Readonly<DeskState> | undefined,
+    thread: Thread,
+    archived: boolean,
+): boolean {
+    return archived && !(typeof thread.session === "number" && deskArchived(state, thread.session));
 }
 
 /** One session to bring back: the archive's work, and the threads bound to the session that are open again. */
@@ -22417,9 +22433,7 @@ export default function createDesk(host: Host, web: Web) {
 
                 // A session the desk archived is not archived for a thread that opened again: it keeps the session
                 // hold, the close-out and the agent's repair route until the archive pass brings the session back.
-                const archived =
-                    session.archived &&
-                    !(typeof thread.session === "number" && deskArchived(state, thread.session));
+                const archived = archivedFact(state, thread, session.archived);
 
                 if (thread.run.archived !== archived) {
                     thread.run.archived = archived;
@@ -22642,7 +22656,8 @@ export default function createDesk(host: Host, web: Web) {
 
             if (session !== undefined) {
                 thread.run.busy = session.busy;
-                thread.run.archived = session.archived;
+                // The same mask as for an open thread: a thread that reopens in this sweep routes its repairs right.
+                thread.run.archived = archivedFact(state, thread, session.archived);
             }
         }
 

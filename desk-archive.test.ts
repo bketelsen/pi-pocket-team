@@ -11,6 +11,7 @@ import {
     archiveKey,
     archivePending,
     archiveRestores,
+    archivedFact,
     archivesOf,
     deskArchived,
     SWEEP_MIN_AGE_MS,
@@ -671,7 +672,7 @@ describe("the archive's pending and reopen work", () => {
         );
     });
 
-    test("deskArchived: a done entry with no restored, on any thread", () => {
+    test("deskArchived: a pending entry, or a done entry with no restored, on any thread", () => {
         const one = thread();
         const other = thread({ session: one.session, state: "open" });
 
@@ -686,7 +687,13 @@ describe("the archive's pending and reopen work", () => {
         one.run.archives = {
             [String(one.session)]: { at: 1, by: "auto", key: "k", state: "pending" },
         };
-        assert.equal(deskArchived(stateOf([one, other]), one.session!), false, "pending");
+        assert.equal(
+            deskArchived(stateOf([one, other]), one.session!),
+            true,
+            "pending: the call may have acted",
+        );
+        assert.equal(archivedFact(stateOf([one, other]), other, true), false, "masked");
+        assert.equal(archivedFact(stateOf([one, other]), one, true), false, "in every state");
 
         one.run.archives = {
             [String(one.session)]: { at: 1, by: "auto", key: "k", state: "done", restored: 2 },

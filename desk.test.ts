@@ -24385,6 +24385,8 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
                 refuse?: string;
                 /** A refusal for the calls that bring a session back only. */
                 refuseBack?: string;
+                /** How many of the next list reads fail. */
+                listFailures?: number;
                 /** A read of the tool's api: a promise replaces Pocket's read, undefined passes it on. */
                 snapshot?: (doc: string, conversationId: unknown) => Promise<unknown> | undefined;
             } = {};
@@ -24449,6 +24451,12 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
                 linkedSessions: {
                     send: async () => {},
                     list: async () => {
+                        if ((control.listFailures ?? 0) > 0) {
+                            control.listFailures! -= 1;
+
+                            throw new Error("the list is not readable now");
+                        }
+
                         reads.push(
                             Object.fromEntries(
                                 [...listed.values()].map((each) => [each.address, each.archived]),
@@ -24968,6 +24976,111 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
                 assert.equal(after?.state, "open");
                 assert.equal(after?.run.archived, false);
                 assert.equal(closeoutKey(after!), `closeout:${after!.key}:frostyard/test#7`);
+            } finally {
+                stub.restore();
+            }
+        });
+
+        test("a pending archive that acted counts as not archived for a reopened thread when the early list read fails", async () => {
+            const stub = archiveDesk();
+
+            try {
+                const source = await supervisor("archive-mask-pending");
+
+                writeFileSync(
+                    fixturePath,
+                    JSON.stringify({ data: { viewer: { login: "github-viewer" } } }),
+                );
+
+                const one = await closedThread(source, stub, 3 * DAY, (thread) => {
+                    thread.repo = "frostyard/test";
+                    thread.prs["frostyard/test#7"] = { via: "seen", state: "MERGED" };
+                });
+                const key = `x.desk.archive:${one.id}:${String(one.session)}:${String((await threadOf(one.id))?.closed?.at)}`;
+
+                // A pass committed `pending` and called; it stopped before `done`. Then a tool opened the thread again.
+                await app.harness.commit(async (tx) => {
+                    const thread = (await tx.doc(DeskThreads)).threads[one.id]!;
+
+                    thread.run.archives = {
+                        [String(one.session)]: {
+                            at: Date.now(),
+                            by: "sweep",
+                            key,
+                            state: "pending",
+                        },
+                    };
+                    thread.state = "open";
+                    delete thread.closed;
+                }, context);
+                await stub.archive(Number(source), { to: one.address }, key);
+                // The early pass cannot read the list; the sweep's own read can, and sees the session archived.
+                stub.control.listFailures = 1;
+                stub.reads.length = 0;
+                await stub.sync(source);
+
+                const after = await threadOf(one.id);
+
+                assert.equal(stub.reads[0]?.[one.address], true, "the sweep read it archived");
+                assert.equal(after?.state, "open", "the sweep does not close it");
+                assert.equal(after?.run.archived, false);
+                assert.equal(closeoutKey(after!), `closeout:${after!.key}:frostyard/test#7`);
+                assert.equal(
+                    stub.listed.get(one.address)?.archived,
+                    false,
+                    "the pass brings it back",
+                );
+            } finally {
+                stub.restore();
+            }
+        });
+
+        test("a thread that session activity reopens in the sweep routes its new repair to the agent, not to Odrade", async () => {
+            const stub = archiveDesk();
+
+            try {
+                const source = await supervisor("archive-repair-route");
+
+                writeFileSync(
+                    fixturePath,
+                    JSON.stringify({ data: { viewer: { login: "github-viewer" } } }),
+                );
+
+                const ref = "frostyard/test#8";
+                const one = await closedThread(source, stub, 2 * DAY, (thread) => {
+                    thread.repo = "frostyard/test";
+                    thread.prs[ref] = {
+                        via: "seen",
+                        state: "OPEN",
+                        mergeable: "CONFLICTING",
+                        head: "a1b2c3d4e5f6",
+                    };
+                    thread.run.archives = {
+                        [String(thread.session)]: {
+                            at: 1,
+                            by: "auto",
+                            key: `x.desk.archive:${thread.id}:${String(thread.session)}:5`,
+                            state: "done",
+                        },
+                    };
+                });
+
+                // The desk archived the session, and the agent works in it now: the sweep reopens the thread.
+                stub.listed.get(one.address)!.archived = true;
+                stub.listed.get(one.address)!.busy = true;
+                await stub.sync(source);
+
+                const after = await threadOf(one.id);
+                const repairs = Object.values(
+                    (after?.run.repairs ?? {}) as Record<string, { to: string; why: string }>,
+                );
+
+                assert.equal(after?.state, "open", "session activity reopened it");
+                assert(repairs.length > 0, "a new repair key in the same sweep");
+                assert.deepEqual(
+                    repairs.map((each) => [each.to, each.why]),
+                    repairs.map(() => ["agent", "change"]),
+                );
             } finally {
                 stub.restore();
             }
