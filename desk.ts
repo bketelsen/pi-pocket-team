@@ -690,7 +690,9 @@ export type PlanTask = {
     /**
      * Every delivery of the task, oldest first: the first one, and 1 more for each repair after a failed verification.
      * An attempt is never removed or changed after it ends; a repair adds a new one. A failed verification does not
-     * change an attempt: the round records it (`Verification.rounds`).
+     * change an attempt: the round records it (`Verification.rounds`). 1 exception, a repair of stored data
+     * (`planFacts`): the newest attempt of a `ready` or `waiting` task that ended `stopped` while its PR was still open
+     * ends `merged` when its thread later has a merged PR and no open PR.
      */
     attempts: {
         /** The task thread. */
@@ -11106,6 +11108,10 @@ export const PLAN_DESK_SECTIONS: readonly { id: string; heading: string }[] = [
 const DESK_SECTION_ERROR =
     "Decisions and Tasks belong to the desk: it writes them. Write another section.";
 
+/** The refusal of a whole-file write that changes the body of a section of the desk's own. */
+const DESK_SECTION_WHOLE_FILE_ERROR =
+    "Decisions and Tasks belong to the desk: leave them out of a whole-file write, or copy them unchanged from plan read.";
+
 /** A secret form that a plan file refuses, and its name in the refusal. */
 const SECRET_FORMS: readonly { name: string; pattern: RegExp }[] = [
     { name: "ghp_", pattern: /\bghp_[A-Za-z0-9]{20,}/ },
@@ -11473,10 +11479,14 @@ export function buildPlanText(
                 section.id !== undefined &&
                 PLAN_DESK_SECTIONS.some((each) => each.id === section.id)
             ) {
+                // The body that plan read gave (the current file) or the new render: a write that settles asks
+                // renders Decisions again, so a copy of the body the caller read is also unchanged.
                 const kept = section.id === "decisions" ? desk.decisions.trim() : desk.tasks.trim();
+                const read = parsed.sections.find((each) => each.id === section.id)?.body.trim();
+                const body = section.body.trim();
 
-                if (section.body.trim() !== kept) {
-                    return { error: DESK_SECTION_ERROR };
+                if (body !== kept && body !== read) {
+                    return { error: DESK_SECTION_WHOLE_FILE_ERROR };
                 }
 
                 continue;
@@ -11750,6 +11760,27 @@ export function askMarksText(ask: Ask, quote: (text: string) => string): string 
 
 /** A roster entry, as Team's `roster()` gives it: enough to check a graph's agents and repositories. */
 export type PlanRoster = { id: string; role: string; repositories?: Record<string, string> };
+
+/**
+ * The lines of `plan read` for the planning session: each agent with role `agent` and its repository names. Names only:
+ * never a folder path or a home.
+ */
+export function planRosterText(members: readonly PlanRoster[] | undefined): string[] {
+    if (members === undefined) {
+        return ["Agents: the roster is not available now."];
+    }
+
+    return [
+        "Agents (role agent) and their repositories:",
+        ...members
+            .filter((member) => member.role === "agent")
+            .map((member) => {
+                const repos = Object.keys(member.repositories ?? {});
+
+                return `- ${member.id}: ${repos.length === 0 ? "no repository (home only)" : repos.join(", ")}`;
+            }),
+    ];
+}
 
 /** The first cycle of the deps, as the ids it goes through, when there is one. */
 function depCycle(tasks: readonly PlanTask[]): string[] | undefined {
@@ -13957,10 +13988,104 @@ const prOpen = (link: PrLink | undefined): boolean =>
     link !== undefined && (link.state === "OPEN" || link.state === undefined);
 
 /**
+ * The closed task threads of a supervisor whose PRs the sweep still reads: each is the thread of an open attempt in the
+ * approved graph of a plan that is not done or dropped, and did not close `failed`. A thread that closed while its PR
+ * was open keeps its attempt open (`planFacts`), so its PR's merge or close must be read at any close age. A thread
+ * that `reopenable` gives is left out: the 7-day set reads it already. The sweep only reads their PRs: no reopen, no
+ * attribution, no labels and no issues.
+ */
+export function planTaskClosedThreads(
+    state: DeskState | undefined,
+    supervisor: number,
+    now: number,
+): Thread[] {
+    const found = new Map<string, Thread>();
+
+    for (const plan of Object.values(state?.plans ?? {})) {
+        const graph = approvedGraphOf(plan);
+
+        if (graph === undefined || plan.state === "done" || plan.state === "dropped") {
+            continue;
+        }
+
+        for (const task of graph.tasks) {
+            const attempt = openAttempt(task);
+            const thread = attempt === undefined ? undefined : threadById(state, attempt.thread);
+
+            if (
+                thread === undefined ||
+                thread.supervisor !== supervisor ||
+                thread.state !== "closed" ||
+                thread.closed?.why === "failed" ||
+                reopenable(thread, now)
+            ) {
+                continue;
+            }
+
+            found.set(thread.id, thread);
+        }
+    }
+
+    return [...found.values()];
+}
+
+/**
+ * The repair of a task that an older sweep set back to `ready` while its PR was still open (F9): the task is `ready` or
+ * `waiting`, its newest attempt ended `stopped`, and that attempt's thread now has a merged PR and no open PR. The
+ * attempt takes the thread's PRs (a merged one with its head) and ends `merged`, and the task is done. A task in any
+ * other state (`stopped` by a scope change, `delegated`, `done`) and an older attempt are never touched. True when it
+ * repaired the task.
+ */
+function repairStopped(state: DeskState, task: PlanTask, now: number): boolean {
+    const newest = task.attempts.at(-1);
+
+    if (
+        (task.state !== "ready" && task.state !== "waiting") ||
+        newest === undefined ||
+        newest.end?.how !== "stopped"
+    ) {
+        return false;
+    }
+
+    const thread = threadById(state, newest.thread);
+    const links = Object.values(thread?.prs ?? {});
+
+    if (
+        thread === undefined ||
+        !links.some((link) => link.state === "MERGED") ||
+        links.some((link) => prOpen(link))
+    ) {
+        return false;
+    }
+
+    for (const ref of Object.keys(thread.prs)) {
+        if (!newest.prs.some((each) => each.ref === ref)) {
+            newest.prs.push({ ref });
+        }
+    }
+
+    for (const pr of newest.prs) {
+        const link = thread.prs[pr.ref];
+
+        if (link?.state === "MERGED" && link.head !== undefined && link.head !== "") {
+            pr.head = link.head;
+        }
+    }
+
+    newest.end = { at: now, how: "merged" };
+    task.state = "done";
+
+    return true;
+}
+
+/**
  * The PR facts of a plan's task threads, in the sweep's commit (decisions 11 to 14). For each task with an open
  * attempt: the attempt's `prs` take every PR of its thread (a merged one with its head); a second PR gets 1 warning
  * event on both threads, once for each ref; the attempt ends `merged` when a PR merged and none is open, and the task
- * is done; a thread that closed with no merged PR ends its attempt `stopped`, and the task is ready again. A task that
+ * is done; a thread that closed with no merged PR and no open PR (or none not read yet) ends its attempt `stopped`,
+ * and the task is ready again. A closed thread with an open PR keeps its attempt open until the PR merges or closes.
+ * A `ready` or `waiting` task whose newest attempt ended `stopped` (an older sweep ended it while its PR was open)
+ * becomes done when that thread now has a merged PR and no open PR: a repair of stored data, with 1 event. A task that
  * the scope change did not name goes on also while `revising` is set. A second sweep with the same facts changes
  * nothing, and gives no item.
  */
@@ -14019,6 +14144,22 @@ export function planFacts(
         }
 
         if (attempt === undefined) {
+            if (repairStopped(state, task, now)) {
+                const newest = task.attempts.at(-1);
+
+                changed = true;
+                event(
+                    planThread,
+                    `plan-task-merged:${newest?.thread ?? ""}`,
+                    `${task.id} merged after ${newest?.thread ?? ""} closed: the task is done (${(
+                        newest?.prs ?? []
+                    )
+                        .filter((pr) => pr.head !== undefined)
+                        .map((pr) => pr.ref)
+                        .join(", ")})`,
+                );
+            }
+
             continue;
         }
 
@@ -14073,9 +14214,10 @@ export function planFacts(
             continue;
         }
 
-        // A thread that closed with no merge: the task is ready again. A failed start may still run a session: it
-        // stays delegated (PR 1).
-        if (thread.state === "closed" && thread.closed?.why !== "failed" && !merged) {
+        // A thread that closed with no merge and no open PR: the task is ready again. A failed start may still run a
+        // session: it stays delegated (PR 1). A PR that is open, or not read yet, keeps the attempt open: its merge or
+        // its close ends it in a later sweep.
+        if (thread.state === "closed" && thread.closed?.why !== "failed" && !merged && !open) {
             attempt.end = { at: now, how: "stopped" };
 
             const depsDone = task.deps.every(
@@ -20171,6 +20313,16 @@ export default function createDesk(host: Host, web: Web) {
             }
         }
 
+        // A closed task thread of a plan's open attempt, at any close age: its PRs that are open, or not read yet, are
+        // pinned too, so their merge or close ends the attempt (`planFacts`). The same 1 read: a pinned PR only.
+        for (const thread of planTaskClosedThreads(state, Number(supervisor), now)) {
+            for (const [ref, link] of Object.entries(thread.prs)) {
+                if (prOpen(link) && REF.test(ref) && isRepoName(repoOf(ref))) {
+                    pinned.add(ref);
+                }
+            }
+        }
+
         // A watch that waits for a PR's event: that PR is pinned too, read by number in the same 1 read, also when no
         // thread holds it, with all its labels and the latest review of each reviewer. Its repository is not listed: it
         // attributes nothing, and only the watch reads the facts. At most `MAX_PR_WATCHES`, the oldest first; a bad
@@ -20879,6 +21031,12 @@ export default function createDesk(host: Host, web: Web) {
             // A thread that closed as done in the last 7 days keeps its PRs fresh: a merge shows on the page, and a merge
             // ask on it is answered. Its labels and its issues are not planned: it is closed.
             for (const thread of closedDone) {
+                events += updatePrs(thread, facts.github, now);
+            }
+
+            // A closed task thread of a plan's open attempt, older than 7 days: its PRs only (`planTaskClosedThreads`).
+            // `planFacts` then ends the attempt, later in this commit.
+            for (const thread of planTaskClosedThreads(state, supervisor, now)) {
                 events += updatePrs(thread, facts.github, now);
             }
 
@@ -25789,7 +25947,7 @@ export default function createDesk(host: Host, web: Web) {
     const planTool = defineTool({
         name: "plan",
         description:
-            "The plan of a piece of work, before it starts: its Markdown file, its decisions, and its task graph. The planning session (the session of a plan thread) reads and writes its plan here; the supervisor and its Clerk read and list plans; a task session reads the plan it works on. Actions: read (the plan, its sections, the gate, its graph, and the file), write (1 section, or the whole file, with the rev you read: a stale rev is refused; name the asks and comments it settles), ask (1 question for Brian, anchored to a section, with options and up to 5 criteria), tasks (draft the task graph for the plan's revision; a done task that stays the same is carried), ready (the plan goes to Brian for his approval, when nothing waits), revise (a scope change of an approved plan: a task session of the plan, or the supervisor; why, and the task ids it stops), nochange (a task session: the task is done with no PR; reason and evidence), verify (the verification session: the whole-plan result, 1 entry for each task), consult (the planning session, while the plan drafts: ask 1 to 3 other agents a question, each in a read-only session of its own; each answers once with a finding), finding (a consult session: its 1 answer, a stance and a summary), list (1 line for each open plan).",
+            "The plan of a piece of work, before it starts: its Markdown file, its decisions, and its task graph. The planning session (the session of a plan thread) reads and writes its plan here; the supervisor and its Clerk read and list plans; a task session reads the plan it works on; any agent reads any plan. Actions: read (the plan, its sections, the gate, its graph, and the file; for the planning session also the agents and their repositories), write (1 section, or the whole file, with the rev you read: a stale rev is refused; name the asks and comments it settles), ask (1 question for Brian, anchored to a section, with options and up to 5 criteria), tasks (draft the task graph for the plan's revision; a done task that stays the same is carried), ready (the plan goes to Brian for his approval, when nothing waits), revise (a scope change of an approved plan: a task session of the plan, or the supervisor; why, and the task ids it stops), nochange (a task session: the task is done with no PR; reason and evidence), verify (the verification session: the whole-plan result, 1 entry for each task), consult (the planning session, while the plan drafts: ask 1 to 3 other agents a question, each in a read-only session of its own; each answers once with a finding), finding (a consult session: its 1 answer, a stance and a summary), list (1 line for each open plan).",
         parameters: Type.Object({
             action: Type.Union([
                 Type.Literal("read"),
@@ -26079,7 +26237,11 @@ export default function createDesk(host: Host, web: Web) {
             /** The planning session of this plan writes it: the desk knows that session by its conversation id. */
             const isPlanning = planning?.id === plan.thread;
             const isTask = mine?.planTask?.plan === plan.thread;
-            const readsAny = persona?.role === "supervisor" || (persona?.role === "clerk" && clerk);
+            // Any agent reads any plan (a dependency of its own, say): a read changes nothing. Only `read` uses this.
+            const readsAny =
+                persona?.role === "supervisor" ||
+                (persona?.role === "clerk" && clerk) ||
+                persona?.role === "agent";
 
             // A scope change comes from a task session of this plan, or from the supervisor: never from the planner.
             if (args.action === "revise" && !isTask && persona?.role !== "supervisor") {
@@ -26114,7 +26276,7 @@ export default function createDesk(host: Host, web: Web) {
 
             if (args.action === "read" && !isPlanning && !isTask && !readsAny) {
                 throw new Error(
-                    `Only the planning session of ${plan.thread}, its task sessions, the supervisor and its Clerk read it: this session holds no ${plan.thread}.`,
+                    `Only the planning session of ${plan.thread}, its task sessions, the supervisor, its Clerk and agent sessions read it: this session holds no ${plan.thread}.`,
                 );
             }
 
@@ -26362,6 +26524,14 @@ export default function createDesk(host: Host, web: Web) {
             if (args.action === "read") {
                 const text = await readStore(planRoot(plan), plan.rev).catch(() => undefined);
                 const graph = newestGraph(plan);
+                // The planning session picks each task's agent and repository: it reads the roster each time.
+                const roster = isPlanning
+                    ? planRosterText(
+                          team === undefined
+                              ? undefined
+                              : await team.roster().catch(() => undefined),
+                      )
+                    : [];
 
                 return reply(
                     [
@@ -26389,6 +26559,7 @@ export default function createDesk(host: Host, web: Web) {
                                           `- ${task.id} ${task.title} · ${taskWhere(task.agent, task.repo)} · ${task.state} · deps: ${task.deps.join(", ") || "none"}`,
                                   ),
                               ]),
+                        ...roster,
                         ...(thread.asks.length === 0
                             ? []
                             : [
