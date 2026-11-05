@@ -5,6 +5,11 @@ import { DAY } from "./common.mjs";
 
 /** The window of `prRounds` and `blockers`, in days. */
 export const REVIEW_WINDOW_DAYS = 30;
+/**
+ * The audit loads the review calls of this many days before the window too: a spawn before the window still names
+ * the reviewer and the PR of a send or an answer in the window.
+ */
+export const REVIEW_LOOKBACK_DAYS = 7;
 
 /**
  * A cross-review reviewer (Brian's cross-review policy): a read-only subagent with exactly the tools `read` and
@@ -188,15 +193,15 @@ export function callPr(call, data, owners = ownersOf(data)) {
 }
 
 /**
- * The review calls of the window, oldest first, each with `round` (a cross-review spawn, or a send whose name's latest
- * spawn in that session was one), `pr` (`callPr`; a send with no PR of its own takes the PR of the latest earlier call
- * to the same name in the same session) and `head` (the call's own).
+ * Every loaded review call (the window and its lookback), oldest first, each with `round` (a cross-review spawn, or a
+ * send whose name's latest spawn in that session was one), `pr` (`callPr`; a send with no PR of its own takes the PR
+ * of the latest earlier call to the same name in the same session) and `head` (the call's own). No window filter
+ * here: a spawn before the window still sets the round and the PR of a later send.
  */
-function reviewCalls(data, ctx) {
-    const from = ctx.now - REVIEW_WINDOW_DAYS * DAY;
+function reviewCalls(data) {
     const owners = ownersOf(data);
     const calls = (Array.isArray(data.reviewCalls) ? data.reviewCalls : [])
-        .filter((call) => typeof call?.at === "number" && call.at >= from)
+        .filter((call) => typeof call?.at === "number")
         .map((call, index) => ({ call, index }))
         .sort((a, b) => a.call.at - b.call.at || a.call.id - b.call.id || a.index - b.index)
         .map((item) => item.call);
@@ -225,10 +230,15 @@ function reviewCalls(data, ctx) {
     });
 }
 
-/** The cross-review rounds of the window, oldest first: `{ ref, head, at, session, reviewer }`; `ref` may be null. */
+/**
+ * The cross-review rounds of the window, oldest first: `{ ref, head, at, session, reviewer }`; `ref` may be null. The
+ * calls of the lookback set the rounds and the PRs, and are not counted.
+ */
 export function reviewRounds(data, ctx) {
-    return reviewCalls(data, ctx)
-        .filter((item) => item.round)
+    const from = ctx.now - REVIEW_WINDOW_DAYS * DAY;
+
+    return reviewCalls(data)
+        .filter((item) => item.round && item.call.at >= from)
         .map((item) => ({
             ref: item.pr.ref,
             head: item.head,
@@ -247,7 +257,8 @@ export function reviewRounds(data, ctx) {
  */
 export function reviewPoints(data, ctx) {
     const from = ctx.now - REVIEW_WINDOW_DAYS * DAY;
-    const calls = reviewCalls(data, ctx);
+    // The answers of the window join to every loaded call, the lookback's too.
+    const calls = reviewCalls(data);
     const answers = (Array.isArray(data.reviewAnswers) ? data.reviewAnswers : []).filter(
         (answer) => typeof answer?.at === "number" && answer.at >= from,
     );

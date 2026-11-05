@@ -728,11 +728,12 @@ test("main --no-github: Q1's day record is incomplete and says why", async () =>
     );
 });
 
-test("main: a final guard of a blocking point in an earlier findings.json makes no GitHub call again", async () => {
-    const t = setup();
-    const head = "a".repeat(40);
-    const final = "b".repeat(40);
-    const db = new DatabaseSync(path.join(t.pocketDir, "pocket.sqlite"));
+/**
+ * T1 works in acme/w; its session spawns a reviewer with `message` 3 hours before NOW, and gets 1 blocking point back
+ * 1 hour later.
+ */
+function addReview(pocketDir: string, message: string) {
+    const db = new DatabaseSync(path.join(pocketDir, "pocket.sqlite"));
     const insert = (id: number, conversation: number, record: object) =>
         db
             .prepare(
@@ -740,7 +741,6 @@ test("main: a final guard of a blocking point in an earlier findings.json makes 
             )
             .run(id, conversation, null, id, JSON.stringify(record));
 
-    // T1 works in acme/w; its session spawns a reviewer of acme/w#5 at a head, and gets 1 blocking point back.
     db.prepare(
         "insert into document_revisions (document_id, seq, kind, version, content) values (?,?,?,?,?)",
     ).run(1, 10_000, "delta", 1, JSON.stringify([["s", ["threads", "T1", "repo"], "acme/w"]]));
@@ -758,7 +758,7 @@ test("main: a final guard of a blocking point in an earlier findings.json makes 
                             action: "spawn",
                             name: "rv",
                             tools: ["read", "bash"],
-                            message: `Cross-review acme/w#5 at head ${head}.`,
+                            message,
                         },
                     },
                 ],
@@ -778,6 +778,14 @@ test("main: a final guard of a blocking point in an earlier findings.json makes 
         ],
     });
     db.close();
+}
+
+test("main: a final guard of a blocking point in an earlier findings.json makes no GitHub call again", async () => {
+    const t = setup();
+    const head = "a".repeat(40);
+    const final = "b".repeat(40);
+
+    addReview(t.pocketDir, `Cross-review acme/w#5 at head ${head}.`);
 
     const ghCalls: string[][] = [];
 
@@ -914,4 +922,104 @@ test("main: a final guard of a blocking point in an earlier findings.json makes 
         first.metrics.Q1.blockers.points[0].guard,
     );
     assert.equal(second.metrics.Q1.blockers.totals.evaluated, 1);
+});
+
+/** A `gh` runner for the guard read: an empty search, `pr` answers the PR query and `blob` the blob query. */
+const guardRun =
+    (t: ReturnType<typeof setup>, pr: () => string, blob: () => string) =>
+    (command: string, args: string[]) => {
+        if (command !== "gh") {
+            return t.run(command, args);
+        }
+
+        if (args[0] === "search") {
+            return "[]";
+        }
+
+        const query = args.find((arg) => arg.startsWith("query=")) ?? "";
+
+        if (query.includes("search(")) {
+            return JSON.stringify({
+                data: {
+                    search: {
+                        issueCount: 0,
+                        pageInfo: { hasNextPage: false, endCursor: null },
+                        nodes: [],
+                    },
+                },
+            });
+        }
+
+        return query.includes("pullRequest(") ? pr() : blob();
+    };
+
+const fail = () => {
+    throw new Error("gh: HTTP 502");
+};
+
+test("main: a failed PR query, a failed blob query and a refused repository name are named in blockers.guards", async () => {
+    const head = "a".repeat(40);
+    const mergedPr = () =>
+        JSON.stringify({
+            data: {
+                p0: {
+                    pullRequest: {
+                        state: "MERGED",
+                        mergedAt: null,
+                        closedAt: null,
+                        headRefOid: "b".repeat(40),
+                        files: { totalCount: 1, nodes: [{ path: "a.test.ts", additions: 1 }] },
+                    },
+                },
+            },
+        });
+
+    const guardsOf = async (message: string, run: ReturnType<typeof guardRun>) => {
+        const t = setup();
+
+        addReview(t.pocketDir, message);
+        fs.rmSync(t.outDir, { recursive: true });
+        await main(["--no-llm", "--out-dir", t.outDir], {
+            env: t.env,
+            now: NOW,
+            run: (command, args) => run(command, args),
+            log: () => undefined,
+        });
+
+        const json = JSON.parse(fs.readFileSync(path.join(t.outDir, "findings.json"), "utf8"));
+
+        // The point shows in every case.
+        assert.equal(json.metrics.Q1.blockers.totals.points, 1);
+
+        return json.metrics.Q1.blockers.guards;
+    };
+
+    const review = `Cross-review acme/w#5 at head ${head}.`;
+    const t = setup();
+
+    assert.deepEqual(await guardsOf(review, guardRun(t, fail, fail)), {
+        available: true,
+        errors: ["PR query failed"],
+        calls: 1,
+        pending: 1,
+    });
+    assert.deepEqual(await guardsOf(review, guardRun(t, mergedPr, fail)), {
+        available: true,
+        errors: ["blob query failed"],
+        calls: 2,
+        pending: 1,
+    });
+    // A repository name that the read-only `gh` would refuse is left out of the query and named; its key stays pending.
+    assert.deepEqual(
+        await guardsOf(
+            `Cross-review acme/mutation#5 at head ${head}.`,
+            guardRun(t, mergedPr, fail),
+        ),
+        {
+            available: true,
+            errors: ["repository name refused by the read-only gh"],
+            calls: 0,
+            pending: 1,
+        },
+    );
 });

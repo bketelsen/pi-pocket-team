@@ -3266,3 +3266,55 @@ test("Q1 blockers: points of answers with their PR, head, state and guard; ambig
         { available: false, reason: "boom" },
     );
 });
+
+test("Q1 blockers: guards says how the guard read went; a loader that failed is named, and the points stay", () => {
+    const t1 = thread("T1");
+    const at = ago(DAY);
+    const data = (over: object) =>
+        emptyData({
+            decided: todayEmpty,
+            threads: threadMap(t1),
+            reviewCalls: [
+                named(reviewerSpawn(t1.session, at, "rv"), ["acme/widgets#4"], [], HEAD_A),
+            ],
+            reviewAnswers: [
+                { id: 1, c: t1.session, at: at + MINUTE, name: "rv", ready: false, items: ["1"] },
+            ],
+            ...over,
+        });
+    const blockers = (over: object) => checkQ1(data(over), q1Ctx([])).metrics.blockers;
+
+    assert.deepEqual(
+        blockers({
+            blockerGuards: {
+                prs: {},
+                guards: {},
+                calls: 3,
+                pending: 1,
+                errors: ["PR query failed", "blob query returned errors"],
+            },
+        }).guards,
+        {
+            available: true,
+            errors: ["PR query failed", "blob query returned errors"],
+            calls: 3,
+            pending: 1,
+        },
+    );
+
+    const failed = blockers({
+        blockerGuards: undefined,
+        sourceErrors: { blockerGuards: "boom" },
+    });
+
+    assert.deepEqual(failed.guards, {
+        available: false,
+        reason: "boom",
+        errors: [],
+        calls: null,
+        pending: null,
+    });
+    assert.equal(failed.available, true);
+    assert.equal(failed.totals.points, 1);
+    assert.equal(failed.points[0].state, "unknown");
+});

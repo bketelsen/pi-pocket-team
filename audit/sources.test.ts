@@ -2143,6 +2143,7 @@ function guardGh(
     answer: (data: Record<string, Record<string, unknown>>, query: string) => unknown = (data) => ({
         data,
     }),
+    prAnswer: (data: Record<string, unknown>) => unknown = (data) => ({ data }),
 ) {
     const seen: string[][] = [];
     const commits = new Set(world.commits ?? [SHA_A, SHA_B]);
@@ -2175,7 +2176,7 @@ function guardGh(
                 };
             }
 
-            return JSON.stringify({ data });
+            return JSON.stringify(prAnswer(data));
         }
 
         queries.push(query);
@@ -2261,6 +2262,7 @@ test("loadBlockerGuards: 1 PR query, then 1 blob query with the candidates at th
         },
         calls: 2,
         pending: 0,
+        errors: [],
     });
 });
 
@@ -2503,7 +2505,7 @@ test("loadBlockerGuards: a cached final result needs no call; a closed PR is fin
     const none = loadBlockerGuards(blockerData([{ n: 4 }]), { gh: cached.gh, now: NOW, cache });
 
     assert.equal(cached.seen.length, 0);
-    assert.deepEqual(none, { prs: {}, guards: {}, calls: 0, pending: 0 });
+    assert.deepEqual(none, { prs: {}, guards: {}, calls: 0, pending: 0, errors: [] });
 
     const closed = guardGh(() => ({ state: "CLOSED", files: prFiles("a.test.ts") }));
     const result = loadBlockerGuards(blockerData([{ n: 5 }]), { gh: closed.gh, now: NOW });
@@ -2555,10 +2557,16 @@ test("loadBlockerGuards: a PR that GitHub cannot find fails the call; the other 
 
             error.stdout = JSON.stringify({
                 data: {
-                    p0: { pullRequest: { state: "OPEN", headRefOid: SHA_B } },
+                    p0: {
+                        pullRequest: {
+                            state: "OPEN",
+                            headRefOid: SHA_B,
+                            files: { totalCount: 0, nodes: [] },
+                        },
+                    },
                     p1: { pullRequest: null },
                 },
-                errors: [{ type: "NOT_FOUND" }],
+                errors: [{ type: "NOT_FOUND", path: ["p1", "pullRequest"] }],
             });
 
             throw error;
@@ -2580,6 +2588,9 @@ test("loadBlockerGuards: a PR that GitHub cannot find fails the call; the other 
     assert.equal(gh.state.failures, 1);
     assert.deepEqual(Object.keys(result.prs), ["acme/w#9"]);
     assert.equal(result.prs["acme/w#9"]!.state, "open");
+    // PR 8's key stays pending, and the failure is named with no text from GitHub.
+    assert.equal(result.pending, 1);
+    assert.deepEqual(result.errors, ["PR query failed", "PR query returned errors"]);
 });
 
 test("loadBlockerGuards: a key over 150 lookups, or a path the read-only gh refuses, is final with no query", () => {
@@ -2603,4 +2614,110 @@ test("loadBlockerGuards: a key over 150 lookups, or a path the read-only gh refu
     assert.equal(result.guards[`acme/w#1@${SHA_A}`]!.reason, "too many files");
     assert.equal(result.guards[`acme/w#2@${SHA_A}`]!.reason, "path refused by the read-only gh");
     assert.equal(result.guards[`acme/w#2@${SHA_A}`]!.guarded, null);
+});
+
+test("loadBlockerGuards: a PR node with no whole file list, or with an error on its alias, leaves its key pending", () => {
+    const { queries, gh } = guardGh(
+        (n) =>
+            n === 1
+                ? ({ state: "MERGED", files: null } as unknown as PrNode)
+                : n === 2
+                  ? ({ state: "MERGED", files: { totalCount: 1 } } as unknown as PrNode)
+                  : n === 3
+                    ? {
+                          state: "MERGED",
+                          files: { totalCount: 2, nodes: [{ path: "a.test.ts", additions: 1 }] },
+                      }
+                    : { state: "MERGED", files: prFiles("a.test.ts") },
+        { blobs: { [`${SHA_B}:a.test.ts`]: { oid: "t1" } } },
+        undefined,
+        // PR 5 is the newest point: alias p0. An error names it; its node is whole and still not used.
+        (data) => ({ data, errors: [{ path: ["p0", "pullRequest", "files"], message: "x" }] }),
+    );
+    const result = loadBlockerGuards(
+        blockerData([
+            { n: 1, minutes: 50 },
+            { n: 2, minutes: 40 },
+            { n: 3, minutes: 30 },
+            { n: 4, minutes: 20 },
+            { n: 5, minutes: 10 },
+        ]),
+        { gh, now: NOW },
+    );
+
+    // Only PR 4 is read and judged; the 4 other keys are pending, not final.
+    assert.deepEqual(Object.keys(result.prs), ["acme/w#4"]);
+    assert.deepEqual(Object.keys(result.guards), [`acme/w#4@${SHA_A}`]);
+    assert.equal(result.guards[`acme/w#4@${SHA_A}`]!.test, true);
+    assert.equal(queries.length, 1);
+    assert.equal(result.pending, 4);
+    assert.deepEqual(result.errors.sort(), [
+        "PR query returned an incomplete PR",
+        "PR query returned errors",
+    ]);
+});
+
+test("loadBlockerGuards: a failed blob query and the call cap are named in errors", () => {
+    const failed = guardGh(
+        () => ({ state: "MERGED", files: prFiles("a.test.ts") }),
+        {},
+        () => ({ errors: [{ message: "Something went wrong" }] }),
+    );
+    const one = loadBlockerGuards(blockerData([{ n: 4 }]), { gh: failed.gh, now: NOW });
+
+    assert.equal(one.pending, 1);
+    assert.deepEqual(one.errors, ["blob query returned errors"]);
+    assert.ok(!JSON.stringify(one).includes("Something"));
+
+    const capped = guardGh(() => ({ state: "MERGED", files: prFiles("a.test.ts") }));
+
+    // 39 calls are used before: the PR query is the 40th, and the blob query meets the cap.
+    for (let i = 0; i < 39; i += 1) {
+        capped.gh.api("repos/acme/w");
+    }
+
+    const two = loadBlockerGuards(blockerData([{ n: 4 }]), { gh: capped.gh, now: NOW });
+
+    assert.equal(two.pending, 1);
+    assert.deepEqual(two.errors, ["GitHub call cap reached"]);
+});
+
+test("loadData: the review calls of 7 days before the 30-day window are loaded too", () => {
+    const { pocketDir, odradeDir, homesDir, run } = setup();
+
+    addRows(pocketDir, (db) => {
+        for (const [id, days] of [
+            [400, 36],
+            [401, 38],
+        ]) {
+            insertEntry(db, id, SUPERVISOR, NOW - days * DAY, [
+                {
+                    type: "toolCall",
+                    id: `c${id}`,
+                    name: "subagent",
+                    arguments: {
+                        action: "spawn",
+                        name: `s${days}`,
+                        tools: ["read", "bash"],
+                        message: "Review",
+                    },
+                },
+            ]);
+        }
+    });
+
+    const data = loadData({
+        pocketDir,
+        odradeDir,
+        homesDir,
+        now: NOW,
+        hours: 24,
+        useGithub: false,
+        run,
+    });
+
+    assert.deepEqual(
+        data.reviewCalls.map((call: { name: string }) => call.name),
+        ["w", "audit", "old", "s36"],
+    );
 });

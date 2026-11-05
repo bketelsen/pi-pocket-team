@@ -289,3 +289,58 @@ test("guardCacheOf: final guards of earlier days by ref@head; the newest day win
     assert.deepEqual(guardCacheOf([day("2026-10-22", { final: false })]), {});
     assert.deepEqual(guardCacheOf(undefined), {});
 });
+
+test("reviewRounds and reviewPoints: a spawn before the 30-day window still sets the round and the PR of a send and an answer in it", () => {
+    const data = emptyData({
+        threads: threadMap(t1),
+        reviewCalls: [
+            spawn(1, ago(31 * DAY), { refs: ["acme/widgets#4"], head: SHA_A }),
+            send(2, ago(29 * DAY), { head: SHA_B }),
+        ],
+        reviewAnswers: [
+            {
+                id: 3,
+                c: t1.session,
+                at: ago(29 * DAY) + MINUTE,
+                name: "rv",
+                ready: false,
+                items: ["1", "2"],
+            },
+            // An answer before the window is not counted.
+            {
+                id: 4,
+                c: t1.session,
+                at: ago(31 * DAY) + MINUTE,
+                name: "rv",
+                ready: false,
+                items: ["1"],
+            },
+        ],
+    });
+
+    // 1 round in the window: the send. The spawn is in the lookback and is not counted.
+    assert.deepEqual(reviewRounds(data, { now: NOW }), [
+        {
+            ref: "acme/widgets#4",
+            head: SHA_B,
+            at: ago(29 * DAY),
+            session: t1.session,
+            reviewer: "rv",
+        },
+    ]);
+
+    const found = reviewPoints(data, { now: NOW });
+
+    assert.equal(found.answers, 1);
+    assert.deepEqual(
+        found.points.map((point: { ref: string; head: string; item: string }) => [
+            point.ref,
+            point.head,
+            point.item,
+        ]),
+        [
+            ["acme/widgets#4", SHA_B, "1"],
+            ["acme/widgets#4", SHA_B, "2"],
+        ],
+    );
+});

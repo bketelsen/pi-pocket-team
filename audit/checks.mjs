@@ -2501,6 +2501,33 @@ function q1PrRounds(data, ctx) {
     };
 }
 
+/**
+ * How this run's guard read went: `{ available, reason?, errors, calls, pending }`. `errors` names each kind of failed
+ * GitHub call of `loadBlockerGuards`. A loader that failed, or GitHub turned off, is `available: false` with its
+ * reason, and `calls` and `pending` are null (unknown, not 0).
+ */
+function guardsSource(data) {
+    const loaded = data.blockerGuards;
+    const reason = data.sourceErrors?.blockerGuards;
+
+    if (reason || !loaded || typeof loaded !== "object") {
+        return {
+            available: false,
+            reason: reason ?? "no data",
+            errors: [],
+            calls: null,
+            pending: null,
+        };
+    }
+
+    return {
+        available: true,
+        errors: Array.isArray(loaded.errors) ? [...loaded.errors] : [],
+        calls: typeof loaded.calls === "number" ? loaded.calls : null,
+        pending: typeof loaded.pending === "number" ? loaded.pending : null,
+    };
+}
+
 /** The state of a PR for a blocking point: from this run's GitHub read, else from a cached guard. */
 function pointState(ref, prs, guard) {
     if (ref === null) {
@@ -2524,7 +2551,9 @@ function pointState(ref, prs, guard) {
  * Q1's blocking points of cross-review answers ("Blocker to guard"): every blocking item of an answer, with the PR
  * and the reviewed head of the review call it answers, the PR's state, and its guard: whether, from the reviewed head
  * to the PR's final head, a test or an `AGENTS.md` file of the PR changed and `.memory/corrections.jsonl` got lines
- * (`loadBlockerGuards`, or a final result of an earlier day). Without GitHub, the points still show, with state `unknown`. No findings.
+ * (`loadBlockerGuards`, or a final result of an earlier day). `guards` says how this run's guard read went
+ * (`guardsSource`). Without GitHub, or when the guard read fails, the points still show, with state `unknown` (a
+ * cached guard still applies). No findings.
  */
 function q1Blockers(data, ctx) {
     const unavailable =
@@ -2595,7 +2624,13 @@ function q1Blockers(data, ctx) {
 
     totals.rate = totals.evaluated === 0 ? null : round2(totals.guarded / totals.evaluated);
 
-    return { available: true, windowDays: REVIEW_WINDOW_DAYS, totals, points };
+    return {
+        available: true,
+        windowDays: REVIEW_WINDOW_DAYS,
+        guards: guardsSource(data),
+        totals,
+        points,
+    };
 }
 
 /** Run 1 new Q1 part; a part that throws is unavailable, and the acceptance part still stands. */

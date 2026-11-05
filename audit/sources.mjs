@@ -12,6 +12,8 @@ import { apply } from "@earendil-works/chord/delta";
 import { DAY, HOUR, branchLeft, refsIn } from "./common.mjs";
 import {
     ANSWER,
+    REVIEW_LOOKBACK_DAYS,
+    REVIEW_WINDOW_DAYS,
     blockingItems,
     guardCacheOf,
     headIn,
@@ -1233,6 +1235,67 @@ export function guardOf(ref, { head, files }) {
     };
 }
 
+/**
+ * 1 GraphQL call of `loadBlockerGuards`, as `{ data, errors }` (`data` null when the answer has none). A failed call,
+ * an answer with errors, or the cap is named in `errors` once, by `label` and kind: no text from GitHub.
+ */
+function ghAnswer(gh, query, label, errors) {
+    const failures = gh.state.failures;
+    const out = gh.graphql(query);
+
+    if (gh.state.capReached && out === "") {
+        errors.add("GitHub call cap reached");
+    } else if (gh.state.failures > failures) {
+        errors.add(`${label} failed`);
+    }
+
+    const answer = json(out, {});
+    const list = Array.isArray(answer?.errors) ? answer.errors : [];
+
+    if (list.length > 0) {
+        errors.add(`${label} returned errors`);
+    }
+
+    return {
+        data: answer?.data && typeof answer.data === "object" ? answer.data : null,
+        errors: list,
+    };
+}
+
+/** The top-level aliases that GraphQL errors name; `all` when an error has no path. */
+function errorAliases(list) {
+    const names = new Set();
+    let all = false;
+
+    for (const error of list) {
+        const first = Array.isArray(error?.path) ? error.path[0] : undefined;
+
+        if (typeof first === "string") {
+            names.add(first);
+        } else {
+            all = true;
+        }
+    }
+
+    return { names, all };
+}
+
+/**
+ * A PR node that `loadBlockerGuards` can judge: a string `state`, and a whole file list (a number `totalCount`, an
+ * array of nodes with a string `path`, as many as `totalCount`, or 100 of more than 100 files: "too many files").
+ */
+function isWholePr(node) {
+    const files = node?.files;
+
+    return (
+        typeof node?.state === "string" &&
+        typeof files?.totalCount === "number" &&
+        Array.isArray(files.nodes) &&
+        files.nodes.every((file) => typeof file?.path === "string") &&
+        (files.nodes.length === files.totalCount || files.totalCount > BLOCKER_PR_FILES)
+    );
+}
+
 /** The object lookups of 1 key in 1 blob query: H, and each candidate at H and at F. */
 const lookupCount = (key) => 1 + 2 * key.files.length;
 
@@ -1341,37 +1404,66 @@ function guardsOfAnswer(batch, aliases, answer) {
  * merged `(ref, head)`, the candidate files of the PR's own diff (`guardCandidates`) are looked up at the reviewed
  * head and at the final head, with no compare call: at most `BLOCKER_LOOKUPS` object lookups a query, at most
  * `BLOCKER_MAX_QUERIES` queries a run, newest keys first. Keys that do not fit, or whose answer is missing, stay
- * pending: the next run tries again. A closed PR is final with no lookup. Returns `{ prs, guards, calls, pending }`.
+ * pending: the next run tries again. A closed PR is final with no lookup. A PR node is used only when no error names
+ * its alias and its file list is whole (`isWholePr`); else its keys stay pending, never final. Returns
+ * `{ prs, guards, calls, pending, errors }`: `errors` names each kind of failed call once, with no text from GitHub.
  */
 export function loadBlockerGuards(data, { gh, now, cache = {} }) {
     const startCalls = gh.state.calls;
     const { points } = reviewPoints(data, { now });
     const newest = [...points].reverse();
     const isFinal = (point) => cache[`${point.ref}@${point.head}`]?.final === true;
-    const refs = [
+    const wanted = [
         ...new Set(
             newest
                 .filter((point) => point.ref !== null && !(point.head !== null && isFinal(point)))
                 .map((point) => point.ref),
         ),
-    ].slice(0, 40 * BLOCKER_MAX_PR_QUERIES);
+    ];
     const nodes = {};
+    const errors = new Set();
+    // The refs that were asked for and got no whole node: their keys stay pending.
+    const unread = new Set();
+    // `checkGhArgs` refuses a whole query with such a word: 1 such repository name must not stop the others.
+    const refused = wanted.filter((ref) => READ_ONLY_REFUSED.test(ref));
 
-    for (let start = 0; start < refs.length && !gh.state.capReached; start += 40) {
+    if (refused.length > 0) {
+        refused.forEach((ref) => unread.add(ref));
+        errors.add("repository name refused by the read-only gh");
+    }
+
+    const refs = wanted
+        .filter((ref) => !READ_ONLY_REFUSED.test(ref))
+        .slice(0, 40 * BLOCKER_MAX_PR_QUERIES);
+
+    for (let start = 0; start < refs.length; start += 40) {
         const chunk = refs.slice(start, start + 40);
+
+        if (gh.state.capReached) {
+            errors.add("GitHub call cap reached");
+            break;
+        }
+
         const parts = chunk.map((ref, index) => {
             const [, owner, name, number] = /^([^/]+)\/([^#]+)#(\d+)$/.exec(ref);
 
             return `p${index}: repository(owner: ${JSON.stringify(owner)}, name: ${JSON.stringify(name)}) { pullRequest(number: ${number}) { ${BLOCKER_PR_QUERY} } }`;
         });
-        const answer = json(gh.graphql(`{ ${parts.join("\n")} }`), {});
+        const result = ghAnswer(gh, `{ ${parts.join("\n")} }`, "PR query", errors);
+        const badAliases = errorAliases(result.errors);
 
-        // A PR that GitHub cannot find is null with an error beside it, and `gh` fails: the other PRs still count.
+        // A PR that GitHub cannot find is null with an error on its alias, and `gh` fails: the other PRs still count.
         chunk.forEach((ref, index) => {
-            const node = answer.data?.[`p${index}`]?.pullRequest;
+            const alias = `p${index}`;
+            const node = result.data?.[alias]?.pullRequest;
 
-            if (node && typeof node.state === "string") {
+            if (badAliases.all || badAliases.names.has(alias) || !node) {
+                unread.add(ref);
+            } else if (isWholePr(node)) {
                 nodes[ref] = node;
+            } else {
+                unread.add(ref);
+                errors.add("PR query returned an incomplete PR");
             }
         });
     }
@@ -1389,6 +1481,7 @@ export function loadBlockerGuards(data, { gh, now, cache = {} }) {
 
     const guards = {};
     const keys = [];
+    const unreadKeys = new Set();
     const tooMany = { final: true, state: "merged", guarded: null, reason: "too many files" };
 
     for (const point of newest) {
@@ -1398,11 +1491,20 @@ export function loadBlockerGuards(data, { gh, now, cache = {} }) {
         if (
             point.ref === null ||
             point.head === null ||
-            !node ||
             isFinal(point) ||
             key in guards ||
-            keys.some((item) => item.key === key)
+            keys.some((item) => item.key === key) ||
+            unreadKeys.has(key)
         ) {
+            continue;
+        }
+
+        if (!node) {
+            // A PR asked for that came back with an error, or not whole: its key stays pending.
+            if (unread.has(point.ref)) {
+                unreadKeys.add(key);
+            }
+
             continue;
         }
 
@@ -1415,10 +1517,9 @@ export function loadBlockerGuards(data, { gh, now, cache = {} }) {
             continue;
         }
 
-        const prFiles = Array.isArray(node.files?.nodes) ? node.files.nodes : [];
-        const files = guardCandidates(prFiles);
+        const files = guardCandidates(node.files.nodes);
 
-        if (node.files?.totalCount > BLOCKER_PR_FILES) {
+        if (node.files.totalCount > BLOCKER_PR_FILES) {
             guards[key] = tooMany;
         } else if (point.head === node.headRefOid || files.length === 0) {
             // No commit after the reviewed head, or no file that can guard: nothing to look up.
@@ -1456,17 +1557,28 @@ export function loadBlockerGuards(data, { gh, now, cache = {} }) {
         }
     }
 
-    let pending = 0;
+    let pending = unreadKeys.size;
 
     batches.forEach((batch, index) => {
-        if (index >= BLOCKER_MAX_QUERIES || gh.state.capReached) {
+        if (index >= BLOCKER_MAX_QUERIES) {
+            pending += batch.keys.length;
+
+            return;
+        }
+
+        if (gh.state.capReached) {
+            errors.add("GitHub call cap reached");
             pending += batch.keys.length;
 
             return;
         }
 
         const query = blobQuery(batch.keys);
-        const found = guardsOfAnswer(batch.keys, query.aliases, json(gh.graphql(query.text), {}));
+        const found = guardsOfAnswer(
+            batch.keys,
+            query.aliases,
+            ghAnswer(gh, query.text, "blob query", errors),
+        );
 
         for (const key of batch.keys) {
             if (found.has(key.key)) {
@@ -1477,7 +1589,7 @@ export function loadBlockerGuards(data, { gh, now, cache = {} }) {
         }
     });
 
-    return { prs, guards, calls: gh.state.calls - startCalls, pending };
+    return { prs, guards, calls: gh.state.calls - startCalls, pending, errors: [...errors] };
 }
 
 // ---------- Odrade's notes ----------
@@ -1764,8 +1876,16 @@ export function loadData({
             data.spawns = loadSpawns(db, horizon);
         });
         attempt("costs", () => (data.costRows = loadCosts(db, horizon)));
-        // Q1's review rounds and 3-failure stops: 30 days of spawn and send calls, and every goal revision.
-        attempt("reviews", () => (data.reviewCalls = loadReviewCalls(db, now - 30 * DAY)));
+        // Q1's review rounds and 3-failure stops: spawn and send calls, answers of 30 days, and every goal revision.
+        // The calls of 7 days before the window too: a spawn there sets the round and the PR of a send in it.
+        attempt(
+            "reviews",
+            () =>
+                (data.reviewCalls = loadReviewCalls(
+                    db,
+                    now - (REVIEW_WINDOW_DAYS + REVIEW_LOOKBACK_DAYS) * DAY,
+                )),
+        );
         attempt(
             "reviewAnswers",
             () => (data.reviewAnswers = loadReviewAnswers(db, now - 30 * DAY)),
