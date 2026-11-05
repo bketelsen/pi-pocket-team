@@ -115,6 +115,7 @@ import {
     renderPlanText,
     renderTasks,
     reopenable,
+    repairsOf,
     secretForm,
     setWatch,
     startTask,
@@ -5432,6 +5433,44 @@ describe("the PR facts of a task thread", () => {
         assert.deepEqual(t1.attempts[0]?.end, { at: tick(11), how: "stopped" });
     });
 
+    test("a closed thread with a ref the sweep cannot pin: 1 event for each ref, and the task stays delegated", () => {
+        const { state, graph } = buildingPlan();
+        const thread = state.threads.T2 ?? assert.fail("T2");
+        const t1 = taskOf(graph, "t1");
+
+        thread.state = "closed";
+        thread.closed = { at: tick(9), why: "done", by: "sweep" };
+        // A bad stored ref: never `owner/name#N`, so no read gives its state.
+        prOn(state, "T2", "snow#1");
+        prOn(state, "T2", "frostyard/snow#0");
+        planFacts(state, "T1", tick(10));
+
+        const unread = () =>
+            (state.threads.T1?.events ?? [])
+                .filter((event) => event.key.startsWith("plan-unread-pr:"))
+                .map((event) => [event.key, event.text]);
+
+        assert.deepEqual(unread(), [
+            [
+                "plan-unread-pr:T2:snow#1",
+                "t1: T2 is closed and holds snow#1, which the desk cannot read on GitHub: the task stays delegated. Recover it with plan revise.",
+            ],
+            [
+                "plan-unread-pr:T2:frostyard/snow#0",
+                "t1: T2 is closed and holds frostyard/snow#0, which the desk cannot read on GitHub: the task stays delegated. Recover it with plan revise.",
+            ],
+        ]);
+        // No merge and no close is inferred.
+        assert.equal(t1.state, "delegated");
+        assert.equal(t1.attempts[0]?.end, undefined);
+
+        // A second sweep adds no second event.
+        const snapshot = JSON.stringify(state);
+
+        assert.deepEqual(planFacts(state, "T1", tick(11)), { events: 0, items: [] });
+        assert.equal(JSON.stringify(state), snapshot);
+    });
+
     test("the repair: a ready task whose newest attempt stopped while its PR was open is done when the PR merges", () => {
         for (const reopened of [false, true]) {
             const { state, graph } = buildingPlan();
@@ -9441,19 +9480,37 @@ describe("with the Pi Pocket app", () => {
         assert.equal((await planThread())?.events.length, events);
     });
 
-    test("a task thread that closed more than 7 days ago with an open PR gets the PR's merge, and the task is done", async () => {
-        const source = await supervisor("plan-old-close");
+    /**
+     * A plan of 1 task, of a new supervisor session, whose task thread closed `closedAgo` ms ago with 1 PR link. The
+     * fake `gh` gives `pr` for that ref; `run` runs the sweep and the checks. After it, the fake `gh` gives the
+     * viewer only again, and the plan is dropped, so no later test counts it as open. The `gh` calls' arguments
+     * are kept for `run`.
+     */
+    async function closedTaskPlan(
+        name: string,
+        closedAgo: number,
+        link: { state?: "OPEN" },
+        pr: Record<string, unknown>,
+        run: (ids: {
+            source: ConversationId;
+            plan: string;
+            task: string;
+            ghArgs: () => string;
+        }) => Promise<void>,
+    ): Promise<void> {
+        const source = await supervisor(name);
         const ref = "frostyard/snow#41";
-        const head = "c".repeat(40);
         const at = Date.now();
-        let planIdOld = "";
-        let taskThreadId = "";
+        const argsLog = join(root, `${name}-gh-args.txt`);
+        let plan = "";
+        let task = "";
 
         await app.harness.commit(async (tx) => {
             const state = await tx.doc(DeskThreads);
             const text = initialPlanText("T0", "Old close", "Sign the old ISO.");
-            const planThreadOld = openThread(state, {
-                key: "x.test:old-close-plan",
+
+            plan = openThread(state, {
+                key: `x.test:${name}-plan`,
                 supervisor: Number(source),
                 agents: [],
                 title: "Old close",
@@ -9467,22 +9524,20 @@ describe("with the Pi Pocket app", () => {
                         rev: gitBlobSha(text),
                     },
                 },
-            }).thread;
-
-            planIdOld = planThreadOld.id;
+            }).thread.id;
             // The stored thread, not the copy that openThread gives back.
-            (state.threads[planIdOld] ?? assert.fail("the plan thread")).state = "open";
+            (state.threads[plan] ?? assert.fail("the plan thread")).state = "open";
 
-            const plan = planOf(state, planIdOld) ?? assert.fail("the plan");
+            const stored = planOf(state, plan) ?? assert.fail("the plan");
 
-            delete plan.pending;
+            delete stored.pending;
             assert(
                 !(
                     "error" in
-                    draftGraph(state, planIdOld, {
+                    draftGraph(state, plan, {
                         key: "graph:old",
                         at,
-                        rev: plan.rev,
+                        rev: stored.rev,
                         tasks: [
                             {
                                 id: "t1",
@@ -9498,12 +9553,12 @@ describe("with the Pi Pocket app", () => {
                     })
                 ),
             );
-            assert(!("error" in readyPlan(state, planIdOld, { key: "ready:old", at })));
+            assert(!("error" in readyPlan(state, plan, { key: "ready:old", at })));
             assert(
                 !(
                     "error" in
-                    approvePlan(state, planIdOld, {
-                        rev: plan.rev,
+                    approvePlan(state, plan, {
+                        rev: stored.rev,
                         graph: 1,
                         key: "approve:old",
                         by: "brian",
@@ -9511,29 +9566,25 @@ describe("with the Pi Pocket app", () => {
                     })
                 ),
             );
-
-            const task = openThread(state, {
-                key: "x.test:old-close-task",
+            task = openThread(state, {
+                key: `x.test:${name}-task`,
                 supervisor: Number(source),
                 agents: ["lucilla"],
                 repo: "frostyard/snow",
                 title: "Sign the old ISO",
                 at,
-            }).thread;
+            }).thread.id;
+            assert(!("error" in startTask(state, plan, "t1", task, at)));
 
-            taskThreadId = task.id;
-            assert(!("error" in startTask(state, planIdOld, "t1", taskThreadId, at)));
+            const thread = state.threads[task] ?? assert.fail("the task thread");
 
-            const stored = state.threads[taskThreadId] ?? assert.fail("the task thread");
-
-            // The thread closed 8 days ago while its PR was open: the 7-day set does not read it.
-            stored.state = "closed";
-            stored.closed = { at: at - 8 * 24 * 3600_000, why: "done", by: "sweep" };
-            stored.prs[ref] = { via: "attached", state: "OPEN" };
+            thread.state = "closed";
+            thread.closed = { at: at - closedAgo, why: "done", by: "sweep" };
+            thread.prs[ref] = { via: "attached", ...link };
         }, context);
 
         try {
-            // GitHub gives the PR merged, read by number.
+            // GitHub gives the PR read by number; the fake `gh` keeps its arguments.
             writeFileSync(
                 fixturePath,
                 JSON.stringify({
@@ -9546,46 +9597,42 @@ describe("with the Pi Pocket app", () => {
                                 number: 41,
                                 title: "Sign the old ISO",
                                 url: "https://github.com/frostyard/snow/pull/41",
-                                state: "MERGED",
                                 isDraft: false,
                                 createdAt: new Date(at).toISOString(),
                                 headRefName: "old-iso",
-                                mergeable: "UNKNOWN",
-                                reviewDecision: "APPROVED",
+                                reviewDecision: "REVIEW_REQUIRED",
                                 author: { login: "github-viewer" },
-                                commits: { nodes: [{ commit: { oid: head } }] },
+                                ...pr,
                             },
                         },
                     },
                 }),
             );
-            await say(app, source, "desk sync test");
-
-            const state = await deskSnapshot();
-            const task = planOf(state, planIdOld)?.graphs.find((each) => each.state === "approved")
-                ?.tasks[0];
-
-            assert.equal(state?.threads[taskThreadId]?.prs[ref]?.state, "MERGED");
-            assert.equal(task?.state, "done");
-            assert.equal(task?.attempts[0]?.end?.how, "merged");
-            assert.deepEqual(task?.attempts[0]?.prs, [{ ref, head }]);
-            // Only its PRs are read: the thread stays closed.
-            assert.equal(state?.threads[taskThreadId]?.state, "closed");
+            writeFileSync(
+                fakeGh,
+                `#!/bin/sh\nprintf '%s\\n' "$@" >> ${JSON.stringify(argsLog)}\ncat ${JSON.stringify(fixturePath)}\n`,
+            );
+            await run({
+                source,
+                plan,
+                task,
+                ghArgs: () => (existsSync(argsLog) ? readFileSync(argsLog, "utf8") : ""),
+            });
         } finally {
+            writeFileSync(fakeGh, `#!/bin/sh\ncat ${JSON.stringify(fixturePath)}\n`);
             writeFileSync(
                 fixturePath,
                 JSON.stringify({ data: { viewer: { login: "github-viewer" } } }),
             );
-            // The plan goes, so no later test counts it as open.
             await app.harness.commit(async (tx) => {
                 const state = await tx.doc(DeskThreads);
-                const plan = planOf(state, planIdOld);
+                const stored = planOf(state, plan);
 
-                if (plan !== undefined && plan.state !== "done" && plan.state !== "dropped") {
+                if (stored !== undefined && stored.state !== "done" && stored.state !== "dropped") {
                     assert(
                         !(
                             "error" in
-                            dropPlan(state, planIdOld, {
+                            dropPlan(state, plan, {
                                 by: "brian",
                                 why: "the test ends",
                                 at: Date.now(),
@@ -9595,6 +9642,131 @@ describe("with the Pi Pocket app", () => {
                 }
             }, context);
         }
+    }
+
+    /** The task of a plan made by `closedTaskPlan`, from the desk's document. */
+    const closedTaskOf = async (plan: string): Promise<PlanTask | undefined> =>
+        planOf(await deskSnapshot(), plan)?.graphs.find((each) => each.state === "approved")
+            ?.tasks[0];
+
+    test("a task thread that closed more than 7 days ago with an open PR gets the PR's merge, and the task is done", async () => {
+        const head = "c".repeat(40);
+
+        await closedTaskPlan(
+            "plan-old-close",
+            8 * 24 * 3600_000,
+            { state: "OPEN" },
+            {
+                state: "MERGED",
+                mergeable: "UNKNOWN",
+                commits: { nodes: [{ commit: { oid: head } }] },
+            },
+            async ({ source, plan, task }) => {
+                await say(app, source, "desk sync test");
+
+                const state = await deskSnapshot();
+                const done = await closedTaskOf(plan);
+
+                assert.equal(state?.threads[task]?.prs["frostyard/snow#41"]?.state, "MERGED");
+                assert.equal(done?.state, "done");
+                assert.equal(done?.attempts[0]?.end?.how, "merged");
+                assert.deepEqual(done?.attempts[0]?.prs, [{ ref: "frostyard/snow#41", head }]);
+                // Only its PRs are read: the thread stays closed.
+                assert.equal(state?.threads[task]?.state, "closed");
+            },
+        );
+    });
+
+    test("an old closed task thread whose open PR conflicts opens again, and its repair wake-up goes to Odrade, as for any closed thread", async () => {
+        const head = "d".repeat(40);
+
+        await closedTaskPlan(
+            "plan-old-conflict",
+            8 * 24 * 3600_000,
+            { state: "OPEN" },
+            {
+                state: "OPEN",
+                mergeable: "CONFLICTING",
+                commits: {
+                    nodes: [
+                        {
+                            commit: {
+                                oid: head,
+                                statusCheckRollup: {
+                                    state: "FAILURE",
+                                    contexts: {
+                                        nodes: [
+                                            {
+                                                __typename: "CheckRun",
+                                                name: "test",
+                                                conclusion: "FAILURE",
+                                            },
+                                        ],
+                                    },
+                                },
+                            },
+                        },
+                    ],
+                },
+            },
+            async ({ source, plan, task }) => {
+                await say(app, source, "desk sync test");
+
+                const state = await deskSnapshot();
+                const thread = state?.threads[task] ?? assert.fail("the task thread");
+
+                // The read reached the PR: its head is stored.
+                assert.equal(thread.prs["frostyard/snow#41"]?.head, head);
+                // The standing repair rule: the thread opens again, and the wake-up goes to Odrade.
+                assert.notEqual(thread.state, "closed");
+                assert.deepEqual(
+                    Object.values(repairsOf(thread)).map((entry) => [entry.to, entry.why]),
+                    [["odrade", "closed"]],
+                );
+                assert(
+                    thread.events.some(
+                        (event) =>
+                            event.key.startsWith("reopened:") &&
+                            event.text === "reopened: frostyard/snow#41 is conflicting",
+                    ),
+                );
+                // The PR is open: the attempt stays open, and the task stays delegated.
+                assert.equal((await closedTaskOf(plan))?.state, "delegated");
+            },
+        );
+    });
+
+    test("a task thread closed 1 day ago with a PR not read yet: the read asks for it, and its merge makes the task done", async () => {
+        const head = "e".repeat(40);
+
+        await closedTaskPlan(
+            "plan-recent-unread",
+            24 * 3600_000,
+            {},
+            {
+                state: "MERGED",
+                mergeable: "UNKNOWN",
+                commits: { nodes: [{ commit: { oid: head } }] },
+            },
+            async ({ source, plan, task, ghArgs }) => {
+                await say(app, source, "desk sync test");
+
+                // The 7-day set pins only OPEN links: the plan's pin asks for this one by number.
+                assert.match(
+                    ghArgs(),
+                    /p[0-9]+: repository\(owner: "frostyard", name: "snow"\) \{[^{}]*pullRequest\(number: 41\)/,
+                );
+
+                const done = await closedTaskOf(plan);
+
+                assert.equal(
+                    (await deskSnapshot())?.threads[task]?.prs["frostyard/snow#41"]?.state,
+                    "MERGED",
+                );
+                assert.equal(done?.state, "done");
+                assert.deepEqual(done?.attempts[0]?.prs, [{ ref: "frostyard/snow#41", head }]);
+            },
+        );
     });
 
     test("a new graph carries t3, and the approval makes t1 ready", async () => {

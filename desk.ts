@@ -13987,18 +13987,19 @@ function settlePlan(
 const prOpen = (link: PrLink | undefined): boolean =>
     link !== undefined && (link.state === "OPEN" || link.state === undefined);
 
+/** A stored PR ref that the sweep can pin in its GitHub read: `owner/name#N`, with a valid repository name. */
+const pinnableRef = (ref: string): boolean => REF.test(ref) && isRepoName(repoOf(ref));
+
 /**
  * The closed task threads of a supervisor whose PRs the sweep still reads: each is the thread of an open attempt in the
  * approved graph of a plan that is not done or dropped, and did not close `failed`. A thread that closed while its PR
- * was open keeps its attempt open (`planFacts`), so its PR's merge or close must be read at any close age. A thread
- * that `reopenable` gives is left out: the 7-day set reads it already. The sweep only reads their PRs: no reopen, no
- * attribution, no labels and no issues.
+ * was open keeps its attempt open (`planFacts`), so its PR's merge or close must be read at any close age. The sweep
+ * pins their PRs that are open or not read yet, also for a thread that `reopenable` gives (the 7-day set pins only
+ * `OPEN` links). It runs `updatePrs` on the ones that are not in the 7-day set, 1 time. The desk's standing repair rule
+ * (`repairReopen`, for any closed thread that is not dropped) still opens such a thread again for Odrade when its open
+ * PR conflicts or fails. No other rule reopens them, and they get no attribution, no labels and no issues.
  */
-export function planTaskClosedThreads(
-    state: DeskState | undefined,
-    supervisor: number,
-    now: number,
-): Thread[] {
+export function planTaskClosedThreads(state: DeskState | undefined, supervisor: number): Thread[] {
     const found = new Map<string, Thread>();
 
     for (const plan of Object.values(state?.plans ?? {})) {
@@ -14016,8 +14017,7 @@ export function planTaskClosedThreads(
                 thread === undefined ||
                 thread.supervisor !== supervisor ||
                 thread.state !== "closed" ||
-                thread.closed?.why === "failed" ||
-                reopenable(thread, now)
+                thread.closed?.why === "failed"
             ) {
                 continue;
             }
@@ -14085,7 +14085,9 @@ function repairStopped(state: DeskState, task: PlanTask, now: number): boolean {
  * is done; a thread that closed with no merged PR and no open PR (or none not read yet) ends its attempt `stopped`,
  * and the task is ready again. A closed thread with an open PR keeps its attempt open until the PR merges or closes.
  * A `ready` or `waiting` task whose newest attempt ended `stopped` (an older sweep ended it while its PR was open)
- * becomes done when that thread now has a merged PR and no open PR: a repair of stored data, with 1 event. A task that
+ * becomes done when that thread now has a merged PR and no open PR: a repair of stored data, with 1 event. A closed
+ * thread whose open ref the sweep cannot pin (not `owner/name#N`) is never read: it gets 1 event on the plan thread for
+ * each such ref, and its task stays delegated; a scope revision (`plan revise`) is the way to recover it. A task that
  * the scope change did not name goes on also while `revising` is set. A second sweep with the same facts changes
  * nothing, and gives no item.
  */
@@ -14196,6 +14198,20 @@ export function planFacts(
         const links = attempt.prs.map((pr) => thread.prs[pr.ref]);
         const merged = links.some((link) => link?.state === "MERGED");
         const open = links.some((link) => prOpen(link));
+
+        // A closed thread with a ref that the sweep cannot pin is never read again: it keeps the attempt open. 1 event
+        // for each ref says so; the desk infers no merge and no close.
+        if (thread.state === "closed" && thread.closed?.why !== "failed") {
+            for (const pr of attempt.prs) {
+                if (prOpen(thread.prs[pr.ref]) && !pinnableRef(pr.ref)) {
+                    event(
+                        planThread,
+                        `plan-unread-pr:${thread.id}:${pr.ref}`,
+                        `${task.id}: ${thread.id} is closed and holds ${pr.ref}, which the desk cannot read on GitHub: the task stays delegated. Recover it with plan revise.`,
+                    );
+                }
+            }
+        }
 
         // A merged PR with no known head (a partial GitHub answer) ends the attempt with its ref and no head: the whole-plan
         // check then names the ref only, never an older head.
@@ -20315,9 +20331,9 @@ export default function createDesk(host: Host, web: Web) {
 
         // A closed task thread of a plan's open attempt, at any close age: its PRs that are open, or not read yet, are
         // pinned too, so their merge or close ends the attempt (`planFacts`). The same 1 read: a pinned PR only.
-        for (const thread of planTaskClosedThreads(state, Number(supervisor), now)) {
+        for (const thread of planTaskClosedThreads(state, Number(supervisor))) {
             for (const [ref, link] of Object.entries(thread.prs)) {
-                if (prOpen(link) && REF.test(ref) && isRepoName(repoOf(ref))) {
+                if (prOpen(link) && pinnableRef(ref)) {
                     pinned.add(ref);
                 }
             }
@@ -20672,6 +20688,13 @@ export default function createDesk(host: Host, web: Web) {
         // Threads that closed as done in the last 7 days: new work may bring them back.
         const closedDone = Object.values(state.threads).filter(
             (thread) => thread.supervisor === supervisor && reopenable(thread, now),
+        );
+        // Closed task threads of a plan's open attempt that are not in the 7-day set: the sweep runs `updatePrs` on
+        // them, and the standing repair rule (`repairReopen`) applies as for any closed thread. No other rule of this
+        // sweep reopens them (`planTaskClosedThreads`).
+        const closedDoneIds = new Set(closedDone.map((thread) => thread.id));
+        const planTaskOnly = planTaskClosedThreads(state, supervisor).filter(
+            (thread) => !closedDoneIds.has(thread.id),
         );
         const usersBefore = new Map(
             closedDone.map((thread) => [thread.id, thread.run.lastUserEntry]),
@@ -21034,9 +21057,10 @@ export default function createDesk(host: Host, web: Web) {
                 events += updatePrs(thread, facts.github, now);
             }
 
-            // A closed task thread of a plan's open attempt, older than 7 days: its PRs only (`planTaskClosedThreads`).
-            // `planFacts` then ends the attempt, later in this commit.
-            for (const thread of planTaskClosedThreads(state, supervisor, now)) {
+            // A closed task thread of a plan's open attempt, not in the 7-day set: its PRs, 1 time
+            // (`planTaskClosedThreads`). `planFacts` then ends the attempt, later in this commit. The repair rule below
+            // may still open it again for Odrade, as any closed thread.
+            for (const thread of planTaskOnly) {
                 events += updatePrs(thread, facts.github, now);
             }
 
@@ -21106,6 +21130,7 @@ export default function createDesk(host: Host, web: Web) {
 
         if (facts.github !== undefined) {
             for (const thread of mine) {
+                // Also a closed task thread of a plan: a PR that conflicts or fails needs its repair.
                 if (repairReopen(thread, facts.github, now)) {
                     events += 1;
                 }
