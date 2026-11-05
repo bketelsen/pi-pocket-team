@@ -26,6 +26,7 @@ import {
     deepseekStart,
     DEFAULT_ROUNDS,
     type CheckResult,
+    failedChecks,
     type Goal,
     GoalDoc,
     nextClockTime,
@@ -1052,6 +1053,112 @@ describe("check command and status together", () => {
         assert.equal(goal.reason, "blocked");
         assert.equal(goal.round, 3);
         assert.match(goal.why ?? "", /same check failure came 3 times/);
+        // A check with no gh rows records no failing jobs.
+        assert.equal(goal.stopChecks, undefined);
+        assert.equal("stopChecks" in goal, false);
+    });
+
+    test("failedChecks reads the failing gh pr checks rows", () => {
+        const failed = (tail: string, cutOff?: true): CheckResult => ({
+            passed: false,
+            code: 1,
+            tail,
+            cutOff,
+        });
+        const race =
+            "Race Detection\tfail\t2m1s\thttps://github.com/frostyard/pilothouse/actions/runs/41765923252/job/126364150626\t";
+        const passRow =
+            "Lint\tpass\t30s\thttps://github.com/frostyard/pilothouse/actions/runs/41765923252/job/126364150001\t";
+
+        // A fail row with a job URL; a pass row is left out.
+        assert.deepEqual(failedChecks(failed(`${passRow}\n${race}\n`)), [
+            {
+                name: "Race Detection",
+                repo: "frostyard/pilothouse",
+                run: 41765923252,
+                job: 126364150626,
+            },
+        ]);
+        // A cancel row, a row with no URL (a name only), duplicates removed, sorted by name then job.
+        assert.deepEqual(
+            failedChecks(
+                failed(
+                    [
+                        "build\tcancel\t1m\thttps://github.com/acme/widgets/actions/runs/7/job/9\t",
+                        "build\tfail\t1m\thttps://github.com/acme/widgets/actions/runs/7/job/8\t",
+                        "build\tcancel\t1m\thttps://github.com/acme/widgets/actions/runs/7/job/9\t",
+                        "deploy\tfail\t0\t\tno URL here",
+                        "\tfail\t1m\thttps://github.com/acme/widgets/actions/runs/7/job/3\t",
+                        "Analyze\tfail\t1m\thttps://example.test/not/a/job\t",
+                    ].join("\n"),
+                ),
+            ),
+            [
+                { name: "Analyze" },
+                { name: "build", repo: "acme/widgets", run: 7, job: 8 },
+                { name: "build", repo: "acme/widgets", run: 7, job: 9 },
+                { name: "deploy" },
+            ],
+        );
+        // Only passing rows, then a failed label check: no failing jobs.
+        assert.deepEqual(failedChecks(failed(`${passRow}\nAll checks were successful\n`)), []);
+        // No gh rows, a cut-off check, a passing check, or no check.
+        assert.deepEqual(failedChecks(failed("FAIL: TestRace\nexit status 1")), []);
+        assert.deepEqual(failedChecks(failed(race, true)), []);
+        assert.deepEqual(failedChecks({ passed: true, code: 0, tail: race }), []);
+        assert.deepEqual(failedChecks(undefined), []);
+        // A long name is cut to 200 characters, and at most 20 rows are kept.
+        const many = Array.from(
+            { length: 25 },
+            (_, i) => `${"x".repeat(250)}${String(i).padStart(2, "0")}\tfail\t1s\t\t`,
+        ).join("\n");
+        const kept = failedChecks(failed(many));
+
+        assert.equal(kept.length, 1, "the names are the same after the cut");
+        assert.equal(kept[0]!.name.length, 200);
+        const twenty = failedChecks(
+            failed(
+                Array.from(
+                    { length: 25 },
+                    (_, i) => `job ${String(i).padStart(2, "0")}\tfail\t1s\t\t`,
+                ).join("\n"),
+            ),
+        );
+
+        assert.equal(twenty.length, 20);
+        assert.equal(twenty[19]!.name, "job 19");
+    });
+
+    test("a stop after the same failed gh check records the failing jobs; why stays the same; resume removes them", async () => {
+        const id = await session("repeat-gh-failure");
+        const rows =
+            "Race Detection\\tfail\\t2m1s\\thttps://github.com/acme/widgets/actions/runs/41/job/126\\t\\n" +
+            "Lint\\tpass\\t10s\\thttps://github.com/acme/widgets/actions/runs/41/job/127\\t\\n";
+
+        // 3 runs fail with the same gh rows; the 4th passes.
+        await command(
+            id,
+            `max 6 check \`printf x >> runs.txt; if [ $(wc -c < runs.txt) -le 3 ]; then printf '${rows}'; exit 1; fi\`: scenario-repeat-failure; stop when never`,
+        );
+        let goal = await settled(id);
+
+        assert.equal(goal.reason, "blocked");
+        assert.equal(goal.round, 3);
+        assert.equal(
+            goal.why,
+            'Pi is blocked: the same check failure came 3 times in a row: checks failed: ["Race Detection"]',
+        );
+        assert.deepEqual(goal.stopChecks, [
+            { name: "Race Detection", repo: "acme/widgets", run: 41, job: 126 },
+        ]);
+
+        const resumed = await command(id, "resume");
+
+        assert.match(JSON.stringify(resumed), /resumed/);
+        goal = await settled(id);
+        assert.equal(goal.reason, "done");
+        assert.equal(goal.round, 4);
+        assert.equal(goal.stopChecks, undefined);
     });
 
     test("different failed check output does not stop as blocked", async () => {

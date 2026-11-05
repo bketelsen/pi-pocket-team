@@ -45,7 +45,7 @@ What exists today:
 | Tokens and cost, by session, UTC day and `provider/model`                                      | `x.desk.usage` (`_desk-usage.ts`), Desk-linked sessions and their subagents                       |
 | Router suggestion: kind, tier, model, thinking, named worker                                   | `thread.route` (`ThreadRoute`), from `model-router.ts`, shadow only                               |
 | Night-shift rounds, verdicts, check results, worker, stop reason                               | `x.night-shift.goal` (`Goal`, `RoundRecord`)                                                      |
-| A stop after 3 same check failures                                                             | `goal.why` detail (pi-pocket-team#108), `SAME_FAILURES` in `night-shift.ts`                       |
+| A stop after 3 same check failures, and its failing jobs (`goal.stopChecks`)                   | `goal.why` (#108), `SAME_FAILURES`; audit: `metrics.Q1.stops.goals[].checks`, `flakyKeys`         |
 | Subagent spawns and sends: model, name, tools, brief                                           | Pocket's entries; `audit/sources.mjs` keeps 300 characters of a brief                             |
 | Finished work: 1 entry per thread closed done (`completed`, `verified`), when `journal` is set | PocketJournal: the `x.desk.journal` task writes it to frostnotes (`docs/plans/pocket-journal.md`) |
 | Each day's findings and metrics                                                                | `findings.json` of the daily audit, 1 folder per day                                              |

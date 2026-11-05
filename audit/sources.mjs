@@ -641,13 +641,71 @@ export function loadReviewCalls(db, since) {
 /** The detail that Night shift writes in `why` when the same check failure stops a goal (pi-pocket-team#108). */
 const SAME_FAILURE_STOP = /the same check failure came \d+ times in a row/;
 
+/** The start of a failure fingerprint made from `gh pr checks` rows (`checkFingerprint` in `night-shift.ts`). */
+const CHECKS_FINGERPRINT = "checks failed: ";
+
+const OWNER_NAME = /^[^/\s]+\/[^/\s]+$/;
+
+/**
+ * The failing jobs of a stopped goal, as new plain objects: from `goal.stopChecks` (`checksFrom: "record"`), else the
+ * names in a `checks failed: [...]` fingerprint (`"fingerprint"`), else none (`null`).
+ */
+function stopChecksOf(goal) {
+    const recorded = (Array.isArray(goal.stopChecks) ? goal.stopChecks : [])
+        .filter((each) => typeof each?.name === "string" && each.name !== "")
+        .map((each) => {
+            const check = { name: each.name };
+
+            if (typeof each.repo === "string" && OWNER_NAME.test(each.repo)) {
+                check.repo = each.repo;
+            }
+
+            if (Number.isSafeInteger(each.run)) {
+                check.run = each.run;
+            }
+
+            if (Number.isSafeInteger(each.job)) {
+                check.job = each.job;
+            }
+
+            return check;
+        });
+
+    if (recorded.length > 0) {
+        return { checks: recorded, checksFrom: "record" };
+    }
+
+    const fingerprint = goal.failures?.fingerprint;
+
+    if (typeof fingerprint === "string" && fingerprint.startsWith(CHECKS_FINGERPRINT)) {
+        try {
+            const names = JSON.parse(fingerprint.slice(CHECKS_FINGERPRINT.length));
+
+            if (Array.isArray(names)) {
+                const checks = names
+                    .filter((name) => typeof name === "string" && name !== "")
+                    .map((name) => ({ name }));
+
+                if (checks.length > 0) {
+                    return { checks, checksFrom: "fingerprint" };
+                }
+            }
+        } catch {
+            // A fingerprint that is not a JSON list gives no checks.
+        }
+    }
+
+    return { checks: [], checksFrom: null };
+}
+
 /**
  * Q1's 3-failure stops. The goal document holds 1 goal per session, and a new goal writes over the old one: so every
  * revision of every `x.night-shift.goal` document (retired ones too) is walked from the first one, and the newest
  * state seen of each goal id is that goal's last state. A goal whose last state is `status: "ended"`,
- * `reason: "blocked"` and the same-failure detail is 1 stop: `{ session, id, at }`. A goal in its summary round
+ * `reason: "blocked"` and the same-failure detail is 1 stop: `{ session, id, at, checks, checksFrom }`. A goal in its summary round
  * (`status: "summary"`) is not a stop yet: Night shift sets `reason` and `why` before the summary, and `endedAt` and
- * `status: "ended"` only after it. Neither `why` nor the failure fingerprint is kept.
+ * `status: "ended"` only after it. Each stop also has `checks` and `checksFrom` (`stopChecksOf`): the failing jobs from
+ * `goal.stopChecks`, or the job names of the failure fingerprint. `why` and the fingerprint text are not kept.
  */
 export function loadGoalStops(db) {
     const revisions = db.prepare(
@@ -674,13 +732,16 @@ export function loadGoalStops(db) {
             const lastRound = rounds.at(-1);
 
             // Copies of plain values only: a later `apply` cannot change them.
+            const stop =
+                goal.status === "ended" &&
+                goal.reason === "blocked" &&
+                typeof goal.why === "string" &&
+                SAME_FAILURE_STOP.test(goal.why);
+
             last.set(String(goal.id), {
                 id: String(goal.id),
-                stop:
-                    goal.status === "ended" &&
-                    goal.reason === "blocked" &&
-                    typeof goal.why === "string" &&
-                    SAME_FAILURE_STOP.test(goal.why),
+                stop,
+                ...(stop ? stopChecksOf(goal) : { checks: [], checksFrom: null }),
                 endedAt: typeof goal.endedAt === "number" ? goal.endedAt : undefined,
                 roundAt: typeof lastRound?.at === "number" ? lastRound.at : undefined,
                 setAt: typeof goal.setAt === "number" ? goal.setAt : undefined,
@@ -691,7 +752,13 @@ export function loadGoalStops(db) {
             const at = goal.endedAt ?? goal.roundAt ?? goal.setAt;
 
             if (goal.stop && at !== undefined) {
-                stops.push({ session: doc.owner_id, id: goal.id, at });
+                stops.push({
+                    session: doc.owner_id,
+                    id: goal.id,
+                    at,
+                    checks: goal.checks,
+                    checksFrom: goal.checksFrom,
+                });
             }
         }
     }
@@ -1061,37 +1128,10 @@ export function readOdrade(dir, git) {
 const FLAKY_FOLDER = /^\d{4}-\d{2}-\d{2}.*-flaky-scan$/;
 
 /**
- * The newest flaky-test scan (core spec `docs/specs/flaky-test-scan.md`): `reports/<date>…-flaky-scan/scan.json` under
- * Odrade's folder, the greatest folder name that holds a `scan.json`. `null` when there is none. A file that is not
- * valid JSON, has another `schema_version` than 1, or has no `repos` list throws. Returns
- * `{ file, generatedAt, window, repos: { [repo]: rerunAttempts } }`; a repository with an `error`, or whose
- * `rerunAttempts` is not a whole number of 0 or more, is `null`, never `0`. Never written.
+ * 1 flaky-scan file, parsed and checked: a file that is not valid JSON, has another `schema_version` than 1, or has no
+ * `repos` list throws.
  */
-export function readFlakyScan(odradeDir) {
-    const reports = path.join(odradeDir, "reports");
-    let names;
-
-    try {
-        names = fs.readdirSync(reports);
-    } catch (error) {
-        if (error?.code === "ENOENT") {
-            return null;
-        }
-
-        throw error;
-    }
-
-    const folder = names
-        .filter((name) => FLAKY_FOLDER.test(name))
-        .sort()
-        .reverse()
-        .find((name) => fs.existsSync(path.join(reports, name, "scan.json")));
-
-    if (folder === undefined) {
-        return null;
-    }
-
-    const file = `reports/${folder}/scan.json`;
+function readScanFile(odradeDir, file) {
     let scan;
 
     try {
@@ -1108,6 +1148,50 @@ export function readFlakyScan(odradeDir) {
         throw new Error(`${file} has no repos list`);
     }
 
+    return scan;
+}
+
+/** The flaky-scan folders under `reports`, oldest first, or `null` when there is no reports folder. */
+function flakyFolders(reports) {
+    try {
+        return fs
+            .readdirSync(reports)
+            .filter((name) => FLAKY_FOLDER.test(name))
+            .sort();
+    } catch (error) {
+        if (error?.code === "ENOENT") {
+            return null;
+        }
+
+        throw error;
+    }
+}
+
+/**
+ * The newest flaky-test scan (core spec `docs/specs/flaky-test-scan.md`): `reports/<date>…-flaky-scan/scan.json` under
+ * Odrade's folder, the greatest folder name that holds a `scan.json`. `null` when there is none. A file that is not
+ * valid JSON, has another `schema_version` than 1, or has no `repos` list throws. Returns
+ * `{ file, generatedAt, window, repos: { [repo]: rerunAttempts } }`; a repository with an `error`, or whose
+ * `rerunAttempts` is not a whole number of 0 or more, is `null`, never `0`. Never written.
+ */
+export function readFlakyScan(odradeDir) {
+    const reports = path.join(odradeDir, "reports");
+    const names = flakyFolders(reports);
+
+    if (names === null) {
+        return null;
+    }
+
+    const folder = [...names]
+        .reverse()
+        .find((name) => fs.existsSync(path.join(reports, name, "scan.json")));
+
+    if (folder === undefined) {
+        return null;
+    }
+
+    const file = `reports/${folder}/scan.json`;
+    const scan = readScanFile(odradeDir, file);
     const repos = {};
 
     for (const entry of scan.repos) {
@@ -1136,6 +1220,84 @@ export function readFlakyScan(odradeDir) {
                   }
                 : null,
         repos,
+    };
+}
+
+/**
+ * The flaky keys of every flaky-test scan from the UTC date of `sinceMs` on (Q1's 3-failure stops join them with the
+ * failing jobs): `reports/<date>…-flaky-scan/scan.json` whose folder date is that date or later. Each file is checked
+ * as `readFlakyScan` checks it, and a bad file throws. Each `repos[].flaky[]` entry with a string `key` gives
+ * `{ key, repo, workflow, job, test, jobIds, file }`; `jobIds` are the safe-integer `events[].job_id`. The same key in
+ * 2 scans is 1 entry, with the newest folder's fields and the job ids of both. `repos` are the lower-case repositories
+ * that at least 1 scan read with no `error`: only for those does no key mean "not flaky"; for another repository it is
+ * unknown. Returns `{ files, repos, keys }`, sorted, or `null` when there is no reports folder or no scan in the
+ * window. Never written.
+ */
+export function readFlakyKeys(odradeDir, sinceMs) {
+    const reports = path.join(odradeDir, "reports");
+    const names = flakyFolders(reports);
+
+    if (names === null) {
+        return null;
+    }
+
+    const from = new Date(sinceMs).toISOString().slice(0, 10);
+    const files = names
+        .filter((name) => name.slice(0, 10) >= from)
+        .filter((name) => fs.existsSync(path.join(reports, name, "scan.json")))
+        .map((name) => `reports/${name}/scan.json`);
+
+    if (files.length === 0) {
+        return null;
+    }
+
+    const text = (value) => (typeof value === "string" ? value : null);
+    const keys = new Map();
+    const scanned = new Set();
+
+    // Oldest first: a newer scan's fields replace an older one's, and the job ids add up.
+    for (const file of files) {
+        const scan = readScanFile(odradeDir, file);
+
+        for (const repo of scan.repos) {
+            if (
+                typeof repo?.repo === "string" &&
+                repo.repo !== "" &&
+                (repo.error === null || repo.error === undefined)
+            ) {
+                scanned.add(repo.repo.toLowerCase());
+            }
+
+            for (const flaky of Array.isArray(repo?.flaky) ? repo.flaky : []) {
+                if (typeof flaky?.key !== "string") {
+                    continue;
+                }
+
+                const jobIds = new Set(keys.get(flaky.key)?.jobIds ?? []);
+
+                for (const event of Array.isArray(flaky.events) ? flaky.events : []) {
+                    if (Number.isSafeInteger(event?.job_id)) {
+                        jobIds.add(event.job_id);
+                    }
+                }
+
+                keys.set(flaky.key, {
+                    key: flaky.key,
+                    repo: text(repo.repo),
+                    workflow: text(flaky.workflow),
+                    job: text(flaky.job),
+                    test: text(flaky.test),
+                    jobIds: [...jobIds].sort((a, b) => a - b),
+                    file,
+                });
+            }
+        }
+    }
+
+    return {
+        files,
+        repos: [...scanned].sort(),
+        keys: [...keys.values()].sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0)),
     };
 }
 
@@ -1264,6 +1426,7 @@ export function loadData({
         reviewCalls: [],
         goalStops: [],
         flakyScan: null,
+        flakyKeys: null,
         planSessions: [],
         sourceErrors,
     };
@@ -1378,6 +1541,10 @@ export function loadData({
     // Q1's CI reruns: the newest flaky-test scan in Odrade's reports. No scan is `null`, not an error.
     attempt("flakyScan", () => {
         data.flakyScan = readFlakyScan(odradeDir);
+    });
+    // Q1's 3-failure stops: the flaky keys of the scans of the last 30 days, to join with the failing jobs.
+    attempt("flakyKeys", () => {
+        data.flakyKeys = readFlakyKeys(odradeDir, now - 30 * DAY);
     });
 
     return data;

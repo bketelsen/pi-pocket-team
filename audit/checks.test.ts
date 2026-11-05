@@ -2744,14 +2744,14 @@ test("Q1 stops: 2 stops of 1 repository in 7 days are a finding; with 1 older th
 
     assert.equal(stopsMetrics.available, true);
     assert.deepEqual(stopsMetrics.thresholds, Q1_STOP_THRESHOLDS);
-    assert.deepEqual(stopsMetrics.totals, { stops: 4, last7: 4 });
+    assert.deepEqual(stopsMetrics.totals, { stops: 4, last7: 4, withChecks: 0, flaky: 0 });
     assert.deepEqual(stopsMetrics.repos, {
-        "acme/widgets": { stops: 2, last7: 2 },
-        unattributed: { stops: 2, last7: 2 },
+        "acme/widgets": { stops: 2, last7: 2, withChecks: 0, flaky: 0 },
+        unattributed: { stops: 2, last7: 2, withChecks: 0, flaky: 0 },
     });
     assert.deepEqual(stopsMetrics.agents, {
-        irulan: { stops: 2, last7: 2 },
-        teg: { stops: 2, last7: 2 },
+        irulan: { stops: 2, last7: 2, withChecks: 0, flaky: 0 },
+        teg: { stops: 2, last7: 2, withChecks: 0, flaky: 0 },
     });
     assert.deepEqual(
         stopsMetrics.goals.map((goal: { id: string; thread: string | null }) => [
@@ -2775,8 +2775,285 @@ test("Q1 stops: 2 stops of 1 repository in 7 days are a finding; with 1 older th
         q1Ctx([]),
     );
 
-    assert.deepEqual(older.metrics.stops.totals, { stops: 2, last7: 1 });
+    assert.deepEqual(older.metrics.stops.totals, { stops: 2, last7: 1, withChecks: 0, flaky: 0 });
     assert.deepEqual(ids(older), []);
+});
+
+test("Q1 stops: the failing jobs join the flaky keys by repository and job name, or by job id", () => {
+    const t1 = thread("T1");
+    const t2 = thread("T2", { repo: "Acme/Gears" });
+    const flakyKeys = {
+        files: ["reports/2026-10-20-flaky-scan/scan.json"],
+        repos: ["acme/gears", "acme/other", "acme/widgets"],
+        keys: [
+            {
+                key: "acme/widgets/ci.yml/race/TestRace",
+                repo: "acme/widgets",
+                workflow: "ci.yml",
+                job: "Race Detection",
+                test: "TestRace",
+                jobIds: [11],
+                file: "reports/2026-10-20-flaky-scan/scan.json",
+            },
+            {
+                key: "acme/other/ci.yml/build/TestBuild",
+                repo: "acme/other",
+                workflow: "ci.yml",
+                job: "build",
+                test: "TestBuild",
+                jobIds: [777],
+                file: "reports/2026-10-20-flaky-scan/scan.json",
+            },
+            {
+                key: "acme/gears/ci.yml/lint/TestLint",
+                repo: "acme/gears",
+                workflow: "ci.yml",
+                job: "lint",
+                test: "TestLint",
+                jobIds: [],
+                file: "reports/2026-10-20-flaky-scan/scan.json",
+            },
+        ],
+    };
+    const goalStops = [
+        // By repository (case-insensitive) and the exact job name.
+        {
+            session: t1.session,
+            id: "g1",
+            at: ago(DAY),
+            checks: [{ name: "Race Detection", repo: "ACME/Widgets", run: 5, job: 99 }],
+            checksFrom: "record",
+        },
+        // By the job id only: another repository and another name.
+        {
+            session: t1.session,
+            id: "g2",
+            at: ago(2 * DAY),
+            checks: [{ name: "Build all", repo: "acme/x", run: 6, job: 777 }],
+            checksFrom: "record",
+        },
+        // A name from the fingerprint: the thread's repository, compared case-insensitively.
+        {
+            session: t2.session,
+            id: "g3",
+            at: ago(3 * DAY),
+            checks: [{ name: "lint" }],
+            checksFrom: "fingerprint",
+        },
+        // No match: a name that is not exact.
+        {
+            session: t1.session,
+            id: "g4",
+            at: ago(4 * DAY),
+            checks: [{ name: "Race", repo: "acme/widgets" }],
+            checksFrom: "record",
+        },
+        // No checks.
+        { session: t1.session, id: "g5", at: ago(5 * DAY), checks: [], checksFrom: null },
+    ];
+    const result = checkQ1(
+        emptyData({
+            decided: todayEmpty,
+            threads: threadMap(t1, t2),
+            goalStops,
+            flakyKeys,
+        }),
+        q1Ctx([]),
+    );
+    const stops = result.metrics.stops;
+    const rows = Object.fromEntries(
+        stops.goals.map((goal: { id: string }) => [goal.id, goal]),
+    ) as Record<
+        string,
+        { checks: object[]; checksFrom: string | null; flakyKeys: string[]; flaky: boolean | null }
+    >;
+
+    assert.deepEqual(rows.g1!.flakyKeys, ["acme/widgets/ci.yml/race/TestRace"]);
+    assert.equal(rows.g1!.flaky, true);
+    assert.deepEqual(rows.g1!.checks, [
+        { name: "Race Detection", repo: "ACME/Widgets", run: 5, job: 99 },
+    ]);
+    assert.equal(rows.g1!.checksFrom, "record");
+    assert.deepEqual(rows.g2!.flakyKeys, ["acme/other/ci.yml/build/TestBuild"]);
+    assert.equal(rows.g2!.flaky, true);
+    assert.deepEqual(rows.g3!.flakyKeys, ["acme/gears/ci.yml/lint/TestLint"]);
+    assert.equal(rows.g3!.checksFrom, "fingerprint");
+    assert.deepEqual(rows.g4!.flakyKeys, []);
+    assert.equal(rows.g4!.flaky, false);
+    assert.deepEqual(rows.g5!.flakyKeys, []);
+    assert.equal(rows.g5!.flaky, null);
+    assert.equal(rows.g5!.checksFrom, null);
+    assert.deepEqual(stops.totals, { stops: 5, last7: 5, withChecks: 4, flaky: 3 });
+    assert.deepEqual(stops.repos["acme/widgets"], {
+        stops: 4,
+        last7: 4,
+        withChecks: 3,
+        flaky: 2,
+    });
+    assert.deepEqual(stops.flakyScans, flakyKeys.files);
+    // The join adds no finding of its own: the stop finding stays as it was.
+    assert.deepEqual(ids(result), ["Q1:stops:repo:acme/widgets"]);
+
+    // The flaky source unavailable: `flaky` is unknown, not false, and the scans are null.
+    for (const data of [
+        emptyData({ decided: todayEmpty, threads: threadMap(t1, t2), goalStops, flakyKeys: null }),
+        emptyData({
+            decided: todayEmpty,
+            threads: threadMap(t1, t2),
+            goalStops,
+            flakyKeys,
+            sourceErrors: { flakyKeys: "boom" },
+        }),
+        emptyData({
+            decided: todayEmpty,
+            threads: threadMap(t1, t2),
+            goalStops,
+            flakyKeys: undefined,
+        }),
+    ]) {
+        const off = checkQ1(data, q1Ctx([])).metrics.stops;
+
+        assert.deepEqual(
+            off.goals.map((goal: { flaky: boolean | null; flakyKeys: string[] }) => [
+                goal.flaky,
+                goal.flakyKeys,
+            ]),
+            [
+                [null, []],
+                [null, []],
+                [null, []],
+                [null, []],
+                [null, []],
+            ],
+        );
+        assert.equal(off.flakyScans, null);
+        assert.equal(off.totals.flaky, 0);
+        assert.equal(off.totals.withChecks, 4);
+    }
+});
+
+test("Q1 stops: a check name that gh cut with ... matches a flaky key whose job starts with the rest", () => {
+    const t1 = thread("T1");
+    const long =
+        "Install packages on target distros (debian, debian:12@sha256:9344f8b8992482f80cba753f323adeaf1769c0ab)";
+    const cut =
+        "Install packages on target distros (debian, debian:12@sha256:9344f8b8992482f80cba753f323adeaf1769...";
+    const key = (name: string, job: string) => ({
+        key: name,
+        repo: "acme/widgets",
+        workflow: "ci.yml",
+        job,
+        test: null,
+        jobIds: [],
+        file: "reports/2026-10-20-flaky-scan/scan.json",
+    });
+    const result = checkQ1(
+        emptyData({
+            decided: todayEmpty,
+            threads: threadMap(t1),
+            goalStops: [
+                {
+                    session: t1.session,
+                    id: "g1",
+                    at: ago(DAY),
+                    checks: [{ name: cut, repo: "acme/widgets" }],
+                    checksFrom: "record",
+                },
+                // A name with no ... must match exactly: a prefix is not enough.
+                {
+                    session: t1.session,
+                    id: "g2",
+                    at: ago(2 * DAY),
+                    checks: [{ name: "Install packages", repo: "acme/widgets" }],
+                    checksFrom: "record",
+                },
+            ],
+            flakyKeys: {
+                files: ["reports/2026-10-20-flaky-scan/scan.json"],
+                repos: ["acme/widgets"],
+                keys: [key("k-long", long), key("k-other", "Install packages on host")],
+            },
+        }),
+        q1Ctx([]),
+    );
+    const goals = result.metrics.stops.goals as {
+        id: string;
+        flakyKeys: string[];
+        flaky: boolean;
+    }[];
+
+    assert.deepEqual(
+        goals.map((goal) => [goal.id, goal.flakyKeys, goal.flaky]),
+        [
+            ["g2", [], false],
+            ["g1", ["k-long"], true],
+        ],
+    );
+});
+
+test("Q1 stops: flaky is false only when a scan read the repository of every check with no error; else null", () => {
+    const t1 = thread("T1");
+    const stop = (id: string, session: number, checks: object[]) => ({
+        session,
+        id,
+        at: ago(DAY),
+        checks,
+        checksFrom: "record",
+    });
+    const result = checkQ1(
+        emptyData({
+            decided: todayEmpty,
+            threads: threadMap(t1),
+            goalStops: [
+                // The scan had an error for acme/broken: it is not in `repos`.
+                stop("g1", t1.session, [{ name: "build", repo: "acme/broken" }]),
+                // No scan in the window read acme/nowhere.
+                stop("g2", t1.session, [{ name: "build", repo: "acme/nowhere" }]),
+                // Scanned, no matching key: not flaky (the repository compared case-insensitively).
+                stop("g3", t1.session, [{ name: "build", repo: "ACME/Widgets" }]),
+                // No repository on the check: the thread's (acme/widgets).
+                stop("g4", t1.session, [{ name: "build" }]),
+                // 1 check of a repository that no scan read: unknown.
+                stop("g5", t1.session, [
+                    { name: "build", repo: "acme/widgets" },
+                    { name: "build", repo: "acme/nowhere" },
+                ]),
+                // An unattributed session and a check with no repository: unknown.
+                stop("g6", 900, [{ name: "build" }]),
+                // A match is flaky, also beside a check of a repository that no scan read.
+                stop("g7", t1.session, [
+                    { name: "race", repo: "acme/widgets" },
+                    { name: "build", repo: "acme/nowhere" },
+                ]),
+            ],
+            flakyKeys: {
+                files: ["reports/2026-10-20-flaky-scan/scan.json"],
+                repos: ["acme/widgets"],
+                keys: [
+                    {
+                        key: "acme/widgets/ci.yml/race/TestRace",
+                        repo: "acme/widgets",
+                        workflow: "ci.yml",
+                        job: "race",
+                        test: "TestRace",
+                        jobIds: [],
+                        file: "reports/2026-10-20-flaky-scan/scan.json",
+                    },
+                ],
+            },
+        }),
+        q1Ctx([]),
+    );
+    const stops = result.metrics.stops;
+
+    assert.deepEqual(
+        Object.fromEntries(
+            stops.goals.map((goal: { id: string; flaky: boolean | null }) => [goal.id, goal.flaky]),
+        ),
+        { g1: null, g2: null, g3: false, g4: false, g5: null, g6: null, g7: true },
+    );
+    assert.equal(stops.totals.flaky, 1);
+    assert.equal(stops.totals.withChecks, 7);
 });
 
 test("Q1 CI reruns: the scan's values, null for a repository with no value, and never 0 with no scan", () => {

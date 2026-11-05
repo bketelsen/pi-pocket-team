@@ -2339,24 +2339,45 @@ function q1Stops(data, ctx) {
         return { metrics: unavailable, findings: [] };
     }
 
+    // The flaky keys to join with the failing jobs: unknown (`null`), not none, when the source failed or is absent.
+    const flakySource =
+        data.sourceErrors?.flakyKeys || data.flakyKeys === null || data.flakyKeys === undefined
+            ? undefined
+            : data.flakyKeys;
+    const flakyList = Array.isArray(flakySource?.keys) ? flakySource.keys : [];
+    const scannedRepos = new Set(
+        (Array.isArray(flakySource?.repos) ? flakySource.repos : [])
+            .filter((repo) => typeof repo === "string")
+            .map((repo) => repo.toLowerCase()),
+    );
     const from = ctx.now - 30 * DAY;
     const last7From = ctx.now - Q1_STOP_THRESHOLDS.days * DAY;
     const goals = (Array.isArray(data.goalStops) ? data.goalStops : [])
         .filter((stop) => typeof stop?.at === "number" && stop.at >= from)
         .map((stop) => {
             const thread = q1ThreadAt(data, stop.session, stop.at);
+            const repo = q1RepoOf(thread);
+            const checks = q1StopChecks(stop.checks);
+            const flakyKeys = q1FlakyKeysOf(checks, repo, flakyList);
 
             return {
                 id: String(stop.id),
                 session: stop.session,
                 thread: thread?.id ?? null,
-                repo: q1RepoOf(thread),
+                repo,
                 agent: q1AgentOf(thread) ?? data.agentOf?.[stop.session] ?? UNATTRIBUTED,
                 at: stop.at,
+                checks,
+                checksFrom: checks.length > 0 ? (stop.checksFrom ?? null) : null,
+                flakyKeys,
+                flaky:
+                    checks.length === 0 || flakySource === undefined
+                        ? null
+                        : q1FlakyOf(checks, repo, flakyKeys, scannedRepos),
             };
         })
         .sort((a, b) => a.at - b.at || a.id.localeCompare(b.id));
-    const zero = () => ({ stops: 0, last7: 0 });
+    const zero = () => ({ stops: 0, last7: 0, withChecks: 0, flaky: 0 });
     const totals = zero();
     const repos = {};
     const agents = {};
@@ -2369,6 +2390,8 @@ function q1Stops(data, ctx) {
         ]) {
             row.stops += 1;
             row.last7 += goal.at >= last7From ? 1 : 0;
+            row.withChecks += goal.checks.length > 0 ? 1 : 0;
+            row.flaky += goal.flaky === true ? 1 : 0;
         }
     }
 
@@ -2405,9 +2428,106 @@ function q1Stops(data, ctx) {
             repos: sortedKeys(repos),
             agents: sortedKeys(agents),
             goals: goals.map((goal) => ({ ...goal, at: iso(goal.at) })),
+            flakyScans: flakySource === undefined ? null : [...(flakySource.files ?? [])],
         },
         findings,
     };
+}
+
+/** A stop's failing jobs, as new plain objects: entries with a non-empty `name` only. */
+function q1StopChecks(list) {
+    return (Array.isArray(list) ? list : [])
+        .filter((each) => typeof each?.name === "string" && each.name !== "")
+        .map((each) => {
+            const check = { name: each.name };
+
+            for (const field of ["repo", "run", "job"]) {
+                if (each[field] !== undefined) {
+                    check[field] = each[field];
+                }
+            }
+
+            return check;
+        });
+}
+
+/** The marker that `gh pr checks` puts at the end of a check name it cuts. */
+const GH_CUT = "...";
+
+/**
+ * Does a check name name a flaky key's job? Exactly, or, for a name that `gh` cut (it ends with `...`), when the job
+ * starts with the rest of the name.
+ */
+function q1JobMatches(name, job) {
+    if (typeof job !== "string") {
+        return false;
+    }
+
+    if (name.endsWith(GH_CUT)) {
+        const prefix = name.slice(0, -GH_CUT.length);
+
+        return prefix !== "" && job.startsWith(prefix);
+    }
+
+    return job === name;
+}
+
+/** The repository of a failing job: the check's own, else the goal's thread repository unless unattributed. */
+const q1CheckRepo = (check, threadRepo) =>
+    typeof check.repo === "string"
+        ? check.repo
+        : threadRepo !== UNATTRIBUTED
+          ? threadRepo
+          : undefined;
+
+/**
+ * Is a stop's failure flaky? `true` when a key matches; `false` only when a scan read the repository of every check
+ * with no error, so that no key means "not flaky"; else unknown (`null`): a repository that no scan read, or read with
+ * an error.
+ */
+function q1FlakyOf(checks, threadRepo, flakyKeys, scannedRepos) {
+    if (flakyKeys.length > 0) {
+        return true;
+    }
+
+    return checks.every((check) => {
+        const repo = q1CheckRepo(check, threadRepo);
+
+        return repo !== undefined && scannedRepos.has(repo.toLowerCase());
+    })
+        ? false
+        : null;
+}
+
+/**
+ * The sorted flaky keys that match a stop's failing jobs: a key of the check's repository (else the goal's thread
+ * repository, unless unattributed; compared case-insensitively) whose `job` names the check, or a key whose job ids
+ * hold the check's job id.
+ */
+function q1FlakyKeysOf(checks, threadRepo, keys) {
+    const found = new Set();
+
+    for (const check of checks) {
+        const repo = q1CheckRepo(check, threadRepo);
+
+        for (const key of keys) {
+            const sameRepo =
+                typeof repo === "string" &&
+                typeof key?.repo === "string" &&
+                key.repo.toLowerCase() === repo.toLowerCase();
+            const byName = sameRepo && q1JobMatches(check.name, key.job);
+            const byJob =
+                check.job !== undefined &&
+                Array.isArray(key?.jobIds) &&
+                key.jobIds.includes(check.job);
+
+            if ((byName || byJob) && typeof key.key === "string") {
+                found.add(key.key);
+            }
+        }
+    }
+
+    return [...found].sort();
 }
 
 const isRerunCount = (value) => Number.isInteger(value) && value >= 0;

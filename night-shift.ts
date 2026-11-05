@@ -172,6 +172,72 @@ export function checkFingerprint(check: CheckResult | undefined): string | undef
     return `exit ${check.code}: ${lines.join(" / ")}`;
 }
 
+/** A failing `gh pr checks` row: the check's name, and its repository, run and job when its URL names them. */
+export type FailedCheck = { name: string; repo?: string; run?: number; job?: number };
+
+const MAX_FAILED_CHECKS = 20;
+const MAX_CHECK_NAME = 200;
+const JOB_URL = /^https:\/\/github\.com\/([^/\s]+\/[^/\s]+)\/actions\/runs\/(\d+)\/job\/(\d+)/;
+
+/**
+ * The failing (`fail` or `cancel`) rows of a check's `gh pr checks` output, read as `checkFingerprint` reads them. `[]`
+ * for no check, a passing or cut-off check, or a check with no gh rows.
+ */
+export function failedChecks(check: CheckResult | undefined): FailedCheck[] {
+    if (check === undefined || check.passed || check.cutOff) {
+        return [];
+    }
+
+    const found = new Map<string, FailedCheck>();
+
+    for (const line of check.tail.split("\n")) {
+        const parts = line.split("\t");
+
+        if (parts.length < 4) {
+            continue;
+        }
+
+        const state = parts[1]?.trim();
+
+        // Of the gh states (pass, fail, pending, skipping, cancel), only the failing ones.
+        if (state !== "fail" && state !== "cancel") {
+            continue;
+        }
+
+        const name = (parts[0] ?? "").trim().slice(0, MAX_CHECK_NAME);
+
+        if (name === "") {
+            continue;
+        }
+
+        const entry: FailedCheck = { name };
+        const url = JOB_URL.exec((parts[3] ?? "").trim());
+
+        if (url !== null) {
+            const run = Number(url[2]);
+            const job = Number(url[3]);
+
+            entry.repo = url[1];
+
+            if (Number.isSafeInteger(run)) {
+                entry.run = run;
+            }
+
+            if (Number.isSafeInteger(job)) {
+                entry.job = job;
+            }
+        }
+
+        found.set(JSON.stringify([entry.name, entry.repo, entry.run, entry.job]), entry);
+    }
+
+    return [...found.values()]
+        .sort((a, b) =>
+            a.name < b.name ? -1 : a.name > b.name ? 1 : (a.job ?? -1) - (b.job ?? -1),
+        )
+        .slice(0, MAX_FAILED_CHECKS);
+}
+
 export type FailureStreak = { fingerprint: string; count: number; round: number };
 
 /** Update a goal's streak without changing it for a replay or a cut-off check. */
@@ -241,6 +307,11 @@ export type Goal = {
      * later: an older goal has none, and starts a new run. Absent: no run.
      */
     failures?: FailureStreak;
+    /**
+     * Set only when the same check failure stops the goal (`SAME_FAILURES`): the failing `gh pr checks` rows of the last
+     * check (`failedChecks`). Absent for a check with no gh rows, and removed on resume. Added later; stored data.
+     */
+    stopChecks?: FailedCheck[];
     /** The task that drives the goal now; another task that finds this changed stops. */
     driver?: string;
     endedAt?: number;
@@ -2100,6 +2171,14 @@ export default function createNightShift(host: Host, web: Web) {
                                     0,
                                     300,
                                 );
+                            const stopChecks = failedChecks(check);
+
+                            if (stopChecks.length > 0) {
+                                goal.stopChecks = stopChecks;
+                            } else {
+                                delete goal.stopChecks;
+                            }
+
                             const state = stopIn(goal, "blocked", detail, runtime.now());
 
                             seen.goal = copy(goal);
@@ -2613,6 +2692,7 @@ export default function createNightShift(host: Host, web: Web) {
             delete goal.reason;
             delete goal.why;
             delete goal.endedAt;
+            delete goal.stopChecks;
 
             return copy(goal);
         });
