@@ -106,6 +106,7 @@ import {
     parsePlanText,
     planDecidedItem,
     planReadyItem,
+    planRosterText,
     planSlug,
     planWaiting,
     planWarning,
@@ -115,6 +116,7 @@ import {
     renderPlanText,
     renderTasks,
     reopenable,
+    repairsOf,
     secretForm,
     setWatch,
     startTask,
@@ -620,7 +622,48 @@ describe("a plan write", () => {
         const refused = write(state, { text: whole });
 
         assert.ok("error" in refused);
-        assert.match(refused.error, /belong to the desk/);
+        assert.equal(
+            refused.error,
+            "Decisions and Tasks belong to the desk: leave them out of a whole-file write, or copy them unchanged from plan read.",
+        );
+    });
+
+    test("a whole file that settles an ask and copies Decisions from plan read is written, and Decisions lists the ask", () => {
+        const { state, plan, thread } = startPlan();
+
+        plan.state = "review";
+
+        const filed = addPlanAsk(state, "T1", {
+            key: "ask:1",
+            by: "lucilla",
+            at: tick(1),
+            section: "idea",
+            rev: plan.rev,
+            text: "Where do the keys live?",
+        });
+
+        assert(!("error" in filed));
+        (thread.asks[0] ?? assert.fail("an ask")).answer = {
+            at: tick(2),
+            by: "Brian",
+            words: "In the TPM.",
+        };
+
+        // The caller copies the file as plan read gave it: Decisions says "None yet.", the render after the settle does not.
+        assert.equal(
+            parsePlanText(file).sections.find((each) => each.id === "decisions")?.body,
+            "None yet.",
+        );
+
+        const whole = file.replace("Sign the ISO with the TPM key.", "The keys live in the TPM.");
+        const settled = write(state, { text: whole, asks: [{ ask: "T1a", gen: 0 }] });
+
+        assert(!("error" in settled));
+        assert.deepEqual(settled.settled, ["T1a"]);
+        assert.match(
+            parsePlanText(file).sections.find((each) => each.id === "decisions")?.body ?? "",
+            /T1a\*\* \(Idea\): Where do the keys live\? → In the TPM\./,
+        );
     });
 
     test("a whole file keeps the desk's sections, and adds an id where one is missing", () => {
@@ -1114,6 +1157,19 @@ describe("the gate", () => {
 describe("a task graph", () => {
     test("a valid graph passes", () => {
         assert.equal(validateGraph(tasks(), ROSTER), undefined);
+    });
+
+    test("the roster lines of a planning read: agents and repository names only, or 1 line when it cannot be read", () => {
+        // A home is never shown: only the id and the repository names.
+        const irulan = { id: "irulan", role: "agent", home: "/tmp/irulan" };
+
+        assert.deepEqual(planRosterText([...ROSTER, irulan]), [
+            "Agents (role agent) and their repositories:",
+            "- lucilla: frostyard/snow",
+            "- teg: frostyard/nsl",
+            "- irulan: no repository (home only)",
+        ]);
+        assert.deepEqual(planRosterText(undefined), ["Agents: the roster is not available now."]);
     });
 
     test("a graph with no task, or too many, is refused", () => {
@@ -5339,6 +5395,225 @@ describe("the PR facts of a task thread", () => {
         assert.equal(t1.state, "delegated");
     });
 
+    test("a thread that closed while its PR is open keeps the attempt open, and the merge makes the task done", () => {
+        const { state, graph } = buildingPlan();
+        const thread = state.threads.T2 ?? assert.fail("T2");
+        const t1 = taskOf(graph, "t1");
+
+        prOn(state, "T2", "frostyard/snow#1", "OPEN");
+        thread.state = "closed";
+        thread.closed = { at: tick(9), why: "done", by: "sweep" };
+
+        assert.deepEqual(planFacts(state, "T1", tick(10)).items, []);
+        assert.equal(t1.state, "delegated");
+        assert.equal(t1.attempts[0]?.end, undefined);
+
+        // A PR not read yet may be open: it keeps the attempt open too.
+        prOn(state, "T2", "frostyard/snow#1");
+        planFacts(state, "T1", tick(11));
+        assert.equal(t1.state, "delegated");
+        assert.equal(t1.attempts[0]?.end, undefined);
+        assert.equal(
+            state.threads.T1?.events.some((event) => event.key === "plan-task-end:T2"),
+            false,
+        );
+
+        prOn(state, "T2", "frostyard/snow#1", "MERGED");
+
+        const done = planFacts(state, "T1", tick(12));
+
+        assert.equal(t1.state, "done");
+        assert.deepEqual(t1.attempts[0]?.end, { at: tick(12), how: "merged" });
+        assert.equal(taskOf(graph, "t2").state, "ready");
+        assert.deepEqual(
+            done.items.map((item) => item.key),
+            ["plan-tasks:T1:v1:t2:2"],
+        );
+        assert(
+            state.threads.T1?.events.some(
+                (event) => event.text === "t1 merged: T2 (frostyard/snow#1)",
+            ),
+        );
+    });
+
+    test("a thread that closed while its PR is open: the PR's close with no merge makes the task ready again", () => {
+        const { state, graph } = buildingPlan();
+        const thread = state.threads.T2 ?? assert.fail("T2");
+        const t1 = taskOf(graph, "t1");
+
+        prOn(state, "T2", "frostyard/snow#1", "OPEN");
+        thread.state = "closed";
+        thread.closed = { at: tick(9), why: "done", by: "sweep" };
+        planFacts(state, "T1", tick(10));
+        assert.equal(t1.state, "delegated");
+
+        prOn(state, "T2", "frostyard/snow#1", "CLOSED");
+        planFacts(state, "T1", tick(11));
+        assert.equal(t1.state, "ready");
+        assert.deepEqual(t1.attempts[0]?.end, { at: tick(11), how: "stopped" });
+    });
+
+    test("a closed thread with a ref the sweep cannot pin: 1 event for each ref, and the task stays delegated", () => {
+        const { state, graph } = buildingPlan();
+        const thread = state.threads.T2 ?? assert.fail("T2");
+        const t1 = taskOf(graph, "t1");
+
+        thread.state = "closed";
+        thread.closed = { at: tick(9), why: "done", by: "sweep" };
+        // A bad stored ref: never `owner/name#N`, so no read gives its state.
+        prOn(state, "T2", "snow#1");
+        prOn(state, "T2", "frostyard/snow#0");
+        planFacts(state, "T1", tick(10));
+
+        const unread = () =>
+            (state.threads.T1?.events ?? [])
+                .filter((event) => event.key.startsWith("plan-unread-pr:"))
+                .map((event) => [event.key, event.text]);
+
+        assert.deepEqual(unread(), [
+            [
+                "plan-unread-pr:T2:snow#1",
+                "t1: T2 is closed and holds snow#1, which the desk cannot read on GitHub: the task stays delegated. Recover it with plan revise.",
+            ],
+            [
+                "plan-unread-pr:T2:frostyard/snow#0",
+                "t1: T2 is closed and holds frostyard/snow#0, which the desk cannot read on GitHub: the task stays delegated. Recover it with plan revise.",
+            ],
+        ]);
+        // No merge and no close is inferred.
+        assert.equal(t1.state, "delegated");
+        assert.equal(t1.attempts[0]?.end, undefined);
+
+        // A second sweep adds no second event.
+        const snapshot = JSON.stringify(state);
+
+        assert.deepEqual(planFacts(state, "T1", tick(11)), { events: 0, items: [] });
+        assert.equal(JSON.stringify(state), snapshot);
+    });
+
+    test("the repair: a ready task whose newest attempt stopped while its PR was open is done when the PR merges", () => {
+        for (const reopened of [false, true]) {
+            const { state, graph } = buildingPlan();
+            const thread = state.threads.T2 ?? assert.fail("T2");
+            const t1 = taskOf(graph, "t1");
+
+            // The stored shape of an older sweep: T2 closed while its PR was open, and that sweep stopped the attempt.
+            prOn(state, "T2", "frostyard/snow#1", "OPEN");
+            thread.state = "closed";
+            thread.closed = { at: tick(9), why: "done", by: "sweep" };
+            t1.attempts[0]!.prs = [{ ref: "frostyard/snow#1" }];
+            t1.attempts[0]!.end = { at: tick(10), how: "stopped" };
+            t1.state = "ready";
+
+            // The PR merges later; the thread may stay closed or open again.
+            if (reopened) {
+                thread.state = "open";
+                delete thread.closed;
+            }
+
+            prOn(state, "T2", "frostyard/snow#1", "MERGED");
+
+            const done = planFacts(state, "T1", tick(20));
+
+            assert.equal(t1.state, "done");
+            assert.deepEqual(t1.attempts[0]?.end, { at: tick(20), how: "merged" });
+            assert.deepEqual(t1.attempts[0]?.prs, [
+                { ref: "frostyard/snow#1", head: `1${"0".repeat(39)}` },
+            ]);
+            assert.equal(taskOf(graph, "t2").state, "ready");
+            assert.deepEqual(
+                done.items.map((item) => item.key),
+                ["plan-tasks:T1:v1:t2:2"],
+            );
+            assert.deepEqual(
+                state.threads.T1?.events
+                    .filter((event) => event.key === "plan-task-merged:T2")
+                    .map((event) => event.text),
+                ["t1 merged after T2 closed: the task is done (frostyard/snow#1)"],
+            );
+
+            // A replayed sweep changes nothing.
+            const snapshot = JSON.stringify(state);
+
+            assert.deepEqual(planFacts(state, "T1", tick(21)), { events: 0, items: [] });
+            assert.equal(JSON.stringify(state), snapshot);
+        }
+    });
+
+    test("the repair skips a done task (the T801 t12 shape), a task stopped by a scope change, and an older attempt", () => {
+        const stoppedThen = (state: DeskState, task: PlanTask): void => {
+            const thread = state.threads.T2 ?? assert.fail("T2");
+
+            prOn(state, "T2", "frostyard/snow#1", "MERGED");
+            thread.state = "closed";
+            thread.closed = { at: tick(9), why: "done", by: "sweep" };
+            task.attempts[0]!.prs = [{ ref: "frostyard/snow#1" }];
+            task.attempts[0]!.end = { at: tick(10), how: "stopped" };
+        };
+
+        const unchanged = (state: DeskState): void => {
+            const snapshot = JSON.stringify(state);
+
+            assert.deepEqual(planFacts(state, "T1", tick(20)).events, 0);
+            assert.equal(JSON.stringify(state), snapshot);
+        };
+
+        // T801 t12: T816 stopped (its PR merged later), then T859 ended no-change, and the task is done.
+        {
+            const { state, graph } = buildingPlan();
+            const t1 = taskOf(graph, "t1");
+
+            stoppedThen(state, t1);
+            taskThread(state, "T4");
+            t1.attempts.push({
+                thread: "T4",
+                at: tick(11),
+                prs: [],
+                end: {
+                    at: tick(12),
+                    how: "no-change",
+                    noChange: { reason: "Merged already.", evidence: "#1 merged." },
+                },
+            });
+            t1.state = "done";
+            planFacts(state, "T1", tick(13));
+            unchanged(state);
+            assert.equal(t1.attempts[0]?.end?.how, "stopped");
+            assert.equal(
+                state.threads.T1?.events.some((event) => event.key.startsWith("plan-task-merged:")),
+                false,
+            );
+        }
+
+        // A task that a scope change stopped.
+        {
+            const { state, graph } = buildingPlan();
+            const t1 = taskOf(graph, "t1");
+
+            stoppedThen(state, t1);
+            t1.state = "stopped";
+            unchanged(state);
+        }
+
+        // A ready task whose stopped attempt with the merge is not the newest.
+        {
+            const { state, graph } = buildingPlan();
+            const t1 = taskOf(graph, "t1");
+
+            stoppedThen(state, t1);
+            taskThread(state, "T4").state = "closed";
+            t1.attempts.push({
+                thread: "T4",
+                at: tick(11),
+                prs: [],
+                end: { at: tick(12), how: "stopped" },
+            });
+            t1.state = "ready";
+            unchanged(state);
+            assert.equal(t1.attempts[0]?.end?.how, "stopped");
+        }
+    });
+
     test("a failed start stays delegated: a session may still run", () => {
         const { state, graph } = buildingPlan();
         const thread = state.threads.T2 ?? assert.fail("T2");
@@ -7306,6 +7581,20 @@ const model = scriptedModel((request) => {
         return call("plan", { action: "read" });
     }
 
+    if (text.endsWith("plan read other test")) {
+        return call("plan", { action: "read", plan: planId });
+    }
+
+    if (text.endsWith("plan write other test")) {
+        return call("plan", {
+            action: "write",
+            plan: planId,
+            section: "idea",
+            text: "A change from a session that does not plan it.",
+            rev: writeRev,
+        });
+    }
+
     if (text.endsWith("plan stale write test")) {
         return call("plan", {
             action: "write",
@@ -7793,12 +8082,19 @@ function command(
 
 /** A new session that carries Odrade's identity. */
 async function supervisor(name: string): Promise<ConversationId> {
+    return personaSession(name, "odrade");
+}
+
+/** A new session that carries the identity `agent`, or none. */
+async function personaSession(name: string, agent?: string): Promise<ConversationId> {
     const folder = join(root, name);
 
     mkdirSync(folder, { recursive: true });
     const id = await newSession(app, folder);
 
-    await command(id, "team-agent", "odrade");
+    if (agent !== undefined) {
+        await command(id, "team-agent", agent);
+    }
 
     return id;
 }
@@ -8253,6 +8549,75 @@ describe("with the Pi Pocket app", () => {
         );
 
         assert.equal((await planSnapshot())?.revs.length, revs);
+    });
+
+    test("the planning session's read lists each agent and its repository names, and no folder", async () => {
+        const reads = async (): Promise<string[]> =>
+            (await modelTexts(app, planningId!)).filter((each) => each.includes("<plan-file rev="));
+        const before = (await reads()).length;
+
+        await say(app, planningId!, "plan read test");
+        await until(async () => (await reads()).length > before, "the planning read", 20_000);
+
+        const read = (await reads()).at(-1) ?? assert.fail("the planning session read its plan");
+
+        assert.match(read, /Agents \(role agent\) and their repositories:/);
+        assert.match(read, /- lucilla: frostyard\/snow\\n/);
+        assert.match(read, /- paul: frostyard\/snow, frostyard\/nsl\\n/);
+        assert.match(read, /- teg: frostyard\/nsl\\n/);
+        // A supervisor is no agent, and no folder or home shows.
+        assert.doesNotMatch(read, /- odrade:/);
+
+        for (const folder of [snowRepo, nslRepo, lucillaHome, paulHome, tegHome]) {
+            assert.equal(read.includes(folder), false, `${folder} is not in the read`);
+        }
+    });
+
+    test("an agent session reads another plan and writes none; a session with no persona reads none", async () => {
+        const teg = await personaSession("plan-teg-read", "teg");
+
+        await say(app, teg, "plan read other test");
+        await until(
+            async () =>
+                (await modelTexts(app, teg)).some((each) => each.includes(`<plan-file rev=`)),
+            "the agent's read",
+            20_000,
+        );
+        // Only the planning session gets the roster lines.
+        assert.equal(
+            (await modelTexts(app, teg)).some((each) => each.includes("Agents (role agent)")),
+            false,
+        );
+
+        const revs = (await planSnapshot())?.revs.length ?? 0;
+
+        writeRev = (await planSnapshot())?.rev ?? "";
+        await say(app, teg, "plan write other test");
+        await until(
+            async () =>
+                (await modelTexts(app, teg)).some((each) =>
+                    each.includes(`Only the planning session of ${planId} can write its plan`),
+                ),
+            "the write refusal",
+            20_000,
+        );
+        assert.equal((await planSnapshot())?.revs.length, revs);
+
+        const nobody = await personaSession("plan-nobody-read");
+
+        await say(app, nobody, "plan read other test");
+        await until(
+            async () =>
+                (await modelTexts(app, nobody)).some((each) =>
+                    each.includes(`this session holds no ${planId}`),
+                ),
+            "the read refusal",
+            20_000,
+        );
+        assert.equal(
+            (await modelTexts(app, nobody)).some((each) => each.includes("<plan-file rev=")),
+            false,
+        );
     });
 
     test("a write from a stale revision is refused, and names the revision", async () => {
@@ -8752,6 +9117,23 @@ describe("with the Pi Pocket app", () => {
         );
         assert.equal((await planSnapshot())?.state, "building");
 
+        // The task session reads its plan, with no roster lines: those are the planning session's.
+        await say(app, task.session as ConversationId, "plan read test");
+        await until(
+            async () =>
+                (await modelTexts(app, task.session as ConversationId)).some((each) =>
+                    each.includes("<plan-file rev="),
+                ),
+            "the task session's read",
+            20_000,
+        );
+        assert.equal(
+            (await modelTexts(app, task.session as ConversationId)).some((each) =>
+                each.includes("Agents (role agent)"),
+            ),
+            false,
+        );
+
         // A delivery with a night shift keeps the plan's brief: the task's words come after it.
         const shiftSource = await supervisor("plan-shift");
 
@@ -9129,6 +9511,295 @@ describe("with the Pi Pocket app", () => {
 
         await say(app, startSource!, "desk sync test");
         assert.equal((await planThread())?.events.length, events);
+    });
+
+    /**
+     * A plan of 1 task, of a new supervisor session, whose task thread closed `closedAgo` ms ago with 1 PR link. The
+     * fake `gh` gives `pr` for that ref; `run` runs the sweep and the checks. After it, the fake `gh` gives the
+     * viewer only again, and the plan is dropped, so no later test counts it as open. The `gh` calls' arguments
+     * are kept for `run`.
+     */
+    async function closedTaskPlan(
+        name: string,
+        closedAgo: number,
+        link: { state?: "OPEN" },
+        pr: Record<string, unknown>,
+        run: (ids: {
+            source: ConversationId;
+            plan: string;
+            task: string;
+            ghArgs: () => string;
+        }) => Promise<void>,
+    ): Promise<void> {
+        const source = await supervisor(name);
+        const ref = "frostyard/snow#41";
+        const at = Date.now();
+        const argsLog = join(root, `${name}-gh-args.txt`);
+        let plan = "";
+        let task = "";
+
+        await app.harness.commit(async (tx) => {
+            const state = await tx.doc(DeskThreads);
+            const text = initialPlanText("T0", "Old close", "Sign the old ISO.");
+
+            plan = openThread(state, {
+                key: `x.test:${name}-plan`,
+                supervisor: Number(source),
+                agents: [],
+                title: "Old close",
+                at,
+                plan: {
+                    start: {
+                        idea: "Sign the old ISO.",
+                        lead: "lucilla",
+                        root: plansFolder,
+                        text,
+                        rev: gitBlobSha(text),
+                    },
+                },
+            }).thread.id;
+            // The stored thread, not the copy that openThread gives back.
+            (state.threads[plan] ?? assert.fail("the plan thread")).state = "open";
+
+            const stored = planOf(state, plan) ?? assert.fail("the plan");
+
+            delete stored.pending;
+            assert(
+                !(
+                    "error" in
+                    draftGraph(state, plan, {
+                        key: "graph:old",
+                        at,
+                        rev: stored.rev,
+                        tasks: [
+                            {
+                                id: "t1",
+                                title: "Sign the old ISO",
+                                agent: "lucilla",
+                                repo: "frostyard/snow",
+                                acceptance: ["The old ISO is signed."],
+                                deps: [],
+                                state: "waiting",
+                                attempts: [],
+                            },
+                        ],
+                    })
+                ),
+            );
+            assert(!("error" in readyPlan(state, plan, { key: "ready:old", at })));
+            assert(
+                !(
+                    "error" in
+                    approvePlan(state, plan, {
+                        rev: stored.rev,
+                        graph: 1,
+                        key: "approve:old",
+                        by: "brian",
+                        at,
+                    })
+                ),
+            );
+            task = openThread(state, {
+                key: `x.test:${name}-task`,
+                supervisor: Number(source),
+                agents: ["lucilla"],
+                repo: "frostyard/snow",
+                title: "Sign the old ISO",
+                at,
+            }).thread.id;
+            assert(!("error" in startTask(state, plan, "t1", task, at)));
+
+            const thread = state.threads[task] ?? assert.fail("the task thread");
+
+            thread.state = "closed";
+            thread.closed = { at: at - closedAgo, why: "done", by: "sweep" };
+            thread.prs[ref] = { via: "attached", ...link };
+        }, context);
+
+        try {
+            // GitHub gives the PR read by number; the fake `gh` keeps its arguments.
+            writeFileSync(
+                fixturePath,
+                JSON.stringify({
+                    data: {
+                        viewer: { login: "github-viewer" },
+                        p0: {
+                            nameWithOwner: "frostyard/snow",
+                            isArchived: false,
+                            pullRequest: {
+                                number: 41,
+                                title: "Sign the old ISO",
+                                url: "https://github.com/frostyard/snow/pull/41",
+                                isDraft: false,
+                                createdAt: new Date(at).toISOString(),
+                                headRefName: "old-iso",
+                                reviewDecision: "REVIEW_REQUIRED",
+                                author: { login: "github-viewer" },
+                                ...pr,
+                            },
+                        },
+                    },
+                }),
+            );
+            writeFileSync(
+                fakeGh,
+                `#!/bin/sh\nprintf '%s\\n' "$@" >> ${JSON.stringify(argsLog)}\ncat ${JSON.stringify(fixturePath)}\n`,
+            );
+            await run({
+                source,
+                plan,
+                task,
+                ghArgs: () => (existsSync(argsLog) ? readFileSync(argsLog, "utf8") : ""),
+            });
+        } finally {
+            writeFileSync(fakeGh, `#!/bin/sh\ncat ${JSON.stringify(fixturePath)}\n`);
+            writeFileSync(
+                fixturePath,
+                JSON.stringify({ data: { viewer: { login: "github-viewer" } } }),
+            );
+            await app.harness.commit(async (tx) => {
+                const state = await tx.doc(DeskThreads);
+                const stored = planOf(state, plan);
+
+                if (stored !== undefined && stored.state !== "done" && stored.state !== "dropped") {
+                    assert(
+                        !(
+                            "error" in
+                            dropPlan(state, plan, {
+                                by: "brian",
+                                why: "the test ends",
+                                at: Date.now(),
+                            })
+                        ),
+                    );
+                }
+            }, context);
+        }
+    }
+
+    /** The task of a plan made by `closedTaskPlan`, from the desk's document. */
+    const closedTaskOf = async (plan: string): Promise<PlanTask | undefined> =>
+        planOf(await deskSnapshot(), plan)?.graphs.find((each) => each.state === "approved")
+            ?.tasks[0];
+
+    test("a task thread that closed more than 7 days ago with an open PR gets the PR's merge, and the task is done", async () => {
+        const head = "c".repeat(40);
+
+        await closedTaskPlan(
+            "plan-old-close",
+            8 * 24 * 3600_000,
+            { state: "OPEN" },
+            {
+                state: "MERGED",
+                mergeable: "UNKNOWN",
+                commits: { nodes: [{ commit: { oid: head } }] },
+            },
+            async ({ source, plan, task }) => {
+                await say(app, source, "desk sync test");
+
+                const state = await deskSnapshot();
+                const done = await closedTaskOf(plan);
+
+                assert.equal(state?.threads[task]?.prs["frostyard/snow#41"]?.state, "MERGED");
+                assert.equal(done?.state, "done");
+                assert.equal(done?.attempts[0]?.end?.how, "merged");
+                assert.deepEqual(done?.attempts[0]?.prs, [{ ref: "frostyard/snow#41", head }]);
+                // Only its PRs are read: the thread stays closed.
+                assert.equal(state?.threads[task]?.state, "closed");
+            },
+        );
+    });
+
+    test("an old closed task thread whose open PR conflicts opens again, and its repair wake-up goes to Odrade, as for any closed thread", async () => {
+        const head = "d".repeat(40);
+
+        await closedTaskPlan(
+            "plan-old-conflict",
+            8 * 24 * 3600_000,
+            { state: "OPEN" },
+            {
+                state: "OPEN",
+                mergeable: "CONFLICTING",
+                commits: {
+                    nodes: [
+                        {
+                            commit: {
+                                oid: head,
+                                statusCheckRollup: {
+                                    state: "FAILURE",
+                                    contexts: {
+                                        nodes: [
+                                            {
+                                                __typename: "CheckRun",
+                                                name: "test",
+                                                conclusion: "FAILURE",
+                                            },
+                                        ],
+                                    },
+                                },
+                            },
+                        },
+                    ],
+                },
+            },
+            async ({ source, plan, task }) => {
+                await say(app, source, "desk sync test");
+
+                const state = await deskSnapshot();
+                const thread = state?.threads[task] ?? assert.fail("the task thread");
+
+                // The read reached the PR: its head is stored.
+                assert.equal(thread.prs["frostyard/snow#41"]?.head, head);
+                // The standing repair rule: the thread opens again, and the wake-up goes to Odrade.
+                assert.notEqual(thread.state, "closed");
+                assert.deepEqual(
+                    Object.values(repairsOf(thread)).map((entry) => [entry.to, entry.why]),
+                    [["odrade", "closed"]],
+                );
+                assert(
+                    thread.events.some(
+                        (event) =>
+                            event.key.startsWith("reopened:") &&
+                            event.text === "reopened: frostyard/snow#41 is conflicting",
+                    ),
+                );
+                // The PR is open: the attempt stays open, and the task stays delegated.
+                assert.equal((await closedTaskOf(plan))?.state, "delegated");
+            },
+        );
+    });
+
+    test("a task thread closed 1 day ago with a PR not read yet: the read asks for it, and its merge makes the task done", async () => {
+        const head = "e".repeat(40);
+
+        await closedTaskPlan(
+            "plan-recent-unread",
+            24 * 3600_000,
+            {},
+            {
+                state: "MERGED",
+                mergeable: "UNKNOWN",
+                commits: { nodes: [{ commit: { oid: head } }] },
+            },
+            async ({ source, plan, task, ghArgs }) => {
+                await say(app, source, "desk sync test");
+
+                // The 7-day set pins only OPEN links: the plan's pin asks for this one by number.
+                assert.match(
+                    ghArgs(),
+                    /p[0-9]+: repository\(owner: "frostyard", name: "snow"\) \{[^{}]*pullRequest\(number: 41\)/,
+                );
+
+                const done = await closedTaskOf(plan);
+
+                assert.equal(
+                    (await deskSnapshot())?.threads[task]?.prs["frostyard/snow#41"]?.state,
+                    "MERGED",
+                );
+                assert.equal(done?.state, "done");
+                assert.deepEqual(done?.attempts[0]?.prs, [{ ref: "frostyard/snow#41", head }]);
+            },
+        );
     });
 
     test("a new graph carries t3, and the approval makes t1 ready", async () => {
