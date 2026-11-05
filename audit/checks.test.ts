@@ -2784,6 +2784,7 @@ test("Q1 stops: the failing jobs join the flaky keys by repository and job name,
     const t2 = thread("T2", { repo: "Acme/Gears" });
     const flakyKeys = {
         files: ["reports/2026-10-20-flaky-scan/scan.json"],
+        repos: ["acme/gears", "acme/other", "acme/widgets"],
         keys: [
             {
                 key: "acme/widgets/ci.yml/race/TestRace",
@@ -2969,6 +2970,7 @@ test("Q1 stops: a check name that gh cut with ... matches a flaky key whose job 
             ],
             flakyKeys: {
                 files: ["reports/2026-10-20-flaky-scan/scan.json"],
+                repos: ["acme/widgets"],
                 keys: [key("k-long", long), key("k-other", "Install packages on host")],
             },
         }),
@@ -2987,6 +2989,71 @@ test("Q1 stops: a check name that gh cut with ... matches a flaky key whose job 
             ["g1", ["k-long"], true],
         ],
     );
+});
+
+test("Q1 stops: flaky is false only when a scan read the repository of every check with no error; else null", () => {
+    const t1 = thread("T1");
+    const stop = (id: string, session: number, checks: object[]) => ({
+        session,
+        id,
+        at: ago(DAY),
+        checks,
+        checksFrom: "record",
+    });
+    const result = checkQ1(
+        emptyData({
+            decided: todayEmpty,
+            threads: threadMap(t1),
+            goalStops: [
+                // The scan had an error for acme/broken: it is not in `repos`.
+                stop("g1", t1.session, [{ name: "build", repo: "acme/broken" }]),
+                // No scan in the window read acme/nowhere.
+                stop("g2", t1.session, [{ name: "build", repo: "acme/nowhere" }]),
+                // Scanned, no matching key: not flaky (the repository compared case-insensitively).
+                stop("g3", t1.session, [{ name: "build", repo: "ACME/Widgets" }]),
+                // No repository on the check: the thread's (acme/widgets).
+                stop("g4", t1.session, [{ name: "build" }]),
+                // 1 check of a repository that no scan read: unknown.
+                stop("g5", t1.session, [
+                    { name: "build", repo: "acme/widgets" },
+                    { name: "build", repo: "acme/nowhere" },
+                ]),
+                // An unattributed session and a check with no repository: unknown.
+                stop("g6", 900, [{ name: "build" }]),
+                // A match is flaky, also beside a check of a repository that no scan read.
+                stop("g7", t1.session, [
+                    { name: "race", repo: "acme/widgets" },
+                    { name: "build", repo: "acme/nowhere" },
+                ]),
+            ],
+            flakyKeys: {
+                files: ["reports/2026-10-20-flaky-scan/scan.json"],
+                repos: ["acme/widgets"],
+                keys: [
+                    {
+                        key: "acme/widgets/ci.yml/race/TestRace",
+                        repo: "acme/widgets",
+                        workflow: "ci.yml",
+                        job: "race",
+                        test: "TestRace",
+                        jobIds: [],
+                        file: "reports/2026-10-20-flaky-scan/scan.json",
+                    },
+                ],
+            },
+        }),
+        q1Ctx([]),
+    );
+    const stops = result.metrics.stops;
+
+    assert.deepEqual(
+        Object.fromEntries(
+            stops.goals.map((goal: { id: string; flaky: boolean | null }) => [goal.id, goal.flaky]),
+        ),
+        { g1: null, g2: null, g3: false, g4: false, g5: null, g6: null, g7: true },
+    );
+    assert.equal(stops.totals.flaky, 1);
+    assert.equal(stops.totals.withChecks, 7);
 });
 
 test("Q1 CI reruns: the scan's values, null for a repository with no value, and never 0 with no scan", () => {

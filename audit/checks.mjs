@@ -2345,6 +2345,11 @@ function q1Stops(data, ctx) {
             ? undefined
             : data.flakyKeys;
     const flakyList = Array.isArray(flakySource?.keys) ? flakySource.keys : [];
+    const scannedRepos = new Set(
+        (Array.isArray(flakySource?.repos) ? flakySource.repos : [])
+            .filter((repo) => typeof repo === "string")
+            .map((repo) => repo.toLowerCase()),
+    );
     const from = ctx.now - 30 * DAY;
     const last7From = ctx.now - Q1_STOP_THRESHOLDS.days * DAY;
     const goals = (Array.isArray(data.goalStops) ? data.goalStops : [])
@@ -2366,7 +2371,9 @@ function q1Stops(data, ctx) {
                 checksFrom: checks.length > 0 ? (stop.checksFrom ?? null) : null,
                 flakyKeys,
                 flaky:
-                    checks.length === 0 || flakySource === undefined ? null : flakyKeys.length > 0,
+                    checks.length === 0 || flakySource === undefined
+                        ? null
+                        : q1FlakyOf(checks, repo, flakyKeys, scannedRepos),
             };
         })
         .sort((a, b) => a.at - b.at || a.id.localeCompare(b.id));
@@ -2465,6 +2472,33 @@ function q1JobMatches(name, job) {
     return job === name;
 }
 
+/** The repository of a failing job: the check's own, else the goal's thread repository unless unattributed. */
+const q1CheckRepo = (check, threadRepo) =>
+    typeof check.repo === "string"
+        ? check.repo
+        : threadRepo !== UNATTRIBUTED
+          ? threadRepo
+          : undefined;
+
+/**
+ * Is a stop's failure flaky? `true` when a key matches; `false` only when a scan read the repository of every check
+ * with no error, so that no key means "not flaky"; else unknown (`null`): a repository that no scan read, or read with
+ * an error.
+ */
+function q1FlakyOf(checks, threadRepo, flakyKeys, scannedRepos) {
+    if (flakyKeys.length > 0) {
+        return true;
+    }
+
+    return checks.every((check) => {
+        const repo = q1CheckRepo(check, threadRepo);
+
+        return repo !== undefined && scannedRepos.has(repo.toLowerCase());
+    })
+        ? false
+        : null;
+}
+
 /**
  * The sorted flaky keys that match a stop's failing jobs: a key of the check's repository (else the goal's thread
  * repository, unless unattributed; compared case-insensitively) whose `job` names the check, or a key whose job ids
@@ -2474,12 +2508,7 @@ function q1FlakyKeysOf(checks, threadRepo, keys) {
     const found = new Set();
 
     for (const check of checks) {
-        const repo =
-            typeof check.repo === "string"
-                ? check.repo
-                : threadRepo !== UNATTRIBUTED
-                  ? threadRepo
-                  : undefined;
+        const repo = q1CheckRepo(check, threadRepo);
 
         for (const key of keys) {
             const sameRepo =

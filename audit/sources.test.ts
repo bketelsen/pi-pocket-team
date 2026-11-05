@@ -1969,6 +1969,8 @@ test("readFlakyKeys joins the keys of the scans in the window; an older scan is 
                         { workflow: "no key" },
                     ],
                 },
+                { repo: "acme/broken", error: "HTTP 404", flaky: [] },
+                { repo: "acme/gears", error: "HTTP 500", flaky: [] },
             ],
         }),
     );
@@ -1987,7 +1989,9 @@ test("readFlakyKeys joins the keys of the scans in the window; an older scan is 
                         }),
                     ],
                 },
-                { repo: "acme/calm", error: null, flaky: [] },
+                // Lower-cased; read with no error in this scan, though it had an error in the older one.
+                { repo: "Acme/Calm", error: null, flaky: [] },
+                { repo: "acme/gears", flaky: [] },
             ],
         }),
     );
@@ -1999,6 +2003,8 @@ test("readFlakyKeys joins the keys of the scans in the window; an older scan is 
             "reports/2026-10-13-flaky-scan/scan.json",
             "reports/2026-10-20-flaky-scan/scan.json",
         ],
+        // acme/broken has only an error, and acme/old is older than the window: neither was read.
+        repos: ["acme/calm", "acme/gears", "acme/widgets"],
         keys: [
             {
                 key: "acme/widgets/ci.yml/lint/TestLint",
@@ -2041,6 +2047,8 @@ test("readFlakyKeys: a bad scan in the window throws, and loadData names the sou
     writeScan(old, "2026-10-20-flaky-scan", scanFile());
     assert.deepEqual(readFlakyKeys(old, NOW - 30 * DAY), {
         files: ["reports/2026-10-20-flaky-scan/scan.json"],
+        // acme/broken and acme/odd have an error: they are not read.
+        repos: ["acme/bad", "acme/calm", "acme/widgets"],
         keys: [],
     });
 

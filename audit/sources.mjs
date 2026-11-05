@@ -1228,8 +1228,10 @@ export function readFlakyScan(odradeDir) {
  * failing jobs): `reports/<date>…-flaky-scan/scan.json` whose folder date is that date or later. Each file is checked
  * as `readFlakyScan` checks it, and a bad file throws. Each `repos[].flaky[]` entry with a string `key` gives
  * `{ key, repo, workflow, job, test, jobIds, file }`; `jobIds` are the safe-integer `events[].job_id`. The same key in
- * 2 scans is 1 entry, with the newest folder's fields and the job ids of both. Returns `{ files, keys }`, sorted, or
- * `null` when there is no reports folder or no scan in the window. Never written.
+ * 2 scans is 1 entry, with the newest folder's fields and the job ids of both. `repos` are the lower-case repositories
+ * that at least 1 scan read with no `error`: only for those does no key mean "not flaky"; for another repository it is
+ * unknown. Returns `{ files, repos, keys }`, sorted, or `null` when there is no reports folder or no scan in the
+ * window. Never written.
  */
 export function readFlakyKeys(odradeDir, sinceMs) {
     const reports = path.join(odradeDir, "reports");
@@ -1251,12 +1253,21 @@ export function readFlakyKeys(odradeDir, sinceMs) {
 
     const text = (value) => (typeof value === "string" ? value : null);
     const keys = new Map();
+    const scanned = new Set();
 
     // Oldest first: a newer scan's fields replace an older one's, and the job ids add up.
     for (const file of files) {
         const scan = readScanFile(odradeDir, file);
 
         for (const repo of scan.repos) {
+            if (
+                typeof repo?.repo === "string" &&
+                repo.repo !== "" &&
+                (repo.error === null || repo.error === undefined)
+            ) {
+                scanned.add(repo.repo.toLowerCase());
+            }
+
             for (const flaky of Array.isArray(repo?.flaky) ? repo.flaky : []) {
                 if (typeof flaky?.key !== "string") {
                     continue;
@@ -1285,6 +1296,7 @@ export function readFlakyKeys(odradeDir, sinceMs) {
 
     return {
         files,
+        repos: [...scanned].sort(),
         keys: [...keys.values()].sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0)),
     };
 }
