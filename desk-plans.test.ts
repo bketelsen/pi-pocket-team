@@ -47,6 +47,8 @@ import type { ConversationId } from "@earendil-works/pi-durable";
 import {
     addAsk,
     addPlanAsk,
+    applyPlanEdits,
+    PLAN_TEXT_AND_EDITS_ERROR,
     addPlanComment,
     answerKey,
     answerPageAsk,
@@ -75,6 +77,7 @@ import {
     failedRounds,
     planningBrief,
     planTaskBrief,
+    planTaskWhere,
     planVerifyBrief,
     revisePlan,
     carryProblem,
@@ -1257,7 +1260,7 @@ describe("a task graph", () => {
 
         assert.match(
             validateGraph(bad, ROSTER) ?? "",
-            /not a repository of lucilla\. Leave repo out for a repository that is not made yet, or for host work: the task then runs in the agent's home\.$/,
+            /not a repository of lucilla\. Leave repo out for a repository that is not made yet, or for host work: the task then runs in the agent's home, or, once the roster names the new repository for the agent, it can be delivered there\.$/,
         );
     });
 
@@ -1684,11 +1687,11 @@ describe("the delivery of a task", () => {
 
         assert.equal(
             deliverCheck(state, "T1", "t1", { agent: "teg", repo: "frostyard/nsl" }),
-            "t1 is for lucilla in frostyard/snow; this call names teg in frostyard/nsl.",
+            "t1 is for lucilla in frostyard/snow; this call names teg in frostyard/nsl. A task with a repo goes only to its agent in that repository.",
         );
         assert.equal(
             deliverCheck(state, "T1", "t1", { agent: "lucilla" }),
-            "t1 is for lucilla in frostyard/snow; this call names lucilla in its home.",
+            "t1 is for lucilla in frostyard/snow; this call names lucilla in its home. A task with a repo goes only to its agent in that repository.",
         );
     });
 
@@ -1711,6 +1714,155 @@ describe("the delivery of a task", () => {
         assert.deepEqual(graph.tasks[0]?.attempts, [{ thread: "T5", at: tick(4), prs: [] }]);
         assert.deepEqual(state.threads.T5?.planTask, { plan: "T1", task: "t1" });
         assert.match(state.threads.T1?.events.at(-1)?.text ?? "", /t1 delegated: T5/);
+    });
+
+    /** The roster now: lucilla owns a repository made after the approval. */
+    const NOW: PlanRoster[] = [
+        {
+            id: "lucilla",
+            role: "agent",
+            repositories: { "frostyard/snow": "/tmp/snow", "frostyard/problem-intake": "/tmp/pi" },
+        },
+        { id: "teg", role: "agent", repositories: { "frostyard/nsl": "/tmp/nsl" } },
+    ];
+
+    /** An approved plan whose t1 names lucilla's home: its repository was not made at the approval. */
+    function homeTask() {
+        const made = approvedPlan();
+        const task = made.graph.tasks[0] ?? assert.fail("t1");
+
+        delete task.repo;
+
+        return { ...made, task };
+    }
+
+    test("a task whose graph named the home is delivered in a roster repository of its agent, and the attempt keeps it", () => {
+        const { state, plan, graph, task } = homeTask();
+
+        assert.equal(deliverCheck(state, "T1", "t1", { agent: "lucilla" }, NOW), undefined);
+        assert.equal(
+            deliverCheck(
+                state,
+                "T1",
+                "t1",
+                { agent: "lucilla", repo: "frostyard/problem-intake" },
+                NOW,
+            ),
+            undefined,
+        );
+
+        other(state, "T5").repo = "frostyard/problem-intake";
+
+        const events = state.threads.T1!.events.length;
+
+        assert(!("error" in startTask(state, "T1", "t1", "T5", tick(4))));
+        assert.deepEqual(task.attempts, [
+            { thread: "T5", at: tick(4), repo: "frostyard/problem-intake", prs: [] },
+        ]);
+        // The approved graph stays as Brian approved it.
+        assert.equal(task.repo, undefined);
+        assert.equal(plan.approvals.at(-1)?.graph, graph.version);
+        assert.deepEqual(
+            state.threads.T1!.events.slice(events).map((each) => [each.key, each.text]),
+            [
+                ["plan-task:t1:T5", "t1 delegated: T5"],
+                [
+                    "plan-task-repo:t1:T5",
+                    "t1 delivered in frostyard/problem-intake: the graph named the home",
+                ],
+            ],
+        );
+
+        // A replay of the delivery adds nothing.
+        assert(!("error" in startTask(state, "T1", "t1", "T5", tick(5))));
+        assert.equal(task.attempts.length, 1);
+        assert.equal(state.threads.T1!.events.length, events + 2);
+    });
+
+    test("a delivery in the home records no repository and no event of it", () => {
+        const { state, task } = homeTask();
+
+        other(state, "T5");
+        assert(!("error" in startTask(state, "T1", "t1", "T5", tick(4))));
+        assert.deepEqual(task.attempts, [{ thread: "T5", at: tick(4), prs: [] }]);
+        assert.equal(
+            state.threads.T1!.events.some((each) => each.key.startsWith("plan-task-repo:")),
+            false,
+        );
+    });
+
+    test("a task whose graph named the home, in a repository that is not its agent's, is refused", () => {
+        const { state } = homeTask();
+
+        assert.equal(
+            deliverCheck(state, "T1", "t1", { agent: "lucilla", repo: "frostyard/nsl" }, NOW),
+            "t1 is for lucilla in its home, or for lucilla in a repository the roster names for it now (the roster names frostyard/snow, frostyard/problem-intake for lucilla); this call names lucilla in frostyard/nsl.",
+        );
+        // With no roster, only the home.
+        assert.match(
+            deliverCheck(state, "T1", "t1", {
+                agent: "lucilla",
+                repo: "frostyard/problem-intake",
+            }) ?? "",
+            /\(the roster cannot be read now\); this call names lucilla in frostyard\/problem-intake\.$/,
+        );
+    });
+
+    test("a task with a repo, in another repository of its agent, is still refused", () => {
+        const { state } = approvedPlan();
+
+        assert.equal(
+            deliverCheck(
+                state,
+                "T1",
+                "t1",
+                { agent: "lucilla", repo: "frostyard/problem-intake" },
+                NOW,
+            ),
+            "t1 is for lucilla in frostyard/snow; this call names lucilla in frostyard/problem-intake. A task with a repo goes only to its agent in that repository.",
+        );
+    });
+
+    test("another agent is still refused, also in its own repository", () => {
+        const { state } = homeTask();
+
+        assert.match(
+            deliverCheck(state, "T1", "t1", { agent: "teg", repo: "frostyard/nsl" }, NOW) ?? "",
+            /^t1 is for lucilla in its home, or for lucilla in a repository the roster names for it now .*; this call names teg in frostyard\/nsl\.$/,
+        );
+        assert.match(
+            deliverCheck(state, "T1", "t1", { agent: "teg" }, NOW) ?? "",
+            /this call names teg in its home/,
+        );
+    });
+
+    test("the brief, plan read's task line, and the whole-plan check name the repository of the delivery", () => {
+        const { state, plan, graph, task } = homeTask();
+
+        other(state, "T5").repo = "frostyard/problem-intake";
+        assert(!("error" in startTask(state, "T1", "t1", "T5", tick(4))));
+
+        assert.match(
+            planTaskBrief(plan, "Snow ISO signing", graph, task),
+            /^Repository: frostyard\/problem-intake\. The graph named lucilla's home; this delivery is in that repository/m,
+        );
+        assert.equal(
+            planTaskWhere(task),
+            "lucilla in frostyard/problem-intake (the graph named the home)",
+        );
+        assert.equal(planTaskWhere(graph.tasks[1]!), "lucilla in frostyard/snow");
+
+        const attempts = planAttemptsText(graph, (value) => value).join("\n");
+
+        assert.match(
+            attempts,
+            /- t1 Sign the ISO · lucilla in frostyard\/problem-intake \(the graph named the home\) · delegated/,
+        );
+        assert.match(attempts, /- attempt T5 in frostyard\/problem-intake: open/);
+        assert.match(
+            planVerifyBrief(plan, "Snow ISO signing", graph),
+            /- t1 Sign the ISO · lucilla in frostyard\/problem-intake \(the graph named the home\)\n[\s\S]*- attempt T5 in frostyard\/problem-intake: open/,
+        );
     });
 
     test("a started task of a missing thread is refused", () => {
@@ -2226,6 +2378,266 @@ describe("the revision store and the publish", () => {
 });
 
 // ─── The cross-review's fixes ───────────────────────────────────────────────
+
+describe("a plan write by edits", () => {
+    /** 1 flow write of plan T1 from the revision the caller read, by edits. */
+    const edit = (
+        harness: Awaited<ReturnType<typeof storeHarness>>,
+        request: {
+            section?: string;
+            heading?: string;
+            edits: unknown;
+            text?: string;
+            key?: string;
+            from?: string;
+        },
+    ) =>
+        planWriteFlow(harness.io(), "T1", {
+            ...(request.section === undefined ? {} : { section: request.section }),
+            ...(request.heading === undefined ? {} : { heading: request.heading }),
+            ...(request.text === undefined ? {} : { text: request.text }),
+            edits: request.edits,
+            key: request.key ?? "e1",
+            by: "lucilla",
+            at: tick(1),
+            from: request.from ?? harness.plan.rev,
+        });
+
+    const sectionOf = (text: string | undefined, id: string) =>
+        parsePlanText(text ?? "").sections.find((each) => each.id === id);
+
+    test("a section edit changes only that section's body, and can give a new heading", async () => {
+        const harness = await storeHarness();
+        const done = await edit(harness, {
+            section: "idea",
+            heading: "The idea",
+            edits: [{ oldText: "TPM key", newText: "YubiKey" }],
+        });
+
+        assert(!("error" in done));
+        assert.equal(done.replay, false);
+
+        const onDisk = harness.current();
+
+        assert.deepEqual(sectionOf(onDisk, "idea"), {
+            id: "idea",
+            heading: "The idea",
+            body: "> Sign the ISO with the YubiKey.",
+        });
+        assert.equal(sectionOf(onDisk, "decisions")?.body, "None yet.");
+        assert.equal(harness.plan.rev, gitBlobSha(onDisk ?? ""));
+        assert.equal(harness.plan.revs.length, 2);
+    });
+
+    test("a whole-file edit applies to the file as plan read gives it, and keeps the desk's sections", async () => {
+        const harness = await storeHarness();
+        const done = await edit(harness, {
+            edits: [
+                { oldText: "with the TPM key.", newText: "with the TPM key, on each build." },
+                {
+                    oldText: "## Decisions <!-- s:decisions -->",
+                    newText:
+                        "## Storage <!-- s:storage -->\n\nThe keys live in the TPM.\n\n## Decisions <!-- s:decisions -->",
+                },
+            ],
+        });
+
+        assert(!("error" in done));
+
+        const parsed = parsePlanText(harness.current() ?? "");
+
+        assert.deepEqual(
+            parsed.sections.map((each) => [each.id, each.body]),
+            [
+                ["idea", "> Sign the ISO with the TPM key, on each build."],
+                ["storage", "The keys live in the TPM."],
+                ["decisions", "None yet."],
+                ["tasks", "No task graph yet."],
+            ],
+        );
+        assert.equal(parsed.preamble, parsePlanText(harness.text).preamble);
+    });
+
+    test("each edit applies to the original text, not to the text an earlier edit made", () => {
+        assert.deepEqual(
+            applyPlanEdits(
+                "one two",
+                [
+                    { oldText: "one", newText: "two" },
+                    { oldText: "two", newText: "three" },
+                ],
+                "the file",
+            ),
+            { text: "two three" },
+        );
+    });
+
+    test("an oldText that is not there is refused, by its number and the target", async () => {
+        const harness = await storeHarness();
+        const before = harness.plan.rev;
+        const refused = await edit(harness, {
+            section: "idea",
+            edits: [
+                { oldText: "Sign", newText: "Ship" },
+                { oldText: "None yet.", newText: "x" },
+            ],
+        });
+
+        assert.ok("error" in refused);
+        assert.equal(
+            refused.error,
+            "edit 2: oldText is not in section idea: copy it exactly from plan read.",
+        );
+        assert.equal(harness.plan.rev, before);
+    });
+
+    test("an oldText that is there 2 times or more is refused, with the count", async () => {
+        const harness = await storeHarness();
+        const refused = await edit(harness, { edits: [{ oldText: "## ", newText: "### " }] });
+
+        assert.ok("error" in refused);
+        assert.equal(
+            refused.error,
+            "edit 1: oldText is in the file 3 times: give more text to make it unique.",
+        );
+    });
+
+    test("2 edits that overlap are refused, by their numbers", async () => {
+        const harness = await storeHarness();
+        const refused = await edit(harness, {
+            section: "idea",
+            edits: [
+                { oldText: "the TPM key", newText: "a key" },
+                { oldText: "Sign", newText: "Ship" },
+                { oldText: "ISO with the", newText: "image with the" },
+            ],
+        });
+
+        assert.ok("error" in refused);
+        assert.equal(refused.error, "edits 1 and 3 overlap: join them into 1 edit.");
+    });
+
+    test("an empty oldText, no edits, and more than 20 are refused", () => {
+        assert.deepEqual(applyPlanEdits("text", [{ oldText: "", newText: "x" }], "the file"), {
+            error: "edit 1: oldText is empty: give the exact text to replace.",
+        });
+        assert.match(
+            (applyPlanEdits("text", [], "the file") as { error: string }).error,
+            /edits holds 1 to 20 items/,
+        );
+        assert.match(
+            (
+                applyPlanEdits(
+                    "text",
+                    Array.from({ length: 21 }, () => ({ oldText: "text", newText: "x" })),
+                    "the file",
+                ) as { error: string }
+            ).error,
+            /edits holds 1 to 20 items/,
+        );
+    });
+
+    test("text and edits together are refused", async () => {
+        const harness = await storeHarness();
+        const refused = await edit(harness, {
+            section: "idea",
+            text: "A whole body.",
+            edits: [{ oldText: "Sign", newText: "Ship" }],
+        });
+
+        assert.ok("error" in refused);
+        assert.equal(refused.error, PLAN_TEXT_AND_EDITS_ERROR);
+        assert.equal(harness.plan.revs.length, 1);
+    });
+
+    test("a whole-file edit that changes Decisions is refused; a section edit of Decisions too", async () => {
+        const harness = await storeHarness();
+        const whole = await edit(harness, {
+            edits: [{ oldText: "None yet.", newText: "- **T1a** (Idea): x → y" }],
+        });
+
+        assert.ok("error" in whole);
+        assert.equal(
+            whole.error,
+            "Decisions and Tasks belong to the desk: leave them out of a whole-file write, or copy them unchanged from plan read.",
+        );
+
+        const section = await edit(harness, {
+            section: "decisions",
+            edits: [{ oldText: "None yet.", newText: "- a line" }],
+        });
+
+        assert.ok("error" in section);
+        assert.equal(
+            section.error,
+            "Decisions and Tasks belong to the desk: it writes them. Write another section.",
+        );
+
+        const missing = await edit(harness, {
+            section: "storage",
+            edits: [{ oldText: "x", newText: "y" }],
+        });
+
+        assert.ok("error" in missing);
+        assert.match(
+            missing.error,
+            /^Section storage is not in the plan: edits change a section that is there/,
+        );
+        assert.equal(harness.plan.revs.length, 1);
+    });
+
+    test("an edit from a stale rev is refused before the edits apply", async () => {
+        const harness = await storeHarness();
+        const read = harness.plan.rev;
+
+        assert(
+            !(
+                "error" in
+                (await edit(harness, {
+                    section: "idea",
+                    edits: [{ oldText: "TPM key", newText: "YubiKey" }],
+                    key: "e1",
+                }))
+            ),
+        );
+
+        // From the old rev, "TPM key" is in the text the caller read, and not in the text now: the rev decides.
+        const refused = await edit(harness, {
+            section: "idea",
+            edits: [{ oldText: "TPM key", newText: "HSM key" }],
+            key: "e2",
+            from: read,
+        });
+
+        assert.ok("error" in refused);
+        assert.match(refused.error, /^Stale rev: the plan is at [0-9a-f]{7} now/);
+        assert.match(harness.current() ?? "", /YubiKey/);
+        assert.equal(harness.plan.revs.length, 2);
+    });
+
+    test("a replay of the same call key changes nothing", async () => {
+        const harness = await storeHarness();
+        const read = harness.plan.rev;
+        const request = {
+            section: "idea",
+            edits: [{ oldText: "TPM key", newText: "YubiKey" }],
+            key: "e1",
+            from: read,
+        };
+        const first = await edit(harness, request);
+
+        assert(!("error" in first));
+
+        const onDisk = harness.current();
+        const again = await edit(harness, request);
+
+        assert(!("error" in again));
+        assert.equal(again.replay, true);
+        assert.equal(again.rev, first.rev);
+        assert.equal(harness.plan.revs.length, 2);
+        assert.equal(harness.current(), onDisk);
+    });
+});
 
 describe("the text's boundaries", () => {
     test("a body with a section heading is refused", () => {
@@ -7556,6 +7968,25 @@ const model = scriptedModel((request) => {
         });
     }
 
+    if (text.endsWith("plan edit both test")) {
+        return call("plan", {
+            action: "write",
+            section: "idea",
+            text: "A whole body.",
+            edits: [{ oldText: "TPM", newText: "HSM" }],
+            rev: writeRev,
+        });
+    }
+
+    if (text.endsWith("plan edit missing test")) {
+        return call("plan", {
+            action: "write",
+            section: "idea",
+            edits: [{ oldText: "a text that is not in the section", newText: "x" }],
+            rev: writeRev,
+        });
+    }
+
     if (text.endsWith("plan stale write test")) {
         return call("plan", {
             action: "write",
@@ -8594,6 +9025,31 @@ describe("with the Pi Pocket app", () => {
             20_000,
         );
 
+        assert.equal((await planSnapshot())?.rev, rev);
+    });
+
+    test("the tool takes edits: text and edits together are refused, and an oldText that is not there is named", async () => {
+        const rev = (await planSnapshot())?.rev ?? "";
+
+        writeRev = rev;
+        await say(app, planningId!, "plan edit both test");
+        await until(
+            async () =>
+                (await modelTexts(app, planningId!)).some((each) =>
+                    each.includes("A write gives text or edits, not both"),
+                ),
+            "the text-and-edits refusal",
+            20_000,
+        );
+        await say(app, planningId!, "plan edit missing test");
+        await until(
+            async () =>
+                (await modelTexts(app, planningId!)).some((each) =>
+                    each.includes("edit 1: oldText is not in section idea"),
+                ),
+            "the not-found refusal",
+            20_000,
+        );
         assert.equal((await planSnapshot())?.rev, rev);
     });
 
@@ -10601,5 +11057,143 @@ describe("with the Pi Pocket app", () => {
         assert((roster.data.supervisors as number[]).length > 0, "the desk knows a supervisor");
         assert.equal(roster.data.plans.max, 3);
         assert.equal(roster.data.startPlan, true);
+    });
+
+    test("a task whose graph named the home opens in a repository the roster names for its agent now; a replay adds nothing", async () => {
+        const source = await supervisor("plan-home-repo");
+        const desk = (
+            globalThis as unknown as Record<
+                symbol,
+                | {
+                      open: (
+                          tx: unknown,
+                          request: object,
+                      ) => Promise<{ thread: Thread; reused: boolean; plan?: { brief: string } }>;
+                  }
+                | undefined
+            >
+        )[Symbol.for("pi-pocket-team.desk")];
+
+        assert(desk, "the desk publishes its API");
+
+        // A plan put straight in the desk: approved, with 1 ready task for teg in its home (no repo in the graph).
+        const text = initialPlanText("T0", "Home repo", "Deliver in a new repository.");
+        const id = await app.harness.commit(async (tx) => {
+            const state = await tx.doc(DeskThreads);
+            const opened = openThread(state, {
+                key: "x.test:plan-home-repo",
+                supervisor: Number(source),
+                agents: ["teg"],
+                title: "Home repo",
+                at: Date.now(),
+                plan: {
+                    start: {
+                        idea: "Deliver in a new repository.",
+                        lead: "teg",
+                        root: plansFolder,
+                        text,
+                        rev: gitBlobSha(text),
+                    },
+                },
+            });
+            const plan = state.plans?.[opened.thread.id] ?? assert.fail("the plan");
+
+            delete plan.pending;
+            plan.state = "approved";
+            plan.graphs.push({
+                version: 1,
+                rev: plan.rev,
+                state: "approved",
+                at: Date.now(),
+                key: "x.test:graph-home-repo",
+                tasks: [
+                    {
+                        id: "t1",
+                        title: "Make the intake",
+                        agent: "teg",
+                        acceptance: ["It is made."],
+                        deps: [],
+                        state: "ready",
+                        attempts: [],
+                    },
+                ],
+            });
+            plan.approvals.push({
+                rev: plan.rev,
+                graph: 1,
+                at: Date.now(),
+                by: "brian",
+                key: "x.test:approve-home-repo",
+            });
+
+            return opened.thread.id;
+        }, context);
+        const request = (key: string, repo: string) => ({
+            key,
+            supervisor: Number(source),
+            agents: ["teg"],
+            plan: { id, task: "t1" },
+            repo,
+            title: "Make the intake",
+            task: "Make the intake.",
+            at: Date.now(),
+        });
+
+        // frostyard/snow is not teg's: refused, with the repositories the roster names for teg.
+        await assert.rejects(
+            app.harness.commit(
+                (tx) => desk.open(tx, request("x.test:home-repo-snow", "frostyard/snow")),
+                context,
+            ),
+            /t1 is for teg in its home, or for teg in a repository the roster names for it now \(the roster names frostyard\/nsl for teg\); this call names teg in frostyard\/snow\./,
+        );
+
+        const first = await app.harness.commit(
+            (tx) => desk.open(tx, request("x.test:home-repo-nsl", "frostyard/nsl")),
+            context,
+        );
+
+        assert.match(
+            first.plan?.brief ?? "",
+            /^Repository: frostyard\/nsl\. The graph named teg's home/m,
+        );
+
+        const after1 = await deskSnapshot();
+        const task = planOf(after1, id)?.graphs[0]?.tasks[0] ?? assert.fail("t1");
+
+        assert.equal(task.state, "delegated");
+        assert.equal(task.repo, undefined, "the approved graph stays as it was");
+        assert.deepEqual(
+            task.attempts.map((each) => [each.thread, each.repo]),
+            [[first.thread.id, "frostyard/nsl"]],
+        );
+        assert.equal(
+            after1?.threads[id]?.events.filter(
+                (each) => each.text === "t1 delivered in frostyard/nsl: the graph named the home",
+            ).length,
+            1,
+        );
+
+        // A replay of the delivery: the same thread, no second attempt, no second event.
+        const events = after1?.threads[id]?.events.length;
+        const again = await app.harness.commit(
+            (tx) => desk.open(tx, request("x.test:home-repo-nsl", "frostyard/nsl")),
+            context,
+        );
+
+        assert.equal(again.reused, true);
+        assert.equal(again.thread.id, first.thread.id);
+
+        const after2 = await deskSnapshot();
+
+        assert.equal(planOf(after2, id)?.graphs[0]?.tasks[0]?.attempts.length, 1);
+        assert.equal(after2?.threads[id]?.events.length, events);
+
+        // Clean up: the plan ends.
+        await app.harness.commit(async (tx) => {
+            const plan = planOf(await tx.doc(DeskThreads), id) ?? assert.fail("the plan");
+
+            plan.state = "dropped";
+        }, context);
     });
 });
