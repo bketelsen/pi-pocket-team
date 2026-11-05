@@ -24366,6 +24366,698 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
             }
         });
     });
+
+    describe("the archive of closed threads' sessions", () => {
+        /** A Clerk profile of its own: the Clerk tests remove theirs. */
+        const clerkFile = join(definitions, "archive-clerk.md");
+        const DAY = 24 * 3600_000;
+        let made = 0;
+
+        /**
+         * The desk module alone, with a host whose linked sessions list, send, and archive (when `archive` is not
+         * false), as Pi Pocket 0.28.0's do: the same key acts once and returns the first result.
+         */
+        const archiveDesk = (options: { archive?: boolean } = {}) => {
+            const listed = new Map<string, { address: string; busy: boolean; archived: boolean }>();
+            const calls: { source: number; to: string; archived?: boolean; key: string }[] = [];
+            const results = new Map<string, { archived: boolean; repeating: number }>();
+            const control: { refuse?: string } = {};
+            const stubWeb = {
+                conversationRoute() {},
+                route() {},
+                client() {},
+                command() {},
+                send() {},
+                onDispose() {},
+                error: (status: number, message: string) =>
+                    Object.assign(new Error(message), { status }),
+            };
+
+            const archive = async (
+                source: number,
+                request: { to: string; archived?: boolean },
+                key: string,
+            ) => {
+                calls.push({
+                    source: Number(source),
+                    to: request.to,
+                    ...(request.archived === undefined ? {} : { archived: request.archived }),
+                    key,
+                });
+
+                if (control.refuse !== undefined) {
+                    throw new Error(control.refuse);
+                }
+
+                const had = results.get(key);
+
+                if (had !== undefined) {
+                    return had;
+                }
+
+                const entry = listed.get(request.to);
+
+                if (entry === undefined) {
+                    throw new Error("Not a linked session");
+                }
+
+                entry.archived = request.archived !== false;
+
+                const result = { archived: entry.archived, repeating: 0 };
+
+                results.set(key, result);
+
+                return result;
+            };
+
+            const stubHost = {
+                requesterOf: () => owner(app).id,
+                text: { defang: (value: string) => value, quoted: () => "" },
+                notice() {},
+                linkedSessions: {
+                    send: async () => {},
+                    list: async () => [...listed.values()].map((each) => ({ ...each })),
+                    ...(options.archive === false ? {} : { archive }),
+                },
+            };
+            const shared = globalThis as unknown as Record<symbol, unknown>;
+            const saved = shared[Symbol.for("pi-pocket-team.desk")];
+            const extension = createDesk(stubHost as never, stubWeb as never) as unknown as {
+                tools: {
+                    name: string;
+                    execute: (args: object, api: object, context: unknown) => Promise<unknown>;
+                }[];
+            };
+            let calls_ = 0;
+
+            const tool = async (args: object, conversationId: number): Promise<string> => {
+                calls_ += 1;
+
+                const result = await extension.tools
+                    .find((each) => each.name === "desk")!
+                    .execute(
+                        args,
+                        {
+                            conversationId,
+                            taskId: "task-archive",
+                            callId: `call-${String(calls_)}`,
+                            snapshot: (...rest: unknown[]) =>
+                                Reflect.apply(app.harness.snapshot, app.harness, rest),
+                            commit: (change: never, ctx: never) => app.harness.commit(change, ctx),
+                        },
+                        context,
+                    );
+
+                return (result as { output: { text: string }[] }).output
+                    .map((each) => each.text)
+                    .join("\n");
+            };
+
+            return {
+                listed,
+                calls,
+                archive,
+                /** The keys the host acted on: a repeat of a key does not act again. */
+                acts: () => results.size,
+                control,
+                tool,
+                sync: (source: ConversationId) => tool({ action: "sync" }, Number(source)),
+                restore: () => {
+                    shared[Symbol.for("pi-pocket-team.desk")] = saved;
+                },
+            };
+        };
+
+        /** A real session for a thread: the pass reads its schedules, subagents, and night shift. */
+        const conversation = async (): Promise<number> =>
+            Number(
+                (
+                    await app.harness.commit(
+                        (tx) => tx.createConversation({ ownership: { kind: "ownerless" } }),
+                        context,
+                    )
+                ).id,
+            );
+
+        /** A closed delegation thread of `source`, closed `ago` ms ago, whose session the stub lists idle. */
+        const closedThread = async (
+            source: ConversationId,
+            stub: ReturnType<typeof archiveDesk>,
+            ago: number,
+            change: (thread: Thread) => void = () => {},
+        ): Promise<{ id: string; session: number; address: string }> => {
+            const session = await conversation();
+
+            made += 1;
+
+            const address = `session-archive-${String(made)}`;
+            let id = "";
+
+            await app.harness.commit(async (tx) => {
+                const state = await tx.doc(DeskThreads);
+                const opened = openThread(state, {
+                    key: `x.test.archive:${String(made)}:${String(Date.now())}`,
+                    supervisor: Number(source),
+                    agents: ["duncan"],
+                    title: `archive test ${String(made)}`,
+                    at: Date.now() - ago - 1000,
+                }).thread;
+                const stored = state.threads[opened.id]!;
+
+                id = opened.id;
+                stored.session = session;
+                stored.address = address;
+                stored.state = "closed";
+                stored.closed = { at: Date.now() - ago, why: "done", by: "sweep" };
+                stored.run = { busy: false };
+                delete stored.cwd;
+                change(stored);
+            }, context);
+            stub.listed.set(address, { address, busy: false, archived: false });
+
+            return { id, session, address };
+        };
+
+        /** Set `state.archive` by hand: `since`, and no dry run. */
+        const setArchive = async (value: { since?: number } | undefined) => {
+            await app.harness.commit(async (tx) => {
+                const state = await tx.doc(DeskThreads);
+
+                if (value === undefined) {
+                    delete state.archive;
+                } else {
+                    state.archive = value;
+                }
+            }, context);
+        };
+
+        const threadOf = async (id: string) => (await deskState())?.threads[id];
+
+        test("the first auto pass sets since and archives nothing; a thread closed before since stays", async () => {
+            const stub = archiveDesk();
+
+            try {
+                const source = await supervisor("archive-since");
+
+                await setArchive(undefined);
+                await closedThread(source, stub, 3 * DAY);
+
+                const before = Date.now();
+
+                await stub.sync(source);
+
+                const since = (await deskState())?.archive?.since;
+
+                assert(since !== undefined && since >= before, "since is set at the first pass");
+                assert.equal(stub.calls.length, 0, "the first pass archives nothing");
+
+                await stub.sync(source);
+                assert.equal(stub.calls.length, 0, "a thread closed before since is the sweep's");
+                assert.equal((await deskState())?.archive?.since, since, "since is set once");
+            } finally {
+                stub.restore();
+            }
+        });
+
+        test("the auto pass archives after the grace and not before, with its record and event", async () => {
+            const stub = archiveDesk();
+
+            try {
+                const source = await supervisor("archive-grace");
+
+                await setArchive({ since: Date.now() - 10 * DAY });
+
+                const young = await closedThread(source, stub, 23 * 3600_000);
+                const old = await closedThread(source, stub, 25 * 3600_000);
+
+                // archive.auto false: the auto pass does nothing.
+                writeFileSync(
+                    configPath,
+                    JSON.stringify({ digest: { minutes: 0 }, cap: 100, archive: { auto: false } }),
+                );
+                await stub.sync(source);
+                assert.equal(stub.calls.length, 0, "archive.auto false turns the pass off");
+
+                writeFileSync(configPath, JSON.stringify({ digest: { minutes: 0 }, cap: 100 }));
+                await stub.sync(source);
+
+                const closedAt = (await threadOf(old.id))?.closed?.at;
+                const key = `x.desk.archive:${old.id}:${String(old.session)}:${String(closedAt)}`;
+
+                assert.deepEqual(stub.calls, [{ source: Number(source), to: old.address, key }]);
+                assert.equal(stub.listed.get(old.address)?.archived, true);
+                assert.equal(stub.listed.get(young.address)?.archived, false, "in its grace");
+
+                const stored = await threadOf(old.id);
+                const entry = (stored?.run.archives as Record<string, Record<string, unknown>>)[
+                    String(old.session)
+                ];
+
+                assert.equal(entry?.state, "done");
+                assert.equal(entry?.by, "auto");
+                assert.equal(entry?.key, key);
+                assert.deepEqual(
+                    stored?.events
+                        .filter((event) => event.key === `archived:${key}`)
+                        .map((event) => event.text),
+                    [
+                        "session archived (auto): closed 1d ago; idle, no open ask, no night shift, no schedule, no folder",
+                    ],
+                );
+                assert.equal((await threadOf(young.id))?.run.archives, undefined);
+
+                // The next pass: the session is archived, so no call and no second event.
+                await stub.sync(source);
+                assert.equal(stub.calls.length, 1);
+            } finally {
+                writeFileSync(configPath, JSON.stringify({ digest: { minutes: 0 }, cap: 100 }));
+                stub.restore();
+            }
+        });
+
+        test("a refused call leaves 1 event and no entry; the next pass tries again with the same key", async () => {
+            const stub = archiveDesk();
+
+            try {
+                const source = await supervisor("archive-refused");
+
+                await setArchive({ since: Date.now() - 10 * DAY });
+
+                const one = await closedThread(source, stub, 2 * DAY);
+
+                stub.control.refuse = "Pi is in plan mode";
+                await stub.sync(source);
+                assert.deepEqual(
+                    (await threadOf(one.id))?.run.archives,
+                    {},
+                    "the refusal's own pass removes the entry",
+                );
+                await stub.sync(source);
+
+                const refused = await threadOf(one.id);
+
+                assert.equal(stub.calls.length, 2, "1 try in each pass");
+                assert.equal(stub.calls[0]?.key, stub.calls[1]?.key);
+                assert.deepEqual(refused?.run.archives, {}, "no entry after a refusal");
+                assert.equal(
+                    refused?.events.filter(
+                        (event) => event.text === "archive failed: Pi is in plan mode",
+                    ).length,
+                    1,
+                    "1 event for the key",
+                );
+
+                delete stub.control.refuse;
+                await stub.sync(source);
+                assert.equal(stub.calls.at(-1)?.key, stub.calls[0]?.key, "the same key");
+                assert.equal(stub.listed.get(one.address)?.archived, true);
+            } finally {
+                stub.restore();
+            }
+        });
+
+        test("a pending entry is finished by the next pass with the same key, which acts once", async () => {
+            const stub = archiveDesk();
+
+            try {
+                const source = await supervisor("archive-pending");
+
+                await setArchive({ since: Date.now() - 10 * DAY });
+
+                const one = await closedThread(source, stub, 2 * DAY);
+                const closedAt = (await threadOf(one.id))?.closed?.at;
+                const key = `x.desk.archive:${one.id}:${String(one.session)}:${String(closedAt)}`;
+
+                // A pass committed `pending` and called, then stopped before its `done` commit.
+                await app.harness.commit(async (tx) => {
+                    const thread = (await tx.doc(DeskThreads)).threads[one.id]!;
+
+                    thread.run.archives = {
+                        [String(one.session)]: {
+                            at: Date.now(),
+                            by: "auto",
+                            key,
+                            state: "pending",
+                        },
+                    };
+                }, context);
+                // The interrupted pass's call: the host acted on the key.
+                await stub.archive(Number(source), { to: one.address }, key);
+                assert.equal(stub.acts(), 1);
+                await stub.sync(source);
+
+                const stored = await threadOf(one.id);
+                const entry = (stored?.run.archives as Record<string, Record<string, unknown>>)[
+                    String(one.session)
+                ];
+
+                assert.deepEqual(
+                    stub.calls.map((each) => each.key),
+                    [key, key],
+                    "the next pass calls again with the same key",
+                );
+                assert.equal(stub.acts(), 1, "the host acted once");
+                assert.equal(entry?.state, "done");
+                assert(
+                    stored?.events.some(
+                        (event) =>
+                            event.key === `archived:${key}` &&
+                            /^session archived \(auto\): closed 2d ago; finished after an interrupted pass$/.test(
+                                event.text,
+                            ),
+                    ),
+                );
+
+                // The session is archived now: no further call.
+                await stub.sync(source);
+                assert.equal(stub.calls.length, 2);
+            } finally {
+                stub.restore();
+            }
+        });
+
+        test("a reopened thread's archived session comes back once", async () => {
+            const stub = archiveDesk();
+
+            try {
+                const source = await supervisor("archive-reopen");
+
+                await setArchive({ since: Date.now() - 10 * DAY });
+
+                const one = await closedThread(source, stub, 2 * DAY);
+
+                await stub.sync(source);
+                assert.equal(stub.listed.get(one.address)?.archived, true);
+
+                const archiveKeyOf = stub.calls[0]!.key;
+
+                // The thread opens again, and a watch keeps it open through the sweep.
+                await app.harness.commit(async (tx) => {
+                    const thread = (await tx.doc(DeskThreads)).threads[one.id]!;
+
+                    thread.state = "open";
+                    delete thread.closed;
+                    thread.watch = {
+                        checkOn: "2099-01-01",
+                        check: "a later check",
+                        setAt: Date.now(),
+                        setBy: "brian",
+                        key: "x.test.archive-reopen",
+                    };
+                }, context);
+                await stub.sync(source);
+
+                const back = stub.calls.filter((each) => each.archived === false);
+
+                assert.deepEqual(back, [
+                    {
+                        source: Number(source),
+                        to: one.address,
+                        archived: false,
+                        key: archiveKeyOf.replace("x.desk.archive:", "x.desk.unarchive:"),
+                    },
+                ]);
+                assert.equal(stub.listed.get(one.address)?.archived, false);
+
+                const stored = await threadOf(one.id);
+                const entry = (stored?.run.archives as Record<string, Record<string, unknown>>)[
+                    String(one.session)
+                ];
+
+                assert.equal(typeof entry?.restored, "number");
+                assert(
+                    stored?.events.some(
+                        (event) => event.text === "session brought back: the thread reopened",
+                    ),
+                );
+
+                await stub.sync(source);
+                assert.equal(stub.calls.length, 2, "once");
+            } finally {
+                stub.restore();
+            }
+        });
+
+        test("with archive.auto false, a reopened thread's apply-archived session comes back, and no new auto archive happens", async () => {
+            const stub = archiveDesk();
+
+            try {
+                const source = await supervisor("archive-auto-off");
+
+                writeFileSync(
+                    configPath,
+                    JSON.stringify({ digest: { minutes: 0 }, cap: 100, archive: { auto: false } }),
+                );
+                await setArchive({ since: Date.now() - 10 * DAY });
+
+                const swept = await closedThread(source, stub, 3 * DAY);
+
+                await stub.tool({ action: "archive" }, Number(source));
+
+                // After the dry run: a thread that the auto pass would archive, if it were on.
+                const later = await closedThread(source, stub, 2 * DAY);
+
+                await stub.tool({ action: "archive", apply: true }, Number(source));
+                assert.equal(stub.listed.get(swept.address)?.archived, true);
+
+                const archived = stub.calls[0]!.key;
+
+                await app.harness.commit(async (tx) => {
+                    const thread = (await tx.doc(DeskThreads)).threads[swept.id]!;
+
+                    thread.state = "open";
+                    delete thread.closed;
+                    thread.watch = {
+                        checkOn: "2099-01-01",
+                        check: "a later check",
+                        setAt: Date.now(),
+                        setBy: "brian",
+                        key: "x.test.archive-auto-off",
+                    };
+                }, context);
+                await stub.sync(source);
+
+                assert.deepEqual(stub.calls.slice(1), [
+                    {
+                        source: Number(source),
+                        to: swept.address,
+                        archived: false,
+                        key: archived.replace("x.desk.archive:", "x.desk.unarchive:"),
+                    },
+                ]);
+                assert.equal(stub.listed.get(swept.address)?.archived, false, "brought back");
+                assert.equal(stub.listed.get(later.address)?.archived, false, "no auto archive");
+                assert.equal((await threadOf(later.id))?.run.archives, undefined);
+            } finally {
+                writeFileSync(configPath, JSON.stringify({ digest: { minutes: 0 }, cap: 100 }));
+                stub.restore();
+            }
+        });
+
+        test("a Pi Pocket with no archive call: no call and no error; the dry run works and apply is refused", async () => {
+            const stub = archiveDesk({ archive: false });
+
+            try {
+                const source = await supervisor("archive-027");
+
+                await setArchive(undefined);
+                await closedThread(source, stub, 3 * DAY);
+                await stub.sync(source);
+                await stub.sync(source);
+                assert.equal((await deskState())?.archive?.since, undefined, "no pass ran");
+
+                const dry = await stub.tool({ action: "archive" }, Number(source));
+
+                assert.match(dry, /^Archive dry run: 1 session can be archived/);
+                assert.match(
+                    dry,
+                    /Apply needs Pi Pocket 0\.28\.0 \(host\.linkedSessions\.archive\)\.$/,
+                );
+                await assert.rejects(
+                    () => stub.tool({ action: "archive", apply: true }, Number(source)),
+                    /desk archive with apply needs Pi Pocket 0\.28\.0 \(host\.linkedSessions\.archive\)/,
+                );
+            } finally {
+                stub.restore();
+            }
+        });
+
+        test("desk archive's dry run has the count, the kinds, the skips and the list, and changes no session", async () => {
+            const stub = archiveDesk();
+
+            try {
+                const source = await supervisor("archive-dry");
+                const a = await closedThread(source, stub, 3 * DAY);
+                const b = await closedThread(source, stub, 4 * DAY);
+
+                await closedThread(source, stub, DAY);
+                await closedThread(source, stub, 3 * DAY, (thread) => {
+                    thread.origin = "found";
+                });
+                await closedThread(source, stub, 3 * DAY, (thread) => {
+                    thread.asks = [{ id: `${thread.id}a`, text: "which one?", at: 1 }];
+                });
+
+                const text = await stub.tool({ action: "archive" }, Number(source));
+                const lines = text.split("\n");
+
+                assert.equal(
+                    lines[0],
+                    "Archive dry run: 2 sessions can be archived (threads closed 2 days ago or more). Nothing changed.",
+                );
+                assert.equal(lines[1], "By kind: delegate 2.");
+                assert.equal(lines[2], "Skipped: open-ask 1, origin 1, too-new 1.");
+                assert.match(
+                    lines[3]!,
+                    new RegExp(`^- ${a.id} delegate ${a.address} closed 3d ago: archive test`),
+                );
+                assert.match(
+                    lines[4]!,
+                    new RegExp(`^- ${b.id} delegate ${b.address} closed 4d ago: archive test`),
+                );
+                assert.match(
+                    lines[5]!,
+                    /^To archive them, run desk archive with apply: true within 60 minutes\./,
+                );
+                assert.equal(stub.calls.length, 0, "a dry run archives nothing");
+                assert.deepEqual((await deskState())?.archive?.dry?.sessions, [
+                    a.session,
+                    b.session,
+                ]);
+            } finally {
+                stub.restore();
+            }
+        });
+
+        test("apply is refused without a recent dry run, and archives only dry-run sessions that still pass", async () => {
+            const stub = archiveDesk();
+
+            try {
+                const source = await supervisor("archive-apply");
+
+                await app.harness.commit(async (tx) => {
+                    delete (await tx.doc(DeskThreads)).archive?.dry;
+                }, context);
+                await assert.rejects(
+                    () => stub.tool({ action: "archive", apply: true }, Number(source)),
+                    /desk archive with apply needs a dry run of the last 60 minutes/,
+                );
+
+                const a = await closedThread(source, stub, 3 * DAY);
+                const b = await closedThread(source, stub, 3 * DAY);
+
+                await stub.tool({ action: "archive" }, Number(source));
+
+                // A dry run of more than 60 minutes ago: refused.
+                await app.harness.commit(async (tx) => {
+                    const dry = (await tx.doc(DeskThreads)).archive!.dry!;
+
+                    dry.at -= 61 * 60_000;
+                }, context);
+                await assert.rejects(
+                    () => stub.tool({ action: "archive", apply: true }, Number(source)),
+                    /needs a dry run of the last 60 minutes/,
+                );
+                await stub.tool({ action: "archive" }, Number(source));
+
+                // After the dry run: b's session works now, and a new thread is not in the dry run.
+                stub.listed.get(b.address)!.busy = true;
+
+                const c = await closedThread(source, stub, 3 * DAY);
+                const text = await stub.tool({ action: "archive", apply: true }, Number(source));
+
+                assert.match(
+                    text,
+                    /^Archived 1 session of 2 in the dry run\. Nothing was deleted\./,
+                );
+                assert.match(text, new RegExp(`- ${a.id} delegate ${a.address}`));
+                assert.match(text, /Not archived now: busy 1\./);
+                assert.deepEqual(
+                    stub.calls.map((each) => each.to),
+                    [a.address],
+                    "only the dry run's sessions that still pass",
+                );
+                assert.equal(stub.listed.get(c.address)?.archived, false);
+
+                const entry = (
+                    (await threadOf(a.id))?.run.archives as Record<string, Record<string, unknown>>
+                )[String(a.session)];
+
+                assert.equal(entry?.by, "sweep");
+                assert.equal(entry?.state, "done");
+                assert(
+                    (await threadOf(a.id))?.events.some((event) =>
+                        event.text.startsWith("session archived (sweep): closed 3d ago;"),
+                    ),
+                );
+            } finally {
+                stub.restore();
+            }
+        });
+
+        test("desk archive is the supervisor's: a Clerk and an agent are refused", async () => {
+            const stub = archiveDesk();
+            const clerkFolder = join(root, "archive-clerk-folder");
+
+            mkdirSync(clerkFolder, { recursive: true });
+            writeFileSync(
+                clerkFile,
+                `---\nrole: clerk\nworkspace: ${clerkFolder}\n---\n# Archive Clerk\nYou are the desk clerk.`,
+            );
+
+            try {
+                const source = await supervisor("archive-clerk");
+                const clerk = await newSession(app, clerkFolder);
+
+                await command(clerk, "team-agent", "archive-clerk");
+                await app.harness.commit(async (tx) => {
+                    const state = await tx.doc(DeskThreads);
+
+                    state.clerks = {
+                        ...(state.clerks ?? {}),
+                        [String(Number(source))]: {
+                            session: Number(clerk),
+                            address: "session-archive-clerk",
+                            agent: "archive-clerk",
+                            at: Date.now(),
+                        },
+                    };
+                }, context);
+
+                for (const args of [{ action: "archive" }, { action: "archive", apply: true }]) {
+                    await assert.rejects(
+                        () => stub.tool(args, Number(clerk)),
+                        /Only the supervisor archives sessions\. Escalate to Odrade with team_message\./,
+                    );
+                }
+
+                const agentFolder = join(root, "archive-agent");
+
+                mkdirSync(agentFolder, { recursive: true });
+
+                const agent = await newSession(app, agentFolder);
+
+                await command(agent, "team-agent", "duncan");
+                await assert.rejects(
+                    () => stub.tool({ action: "archive", apply: true }, Number(agent)),
+                    /An agent can use only read, watch, and result, on its own thread\. For archive, ask Odrade/,
+                );
+                assert.equal(stub.calls.length, 0);
+            } finally {
+                await app.harness.commit(async (tx) => {
+                    const state = await tx.doc(DeskThreads);
+
+                    for (const [key, each] of Object.entries(state.clerks ?? {})) {
+                        if (each.agent === "archive-clerk") {
+                            delete state.clerks![key];
+                        }
+                    }
+                }, context);
+                rmSync(clerkFile, { force: true });
+                stub.restore();
+            }
+        });
+    });
 });
 
 describe("the label needs-plan", () => {
