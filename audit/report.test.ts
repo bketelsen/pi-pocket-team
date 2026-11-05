@@ -13,6 +13,7 @@ import {
     compareDays,
     isMaybeFixed,
     loadEarlier,
+    moduleOf,
     ownerOf,
     rankOf,
     renderReport,
@@ -115,6 +116,7 @@ test("the owner and the size come from the fixed table, by check", () => {
         I1: ["Odrade", "S"],
         I3: ["each agent (its own home)", "S"],
         J1: ["Brian decides, Odrade proposes", "M"],
+        P1: ["Sheeana", "S"],
     };
 
     for (const [check, [owner, size]] of Object.entries(want)) {
@@ -124,6 +126,7 @@ test("the owner and the size come from the fixed table, by check", () => {
 
     assert.match(ownerOf("E3").component, /night-shift\.ts/);
     assert.match(ownerOf("H1").component, /repository settings/);
+    assert.match(ownerOf("P1").component, /plan/);
 });
 
 test("Q1's owner is the repository's owner agent, and Odrade at muster", () => {
@@ -545,6 +548,29 @@ test("maybe fixed findings, the day compare, metrics and skipped checks are in t
         /GitHub call cap reached/,
     );
     assert.match(renderReport(baseReport()), /No earlier day to compare\./);
+});
+
+test("the metrics show the plan tool's numbers, and n/a for a rate with no calls", () => {
+    const total = (calls: number, refused: number, rate: number | null) => ({
+        P1: {
+            sessions: [],
+            total: {
+                sessions: calls === 0 ? 0 : 3,
+                calls,
+                refused,
+                rate,
+                targeted: 9,
+                sourceReads: 5,
+            },
+        },
+    });
+
+    assert.match(
+        renderReport(baseReport({ metrics: total(79, 13, 0.165) })),
+        /- Plan tool: 79 calls in 3 planning sessions, 13 refused \(rate 0\.165\), 9 with a targeted text, 5 source reads\./,
+    );
+    assert.match(renderReport(baseReport({ metrics: total(0, 0, null) })), /\(rate n\/a\)/);
+    assert.equal(moduleOf("P1"), "desk.ts");
 });
 
 test("the metrics note the subagents on another model, and the cross-reviews that are not flagged", () => {

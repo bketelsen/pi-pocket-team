@@ -30,6 +30,7 @@ export function emptyData(over = {}) {
         reviewCalls: [],
         goalStops: [],
         flakyScan: null,
+        planSessions: [],
         sourceErrors: {},
         ...over,
     };
