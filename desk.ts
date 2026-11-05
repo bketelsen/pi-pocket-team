@@ -13430,7 +13430,7 @@ export function readyPlan(
 
     if (graph === undefined) {
         return {
-            error: `Plan ${plan.thread} has no draft graph for rev ${plan.rev.slice(0, 7)}: call plan tasks first. A write after plan tasks makes a new rev: call plan tasks again with it.`,
+            error: `Plan ${plan.thread} has no draft graph for rev ${plan.rev.slice(0, 7)}: call plan tasks first. A write after plan tasks that changes the file makes a new rev: call plan tasks again with it.`,
         };
     }
 
@@ -15337,7 +15337,7 @@ export function planningBrief(id: string, file: string): string {
         "Write the section first, and give the open question in words, with no ask id. Then file it with plan ask. Decisions lists each settled answer by its ask id, so your sections do not need the id.",
         `Write an answer back with asks: [{ ask, gen }] in your write, and change that ask's section: the desk then marks it settled.`,
         `Brian comments on sections from the Desk page (c1, c2, ...): settle a comment with comments: ["c1"] in a write that changes its section. An open comment holds the plan, as an open ask does.`,
-        `Draft the task graph with plan { action: "tasks", rev, tasks: [...] } after the decisions are written, and then call plan { action: "ready" }. tasks needs the rev you read. A write after plan tasks makes a new rev: call plan tasks again with it before plan ready.`,
+        `Draft the task graph with plan { action: "tasks", rev, tasks: [...] } after the decisions are written, and then call plan { action: "ready" }. tasks needs the rev you read. A write after plan tasks that changes the file makes a new rev: call plan tasks again with it before plan ready.`,
         "After a scope change, a task that is done in the approved graph and stays the same (id, agent, repository, acceptance lines and deps, and each dep carried too) is carried: give it carried: { why } in plan tasks. It keeps its work and stays done. Every other task is new work.",
         `To hear an expert while the plan drafts, call plan { action: "consult", agents: ["teg"], question, ask: "<ask id>" }: 1 to 3 other agents, each in a read-only session of its own. Each answers once with a finding (supports, objects or neutral); the desk wakes you with it, and a running consult holds the plan.`,
         "Brian approves on the Desk page: no tool approves.",
@@ -25814,7 +25814,7 @@ export default function createDesk(host: Host, web: Web) {
             rev: Type.Optional(
                 Type.String({
                     description:
-                        "write, tasks: the full rev you read with read, 40 hex characters; a stale rev is refused, so read again and merge your change; each write makes a new rev, so call tasks again after a write",
+                        "write, tasks: the full rev you read with read, 40 hex characters; a stale rev is refused, so read again and merge your change; a write that changes the file makes a new rev, so call tasks again after it",
                 }),
             ),
             section: Type.Optional(
@@ -26647,7 +26647,7 @@ export default function createDesk(host: Host, web: Web) {
 
             if (draft === undefined) {
                 throw new Error(
-                    `Plan ${plan.thread} has no draft graph for rev ${plan.rev.slice(0, 7)}: call plan tasks first. A write after plan tasks makes a new rev: call plan tasks again with it.`,
+                    `Plan ${plan.thread} has no draft graph for rev ${plan.rev.slice(0, 7)}: call plan tasks first. A write after plan tasks that changes the file makes a new rev: call plan tasks again with it.`,
                 );
             }
 

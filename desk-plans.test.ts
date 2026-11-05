@@ -1431,7 +1431,7 @@ describe("ready and approve", () => {
 
         assert.match(
             (refused as { error: string }).error,
-            /call plan tasks first\. A write after plan tasks makes a new rev: call plan tasks again with it\.$/,
+            /call plan tasks first\. A write after plan tasks that changes the file makes a new rev: call plan tasks again with it\.$/,
         );
     });
 
@@ -5772,7 +5772,7 @@ describe("the task and verify briefs", () => {
         );
         assert.match(
             brief,
-            /plan \{ action: "tasks", rev, tasks: \[\.\.\.\] \}.*tasks needs the rev you read\. A write after plan tasks makes a new rev: call plan tasks again with it before plan ready\.$/m,
+            /plan \{ action: "tasks", rev, tasks: \[\.\.\.\] \}.*tasks needs the rev you read\. A write after plan tasks that changes the file makes a new rev: call plan tasks again with it before plan ready\.$/m,
         );
     });
 

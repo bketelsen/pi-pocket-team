@@ -1663,7 +1663,7 @@ describe("with the Pi Pocket app", () => {
 
             assert.match(
                 properties.rev?.description ?? "",
-                /^write, tasks: the full rev you read .*; each write makes a new rev, so call tasks again after a write$/,
+                /^write, tasks: the full rev you read .*; a write that changes the file makes a new rev, so call tasks again after it$/,
             );
             assert.match(
                 task.repo?.description ?? "",
