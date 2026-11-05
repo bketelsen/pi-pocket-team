@@ -1266,6 +1266,11 @@ test("a consult and the findings of an ask, in 1 line each", () => {
         }),
         "k4 paul · stopped · 0 min · stopped by brian",
     );
+    // A queued consult shows its state as the desk names it: the page has no fixed list of states.
+    assert.equal(
+        consultLine({ id: "k5", agent: "irulan", state: "queued", age: 5 * 60000 }),
+        "k5 irulan · queued · 5 min",
+    );
     assert.equal(
         findingsLine([
             { agent: "lucilla", stance: "supports" },

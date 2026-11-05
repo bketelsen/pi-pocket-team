@@ -65,6 +65,9 @@ import createDesk, {
     planView,
     planWaiting,
     plansConfig,
+    promoteConsults,
+    queuedConsultLine,
+    readyPlan,
     recordFinding,
     stopConsult,
     timeoutConsults,
@@ -225,18 +228,6 @@ describe("the consult bounds", () => {
         );
     });
 
-    test("the running limit refusal says to consult again after a finding", () => {
-        const { state, ask } = drafting();
-
-        assert(
-            !("error" in consult(state, { agents: ["teg", "paul", "irulan"], ask, key: "k:1" })),
-        );
-        assert.match(
-            errorOf(consult(state, { agents: ["teg"], key: "k:2" })),
-            /wait for a finding, or ask fewer agents\. The desk wakes you with each finding: then call plan consult again for the agents that did not start\.$/,
-        );
-    });
-
     test("at most 3 run at once, and 8 in all, by default", () => {
         const { state, ask } = drafting();
         const first = consult(state, { agents: ["teg", "paul", "irulan"], ask, key: "k:1" });
@@ -252,22 +243,24 @@ describe("the consult bounds", () => {
         );
         // Each has its own nonce, stored before any start.
         assert.equal(new Set(first.consults.map((each) => each.nonce)).size, 3);
-        assert.match(
-            errorOf(consult(state, { agents: ["teg"], key: "k:2" })),
-            /3 consults run on T1 now \(k1, k2, k3\), and at most 3 may run at once \(plans.consults.running\)/,
+
+        // A 4th does not fit the 3 at once: it queues, and is no refusal.
+        const fourth = consult(state, { agents: ["teg"], key: "k:2" });
+
+        assert(!("error" in fourth));
+        assert.deepEqual(
+            fourth.consults.map((each) => [each.id, each.state]),
+            [["k4", "queued"]],
         );
 
-        // The 3 end; 5 more fit in the total of 8, and the 9th does not.
+        // The 4 end; 4 more fit in the total of 8, and the 9th does not.
         const plan = planOf(state, "T1") ?? assert.fail("a plan");
 
         for (const each of plan.consults) {
             each.state = "failed";
         }
 
-        for (const [index, agents] of [
-            ["teg", "paul", "irulan"],
-            ["teg", "paul"],
-        ].entries()) {
+        for (const [index, agents] of [["teg", "paul", "irulan"], ["teg"]].entries()) {
             const added = consult(state, { agents, key: `k:more:${String(index)}` });
 
             assert(!("error" in added), "the consults fit");
@@ -300,18 +293,19 @@ describe("the consult bounds", () => {
         assert.deepEqual(plansConfig(undefined, undefined).consults, { running: 3, total: 8 });
 
         const { state } = drafting();
-
-        assert.match(
-            errorOf(consult(state, { agents: ["teg", "paul"] }, { running: 1, total: 2 })),
-            /at most 1 may run at once/,
+        // 1 at once: the second agent of the call queues.
+        const both = consult(
+            state,
+            { agents: ["teg", "paul"], key: "a" },
+            { running: 1, total: 2 },
         );
-        assert(
-            !("error" in consult(state, { agents: ["teg"], key: "a" }, { running: 1, total: 2 })),
+
+        assert(!("error" in both));
+        assert.deepEqual(
+            both.consults.map((each) => each.state),
+            ["starting", "queued"],
         );
         planOf(state, "T1")!.consults[0]!.state = "answered";
-        assert(
-            !("error" in consult(state, { agents: ["paul"], key: "b" }, { running: 1, total: 2 })),
-        );
         planOf(state, "T1")!.consults[1]!.state = "answered";
         assert.match(
             errorOf(consult(state, { agents: ["irulan"], key: "c" }, { running: 1, total: 2 })),
@@ -939,6 +933,346 @@ describe("the end of a consult", () => {
             ],
         );
         assert.deepEqual(endOpenConsults(state, "T1", minutes(2)), []);
+    });
+});
+
+describe("the consult queue", () => {
+    /** 1 at once and 8 in all: each call below fits the total, and only 1 consult runs. */
+    const ONE = { running: 1, total: 8 };
+
+    /** The consults of plan T1: id, agent, state, and `at`. */
+    const states = (state: DeskState) =>
+        (planOf(state, "T1")?.consults ?? []).map((each) => [
+            each.id,
+            each.agent,
+            each.state,
+            each.at,
+        ]);
+
+    test("over the running limit, the extra agents queue: the call result and the stored states", () => {
+        const { state, ask } = drafting();
+        const first = consult(
+            state,
+            { agents: ["teg", "paul", "irulan"], ask, key: "k:1", at: minutes(1) },
+            { running: 2, total: 8 },
+        );
+
+        assert(!("error" in first));
+        assert.equal(first.replay, false);
+        assert.deepEqual(
+            first.consults.map((each) => [each.id, each.state, each.at, each.queuedAt]),
+            [
+                ["k1", "starting", minutes(1), undefined],
+                ["k2", "starting", minutes(1), undefined],
+                ["k3", "queued", minutes(1), minutes(1)],
+            ],
+        );
+        assert.equal(
+            queuedConsultLine(first.consults[2]!),
+            "k3 (irulan) queued: it starts when a running consult ends",
+        );
+
+        // A later call queues behind the queue, also when it names 1 agent.
+        const second = consult(
+            state,
+            { agents: ["teg"], key: "k:2", at: minutes(2) },
+            { running: 2, total: 8 },
+        );
+
+        assert(!("error" in second));
+        assert.deepEqual(
+            second.consults.map((each) => [each.id, each.state, each.queuedAt]),
+            [["k4", "queued", minutes(2)]],
+        );
+        assert.deepEqual(
+            state.threads.T1?.events
+                .filter((each) => each.key.startsWith("consult:"))
+                .map((each) => each.text),
+            [
+                `consult k1 to teg on ${ask}: starting`,
+                `consult k2 to paul on ${ask}: starting`,
+                `consult k3 to irulan on ${ask}: queued (at most 2 run at once)`,
+                "consult k4 to teg: queued (at most 2 run at once)",
+            ],
+        );
+
+        // A replay of the call gives what it made, and makes nothing.
+        const again = consult(
+            state,
+            { agents: ["teg", "paul", "irulan"], ask, key: "k:1" },
+            { running: 2, total: 8 },
+        );
+
+        assert(!("error" in again));
+        assert.equal(again.replay, true);
+        assert.equal(planOf(state, "T1")?.consults.length, 4);
+
+        // No start try, no deadline: a queued consult is no sweep candidate, and holds no sweeper.
+        assert.deepEqual(
+            consultRetries(state, 7, minutes(30)).map((each) => each.consult),
+            ["k1", "k2"],
+        );
+        assert.equal(consultInFlight(planOf(state, "T1")!.consults[2]!, minutes(30)), false);
+
+        // plan read shows it as queued.
+        assert.match(
+            consultsText(planOf(state, "T1")!, (value) => `“${value}”`).join("\n"),
+            /- k3 irulan · queued · on T1a: “Do TPM keys survive a re-image\?”/,
+        );
+    });
+
+    test("a finding frees a slot: the oldest queued becomes starting, with a new at, in the same commit", () => {
+        const { state } = drafting();
+
+        running(state, "teg", 41);
+        assert(!("error" in consult(state, { agents: ["paul"], key: "q:1", at: minutes(1) }, ONE)));
+        assert(
+            !("error" in consult(state, { agents: ["irulan"], key: "q:2", at: minutes(2) }, ONE)),
+        );
+
+        const found = recordFinding(state, {
+            session: 41,
+            key: "f1",
+            at: minutes(10),
+            stance: "supports",
+            summary: "Yes.",
+            running: ONE.running,
+        });
+
+        assert(!("error" in found));
+        assert.deepEqual(states(state), [
+            ["k1", "teg", "answered", now],
+            ["k2", "paul", "starting", minutes(10)],
+            ["k3", "irulan", "queued", minutes(2)],
+        ]);
+        assert.equal(planOf(state, "T1")!.consults[1]!.queuedAt, minutes(1), "queuedAt stays");
+        assert.deepEqual(
+            state.threads.T1?.events
+                .filter((each) => each.key.startsWith("consult-dequeued:"))
+                .map((each) => each.text),
+            ["consult k2 (paul) leaves the queue: starting"],
+        );
+
+        // The sweep's start path starts it: its try spacing counts from the new `at`.
+        assert.deepEqual(consultRetries(state, 7, minutes(10) + CONSULT_RETRY_MS - 1), []);
+        assert.deepEqual(
+            consultRetries(state, 7, minutes(10) + CONSULT_RETRY_MS).map((each) => [
+                each.consult,
+                each.mode,
+            ]),
+            [["k2", "start"]],
+        );
+        // Its 60-minute limit counts from the new `at` too.
+        assert.deepEqual(timeoutConsults(state, "T1", now + CONSULT_LIMIT_MS, ONE.running), []);
+    });
+
+    test("a timeout, a stop and a start that never finished free a slot too; a queued consult never times out", () => {
+        const { state } = drafting();
+
+        running(state, "teg", 41);
+        assert(
+            !(
+                "error" in
+                consult(state, { agents: ["paul", "irulan"], key: "q:1", at: minutes(1) }, ONE)
+            ),
+        );
+        assert(!("error" in consult(state, { agents: ["teg"], key: "q:2", at: minutes(2) }, ONE)));
+
+        // k1 runs with no finding for 60 minutes: it fails, and k2 starts. k3 and k4 waited as long, and stay queued.
+        const late = now + CONSULT_LIMIT_MS;
+
+        assert.deepEqual(timeoutConsults(state, "T1", late, ONE.running), ["k1"]);
+        assert.deepEqual(states(state), [
+            ["k1", "teg", "failed", now],
+            ["k2", "paul", "starting", late],
+            ["k3", "irulan", "queued", minutes(1)],
+            ["k4", "teg", "queued", minutes(2)],
+        ]);
+
+        // k2's start throws: it stays starting, and frees nothing.
+        const tried = consultTry(state, "T1", "k2", late + CONSULT_RETRY_MS, RETRY);
+
+        assert(tried !== undefined);
+        consultStartFailed(state, "T1", "k2", "the start broke", late + CONSULT_RETRY_MS);
+        assert.equal(planOf(state, "T1")!.consults[2]!.state, "queued");
+
+        // Its start does not finish in 60 minutes: it fails, and k3 starts.
+        const later = late + CONSULT_LIMIT_MS;
+
+        assert.deepEqual(timeoutConsults(state, "T1", later, ONE.running), ["k2"]);
+        assert.deepEqual(states(state).slice(1), [
+            ["k2", "paul", "failed", late],
+            ["k3", "irulan", "starting", later],
+            ["k4", "teg", "queued", minutes(2)],
+        ]);
+
+        // Brian stops k3: k4 starts in the same commit.
+        const stopped = stopConsult(state, "T1", "k3", {
+            by: "brian",
+            at: later + 5,
+            running: ONE.running,
+        });
+
+        assert(!("error" in stopped));
+        assert.deepEqual(states(state).slice(2), [
+            ["k3", "irulan", "stopped", later],
+            ["k4", "teg", "starting", later + 5],
+        ]);
+    });
+
+    test("a second sweep, or a replayed commit, promotes nothing more", () => {
+        const { state } = drafting();
+
+        running(state, "teg", 41);
+        assert(
+            !(
+                "error" in
+                consult(state, { agents: ["paul", "irulan"], key: "q:1", at: minutes(1) }, ONE)
+            ),
+        );
+
+        const finding = {
+            session: 41,
+            key: "f1",
+            at: minutes(5),
+            stance: "neutral",
+            summary: "No view.",
+            running: ONE.running,
+        };
+
+        assert(!("error" in recordFinding(state, finding)));
+
+        const before = JSON.stringify(planOf(state, "T1"));
+        const events = state.threads.T1!.events.length;
+
+        // The replayed finding, and 2 sweeps: each sees 1 consult starting, and 1 at once is the limit.
+        const replayed = recordFinding(state, finding);
+
+        assert(!("error" in replayed) && replayed.replay);
+        assert.deepEqual(promoteConsults(state, "T1", minutes(6), ONE.running), []);
+        assert.deepEqual(promoteConsults(state, "T1", minutes(7), ONE.running), []);
+        assert.equal(JSON.stringify(planOf(state, "T1")), before);
+        assert.equal(state.threads.T1!.events.length, events);
+
+        // A higher limit lets the sweep move the next one, once.
+        assert.deepEqual(promoteConsults(state, "T1", minutes(8), 2), ["k3"]);
+        assert.deepEqual(promoteConsults(state, "T1", minutes(9), 2), []);
+    });
+
+    test("the total limit counts queued consults", () => {
+        const { state } = drafting();
+        const limits = { running: 1, total: 3 };
+
+        assert(!("error" in consult(state, { agents: ["teg", "paul"], key: "a" }, limits)));
+        assert(!("error" in consult(state, { agents: ["irulan"], key: "b" }, limits)));
+        assert.deepEqual(
+            states(state).map((each) => each[2]),
+            ["starting", "queued", "queued"],
+        );
+        assert.match(
+            errorOf(consult(state, { agents: ["teg"], key: "c" }, limits)),
+            /T1 has had 3 consults, and a plan has at most 3 \(plans.consults.total\)/,
+        );
+        assert.equal(planOf(state, "T1")?.consults.length, 3);
+    });
+
+    test("Brian stops a queued consult: it ends stopped, the queue behind it waits, and the page offers Stop", () => {
+        const { state } = drafting();
+
+        running(state, "teg", 41);
+        assert(
+            !(
+                "error" in
+                consult(state, { agents: ["paul", "irulan"], key: "q:1", at: minutes(1) }, ONE)
+            ),
+        );
+
+        const view = planView(
+            state,
+            "T1",
+            initialPlanText("T1", "Snow ISO signing", "Sign it."),
+            minutes(3),
+        );
+
+        assert(!("error" in view));
+        assert.deepEqual(
+            view.consults.map((each) => [each.id, each.state, each.canStop]),
+            [
+                ["k1", "running", true],
+                ["k2", "queued", true],
+                ["k3", "queued", true],
+            ],
+        );
+
+        const stopped = stopConsult(state, "T1", "k2", {
+            by: "brian",
+            at: minutes(3),
+            running: ONE.running,
+        });
+
+        assert(!("error" in stopped));
+        assert.equal(stopped.consult.state, "stopped");
+        assert.deepEqual(stopped.consult.end, { at: minutes(3), why: "stopped", by: "brian" });
+        // k1 still runs: the slot is not free, so k3 stays queued.
+        assert.deepEqual(
+            states(state).map((each) => each[2]),
+            ["running", "stopped", "queued"],
+        );
+        assert.match(
+            errorOf(stopConsult(state, "T1", "k2", { by: "brian", at: minutes(4) })),
+            /k2 is stopped already: only a queued, starting or running consult stops/,
+        );
+        // A stopped queued consult never started: no recovery try.
+        assert.deepEqual(consultRetries(state, 7, minutes(30)), []);
+        assert.deepEqual(
+            consultWakeLines(planOf(state, "T1")!, (text) => text).map((each) => each.key),
+            ["consult-end:k2"],
+        );
+    });
+
+    test("the plan leaving drafting ends queued consults with why plan", () => {
+        const { state } = drafting();
+
+        running(state, "teg", 41);
+        assert(!("error" in consult(state, { agents: ["paul"], key: "q:1", at: minutes(1) }, ONE)));
+        state.threads.T1!.asks[0]!.resolved = { at: now, why: "test", by: "test" };
+
+        const dropped = dropPlan(state, "T1", { by: "brian", why: "not now", at: minutes(2) });
+
+        assert(!("error" in dropped));
+        assert.deepEqual(
+            planOf(state, "T1")!.consults.map((each) => [each.id, each.state, each.end?.why]),
+            [
+                ["k1", "stopped", "plan"],
+                ["k2", "stopped", "plan"],
+            ],
+        );
+        // A plan that does not draft moves no queue.
+        assert.deepEqual(promoteConsults(state, "T1", minutes(3), ONE.running), []);
+    });
+
+    test("a queued consult holds ready, as a running one does", () => {
+        const { state } = drafting();
+
+        running(state, "teg", 41);
+        assert(!("error" in consult(state, { agents: ["paul"], key: "q:1", at: minutes(1) }, ONE)));
+        state.threads.T1!.asks[0]!.resolved = { at: now, why: "test", by: "test" };
+
+        assert.deepEqual(
+            planWaiting(state, "T1").filter((each) => each.startsWith("k")),
+            ["k1 running", "k2 queued"],
+        );
+
+        // k1 ends with no move of the queue (no limit given): k2 is the only open consult, and it still holds the plan.
+        assert(!("error" in stopConsult(state, "T1", "k1", { by: "brian", at: minutes(2) })));
+        assert.deepEqual(planWaiting(state, "T1"), ["k2 queued"]);
+        assert.match(
+            errorOf(readyPlan(state, "T1", { key: "ready:1", at: minutes(3) })),
+            /^Plan T1 is not settled: .*k2 queued/,
+        );
+
+        stopConsult(state, "T1", "k2", { by: "brian", at: minutes(3) });
+        assert.deepEqual(planWaiting(state, "T1"), []);
     });
 });
 
@@ -2029,7 +2363,9 @@ describe("with the Pi Pocket app", () => {
         );
 
         try {
-            // k2 runs: 1 at once is the most.
+            // k2 runs, and 3 consults are there (k1, k2, k3): the total of 3 refuses a 4th before it can queue.
+            const count = (await planSnapshot()).consults.length;
+
             await runTool(planningId, "plan", {
                 action: "consult",
                 agents: ["irulan"],
@@ -2037,8 +2373,9 @@ describe("with the Pi Pocket app", () => {
             });
             assert.match(
                 await results(planningId),
-                /at most 1 may run at once \(plans.consults.running\)/,
+                /T\d+ has had 3 consults, and a plan has at most 3 \(plans.consults.total\)/,
             );
+            assert.equal((await planSnapshot()).consults.length, count);
 
             await routes(`plans/${planId}/consults/k2/stop`, {});
             await runTool(planningId, "plan", {
@@ -3208,5 +3545,81 @@ describe("with the Pi Pocket app", () => {
 
             k4.start = { at: Date.now(), tries: CONSULT_START_TRIES, unresolved: true };
         }, context);
+    });
+
+    test("over the running limit, plan consult queues the extra agent and says so; a Stop from the page moves the queue", async () => {
+        writeFileSync(
+            configPath,
+            JSON.stringify({
+                digest: { minutes: 0 },
+                cap: 100,
+                plans: { root: plansFolder, consults: { running: 1, total: 8 } },
+            }),
+        );
+
+        const folder = join(root, "odrade-3");
+
+        mkdirSync(folder, { recursive: true });
+
+        const supervisor3 = await newSession(app, folder);
+
+        await command(supervisor3, "team-agent", "odrade");
+        await say(app, supervisor3, "plan start test");
+
+        const thread =
+            Object.values((await deskSnapshot())?.threads ?? {}).find(
+                (each) =>
+                    each.origin === "plan" &&
+                    each.supervisor === Number(supervisor3) &&
+                    each.state !== "closed",
+            ) ?? assert.fail("plan 3 started");
+        const plan3 = thread.id;
+        const planning3 = thread.session as unknown as ConversationId;
+        const consult3 = async (id: string) =>
+            planOf(await deskSnapshot(), plan3)?.consults.find((each) => each.id === id) ??
+            assert.fail(`consult ${id} of plan 3`);
+
+        try {
+            await runTool(planning3, "plan", {
+                action: "consult",
+                agents: ["teg", "paul"],
+                question: "Queue the second?",
+            });
+            await until(
+                async () => (await results(planning3)).includes("Consults on plan"),
+                "the consult reply",
+                20_000,
+            );
+            assert.match(
+                await results(planning3),
+                /k2 \(paul\) queued: it starts when a running consult ends/,
+            );
+
+            const k2 = await consult3("k2");
+
+            assert.equal((await consult3("k1")).state, "running");
+            assert.equal(k2.state, "queued");
+            assert.equal(k2.queuedAt, k2.at);
+            assert.equal(k2.session, undefined, "a queued consult starts no session");
+            assert.deepEqual(planWaiting(await deskSnapshot(), plan3), ["k1 running", "k2 queued"]);
+
+            // Brian stops k1: k2 leaves the queue in the same commit, with a new `at`.
+            assert.equal((await routes(`plans/${plan3}/consults/k1/stop`, {})).status, 200);
+
+            const moved = await consult3("k2");
+
+            assert.equal(moved.state, "starting");
+            assert(moved.at > k2.at, "its at is when it left the queue");
+        } finally {
+            writeFileSync(
+                configPath,
+                JSON.stringify({ digest: { minutes: 0 }, cap: 100, plans: { root: plansFolder } }),
+            );
+            // Clean up: k2 stops before its first try, and plan 3 ends.
+            await routes(`plans/${plan3}/consults/k2/stop`, {});
+            await routes(`threads/${plan3}/drop`, { reason: "done with the test" });
+        }
+
+        assert.equal((await consult3("k2")).state, "stopped");
     });
 });
