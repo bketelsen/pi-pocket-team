@@ -1,0 +1,49 @@
+{
+    "schema": 1,
+    "models": [
+        {
+            "id": "github-copilot/gpt-6-luna",
+            "priced": true
+        },
+        {
+            "id": "anthropic/claude-haiku-5-5",
+            "priced": true
+        },
+        {
+            "id": "deepseek/deepseek-flash",
+            "priced": true,
+            "peakUtc": [
+                [1, 4],
+                [6, 10]
+            ]
+        },
+        {
+            "id": "halogen/halogen-qwen3.8-flash-next",
+            "priced": false
+        },
+        {
+            "id": "github-copilot/mai-code-2-flash",
+            "priced": false
+        },
+        {
+            "id": "github-copilot/gemini-3.8-flash",
+            "priced": true
+        },
+        {
+            "id": "github-copilot/grok-4.7",
+            "priced": true
+        },
+        {
+            "id": "github-copilot/claude-sonnet-5.5",
+            "priced": true
+        },
+        {
+            "id": "github-copilot/gpt-6.1-sol",
+            "priced": true
+        },
+        {
+            "id": "github-copilot/claude-opus-5.5",
+            "priced": true
+        }
+    ]
+}

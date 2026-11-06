@@ -3,3 +3,4 @@ _pocket.d.ts
 _pocket
 site/dist/
 build/
+bench/results/
