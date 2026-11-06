@@ -2,7 +2,7 @@
 
 "Do X overnight while I sleep. Stop only when Y." Pi works in rounds; after each round's answer the module decides whether to go on. When the goal stops, Pi writes a summary for the morning: what it did, what is left, and why it stopped.
 
-Files: `night-shift.ts` (the command, the prompt section, the driver task and 1 route) and `night-shift-web/` (the status-line item and its sheet). The page is `/night-shift`.
+Files: `night-shift.ts` (the command, the prompt section, the driver task and 1 route) and `night-shift-web/` (the status-line item and its sheet). There is no page: you type `/night-shift` in a conversation, and the status-line item under the message box opens the rounds.
 
 ## Use it
 
@@ -12,8 +12,8 @@ Files: `night-shift.ts` (the command, the prompt section, the driver task and 1 
 ```
 
 - Options come first, in any order, then an optional `:`, then the objective. The text splits at the last "stop when" (or "stop only when").
-- `start 06:00` (also `6am`): round 1 waits until the next time the server's clock shows it, at most 24 hours away. Without it, round 1 starts at once.
-- `until 07:00` is the next time the server's clock shows it. `for 8h`, `for 90m`, `for 7h30m` count from `start` when it is given, else from now, up to 24 hours. Give one or neither, and `until` must be after `start`.
+- `start 06:00` (also `6am`): round 1 waits until the next time the server's clock shows it, at most 24 hours away. Without it, round 1 starts at once, with 1 exception: with a `deepseek/…` worker, round 1 waits until DeepSeek's peak hours end (01:00–04:00 and 06:00–10:00 UTC), at 04:00 or 10:00 UTC. An explicit `start` always wins.
+- `until 07:00` is the next time the server's clock shows it. `for 8h`, `for 90m`, `for 7h30m` count from the start of round 1 (a given `start`, or the DeepSeek wait), else from now, up to 24 hours. Give one or neither, and `until` must be after `start`.
 - `max N`: rounds, 1 to 100. Default 20.
 - `with provider/model`: runs the work in subagents on that model. The model must be in **Providers → Models for subagents**; the command refuses another model, and it never substitutes one.
 - `` check `cmd` ``: runs in the session's folder after Pi says DONE, and it must pass too. Owner only.

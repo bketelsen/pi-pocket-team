@@ -1,9 +1,9 @@
 ---
 title: pi-pocket-team
-description: Drop-in extensions for Pi Pocket: named agents, a desk of background work, night shifts, a wiki page, a terminal page and a shadow model router.
+description: "Drop-in extensions for Pi Pocket: named agents, a desk of background work, night shifts, a wiki page, a terminal page and a shadow model router."
 hide:
-  - navigation
-  - toc
+    - navigation
+    - toc
 ---
 
 <div class="fy-hero" markdown>

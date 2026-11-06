@@ -363,7 +363,7 @@ Brian's 3 rules, which the code keeps:
 **Menu → Extensions → Model router**:
 
 - **`mode`**: `off`, or `shadow` (the default). `shadow` classifies and records; `off` records the line `Route: off (the router's mode is off); nothing changes` and calls nothing.
-- **`typesafeApiKey`**: the TypeSafe API key (a secret setting: it never leaves the server). It is also hidden from Pi's view with `host.hide`, so it shows as `[TYPESAFE_API_KEY]` in a tool result. Without a key, a route fails with "no TypeSafe key set", and the delegation goes on as before.
+- **`typesafeApiKey`**: the TypeSafe API key (a secret setting: the server sends it only to the fixed TypeSafe endpoint, as the `Authorization` header; see "What is sent"). It is also hidden from Pi's view with `host.hide`, so it shows as `[TYPESAFE_API_KEY]` in a tool result. Without a key, a route fails with "no TypeSafe key set", and the delegation goes on as before.
 
 ## What is sent
 

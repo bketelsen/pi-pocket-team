@@ -17,13 +17,13 @@ The code keeps Brian's 3 rules:
 **Menu → Extensions → Model router**:
 
 - **`mode`**: `off`, or `shadow` (the default). `shadow` classifies and records. `off` records the line `Route: off (the router's mode is off); nothing changes` and calls nothing.
-- **`typesafeApiKey`**: the TypeSafe API key. It is a secret setting and never leaves the server, and it shows as `[TYPESAFE_API_KEY]` in a tool result. Without a key, a route fails with "no TypeSafe key set", and the delegation goes on as before.
+- **`typesafeApiKey`**: the TypeSafe API key. It is a secret setting: Pi and the browser never see it, and it shows as `[TYPESAFE_API_KEY]` in a tool result. The server sends it only to the fixed TypeSafe endpoint below, as the `Authorization` header. Without a key, a route fails with "no TypeSafe key set", and the delegation goes on as before.
 
 The module needs Pi Pocket v0.22.0 or later for its settings. Like every new module it starts off.
 
 ## What is sent
 
-One POST to `https://api.typesafe.ai/v1/systemone` (fixed in the code: there is no environment override, because a variable could send the key elsewhere), with the masked brief as `state.request`, the model alias `jev-latest`, and 4 questions. No folder, no history, no spend, and no environment. The timeout is 3.5 s in total, there is no retry, and a failure never holds a delegation: `team.ts` gives the router 4 s, then records a failed route and goes on.
+One POST to `https://api.typesafe.ai/v1/systemone` (fixed in the code: there is no environment override, because a variable could send the key elsewhere), with `Authorization: Bearer <key>`, the masked brief as `state.request`, the model alias `jev-latest`, and 4 questions. No folder, no history, no spend, and no environment. The timeout is 3.5 s in total, there is no retry, and a failure never holds a delegation: `team.ts` gives the router 4 s, then records a failed route and goes on.
 
 ## Tiers
 
