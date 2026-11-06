@@ -807,6 +807,9 @@ const FIXTURE_STAGE1 = {
 const STRICT_SIMULATION = {
     margin: 0.1,
     gap: 0.15,
+    seed: 1064,
+    reps: 2000,
+    draws: 100000,
     rows: [
         { n: 30, threshold: 0.8, falseAcceptance: 0.25 },
         { n: 60, threshold: 0.8, falseAcceptance: 0.05 },
@@ -925,7 +928,7 @@ test("the command line: stage 1 expects the 10 candidates, refuses an empty stag
                         log,
                     },
                 ),
-            /12 tasks have a missing result/,
+            /no usable task \(0 dropped by a harness failure, 12 incomplete\)/,
         );
         // The same manifest twice would count each task twice.
         assert.throws(
@@ -1083,6 +1086,22 @@ test("the simulation's threshold: settings checked, threshold computed again fro
     assert.equal(thresholdFromSimulation(fine), CLOSE_THRESHOLD);
     assert.throws(() => thresholdFromSimulation({ ...STRICT_SIMULATION, margin: 0.05 }), /margin/);
     assert.throws(() => thresholdFromSimulation({ ...STRICT_SIMULATION, gap: 0.1 }), /gap/);
+
+    // Incomplete calibration evidence: a missing or impossible rate, no reps, another seed.
+    for (const falseAcceptance of [undefined, null, "0.1", NaN, -0.1, 1.5]) {
+        const broken = structuredClone(STRICT_SIMULATION);
+
+        broken.rows[0].falseAcceptance = falseAcceptance;
+        assert.throws(() => thresholdFromSimulation(broken), /false-acceptance rate/);
+    }
+
+    for (const change of [{ reps: 0 }, { reps: null }, { draws: 1.5 }, { seed: 1 }]) {
+        assert.throws(
+            () => thresholdFromSimulation({ ...STRICT_SIMULATION, ...change }),
+            /seed 1064 and positive whole numbers/,
+        );
+    }
+
     assert.throws(
         () =>
             thresholdFromSimulation({
@@ -1285,4 +1304,131 @@ test("predictTier uses the weights of the one-hot columns and the median fill", 
         () => predictTier({ ...rule, weights: { complexity: 0 } }, {}),
         /no weight for column kind=debug/,
     );
+});
+
+test("re-review 1: stage 1 with no usable task freezes no rule", () => {
+    const root = mkdtempSync(join(tmpdir(), "bench-analyze-"));
+
+    const log = () => {};
+
+    try {
+        writeBench(root, "stage1");
+        const dir = join(root, "bench/results/stage1");
+        const all = fixtureResults("stage1");
+
+        // Every task has a harness failure.
+        for (const r of all) {
+            writeFileSync(
+                join(dir, r.task, `${r.model.replace("/", "--")}.json`),
+                JSON.stringify(r.model === BIG ? { ...r, harness: "sandbox died" } : r),
+            );
+        }
+
+        const flags = ["--stage", "1", "--manifest", "manifest.json", ...MODELS_FLAG];
+
+        assert.throws(
+            () => main(flags, { root, log }),
+            /no usable task \(12 dropped by a harness failure/,
+        );
+
+        // Every task incomplete, and --allow-incomplete drops them all.
+        for (const r of all) {
+            writeFileSync(
+                join(dir, r.task, `${r.model.replace("/", "--")}.json`),
+                JSON.stringify(r.model === BIG ? { ...r, judgePending: true } : r),
+            );
+        }
+
+        assert.throws(
+            () => main([...flags, "--allow-incomplete"], { root, log }),
+            /no usable task \(0 dropped by a harness failure, 12 incomplete\)/,
+        );
+        assert.equal(existsSync(join(root, "bench/rule-v1.json")), false);
+        assert.equal(existsSync(join(dir, "summary.json")), false);
+        assert.equal(existsSync(join(dir, "rule.json")), false);
+    } finally {
+        rmSync(root, { recursive: true });
+    }
+});
+
+test("re-review 1: stage 2 refuses a rule or a stage 1 summary that is not whole", () => {
+    const root = mkdtempSync(join(tmpdir(), "bench-analyze-"));
+
+    const log = () => {};
+
+    try {
+        writeBench(root, "stage2");
+
+        const brokenRules = [
+            null,
+            {},
+            { ...FIXTURE_RULE, version: 2 },
+            { ...FIXTURE_RULE, features: ["notAFeature"] },
+            { ...FIXTURE_RULE, scale: { briefChars: 0 } },
+            { ...FIXTURE_RULE, medians: {} },
+            { ...FIXTURE_RULE, weights: {} },
+            { ...FIXTURE_RULE, thresholds: [null, null] },
+            { ...FIXTURE_RULE, thresholds: [2, -2] },
+            { ...FIXTURE_RULE, features: ["kind"], levels: { kind: ["debug"] } },
+        ];
+
+        for (const rule of brokenRules) {
+            writeFileSync(join(root, "rule.json"), JSON.stringify(rule));
+            assert.throws(
+                () => main(STAGE2_FLAGS, { root, log }),
+                /the frozen rule is not valid/,
+                JSON.stringify(rule),
+            );
+        }
+
+        writeFileSync(join(root, "rule.json"), JSON.stringify(FIXTURE_RULE));
+
+        const brokenSummaries = [
+            null,
+            {},
+            { ...FIXTURE_STAGE1, tasks: { ids: [] } },
+            { ...FIXTURE_STAGE1, majorityBand: "unsolved" },
+            { ...FIXTURE_STAGE1, overall: {} },
+            { ...FIXTURE_STAGE1, tiers: { easy: FIXTURE_STAGE1.tiers.easy } },
+            { ...FIXTURE_STAGE1, tiers: { ...FIXTURE_STAGE1.tiers, hard: { b1: BIG } } },
+        ];
+
+        for (const stage1 of brokenSummaries) {
+            writeFileSync(join(root, "stage1.json"), JSON.stringify(stage1));
+            assert.throws(
+                () => main(STAGE2_FLAGS, { root, log }),
+                /the stage 1 summary is not valid/,
+                JSON.stringify(stage1),
+            );
+        }
+
+        assert.equal(existsSync(join(root, "bench/results/stage2/summary.json")), false);
+        // The library refuses a broken rule too.
+        assert.throws(
+            () =>
+                analyzeStage2({
+                    tasks: fixtureTasks(),
+                    results: fixtureResults("stage2"),
+                    rule: {},
+                }),
+            /the frozen rule is not valid/,
+        );
+    } finally {
+        rmSync(root, { recursive: true });
+    }
+});
+
+test("re-review 1: --simulate refuses counts and shares out of range", () => {
+    const log = () => {};
+
+    for (const flags of [
+        ["--reps", "0"],
+        ["--reps", "1.5"],
+        ["--draws", "-1"],
+        ["--discordance", "2"],
+        ["--pb", "x"],
+        ["--rescue", "-0.5"],
+    ]) {
+        assert.throws(() => main(["--simulate", ...flags], { log }), /must be/, flags.join(" "));
+    }
 });

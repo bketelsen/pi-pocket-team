@@ -903,6 +903,99 @@ export function predictTier(rule, features) {
     return BANDS[predictIndex(w, rule.thresholds, designRow(transform, features))];
 }
 
+const isFiniteNumber = (x) => typeof x === "number" && Number.isFinite(x);
+
+/** A frozen rule must be whole: version 1, known features, a transform and a finite weight per column, 2 ordered
+ * finite thresholds. Gives the rule, or throws. */
+export function validateRule(rule) {
+    const bad = (why) => {
+        throw new Error(`the frozen rule is not valid: ${why}`);
+    };
+
+    if (!rule || typeof rule !== "object") {
+        bad("not an object");
+    }
+
+    if (rule.version !== RULE_VERSION) {
+        bad(`version must be ${RULE_VERSION}`);
+    }
+
+    if (!Array.isArray(rule.features) || rule.features.some((f) => !FEATURES_V1.includes(f))) {
+        bad("features must be a list of version 1 features");
+    }
+
+    for (const f of rule.features) {
+        if (CATEGORICAL.has(f)) {
+            if (!Array.isArray(rule.levels?.[f]) || !rule.levels[f].includes("unknown")) {
+                bad(`levels of ${f} must be a list with unknown`);
+            }
+        } else if (
+            !isFiniteNumber(rule.center?.[f]) ||
+            !isFiniteNumber(rule.medians?.[f]) ||
+            !isFiniteNumber(rule.scale?.[f]) ||
+            !(rule.scale[f] > 0)
+        ) {
+            bad(`center, median and a positive scale of ${f} must be finite numbers`);
+        }
+    }
+
+    const cols = columnsOf({ features: rule.features, levels: rule.levels ?? {} });
+
+    if (!rule.weights || cols.some((c) => !isFiniteNumber(rule.weights[c]))) {
+        bad("every column needs a finite weight");
+    }
+
+    const t = rule.thresholds;
+
+    if (!Array.isArray(t) || t.length !== 2 || !t.every(isFiniteNumber) || !(t[0] < t[1])) {
+        bad("thresholds must be 2 finite numbers in order");
+    }
+
+    return rule;
+}
+
+/**
+ * The stage 1 summary that stage 2 stands on must be whole: its task ids, its majority band, and for each tier B1
+ * (or null for an empty tier) and a shortlist, plus C1. Gives the summary, or throws.
+ */
+export function validateStage1Summary(stage1) {
+    const bad = (why) => {
+        throw new Error(`the stage 1 summary is not valid: ${why}`);
+    };
+
+    if (!stage1 || typeof stage1 !== "object") {
+        bad("not an object");
+    }
+
+    const ids = stage1.tasks?.ids;
+
+    if (!Array.isArray(ids) || ids.length === 0 || ids.some((id) => typeof id !== "string")) {
+        bad("tasks.ids must list the stage 1 task ids");
+    }
+
+    if (!BANDS.includes(stage1.majorityBand)) {
+        bad("majorityBand must be a band");
+    }
+
+    if (typeof stage1.overall?.c1 !== "string") {
+        bad("overall.c1 must name a model");
+    }
+
+    for (const band of BANDS) {
+        const tier = stage1.tiers?.[band];
+
+        if (!tier || !(tier.b1 === null || typeof tier.b1 === "string")) {
+            bad(`tiers.${band}.b1 must name a model, or be null`);
+        }
+
+        if (!Array.isArray(tier.shortlist) || tier.shortlist.some((m) => typeof m !== "string")) {
+            bad(`tiers.${band}.shortlist must be a list of models`);
+        }
+    }
+
+    return stage1;
+}
+
 export function writeRule(path, rule) {
     mkdirSync(dirname(path), { recursive: true });
     writeFileSync(path, `${JSON.stringify(rule, null, 4)}\n`);
@@ -1020,6 +1113,13 @@ export function analyzeStage1({ tasks, results, options = {} }) {
 
         return { tiers, overall: { n: solved.length, best, c1, stats: overall, vsBest } };
     };
+
+    // With no usable task there is nothing to measure, and a rule fit on no rows has no thresholds.
+    if (usable.length === 0) {
+        throw new Error(
+            `stage 1 has no usable task (${dropped.length} dropped by a harness failure, ${incomplete.length} incomplete)`,
+        );
+    }
 
     const standin = decide("standin");
     const zero = decide("zero");
@@ -1215,6 +1315,11 @@ export function decideTier(byTask, models, usable, options = {}) {
  */
 export function analyzeStage2({ tasks, results, rule = null, stage1 = null, options: given = {} }) {
     checkTasks(tasks);
+
+    if (rule !== null) {
+        validateRule(rule);
+    }
+
     // The cells do not depend on the pricing: 1 cache serves both pricings.
     const options = { ...given, prob: given.prob ?? memoProb() };
 
@@ -1733,11 +1838,27 @@ export function manifestTasks(json, file = "manifest") {
  * pre-registered settings (margin, gap = margin + 5 points, tier sizes 30 and 60 at 0.8), and the threshold is
  * computed again from its rows, not read from it.
  */
+const isCount = (x) => Number.isInteger(x) && x > 0;
+
 export function thresholdFromSimulation(report) {
     const gap = Math.round((MARGIN + 0.05) * 1000) / 1000;
 
     if (report?.margin !== MARGIN || report?.gap !== gap || !Array.isArray(report?.rows)) {
         throw new Error(`the simulation report must use margin ${MARGIN} and gap ${gap}`);
+    }
+
+    if (report.seed !== SEED || !isCount(report.reps) || !isCount(report.draws)) {
+        throw new Error(
+            `the simulation report must use seed ${SEED} and positive whole numbers of reps and draws`,
+        );
+    }
+
+    const rate = (x) => isFiniteNumber(x) && x >= 0 && x <= 1;
+
+    for (const r of report.rows) {
+        if (!rate(r?.falseAcceptance)) {
+            throw new Error(`the simulation report has a row with no valid false-acceptance rate`);
+        }
     }
 
     for (const n of [MIN_PAIRED, TIER_N]) {
@@ -1835,6 +1956,25 @@ export function main(argv, { root = process.cwd(), log = console.log } = {}) {
     const args = parseArgs(argv);
 
     if (args.simulate) {
+        for (const [flag, x] of [
+            ["--reps", args.reps],
+            ["--draws", args.draws],
+        ]) {
+            if (x !== undefined && !isCount(x)) {
+                throw new Error(`${flag} must be a positive whole number`);
+            }
+        }
+
+        for (const [flag, x] of [
+            ["--discordance", args.discordance],
+            ["--pb", args.pB],
+            ["--rescue", args.rescue],
+        ]) {
+            if (x !== undefined && !(isFiniteNumber(x) && x >= 0 && x <= 1)) {
+                throw new Error(`${flag} must be a number from 0 to 1`);
+            }
+        }
+
         const report = simulationReport({
             reps: args.reps ?? 2000,
             draws: args.draws ?? DRAWS,
@@ -1905,10 +2045,14 @@ export function main(argv, { root = process.cwd(), log = console.log } = {}) {
     } else {
         // Confirmation needs the frozen rule (the tiers), the stage 1 summary (fresh tasks, the model sets, H1) and
         // the simulation run before stage 2 (the threshold).
-        const rule = readJson(resolve(root, args.rule ?? "bench/rule-v1.json"), "the frozen rule");
-        const stage1 = readJson(
-            resolve(root, args.stage1 ?? join(resultsRoot, "stage1", "summary.json")),
-            "the stage 1 summary",
+        const rule = validateRule(
+            readJson(resolve(root, args.rule ?? "bench/rule-v1.json"), "the frozen rule"),
+        );
+        const stage1 = validateStage1Summary(
+            readJson(
+                resolve(root, args.stage1 ?? join(resultsRoot, "stage1", "summary.json")),
+                "the stage 1 summary",
+            ),
         );
         const simulation = readJson(
             resolve(root, args.simulation ?? join(resultsRoot, "simulation.json")),
@@ -1932,6 +2076,11 @@ export function main(argv, { root = process.cwd(), log = console.log } = {}) {
         throw new Error(
             `${incomplete.length} tasks have a missing result or wait for a judge: ${incomplete.join(", ")} (--allow-incomplete drops them)`,
         );
+    }
+
+    // A rule that is not whole is never written, nor frozen; nothing is written then.
+    if (args.stage === "1") {
+        validateRule(summary.rule);
     }
 
     mkdirSync(stageDir, { recursive: true });
