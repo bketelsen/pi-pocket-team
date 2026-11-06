@@ -15,8 +15,9 @@
 //   /preview-login            sign in as the owner, in the preview's first session
 //   /preview-login?plan=N     sign in, in the planning session of plan N (T101 to T105): the Plan panel's place
 //   /preview-plans?on=0|1     take the fixture's plans and their threads out of the desk, or seed them again
-//   /preview-asks?on=1|0      seed thread T140 with 3 open asks in Markdown (inline code, bold, a link, an artifact,
-//                            a desk path; 1-line numbered steps with options; a long ask), or take it out
+//   /preview-asks?on=1|0      seed thread T140 with 3 open asks in Markdown (inline code, a command block with Copy,
+//                            bold, a link, an artifact, a desk path; 1-line numbered steps with options; a long ask),
+//                            or take it out
 //   /preview-fixture?name=N   seed variant N again (main, empty, not-started, stale, usage-unavailable, partial-usage,
 //                            residual-only, long)
 //   /preview-fail?on=1|0      make `GET dashboard` fail with a 500, or not
@@ -189,7 +190,7 @@ const seedAsks = async (on: boolean): Promise<void> => {
                 at: now - 900_000,
                 by: "odrade",
                 from: "duncan",
-                text: `Before go-live, check the **502** fix: run \`npm run check:502\` and read the [runbook](https://github.com/frostyard/intake/blob/main/docs/runbook.md). The chart is artifact:intake-502-check and the report is ${reportPath}. Go live today?`,
+                text: `Before go-live, check the **502** fix: run \`npm run check:502\` and read the [runbook](https://github.com/frostyard/intake/blob/main/docs/runbook.md). The chart is artifact:intake-502-check and the report is ${reportPath}. To update the host first, run \`git pull && npm run install-check && npm run install-extension\` there. Go live today?`,
                 options: ["Go live today", "Wait"],
             },
             {

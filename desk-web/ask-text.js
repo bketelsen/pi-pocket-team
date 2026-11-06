@@ -1,7 +1,8 @@
 // The text of an ask (a question for Brian) as safe Markdown: a small parser and a renderer that makes only `html`
 // tagged templates, with each text as a child value, so Preact escapes it. No raw HTML, no images, no
 // `dangerouslySetInnerHTML`. Links open only for `https:`. 2 reference forms are buttons: `artifact:<id>` and a desk
-// path (`reports/…`, `desk/…`, `plans/…`, `decisions/…` ending in `.md`). No import of the app: pure functions only.
+// path (`reports/…`, `desk/…`, `plans/…`, `decisions/…` ending in `.md`). A long inline code span is a command block
+// with a Copy button. No import of the app: pure functions only.
 
 /** The longest artifact id that is a reference. */
 export const ARTIFACT_ID_MAX = 80;
@@ -9,6 +10,10 @@ export const ARTIFACT_ID_MAX = 80;
 export const DESK_PATH_MAX = 200;
 /** The folders a desk path starts with: each is a folder beside the desk export. */
 export const DESK_PATH_ROOTS = ["reports", "desk", "plans", "decisions"];
+/** The shortest inline code span that is a command block (with a Copy button) and not inline code. */
+export const CODE_BLOCK_MIN = 41;
+/** How long a Copy button shows "Copied" or "Copy failed", in ms. */
+export const COPY_SHOWN_MS = 1500;
 
 const ARTIFACT_ID = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const SEGMENT = /^[A-Za-z0-9_][A-Za-z0-9._-]*$/;
@@ -476,12 +481,198 @@ export const parseInline = (text, inLink = false) => {
     return nodes;
 };
 
+// ─── Command blocks and copy ────────────────────────────────────────────────
+
+/** Whether an inline node is a command block: inline code of `CODE_BLOCK_MIN` or more characters. */
+const isCommand = (node) => node.type === "code" && node.text.length >= CODE_BLOCK_MIN;
+
+/**
+ * Whether a run of inline nodes holds a command block: at the top level, or inside bold (to any depth). Code in a link
+ * label stays inline, so the link keeps its text.
+ */
+const holdsCommand = (nodes) =>
+    nodes.some((node) => isCommand(node) || (node.type === "bold" && holdsCommand(node.children)));
+
+/** Whether an inline node shows only spaces: blank text, or bold that holds only such nodes. */
+const blank = (node) =>
+    node.type === "text"
+        ? node.text.trim() === ""
+        : node.type === "bold" && node.children.every(blank);
+
+/**
+ * A run of inline nodes without the spaces at 1 end (`atEnd`: the last end, else the first), into bold at that end
+ * too. Blank nodes at that end go. Only the 2 ends of a whole paragraph are trimmed: spaces inside the run stay.
+ */
+const trimEdge = (nodes, atEnd) => {
+    const run = [...nodes];
+
+    while (run.length > 0 && blank(atEnd ? run.at(-1) : run[0])) {
+        if (atEnd) {
+            run.pop();
+        } else {
+            run.shift();
+        }
+    }
+
+    if (run.length === 0) {
+        return run;
+    }
+
+    const index = atEnd ? run.length - 1 : 0;
+    const node = run[index];
+
+    if (node.type === "text") {
+        run[index] = { type: "text", text: atEnd ? node.text.trimEnd() : node.text.trimStart() };
+    } else if (node.type === "bold") {
+        run[index] = { type: "bold", children: trimEdge(node.children, atEnd) };
+    }
+
+    return run;
+};
+
+/** A paragraph's run without the spaces at its 2 ends (into bold there too), and without blank nodes at its ends. */
+const trimRun = (nodes) => trimEdge(trimEdge(nodes, false), true);
+
+/**
+ * The parts of a run, untrimmed: a command, or bold that holds one, splits the run. Bold around a command splits into
+ * bold before it and bold after it, each with its spaces as they are, so the words beside it keep their spaces.
+ */
+const splitRaw = (nodes) => {
+    const parts = [];
+    let run = [];
+
+    const flush = () => {
+        if (run.length > 0) {
+            parts.push({ type: "run", nodes: run });
+        }
+
+        run = [];
+    };
+
+    for (const node of nodes) {
+        if (isCommand(node)) {
+            flush();
+            parts.push({ type: "cmd", text: node.text });
+        } else if (node.type === "bold" && holdsCommand(node.children)) {
+            // The bold splits around its command: each run of its text stays bold, in the paragraph it falls in.
+            for (const part of splitRaw(node.children)) {
+                if (part.type === "cmd") {
+                    flush();
+                    parts.push(part);
+                } else {
+                    run.push({ type: "bold", children: part.nodes });
+                }
+            }
+        } else {
+            run.push(node);
+        }
+    }
+
+    flush();
+
+    return parts;
+};
+
+/**
+ * The parts of a paragraph or a list item: `{ type: "run", nodes }` and `{ type: "cmd", text }`. A long inline code
+ * span (`CODE_BLOCK_MIN` or more characters, at the top level or inside bold) breaks the run of text into the text
+ * before it, the command, and the text after it. Bold around a command is split too: its text before and after the
+ * command stays bold. Code in a link label stays inline. Each paragraph is trimmed only at its 2 ends (into bold
+ * there), after the split, and a paragraph with only spaces goes. With no long span, 1 run with the nodes unchanged.
+ */
+export const splitCommands = (nodes) => {
+    if (!holdsCommand(nodes)) {
+        return [{ type: "run", nodes }];
+    }
+
+    return splitRaw(nodes)
+        .map((part) => (part.type === "run" ? { type: "run", nodes: trimRun(part.nodes) } : part))
+        .filter((part) => part.type === "cmd" || part.nodes.length > 0);
+};
+
+/** Copy with a hidden textarea and `execCommand("copy")`: the way that works without the Clipboard API. */
+const copyByCommand = (text, doc) => {
+    if (typeof doc?.createElement !== "function" || typeof doc.execCommand !== "function") {
+        return false;
+    }
+
+    let area;
+
+    try {
+        area = doc.createElement("textarea");
+        area.value = text;
+        area.setAttribute?.("readonly", "");
+
+        if (area.style !== undefined) {
+            Object.assign(area.style, { position: "fixed", top: "0", left: "0", opacity: "0" });
+        }
+
+        doc.body.appendChild(area);
+        area.select?.();
+
+        return doc.execCommand("copy") === true;
+    } catch {
+        return false;
+    } finally {
+        try {
+            if (area !== undefined && area.parentNode !== null) {
+                doc.body.removeChild(area);
+            }
+        } catch {
+            // The textarea is gone already.
+        }
+    }
+};
+
+/**
+ * Copy a text to the clipboard: with `navigator.clipboard.writeText` when it is there, else (or when it fails) with a
+ * hidden textarea and `document.execCommand("copy")`. A Promise of true or false: it never throws.
+ */
+export const copyText = async (text, env = globalThis) => {
+    try {
+        const clipboard = env?.navigator?.clipboard;
+
+        if (typeof clipboard?.writeText === "function") {
+            await clipboard.writeText(text);
+
+            return true;
+        }
+    } catch {
+        // No permission, or no secure context: try the fallback.
+    }
+
+    try {
+        return copyByCommand(text, env?.document);
+    } catch {
+        return false;
+    }
+};
+
+/** A tap on a Copy button: copy, show "Copied" or "Copy failed" on the button, then "Copy" again. */
+const copyFromButton = async (button, text) => {
+    const done = await copyText(text);
+
+    const show = (label) => {
+        if (button !== null && typeof button === "object") {
+            button.textContent = label;
+            button.setAttribute?.("aria-label", label);
+        }
+    };
+
+    show(done ? "Copied" : "Copy failed");
+    globalThis.setTimeout(() => show("Copy"), COPY_SHOWN_MS);
+
+    return done;
+};
+
 // ─── Render ─────────────────────────────────────────────────────────────────
 
 /**
  * The nodes of an ask text, in a `<div class="desk-md">`. `html` is htm bound to Preact: every text goes in as a
  * child value, so Preact escapes it. An https link opens in a new tab; an artifact or path reference is a button that
- * calls `openArtifact(id)` or `openPath(path)`. Without its handler, a reference shows as code.
+ * calls `openArtifact(id)` or `openPath(path)`. Without its handler, a reference shows as code. Inline code of
+ * `CODE_BLOCK_MIN` or more characters, and a fenced block, is a command block: a `pre` that scrolls sideways, with a
+ * Copy button.
  */
 export const renderAskText = (html, text, { openArtifact, openPath } = {}) => {
     const inline = (nodes) =>
@@ -537,20 +728,43 @@ export const renderAskText = (html, text, { openArtifact, openPath } = {}) => {
             }
         });
 
+    /** A command block or a fenced block: the text in a `pre` that scrolls sideways, and a Copy button. */
+    const command = (text) =>
+        html`<div class="desk-md-cmd"><pre class="desk-md-code"><code>${text}</code></pre><button
+                type="button"
+                class="desk-md-copy"
+                aria-label="Copy"
+                onClick=${(event) => copyFromButton(event?.currentTarget, text)}
+            >Copy</button></div>`;
+
+    /** The text of a paragraph or a list item, with its command blocks: each run of text in a `<p>` of its own. */
+    const flow = (text) =>
+        splitCommands(parseInline(text)).map((part) =>
+            part.type === "cmd" ? command(part.text) : html`<p>${inline(part.nodes)}</p>`,
+        );
+
+    /** Whether a text holds a command block. */
+    const hasCommand = (text) => holdsCommand(parseInline(text));
+
+    const item = (text) =>
+        hasCommand(text)
+            ? html`<li>${flow(text)}</li>`
+            : html`<li>${inline(parseInline(text))}</li>`;
+
     const block = (each) => {
         switch (each.type) {
             case "code":
-                return html`<pre class="desk-md-code"><code>${each.text}</code></pre>`;
+                return command(each.text);
             case "ul":
                 return html`<ul>
-                    ${each.items.map((item) => html`<li>${inline(parseInline(item))}</li>`)}
+                    ${each.items.map(item)}
                 </ul>`;
             case "ol":
                 return html`<ol start=${each.start === 1 ? undefined : each.start}>
-                    ${each.items.map((item) => html`<li>${inline(parseInline(item))}</li>`)}
+                    ${each.items.map(item)}
                 </ol>`;
             default:
-                return html`<p>${inline(parseInline(each.text))}</p>`;
+                return flow(each.text);
         }
     };
 
