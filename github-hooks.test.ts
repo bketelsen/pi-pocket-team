@@ -34,6 +34,8 @@
 // - PR #141 re-review 1: rule D2 (each delivery that changes the coverage syncs the starts: a kept repository inherits
 //   the account start, an ended coverage ends its start at once) and rule B2 (a legacy selected repository starts no
 //   later than its own earliest entry): the "rule D2" and "rule B2" tests in "The coverage alarm".
+// - PR #141 re-review 2: a repository fact first ends a start whose 30-day coverage expired, then starts it again: "rule
+//   D2: a fact that renews 30-day coverage after it expired between 2 evaluations starts it again".
 // - Secret file: missing, short, changed mtime: "The secret source", and 503 in "Secret".
 import assert from "node:assert/strict";
 import { createHmac, randomUUID } from "node:crypto";
@@ -76,6 +78,7 @@ import {
     INBOX_MAX,
     NUDGE_RETRY_MS,
     COVERAGE_EVERY_MS,
+    COVERED_MS,
     REFUSAL_FLUSH_MS,
 } from "./github-hooks.ts";
 import { HOSTILE, fixture, withHostileText } from "./github-hooks-fixture.ts";
@@ -2010,6 +2013,60 @@ describe("The coverage alarm", () => {
         assert.deepEqual(coverage.since, { "frostyard/nsl": T0 });
         assert.equal(state.coverage["frostyard/nsl|labels"]?.cleared, undefined);
         assert.deepEqual(state.misses["frostyard/nsl|labels"], misses);
+    });
+
+    test("rule D2: a fact that renews 30-day coverage after it expired between 2 evaluations starts it again", () => {
+        const state = docs();
+        const S = 1000 * H;
+        const expiry = S + COVERED_MS;
+        const F = expiry + 3 * H;
+
+        // Only the 30-day rule covers bketelsen/x: its first fact starts it at S.
+        repoFact(state, S, "bketelsen/x");
+        evaluateCoverage(
+            { last: {}, changes: [] },
+            state.coverage,
+            state.alarms,
+            expiry - 5 * 60_000,
+            state.deliveries,
+        );
+        assert.deepEqual(
+            state.coverage.since,
+            { "bketelsen/x": S },
+            "still covered just before the expiry",
+        );
+
+        // The coverage expires; 2 label changes come with no delivery; then a ci fact renews it before the next evaluation.
+        const observed: ObservedState = {
+            last: {},
+            changes: [
+                change("bketelsen/x", 1, "labels", expiry + H),
+                change("bketelsen/x", 2, "labels", expiry + 2 * H),
+            ],
+        };
+
+        applyDelivery(
+            state,
+            job(
+                { at: F },
+                {
+                    event: "status",
+                    action: undefined,
+                    repo: "bketelsen/x",
+                    number: undefined,
+                    label: undefined,
+                    sha: "f".repeat(40),
+                },
+            ),
+            F,
+            { nudge: false },
+        );
+        assert.deepEqual(
+            evaluateCoverage(observed, state.coverage, state.alarms, F + H, state.deliveries),
+            [],
+        );
+        assert.deepEqual(state.coverage.since, { "bketelsen/x": F });
+        assert.deepEqual(state.alarms.misses, {});
     });
 
     test("24 hours of silence raise nothing", () => {

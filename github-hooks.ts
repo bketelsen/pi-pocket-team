@@ -1133,6 +1133,8 @@ export function applyDelivery(
             docs.coverage.recent.splice(0, docs.coverage.recent.length - RECENT_MAX);
         }
 
+        // First end a start whose coverage expired before this fact (on the coverage before it), then start it again.
+        syncStarts(docs.coverage, fact.at);
         docs.coverage.repos[repo] = fact.at;
         syncStarts(docs.coverage, fact.at);
 
