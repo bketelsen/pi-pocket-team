@@ -8,7 +8,7 @@ Files: `desk.ts` and `desk-web/`. The tools are `desk`, `team_delegate` and `tea
 
 **Desk** is the owner's inbox, phone first. Its sections:
 
-- **Needs you:** each ask with an **Answered** button and an optional field for the words, and the PRs ready to merge. An ask's text shows as Markdown: lists, bold, `https:` links, and code. A long command (41 characters or more in backticks) gets a box of its own with a **Copy** button. A tap on `artifact:<id>` opens the supervisor's session, and a tap on a desk path such as `reports/…/x.md` opens that file, read only.
+- **Needs you:** each ask with an **Answered** button and an optional field for the words, and the PRs ready to merge. An ask's text shows as Markdown: lists, bold, `https:` links, and code. A long command (41 characters or more in backticks, also in bold) gets a box of its own with a **Copy** button; code in a link's text stays in the line. A tap on `artifact:<id>` opens the supervisor's session, and a tap on a desk path such as `reports/…/x.md` opens that file, read only.
 - **Ready to merge:** each PR with the label `ready-for-human`: its ref, title, head, thread, agents and CI state. Brian merges them there; Odrade files no ask for a merge.
 - **Found, Stale, Watching, Working, Waiting on review, Parked:** attach or drop, keep, park, wake, and a dated check with Pass and Fail.
 - **Other PRs** and **Closed in the last 7 days**, both collapsed.

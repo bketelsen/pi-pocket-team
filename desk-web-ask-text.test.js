@@ -346,6 +346,33 @@ test("inline code of 41 or more characters is a command block between 2 paragrap
     assert.doesNotMatch(out(`Run \`${span}\` `), /<p>\s*<\/p>/);
 });
 
+test("a long span inside bold is a command block too: the bold splits around it and keeps its text", () => {
+    assert.equal(
+        out(`Run **\`${LONG}\`** now.`),
+        `<div class="desk-md"><p>Run</p>${cmd(LONG)}<p>now.</p></div>`,
+    );
+    assert.equal(
+        out(`**Run \`${LONG}\` first**, then answer.`),
+        `<div class="desk-md"><p><strong>Run</strong></p>${cmd(LONG)}<p><strong>first</strong>, then answer.</p></div>`,
+    );
+    assert.equal(
+        out(`- step **\`${LONG}\`** done`),
+        `<div class="desk-md"><ul><li><p>step</p>${cmd(LONG)}<p>done</p></li></ul></div>`,
+        "in a list item, the block stays inside the <li>",
+    );
+});
+
+test("a long span in a link label stays inline, so the link keeps its text", () => {
+    const html = out(`See [\`${LONG}\`](https://example.com/run) now.`);
+
+    assert.ok(
+        html.includes(`href="https://example.com/run"`) &&
+            html.includes(`<code>${LONG.replaceAll("&", "&amp;")}</code></a>`),
+        html,
+    );
+    assert.doesNotMatch(html, /desk-md-cmd/);
+});
+
 test("inline code of 40 characters or fewer stays inline in its paragraph", () => {
     const span = "y".repeat(CODE_BLOCK_MIN - 1);
 

@@ -486,6 +486,13 @@ export const parseInline = (text, inLink = false) => {
 /** Whether an inline node is a command block: inline code of `CODE_BLOCK_MIN` or more characters. */
 const isCommand = (node) => node.type === "code" && node.text.length >= CODE_BLOCK_MIN;
 
+/**
+ * Whether a run of inline nodes holds a command block: at the top level, or inside bold (to any depth). Code in a link
+ * label stays inline, so the link keeps its text.
+ */
+const holdsCommand = (nodes) =>
+    nodes.some((node) => isCommand(node) || (node.type === "bold" && holdsCommand(node.children)));
+
 /** A run of inline nodes without the spaces at its 2 ends, and without a text node that is then empty. */
 const trimRun = (nodes) => {
     const run = [...nodes];
@@ -511,11 +518,13 @@ const trimRun = (nodes) => {
 
 /**
  * The parts of a paragraph or a list item: `{ type: "run", nodes }` and `{ type: "cmd", text }`. A long inline code
- * span (`CODE_BLOCK_MIN` or more characters, at the top level only) breaks the run of text into the text before it,
- * the command, and the text after it; a run with only spaces goes. With no long span, 1 run with the nodes unchanged.
+ * span (`CODE_BLOCK_MIN` or more characters, at the top level or inside bold) breaks the run of text into the text
+ * before it, the command, and the text after it; a run with only spaces goes. Bold around a command is split too: its
+ * text before and after the command stays bold. Code in a link label stays inline. With no long span, 1 run with the
+ * nodes unchanged.
  */
 export const splitCommands = (nodes) => {
-    if (!nodes.some(isCommand)) {
+    if (!holdsCommand(nodes)) {
         return [{ type: "run", nodes }];
     }
 
@@ -536,6 +545,16 @@ export const splitCommands = (nodes) => {
         if (isCommand(node)) {
             flush();
             parts.push({ type: "cmd", text: node.text });
+        } else if (node.type === "bold" && holdsCommand(node.children)) {
+            // The bold splits around its command: each run of its text stays bold, in the paragraph it falls in.
+            for (const part of splitCommands(node.children)) {
+                if (part.type === "cmd") {
+                    flush();
+                    parts.push(part);
+                } else {
+                    run.push({ type: "bold", children: part.nodes });
+                }
+            }
         } else {
             run.push(node);
         }
@@ -700,7 +719,7 @@ export const renderAskText = (html, text, { openArtifact, openPath } = {}) => {
         );
 
     /** Whether a text holds a command block. */
-    const hasCommand = (text) => parseInline(text).some(isCommand);
+    const hasCommand = (text) => holdsCommand(parseInline(text));
 
     const item = (text) =>
         hasCommand(text)
