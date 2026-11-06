@@ -362,6 +362,24 @@ test("a long span inside bold is a command block too: the bold splits around it 
     );
 });
 
+test("bold split around a command keeps the spaces between words; only the paragraph ends are trimmed", () => {
+    assert.equal(
+        out(`**Run \`${LONG}\` first **then answer.`),
+        `<div class="desk-md"><p><strong>Run</strong></p>${cmd(LONG)}<p><strong>first </strong>then answer.</p></div>`,
+        "the space at the end of the bold stays",
+    );
+    assert.equal(
+        out(`Do it** now \`${LONG}\`**`),
+        `<div class="desk-md"><p>Do it<strong> now</strong></p>${cmd(LONG)}</div>`,
+        "the space at the start of the bold stays",
+    );
+    assert.equal(
+        out(`**\`${LONG}\` ** and go`),
+        `<div class="desk-md">${cmd(LONG)}<p>and go</p></div>`,
+        "a bold with only spaces at a paragraph end goes",
+    );
+});
+
 test("a long span in a link label stays inline, so the link keeps its text", () => {
     const html = out(`See [\`${LONG}\`](https://example.com/run) now.`);
 

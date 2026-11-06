@@ -493,49 +493,57 @@ const isCommand = (node) => node.type === "code" && node.text.length >= CODE_BLO
 const holdsCommand = (nodes) =>
     nodes.some((node) => isCommand(node) || (node.type === "bold" && holdsCommand(node.children)));
 
-/** A run of inline nodes without the spaces at its 2 ends, and without a text node that is then empty. */
-const trimRun = (nodes) => {
+/** Whether an inline node shows only spaces: blank text, or bold that holds only such nodes. */
+const blank = (node) =>
+    node.type === "text"
+        ? node.text.trim() === ""
+        : node.type === "bold" && node.children.every(blank);
+
+/**
+ * A run of inline nodes without the spaces at 1 end (`atEnd`: the last end, else the first), into bold at that end
+ * too. Blank nodes at that end go. Only the 2 ends of a whole paragraph are trimmed: spaces inside the run stay.
+ */
+const trimEdge = (nodes, atEnd) => {
     const run = [...nodes];
 
-    while (run.length > 0 && run[0].type === "text" && run[0].text.trim() === "") {
-        run.shift();
+    while (run.length > 0 && blank(atEnd ? run.at(-1) : run[0])) {
+        if (atEnd) {
+            run.pop();
+        } else {
+            run.shift();
+        }
     }
 
-    while (run.length > 0 && run.at(-1).type === "text" && run.at(-1).text.trim() === "") {
-        run.pop();
+    if (run.length === 0) {
+        return run;
     }
 
-    if (run[0]?.type === "text") {
-        run[0] = { type: "text", text: run[0].text.trimStart() };
-    }
+    const index = atEnd ? run.length - 1 : 0;
+    const node = run[index];
 
-    if (run.at(-1)?.type === "text") {
-        run[run.length - 1] = { type: "text", text: run.at(-1).text.trimEnd() };
+    if (node.type === "text") {
+        run[index] = { type: "text", text: atEnd ? node.text.trimEnd() : node.text.trimStart() };
+    } else if (node.type === "bold") {
+        run[index] = { type: "bold", children: trimEdge(node.children, atEnd) };
     }
 
     return run;
 };
 
-/**
- * The parts of a paragraph or a list item: `{ type: "run", nodes }` and `{ type: "cmd", text }`. A long inline code
- * span (`CODE_BLOCK_MIN` or more characters, at the top level or inside bold) breaks the run of text into the text
- * before it, the command, and the text after it; a run with only spaces goes. Bold around a command is split too: its
- * text before and after the command stays bold. Code in a link label stays inline. With no long span, 1 run with the
- * nodes unchanged.
- */
-export const splitCommands = (nodes) => {
-    if (!holdsCommand(nodes)) {
-        return [{ type: "run", nodes }];
-    }
+/** A paragraph's run without the spaces at its 2 ends (into bold there too), and without blank nodes at its ends. */
+const trimRun = (nodes) => trimEdge(trimEdge(nodes, false), true);
 
+/**
+ * The parts of a run, untrimmed: a command, or bold that holds one, splits the run. Bold around a command splits into
+ * bold before it and bold after it, each with its spaces as they are, so the words beside it keep their spaces.
+ */
+const splitRaw = (nodes) => {
     const parts = [];
     let run = [];
 
     const flush = () => {
-        const trimmed = trimRun(run);
-
-        if (trimmed.length > 0) {
-            parts.push({ type: "run", nodes: trimmed });
+        if (run.length > 0) {
+            parts.push({ type: "run", nodes: run });
         }
 
         run = [];
@@ -547,7 +555,7 @@ export const splitCommands = (nodes) => {
             parts.push({ type: "cmd", text: node.text });
         } else if (node.type === "bold" && holdsCommand(node.children)) {
             // The bold splits around its command: each run of its text stays bold, in the paragraph it falls in.
-            for (const part of splitCommands(node.children)) {
+            for (const part of splitRaw(node.children)) {
                 if (part.type === "cmd") {
                     flush();
                     parts.push(part);
@@ -563,6 +571,23 @@ export const splitCommands = (nodes) => {
     flush();
 
     return parts;
+};
+
+/**
+ * The parts of a paragraph or a list item: `{ type: "run", nodes }` and `{ type: "cmd", text }`. A long inline code
+ * span (`CODE_BLOCK_MIN` or more characters, at the top level or inside bold) breaks the run of text into the text
+ * before it, the command, and the text after it. Bold around a command is split too: its text before and after the
+ * command stays bold. Code in a link label stays inline. Each paragraph is trimmed only at its 2 ends (into bold
+ * there), after the split, and a paragraph with only spaces goes. With no long span, 1 run with the nodes unchanged.
+ */
+export const splitCommands = (nodes) => {
+    if (!holdsCommand(nodes)) {
+        return [{ type: "run", nodes }];
+    }
+
+    return splitRaw(nodes)
+        .map((part) => (part.type === "run" ? { type: "run", nodes: trimRun(part.nodes) } : part))
+        .filter((part) => part.type === "cmd" || part.nodes.length > 0);
 };
 
 /** Copy with a hidden textarea and `execCommand("copy")`: the way that works without the Clipboard API. */
