@@ -2316,6 +2316,83 @@ describe("The coverage alarm", () => {
         assert.equal(docs3.coverage.began?.["account:frostyard"], T0);
     });
 
+    test("rule G3: an upgrade while the coverage is ended (suspended, or a repository removed): a later start keeps the real alarm", () => {
+        const T0 = NOW - 20 * H;
+        const real = [T0 + H, T0 + 2 * H];
+
+        // Suspended under the version before began: no installation, no start; the alarm of the coverage at T0 stays.
+        const state = docs();
+
+        state.coverage = { ...legacy({}, {}), since: {} };
+        state.deliveries = logOf({ at: T0, installation: 9 }, { at: T0 + 5 * H, installation: 9 });
+        state.alarms.coverage["frostyard/nsl|labels"] = { raised: T0 + 4 * H, misses: [...real] };
+        state.alarms.misses["frostyard/nsl|labels"] = [...real];
+        install(state, T0 + 6 * H, "installation", "unsuspend", {
+            id: 9,
+            account: "frostyard",
+            selection: "all",
+        });
+        assert.equal(state.coverage.since?.["account:frostyard"], T0 + 6 * H);
+        assert.equal(state.coverage.began?.["account:frostyard"], T0);
+        evaluateCoverage(
+            { last: {}, changes: [] },
+            state.coverage,
+            state.alarms,
+            T0 + 7 * H,
+            state.deliveries,
+        );
+        assert.equal(state.alarms.coverage["frostyard/nsl|labels"]?.cleared, undefined);
+        assert.deepEqual(state.alarms.misses["frostyard/nsl|labels"], real);
+
+        // A selected repository removed under the older version, then added again after the upgrade.
+        const removed = docs();
+
+        removed.coverage = {
+            ...legacy({ "5": { account: "bketelsen", selection: "selected", repos: [] } }, {}),
+            since: {},
+        };
+        removed.deliveries = logOf({ at: T0, repo: "bketelsen/a" });
+        removed.alarms.coverage["bketelsen/a|state"] = { raised: T0 + 4 * H, misses: [...real] };
+        removed.alarms.misses["bketelsen/a|state"] = [...real];
+        install(removed, T0 + 6 * H, "installation_repositories", "added", {
+            id: 5,
+            account: "bketelsen",
+            added: ["bketelsen/a"],
+        });
+        assert.equal(removed.coverage.since?.["bketelsen/a"], T0 + 6 * H);
+        assert.equal(removed.coverage.began?.["bketelsen/a"], T0);
+        evaluateCoverage(
+            { last: {}, changes: [] },
+            removed.coverage,
+            removed.alarms,
+            T0 + 7 * H,
+            removed.deliveries,
+        );
+        assert.equal(removed.alarms.coverage["bketelsen/a|state"]?.cleared, undefined);
+        assert.deepEqual(removed.alarms.misses["bketelsen/a|state"], real);
+
+        // No evidence in the log: 0, unknown, and nothing is cleared.
+        const unknown = docs();
+
+        unknown.coverage = { ...legacy({}, {}), since: {} };
+        unknown.alarms.coverage["frostyard/x|ci"] = { raised: T0 + 4 * H, misses: [...real] };
+        install(unknown, T0 + 6 * H, "installation", "created", {
+            id: 7,
+            account: "frostyard",
+            selection: "all",
+            repositories: [],
+        });
+        assert.equal(unknown.coverage.began?.["account:frostyard"], 0);
+        evaluateCoverage(
+            { last: {}, changes: [] },
+            unknown.coverage,
+            unknown.alarms,
+            T0 + 7 * H,
+            unknown.deliveries,
+        );
+        assert.equal(unknown.alarms.coverage["frostyard/x|ci"]?.cleared, undefined);
+    });
+
     test("rule G: a selected repository removed and added again keeps its real alarm and misses", () => {
         const state = docs();
         const T0 = NOW - 20 * H;

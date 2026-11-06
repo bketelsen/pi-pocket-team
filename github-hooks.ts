@@ -978,11 +978,16 @@ export function ensureSince(
  * of the accepted delivery log. An account key: the earlier of its start and the earliest entry of an installation of
  * that account. A repository key: the earlier of its start, its own earliest entry, and the earliest installation entry
  * of its owner. No such entry in a complete log: its start. A log that dropped entries proves nothing: `0`, unknown,
- * and nothing is cleared for that key. With `began` present, nothing changes. Returns `began`.
+ * and nothing is cleared for that key. A coverage that ended before the upgrade (a suspend not yet undone, a removed
+ * repository) has no start: each repository of a stored miss or alarm whose repository key and account key have no start
+ * gets a `began` for both (the earliest of that evidence; `0` when there is none), so a later start never clears the
+ * misses of that coverage. With
+ * `began` present, nothing changes. Returns `began`.
  */
 export function ensureBegan(
     coverage: CoverageState,
     deliveries: DeliveriesState,
+    alarms?: AlarmsState,
 ): Record<string, number> {
     if (coverage.began !== undefined) {
         return coverage.began;
@@ -1008,21 +1013,39 @@ export function ensureBegan(
     const ofAccount = (owner: string) =>
         first((entry) => entry.fact?.installation?.account?.toLowerCase() === owner);
     const began: Record<string, number> = {};
+    const evidenceOf = (key: string): number[] =>
+        (key.startsWith("account:")
+            ? [ofAccount(key.slice("account:".length))]
+            : [first((entry) => entry.repo?.toLowerCase() === key), ofAccount(ownerOf(key))]
+        ).filter((at): at is number => typeof at === "number");
 
     for (const [key, start] of Object.entries(coverage.since ?? {})) {
-        if (!complete) {
-            began[key] = 0;
+        began[key] = complete ? Math.min(start, ...evidenceOf(key)) : 0;
+    }
+
+    // The keys of a coverage that ended before the upgrade: the repositories of the stored misses and alarms.
+    for (const stored of [
+        ...Object.keys(alarms?.coverage ?? {}),
+        ...Object.keys(alarms?.misses ?? {}),
+    ]) {
+        const repo = (stored.split("|")[0] ?? "").toLowerCase();
+
+        if (!REPO.test(repo)) {
             continue;
         }
 
-        const evidence = key.startsWith("account:")
-            ? [ofAccount(key.slice("account:".length))]
-            : [first((entry) => entry.repo?.toLowerCase() === key), ofAccount(ownerOf(key))];
+        const keys = [repo, accountKey(ownerOf(repo))];
 
-        began[key] = Math.min(
-            start,
-            ...evidence.filter((at): at is number => typeof at === "number"),
-        );
+        // A repository that a current start already covers (its own, or its account's) keeps that evidence.
+        if (keys.some((key) => began[key] !== undefined)) {
+            continue;
+        }
+
+        for (const key of keys) {
+            const evidence = complete ? evidenceOf(key) : [];
+
+            began[key] = evidence.length === 0 ? 0 : Math.min(...evidence);
+        }
     }
 
     coverage.began = began;
@@ -1211,7 +1234,7 @@ export function applyDelivery(
     // Migrate a coverage document stored before `since` and `began` from the log as it was, before this commit writes
     // any start.
     ensureSince(docs.coverage, docs.deliveries);
-    ensureBegan(docs.coverage, docs.deliveries);
+    ensureBegan(docs.coverage, docs.deliveries, docs.alarms);
     recordEntries(docs.deliveries, [entry("accepted", job.fact)]);
     docs.deliveries.last = job.at;
 
@@ -1329,7 +1352,7 @@ export function evaluateCoverage(
     const { repos, accounts } = coveredRepos(coverage, now);
     const raised: string[] = [];
 
-    ensureBegan(coverage, deliveries);
+    ensureBegan(coverage, deliveries, alarms);
 
     // Before a start ends below: `began` keeps the earliest start of each key.
     noteBegan(coverage);
