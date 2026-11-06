@@ -44,7 +44,7 @@ A `x.desk.sweeper` task sweeps each supervisor's threads every 10 minutes. Its r
 - it reads by number the PRs a session named when their repository's open list was not read whole, and only the seen and branch rules attach them;
 - it computes the next actor (`brian`, `agent`, `odrade`, a `reviewer`, or `none`) and checks whether every part is closed. A thread is not done while the read left out a PR its session named, or, for a thread with no PR of its own, the open PRs of its repository: GitHub being down keeps such a thread open until a read works.
 
-`desk list`, `desk sync`, the prompt section and the page header say `Unread: T12 (frostyard/x#5, 6 h)` for a PR link that no read gave facts for in more than 30 minutes, `GitHub: last read at 01:47, 6 h ago` when the read is that old, and `Sweep failed at 01:47: <why>` until the next good sweep.
+`desk list`, `desk sync` and the prompt section say `Unread: T12 (frostyard/x#5, 6 h)` for a PR link that no read gave facts for in more than 30 minutes, `GitHub: last read at 01:47, 6 h ago` when the read is that old, and `Sweep failed at 01:47: <why>` until the next good sweep. The page header shows only the `Unread: …` line.
 
 The sweep also wakes an agent when every PR on its thread is merged or closed, tells a session once when its PR conflicts or its checks fail, removes the label `ready-for-human` when the PR changes after it, and archives the idle sessions of closed threads.
 

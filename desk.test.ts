@@ -16165,26 +16165,93 @@ describe("the desk in a Pi Pocket", () => {
         await dropThreads([id]);
     });
 
-    test("a failed sweep shows in desk list until the next good sweep of its supervisor clears it", async () => {
-        const source = await supervisor("sweep-error");
+    test("a sweeper sweep or a desk sync that throws records the failure on the desk, and the next good sync clears it", async () => {
+        await stopSweepers();
 
+        const source = await supervisor("sweep-error");
+        const key = String(Number(source));
+        let id = "";
+
+        // A real failure of the sweep's reads: a stored thread whose PR record is not an object makes `gather` throw.
         await app.harness.commit(async (tx) => {
             const state = await tx.doc(DeskThreads);
+            const opened =
+                state.threads[
+                    openThread(state, {
+                        key: "x.test.sweep-error",
+                        supervisor: Number(source),
+                        agents: ["duncan"],
+                        repo: "frostyard/test",
+                        title: "A broken record",
+                        at: Date.now(),
+                    }).thread.id
+                ]!;
 
-            state.sweepErrors = {
-                [String(Number(source))]: { at: Date.now(), error: "boom: the commit failed" },
-            };
+            opened.state = "open";
+            // Read only by the sweep's reads (`gather`): the list's text does not touch it.
+            (opened as unknown as { issues: unknown }).issues = 42;
+            id = opened.id;
         }, context);
+
+        // The sweeper: `desk list` starts it, and its first sweep throws in its reads. The phase faults the task, as
+        // before, and the failure is on the desk.
+        const started = Date.now();
+
+        await say(app, source, "desk list test");
+        await until(
+            async () => ((await deskState())?.sweepErrors?.[key]?.at ?? 0) >= started,
+            "the sweeper's failure on the desk",
+            20_000,
+        );
+        assert.match(
+            (await deskState())?.sweepErrors?.[key]?.error ?? "",
+            /is not a function/,
+            "the sweeper's own error",
+        );
+
+        await app.harness.commit(async (tx) => {
+            const thread = (await tx.doc(DeskThreads)).threads[id]!;
+
+            delete thread.issues;
+            // The sync: the same kind of break, in another field.
+            (thread as unknown as { prs: unknown }).prs = null;
+        }, context);
+
+        const before = Date.now();
+
+        try {
+            await say(app, source, "desk sync test");
+        } finally {
+            // Mend the record, so no other sweep meets it.
+            await app.harness.commit(async (tx) => {
+                (await tx.doc(DeskThreads)).threads[id]!.prs = {};
+            }, context);
+        }
+
+        const failure = (await deskState())?.sweepErrors?.[key];
+
+        assert(failure !== undefined, "the failed sync is recorded");
+        assert(failure.at >= before);
+        assert.match(failure.error, /Cannot convert undefined or null to object/);
+
+        // The sync itself still fails, with its own error.
+        const texts = (await modelTexts(app, source)).join("\n");
+        const reply = texts.slice(texts.lastIndexOf("desk sync test"));
+
+        assert.match(reply, /Cannot convert undefined or null to object/);
+        assert.doesNotMatch(reply, /new events?\./);
 
         await say(app, source, "desk list test");
         assert.match(
             (await modelTexts(app, source)).join("\n"),
             // More than 1 supervisor on the desk: the line names the supervisor.
-            /Sweep failed at \d\d:\d\d(?: \(supervisor \d+\))?: boom: the commit failed/,
+            /Sweep failed at \d\d:\d\d(?: \(supervisor \d+\))?: Cannot convert undefined or null to object/,
         );
 
         await say(app, source, "desk sync test");
-        assert.equal((await deskState())?.sweepErrors, undefined);
+        assert.equal((await deskState())?.sweepErrors?.[key], undefined, "a good sync clears it");
+
+        await dropThreads([id]);
     });
 
     test("desk attach refuses a ref GitHub cannot read, and detach takes one off", async () => {

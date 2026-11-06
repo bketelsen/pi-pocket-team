@@ -10,6 +10,7 @@ import {
     buildQuery,
     closeCheck,
     closeUnread,
+    cutRepoLines,
     type DeskState,
     githubChunks,
     githubLines,
@@ -519,6 +520,80 @@ describe("readGitHubChunks", () => {
         assert.deepEqual(read.cutRepos, ["frostyard/hotfix"]);
         assert.deepEqual(read.facts?.repos["frostyard/hotfix"]?.open, []);
         assert.equal(openListComplete(read.facts, "frostyard/other"), true);
+    });
+
+    test("a repository cut 2 times with no node gets a line, and holds a thread with no PR there (regression)", async () => {
+        // Both answers give the alias null, with a resource error under it: no node of the repository came at all.
+        let calls = 0;
+
+        const ask = async (query: string): Promise<unknown> => {
+            calls += 1;
+
+            const alias = /^ {2}(r[0-9]+): repository\(owner: "frostyard", name: "hotfix"\)/m.exec(
+                query,
+            )?.[1];
+
+            return {
+                data: { viewer: { login: VIEWER }, [alias ?? "r0"]: null },
+                errors: [
+                    {
+                        type: RESOURCE_LIMITS,
+                        path: [alias ?? "r0", "nameWithOwner"],
+                        message: "Resource limits for this query exceeded.",
+                    },
+                ],
+            };
+        };
+
+        const read = await readGitHubChunks(ask, { repos: ["frostyard/hotfix"], prs: [] }, explain);
+
+        assert.equal(calls, 2, "the first answer, and 1 read again");
+        assert.deepEqual(read.cutRepos, ["frostyard/hotfix"]);
+        assert.equal(read.facts?.repos["frostyard/hotfix"], undefined);
+        assert.deepEqual(read.facts?.incomplete, ["frostyard/hotfix: not read (resource limits)"]);
+
+        // The paging step keeps the line, and adds no second one.
+        const after = cutRepoLines(read.facts!, read.cutRepos, new Map());
+
+        assert.deepEqual(after.incomplete, ["frostyard/hotfix: not read (resource limits)"]);
+        // The helper alone gives the line too, to facts that lost it.
+        assert.deepEqual(
+            cutRepoLines({ ...read.facts!, incomplete: [] }, read.cutRepos, new Map()).incomplete,
+            ["frostyard/hotfix: not read (resource limits)"],
+        );
+
+        const state = deskOf();
+        const thread = placed(state, 100, "frostyard/hotfix");
+
+        thread.run = { ...thread.run, busy: false, reportedUserEntry: 5, lastUserEntry: 5 };
+
+        const held = closeUnread(state, 1, { github: after, asked: ["frostyard/hotfix"] });
+
+        assert.deepEqual(held.get(thread.id), [
+            "the open PRs of frostyard/hotfix are not all read",
+        ]);
+        assert.equal(
+            closeCheck(thread, { now: 1000, folders: new Set(), unread: held }).close,
+            false,
+        );
+    });
+
+    test("a repository cut 2 times whose count is unknown says how many PRs came", () => {
+        const facts: GitHubFacts = {
+            viewer: VIEWER,
+            repos: { "frostyard/hotfix": { archived: false, open: [] } },
+            prs: {},
+        };
+
+        assert.deepEqual(cutRepoLines(facts, ["frostyard/hotfix"], new Map()).incomplete, [
+            "frostyard/hotfix: 0 open PRs read, and more follow",
+        ]);
+        // A count that says every PR came: no line.
+        assert.equal(
+            cutRepoLines(facts, ["frostyard/hotfix"], new Map([["frostyard/hotfix", 0]]))
+                .incomplete,
+            undefined,
+        );
     });
 
     test("a query that fails with no data fails only its own names", async () => {

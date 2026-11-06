@@ -7490,7 +7490,8 @@ export type GraphqlAnswer = (query: string) => Promise<unknown>;
  * fails only its own part: each of its names gets the line `name: not read (why)`. Only when every query fails is the
  * read a failure. The aliases that GitHub cut (`readChunkAnswer`) are read again 1 time, in smaller queries
  * (`GITHUB_RETRY_LIMITS`). A PR or an issue still cut gets the line `owner/name#12: not read (resource limits)` (or
- * `read in part` when some of it came); a repository still cut is in `cutRepos`, and keeps the PRs that came.
+ * `read in part` when some of it came); a repository still cut is in `cutRepos`, and keeps the PRs that came, and one
+ * still cut with no node gets the line `owner/name: not read (resource limits)`.
  */
 export async function readGitHubChunks(
     ask: GraphqlAnswer,
@@ -7567,6 +7568,17 @@ export async function readGitHubChunks(
 
     const lines = [...(facts.incomplete ?? []), ...failed];
 
+    // A repository that both answers cut with no node of it: nothing of it was read, and a line must say so, or the close
+    // rule would take its open PRs for read.
+    for (const repo of cut.repos) {
+        if (
+            keyOf(facts.repos, repo) === undefined &&
+            !lines.some((line) => openLineOf(line, repo))
+        ) {
+            lines.push(`${repo}: not read (resource limits)`);
+        }
+    }
+
     for (const ref of [...cut.prs, ...cut.issues]) {
         const read =
             keyOf(facts.prs, ref) !== undefined || keyOf(facts.issues ?? {}, ref) !== undefined;
@@ -7579,6 +7591,37 @@ export async function readGitHubChunks(
     }
 
     return { facts, cutRepos: [...cut.repos] };
+}
+
+/**
+ * The lines of the repositories GitHub cut in both answers (`cutRepos` of `readGitHubChunks`), after the paging: each
+ * one with no complete open list gets a line. One with no node says `owner/name: not read (resource limits)`; one whose
+ * open count is unknown (`totals`, read before the paging) says how many PRs came, and that more may follow. A
+ * repository with a line already, or whose count says every PR came, gets none.
+ */
+export function cutRepoLines(
+    facts: GitHubFacts,
+    cutRepos: readonly string[],
+    totals: ReadonlyMap<string, number | undefined>,
+): GitHubFacts {
+    const lines = [...(facts.incomplete ?? [])];
+
+    for (const repo of cutRepos) {
+        const key = keyOf(facts.repos, repo);
+        const entry = key === undefined ? undefined : facts.repos[key];
+
+        if (lines.some((line) => openLineOf(line, key ?? repo) || openLineOf(line, repo))) {
+            continue;
+        }
+
+        if (entry === undefined || key === undefined) {
+            lines.push(`${repo}: not read (resource limits)`);
+        } else if (totals.get(repo) === undefined) {
+            lines.push(openIncompleteLine(key, entry.open.length, undefined));
+        }
+    }
+
+    return lines.length === 0 ? facts : { ...facts, incomplete: lines };
 }
 
 /** The event text of an answer, as `answerAsk` writes it: `answered T13a (desk): merged`. */
@@ -22435,30 +22478,7 @@ export default function createDesk(host: Host, web: Web) {
         );
         const facts = await pageOpen(read.facts, graphqlAsk);
 
-        // A repository GitHub cut 2 times, whose count is unknown: its list may lack PRs, and a line says so.
-        for (const repo of read.cutRepos) {
-            const key = Object.keys(facts.repos).find(
-                (name) => name.toLowerCase() === repo.toLowerCase(),
-            );
-            const entry = key === undefined ? undefined : facts.repos[key];
-            const said = (facts.incomplete ?? []).some((line) =>
-                line.toLowerCase().startsWith(`${(key ?? repo).toLowerCase()}: `),
-            );
-
-            if (
-                entry !== undefined &&
-                key !== undefined &&
-                !said &&
-                totals.get(repo) === undefined
-            ) {
-                facts.incomplete = [
-                    ...(facts.incomplete ?? []),
-                    openIncompleteLine(key, entry.open.length, undefined),
-                ];
-            }
-        }
-
-        return { facts };
+        return { facts: cutRepoLines(facts, read.cutRepos, totals) };
     }
 
     /**
