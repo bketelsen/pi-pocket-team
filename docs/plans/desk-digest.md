@@ -18,24 +18,35 @@ each interval (default 15 minutes), and only when something is new. A few kinds 
 
 Each piece of news is 1 digest item of 1 kind. Stored data: never rename a kind.
 
-| Kind            | Source                                                                                          | Default     |
-| --------------- | ----------------------------------------------------------------------------------------------- | ----------- |
-| `report`        | an agent's `team_message` report, filed on its thread                                           | digest      |
-| `shift`         | a night shift report that stopped for any reason except `blocked` or `failed`                   | digest      |
-| `shift-blocked` | a night shift report that stopped `blocked` or `failed`                                         | **at once** |
-| `answer`        | Brian's Desk-page answer that is only an acknowledgement (`ok`, `no`, `thanks`, `later`, …)     | digest      |
-| `answer-action` | any other Desk-page answer: it names something for the supervisor to do                         | **at once** |
-| `closed`        | the sweep closed the thread: done, nothing remains                                              | digest      |
-| `queue`         | a thread newly waits on the supervisor: a due watch, found work, a missing PR, a silent session | digest      |
-| `repair`        | a thread newly waits on the supervisor for a repair that its agent cannot take (after the cap)  | **at once** |
-| `issue`         | an issue that Brian queued on GitHub, newly (`issue-queue.md`)                                  | digest      |
-| `issue-urgent`  | an issue newly urgent: the label `agent-urgent` by Brian                                        | **at once** |
-| `issue-left`    | an issue with a thread left the queue while open, with proof                                    | digest      |
+| Kind                | Source                                                                                          | Default     |
+| ------------------- | ----------------------------------------------------------------------------------------------- | ----------- |
+| `report`            | an agent's `team_message` report, filed on its thread                                           | digest      |
+| `shift`             | a night shift report that stopped for any reason except `blocked` or `failed`                   | digest      |
+| `shift-blocked`     | a night shift report that stopped `blocked` or `failed`                                         | **at once** |
+| `answer`            | Brian's Desk-page answer that is only an acknowledgement (`ok`, `no`, `thanks`, `later`, …)     | digest      |
+| `answer-action`     | any other Desk-page answer: it names something for the supervisor to do                         | **at once** |
+| `closed`            | the sweep closed the thread: done, nothing remains                                              | digest      |
+| `queue`             | a thread newly waits on the supervisor: a due watch, found work, a missing PR, a silent session | digest      |
+| `repair`            | a thread newly waits on the supervisor for a repair that its agent cannot take (after the cap)  | **at once** |
+| `issue`             | an issue that Brian queued on GitHub, newly (`issue-queue.md`)                                  | digest      |
+| `issue-urgent`      | an issue newly urgent: the label `agent-urgent` by Brian                                        | **at once** |
+| `issue-left`        | an issue with a thread left the queue while open, with proof                                    | digest      |
+| `escalation`        | a Clerk's `desk escalate` that the drop rule kept (`clerk.md` section 4)                        | digest      |
+| `escalation-urgent` | a Clerk's `desk escalate` with `urgent: true` that the drop rule kept                           | **at once** |
 
 An "at once" item is not sent alone: it makes the next digest go now, with every item that waits.
 
 The 3 issue kinds were added after the first 8: they go to the supervisor also with a Clerk (they are in no
 default Clerk list), because only the supervisor plans shifts. The default `now` list gets `issue-urgent`.
+
+The 2 escalation kinds were added on 2026-11-06, at the end of the list (`clerk.md` sections 3 and 4). They
+go only to the supervisor, also when `digest.clerk` names them. `escalation-urgent` is in the default `now`
+list, and goes at once also when `now` leaves it out. An escalation uses the digest also at `minutes` 0:
+it then goes at once. The take drops an escalation that repeats news the supervisor has, merges the
+escalations of 1 thread into 1 line, and keeps an escalation line of a thread closed in the same digest.
+Escalation lines come first in the message, and the 30-line cap never cuts them: an escalation is on no
+Desk page. The box's 100-item cap never removes an escalation: the oldest other items go, and a box of
+escalations only may hold more.
 
 ## 3. Settings
 

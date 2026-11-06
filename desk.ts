@@ -408,7 +408,12 @@ export type Thread = {
      * thread that stays quiet, with no report after it, may close again, see `quietSilence`; a thread stored with it
      * keeps that meaning, and a quiet wake now keeps the thread closed, see `quietWake`), `handled` (`{ at, by, act
      * }`: the newest `desk` action of the supervisor on the thread, `at` its time, `by` its name, and `act` the action's
-     * name; a report filed at or before `at` needs no escalation, see `handledAfter`), `quietWake` (`{ at, entry }`: a
+     * name; a report filed at or before `at` needs no escalation, see `handledAfter`), `told` (`{ at, kind }`: the newest item time
+     * of news of the thread that went to the supervisor itself in a digest message, and that item's kind; the kinds
+     * `answer`, the issue kinds and the escalation kinds never set it; a Clerk escalation whose cause is at or before
+     * `at` is dropped, see `escalationDrop`), `clerkNews` (`{ at, sent }`: the newest item time of the thread's news
+     * that went to the Clerk in a digest, and when that digest was taken; an escalation within
+     * `ESCALATION_CAUSE_MS` of `sent` takes `at` as its cause, see `escalationCause`), `quietWake` (`{ at, entry }`: a
      * sweep found a supervisor message that woke a done thread, and kept it closed: `at` is the sweep's time, `entry`
      * the session's newest user entry before that message; a report, folder work or a PR after the wake opens the thread
      * again, see `quietTrigger`), and `journaled` (when the thread's 1 journal entry went into the queue: a thread that
@@ -485,7 +490,11 @@ export type DigestKind =
     | "plan-approved"
     | "plan-verify"
     | "plan-revise"
-    | "plan-decided";
+    | "plan-decided"
+    /** A Clerk's `desk escalate`, for the supervisor's next digest. */
+    | "escalation"
+    /** A Clerk's `desk escalate` with `urgent: true`: it goes at once. */
+    | "escalation-urgent";
 
 /** Every digest kind, in the design's order: new kinds go at the end. */
 export const DIGEST_KINDS: readonly DigestKind[] = [
@@ -506,6 +515,8 @@ export const DIGEST_KINDS: readonly DigestKind[] = [
     "plan-verify",
     "plan-revise",
     "plan-decided",
+    "escalation",
+    "escalation-urgent",
 ];
 
 /** One piece of desk news for the supervisor's digest. Stored data: never rename a field. */
@@ -518,6 +529,16 @@ export type DigestItem = {
     /** The one line the digest shows: `shortLine`, `answeredText`, or a line of its own. */
     line: string;
     at: number;
+    /**
+     * An escalation's own text, flat (1 line), for the merge of the escalations of 1 thread in 1 digest. Absent for
+     * every other kind, and for an item stored before the field.
+     */
+    text?: string;
+    /**
+     * An escalation's cause: the time of the news that caused it (`escalationCause`). The take checks the drop rule
+     * again against it. Absent for every other kind.
+     */
+    cause?: number;
 };
 
 /** One supervisor's waiting digest news. Stored data: never rename a field. */
@@ -683,6 +704,26 @@ export type DeskState = {
      * key, and the session ids it listed; `apply` archives only those.
      */
     archive?: { since?: number; dry?: { at: number; key: string; sessions: number[] } };
+    /**
+     * The Clerk's escalations (`desk escalate`). `keys`: the replay keys of the last 200 accepted calls
+     * (`x.desk.escalate:<task>:<call>`): a call with one of them changes nothing. `days`: by local day (the journal's
+     * zone, else the server's), the newest 60 days: `filed` the calls accepted (no replay), `urgent` how many of them
+     * were urgent, `dropped` the escalations dropped at the call or at the digest's take, `sent` the escalation items
+     * in a supervisor's digest message, and `lines` the escalation lines of those messages after the merge per thread.
+     * Absent until the first escalation.
+     */
+    escalations?: {
+        keys: string[];
+        days: Record<
+            string,
+            { filed: number; urgent: number; dropped: number; sent: number; lines: number }
+        >;
+        /**
+         * By replay key: the calls the desk dropped at the call, with the thread id and the reason, so a replay gives
+         * the same reply. Pruned with `keys` (the same 200). Absent until the first drop, and in a state from before it.
+         */
+        drops?: Record<string, { id: string; reason: string }>;
+    };
 };
 
 /** One plan's state: the shape of its thread's work. Stored data: never rename a field. */
@@ -5526,6 +5567,7 @@ export const DIGEST_NOW: readonly DigestKind[] = [
     "plan-approved",
     "plan-verify",
     "plan-revise",
+    "escalation-urgent",
 ];
 /** The kinds the Clerk gets, by default: the routine news. The issue kinds go to the supervisor: she plans the shifts. */
 export const DIGEST_CLERK: readonly DigestKind[] = [
@@ -5535,7 +5577,7 @@ export const DIGEST_CLERK: readonly DigestKind[] = [
     "queue",
     "plan-decided",
 ];
-/** The most items a box keeps: the oldest go first. */
+/** The most items a box keeps: the oldest go first, except an escalation, which always stays. */
 export const DIGEST_MAX_ITEMS = 100;
 /** The most item lines 1 digest message shows. */
 export const DIGEST_MAX_LINES = 30;
@@ -5695,6 +5737,21 @@ export function askAnswerKind(ask: Pick<Ask, "key">, words: string): "answer" | 
 /** The kinds of the issue queue: news about an issue stays in a digest even when its thread closes. */
 const ISSUE_KINDS: readonly DigestKind[] = ["issue", "issue-urgent", "issue-left"];
 
+/** The kinds of a Clerk's escalation: they go to the supervisor only, never back to the Clerk. */
+export const ESCALATION_KINDS: readonly DigestKind[] = ["escalation", "escalation-urgent"];
+
+/**
+ * An escalation this soon after the Clerk's digest take is about the news of that take: its cause is the newest item
+ * of that take for the thread, not the call's time.
+ */
+export const ESCALATION_CAUSE_MS = 60 * 60_000;
+
+/** The most replay keys of escalations the desk keeps. */
+export const ESCALATION_KEYS_MAX = 200;
+
+/** The most days of escalation counts the desk keeps. */
+export const ESCALATION_DAYS_MAX = 60;
+
 /** The kinds that carry a report. */
 const REPORT_KINDS: readonly DigestKind[] = ["report", "shift", "shift-blocked", "report-blocked"];
 
@@ -5721,7 +5778,8 @@ function setDigestBox(state: DeskState, supervisor: number, box: DigestBox): voi
 
 /**
  * Add 1 item to a supervisor's box, and give the time of the digest task to create: none when an item with that key is
- * there already, or a scheduled time at or before the item's wanted time covers it. An "at once" kind wants `now`;
+ * there already, or a scheduled time at or before the item's wanted time covers it. Above `DIGEST_MAX_ITEMS`, the
+ * oldest items that are not escalations go; an escalation is never removed. An "at once" kind wants `now`;
  * any other wants `now` plus the interval.
  */
 export function enqueueDigest(
@@ -5739,11 +5797,27 @@ export function enqueueDigest(
 
     box.items.push(item);
 
-    if (box.items.length > DIGEST_MAX_ITEMS) {
-        box.items.splice(0, box.items.length - DIGEST_MAX_ITEMS);
+    // Above the cap, the oldest items go, but never an escalation: the Clerk was told it is queued, and no other record
+    // of it reaches the supervisor. A box of escalations only may hold more than the cap.
+    let over = box.items.length - DIGEST_MAX_ITEMS;
+
+    if (over > 0) {
+        box.items = box.items.filter((each) => {
+            if (over > 0 && !ESCALATION_KINDS.includes(each.kind)) {
+                over -= 1;
+
+                return false;
+            }
+
+            return true;
+        });
     }
 
-    const wanted = config.now.includes(item.kind) ? now : now + config.minutes * 60_000;
+    // The Clerk asked for an urgent escalation to go at once: it does, also when the setting's `now` leaves it out.
+    const wanted =
+        config.now.includes(item.kind) || item.kind === "escalation-urgent"
+            ? now
+            : now + config.minutes * 60_000;
     // A task at or before the wanted time takes this item too: no second task.
     const covered = box.scheduled.some((at) => at <= wanted);
 
@@ -5822,19 +5896,26 @@ export function deskTime(at: number, timeZone: string): string {
     return `${journalDay(at, timeZone)} ${journalTime(at, timeZone)} ${name}`;
 }
 
+/** 1 line of a digest message, and the items it carries: its own, and for a closed line the reports folded into it. */
+type DigestEntry = { line: string; items: DigestItem[] };
+
 /**
- * The digest message: 1 header line, then 1 line for each item. A thread closed in this digest gets its closed line
- * only, with the count of its reports in the same digest. At most 30 item lines; the rest are counted. With `now`, the
- * header says the time, so the reader needs no `date` call to set a watch or date a record.
+ * The lines of a digest message, in 2 parts: the escalation lines, which are never cut, and the other lines, at most
+ * `DIGEST_MAX_LINES` of them; `more` counts the other lines that are cut. A thread closed in this digest gets its
+ * closed line only, with the count of its reports in the same digest: those items ride on the closed line.
  */
-export function digestText(
-    items: readonly DigestItem[],
-    now?: { at: number; timeZone: string },
-): string {
+function digestEntries(items: readonly DigestItem[]): {
+    escalations: DigestEntry[];
+    shown: DigestEntry[];
+    more: number;
+} {
     const closed = new Set(
         items.filter((item) => item.kind === "closed").map((item) => item.thread),
     );
+    const folded = new Map<string, DigestItem[]>();
     const reports = new Map<string, number>();
+    const escalations: DigestEntry[] = [];
+    const others: DigestEntry[] = [];
 
     for (const item of items) {
         if (closed.has(item.thread) && REPORT_KINDS.includes(item.kind)) {
@@ -5842,40 +5923,87 @@ export function digestText(
         }
     }
 
-    const lines: string[] = [];
-
     for (const item of items) {
-        // A closed thread's report and queue lines are inside its closed line; an answer to Brian stays.
+        // A closed thread's report and queue lines are inside its closed line; an answer to Brian stays, and so does
+        // the Clerk's escalation.
         if (
             closed.has(item.thread) &&
             item.kind !== "closed" &&
             item.kind !== "answer" &&
             item.kind !== "answer-action" &&
-            !ISSUE_KINDS.includes(item.kind)
+            !ISSUE_KINDS.includes(item.kind) &&
+            !ESCALATION_KINDS.includes(item.kind)
         ) {
+            folded.set(item.thread, [...(folded.get(item.thread) ?? []), item]);
+            continue;
+        }
+
+        if (ESCALATION_KINDS.includes(item.kind)) {
+            escalations.push({ line: item.line, items: [item] });
             continue;
         }
 
         if (item.kind === "closed") {
             const count = reports.get(item.thread) ?? 0;
 
-            lines.push(
-                count === 0
-                    ? item.line
-                    : putBeforeRead(item.line, `${String(count)} report${count === 1 ? "" : "s"}`),
-            );
+            others.push({
+                line:
+                    count === 0
+                        ? item.line
+                        : putBeforeRead(
+                              item.line,
+                              `${String(count)} report${count === 1 ? "" : "s"}`,
+                          ),
+                items: [item],
+            });
             continue;
         }
 
-        lines.push(item.line);
+        others.push({ line: item.line, items: [item] });
     }
 
-    const shown = lines.slice(0, DIGEST_MAX_LINES);
-    const more = lines.length - shown.length;
+    // The items folded into a closed line go with that line.
+    for (const entry of others) {
+        const [first] = entry.items;
+
+        if (first?.kind === "closed") {
+            entry.items.push(...(folded.get(first.thread) ?? []));
+            folded.delete(first.thread);
+        }
+    }
+
+    const shown = others.slice(0, DIGEST_MAX_LINES);
+
+    return { escalations, shown, more: others.length - shown.length };
+}
+
+/**
+ * The items a digest message shows: each item with a line in it, and each report folded into a shown closed line. An
+ * item cut by the 30-line cap is not shown; an escalation is never cut. Only the shown items count as told.
+ */
+export function digestShown(items: readonly DigestItem[]): DigestItem[] {
+    const { escalations, shown } = digestEntries(items);
+
+    return [...escalations, ...shown].flatMap((entry) => entry.items);
+}
+
+/**
+ * The digest message: 1 header line, then the escalation lines (never cut: an escalation is on no Desk page), then 1
+ * line for each other item. A thread closed in this digest gets its closed line only, with the count of its reports in
+ * the same digest. At most 30 other item lines; the rest are counted. With `now`, the header says the time, so the
+ * reader needs no `date` call to set a watch or date a record.
+ */
+export function digestText(
+    items: readonly DigestItem[],
+    now?: { at: number; timeZone: string },
+): string {
+    const { escalations, shown, more } = digestEntries(items);
+    const total = escalations.length + shown.length + more;
 
     return [
-        `[desk] digest: ${String(lines.length)} new.${now === undefined ? "" : ` Now ${deskTime(now.at, now.timeZone)}.`} Read each with desk read <id> before you act.`,
-        ...shown,
+        `[desk] digest: ${String(total)} new.${now === undefined ? "" : ` Now ${deskTime(now.at, now.timeZone)}.`} Read each with desk read <id> before you act.`,
+        ...escalations.map((entry) => entry.line),
+        ...shown.map((entry) => entry.line),
         ...(more === 0 ? [] : [`… and ${String(more)} more on the Desk page.`]),
     ].join("\n");
 }
@@ -5944,18 +6072,365 @@ export function dropHandled(
     });
 }
 
+/** A thread's `told` mark: `{ at, kind }`. Undefined when it has none, or the stored one has another shape. */
+function toldMark(thread: Thread): { at: number; kind: string } | undefined {
+    const mark = thread.run.told;
+
+    if (mark === null || typeof mark !== "object" || Array.isArray(mark)) {
+        return undefined;
+    }
+
+    const at = numberOr(mark.at);
+    const kind = typeof mark.kind === "string" ? mark.kind : undefined;
+
+    return at === undefined || kind === undefined ? undefined : { at, kind };
+}
+
+/** A thread's `clerkNews` mark: `{ at, sent }`. Undefined when it has none, or the stored one has another shape. */
+function clerkNewsMark(thread: Thread): { at: number; sent: number } | undefined {
+    const mark = thread.run.clerkNews;
+
+    if (mark === null || typeof mark !== "object" || Array.isArray(mark)) {
+        return undefined;
+    }
+
+    const at = numberOr(mark.at);
+    const sent = numberOr(mark.sent);
+
+    return at === undefined || sent === undefined ? undefined : { at, sent };
+}
+
 /**
- * The Clerk takes the routine kinds; a kind that goes at once always stays with the supervisor. With no Clerk, every
- * item is the supervisor's. The issue kinds are in no default list of the Clerk: only the supervisor plans shifts.
+ * The cause of a Clerk escalation made at `at`: the newest news of the thread that went to the Clerk, when that digest
+ * was taken at most `ESCALATION_CAUSE_MS` before `at`; else `at` itself. No thread: `at`.
+ */
+export function escalationCause(thread: Thread | undefined, at: number): number {
+    const news = thread === undefined ? undefined : clerkNewsMark(thread);
+
+    return news !== undefined && news.sent <= at && at - news.sent <= ESCALATION_CAUSE_MS
+        ? news.at
+        : at;
+}
+
+/**
+ * Why a Clerk escalation with this cause repeats known news, in words; undefined to keep it. It is dropped when the
+ * supervisor acted on the thread at or after the cause (`handledAfter`), or got news of the thread directly at or after
+ * it (`told`). An escalation with no thread is never dropped. A stored mark of another shape counts as absent.
+ */
+export function escalationDrop(thread: Thread | undefined, cause: number): string | undefined {
+    if (thread === undefined) {
+        return undefined;
+    }
+
+    const handled = handledMark(thread);
+
+    if (handled !== undefined && handled.at >= cause) {
+        return `the supervisor acted after its news: desk ${handled.act} at ${new Date(handled.at).toISOString()}`;
+    }
+
+    const told = toldMark(thread);
+
+    if (told !== undefined && told.at >= cause) {
+        return `the supervisor got ${told.kind} news of it directly at ${new Date(told.at).toISOString()}`;
+    }
+
+    return undefined;
+}
+
+/** An escalation's text as 1 line: each line of it flat, joined with " | ". */
+export function escalationText(raw: string): string {
+    return raw
+        .split(/\r\n|\r|\n/)
+        .map(flatLine)
+        .filter((line) => line !== "")
+        .join(" | ");
+}
+
+/** An escalation's text, clipped for an event: at most 200 characters. */
+export function escalationClip(text: string): string {
+    return text.length > MAX_LINE ? clipLine(text) : text;
+}
+
+/**
+ * The escalation items of a take that still go, and the ones the drop rule removes, with the reason. It reads the
+ * marks of the threads as they are: call it before `recordTold`, so the news of the same take never drops an
+ * escalation that goes in the same message. Every other item is kept as it is; an item stored with no `cause` takes
+ * its own time.
+ */
+export function dropEscalations(
+    items: readonly DigestItem[],
+    state: Readonly<DeskState> | undefined,
+): { kept: DigestItem[]; dropped: { item: DigestItem; reason: string }[] } {
+    const kept: DigestItem[] = [];
+    const dropped: { item: DigestItem; reason: string }[] = [];
+
+    for (const item of items) {
+        const thread = item.thread === "" ? undefined : state?.threads[item.thread];
+        const reason = ESCALATION_KINDS.includes(item.kind)
+            ? escalationDrop(thread, item.cause ?? item.at)
+            : undefined;
+
+        if (reason === undefined) {
+            kept.push(item);
+        } else {
+            dropped.push({ item, reason });
+        }
+    }
+
+    return { kept, dropped };
+}
+
+/** The line of 1 escalation, or of `count` merged ones of 1 thread (or of no thread, with `thread` ""). */
+export function escalationLine(thread: string, text: string, urgent: boolean, count = 1): string {
+    const head = `the Clerk escalates${urgent ? " (urgent)" : ""}${count > 1 ? ` (${String(count)})` : ""}: ${text}`;
+
+    return thread === "" ? `[desk] ${head}` : `[desk] ${thread} · ${head} · desk read ${thread}`;
+}
+
+/**
+ * The escalations of 1 thread as 1 item with 1 line, and all the ones with no thread as 1 more; every other item stays
+ * as it is. The merged item sits where the first of its thread was, is urgent when 1 of them is, and keeps the newest
+ * time. 1 escalation of a thread keeps its own line.
+ */
+export function mergeEscalations(items: readonly DigestItem[]): DigestItem[] {
+    const groups = new Map<string, DigestItem[]>();
+
+    for (const item of items) {
+        if (ESCALATION_KINDS.includes(item.kind)) {
+            groups.set(item.thread, [...(groups.get(item.thread) ?? []), item]);
+        }
+    }
+
+    const out: DigestItem[] = [];
+
+    for (const item of items) {
+        if (!ESCALATION_KINDS.includes(item.kind)) {
+            out.push(item);
+            continue;
+        }
+
+        const group = groups.get(item.thread) ?? [item];
+
+        if (group[0] !== item) {
+            continue;
+        }
+
+        if (group.length === 1) {
+            out.push(item);
+            continue;
+        }
+
+        const urgent = group.some((each) => each.kind === "escalation-urgent");
+        const texts = group.map((each) => each.text ?? each.line);
+        const text = texts.join(" / ");
+        const causes = group.map((each) => each.cause ?? each.at);
+
+        out.push({
+            key: item.key,
+            thread: item.thread,
+            kind: urgent ? "escalation-urgent" : "escalation",
+            line: escalationLine(item.thread, text, urgent, group.length),
+            at: Math.max(...group.map((each) => each.at)),
+            text,
+            cause: Math.min(...causes),
+        });
+    }
+
+    return out;
+}
+
+/**
+ * Record what a digest take sent: for each item of the supervisor's own message (`ours`) whose thread is on the desk,
+ * `told` (the newest item time and its kind), except an `answer`, an issue kind and an escalation kind; for each item
+ * that went to the Clerk (`theirs`), `clerkNews` (the newest item time of that thread, and `now`, the take's time). A
+ * newer time replaces an older one, and an older one never replaces a newer one.
+ */
+export function recordTold(
+    state: DeskState,
+    ours: readonly DigestItem[],
+    theirs: readonly DigestItem[],
+    now: number,
+): void {
+    for (const item of ours) {
+        if (
+            item.kind === "answer" ||
+            ISSUE_KINDS.includes(item.kind) ||
+            ESCALATION_KINDS.includes(item.kind)
+        ) {
+            continue;
+        }
+
+        const thread = item.thread === "" ? undefined : state.threads[item.thread];
+
+        if (thread === undefined) {
+            continue;
+        }
+
+        const had = toldMark(thread);
+
+        if (had === undefined || had.at < item.at) {
+            thread.run.told = { at: item.at, kind: item.kind };
+        }
+    }
+
+    const newest = new Map<string, number>();
+
+    for (const item of theirs) {
+        newest.set(item.thread, Math.max(newest.get(item.thread) ?? item.at, item.at));
+    }
+
+    for (const [id, at] of newest) {
+        const thread = id === "" ? undefined : state.threads[id];
+
+        if (thread === undefined) {
+            continue;
+        }
+
+        const had = clerkNewsMark(thread);
+
+        if (had === undefined || had.at < at || (had.at === at && had.sent < now)) {
+            thread.run.clerkNews = { at, sent: now };
+        }
+    }
+}
+
+/** The escalation counts of 1 day. */
+type EscalationDay = {
+    filed: number;
+    urgent: number;
+    dropped: number;
+    sent: number;
+    lines: number;
+};
+
+/** The stored escalations as a plain copy: a part of another shape starts again, empty. */
+function escalationsOf(state: Readonly<DeskState>): {
+    keys: string[];
+    days: Record<string, EscalationDay>;
+    drops: Record<string, { id: string; reason: string }>;
+} {
+    const stored = state.escalations as Record<string, unknown> | undefined;
+    const record = (value: unknown): Record<string, unknown> =>
+        value !== null && typeof value === "object" && !Array.isArray(value)
+            ? (value as Record<string, unknown>)
+            : {};
+    const keys = Array.isArray(stored?.keys)
+        ? stored.keys.filter((key): key is string => typeof key === "string")
+        : [];
+    const count = (value: unknown): number => (typeof value === "number" ? value : 0);
+    const days = Object.fromEntries(
+        Object.entries(record(stored?.days)).map(([day, value]) => {
+            const each = record(value);
+
+            return [
+                day,
+                {
+                    filed: count(each.filed),
+                    urgent: count(each.urgent),
+                    dropped: count(each.dropped),
+                    sent: count(each.sent),
+                    lines: count(each.lines),
+                },
+            ];
+        }),
+    );
+    const drops: Record<string, { id: string; reason: string }> = {};
+
+    for (const [key, value] of Object.entries(record(stored?.drops))) {
+        const each = record(value);
+
+        if (typeof each.id === "string" && typeof each.reason === "string") {
+            drops[key] = { id: each.id, reason: each.reason };
+        }
+    }
+
+    return { keys, days, drops };
+}
+
+/** Write the escalations back: the newest keys, their drops only, and the newest days. */
+function setEscalations(state: DeskState, value: ReturnType<typeof escalationsOf>): void {
+    const keys = value.keys.slice(-ESCALATION_KEYS_MAX);
+    const kept = Object.keys(value.days).sort().slice(-ESCALATION_DAYS_MAX);
+    const drops = Object.fromEntries(
+        Object.entries(value.drops).filter(([key]) => keys.includes(key)),
+    );
+
+    state.escalations = {
+        keys,
+        days: Object.fromEntries(kept.map((day) => [day, value.days[day]!])),
+        ...(Object.keys(drops).length === 0 ? {} : { drops }),
+    };
+}
+
+/**
+ * Add to the escalation counts of the day `day`: a new day starts at 0, and only the newest `ESCALATION_DAYS_MAX` days
+ * stay. A stored value of another shape starts again.
+ */
+export function countEscalations(state: DeskState, day: string, add: Partial<EscalationDay>): void {
+    const value = escalationsOf(state);
+    const had = value.days[day] ?? { filed: 0, urgent: 0, dropped: 0, sent: 0, lines: 0 };
+
+    value.days[day] = {
+        filed: had.filed + (add.filed ?? 0),
+        urgent: had.urgent + (add.urgent ?? 0),
+        dropped: had.dropped + (add.dropped ?? 0),
+        sent: had.sent + (add.sent ?? 0),
+        lines: had.lines + (add.lines ?? 0),
+    };
+    setEscalations(state, value);
+}
+
+/** Whether a call's replay key is among the escalations the desk accepted. */
+export function escalationKnown(state: Readonly<DeskState>, key: string): boolean {
+    return escalationsOf(state).keys.includes(key);
+}
+
+/**
+ * Record 1 accepted escalation's replay key, and with `drop` the thread and the reason of its drop at the call: the
+ * newest `ESCALATION_KEYS_MAX` keys stay, and a drop goes with its key.
+ */
+export function rememberEscalation(
+    state: DeskState,
+    key: string,
+    drop?: { id: string; reason: string },
+): void {
+    const value = escalationsOf(state);
+
+    if (!value.keys.includes(key)) {
+        value.keys.push(key);
+    }
+
+    if (drop !== undefined) {
+        value.drops[key] = drop;
+    }
+
+    setEscalations(state, value);
+}
+
+/** The drop of an accepted call, when the call was dropped: its thread id and reason. */
+export function escalationDropOf(
+    state: Readonly<DeskState>,
+    key: string,
+): { id: string; reason: string } | undefined {
+    return escalationsOf(state).drops[key];
+}
+
+/**
+ * The Clerk takes the routine kinds; a kind that goes at once always stays with the supervisor, and so does an
+ * escalation, also when the setting's `clerk` names its kind. With no Clerk, every item is the supervisor's. The issue kinds are in no default list of the Clerk: only the supervisor plans shifts.
  */
 export function splitDigest(
     items: readonly DigestItem[],
     hasClerk: boolean,
     config: DigestConfig,
 ): { theirs: DigestItem[]; ours: DigestItem[] } {
+    // An escalation is the Clerk's own news for the supervisor: it never goes back to the Clerk.
     const theirs = hasClerk
         ? items.filter(
-              (item) => config.clerk.includes(item.kind) && !config.now.includes(item.kind),
+              (item) =>
+                  config.clerk.includes(item.kind) &&
+                  !config.now.includes(item.kind) &&
+                  !ESCALATION_KINDS.includes(item.kind),
           )
         : [];
 
@@ -15683,7 +16158,9 @@ export function deliverCheck(
 
 /**
  * Record that a plan task's thread opened: the task is delegated, the attempt is stored, and the plan moves from
- * `approved` to `building`. The task `verify` is the whole-plan check: its thread goes in `verification.threads`.
+ * `approved` to `building`. The task `verify` is the whole-plan check: its thread goes in `verification.threads`. The
+ * plan thread gets the handled mark `delegate` by `by` (the supervisor's name, else "supervisor") when a thread binds,
+ * and never on a replay that changes nothing.
  */
 export function startTask(
     state: DeskState,
@@ -15691,6 +16168,7 @@ export function startTask(
     taskId: string,
     threadId: string,
     at: number,
+    by = "supervisor",
 ): { task?: PlanTask } | { error: string } {
     const plan = planOf(state, planId);
 
@@ -15703,7 +16181,9 @@ export function startTask(
 
         plan.verification ??= { threads: [], rounds: [] };
 
-        if (!plan.verification.threads.includes(thread.id)) {
+        const bound = !plan.verification.threads.includes(thread.id);
+
+        if (bound) {
             plan.verification.threads.push(thread.id);
         }
 
@@ -15728,6 +16208,11 @@ export function startTask(
                 `verify delegated: ${thread.id}`,
                 at,
             );
+
+            // The supervisor's delegation is an act on the plan: a Clerk escalation of older plan news is dropped.
+            if (bound) {
+                markHandled(planThread, { at, by, act: "delegate" });
+            }
         }
 
         return {};
@@ -15773,6 +16258,8 @@ export function startTask(
             `${taskId} delegated: ${threadId}`,
             at,
         );
+        // The supervisor's delegation is an act on the plan: a Clerk escalation of older plan news is dropped.
+        markHandled(planThread, { at, by, act: "delegate" });
 
         if (repo !== undefined) {
             addEvent(
@@ -26219,11 +26706,54 @@ export default function createDesk(host: Host, web: Web) {
                     const split = splitDigest(items, clerk !== undefined, digest);
                     // A report that a supervisor handled after it left the Clerk's list: it needs no escalation.
                     const theirs = dropHandled(split.theirs, state);
-                    const { ours } = split;
-                    const base = `x.desk.digest:${String(supervisor)}:${String(taken.seq)}`;
-                    const messages: DigestMessage[] = [];
                     // The journal's zone, or the server's. The checkpoint keeps the text, so a replay says the same time.
                     const now = { at: runtime.now(), timeZone: journal?.timeZone ?? serverZone() };
+                    const day = journalDay(now.at, now.timeZone);
+                    // A Clerk escalation that repeats known news goes no further. The marks are those from before this
+                    // take: news in this same message must not drop an escalation that goes with it.
+                    const checked = dropEscalations(split.ours, state);
+
+                    for (const { item, reason } of checked.dropped) {
+                        const thread = item.thread === "" ? undefined : state.threads[item.thread];
+
+                        if (thread !== undefined) {
+                            addEvent(
+                                thread,
+                                `escalate-drop:${item.key}`,
+                                `Clerk escalation dropped: ${reason}: ${escalationClip(item.text ?? item.line)}`,
+                                now.at,
+                            );
+                        }
+                    }
+
+                    const sent = checked.kept.filter((item) =>
+                        ESCALATION_KINDS.includes(item.kind),
+                    ).length;
+                    // The escalations of 1 thread go as 1 line.
+                    const ours = mergeEscalations(checked.kept);
+                    const lines = ours.filter((item) =>
+                        ESCALATION_KINDS.includes(item.kind),
+                    ).length;
+
+                    // What went to whom, of the lines each message shows: a later escalation of the same news is dropped.
+                    // A line cut by the 30-line cap told nobody.
+                    recordTold(
+                        state,
+                        digestShown(ours),
+                        clerk === undefined ? [] : digestShown(theirs),
+                        now.at,
+                    );
+
+                    if (checked.dropped.length > 0 || sent > 0) {
+                        countEscalations(state, day, {
+                            dropped: checked.dropped.length,
+                            sent,
+                            lines,
+                        });
+                    }
+
+                    const base = `x.desk.digest:${String(supervisor)}:${String(taken.seq)}`;
+                    const messages: DigestMessage[] = [];
 
                     if (theirs.length > 0 && clerk !== undefined) {
                         messages.push({
@@ -26239,6 +26769,14 @@ export default function createDesk(host: Host, web: Web) {
                             text: digestText(ours, now),
                             requestId: base,
                         });
+                    }
+
+                    // Every item was dropped: no message, and the task ends; the records above stay in this commit.
+                    if (messages.length === 0) {
+                        return {
+                            status: "terminal",
+                            outcome: { status: "completed", result: null },
+                        };
                     }
 
                     return {
@@ -29178,7 +29716,7 @@ export default function createDesk(host: Host, web: Web) {
     const tool = defineTool({
         name: "desk",
         description:
-            "The desk of threads for work the team runs in the background. A supervisor session can use every action; a Clerk can use list, read, sync, attach, detach, watch, result, send, and issues for its supervisor's threads; an agent session can use read, watch, and result on its own thread only. Actions: list (one line per open thread), read (one thread in full), sync (observe the threads now, with linked sessions, Night shift, git, and GitHub), seed (import a seed.json file one time), attach (put a PR, a queued issue, or all of another thread's work, on one thread), detach (take a PR off a thread for good: the sweep does not attach or find it again; only attach brings it back), own (mark a found PR thread as Brian's own: it closes, and no sweep finds its PR again), ask (file a question for Brian on a thread, or on a new one; never for a plain merge: Ready to merge on the Desk page lists those), rewrite (give an open ask new words, and new options or none: an agent's ask is filed as it wrote it, so make it clear for Brian), withdraw (end an open ask that Brian need not answer, with words saying why, or with into to merge it into another open ask), answer (record Brian's words for an ask), watch (set a dated check on a thread: it sleeps until that date, or until its optional on event, and does not count toward the cap; a thread closed as done in the last 7 days opens again for it, and sleeps), result (record that check's pass, which closes the thread, or its fail, which opens it again: a pass is refused while the thread has an open ask), send (send 1 message from the supervisor's session to a thread's agent), issues (read the issues Brian queued on GitHub: read only), archive (supervisor only: a dry run that lists the idle sessions of threads closed 2 days ago or more that the desk can archive, with the skips and their reasons; with apply: true, archive the sessions of a dry run of the last 60 minutes that still pass every rule; it archives, it never deletes).",
+            "The desk of threads for work the team runs in the background. A supervisor session can use every action; a Clerk can use list, read, sync, attach, detach, watch, result, send, issues, and escalate for its supervisor's threads; an agent session can use read, watch, and result on its own thread only. Actions: list (one line per open thread), read (one thread in full), sync (observe the threads now, with linked sessions, Night shift, git, and GitHub), seed (import a seed.json file one time), attach (put a PR, a queued issue, or all of another thread's work, on one thread), detach (take a PR off a thread for good: the sweep does not attach or find it again; only attach brings it back), own (mark a found PR thread as Brian's own: it closes, and no sweep finds its PR again), ask (file a question for Brian on a thread, or on a new one; never for a plain merge: Ready to merge on the Desk page lists those), rewrite (give an open ask new words, and new options or none: an agent's ask is filed as it wrote it, so make it clear for Brian), withdraw (end an open ask that Brian need not answer, with words saying why, or with into to merge it into another open ask), answer (record Brian's words for an ask), watch (set a dated check on a thread: it sleeps until that date, or until its optional on event, and does not count toward the cap; a thread closed as done in the last 7 days opens again for it, and sleeps), result (record that check's pass, which closes the thread, or its fail, which opens it again: a pass is refused while the thread has an open ask), send (send 1 message from the supervisor's session to a thread's agent), issues (read the issues Brian queued on GitHub: read only), escalate (Clerk only: 1 escalation to the supervisor; the desk drops it when the supervisor already acted on the thread or got its news directly, and else puts it in her next digest, or sends it at once with urgent: true), archive (supervisor only: a dry run that lists the idle sessions of threads closed 2 days ago or more that the desk can archive, with the skips and their reasons; with apply: true, archive the sessions of a dry run of the last 60 minutes that still pass every rule; it archives, it never deletes).",
         parameters: Type.Object({
             action: Type.Union([
                 Type.Literal("list"),
@@ -29197,11 +29735,12 @@ export default function createDesk(host: Host, web: Web) {
                 Type.Literal("send"),
                 Type.Literal("issues"),
                 Type.Literal("archive"),
+                Type.Literal("escalate"),
             ]),
             thread: Type.Optional(
                 Type.String({
                     description:
-                        "read: a thread id, such as T13; an agent may leave it out for its own thread; attach: the target thread; watch, result: the thread to change; send: the thread whose agent gets the message; own: the found thread",
+                        "read: a thread id, such as T13; an agent may leave it out for its own thread; attach: the target thread; watch, result: the thread to change; send: the thread whose agent gets the message; own: the found thread; escalate: the thread the item is about (optional)",
                 }),
             ),
             ref: Type.Optional(
@@ -29213,7 +29752,7 @@ export default function createDesk(host: Host, web: Web) {
             text: Type.Optional(
                 Type.String({
                     description:
-                        "ask, rewrite: the question for Brian, 1 to 500 characters, on one line; watch: the check, 1 to 200 characters; result: what happened, 1 to 200 characters; send: the message to the thread's agent, 1 to 2000 characters",
+                        "ask, rewrite: the question for Brian, 1 to 500 characters, on one line; watch: the check, 1 to 200 characters; result: what happened, 1 to 200 characters; send: the message to the thread's agent, 1 to 2000 characters; escalate: the escalation for the supervisor, 1 to 2000 characters",
                 }),
             ),
             title: Type.Optional(
@@ -29272,6 +29811,12 @@ export default function createDesk(host: Host, web: Web) {
                         "archive: true to archive the sessions of the last dry run (it must be at most 60 minutes old); without it, a dry run that changes no session",
                 }),
             ),
+            urgent: Type.Optional(
+                Type.Boolean({
+                    description:
+                        "escalate: true when the supervisor must get it at once; else it goes in her next digest",
+                }),
+            ),
         }),
         replay: "safe",
         execute: async (args, api, context) => {
@@ -29323,19 +29868,19 @@ export default function createDesk(host: Host, web: Web) {
                     args.action === "seed"
                 ) {
                     throw new Error(
-                        `Only the supervisor files asks, records Brian's answers, and seeds the desk. Escalate to ${await supervisorName()} with team_message.`,
+                        `Only the supervisor files asks, records Brian's answers, and seeds the desk. Escalate to ${await supervisorName()} with desk escalate.`,
                     );
                 }
 
                 if (args.action === "own") {
                     throw new Error(
-                        `Only the supervisor marks a thread as Brian's own. Escalate to ${await supervisorName()} with team_message.`,
+                        `Only the supervisor marks a thread as Brian's own. Escalate to ${await supervisorName()} with desk escalate.`,
                     );
                 }
 
                 if (args.action === "archive") {
                     throw new Error(
-                        `Only the supervisor archives sessions. Escalate to ${await supervisorName()} with team_message.`,
+                        `Only the supervisor archives sessions. Escalate to ${await supervisorName()} with desk escalate.`,
                     );
                 }
 
@@ -29785,6 +30330,7 @@ export default function createDesk(host: Host, web: Web) {
                     const target = threadById(state, targetId);
                     const source = PR_REF.test(ref) ? undefined : threadById(state, ref);
                     const issue = queuedIssue(state, ref);
+                    const at = Date.now();
 
                     // A Clerk works only on its supervisor's threads.
                     for (const thread of [target, source]) {
@@ -29795,16 +30341,42 @@ export default function createDesk(host: Host, web: Web) {
                         }
                     }
 
-                    if (issue !== undefined) {
-                        return attachIssue(state, ref, targetId, Date.now());
-                    }
-
                     // It was an issue when GitHub was not asked, and left the queue since: no PR check was made.
-                    if (queued !== undefined) {
+                    if (issue === undefined && queued !== undefined) {
                         return { error: `${ref} left the issue queue just now. Nothing changed.` };
                     }
 
-                    return attachTo(state, ref, targetId, Date.now(), persona.name);
+                    // Every thread the call can change: the target, a source thread, and each thread that holds the PR
+                    // now (an attach moves it off its holder).
+                    const holders = PR_REF.test(ref)
+                        ? Object.values(state.threads).filter(
+                              (thread) => thread.prs[ref] !== undefined,
+                          )
+                        : [];
+                    const touched = [
+                        ...new Set(
+                            [target, source, ...holders].filter(
+                                (thread): thread is Thread => thread !== undefined,
+                            ),
+                        ),
+                    ];
+                    const before = touched.map((thread) => JSON.stringify(thread));
+                    const done =
+                        issue !== undefined
+                            ? attachIssue(state, ref, targetId, at)
+                            : attachTo(state, ref, targetId, at, persona.name);
+
+                    // The supervisor's attach is an act on each thread it changed: a Clerk escalation of older news of
+                    // it is dropped. A call that changed nothing marks nothing.
+                    if (!("error" in done) && persona.role === "supervisor") {
+                        touched.forEach((thread, index) => {
+                            if (JSON.stringify(thread) !== before[index]) {
+                                markHandled(thread, { at, by: persona.name, act: "attach" });
+                            }
+                        });
+                    }
+
+                    return done;
                 }, context);
 
                 if ("error" in result) {
@@ -29840,7 +30412,21 @@ export default function createDesk(host: Host, web: Web) {
                         };
                     }
 
-                    return detachFrom(state, ref, targetId, Date.now());
+                    const at = Date.now();
+                    const before = target === undefined ? undefined : JSON.stringify(target);
+                    const done = detachFrom(state, ref, targetId, at);
+
+                    // The supervisor's detach is an act on the thread, when it changed it.
+                    if (
+                        !("error" in done) &&
+                        persona.role === "supervisor" &&
+                        target !== undefined &&
+                        JSON.stringify(target) !== before
+                    ) {
+                        markHandled(target, { at, by: persona.name, act: "detach" });
+                    }
+
+                    return done;
                 }, context);
 
                 if ("error" in result) {
@@ -29881,6 +30467,130 @@ export default function createDesk(host: Host, web: Web) {
                 return reply(result.text);
             }
 
+            if (args.action === "escalate") {
+                // Only a registered Clerk escalates: an agent was refused above, and a supervisor escalates to nobody.
+                if (persona.role !== "clerk") {
+                    throw new Error(
+                        "Only a Clerk escalates, to its supervisor. A supervisor escalates to nobody: put a decision for Brian on the desk with desk ask.",
+                    );
+                }
+
+                const text = escalationText(args.text ?? "");
+
+                if (text === "" || text.length > MAX_SEND) {
+                    throw new Error(
+                        `escalate needs text: 1 to ${String(MAX_SEND)} characters for the supervisor.`,
+                    );
+                }
+
+                const asked = args.thread?.trim() ?? "";
+                const urgent = args.urgent === true;
+                const key = `x.desk.escalate:${api.taskId}:${api.callId}`;
+                const at = Date.now();
+                const boss = await supervisorName();
+                const { digest, journal } = await deskConfig();
+                const day = journalDay(at, journal?.timeZone ?? serverZone());
+                const clipped = escalationClip(text);
+                const dropPrefix = "Clerk escalation dropped: ";
+                const result = await write(async (tx) => {
+                    const state = await tx.doc(DeskThreads);
+                    const thread = asked === "" ? undefined : threadById(state, asked);
+
+                    if (asked !== "" && thread === undefined) {
+                        return { error: `There is no thread ${asked.toUpperCase()} on the desk.` };
+                    }
+
+                    if (thread !== undefined && !changes(thread)) {
+                        return {
+                            error: `${thread.id} is another supervisor's thread: a Clerk escalates only its own supervisor's threads.`,
+                        };
+                    }
+
+                    // A replay changes nothing: no item, no event, and no count. It gives the same reply.
+                    if (escalationKnown(state, key)) {
+                        const drop = escalationDropOf(state, key);
+
+                        return drop === undefined
+                            ? { queued: true as const }
+                            : { dropped: drop.reason, id: drop.id };
+                    }
+
+                    const cause = escalationCause(thread, at);
+                    const reason = escalationDrop(thread, cause);
+
+                    rememberEscalation(
+                        state,
+                        key,
+                        reason === undefined || thread === undefined
+                            ? undefined
+                            : { id: thread.id, reason },
+                    );
+                    countEscalations(state, day, { filed: 1, urgent: urgent ? 1 : 0 });
+
+                    if (reason !== undefined && thread !== undefined) {
+                        addEvent(
+                            thread,
+                            `escalate-drop:${key}`,
+                            `${dropPrefix}${reason}: ${clipped}`,
+                            at,
+                        );
+                        countEscalations(state, day, { dropped: 1 });
+
+                        return { dropped: reason, id: thread.id };
+                    }
+
+                    if (thread !== undefined) {
+                        addEvent(
+                            thread,
+                            `escalate:${key}`,
+                            `Clerk escalation queued${urgent ? " (urgent)" : ""}: ${clipped}`,
+                            at,
+                        );
+                    }
+
+                    // Also with the digest at 0 minutes: the wanted time is then now.
+                    const due = enqueueDigest(
+                        state,
+                        supervisor,
+                        {
+                            key: `escalate:${key}`,
+                            thread: thread?.id ?? "",
+                            kind: urgent ? "escalation-urgent" : "escalation",
+                            line: escalationLine(thread?.id ?? "", text, urgent),
+                            at,
+                            text,
+                            cause,
+                        },
+                        at,
+                        digest,
+                    );
+
+                    if (due !== undefined) {
+                        await startDigest(tx, supervisor, due);
+                    }
+
+                    return { queued: true as const };
+                }, context);
+
+                if ("error" in result) {
+                    throw new Error(result.error);
+                }
+
+                if ("dropped" in result) {
+                    await exportNow(api, context);
+
+                    return reply(
+                        `Not sent: ${result.dropped}. It is recorded on ${result.id}. Do not send it with team_message.`,
+                    );
+                }
+
+                await exportNow(api, context);
+
+                return reply(
+                    `Queued for ${boss}: ${urgent || digest.now.includes("escalation") || digest.minutes === 0 ? "at once" : "in the next digest"}.`,
+                );
+            }
+
             if (args.action === "send") {
                 const id = args.thread?.trim() ?? "";
                 const text = (args.text ?? "").trim();
@@ -29916,7 +30626,7 @@ export default function createDesk(host: Host, web: Web) {
                         return {
                             error: `${thread.id} is closed: there is no agent to message. ${
                                 persona.role === "clerk"
-                                    ? `For new work, escalate to ${boss} with team_message.`
+                                    ? `For new work, escalate to ${boss} with desk escalate.`
                                     : "For new work, use team_delegate; to put a question on it, use desk ask (it opens a done or failed thread again)."
                             }`,
                         };
