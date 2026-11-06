@@ -2,6 +2,8 @@
 
 Drop-in extensions for [Pi Pocket](https://github.com/TannerMidd/pi-pocket), written for Brian Ketelsen's own server and shared as they are. MIT license ([LICENSE](LICENSE)).
 
+Documentation site: https://bketelsen.github.io/pi-pocket-team/
+
 | Module           | Files                                | What it is                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | ---------------- | ------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Team**         | `team.ts`, `team-web/`               | Named agents in ordinary Pi Pocket sessions, a supervisor's delegation into their repositories, and each agent's own memory.                                                                                                                                                                                                                                                                                                                                                      |
@@ -271,7 +273,7 @@ Examples:
 
 `start 06:00` holds round 1 until the next 06:00 on the server's clock, so a goal set before bed can begin after the DeepSeek Flash peak hours (01:00–04:00 and 06:00–10:00 UTC). The start must be within 24 hours; `until` must be after it; `for` and the 24-hour limit count from it. The status line says "waiting until 06:00 EDT", and `/night-shift stop` cancels it.
 
-With `with deepseek/…` and no `start`, round 1 waits until the end of DeepSeek's peak hours (01:00–04:00 and 06:00–10:00 UTC): 04:00 UTC or 10:00 UTC on the same day. The label shows the server's clock, such as "05:00 EST". `for` counts from that start, `until` must be after it, and the status says "waiting until 05:00 EST (after DeepSeek's peak hours …)". An explicit `start` always wins.
+With `with deepseek/…` and no `start`, a goal set during DeepSeek's peak hours (01:00–04:00 and 06:00–10:00 UTC) waits until that window ends: 04:00 UTC or 10:00 UTC on the same day. Outside those hours, round 1 starts at once. The label shows the server's clock, such as "05:00 EST". `for` counts from that start, `until` must be after it, and the status says "waiting until 05:00 EST (after DeepSeek's peak hours …)". An explicit `start` always wins.
 
 A person's message during the wait does not cancel the goal: messages written then do not pause it at start. Plan mode at start pauses it, as before a round. The prompt section is off before round 1, because a person can talk to Pi during the wait. The wait is a restart-safe wait in the driver task's `wait` phase, so a restart neither starts round 1 early nor twice, and a server that was down past the start time starts round 1 at once.
 
@@ -361,7 +363,7 @@ Brian's 3 rules, which the code keeps:
 **Menu → Extensions → Model router**:
 
 - **`mode`**: `off`, or `shadow` (the default). `shadow` classifies and records; `off` records the line `Route: off (the router's mode is off); nothing changes` and calls nothing.
-- **`typesafeApiKey`**: the TypeSafe API key (a secret setting: it never leaves the server). It is also hidden from Pi's view with `host.hide`, so it shows as `[TYPESAFE_API_KEY]` in a tool result. Without a key, a route fails with "no TypeSafe key set", and the delegation goes on as before.
+- **`typesafeApiKey`**: the TypeSafe API key (a secret setting: the server sends it only to the fixed TypeSafe endpoint, as the `Authorization` header; see "What is sent"). It is also hidden from Pi's view with `host.hide`, so it shows as `[TYPESAFE_API_KEY]` in a tool result. Without a key, a route fails with "no TypeSafe key set", and the delegation goes on as before.
 
 ## What is sent
 

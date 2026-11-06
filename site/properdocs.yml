@@ -1,0 +1,105 @@
+# yaml-language-server: $schema=https://jaywhj.github.io/mkdocs-materialx/schema.json
+# The pi-pocket-team documentation site: ProperDocs with the MaterialX theme.
+# The layout comes from frostyard/core ADR-0070. `make site` builds it into
+# site/dist; `make site-serve` previews it at
+# http://127.0.0.1:8000/pi-pocket-team/.
+
+site_name: pi-pocket-team
+site_url: https://bketelsen.github.io/pi-pocket-team/
+site_description: "Drop-in extensions for Pi Pocket: named agents, a desk of background work, night shifts, a wiki page, a terminal page and a shadow model router."
+site_author: Brian Ketelsen
+copyright: pi-pocket-team is MIT licensed.
+
+repo_name: bketelsen/pi-pocket-team
+repo_url: https://github.com/bketelsen/pi-pocket-team
+edit_uri: edit/main/site/content/
+
+docs_dir: content
+site_dir: dist
+
+validation:
+  omitted_files: warn
+  absolute_links: warn
+  unrecognized_links: warn
+  anchors: warn
+
+nav:
+  - Home: index.md
+  - Get started:
+      - Install: getting-started/install.md
+  - Modules:
+      - Team: modules/team.md
+      - Homewiki: modules/homewiki.md
+      - Night shift: modules/night-shift.md
+      - Model router: modules/model-router.md
+      - Desk: modules/desk.md
+      - Terminal: modules/terminal.md
+  - Contributing:
+      - Build and test: contributing/build.md
+
+theme:
+  name: materialx
+  logo: assets/logo.svg
+  favicon: assets/logo.svg
+  language: en
+  font: false
+  # Frostyard surfaces are solid; no frosted-glass header.
+  topbar_style: primary
+  palette:
+    - scheme: slate
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+    - scheme: default
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+  features:
+    - content.action.edit
+    - content.code.copy
+    - navigation.footer
+    - navigation.sections
+    - navigation.tabs
+    - search.highlight
+    - search.share
+    - toc.follow
+
+plugins:
+  - search
+
+extra_css:
+  - stylesheets/frostyard.css
+
+extra:
+  generator: false
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/bketelsen/pi-pocket-team
+      name: pi-pocket-team on GitHub
+
+markdown_extensions:
+  - abbr
+  - admonition
+  - attr_list
+  - def_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.keys
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
