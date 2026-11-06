@@ -23,6 +23,7 @@ import {
     writeFileSync,
 } from "node:fs";
 import { createServer, type Server } from "node:http";
+import { open } from "node:fs/promises";
 import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
 import { createHandler } from "./_pocket/src/server/http.ts";
@@ -131,7 +132,7 @@ describe("readDeskFile: a writer that swaps the file between the checks and the 
         assert.ok(!("text" in read));
     });
 
-    test("the opened file swapped after the open: the name is no longer the descriptor's file, refused", async () => {
+    test("the check follows the descriptor, not the name: the name moved after the open still reads the opened file", async () => {
         const { at, file, out } = fresh();
         const read = await readDeskFile(at, file, {
             afterOpen: () => {
@@ -139,6 +140,30 @@ describe("readDeskFile: a writer that swaps the file between the checks and the 
                 symlinkSync(join(out, "x.md"), file);
             },
         });
+
+        assert.deepEqual(read, { text: "inside" });
+    });
+
+    test("an outside file opened, then an inside file put back at the name before the checks: refused", async () => {
+        const { at, file, out } = fresh();
+        const read = await readDeskFile(at, file, {
+            beforeOpen: () => {
+                renameSync(file, `${file}.old`);
+                symlinkSync(join(out, "x.md"), file);
+            },
+            afterOpen: () => {
+                rmSync(file);
+                writeFileSync(file, "inside again");
+            },
+        });
+
+        assert.equal((read as { status: number }).status, 400);
+        assert.ok(!("text" in read));
+    });
+
+    test("an opened file that is deleted before the checks is refused", async () => {
+        const { at, file } = fresh();
+        const read = await readDeskFile(at, file, { afterOpen: () => rmSync(file) });
 
         assert.equal((read as { status: number }).status, 400);
     });
@@ -155,15 +180,54 @@ describe("readDeskFile: a writer that swaps the file between the checks and the 
         assert.equal((read as { status: number }).status, 404);
     });
 
-    test("a file that grows past the limit after the size check is a 413", async () => {
+    test("a file that grows past the limit after the size check is a 413, and at most the limit + 1 byte is read", async () => {
         const { at, file } = fresh();
+        let consumed = 0;
+        // The real open, with a handle that counts every byte that `read` and `readFile` give back.
+        const counting = (async (...args: Parameters<typeof open>) => {
+            const handle = await open(...args);
+
+            return new Proxy(handle, {
+                get(target, key) {
+                    if (key === "read") {
+                        return async (...rest: unknown[]) => {
+                            const done = await (
+                                target.read as (...a: unknown[]) => Promise<{ bytesRead: number }>
+                            )(...rest);
+
+                            consumed += done.bytesRead;
+
+                            return done;
+                        };
+                    }
+
+                    if (key === "readFile") {
+                        return async (...rest: unknown[]) => {
+                            const bytes = await (
+                                target.readFile as (...a: unknown[]) => Promise<Buffer>
+                            )(...rest);
+
+                            consumed += bytes.length;
+
+                            return bytes;
+                        };
+                    }
+
+                    const value = Reflect.get(target, key, target) as unknown;
+
+                    return typeof value === "function" ? value.bind(target) : value;
+                },
+            });
+        }) as typeof open;
         const read = await readDeskFile(at, file, {
+            open: counting,
             beforeRead: () => {
-                appendFileSync(file, "x".repeat(DESK_FILE_MAX + 10));
+                appendFileSync(file, "x".repeat(4 * DESK_FILE_MAX));
             },
         });
 
         assert.equal((read as { status: number }).status, 413);
+        assert.ok(consumed <= DESK_FILE_MAX + 1, `read ${String(consumed)} bytes`);
     });
 });
 

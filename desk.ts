@@ -1153,11 +1153,12 @@ export function deskFileTarget(
 }
 
 /**
- * Read 1 desk file, bound to the descriptor that reads it: a writer that swaps the file, or a folder above it, for a
- * symlink out of the root between the checks and the read cannot make it read an outside file. The open does not block
- * (`O_NONBLOCK`: a FIFO cannot hang it), the descriptor must be a regular file, the real path of `file` must be in the
- * real root and be the same file as the descriptor (device and inode), and the read stops at `DESK_FILE_MAX` + 1 bytes.
- * The hooks run between the steps, for the race tests only.
+ * Read 1 desk file, bound to the descriptor that reads it. The open does not block (`O_NONBLOCK`: a FIFO cannot hang
+ * it), the descriptor must be a regular file, and the place of the descriptor's file (`/proc/self/fd/<fd>`, resolved by
+ * the kernel from the open file, not from its name again) must be in the real root. So a writer that swaps the name, or
+ * a folder above it, between the open and the checks cannot make it read an outside file. A deleted or unresolved
+ * target is refused. Linux only (`/proc`): elsewhere every read is refused. The read stops at `DESK_FILE_MAX` + 1 bytes.
+ * The hooks run between the steps, and `open` replaces the open, for the tests only.
  */
 export async function readDeskFile(
     root: string,
@@ -1166,6 +1167,7 @@ export async function readDeskFile(
         beforeOpen?: () => Promise<void> | void;
         afterOpen?: () => Promise<void> | void;
         beforeRead?: () => Promise<void> | void;
+        open?: typeof open;
     } = {},
 ): Promise<{ text: string } | { status: 400 | 404 | 413; error: string }> {
     const missing = { status: 404 as const, error: "There is no desk file" };
@@ -1183,7 +1185,7 @@ export async function readDeskFile(
     let handle: Awaited<ReturnType<typeof open>>;
 
     try {
-        handle = await open(file, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK);
+        handle = await (hooks.open ?? open)(file, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK);
     } catch {
         return missing;
     }
@@ -1197,21 +1199,16 @@ export async function readDeskFile(
             return { status: 404, error: "The desk path is not a file" };
         }
 
+        // Where the open file is now, from the descriptor: no second resolution of the name that a writer can swap.
         let real: string;
-        let named: { dev: number; ino: number };
 
         try {
-            real = await realpath(file);
-            named = await stat(real);
+            real = await realpath(`/proc/self/fd/${String(handle.fd)}`);
         } catch {
             return outside;
         }
 
-        if (
-            !real.startsWith(realRoot.endsWith(sep) ? realRoot : realRoot + sep) ||
-            named.dev !== facts.dev ||
-            named.ino !== facts.ino
-        ) {
+        if (!real.startsWith(realRoot.endsWith(sep) ? realRoot : realRoot + sep)) {
             return outside;
         }
 
