@@ -1717,6 +1717,28 @@ describe("the delivery of a task", () => {
         assert.match(state.threads.T1?.events.at(-1)?.text ?? "", /t1 delegated: T5/);
     });
 
+    test("a started task marks the plan thread handled by the delegation, and a replay changes no mark", () => {
+        const { state } = approvedPlan();
+
+        other(state, "T5");
+        assert(!("error" in startTask(state, "T1", "t1", "T5", tick(4), "Odrade")));
+        assert.deepEqual(state.threads.T1?.run.handled, {
+            at: tick(4),
+            by: "Odrade",
+            act: "delegate",
+        });
+        // A replay for the same thread binds nothing new: the mark stays.
+        assert(!("error" in startTask(state, "T1", "t1", "T5", tick(6), "Odrade")));
+        assert.equal((state.threads.T1?.run.handled as { at?: number }).at, tick(4));
+
+        // With no name, the mark says "supervisor".
+        const plain = approvedPlan().state;
+
+        other(plain, "T5");
+        assert(!("error" in startTask(plain, "T1", "t1", "T5", tick(4))));
+        assert.equal((plain.threads.T1?.run.handled as { by?: string }).by, "supervisor");
+    });
+
     /** The roster now: lucilla owns a repository made after the approval. */
     const NOW: PlanRoster[] = [
         {

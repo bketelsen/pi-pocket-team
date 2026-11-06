@@ -369,7 +369,7 @@ test("drop-in identities, named delegation, HTTP permissions, replay and restart
             await say(app, clerkSession, "Hello");
             assert.match(
                 requestContext,
-                /You are the desk clerk of your supervisor\. Desk digests arrive as messages whose lines start with \[desk\]\. Escalate to your supervisor with team_message to the return address in your first message\. A thread that desk read shows as Handled needs no escalation for its reports, because the supervisor acted after them\./,
+                /You are the desk clerk of your supervisor\. Desk digests arrive as messages whose lines start with \[desk\]\. Escalate to your supervisor with desk escalate: thread \(the thread it is about\), text, and urgent: true only for what must go at once\. The desk drops an escalation when the supervisor acted on the thread, or got its news directly, after the news that caused it, and records the drop on the thread\. Use team_message to your supervisor only to answer a task that it sent you\. A thread that desk read shows as Handled needs no escalation for its reports, because the supervisor acted after them\./,
             );
             assert.doesNotMatch(requestContext, /Named teammates:/, "a Clerk gets no roster");
         } finally {

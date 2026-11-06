@@ -27,7 +27,7 @@ A session with a supervisor identity uses `desk`; another session is refused.
 - `watch`, `result`: sleep a thread until a date or an event, and record the pass or the fail.
 - `archive`: the one-time sweep of the idle sessions of closed threads.
 
-An agent session can use `read`, `watch` and `result` on its own thread only. A Clerk has its own smaller list.
+An agent session can use `read`, `watch` and `result` on its own thread only. A Clerk has its own smaller list, and escalates to its supervisor with `desk escalate`: the desk drops an escalation of news the supervisor already acted on or got, and puts the rest in her next digest, or sends it at once with `urgent: true`.
 
 ## Asks, watches and the cap
 

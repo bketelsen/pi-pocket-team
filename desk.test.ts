@@ -139,6 +139,15 @@ import {
     markHandled,
     handledAfter,
     dropHandled,
+    countEscalations,
+    dropEscalations,
+    ESCALATION_CAUSE_MS,
+    escalationCause,
+    escalationDrop,
+    escalationLine,
+    escalationText,
+    mergeEscalations,
+    recordTold,
     dropStaleQueue,
     forgetDropped,
     watchDueAt,
@@ -2900,6 +2909,260 @@ describe("a quiet session after a supervisor's message", () => {
             false,
             "a watch",
         );
+    });
+});
+
+describe("the Clerk's escalations", () => {
+    const HOUR = 60 * 60_000;
+    const escalation = (
+        threadId: string,
+        text: string,
+        at: number,
+        urgent = false,
+        cause = at,
+    ): DigestItem => ({
+        key: `escalate:${threadId}:${text}`,
+        thread: threadId,
+        kind: urgent ? "escalation-urgent" : "escalation",
+        line: escalationLine(threadId, text, urgent),
+        at,
+        text,
+        cause,
+    });
+    const news = (threadId: string, kind: DigestKind, at: number): DigestItem => ({
+        key: `${threadId}:${kind}:${String(at)}`,
+        thread: threadId,
+        kind,
+        line: `[desk] ${threadId} · ${kind}`,
+        at,
+    });
+
+    test("an escalation is dropped when the supervisor acted on the thread after its cause", () => {
+        const marked = thread({ run: { handled: { at: 500, by: "Odrade", act: "send" } } });
+
+        assert.equal(
+            escalationDrop(marked, 400),
+            `the supervisor acted after its news: desk send at ${new Date(500).toISOString()}`,
+        );
+        assert.equal(escalationDrop(marked, 500), escalationDrop(marked, 400), "at the cause");
+        assert.equal(escalationDrop(marked, 501), undefined, "an act before the cause");
+    });
+
+    test("an escalation is dropped when the supervisor got the thread's news directly after its cause", () => {
+        const told = thread({ run: { told: { at: 700, kind: "report-blocked" } } });
+
+        assert.equal(
+            escalationDrop(told, 650),
+            `the supervisor got report-blocked news of it directly at ${new Date(700).toISOString()}`,
+        );
+        assert.equal(escalationDrop(told, 701), undefined);
+    });
+
+    test("an escalation stays when the supervisor did nothing, and one with no thread is never dropped", () => {
+        assert.equal(escalationDrop(thread(), 100), undefined);
+        assert.equal(escalationDrop(undefined, 100), undefined);
+        assert.deepEqual(
+            dropEscalations([escalation("", "no thread", 100)], { ...empty(), threads: {} })
+                .dropped,
+            [],
+        );
+    });
+
+    test("an acknowledgement does not set told; a direct kind does, and an older one never replaces a newer one", () => {
+        const state: DeskState = { ...empty(), threads: { T1: thread({ id: "T1" }) } };
+
+        recordTold(state, [news("T1", "answer", 900)], [], 1000);
+        assert.equal(state.threads.T1?.run.told, undefined, "answer names nothing to do");
+        recordTold(
+            state,
+            [
+                news("T1", "issue", 900),
+                escalation("T1", "x", 900),
+                news("T9", "repair", 900),
+                news("", "issue-left", 900),
+            ],
+            [],
+            1000,
+        );
+        assert.equal(state.threads.T1?.run.told, undefined, "issue and escalation kinds");
+        recordTold(state, [news("T1", "answer-action", 800)], [], 1000);
+        assert.deepEqual(state.threads.T1?.run.told, { at: 800, kind: "answer-action" });
+        recordTold(state, [news("T1", "repair", 700)], [], 1000);
+        assert.deepEqual(state.threads.T1?.run.told, { at: 800, kind: "answer-action" }, "older");
+        recordTold(state, [news("T1", "repair", 850)], [], 1000);
+        assert.deepEqual(state.threads.T1?.run.told, { at: 850, kind: "repair" });
+    });
+
+    test("the Clerk's news sets clerkNews, and an escalation soon after takes that news as its cause", () => {
+        const state: DeskState = { ...empty(), threads: { T1: thread({ id: "T1" }) } };
+
+        recordTold(state, [], [news("T1", "report", 300), news("T1", "closed", 400)], 1000);
+        assert.deepEqual(state.threads.T1?.run.clerkNews, { at: 400, sent: 1000 });
+
+        const one = state.threads.T1!;
+
+        assert.equal(escalationCause(one, 1000 + 10 * 60_000), 400, "10 minutes after the take");
+        assert.equal(escalationCause(one, 1000 + ESCALATION_CAUSE_MS), 400, "at 60 minutes");
+        // Older than 60 minutes: the call's time is the cause.
+        const late = 1000 + ESCALATION_CAUSE_MS + 1;
+
+        assert.equal(escalationCause(one, late), late);
+        assert.equal(escalationCause(undefined, late), late, "no thread");
+        // The supervisor acted at 500: after the news at 400, so an escalation of it soon after is dropped.
+        one.run.handled = { at: 500, by: "Odrade", act: "watch" };
+        assert.match(
+            escalationDrop(one, escalationCause(one, 1000 + HOUR / 2)) ?? "",
+            /desk watch/,
+        );
+        assert.equal(escalationDrop(one, escalationCause(one, late)), undefined, "a late call");
+    });
+
+    test("bad stored shapes of told, clerkNews and handled read as absent", () => {
+        for (const run of [
+            { told: "x" },
+            { told: null },
+            { told: [1, 2] },
+            { told: { at: "9", kind: "repair" } },
+            { told: { at: 9 } },
+            { handled: { at: 9, by: "Odrade" } },
+        ] as Record<string, JsonValue>[]) {
+            assert.equal(escalationDrop(thread({ run }), 1), undefined, JSON.stringify(run));
+        }
+
+        for (const clerkNews of ["x", null, [1], { at: 5 }, { at: 5, sent: "9" }] as JsonValue[]) {
+            assert.equal(escalationCause(thread({ run: { clerkNews } }), 100), 100);
+        }
+
+        // A bad mark is replaced by the next take.
+        const state: DeskState = {
+            ...empty(),
+            threads: { T1: thread({ id: "T1", run: { told: "x", clerkNews: [1] } }) },
+        };
+
+        recordTold(state, [news("T1", "repair", 5)], [news("T1", "report", 6)], 10);
+        assert.deepEqual(state.threads.T1?.run.told, { at: 5, kind: "repair" });
+        assert.deepEqual(state.threads.T1?.run.clerkNews, { at: 6, sent: 10 });
+    });
+
+    test("an urgent escalation wants now, also when the setting's now leaves it out", () => {
+        const config: DigestConfig = { minutes: 15, now: [], clerk: [] };
+        const state = empty();
+
+        assert.equal(
+            enqueueDigest(state, 1, escalation("T1", "now", 1000, true), 1000, config),
+            1000,
+        );
+        assert.equal(
+            enqueueDigest(state, 2, escalation("T1", "later", 1000), 1000, config),
+            1000 + 15 * 60_000,
+        );
+        assert.equal(
+            digestConfig(undefined).now.includes("escalation-urgent"),
+            true,
+            "in the default list",
+        );
+    });
+
+    test("splitDigest never gives an escalation to the Clerk, also when its setting lists the kind", () => {
+        const config: DigestConfig = {
+            minutes: 15,
+            now: [],
+            clerk: ["report", "escalation", "escalation-urgent"],
+        };
+        const items = [
+            news("T1", "report", 1),
+            escalation("T1", "a", 2),
+            escalation("T2", "b", 3, true),
+        ];
+        const split = splitDigest(items, true, config);
+
+        assert.deepEqual(
+            split.theirs.map((item) => item.kind),
+            ["report"],
+        );
+        assert.deepEqual(
+            split.ours.map((item) => item.kind),
+            ["escalation", "escalation-urgent"],
+        );
+    });
+
+    test("the escalations of 1 thread merge into 1 line; another thread's keeps its own", () => {
+        const merged = mergeEscalations([
+            escalation("T1", "first", 10),
+            news("T3", "repair", 11),
+            escalation("T2", "other", 12),
+            escalation("T1", "second", 13, true, 5),
+            escalation("", "loose 1", 14),
+            escalation("", "loose 2", 15),
+        ]);
+
+        assert.deepEqual(
+            merged.map((item) => item.line),
+            [
+                "[desk] T1 · the Clerk escalates (urgent) (2): first / second · desk read T1",
+                "[desk] T3 · repair",
+                "[desk] T2 · the Clerk escalates: other · desk read T2",
+                "[desk] the Clerk escalates (2): loose 1 / loose 2",
+            ],
+        );
+        assert.equal(merged[0]?.kind, "escalation-urgent");
+        assert.equal(merged[0]?.at, 13);
+        assert.equal(merged[0]?.cause, 5);
+        assert.equal(escalationText(" a\n\n b  c \r\nd "), "a | b c | d");
+    });
+
+    test("digestText keeps an escalation line of a thread closed in the same digest", () => {
+        const text = digestText([
+            news("T1", "report", 1),
+            escalation("T1", "look at it", 2),
+            { ...news("T1", "closed", 3), line: "[desk] T1 · closed · desk read T1" },
+        ]);
+
+        assert.match(text, /\[desk\] T1 · the Clerk escalates: look at it · desk read T1/);
+        assert.match(text, /\[desk\] T1 · closed · 1 report · desk read T1/);
+        assert.doesNotMatch(text, /\[desk\] T1 · report/);
+    });
+
+    test("the news of the same take does not drop an escalation of that take", () => {
+        const state: DeskState = { ...empty(), threads: { T1: thread({ id: "T1" }) } };
+        const ours = [news("T1", "repair", 900), escalation("T1", "the repair", 800)];
+        const checked = dropEscalations(ours, state);
+
+        assert.equal(checked.dropped.length, 0, "the marks from before the take");
+        recordTold(state, mergeEscalations(checked.kept), [], 1000);
+        assert.deepEqual(state.threads.T1?.run.told, { at: 900, kind: "repair" });
+        // At the next take, an escalation with an older cause is dropped.
+        const next = dropEscalations([escalation("T1", "again", 950, false, 850)], state);
+
+        assert.equal(next.kept.length, 0);
+        assert.match(next.dropped[0]?.reason ?? "", /got repair news of it directly/);
+    });
+
+    test("the counts keep the newest 60 days, and a bad stored value starts again", () => {
+        const state = empty();
+
+        for (let day = 1; day <= 62; day += 1) {
+            countEscalations(state, `2026-01-${String(day).padStart(3, "0")}`, { filed: 1 });
+        }
+
+        assert.equal(Object.keys(state.escalations?.days ?? {}).length, 60);
+        assert.equal(state.escalations?.days["2026-01-001"], undefined);
+        countEscalations(state, "2026-01-062", { dropped: 2, sent: 3, lines: 1 });
+        assert.deepEqual(state.escalations?.days["2026-01-062"], {
+            filed: 1,
+            urgent: 0,
+            dropped: 2,
+            sent: 3,
+            lines: 1,
+        });
+
+        const bad = { ...empty(), escalations: "x" } as unknown as DeskState;
+
+        countEscalations(bad, "2026-11-06", { urgent: 1 });
+        assert.deepEqual(bad.escalations, {
+            keys: [],
+            days: { "2026-11-06": { filed: 0, urgent: 1, dropped: 0, sent: 0, lines: 0 } },
+        });
     });
 });
 
@@ -9974,6 +10237,7 @@ describe("the digest's rules", () => {
             "plan-approved",
             "plan-verify",
             "plan-revise",
+            "escalation-urgent",
         ];
         const routine = ["report", "shift", "closed", "queue", "plan-decided"];
 
@@ -14153,6 +14417,8 @@ describe("the issue digest kinds", () => {
             "plan-verify",
             "plan-revise",
             "plan-decided",
+            "escalation",
+            "escalation-urgent",
         ]);
     });
 
@@ -24280,6 +24546,478 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
             }
         });
 
+        /** A Clerk session of `source`, registered on the desk by hand: no model start is needed for the tool. */
+        const handClerk = async (source: ConversationId, name: string) => {
+            writeClerk();
+            const session = await newSession(app, newFolder(name));
+
+            await command(session, "team-agent", "clerk");
+            await app.harness.commit(async (tx) => {
+                const state = await tx.doc(DeskThreads);
+
+                state.clerks = {
+                    ...(state.clerks ?? {}),
+                    [String(Number(source))]: {
+                        session: Number(session),
+                        address: `session-${name}`,
+                        agent: "clerk",
+                        at: Date.now(),
+                    },
+                };
+            }, context);
+
+            return session;
+        };
+
+        const unregister = async (source: ConversationId) => {
+            await app.harness.commit(async (tx) => {
+                delete (await tx.doc(DeskThreads)).clerks?.[String(Number(source))];
+            }, context);
+        };
+
+        /** The escalation counts of every day, summed. */
+        const escalationTotals = async () => {
+            const sum = { filed: 0, urgent: 0, dropped: 0, sent: 0, lines: 0 };
+
+            for (const day of Object.values((await deskState())?.escalations?.days ?? {})) {
+                sum.filed += day.filed;
+                sum.urgent += day.urgent;
+                sum.dropped += day.dropped;
+                sum.sent += day.sent;
+                sum.lines += day.lines;
+            }
+
+            return sum;
+        };
+
+        const textOf = (result: unknown) =>
+            (result as { output: { text: string }[] }).output.map((each) => each.text).join("\n");
+
+        test("a Clerk's escalation after the supervisor's desk send is dropped, recorded, and counted once", async () => {
+            const stub = stubDesk();
+            const { source, thread } = await delegated("escalate-drop");
+
+            try {
+                const clerk = await handClerk(source, "escalate-drop-clerk");
+                const before = await escalationTotals();
+                const news = Date.now() - 2000;
+
+                // The Clerk got the thread's report in a digest a moment ago; the supervisor then sent to the agent.
+                await app.harness.commit(async (tx) => {
+                    (await tx.doc(DeskThreads)).threads[thread.id]!.run.clerkNews = {
+                        at: news,
+                        sent: news + 1000,
+                    };
+                }, context);
+                await stub.tool(
+                    { action: "send", thread: thread.id, text: "Check the merge." },
+                    Number(source),
+                    "task-send",
+                    "call-send",
+                );
+
+                const escalate = () =>
+                    stub.tool(
+                        { action: "escalate", thread: thread.id, text: "T is done:\nmerge it?" },
+                        Number(clerk),
+                        "task-esc",
+                        "call-drop",
+                    );
+                const first = textOf(await escalate());
+
+                assert.match(
+                    first,
+                    new RegExp(
+                        `^Not sent: the supervisor acted after its news: desk send at .*Z\\. It is recorded on ${thread.id}\\. Do not send it with team_message\\.$`,
+                    ),
+                );
+
+                const after = await deskState();
+                const events = after?.threads[thread.id]?.events.filter(
+                    (event) => event.key === "escalate-drop:x.desk.escalate:task-esc:call-drop",
+                );
+
+                assert.equal(events?.length, 1);
+                assert.match(
+                    events?.[0]?.text ?? "",
+                    /^Clerk escalation dropped: the supervisor acted after its news: desk send at .*: T is done: \| merge it\?$/,
+                );
+                assert.equal(
+                    (after?.digests?.[String(Number(source))]?.items ?? []).filter((item) =>
+                        item.key.startsWith("escalate:"),
+                    ).length,
+                    0,
+                    "no digest item",
+                );
+
+                const counted = await escalationTotals();
+
+                assert.equal(counted.filed - before.filed, 1);
+                assert.equal(counted.dropped - before.dropped, 1);
+
+                // A replay of the same call: the same reply, and nothing added.
+                assert.equal(textOf(await escalate()), first);
+                assert.deepEqual(await escalationTotals(), counted);
+                assert.equal(
+                    (await deskState())?.threads[thread.id]?.events.filter((event) =>
+                        event.key.startsWith("escalate-drop:"),
+                    ).length,
+                    1,
+                );
+            } finally {
+                await unregister(source);
+                stub.restore();
+                removeClerk();
+            }
+        });
+
+        test("a kept escalation goes in the supervisor's next digest, and the Clerk gets nothing of it", async () => {
+            const stub = stubDesk();
+            const { source, linked, thread } = await delegated("escalate-keep");
+
+            try {
+                const clerk = await handClerk(source, "escalate-keep-clerk");
+
+                await until(() => !app.isBusy(linked), "the linked session to settle", 20_000);
+
+                const before = await escalationTotals();
+                const call = () =>
+                    stub.tool(
+                        { action: "escalate", thread: thread.id, text: "Its PR waits for Brian." },
+                        Number(clerk),
+                        "task-esc",
+                        "call-keep",
+                    );
+
+                // The digest is at 0 minutes in these tests: the wanted time is now.
+                assert.equal(textOf(await call()), "Queued for Odrade: at once.");
+                await until(
+                    async () =>
+                        (await modelTexts(app, source))
+                            .join("\n")
+                            .includes(
+                                `[desk] ${thread.id} · the Clerk escalates: Its PR waits for Brian. · desk read ${thread.id}`,
+                            ),
+                    "the supervisor's digest",
+                    20_000,
+                );
+                assert.equal(
+                    (await modelTexts(app, clerk)).some((each) => each.includes("escalates")),
+                    false,
+                    "the Clerk gets nothing of it",
+                );
+
+                const after = await deskState();
+
+                assert(
+                    after?.threads[thread.id]?.events.some(
+                        (event) =>
+                            event.key === "escalate:x.desk.escalate:task-esc:call-keep" &&
+                            event.text === "Clerk escalation queued: Its PR waits for Brian.",
+                    ),
+                    "the queued event",
+                );
+                assert.equal(after?.threads[thread.id]?.run.told, undefined, "no told mark");
+
+                const counted = await escalationTotals();
+
+                assert.equal(counted.filed - before.filed, 1);
+                assert.equal(counted.sent - before.sent, 1);
+                assert.equal(counted.lines - before.lines, 1);
+
+                // A replay: the same reply, no second item, no second count.
+                assert.equal(textOf(await call()), "Queued for Odrade: at once.");
+                assert.deepEqual(await escalationTotals(), counted);
+                assert.equal(
+                    (await deskState())?.threads[thread.id]?.events.filter((event) =>
+                        event.key.startsWith("escalate:"),
+                    ).length,
+                    1,
+                );
+            } finally {
+                await stopDigests();
+                await unregister(source);
+                stub.restore();
+                removeClerk();
+            }
+        });
+
+        test("an urgent escalation starts a digest due now, and takes the waiting escalation of its thread in 1 line", async () => {
+            const stub = stubDesk();
+
+            digestMinutes(15);
+
+            const { source, linked, thread } = await delegated("escalate-urgent");
+
+            try {
+                const clerk = await handClerk(source, "escalate-urgent-clerk");
+
+                await until(() => !app.isBusy(linked), "the linked session to settle", 20_000);
+                await clearDigests();
+
+                const start = Date.now();
+
+                assert.equal(
+                    textOf(
+                        await stub.tool(
+                            { action: "escalate", thread: thread.id, text: "first" },
+                            Number(clerk),
+                            "task-esc",
+                            "call-later",
+                        ),
+                    ),
+                    "Queued for Odrade: in the next digest.",
+                );
+
+                const box = (await deskState())?.digests?.[String(Number(source))];
+
+                assert.equal(box?.items.at(-1)?.kind, "escalation");
+                assert((box?.scheduled[0] ?? 0) >= start + 15 * 60_000, "due in 15 minutes");
+
+                assert.equal(
+                    textOf(
+                        await stub.tool(
+                            {
+                                action: "escalate",
+                                thread: thread.id,
+                                text: "second",
+                                urgent: true,
+                            },
+                            Number(clerk),
+                            "task-esc",
+                            "call-now",
+                        ),
+                    ),
+                    "Queued for Odrade: at once.",
+                );
+                await until(
+                    async () =>
+                        (await modelTexts(app, source))
+                            .join("\n")
+                            .includes(
+                                `[desk] ${thread.id} · the Clerk escalates (urgent) (2): first / second · desk read ${thread.id}`,
+                            ),
+                    "the urgent digest",
+                    20_000,
+                );
+            } finally {
+                await stopDigests();
+                digestMinutes(0);
+                await unregister(source);
+                stub.restore();
+                removeClerk();
+            }
+        });
+
+        test("the take drops a waiting escalation when the supervisor acted on its thread after the call", async () => {
+            const stub = stubDesk();
+
+            digestMinutes(15);
+
+            const { source, linked, thread } = await delegated("escalate-take");
+
+            try {
+                const clerk = await handClerk(source, "escalate-take-clerk");
+
+                await until(() => !app.isBusy(linked), "the linked session to settle", 20_000);
+                await clearDigests();
+
+                const before = await escalationTotals();
+
+                await stub.tool(
+                    { action: "escalate", thread: thread.id, text: "waits" },
+                    Number(clerk),
+                    "task-esc",
+                    "call-wait",
+                );
+                // The supervisor acts on the thread after the call: the waiting escalation repeats known news.
+                await app.harness.commit(async (tx) => {
+                    markHandled((await tx.doc(DeskThreads)).threads[thread.id]!, {
+                        at: Date.now() + 1,
+                        by: "Odrade",
+                        act: "send",
+                    });
+                }, context);
+                // An urgent escalation with no thread takes the box now.
+                await stub.tool(
+                    { action: "escalate", text: "no thread", urgent: true },
+                    Number(clerk),
+                    "task-esc",
+                    "call-loose",
+                );
+                await until(
+                    async () =>
+                        (await modelTexts(app, source))
+                            .join("\n")
+                            .includes("[desk] the Clerk escalates (urgent): no thread"),
+                    "the urgent digest",
+                    20_000,
+                );
+
+                const texts = (await modelTexts(app, source)).join("\n");
+
+                assert.match(texts, /\[desk\] digest: 1 new\./);
+                assert.doesNotMatch(texts, /the Clerk escalates: waits/);
+                assert(
+                    (await deskState())?.threads[thread.id]?.events.some(
+                        (event) =>
+                            event.key ===
+                                "escalate-drop:escalate:x.desk.escalate:task-esc:call-wait" &&
+                            /^Clerk escalation dropped: the supervisor acted after its news: desk send at .*: waits$/.test(
+                                event.text,
+                            ),
+                    ),
+                    "the drop is recorded on the thread",
+                );
+
+                const counted = await escalationTotals();
+
+                assert.equal(counted.filed - before.filed, 2);
+                assert.equal(counted.urgent - before.urgent, 1);
+                assert.equal(counted.dropped - before.dropped, 1);
+                assert.equal(counted.sent - before.sent, 1);
+                assert.equal(counted.lines - before.lines, 1);
+            } finally {
+                await stopDigests();
+                digestMinutes(0);
+                await unregister(source);
+                stub.restore();
+                removeClerk();
+            }
+        });
+
+        test("escalate is refused to a supervisor, to an agent, and to a Clerk on another supervisor's thread", async () => {
+            const stub = stubDesk();
+            const { source, linked, thread } = await delegated("escalate-refuse");
+            const { thread: other } = await delegated("escalate-refuse-other");
+
+            try {
+                const clerk = await handClerk(source, "escalate-refuse-clerk");
+                const before = JSON.stringify((await deskState())?.escalations ?? null);
+
+                await assert.rejects(
+                    () =>
+                        stub.tool(
+                            { action: "escalate", thread: thread.id, text: "x" },
+                            Number(source),
+                        ),
+                    /Only a Clerk escalates, to its supervisor\. A supervisor escalates to nobody/,
+                );
+                await assert.rejects(
+                    () =>
+                        stub.tool(
+                            { action: "escalate", thread: thread.id, text: "x" },
+                            Number(linked),
+                        ),
+                    /Only a session assigned a supervisor identity can use the desk\. An agent can use only read, watch, and result/,
+                );
+                await assert.rejects(
+                    () =>
+                        stub.tool(
+                            { action: "escalate", thread: other.id, text: "x" },
+                            Number(clerk),
+                        ),
+                    new RegExp(`${other.id} is another supervisor's thread`),
+                );
+                await assert.rejects(
+                    () => stub.tool({ action: "escalate", text: "  \n " }, Number(clerk)),
+                    /escalate needs text: 1 to 2000 characters for the supervisor\./,
+                );
+                assert.equal(
+                    JSON.stringify((await deskState())?.escalations ?? null),
+                    before,
+                    "a refusal counts nothing",
+                );
+            } finally {
+                await unregister(source);
+                stub.restore();
+                removeClerk();
+            }
+        });
+
+        test("a supervisor's attach and detach mark the threads they changed, and a call that changed nothing marks none", async () => {
+            const stub = stubDesk();
+            const { source, thread } = await delegated("handled-attach");
+            const { thread: merged } = await delegated("handled-attach-source");
+
+            try {
+                // The source thread is the same supervisor's: move it there.
+                await app.harness.commit(async (tx) => {
+                    const state = await tx.doc(DeskThreads);
+
+                    state.threads[merged.id]!.supervisor = Number(source);
+                    state.threads[thread.id]!.prs["frostyard/test#71"] = {
+                        state: "OPEN",
+                    } as never;
+                }, context);
+                await stub.tool(
+                    { action: "attach", ref: merged.id, thread: thread.id },
+                    Number(source),
+                    "task-attach",
+                    "call-attach",
+                );
+
+                const after = await deskState();
+
+                assert.equal(
+                    (after?.threads[thread.id]?.run.handled as { act?: string }).act,
+                    "attach",
+                );
+                assert.equal(
+                    (after?.threads[merged.id]?.run.handled as { act?: string }).act,
+                    "attach",
+                );
+
+                const mark = after?.threads[merged.id]?.run.handled;
+
+                // The detach below may share the attach's millisecond: an equal time keeps the older mark.
+                await app.harness.commit(async (tx) => {
+                    delete (await tx.doc(DeskThreads)).threads[thread.id]!.run.handled;
+                }, context);
+
+                // Again: the source is closed, nothing moved, and its mark stays.
+                await stub.tool(
+                    { action: "attach", ref: merged.id, thread: thread.id },
+                    Number(source),
+                    "task-attach",
+                    "call-again",
+                );
+                assert.deepEqual((await deskState())?.threads[merged.id]?.run.handled, mark);
+                assert.equal(
+                    (await deskState())?.threads[thread.id]?.run.handled,
+                    undefined,
+                    "an attach that changed nothing marks nothing",
+                );
+
+                await stub.tool(
+                    { action: "detach", ref: "frostyard/test#71", thread: thread.id },
+                    Number(source),
+                    "task-detach",
+                    "call-detach",
+                );
+
+                const detached = (await deskState())?.threads[thread.id]?.run.handled as {
+                    at: number;
+                    act?: string;
+                };
+
+                assert.equal(detached.act, "detach");
+                // Again: the PR is not on it, nothing changed, and no new mark.
+                await stub.tool(
+                    { action: "detach", ref: "frostyard/test#71", thread: thread.id },
+                    Number(source),
+                    "task-detach",
+                    "call-detach-again",
+                );
+                assert.deepEqual((await deskState())?.threads[thread.id]?.run.handled, detached);
+            } finally {
+                stub.restore();
+                await app.harness.commit(async (tx) => {
+                    delete (await tx.doc(DeskThreads)).dropped?.["frostyard/test#71"];
+                }, context);
+            }
+        });
+
         test("a long watch result is cut to 200 characters, and an empty one is refused", async () => {
             const stub = stubDesk();
 
@@ -24535,7 +25273,7 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
                     await say(app, clerkSession, words);
                     assert.match(
                         (await modelTexts(app, clerkSession)).join("\n"),
-                        /Only the supervisor files asks, records Brian's answers, and seeds the desk\. Escalate to Odrade with team_message\./,
+                        /Only the supervisor files asks, records Brian's answers, and seeds the desk\. Escalate to Odrade with desk escalate\./,
                         words,
                     );
                 }
@@ -24554,7 +25292,7 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
                 await say(app, clerkSession, "clerk own test");
                 assert.match(
                     (await modelTexts(app, clerkSession)).join("\n"),
-                    /Only the supervisor marks a thread as Brian's own\. Escalate to Odrade with team_message\./,
+                    /Only the supervisor marks a thread as Brian's own\. Escalate to Odrade with desk escalate\./,
                 );
 
                 const afterOwn = (await deskState())?.threads[thread.id];
@@ -24613,7 +25351,7 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
                 await say(app, clerkSession, "clerk send test");
                 assert.match(
                     (await modelTexts(app, clerkSession)).join("\n"),
-                    /is closed: there is no agent to message\. For new work, escalate to Odrade with team_message\./,
+                    /is closed: there is no agent to message\. For new work, escalate to Odrade with desk escalate\./,
                 );
 
                 // The bash hook blocks a merge in the Clerk's session.
@@ -25871,7 +26609,7 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
                 for (const args of [{ action: "archive" }, { action: "archive", apply: true }]) {
                     await assert.rejects(
                         () => stub.tool(args, Number(clerk)),
-                        /Only the supervisor archives sessions\. Escalate to Odrade with team_message\./,
+                        /Only the supervisor archives sessions\. Escalate to Odrade with desk escalate\./,
                     );
                 }
 

@@ -41,8 +41,12 @@ digest, the desk splits the items:
   `["report", "shift", "closed", "queue"]`. A kind in `digest.now` always goes to the supervisor.
 - When the Clerk's session cannot take a message (it is gone, or held back), its items go to the
   supervisor in the same digest, with 1 notice.
-- Escalations from the Clerk to Odrade are ordinary `team_message`s to its return address: they wake her
-  at once. The Clerk sends at most 1 escalation for each digest it gets, with every item in it.
+- Escalations from the Clerk to Odrade go through `desk escalate` (since 2026-11-06; before, they were
+  `team_message`s that woke her at once). The desk drops an escalation that repeats news she has (Section
+  4), and puts every other one in her next digest as the kind `escalation`. An escalation with
+  `urgent: true` is the kind `escalation-urgent`: it goes at once, also when `digest.now` leaves it out.
+  The escalations of 1 thread in 1 digest go as 1 line; so do all the escalations with no thread. An
+  escalation kind never goes to the Clerk, also when `digest.clerk` names it.
 
 ## 4. What the Clerk does, and what it escalates
 
@@ -62,7 +66,8 @@ The Clerk handles, with no message to Odrade:
 6. **A handled report.** When `desk read` shows `Handled:`, the supervisor acted on the thread after its
    newest report, so that report needs no escalation: the digest leaves it out, and the Clerk does too.
 
-It escalates to Odrade (1 `team_message`, 1 line for each item, with the thread id and why):
+It escalates to Odrade with `desk escalate` (1 call for each item: `thread`, `text` with why, and
+`urgent: true` only for what must go at once):
 
 - a new plan, a brief, or new work for an agent (only Odrade delegates);
 - the muster, the morning brief, and anything Brian must hear;
@@ -73,6 +78,20 @@ It escalates to Odrade (1 `team_message`, 1 line for each item, with the thread 
 - a silent session whose last answer is not a report;
 - anything it is not sure of.
 
+The drop rule (`escalationDrop` in `desk.ts`). The cause of an escalation is the time of the news that
+caused it: when the Clerk got the thread's news in a digest taken at most 60 minutes before the call, the
+newest item time of that news (`clerkNews`); else the call's time. The desk drops the escalation when:
+
+- the supervisor acted on the thread with a `desk` action at or after the cause (`handled`: send, watch,
+  result, ask, answer, rewrite, withdraw, attach, detach, or a plan task's delegation); or
+- the supervisor got news of the thread directly in her own digest at or after the cause (`told`); an
+  acknowledgement (`answer`), the issue kinds and the escalation kinds never count.
+
+An escalation with no thread is never dropped. The rule runs at the call, and again when the digest takes
+the item (with the marks from before that take, so news in the same message never drops it). Each drop
+adds an event on the thread (`Clerk escalation dropped: <reason>: <text>`) and a count; the call's reply
+says `Not sent: <reason>` and that the Clerk must not send it with `team_message`.
+
 ## 5. Tools and limits
 
 | Tool                                                                       | The Clerk                                                         |
@@ -80,9 +99,10 @@ It escalates to Odrade (1 `team_message`, 1 line for each item, with the thread 
 | `desk` list, read, sync                                                    | yes, for its supervisor's threads                                 |
 | `desk` attach, detach, watch, result                                       | yes, on its supervisor's threads                                  |
 | `desk send` (new)                                                          | yes: 1 message to a thread's agent, from the supervisor's session |
+| `desk escalate`                                                            | yes: Clerk only, 1 escalation to its supervisor (Section 4)       |
 | `desk` ask, answer, seed, own                                              | **refused**: `own`, asks, and Brian's words are Odrade's          |
 | `team_delegate`                                                            | **refused** (supervisor only, as today)                           |
-| `team_message`                                                             | yes: to its return address (Odrade), for escalations              |
+| `team_message`                                                             | only to answer a task that Odrade sent it; never to escalate      |
 | `bash`, `read`, `edit`, `write`                                            | yes, in its workspace                                             |
 | `gh pr merge`, `gh pr review`, `gh release`, `git tag`, `git push --force` | **blocked** by a hook in the Clerk's session                      |
 
@@ -134,8 +154,10 @@ reads only what needs her judgement. Be brief, exact, and quiet.
 
 ## Escalate to Odrade
 
-Send Odrade 1 `team_message` to your return address for each digest that has work for her: 1 line for
-each item, with the thread id and why. Escalate new plans, briefs and new work, the muster, conflicts,
+Escalate to Odrade with `desk escalate`: `thread` (the thread it is about), `text` (why), and
+`urgent: true` only for what must go at once. The desk drops an escalation when Odrade acted on the
+thread, or got its news directly, after the news that caused it, and records the drop on the thread. Use
+`team_message` to Odrade only to answer a task that she sent you. Escalate new plans, briefs and new work, the muster, conflicts,
 anything that needs an ask to Brian, a report that is blocked or failed or asks for a decision, found
 sessions and folders, silent sessions, and anything you are not sure of. A thread that `desk read` shows
 as `Handled` needs no escalation for its reports, because the supervisor acted after them. When nothing
@@ -156,6 +178,15 @@ never send Brian a message. Write to Odrade in ASD-STE100.
 - `team_delegate` refuses a `night_shift` or a `watch` for the Clerk: it has no desk thread.
 - The desk API has 2 new members: `clerk` (register) and `clerkOf` (the read before a start).
 - `desk send` uses the key `x.desk.send:<task>:<call>`: a replay sends once.
+- `desk escalate` (2026-11-06) uses the key `x.desk.escalate:<task>:<call>`. Its 1 commit records the key
+  in `DeskState.escalations.keys` (the last 200), the counts, the event and the digest item: a replay finds
+  the key, changes nothing, and gives the same kind of reply. The stored fields are new and optional:
+  `DigestItem.text` and `DigestItem.cause` (the escalation's text and cause), `Thread.run.told`
+  (`{ at, kind }`), `Thread.run.clerkNews` (`{ at, sent }`), and `DeskState.escalations`
+  (`{ keys, days }`: by local day, the newest 60, `filed`, `urgent`, `dropped`, `sent`, `lines`). The 2
+  digest kinds `escalation` and `escalation-urgent` are new, at the end of the list. The digest's `take`
+  commit drops, merges, and records `told`, `clerkNews` and the counts with the take, so a restart in
+  `deliver` sends the same text once.
 - The digest's split happens in the `take` commit: each target gets its own request id
   (`x.desk.digest:<supervisor>:<seq>` and `…:<seq>:clerk`), so a restart in `deliver` sends each once.
 - The sweep never makes a found thread of the Clerk's session: its address counts as known.
