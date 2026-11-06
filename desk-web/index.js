@@ -1,6 +1,7 @@
 // The Desk page: Brian's inbox for the work the team runs in the background. Phone first, one column. Everything here
 // is owner-only: the page, its routes, and the rail badge.
 
+import { renderAskText } from "./ask-text.js";
 import { makeDashboard } from "./dashboard.js";
 
 export const pocketApi = 1;
@@ -144,6 +145,59 @@ export const planAskLine = (ask) => {
     const answer = ask.answer === undefined ? "" : ` → ${ask.answer.words} (${ask.answer.by})`;
 
     return `${ask.id}: ${ask.text}${answer}${ask.written ? "" : " · not written"}`;
+};
+
+/**
+ * The part of a plan ask's line after its text: `planAskLine(ask)` is `${ask.id}: ${ask.text}` and this. The plan ask
+ * card shows the text as Markdown, and this part as plain text after it.
+ */
+export const planAskTail = (ask) => planAskLine(ask).slice(`${ask.id}: ${ask.text}`.length);
+
+/**
+ * How a tap on `artifact:<id>` opens it: the session of the thread's supervisor, and a notice that names the artifact.
+ * Pocket has no public API to open an artifact of another session, so this is the smallest supported way: open the
+ * session with `openConversation`, and say where the artifact is. Without a known supervisor, or an app without
+ * `openConversation`, a warning says so. `supervisor` is a conversation id, or undefined.
+ */
+export const openArtifactIn = (pocket, supervisor, id) => {
+    const notify = (level, message) =>
+        typeof pocket.notify === "function" ? pocket.notify(level, message) : undefined;
+
+    if (
+        supervisor === undefined ||
+        supervisor === null ||
+        typeof pocket.openConversation !== "function"
+    ) {
+        notify(
+            "warning",
+            `The session of artifact ${id} is not known: open the supervisor's session, then Artifacts.`,
+        );
+
+        return false;
+    }
+
+    pocket.openConversation(supervisor);
+    notify("info", `Open Artifacts, then ${id}.`);
+
+    return true;
+};
+
+/**
+ * How a tap on a desk path opens it: the Desk file sheet, or a notice with the path when the app has no sheets.
+ * `hasSheet`: the module added the sheet in `setup`.
+ */
+export const openPathIn = (pocket, hasSheet, path) => {
+    if (hasSheet && typeof pocket.openSheet === "function") {
+        pocket.openSheet("file", { path });
+
+        return true;
+    }
+
+    if (typeof pocket.notify === "function") {
+        pocket.notify("info", `Desk file: ${path}`);
+    }
+
+    return false;
 };
 
 // ─── Plan acts: their keys, the marks matrix, and the New plan form ─────────
@@ -792,6 +846,73 @@ export default function setup(pocket) {
     // The owner-only Dashboard view: the page is owner-only, and so is its route.
     const Dashboard = makeDashboard(pocket);
 
+    /**
+     * The Desk file sheet: 1 desk file (a report, a plan, a decision) from a path in an ask, read only. It reads
+     * `GET file`, and shows the text with the app's Markdown, or as plain text in an app without it.
+     */
+    function FileSheet({ path }) {
+        const [file, setFile] = useState(null);
+        const [error, setError] = useState("");
+
+        useEffect(() => {
+            const abort = new AbortController();
+
+            setFile(null);
+            setError("");
+            pocket
+                .api(`file?path=${encodeURIComponent(path ?? "")}`, undefined, {
+                    signal: abort.signal,
+                })
+                .then(
+                    (answer) => setFile(answer),
+                    (failure) => {
+                        if (!abort.signal.aborted) {
+                            setError(failure.message);
+                        }
+                    },
+                );
+
+            return () => abort.abort();
+        }, [path]);
+
+        const Markdown = typeof pocket.Markdown === "function" ? pocket.Markdown : null;
+
+        return html`<div class="desk desk-file">
+            <h2 class="desk-file-path mono">${path}</h2>
+            ${
+                error
+                    ? html`<p class="desk-warn" role="alert">${error}</p>`
+                    : file === null
+                      ? html`<${Loader} label="Opening the file" />`
+                      : Markdown === null
+                        ? html`<pre class="desk-report">${file.text}</pre>`
+                        : html`<div class="desk-file-text"><${Markdown} text=${file.text} /></div>`
+            }
+        </div>`;
+    }
+
+    const hasFileSheet = typeof pocket.sheet === "function";
+
+    if (hasFileSheet) {
+        pocket.sheet({ id: "file", title: "Desk file", component: FileSheet });
+    }
+
+    /** A tap on a desk path in an ask. */
+    const openPath = (path) => openPathIn(pocket, hasFileSheet, path);
+
+    /**
+     * An ask's text as safe Markdown. `supervisor` is the conversation of the thread's supervisor: a tap on
+     * `artifact:<id>` opens it.
+     */
+    const askText = (text, supervisor) =>
+        renderAskText(html, text, {
+            openArtifact: (id) => openArtifactIn(pocket, supervisor, id),
+            openPath,
+        });
+
+    /** The supervisor of a thread in the threads view, by its id: the plan view has none of its own. */
+    const supervisorOf = (id) => view?.threads?.find((thread) => thread.id === id)?.supervisor;
+
     const time = (at) => new Date(at).toLocaleString();
 
     /** A clock time, as the queue's "read 19:02" shows it. */
@@ -1276,7 +1397,10 @@ export default function setup(pocket) {
 
         /** 1 ask card: the question, its options and marks, Brian's answer and why, or the answer with Reopen. */
         const askCard = (ask) => html`<div class="desk-plan-ask">
-            <div class="small">${planAskLine(ask)}</div>
+            <div class="small desk-ask-line">
+                <span class="desk-id">${ask.id}:</span> ${askText(ask.text, supervisorOf(plan.id))}
+                ${planAskTail(ask) === "" ? null : html`<span class="muted"> ${planAskTail(ask).trim()}</span>`}
+            </div>
             ${
                 (ask.history ?? []).length === 0
                     ? null
@@ -1945,7 +2069,8 @@ export default function setup(pocket) {
                                   : html`<ul class="desk-list">
                                         ${thread.asks.map(
                                             (ask) => html`<li>
-                                                <span class="desk-id">${ask.id}</span> ${ask.text}
+                                                <span class="desk-id">${ask.id}</span>
+                                                ${askText(ask.text, thread.supervisor)}
                                                 ${ask.from ? html`<div class="small">from ${ask.from}</div>` : null}
                                             </li>`,
                                         )}
@@ -1958,7 +2083,8 @@ export default function setup(pocket) {
                                         <ul class="desk-list">
                                             ${thread.resolved.map(
                                                 (ask) => html`<li>
-                                                    <span class="desk-id">${ask.id}</span> ${ask.text}
+                                                    <span class="desk-id">${ask.id}</span>
+                                                    ${askText(ask.text, thread.supervisor)}
                                                     <div class="small">
                                                         ${ask.by ? `withdrawn by ${ask.by}` : "by the desk"}:
                                                         ${ask.why}
@@ -1974,7 +2100,8 @@ export default function setup(pocket) {
                                         <ul class="desk-list">
                                             ${thread.answered.map(
                                                 (ask) => html`<li>
-                                                    <span class="desk-id">${ask.id}</span> ${ask.text}
+                                                    <span class="desk-id">${ask.id}</span>
+                                                    ${askText(ask.text, thread.supervisor)}
                                                     <div class="small">${ask.by}: “${ask.words}”</div>
                                                 </li>`,
                                             )}
@@ -2814,13 +2941,10 @@ export default function setup(pocket) {
             html`<div class="desk-need">
                 ${thread.asks.map(
                     (ask) => html`<div class="desk-ask">
-                        <p class="small">
-                            ${ask.id}${ask.from ? ` · from ${ask.from}` : ""} · ${ask.text}${
-                                ask.options && ask.options.length > 0
-                                    ? ` [${ask.options.join(" | ")}]`
-                                    : ""
-                            }
+                        <p class="small muted desk-ask-from">
+                            ${ask.id}${ask.from ? ` · from ${ask.from}` : ""}
                         </p>
+                        ${askText(ask.text, thread.supervisor)}
                         ${
                             ask.options && ask.options.length > 0
                                 ? html`<div class="desk-actions">

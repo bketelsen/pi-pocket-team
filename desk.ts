@@ -19,9 +19,19 @@
  */
 import { execFile } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { access, lstat, mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import {
+    access,
+    lstat,
+    mkdir,
+    open,
+    readFile,
+    realpath,
+    rename,
+    stat,
+    writeFile,
+} from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join } from "node:path";
+import { dirname, isAbsolute, join, sep } from "node:path";
 import { promisify } from "node:util";
 import type { Context, JsonValue } from "@earendil-works/chord";
 import { Type } from "@earendil-works/pi-ai";
@@ -1087,6 +1097,58 @@ export function threadById(state: Readonly<DeskState> | undefined, id: string): 
     const key = id.trim().replace(/^#/, "").toUpperCase();
 
     return Object.hasOwn(threads, key) ? threads[key] : undefined;
+}
+
+/** The folders a desk path starts with: each is beside the export folder. `desk-web/ask-text.js` has the same list. */
+export const DESK_PATH_ROOTS = ["reports", "desk", "plans", "decisions"] as const;
+/** The longest desk path, in characters. */
+export const DESK_PATH_MAX = 200;
+/** The largest file `GET file` reads, in bytes. */
+export const DESK_FILE_MAX = 256 * 1024;
+
+/**
+ * Whether a text is a desk path: relative, under 1 of `DESK_PATH_ROOTS`, ending in `.md`, at most 200 characters, each
+ * segment `[A-Za-z0-9_][A-Za-z0-9._-]*` (so no `.` or `..` segment and no hidden file). The same rule as `deskPath` in
+ * `desk-web/ask-text.js`, which makes the tap targets of the Desk page.
+ */
+export function isDeskPath(text: unknown): text is string {
+    if (typeof text !== "string" || text.length === 0 || text.length > DESK_PATH_MAX) {
+        return false;
+    }
+
+    const segments = text.split("/");
+
+    return (
+        segments.length >= 2 &&
+        (DESK_PATH_ROOTS as readonly string[]).includes(segments[0] ?? "") &&
+        segments.every((segment) => /^[A-Za-z0-9_][A-Za-z0-9._-]*$/.test(segment)) &&
+        text.endsWith(".md")
+    );
+}
+
+/**
+ * The absolute path of a desk file under the root (the parent folder of the export folder), or an error with its HTTP
+ * status: 404 with no export folder, 400 for a path that is not a desk path. Pure: the route checks the file itself
+ * (its real path, its kind, its size) after this.
+ */
+export function deskFileTarget(
+    exportFolder: string | undefined,
+    path: unknown,
+): { root: string; file: string } | { status: 400 | 404; error: string } {
+    if (exportFolder === undefined || !isAbsolute(exportFolder)) {
+        return { status: 404, error: "The desk has no export folder: set export in desk.json." };
+    }
+
+    if (!isDeskPath(path)) {
+        return {
+            status: 400,
+            error: `path must be a relative .md path under ${DESK_PATH_ROOTS.join("/, ")}/: at most ${DESK_PATH_MAX} characters, no . or .. segment, no hidden file.`,
+        };
+    }
+
+    const root = dirname(exportFolder.replace(/\/+$/, ""));
+
+    return { root, file: join(root, path) };
 }
 
 /** The thread of a linked session, whatever its state. */
@@ -25181,6 +25243,75 @@ export default function createDesk(host: Host, web: Web) {
                     text: report.text,
                 })),
             };
+        },
+        { access: "owner" },
+    );
+
+    // 1 desk file, for the tap on a path in an ask: `file?path=reports/…/x.md`. The root is the parent folder of the
+    // export folder. Read only: it records nothing, and it makes no commit, sweep, export or GitHub call. A symlink out
+    // of the root, a file that is not a regular file, and a file over 256 KB are refused.
+    web.route(
+        "GET",
+        "file",
+        async (request) => {
+            const path = request.query.get("path") ?? "";
+            const target = deskFileTarget((await deskConfig()).export, path);
+
+            if ("error" in target) {
+                throw web.error(target.status, target.error);
+            }
+
+            let root: string;
+            let real: string;
+
+            try {
+                root = await realpath(target.root);
+                real = await realpath(target.file);
+            } catch {
+                throw web.error(404, `There is no desk file ${path}.`);
+            }
+
+            if (!real.startsWith(root.endsWith(sep) ? root : root + sep)) {
+                throw web.error(400, `The desk file ${path} is outside the desk folder.`);
+            }
+
+            const tooLarge = () =>
+                web.error(413, `The desk file ${path} is over ${String(DESK_FILE_MAX / 1024)} KB.`);
+
+            /** The kind and the size, before the open (a FIFO must not block the open) and again after it. */
+            const check = (facts: { isFile(): boolean; size: number }) => {
+                if (!facts.isFile()) {
+                    throw web.error(404, `The desk path ${path} is not a file.`);
+                }
+
+                if (facts.size > DESK_FILE_MAX) {
+                    throw tooLarge();
+                }
+            };
+
+            check(
+                await stat(real).catch(() => {
+                    throw web.error(404, `There is no desk file ${path}.`);
+                }),
+            );
+
+            const handle = await open(real, "r").catch(() => {
+                throw web.error(404, `There is no desk file ${path}.`);
+            });
+
+            try {
+                check(await handle.stat());
+
+                const bytes = await handle.readFile();
+
+                if (bytes.length > DESK_FILE_MAX) {
+                    throw tooLarge();
+                }
+
+                return { path, text: bytes.toString("utf8") };
+            } finally {
+                await handle.close();
+            }
         },
         { access: "owner" },
     );
