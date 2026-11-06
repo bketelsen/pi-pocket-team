@@ -15,7 +15,7 @@ wakes Odrade only for judgement.
 ## 2. What the Clerk is
 
 - A named agent with `role: clerk` in its profile (`~/.config/pi-pocket-team/agents/clerk.md`). Its
-  `workspace` is Odrade's desk folder (`/var/home/bjk/projects/odrade`).
+  `workspace` is Odrade's desk folder (`~/agents/odrade`).
 - 1 long-lived linked session of the supervisor. Odrade starts it once with
   `team_delegate agent=clerk task="Run the desk."`. The start registers it as her Clerk on the desk. It
   opens no desk thread and does not count toward the cap.
