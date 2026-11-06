@@ -32,6 +32,8 @@ import { after, before, test } from "node:test";
 import type { ConversationId } from "@earendil-works/pi-durable";
 import { DeskNudges } from "./desk.ts";
 import {
+    type DeliveryJob,
+    type HooksProbe,
     AlarmsDoc,
     CoverageDoc,
     DeliveriesDoc,
@@ -50,6 +52,12 @@ const secretDir = join(root, "hooks-secret");
 const fakeGh = join(root, "fake-gh.sh");
 const ghAnswer = join(root, "github.json");
 const model = scriptedModel();
+const shared = globalThis as unknown as Record<symbol, unknown>;
+const TEST_FAIL = Symbol.for("pi-pocket-team.github-hooks.test-fail");
+/** The module's test probe: receiver ticks, receiver commits, and phases parked in the turn-off wait. */
+const probe: HooksProbe = { ticks: 0, commits: 0, parked: 0, parks: 0 };
+
+shared[Symbol.for("pi-pocket-team.github-hooks.test")] = probe;
 
 let app: App;
 let port = 0;
@@ -117,7 +125,37 @@ async function command(args: string) {
 
 /** The listener answers: a bound server in the live set, and a request gets a status. */
 async function listening(): Promise<void> {
-    await until(() => liveListeners().size === 1, "1 live listener", 15_000);
+    await until(
+        () =>
+            liveListeners().size === 1 && [...liveListeners()].every((server) => server.listening),
+        "1 live listener",
+        15_000,
+    );
+}
+
+/** Let many turns of the event loop pass: a condition on turns, not a time. */
+async function turns(count: number): Promise<void> {
+    for (let index = 0; index < count; index += 1) {
+        await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+}
+
+/**
+ * The module is off: wait until the receiver phase is parked in its turn-off wait, let many event-loop turns pass, and
+ * check that the receiver made no commit and its checkpoint did not change.
+ */
+async function assertParkedWithNoCommit(): Promise<string> {
+    await until(() => probe.parked === 1, "the phase is parked in its turn-off wait");
+
+    const commits = probe.commits;
+    const state = JSON.stringify((await receivers())[0]?.record.state);
+
+    await turns(500);
+    assert.equal(probe.commits, commits, "no commit while parked");
+    assert.equal(JSON.stringify((await receivers())[0]?.record.state), state);
+    assert.equal(probe.parked, 1, "still parked");
+
+    return state;
 }
 
 async function writeMarker(delivery: string): Promise<void> {
@@ -249,6 +287,56 @@ test("end to end: a signed delivery is accepted, the desk takes it by nudge, and
     );
 });
 
+test("a real failed commit: 500, and no seen entry, accepted entry or marker persists; the same delivery then gets 202", async () => {
+    const id = randomUUID();
+    const payload = pr();
+    const seenBefore = await snap<{ ids: Record<string, number>; digests: Record<string, number> }>(
+        SeenDoc,
+    );
+    let thrown = 0;
+
+    // The module's test hook: it runs inside the delivery commit, after the changes; a throw rolls them back.
+    shared[TEST_FAIL] = (job: DeliveryJob) => {
+        if (job.delivery === id && thrown === 0) {
+            thrown += 1;
+
+            throw new Error("test: the delivery commit fails");
+        }
+    };
+
+    try {
+        const failed = await post("pull_request", payload, id);
+
+        assert.equal(failed.status, 500);
+        assert.equal(thrown, 1);
+        assert.match(failed.text, /\r\n\r\n7\r\nfailed\n\r\n0\r\n\r\n$/, "no detail");
+
+        const seen = await snap<{ ids: Record<string, number>; digests: Record<string, number> }>(
+            SeenDoc,
+        );
+
+        assert.equal(seen?.ids[id], undefined, "no seen id");
+        assert.equal(
+            Object.keys(seen?.digests ?? {}).length,
+            Object.keys(seenBefore?.digests ?? {}).length,
+            "no seen digest",
+        );
+        assert.ok(!(await markers()).includes(id), "no marker");
+
+        const log =
+            (await snap<{ log: { delivery?: string; outcome: string }[] }>(DeliveriesDoc))?.log ??
+            [];
+
+        assert.ok(!log.some((entry) => entry.delivery === id && entry.outcome === "accepted"));
+
+        // The same delivery (id and body) goes through now.
+        assert.equal((await post("pull_request", payload, id)).status, 202);
+        await until(async () => (await deskSeen())[id] !== undefined, "the desk took it");
+    } finally {
+        delete shared[TEST_FAIL];
+    }
+});
+
 test("the status card: the listener, the receiver, the secret state (never its value), counts and alarms", async () => {
     const card = await command("");
 
@@ -256,7 +344,7 @@ test("the status card: the listener, the receiver, the secret state (never its v
     assert.match(card.output ?? "", new RegExp(`Listener: bound on port ${String(port)}`));
     assert.match(card.output ?? "", /Receiver: task \d+ in session \d+, running/);
     assert.match(card.output ?? "", /Secret: ok \(next: none\)/);
-    assert.match(card.output ?? "", /accepted 1/);
+    assert.match(card.output ?? "", /Deliveries: accepted \d+/);
     assert.match(card.output ?? "", /Pending markers: 0/);
     assert.ok(!(card.output ?? "").includes(SECRET));
 });
@@ -325,6 +413,46 @@ test("20 reloads: 1 live listener, 1 live receiver on the newest code, the port 
     );
 });
 
+test("1 real reload: an idle keep-alive socket closes at once, and the new listener accepts", async () => {
+    await listening();
+
+    const body = Buffer.from(JSON.stringify(pr()));
+    const head =
+        "POST /github HTTP/1.1\r\nHost: hooks.test\r\nConnection: keep-alive\r\nContent-Type: application/json\r\n" +
+        `Content-Length: ${String(body.length)}\r\nX-GitHub-Event: pull_request\r\nX-GitHub-Delivery: ${randomUUID()}\r\n` +
+        `X-Hub-Signature-256: sha256=${createHmac("sha256", SECRET).update(body).digest("hex")}\r\n\r\n`;
+    let text = "";
+    let closed = false;
+    const socket = connect(port, "127.0.0.1");
+
+    socket.on("data", (chunk: Buffer) => {
+        text += chunk.toString("latin1");
+    });
+    socket.on("error", () => {});
+    socket.on("close", () => {
+        closed = true;
+    });
+    socket.write(Buffer.concat([Buffer.from(head, "latin1"), body]));
+    await until(
+        () => /^HTTP\/1\.1 202/.test(text) && text.endsWith("\r\n0\r\n\r\n"),
+        "the answer, the socket kept",
+    );
+    assert.equal(closed, false, "a keep-alive socket stays open");
+
+    const reloadAt = Date.now();
+    let closedAt = 0;
+
+    socket.on("close", () => {
+        closedAt = Date.now();
+    });
+    await app.loader.reload("github-hooks.ts");
+    await until(() => closed, "the idle socket closed at the reload");
+    assert.ok(closedAt - reloadAt < 2_000, "at once, not after the 2-second grace time");
+    await listening();
+    await until(() => receiverHandle() !== undefined, "the receiver after the reload");
+    assert.equal((await post("pull_request", pr())).status, 202);
+});
+
 test("turned off: the receiver waits in memory with no commit; turned on: the new code runs and accepts", async () => {
     const before = (await receivers())[0]!;
     const checkpoint = () => receivers().then((tasks) => JSON.stringify(tasks[0]?.record.state));
@@ -344,11 +472,8 @@ test("turned off: the receiver waits in memory with no commit; turned on: the ne
     );
     assert.equal(fired, true);
 
-    const off = await checkpoint();
-
-    // No commit loop: the state stays the same over many ticks (the tick is 50 ms here).
-    await new Promise((resolve) => setTimeout(resolve, 400));
-    assert.equal(await checkpoint(), off);
+    // No commit loop: parked, and no commit over many turns of the event loop.
+    const off = await assertParkedWithNoCommit();
 
     const tasks = await receivers();
 
@@ -382,11 +507,7 @@ test("a load that fails after it set its version id: a later turn-off still wait
 
     await app.setExtensionEnabled(owner(app), "github-hooks.ts", false);
 
-    const state = async () => JSON.stringify((await receivers())[0]?.record.state);
-    const first = await state();
-
-    await new Promise((resolve) => setTimeout(resolve, 400));
-    assert.equal(await state(), first, "no commit loop");
+    await assertParkedWithNoCommit();
 
     await app.setExtensionEnabled(owner(app), "github-hooks.ts", true);
     await listening();
@@ -405,7 +526,10 @@ test("the desk off: a delivery is accepted with no marker; a written marker wait
     const marker = randomUUID();
 
     await writeMarker(marker);
-    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    const ticks = probe.ticks;
+
+    await until(() => probe.ticks >= ticks + 3, "3 receiver ticks");
     assert.deepEqual(await markers(), [marker], "the marker waits for the desk");
 
     await app.setExtensionEnabled(owner(app), "desk.ts", true);

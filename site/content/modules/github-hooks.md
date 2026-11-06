@@ -1,6 +1,6 @@
 # GitHub hooks
 
-GitHub webhook deliveries wake the desk early. The module listens on port 8790 for `POST /github`, verifies each delivery with the webhook secret, keeps only checked facts (the repository, the number, the event and action, a team label, a sha), and hands them to the desk. No title, body, comment or branch name is kept, so no GitHub text reaches a prompt. The desk then reads GitHub itself in an early sync. The 10-minute sweep stays as the fallback.
+GitHub webhook deliveries wake the desk early. The module listens on port 8790 for `POST /github`, verifies each delivery with the webhook secret, keeps only checked facts (the repository, the number, the event and action, a team label, a sha, and the branch when it is `main` or `master`), and hands them to the desk. No title, body, comment, or other branch name is kept, so no GitHub text reaches a prompt. The desk then reads GitHub itself in an early sync. The 10-minute sweep stays as the fallback.
 
 Files: `github-hooks.ts`. It works with the Desk module; with the desk off, it only records the facts.
 
@@ -19,9 +19,9 @@ Files: `github-hooks.ts`. It works with the Desk module; with the desk off, it o
 - Only `POST /github` with `Content-Type: application/json` and a `Content-Length` of 1 MiB or less. At most 16 sockets, 8 requests and 8 MiB of bodies at once.
 - Only a valid `X-Hub-Signature-256`, checked before anything is parsed. A rotation can use `github-webhook.secret.next` too.
 - Only the events `pull_request`, `pull_request_review`, `check_suite`, `status`, `issues`, `ping`, `installation` and `installation_repositories`, and only repositories of `frostyard` and `bketelsen`.
-- A delivery id or a body it saw in the last 72 hours is a duplicate: `200`, and nothing changes.
+- A delivery id or a body it saw in the last 72 hours is a duplicate: `200`. It adds a log entry and a count, but no fact and no nudge.
 
-The answers: `202` accepted; `200` for a duplicate, an action it ignores, or `ping`; `401` bad signature; `400` bad id, event or JSON; `404`, `411`, `413`, `415` for the request's shape; `422` another owner; `503` when the secret is missing, no receiver runs, or a limit is full; `500` when a commit fails.
+The answers: `202` accepted; `200` for a duplicate, an action it ignores, or `ping`; `401` bad signature; `400` bad id, event or JSON; `404`, `411`, `413`, `415` for the request's shape; `408` for slow headers (5 seconds) or a slow body (10 seconds); `422` another owner; `503` when the secret is missing, no receiver runs, or a limit is full; `500` when a commit fails.
 
 ## Reloads and turning it off
 

@@ -574,6 +574,7 @@ export type DeliveryOutcome =
     | "pending-full"
     | "receiver-gone"
     | "receiver-missing"
+    | "receiver-busy"
     | "receiver-timeout"
     | "failed"
     | "unprocessable"
@@ -641,6 +642,11 @@ export type RecentFact = {
     sha?: string;
     class: ChangeClass;
     at: number;
+    /**
+     * `"status"` for a `status` fact: only such a fact may match a CI change by the observed head sha alone. Absent (an
+     * entry stored before this field, or any other event): not a status fact.
+     */
+    event?: "status";
 };
 
 /** Which repositories send events. Stored data. */
@@ -925,13 +931,18 @@ export function applyDelivery(
 
     pruneSeen(docs.seen, now);
 
+    const full = Object.keys(docs.seen.ids).length >= SEEN_MAX;
+    // The set is under its cap again: clear the alarm in every commit, a duplicate's too.
+    const cleared: SystemAlarm[] =
+        !full && clearSystem(docs.alarms, "seen-full", now) ? ["seen-full"] : [];
+
     if (docs.seen.ids[job.delivery] !== undefined || docs.seen.digests[job.digest] !== undefined) {
         recordEntries(docs.deliveries, [entry("duplicate")]);
 
-        return result("duplicate");
+        return result("duplicate", { cleared });
     }
 
-    if (Object.keys(docs.seen.ids).length >= SEEN_MAX) {
+    if (full) {
         recordEntries(docs.deliveries, [entry("seen-full")]);
 
         return result("seen-full", {
@@ -939,7 +950,6 @@ export function applyDelivery(
         });
     }
 
-    const cleared: SystemAlarm[] = clearSystem(docs.alarms, "seen-full", now) ? ["seen-full"] : [];
     const nudgeFact = job.ignored ? undefined : toNudgeFact(job.fact);
     const marker = options.nudge && nudgeFact !== undefined;
 
@@ -980,6 +990,7 @@ export function applyDelivery(
             ...(fact.sha === undefined ? {} : { sha: fact.sha }),
             class: change,
             at: fact.at,
+            ...(fact.event === "status" ? { event: "status" as const } : {}),
         });
         docs.coverage.recent = docs.coverage.recent.filter((each) => now - each.at <= RECENT_MS);
 
@@ -1103,7 +1114,11 @@ export function evaluateCoverage(
             if (fact.class === change.class) {
                 return (
                     sameNumber(fact) ||
-                    (change.class === "ci" && head !== undefined && fact.sha === head)
+                    // By sha alone only a status fact: it has no PR number. A check_suite fact matches by number.
+                    (change.class === "ci" &&
+                        fact.event === "status" &&
+                        head !== undefined &&
+                        fact.sha === head)
                 );
             }
 
@@ -1233,13 +1248,17 @@ export function createSecretSource(
 
 /** What the receiver answers for 1 job. */
 export type ReceiverAnswer = {
-    outcome: ApplyResult["outcome"] | "receiver-gone" | "failed";
+    /**
+     * `receiver-busy`: the inbox holds `INBOX_MAX` jobs already. `cancelled`: the listener gave up on the job before its
+     * commit started (nobody reads this answer).
+     */
+    outcome: ApplyResult["outcome"] | "receiver-gone" | "receiver-busy" | "cancelled" | "failed";
 };
 
-/** The receiver as the listener sees it. */
+/** The receiver as the listener sees it. An abort of `signal` cancels the job while its commit has not started. */
 export type ReceiverHandle = {
     taskId: string;
-    submit: (job: DeliveryJob) => Promise<ReceiverAnswer>;
+    submit: (job: DeliveryJob, options?: { signal?: AbortSignal }) => Promise<ReceiverAnswer>;
 };
 
 /** What the listener reports to its module: a refusal for the log, or a system alarm. */
@@ -1267,7 +1286,7 @@ export type ListenerStatus = {
     port?: number;
 };
 
-/** Every listening server of this module, over all versions: a test counts them. */
+/** Every listening server of this module, over all versions (a closed one leaves at once): a test counts them. */
 const LISTENERS = Symbol.for("pi-pocket-team.github-hooks.listeners");
 
 export function liveListeners(): Set<Server> {
@@ -1302,6 +1321,8 @@ const ANSWER_STATUS: Record<ReceiverAnswer["outcome"], number> = {
     "seen-full": 503,
     "pending-full": 503,
     "receiver-gone": 503,
+    "receiver-busy": 503,
+    cancelled: 503,
     failed: 500,
 };
 
@@ -1589,8 +1610,11 @@ export function createHookListener(deps: ListenerDeps) {
                 fact: built.fact,
             };
             let timeout: NodeJS.Timeout | undefined;
+            const cancel = new AbortController();
             const result = await Promise.race([
-                receiver.submit(job).catch((): ReceiverAnswer => ({ outcome: "failed" })),
+                receiver
+                    .submit(job, { signal: cancel.signal })
+                    .catch((): ReceiverAnswer => ({ outcome: "failed" })),
                 new Promise<undefined>((resolve) => {
                     timeout = setTimeout(() => resolve(undefined), limits.jobTimeoutMs);
                 }),
@@ -1599,6 +1623,8 @@ export function createHookListener(deps: ListenerDeps) {
             clearTimeout(timeout);
 
             if (result === undefined) {
+                // The job leaves the inbox unless its commit started; a commit that started can still land.
+                cancel.abort();
                 refuse(res, socket, peer, "receiver-timeout", 503, { delivery, event });
 
                 return;
@@ -1606,8 +1632,17 @@ export function createHookListener(deps: ListenerDeps) {
 
             const code = ANSWER_STATUS[result.outcome];
 
-            if (result.outcome === "receiver-gone" || result.outcome === "failed") {
-                refuse(res, socket, peer, result.outcome, code, { delivery, event });
+            if (
+                result.outcome === "receiver-gone" ||
+                result.outcome === "receiver-busy" ||
+                result.outcome === "cancelled" ||
+                result.outcome === "failed"
+            ) {
+                // A job cancelled before it ran is a timeout for the sender.
+                const outcome =
+                    result.outcome === "cancelled" ? "receiver-timeout" : result.outcome;
+
+                refuse(res, socket, peer, outcome, code, { delivery, event });
 
                 return;
             }
@@ -1768,6 +1803,8 @@ export function createHookListener(deps: ListenerDeps) {
                 return;
             }
 
+            // It stops listening now: it leaves the set of listening servers at once.
+            liveListeners().delete(current);
             current.close();
             current.closeIdleConnections();
 
@@ -1784,6 +1821,273 @@ export function createHookListener(deps: ListenerDeps) {
     };
 }
 
+// ─── The receiver's inbox and loop ───────────────────────────────────────────
+
+/** The most jobs the receiver holds at once, the job whose commit runs included: then `receiver-busy`. */
+export const INBOX_MAX = 16;
+
+type InboxSlot = {
+    job: DeliveryJob;
+    resolve: (answer: ReceiverAnswer) => void;
+    signal?: AbortSignal;
+    onAbort?: () => void;
+};
+
+/**
+ * The receiver's inbox: at most `max` jobs, the active one included; a job over the bound gets `receiver-busy` at once.
+ * A job whose signal aborts before `take` leaves the inbox and never commits. `take` makes a job active: from then on
+ * its commit runs, and an abort changes nothing.
+ */
+export function createInbox(max = INBOX_MAX) {
+    const queue: InboxSlot[] = [];
+    let active: InboxSlot | undefined;
+    let open = true;
+    let wake: (() => void) | undefined;
+
+    const detach = (slot: InboxSlot) => {
+        if (slot.onAbort !== undefined) {
+            slot.signal?.removeEventListener("abort", slot.onAbort);
+        }
+    };
+
+    return {
+        submit(job: DeliveryJob, options: { signal?: AbortSignal } = {}): Promise<ReceiverAnswer> {
+            if (!open) {
+                return Promise.resolve({ outcome: "receiver-gone" });
+            }
+
+            if (options.signal?.aborted === true) {
+                return Promise.resolve({ outcome: "cancelled" });
+            }
+
+            if (queue.length + (active === undefined ? 0 : 1) >= max) {
+                return Promise.resolve({ outcome: "receiver-busy" });
+            }
+
+            return new Promise<ReceiverAnswer>((resolve) => {
+                const slot: InboxSlot = {
+                    job,
+                    resolve,
+                    ...(options.signal === undefined ? {} : { signal: options.signal }),
+                };
+
+                if (options.signal !== undefined) {
+                    slot.onAbort = () => {
+                        const index = queue.indexOf(slot);
+
+                        if (index >= 0) {
+                            queue.splice(index, 1);
+                            resolve({ outcome: "cancelled" });
+                        }
+                    };
+
+                    options.signal.addEventListener("abort", slot.onAbort, { once: true });
+                }
+
+                queue.push(slot);
+                wake?.();
+            });
+        },
+        /** The next job, now active: its commit starts, and it can no longer be cancelled. */
+        take(): { job: DeliveryJob; resolve: (answer: ReceiverAnswer) => void } | undefined {
+            const slot = queue.shift();
+
+            if (slot === undefined) {
+                return undefined;
+            }
+
+            detach(slot);
+            active = slot;
+
+            return {
+                job: slot.job,
+                resolve: (answer) => {
+                    if (active === slot) {
+                        active = undefined;
+                    }
+
+                    slot.resolve(answer);
+                },
+            };
+        },
+        /** Jobs held now: queued, plus the active one. */
+        size(): number {
+            return queue.length + (active === undefined ? 0 : 1);
+        },
+        /** Called once at the next submit. */
+        onWake(run: (() => void) | undefined): void {
+            wake = run;
+        },
+        /** Take no more jobs; answer each queued one `receiver-gone`. */
+        close(): void {
+            open = false;
+
+            for (const slot of queue.splice(0)) {
+                detach(slot);
+                slot.resolve({ outcome: "receiver-gone" });
+            }
+        },
+    };
+}
+
+export type Inbox = ReturnType<typeof createInbox>;
+
+export type ReceiverLoopDeps = {
+    inbox: Inbox;
+    /** The clock of every deadline here. */
+    now: () => number;
+    tickMs: number;
+    /** True once the module's version went or the task aborts. */
+    stopped: () => boolean;
+    /** Wait up to `ms`, or until a job, the dispose or the abort. */
+    wait: (ms: number) => Promise<void>;
+    /** The delivery commit; undefined when it failed. */
+    deliver: (job: DeliveryJob) => Promise<ApplyResult | undefined>;
+    /** After the answer: notices. */
+    afterDelivery?: (job: DeliveryJob, result: ApplyResult) => void;
+    /** The desk API object now, and whether it has `nudge`. */
+    desk: () => unknown;
+    hasNudge: (desk: unknown) => boolean;
+    /** 1 commit that hands up to `NUDGE_BATCH` markers to `nudge`; the count it handed; it throws when `nudge` threw. */
+    handOver: () => Promise<number>;
+    /** Write the refusals and system alarms kept in memory. */
+    flushMemory: () => Promise<void>;
+    /** Evaluate the coverage alarm. */
+    evaluate: () => Promise<void>;
+};
+
+/**
+ * The receiver's loop: 1 job at a time, and after each job and at each tick the maintenance (the desk-change check, the
+ * refusal flush every `min(REFUSAL_FLUSH_MS, 5 ticks)`, the coverage alarm every `COVERAGE_EVERY_MS`), so a busy inbox
+ * never starves it. Every hand-over of markers obeys the back-off: after a `nudge` that threw, no try before
+ * `NUDGE_RETRY_MS` passed.
+ */
+export function createReceiverLoop(deps: ReceiverLoopDeps) {
+    let retryAt = 0;
+    let lastDesk: unknown;
+    let lastNudge = false;
+    let refusalsAt = 0;
+    let coverageAt = 0;
+
+    /** Hand the pending markers to the desk, 500 at a time, unless the back-off holds. */
+    const flushMarkers = async (): Promise<void> => {
+        if (retryAt !== 0 && deps.now() < retryAt) {
+            return;
+        }
+
+        for (let round = 0; round < 10; round += 1) {
+            if (!deps.hasNudge(deps.desk())) {
+                return;
+            }
+
+            let handed: number;
+
+            try {
+                handed = await deps.handOver();
+            } catch {
+                // The commit rolled back: the markers stay, and the next try waits.
+                retryAt = deps.now() + NUDGE_RETRY_MS;
+
+                return;
+            }
+
+            retryAt = 0;
+
+            if (handed < NUDGE_BATCH) {
+                return;
+            }
+        }
+    };
+
+    const maintain = async (): Promise<void> => {
+        const now = deps.now();
+        const desk = deps.desk();
+        const hasNudge = deps.hasNudge(desk);
+
+        if (
+            (desk !== lastDesk && hasNudge) ||
+            (hasNudge && !lastNudge) ||
+            (retryAt !== 0 && now >= retryAt)
+        ) {
+            await flushMarkers();
+        }
+
+        lastDesk = desk;
+        lastNudge = hasNudge;
+
+        if (now - refusalsAt >= Math.min(REFUSAL_FLUSH_MS, deps.tickMs * 5)) {
+            refusalsAt = now;
+            await deps.flushMemory();
+        }
+
+        if (now - coverageAt >= COVERAGE_EVERY_MS) {
+            coverageAt = now;
+
+            try {
+                await deps.evaluate();
+            } catch {
+                // The next evaluation tries again.
+            }
+        }
+    };
+
+    return {
+        flushMarkers,
+        /** When the next hand-over may run after a failure; 0 when none failed. */
+        retryAt: () => retryAt,
+        async run(): Promise<void> {
+            lastDesk = deps.desk();
+            lastNudge = deps.hasNudge(lastDesk);
+            coverageAt = deps.now();
+
+            if (deps.stopped()) {
+                return;
+            }
+
+            await flushMarkers();
+            await deps.flushMemory();
+            refusalsAt = deps.now();
+
+            while (!deps.stopped()) {
+                const taken = deps.inbox.take();
+
+                if (taken !== undefined) {
+                    let result: ApplyResult | undefined;
+
+                    try {
+                        result = await deps.deliver(taken.job);
+                    } catch {
+                        result = undefined;
+                    }
+
+                    taken.resolve({ outcome: result?.outcome ?? "failed" });
+
+                    if (result !== undefined) {
+                        deps.afterDelivery?.(taken.job, result);
+
+                        if (result.marker) {
+                            await flushMarkers();
+                        }
+                    }
+
+                    // After each job too: a busy inbox must not starve the maintenance.
+                    await maintain();
+
+                    continue;
+                }
+
+                await maintain();
+
+                if (deps.stopped()) {
+                    return;
+                }
+
+                await deps.wait(deps.tickMs);
+            }
+        },
+    };
+}
+
 // ─── The module ──────────────────────────────────────────────────────────────
 
 /** The live receiver of this process. */
@@ -1791,6 +2095,19 @@ const RECEIVER = Symbol.for("pi-pocket-team.github-hooks.receiver");
 /** The newest loaded version of this module: `id`, and the waiters of a turned-off phase. */
 const VERSION = Symbol.for("pi-pocket-team.github-hooks.version");
 const DESK = Symbol.for("pi-pocket-team.desk");
+/**
+ * Test hooks, absent in production (nothing here sets them, and an absent slot changes nothing):
+ * - `TEST_FAIL`: a function the delivery commit calls after its changes, inside the commit. A test makes it throw once
+ *   to get a real failed commit (a rollback, and `500`).
+ * - `PROBE`: counters a test reads instead of waiting for a time: `ticks` (receiver waits), `commits` (receiver commits),
+ *   `parked` (phases now in the turn-off wait) and `parks` (turn-off waits entered).
+ */
+const TEST_FAIL = Symbol.for("pi-pocket-team.github-hooks.test-fail");
+const PROBE = Symbol.for("pi-pocket-team.github-hooks.test");
+
+export type HooksProbe = { ticks: number; commits: number; parked: number; parks: number };
+
+const probe = (): HooksProbe | undefined => shared[PROBE] as HooksProbe | undefined;
 
 type VersionSlot = { id: string; waiters: Set<() => void> };
 type DeskApi = {
@@ -2042,55 +2359,39 @@ export default function createGithubHooks(host: Host, web: Web) {
         }
     };
 
-    let nudgeRetryAt = 0;
+    /** 1 commit: up to 500 markers to `nudge`, deleted in the same commit. Throws when `nudge` threw (a rollback). */
+    const handOver = async (runtime: Runtime, context: Context): Promise<number> => {
+        const desk = deskApi();
+        let handed = 0;
 
-    /** Hand the pending markers to the desk, 500 at a time; a marker goes only in the commit where the desk took it. */
-    const flushMarkers = async (runtime: Runtime, context: Context): Promise<void> => {
-        for (let round = 0; round < 10; round += 1) {
-            const desk = deskApi();
-
-            if (typeof desk?.nudge !== "function") {
-                return;
-            }
-
-            let handed = 0;
-
-            try {
-                await runtime.commit(async (tx) => {
-                    const pending = await tx.doc(PendingDoc);
-                    const ids = Object.keys(pending.markers).slice(0, NUDGE_BATCH);
-
-                    if (ids.length === 0) {
-                        return undefined;
-                    }
-
-                    const facts = ids.map(
-                        (id) => JSON.parse(JSON.stringify(pending.markers[id]!.fact)) as NudgeFact,
-                    );
-
-                    await desk.nudge!(tx, facts, runtime.now());
-
-                    for (const id of ids) {
-                        delete pending.markers[id];
-                    }
-
-                    handed = ids.length;
-
-                    return undefined;
-                }, context);
-            } catch {
-                // The commit rolled back: the markers stay, and the next try waits.
-                nudgeRetryAt = Date.now() + NUDGE_RETRY_MS;
-
-                return;
-            }
-
-            nudgeRetryAt = 0;
-
-            if (handed < NUDGE_BATCH) {
-                return;
-            }
+        if (typeof desk?.nudge !== "function") {
+            return 0;
         }
+
+        await runtime.commit(async (tx) => {
+            const pending = await tx.doc(PendingDoc);
+            const ids = Object.keys(pending.markers).slice(0, NUDGE_BATCH);
+
+            if (ids.length === 0) {
+                return undefined;
+            }
+
+            const facts = ids.map(
+                (id) => JSON.parse(JSON.stringify(pending.markers[id]!.fact)) as NudgeFact,
+            );
+
+            await desk.nudge!(tx, facts, runtime.now());
+
+            for (const id of ids) {
+                delete pending.markers[id];
+            }
+
+            handed = ids.length;
+
+            return undefined;
+        }, context);
+
+        return handed;
     };
 
     let observedFailed = false;
@@ -2145,7 +2446,27 @@ export default function createGithubHooks(host: Host, web: Web) {
         version: 1,
         initial: () => ({ phase: "receive", generation: 0 }),
         phases: {
-            receive: async (task, runtime, context) => {
+            receive: async (task, original, context) => {
+                // Every commit of this phase counts in the test probe, when a test set one.
+                const runtime = new Proxy(original, {
+                    get(target, property) {
+                        if (property === "commit") {
+                            return (...args: Parameters<Runtime["commit"]>) => {
+                                const counters = probe();
+
+                                if (counters !== undefined) {
+                                    counters.commits += 1;
+                                }
+
+                                return target.commit(...args);
+                            };
+                        }
+
+                        const value = Reflect.get(target, property, target) as unknown;
+
+                        return typeof value === "function" ? value.bind(target) : value;
+                    },
+                }) as Runtime;
                 const generation = task.state.checkpoint.generation;
                 const taskId = String(runtime.taskId);
                 const signal = runtime.signal;
@@ -2164,30 +2485,10 @@ export default function createGithubHooks(host: Host, web: Web) {
                     return;
                 }
 
-                const inbox: { job: DeliveryJob; resolve: (answer: ReceiverAnswer) => void }[] = [];
-                let wake: (() => void) | undefined;
-                let open = true;
+                const inbox = createInbox();
                 const handle: ReceiverHandle = {
                     taskId,
-                    submit: (job) =>
-                        open
-                            ? new Promise<ReceiverAnswer>((resolve) => {
-                                  inbox.push({ job, resolve });
-                                  wake?.();
-                              })
-                            : Promise.resolve({ outcome: "receiver-gone" }),
-                };
-
-                const stop = () => {
-                    open = false;
-
-                    for (const waiting of inbox.splice(0)) {
-                        waiting.resolve({ outcome: "receiver-gone" });
-                    }
-
-                    if (shared[RECEIVER] === handle) {
-                        delete shared[RECEIVER];
-                    }
+                    submit: (job, options) => inbox.submit(job, options),
                 };
 
                 if (!disposed) {
@@ -2195,148 +2496,122 @@ export default function createGithubHooks(host: Host, web: Web) {
                     clearInMemory("receiver-missing");
                 }
 
-                try {
-                    let lastDesk = deskApi();
-                    let lastNudge = typeof lastDesk?.nudge === "function";
-                    let refusalsAt = 0;
-                    let coverageAt = runtime.now();
-
-                    if (!disposed) {
-                        await flushMarkers(runtime, context);
-                        await flushMemory(runtime, context);
-                        refusalsAt = Date.now();
-                    }
-
-                    while (!disposed) {
-                        signal.throwIfAborted();
-
-                        const waiting = inbox.shift();
-
-                        if (waiting !== undefined) {
-                            const { job, resolve } = waiting;
-                            let result: ApplyResult | undefined;
-                            const nudge = typeof deskApi()?.nudge === "function";
-
-                            try {
-                                await runtime.commit(async (tx) => {
-                                    result = applyDelivery(
-                                        {
-                                            seen: await tx.doc(SeenDoc),
-                                            deliveries: await tx.doc(DeliveriesDoc),
-                                            pending: await tx.doc(PendingDoc),
-                                            alarms: await tx.doc(AlarmsDoc),
-                                            coverage: await tx.doc(CoverageDoc),
-                                        },
-                                        job,
-                                        runtime.now(),
-                                        { nudge },
-                                    );
-
-                                    return undefined;
-                                }, context);
-                            } catch {
-                                result = undefined;
-                            }
-
-                            resolve({ outcome: result?.outcome ?? "failed" });
-
-                            if (result === undefined) {
-                                continue;
-                            }
-
-                            if (result.raised.includes("seen-full")) {
-                                memory.system["seen-full"] = {
-                                    raised: true,
-                                    at: Date.now(),
-                                    dirty: false,
-                                };
-                                host.notice(
-                                    "warning",
-                                    "github-hooks: the dedupe set is full (20000 deliveries in 72 hours): deliveries get 503.",
-                                );
-                            }
-
-                            if (result.cleared.includes("seen-full")) {
-                                memory.system["seen-full"] = {
-                                    raised: false,
-                                    at: Date.now(),
-                                    dirty: false,
-                                };
-                            }
-
-                            if (
-                                result.outcome === "accepted" &&
-                                !nudge &&
-                                toNudgeFact(job.fact) !== undefined
-                            ) {
-                                noticeOnce(
-                                    "desk",
-                                    "info",
-                                    "github-hooks: the desk is off or has no nudge: facts are recorded, and the desk gets none.",
-                                );
-                            }
-
-                            if (result.marker) {
-                                await flushMarkers(runtime, context);
-                            }
-
-                            continue;
-                        }
-
-                        const now = Date.now();
-                        const desk = deskApi();
-                        const hasNudge = typeof desk?.nudge === "function";
-
-                        if (
-                            (desk !== lastDesk && hasNudge) ||
-                            (hasNudge && !lastNudge) ||
-                            (nudgeRetryAt !== 0 && now >= nudgeRetryAt)
-                        ) {
-                            await flushMarkers(runtime, context);
-                        }
-
-                        lastDesk = desk;
-                        lastNudge = hasNudge;
-
-                        if (now - refusalsAt >= Math.min(REFUSAL_FLUSH_MS, tickMs * 5)) {
-                            refusalsAt = now;
-                            await flushMemory(runtime, context);
-                        }
-
-                        if (runtime.now() - coverageAt >= COVERAGE_EVERY_MS) {
-                            coverageAt = runtime.now();
-
-                            try {
-                                await evaluate(runtime, context);
-                            } catch {
-                                // The next evaluation tries again.
-                            }
-                        }
-
-                        // Wait for a job, the tick, the dispose, or the abort.
-                        await new Promise<void>((resolve) => {
+                const loop = createReceiverLoop({
+                    inbox,
+                    now: () => runtime.now(),
+                    tickMs,
+                    stopped: () => disposed || signal.aborted,
+                    // Wait for a job, the tick, the dispose, or the abort.
+                    wait: (ms) =>
+                        new Promise<void>((resolve) => {
                             let disarm = () => {};
 
                             const done = () => {
-                                wake = undefined;
+                                inbox.onWake(undefined);
                                 disposeWaiters.delete(done);
                                 signal.removeEventListener("abort", done);
                                 disarm();
                                 resolve();
                             };
 
-                            wake = done;
+                            inbox.onWake(done);
                             disposeWaiters.add(done);
                             signal.addEventListener("abort", done, { once: true });
-                            disarm = runtime.setTimer(done, tickMs);
+                            disarm = runtime.setTimer(done, ms);
 
-                            if (inbox.length > 0 || disposed || signal.aborted) {
+                            const counters = probe();
+
+                            if (counters !== undefined) {
+                                counters.ticks += 1;
+                            }
+
+                            if (inbox.size() > 0 || disposed || signal.aborted) {
                                 done();
                             }
-                        });
-                    }
+                        }),
+                    deliver: async (job) => {
+                        let result: ApplyResult | undefined;
+                        const nudge = typeof deskApi()?.nudge === "function";
+
+                        try {
+                            await runtime.commit(async (tx) => {
+                                result = applyDelivery(
+                                    {
+                                        seen: await tx.doc(SeenDoc),
+                                        deliveries: await tx.doc(DeliveriesDoc),
+                                        pending: await tx.doc(PendingDoc),
+                                        alarms: await tx.doc(AlarmsDoc),
+                                        coverage: await tx.doc(CoverageDoc),
+                                    },
+                                    job,
+                                    runtime.now(),
+                                    { nudge },
+                                );
+
+                                // A test hook only (see `TEST_FAIL`): a throw here rolls the whole commit back.
+                                const fail = shared[TEST_FAIL];
+
+                                if (typeof fail === "function") {
+                                    (fail as (job: DeliveryJob) => void)(job);
+                                }
+
+                                return undefined;
+                            }, context);
+                        } catch {
+                            return undefined;
+                        }
+
+                        if (
+                            result !== undefined &&
+                            result.outcome === "accepted" &&
+                            !nudge &&
+                            toNudgeFact(job.fact) !== undefined
+                        ) {
+                            noticeOnce(
+                                "desk",
+                                "info",
+                                "github-hooks: the desk is off or has no nudge: facts are recorded, and the desk gets none.",
+                            );
+                        }
+
+                        return result;
+                    },
+                    afterDelivery: (_job, result) => {
+                        if (result.raised.includes("seen-full")) {
+                            memory.system["seen-full"] = {
+                                raised: true,
+                                at: Date.now(),
+                                dirty: false,
+                            };
+                            host.notice(
+                                "warning",
+                                "github-hooks: the dedupe set is full (20000 deliveries in 72 hours): deliveries get 503.",
+                            );
+                        }
+
+                        if (result.cleared.includes("seen-full")) {
+                            memory.system["seen-full"] = {
+                                raised: false,
+                                at: Date.now(),
+                                dirty: false,
+                            };
+                        }
+                    },
+                    desk: deskApi,
+                    hasNudge: (desk) => typeof (desk as DeskApi | undefined)?.nudge === "function",
+                    handOver: () => handOver(runtime, context),
+                    flushMemory: () => flushMemory(runtime, context),
+                    evaluate: () => evaluate(runtime, context),
+                });
+
+                try {
+                    await loop.run();
                 } finally {
-                    stop();
+                    inbox.close();
+
+                    if (shared[RECEIVER] === handle) {
+                        delete shared[RECEIVER];
+                    }
                 }
 
                 signal.throwIfAborted();
@@ -2349,10 +2624,22 @@ export default function createGithubHooks(host: Host, web: Web) {
                 const blocked = () => slot.id === versionId || slot.id === handedTo;
 
                 if (blocked()) {
+                    const counters = probe();
+
+                    if (counters !== undefined) {
+                        counters.parked += 1;
+                        counters.parks += 1;
+                    }
+
                     await new Promise<void>((resolve) => {
                         const done = () => {
                             slot.waiters.delete(done);
                             signal.removeEventListener("abort", done);
+
+                            if (counters !== undefined) {
+                                counters.parked -= 1;
+                            }
+
                             resolve();
                         };
 
