@@ -78,7 +78,10 @@ test("every site page's front matter parses as a mapping", () => {
 });
 
 test("the check fails on an unquoted ': ' in a value, and passes when it is quoted", () => {
-    assert.match(String(frontMatterProblem("title: x\ndescription: a: b\n")), /./);
+    const problem = frontMatterProblem("title: x\ndescription: a: b\n");
+
+    assert.equal(typeof problem, "string");
+    assert.ok(problem.length > 0);
     assert.equal(frontMatterProblem('title: x\ndescription: "a: b"\n'), undefined);
     assert.equal(frontMatterProblem("- a\n- b\n"), "it is not a mapping");
 });

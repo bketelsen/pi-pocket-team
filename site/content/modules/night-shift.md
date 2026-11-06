@@ -12,7 +12,7 @@ Files: `night-shift.ts` (the command, the prompt section, the driver task and 1 
 ```
 
 - Options come first, in any order, then an optional `:`, then the objective. The text splits at the last "stop when" (or "stop only when").
-- `start 06:00` (also `6am`): round 1 waits until the next time the server's clock shows it, at most 24 hours away. Without it, round 1 starts at once, with 1 exception: with a `deepseek/…` worker, round 1 waits until DeepSeek's peak hours end (01:00–04:00 and 06:00–10:00 UTC), at 04:00 or 10:00 UTC. An explicit `start` always wins.
+- `start 06:00` (also `6am`): round 1 waits until the next time the server's clock shows it, at most 24 hours away. Without it, round 1 starts at once, with 1 exception: with a `deepseek/…` worker, a goal set during DeepSeek's peak hours (01:00–04:00 and 06:00–10:00 UTC) waits until that window ends, at 04:00 or 10:00 UTC; outside them it starts at once. An explicit `start` always wins.
 - `until 07:00` is the next time the server's clock shows it. `for 8h`, `for 90m`, `for 7h30m` count from the start of round 1 (a given `start`, or the DeepSeek wait), else from now, up to 24 hours. Give one or neither, and `until` must be after `start`.
 - `max N`: rounds, 1 to 100. Default 20.
 - `with provider/model`: runs the work in subagents on that model. The model must be in **Providers → Models for subagents**; the command refuses another model, and it never substitutes one.
