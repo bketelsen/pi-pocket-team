@@ -1,6 +1,8 @@
 # The tests need a Pi Pocket checkout: link.mjs symlinks node_modules, _pocket.d.ts and _pocket into the
 # checkout at PI_POCKET_CHECKOUT. Here we clone the public Pi Pocket repository at tag v0.27.0 into the
-# runner's temporary folder, install its dependencies, and point the links at it.
+# runner's temporary folder, install its dependencies, and point the links at it. Then the job runs the gate,
+# make ci. Actions are pinned by commit SHA, and the token can only read (frostyard/core ADR-0021).
+# The ruleset requires the check "Test": keep the job's name.
 name: CI
 
 on:
@@ -8,8 +10,7 @@ on:
     push:
         branches: [main]
 
-permissions:
-    contents: read
+permissions: {}
 
 concurrency:
     group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -20,14 +21,23 @@ jobs:
         name: Test
         runs-on: ubuntu-latest
         timeout-minutes: 20
+        permissions:
+            contents: read
         steps:
             - name: Check out this repository
-              uses: actions/checkout@v4
-
-            - name: Set up Node.js 24
-              uses: actions/setup-node@v4
+              uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
               with:
-                  node-version: 24
+                  persist-credentials: false
+                  # The corrections check compares .memory/corrections.jsonl with the PR base, so the base
+                  # commit must be in the clone.
+                  fetch-depth: 0
+
+            - name: Install the pinned Node (mise.toml, mise.lock)
+              uses: jdx/mise-action@3c2e0cf82a5b2e5249f0d3635a4d83d0ae861518 # v4.2.5
+              with:
+                  install: true
+                  install_args: node
+                  cache: true
 
             - name: Set the Pi Pocket checkout path
               run: echo "PI_POCKET_CHECKOUT=$RUNNER_TEMP/pi-pocket" >> "$GITHUB_ENV"
@@ -42,11 +52,7 @@ jobs:
             - name: Link this project to the Pi Pocket checkout
               run: npm run link
 
-            - name: Run the lint
-              run: npm run lint
-
-            - name: Run the tests
-              run: npm test
-
-            - name: Run the type check
-              run: npm run typecheck
+            - name: Run the gate (template gate, lint, tests, type check, corrections)
+              run: make ci BASE="$BASE"
+              env:
+                  BASE: ${{ github.event.pull_request.base.sha || '' }}

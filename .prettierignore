@@ -1,1 +1,12 @@
 terminal-web/vendor/
+
+# Byte-identical copies from bketelsen/agentic-template and frostyard/core: never reformat them (make verify pins 2 of them).
+scripts/check-template.mjs
+scripts/check-corrections.mjs
+scripts/lib/
+test/check-template.test.mjs
+.github/workflows/risk-paths.yml
+.memory/README.md
+.agents/
+.claude/
+docs/*/TEMPLATE.md
