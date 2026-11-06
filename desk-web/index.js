@@ -803,6 +803,36 @@ const load = async () => {
     }
 };
 
+/** A span as the desk says it: 45 min, 6 h, 3 d (`spanWords` in desk.ts). */
+const spanText = (ms) => {
+    const minutes = Math.max(0, Math.floor(ms / 60_000));
+
+    if (minutes < 60) {
+        return `${minutes} min`;
+    }
+
+    const hours = Math.floor(minutes / 60);
+
+    return hours < 48 ? `${hours} h` : `${Math.floor(hours / 24)} d`;
+};
+
+/**
+ * The PR links that no GitHub read gave facts for in more than 30 minutes, as 1 warning: `Unread: T12 (frostyard/x#5,
+ * 6 h), …`, the oldest first, at most 10, then how many more. Null when there are none.
+ */
+export const unreadText = (unread) => {
+    if (!Array.isArray(unread) || unread.length === 0) {
+        return null;
+    }
+
+    const shown = unread
+        .slice(0, 10)
+        .map((one) => `${one.thread} (${one.ref}, ${spanText(one.age)})`);
+    const more = unread.length - 10;
+
+    return `Unread: ${shown.join(", ")}${more > 0 ? `, and ${more} more` : ""}`;
+};
+
 /**
  * The queue's read status, for the page: its words, and whether it is a warning. A queue that is turned off is a short
  * muted line, not a failure. Null when a good read has nothing to say.
@@ -3284,6 +3314,11 @@ export default function setup(pocket) {
                         ? html`<p class="small desk-warn">
                               GitHub read incomplete: ${view.github.incomplete.join(", ")}
                           </p>`
+                        : null
+                }
+                ${
+                    view.github && unreadText(view.github.unread)
+                        ? html`<p class="small desk-warn">${unreadText(view.github.unread)}</p>`
                         : null
                 }
                 ${

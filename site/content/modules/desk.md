@@ -39,9 +39,12 @@ An agent session can use `read`, `watch` and `result` on its own thread only. A 
 
 A `x.desk.sweeper` task sweeps each supervisor's threads every 10 minutes. Its reads are outside any commit, then it writes 1 commit:
 
-- it reads the linked sessions, the subagents, each thread session's night shift, the git state of each folder and its worktrees, and makes 1 GitHub GraphQL call;
+- it reads the linked sessions, the subagents, each thread session's night shift, the git state of each folder and its worktrees, and GitHub: 1 GraphQL call for a small desk, and queries of at most 10 repositories and 20 PRs, 1 after the other, for a big one; a part that GitHub cut is read again 1 time, and a part still not read is named in `desk list`;
 - it attributes a PR to a thread by 3 rules in order (the PR was seen in the session, or exactly 1 thread made its branch, or exactly 1 thread was open when it was made);
-- it computes the next actor (`brian`, `agent`, `odrade`, a `reviewer`, or `none`) and checks whether every part is closed.
+- it reads by number the PRs a session named when their repository's open list was not read whole, and only the seen and branch rules attach them;
+- it computes the next actor (`brian`, `agent`, `odrade`, a `reviewer`, or `none`) and checks whether every part is closed. A thread is not done while the read left out a PR its session named, or, for a thread with no PR of its own, the open PRs of its repository: GitHub being down keeps such a thread open until a read works.
+
+`desk list`, `desk sync` and the prompt section say `Unread: T12 (frostyard/x#5, 6 h)` for a PR link that no read gave facts for in more than 30 minutes, `GitHub: last read at 01:47, 6 h ago` when the read is that old, and `Sweep failed at 01:47: <why>` until the next good sweep. The page header shows only the `Unread: …` line.
 
 The sweep also wakes an agent when every PR on its thread is merged or closed, tells a session once when its PR conflicts or its checks fail, removes the label `ready-for-human` when the PR changes after it, and archives the idle sessions of closed threads.
 

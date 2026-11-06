@@ -42,6 +42,7 @@ import setup, {
     planStateLine,
     queueStatus,
     stillMounted,
+    unreadText,
     completedLines,
     panelStep,
     newestReads,
@@ -190,6 +191,43 @@ test("queueStatus: a good read says nothing; a failure, a cut read and a queue t
             warn: false,
         },
     );
+});
+
+test("unreadText: the unread links, the oldest first, at most 10, then how many more", () => {
+    assert.equal(unreadText(undefined), null);
+    assert.equal(unreadText([]), null);
+    assert.equal(
+        unreadText([
+            { thread: "T12", ref: "frostyard/x#5", age: 6 * 3600_000 },
+            { thread: "T13", ref: "frostyard/y#2", age: 45 * 60_000 },
+        ]),
+        "Unread: T12 (frostyard/x#5, 6 h), T13 (frostyard/y#2, 45 min)",
+    );
+
+    const many = Array.from({ length: 12 }, (_, index) => ({
+        thread: `T${index}`,
+        ref: "frostyard/x#1",
+        age: 3 * 86400_000,
+    }));
+
+    assert.match(unreadText(many), /^Unread: T0 \(frostyard\/x#1, 3 d\), .*, and 2 more$/);
+});
+
+test("the header warns of PR links that no read gave facts for", async () => {
+    const out = await render({
+        ...viewWith(undefined),
+        github: {
+            at: NOW,
+            ok: true,
+            unread: [{ thread: "T12", ref: "frostyard/x#5", age: 6 * 3600_000 }],
+        },
+    });
+
+    assert.match(out, /desk-warn">Unread: T12 \(frostyard\/x#5, 6 h\)/);
+
+    const fresh = await render({ ...viewWith(undefined), github: { at: NOW, ok: true } });
+
+    assert.doesNotMatch(fresh, /Unread:/);
 });
 
 test("a row names every counted signal, the actor and the age", async () => {

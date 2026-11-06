@@ -640,6 +640,11 @@ export type DeskState = {
         incomplete?: string[];
     };
     /**
+     * By supervisor id: the last sweep of that supervisor that failed (its reads, or its commit), when and why, in 1 line
+     * of 200 characters at most. The next good sweep of that supervisor removes it.
+     */
+    sweepErrors?: Record<string, { at: number; error: string }>;
+    /**
      * What a supervisor's first sweep saw. Old work never becomes a found thread: only the seed brings it in. A folder
      * leaves `folders` when it is clean. `pending` holds the folders that have been dirty since a sweep first saw them,
      * with that time: a found thread waits until they stay dirty for `FOUND_FOLDER_DELAY_MS`.
@@ -3803,6 +3808,11 @@ export type CloseFacts = {
     now: number;
     /** Folders that another open thread works in: the folder part does not count there. */
     folders: Set<string>;
+    /**
+     * By thread id: what the sweep's GitHub read did not read that the thread may need (`closeUnread`). Each line holds
+     * the thread open until a read has it. Absent: nothing.
+     */
+    unread?: ReadonlyMap<string, readonly string[]>;
 };
 
 /** Whether every part of a thread is closed, and if not, which parts are still open, in words. */
@@ -3843,6 +3853,9 @@ export function closeCheck(thread: Thread, facts: CloseFacts): { close: boolean;
             open.push(`PR ${ref} is ${pr.state?.toLowerCase() ?? "not read"}`);
         }
     }
+
+    // A PR its session named, or its repository's open PRs, that the read did not have: the work may be there.
+    open.push(...(facts.unread?.get(thread.id) ?? []));
 
     for (const ask of thread.asks) {
         if (askIsOpen(ask)) {
@@ -6343,6 +6356,13 @@ export type GitHubFacts = {
     missing?: string[];
     /** The parts of the read that are not complete, in short lines, when the read cut something off. */
     incomplete?: string[];
+    /**
+     * The PRs that the read asked for by number only because a thread's session named them (`seenPinCandidates`): their
+     * facts are in `prs`, and attribution gives them only by evidence (rules 1 and 2).
+     */
+    seenPins?: string[];
+    /** The refs of `seenPins` that GitHub does not have. Not `missing`: no thread holds them, so no line lists them. */
+    seenMissing?: string[];
 };
 
 /** The most open PRs one page holds: GitHub's maximum for a connection. */
@@ -6418,8 +6438,9 @@ const ISSUE_PINNED =
     "number state stateReason closedByPullRequestsReferences(first: 5, includeClosedPrs: true) { nodes { number state repository { nameWithOwner } } }";
 
 /**
- * The one GraphQL query of a sweep: the viewer, each repository's open PRs, each attached PR by number, and each
- * linked issue by number (`iN`). `detail` names the attached PRs that also give their body and the issues they close;
+ * 1 GraphQL query of a sweep's read (`githubChunks` splits the read into such queries): the viewer, each repository's
+ * open PRs, each attached PR by number, and each linked issue by number (`iN`). `detail` names the attached PRs that
+ * also give their body and the issues they close;
  * `watched` names the pinned PRs that also give their labels and latest reviews (`PR_WATCH`). Every owner, name, and
  * number is checked first: nothing else goes into the query.
  */
@@ -7075,6 +7096,534 @@ function pinnedIssue(value: unknown, repo: string): PinnedIssue | undefined {
     };
 }
 
+// ─── The chunked read ───────────────────────────────────────────────────────
+
+/**
+ * The most repositories that 1 query of a sweep's read lists. A query of 39 repositories and 59 pinned PRs came back cut
+ * (`RESOURCE_LIMITS_EXCEEDED`: the last aliases had no data), and 39 repositories alone gave HTTP 502; 10 read well.
+ */
+export const GITHUB_REPOS_PER_QUERY = 10;
+
+/** The most attached PRs that 1 query reads by number. 20 and 30 read well. */
+export const GITHUB_PRS_PER_QUERY = 20;
+
+/** The most linked issues that 1 query reads by number. They have queries of their own. */
+export const GITHUB_ISSUES_PER_QUERY = 20;
+
+/** The limits of a query of a sweep's read. */
+export type ChunkLimits = { repos: number; prs: number; issues: number };
+
+/** The limits of the 1 read again of the aliases a first answer cut: smaller, so GitHub has room for each. */
+export const GITHUB_RETRY_LIMITS: ChunkLimits = { repos: 2, prs: 5, issues: 5 };
+
+/** What 1 query of a sweep's read asks for. */
+export type GitHubChunk = { repos: string[]; prs: string[]; issues: string[] };
+
+/** The error type GitHub gives when a query asks for more than it reads in 1 go: the aliases after it have no data. */
+export const RESOURCE_LIMITS = "RESOURCE_LIMITS_EXCEEDED";
+
+/**
+ * The queries of 1 read, in order: query N lists the Nth group of `limits.repos` repositories and reads the Nth group of
+ * `limits.prs` PRs; the linked issues come last, in queries of their own. Each list loses its repeats first. A read of at
+ * most 10 repositories and 20 PRs, and no issue, is 1 query.
+ */
+export function githubChunks(
+    repos: readonly string[],
+    prs: readonly string[],
+    issues: readonly string[] = [],
+    limits: ChunkLimits = {
+        repos: GITHUB_REPOS_PER_QUERY,
+        prs: GITHUB_PRS_PER_QUERY,
+        issues: GITHUB_ISSUES_PER_QUERY,
+    },
+): GitHubChunk[] {
+    const wanted = [...new Set(repos)];
+    const pinned = [...new Set(prs)];
+    const linked = [...new Set(issues)];
+    const chunks: GitHubChunk[] = [];
+    const count = Math.max(
+        Math.ceil(wanted.length / limits.repos),
+        Math.ceil(pinned.length / limits.prs),
+    );
+
+    for (let index = 0; index < count; index += 1) {
+        chunks.push({
+            repos: wanted.slice(index * limits.repos, (index + 1) * limits.repos),
+            prs: pinned.slice(index * limits.prs, (index + 1) * limits.prs),
+            issues: [],
+        });
+    }
+
+    for (let at = 0; at < linked.length; at += limits.issues) {
+        chunks.push({ repos: [], prs: [], issues: linked.slice(at, at + limits.issues) });
+    }
+
+    return chunks;
+}
+
+/** 1 query's answer as facts, and what GitHub cut from it: the aliases to read again. */
+export type ChunkRead = {
+    facts: GitHubFacts;
+    cut: { repos: string[]; prs: string[]; issues: string[] };
+};
+
+const sameName = (a: string, b: string) => a.toLowerCase() === b.toLowerCase();
+
+/** The key of a record that matches a name in any case: GitHub gives canonical names, the desk keeps what it was given. */
+const keyOf = (record: Record<string, unknown>, name: string): string | undefined =>
+    Object.hasOwn(record, name) ? name : Object.keys(record).find((key) => sameName(key, name));
+
+/** Whether a line of `incomplete` speaks of this repository's open list (`owner/name: …`), in any case. */
+const openLineOf = (line: string, repo: string): boolean =>
+    line.toLowerCase().startsWith(`${repo.toLowerCase()}: `);
+
+/** The why of a GraphQL error, short, on 1 line. */
+const errorWords = (entry: { message?: unknown; type?: unknown }): string =>
+    flatLine(typeof entry.message === "string" ? entry.message : text(entry.type)).slice(0, 120) ||
+    "GitHub gave an error";
+
+/**
+ * 1 query's answer (`buildQuery` of `chunk`) as facts. The errors of a partial answer decide, by alias:
+ * - `pN`: cut (read again) when an error of type `RESOURCE_LIMITS_EXCEEDED` is under it, or when its `pullRequest` is null
+ *   and an error is deeper than `pullRequest`; missing when an error ends at the alias or at `pullRequest` and no PR
+ *   came; else the error is in a detail, and the PR keeps its facts without its body and closing issues.
+ * - `rN`: not read when its only errors end at the alias (the repository is gone, or not ours to read): it leaves the
+ *   facts, with the line `owner/name: not read (why)`. An error deeper under it, or a resource error, is a cut: the PRs
+ *   that came stay.
+ * - `iN`: cut when a resource error is under it, or its `issue` is null and an error is deeper than `issue`.
+ */
+export function readChunkAnswer(answer: unknown, chunk: GitHubChunk): ChunkRead {
+    const facts = parseGitHub(answer);
+    const data = (answer as { data?: unknown } | null | undefined)?.data;
+    const root = (data ?? {}) as Record<string, unknown>;
+    const errors = (answer as { errors?: unknown } | null | undefined)?.errors;
+    const byAlias = new Map<string, { path: unknown[]; type: string; message?: unknown }[]>();
+    const cut: ChunkRead["cut"] = { repos: [], prs: [], issues: [] };
+    const missing: string[] = [];
+    let incomplete = [...(facts.incomplete ?? [])];
+
+    for (const entry of Array.isArray(errors) ? errors : []) {
+        const one = entry as { path?: unknown; type?: unknown; message?: unknown } | null;
+        const path = one?.path;
+
+        if (!Array.isArray(path) || typeof path[0] !== "string") {
+            continue;
+        }
+
+        const list = byAlias.get(path[0]) ?? [];
+
+        list.push({ path, type: text(one?.type), message: one?.message });
+        byAlias.set(path[0], list);
+    }
+
+    for (const [alias, list] of byAlias) {
+        const index = Number(alias.slice(1));
+        const resource = list.some((entry) => entry.type === RESOURCE_LIMITS);
+
+        if (/^p[0-9]+$/.test(alias)) {
+            const ref = chunk.prs[index];
+
+            if (ref === undefined) {
+                continue;
+            }
+
+            const node = (root[alias] as { pullRequest?: unknown } | null | undefined)?.pullRequest;
+            const nodeNull = node === null || node === undefined || typeof node !== "object";
+            const ends = (path: unknown[]) =>
+                path.length === 1 || (path.length === 2 && path[1] === "pullRequest");
+            const key = keyOf(facts.prs, ref);
+            const fact = key === undefined ? undefined : facts.prs[key];
+
+            if (resource || (nodeNull && list.some((entry) => !ends(entry.path)))) {
+                cut.prs.push(ref);
+            }
+
+            if (fact !== undefined) {
+                // An error in a detail: the PR keeps its facts, and its detail is left out, so a partial class is unknown.
+                delete fact.body;
+                delete fact.closing;
+            } else if (
+                !cut.prs.includes(ref) &&
+                list.some((entry) => ends(entry.path)) &&
+                !missing.includes(ref)
+            ) {
+                missing.push(ref);
+            }
+        } else if (/^r[0-9]+$/.test(alias)) {
+            const repo = chunk.repos[index];
+
+            if (repo === undefined) {
+                continue;
+            }
+
+            if (resource || list.some((entry) => entry.path.length > 1)) {
+                cut.repos.push(repo);
+                continue;
+            }
+
+            // That repository could not be read: it leaves the facts, and a line says so.
+            const key = keyOf(facts.repos, repo);
+
+            if (key !== undefined) {
+                delete facts.repos[key];
+            }
+
+            incomplete = incomplete.filter((line) => !openLineOf(line, key ?? repo));
+            incomplete.push(`${repo}: not read (${errorWords(list[0]!)})`);
+        } else if (/^i[0-9]+$/.test(alias)) {
+            const ref = chunk.issues[index];
+
+            if (ref === undefined) {
+                continue;
+            }
+
+            const node = (root[alias] as { issue?: unknown } | null | undefined)?.issue;
+            const nodeNull = node === null || node === undefined || typeof node !== "object";
+            const deeper = list.some(
+                (entry) =>
+                    entry.path.length > 2 || (entry.path.length === 2 && entry.path[1] !== "issue"),
+            );
+
+            if (resource || (nodeNull && deeper)) {
+                cut.issues.push(ref);
+            }
+        }
+    }
+
+    const result: GitHubFacts = { ...facts };
+
+    delete result.incomplete;
+
+    if (incomplete.length > 0) {
+        result.incomplete = incomplete;
+    }
+
+    if (missing.length > 0) {
+        result.missing = missing;
+    }
+
+    return { facts: result, cut };
+}
+
+/** The lines of a repository: its open list's (`owner/name: …`), and those of the PRs of its list (`owner/name#12: …`). */
+function repoLines(lines: readonly string[], repo: string, open: readonly PrFact[]): string[] {
+    return lines.filter(
+        (line) => openLineOf(line, repo) || open.some((pr) => openLineOf(line, pr.ref)),
+    );
+}
+
+/** The lines without those `repoLines` gives. */
+function withoutRepoLines(
+    lines: readonly string[],
+    repo: string,
+    open: readonly PrFact[],
+): string[] {
+    const own = new Set(repoLines(lines, repo, open));
+
+    return lines.filter((line) => !own.has(line));
+}
+
+/** The lines in order, each once. */
+const uniqueLines = (lines: readonly string[]): string[] => [...new Set(lines)];
+
+/**
+ * The facts of a read's queries as 1 read. A repository, a PR or an issue comes from the query that asked for it; one
+ * that no query asked for (a fake's answer) comes from the first query that gave it. The viewer is the first one given;
+ * the missing refs and the lines are all of them, each once.
+ */
+export function mergeGitHubChunks(
+    parts: readonly { chunk: GitHubChunk; facts: GitHubFacts }[],
+): GitHubFacts {
+    const asked = (list: (chunk: GitHubChunk) => string[], name: string) =>
+        parts.some((part) => list(part.chunk).some((one) => sameName(one, name)));
+    const merged: GitHubFacts = { viewer: "", repos: {}, prs: {} };
+    const issues: Record<string, PinnedIssue> = {};
+    const missing: string[] = [];
+    const lines: string[] = [];
+
+    for (const part of parts) {
+        if (merged.viewer === "") {
+            merged.viewer = part.facts.viewer;
+        }
+
+        const take = <T>(
+            from: Record<string, T>,
+            into: Record<string, T>,
+            list: (chunk: GitHubChunk) => string[],
+        ) => {
+            for (const [name, value] of Object.entries(from)) {
+                const mine = list(part.chunk).some((one) => sameName(one, name));
+
+                if (mine || (!asked(list, name) && keyOf(into, name) === undefined)) {
+                    into[name] = value;
+                }
+            }
+        };
+
+        take(part.facts.repos, merged.repos, (chunk) => chunk.repos);
+        take(part.facts.prs, merged.prs, (chunk) => chunk.prs);
+        take(part.facts.issues ?? {}, issues, (chunk) => chunk.issues);
+        missing.push(...(part.facts.missing ?? []));
+        lines.push(...(part.facts.incomplete ?? []));
+    }
+
+    if (Object.keys(issues).length > 0) {
+        merged.issues = issues;
+    }
+
+    if (missing.length > 0) {
+        merged.missing = uniqueLines(missing);
+    }
+
+    if (lines.length > 0) {
+        merged.incomplete = uniqueLines(lines);
+    }
+
+    return merged;
+}
+
+/**
+ * The second answer of the aliases a first answer cut (`GITHUB_RETRY_LIMITS`), into the merged facts. An alias that the
+ * second answer gives whole replaces the first; one it cuts again replaces the first only when it read more (more open
+ * PRs of a repository, or a PR or an issue the first did not have). Gives the names the second answer read whole.
+ */
+export function mergeRetry(
+    first: GitHubFacts,
+    chunk: GitHubChunk,
+    second: ChunkRead,
+): { repos: string[]; prs: string[]; issues: string[] } {
+    const fixed = { repos: [] as string[], prs: [] as string[], issues: [] as string[] };
+    let lines = [...(first.incomplete ?? [])];
+    const secondLines = second.facts.incomplete ?? [];
+
+    for (const repo of chunk.repos) {
+        const whole = !second.cut.repos.includes(repo);
+        const oldKey = keyOf(first.repos, repo);
+        const newKey = keyOf(second.facts.repos, repo);
+        const old = oldKey === undefined ? undefined : first.repos[oldKey];
+        const next = newKey === undefined ? undefined : second.facts.repos[newKey];
+        const better =
+            next !== undefined && (old === undefined || next.open.length > old.open.length);
+
+        if (!whole && !better) {
+            continue;
+        }
+
+        if (whole) {
+            fixed.repos.push(repo);
+        }
+
+        lines = withoutRepoLines(lines, oldKey ?? repo, old?.open ?? []);
+
+        if (oldKey !== undefined) {
+            delete first.repos[oldKey];
+        }
+
+        if (next !== undefined && newKey !== undefined) {
+            first.repos[newKey] = next;
+        }
+
+        lines.push(
+            ...repoLines(secondLines, newKey ?? repo, next?.open ?? []),
+            ...(newKey === undefined || sameName(newKey, repo)
+                ? []
+                : repoLines(secondLines, repo, [])),
+        );
+    }
+
+    for (const ref of chunk.prs) {
+        const whole = !second.cut.prs.includes(ref);
+        const oldKey = keyOf(first.prs, ref);
+        const newKey = keyOf(second.facts.prs, ref);
+        const gone = (second.facts.missing ?? []).some((one) => sameName(one, ref));
+
+        if (whole) {
+            fixed.prs.push(ref);
+        }
+
+        if (newKey !== undefined && (whole || oldKey === undefined)) {
+            if (oldKey !== undefined) {
+                lines = lines.filter((line) => !openLineOf(line, oldKey));
+                delete first.prs[oldKey];
+            }
+
+            first.prs[newKey] = second.facts.prs[newKey]!;
+            lines.push(...secondLines.filter((line) => openLineOf(line, newKey)));
+        } else if (whole && gone) {
+            if (oldKey !== undefined) {
+                lines = lines.filter((line) => !openLineOf(line, oldKey));
+                delete first.prs[oldKey];
+            }
+
+            first.missing = uniqueLines([...(first.missing ?? []), ref]);
+        }
+    }
+
+    for (const ref of chunk.issues) {
+        const whole = !second.cut.issues.includes(ref);
+        const newKey = keyOf(second.facts.issues ?? {}, ref);
+
+        if (whole) {
+            fixed.issues.push(ref);
+        }
+
+        if (newKey !== undefined && (whole || keyOf(first.issues ?? {}, ref) === undefined)) {
+            first.issues ??= {};
+            first.issues[newKey] = second.facts.issues![newKey]!;
+        }
+    }
+
+    if (lines.length === 0) {
+        delete first.incomplete;
+    } else {
+        first.incomplete = uniqueLines(lines);
+    }
+
+    return fixed;
+}
+
+/** The ask of 1 query: its answer, also a partial one with data; it throws when there is no data. */
+export type GraphqlAnswer = (query: string) => Promise<unknown>;
+
+/**
+ * A sweep's read in queries (`githubChunks`), 1 after the other, never at the same time. A query that fails with no data
+ * fails only its own part: each of its names gets the line `name: not read (why)`. Only when every query fails is the
+ * read a failure. The aliases that GitHub cut (`readChunkAnswer`) are read again 1 time, in smaller queries
+ * (`GITHUB_RETRY_LIMITS`). A PR or an issue still cut gets the line `owner/name#12: not read (resource limits)` (or
+ * `read in part` when some of it came); a repository still cut is in `cutRepos`, and keeps the PRs that came, and one
+ * still cut with no node gets the line `owner/name: not read (resource limits)`.
+ */
+export async function readGitHubChunks(
+    ask: GraphqlAnswer,
+    want: {
+        repos: readonly string[];
+        prs: readonly string[];
+        issues?: readonly string[];
+        detail?: readonly string[];
+        watched?: readonly string[];
+    },
+    explain: (error: unknown) => string,
+): Promise<{ facts?: GitHubFacts; error?: string; cutRepos: string[] }> {
+    const detail = [...(want.detail ?? [])];
+    const watched = [...(want.watched ?? [])];
+    const query = (chunk: GitHubChunk) =>
+        buildQuery(chunk.repos, chunk.prs, chunk.issues, detail, watched);
+    const parts: { chunk: GitHubChunk; facts: GitHubFacts }[] = [];
+    const failed: string[] = [];
+    const cut = { repos: new Set<string>(), prs: new Set<string>(), issues: new Set<string>() };
+    let firstError: string | undefined;
+
+    for (const chunk of githubChunks(want.repos, want.prs, want.issues ?? [])) {
+        let read: ChunkRead;
+
+        try {
+            read = readChunkAnswer(await ask(query(chunk)), chunk);
+        } catch (error) {
+            const why = explain(error);
+
+            firstError ??= why;
+
+            for (const name of [...chunk.repos, ...chunk.prs, ...chunk.issues]) {
+                failed.push(`${name}: not read (${why})`);
+            }
+
+            continue;
+        }
+
+        parts.push({ chunk, facts: read.facts });
+        read.cut.repos.forEach((one) => cut.repos.add(one));
+        read.cut.prs.forEach((one) => cut.prs.add(one));
+        read.cut.issues.forEach((one) => cut.issues.add(one));
+    }
+
+    if (parts.length === 0) {
+        return firstError === undefined ? { cutRepos: [] } : { error: firstError, cutRepos: [] };
+    }
+
+    const facts = mergeGitHubChunks(parts);
+
+    if (cut.repos.size + cut.prs.size + cut.issues.size > 0) {
+        for (const chunk of githubChunks(
+            [...cut.repos],
+            [...cut.prs],
+            [...cut.issues],
+            GITHUB_RETRY_LIMITS,
+        )) {
+            let second: ChunkRead;
+
+            try {
+                second = readChunkAnswer(await ask(query(chunk)), chunk);
+            } catch {
+                // The first answer stays, with what it cut.
+                continue;
+            }
+
+            const fixed = mergeRetry(facts, chunk, second);
+
+            fixed.repos.forEach((one) => cut.repos.delete(one));
+            fixed.prs.forEach((one) => cut.prs.delete(one));
+            fixed.issues.forEach((one) => cut.issues.delete(one));
+        }
+    }
+
+    const lines = [...(facts.incomplete ?? []), ...failed];
+
+    // A repository that both answers cut with no node of it: nothing of it was read, and a line must say so, or the close
+    // rule would take its open PRs for read.
+    for (const repo of cut.repos) {
+        if (
+            keyOf(facts.repos, repo) === undefined &&
+            !lines.some((line) => openLineOf(line, repo))
+        ) {
+            lines.push(`${repo}: not read (resource limits)`);
+        }
+    }
+
+    for (const ref of [...cut.prs, ...cut.issues]) {
+        const read =
+            keyOf(facts.prs, ref) !== undefined || keyOf(facts.issues ?? {}, ref) !== undefined;
+
+        lines.push(`${ref}: ${read ? "read in part" : "not read"} (resource limits)`);
+    }
+
+    if (lines.length > 0) {
+        facts.incomplete = uniqueLines(lines);
+    }
+
+    return { facts, cutRepos: [...cut.repos] };
+}
+
+/**
+ * The lines of the repositories GitHub cut in both answers (`cutRepos` of `readGitHubChunks`), after the paging: each
+ * one with no complete open list gets a line. One with no node says `owner/name: not read (resource limits)`; one whose
+ * open count is unknown (`totals`, read before the paging) says how many PRs came, and that more may follow. A
+ * repository with a line already, or whose count says every PR came, gets none.
+ */
+export function cutRepoLines(
+    facts: GitHubFacts,
+    cutRepos: readonly string[],
+    totals: ReadonlyMap<string, number | undefined>,
+): GitHubFacts {
+    const lines = [...(facts.incomplete ?? [])];
+
+    for (const repo of cutRepos) {
+        const key = keyOf(facts.repos, repo);
+        const entry = key === undefined ? undefined : facts.repos[key];
+
+        if (lines.some((line) => openLineOf(line, key ?? repo) || openLineOf(line, repo))) {
+            continue;
+        }
+
+        if (entry === undefined || key === undefined) {
+            lines.push(`${repo}: not read (resource limits)`);
+        } else if (totals.get(repo) === undefined) {
+            lines.push(openIncompleteLine(key, entry.open.length, undefined));
+        }
+    }
+
+    return lines.length === 0 ? facts : { ...facts, incomplete: lines };
+}
+
 /** The event text of an answer, as `answerAsk` writes it: `answered T13a (desk): merged`. */
 const answeredLine = (id: string, by: string, words: string) =>
     `answered ${id} (${by}): ${words.length > 120 ? `${words.slice(0, 119)}…` : words}`;
@@ -7416,187 +7965,418 @@ export function attribute(
         }
     }
 
-    for (const [repo, facts] of Object.entries(github.repos)) {
-        if (facts.archived) {
-            continue;
+    /**
+     * 1 PR of ours, by the rules in order. `evidenceOnly`: a PR that only a read by number gave (a discovery pin,
+     * `seenPins`), in no repository's open list: only rules 1 (seen) and 2 (branch) may attach it, never 3 (window) or
+     * 4 (found), which would guess from a list that the read did not have.
+     */
+    const consider = (pr: PrFact, evidenceOnly: boolean): void => {
+        if (!ours(pr.author)) {
+            return;
         }
 
-        for (const pr of facts.open) {
-            if (!ours(pr.author)) {
-                continue;
+        // A PR a person took off by hand stays off: no sweep attaches it, and none finds it again.
+        if (state.dropped?.[pr.ref] !== undefined) {
+            return;
+        }
+
+        // Brian's own PR: only the evidence rules apply to it.
+        const ownPr = owned(pr.author);
+
+        const holder = holderOf(pr.ref);
+
+        // A PR attached by hand (the tool, the page, or the seed) stays on its thread: never a candidate.
+        if (holder?.prs[pr.ref]?.via === "attached") {
+            return;
+        }
+
+        if (holder !== undefined) {
+            // The "touched" move: a newer thread of this supervisor pushed the branch of an older thread's PR.
+            if (holder.state === "closed" || holder.supervisor !== supervisor) {
+                return;
             }
 
-            // A PR a person took off by hand stays off: no sweep attaches it, and none finds it again.
-            if (state.dropped?.[pr.ref] !== undefined) {
-                continue;
-            }
-
-            // Brian's own PR: only the evidence rules apply to it.
-            const ownPr = owned(pr.author);
-
-            const holder = holderOf(pr.ref);
-
-            // A PR attached by hand (the tool, the page, or the seed) stays on its thread: never a candidate.
-            if (holder?.prs[pr.ref]?.via === "attached") {
-                continue;
-            }
-
-            if (holder !== undefined) {
-                // The "touched" move: a newer thread of this supervisor pushed the branch of an older thread's PR.
-                if (holder.state === "closed" || holder.supervisor !== supervisor) {
-                    continue;
-                }
-
-                const newer = mine()
-                    .filter(
-                        (thread) =>
-                            thread !== holder &&
-                            thread.startedAt > holder.startedAt &&
-                            threadRepos(thread).includes(pr.repo) &&
-                            seenRef(thread, pr.ref) &&
-                            thread.branches.includes(pr.headRefName),
-                    )
-                    .sort((a, b) => b.startedAt - a.startedAt)[0];
-
-                if (newer !== undefined) {
-                    delete holder.prs[pr.ref];
-                    newer.prs[pr.ref] = { ...linkFor(pr, "seen"), readAt: now };
-
-                    if (
-                        addEvent(
-                            holder,
-                            `moved:${pr.ref}:to:${newer.id}:${String(now)}`,
-                            `${pr.ref} moved to ${newer.id}`,
-                            now,
-                        )
-                    ) {
-                        events += 1;
-                    }
-
-                    if (
-                        addEvent(
-                            newer,
-                            `moved:${pr.ref}:from:${holder.id}:${String(now)}`,
-                            `${pr.ref} moved from ${holder.id}`,
-                            now,
-                        )
-                    ) {
-                        events += 1;
-                    }
-                }
-
-                continue;
-            }
-
-            // Rules 1 and 2 may also give a PR back to a thread that closed as done in the last 7 days.
-            const threads = targetsFor();
-
-            // 1. seen: it was in the thread's context. An older PR counts only when the thread pushed its branch.
-            let target = threads
-                .filter((thread) => seenRef(thread, pr.ref) && pr.createdAt >= thread.startedAt)
-                .sort((a, b) => b.startedAt - a.startedAt)[0];
-            let via: "seen" | "branch" | "window" = "seen";
-
-            if (target === undefined) {
-                target = threads
-                    .filter(
-                        (thread) =>
-                            seenRef(thread, pr.ref) && thread.branches.includes(pr.headRefName),
-                    )
-                    .sort((a, b) => b.startedAt - a.startedAt)[0];
-            }
-
-            // 2. branch: a thread in that repository that made or has the branch, and exactly one.
-            if (target === undefined) {
-                const matches = threads.filter(
+            const newer = mine()
+                .filter(
                     (thread) =>
+                        thread !== holder &&
+                        thread.startedAt > holder.startedAt &&
                         threadRepos(thread).includes(pr.repo) &&
-                        (thread.branches.includes(pr.headRefName) ||
-                            madeBranch(gitFacts, thread, pr.headRefName)),
-                );
+                        seenRef(thread, pr.ref) &&
+                        thread.branches.includes(pr.headRefName),
+                )
+                .sort((a, b) => b.startedAt - a.startedAt)[0];
 
-                if (matches.length === 1) {
-                    target = matches[0];
-                    via = "branch";
-                }
-            }
-
-            // 3. window: exactly one open thread in that repository was open when the PR was made. Never a closed one.
-            // A window is a guess, so it never claims Brian's own PR.
-            if (target === undefined && !ownPr) {
-                const matches = mine().filter(
-                    (thread) =>
-                        threadRepos(thread).includes(pr.repo) && thread.startedAt <= pr.createdAt,
-                );
-
-                if (matches.length === 1) {
-                    target = matches[0];
-                    via = "window";
-                }
-            }
-
-            if (target !== undefined) {
-                target.prs[pr.ref] = { ...linkFor(pr, via), readAt: now };
+            if (newer !== undefined) {
+                delete holder.prs[pr.ref];
+                newer.prs[pr.ref] = { ...linkFor(pr, "seen"), readAt: now };
 
                 if (
                     addEvent(
-                        target,
-                        `pr:${pr.ref}:${via}:${String(now)}`,
-                        `${pr.ref} attached (${via})`,
+                        holder,
+                        `moved:${pr.ref}:to:${newer.id}:${String(now)}`,
+                        `${pr.ref} moved to ${newer.id}`,
                         now,
                     )
                 ) {
                     events += 1;
                 }
 
-                if (recent.has(target.id)) {
-                    reopened.add(target.id);
+                if (
+                    addEvent(
+                        newer,
+                        `moved:${pr.ref}:from:${holder.id}:${String(now)}`,
+                        `${pr.ref} moved from ${holder.id}`,
+                        now,
+                    )
+                ) {
+                    events += 1;
                 }
-
-                continue;
             }
 
-            // 4. found: new work, not older than the desk's epoch. Brian's own PR is his, so it makes no found thread.
-            if (ownPr) {
-                continue;
+            return;
+        }
+
+        // Rules 1 and 2 may also give a PR back to a thread that closed as done in the last 7 days.
+        const threads = targetsFor();
+
+        // 1. seen: it was in the thread's context. An older PR counts only when the thread pushed its branch.
+        let target = threads
+            .filter((thread) => seenRef(thread, pr.ref) && pr.createdAt >= thread.startedAt)
+            .sort((a, b) => b.startedAt - a.startedAt)[0];
+        let via: "seen" | "branch" | "window" = "seen";
+
+        if (target === undefined) {
+            target = threads
+                .filter(
+                    (thread) => seenRef(thread, pr.ref) && thread.branches.includes(pr.headRefName),
+                )
+                .sort((a, b) => b.startedAt - a.startedAt)[0];
+        }
+
+        // 2. branch: a thread in that repository that made or has the branch, and exactly one.
+        if (target === undefined) {
+            const matches = threads.filter(
+                (thread) =>
+                    threadRepos(thread).includes(pr.repo) &&
+                    (thread.branches.includes(pr.headRefName) ||
+                        madeBranch(gitFacts, thread, pr.headRefName)),
+            );
+
+            if (matches.length === 1) {
+                target = matches[0];
+                via = "branch";
             }
+        }
 
-            const epoch = deskEpoch(state);
+        // 3. window: exactly one open thread in that repository was open when the PR was made. Never a closed one.
+        // A window is a guess, so it never claims Brian's own PR, nor a PR from a read by number.
+        if (target === undefined && !ownPr && !evidenceOnly) {
+            const matches = mine().filter(
+                (thread) =>
+                    threadRepos(thread).includes(pr.repo) && thread.startedAt <= pr.createdAt,
+            );
 
-            if (epoch === undefined || pr.createdAt < epoch) {
-                continue;
+            if (matches.length === 1) {
+                target = matches[0];
+                via = "window";
             }
+        }
 
-            const id = `F${String(state.next.F)}`;
+        if (target !== undefined) {
+            target.prs[pr.ref] = { ...linkFor(pr, via), readAt: now };
 
-            state.next.F += 1;
-            const found: Thread = {
-                id,
-                key: `found:pr:${pr.ref}`,
-                origin: "found",
-                title: oneLine(pr.title) || pr.ref,
-                agents: [],
-                repo: pr.repo,
-                supervisor,
-                state: "open",
-                startedAt: now,
-                lastEventAt: now,
-                prs: { [pr.ref]: { ...linkFor(pr, "attached"), readAt: now } },
-                branches: [],
-                asks: [],
-                run: { next: "odrade", sweptAt: now },
-                events: [],
-            };
-
-            state.threads[id] = found;
-
-            if (addEvent(found, "found", "found: a PR with no thread", now)) {
+            if (
+                addEvent(
+                    target,
+                    `pr:${pr.ref}:${via}:${String(now)}`,
+                    `${pr.ref} attached (${via})`,
+                    now,
+                )
+            ) {
                 events += 1;
+            }
+
+            if (recent.has(target.id)) {
+                reopened.add(target.id);
+            }
+
+            return;
+        }
+
+        // 4. found: new work, not older than the desk's epoch. Brian's own PR is his, so it makes no found thread. A PR
+        // from a read by number is in no open list the read had: it makes none either.
+        if (ownPr || evidenceOnly) {
+            return;
+        }
+
+        const epoch = deskEpoch(state);
+
+        if (epoch === undefined || pr.createdAt < epoch) {
+            return;
+        }
+
+        const id = `F${String(state.next.F)}`;
+
+        state.next.F += 1;
+        const found: Thread = {
+            id,
+            key: `found:pr:${pr.ref}`,
+            origin: "found",
+            title: oneLine(pr.title) || pr.ref,
+            agents: [],
+            repo: pr.repo,
+            supervisor,
+            state: "open",
+            startedAt: now,
+            lastEventAt: now,
+            prs: { [pr.ref]: { ...linkFor(pr, "attached"), readAt: now } },
+            branches: [],
+            asks: [],
+            run: { next: "odrade", sweptAt: now },
+            events: [],
+        };
+
+        state.threads[id] = found;
+
+        if (addEvent(found, "found", "found: a PR with no thread", now)) {
+            events += 1;
+        }
+    };
+
+    for (const facts of Object.values(github.repos)) {
+        if (facts.archived) {
+            continue;
+        }
+
+        for (const pr of facts.open) {
+            consider(pr, false);
+        }
+    }
+
+    // The PRs a thread's session named, read by number because their repository's open list was cut: by evidence only.
+    // A watch's pin, or a pin of another thread, is not in `seenPins`: it attributes nothing.
+    const listed = new Set(
+        Object.values(github.repos).flatMap((facts) =>
+            facts.open.map((pr) => pr.ref.toLowerCase()),
+        ),
+    );
+
+    for (const ref of github.seenPins ?? []) {
+        const key = Object.keys(github.prs).find(
+            (name) => name.toLowerCase() === ref.toLowerCase(),
+        );
+        const pr = key === undefined ? undefined : github.prs[key];
+
+        if (
+            pr === undefined ||
+            pr.state !== "OPEN" ||
+            pr.archived ||
+            github.repos[pr.repo]?.archived === true ||
+            listed.has(pr.ref.toLowerCase())
+        ) {
+            continue;
+        }
+
+        consider(pr, true);
+    }
+
+    return { events, reopened: [...reopened] };
+}
+
+/** The most PRs of 1 thread that a sweep reads by number because its session named them (`seenPinCandidates`). */
+export const SEEN_PINS_MAX = 3;
+
+/**
+ * Whether a read has a complete open list of a repository: the repository came, and no line of `incomplete` speaks of
+ * its list (`owner/name: …`: PRs left unread, or not read at all).
+ */
+export function openListComplete(github: GitHubFacts | undefined, repo: string): boolean {
+    if (github === undefined) {
+        return false;
+    }
+
+    const key = keyOf(github.repos, repo);
+
+    return (
+        key !== undefined &&
+        !(github.incomplete ?? []).some((line) => openLineOf(line, key) || openLineOf(line, repo))
+    );
+}
+
+/**
+ * The PRs that a thread's session named (`run.seenPrs`) and that the read may not show, by thread id, the newest first:
+ * for each thread of the supervisor that is not closed and is not a plan, each named ref in a repository of the thread
+ * (`threadRepos`), that may go into a query, that no thread holds, that was not dropped, that is not `pinned` already,
+ * and whose repository has no complete open list in the read (`openListComplete`). At most `max` of each thread. All
+ * names compare in any case.
+ */
+export function seenPinCandidates(
+    state: Readonly<DeskState> | undefined,
+    supervisor: number,
+    github: GitHubFacts | undefined,
+    options: { pinned?: Iterable<string>; max?: number } = {},
+): Map<string, string[]> {
+    const threads = Object.values(state?.threads ?? {});
+    const held = new Set(
+        threads.flatMap((thread) => Object.keys(thread.prs).map((ref) => ref.toLowerCase())),
+    );
+    const dropped = new Set(Object.keys(state?.dropped ?? {}).map((ref) => ref.toLowerCase()));
+    const pinned = new Set([...(options.pinned ?? [])].map((ref) => ref.toLowerCase()));
+    const found = new Map<string, string[]>();
+
+    for (const thread of threads) {
+        if (
+            thread.supervisor !== supervisor ||
+            thread.state === "closed" ||
+            thread.origin === "plan" ||
+            !Array.isArray(thread.run.seenPrs)
+        ) {
+            continue;
+        }
+
+        const repos = new Set(threadRepos(thread).map((repo) => repo.toLowerCase()));
+        const refs: string[] = [];
+
+        for (const ref of [...thread.run.seenPrs].reverse()) {
+            if (
+                typeof ref !== "string" ||
+                !REF.test(ref) ||
+                !isRepoName(repoOf(ref)) ||
+                !repos.has(repoOf(ref).toLowerCase()) ||
+                held.has(ref.toLowerCase()) ||
+                dropped.has(ref.toLowerCase()) ||
+                pinned.has(ref.toLowerCase()) ||
+                refs.some((one) => sameName(one, ref)) ||
+                openListComplete(github, repoOf(ref))
+            ) {
+                continue;
+            }
+
+            refs.push(ref);
+
+            if (options.max !== undefined && refs.length >= options.max) {
+                break;
+            }
+        }
+
+        if (refs.length > 0) {
+            found.set(thread.id, refs);
+        }
+    }
+
+    return found;
+}
+
+/**
+ * A read's facts with the discovery pins' read (`seenPinCandidates`): each PR fact it gave that the read lacks, the
+ * refs it asked for (`seenPins`), the refs GitHub does not have (`seenMissing`), and its lines. A read that failed gives
+ * the line `owner/name#12: not read (why)` for each ref.
+ */
+export function withSeenPins(
+    github: GitHubFacts,
+    refs: readonly string[],
+    read: { facts?: GitHubFacts; error?: string },
+): GitHubFacts {
+    const merged: GitHubFacts = { ...github, prs: { ...github.prs }, seenPins: [...refs] };
+    const lines = [...(github.incomplete ?? [])];
+
+    for (const [ref, fact] of Object.entries(read.facts?.prs ?? {})) {
+        if (keyOf(merged.prs, ref) === undefined) {
+            merged.prs[ref] = fact;
+        }
+    }
+
+    const missing = (read.facts?.missing ?? []).filter((ref) =>
+        refs.some((one) => sameName(one, ref)),
+    );
+
+    if (missing.length > 0) {
+        merged.seenMissing = missing;
+    }
+
+    if (read.facts === undefined && read.error !== undefined) {
+        lines.push(...refs.map((ref) => `${ref}: not read (${read.error!})`));
+    }
+
+    lines.push(...(read.facts?.incomplete ?? []));
+
+    if (lines.length > 0) {
+        merged.incomplete = uniqueLines(lines);
+    }
+
+    return merged;
+}
+
+/**
+ * What a sweep did not read that a thread may need, by thread id: the close rule holds the thread for each line
+ * (`CloseFacts.unread`), until a read has it.
+ * 1. A PR its session named (`seenPinCandidates`, with no limit) that the read has no fact of and GitHub did not call
+ *    missing, when the read failed, did not ask for it (more than `SEEN_PINS_MAX`, or named after the read), or has
+ *    a line for it: `PR owner/name#12 named in its session is not read`.
+ * 2. Only for a thread with no PR of its own: each of its repositories that the sweep asked GitHub for, when the read
+ *    failed or has a line for its open list: `the open PRs of owner/name are not all read`.
+ * A sweep that asked GitHub nothing (`asked` empty and no read) holds nothing.
+ */
+export function closeUnread(
+    state: Readonly<DeskState>,
+    supervisor: number,
+    read: { github?: GitHubFacts; error?: string; asked?: readonly string[] },
+): Map<string, string[]> {
+    const github = read.github;
+    const failed = read.error !== undefined;
+    const held = new Map<string, string[]>();
+    const add = (id: string, line: string) => held.set(id, [...(held.get(id) ?? []), line]);
+
+    if (github === undefined && !failed) {
+        return held;
+    }
+
+    const gone = [...(github?.missing ?? []), ...(github?.seenMissing ?? [])];
+    const lines = github?.incomplete ?? [];
+
+    for (const [id, refs] of seenPinCandidates(state, supervisor, github)) {
+        for (const ref of refs) {
+            if (
+                (github !== undefined && keyOf(github.prs, ref) !== undefined) ||
+                gone.some((one) => sameName(one, ref))
+            ) {
+                continue;
+            }
+
+            if (
+                failed ||
+                !(github?.seenPins ?? []).some((one) => sameName(one, ref)) ||
+                lines.some((line) => openLineOf(line, ref))
+            ) {
+                add(id, `PR ${ref} named in its session is not read`);
             }
         }
     }
 
-    return { events, reopened: [...reopened] };
+    const asked = read.asked ?? [];
+
+    for (const thread of Object.values(state.threads)) {
+        if (
+            thread.supervisor !== supervisor ||
+            thread.state === "closed" ||
+            thread.origin === "plan" ||
+            ownPrs(thread).length > 0
+        ) {
+            continue;
+        }
+
+        for (const repo of threadRepos(thread)) {
+            if (
+                asked.some((one) => sameName(one, repo)) &&
+                (failed || lines.some((line) => openLineOf(line, repo)))
+            ) {
+                add(thread.id, `the open PRs of ${repo} are not all read`);
+            }
+        }
+    }
+
+    return held;
 }
 
 /** Put a PR, or all of another thread's work, on one thread. Pure over the state: the caller commits it. */
@@ -10765,15 +11545,111 @@ export type GitHubView = {
     skipped?: string[];
     missing?: string[];
     incomplete?: string[];
+    /** The PR links in the sweep's scope that no read gave facts for in more than 30 minutes (`unreadLinks`). */
+    unread?: UnreadLink[];
 };
 
-/** The last GitHub read as a plain value; null when no read happened yet. */
-export function githubView(state: Readonly<DeskState> | undefined): GitHubView | null {
+/** How long a PR link in the sweep's scope may go unread before the desk says so. */
+export const UNREAD_MS = 30 * 60_000;
+
+/** The most unread links the line names: the rest are counted. */
+const UNREAD_SHOWN = 10;
+
+/** A PR link that no read gave facts for in more than `UNREAD_MS`: its thread, its ref, and for how long. */
+export type UnreadLink = { thread: string; ref: string; age: number };
+
+/** When a link came onto its thread: its attach event (`attached:<ref>:<ms>` or `pr:<ref>:<via>:<ms>`), else the thread's start. */
+function attachedAt(thread: Thread, ref: string): number {
+    let at: number | undefined;
+
+    for (const event of thread.events) {
+        if (!event.key.startsWith(`attached:${ref}:`) && !event.key.startsWith(`pr:${ref}:`)) {
+            continue;
+        }
+
+        const ms = Number(event.key.slice(event.key.lastIndexOf(":") + 1));
+
+        if (Number.isFinite(ms) && ms > 0) {
+            at = Math.max(at ?? 0, ms);
+        }
+    }
+
+    return at ?? thread.startedAt;
+}
+
+/** The supervisors that threads of the desk name: each has its own sweep. */
+const supervisorsOf = (state: Readonly<DeskState> | undefined): Set<number> =>
+    new Set(
+        Object.values(state?.threads ?? {})
+            .map((thread) => thread.supervisor)
+            .filter((supervisor): supervisor is number => typeof supervisor === "number"),
+    );
+
+/**
+ * The PR links in the sweeps' scope (`sweepPinnedLinks`, for each supervisor) that no read gave facts for in more than
+ * `UNREAD_MS`, the oldest first. The age runs from the link's last read (`readAt`); a link never read counts from when
+ * it came onto its thread (`attachedAt`).
+ */
+export function unreadLinks(state: Readonly<DeskState> | undefined, now: number): UnreadLink[] {
+    const supervisors = supervisorsOf(state);
+    const found: UnreadLink[] = [];
+
+    for (const supervisor of supervisors) {
+        for (const { thread, ref, link } of sweepPinnedLinks(
+            state as DeskState | undefined,
+            supervisor,
+            now,
+        )) {
+            const age = now - (link.readAt ?? attachedAt(thread, ref));
+
+            if (age > UNREAD_MS) {
+                found.push({ thread: thread.id, ref, age });
+            }
+        }
+    }
+
+    return found.sort(
+        (a, b) =>
+            b.age - a.age || idNumber(a.thread) - idNumber(b.thread) || a.ref.localeCompare(b.ref),
+    );
+}
+
+/** A span as the lines say it: 45 min, 6 h, 3 d. */
+export function spanWords(ms: number): string {
+    const minutes = Math.max(0, Math.floor(ms / 60_000));
+
+    if (minutes < 60) {
+        return `${String(minutes)} min`;
+    }
+
+    const hours = Math.floor(minutes / 60);
+
+    return hours < 48 ? `${String(hours)} h` : `${String(Math.floor(hours / 24))} d`;
+}
+
+/** The unread line: `Unread: T12 (frostyard/x#5, 6 h), …`, at most `UNREAD_SHOWN` items, then how many more. */
+export function unreadLine(unread: readonly UnreadLink[]): string | undefined {
+    if (unread.length === 0) {
+        return undefined;
+    }
+
+    const shown = unread
+        .slice(0, UNREAD_SHOWN)
+        .map((one) => `${one.thread} (${one.ref}, ${spanWords(one.age)})`);
+    const more = unread.length - UNREAD_SHOWN;
+
+    return `Unread: ${shown.join(", ")}${more > 0 ? `, and ${String(more)} more` : ""}`;
+}
+
+/** The last GitHub read as a plain value, with the links unread at `now`; null when no read happened yet. */
+export function githubView(state: Readonly<DeskState> | undefined, now: number): GitHubView | null {
     const github = state?.github;
 
     if (github === undefined) {
         return null;
     }
+
+    const unread = unreadLinks(state, now);
 
     return {
         at: github.at,
@@ -10782,38 +11658,67 @@ export function githubView(state: Readonly<DeskState> | undefined): GitHubView |
         ...(github.skipped === undefined ? {} : { skipped: [...github.skipped] }),
         ...(github.missing === undefined ? {} : { missing: [...github.missing] }),
         ...(github.incomplete === undefined ? {} : { incomplete: [...github.incomplete] }),
+        ...(unread.length === 0 ? {} : { unread }),
     };
 }
 
 /** A read time as the list and the section show it: 01:47, the server's clock. */
 const clock = (at: number) => new Date(at).toTimeString().slice(0, 5);
 
-/** The GitHub status lines for `desk list` and the section: a failure, a cut read, and the skipped roster names. */
-export function githubLines(state: Readonly<DeskState> | undefined): string[] {
+/**
+ * The GitHub status lines for `desk list`, `desk sync` and the section: a failure, a cut read, the skipped roster names,
+ * the refs GitHub lacks, the links unread for more than 30 minutes, a last read older than that while a thread is open or
+ * a link is in the sweeps' scope, and each supervisor's failed sweep.
+ */
+export function githubLines(state: Readonly<DeskState> | undefined, now: number): string[] {
     const github = state?.github;
-
-    if (github === undefined) {
-        return [];
-    }
-
     const lines: string[] = [];
 
-    if (!github.ok) {
-        lines.push(
-            `GitHub: read failed at ${clock(github.at)}: ${github.error ?? "unknown error"}`,
+    if (github !== undefined) {
+        if (!github.ok) {
+            lines.push(
+                `GitHub: read failed at ${clock(github.at)}: ${github.error ?? "unknown error"}`,
+            );
+        }
+
+        if (github.incomplete !== undefined && github.incomplete.length > 0) {
+            lines.push(`GitHub read incomplete: ${github.incomplete.join(", ")}`);
+        }
+
+        if (github.skipped !== undefined && github.skipped.length > 0) {
+            lines.push(`Skipped roster names: ${github.skipped.join(", ")}`);
+        }
+
+        if (github.missing !== undefined && github.missing.length > 0) {
+            lines.push(`Not found on GitHub: ${github.missing.join(", ")}`);
+        }
+    }
+
+    const unread = unreadLinks(state, now);
+    const said = unreadLine(unread);
+
+    if (said !== undefined) {
+        lines.push(said);
+    }
+
+    const supervisors = supervisorsOf(state);
+    const inScope =
+        Object.values(state?.threads ?? {}).some((thread) => thread.state !== "closed") ||
+        [...supervisors].some(
+            (supervisor) =>
+                sweepPinnedLinks(state as DeskState | undefined, supervisor, now).length > 0,
         );
+
+    if (github !== undefined && inScope && now - github.at > UNREAD_MS) {
+        lines.push(`GitHub: last read at ${clock(github.at)}, ${spanWords(now - github.at)} ago`);
     }
 
-    if (github.incomplete !== undefined && github.incomplete.length > 0) {
-        lines.push(`GitHub read incomplete: ${github.incomplete.join(", ")}`);
-    }
-
-    if (github.skipped !== undefined && github.skipped.length > 0) {
-        lines.push(`Skipped roster names: ${github.skipped.join(", ")}`);
-    }
-
-    if (github.missing !== undefined && github.missing.length > 0) {
-        lines.push(`Not found on GitHub: ${github.missing.join(", ")}`);
+    for (const [supervisor, failure] of Object.entries(state?.sweepErrors ?? {}).sort(
+        (a, b) => a[1].at - b[1].at || a[0].localeCompare(b[0]),
+    )) {
+        lines.push(
+            `Sweep failed at ${clock(failure.at)}${supervisors.size > 1 ? ` (supervisor ${supervisor})` : ""}: ${failure.error}`,
+        );
     }
 
     return lines;
@@ -11560,7 +12465,7 @@ export function threadsView(
                 list.map((pr) => ({ ...pr })),
             ]),
         ),
-        github: githubView(state),
+        github: githubView(state, now),
         issues: issuesView(state, now),
         ready,
         plans: [...Object.values(state?.plans ?? {})]
@@ -15077,6 +15982,71 @@ export function planTaskClosedThreads(state: DeskState | undefined, supervisor: 
     }
 
     return [...found.values()];
+}
+
+/** Where a pinned link comes from: an open thread, a thread closed as done in the last 7 days, or a plan's task thread. */
+export type PinScope = "open" | "recent" | "plan";
+
+/**
+ * The PR links that a supervisor's sweep reads by number, in the read's order: every link of a thread that is not
+ * closed; then the `OPEN` links of a thread closed as done in the last 7 days (`reopenable`); then the links that are
+ * open or not read yet (`prOpen`) of a closed task thread of a plan's open attempt (`planTaskClosedThreads`). Each ref
+ * may go into a query (`pinnableRef`). A link in 2 sets is given once. The sweep's pins and the unread alarm
+ * (`unreadLinks`) both read this, so they cannot differ.
+ */
+export function sweepPinnedLinks(
+    state: DeskState | undefined,
+    supervisor: number,
+    now: number,
+): { thread: Thread; ref: string; link: PrLink; scope: PinScope }[] {
+    const threads = Object.values(state?.threads ?? {}).filter(
+        (thread) => thread.supervisor === supervisor,
+    );
+    const found: { thread: Thread; ref: string; link: PrLink; scope: PinScope }[] = [];
+    const seen = new Set<string>();
+
+    const add = (thread: Thread, ref: string, link: PrLink, scope: PinScope) => {
+        const key = `${thread.id} ${ref}`;
+
+        if (!seen.has(key)) {
+            seen.add(key);
+            found.push({ thread, ref, link, scope });
+        }
+    };
+
+    for (const thread of threads) {
+        if (thread.state === "closed") {
+            continue;
+        }
+
+        for (const [ref, link] of Object.entries(thread.prs)) {
+            if (pinnableRef(ref)) {
+                add(thread, ref, link, "open");
+            }
+        }
+    }
+
+    for (const thread of threads) {
+        if (!reopenable(thread, now)) {
+            continue;
+        }
+
+        for (const [ref, link] of Object.entries(thread.prs)) {
+            if (link.state === "OPEN" && pinnableRef(ref)) {
+                add(thread, ref, link, "recent");
+            }
+        }
+    }
+
+    for (const thread of planTaskClosedThreads(state, supervisor)) {
+        for (const [ref, link] of Object.entries(thread.prs)) {
+            if (prOpen(link) && pinnableRef(ref)) {
+                add(thread, ref, link, "plan");
+            }
+        }
+    }
+
+    return found;
 }
 
 /**
@@ -20016,6 +20986,8 @@ export default function createDesk(host: Host, web: Web) {
         githubError?: string;
         /** Roster repository names that are not "owner/name": skipped, never queried. */
         githubSkipped?: string[];
+        /** The repositories whose open PRs the read asked GitHub for: the roster's, and those of the pinned PRs. */
+        githubAsked?: string[];
         /** The issue queue's read: absent when nothing was searched (no owner to search). */
         queue?: QueueRead;
         /** The logins that count as ours, from the desk's config file. */
@@ -20829,6 +21801,30 @@ export default function createDesk(host: Host, web: Web) {
      * list: a thread that opened again by a tool or the page sees its session back in that read. A failure never fails
      * the sweep.
      */
+    /**
+     * Record that a supervisor's sweep failed (its reads, or its commit), in a commit of its own: the failure is on the
+     * desk (`githubLines`) until the next good sweep of that supervisor clears it. A failed record changes nothing.
+     */
+    const recordSweepError = async (
+        supervisor: number,
+        error: unknown,
+        now: number,
+        commit: (change: (tx: Tx) => Promise<undefined>) => Promise<unknown>,
+    ): Promise<void> => {
+        try {
+            await commit(async (tx) => {
+                const state = await tx.doc(DeskThreads);
+
+                state.sweepErrors ??= {};
+                state.sweepErrors[String(supervisor)] = { at: now, error: githubError(error) };
+
+                return undefined;
+            });
+        } catch {
+            // The sweep's own failure stands: the next try records it again.
+        }
+    };
+
     const earlyArchive = async (
         supervisor: number,
         read: Reader,
@@ -21439,11 +22435,12 @@ export default function createDesk(host: Host, web: Web) {
     }
 
     /**
-     * The one GitHub read of a sweep: its facts, or why it failed. A transient failure (`transientGitHub`) gets 1 more
-     * try after `GITHUB_RETRY_MS`; a second failure is the sweep's error, as before. `gh api graphql` exits non-zero when the answer has
-     * an error, but it still prints the data it has: a wrong PR ref must not hide every other PR. An alias with an
-     * error is a missing ref (`pN`) or a skipped repository (`rN`); only no data at all is a failure. Each repository
-     * with more than 1 page of open PRs is read to its last page.
+     * The GitHub read of a sweep: its facts, or why it failed. It runs in queries of at most `GITHUB_REPOS_PER_QUERY`
+     * repositories and `GITHUB_PRS_PER_QUERY` PRs, 1 after the other (`readGitHubChunks`): 1 big query makes GitHub cut
+     * the aliases at its end (`RESOURCE_LIMITS_EXCEEDED`). Each query gets 1 more try after a transient failure
+     * (`graphqlAsk`). `gh api graphql` exits non-zero when the answer has an error, but it still prints the data it has:
+     * a wrong PR ref must not hide every other PR. A cut alias is read again 1 time in a smaller query; only no data
+     * from every query is a failure. Each repository with more than 1 page of open PRs is read to its last page.
      */
     async function readGitHub(
         repos: string[],
@@ -21456,103 +22453,32 @@ export default function createDesk(host: Host, web: Web) {
             return {};
         }
 
-        const wanted = [...new Set(repos)];
-        const pinned = [...new Set(prs)];
-        const ask = graphqlAsk;
+        const read = await readGitHubChunks(
+            graphqlJson,
+            { repos, prs, issues, detail, watched },
+            githubError,
+        );
 
-        let facts: GitHubFacts;
-
-        try {
-            const { stdout } = await ask(buildQuery(wanted, pinned, issues, detail, watched));
-
-            facts = parseGitHub(JSON.parse(stdout));
-        } catch (error) {
-            const failure = error as { stdout?: unknown } | null;
-            const raw =
-                typeof failure?.stdout === "string"
-                    ? failure.stdout
-                    : Buffer.isBuffer(failure?.stdout)
-                      ? failure.stdout.toString("utf8")
-                      : "";
-            let answer: unknown;
-
-            try {
-                answer = raw.trim() === "" ? undefined : JSON.parse(raw);
-            } catch {
-                answer = undefined;
-            }
-
-            const data = (answer as { data?: unknown } | undefined)?.data;
-
-            if (data === undefined || data === null || typeof data !== "object") {
-                return { error: githubError(error) };
-            }
-
-            facts = parseGitHub(answer);
-
-            const missing: string[] = [];
-            const errors = (answer as { errors?: unknown }).errors;
-
-            if (Array.isArray(errors)) {
-                for (const entry of errors) {
-                    const path = (entry as { path?: unknown } | null)?.path;
-                    const alias =
-                        Array.isArray(path) && typeof path[0] === "string" ? path[0] : undefined;
-
-                    if (alias === undefined) {
-                        continue;
-                    }
-
-                    if (/^p[0-9]+$/.test(alias)) {
-                        const ref = pinned[Number(alias.slice(1))];
-
-                        if (ref === undefined) {
-                            continue;
-                        }
-
-                        // The PR is missing only when the error ends at the alias or at its `pullRequest` node, and that
-                        // node is null or absent. An error deeper in the path (`NOT_FOUND` too) is in a detail: the PR
-                        // keeps its facts, and its detail is left out, so a partial class is unknown.
-                        const inside = Array.isArray(path) ? path.slice(1) : [];
-                        const ends =
-                            inside.length === 0 ||
-                            (inside.length === 1 && inside[0] === "pullRequest");
-                        const fact = Object.values(facts.prs).find(
-                            (pr) => pr.ref.toLowerCase() === ref.toLowerCase(),
-                        );
-
-                        if (fact !== undefined) {
-                            delete fact.body;
-                            delete fact.closing;
-                        } else if (ends && !missing.includes(ref)) {
-                            missing.push(ref);
-                        }
-                    } else if (/^r[0-9]+$/.test(alias)) {
-                        // That repository could not be read: skip it, and keep the others.
-                        const repo = wanted[Number(alias.slice(1))];
-
-                        if (repo !== undefined) {
-                            delete facts.repos[repo];
-
-                            // Its "open PRs read" line would name a repository that the facts do not hold.
-                            const kept = withoutOpenLine(facts.incomplete ?? [], repo);
-
-                            if (kept.length === 0) {
-                                delete facts.incomplete;
-                            } else {
-                                facts.incomplete = kept;
-                            }
-                        }
-                    }
-                }
-            }
-
-            if (missing.length > 0) {
-                facts.missing = missing;
-            }
+        if (read.facts === undefined) {
+            return { error: read.error ?? "the GitHub read failed" };
         }
 
-        return { facts: await pageOpen(facts, ask) };
+        // `pageOpen` drops the page: the count of a cut repository is read before it.
+        const totals = new Map(
+            read.cutRepos.map((repo) => {
+                const key = Object.keys(read.facts!.repos).find(
+                    (name) => name.toLowerCase() === repo.toLowerCase(),
+                );
+
+                return [
+                    repo,
+                    key === undefined ? undefined : read.facts!.repos[key]?.page?.totalCount,
+                ];
+            }),
+        );
+        const facts = await pageOpen(read.facts, graphqlAsk);
+
+        return { facts: cutRepoLines(facts, read.cutRepos, totals) };
     }
 
     /**
@@ -22154,7 +23080,6 @@ export default function createDesk(host: Host, web: Web) {
                     continue;
                 }
 
-                pinned.add(ref);
                 repositories.add(repoOf(ref));
 
                 if (linked.length > 0) {
@@ -22163,24 +23088,13 @@ export default function createDesk(host: Host, web: Web) {
             }
         }
 
-        // A thread that closed as done in the last 7 days may come back, and the page still shows its PRs: its open ones
-        // are pinned too, so its label, its checks and its merge stay fresh. The same 1 read: a pinned PR only.
-        for (const thread of recent) {
-            for (const [ref, link] of Object.entries(thread.prs)) {
-                if (link.state === "OPEN" && REF.test(ref) && isRepoName(repoOf(ref))) {
-                    pinned.add(ref);
-                }
-            }
-        }
-
-        // A closed task thread of a plan's open attempt, at any close age: its PRs that are open, or not read yet, are
-        // pinned too, so their merge or close ends the attempt (`planFacts`). The same 1 read: a pinned PR only.
-        for (const thread of planTaskClosedThreads(state, Number(supervisor))) {
-            for (const [ref, link] of Object.entries(thread.prs)) {
-                if (prOpen(link) && pinnableRef(ref)) {
-                    pinned.add(ref);
-                }
-            }
+        // The pinned PRs (`sweepPinnedLinks`): every PR of an open thread; the open PRs of a thread that closed as done in
+        // the last 7 days, which may come back, so its label, its checks and its merge stay fresh on the page; and the
+        // PRs that are open, or not read yet, of a closed task thread of a plan's open attempt, at any close age, so their
+        // merge or close ends the attempt (`planFacts`). The last 2 are pinned PRs only: their repositories are not
+        // listed.
+        for (const { ref } of sweepPinnedLinks(state, Number(supervisor), now)) {
+            pinned.add(ref);
         }
 
         // A watch that waits for a PR's event: that PR is pinned too, read by number in the same 1 read, also when no
@@ -22200,6 +23114,33 @@ export default function createDesk(host: Host, web: Web) {
             [...detail],
             watched,
         );
+
+        // A PR that a thread's session named, in a repository whose open list the read did not have whole: read by
+        // number, so the evidence rules can attach it (`seenPinCandidates`, `attribute`). At most `SEEN_PINS_MAX` of each
+        // thread, the newest first; the same chunked read, PRs only.
+        if (githubRead.facts !== undefined) {
+            const seenRefs: string[] = [];
+
+            for (const refs of seenPinCandidates(state, Number(supervisor), githubRead.facts, {
+                pinned,
+                max: SEEN_PINS_MAX,
+            }).values()) {
+                for (const ref of refs) {
+                    if (!seenRefs.some((one) => one.toLowerCase() === ref.toLowerCase())) {
+                        seenRefs.push(ref);
+                    }
+                }
+            }
+
+            if (seenRefs.length > 0) {
+                githubRead.facts = withSeenPins(
+                    githubRead.facts,
+                    seenRefs,
+                    await readGitHub([], seenRefs),
+                );
+            }
+        }
+
         const { authors, ownAuthors, queue: queueRaw } = await deskConfig();
         // The issue queue: its own read, after the PR read. A failure of one never touches the other.
         const queueSetting = queueConfig(queueRaw, ownersOfRepos(rosterRepos));
@@ -22279,6 +23220,7 @@ export default function createDesk(host: Host, web: Web) {
             ...(githubRead.facts === undefined ? {} : { github: githubRead.facts }),
             ...(githubRead.error === undefined ? {} : { githubError: githubRead.error }),
             ...(skipped.size === 0 ? {} : { githubSkipped: [...skipped].sort() }),
+            githubAsked: [...repositories],
             ...(queue === undefined ? {} : { queue }),
             authors,
             ownAuthors,
@@ -22476,6 +23418,16 @@ export default function createDesk(host: Host, web: Web) {
 
         state.sweepers ??= {};
         state.baseline ??= {};
+
+        // A good sweep of this supervisor: its failure, if one was recorded, is over.
+        if (state.sweepErrors?.[key] !== undefined) {
+            delete state.sweepErrors[key];
+
+            if (Object.keys(state.sweepErrors).length === 0) {
+                delete state.sweepErrors;
+            }
+        }
+
         repairEpoch(state, now);
         // The digest's setting, read at each sweep: a change works without a reload.
         const { cap, digest, plans: planSettings } = await deskConfig();
@@ -23007,6 +23959,14 @@ export default function createDesk(host: Host, web: Web) {
             }
         }
 
+        // What the GitHub read did not read that a thread may need: after attribution, so a PR it attached holds the
+        // thread by itself. Each line holds its thread open (`closeUnread`).
+        const unread = closeUnread(state, supervisor, {
+            ...(facts.github === undefined ? {} : { github: facts.github }),
+            ...(facts.githubError === undefined ? {} : { error: facts.githubError }),
+            asked: facts.githubAsked ?? [],
+        });
+
         for (const thread of open) {
             // A due watch records its wake here, once: a second sweep adds no second event. Its event, when it has
             // one, may come first: a target thread that closed, or a PR in this sweep's GitHub read.
@@ -23022,7 +23982,7 @@ export default function createDesk(host: Host, web: Web) {
                     .map((other) => folderOf(other))
                     .filter((folder): folder is string => folder !== undefined),
             );
-            const check = closeCheck(thread, { now, folders: elsewhere });
+            const check = closeCheck(thread, { now, folders: elsewhere, unread });
 
             if (!check.close) {
                 continue;
@@ -23634,7 +24594,18 @@ export default function createDesk(host: Host, web: Web) {
                     runtime.commit(change, context),
                 );
 
-                const facts = await gather(supervisor, runtime, runtime.now(), context);
+                let facts: SweepFacts;
+
+                try {
+                    facts = await gather(supervisor, runtime, runtime.now(), context);
+                } catch (error) {
+                    await recordSweepError(Number(supervisor), error, runtime.now(), (change) =>
+                        runtime.commit(change, context),
+                    );
+
+                    throw error;
+                }
+
                 // The threads that closed out in the commit below: their agents hear about it after the commit, so a
                 // restart before the send loses nothing (the next sweep finds them again, because `run.closeout` is
                 // unset). The key makes a repeated send act once.
@@ -23646,7 +24617,7 @@ export default function createDesk(host: Host, web: Web) {
                 // could not finish. A removal and a send act once by their key.
                 const unready: UnreadyWork[] = [];
 
-                await runtime.commit(async (tx) => {
+                const sweepCommit = runtime.commit(async (tx) => {
                     const state = await tx.doc(DeskThreads);
                     // Read before any table write of this commit: Durable refuses a table read after one. The dashboard
                     // never fails a sweep: a failed read is unknown, and an unknown answer starts no collector.
@@ -23800,6 +24771,16 @@ export default function createDesk(host: Host, web: Web) {
                         checkpoint: { phase: "sleep", until: runtime.now() + SWEEP_SLEEP_MS },
                     };
                 }, context);
+
+                try {
+                    await sweepCommit;
+                } catch (error) {
+                    await recordSweepError(Number(supervisor), error, runtime.now(), (change) =>
+                        runtime.commit(change, context),
+                    );
+
+                    throw error;
+                }
 
                 for (const wake of closedOut) {
                     let failure: string | undefined;
@@ -25338,7 +26319,7 @@ export default function createDesk(host: Host, web: Web) {
 
             return {
                 thread: threadView(state?.threads ?? {}, thread, Date.now()),
-                github: githubView(state),
+                github: githubView(state, Date.now()),
                 reports: (reports?.reports ?? []).map((report) => ({
                     at: report.at,
                     from: report.from,
@@ -27313,7 +28294,7 @@ export default function createDesk(host: Host, web: Web) {
                     [
                         ...(queued === undefined ? [] : [queued]),
                         first,
-                        ...githubLines(snapshot),
+                        ...githubLines(snapshot, Date.now()),
                         text,
                     ].join("\n"),
                 );
@@ -27914,27 +28895,44 @@ export default function createDesk(host: Host, web: Web) {
                     api.commit(change, context),
                 );
 
-                const facts = await gather(supervisor as ConversationId, api, Date.now(), context);
-                const result = await api.commit(async (tx) => {
-                    // As in the sweep: read first, start last, and a failure is no failed sync. A desk with only
-                    // closed threads has no sweeper: a sync starts the dashboard's collector.
-                    const live = await dashboard.collectorLive(tx).catch(() => undefined);
-                    const swept = await applySweep(
-                        tx,
-                        await tx.doc(DeskThreads),
-                        supervisor,
-                        facts,
+                let result: { events: number };
+
+                try {
+                    const facts = await gather(
+                        supervisor as ConversationId,
+                        api,
+                        Date.now(),
+                        context,
                     );
 
-                    await startMissingSweepers(tx);
-                    // Entries that wait with no writer: a sync starts one too, also with no open thread.
-                    await resumeJournal(tx, supervisor);
-                    await dashboard
-                        .ensureCollector(tx, supervisor, Collector, live)
-                        .catch(() => undefined);
+                    result = await api.commit(async (tx) => {
+                        // As in the sweep: read first, start last, and a failure is no failed sync. A desk with only
+                        // closed threads has no sweeper: a sync starts the dashboard's collector.
+                        const live = await dashboard.collectorLive(tx).catch(() => undefined);
+                        const swept = await applySweep(
+                            tx,
+                            await tx.doc(DeskThreads),
+                            supervisor,
+                            facts,
+                        );
 
-                    return swept;
-                }, context);
+                        await startMissingSweepers(tx);
+                        // Entries that wait with no writer: a sync starts one too, also with no open thread.
+                        await resumeJournal(tx, supervisor);
+                        await dashboard
+                            .ensureCollector(tx, supervisor, Collector, live)
+                            .catch(() => undefined);
+
+                        return swept;
+                    }, context);
+                } catch (error) {
+                    // A failed sync is on the desk until a good sweep: the sync still fails as before.
+                    await recordSweepError(supervisor, error, Date.now(), (change) =>
+                        api.commit(change, context),
+                    );
+
+                    throw error;
+                }
 
                 // The worktrees of this supervisor's closed threads: git runs outside the commit above.
                 await sweepWorktrees(Number(supervisor), api, Date.now(), context, (change) =>
@@ -27960,8 +28958,11 @@ export default function createDesk(host: Host, web: Web) {
                 const state = await api.snapshot(DeskThreads, context);
                 const events =
                     result.events === 1 ? "1 new event." : `${String(result.events)} new events.`;
+                const lines = githubLines(state, Date.now());
 
-                return reply(`${listText(state, Date.now())}\n\n${events}`);
+                return reply(
+                    `${lines.length === 0 ? "" : `${lines.join("\n")}\n`}${listText(state, Date.now())}\n\n${events}`,
+                );
             }
 
             if (args.path === undefined || !isAbsolute(args.path)) {
@@ -29083,7 +30084,7 @@ export default function createDesk(host: Host, web: Web) {
                               `Ready to merge: ${ready.join(", ")}. Brian merges them from the Desk page: file no ask for a merge.`,
                           ]),
                     `Counted: ${String(capped.counted)} of ${String(capped.cap)}.`,
-                    ...githubLines(state),
+                    ...githubLines(state, now),
                     ...(capped.full
                         ? [
                               'The desk is full: team_delegate refuses new work; it does not queue it. When Brian taps Allow on the Desk page, a [desk] message tells you; when he writes "desk ok" in this chat, you see it. Then delegate the work again.',
