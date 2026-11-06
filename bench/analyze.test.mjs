@@ -18,6 +18,15 @@ import {
     buildRule,
     chooseThreshold,
     closeEnough,
+    decideTier,
+    designRow,
+    fitTransform,
+    manifestTasks,
+    simulatedTier,
+    SIM_B,
+    SIM_M,
+    SIM_OTHER,
+    thresholdFromSimulation,
     familyOf,
     fitOrdinal,
     forwardSelect,
@@ -272,11 +281,19 @@ test("a pass needs a finished attempt, S1, S2 or no S2, no protocol breach, and 
     assert.equal(toAttempt({ ...base, s1: false }).pass, false);
     assert.equal(toAttempt({ ...base, grades: [4, 2] }).pass, false);
     assert.equal(toAttempt({ ...base, grades: [4] }).pass, false);
+    assert.equal(toAttempt({ ...base, grades: [4] }).status, "unscored");
+    assert.equal(toAttempt({ ...base, s1: undefined }).status, "unscored");
+    assert.equal(toAttempt({ ...base, s2: undefined }).status, "unscored");
+    // A failed attempt needs no score: it is a fail.
+    assert.equal(
+        toAttempt({ ...base, failure: "provider", s1: undefined, grades: null }).status,
+        "valid",
+    );
     assert.equal(toAttempt({ ...base, failure: "limit" }).pass, false);
     assert.equal(toAttempt({ ...base, s0: { protocol: true, leakTry: false } }).pass, false);
     assert.equal(toAttempt({ ...base, harness: "setup failed" }).status, "harness");
     assert.equal(toAttempt({ ...base, judgePending: true }).status, "pending");
-    assert.equal(toAttempt({ ...base, grades: null }).grade, 0);
+    assert.equal(toAttempt({ ...base, failure: "limit", grades: null }).grade, 0);
 });
 
 test("a model with no list price takes the stand-in price, or $0 when asked", () => {
@@ -758,13 +775,53 @@ test("the simulated procedure: an equal or better M is always accepted, and the 
 // The command line.
 // ---------------------------------------------------------------------------------------------------------------
 
+const KEPT = { keep: true, reason: "fixture", scopeMatches: true, commandsConfirmed: true };
+const MODELS_FLAG = ["--models", MODELS.join(",")];
+
+/** A rule on briefChars alone that gives the fixture's tiers: 400 easy, 1500 medium, 4000 hard. */
+const FIXTURE_RULE = {
+    version: 1,
+    features: ["briefChars"],
+    center: { briefChars: 1500 },
+    scale: { briefChars: 1000 },
+    levels: {},
+    weights: { briefChars: 5 },
+    thresholds: [-2, 2],
+    medians: { briefChars: 1500 },
+};
+
+/** A stage 1 summary whose tiers expect all 3 fixture models, and whose only task is not in the fixture. */
+const FIXTURE_STAGE1 = {
+    tasks: { ids: ["old-1"] },
+    bands: { "old-1": "easy" },
+    majorityBand: "easy",
+    tiers: {
+        easy: { b1: BIG, shortlist: [MID, HALOGEN] },
+        medium: { b1: BIG, shortlist: [MID] },
+        hard: { b1: BIG, shortlist: [MID] },
+    },
+    overall: { c1: HALOGEN },
+};
+
+/** A simulation report whose rate at 0.8 is above 20% at tier size 30: stage 2 must use 0.9. */
+const STRICT_SIMULATION = {
+    margin: 0.1,
+    gap: 0.15,
+    rows: [
+        { n: 30, threshold: 0.8, falseAcceptance: 0.25 },
+        { n: 60, threshold: 0.8, falseAcceptance: 0.05 },
+    ],
+};
+
 function writeBench(root, stage) {
     const manifest = join(root, "manifest.json");
+    const tasks = fixtureTasks().map((t) => {
+        const { predictedTier: _tier, ...rest } = t;
 
-    writeFileSync(
-        manifest,
-        JSON.stringify({ tasks: fixtureTasks().map((t) => ({ ...t, owner: { keep: true } })) }),
-    );
+        return { ...rest, owner: KEPT };
+    });
+
+    writeFileSync(manifest, JSON.stringify({ tasks }));
 
     for (const r of fixtureResults(stage)) {
         const dir = join(root, "bench", "results", stage, r.task);
@@ -773,8 +830,27 @@ function writeBench(root, stage) {
         writeFileSync(join(dir, `${r.model.replace("/", "--")}.json`), JSON.stringify(r));
     }
 
+    if (stage === "stage2") {
+        writeFileSync(join(root, "rule.json"), JSON.stringify(FIXTURE_RULE));
+        writeFileSync(join(root, "stage1.json"), JSON.stringify(FIXTURE_STAGE1));
+        writeFileSync(join(root, "simulation.json"), JSON.stringify(STRICT_SIMULATION));
+    }
+
     return manifest;
 }
+
+const STAGE2_FLAGS = [
+    "--stage",
+    "2",
+    "--manifest",
+    "manifest.json",
+    "--rule",
+    "rule.json",
+    "--stage1",
+    "stage1.json",
+    "--simulation",
+    "simulation.json",
+];
 
 test("the command line writes the stage 1 summary and freezes rule-v1.json once", () => {
     const root = mkdtempSync(join(tmpdir(), "bench-analyze-"));
@@ -784,12 +860,15 @@ test("the command line writes the stage 1 summary and freezes rule-v1.json once"
         // A kept pool task that stage 1 did not run is not part of the stage.
         const json = JSON.parse(readFileSync(manifest, "utf8"));
 
-        json.tasks.push({ id: "pool-1", repo: "owner/r9", features: {}, owner: { keep: true } });
+        json.tasks.push({ id: "pool-1", repo: "owner/r9", features: {}, owner: KEPT });
         writeFileSync(manifest, JSON.stringify(json));
         const logs = [];
         const log = (line) => logs.push(line);
 
-        assert.equal(main(["--stage", "1", "--manifest", "manifest.json"], { root, log }), 0);
+        assert.equal(
+            main(["--stage", "1", "--manifest", "manifest.json", ...MODELS_FLAG], { root, log }),
+            0,
+        );
         const summary = JSON.parse(
             readFileSync(join(root, "bench/results/stage1/summary.json"), "utf8"),
         );
@@ -807,7 +886,7 @@ test("the command line writes the stage 1 summary and freezes rule-v1.json once"
 
         // A second run never replaces the frozen rule.
         writeFileSync(rulePath, '{"version":1,"frozen":true}\n');
-        main(["--stage", "1", "--manifest", "manifest.json"], { root, log });
+        main(["--stage", "1", "--manifest", "manifest.json", ...MODELS_FLAG], { root, log });
         assert.equal(readFileSync(rulePath, "utf8"), '{"version":1,"frozen":true}\n');
         assert.ok(existsSync(join(root, "bench/results/stage1/rule.json")));
         assert.ok(logs.some((l) => l.includes("stays frozen")));
@@ -816,31 +895,142 @@ test("the command line writes the stage 1 summary and freezes rule-v1.json once"
     }
 });
 
-test("the command line refuses incomplete results unless asked to drop them", () => {
+test("the command line: stage 1 expects the 10 candidates, refuses an empty stage and repeated tasks", () => {
     const root = mkdtempSync(join(tmpdir(), "bench-analyze-"));
+
+    const log = () => {};
+
+    try {
+        writeBench(root, "stage1");
+        // Without --models, every task needs a result of each of the 10 candidates: the 3 fixture models are not
+        // candidates, so they are unexpected.
+        assert.throws(
+            () => main(["--stage", "1", "--manifest", "manifest.json"], { root, log }),
+            /not expected/,
+        );
+        // A candidate with no result anywhere leaves every task incomplete.
+        assert.throws(
+            () =>
+                main(
+                    [
+                        "--stage",
+                        "1",
+                        "--manifest",
+                        "manifest.json",
+                        "--models",
+                        [...MODELS, "x/missing"].join(","),
+                    ],
+                    {
+                        root,
+                        log,
+                    },
+                ),
+            /12 tasks have a missing result/,
+        );
+        // The same manifest twice would count each task twice.
+        assert.throws(
+            () =>
+                main(
+                    [
+                        "--stage",
+                        "1",
+                        "--manifest",
+                        "manifest.json",
+                        "--manifest",
+                        "manifest.json",
+                        ...MODELS_FLAG,
+                    ],
+                    {
+                        root,
+                        log,
+                    },
+                ),
+            /task ids repeat/,
+        );
+        assert.equal(existsSync(join(root, "bench/results/stage1/summary.json")), false);
+        assert.equal(existsSync(join(root, "bench/rule-v1.json")), false);
+
+        rmSync(join(root, "bench/results"), { recursive: true });
+        assert.throws(
+            () =>
+                main(["--stage", "1", "--manifest", "manifest.json", ...MODELS_FLAG], {
+                    root,
+                    log,
+                }),
+            /no results/,
+        );
+        assert.equal(existsSync(join(root, "bench/rule-v1.json")), false);
+    } finally {
+        rmSync(root, { recursive: true });
+    }
+});
+
+test("the command line: stage 2 uses the frozen rule, the stage 1 model sets and the simulation's threshold", () => {
+    const root = mkdtempSync(join(tmpdir(), "bench-analyze-"));
+
+    const log = () => {};
 
     try {
         writeBench(root, "stage2");
-        rmSync(join(root, "bench/results/stage2/t03/test--mid.json"));
-
-        const log = () => {};
-
-        assert.throws(
-            () => main(["--stage", "2", "--manifest", "manifest.json"], { root, log }),
-            /t03/,
-        );
-        assert.equal(
-            main(["--stage", "2", "--manifest", "manifest.json", "--allow-incomplete"], {
-                root,
-                log,
-            }),
-            0,
-        );
+        assert.equal(main(STAGE2_FLAGS, { root, log }), 0);
         const summary = JSON.parse(
             readFileSync(join(root, "bench/results/stage2/summary.json"), "utf8"),
         );
 
-        assert.deepEqual(summary.incomplete, ["t03"]);
+        assert.equal(summary.settings.threshold, CLOSE_THRESHOLD_STRICT);
+        assert.equal(summary.tiers.easy.n, 6);
+        assert.equal(summary.tiers.hard.n, 4);
+
+        // Each input is required.
+        for (const flag of ["--rule", "--stage1", "--simulation"]) {
+            const flags = [...STAGE2_FLAGS];
+
+            flags[flags.indexOf(flag) + 1] = "missing.json";
+            assert.throws(() => main(flags, { root, log }), /stage 2 needs/);
+        }
+
+        // A stage 1 summary that names a fixture task: stage 2 refuses it.
+        writeFileSync(
+            join(root, "stage1.json"),
+            JSON.stringify({ ...FIXTURE_STAGE1, tasks: { ids: ["t05"] } }),
+        );
+        assert.throws(() => main(STAGE2_FLAGS, { root, log }), /fresh tasks/);
+
+        // A tier whose stage 1 model set lacks a model that has results: an error, not a silent extra.
+        const narrow = structuredClone(FIXTURE_STAGE1);
+
+        narrow.tiers.easy.shortlist = [MID];
+        narrow.overall.c1 = MID;
+        writeFileSync(join(root, "stage1.json"), JSON.stringify(narrow));
+        assert.throws(() => main(STAGE2_FLAGS, { root, log }), /not expected in the easy tier/);
+    } finally {
+        rmSync(root, { recursive: true });
+    }
+});
+
+test("the command line refuses incomplete results unless asked to drop them", () => {
+    const root = mkdtempSync(join(tmpdir(), "bench-analyze-"));
+
+    const log = () => {};
+
+    try {
+        writeBench(root, "stage2");
+        rmSync(join(root, "bench/results/stage2/t03/test--mid.json"));
+        // A result the scorer has not finished: no S1 and no grades yet.
+        const t04 = join(root, "bench/results/stage2/t04/test--big.json");
+        const unscored = { ...JSON.parse(readFileSync(t04, "utf8")) };
+
+        delete unscored.s1;
+        delete unscored.grades;
+        writeFileSync(t04, JSON.stringify(unscored));
+
+        assert.throws(() => main(STAGE2_FLAGS, { root, log }), /t03, t04/);
+        assert.equal(main([...STAGE2_FLAGS, "--allow-incomplete"], { root, log }), 0);
+        const summary = JSON.parse(
+            readFileSync(join(root, "bench/results/stage2/summary.json"), "utf8"),
+        );
+
+        assert.deepEqual(summary.incomplete, ["t03", "t04"]);
         assert.throws(() => main(["--stage", "3"], { root, log }), /--stage/);
 
         // A result for a task that no kept manifest task names is an error.
@@ -851,15 +1041,248 @@ test("the command line refuses incomplete results unless asked to drop them", ()
             join(stray, "test--big.json"),
             JSON.stringify({ ...result("t01", BIG), task: "ghost" }),
         );
-        assert.throws(
-            () =>
-                main(["--stage", "2", "--manifest", "manifest.json", "--allow-incomplete"], {
-                    root,
-                    log,
-                }),
-            /ghost/,
-        );
+        assert.throws(() => main([...STAGE2_FLAGS, "--allow-incomplete"], { root, log }), /ghost/);
     } finally {
         rmSync(root, { recursive: true });
     }
+});
+
+test("manifests: only tasks the owner kept, with both confirmations; an unreviewed task is an error", () => {
+    const task = (id, owner) => ({ id, repo: "owner/r", features: {}, owner });
+
+    assert.deepEqual(
+        manifestTasks({ tasks: [task("a", KEPT), task("b", { ...KEPT, keep: false })] }).map(
+            (t) => t.id,
+        ),
+        ["a"],
+    );
+    assert.deepEqual(manifestTasks([task("a", KEPT)]).length, 1);
+    assert.throws(() => manifestTasks({ tasks: [task("a", undefined)] }), /no owner review/);
+    assert.throws(() => manifestTasks({ tasks: [task("a", { reason: "x" })] }), /no owner review/);
+    assert.throws(
+        () => manifestTasks({ tasks: [task("a", { ...KEPT, scopeMatches: false })] }),
+        /scopeMatches/,
+    );
+    assert.throws(
+        () => manifestTasks({ tasks: [task("a", { keep: true, scopeMatches: true })] }),
+        /commandsConfirmed/,
+    );
+    assert.throws(() => manifestTasks({}), /no task list/);
+});
+
+test("the simulation's threshold: settings checked, threshold computed again from the rows", () => {
+    assert.equal(thresholdFromSimulation(STRICT_SIMULATION), CLOSE_THRESHOLD_STRICT);
+    // The report's own `threshold` field is not trusted.
+    assert.equal(
+        thresholdFromSimulation({ ...STRICT_SIMULATION, threshold: 0.8 }),
+        CLOSE_THRESHOLD_STRICT,
+    );
+    const fine = structuredClone(STRICT_SIMULATION);
+
+    fine.rows[0].falseAcceptance = 0.088;
+    assert.equal(thresholdFromSimulation(fine), CLOSE_THRESHOLD);
+    assert.throws(() => thresholdFromSimulation({ ...STRICT_SIMULATION, margin: 0.05 }), /margin/);
+    assert.throws(() => thresholdFromSimulation({ ...STRICT_SIMULATION, gap: 0.1 }), /gap/);
+    assert.throws(
+        () =>
+            thresholdFromSimulation({
+                ...STRICT_SIMULATION,
+                rows: STRICT_SIMULATION.rows.slice(1),
+            }),
+        /tier size 30/,
+    );
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// Guards from the cross-review of the first version.
+// ---------------------------------------------------------------------------------------------------------------
+
+test("the simulation decides each tier with the stage 2 code: the same outcomes give the same decision", () => {
+    // 30 tasks: 18 both pass, 4 only B, 2 only M, 6 both fail (all 6 solved by the third model).
+    const outcomes = [
+        ...Array.from({ length: 18 }, () => ({ b: true, m: true, other: false })),
+        ...Array.from({ length: 4 }, () => ({ b: true, m: false, other: false })),
+        ...Array.from({ length: 2 }, () => ({ b: false, m: true, other: false })),
+        ...Array.from({ length: 6 }, () => ({ b: false, m: false, other: true })),
+    ];
+    const sim = simulatedTier(outcomes);
+
+    // The same outcomes as result files, through analyzeStage2.
+    const cost = { [SIM_B]: 1, [SIM_M]: 0.1, [SIM_OTHER]: 10 };
+    const tasks = outcomes.map((_, i) => ({
+        id: `sim-${i}`,
+        repo: "owner/r",
+        predictedTier: "easy",
+    }));
+    const results = outcomes.flatMap((o, i) =>
+        [
+            [SIM_B, o.b],
+            [SIM_M, o.m],
+            [SIM_OTHER, o.other],
+        ].map(([model, ok]) => ({
+            task: `sim-${i}`,
+            model,
+            wallMs: 1000,
+            usage: { input: 0, output: 0, cacheRead: 0, cost: cost[model] },
+            s0: { protocol: false },
+            s1: ok,
+            s2: null,
+            grades: [3, 4],
+        })),
+    );
+    const real = analyzeStage2({ tasks, results }).tiers.easy;
+
+    assert.equal(sim.status, "decided");
+    assert.equal(real.status, sim.status);
+    assert.equal(real.b, sim.b);
+    assert.equal(real.pick, sim.pick);
+    assert.deepEqual(real.vsB[SIM_M], sim.vsB[SIM_M]);
+    assert.equal(sim.vsB[SIM_M].n00, 6);
+
+    // Without the third model, the 6 both-fail tasks are unsolved and drop: 24 tasks are under the minimum of 30.
+    const dropped = simulatedTier(outcomes.map((o) => ({ ...o, other: false })));
+
+    assert.equal(dropped.unsolved.length, 6);
+    assert.equal(dropped.status, "inconclusive");
+    assert.equal(dropped.pick, undefined);
+});
+
+test("the simulation: with no rescue, unsolved drops make small tiers inconclusive", () => {
+    const worst = simulateAcceptance({ n: 30, gap: 0, reps: 100, draws: 2000 });
+    const none = simulateAcceptance({ n: 30, gap: 0, reps: 100, draws: 2000, rescue: 0 });
+
+    assert.ok(worst.rate > 0.4, JSON.stringify(worst));
+    // At 30 tasks, a tier with even 1 unsolved task has fewer than 30 and accepts nobody.
+    assert.ok(none.rate < 0.05, JSON.stringify(none));
+});
+
+test("stage 2: a stored tier that the frozen rule contradicts is an error; the rule decides without one", () => {
+    const tasks = fixtureTasks();
+    const results = fixtureResults("stage2");
+
+    assert.equal(
+        analyzeStage2({ tasks, results, rule: FIXTURE_RULE, options: { minPaired: 4 } }).tiers.easy
+            .n,
+        6,
+    );
+    const wrong = tasks.map((t) => (t.id === "t01" ? { ...t, predictedTier: "hard" } : t));
+
+    assert.throws(
+        () => analyzeStage2({ tasks: wrong, results, rule: FIXTURE_RULE }),
+        /t01: stored tier hard/,
+    );
+    const bare = tasks.map((t) => ({ ...t, predictedTier: undefined }));
+
+    const byRule = analyzeStage2({
+        tasks: bare,
+        results,
+        rule: FIXTURE_RULE,
+        options: { minPaired: 4 },
+    });
+
+    assert.deepEqual(
+        BANDS.map((b) => byRule.tiers[b].ids.length + byRule.tiers[b].unsolved.length),
+        [6, 2, 4],
+    );
+});
+
+test("stage 2: a model of the stage 1 set with no result leaves the tier's tasks incomplete", () => {
+    const stage1 = structuredClone(FIXTURE_STAGE1);
+
+    stage1.tiers.hard.shortlist = [MID, "x/never-ran"];
+    const s = analyzeStage2({
+        tasks: fixtureTasks(),
+        results: fixtureResults("stage2"),
+        stage1,
+        options: { minPaired: 4 },
+    });
+
+    assert.deepEqual(s.tiers.hard.incomplete, ["t09", "t10", "t11", "t12"]);
+    assert.equal(s.tiers.hard.status, "inconclusive");
+    assert.deepEqual(s.incomplete, ["t09", "t10", "t11", "t12"]);
+});
+
+test("stage 1 and stage 2 refuse a repeated task id and an empty task list", () => {
+    const tasks = fixtureTasks();
+    const results = fixtureResults("stage1");
+
+    assert.throws(
+        () => analyzeStage1({ tasks: [...tasks, tasks[0]], results, options: { fitRule: false } }),
+        /task ids repeat: t01/,
+    );
+    assert.throws(() => analyzeStage1({ tasks: [], results: [] }), /no tasks/);
+    assert.throws(
+        () => analyzeStage2({ tasks: [...tasks, tasks[3]], results }),
+        /task ids repeat: t04/,
+    );
+});
+
+test("the transform: exact medians, means, scales, missing fill and unknown levels", () => {
+    const rows = [
+        { features: { briefChars: 100, kind: "write", riskPathNamed: true } },
+        { features: { briefChars: 300, kind: "debug", riskPathNamed: false } },
+        { features: { kind: "", riskPathNamed: null } },
+        { features: { briefChars: 500 } },
+    ];
+    const t = fitTransform(rows, ["briefChars", "kind", "riskPathNamed"]);
+
+    // briefChars: median of 100, 300, 500 is 300; the filled column 100, 300, 300, 500 has mean 300 and standard
+    // deviation sqrt(20000).
+    assert.equal(t.medians.briefChars, 300);
+    assert.equal(t.center.briefChars, 300);
+    assert.equal(t.scale.briefChars, Math.sqrt(20000));
+    // riskPathNamed: 1, 0 present; median 0.5; filled 1, 0, 0.5, 0.5; mean 0.5; deviation sqrt(0.125).
+    assert.equal(t.medians.riskPathNamed, 0.5);
+    assert.equal(t.center.riskPathNamed, 0.5);
+    assert.equal(t.scale.riskPathNamed, Math.sqrt(0.125));
+    // kind: an empty or missing value is `unknown`; levels sorted.
+    assert.deepEqual(t.levels.kind, ["debug", "unknown", "write"]);
+
+    const s = Math.sqrt(20000);
+
+    assert.deepEqual(designRow(t, { briefChars: 100, kind: "write", riskPathNamed: true }), [
+        -200 / s,
+        0,
+        0,
+        1,
+        0.5 / Math.sqrt(0.125),
+    ]);
+    // Missing numbers take the median: (300 - 300) / s = 0 and (0.5 - 0.5) = 0. An unseen kind is `unknown`.
+    assert.deepEqual(designRow(t, { kind: "never-seen" }), [0, 0, 1, 0, 0]);
+    // A constant column gets scale 1.
+    assert.equal(
+        fitTransform(
+            [{ features: { pathsNamed: 2 } }, { features: { pathsNamed: 2 } }],
+            ["pathsNamed"],
+        ).scale.pathsNamed,
+        1,
+    );
+});
+
+test("predictTier uses the weights of the one-hot columns and the median fill", () => {
+    const rule = {
+        version: 1,
+        features: ["kind", "complexity"],
+        center: { complexity: 1 },
+        scale: { complexity: 1 },
+        levels: { kind: ["debug", "unknown", "write"] },
+        weights: { "kind=debug": 6, "kind=unknown": 0, "kind=write": -6, complexity: 0 },
+        thresholds: [-2, 2],
+        medians: { complexity: 1 },
+    };
+
+    assert.equal(predictTier(rule, { kind: "debug" }), "hard");
+    assert.equal(predictTier(rule, { kind: "write" }), "easy");
+    // An unseen kind, and a missing kind, take the `unknown` weight 0: medium.
+    assert.equal(predictTier(rule, { kind: "never-seen" }), "medium");
+    assert.equal(predictTier(rule, {}), "medium");
+    // A missing number takes the median 1: (1 - 1) / 1 = 0. With weight 3 on complexity, 4 gives 9: hard.
+    const steep = { ...rule, weights: { ...rule.weights, complexity: 3 } };
+
+    assert.equal(predictTier(steep, { kind: "never-seen" }), "medium");
+    assert.equal(predictTier(steep, { kind: "never-seen", complexity: 4 }), "hard");
+    assert.throws(
+        () => predictTier({ ...rule, weights: { complexity: 0 } }, {}),
+        /no weight for column kind=debug/,
+    );
 });

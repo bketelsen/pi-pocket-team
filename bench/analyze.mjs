@@ -23,8 +23,14 @@
 // nothing outside its output files. Usage:
 //
 //   node bench/analyze.mjs --stage 1 --manifest <file> [--manifest <file> ...] [--results bench/results]
-//   node bench/analyze.mjs --stage 2 --manifest <file> ... [--rule bench/rule-v1.json] [--stage1 <summary.json>]
-//   node bench/analyze.mjs --simulate [--reps 2000] [--draws 100000] [--discordance 0.2] [--pb 0.7] [--out <file>]
+//       [--models <a,b,...>]   (default: the 10 CANDIDATES; every task needs a result of each)
+//   node bench/analyze.mjs --stage 2 --manifest <file> ... [--rule bench/rule-v1.json]
+//       [--stage1 bench/results/stage1/summary.json] [--simulation bench/results/simulation.json]
+//   node bench/analyze.mjs --simulate [--reps 2000] [--draws 100000] [--discordance 0.2] [--pb 0.7]
+//       [--rescue 1] [--out <file>]
+//
+// Manifests are the owners' reviewed files: only kept tasks count. Stage 2 needs the frozen rule, the stage 1
+// summary and the simulation report (its threshold); it refuses a task that stage 1 used.
 //
 // The simulation's defaults are the plan's assumptions (about 20% discordant pairs, B passes 70%); run it again
 // with the discordance that stage 1 measures before stage 2 starts.
@@ -71,6 +77,20 @@ export const UNPRICED_MODELS = new Set([
     "halogen/halogen-qwen3.8-flash-next",
     "github-copilot/mai-code-2-flash",
 ]);
+
+/** The 10 candidate models of stage 1, each on its 1 provider route (the plan's section Candidates). */
+export const CANDIDATES = [
+    "github-copilot/gpt-6-luna",
+    "anthropic/claude-haiku-5-5",
+    "deepseek/deepseek-flash",
+    "halogen/halogen-qwen3.8-flash-next",
+    "github-copilot/mai-code-2-flash",
+    "github-copilot/gemini-3.8-flash",
+    "github-copilot/grok-4.7",
+    "github-copilot/claude-sonnet-5.5",
+    "github-copilot/gpt-6.1-sol",
+    "github-copilot/claude-opus-5.5",
+];
 
 export const RULE_VERSION = 1;
 export const L2 = 1.0;
@@ -272,18 +292,33 @@ export function attemptCost(result, pricing = "standin") {
 
 /**
  * Pass: the attempt finished (no `failure`), S0 found no protocol breach, S1 passed, every hidden test of S2 passed
- * (or the task has no S2), and both judges graded 3 or more. A missing grade counts as 0 in the mean grade.
+ * (or the task has no S2: `s2` null), and both judges graded 3 or more.
+ *
+ * Status: `harness` (out of every comparison), `pending` (waits for a judge), `unscored` (it finished, but the
+ * scorer has not written S1, S2 and both grades yet), or `valid`. An attempt with a `failure` is a fail and needs no
+ * score; a missing grade there counts as 0 in the mean grade.
  */
 export function toAttempt(result, pricing = "standin") {
     const grades = Array.isArray(result.grades) ? result.grades : [];
     const g = [0, 1].map((i) => (typeof grades[i] === "number" ? grades[i] : null));
-    const status = result.harness ? "harness" : result.judgePending ? "pending" : "valid";
+    const scored =
+        typeof result.s1 === "boolean" &&
+        (result.s2 === null || typeof result.s2 === "boolean") &&
+        g[0] !== null &&
+        g[1] !== null;
+    const status = result.harness
+        ? "harness"
+        : result.judgePending
+          ? "pending"
+          : !result.failure && !scored
+            ? "unscored"
+            : "valid";
     const pass =
         status === "valid" &&
         !result.failure &&
         !result.s0?.protocol &&
         result.s1 === true &&
-        (result.s2 === null || result.s2 === undefined || result.s2 === true) &&
+        (result.s2 === null || result.s2 === true) &&
         g[0] !== null &&
         g[1] !== null &&
         g[0] >= 3 &&
@@ -324,7 +359,8 @@ export function indexAttempts(attempts) {
 
 /**
  * The tasks a set of models can be compared on. A task where any of the models has a harness failure is dropped
- * from every comparison; a task where one has no result yet, or waits for a judge, is `incomplete`.
+ * from every comparison; a task where one has no result yet, waits for a judge, or is not scored yet, is
+ * `incomplete`.
  */
 export function usableTasks(byTask, taskIds, models) {
     const usable = [];
@@ -337,7 +373,7 @@ export function usableTasks(byTask, taskIds, models) {
 
         if (list.some((a) => a?.status === "harness")) {
             dropped.push(id);
-        } else if (list.some((a) => !a || a.status === "pending")) {
+        } else if (list.some((a) => !a || a.status === "pending" || a.status === "unscored")) {
             incomplete.push(id);
         } else {
             usable.push(id);
@@ -878,18 +914,55 @@ export function writeRule(path, rule) {
 
 const modelsIn = (attempts) => [...new Set(attempts.map((a) => a.model))].sort();
 
+/** A task id may appear once: a repeated task would count twice in every posterior. */
+export function checkTasks(tasks) {
+    const seen = new Set();
+    const repeated = new Set();
+
+    for (const t of tasks) {
+        if (seen.has(t.id)) {
+            repeated.add(t.id);
+        }
+
+        seen.add(t.id);
+    }
+
+    if (repeated.size) {
+        throw new Error(`task ids repeat: ${[...repeated].join(", ")}`);
+    }
+
+    if (tasks.length === 0) {
+        throw new Error("no tasks to analyze");
+    }
+}
+
+/** Every result must be of an expected model: a result of another model is an error, not a silent extra. */
+function checkModels(results, expected, where) {
+    const allowed = new Set(expected);
+    const stray = [...new Set(results.map((r) => r.model))].filter((m) => !allowed.has(m));
+
+    if (stray.length) {
+        throw new Error(`results of models not expected in ${where}: ${stray.join(", ")}`);
+    }
+}
+
 const hasJev = (features) => JEV_NUMBERS.some((f) => typeof features?.[f] === "number");
 
 /**
  * Stage 1. `tasks`: `{ id, repo, features }`; `results`: result files (schema v1). Gives the bands, the per-model
  * figures by band, B1, the shortlists, C1, H2 and, unless `fitRule` is false, the rule with its nested accuracy.
+ * `options.models`: the models every task must have a result of (the command line gives CANDIDATES); a task that
+ * lacks one is incomplete. Without it, the models of the results.
  */
 export function analyzeStage1({ tasks, results, options = {} }) {
+    checkTasks(tasks);
     // The cells do not depend on the pricing: 1 cache serves both pricings.
     const prob = options.prob ?? memoProb();
     const probOptions = { margin: options.margin ?? MARGIN, draws: options.draws ?? DRAWS };
     const attempts = results.map((r) => toAttempt(r, "standin"));
-    const models = modelsIn(attempts);
+    const models = options.models ? [...options.models].sort() : modelsIn(attempts);
+
+    checkModels(results, models, "stage 1");
     const byTask = indexAttempts(attempts);
     const taskIds = tasks.map((t) => t.id);
     const { usable, dropped, incomplete } = usableTasks(byTask, taskIds, models);
@@ -1109,13 +1182,58 @@ const costOn = (byTask, model, ids) => {
 };
 
 /**
- * Stage 2. `tasks`: `{ id, repo, features, predictedTier? }` (fresh tasks only); the tier comes from
- * `predictedTier`, or from `rule` when given. `stage1`: the stage 1 summary, for the majority band of H1.
+ * Stage 1's model set for a stage 2 tier: B1, its shortlist and C1 (at most 4). Null when the summary has no tiers.
+ */
+export function tierModelsFrom(stage1, band) {
+    if (!stage1?.tiers) {
+        return null;
+    }
+
+    const tier = stage1.tiers[band] ?? {};
+
+    return [
+        ...new Set([tier.b1, ...(tier.shortlist ?? []), stage1.overall?.c1].filter(Boolean)),
+    ].sort();
+}
+
+/**
+ * A tier's decision with the unsolved rule: a task that no model of the tier passes drops from every pick (it would
+ * only add to n00), then decideSet. Stage 2 and the simulation both use it.
+ */
+export function decideTier(byTask, models, usable, options = {}) {
+    const solved = usable.filter((id) => models.some((m) => byTask.get(id).get(m).pass));
+    const unsolved = usable.filter((id) => !solved.includes(id));
+
+    return { ...decideSet(byTask, models, solved, options), unsolved };
+}
+
+/**
+ * Stage 2. `tasks`: `{ id, repo, features, predictedTier? }` (fresh tasks only); the tier comes from the frozen
+ * `rule`, or from `predictedTier` without one; a stored tier that the rule contradicts is an error. `stage1`: the
+ * stage 1 summary: its task ids (stage 2 refuses them), its majority band (H1) and, when it has tiers, each tier's
+ * expected models (B1, the shortlist and C1). `options.threshold`: the simulation's threshold.
  */
 export function analyzeStage2({ tasks, results, rule = null, stage1 = null, options: given = {} }) {
+    checkTasks(tasks);
     // The cells do not depend on the pricing: 1 cache serves both pricings.
     const options = { ...given, prob: given.prob ?? memoProb() };
-    const tierOf = (t) => t.predictedTier ?? (rule ? predictTier(rule, t.features ?? {}) : null);
+
+    const tierOf = (t) => {
+        if (!rule) {
+            return t.predictedTier ?? null;
+        }
+
+        const tier = predictTier(rule, t.features ?? {});
+
+        if (t.predictedTier !== undefined && t.predictedTier !== tier) {
+            throw new Error(
+                `task ${t.id}: stored tier ${t.predictedTier}, but the frozen rule gives ${tier}`,
+            );
+        }
+
+        return tier;
+    };
+
     // Every stage 1 task, dropped and incomplete ones included.
     const stage1Ids = new Set(stage1?.tasks?.ids ?? Object.keys(stage1?.bands ?? {}));
     const reused = tasks.filter((t) => stage1Ids.has(t.id)).map((t) => t.id);
@@ -1124,8 +1242,10 @@ export function analyzeStage2({ tasks, results, rule = null, stage1 = null, opti
         throw new Error(`stage 2 must use fresh tasks; stage 1 used ${reused.join(", ")}`);
     }
 
+    const tierById = new Map(tasks.map((t) => [t.id, tierOf(t)]));
+
     for (const t of tasks) {
-        if (!BANDS.includes(tierOf(t))) {
+        if (!BANDS.includes(tierById.get(t.id))) {
             throw new Error(`task ${t.id} has no predicted tier`);
         }
     }
@@ -1140,23 +1260,23 @@ export function analyzeStage2({ tasks, results, rule = null, stage1 = null, opti
         const incompleteAll = [];
 
         for (const band of BANDS) {
-            const ids = tasks.filter((t) => tierOf(t) === band).map((t) => t.id);
-            const models = modelsIn(attempts.filter((a) => ids.includes(a.task)));
+            const ids = tasks.filter((t) => tierById.get(t.id) === band).map((t) => t.id);
+            const tierResults = results.filter((r) => ids.includes(r.task));
+            const expected = tierModelsFrom(stage1, band);
+            const models = expected ?? modelsIn(attempts.filter((a) => ids.includes(a.task)));
+
+            if (expected) {
+                checkModels(tierResults, expected, `the ${band} tier`);
+            }
+
             const { usable, dropped, incomplete } = usableTasks(byTask, ids, models);
-            // A task that no model passes is unsolved: it drops from every pick (it would only add to n00).
-            const solved = usable.filter((id) => models.some((m) => byTask.get(id).get(m).pass));
-            const unsolved = usable.filter((id) => !solved.includes(id));
+            const tier = decideTier(byTask, models, usable, options);
 
             usableAll.push(...usable);
-            solvedAll.push(...solved);
+            solvedAll.push(...tier.ids);
             droppedAll.push(...dropped);
             incompleteAll.push(...incomplete);
-            tiers[band] = {
-                ...decideSet(byTask, models, solved, options),
-                unsolved,
-                dropped,
-                incomplete,
-            };
+            tiers[band] = { ...tier, dropped, incomplete };
         }
 
         // The constant policy: over all solved stage 2 tasks, among the models that ran on every one of them.
@@ -1254,9 +1374,8 @@ export function analyzeStage2({ tasks, results, rule = null, stage1 = null, opti
     if (stage1?.majorityBand && standin.usable.length) {
         const ids = standin.usable;
         const hard = (b) => (b === "unsolved" ? "hard" : b);
-        const byId = new Map(tasks.map((t) => [t.id, t]));
         const ruleAcc =
-            ids.filter((id) => tierOf(byId.get(id)) === hard(observed[id])).length / ids.length;
+            ids.filter((id) => tierById.get(id) === hard(observed[id])).length / ids.length;
         const baseAcc =
             ids.filter((id) => stage1.majorityBand === hard(observed[id])).length / ids.length;
 
@@ -1293,20 +1412,66 @@ export function analyzeStage2({ tasks, results, rule = null, stage1 = null, opti
 // The simulation.
 // ---------------------------------------------------------------------------------------------------------------
 
+export const SIM_B = "sim/best";
+export const SIM_M = "sim/cheaper";
+export const SIM_OTHER = "sim/other";
+
+/**
+ * 1 simulated stage 2 tier through the real decision code (decideTier: the unsolved rule, the minimum of tasks,
+ * B, the 4 guards and the pick). `outcomes`: 1 `{ b, m, other }` of booleans per task. All attempts get the same
+ * grade, availability and wall time, so guards (2) to (4) hold: the worst case for false acceptance. M costs less
+ * than B, so a tie in passes goes to M. A third model, dearest and passing only where it is told to, stands for the
+ * tier's other models: it keeps a task that B and M both fail from being unsolved.
+ */
+export function simulatedTier(outcomes, options = {}) {
+    const cost = { [SIM_B]: 1, [SIM_M]: 0.1, [SIM_OTHER]: 10 };
+    const byTask = new Map();
+    const ids = [];
+
+    outcomes.forEach((o, i) => {
+        const id = `sim-${i}`;
+        const row = new Map();
+
+        for (const [model, pass] of [
+            [SIM_B, o.b],
+            [SIM_M, o.m],
+            [SIM_OTHER, o.other],
+        ]) {
+            row.set(model, {
+                task: id,
+                model,
+                status: "valid",
+                pass,
+                providerFail: false,
+                grade: 3.5,
+                wallMs: 1000,
+                cost: cost[model],
+            });
+        }
+
+        byTask.set(id, row);
+        ids.push(id);
+    });
+
+    return decideTier(byTask, [SIM_B, SIM_M, SIM_OTHER], ids, options);
+}
+
 /**
  * The false-acceptance rate of the stage 2 rule for 1 cheaper model M against the best model B, by Monte Carlo. Each
- * task draws its (B, M) outcome from the true cells: p10 - p01 = gap, p10 + p01 = discordance, B's pass rate pB.
- * The procedure is the whole stage 2 rule for 2 models: B is the model with more passes (a tie goes to M: equal
- * grades are assumed, and M is cheaper), then M is accepted when it is B, or when P(gap <= margin) against B reaches
- * the threshold. Guards (2) to (4) are taken as met: the worst case for false acceptance.
+ * of the tier's n tasks draws its (B, M) outcome from the true cells: p10 - p01 = gap, p10 + p01 = discordance, B's
+ * pass rate pB. A task that both fail is solved by another model of the tier with probability `rescue` (default 1,
+ * the worst case: no task drops as unsolved, and every n00 stays in the posterior); else it drops, and a tier left
+ * with fewer than `minPaired` tasks is inconclusive. M is accepted when the decision picks it (simulatedTier).
  */
 export function simulateAcceptance({
     n,
     gap,
     discordance = 0.2,
     pB = 0.7,
+    rescue = 1,
     threshold = CLOSE_THRESHOLD,
     margin = MARGIN,
+    minPaired = MIN_PAIRED,
     reps = 2000,
     seed = SEED,
     draws = DRAWS,
@@ -1322,39 +1487,43 @@ export function simulateAcceptance({
     }
 
     const rng = mulberry32(seed);
+    const options = { threshold, margin, minPaired, draws, prob };
     let accepted = 0;
 
     for (let r = 0; r < reps; r++) {
-        const cells = { n11: 0, n10: 0, n01: 0, n00: 0 };
+        const outcomes = [];
 
         for (let i = 0; i < n; i++) {
             const u = rng();
 
             if (u < p11) {
-                cells.n11++;
+                outcomes.push({ b: true, m: true, other: false });
             } else if (u < p11 + p10) {
-                cells.n10++;
+                outcomes.push({ b: true, m: false, other: false });
             } else if (u < p11 + p10 + p01) {
-                cells.n01++;
+                outcomes.push({ b: false, m: true, other: false });
             } else {
-                cells.n00++;
+                outcomes.push({ b: false, m: false, other: rng() < rescue });
             }
         }
 
-        const bPasses = cells.n11 + cells.n10;
-        const mPasses = cells.n11 + cells.n01;
-
-        if (mPasses >= bPasses) {
-            accepted++;
-            continue;
-        }
-
-        if (prob(cells, { margin, draws }) >= threshold) {
+        if (simulatedTier(outcomes, options).pick === SIM_M) {
             accepted++;
         }
     }
 
-    return { n, gap, discordance, pB, threshold, reps, draws, accepted, rate: accepted / reps };
+    return {
+        n,
+        gap,
+        discordance,
+        pB,
+        rescue,
+        threshold,
+        reps,
+        draws,
+        accepted,
+        rate: accepted / reps,
+    };
 }
 
 /** The threshold rule: 0.9 when the false-acceptance rate at 0.8 is above 20% at any tier size, else 0.8. */
@@ -1384,6 +1553,7 @@ export function simulationReport({
     margin = MARGIN,
     discordance = 0.2,
     pB = 0.7,
+    rescue = 1,
 } = {}) {
     const prob = memoProb();
     const falseGap = Math.round((margin + 0.05) * 1000) / 1000;
@@ -1391,7 +1561,18 @@ export function simulationReport({
 
     for (const n of sizes) {
         for (const threshold of thresholds) {
-            const common = { n, threshold, margin, reps, draws, seed, prob, discordance, pB };
+            const common = {
+                n,
+                threshold,
+                margin,
+                reps,
+                draws,
+                seed,
+                prob,
+                discordance,
+                pB,
+                rescue,
+            };
             const far = simulateAcceptance({ ...common, gap: falseGap });
             const power = simulateAcceptance({ ...common, gap: 0 });
 
@@ -1404,6 +1585,7 @@ export function simulationReport({
         margin,
         discordance,
         pB,
+        rescue,
         reps,
         draws,
         seed,
@@ -1517,11 +1699,56 @@ export function stage2Markdown(s) {
 // The command line.
 // ---------------------------------------------------------------------------------------------------------------
 
-/** The tasks of a manifest file: an array of tasks, or an object with `tasks`. Only kept tasks count. */
-export function manifestTasks(json) {
-    const list = Array.isArray(json) ? json : (json?.tasks ?? []);
+/**
+ * The tasks of a reviewed manifest file (an array of tasks, or an object with `tasks`). Only tasks the owner kept
+ * count: `owner.keep` true, with `scopeMatches` and `commandsConfirmed` true. `keep` false drops a task. A task with
+ * no owner review, or a kept task without both confirmations, is an error: the file is not a reviewed manifest.
+ */
+export function manifestTasks(json, file = "manifest") {
+    const list = Array.isArray(json) ? json : json?.tasks;
 
-    return list.filter((t) => t?.owner?.keep !== false);
+    if (!Array.isArray(list)) {
+        throw new Error(`${file}: no task list`);
+    }
+
+    return list.filter((t) => {
+        const owner = t?.owner;
+
+        if (!t?.id || typeof owner?.keep !== "boolean") {
+            throw new Error(`${file}: task ${t?.id ?? "(no id)"} has no owner review`);
+        }
+
+        if (owner.keep && (owner.scopeMatches !== true || owner.commandsConfirmed !== true)) {
+            throw new Error(
+                `${file}: task ${t.id} is kept without scopeMatches and commandsConfirmed both true`,
+            );
+        }
+
+        return owner.keep;
+    });
+}
+
+/**
+ * The threshold that stage 2 must use, from the simulation report run before it: the report must hold the
+ * pre-registered settings (margin, gap = margin + 5 points, tier sizes 30 and 60 at 0.8), and the threshold is
+ * computed again from its rows, not read from it.
+ */
+export function thresholdFromSimulation(report) {
+    const gap = Math.round((MARGIN + 0.05) * 1000) / 1000;
+
+    if (report?.margin !== MARGIN || report?.gap !== gap || !Array.isArray(report?.rows)) {
+        throw new Error(`the simulation report must use margin ${MARGIN} and gap ${gap}`);
+    }
+
+    for (const n of [MIN_PAIRED, TIER_N]) {
+        if (!report.rows.some((r) => r.n === n && r.threshold === CLOSE_THRESHOLD)) {
+            throw new Error(
+                `the simulation report has no row for tier size ${n} at ${CLOSE_THRESHOLD}`,
+            );
+        }
+    }
+
+    return chooseThreshold(report.rows);
 }
 
 /** Every result file under `dir` (`<task-id>/<model-slug>.json`). */
@@ -1573,6 +1800,13 @@ function parseArgs(argv) {
             args.rule = value();
         } else if (a === "--stage1") {
             args.stage1 = value();
+        } else if (a === "--simulation") {
+            args.simulation = value();
+        } else if (a === "--models") {
+            args.models = value()
+                .split(",")
+                .map((m) => m.trim())
+                .filter(Boolean);
         } else if (a === "--out") {
             args.out = value();
         } else if (a === "--reps") {
@@ -1585,6 +1819,8 @@ function parseArgs(argv) {
             args.discordance = Number(value());
         } else if (a === "--pb") {
             args.pB = Number(value());
+        } else if (a === "--rescue") {
+            args.rescue = Number(value());
         } else if (a === "--simulate") {
             args.simulate = true;
         } else {
@@ -1604,6 +1840,7 @@ export function main(argv, { root = process.cwd(), log = console.log } = {}) {
             draws: args.draws ?? DRAWS,
             discordance: args.discordance ?? 0.2,
             pB: args.pB ?? 0.7,
+            rescue: args.rescue ?? 1,
         });
         const text = `${JSON.stringify(report, null, 4)}\n`;
 
@@ -1625,8 +1862,10 @@ export function main(argv, { root = process.cwd(), log = console.log } = {}) {
     }
 
     const tasks = args.manifest.flatMap((f) =>
-        manifestTasks(JSON.parse(readFileSync(resolve(root, f), "utf8"))),
+        manifestTasks(JSON.parse(readFileSync(resolve(root, f), "utf8")), f),
     );
+
+    checkTasks(tasks);
     const resultsRoot = resolve(root, args.results ?? "bench/results");
     const stageDir = join(resultsRoot, `stage${args.stage}`);
     const results = readResults(stageDir);
@@ -1640,19 +1879,50 @@ export function main(argv, { root = process.cwd(), log = console.log } = {}) {
 
     const ran = new Set(results.map((r) => r.task));
     const stageTasks = tasks.filter((t) => ran.has(t.id));
+
+    if (stageTasks.length === 0) {
+        throw new Error(`no results in ${stageDir}`);
+    }
+
+    const readJson = (path, what) => {
+        if (!existsSync(path)) {
+            throw new Error(`stage 2 needs ${what}: ${path} does not exist`);
+        }
+
+        return JSON.parse(readFileSync(path, "utf8"));
+    };
+
     let summary;
     let markdown;
 
     if (args.stage === "1") {
-        summary = analyzeStage1({ tasks: stageTasks, results });
+        summary = analyzeStage1({
+            tasks: stageTasks,
+            results,
+            options: { models: args.models ?? CANDIDATES },
+        });
         markdown = stage1Markdown(summary);
     } else {
-        const rulePath = resolve(root, args.rule ?? "bench/rule-v1.json");
-        const rule = existsSync(rulePath) ? JSON.parse(readFileSync(rulePath, "utf8")) : null;
-        const s1Path = resolve(root, args.stage1 ?? join(resultsRoot, "stage1", "summary.json"));
-        const stage1 = existsSync(s1Path) ? JSON.parse(readFileSync(s1Path, "utf8")) : null;
+        // Confirmation needs the frozen rule (the tiers), the stage 1 summary (fresh tasks, the model sets, H1) and
+        // the simulation run before stage 2 (the threshold).
+        const rule = readJson(resolve(root, args.rule ?? "bench/rule-v1.json"), "the frozen rule");
+        const stage1 = readJson(
+            resolve(root, args.stage1 ?? join(resultsRoot, "stage1", "summary.json")),
+            "the stage 1 summary",
+        );
+        const simulation = readJson(
+            resolve(root, args.simulation ?? join(resultsRoot, "simulation.json")),
+            "the simulation report",
+        );
+        const threshold = thresholdFromSimulation(simulation);
 
-        summary = analyzeStage2({ tasks: stageTasks, results, rule, stage1 });
+        summary = analyzeStage2({
+            tasks: stageTasks,
+            results,
+            rule,
+            stage1,
+            options: { threshold },
+        });
         markdown = stage2Markdown(summary);
     }
 
