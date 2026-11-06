@@ -40,11 +40,13 @@ import {
     NUDGE_WINDOW_MS,
     OBSERVED_KEPT,
     SyncRunner,
+    claimNudges,
     nudgeDue,
     nudgeSupervisors,
     observeIssue,
     observePr,
     openThread,
+    parseGitHub,
     recordObserved,
     takeNudges,
 } from "./desk.ts";
@@ -524,12 +526,12 @@ describe("takeNudges", () => {
         assert.equal(nudges.pending[String(SUPERVISOR)]!.deliveries.length, NUDGE_DELIVERIES_MAX);
     });
 
-    test("seen is pruned by age, then the oldest above the most", () => {
+    test("seen is pruned by age, then the oldest above the most, by a call with a new delivery", () => {
         const nudges = emptyNudges();
 
         nudges.seen = { old: T0 - NUDGE_SEEN_MS - 1, fresh: T0 - 1000 };
-        takeNudges(nudges, stateOf([]), [], T0);
-        assert.deepEqual(Object.keys(nudges.seen), ["fresh"]);
+        takeNudges(nudges, stateOf([]), [fact(0)], T0);
+        assert.deepEqual(Object.keys(nudges.seen), ["fresh", UUIDS[0]]);
 
         nudges.seen = Object.fromEntries(
             Array.from({ length: NUDGE_SEEN_MAX + 2 }, (_, index) => [
@@ -537,11 +539,117 @@ describe("takeNudges", () => {
                 T0 - 100_000 + index,
             ]),
         );
-        takeNudges(nudges, stateOf([]), [], T0);
-        assert.equal(Object.keys(nudges.seen).length, NUDGE_SEEN_MAX);
+        takeNudges(nudges, stateOf([]), [fact(1)], T0);
+        assert.equal(
+            Object.keys(nudges.seen).length,
+            NUDGE_SEEN_MAX + 1,
+            "the most, and the new id",
+        );
         assert.equal(nudges.seen.id0, undefined);
         assert.equal(nudges.seen.id1, undefined);
         assert.notEqual(nudges.seen.id2, undefined);
+    });
+});
+
+describe("takeNudges changes nothing on a call with no new delivery", () => {
+    test("duplicates, an expired unrelated seen id and an overdue pending entry with a task: deep-equal, no start", () => {
+        const nudges = emptyNudges();
+        const state = stateOf([
+            threadOf({ prs: { "frostyard/test#7": { via: "attached", state: "OPEN" } } }),
+        ]);
+
+        takeNudges(nudges, state, [fact(0), fact(1)], T0);
+        nudges.tasks[String(SUPERVISOR)] = "task-1";
+        // An unrelated id past its 72 hours, and the pending entry 11 minutes past its due time.
+        nudges.seen.expired = T0 - NUDGE_SEEN_MS - 1;
+
+        const now = nudges.pending[String(SUPERVISOR)]!.due + 11 * 60_000;
+        const before = JSON.parse(JSON.stringify(nudges)) as DeskNudgesState;
+        const { result, start } = takeNudges(
+            nudges,
+            state,
+            [fact(0), fact(1), fact(2, { delivery: "not-a-uuid" })],
+            now,
+        );
+
+        assert.deepEqual(nudges, before, "the stored state is the same");
+        assert.deepEqual(start, []);
+        assert.deepEqual(result.outcomes, {
+            [UUIDS[0]!]: "duplicate",
+            [UUIDS[1]!]: "duplicate",
+            "not-a-uuid": "invalid",
+        });
+    });
+});
+
+describe("claimNudges", () => {
+    const key = String(SUPERVISOR);
+    const pendingOf = (due: number) => ({
+        first: due - NUDGE_WINDOW_MS,
+        due,
+        count: 2,
+        deliveries: [
+            { id: UUIDS[5]!, at: due - 21_000 },
+            { id: UUIDS[6]!, at: due - 20_500 },
+        ],
+    });
+
+    test("a pending entry that is not due, and no running entry: nothing taken, nothing changes", () => {
+        const nudges = emptyNudges();
+
+        nudges.pending[key] = pendingOf(T0 + 30_000);
+        nudges.last[key] = T0 - 30_000;
+
+        const before = JSON.parse(JSON.stringify(nudges)) as DeskNudgesState;
+
+        assert.equal(claimNudges(nudges, key, T0), false);
+        assert.deepEqual(nudges, before);
+    });
+
+    test("a running entry a restart left, and a pending entry not due: only running is taken, pending stays", () => {
+        const nudges = emptyNudges();
+
+        nudges.pending[key] = pendingOf(T0 + 30_000);
+        nudges.running[key] = {
+            started: T0 - 30_000,
+            count: 1,
+            deliveries: [{ id: UUIDS[1]!, at: T0 - 31_000 }],
+        };
+        nudges.last[key] = T0 - 30_000;
+
+        assert.equal(claimNudges(nudges, key, T0), true);
+        assert.deepEqual(nudges.running[key], {
+            started: T0 - 30_000,
+            count: 1,
+            deliveries: [{ id: UUIDS[1]!, at: T0 - 31_000 }],
+        });
+        assert.deepEqual(
+            nudges.pending[key],
+            pendingOf(T0 + 30_000),
+            "the follow-up waits for its due time",
+        );
+        assert.equal(nudges.last[key], T0 - 30_000, "last changes only with a pending entry");
+    });
+
+    test("a pending entry that is due: taken into running with a running entry left, and last set", () => {
+        const nudges = emptyNudges();
+
+        nudges.pending[key] = pendingOf(T0);
+        nudges.running[key] = {
+            started: T0 - 90_000,
+            count: 1,
+            deliveries: [{ id: UUIDS[1]!, at: T0 - 91_000 }],
+        };
+
+        assert.equal(claimNudges(nudges, key, T0), true);
+        assert.equal(nudges.pending[key], undefined);
+        assert.equal(nudges.last[key], T0);
+        assert.deepEqual(nudges.running[key], {
+            started: T0,
+            count: 3,
+            deliveries: [{ id: UUIDS[1]!, at: T0 - 91_000 }, ...pendingOf(T0).deliveries],
+        });
+        assert.equal(claimNudges(emptyNudges(), key, T0), false, "nothing at all: no sync");
     });
 });
 
@@ -663,6 +771,82 @@ describe("observePr", () => {
         ]);
         assert.deepEqual(observePr(reviewed, pr({ reviewedAt: 10 }), T0).changes, []);
         assert.deepEqual(observePr(reviewed, pr(), T0).changes, [], "a read with no review time");
+    });
+});
+
+describe("labels from the parser to the observer", () => {
+    test("a full watched read of 21 labels, then a normal read of 20 of 21: no labels change, the 21 stay", () => {
+        const names = Array.from(
+            { length: 21 },
+            (_, index) => `label-${String(index).padStart(2, "0")}`,
+        );
+        const node = (labels: object, more: object = {}) => ({
+            number: 7,
+            title: "A fix",
+            url: "https://github.com/frostyard/test/pull/7",
+            state: "OPEN",
+            isDraft: false,
+            createdAt: "2026-11-10T10:00:00Z",
+            headRefName: "fix-7",
+            mergeable: "MERGEABLE",
+            reviewDecision: "",
+            author: { login: "github-viewer" },
+            labels,
+            commits: {
+                nodes: [
+                    {
+                        commit: {
+                            oid: SHA1,
+                            committedDate: "2026-11-10T11:00:00Z",
+                            statusCheckRollup: {
+                                state: "SUCCESS",
+                                contexts: { totalCount: 0, nodes: [] },
+                            },
+                        },
+                    },
+                ],
+            },
+            ...more,
+        });
+        const first20 = {
+            totalCount: 21,
+            nodes: names.slice(0, 20).map((name) => ({ name })),
+        };
+        const watched = parseGitHub({
+            data: {
+                viewer: { login: "github-viewer" },
+                p0: {
+                    nameWithOwner: "frostyard/test",
+                    isArchived: false,
+                    pullRequest: node(first20, {
+                        watchLabels: { totalCount: 21, nodes: names.map((name) => ({ name })) },
+                    }),
+                },
+            },
+        }).prs["frostyard/test#7"]!;
+        const normal = parseGitHub({
+            data: {
+                viewer: { login: "github-viewer" },
+                r0: {
+                    nameWithOwner: "frostyard/test",
+                    isArchived: false,
+                    pullRequests: {
+                        totalCount: 1,
+                        pageInfo: { hasNextPage: false },
+                        nodes: [node(first20)],
+                    },
+                },
+            },
+        }).repos["frostyard/test"]!.open[0]!;
+
+        assert.equal(watched.labelsCut, undefined, "the watched read has all 21");
+        assert.equal(normal.labelsCut, true, "the normal read says it is cut");
+
+        const baseline = observePr(undefined, watched, T0).snap;
+        const next = observePr(baseline, normal, T0 + 60_000);
+
+        assert.deepEqual(next.changes, []);
+        assert.deepEqual(next.snap.labels, [...names].sort());
     });
 });
 

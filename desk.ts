@@ -6423,7 +6423,7 @@ function splitRef(ref: string): { repo: string; number: number } {
     return { repo: match[1]!, number: Number(match[2]) };
 }
 
-const PR_FIELDS = `number title url state isDraft createdAt mergedAt closedAt headRefName mergeable reviewDecision author { login } labels(first: 20) { nodes { name } } commits(last: 1) { nodes { commit { oid committedDate statusCheckRollup { state contexts(first: ${String(GITHUB_CHECKS)}) { totalCount nodes { __typename ... on CheckRun { name conclusion status startedAt } ... on StatusContext { context state } } } } } } }`;
+const PR_FIELDS = `number title url state isDraft createdAt mergedAt closedAt headRefName mergeable reviewDecision author { login } labels(first: 20) { totalCount nodes { name } } commits(last: 1) { nodes { commit { oid committedDate statusCheckRollup { state contexts(first: ${String(GITHUB_CHECKS)}) { totalCount nodes { __typename ... on CheckRun { name conclusion status startedAt } ... on StatusContext { context state } } } } } } }`;
 
 /**
  * The fields of an attached PR: `PR_FIELDS`, the label events, the reviews, and the comments. Only the pinned parts of
@@ -6640,14 +6640,20 @@ function prFact(
 }
 
 /**
- * A PR node's labels for a watch: the full list a watched pin read (`watchLabels`, up to 100, with `labelsCut` when
- * GitHub has more), else the first 20 of the list every read has.
+ * A PR node's labels for a watch: the full list a watched pin read (`watchLabels`, up to 100), else the first 20 of the
+ * list every read has. Either way `labelsCut` when GitHub has more (`totalCount` above the names read): a label that is
+ * not in a cut list is not known to be absent.
  */
 function watchLabelsOf(node: Record<string, unknown>): Pick<PrFact, "labels" | "labelsCut"> {
     const all = node.watchLabels as { totalCount?: unknown; nodes?: unknown } | null | undefined;
 
     if (all === null || typeof all !== "object" || !Array.isArray(all.nodes)) {
-        return { labels: labelsOf(node) };
+        const labels = labelsOf(node);
+        const total = (node.labels as { totalCount?: unknown } | null | undefined)?.totalCount;
+
+        return typeof total === "number" && total > labels.length
+            ? { labels, labelsCut: true }
+            : { labels };
     }
 
     const labels = labelsOf({ labels: all });
@@ -20431,10 +20437,11 @@ function pruneSeen(nudges: DeskNudgesState, now: number): void {
 
 /**
  * Take a batch of facts into the nudges document: each fact's outcome, a pending entry for each matched supervisor
- * (`count` and the first `NUDGE_DELIVERIES_MAX` deliveries), and the supervisors that need a new `x.desk.nudge` task
- * (`start`): a pending entry with no task, or one more than `NUDGE_LOST_MS` past its due time (a lost task heals; a
- * second task is harmless, because its sync goes through the runner and finds nothing pending). More than
- * `NUDGE_FACTS_MAX` facts is an error.
+ * (`count` and the first `NUDGE_DELIVERIES_MAX` deliveries), and the supervisors of this call that need a new
+ * `x.desk.nudge` task (`start`): a pending entry with no task, or one more than `NUDGE_LOST_MS` past its due time (a
+ * lost task heals at the next new nudge for its supervisor; a second task is harmless, because its sync goes through
+ * the runner and claims only what is due). A call with no new delivery (duplicates and invalid facts only) changes
+ * nothing. More than `NUDGE_FACTS_MAX` facts is an error.
  */
 export function takeNudges(
     nudges: DeskNudgesState,
@@ -20446,7 +20453,17 @@ export function takeNudges(
         throw new Error(`nudge takes at most ${String(NUDGE_FACTS_MAX)} facts in 1 call.`);
     }
 
-    pruneSeen(nudges, now);
+    // A delivery id the desk took within `NUDGE_SEEN_MS`: an older entry is pruned at the next new delivery.
+    const seen = (id: string) => {
+        const at = nudges.seen[id];
+
+        return at !== undefined && now - at <= NUDGE_SEEN_MS;
+    };
+
+    // Only a call that takes a new delivery writes: a call of duplicates and invalid facts changes nothing.
+    if (facts.some((fact) => validNudgeFact(fact) && !seen(fact.delivery.toLowerCase()))) {
+        pruneSeen(nudges, now);
+    }
 
     const outcomes: Record<string, NudgeOutcome> = {};
     const matched = new Set<number>();
@@ -20464,7 +20481,7 @@ export function takeNudges(
 
         const id = fact.delivery.toLowerCase();
 
-        if (nudges.seen[id] !== undefined) {
+        if (seen(id)) {
             note(id, "duplicate");
             continue;
         }
@@ -20504,15 +20521,53 @@ export function takeNudges(
         }
     }
 
-    const start = Object.entries(nudges.pending)
-        .filter(
-            ([key, entry]) => nudges.tasks[key] === undefined || now - entry.due > NUDGE_LOST_MS,
-        )
-        .map(([key]) => Number(key))
-        .filter((supervisor) => Number.isInteger(supervisor))
+    // Only the supervisors this call matched: a lost task heals at the next new nudge for its supervisor.
+    const start = [...matched]
+        .filter((supervisor) => {
+            const key = String(supervisor);
+            const entry = nudges.pending[key];
+
+            return (
+                entry !== undefined &&
+                (nudges.tasks[key] === undefined || now - entry.due > NUDGE_LOST_MS)
+            );
+        })
         .sort((a, b) => a - b);
 
     return { result: { outcomes, supervisors: [...matched].sort((a, b) => a - b) }, start };
+}
+
+/**
+ * A nudged sync's claim of 1 supervisor's nudges. It always takes a `running` entry that a restart left (its sync did
+ * not commit). It takes the `pending` entry only when it is due (`now >= due`): then the entries merge into `running`,
+ * at most `NUDGE_DELIVERIES_MAX` deliveries, and `last` is `now`, so the next pending entry waits `NUDGE_GAP_MS`. A
+ * pending entry that is not due stays, and `last` stays. False: nothing taken, so no sync.
+ */
+export function claimNudges(nudges: DeskNudgesState, key: string, now: number): boolean {
+    const pending = nudges.pending[key];
+    const running = nudges.running[key];
+    const due = pending !== undefined && now >= pending.due;
+
+    if (!due && running === undefined) {
+        return false;
+    }
+
+    const taken = due ? pending : undefined;
+
+    nudges.running[key] = {
+        started: taken === undefined ? running!.started : now,
+        count: (running?.count ?? 0) + (taken?.count ?? 0),
+        deliveries: [...(running?.deliveries ?? []), ...(taken?.deliveries ?? [])]
+            .slice(0, NUDGE_DELIVERIES_MAX)
+            .map((one) => ({ id: one.id, at: one.at })),
+    };
+
+    if (taken !== undefined) {
+        delete nudges.pending[key];
+        nudges.last[key] = now;
+    }
+
+    return true;
 }
 
 /** 1 line of 200 characters at most: an error for the beacon. */
@@ -25841,32 +25896,10 @@ export default function createDesk(host: Host, web: Web) {
                     await runner.run(supervisor, "nudge", async () => {
                         let claimed = false;
 
-                        // The claim: the pending nudges are this sync's, and the next ones wait `NUDGE_GAP_MS`. A
-                        // `running` entry a restart left joins them.
+                        // The claim (`claimNudges`): a `running` entry a restart left, and the pending nudges
+                        // when they are due. A pending entry not due yet waits: a restart never skips the gap.
                         await runtime.commit(async (tx) => {
-                            const nudges = await tx.doc(DeskNudges);
-                            const pending = nudges.pending[key];
-                            const running = nudges.running[key];
-
-                            if (pending === undefined && running === undefined) {
-                                return undefined;
-                            }
-
-                            const now = runtime.now();
-
-                            nudges.running[key] = {
-                                started: now,
-                                count: (running?.count ?? 0) + (pending?.count ?? 0),
-                                deliveries: [
-                                    ...(running?.deliveries ?? []),
-                                    ...(pending?.deliveries ?? []),
-                                ]
-                                    .slice(0, NUDGE_DELIVERIES_MAX)
-                                    .map((one) => ({ id: one.id, at: one.at })),
-                            };
-                            delete nudges.pending[key];
-                            nudges.last[key] = now;
-                            claimed = true;
+                            claimed = claimNudges(await tx.doc(DeskNudges), key, runtime.now());
 
                             return undefined;
                         }, context);
