@@ -140,6 +140,8 @@ import {
     handledAfter,
     dropHandled,
     countEscalations,
+    digestShown,
+    DIGEST_MAX_ITEMS,
     dropEscalations,
     ESCALATION_CAUSE_MS,
     escalationCause,
@@ -3163,6 +3165,61 @@ describe("the Clerk's escalations", () => {
             keys: [],
             days: { "2026-11-06": { filed: 0, urgent: 1, dropped: 0, sent: 0, lines: 0 } },
         });
+    });
+
+    test("an escalation line is never cut by the 30-line cap, and shows first", () => {
+        const many = Array.from({ length: 35 }, (_, index) =>
+            news(`T${String(index + 10)}`, "repair", index),
+        );
+        const urgent = escalation("T99", "must go now", 100, true);
+        const text = digestText([...many, urgent]);
+        const lines = text.split("\n");
+
+        assert.match(lines[0] ?? "", /^\[desk\] digest: 36 new\./);
+        assert.equal(lines[1], urgent.line, "the escalation shows first");
+        assert.equal(lines.length, 1 + 1 + 30 + 1, "header, escalation, 30 lines, the count");
+        assert.equal(lines.at(-1), "… and 5 more on the Desk page.");
+        assert(digestShown([...many, urgent]).includes(urgent));
+    });
+
+    test("a direct item cut by the cap sets no told, and a report folded into a shown closed line counts", () => {
+        const many = Array.from({ length: 31 }, (_, index) =>
+            news(`T${String(index + 1)}`, "repair", 100 + index),
+        );
+        const threads = Object.fromEntries(
+            many.map((item) => [item.thread, thread({ id: item.thread })]),
+        );
+        const state: DeskState = { ...empty(), threads };
+
+        recordTold(state, digestShown(many), [], 1000);
+        assert.deepEqual(state.threads.T1?.run.told, { at: 100, kind: "repair" }, "shown");
+        assert.equal(state.threads.T31?.run.told, undefined, "the 31st line is cut");
+
+        const folded = [news("T1", "report", 5), news("T1", "closed", 6)];
+
+        assert.deepEqual(
+            digestShown(folded).map((item) => item.kind),
+            ["closed", "report"],
+        );
+    });
+
+    test("the box drops its oldest items above the cap, but never an escalation", () => {
+        const state = empty();
+        const config: DigestConfig = { minutes: 15, now: [], clerk: [] };
+        const kept = escalation("T1", "keep me", 1);
+
+        enqueueDigest(state, 1, kept, 1, config);
+
+        for (let index = 0; index < 120; index += 1) {
+            enqueueDigest(state, 1, news(`T${String(index + 2)}`, "report", 10 + index), 2, config);
+        }
+
+        const items = state.digests?.["1"]?.items ?? [];
+
+        assert.equal(items.length, DIGEST_MAX_ITEMS);
+        assert.equal(items[0]?.key, kept.key, "the escalation stays");
+        assert.equal(items.at(-1)?.thread, "T121", "the newest stays");
+        assert.equal(items[1]?.thread, "T23", "the oldest other items went");
     });
 });
 
@@ -24664,6 +24721,33 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
                     ).length,
                     1,
                 );
+                assert.deepEqual(
+                    (await deskState())?.escalations?.drops?.["x.desk.escalate:task-esc:call-drop"]
+                        ?.id,
+                    thread.id,
+                    "the drop is stored beside its key",
+                );
+
+                // The drop event leaves the thread's last 50 events: a replay still gives the same reply, from the
+                // stored drop.
+                await app.harness.commit(async (tx) => {
+                    const stored = (await tx.doc(DeskThreads)).threads[thread.id]!;
+
+                    stored.events = Array.from({ length: 50 }, (_, index) => ({
+                        at: index,
+                        key: `filler:${String(index)}`,
+                        text: "filler",
+                    }));
+                }, context);
+                assert.equal(textOf(await escalate()), first);
+                assert.deepEqual(await escalationTotals(), counted);
+                assert.equal(
+                    (await deskState())?.threads[thread.id]?.events.some((event) =>
+                        event.key.startsWith("escalate"),
+                    ),
+                    false,
+                    "a replay adds no event",
+                );
             } finally {
                 await unregister(source);
                 stub.restore();
@@ -24886,6 +24970,292 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
             }
         });
 
+        /** The live digest tasks of a supervisor, with their ids and checkpoints. */
+        const digestTasks = async (source: ConversationId) => {
+            const live = await app.harness.inspect(context);
+            const tasks = [];
+
+            for (const task of live.tasks) {
+                if (
+                    task.record.kind === "x.desk.digest" &&
+                    Number(task.record.conversationId) === Number(source)
+                ) {
+                    const record = await app.harness.getTask(task.record.id, context);
+
+                    tasks.push({
+                        id: task.record.id,
+                        checkpoint: (record?.state as { checkpoint?: { phase?: string } })
+                            ?.checkpoint,
+                    });
+                }
+            }
+
+            return tasks;
+        };
+
+        test("a take that drops every item sends no message to anybody, ends, and keeps its records", async () => {
+            const stub = stubDesk();
+
+            digestMinutes(15);
+
+            const { source, linked, thread } = await delegated("escalate-all-drop");
+
+            try {
+                const clerk = await handClerk(source, "escalate-all-drop-clerk");
+
+                await until(() => !app.isBusy(linked), "the linked session to settle", 20_000);
+                await until(
+                    async () =>
+                        typeof (await deskState())?.threads[thread.id]?.run.sweptAt === "number",
+                    "the first sweep",
+                    20_000,
+                );
+                await clearDigests();
+
+                const before = await escalationTotals();
+
+                assert.equal(
+                    textOf(
+                        await stub.tool(
+                            { action: "escalate", thread: thread.id, text: "stale" },
+                            Number(clerk),
+                            "task-esc",
+                            "call-stale",
+                        ),
+                    ),
+                    "Queued for Odrade: in the next digest.",
+                );
+                // The supervisor acts on the thread after the call: at the take, nothing is left to send.
+                await app.harness.commit(async (tx) => {
+                    markHandled((await tx.doc(DeskThreads)).threads[thread.id]!, {
+                        at: Date.now() + 1,
+                        by: "Odrade",
+                        act: "send",
+                    });
+                }, context);
+
+                const [waiting] = await digestTasks(source);
+
+                assert(waiting, "a digest task waits");
+                // From here no other news enters the box: the take holds the escalation alone.
+                digestMinutes(0);
+                await quiet([thread.id]);
+                await restartApp(16 * 60_000);
+
+                const settled = await app.harness.waitForTask(waiting.id, context);
+
+                assert.equal(
+                    (settled.state as { outcome?: { status?: string } }).outcome?.status,
+                    "completed",
+                    "the task ends",
+                );
+
+                const after = await deskState();
+
+                assert(
+                    after?.threads[thread.id]?.events.some(
+                        (event) =>
+                            event.key ===
+                                "escalate-drop:escalate:x.desk.escalate:task-esc:call-stale" &&
+                            /^Clerk escalation dropped: the supervisor acted after its news: desk send at .*: stale$/.test(
+                                event.text,
+                            ),
+                    ),
+                    "the drop is recorded on the thread",
+                );
+
+                const counted = await escalationTotals();
+
+                assert.equal(counted.filed - before.filed, 1);
+                assert.equal(counted.dropped - before.dropped, 1);
+                assert.equal(counted.sent - before.sent, 0);
+                assert.equal(counted.lines - before.lines, 0);
+                assert.equal(
+                    (after?.digests?.[String(Number(source))]?.items ?? []).filter((item) =>
+                        item.key.startsWith("escalate:"),
+                    ).length,
+                    0,
+                    "the box holds no escalation",
+                );
+
+                for (const session of [source, clerk]) {
+                    assert.equal(
+                        (await modelTexts(app, session)).some((each) =>
+                            each.includes("[desk] digest:"),
+                        ),
+                        false,
+                        "no digest message",
+                    );
+                }
+            } finally {
+                await stopDigests();
+                await quiet([]);
+                shift = 0;
+                digestMinutes(0);
+                await unregister(source);
+                stub.restore();
+                removeClerk();
+            }
+        });
+
+        test("a restart in deliver sends the escalation digest once, with the same text and request id, and records nothing twice", async () => {
+            const stub = stubDesk();
+            // The digest stays at 0 minutes: no other news enters the box, and the urgent call takes it at once.
+            const { source, linked, thread } = await delegated("escalate-restart");
+            // The test's fault: a task's submit goes through this class, so the test can stop a digest in `deliver`.
+            // An internal path of pi-durable: a dynamic import, so a move of it fails only this test.
+            const { Submissions } =
+                await import("./_pocket/node_modules/@earendil-works/pi-durable/dist/harness/submissions.js");
+            const proto = Submissions.prototype as unknown as {
+                submit: (id: unknown, draft: unknown, at: unknown) => Promise<unknown>;
+            };
+            const original = proto.submit;
+            const prefix = `x.desk.digest:${String(Number(source))}:`;
+            const seen: { requestId: string; text: string }[] = [];
+            let hold = true;
+
+            // The supervisor's digest goes in, then its step never returns: the process stops in `deliver`.
+            proto.submit = function (
+                this: unknown,
+                id: unknown,
+                draft: { requestId?: string; content?: unknown },
+                at: { abortSignal?: AbortSignal },
+            ) {
+                const done = Reflect.apply(original, this, [id, draft, at]) as Promise<unknown>;
+
+                if (!String(draft.requestId ?? "").startsWith(prefix)) {
+                    return done;
+                }
+
+                seen.push({ requestId: String(draft.requestId), text: String(draft.content) });
+
+                if (!hold) {
+                    return done;
+                }
+
+                return done.then(
+                    () =>
+                        new Promise((_, reject) => {
+                            const stop = () => reject(new Error("the process stopped"));
+
+                            if (at.abortSignal?.aborted === true) {
+                                stop();
+                            }
+
+                            at.abortSignal?.addEventListener("abort", stop, { once: true });
+                        }),
+                );
+            };
+
+            try {
+                const clerk = await handClerk(source, "escalate-restart-clerk");
+
+                await until(() => !app.isBusy(linked), "the linked session to settle", 20_000);
+                await clearDigests();
+
+                const before = await escalationTotals();
+
+                // 1 waiting escalation that the take drops (the supervisor acted after it, in the same commit), and 1
+                // urgent one with no thread that takes the box now.
+                await app.harness.commit(async (tx) => {
+                    const state = await tx.doc(DeskThreads);
+                    const at = Date.now();
+
+                    enqueueDigest(
+                        state,
+                        Number(source),
+                        {
+                            key: "escalate:x.desk.escalate:task-esc:call-stale",
+                            thread: thread.id,
+                            kind: "escalation",
+                            line: escalationLine(thread.id, "stale", false),
+                            at,
+                            text: "stale",
+                            cause: at,
+                        },
+                        at,
+                        { minutes: 15, now: [], clerk: [] },
+                    );
+                    // No task was made for it here: the urgent call's task takes it.
+                    state.digests![String(Number(source))]!.scheduled = [];
+                    markHandled(state.threads[thread.id]!, {
+                        at: at + 1,
+                        by: "Odrade",
+                        act: "send",
+                    });
+                }, context);
+                await stub.tool(
+                    { action: "escalate", text: "go", urgent: true },
+                    Number(clerk),
+                    "task-esc",
+                    "call-go",
+                );
+                await until(() => seen.length === 1, "the digest at the supervisor", 20_000);
+
+                const held = (await digestTasks(source)).find(
+                    (task) => task.checkpoint?.phase === "deliver",
+                );
+
+                assert(held, "the task is in deliver");
+
+                const stored = await deskState();
+                const counted = await escalationTotals();
+
+                assert.equal(counted.dropped - before.dropped, 1);
+                assert.equal(counted.sent - before.sent, 1);
+
+                hold = false;
+                await quiet([thread.id]);
+                await restartApp(shift);
+                await app.harness.waitForTask(held.id as never, context);
+
+                assert.equal(seen.length, 2, "1 more submit after the restart");
+                assert.deepEqual(seen[1], seen[0], "the same request id and text");
+                assert.match(seen[0]?.text ?? "", /\[desk\] the Clerk escalates \(urgent\): go/);
+                assert.doesNotMatch(seen[0]?.text ?? "", /stale/);
+                assert.equal(
+                    (await modelTexts(app, source)).filter((each) =>
+                        each.includes("[desk] the Clerk escalates (urgent): go"),
+                    ).length,
+                    1,
+                    "delivered once",
+                );
+
+                const after = await deskState();
+
+                assert.deepEqual(await escalationTotals(), counted, "no second count");
+                assert.deepEqual(
+                    after?.threads[thread.id]?.events.filter((event) =>
+                        event.key.startsWith("escalate-drop:"),
+                    ),
+                    stored?.threads[thread.id]?.events.filter((event) =>
+                        event.key.startsWith("escalate-drop:"),
+                    ),
+                    "no second drop",
+                );
+                assert.deepEqual(
+                    {
+                        handled: after?.threads[thread.id]?.run.handled,
+                        told: after?.threads[thread.id]?.run.told,
+                        clerkNews: after?.threads[thread.id]?.run.clerkNews,
+                    },
+                    {
+                        handled: stored?.threads[thread.id]?.run.handled,
+                        told: stored?.threads[thread.id]?.run.told,
+                        clerkNews: stored?.threads[thread.id]?.run.clerkNews,
+                    },
+                    "no second mark",
+                );
+            } finally {
+                proto.submit = original;
+                await stopDigests();
+                await quiet([]);
+                await unregister(source);
+                stub.restore();
+                removeClerk();
+            }
+        });
+
         test("escalate is refused to a supervisor, to an agent, and to a Clerk on another supervisor's thread", async () => {
             const stub = stubDesk();
             const { source, linked, thread } = await delegated("escalate-refuse");
@@ -25015,6 +25385,57 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
                 await app.harness.commit(async (tx) => {
                     delete (await tx.doc(DeskThreads)).dropped?.["frostyard/test#71"];
                 }, context);
+            }
+        });
+
+        test("a supervisor's attach of a PR marks the thread it moved from and the thread it moved to", async () => {
+            const stub = stubDesk();
+            const { source, thread: to } = await delegated("handled-move-to");
+            const { thread: from } = await delegated("handled-move-from");
+            // A ref that no other test puts on a thread.
+            const ref = "frostyard/test#7341";
+
+            try {
+                await app.harness.commit(async (tx) => {
+                    const state = await tx.doc(DeskThreads);
+
+                    state.threads[from.id]!.supervisor = Number(source);
+                    state.threads[from.id]!.prs[ref] = { state: "OPEN" } as never;
+                    delete state.threads[from.id]!.run.handled;
+                    delete state.threads[to.id]!.run.handled;
+                }, context);
+
+                // A PR that GitHub has.
+                process.env.PI_POCKET_DESK_GH = okGh;
+
+                try {
+                    await stub.tool(
+                        { action: "attach", ref, thread: to.id },
+                        Number(source),
+                        "task-move",
+                        "call-move",
+                    );
+                } finally {
+                    process.env.PI_POCKET_DESK_GH = fakeGh;
+                }
+
+                const after = await deskState();
+
+                assert.equal(after?.threads[from.id]?.prs[ref], undefined, "moved off");
+                assert.notEqual(after?.threads[to.id]?.prs[ref], undefined, "moved on");
+
+                for (const id of [from.id, to.id]) {
+                    assert.deepEqual(
+                        (after?.threads[id]?.run.handled as { by?: string; act?: string }) && {
+                            by: (after?.threads[id]?.run.handled as { by?: string }).by,
+                            act: (after?.threads[id]?.run.handled as { act?: string }).act,
+                        },
+                        { by: "Odrade", act: "attach" },
+                        id,
+                    );
+                }
+            } finally {
+                stub.restore();
             }
         });
 

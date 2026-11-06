@@ -718,6 +718,11 @@ export type DeskState = {
             string,
             { filed: number; urgent: number; dropped: number; sent: number; lines: number }
         >;
+        /**
+         * By replay key: the calls the desk dropped at the call, with the thread id and the reason, so a replay gives
+         * the same reply. Pruned with `keys` (the same 200). Absent until the first drop, and in a state from before it.
+         */
+        drops?: Record<string, { id: string; reason: string }>;
     };
 };
 
@@ -5572,7 +5577,7 @@ export const DIGEST_CLERK: readonly DigestKind[] = [
     "queue",
     "plan-decided",
 ];
-/** The most items a box keeps: the oldest go first. */
+/** The most items a box keeps: the oldest go first, except an escalation, which always stays. */
 export const DIGEST_MAX_ITEMS = 100;
 /** The most item lines 1 digest message shows. */
 export const DIGEST_MAX_LINES = 30;
@@ -5773,7 +5778,8 @@ function setDigestBox(state: DeskState, supervisor: number, box: DigestBox): voi
 
 /**
  * Add 1 item to a supervisor's box, and give the time of the digest task to create: none when an item with that key is
- * there already, or a scheduled time at or before the item's wanted time covers it. An "at once" kind wants `now`;
+ * there already, or a scheduled time at or before the item's wanted time covers it. Above `DIGEST_MAX_ITEMS`, the
+ * oldest items that are not escalations go; an escalation is never removed. An "at once" kind wants `now`;
  * any other wants `now` plus the interval.
  */
 export function enqueueDigest(
@@ -5791,8 +5797,20 @@ export function enqueueDigest(
 
     box.items.push(item);
 
-    if (box.items.length > DIGEST_MAX_ITEMS) {
-        box.items.splice(0, box.items.length - DIGEST_MAX_ITEMS);
+    // Above the cap, the oldest items go, but never an escalation: the Clerk was told it is queued, and no other record
+    // of it reaches the supervisor. A box of escalations only may hold more than the cap.
+    let over = box.items.length - DIGEST_MAX_ITEMS;
+
+    if (over > 0) {
+        box.items = box.items.filter((each) => {
+            if (over > 0 && !ESCALATION_KINDS.includes(each.kind)) {
+                over -= 1;
+
+                return false;
+            }
+
+            return true;
+        });
     }
 
     // The Clerk asked for an urgent escalation to go at once: it does, also when the setting's `now` leaves it out.
@@ -5878,27 +5896,32 @@ export function deskTime(at: number, timeZone: string): string {
     return `${journalDay(at, timeZone)} ${journalTime(at, timeZone)} ${name}`;
 }
 
+/** 1 line of a digest message, and the items it carries: its own, and for a closed line the reports folded into it. */
+type DigestEntry = { line: string; items: DigestItem[] };
+
 /**
- * The digest message: 1 header line, then 1 line for each item. A thread closed in this digest gets its closed line
- * only, with the count of its reports in the same digest. At most 30 item lines; the rest are counted. With `now`, the
- * header says the time, so the reader needs no `date` call to set a watch or date a record.
+ * The lines of a digest message, in 2 parts: the escalation lines, which are never cut, and the other lines, at most
+ * `DIGEST_MAX_LINES` of them; `more` counts the other lines that are cut. A thread closed in this digest gets its
+ * closed line only, with the count of its reports in the same digest: those items ride on the closed line.
  */
-export function digestText(
-    items: readonly DigestItem[],
-    now?: { at: number; timeZone: string },
-): string {
+function digestEntries(items: readonly DigestItem[]): {
+    escalations: DigestEntry[];
+    shown: DigestEntry[];
+    more: number;
+} {
     const closed = new Set(
         items.filter((item) => item.kind === "closed").map((item) => item.thread),
     );
+    const folded = new Map<string, DigestItem[]>();
     const reports = new Map<string, number>();
+    const escalations: DigestEntry[] = [];
+    const others: DigestEntry[] = [];
 
     for (const item of items) {
         if (closed.has(item.thread) && REPORT_KINDS.includes(item.kind)) {
             reports.set(item.thread, (reports.get(item.thread) ?? 0) + 1);
         }
     }
-
-    const lines: string[] = [];
 
     for (const item of items) {
         // A closed thread's report and queue lines are inside its closed line; an answer to Brian stays, and so does
@@ -5911,29 +5934,76 @@ export function digestText(
             !ISSUE_KINDS.includes(item.kind) &&
             !ESCALATION_KINDS.includes(item.kind)
         ) {
+            folded.set(item.thread, [...(folded.get(item.thread) ?? []), item]);
+            continue;
+        }
+
+        if (ESCALATION_KINDS.includes(item.kind)) {
+            escalations.push({ line: item.line, items: [item] });
             continue;
         }
 
         if (item.kind === "closed") {
             const count = reports.get(item.thread) ?? 0;
 
-            lines.push(
-                count === 0
-                    ? item.line
-                    : putBeforeRead(item.line, `${String(count)} report${count === 1 ? "" : "s"}`),
-            );
+            others.push({
+                line:
+                    count === 0
+                        ? item.line
+                        : putBeforeRead(
+                              item.line,
+                              `${String(count)} report${count === 1 ? "" : "s"}`,
+                          ),
+                items: [item],
+            });
             continue;
         }
 
-        lines.push(item.line);
+        others.push({ line: item.line, items: [item] });
     }
 
-    const shown = lines.slice(0, DIGEST_MAX_LINES);
-    const more = lines.length - shown.length;
+    // The items folded into a closed line go with that line.
+    for (const entry of others) {
+        const [first] = entry.items;
+
+        if (first?.kind === "closed") {
+            entry.items.push(...(folded.get(first.thread) ?? []));
+            folded.delete(first.thread);
+        }
+    }
+
+    const shown = others.slice(0, DIGEST_MAX_LINES);
+
+    return { escalations, shown, more: others.length - shown.length };
+}
+
+/**
+ * The items a digest message shows: each item with a line in it, and each report folded into a shown closed line. An
+ * item cut by the 30-line cap is not shown; an escalation is never cut. Only the shown items count as told.
+ */
+export function digestShown(items: readonly DigestItem[]): DigestItem[] {
+    const { escalations, shown } = digestEntries(items);
+
+    return [...escalations, ...shown].flatMap((entry) => entry.items);
+}
+
+/**
+ * The digest message: 1 header line, then the escalation lines (never cut: an escalation is on no Desk page), then 1
+ * line for each other item. A thread closed in this digest gets its closed line only, with the count of its reports in
+ * the same digest. At most 30 other item lines; the rest are counted. With `now`, the header says the time, so the
+ * reader needs no `date` call to set a watch or date a record.
+ */
+export function digestText(
+    items: readonly DigestItem[],
+    now?: { at: number; timeZone: string },
+): string {
+    const { escalations, shown, more } = digestEntries(items);
+    const total = escalations.length + shown.length + more;
 
     return [
-        `[desk] digest: ${String(lines.length)} new.${now === undefined ? "" : ` Now ${deskTime(now.at, now.timeZone)}.`} Read each with desk read <id> before you act.`,
-        ...shown,
+        `[desk] digest: ${String(total)} new.${now === undefined ? "" : ` Now ${deskTime(now.at, now.timeZone)}.`} Read each with desk read <id> before you act.`,
+        ...escalations.map((entry) => entry.line),
+        ...shown.map((entry) => entry.line),
         ...(more === 0 ? [] : [`… and ${String(more)} more on the Desk page.`]),
     ].join("\n");
 }
@@ -6224,61 +6294,125 @@ export function recordTold(
     }
 }
 
+/** The escalation counts of 1 day. */
+type EscalationDay = {
+    filed: number;
+    urgent: number;
+    dropped: number;
+    sent: number;
+    lines: number;
+};
+
+/** The stored escalations as a plain copy: a part of another shape starts again, empty. */
+function escalationsOf(state: Readonly<DeskState>): {
+    keys: string[];
+    days: Record<string, EscalationDay>;
+    drops: Record<string, { id: string; reason: string }>;
+} {
+    const stored = state.escalations as Record<string, unknown> | undefined;
+    const record = (value: unknown): Record<string, unknown> =>
+        value !== null && typeof value === "object" && !Array.isArray(value)
+            ? (value as Record<string, unknown>)
+            : {};
+    const keys = Array.isArray(stored?.keys)
+        ? stored.keys.filter((key): key is string => typeof key === "string")
+        : [];
+    const count = (value: unknown): number => (typeof value === "number" ? value : 0);
+    const days = Object.fromEntries(
+        Object.entries(record(stored?.days)).map(([day, value]) => {
+            const each = record(value);
+
+            return [
+                day,
+                {
+                    filed: count(each.filed),
+                    urgent: count(each.urgent),
+                    dropped: count(each.dropped),
+                    sent: count(each.sent),
+                    lines: count(each.lines),
+                },
+            ];
+        }),
+    );
+    const drops: Record<string, { id: string; reason: string }> = {};
+
+    for (const [key, value] of Object.entries(record(stored?.drops))) {
+        const each = record(value);
+
+        if (typeof each.id === "string" && typeof each.reason === "string") {
+            drops[key] = { id: each.id, reason: each.reason };
+        }
+    }
+
+    return { keys, days, drops };
+}
+
+/** Write the escalations back: the newest keys, their drops only, and the newest days. */
+function setEscalations(state: DeskState, value: ReturnType<typeof escalationsOf>): void {
+    const keys = value.keys.slice(-ESCALATION_KEYS_MAX);
+    const kept = Object.keys(value.days).sort().slice(-ESCALATION_DAYS_MAX);
+    const drops = Object.fromEntries(
+        Object.entries(value.drops).filter(([key]) => keys.includes(key)),
+    );
+
+    state.escalations = {
+        keys,
+        days: Object.fromEntries(kept.map((day) => [day, value.days[day]!])),
+        ...(Object.keys(drops).length === 0 ? {} : { drops }),
+    };
+}
+
 /**
  * Add to the escalation counts of the day `day`: a new day starts at 0, and only the newest `ESCALATION_DAYS_MAX` days
  * stay. A stored value of another shape starts again.
  */
-export function countEscalations(
-    state: DeskState,
-    day: string,
-    add: Partial<{ filed: number; urgent: number; dropped: number; sent: number; lines: number }>,
-): void {
-    const stored = state.escalations;
-    const keys = Array.isArray(stored?.keys)
-        ? stored.keys.filter((key): key is string => typeof key === "string")
-        : [];
-    const days =
-        stored?.days !== null && typeof stored?.days === "object" && !Array.isArray(stored.days)
-            ? { ...stored.days }
-            : {};
-    const had = days[day];
-    const base = (value: unknown): number => (typeof value === "number" ? value : 0);
-    const next = {
-        filed: base(had?.filed) + (add.filed ?? 0),
-        urgent: base(had?.urgent) + (add.urgent ?? 0),
-        dropped: base(had?.dropped) + (add.dropped ?? 0),
-        sent: base(had?.sent) + (add.sent ?? 0),
-        lines: base(had?.lines) + (add.lines ?? 0),
+export function countEscalations(state: DeskState, day: string, add: Partial<EscalationDay>): void {
+    const value = escalationsOf(state);
+    const had = value.days[day] ?? { filed: 0, urgent: 0, dropped: 0, sent: 0, lines: 0 };
+
+    value.days[day] = {
+        filed: had.filed + (add.filed ?? 0),
+        urgent: had.urgent + (add.urgent ?? 0),
+        dropped: had.dropped + (add.dropped ?? 0),
+        sent: had.sent + (add.sent ?? 0),
+        lines: had.lines + (add.lines ?? 0),
     };
-
-    days[day] = next;
-
-    const kept = Object.keys(days).sort().slice(-ESCALATION_DAYS_MAX);
-
-    state.escalations = {
-        keys,
-        days: Object.fromEntries(kept.map((each) => [each, days[each]!])),
-    };
+    setEscalations(state, value);
 }
 
 /** Whether a call's replay key is among the escalations the desk accepted. */
 export function escalationKnown(state: Readonly<DeskState>, key: string): boolean {
-    return Array.isArray(state.escalations?.keys) && state.escalations.keys.includes(key);
+    return escalationsOf(state).keys.includes(key);
 }
 
-/** Record 1 accepted escalation's replay key: the newest `ESCALATION_KEYS_MAX` stay. */
-export function rememberEscalation(state: DeskState, key: string): void {
-    const stored = state.escalations;
-    const keys = Array.isArray(stored?.keys)
-        ? stored.keys.filter((each): each is string => typeof each === "string")
-        : [];
-    const days =
-        stored?.days !== null && typeof stored?.days === "object" && !Array.isArray(stored.days)
-            ? stored.days
-            : {};
+/**
+ * Record 1 accepted escalation's replay key, and with `drop` the thread and the reason of its drop at the call: the
+ * newest `ESCALATION_KEYS_MAX` keys stay, and a drop goes with its key.
+ */
+export function rememberEscalation(
+    state: DeskState,
+    key: string,
+    drop?: { id: string; reason: string },
+): void {
+    const value = escalationsOf(state);
 
-    keys.push(key);
-    state.escalations = { keys: keys.slice(-ESCALATION_KEYS_MAX), days };
+    if (!value.keys.includes(key)) {
+        value.keys.push(key);
+    }
+
+    if (drop !== undefined) {
+        value.drops[key] = drop;
+    }
+
+    setEscalations(state, value);
+}
+
+/** The drop of an accepted call, when the call was dropped: its thread id and reason. */
+export function escalationDropOf(
+    state: Readonly<DeskState>,
+    key: string,
+): { id: string; reason: string } | undefined {
+    return escalationsOf(state).drops[key];
 }
 
 /**
@@ -26601,8 +26735,14 @@ export default function createDesk(host: Host, web: Web) {
                         ESCALATION_KINDS.includes(item.kind),
                     ).length;
 
-                    // What went to whom: a later escalation of the same news is dropped.
-                    recordTold(state, ours, clerk === undefined ? [] : theirs, now.at);
+                    // What went to whom, of the lines each message shows: a later escalation of the same news is dropped.
+                    // A line cut by the 30-line cap told nobody.
+                    recordTold(
+                        state,
+                        digestShown(ours),
+                        clerk === undefined ? [] : digestShown(theirs),
+                        now.at,
+                    );
 
                     if (checked.dropped.length > 0 || sent > 0) {
                         countEscalations(state, day, {
@@ -30206,9 +30346,20 @@ export default function createDesk(host: Host, web: Web) {
                         return { error: `${ref} left the issue queue just now. Nothing changed.` };
                     }
 
-                    const touched = [target, source].filter(
-                        (thread): thread is Thread => thread !== undefined,
-                    );
+                    // Every thread the call can change: the target, a source thread, and each thread that holds the PR
+                    // now (an attach moves it off its holder).
+                    const holders = PR_REF.test(ref)
+                        ? Object.values(state.threads).filter(
+                              (thread) => thread.prs[ref] !== undefined,
+                          )
+                        : [];
+                    const touched = [
+                        ...new Set(
+                            [target, source, ...holders].filter(
+                                (thread): thread is Thread => thread !== undefined,
+                            ),
+                        ),
+                    ];
                     const before = touched.map((thread) => JSON.stringify(thread));
                     const done =
                         issue !== undefined
@@ -30355,33 +30506,26 @@ export default function createDesk(host: Host, web: Web) {
                         };
                     }
 
-                    // A replay changes nothing: no item, no event, and no count. It gives the same kind of reply.
+                    // A replay changes nothing: no item, no event, and no count. It gives the same reply.
                     if (escalationKnown(state, key)) {
-                        const event = thread?.events.find(
-                            (each) => each.key === `escalate-drop:${key}`,
-                        );
+                        const drop = escalationDropOf(state, key);
 
-                        if (event !== undefined) {
-                            const tail = `: ${clipped}`;
-                            const reason =
-                                event.text.startsWith(dropPrefix) && event.text.endsWith(tail)
-                                    ? event.text.slice(
-                                          dropPrefix.length,
-                                          event.text.length - tail.length,
-                                      )
-                                    : "it repeats news the supervisor has";
-
-                            return { dropped: reason, id: thread?.id ?? "" };
-                        }
-
-                        return { queued: true as const };
+                        return drop === undefined
+                            ? { queued: true as const }
+                            : { dropped: drop.reason, id: drop.id };
                     }
-
-                    rememberEscalation(state, key);
-                    countEscalations(state, day, { filed: 1, urgent: urgent ? 1 : 0 });
 
                     const cause = escalationCause(thread, at);
                     const reason = escalationDrop(thread, cause);
+
+                    rememberEscalation(
+                        state,
+                        key,
+                        reason === undefined || thread === undefined
+                            ? undefined
+                            : { id: thread.id, reason },
+                    );
+                    countEscalations(state, day, { filed: 1, urgent: urgent ? 1 : 0 });
 
                     if (reason !== undefined && thread !== undefined) {
                         addEvent(

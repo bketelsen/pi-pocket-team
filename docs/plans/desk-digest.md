@@ -44,6 +44,9 @@ go only to the supervisor, also when `digest.clerk` names them. `escalation-urge
 list, and goes at once also when `now` leaves it out. An escalation uses the digest also at `minutes` 0:
 it then goes at once. The take drops an escalation that repeats news the supervisor has, merges the
 escalations of 1 thread into 1 line, and keeps an escalation line of a thread closed in the same digest.
+Escalation lines come first in the message, and the 30-line cap never cuts them: an escalation is on no
+Desk page. The box's 100-item cap never removes an escalation: the oldest other items go, and a box of
+escalations only may hold more.
 
 ## 3. Settings
 

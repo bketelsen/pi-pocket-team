@@ -179,14 +179,19 @@ never send Brian a message. Write to Odrade in ASD-STE100.
 - The desk API has 2 new members: `clerk` (register) and `clerkOf` (the read before a start).
 - `desk send` uses the key `x.desk.send:<task>:<call>`: a replay sends once.
 - `desk escalate` (2026-11-06) uses the key `x.desk.escalate:<task>:<call>`. Its 1 commit records the key
-  in `DeskState.escalations.keys` (the last 200), the counts, the event and the digest item: a replay finds
-  the key, changes nothing, and gives the same kind of reply. The stored fields are new and optional:
+  in `DeskState.escalations.keys` (the last 200), for a drop at the call also its thread id and reason in
+  `DeskState.escalations.drops` (by key, pruned with the keys), the counts, the event and the digest item: a
+  replay finds the key, changes nothing, and gives the same reply (a drop's from `drops`, not from the
+  thread's events, which keep only 50). The stored fields are new and optional:
   `DigestItem.text` and `DigestItem.cause` (the escalation's text and cause), `Thread.run.told`
   (`{ at, kind }`), `Thread.run.clerkNews` (`{ at, sent }`), and `DeskState.escalations`
-  (`{ keys, days }`: by local day, the newest 60, `filed`, `urgent`, `dropped`, `sent`, `lines`). The 2
+  (`{ keys, days, drops? }`: `days` by local day, the newest 60, `filed`, `urgent`, `dropped`, `sent`,
+  `lines`; `drops` by key, `{ id, reason }`). The 2
   digest kinds `escalation` and `escalation-urgent` are new, at the end of the list. The digest's `take`
   commit drops, merges, and records `told`, `clerkNews` and the counts with the take, so a restart in
-  `deliver` sends the same text once.
+  `deliver` sends the same text once. An escalation line is never cut by the digest's 30-line cap (it is on
+  no Desk page): the escalation lines come first. `told` and `clerkNews` record only the items whose lines
+  a message shows. The box's 100-item cap never removes an escalation: the oldest other items go.
 - The digest's split happens in the `take` commit: each target gets its own request id
   (`x.desk.digest:<supervisor>:<seq>` and `…:<seq>:clerk`), so a restart in `deliver` sends each once.
 - The sweep never makes a found thread of the Clerk's session: its address counts as known.
