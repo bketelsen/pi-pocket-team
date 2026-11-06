@@ -898,8 +898,14 @@ test("2 tabs: the slow one holds the shell back and loses no character", async (
             lagged ||= fast.offset > slow.offset;
             await stream(slow);
 
-            // The last line of seq, and not the typed command line, which is echoed as "seq 1 300000".
-            return slow.text.includes("\r\n300000\r\n") && fast.text.includes("\r\n300000\r\n");
+            // The last line of seq, and not the typed command line, which is echoed as "seq 1 300000". The shell's
+            // prompt comes after it, at a time of its own: a prompt that lands between the 2 polls goes to the slow tab
+            // only (issue #115). So the wait ends on an event, not on a pass of the loop: both tabs at the same offset.
+            return (
+                slow.text.includes("\r\n300000\r\n") &&
+                fast.text.includes("\r\n300000\r\n") &&
+                slow.offset === fast.offset
+            );
         },
         "both tabs to read the whole output",
         30_000,
