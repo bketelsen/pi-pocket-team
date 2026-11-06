@@ -1,15 +1,22 @@
 // Isolated browser preview of the Desk: its Dashboard and its plans. Pocket's test harness (temporary data, test
 // credentials, a fake model), only `desk.ts` on, the facts of `desk-dashboard-fixture.ts`, and the plans of
 // `desk-plans-fixture.ts` (drafting, building, verifying, done, dropped), each with a planning session of its own that
-// holds 1 short exchange. Nothing reads Brian's data or GitHub.
+// holds 1 short exchange. Nothing reads Brian's data or GitHub. The desk's export folder is `<tmp>/odrade/desk`, a
+// temporary folder: `GET file` reads the desk files beside it, such as the 1 report this preview writes in
+// `<tmp>/odrade/reports/`.
 //
 // The collector never runs here, so it cannot overwrite the fixture: it starts only from a desk sweep or `desk sync`,
-// and no thread of the desk has a supervisor, so no sweeper starts. The fake `gh` also fails every call.
+// and no thread of the desk has a supervisor, so no sweeper starts. The fake `gh` also fails every call. The asks
+// thread of `/preview-asks?on=1` is the 1 exception: it has a supervisor (the preview's first session), so a tap on
+// `artifact:<id>` opens a session. While it is there, a desk read can start a sweep; seed the dashboard again with
+// `/preview-fixture` if it changed, and take the thread out with `/preview-asks?on=0`.
 //
 // Routes beside the app's own, for the checks:
 //   /preview-login            sign in as the owner, in the preview's first session
 //   /preview-login?plan=N     sign in, in the planning session of plan N (T101 to T105): the Plan panel's place
 //   /preview-plans?on=0|1     take the fixture's plans and their threads out of the desk, or seed them again
+//   /preview-asks?on=1|0      seed thread T140 with 3 open asks in Markdown (inline code, bold, a link, an artifact,
+//                            a desk path; 1-line numbered steps with options; a long ask), or take it out
 //   /preview-fixture?name=N   seed variant N again (main, empty, not-started, stale, usage-unavailable, partial-usage,
 //                            residual-only, long)
 //   /preview-fail?on=1|0      make `GET dashboard` fail with a 500, or not
@@ -36,7 +43,7 @@ import {
 import { fauxAssistantMessage, fauxText } from "@earendil-works/pi-ai/providers/faux";
 import { cpSync, mkdirSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { createHandler } from "./_pocket/src/server/http.ts";
 import { setAuthCookie } from "./_pocket/src/server/auth.ts";
 import { DeskDashboard } from "./_desk-dashboard.ts";
@@ -47,16 +54,41 @@ import {
     VARIANTS,
     type Variant,
 } from "./desk-dashboard-fixture.ts";
-import { DeskThreads, writeStore } from "./desk.ts";
+import { DeskThreads, type Thread, writeStore } from "./desk.ts";
 import { FIXTURE_PLANS, plansFixture } from "./desk-plans-fixture.ts";
 
 const fakeGh = join(root, "preview-gh");
 const agents = join(root, "preview-agents");
 const config = join(root, "preview-desk.json");
+/** Odrade's folder, temporary: the export folder `desk/` and the desk files beside it, for `GET file`. */
+const odrade = join(root, "odrade");
+const reportPath = "reports/2026-11-05-intake-go-live/502-check.md";
 
 writeFileSync(fakeGh, "#!/bin/sh\necho 'preview: no GitHub here' >&2\nexit 1\n", { mode: 0o755 });
 mkdirSync(agents, { recursive: true });
-writeFileSync(config, JSON.stringify({ digest: { minutes: 0 } }));
+mkdirSync(join(odrade, "desk"), { recursive: true });
+mkdirSync(dirname(join(odrade, reportPath)), { recursive: true });
+writeFileSync(
+    join(odrade, reportPath),
+    [
+        "# Intake go-live: the 502 check",
+        "",
+        "The preview's report, for the tap on a desk path.",
+        "",
+        "## Result",
+        "",
+        "- 500 requests to `/intake` through the proxy: **0** answers with 502.",
+        "- p95 latency: 180 ms (it was 210 ms).",
+        "",
+        "```",
+        "ab -n 500 -c 20 https://intake.example.org/intake",
+        "```",
+        "",
+        "Next: turn the flag on for all.",
+        "",
+    ].join("\n"),
+);
+writeFileSync(config, JSON.stringify({ digest: { minutes: 0 }, export: join(odrade, "desk") }));
 process.env.PI_POCKET_DESK_GH = fakeGh;
 process.env.PI_POCKET_DESK_CONFIG = config;
 process.env.PI_POCKET_TEAM_AGENTS = agents;
@@ -129,6 +161,65 @@ const seedPlans = async (on: boolean): Promise<void> => {
 };
 
 await seedPlans(true);
+
+/** The asks thread's id: after the plans' threads. */
+const ASKS_THREAD = "T140";
+
+/** Put thread T140 with 3 open asks in Markdown in the desk; or take it out (`on` false). */
+const seedAsks = async (on: boolean): Promise<void> => {
+    const now = Date.now();
+    const thread: Thread = {
+        id: ASKS_THREAD,
+        key: `preview:${ASKS_THREAD}`,
+        origin: "delegate",
+        agents: ["duncan"],
+        repo: "frostyard/intake",
+        title: "Intake go-live (preview asks)",
+        state: "open",
+        startedAt: now - 3 * 3600_000,
+        lastEventAt: now - 600_000,
+        supervisor: session,
+        prs: {},
+        branches: [],
+        run: {},
+        events: [],
+        asks: [
+            {
+                id: `${ASKS_THREAD}a`,
+                at: now - 900_000,
+                by: "odrade",
+                from: "duncan",
+                text: `Before go-live, check the **502** fix: run \`npm run check:502\` and read the [runbook](https://github.com/frostyard/intake/blob/main/docs/runbook.md). The chart is artifact:intake-502-check and the report is ${reportPath}. Go live today?`,
+                options: ["Go live today", "Wait"],
+            },
+            {
+                id: `${ASKS_THREAD}b`,
+                at: now - 600_000,
+                by: "odrade",
+                text: "How do we roll out the intake change (Phases 1-5 are done)? 1) merge #502 behind the flag \`intake.v2\` 2) turn the flag on for 10% of traffic for 15-30 min 3) turn it on for all, and watch the 5xx rate - stop at 1%.",
+                options: ["Steps as written", "Skip the 10% step", "Wait a week"],
+            },
+            {
+                id: `${ASKS_THREAD}c`,
+                at: now - 300_000,
+                by: "odrade",
+                from: "duncan",
+                text: "The intake service writes each form to the queue and then to the archive. On 2026-11-04 the archive write failed for 37 forms, because the bucket policy changed at 14:02 UTC and the service had no retry. The forms are safe in the queue, and \`intake replay --since 2026-11-04T14:00Z\` can write them again. Do you want me to replay the 37 forms now, add a retry with backoff in a PR first, or both: the PR first, then the replay with the new code? I vote both: a new policy change must not lose forms.",
+            },
+        ],
+    };
+
+    await app.harness.commit(async (tx) => {
+        const state = await tx.doc(DeskThreads);
+
+        delete state.threads[ASKS_THREAD];
+
+        if (on) {
+            state.threads[ASKS_THREAD] = thread;
+            state.next = { ...state.next, T: Math.max(state.next.T, 141) };
+        }
+    }, context);
+};
 
 /** The variant seeded last: the thread details answer from it. */
 let seeded: Variant = "main";
@@ -226,6 +317,17 @@ const server = createServer((req, res) => {
 
         void seedPlans(on).then(
             () => text(res, 200, `plans ${on ? "seeded" : "gone"}`),
+            (error: unknown) => text(res, 500, String(error)),
+        );
+
+        return;
+    }
+
+    if (url.pathname === "/preview-asks") {
+        const on = url.searchParams.get("on") !== "0";
+
+        void seedAsks(on).then(
+            () => text(res, 200, `asks ${on ? "seeded" : "gone"}`),
             (error: unknown) => text(res, 500, String(error)),
         );
 

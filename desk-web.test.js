@@ -442,7 +442,7 @@ test("a found thread with an open ask is under Needs you, with its ask card and 
     );
 
     assert.match(need, /F2/);
-    assert.match(need, /T1a · Which one\?/);
+    assert.match(need, /T1a\s*<\/p>\s*<div class="desk-md"><p>Which one\?<\/p>/);
     assert.match(need, /aria-label=Answered T1a/);
     assert.match(need, /> Answered </);
     assert.match(need, /Attach to…/, "it can still be attached");
@@ -482,7 +482,7 @@ test("a watched thread with an open ask is under Needs you, with its ask card an
     );
 
     assert.match(need, /T3/);
-    assert.match(need, /T1a · Which one\?/);
+    assert.match(need, /T1a\s*<\/p>\s*<div class="desk-md"><p>Which one\?<\/p>/);
     assert.match(need, /> Answered </);
     assert.match(need, /check on 2026-12-01/, "the watch date still shows");
     assert.doesNotMatch(out, /<h2>Watching /, "it is not in Watching");
@@ -777,7 +777,7 @@ test("a thread closed with an open ask shows in Needs you with its answer contro
     );
 
     assert.match(need, /T406/);
-    assert.match(need, /T406b · Keep the old blob store\?/);
+    assert.match(need, /T406b[^<]*<\/p>\s*<div class="desk-md"><p>Keep the old blob store\?<\/p>/);
     assert.match(need, /Answered T406b/, "Brian can answer it");
     assert.doesNotMatch(need, /T407/);
     assert.match(out, /Closed in the last 7 days \(1\)/, "only the plain one is under Closed");
@@ -810,7 +810,7 @@ test("a closed found thread with an open ask and a watch shows the answer contro
         out.indexOf("</section>", out.indexOf("<h2>Needs you")),
     );
 
-    assert.match(need, /F7a · Adopt it\?/);
+    assert.match(need, /F7a[^<]*<\/p>\s*<div class="desk-md"><p>Adopt it\?<\/p>/);
     assert.match(need, /aria-label=Answered F7a/);
     assert.doesNotMatch(need, /Attach/);
     assert.doesNotMatch(need, /Drop/);

@@ -18,10 +18,22 @@
  * import would keep a stale copy after a reload. With this module off, Team and Night shift work as before.
  */
 import { execFile } from "node:child_process";
+import { constants as fsConstants } from "node:fs";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { access, lstat, mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import {
+    access,
+    lstat,
+    mkdir,
+    open,
+    readFile,
+    readlink,
+    realpath,
+    rename,
+    stat,
+    writeFile,
+} from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join } from "node:path";
+import { dirname, isAbsolute, join, sep } from "node:path";
 import { promisify } from "node:util";
 import type { Context, JsonValue } from "@earendil-works/chord";
 import { Type } from "@earendil-works/pi-ai";
@@ -1087,6 +1099,158 @@ export function threadById(state: Readonly<DeskState> | undefined, id: string): 
     const key = id.trim().replace(/^#/, "").toUpperCase();
 
     return Object.hasOwn(threads, key) ? threads[key] : undefined;
+}
+
+/** The folders a desk path starts with: each is beside the export folder. `desk-web/ask-text.js` has the same list. */
+export const DESK_PATH_ROOTS = ["reports", "desk", "plans", "decisions"] as const;
+/** The longest desk path, in characters. */
+export const DESK_PATH_MAX = 200;
+/** The largest file `GET file` reads, in bytes. */
+export const DESK_FILE_MAX = 256 * 1024;
+
+/**
+ * Whether a text is a desk path: relative, under 1 of `DESK_PATH_ROOTS`, ending in `.md`, at most 200 characters, each
+ * segment `[A-Za-z0-9_][A-Za-z0-9._-]*` (so no `.` or `..` segment and no hidden file). The same rule as `deskPath` in
+ * `desk-web/ask-text.js`, which makes the tap targets of the Desk page.
+ */
+export function isDeskPath(text: unknown): text is string {
+    if (typeof text !== "string" || text.length === 0 || text.length > DESK_PATH_MAX) {
+        return false;
+    }
+
+    const segments = text.split("/");
+
+    return (
+        segments.length >= 2 &&
+        (DESK_PATH_ROOTS as readonly string[]).includes(segments[0] ?? "") &&
+        segments.every((segment) => /^[A-Za-z0-9_][A-Za-z0-9._-]*$/.test(segment)) &&
+        text.endsWith(".md")
+    );
+}
+
+/**
+ * The absolute path of a desk file under the root (the parent folder of the export folder), or an error with its HTTP
+ * status: 404 with no export folder, 400 for a path that is not a desk path. Pure: the route checks the file itself
+ * (its real path, its kind, its size) after this.
+ */
+export function deskFileTarget(
+    exportFolder: string | undefined,
+    path: unknown,
+): { root: string; file: string } | { status: 400 | 404; error: string } {
+    if (exportFolder === undefined || !isAbsolute(exportFolder)) {
+        return { status: 404, error: "The desk has no export folder: set export in desk.json." };
+    }
+
+    if (!isDeskPath(path)) {
+        return {
+            status: 400,
+            error: `path must be a relative .md path under ${DESK_PATH_ROOTS.join("/, ")}/: at most ${DESK_PATH_MAX} characters, no . or .. segment, no hidden file.`,
+        };
+    }
+
+    const root = dirname(exportFolder.replace(/\/+$/, ""));
+
+    return { root, file: join(root, path) };
+}
+
+/**
+ * Read 1 desk file, bound to the descriptor that reads it. The open does not block (`O_NONBLOCK`: a FIFO cannot hang
+ * it), the descriptor must be a regular file, and the place of the descriptor's file (the kernel's text of
+ * `/proc/self/fd/<fd>`, read with `readlink` and not resolved again) must be in the real root. So a writer that swaps the name, or
+ * a folder above it, between the open and the checks cannot make it read an outside file. A deleted or unresolved
+ * target is refused. Linux only (`/proc`): elsewhere every read is refused. The read stops at `DESK_FILE_MAX` + 1 bytes.
+ * The hooks run between the steps, and `open` replaces the open, for the tests only.
+ */
+export async function readDeskFile(
+    root: string,
+    file: string,
+    hooks: {
+        beforeOpen?: () => Promise<void> | void;
+        afterOpen?: () => Promise<void> | void;
+        beforeRead?: () => Promise<void> | void;
+        open?: typeof open;
+    } = {},
+): Promise<{ text: string } | { status: 400 | 404 | 413; error: string }> {
+    const missing = { status: 404 as const, error: "There is no desk file" };
+    const outside = { status: 400 as const, error: "The desk file is outside the desk folder" };
+    let realRoot: string;
+
+    try {
+        realRoot = await realpath(root);
+    } catch {
+        return missing;
+    }
+
+    await hooks.beforeOpen?.();
+
+    let handle: Awaited<ReturnType<typeof open>>;
+
+    try {
+        handle = await (hooks.open ?? open)(file, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK);
+    } catch {
+        return missing;
+    }
+
+    try {
+        await hooks.afterOpen?.();
+
+        const facts = await handle.stat();
+
+        if (!facts.isFile()) {
+            return { status: 404, error: "The desk path is not a file" };
+        }
+
+        // Where the open file is now: the kernel's text for the descriptor, read with `readlink` and never resolved
+        // again (`realpath` would walk names a writer can swap). A deleted file's text ends in " (deleted)".
+        let real: string;
+
+        try {
+            real = await readlink(`/proc/self/fd/${String(handle.fd)}`);
+        } catch {
+            return outside;
+        }
+
+        if (
+            !isAbsolute(real) ||
+            real.endsWith(" (deleted)") ||
+            !real.startsWith(realRoot.endsWith(sep) ? realRoot : realRoot + sep)
+        ) {
+            return outside;
+        }
+
+        const tooLarge = {
+            status: 413 as const,
+            error: `The desk file is over ${String(DESK_FILE_MAX / 1024)} KB`,
+        };
+
+        if (facts.size > DESK_FILE_MAX) {
+            return tooLarge;
+        }
+
+        await hooks.beforeRead?.();
+
+        // At most 1 byte more than the limit: a file that grew after the size check is a 413, never a large read.
+        const buffer = Buffer.alloc(DESK_FILE_MAX + 1);
+        let length = 0;
+
+        while (length < buffer.length) {
+            const { bytesRead } = await handle.read(buffer, length, buffer.length - length, length);
+
+            if (bytesRead === 0) {
+                break;
+            }
+
+            length += bytesRead;
+        }
+
+        if (length > DESK_FILE_MAX) {
+            return tooLarge;
+        }
+
+        return { text: buffer.subarray(0, length).toString("utf8") };
+    } finally {
+        await handle.close();
+    }
 }
 
 /** The thread of a linked session, whatever its state. */
@@ -25181,6 +25345,31 @@ export default function createDesk(host: Host, web: Web) {
                     text: report.text,
                 })),
             };
+        },
+        { access: "owner" },
+    );
+
+    // 1 desk file, for the tap on a path in an ask: `file?path=reports/…/x.md`. The root is the parent folder of the
+    // export folder. Read only: it records nothing, and it makes no commit, sweep, export or GitHub call. A symlink out
+    // of the root, a file that is not a regular file, and a file over 256 KB are refused.
+    web.route(
+        "GET",
+        "file",
+        async (request) => {
+            const path = request.query.get("path") ?? "";
+            const target = deskFileTarget((await deskConfig()).export, path);
+
+            if ("error" in target) {
+                throw web.error(target.status, target.error);
+            }
+
+            const read = await readDeskFile(target.root, target.file);
+
+            if ("error" in read) {
+                throw web.error(read.status, `${read.error}: ${path}`);
+            }
+
+            return { path, text: read.text };
         },
         { access: "owner" },
     );
