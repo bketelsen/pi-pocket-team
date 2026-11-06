@@ -1,0 +1,57 @@
+{
+    "schema_version": 1,
+    "paths": [
+        {
+            "glob": ".github/risk-paths.json",
+            "why": "governance: the high-risk path list"
+        },
+        {
+            "glob": ".github/workflows/**",
+            "why": "governance: CI, the risk-paths caller and token permissions"
+        },
+        {
+            "glob": "Makefile",
+            "why": "governance: the verify gate"
+        },
+        {
+            "glob": "scripts/check-template.mjs",
+            "why": "governance: the template verification gate"
+        },
+        {
+            "glob": "scripts/check-corrections.mjs",
+            "why": "governance: the corrections validation gate"
+        },
+        {
+            "glob": "scripts/lib/**",
+            "why": "governance: the vendored risk-path validator and matcher"
+        },
+        {
+            "glob": "mise.toml",
+            "why": "governance: the Node pin of the gate"
+        },
+        {
+            "glob": "mise.lock",
+            "why": "governance: the checksums of the Node pin"
+        },
+        {
+            "glob": "package.json",
+            "why": "governance: the lint, test and type-check scripts that the gate runs"
+        },
+        {
+            "glob": ".prettierignore",
+            "why": "governance: the files that the lint gate skips"
+        },
+        {
+            "glob": "eslint.config.js",
+            "why": "governance: the lint rules and the files that the lint gate skips"
+        },
+        {
+            "glob": "install.mjs",
+            "why": "publication: writes the drop-ins into the running server's extensions folder, and each write reloads a module live"
+        },
+        {
+            "glob": "terminal.ts",
+            "why": "auth: the owner-only routes to an interactive login shell as the server's user"
+        }
+    ]
+}

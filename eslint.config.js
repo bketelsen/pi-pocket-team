@@ -5,8 +5,17 @@ import tseslint from "typescript-eslint";
 // Layout only: Prettier formats, and these rules give the code room to breathe.
 export default [
     {
-        // The vendored xterm.js is not this project code: neither linter reads it (nor .prettierignore).
-        ignores: ["node_modules/**", "_pocket/**", "terminal-web/vendor/**"],
+        // The vendored xterm.js is not this project code: neither linter reads it (nor .prettierignore). The same
+        // holds for the copies from bketelsen/agentic-template and frostyard/core (`make verify` pins 2 of them).
+        ignores: [
+            "node_modules/**",
+            "_pocket/**",
+            "terminal-web/vendor/**",
+            "scripts/check-template.mjs",
+            "scripts/check-corrections.mjs",
+            "scripts/lib/**",
+            "test/check-template.test.mjs",
+        ],
     },
     {
         files: ["**/*.ts"],
