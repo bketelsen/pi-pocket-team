@@ -15904,6 +15904,289 @@ describe("the desk in a Pi Pocket", () => {
         );
     });
 
+    /**
+     * A fake `gh` that answers each query from its aliases and cuts like GitHub: after `budget` aliases of 1 query, a
+     * pinned PR comes back null and a repository's list loses its nodes, with errors of type `RESOURCE_LIMITS_EXCEEDED`,
+     * and it exits 1 with the partial answer on stdout. `cut` names repositories whose list is cut in every query; a query
+     * that holds a text of `fail` fails with no data. Any other query (the issue queue) gets the viewer only.
+     */
+    const budgetGh = (setup: {
+        budget?: number;
+        open?: Record<string, number[]>;
+        prs: Record<string, { createdAt: string; headRefName?: string }>;
+        cut?: string[];
+        fail?: string[];
+    }): string => {
+        const configPath = join(root, "budget-gh.json");
+        const script = join(root, "budget-gh.cjs");
+
+        writeFileSync(configPath, JSON.stringify(setup));
+        writeFileSync(
+            script,
+            [
+                `#!${process.execPath}`,
+                `const setup = JSON.parse(require("node:fs").readFileSync(${JSON.stringify(configPath)}, "utf8"));`,
+                'const arg = process.argv.find((one) => one.startsWith("query="));',
+                'const query = arg === undefined ? "" : arg.slice(6);',
+                'const data = { viewer: { login: "github-viewer" } };',
+                "const errors = [];",
+                "if ((setup.fail ?? []).some((text) => query.includes(text))) {",
+                '    process.stderr.write("HTTP 502: Bad Gateway\\n");',
+                "    process.exit(1);",
+                "}",
+                "const node = (repo, number) => {",
+                "    const pr = setup.prs[`${repo}#${number}`] ?? { createdAt: new Date().toISOString() };",
+                "    return { number, title: `PR ${number}`, url: `https://github.com/${repo}/pull/${number}`, state: 'OPEN',",
+                "        isDraft: false, createdAt: pr.createdAt, headRefName: pr.headRefName ?? `pr-${number}`, mergeable: 'MERGEABLE',",
+                "        reviewDecision: '', author: { login: 'github-viewer' },",
+                "        commits: { nodes: [{ commit: { oid: `h${number}`, statusCheckRollup: { state: 'SUCCESS' } } }] } };",
+                "};",
+                "let count = 0;",
+                "let alias;",
+                'for (const line of query.split("\\n")) {',
+                '    const start = /^  ([rpi][0-9]+): repository\\(owner: "([^"]+)", name: "([^"]+)"\\)/.exec(line);',
+                "    if (start !== null) {",
+                "        alias = { name: start[1], repo: `${start[2]}/${start[3]}` };",
+                "        count += 1;",
+                "        if (alias.name.startsWith('r')) {",
+                "            const numbers = (setup.open ?? {})[alias.repo] ?? [];",
+                "            const cut = count > (setup.budget ?? Infinity) || (setup.cut ?? []).includes(alias.repo);",
+                "            data[alias.name] = { nameWithOwner: alias.repo, isArchived: false, pullRequests: {",
+                "                totalCount: numbers.length, pageInfo: { hasNextPage: false, endCursor: null },",
+                "                nodes: numbers.map((number) => (cut ? null : node(alias.repo, number))) } };",
+                "            if (cut) numbers.forEach((_, index) => errors.push({ type: 'RESOURCE_LIMITS_EXCEEDED',",
+                "                path: [alias.name, 'pullRequests', 'nodes', index, 'number'], message: 'Resource limits exceeded.' }));",
+                "        }",
+                "        continue;",
+                "    }",
+                "    const pr = /pullRequest\\(number: ([0-9]+)\\)/.exec(line);",
+                "    if (pr !== null && alias !== undefined) {",
+                "        if (count > (setup.budget ?? Infinity)) {",
+                "            data[alias.name] = { nameWithOwner: alias.repo, isArchived: false, pullRequest: null };",
+                "            errors.push({ type: 'RESOURCE_LIMITS_EXCEEDED', path: [alias.name, 'pullRequest', 'number'],",
+                "                message: 'Resource limits exceeded.' });",
+                "        } else {",
+                "            data[alias.name] = { nameWithOwner: alias.repo, isArchived: false, pullRequest: node(alias.repo, Number(pr[1])) };",
+                "        }",
+                "    }",
+                "}",
+                "process.stdout.write(JSON.stringify(errors.length === 0 ? { data } : { data, errors }));",
+                "process.exit(errors.length === 0 ? 0 : 1);",
+                "",
+            ].join("\n"),
+        );
+        chmodSync(script, 0o755);
+
+        return script;
+    };
+
+    /** Close the threads of a test as dropped, so no later test sees them open. */
+    const dropThreads = async (ids: string[]) => {
+        await app.harness.commit(async (tx) => {
+            const state = await tx.doc(DeskThreads);
+
+            for (const id of ids) {
+                const thread = state.threads[id];
+
+                if (thread !== undefined && thread.state !== "closed") {
+                    thread.state = "closed";
+                    thread.closed = { at: Date.now(), why: "dropped", by: "desk" };
+                }
+            }
+        }, context);
+    };
+
+    test("a big read is read in chunks: a PR attached after GitHub's budget gets its state in 1 sweep", async () => {
+        await stopSweepers();
+
+        const source = await supervisor("github-budget");
+        const now = Date.now();
+        const fillers = Array.from(
+            { length: 29 },
+            (_, index) => `frostyard/test#${String(5101 + index)}`,
+        );
+        let filler = "";
+        let target = "";
+
+        await app.harness.commit(async (tx) => {
+            const state = await tx.doc(DeskThreads);
+            // An open thread with many PRs: they are pinned first.
+            const many =
+                state.threads[
+                    openThread(state, {
+                        key: "x.test.budget-many",
+                        supervisor: Number(source),
+                        agents: ["duncan"],
+                        repo: "frostyard/test",
+                        title: "Many PRs",
+                        at: now - 3600_000,
+                    }).thread.id
+                ]!;
+
+            many.state = "open";
+
+            for (const ref of fillers) {
+                many.prs[ref] = { via: "attached" };
+            }
+
+            // A thread that closed as done, and that `desk attach` opened again with a PR: it is pinned last.
+            const back =
+                state.threads[
+                    openThread(state, {
+                        key: "x.test.budget-back",
+                        supervisor: Number(source),
+                        agents: ["duncan"],
+                        repo: "frostyard/test",
+                        title: "Closed, then attached",
+                        at: now - 3600_000,
+                    }).thread.id
+                ]!;
+
+            back.state = "closed";
+            back.closed = { at: now - 600_000, why: "done", by: "sweep" };
+            assert("text" in attachTo(state, "frostyard/test#5300", back.id, now));
+            assert.equal(back.state, "open");
+
+            filler = many.id;
+            target = back.id;
+        }, context);
+
+        // `state.github` is 1 field for every supervisor: only these threads stay open, so no other sweep writes it.
+        await quiet([filler, target]);
+
+        // 1 query of the roster's repositories and all 30 PRs is over the budget; each chunk is under it.
+        process.env.PI_POCKET_DESK_GH = budgetGh({ budget: 30, prs: {} });
+
+        try {
+            await say(app, source, "desk sync test");
+        } finally {
+            process.env.PI_POCKET_DESK_GH = fakeGh;
+        }
+
+        const state = await deskState();
+
+        assert.equal(state?.github?.ok, true, state?.github?.error);
+        // The control: a PR pinned first had its facts before the fix too.
+        assert.equal(state?.threads[filler]?.prs["frostyard/test#5101"]?.state, "OPEN");
+        assert.equal(state?.github?.incomplete, undefined, state?.github?.incomplete?.join("; "));
+        assert.equal(
+            state?.threads[target]?.prs["frostyard/test#5300"]?.state,
+            "OPEN",
+            "the PR pinned last has its facts after 1 sweep",
+        );
+        assert.equal(typeof state?.threads[target]?.prs["frostyard/test#5300"]?.readAt, "number");
+
+        await dropThreads([filler, target]);
+    });
+
+    test("a PR its session named, in a repository whose open list GitHub cut, does not close the thread as done", async () => {
+        await stopSweepers();
+
+        const source = await supervisor("github-cut-list");
+        const started = Date.now() - 5 * 60_000;
+        const ref = "frostyard/test#5402";
+        let id = "";
+
+        // The live case: the thread started, its agent made the PR (on a branch of its own) and reported its URL, and
+        // the session went idle. The read of the repository's open PRs came back with `nodes: [null]`.
+        await app.harness.commit(async (tx) => {
+            const state = await tx.doc(DeskThreads);
+            const opened =
+                state.threads[
+                    openThread(state, {
+                        key: "x.test.cut-list",
+                        supervisor: Number(source),
+                        agents: ["duncan"],
+                        repo: "frostyard/test",
+                        title: "A docs note",
+                        at: started,
+                    }).thread.id
+                ]!;
+
+            opened.state = "open";
+            opened.run = { busy: false, seenPrs: [ref] };
+            id = opened.id;
+        }, context);
+
+        // `state.github` is 1 field for every supervisor: a sweep of an earlier test's supervisor, which the sync starts
+        // again, would write its own lines over this one's. Only this thread stays open.
+        await quiet([id]);
+
+        const setup = {
+            open: { "frostyard/test": [5402] },
+            prs: {
+                [ref]: {
+                    createdAt: new Date(started + 93_000).toISOString(),
+                    headRefName: "docs/fork-baseline-note",
+                },
+            },
+            cut: ["frostyard/test"],
+        };
+
+        // First, the read by number fails too: the guard holds the thread open.
+        process.env.PI_POCKET_DESK_GH = budgetGh({ ...setup, fail: ["pullRequest(number: 5402)"] });
+
+        try {
+            await say(app, source, "desk sync test");
+        } finally {
+            process.env.PI_POCKET_DESK_GH = fakeGh;
+        }
+
+        let state = await deskState();
+
+        assert.equal(state?.threads[id]?.state, "open", "not closed as completed (no PRs)");
+        assert.deepEqual(state?.threads[id]?.prs, {});
+        assert(
+            state?.github?.incomplete?.includes("frostyard/test: 0 of 1 open PRs read"),
+            state?.github?.incomplete?.join("; "),
+        );
+        assert(
+            state?.github?.incomplete?.includes(
+                `${ref}: not read (exit code 1: HTTP 502: Bad Gateway)`,
+            ),
+            state?.github?.incomplete?.join("; "),
+        );
+
+        // Then the read by number works: the PR attaches by seen, from the discovery pin.
+        process.env.PI_POCKET_DESK_GH = budgetGh(setup);
+
+        try {
+            await say(app, source, "desk sync test");
+        } finally {
+            process.env.PI_POCKET_DESK_GH = fakeGh;
+        }
+
+        state = await deskState();
+
+        assert.equal(state?.threads[id]?.state, "open");
+        assert.equal(state?.threads[id]?.prs[ref]?.via, "seen");
+        assert.equal(state?.threads[id]?.prs[ref]?.state, "OPEN");
+
+        await dropThreads([id]);
+    });
+
+    test("a failed sweep shows in desk list until the next good sweep of its supervisor clears it", async () => {
+        const source = await supervisor("sweep-error");
+
+        await app.harness.commit(async (tx) => {
+            const state = await tx.doc(DeskThreads);
+
+            state.sweepErrors = {
+                [String(Number(source))]: { at: Date.now(), error: "boom: the commit failed" },
+            };
+        }, context);
+
+        await say(app, source, "desk list test");
+        assert.match(
+            (await modelTexts(app, source)).join("\n"),
+            // More than 1 supervisor on the desk: the line names the supervisor.
+            /Sweep failed at \d\d:\d\d(?: \(supervisor \d+\))?: boom: the commit failed/,
+        );
+
+        await say(app, source, "desk sync test");
+        assert.equal((await deskState())?.sweepErrors, undefined);
+    });
+
     test("desk attach refuses a ref GitHub cannot read, and detach takes one off", async () => {
         const { source, thread } = await delegated("attach-pr");
 
@@ -16035,7 +16318,7 @@ describe("the desk in a Pi Pocket", () => {
         );
     });
 
-    test("a thread closed without GitHub reopens when its PR is open", async () => {
+    test("a failed GitHub read holds a thread open; a thread closed before its PR showed reopens when it is open", async () => {
         await stopSweepers();
         await new Promise((resolve) => setTimeout(resolve, 250));
 
@@ -16055,6 +16338,11 @@ describe("the desk in a Pi Pocket", () => {
             process.env.PI_POCKET_DESK_GH = fakeGh;
         }
 
+        // GitHub is down: the open PRs of its repository are not read, so the thread with no PR stays open.
+        assert.equal((await deskState())?.threads[thread.id]?.state, "open");
+
+        // A good read that does not list the PR yet: the thread closes as done.
+        await say(app, source, "desk sync test");
         assert.equal((await deskState())?.threads[thread.id]?.state, "closed");
         assert.equal((await deskState())?.threads[thread.id]?.closed?.why, "done");
 
