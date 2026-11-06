@@ -861,10 +861,12 @@ const ownerOf = (repo: string) => repo.slice(0, repo.indexOf("/"));
 /**
  * The 1-time migration of a coverage document stored before `since`: when `since` is absent, build it from the evidence
  * in the delivery log (accepted entries only), never later than the evidence proves. An `all` installation: its account
- * starts at its earliest log entry. Each repository of a `selected` installation: the same time of that installation. A
- * repository that `repos` covers and no `selected` installation lists: its earliest accepted entry, and no later than the
- * start of its account when an `all` installation covers it (the account's start when it has no entry of its own). No evidence, or a log that dropped entries: `0`, unknown
- * (the change always counts). With `since` present, nothing changes. Returns `since`.
+ * starts at the installation's earliest log entry. Each repository of a `selected` installation: the earlier of the
+ * installation's earliest entry and the repository's own earliest entry (the installation's alone when the repository has
+ * none; `0` when the installation has none). A repository that `repos` covers and no `selected` installation lists: its
+ * earliest accepted entry, and no later than the start of its account when an `all` installation covers it (the
+ * account's start when it has no entry of its own). No evidence, or a log that dropped entries: `0`, unknown (the change
+ * always counts). With `since` present, nothing changes. Returns `since`.
  */
 export function ensureSince(
     coverage: CoverageState,
@@ -879,18 +881,20 @@ export function ensureSince(
     // The log keeps the newest entries only: once it dropped one, its earliest entry proves no start.
     const complete = total <= deliveries.log.length;
 
-    const earliest = (match: (entry: DeliveryEntry) => boolean): number => {
-        let first: number | undefined;
+    /** The time of the earliest accepted entry that matches; undefined when none does. */
+    const first = (match: (entry: DeliveryEntry) => boolean): number | undefined => {
+        let found: number | undefined;
 
         for (const entry of accepted) {
-            if (match(entry) && (first === undefined || entry.at < first)) {
-                first = entry.at;
+            if (match(entry) && (found === undefined || entry.at < found)) {
+                found = entry.at;
             }
         }
 
-        return complete && first !== undefined ? first : 0;
+        return found;
     };
 
+    const ofRepo = (repo: string) => first((entry) => entry.repo?.toLowerCase() === repo);
     const since: Record<string, number> = {};
 
     const lower = (key: string, at: number) => {
@@ -898,13 +902,21 @@ export function ensureSince(
     };
 
     for (const [id, installation] of Object.entries(coverage.installations)) {
-        const at = earliest((entry) => String(entry.fact?.installation?.id) === id);
+        const evidence = complete
+            ? (first((entry) => String(entry.fact?.installation?.id) === id) ?? 0)
+            : 0;
 
         if (installation.selection === "all") {
-            lower(accountKey(installation.account), at);
+            lower(accountKey(installation.account), evidence);
         } else {
-            for (const repo of installation.repos) {
-                lower(repo.toLowerCase(), at);
+            for (const key of installation.repos) {
+                const repo = key.toLowerCase();
+                const own = ofRepo(repo);
+
+                lower(
+                    repo,
+                    evidence === 0 || own === undefined ? evidence : Math.min(evidence, own),
+                );
             }
         }
     }
@@ -916,7 +928,7 @@ export function ensureSince(
             continue;
         }
 
-        const at = earliest((entry) => entry.repo?.toLowerCase() === repo);
+        const at = complete ? (ofRepo(repo) ?? 0) : 0;
         const account = since[accountKey(ownerOf(repo))];
 
         // No entry of its own (a complete log): the account's start is the only evidence.
@@ -929,19 +941,37 @@ export function ensureSince(
 }
 
 /**
- * The coverage of `key` begins at `at`, when it has no start yet; a repository starts no later than its account. Never
- * deletes a start: only the evaluation ends one (`evaluateCoverage`).
+ * The starts follow the coverage at each delivery that changes it (an installation fact, an accepted repository fact).
+ * The covered set is `coveredRepos(coverage, at)`. First each covered key with no start gets one: a repository starts at
+ * the earlier of `at` and its account's start when `since` holds that account key (also when this same delivery ends
+ * the account: the coverage went on), else at `at`; an account starts at `at`. Then each start of a key that covers no
+ * more goes: its coverage ended at this delivery, and a later coverage begins again.
  */
-function startCoverage(coverage: CoverageState, key: string, at: number): void {
+function syncStarts(coverage: CoverageState, at: number): void {
     const since = (coverage.since ??= {});
+    const { repos, accounts } = coveredRepos(coverage, at);
 
-    if (since[key] !== undefined) {
-        return;
+    for (const repo of repos) {
+        if (since[repo] === undefined) {
+            const account = since[accountKey(ownerOf(repo))];
+
+            since[repo] = account === undefined ? at : Math.min(at, account);
+        }
     }
 
-    const account = key.startsWith("account:") ? undefined : since[accountKey(ownerOf(key))];
+    for (const owner of accounts) {
+        since[accountKey(owner)] ??= at;
+    }
 
-    since[key] = account === undefined ? at : Math.min(at, account);
+    for (const key of Object.keys(since)) {
+        const covers = key.startsWith("account:")
+            ? accounts.has(key.slice("account:".length))
+            : repos.has(key);
+
+        if (!covers) {
+            delete since[key];
+        }
+    }
 }
 
 function updateInstallations(coverage: CoverageState, fact: HookFact): void {
@@ -957,6 +987,7 @@ function updateInstallations(coverage: CoverageState, fact: HookFact): void {
     if (fact.event === "installation") {
         if (fact.action === "deleted" || fact.action === "suspend") {
             delete coverage.installations[key];
+            syncStarts(coverage, fact.at);
 
             return;
         }
@@ -971,14 +1002,7 @@ function updateInstallations(coverage: CoverageState, fact: HookFact): void {
         };
 
         coverage.installations[key] = entry;
-
-        if (entry.selection === "all") {
-            startCoverage(coverage, accountKey(entry.account), fact.at);
-        } else {
-            for (const repo of entry.repos) {
-                startCoverage(coverage, repo, fact.at);
-            }
-        }
+        syncStarts(coverage, fact.at);
 
         return;
     }
@@ -987,15 +1011,10 @@ function updateInstallations(coverage: CoverageState, fact: HookFact): void {
 
     entry.selection = facts.selection ?? entry.selection;
 
-    if (entry.selection === "all") {
-        startCoverage(coverage, accountKey(entry.account), fact.at);
-    }
-
     const repos = new Set(entry.repos);
 
     for (const repo of facts.added ?? []) {
         repos.add(repo.toLowerCase());
-        startCoverage(coverage, repo.toLowerCase(), fact.at);
     }
 
     for (const repo of facts.removed ?? []) {
@@ -1004,6 +1023,7 @@ function updateInstallations(coverage: CoverageState, fact: HookFact): void {
 
     entry.repos = [...repos].sort();
     coverage.installations[key] = entry;
+    syncStarts(coverage, fact.at);
 }
 
 /**
@@ -1114,7 +1134,7 @@ export function applyDelivery(
         }
 
         docs.coverage.repos[repo] = fact.at;
-        startCoverage(docs.coverage, repo, fact.at);
+        syncStarts(docs.coverage, fact.at);
 
         const key = `${repo}|${change}`;
 
