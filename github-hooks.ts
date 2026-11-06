@@ -979,10 +979,11 @@ export function ensureSince(
  * that account. A repository key: the earlier of its start, its own earliest entry, and the earliest installation entry
  * of its owner. No such entry in a complete log: its start. A log that dropped entries proves nothing: `0`, unknown,
  * and nothing is cleared for that key. A coverage that ended before the upgrade (a suspend not yet undone, a removed
- * repository) has no start: each repository of a stored miss or alarm whose repository key and account key have no start
- * gets a `began` for both (the earliest of that evidence; `0` when there is none), so a later start never clears the
- * misses of that coverage. With
- * `began` present, nothing changes. Returns `began`.
+ * repository, an expired 30-day coverage) may have no start, or only a later one of its account: so each repository of
+ * a stored miss or alarm gets, on its repository key only, the earlier of its `began` and its own evidence (its entries
+ * and its owner's installation entries); with no evidence and no start of the repository or its account, `0`. A
+ * repository's own history never sets its account's `began`. So a later start never clears the misses of an earlier
+ * coverage. With `began` present, nothing changes. Returns `began`.
  */
 export function ensureBegan(
     coverage: CoverageState,
@@ -1034,17 +1035,20 @@ export function ensureBegan(
             continue;
         }
 
-        const keys = [repo, accountKey(ownerOf(repo))];
-
-        // A repository that a current start already covers (its own, or its account's) keeps that evidence.
-        if (keys.some((key) => began[key] !== undefined)) {
+        // Only the repository key: a repository's own history never sets its account's `began`.
+        if (!complete) {
+            began[repo] = 0;
             continue;
         }
 
-        for (const key of keys) {
-            const evidence = complete ? evidenceOf(key) : [];
+        const evidence = evidenceOf(repo);
 
-            began[key] = evidence.length === 0 ? 0 : Math.min(...evidence);
+        if (evidence.length > 0) {
+            // Its own evidence counts also when its account has a later current start.
+            began[repo] = Math.min(began[repo] ?? Number.POSITIVE_INFINITY, ...evidence);
+        } else if (began[repo] === undefined && began[accountKey(ownerOf(repo))] === undefined) {
+            // No start and no evidence: unknown.
+            began[repo] = 0;
         }
     }
 

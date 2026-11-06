@@ -2290,7 +2290,7 @@ describe("The coverage alarm", () => {
         );
         assert.deepEqual(
             coverage.began,
-            { "account:frostyard": T0 },
+            { "account:frostyard": T0, "frostyard/nsl": T0 },
             "the installation's first entry",
         );
         assert.equal(state.coverage["frostyard/nsl|labels"]?.cleared, undefined);
@@ -2304,7 +2304,7 @@ describe("The coverage alarm", () => {
         cut.counts = { accepted: 5000 };
         state2.coverage["frostyard/nsl|labels"] = { raised: T0 + 4 * H, misses: [...real] };
         evaluateCoverage({ last: {}, changes: [] }, coverage2, state2, T0 + 23 * H, cut);
-        assert.deepEqual(coverage2.began, { "account:frostyard": 0 });
+        assert.deepEqual(coverage2.began, { "account:frostyard": 0, "frostyard/nsl": 0 });
         assert.equal(state2.coverage["frostyard/nsl|labels"]?.cleared, undefined);
 
         // A delivery commit migrates it too, before it changes a start.
@@ -2333,7 +2333,12 @@ describe("The coverage alarm", () => {
             selection: "all",
         });
         assert.equal(state.coverage.since?.["account:frostyard"], T0 + 6 * H);
-        assert.equal(state.coverage.began?.["account:frostyard"], T0);
+        assert.equal(state.coverage.began?.["frostyard/nsl"], T0, "the repository's own evidence");
+        assert.equal(
+            state.coverage.began?.["account:frostyard"],
+            T0 + 6 * H,
+            "its history never sets the account",
+        );
         evaluateCoverage(
             { last: {}, changes: [] },
             state.coverage,
@@ -2382,7 +2387,8 @@ describe("The coverage alarm", () => {
             selection: "all",
             repositories: [],
         });
-        assert.equal(unknown.coverage.began?.["account:frostyard"], 0);
+        assert.equal(unknown.coverage.began?.["frostyard/x"], 0);
+        assert.equal(unknown.coverage.began?.["account:frostyard"], T0 + 6 * H);
         evaluateCoverage(
             { last: {}, changes: [] },
             unknown.coverage,
@@ -2391,6 +2397,51 @@ describe("The coverage alarm", () => {
             unknown.deliveries,
         );
         assert.equal(unknown.alarms.coverage["frostyard/x|ci"]?.cleared, undefined);
+    });
+
+    test("rule G4: an upgrade where a later account start covers a repository with earlier own coverage: its evidence keeps the real alarm", () => {
+        const T0 = NOW - 20 * H;
+        const T5 = NOW - 10 * H;
+        const real = [T0 + H, T0 + 2 * H];
+        // Stored by the version before began: a repository fact at T0 (30-day coverage, since expired), then an all
+        // installation at T5.
+        const coverage: CoverageState = {
+            ...legacy(ALL, {}),
+            since: { "account:frostyard": T5 },
+        };
+        const state = alarms();
+
+        state.coverage["frostyard/nsl|labels"] = { raised: T0 + 4 * H, misses: [...real] };
+        state.misses["frostyard/nsl|labels"] = [...real];
+        // An unrelated legacy false alarm of the same owner, whose repository has no history: it still clears.
+        state.coverage["frostyard/other|labels"] = { raised: T5 + H, misses: [T5 - 2 * H, T5 - H] };
+        state.misses["frostyard/other|labels"] = [T5 - 2 * H, T5 - H];
+
+        evaluateCoverage(
+            { last: {}, changes: [] },
+            coverage,
+            state,
+            T5 + 2 * H,
+            logOf({ at: T0, repo: "frostyard/nsl" }, { at: T5, installation: 9 }),
+        );
+        assert.equal(coverage.began?.["frostyard/nsl"], T0);
+        assert.equal(coverage.began?.["account:frostyard"], T5);
+        assert.equal(
+            coverage.began?.["frostyard/other"],
+            T5,
+            "no own entry: its owner's installation entry",
+        );
+        assert.equal(
+            state.coverage["frostyard/nsl|labels"]?.cleared,
+            undefined,
+            "the real alarm stays",
+        );
+        assert.deepEqual(state.misses["frostyard/nsl|labels"], real);
+        assert.equal(
+            state.coverage["frostyard/other|labels"]?.cleared,
+            T5 + 2 * H,
+            "the false alarm clears",
+        );
     });
 
     test("rule G: a selected repository removed and added again keeps its real alarm and misses", () => {
