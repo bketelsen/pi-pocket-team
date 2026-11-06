@@ -10,6 +10,10 @@
 // - Pending markers: a crash between the commit and `nudge` is recovered at the next load; the desk API reappearing
 //   hands them over; a second `nudge` of the same delivery does nothing: the "pending markers" tests.
 // - Facts: hostile text leaves no trace in any `x.github-hooks.*` document: "hostile text".
+// - Live deliveries (task t4): each file in test/fixtures/github-hooks/live/, with its headers and a test signature,
+//   gets the status, outcome and fact the live module recorded; a redelivery (same id, same body) is a duplicate with
+//   1 fact entry and 1 desk nudge; no free text of any payload is in any `x.github-hooks.*` document: "live
+//   deliveries replay".
 // - Nudge, the desk absent is no error: "the desk off".
 // - The turn-off rule: the receiver waits in memory with no commit, and runs the new code when the module is on again.
 import {
@@ -33,6 +37,7 @@ import type { ConversationId } from "@earendil-works/pi-durable";
 import { DeskNudges } from "./desk.ts";
 import {
     type DeliveryJob,
+    type HookFact,
     type HooksProbe,
     AlarmsDoc,
     CoverageDoc,
@@ -42,8 +47,17 @@ import {
     SeenDoc,
     liveListeners,
     receiverHandle,
+    toNudgeFact,
 } from "./github-hooks.ts";
-import { HOSTILE, fixture, withHostileText } from "./github-hooks-fixture.ts";
+import {
+    type LiveDelivery,
+    HOSTILE,
+    LIVE_DIR,
+    fixture,
+    freeText,
+    liveDeliveries,
+    withHostileText,
+} from "./github-hooks-fixture.ts";
 
 const SECRET = "c".repeat(16) + "0123456789abcdef0123456789abcdef";
 const dataDir = join(root, "data");
@@ -79,10 +93,35 @@ type Answer = { status?: number; text: string };
 
 /** 1 signed delivery over loopback; the status, or none when the socket closed with no answer. */
 function post(event: string, payload: unknown, id = randomUUID()): Promise<Answer> {
-    const body = Buffer.from(JSON.stringify(payload));
+    return send(
+        { "Content-Type": "application/json", "X-GitHub-Event": event, "X-GitHub-Delivery": id },
+        Buffer.from(JSON.stringify(payload)),
+    );
+}
+
+/**
+ * 1 live-delivery fixture over loopback, with its headers (not its length, host or connection) and a signature
+ * made here with the test secret over the exact body bytes (`JSON.stringify(payload)`).
+ */
+function postLive(delivery: LiveDelivery): Promise<Answer> {
+    const own = new Set(["host", "connection", "content-length", "transfer-encoding"]);
+
+    return send(
+        Object.fromEntries(
+            Object.entries(delivery.headers).filter(([name]) => !own.has(name.toLowerCase())),
+        ),
+        Buffer.from(JSON.stringify(delivery.payload)),
+    );
+}
+
+/** Send `body` with `headers`, its length and its signature with the test secret, on 1 connection. */
+function send(headers: Record<string, string>, body: Buffer): Promise<Answer> {
     const head =
-        "POST /github HTTP/1.1\r\nHost: hooks.test\r\nConnection: close\r\nContent-Type: application/json\r\n" +
-        `Content-Length: ${String(body.length)}\r\nX-GitHub-Event: ${event}\r\nX-GitHub-Delivery: ${id}\r\n` +
+        "POST /github HTTP/1.1\r\nHost: hooks.test\r\nConnection: close\r\n" +
+        Object.entries(headers)
+            .map(([name, value]) => `${name}: ${value}\r\n`)
+            .join("") +
+        `Content-Length: ${String(body.length)}\r\n` +
         `X-Hub-Signature-256: sha256=${createHmac("sha256", SECRET).update(body).digest("hex")}\r\n\r\n`;
 
     return new Promise((resolve) => {
@@ -285,6 +324,94 @@ test("end to end: a signed delivery is accepted, the desk takes it by nudge, and
         (await snap<{ ids: Record<string, number> }>(SeenDoc))?.ids[id] !== undefined,
         true,
     );
+});
+
+test("live deliveries replay: the recorded status, outcome and fact; a redelivery is a duplicate; no free text kept", async () => {
+    const live = liveDeliveries();
+
+    assert.ok(
+        live.length > 0,
+        `no live delivery in ${LIVE_DIR}: add the files (test/fixtures/github-hooks/README.md, "Live deliveries")`,
+    );
+
+    type Entry = { delivery?: string; outcome: string; fact?: HookFact };
+
+    const ofId = async (id: string) =>
+        ((await snap<{ log: Entry[] }>(DeliveriesDoc))?.log ?? []).filter(
+            (entry) => entry.delivery === id,
+        );
+
+    for (const delivery of live) {
+        const { name, delivery: id, expect } = delivery;
+
+        assert.equal((await postLive(delivery)).status, expect.status, name);
+
+        if (expect.outcome === "ping") {
+            assert.deepEqual(await ofId(id), [], `${name}: ping records only its log line`);
+            assert.equal((await postLive(delivery)).status, 200, `${name}: a ping again`);
+            continue;
+        }
+
+        // A refusal (422) reaches the log at the receiver's next refusal write: wait for it.
+        await until(
+            async () => (await ofId(id)).some((entry) => entry.outcome === expect.outcome),
+            `${name}: the ${expect.outcome} entry`,
+            15_000,
+        );
+
+        if (expect.outcome === "unprocessable") {
+            assert.equal((await postLive(delivery)).status, 422, `${name}: refused again`);
+            continue;
+        }
+
+        const entry = (await ofId(id)).find((each) => each.outcome === expect.outcome)!;
+
+        if (expect.fact === undefined) {
+            assert.equal(entry.fact, undefined, `${name}: no fact`);
+        } else {
+            const { at: _at, ...fact } = entry.fact!;
+
+            assert.deepEqual(fact, expect.fact, `${name}: the fact`);
+        }
+
+        // Where the fact goes to the desk, the desk's nudge takes it.
+        const toDesk = entry.fact !== undefined && toNudgeFact(entry.fact) !== undefined;
+
+        if (toDesk) {
+            await until(
+                async () => (await deskSeen())[id] !== undefined,
+                `${name}: the desk took it`,
+            );
+        }
+
+        const took = (await deskSeen())[id];
+
+        // GitHub's "Redeliver": the same id and the same body.
+        assert.equal((await postLive(delivery)).status, 200, `${name}: redelivered`);
+
+        const entries = await ofId(id);
+
+        assert.equal(entries.filter((each) => each.outcome === "duplicate").length, 1, name);
+        assert.equal(entries.filter((each) => each.outcome === expect.outcome).length, 1, name);
+        assert.equal(
+            entries.filter((each) => each.fact !== undefined).length,
+            expect.fact === undefined ? 0 : 1,
+            `${name}: 1 entry with a fact`,
+        );
+        assert.equal((await deskSeen())[id], took, `${name}: the desk took it once`);
+    }
+
+    await until(async () => (await markers()).length === 0, "the desk took every fact");
+
+    const free = live.flatMap((delivery) => freeText(delivery.payload));
+
+    for (const token of [SeenDoc, DeliveriesDoc, PendingDoc, AlarmsDoc, CoverageDoc, ReceiverDoc]) {
+        const text = JSON.stringify(await snap(token));
+
+        for (const each of free) {
+            assert.ok(!text.includes(each), `${token.kind}: ${JSON.stringify(each)}`);
+        }
+    }
 });
 
 test("a real failed commit: 500, and no seen entry, accepted entry or marker persists; the same delivery then gets 202", async () => {

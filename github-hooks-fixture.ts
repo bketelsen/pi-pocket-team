@@ -1,6 +1,7 @@
 // Test helpers of the github-hooks tests: the @octokit/webhooks-examples payloads in test/fixtures/github-hooks/, moved
-// to an allowed owner, and hostile text put into every free-text field (in the test, never in the fixture files).
-import { readFileSync } from "node:fs";
+// to an allowed owner, and hostile text put into every free-text field (in the test, never in the fixture files); and
+// the live deliveries in test/fixtures/github-hooks/live/ (synthetic: see the README there), with their free-text strings.
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 const FIXTURES = join(import.meta.dirname, "test", "fixtures", "github-hooks");
@@ -93,4 +94,167 @@ export function withHostileText(payload: Record<string, unknown>): Record<string
     }
 
     return copy;
+}
+
+// ─── Live deliveries ─────────────────────────────────────────────────────────
+
+/** The folder of the live deliveries: synthetic payloads, each set to the checked fields of 1 delivery the live module recorded. */
+export const LIVE_DIR = join(FIXTURES, "live");
+
+/** The outcomes a first delivery of a live-delivery fixture can have, and the status of each. */
+const LIVE_OUTCOMES: Record<string, number> = {
+    accepted: 202,
+    ignored: 200,
+    unprocessable: 422,
+    ping: 200,
+};
+
+/** 1 live-delivery fixture: its file, its headers, its synthetic payload, and what the live module recorded. */
+export type LiveDelivery = {
+    /** The file name. */
+    name: string;
+    /** How the file was made: the example it starts from, and the live delivery it mirrors. */
+    source: string;
+    headers: Record<string, string>;
+    payload: Record<string, unknown>;
+    /** `fact`: the fact of the live `x.github-hooks.deliveries` entry, with no `at`; only for `accepted`. */
+    expect: { status: number; outcome: string; fact?: Record<string, unknown> };
+    /** `X-GitHub-Event`. */
+    event: string;
+    /** `X-GitHub-Delivery`, lower case. */
+    delivery: string;
+};
+
+const SIGNATURE_HEADERS = new Set(["x-hub-signature", "x-hub-signature-256"]);
+
+/** A header of a live-delivery fixture, by its name in any case. */
+export function liveHeader(delivery: { headers: Record<string, string> }, name: string) {
+    const found = Object.entries(delivery.headers).find(
+        ([key]) => key.toLowerCase() === name.toLowerCase(),
+    );
+
+    return found?.[1];
+}
+
+/**
+ * Every live-delivery fixture in `dir` (`*.json`, sorted by name), with its shape checked. It throws when a file has a
+ * signature header, or misses `headers`, `payload`, `X-GitHub-Event`, `X-GitHub-Delivery`, `expect.status` or
+ * `expect.outcome`, or when `expect` does not fit the outcome. The repositories stay as they are: each payload has
+ * owner `frostyard` or `bketelsen` already, as its live delivery had.
+ */
+export function liveDeliveries(dir = LIVE_DIR): LiveDelivery[] {
+    const names = existsSync(dir)
+        ? readdirSync(dir)
+              .filter((name) => name.endsWith(".json"))
+              .sort()
+        : [];
+
+    return names.map((name) => {
+        const fail = (why: string): never => {
+            throw new Error(`live delivery ${name}: ${why}`);
+        };
+
+        const file = JSON.parse(readFileSync(join(dir, name), "utf8")) as Partial<LiveDelivery>;
+        const object = (value: unknown) =>
+            value !== null && typeof value === "object" && !Array.isArray(value);
+
+        if (!object(file.headers)) {
+            fail("no headers");
+        }
+
+        if (!object(file.payload)) {
+            fail("no payload");
+        }
+
+        const expect = file.expect;
+
+        if (!object(expect) || typeof expect?.status !== "number") {
+            fail("no expect.status");
+        }
+
+        if (typeof expect?.outcome !== "string") {
+            fail("no expect.outcome");
+        }
+
+        const headers = file.headers!;
+
+        for (const key of Object.keys(headers)) {
+            if (SIGNATURE_HEADERS.has(key.toLowerCase())) {
+                fail(`a signature header (${key}): never keep a signature`);
+            }
+        }
+
+        const event = liveHeader({ headers }, "X-GitHub-Event");
+        const delivery = liveHeader({ headers }, "X-GitHub-Delivery");
+
+        if (typeof event !== "string" || typeof delivery !== "string") {
+            fail("no X-GitHub-Event or X-GitHub-Delivery header");
+        }
+
+        const status = LIVE_OUTCOMES[expect!.outcome];
+
+        if (status !== expect!.status) {
+            fail(`outcome ${expect!.outcome} with status ${String(expect!.status)}`);
+        }
+
+        if ((expect!.outcome === "accepted") !== object(expect!.fact)) {
+            fail("expect.fact is for an accepted delivery only, and an accepted one needs it");
+        }
+
+        return {
+            name,
+            source: typeof file.source === "string" ? file.source : "",
+            headers,
+            payload: file.payload!,
+            expect: expect!,
+            event: event!,
+            delivery: delivery!.toLowerCase(),
+        };
+    });
+}
+
+/** The labels a fact keeps by name. */
+const TEAM_LABELS = new Set([
+    "ready-for-human",
+    "risk:high",
+    "sweep",
+    "agent-queue",
+    "agent-urgent",
+    "needs-plan",
+]);
+
+/**
+ * The free-text strings of a payload, which no fact and no document may hold: each `title` and `body` of the PR or
+ * issue, the PR's `head.ref` and `head.label`, a `label.name` that is not a team label, `review.body`,
+ * `head_commit.message` (also under `check_suite`), and `description` and `commit.message` (also `commit.commit.message`)
+ * of a status. Empty strings are left
+ * out (every text includes them).
+ */
+export function freeText(payload: Record<string, unknown>): string[] {
+    const at = (value: unknown, ...path: string[]): unknown =>
+        path.reduce<unknown>(
+            (here, key) =>
+                here !== null && typeof here === "object"
+                    ? (here as Record<string, unknown>)[key]
+                    : undefined,
+            value,
+        );
+    const label = at(payload, "label", "name");
+    const found = [
+        ...["pull_request", "issue"].flatMap((key) => [
+            at(payload, key, "title"),
+            at(payload, key, "body"),
+            at(payload, key, "head", "ref"),
+            at(payload, key, "head", "label"),
+        ]),
+        typeof label === "string" && !TEAM_LABELS.has(label) ? label : undefined,
+        at(payload, "review", "body"),
+        at(payload, "check_suite", "head_commit", "message"),
+        at(payload, "head_commit", "message"),
+        at(payload, "description"),
+        at(payload, "commit", "message"),
+        at(payload, "commit", "commit", "message"),
+    ];
+
+    return found.filter((text): text is string => typeof text === "string" && text !== "");
 }

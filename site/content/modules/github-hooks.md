@@ -13,6 +13,8 @@ Files: `github-hooks.ts`. It works with the Desk module; with the desk off, it o
 
 `/github-hooks` shows the listener, the receiver, the secret state (never its value), the counts by outcome, the last accepted delivery, the facts that wait for the desk, and each alarm. Only the owner runs it.
 
+For a report over many days, `node audit/github-hooks.mjs --since <go-live time>` (in a checkout of this repository) reads Pocket's database read-only and prints the deliveries by outcome, the delays from delivery to sync and from GitHub change to sweep, and the alarms.
+
 ## What it accepts
 
 - Only peers in the setting **Allowed peers** (`allowFrom`, default `10.0.1.234`, caddy). Others get the socket closed.
