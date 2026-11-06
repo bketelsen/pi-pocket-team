@@ -1070,11 +1070,18 @@ export function features(
         }
     }
 
-    // Each folder with its resolved path: the reads below never leave it, through a symbolic link either.
+    // Each folder with its resolved path (a folder that is itself a link, or sits below one, resolves first): the reads
+    // below never leave it, through a symbolic link either.
     const dirs = repoDirs.flatMap((dir) => {
-        const real = dir === "" || folderAt(dir) === undefined ? undefined : realInside(dir, dir);
+        if (dir === "" || folderAt(dir) === undefined) {
+            return [];
+        }
 
-        return real === undefined ? [] : [{ dir, real }];
+        try {
+            return [{ dir, real: realpathSync(dir) }];
+        } catch {
+            return [];
+        }
     });
     const named = [...paths];
     let riskPathNamed: boolean | null = null;

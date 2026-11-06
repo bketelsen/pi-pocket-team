@@ -1487,3 +1487,34 @@ test("features: a symbolic link out of the folder is never followed", async () =
         await outside.done();
     }
 });
+
+test("features: a folder reached through a symbolic link has the features of its real path", async () => {
+    const repo = await repoWith({
+        "go.mod": "module x",
+        ".github/risk-paths.json": RISK_LIST,
+        "model-router.ts": "",
+        "pkg/store_test.go": "",
+    });
+    const parent = await mkdtemp(join(tmpdir(), "router-link-parent-"));
+    const linked = join(parent, "checkout");
+
+    try {
+        await symlink(repo.dir, linked);
+
+        const brief = "Change model-router.ts and pkg/store.go";
+        const real = features(brief, [repo.dir]);
+
+        assert.equal(real.riskPathNamed, true);
+        assert.equal(real.testsBeside, true);
+        assert.deepEqual(features(brief, [linked]), real, "the root's link changes nothing");
+
+        // A link in a parent folder: the same.
+        const below = join(parent, "via");
+
+        await symlink(join(repo.dir, ".."), below);
+        assert.deepEqual(features(brief, [join(below, repo.dir.split("/").at(-1)!)]), real);
+    } finally {
+        await rm(parent, { recursive: true, force: true });
+        await repo.done();
+    }
+});
