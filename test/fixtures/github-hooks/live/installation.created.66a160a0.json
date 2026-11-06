@@ -1,0 +1,166 @@
+{
+    "source": "synthetic: @octokit/webhooks-examples installation.created.json, set to the checked fields of live delivery 66a160a0-da10-11f1-8539-a87bccd07061 (2026-11-06)",
+    "headers": {
+        "Content-Type": "application/json",
+        "User-Agent": "GitHub-Hookshot/synthetic",
+        "X-GitHub-Delivery": "66a160a0-da10-11f1-8539-a87bccd07061",
+        "X-GitHub-Event": "installation",
+        "X-GitHub-Hook-ID": "0",
+        "X-GitHub-Hook-Installation-Target-ID": "0",
+        "X-GitHub-Hook-Installation-Target-Type": "integration"
+    },
+    "payload": {
+        "action": "created",
+        "installation": {
+            "id": 179354408,
+            "account": {
+                "login": "bketelsen",
+                "id": 21031067,
+                "node_id": "MDQ6VXNlcjIxMDMxMDY3",
+                "avatar_url": "https://avatars1.githubusercontent.com/u/21031067?v=4",
+                "gravatar_id": "",
+                "url": "https://api.github.com/users/Codertocat",
+                "html_url": "https://github.com/Codertocat",
+                "followers_url": "https://api.github.com/users/Codertocat/followers",
+                "following_url": "https://api.github.com/users/Codertocat/following{/other_user}",
+                "gists_url": "https://api.github.com/users/Codertocat/gists{/gist_id}",
+                "starred_url": "https://api.github.com/users/Codertocat/starred{/owner}{/repo}",
+                "subscriptions_url": "https://api.github.com/users/Codertocat/subscriptions",
+                "organizations_url": "https://api.github.com/users/Codertocat/orgs",
+                "repos_url": "https://api.github.com/users/Codertocat/repos",
+                "events_url": "https://api.github.com/users/Codertocat/events{/privacy}",
+                "received_events_url": "https://api.github.com/users/Codertocat/received_events",
+                "type": "User",
+                "site_admin": false
+            },
+            "repository_selection": "selected",
+            "access_tokens_url": "https://api.github.com/app/installations/957387/access_tokens",
+            "repositories_url": "https://api.github.com/installation/repositories",
+            "html_url": "https://github.com/settings/installations/957387",
+            "app_id": 29310,
+            "target_id": 21031067,
+            "target_type": "User",
+            "permissions": {
+                "administration": "write",
+                "checks": "write",
+                "contents": "write",
+                "deployments": "write",
+                "issues": "write",
+                "pages": "write",
+                "pull_requests": "write",
+                "repository_hooks": "write",
+                "repository_projects": "write",
+                "statuses": "write",
+                "metadata": "read",
+                "vulnerability_alerts": "read"
+            },
+            "events": [],
+            "created_at": 1557933591,
+            "updated_at": 1557933591,
+            "single_file_name": null,
+            "suspended_at": null,
+            "suspended_by": null
+        },
+        "repositories": [
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "truenas-mcp",
+                "full_name": "bketelsen/truenas-mcp",
+                "private": false
+            },
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "agentic-template",
+                "full_name": "bketelsen/agentic-template",
+                "private": false
+            },
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "fleet",
+                "full_name": "bketelsen/fleet",
+                "private": false
+            },
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "homewiki",
+                "full_name": "bketelsen/homewiki",
+                "private": false
+            },
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "pi-pocket",
+                "full_name": "bketelsen/pi-pocket",
+                "private": false
+            },
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "pi-pocket-team",
+                "full_name": "bketelsen/pi-pocket-team",
+                "private": false
+            },
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "pi-pocket-config",
+                "full_name": "bketelsen/pi-pocket-config",
+                "private": false
+            },
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "trimlights",
+                "full_name": "bketelsen/trimlights",
+                "private": false
+            },
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "pi-pocket-dune",
+                "full_name": "bketelsen/pi-pocket-dune",
+                "private": false
+            }
+        ],
+        "sender": {
+            "login": "bketelsen",
+            "id": 21031067,
+            "node_id": "MDQ6VXNlcjIxMDMxMDY3",
+            "avatar_url": "https://avatars1.githubusercontent.com/u/21031067?v=4",
+            "gravatar_id": "",
+            "url": "https://api.github.com/users/Codertocat",
+            "html_url": "https://github.com/Codertocat",
+            "followers_url": "https://api.github.com/users/Codertocat/followers",
+            "following_url": "https://api.github.com/users/Codertocat/following{/other_user}",
+            "gists_url": "https://api.github.com/users/Codertocat/gists{/gist_id}",
+            "starred_url": "https://api.github.com/users/Codertocat/starred{/owner}{/repo}",
+            "subscriptions_url": "https://api.github.com/users/Codertocat/subscriptions",
+            "organizations_url": "https://api.github.com/users/Codertocat/orgs",
+            "repos_url": "https://api.github.com/users/Codertocat/repos",
+            "events_url": "https://api.github.com/users/Codertocat/events{/privacy}",
+            "received_events_url": "https://api.github.com/users/Codertocat/received_events",
+            "type": "User",
+            "site_admin": false
+        }
+    },
+    "expect": {
+        "status": 202,
+        "outcome": "accepted",
+        "fact": {
+            "delivery": "66a160a0-da10-11f1-8539-a87bccd07061",
+            "event": "installation",
+            "sender": "bketelsen",
+            "action": "created",
+            "installation": {
+                "id": 179354408,
+                "account": "bketelsen",
+                "selection": "selected",
+                "repositories": []
+            }
+        }
+    }
+}

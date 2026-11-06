@@ -171,7 +171,7 @@ export function makeGit(run = defaultRun) {
 // ---------- Pocket documents (base revision + deltas, as Pi Durable folds them) ----------
 
 /** The `x` of a stored document `kind`: the database keeps the kind as a JSON string. */
-const docsOfKind = (db, kind, { retired = false } = {}) =>
+export const docsOfKind = (db, kind, { retired = false } = {}) =>
     db
         .prepare(
             `select id, owner_id from documents where kind=?${retired ? "" : " and retired_at is null"}`,

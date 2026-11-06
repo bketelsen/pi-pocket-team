@@ -37,6 +37,9 @@
 // - PR #141 re-review 2: a repository fact first ends a start whose 30-day coverage expired, then starts it again: "rule
 //   D2: a fact that renews 30-day coverage after it expired between 2 evaluations starts it again".
 // - Secret file: missing, short, changed mtime: "The secret source", and 503 in "Secret".
+// - Live deliveries (task t4): each file in test/fixtures/github-hooks/live/ gives its recorded fact or refusal, with
+//   no free text of its payload in the fact, and the loader refuses a signature or a missing part: "Live deliveries";
+//   the replay through the live listener and the desk: P ("live deliveries replay").
 import assert from "node:assert/strict";
 import { createHmac, randomUUID } from "node:crypto";
 import { chmodSync, mkdtempSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
@@ -81,7 +84,14 @@ import {
     COVERED_MS,
     REFUSAL_FLUSH_MS,
 } from "./github-hooks.ts";
-import { HOSTILE, fixture, withHostileText } from "./github-hooks-fixture.ts";
+import {
+    HOSTILE,
+    LIVE_DIR,
+    fixture,
+    freeText,
+    liveDeliveries,
+    withHostileText,
+} from "./github-hooks-fixture.ts";
 
 const SECRET = "a".repeat(16) + "0123456789abcdef0123456789abcdef";
 const NEXT = "b".repeat(16) + "fedcba9876543210fedcba9876543210";
@@ -1282,6 +1292,105 @@ describe("Facts", () => {
             assert.equal(built.fact.sender, undefined, "a hostile login is dropped");
         }
     });
+});
+
+// ─── Live deliveries ─────────────────────────────────────────────────────────
+
+/** A fact as the delivery log keeps it: the installation repository lists left empty. */
+function asLogged(fact: HookFact): HookFact {
+    if (fact.installation === undefined) {
+        return fact;
+    }
+
+    const { repositories, added, removed, ...rest } = fact.installation;
+
+    return {
+        ...fact,
+        installation: {
+            ...rest,
+            ...(repositories === undefined ? {} : { repositories: [] }),
+            ...(added === undefined ? {} : { added: [] }),
+            ...(removed === undefined ? {} : { removed: [] }),
+        },
+    };
+}
+
+describe("Live deliveries", () => {
+    const live = liveDeliveries();
+    const AT = 1_000_000;
+
+    test("the folder live/ holds at least 1 delivery", () => {
+        assert.ok(
+            live.length > 0,
+            `no live delivery in ${LIVE_DIR}: add the files (test/fixtures/github-hooks/README.md, "Live deliveries")`,
+        );
+    });
+
+    test("the loader refuses a signature header, a missing part, and an expect that does not fit", () => {
+        const dir = mkdtempSync(join(tmpdir(), "hooks-live-"));
+        const good = {
+            source: "test",
+            headers: { "X-GitHub-Event": "pull_request", "X-GitHub-Delivery": ID },
+            payload: { action: "labeled" },
+            expect: { status: 200, outcome: "ignored" },
+        };
+
+        const refused = (file: unknown, why: RegExp) => {
+            writeFileSync(join(dir, "one.json"), JSON.stringify(file));
+            assert.throws(() => liveDeliveries(dir), why);
+        };
+
+        try {
+            assert.deepEqual(liveDeliveries(join(dir, "absent")), []);
+            writeFileSync(join(dir, "one.json"), JSON.stringify(good));
+            assert.equal(liveDeliveries(dir)[0]?.delivery, ID);
+            refused(
+                { ...good, headers: { ...good.headers, "x-hub-signature-256": "sha256=00" } },
+                /one\.json: a signature header/,
+            );
+            refused(
+                { ...good, headers: { ...good.headers, "X-Hub-Signature": "sha1=00" } },
+                /a signature header/,
+            );
+            refused({ ...good, headers: undefined }, /no headers/);
+            refused({ ...good, payload: undefined }, /no payload/);
+            refused({ ...good, expect: { outcome: "ignored" } }, /no expect\.status/);
+            refused({ ...good, expect: { status: 200 } }, /no expect\.outcome/);
+            refused({ ...good, expect: { status: 202, outcome: "ignored" } }, /with status/);
+            refused({ ...good, expect: { status: 202, outcome: "accepted" } }, /expect\.fact/);
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    for (const delivery of live) {
+        test(`${delivery.name}: buildFact gives the recorded fact or refusal, with no free text`, () => {
+            const { event, payload, expect } = delivery;
+            const built = buildFact(event, delivery.delivery, AT, payload);
+
+            if (expect.outcome === "ping") {
+                assert.equal(event, "ping");
+                assert.equal(built.kind, "unprocessable", "the listener answers ping itself");
+
+                return;
+            }
+
+            if (expect.outcome === "accepted") {
+                assert.ok(built.kind === "fact", `${delivery.name}: ${built.kind}`);
+                assert.deepEqual(asLogged(built.fact), { ...expect.fact, at: AT });
+            } else {
+                assert.equal(built.kind, expect.outcome);
+            }
+
+            if (built.kind !== "unprocessable") {
+                const text = JSON.stringify(built.fact);
+
+                for (const free of freeText(payload)) {
+                    assert.ok(!text.includes(free), `${delivery.name}: ${JSON.stringify(free)}`);
+                }
+            }
+        });
+    }
 });
 
 // ─── The delivery commit ─────────────────────────────────────────────────────
