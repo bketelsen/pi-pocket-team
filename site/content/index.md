@@ -49,7 +49,7 @@ pi-pocket-team is a set of drop-in extensions for [Pi Pocket](https://github.com
 
     ***
 
-    Shadow only: records the model tier and model it would pick for a delegated night shift, on the desk thread.
+    Shadow only: records the model tier and model it would pick for each delegation, and the brief's features, on the desk thread.
 
 - **[Desk](modules/desk.md)**
 

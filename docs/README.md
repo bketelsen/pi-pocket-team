@@ -58,7 +58,7 @@ summarizes these pages.
 - [modules/team.md](modules/team.md): Team: named agents, delegation, repository ownership, agent homes and memory
 - [modules/desk.md](modules/desk.md): Desk: threads, asks, the sweep, `seed.json`, the page and the Dashboard
 - [modules/night-shift.md](modules/night-shift.md): Night shift: commands, the start time, rounds, stops and limits
-- [modules/model-router.md](modules/model-router.md): Model router (shadow): settings, what is sent, tiers, the record
+- [modules/model-router.md](modules/model-router.md): Model router (shadow): settings, what is sent, tiers, features, the record
 - [modules/homewiki.md](modules/homewiki.md): Homewiki: the Wiki rail page
 - [modules/terminal.md](modules/terminal.md): Terminal: the shell page and its limits
 - [modules/github-hooks.md](modules/github-hooks.md): GitHub hooks: the webhook listener, its checks, facts, documents and alarms

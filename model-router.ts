@@ -27,10 +27,12 @@
  * COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
  * OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
+import { createHash } from "node:crypto";
+import { readFileSync, readdirSync, statSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { isIPv4, isIPv6 } from "node:net";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { Host, Web } from "./_pocket.d.ts";
 
 // ─── What Jev is asked, and how its answer becomes a tier ────────────────────
@@ -588,12 +590,15 @@ export type Decision = {
     notes: string[];
 };
 
+/** The 4 judgments the demand reads: a stored route holds them, so a caller with no full `Analysis` can give these. */
+export type Judgments = Pick<Analysis, "kind" | "complexity" | "capability" | "deepReasoning">;
+
 /**
- * The tier Jev's judgments ask for, then the first model of that tier the owner allows and that works now. When the
- * tier holds none, the nearer tiers are tried in turn. Nothing here changes a model: the answer is a suggestion only.
+ * The demand of Jev's judgments, 0 to 3, not rounded: `0.55 × complexity + 0.45 × capability`, plus 0.75 when the work
+ * needs deep reasoning (0.65 or more), minus 0.25 when it surely does not (0.2 or less), then raised to the kind's floor.
+ * `floored` names the floor's tier when the floor raised it.
  */
-export function decide(analysis: Analysis, options: DecideOptions): Decision {
-    const notes: string[] = [];
+function demandOf(analysis: Judgments): { demand: number; floored?: Tier } {
     let demand = 0.55 * analysis.complexity + 0.45 * analysis.capability;
 
     if (analysis.deepReasoning >= 0.65) {
@@ -606,12 +611,16 @@ export function decide(analysis: Analysis, options: DecideOptions): Decision {
 
     const floor = Math.max(0, TIERS.indexOf(KIND_FLOORS[analysis.kind] ?? "quick"));
 
-    if (demand < floor) {
-        notes.push(`${analysis.kind} floors at ${TIERS[floor]}`);
+    return demand < floor ? { demand: floor, floored: TIERS[floor] } : { demand };
+}
 
-        demand = floor;
-    }
-
+/**
+ * The tier Jev's judgments ask for, then the first model of that tier the owner allows and that works now. When the
+ * tier holds none, the nearer tiers are tried in turn. Nothing here changes a model: the answer is a suggestion only.
+ */
+export function decide(analysis: Analysis, options: DecideOptions): Decision {
+    const { demand, floored } = demandOf(analysis);
+    const notes: string[] = floored === undefined ? [] : [`${analysis.kind} floors at ${floored}`];
     let index = clamp(Math.round(demand), 0, 3);
 
     if (analysis.kindConfidence > 0 && analysis.kindConfidence < 0.34 && index > 1) {
@@ -735,6 +744,376 @@ export async function readTiers(path: string): Promise<{ tiers: Tiers; notes: st
     return given ? { tiers, notes: [] } : invalid;
 }
 
+// ─── Features ────────────────────────────────────────────────────────────────
+
+/**
+ * The facts of 1 delegation that are known when it starts, version 1. Stored data (JSON only): never rename a field or
+ * change what one means; a new fact is a new field, or a new version. The Jev fields are absent when Jev did not answer.
+ */
+export type Features = {
+    v: 1;
+    /** Jev's kind of work. */
+    kind?: string;
+    /** Jev's judgments, 0 to 3, and the probability of deep reasoning, at 2 decimals. */
+    complexity?: number;
+    capability?: number;
+    deepReasoning?: number;
+    /** The demand of the judgments (the route's `demand`), at 2 decimals. */
+    demand?: number;
+    /** The brief's length in characters (code points), before masking. */
+    briefChars: number;
+    /** Distinct paths the masked brief names: tokens with a `/` or a known file extension; never a URL or a roster repository. */
+    pathsNamed: number;
+    /** Distinct `owner/name` tokens that are repositories on the team roster. */
+    reposNamed: number;
+    /** The first repository folder's language, from its marker files; `unknown` with no folder. */
+    language: "go" | "ts" | "js" | "python" | "other" | "unknown";
+    /** A named path matches a folder's `.github/risk-paths.json`; null when no folder has a readable list. */
+    riskPathNamed: boolean | null;
+    /** A named path's folder holds a test file; null when no path is named or no folder exists. */
+    testsBeside: boolean | null;
+};
+
+/** What `features` reads beside the brief: the roster's repository names, and the host names to mask. */
+export type FeatureOptions = {
+    /** Every repository name on the team roster, such as `bketelsen/pi-pocket-team`. Without it, `reposNamed` is 0. */
+    roster?: readonly string[];
+    /** The host names `maskBrief` takes out (this machine's SSH hosts). */
+    hostNames?: readonly string[];
+};
+
+/** The most paths `features` looks at in the folders: a long brief costs no more file reads than this. */
+const MAX_PATHS_READ = 50;
+
+/** The test files `testsBeside` looks for in a named path's folder. */
+const TEST_FILE = /(?:_test\.go|\.test\.ts|\.test\.mjs)$|^test_.*\.py$/;
+
+/** The placeholders `maskBrief` and the key redaction write: a token that holds one is no path. */
+const MASKED = /\[(?:url|host|ip|email|secret|TYPESAFE_API_KEY)\]/;
+
+/**
+ * A token of the brief without the quotes, brackets and sentence punctuation around it, a `:line` or `:line:column`
+ * after a file, a `#12` after a repository, a possessive `'s`, and a leading `./`.
+ */
+function cleanToken(token: string): string {
+    return token
+        .replace(/^[`'"(<{*]+/, "")
+        .replace(/[`'")>}*,.;:!?]+$/, "")
+        .replace(/'s$/, "")
+        .replace(/[`'")>}*,.;:!?]+$/, "")
+        .replace(/#\d+$/, "")
+        .replace(/:\d+(?::\d+)?$/, "")
+        .replace(/^\.\//, "");
+}
+
+/** A token that names a path: it holds a `/` or ends in a known file extension, and it holds a letter. */
+function isPathToken(token: string): boolean {
+    if (!/[A-Za-z]/.test(token) || token.startsWith("//")) {
+        return false;
+    }
+
+    if (token.includes("/")) {
+        return true;
+    }
+
+    const dot = token.lastIndexOf(".");
+
+    return dot > 0 && FILE_EXTENSIONS.has(token.slice(dot + 1).toLowerCase());
+}
+
+/** `path` when it is a folder that exists, else undefined. */
+function folderAt(path: string): string | undefined {
+    try {
+        return statSync(path).isDirectory() ? path : undefined;
+    } catch {
+        return undefined;
+    }
+}
+
+/** The language of a repository folder, by its marker files, in this order. */
+function languageOf(dir: string | undefined): Features["language"] {
+    if (dir === undefined || folderAt(dir) === undefined) {
+        return "unknown";
+    }
+
+    let names: Set<string>;
+
+    try {
+        names = new Set(readdirSync(dir));
+    } catch {
+        return "unknown";
+    }
+
+    if (names.has("go.mod")) {
+        return "go";
+    }
+
+    if (names.has("tsconfig.json")) {
+        return "ts";
+    }
+
+    if (names.has("package.json")) {
+        return "js";
+    }
+
+    return names.has("pyproject.toml") || names.has("requirements.txt") ? "python" : "other";
+}
+
+/**
+ * A named path as a `/`-separated path inside `dir`: an absolute one only when it is inside `dir`, a relative one only
+ * when it stays inside. Undefined otherwise: no file outside the repository is ever read.
+ */
+function insideRepo(dir: string, path: string): string | undefined {
+    const root = resolve(dir);
+    const full = isAbsolute(path) ? resolve(path) : resolve(root, path);
+    const rel = relative(root, full);
+
+    if (rel === "" || rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
+        return undefined;
+    }
+
+    return rel.split(sep).join("/");
+}
+
+/** The globs of a folder's `.github/risk-paths.json`, or undefined when it is absent, unreadable or not a list. */
+function riskGlobs(dir: string): string[] | undefined {
+    try {
+        const parsed = JSON.parse(
+            readFileSync(join(dir, ".github", "risk-paths.json"), "utf8"),
+        ) as { paths?: unknown } | null;
+
+        if (!Array.isArray(parsed?.paths)) {
+            return undefined;
+        }
+
+        return parsed.paths.flatMap((entry: unknown) => {
+            const glob = (entry as { glob?: unknown } | null)?.glob;
+
+            return typeof glob === "string" && glob !== "" ? [glob] : [];
+        });
+    } catch {
+        return undefined;
+    }
+}
+
+// The glob matcher of the risk paths list (frostyard/core ADR-0068): a port of `matchGlob` in the vendored
+// `scripts/lib/risk-paths.mjs`, which is not installed with the module. `model-router.test.ts` checks that both match
+// the same paths.
+
+/** The globs 1 glob stands for, with its `{a,b}` groups expanded; none when it is not valid. */
+function expandGlobBraces(glob: string): string[] {
+    const parts: string[][] = [];
+    let literal = "";
+    let i = 0;
+
+    while (i < glob.length) {
+        const c = glob[i]!;
+
+        if (c === "}") {
+            return [];
+        }
+
+        if (c !== "{") {
+            literal += c;
+            i++;
+            continue;
+        }
+
+        const close = glob.indexOf("}", i + 1);
+        const nextOpen = glob.indexOf("{", i + 1);
+
+        if (close === -1 || (nextOpen !== -1 && nextOpen < close)) {
+            return [];
+        }
+
+        const alternatives = glob.slice(i + 1, close).split(",");
+
+        if (alternatives.length < 2 || alternatives.some((each) => each === "")) {
+            return [];
+        }
+
+        parts.push([literal], alternatives);
+        literal = "";
+        i = close + 1;
+    }
+
+    parts.push([literal]);
+    let expansions = [""];
+
+    for (const alternatives of parts) {
+        const next = expansions.flatMap((prefix) => alternatives.map((each) => prefix + each));
+
+        if (next.length > 256) {
+            return [];
+        }
+
+        expansions = next;
+    }
+
+    return expansions;
+}
+
+/** 1 segment of a glob as a pattern: `*` is any run of characters but `/`, `?` is 1 such character. */
+function globSegment(segment: string): RegExp {
+    let source = "^";
+
+    for (const c of segment) {
+        source +=
+            c === "*" ? "[^/]*" : c === "?" ? "[^/]" : c.replace(/[.*+?^$()|[\]{}\\/]/g, "\\$&");
+    }
+
+    return new RegExp(`${source}$`, "u");
+}
+
+/** Whether the glob's segments match the path's segments; `**` matches 0 or more whole segments. */
+function matchGlobSegments(globSegments: string[], pathSegments: string[]): boolean {
+    const patterns = globSegments.map((segment) =>
+        segment === "**" ? null : globSegment(segment),
+    );
+    const memo = new Map<number, boolean>();
+
+    const visit = (g: number, p: number): boolean => {
+        const key = g * (pathSegments.length + 1) + p;
+        const known = memo.get(key);
+
+        if (known !== undefined) {
+            return known;
+        }
+
+        const pattern = patterns[g];
+        const result =
+            g === patterns.length
+                ? p === pathSegments.length
+                : pattern === null
+                  ? visit(g + 1, p) || (p < pathSegments.length && visit(g, p + 1))
+                  : p < pathSegments.length &&
+                    pattern!.test(pathSegments[p]!) &&
+                    visit(g + 1, p + 1);
+
+        memo.set(key, result);
+
+        return result;
+    };
+
+    return visit(0, 0);
+}
+
+/** Whole-path, case-sensitive match of a risk-paths glob against a repository path, as `matchGlob` matches. */
+export function matchRiskGlob(glob: string, path: string): boolean {
+    if (path === "") {
+        return false;
+    }
+
+    const pathSegments = path.split("/");
+
+    return expandGlobBraces(glob).some((expansion) =>
+        matchGlobSegments(expansion.split("/"), pathSegments),
+    );
+}
+
+/**
+ * The facts of a delegation known when it starts (version 1): Jev's judgments when `analysis` is given, and what the
+ * brief and the repository folders show. It makes no network call and never throws. It reads only the folders'
+ * marker files, their risk paths lists, and the folders of named paths inside them. The brief is masked first
+ * (`maskBrief`), so a URL or a host never counts as a path.
+ */
+export function features(
+    brief: string,
+    repoDirs: readonly string[],
+    analysis?: Judgments,
+    options: FeatureOptions = {},
+): Features {
+    const roster = new Set((options.roster ?? []).map((name) => name.toLowerCase()));
+    const masked = maskBrief(brief, options.hostNames ?? []);
+    const paths = new Set<string>();
+    const repos = new Set<string>();
+
+    for (const raw of masked.split(/\s+/)) {
+        if (raw === "" || MASKED.test(raw)) {
+            continue;
+        }
+
+        const token = cleanToken(raw);
+
+        if (roster.has(token.toLowerCase())) {
+            repos.add(token.toLowerCase());
+        } else if (isPathToken(token)) {
+            paths.add(token);
+        }
+    }
+
+    const dirs = repoDirs.filter((dir) => dir !== "" && folderAt(dir) !== undefined);
+    const named = [...paths].slice(0, MAX_PATHS_READ);
+    let riskPathNamed: boolean | null = null;
+    let testsBeside: boolean | null = null;
+
+    for (const dir of dirs) {
+        const globs = riskGlobs(dir);
+
+        if (globs === undefined) {
+            continue;
+        }
+
+        riskPathNamed ??= false;
+
+        for (const path of named) {
+            const rel = insideRepo(dir, path);
+
+            if (rel !== undefined && globs.some((glob) => matchRiskGlob(glob, rel))) {
+                riskPathNamed = true;
+            }
+        }
+    }
+
+    if (named.length > 0 && dirs.length > 0) {
+        testsBeside = false;
+
+        for (const dir of dirs) {
+            for (const path of named) {
+                const rel = insideRepo(dir, path);
+
+                if (rel === undefined || testsBeside) {
+                    continue;
+                }
+
+                const full = join(dir, rel);
+                const folder = folderAt(full) ?? folderAt(dirname(full));
+
+                try {
+                    testsBeside =
+                        folder !== undefined &&
+                        readdirSync(folder).some((name) => TEST_FILE.test(name));
+                } catch {
+                    // An unreadable folder holds no test that counts.
+                }
+            }
+        }
+    }
+
+    return {
+        v: 1,
+        ...(analysis === undefined
+            ? {}
+            : {
+                  kind: analysis.kind,
+                  complexity: round2(analysis.complexity),
+                  capability: round2(analysis.capability),
+                  deepReasoning: round2(analysis.deepReasoning),
+                  demand: round2(demandOf(analysis).demand),
+              }),
+        briefChars: [...brief].length,
+        pathsNamed: paths.size,
+        reposNamed: repos.size,
+        language: languageOf(repoDirs.find((dir) => dir !== "")),
+        riskPathNamed,
+        testsBeside,
+    };
+}
+
+/** The SHA-256 of the brief as it was given, not masked, in hex: it ties a route to its brief and keeps no text. */
+export const briefHash = (brief: string): string =>
+    createHash("sha256").update(brief, "utf8").digest("hex");
+
 // ─── The record ──────────────────────────────────────────────────────────────
 
 /**
@@ -767,6 +1146,13 @@ export type Route = {
     jevModel?: string;
     jevId?: string;
     latencyMs?: number;
+    /**
+     * The delegation's facts known at its start (version 1, `features`), on every route a router of version 3 or later
+     * records: off and failed ones too, with the Jev fields absent then. An older route has none.
+     */
+    features?: Features;
+    /** The SHA-256 hex of the brief as it was given, not masked (`briefHash`). An older route has none. */
+    briefHash?: string;
     reason: string;
     notes?: string[];
     at: number;
@@ -819,18 +1205,28 @@ export type RouteRequest = {
     startAt: number;
     profileModel?: string;
     worker?: string;
+    /** The delegation's repository folders, for `features` (version 3): the roster checkout, or none. */
+    repoDirs?: readonly string[];
+    /** Every repository name on the team roster, for `features` (version 3). */
+    roster?: readonly string[];
 };
 
 /** What another module finds on `globalThis[Symbol.for("pi-pocket-team.model-router")]`. */
 export type RouterApi = {
-    version: 2;
+    version: 3;
     /**
      * Classify a brief and record the suggestion. It never throws. With a `worker` in the request, the route carries it
-     * (version 2): the router ran beside the named worker.
+     * (version 2): the router ran beside the named worker. Every route carries the brief's `features` and `briefHash`
+     * (version 3), when the mode is off and when Jev fails too.
      */
     route: (request: RouteRequest) => Promise<Route>;
     /** Record that the supervisor named the worker, so the router did not run. Kept for a `team.ts` of version 1. */
     explicit: (request: { worker: string; profileModel?: string }) => Route;
+    /**
+     * The brief's features with no Jev fields, for a route `team.ts` records itself (the router failed or took too
+     * long): the same function, with no network call. It never throws (version 3).
+     */
+    features: (brief: string, repoDirs: readonly string[], roster?: readonly string[]) => Features;
 };
 
 /** Where another module finds this one's live API: a global, never an import. */
@@ -932,16 +1328,53 @@ export default function createModelRouter(host: Host, web: Web) {
     web.onDispose(web.onSettings(hideKey));
     web.onDispose(() => unhide?.());
 
+    /** The SSH host names the last route read: `features` alone masks with them, and reads no file for them. */
+    let knownHosts: readonly string[] = [];
+
+    /** The facts every route records: the brief's features and its hash. */
+    type Facts = { features?: Features; briefHash: string };
+
     /** A route that holds no suggestion: the delegation goes on as it would without the router. */
-    const failed = (reason: string, at: number, worker?: string, notes?: string[]): Route =>
+    const failed = (
+        reason: string,
+        at: number,
+        facts: Facts,
+        worker?: string,
+        notes?: string[],
+    ): Route =>
         withLine({
             mode: mode(),
             status: "failed",
             ...(worker === undefined ? {} : { worker }),
+            ...facts,
             reason,
             ...(notes === undefined || notes.length === 0 ? {} : { notes }),
             at,
         });
+
+    /**
+     * The brief's features, with Jev's judgments when there are any, and its hash. A failure to read the folders leaves
+     * the features out: the route itself never fails for them.
+     */
+    const factsOf = (
+        request: RouteRequest,
+        hostNames: readonly string[],
+        analysis?: Judgments,
+    ): Facts => {
+        const hash = briefHash(request.brief);
+
+        try {
+            return {
+                features: features(request.brief, request.repoDirs ?? [], analysis, {
+                    roster: request.roster ?? [],
+                    hostNames,
+                }),
+                briefHash: hash,
+            };
+        } catch {
+            return { briefHash: hash };
+        }
+    };
 
     /** `text` with the key taken out: it never goes to Jev, to the desk, or to the supervisor. */
     const redact = (text: string, key: string): string =>
@@ -957,12 +1390,16 @@ export default function createModelRouter(host: Host, web: Web) {
     const route = async (request: RouteRequest): Promise<Route> => {
         const now = Date.now();
         const held = mode();
+        const hostNames = await sshNames();
+
+        knownHosts = hostNames;
 
         if (held === "off") {
             return withLine({
                 mode: held,
                 status: "off",
                 ...(request.worker === undefined ? {} : { worker: request.worker }),
+                ...factsOf(request, hostNames),
                 reason: "the router's mode is off",
                 at: now,
             });
@@ -971,8 +1408,10 @@ export default function createModelRouter(host: Host, web: Web) {
         const key = apiKey();
 
         if (key === undefined) {
-            return failed("no TypeSafe key set", now, request.worker);
+            return failed("no TypeSafe key set", now, factsOf(request, hostNames), request.worker);
         }
+
+        let analysisOut: Analysis | undefined;
 
         try {
             // The owner's list and the tiers file are read while Jev answers: the whole route stays near the timeout.
@@ -983,8 +1422,11 @@ export default function createModelRouter(host: Host, web: Web) {
             models.catch(() => undefined);
             tiersFile.catch(() => undefined);
             // The key itself goes before the call, and out of the answer too: it never reaches Jev or the record.
-            const masked = redact(maskBrief(request.brief, await sshNames()), key);
+            const masked = redact(maskBrief(request.brief, hostNames), key);
+
             const analysis = await classify(masked, key);
+
+            analysisOut = analysis;
             const [{ allowed, unusable }, { tiers, notes }] = await Promise.all([
                 models,
                 tiersFile,
@@ -1000,7 +1442,13 @@ export default function createModelRouter(host: Host, web: Web) {
                 decision.tier === undefined ||
                 decision.thinking === undefined
             ) {
-                return failed("no usable model in the allowed list", now, request.worker, all);
+                return failed(
+                    "no usable model in the allowed list",
+                    now,
+                    factsOf(request, hostNames, analysis),
+                    request.worker,
+                    all,
+                );
             }
 
             return withLine({
@@ -1022,12 +1470,19 @@ export default function createModelRouter(host: Host, web: Web) {
                 ...(jevModel === undefined ? {} : { jevModel }),
                 ...(jevId === undefined ? {} : { jevId }),
                 latencyMs: analysis.latencyMs,
+                ...factsOf(request, hostNames, analysis),
                 reason: "shadow: recorded only",
                 ...(all.length === 0 ? {} : { notes: all }),
                 at: now,
             });
         } catch (error) {
-            return failed(reasonOf(error, key), now, request.worker);
+            // Jev's answer, when the failure came after it: its judgments still go in the features.
+            return failed(
+                reasonOf(error, key),
+                now,
+                factsOf(request, hostNames, analysisOut),
+                request.worker,
+            );
         }
     };
 
@@ -1041,8 +1496,16 @@ export default function createModelRouter(host: Host, web: Web) {
             at: Date.now(),
         });
 
+    /** The features alone, for a route that `team.ts` records itself: no Jev fields, and no file read for the hosts. */
+    const featuresOnly = (
+        brief: string,
+        repoDirs: readonly string[],
+        roster?: readonly string[],
+    ): Features =>
+        features(brief, repoDirs, undefined, { roster: roster ?? [], hostNames: knownHosts });
+
     // Another module finds this version here. A new version sets its own before the old one's cleanup runs.
-    const published: RouterApi = { version: 2, route, explicit };
+    const published: RouterApi = { version: 3, route, explicit, features: featuresOnly };
     const shared = globalThis as unknown as Record<symbol, RouterApi | undefined>;
 
     shared[API] = published;
