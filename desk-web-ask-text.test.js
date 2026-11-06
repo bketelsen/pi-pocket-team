@@ -6,6 +6,8 @@ import htm from "htm";
 import { h } from "preact";
 import {
     artifactId,
+    CODE_BLOCK_MIN,
+    copyText,
     deskPath,
     httpsUrl,
     parseAskText,
@@ -217,10 +219,10 @@ test("javascript:, JaVaScRiPt:, data:, http: and vbscript: links are not links: 
 
 // ─── References ─────────────────────────────────────────────────────────────
 
-/** The reference buttons of a tree: their class, and their text. */
+/** The reference buttons of a tree (not the Copy buttons of command blocks): their class, and their text. */
 const refs = (tree) =>
     vnodes(tree)
-        .filter((node) => node.type === "button")
+        .filter((node) => node.type === "button" && node.props.class.startsWith("desk-ref"))
         .map((node) => ({ node, class: node.props.class, text: serialize(node.props.children) }));
 
 test("artifact:<id>, plain, in code and as a link target, is a button that calls openArtifact", () => {
@@ -313,6 +315,240 @@ test("without its handler a reference shows as code, not as a button", () => {
         out("artifact:a and reports/x.md"),
         '<div class="desk-md"><p><code>artifact:a</code> and <code>reports/x.md</code></p></div>',
     );
+});
+
+// ─── Command blocks ─────────────────────────────────────────────────────────
+
+const LONG = "git pull && npm run install-check && npm run install-extension";
+/** A command block, as it renders. */
+const cmd = (text) =>
+    `<div class="desk-md-cmd"><pre class="desk-md-code"><code>${escape(text)}</code></pre>` +
+    '<button type="button" class="desk-md-copy" aria-label="Copy">Copy</button></div>';
+
+test("inline code of 41 or more characters is a command block between 2 paragraphs, with no empty paragraph", () => {
+    const span = "x".repeat(CODE_BLOCK_MIN);
+
+    assert.equal(CODE_BLOCK_MIN, 41);
+    assert.equal(
+        out(`Then run \`${LONG}\` and tell me.`),
+        `<div class="desk-md"><p>Then run</p>${cmd(LONG)}<p>and tell me.</p></div>`,
+    );
+    assert.equal(out(`\`${span}\``), `<div class="desk-md">${cmd(span)}</div>`);
+    assert.equal(
+        out(`Run \`${span}\`.`),
+        `<div class="desk-md"><p>Run</p>${cmd(span)}<p>.</p></div>`,
+    );
+    assert.equal(
+        out(`\`${span}\` \`${span}\``),
+        `<div class="desk-md">${cmd(span)}${cmd(span)}</div>`,
+        "only spaces between 2 blocks: no paragraph",
+    );
+    assert.doesNotMatch(out(`Run \`${span}\` `), /<p>\s*<\/p>/);
+});
+
+test("inline code of 40 characters or fewer stays inline in its paragraph", () => {
+    const span = "y".repeat(CODE_BLOCK_MIN - 1);
+
+    assert.equal(
+        out(`Run \`${span}\` now.`),
+        `<div class="desk-md"><p>Run <code>${span}</code> now.</p></div>`,
+    );
+    assert.equal(
+        vnodes(render(`Run \`${span}\` now.`)).filter((node) => node.type === "button").length,
+        0,
+    );
+});
+
+test("a long span in a list item puts the block inside the <li>", () => {
+    assert.equal(
+        out(`- first\n- update: \`${LONG}\` then reload\n- last`),
+        `<div class="desk-md"><ul><li>first</li><li><p>update:</p>${cmd(LONG)}<p>then reload</p></li><li>last</li></ul></div>`,
+    );
+    assert.equal(
+        out(`1. \`${LONG}\``),
+        `<div class="desk-md"><ol><li>${cmd(LONG)}</li></ol></div>`,
+    );
+});
+
+test("a fenced block also gets the Copy button", () => {
+    assert.equal(
+        out("Run:\n```\nnpm test\n```"),
+        `<div class="desk-md"><p>Run:</p>${cmd("npm test")}</div>`,
+    );
+});
+
+test("a command block escapes its text, and no vnode sets inner HTML", () => {
+    const span = "<script>alert('a long enough script')</script>";
+    const tree = render(`Look: \`${span}\` and **x**`);
+    const shown = serialize(tree);
+
+    assert.ok(span.length >= CODE_BLOCK_MIN);
+    assert.match(
+        shown,
+        /<code>&lt;script&gt;alert\('a long enough script'\)&lt;\/script&gt;<\/code>/,
+    );
+    assert.match(shown, /class="desk-md-cmd"/);
+    assert.doesNotMatch(shown, /<script/);
+
+    for (const node of vnodes(tree)) {
+        assert.equal(
+            node.props?.dangerouslySetInnerHTML,
+            undefined,
+            `no inner HTML on <${node.type}>`,
+        );
+    }
+});
+
+test("a long artifact or path reference stays a reference button, not a block", () => {
+    const id = `intake-${"a".repeat(60)}`;
+    const path = `reports/${"b".repeat(60)}/check.md`;
+    const tree = render(`See \`artifact:${id}\` and \`${path}\` now.`, {
+        openArtifact: () => {},
+        openPath: () => {},
+    });
+
+    assert.deepEqual(
+        refs(tree).map((each) => [each.class, each.text]),
+        [
+            ["desk-ref desk-ref-artifact", `artifact:${id}`],
+            ["desk-ref desk-ref-path", path],
+        ],
+    );
+    assert.equal(vnodes(tree).filter((node) => node.props?.class === "desk-md-cmd").length, 0);
+    assert.equal(vnodes(tree).filter((node) => node.type === "p").length, 1);
+});
+
+/** A fake document for the fallback: it records the textarea and the calls. */
+const fakeDocument = (copies) => {
+    const calls = [];
+    const body = {
+        appendChild: (node) => {
+            calls.push(["append", node.value]);
+            node.parentNode = body;
+        },
+        removeChild: (node) => {
+            calls.push(["remove", node.value]);
+            node.parentNode = null;
+        },
+    };
+
+    return {
+        calls,
+        body,
+        createElement: (tag) => {
+            calls.push(["create", tag]);
+
+            return { style: {}, parentNode: null, select: () => calls.push(["select"]) };
+        },
+        execCommand: (name) => {
+            calls.push(["exec", name]);
+
+            if (copies === "throws") {
+                throw new Error("no");
+            }
+
+            return copies;
+        },
+    };
+};
+
+test("copyText uses clipboard.writeText with the exact text", async () => {
+    const written = [];
+    const document = fakeDocument(true);
+    const env = {
+        navigator: { clipboard: { writeText: async (text) => written.push(text) } },
+        document,
+    };
+
+    assert.equal(await copyText(LONG, env), true);
+    assert.deepEqual(written, [LONG]);
+    assert.deepEqual(document.calls, [], "no fallback");
+});
+
+test("copyText uses the textarea fallback with no clipboard, and removes the textarea", async () => {
+    const document = fakeDocument(true);
+
+    assert.equal(await copyText(LONG, { navigator: {}, document }), true);
+    assert.deepEqual(document.calls, [
+        ["create", "textarea"],
+        ["append", LONG],
+        ["select"],
+        ["exec", "copy"],
+        ["remove", LONG],
+    ]);
+
+    const second = fakeDocument(true);
+    const env = {
+        navigator: { clipboard: { writeText: async () => Promise.reject(new Error("denied")) } },
+        document: second,
+    };
+
+    assert.equal(await copyText("x", env), true, "a refused clipboard falls back");
+    assert.deepEqual(second.calls.at(-1), ["remove", "x"]);
+});
+
+test("copyText gives false and does not throw when both ways fail", async () => {
+    const refuse = { clipboard: { writeText: () => Promise.reject(new Error("denied")) } };
+
+    for (const copies of [false, "throws"]) {
+        const document = fakeDocument(copies);
+
+        assert.equal(await copyText("x", { navigator: refuse, document }), false);
+        assert.deepEqual(document.calls.at(-1), ["remove", "x"], "the textarea goes");
+    }
+
+    assert.equal(await copyText("x", { navigator: refuse }), false, "no document");
+    assert.equal(await copyText("x", {}), false, "nothing");
+    assert.equal(await copyText("x", null), false, "no env");
+});
+
+test("a tap on Copy copies the block text, shows Copied, then Copy again", async () => {
+    const navigator = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+    const setTimeout = globalThis.setTimeout;
+    const written = [];
+    const timers = [];
+
+    Object.defineProperty(globalThis, "navigator", {
+        configurable: true,
+        value: { clipboard: { writeText: async (text) => written.push(text) } },
+    });
+    globalThis.setTimeout = (run, ms) => timers.push([run, ms]);
+
+    try {
+        const copy = vnodes(render(`Run \`${LONG}\`.`)).find(
+            (node) => node.props?.class === "desk-md-copy",
+        );
+        const button = { textContent: "Copy" };
+
+        assert.ok(copy, "the block has a Copy button");
+
+        assert.equal(await copy.props.onClick({ currentTarget: button }), true);
+        assert.deepEqual(written, [LONG]);
+        assert.equal(button.textContent, "Copied");
+        assert.equal(timers.length, 1);
+        assert.ok(timers[0][1] >= 1000 && timers[0][1] <= 2000, String(timers[0][1]));
+        timers[0][0]();
+        assert.equal(button.textContent, "Copy");
+
+        Object.defineProperty(globalThis, "navigator", { configurable: true, value: {} });
+        timers.length = 0;
+        assert.equal(
+            await copy.props.onClick({ currentTarget: button }),
+            false,
+            "no way to copy here",
+        );
+        assert.equal(button.textContent, "Copy failed");
+        timers[0][0]();
+        assert.equal(button.textContent, "Copy");
+    } finally {
+        if (navigator === undefined) {
+            delete globalThis.navigator;
+        } else {
+            Object.defineProperty(globalThis, "navigator", navigator);
+        }
+
+        globalThis.setTimeout = setTimeout;
+    }
 });
 
 // ─── The page's helpers ─────────────────────────────────────────────────────
