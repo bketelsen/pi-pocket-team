@@ -120,8 +120,9 @@ const isPriced = (r) => (typeof r.priced === "boolean" ? r.priced : r.cap > 0);
 /**
  * Settle a reservation: remove it and add an entry with the real cost and tokens of the attempt's tries. A priced
  * model's real cost counts even when its cap was 0; an unpriced model settles 0, and its tokens are kept.
+ * `unknown`: a Pi run's usage was lost (the caller settles at the cap); the entry says `usageUnknown: true`.
  */
-export function settle(data, id, { cost, tokens, tries }, options) {
+export function settle(data, id, { cost, tokens, tries, unknown = false }, options) {
     return update(
         data,
         (spend) => {
@@ -144,6 +145,7 @@ export function settle(data, id, { cost, tokens, tries }, options) {
                 tries,
                 cost: real,
                 tokens,
+                ...(unknown ? { usageUnknown: true } : {}),
                 at: new Date().toISOString(),
             });
 

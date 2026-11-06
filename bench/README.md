@@ -66,7 +66,7 @@ Before each try of an OAuth provider, the runner refreshes the token on the host
 ## Limits and retries
 
 - Per attempt: 45 minutes of Pi wall time; $8 of list cost for a priced model, 4,000,000 tokens for an unpriced one. The limits count over all tries of the attempt, and a limit is reached at its value (not only above it). The usage includes automatic compaction (`compaction_end` `result.usage`). At a limit: SIGTERM to the process group, SIGKILL after 10 s, `failure: "limit"`. A retry does not start when the attempt's allowance is used up: `failure: "limit"`.
-- Budget: an attempt reserves its cap once (the cost limit for a priced model, $0 for an unpriced one), keeps it across its retries, and settles the sum of all its tries once at the end (the entry holds `tries`). A priced model always settles its real cost; an unpriced model settles $0 and keeps its tokens.
+- Budget: an attempt reserves its cap once (the cost limit for a priced model, $0 for an unpriced one), keeps it across its retries, and settles the sum of all its tries once at the end (the entry holds `tries`). A priced model always settles its real cost; an unpriced model settles $0 and keeps its tokens. Each try's usage reaches the settlement as soon as its Pi run ends; when the runner fails while a Pi run's usage is unknown, the attempt settles at its full cap (`usageUnknown: true`).
 - A provider error (`stopReason: "error"` on the last assistant message): 1 retry on a fresh clone; then `failure: "provider"`.
 - A harness failure: 2 repeats on a fresh clone, then `harness: true` and exit 3.
 - A stream with no final event, or with an assistant message that did not end: `usage.partial: true`.
@@ -76,7 +76,7 @@ Before each try of an OAuth provider, the runner refreshes the token on the host
 
 The data dir is `$BENCH_DATA`, else `~/.local/share/pi-pocket-team/bench` (folders 0700, files 0600). It holds `spend.json` (the budget), `slots/`, `halogen.json`, `agent/`, `agent-files/` and `runs/<stage>/<task>/<model-slug>[--<run-id>]/try-<n>/` with `work/`, `session/`, `cache/`, `events.jsonl` and `stderr.log`. Run folders are kept; a new run of the same attempt continues the try numbers. Result files go to `bench/results/` (ignored by git) or `--results`.
 
-Attempt lock: `runs/<stage>/<task>/<model-slug>[--<run-id>].lock` (with the pid) is held from before the result-exists check until the result is written; a second runner of the same attempt exits 1. A lock of a dead pid is free.
+Attempt lock: `runs/<stage>/<task>/<model-slug>[--<run-id>].lock` (with the pid) is held from before the result-exists check until the result is written; a second runner of the same attempt exits 1. A lock of a dead pid is free. The take and the release both hold the short lock `runs/.locks.lock`.
 
 Concurrency: at most 4 tries on the host and 2 per provider; halogen at most the `concurrency` of `halogen.json` (1 before the load test). `--max-provider` and `BENCH_MAX_PROVIDER` (load test only) change only halogen's cap. Halogen needs the lease: `~/.pi/agent/bin/lease take halogen T1064 "bench"` (`batch.mjs` and `load-test.mjs` take it themselves).
 

@@ -302,9 +302,13 @@ export function allowanceSpent(limits, used, priced) {
 
 /**
  * 1 try: take the slots, pre-flight, clone, setup, then Pi. The slots are released whatever happens.
- * Returns the try's log line, its usage and its stream.
+ * Returns the try's log line, its usage and its stream. The try's usage goes into `tally` (the attempt's settlement)
+ * as soon as Pi's run ends, before any cleanup that can throw; while Pi runs, `tally.unknown` is true.
+ * `ctx.hooks.acquireSlots` and `ctx.hooks.runStreamed` replace the real ones in fault-injection tests.
  */
-async function runTry(ctx, tryNo, used, prompt, log) {
+async function runTry(ctx, tryNo, used, prompt, log, tally) {
+    const acquire = ctx.hooks?.acquireSlots ?? acquireSlots;
+    const streamed = ctx.hooks?.runStreamed ?? runStreamed;
     const paths = tryPaths(ctx, tryNo);
     const entry = {
         try: tryNo,
@@ -325,7 +329,9 @@ async function runTry(ctx, tryNo, used, prompt, log) {
         await privateDir(join(paths.cache, cache));
     }
 
-    const slots = await acquireSlots(ctx.data, ctx.provider, {
+    tally.tries += 1;
+
+    const slots = await acquire(ctx.data, ctx.provider, {
         maxProvider: ctx.maxProvider,
         wait: () => delay(ctx.slotPollMs),
     });
@@ -374,7 +380,9 @@ async function runTry(ctx, tryNo, used, prompt, log) {
             );
         }
 
-        const run = await runStreamed({
+        tally.unknown = true;
+
+        const run = await streamed({
             bin: ctx.bwrap,
             args: sandbox(piCommand(ctx.model.id, prompt)),
             eventsFile: paths.events,
@@ -387,6 +395,8 @@ async function runTry(ctx, tryNo, used, prompt, log) {
         });
 
         usage = run.summary.usage;
+        tally.usage = addUsage(tally.usage, usage);
+        tally.unknown = false;
         stream = run.summary.stream;
         Object.assign(entry, {
             wallMs: run.wallMs,
@@ -435,15 +445,18 @@ export async function runAttempt(ctx, log = console.error) {
         return 2;
     }
 
-    const tally = { usage: zeroUsage(), tries: 0 };
+    // The settlement: the usage of each try as soon as its Pi run ends. When the runner fails while a Pi run's usage
+    // is unknown, the attempt settles at its full cap (conservative).
+    const tally = { usage: zeroUsage(), tries: 0, unknown: false };
 
     try {
         return await runTries(ctx, tally, log);
     } finally {
         await settle(ctx.data, reservation.id, {
-            cost: tally.usage.cost,
+            cost: tally.unknown ? Math.max(capOf(ctx), tally.usage.cost) : tally.usage.cost,
             tokens: tally.usage.tokens,
             tries: tally.tries,
+            unknown: tally.unknown,
         });
     }
 }
@@ -474,12 +487,10 @@ async function runTries(ctx, tally, log) {
             break;
         }
 
-        const result = await runTry(ctx, tryNo, used, prompt, log);
+        const result = await runTry(ctx, tryNo, used, prompt, log, tally);
 
         tryLog.push(result.entry);
         usage = addUsage(usage, result.usage);
-        tally.usage = usage;
-        tally.tries = tryLog.length;
         stream = result.stream ?? stream;
         workDir = tryPaths(ctx, tryNo).work;
         used.wallMs += result.entry.wallMs;
