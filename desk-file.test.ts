@@ -11,12 +11,22 @@ import {
     scriptedModel,
 } from "./_pocket/test/helpers.ts";
 import assert from "node:assert/strict";
-import { cpSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import {
+    appendFileSync,
+    cpSync,
+    mkdirSync,
+    readFileSync,
+    renameSync,
+    rmSync,
+    symlinkSync,
+    writeFileSync,
+} from "node:fs";
 import { createServer, type Server } from "node:http";
 import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
 import { createHandler } from "./_pocket/src/server/http.ts";
-import { DESK_FILE_MAX, DeskThreads, deskFileTarget, isDeskPath } from "./desk.ts";
+import { DESK_FILE_MAX, DeskThreads, deskFileTarget, isDeskPath, readDeskFile } from "./desk.ts";
 import { deskPath } from "./desk-web/ask-text.js";
 
 /** Paths both rules must judge the same. */
@@ -67,6 +77,93 @@ describe("the desk path rule", () => {
             (deskFileTarget("rel/desk", "reports/a.md") as { status: number }).status,
             404,
         );
+    });
+});
+
+describe("readDeskFile: a writer that swaps the file between the checks and the read", () => {
+    const base = join(root, "race");
+    const home = join(base, "odrade");
+    const away = join(base, "away");
+    let count = 0;
+
+    /** A fresh root with `reports/sub/x.md`, and an outside folder with a file of the same name. */
+    const fresh = () => {
+        count += 1;
+        const at = join(home, String(count));
+
+        mkdirSync(join(at, "reports", "sub"), { recursive: true });
+        mkdirSync(join(away, String(count)), { recursive: true });
+        writeFileSync(join(at, "reports", "sub", "x.md"), "inside");
+        writeFileSync(join(away, String(count), "x.md"), "secret");
+
+        return { at, file: join(at, "reports", "sub", "x.md"), out: join(away, String(count)) };
+    };
+
+    test("a good file reads; the hooks change nothing", async () => {
+        const { at, file } = fresh();
+
+        assert.deepEqual(await readDeskFile(at, file), { text: "inside" });
+    });
+
+    test("the file swapped for a symlink out of the root before the open: refused, no outside text", async () => {
+        const { at, file, out } = fresh();
+        const read = await readDeskFile(at, file, {
+            beforeOpen: () => {
+                rmSync(file);
+                symlinkSync(join(out, "x.md"), file);
+            },
+        });
+
+        assert.equal((read as { status: number }).status, 400);
+        assert.ok(!("text" in read));
+    });
+
+    test("a folder above the file swapped for a symlink out of the root before the open: refused", async () => {
+        const { at, file, out } = fresh();
+        const read = await readDeskFile(at, file, {
+            beforeOpen: () => {
+                renameSync(join(at, "reports", "sub"), join(at, "reports", "old"));
+                symlinkSync(out, join(at, "reports", "sub"));
+            },
+        });
+
+        assert.equal((read as { status: number }).status, 400);
+        assert.ok(!("text" in read));
+    });
+
+    test("the opened file swapped after the open: the name is no longer the descriptor's file, refused", async () => {
+        const { at, file, out } = fresh();
+        const read = await readDeskFile(at, file, {
+            afterOpen: () => {
+                renameSync(file, `${file}.old`);
+                symlinkSync(join(out, "x.md"), file);
+            },
+        });
+
+        assert.equal((read as { status: number }).status, 400);
+    });
+
+    test("the file swapped for a FIFO before the open: a 404 at once, the open does not block", async () => {
+        const { at, file } = fresh();
+        const read = await readDeskFile(at, file, {
+            beforeOpen: () => {
+                rmSync(file);
+                execFileSync("mkfifo", [file]);
+            },
+        });
+
+        assert.equal((read as { status: number }).status, 404);
+    });
+
+    test("a file that grows past the limit after the size check is a 413", async () => {
+        const { at, file } = fresh();
+        const read = await readDeskFile(at, file, {
+            beforeRead: () => {
+                appendFileSync(file, "x".repeat(DESK_FILE_MAX + 10));
+            },
+        });
+
+        assert.equal((read as { status: number }).status, 413);
     });
 });
 

@@ -18,6 +18,7 @@
  * import would keep a stale copy after a reload. With this module off, Team and Night shift work as before.
  */
 import { execFile } from "node:child_process";
+import { constants as fsConstants } from "node:fs";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import {
     access,
@@ -1149,6 +1150,104 @@ export function deskFileTarget(
     const root = dirname(exportFolder.replace(/\/+$/, ""));
 
     return { root, file: join(root, path) };
+}
+
+/**
+ * Read 1 desk file, bound to the descriptor that reads it: a writer that swaps the file, or a folder above it, for a
+ * symlink out of the root between the checks and the read cannot make it read an outside file. The open does not block
+ * (`O_NONBLOCK`: a FIFO cannot hang it), the descriptor must be a regular file, the real path of `file` must be in the
+ * real root and be the same file as the descriptor (device and inode), and the read stops at `DESK_FILE_MAX` + 1 bytes.
+ * The hooks run between the steps, for the race tests only.
+ */
+export async function readDeskFile(
+    root: string,
+    file: string,
+    hooks: {
+        beforeOpen?: () => Promise<void> | void;
+        afterOpen?: () => Promise<void> | void;
+        beforeRead?: () => Promise<void> | void;
+    } = {},
+): Promise<{ text: string } | { status: 400 | 404 | 413; error: string }> {
+    const missing = { status: 404 as const, error: "There is no desk file" };
+    const outside = { status: 400 as const, error: "The desk file is outside the desk folder" };
+    let realRoot: string;
+
+    try {
+        realRoot = await realpath(root);
+    } catch {
+        return missing;
+    }
+
+    await hooks.beforeOpen?.();
+
+    let handle: Awaited<ReturnType<typeof open>>;
+
+    try {
+        handle = await open(file, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK);
+    } catch {
+        return missing;
+    }
+
+    try {
+        await hooks.afterOpen?.();
+
+        const facts = await handle.stat();
+
+        if (!facts.isFile()) {
+            return { status: 404, error: "The desk path is not a file" };
+        }
+
+        let real: string;
+        let named: { dev: number; ino: number };
+
+        try {
+            real = await realpath(file);
+            named = await stat(real);
+        } catch {
+            return outside;
+        }
+
+        if (
+            !real.startsWith(realRoot.endsWith(sep) ? realRoot : realRoot + sep) ||
+            named.dev !== facts.dev ||
+            named.ino !== facts.ino
+        ) {
+            return outside;
+        }
+
+        const tooLarge = {
+            status: 413 as const,
+            error: `The desk file is over ${String(DESK_FILE_MAX / 1024)} KB`,
+        };
+
+        if (facts.size > DESK_FILE_MAX) {
+            return tooLarge;
+        }
+
+        await hooks.beforeRead?.();
+
+        // At most 1 byte more than the limit: a file that grew after the size check is a 413, never a large read.
+        const buffer = Buffer.alloc(DESK_FILE_MAX + 1);
+        let length = 0;
+
+        while (length < buffer.length) {
+            const { bytesRead } = await handle.read(buffer, length, buffer.length - length, length);
+
+            if (bytesRead === 0) {
+                break;
+            }
+
+            length += bytesRead;
+        }
+
+        if (length > DESK_FILE_MAX) {
+            return tooLarge;
+        }
+
+        return { text: buffer.subarray(0, length).toString("utf8") };
+    } finally {
+        await handle.close();
+    }
 }
 
 /** The thread of a linked session, whatever its state. */
@@ -25261,57 +25360,13 @@ export default function createDesk(host: Host, web: Web) {
                 throw web.error(target.status, target.error);
             }
 
-            let root: string;
-            let real: string;
+            const read = await readDeskFile(target.root, target.file);
 
-            try {
-                root = await realpath(target.root);
-                real = await realpath(target.file);
-            } catch {
-                throw web.error(404, `There is no desk file ${path}.`);
+            if ("error" in read) {
+                throw web.error(read.status, `${read.error}: ${path}`);
             }
 
-            if (!real.startsWith(root.endsWith(sep) ? root : root + sep)) {
-                throw web.error(400, `The desk file ${path} is outside the desk folder.`);
-            }
-
-            const tooLarge = () =>
-                web.error(413, `The desk file ${path} is over ${String(DESK_FILE_MAX / 1024)} KB.`);
-
-            /** The kind and the size, before the open (a FIFO must not block the open) and again after it. */
-            const check = (facts: { isFile(): boolean; size: number }) => {
-                if (!facts.isFile()) {
-                    throw web.error(404, `The desk path ${path} is not a file.`);
-                }
-
-                if (facts.size > DESK_FILE_MAX) {
-                    throw tooLarge();
-                }
-            };
-
-            check(
-                await stat(real).catch(() => {
-                    throw web.error(404, `There is no desk file ${path}.`);
-                }),
-            );
-
-            const handle = await open(real, "r").catch(() => {
-                throw web.error(404, `There is no desk file ${path}.`);
-            });
-
-            try {
-                check(await handle.stat());
-
-                const bytes = await handle.readFile();
-
-                if (bytes.length > DESK_FILE_MAX) {
-                    throw tooLarge();
-                }
-
-                return { path, text: bytes.toString("utf8") };
-            } finally {
-                await handle.close();
-            }
+            return { path, text: read.text };
         },
         { access: "owner" },
     );
