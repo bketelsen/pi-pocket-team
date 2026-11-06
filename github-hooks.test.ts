@@ -39,6 +39,7 @@ import {
     type DeliveryJob,
     type HookDocs,
     type HookFact,
+    type ListenerDeps,
     type ListenerEvent,
     type ListenerLimits,
     type ObservedState,
@@ -161,6 +162,7 @@ async function listen(
         dir?: string;
         receiver?: ReceiverHandle | null;
         port?: number;
+        timers?: ListenerDeps["timers"];
     } = {},
 ) {
     const jobs: DeliveryJob[] = [];
@@ -191,6 +193,7 @@ async function listen(
         log: (line) => lines.push(line),
         onEvent: (event) => events.push(event),
         ...(options.limits === undefined ? {} : { limits: options.limits }),
+        ...(options.timers === undefined ? {} : { timers: options.timers }),
     });
 
     listener.start();
@@ -403,17 +406,12 @@ describe("Size", () => {
 /** Open a socket and keep it, until the test ends it. */
 function hold(
     port: number,
-): Promise<{ socket: Socket; closed: () => boolean; closedAt: () => number; text: () => string }> {
+): Promise<{ socket: Socket; closed: () => boolean; text: () => string }> {
     return new Promise((resolve) => {
-        let closed = 0;
+        let closed = false;
         let text = "";
         const socket = connect(port, "127.0.0.1", () =>
-            resolve({
-                socket,
-                closed: () => closed !== 0,
-                closedAt: () => closed,
-                text: () => text,
-            }),
+            resolve({ socket, closed: () => closed, text: () => text }),
         );
 
         socket.on("data", (chunk: Buffer) => {
@@ -421,7 +419,7 @@ function hold(
         });
         socket.on("error", () => {});
         socket.on("close", () => {
-            closed = Date.now();
+            closed = true;
         });
     });
 }
@@ -602,8 +600,34 @@ describe("Life cycle", () => {
     });
 
     test("close: an idle keep-alive socket ends at once, an active request after the grace time and not before; a new listener accepts", async () => {
-        const grace = 300;
-        const hooks = await listen({ limits: { socketGraceMs: grace } });
+        // The grace timer is held by the test: no wall time decides the order. The bind's timer (0 ms) runs for real.
+        const grace = 12_345;
+        const held: { run: () => void; ms: number }[] = [];
+        const hooks = await listen({
+            limits: { socketGraceMs: grace },
+            timers: {
+                set: (run, ms) => {
+                    if (ms === 0) {
+                        return setTimeout(run, 0);
+                    }
+
+                    const timer = { run, ms };
+
+                    held.push(timer);
+
+                    return timer;
+                },
+                clear: (handle) => {
+                    const index = held.indexOf(handle as (typeof held)[number]);
+
+                    if (index >= 0) {
+                        held.splice(index, 1);
+                    } else {
+                        clearTimeout(handle as NodeJS.Timeout);
+                    }
+                },
+            },
+        });
         const idle = await hold(hooks.port);
 
         idle.socket.write(
@@ -627,18 +651,18 @@ describe("Life cycle", () => {
         );
         await waitFor(() => hooks.listener.load().requests === 1, "1 request in progress");
 
-        const closedAt = Date.now();
-
         hooks.close();
-        await waitFor(() => idle.closed(), "the idle socket closed");
-        assert.ok(idle.closedAt() - closedAt < grace, "the idle socket closed at once");
+        await waitFor(() => idle.closed(), "the idle socket closed, with the grace timer held");
         assert.equal(active.closed(), false, "the active socket is still open");
-        await waitFor(() => active.closed(), "the active socket is destroyed");
-        // Timers can fire up to 1 ms early on some platforms.
-        assert.ok(
-            active.closedAt() - closedAt >= grace - 2,
-            `the active socket closed ${String(active.closedAt() - closedAt)} ms after close, before the grace time`,
+        assert.deepEqual(
+            held.map((timer) => timer.ms),
+            [grace],
+            "1 grace timer of socketGraceMs",
         );
+
+        // The grace time ends: the active socket is destroyed.
+        held.shift()!.run();
+        await waitFor(() => active.closed(), "the active socket is destroyed");
         assert.equal(active.text(), "", "no answer for the cut request");
 
         const next = await listen({ port: hooks.port });

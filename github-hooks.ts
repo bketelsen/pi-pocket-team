@@ -1277,7 +1277,7 @@ export type ListenerDeps = {
     log: (line: string) => void;
     onEvent: (event: ListenerEvent) => void;
     limits?: Partial<ListenerLimits>;
-    /** The timers of the bind and its retries: a test injects its own. */
+    /** The timers of the bind, its retries and the socket grace time at `close`: a test injects its own. */
     timers?: { set: (run: () => void, ms: number) => unknown; clear: (handle: unknown) => void };
 };
 
@@ -1810,12 +1810,14 @@ export function createHookListener(deps: ListenerDeps) {
 
             if (sockets.size > 0) {
                 const open = [...sockets];
-
-                setTimeout(() => {
+                const grace = timers.set(() => {
                     for (const socket of open) {
                         socket.destroy();
                     }
-                }, limits.socketGraceMs).unref();
+                }, limits.socketGraceMs);
+
+                // A real timer must not keep the process alive for this.
+                (grace as { unref?: () => void } | undefined)?.unref?.();
             }
         },
     };
