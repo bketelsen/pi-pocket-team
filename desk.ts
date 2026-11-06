@@ -26,6 +26,7 @@ import {
     mkdir,
     open,
     readFile,
+    readlink,
     realpath,
     rename,
     stat,
@@ -1154,8 +1155,8 @@ export function deskFileTarget(
 
 /**
  * Read 1 desk file, bound to the descriptor that reads it. The open does not block (`O_NONBLOCK`: a FIFO cannot hang
- * it), the descriptor must be a regular file, and the place of the descriptor's file (`/proc/self/fd/<fd>`, resolved by
- * the kernel from the open file, not from its name again) must be in the real root. So a writer that swaps the name, or
+ * it), the descriptor must be a regular file, and the place of the descriptor's file (the kernel's text of
+ * `/proc/self/fd/<fd>`, read with `readlink` and not resolved again) must be in the real root. So a writer that swaps the name, or
  * a folder above it, between the open and the checks cannot make it read an outside file. A deleted or unresolved
  * target is refused. Linux only (`/proc`): elsewhere every read is refused. The read stops at `DESK_FILE_MAX` + 1 bytes.
  * The hooks run between the steps, and `open` replaces the open, for the tests only.
@@ -1199,16 +1200,21 @@ export async function readDeskFile(
             return { status: 404, error: "The desk path is not a file" };
         }
 
-        // Where the open file is now, from the descriptor: no second resolution of the name that a writer can swap.
+        // Where the open file is now: the kernel's text for the descriptor, read with `readlink` and never resolved
+        // again (`realpath` would walk names a writer can swap). A deleted file's text ends in " (deleted)".
         let real: string;
 
         try {
-            real = await realpath(`/proc/self/fd/${String(handle.fd)}`);
+            real = await readlink(`/proc/self/fd/${String(handle.fd)}`);
         } catch {
             return outside;
         }
 
-        if (!real.startsWith(realRoot.endsWith(sep) ? realRoot : realRoot + sep)) {
+        if (
+            !isAbsolute(real) ||
+            real.endsWith(" (deleted)") ||
+            !real.startsWith(realRoot.endsWith(sep) ? realRoot : realRoot + sep)
+        ) {
             return outside;
         }
 

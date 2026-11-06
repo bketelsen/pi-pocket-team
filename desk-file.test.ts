@@ -168,6 +168,17 @@ describe("readDeskFile: a writer that swaps the file between the checks and the 
         assert.equal((read as { status: number }).status, 400);
     });
 
+    test("the descriptor's place is the kernel's readlink text, never resolved again by realpath", () => {
+        // A race inside realpath (a name swapped while it walks the link's target) cannot be timed in a test: this
+        // guard keeps the code on the kernel's text, which no later swap of a name changes.
+        const source = readDeskFile.toString();
+
+        assert.match(source, /readlink\(`\/proc\/self\/fd\//);
+        assert.doesNotMatch(source, /realpath\(`\/proc/);
+        assert.doesNotMatch(source, /realpath\(file\)/);
+        assert.match(source, / \(deleted\)/);
+    });
+
     test("the file swapped for a FIFO before the open: a 404 at once, the open does not block", async () => {
         const { at, file } = fresh();
         const read = await readDeskFile(at, file, {
