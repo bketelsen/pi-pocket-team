@@ -200,14 +200,22 @@ export function summarize(docs, { since, until }) {
     if (alarms === undefined) {
         out.alarms = { absent: true };
     } else {
-        // The misses: `misses` keeps 24 hours; a coverage alarm keeps the misses that raised it. 1 miss is 1 time in a
+        // The misses. `missLog` holds every miss at or after `missLogFrom` (30 days): from there the count is exact.
+        // Before it (or with no log: a document from before it), only 2 lists exist: `misses` keeps 24 hours, and a
+        // coverage alarm keeps the misses that raised it; the count from them is a lower bound. 1 miss is 1 time in a
         // list, and the changes of 1 sweep share 1 time: `[T, T]` is 2 misses. The 2 lists can hold the same misses, so
         // each repository, class and time counts the larger of its 2 counts, never their sum and never 1 for all.
+        const logFrom =
+            Array.isArray(alarms.missLog) && typeof alarms.missLogFrom === "number"
+                ? alarms.missLogFrom
+                : undefined;
+        const logged = (at) => logFrom !== undefined && at >= logFrom;
+
         const tally = (times) => {
             const counts = new Map();
 
             (Array.isArray(times) ? times : [])
-                .filter(inWindow)
+                .filter((at) => inWindow(at) && !logged(at))
                 .forEach((at) => counts.set(at, (counts.get(at) ?? 0) + 1));
 
             return counts;
@@ -217,7 +225,10 @@ export function summarize(docs, { since, until }) {
             ...Object.keys(alarms.misses ?? {}),
             ...Object.keys(alarms.coverage ?? {}),
         ]);
-        let missesInWindow = 0;
+        let missesInWindow =
+            logFrom === undefined
+                ? 0
+                : alarms.missLog.filter((entry) => inWindow(entry?.at) && logged(entry.at)).length;
 
         for (const key of keys) {
             const fromMisses = tally(alarms.misses?.[key]);
@@ -242,6 +253,9 @@ export function summarize(docs, { since, until }) {
             system: list(alarms.system),
             coverage: list(alarms.coverage),
             missesInWindow,
+            // Exact only when the log holds the whole window; else `missesInWindow` is a lower bound.
+            missesComplete: logFrom !== undefined && logFrom <= since,
+            ...(logFrom === undefined ? {} : { missLogFrom: logFrom }),
         };
     }
 
@@ -352,7 +366,12 @@ export function formatMarkdown(summary) {
             lines.push("- No alarm was ever raised.");
         }
 
-        lines.push(`- Coverage misses in the window: ${String(alarms.missesInWindow)}.`, "");
+        lines.push(
+            alarms.missesComplete
+                ? `- Coverage misses in the window: ${String(alarms.missesInWindow)}.`
+                : `- Coverage misses in the window: at least ${String(alarms.missesInWindow)}. The miss log holds every miss only ${alarms.missLogFrom === undefined ? "after its first evaluation (none yet)" : `from ${time(alarms.missLogFrom)}`}; before it, only the misses of the last 24 hours and of raised alarms were kept.`,
+            "",
+        );
     }
 
     return lines.join("\n");

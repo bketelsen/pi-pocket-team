@@ -110,6 +110,10 @@ export const CHANGE_MIN_AGE_MS = 30 * 60_000;
 export const CHANGE_MAX_AGE_MS = 24 * 3600_000;
 /** Misses within this time count toward the alarm. */
 export const MISS_WINDOW_MS = 24 * 3600_000;
+/** The miss log (`AlarmsState.missLog`) keeps the misses of this time, for the report's window. */
+export const MISS_LOG_MS = 30 * 24 * 3600_000;
+/** The most entries the miss log keeps: the oldest go first. */
+export const MISS_LOG_MAX = 2000;
 /** This many misses of 1 repository and class raise its alarm. */
 export const MISSES_TO_RAISE = 2;
 /** The receiver's tick. */
@@ -536,12 +540,18 @@ export type NudgeFact = {
     action?: string;
     repo: string;
     number?: number;
+    /** `check_suite`: every PR number of the suite (at most 20); `number` is the first. */
+    numbers?: number[];
     label?: string;
     sha?: string;
     branch?: string;
 };
 
-/** The fact as the desk takes it: no installation event, no `numbers` (the first number only). */
+/**
+ * The fact as the desk takes it: no installation event. A `check_suite` fact keeps every PR number of the suite in
+ * `numbers` (and the first in `number`, for a desk that knows only `number`): the desk matches a thread that links any
+ * of them, not only the first.
+ */
 export function toNudgeFact(fact: HookFact): NudgeFact | undefined {
     if (fact.repo === undefined || fact.installation !== undefined) {
         return undefined;
@@ -554,6 +564,9 @@ export function toNudgeFact(fact: HookFact): NudgeFact | undefined {
         ...(fact.action === undefined ? {} : { action: fact.action }),
         repo: fact.repo,
         ...(fact.number === undefined ? {} : { number: fact.number }),
+        ...(fact.numbers === undefined || fact.numbers.length === 0
+            ? {}
+            : { numbers: [...fact.numbers] }),
         ...(fact.label === undefined ? {} : { label: fact.label }),
         ...(fact.sha === undefined ? {} : { sha: fact.sha }),
         ...(fact.branch === undefined ? {} : { branch: fact.branch }),
@@ -632,6 +645,17 @@ export type AlarmsState = {
     misses: Record<string, number[]>;
     /** By the key of an observed change: when it was checked. */
     evaluated: Record<string, number>;
+    /**
+     * Every miss, for the report (`audit/github-hooks.mjs`): its "repo|class" key and its time (the `seen` time of its
+     * change, as in `misses`), in the order the evaluations found them; kept `MISS_LOG_MS`, at most `MISS_LOG_MAX`. `misses` keeps only 24 hours,
+     * so it cannot count a 7-day window. Absent: a document stored before this field (the first evaluation adds it).
+     */
+    missLog?: { key: string; at: number }[];
+    /**
+     * The log holds every miss at or after this time: the first evaluation that made the log, moved later when an entry
+     * goes by age or by the cap.
+     */
+    missLogFrom?: number;
 };
 
 /** 1 accepted fact, as the coverage alarm compares it. */
@@ -663,6 +687,13 @@ export type CoverageState = {
      * this field) or a key absent: the evaluation writes it (see `evaluateCoverage`).
      */
     since?: Record<string, number>;
+    /**
+     * The earliest start each key of `since` ever had: a start that ends (a suspend, a removal, an expiry) keeps its
+     * entry here, and a later start never moves it later. The cleanup of stored misses and raised alarms compares only
+     * with it: a miss of an earlier coverage stays a miss, and only a matching delivery clears its alarm. Absent (a
+     * document stored before this field): it starts as a copy of `since` (`noteBegan`).
+     */
+    began?: Record<string, number>;
 };
 
 /** The receiver task of record. Stored data. */
@@ -941,6 +972,18 @@ export function ensureSince(
 }
 
 /**
+ * Copy each start of `since` into `began`, never later than `began` holds it: the earliest start of each key ever. A
+ * document with no `began` gets a copy of `since`.
+ */
+export function noteBegan(coverage: CoverageState): void {
+    const began = (coverage.began ??= {});
+
+    for (const [key, at] of Object.entries(coverage.since ?? {})) {
+        began[key] = began[key] === undefined ? at : Math.min(began[key], at);
+    }
+}
+
+/**
  * The starts follow the coverage at each delivery that changes it (an installation fact, an accepted repository fact).
  * The covered set is `coveredRepos(coverage, at)`. First each covered key with no start gets one: a repository starts at
  * the earlier of `at` and its account's start when `since` holds that account key (also when this same delivery ends
@@ -950,6 +993,9 @@ export function ensureSince(
 function syncStarts(coverage: CoverageState, at: number): void {
     const since = (coverage.since ??= {});
     const { repos, accounts } = coveredRepos(coverage, at);
+
+    // Before a start ends below: a document stored before `began` keeps the start it had.
+    noteBegan(coverage);
 
     for (const repo of repos) {
         if (since[repo] === undefined) {
@@ -962,6 +1008,8 @@ function syncStarts(coverage: CoverageState, at: number): void {
     for (const owner of accounts) {
         since[accountKey(owner)] ??= at;
     }
+
+    noteBegan(coverage);
 
     for (const key of Object.keys(since)) {
         const covers = key.startsWith("account:")
@@ -1183,15 +1231,31 @@ export function coveredRepos(
     return { repos, accounts };
 }
 
+/** Add 1 miss to the miss log; above `MISS_LOG_MAX`, the oldest go, and the log is complete only after them. */
+function logMiss(alarms: AlarmsState, key: string, at: number): void {
+    const log = (alarms.missLog ??= []);
+
+    log.push({ key, at });
+
+    if (log.length > MISS_LOG_MAX) {
+        const dropped = log.splice(0, log.length - MISS_LOG_MAX);
+        const last = Math.max(...dropped.map((entry) => entry.at));
+
+        alarms.missLogFrom = Math.max(alarms.missLogFrom ?? 0, last + 1);
+    }
+}
+
 /**
  * Evaluate the coverage alarm (every 5 minutes): each observed change of a covered repository that is 30 minutes to 24
  * hours old, and not checked before, is checked once against the accepted facts. A change before the coverage of its
  * repository began (`since`: the earliest start of its repository key and its account key; `0` is unknown) is no miss.
  * No match is a miss; 2 misses of 1 repository and class within 24 hours raise its alarm. Silence alone raises nothing:
  * no rule looks at the time since the last delivery. First a document stored before `since` is migrated from the
- * delivery log (`ensureSince`), and the start of a key that covers no more goes; then the misses before the start are
- * dropped, and a raised alarm whose every miss is before the start is cleared. Returns the keys ("repo|class") it
- * raised. Pure, apart from the documents it changes (never the deliveries).
+ * delivery log (`ensureSince`), `began` keeps each start (`noteBegan`), and the start of a key that covers no more
+ * goes; then the misses before the first coverage (`began`) are dropped, and a raised alarm whose every miss is before
+ * it is cleared. A suspend and unsuspend, or a removal and a new add, makes a new start but never a new `began`: the
+ * misses of the earlier coverage stay, and only a matching delivery clears their alarm. Returns the keys
+ * ("repo|class") it raised. Pure, apart from the documents it changes (never the deliveries).
  */
 export function evaluateCoverage(
     observed: ObservedState,
@@ -1203,6 +1267,9 @@ export function evaluateCoverage(
     const since = ensureSince(coverage, deliveries);
     const { repos, accounts } = coveredRepos(coverage, now);
     const raised: string[] = [];
+
+    // Before a start ends below: `began` keeps the earliest start of each key.
+    noteBegan(coverage);
 
     // Only here does a start end: the start of a key that covers no more goes, so a later coverage begins again.
     for (const key of Object.keys(since)) {
@@ -1226,16 +1293,31 @@ export function evaluateCoverage(
         return starts.length === 0 ? 0 : Math.min(...starts);
     };
 
+    /**
+     * When the first coverage of a repository began (`began`: the earliest of its repository key and its account key):
+     * `0` when neither key has one, or it is unknown. A start that ended does not move it: a later coverage keeps it.
+     */
+    const beganOf = (repo: string): number => {
+        const began = coverage.began ?? {};
+        const starts = [began[repo], began[accountKey(ownerOf(repo))]].filter(
+            (at): at is number => typeof at === "number",
+        );
+
+        return starts.length === 0 ? 0 : Math.min(...starts);
+    };
+
     const timeOf = (change: { at: number; seen: number }) =>
         change.at > 0 ? change.at : change.seen;
 
     /**
-     * A stored miss (the `seen` time of its change) is before the start when the observed changes of that repository and
-     * class seen at that time all have their own time before it; with no such change, the miss time itself is compared.
+     * A stored miss (the `seen` time of its change) is before the first coverage when the observed changes of that
+     * repository and class seen at that time all have their own time before it; with no such change, the miss time itself
+     * is compared. Only the first coverage counts (`beganOf`), not the current start: a miss of an earlier coverage that
+     * ended (a suspend, a removal) was real, and only a matching delivery clears its alarm.
      */
     const missBefore = (key: string, miss: number): boolean => {
         const [repo = "", change = ""] = key.split("|");
-        const start = startOf(repo);
+        const start = beganOf(repo);
 
         if (start === 0) {
             return false;
@@ -1260,6 +1342,17 @@ export function evaluateCoverage(
         }
     }
 
+    // The miss log starts with the first evaluation that knows it; then each entry goes by age, the oldest first.
+    alarms.missLogFrom ??= now;
+
+    const missLog = (alarms.missLog ??= []);
+    const oldest = now - MISS_LOG_MS;
+
+    if (missLog.some((entry) => entry.at < oldest)) {
+        alarms.missLog = missLog.filter((entry) => entry.at >= oldest);
+        alarms.missLogFrom = Math.max(alarms.missLogFrom, oldest);
+    }
+
     for (const [key, times] of Object.entries(alarms.misses)) {
         const kept = times.filter((at) => now - at <= MISS_WINDOW_MS && !missBefore(key, at));
 
@@ -1270,7 +1363,8 @@ export function evaluateCoverage(
         }
     }
 
-    // A raised alarm whose every miss came before the coverage began is false: it is cleared.
+    // A raised alarm whose every miss came before the first coverage began is false (a document stored before the
+    // starts): it is cleared. An alarm of an earlier coverage that ended stays until a matching delivery.
     for (const [key, alarm] of Object.entries(alarms.coverage)) {
         if (
             raisedNow(alarm) &&
@@ -1344,6 +1438,7 @@ export function evaluateCoverage(
         const misses = [...(alarms.misses[key] ?? []), change.seen];
 
         alarms.misses[key] = misses;
+        logMiss(alarms, key, change.seen);
 
         if (misses.length >= MISSES_TO_RAISE && !raisedNow(alarms.coverage[key])) {
             alarms.coverage[key] = { raised: now, misses: [...misses] };

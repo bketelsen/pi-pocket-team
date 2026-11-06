@@ -298,6 +298,7 @@ describe("summarize", () => {
             ],
             coverage: [{ name: "frostyard/x|ci", raised: SINCE + 3 * HOUR, misses: 2 }],
             missesInWindow: 3,
+            missesComplete: false,
         });
 
         const markdown = formatMarkdown(summary);
@@ -307,7 +308,70 @@ describe("summarize", () => {
             markdown,
             /coverage `frostyard\/x\|ci`: raised [^,]+, not cleared, 2 misses\./,
         );
-        assert.match(markdown, /Coverage misses in the window: 3\./);
+        assert.match(
+            markdown,
+            /Coverage misses in the window: at least 3\. The miss log holds every miss only after its first evaluation \(none yet\); before it, only the misses of the last 24 hours and of raised alarms were kept\./,
+        );
+    });
+
+    test("alarms: the miss log counts every miss of a 7-day window, also those the 24-hour list dropped", () => {
+        const UNTIL7 = SINCE + 7 * 24 * HOUR;
+        const week = { since: SINCE, until: UNTIL7 };
+        const base = {
+            system: {},
+            coverage: {},
+            // The 24-hour list holds only the last day: 1 miss.
+            misses: { "frostyard/x|ci": [UNTIL7 - HOUR] },
+            evaluated: {},
+            missLog: [
+                { key: "frostyard/x|ci", at: SINCE - HOUR },
+                { key: "frostyard/x|ci", at: SINCE + HOUR },
+                { key: "frostyard/x|ci", at: SINCE + HOUR },
+                { key: "frostyard/y|head", at: SINCE + 3 * 24 * HOUR },
+                { key: "frostyard/x|ci", at: UNTIL7 - HOUR },
+                { key: "frostyard/x|ci", at: UNTIL7 },
+            ],
+        };
+
+        // The log began before the window: the count is exact, from the log alone.
+        const complete = summarize({ alarms: { ...base, missLogFrom: SINCE - 2 * HOUR } }, week)
+            .alarms as { missesInWindow: number; missesComplete: boolean; missLogFrom: number };
+
+        assert.equal(complete.missesInWindow, 4);
+        assert.equal(complete.missesComplete, true);
+        assert.match(
+            formatMarkdown(summarize({ alarms: { ...base, missLogFrom: SINCE - 2 * HOUR } }, week)),
+            /Coverage misses in the window: 4\.\n/,
+        );
+
+        // The log began inside the window: the log from then, the 2 old lists before; a lower bound.
+        const partial = summarize(
+            {
+                alarms: {
+                    ...base,
+                    coverage: {
+                        "frostyard/z|state": {
+                            raised: SINCE + 2 * HOUR,
+                            misses: [SINCE + 30 * 60_000, SINCE + HOUR],
+                        },
+                    },
+                    missLogFrom: SINCE + 2 * 24 * HOUR,
+                },
+            },
+            week,
+        );
+        const alarms = partial.alarms as { missesInWindow: number; missesComplete: boolean };
+
+        assert.equal(
+            alarms.missesInWindow,
+            2 + 2,
+            "2 logged after its start, 2 from the alarm before it",
+        );
+        assert.equal(alarms.missesComplete, false);
+        assert.match(
+            formatMarkdown(partial),
+            /Coverage misses in the window: at least 4\. The miss log holds every miss only from 2026-/,
+        );
     });
 });
 
@@ -420,7 +484,12 @@ describe("end to end", () => {
                 max: 300,
                 negative: 0,
             });
-            assert.deepEqual(summary.alarms, { system: [], coverage: [], missesInWindow: 0 });
+            assert.deepEqual(summary.alarms, {
+                system: [],
+                coverage: [],
+                missesInWindow: 0,
+                missesComplete: false,
+            });
 
             const { text } = run(["--since", new Date(SINCE).toISOString()]);
 

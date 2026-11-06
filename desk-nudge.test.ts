@@ -28,6 +28,7 @@ import {
     type NudgeFact,
     type ObservedSnap,
     type PrFact,
+    type SharedRead,
     type Thread,
     DeskNudges,
     DeskObserved,
@@ -117,6 +118,83 @@ describe("SyncRunner", () => {
         hold.resolve();
         assert.deepEqual(await Promise.all([first, one, two]), ["first", "follow-up", "follow-up"]);
         assert.equal(runs, 1);
+    });
+
+    test("requests of 3 sources during a sync mark 1 follow-up: 1 read, each caller gets its own result", async () => {
+        const runner = new SyncRunner();
+        const hold = deferred();
+        let reads = 0;
+        const log: string[] = [];
+
+        const read = async () => {
+            reads += 1;
+            await settle();
+
+            return { now: 5, items: [1, 2] };
+        };
+
+        const running = runner.run(1, "sweeper", async (shared) => {
+            await shared(read);
+            await hold.promise;
+            log.push("running");
+
+            return "running";
+        });
+
+        const own = (name: string) => async (shared: SharedRead) => {
+            const facts = await shared(read);
+
+            // A work that changes its facts changes only its own copy.
+            facts.items.push(name.length);
+            log.push(`${name}:${String(facts.items.length)}`);
+
+            return `${name} result`;
+        };
+
+        const sweeper = runner.run(1, "sweeper", own("sweeper"));
+        const sync = runner.run(1, "sync", own("sync"));
+        const nudge = runner.run(1, "nudge", own("nudge"));
+        const sync2 = runner.run(1, "sync", own("never"));
+
+        assert.deepEqual(runner.waiting(1), ["sweeper", "sync", "nudge"], "1 follow-up batch");
+        assert.equal(sync2, sync, "the same source joins with the same promise");
+
+        hold.resolve();
+        assert.deepEqual(await Promise.all([running, sweeper, sync, nudge, sync2]), [
+            "running",
+            "sweeper result",
+            "sync result",
+            "nudge result",
+            "sync result",
+        ]);
+        assert.equal(reads, 2, "1 read for the running sync, 1 for the whole follow-up");
+        assert.deepEqual(log, ["running", "sweeper:3", "sync:3", "nudge:3"]);
+        assert.equal(runner.busy(1), false);
+    });
+
+    test("a failed shared read reaches each work of the batch that reads; the lane goes on", async () => {
+        const runner = new SyncRunner();
+        const hold = deferred();
+        let reads = 0;
+
+        const failing = async () => {
+            reads += 1;
+
+            throw new Error("gh down");
+        };
+
+        const running = runner.run(1, "sweeper", () => hold.promise);
+        const a = runner.run(1, "sync", (shared) => shared(failing));
+        const b = runner.run(1, "nudge", (shared) => shared(failing));
+        const c = runner.run(1, "view", async () => "no read");
+
+        hold.resolve();
+        await running;
+        await assert.rejects(a, /gh down/);
+        await assert.rejects(b, /gh down/);
+        assert.equal(await c, "no read");
+        assert.equal(reads, 1);
+        assert.equal(await runner.run(1, "sync", async () => "after"), "after");
     });
 
     test("different sources queue first in, first out; another supervisor has its own lane", async () => {
@@ -319,6 +397,51 @@ describe("nudgeSupervisors", () => {
 
         assert.deepEqual(nudgeSupervisors(watch(), fact(0), T0), [SUPERVISOR]);
         assert.deepEqual(nudgeSupervisors(watch(true), fact(0), T0), []);
+    });
+
+    test("check_suite numbers: a thread or a watch on any of them matches, not only the first", () => {
+        const state = stateOf([
+            threadOf({ prs: { "frostyard/test#12": { via: "attached", state: "OPEN" } } }),
+            threadOf({
+                id: "T2",
+                supervisor: 42,
+                watch: {
+                    checkOn: "2026-12-01",
+                    check: "it merged",
+                    setAt: T0,
+                    setBy: "brian",
+                    key: "k",
+                    on: { kind: "pr", ref: "frostyard/test#30", event: "merged" },
+                },
+            }),
+        ]);
+        const suite = fact(0, {
+            event: "check_suite",
+            action: "completed",
+            number: 4,
+            numbers: [4, 12, 30],
+            sha: SHA1,
+        });
+
+        assert.deepEqual(nudgeSupervisors(state, suite, T0), [SUPERVISOR, 42]);
+        assert.deepEqual(nudgeSupervisors(state, { ...suite, numbers: [4] }, T0), []);
+
+        // The desk takes it: matched; more than 20 numbers, or a bad one, is invalid.
+        const taken = takeNudges(emptyNudges(), state, [suite], T0);
+
+        assert.equal(taken.result.outcomes[UUIDS[0]!], "matched");
+        assert.deepEqual(taken.result.supervisors, [SUPERVISOR, 42]);
+
+        const many = Array.from({ length: 21 }, (_, index) => index + 1);
+        const bad = takeNudges(
+            emptyNudges(),
+            state,
+            [fact(1, { numbers: many }), fact(2, { numbers: [12, 0] })],
+            T0,
+        );
+
+        assert.equal(bad.result.outcomes[UUIDS[1]!], "invalid");
+        assert.equal(bad.result.outcomes[UUIDS[2]!], "invalid");
     });
 
     test("a sha with no number matches a PR head of a live thread", () => {
