@@ -46,6 +46,10 @@ A `x.desk.sweeper` task sweeps each supervisor's threads every 10 minutes. Its r
 
 `desk list`, `desk sync` and the prompt section say `Unread: T12 (frostyard/x#5, 6 h)` for a PR link that no read gave facts for in more than 30 minutes, `GitHub: last read at 01:47, 6 h ago` when the read is that old, and `Sweep failed at 01:47: <why>` until the next good sweep. The page header shows only the `Unread: …` line.
 
+Every sync of a supervisor (the sweeper, `desk sync`, the page's view sweep, and a nudged sync) runs its reads and its commit in that supervisor's lane, 1 after the other, so an older read never commits after a newer one. A request during a sync waits, or joins the 1 sync of its kind that already waits. The page's view sweep does not wait: when the lane is busy, the page shows what the desk has.
+
+A hooks module can hand the desk facts of GitHub webhook deliveries with `nudge` on the desk's API. The desk takes each delivery id once (a redelivery changes nothing). A fact about a PR or an issue on a thread, a PR a watch waits for, a PR head, or the issue queue makes that supervisor's next sync come early: 20 seconds after the first fact, and at most 1 such sync in 60 seconds, by the durable task `x.desk.nudge`. So 50 deliveries in 20 seconds are 1 sync. The fact only decides when to read: the sync's own GitHub read is the truth. Each sweep also records the changes it saw on PRs and queued issues (state, labels, review, head, CI), for a later alarm that compares them with the deliveries.
+
 The sweep also wakes an agent when every PR on its thread is merged or closed, tells a session once when its PR conflicts or its checks fail, removes the label `ready-for-human` when the PR changes after it, and archives the idle sessions of closed threads.
 
 ## Turn it on
@@ -56,7 +60,7 @@ Install the files, then turn on **Desk** in **Menu → Extensions**. Team must b
 
 `PI_POCKET_DESK_CONFIG` names the config file, default `~/.config/pi-pocket-team/desk.json`, and every part reads it each time, so a change needs no restart. Its keys include `authors`, `ownAuthors`, `cap`, `export`, `exportCommit`, `digest`, `queue`, `journal`, `plans` and `archive`.
 
-2 Pocket documents hold the desk: `x.desk.threads` (the app-wide desk) and `x.desk.reports` (one thread session's full reports). They are stored data: never rename a kind or change what a field means. The page and its routes are owner-only.
+These Pocket documents hold the desk: `x.desk.threads` (the app-wide desk), `x.desk.reports` (one thread session's full reports), `x.desk.nudges` (the delivery ids the desk took, the waiting nudges, and for each nudged sync its delivery times and its commit time) and `x.desk.observed` (the changes the sweeps saw, for the hooks' coverage alarm). They are stored data: never rename a kind or change what a field means. The page and its routes are owner-only.
 
 ## Read more
 

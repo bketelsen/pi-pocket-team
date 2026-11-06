@@ -5361,6 +5361,8 @@ const prFact = (patch: Partial<PrFact> = {}): PrFact => ({
     ready: false,
     readyAt: 0,
     headAt: 0,
+    mergedAt: 0,
+    closedAt: 0,
     feedback: [],
     failing: [],
     archived: false,
