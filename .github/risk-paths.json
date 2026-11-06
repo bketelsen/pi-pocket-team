@@ -52,6 +52,18 @@
         {
             "glob": "terminal.ts",
             "why": "auth: the owner-only routes to an interactive login shell as the server's user"
+        },
+        {
+            "glob": "desk.ts",
+            "why": "auth: the owner-only Desk routes, and the desk file route that must keep each read inside its root"
+        },
+        {
+            "glob": "model-router.ts",
+            "why": "secrets and credentials: reads the TypeSafe API key setting, sends it as a bearer token, and redacts it from errors"
+        },
+        {
+            "glob": "night-shift.ts",
+            "why": "auth: only the owner may set a night shift's check command, which runs with the owner's rights and no Lancet Guard"
         }
     ]
 }
