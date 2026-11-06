@@ -20,6 +20,8 @@
         "desk-dashboard-fixture.ts",
         "desk-plans-fixture.ts",
         "desk.ts",
-        "terminal.ts"
+        "terminal.ts",
+        "github-hooks-fixture.ts",
+        "github-hooks.ts"
     ]
 }

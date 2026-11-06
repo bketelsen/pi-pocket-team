@@ -64,6 +64,10 @@
         {
             "glob": "night-shift.ts",
             "why": "auth: only the owner may set a night shift's check command, which runs with the owner's rights and no Lancet Guard"
+        },
+        {
+            "glob": "github-hooks.ts",
+            "why": "auth: the webhook listener on a LAN port, HMAC verification, and the webhook secret file"
         }
     ]
 }

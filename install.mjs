@@ -31,6 +31,7 @@ const MODULES = [
     "desk-web",
     "terminal.ts",
     "terminal-web",
+    "github-hooks.ts",
 ];
 
 /**
