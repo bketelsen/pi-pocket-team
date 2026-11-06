@@ -64,7 +64,8 @@ Gaps:
 - **Model and thinking level actually used.** The router records what it would pick, and the goal records the named
   `worker`. No module of this repository records the thinking level asked for or used per session.
 - **Router coverage.** Closed: a route, with the brief's features (version 1) and its SHA-256 (`briefHash`), is
-  recorded on every `team_delegate` delegation, not only a night shift (a plan start has none). R1 still counts night
+  recorded on every `team_delegate` delegation, not only a night shift (a plan start and a Clerk start
+  have none). R1 still counts night
   shifts only.
 - **Wall time and rounds are partial.** A goal keeps only its newest 30 rounds (`KEPT_ROUNDS`), and a new goal in the
   same session writes over the old one. A thread keeps only its newest 50 events.

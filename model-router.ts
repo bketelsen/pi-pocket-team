@@ -28,7 +28,7 @@
  * OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 import { createHash } from "node:crypto";
-import { readFileSync, readdirSync, statSync } from "node:fs";
+import { readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { isIPv4, isIPv6 } from "node:net";
 import { homedir } from "node:os";
@@ -762,7 +762,7 @@ export type Features = {
     demand?: number;
     /** The brief's length in characters (code points), before masking. */
     briefChars: number;
-    /** Distinct paths the masked brief names: tokens with a `/` or a known file extension; never a URL or a roster repository. */
+    /** Distinct tokens of the masked brief that hold a `/` or end in a known file extension; never a URL. */
     pathsNamed: number;
     /** Distinct `owner/name` tokens that are repositories on the team roster. */
     reposNamed: number;
@@ -781,9 +781,6 @@ export type FeatureOptions = {
     /** The host names `maskBrief` takes out (this machine's SSH hosts). */
     hostNames?: readonly string[];
 };
-
-/** The most paths `features` looks at in the folders: a long brief costs no more file reads than this. */
-const MAX_PATHS_READ = 50;
 
 /** The test files `testsBeside` looks for in a named path's folder. */
 const TEST_FILE = /(?:_test\.go|\.test\.ts|\.test\.mjs)$|^test_.*\.py$/;
@@ -806,9 +803,9 @@ function cleanToken(token: string): string {
         .replace(/^\.\//, "");
 }
 
-/** A token that names a path: it holds a `/` or ends in a known file extension, and it holds a letter. */
+/** A token that names a path: it holds a `/` or ends in a known file extension. A token of only `/` and `.` names none. */
 function isPathToken(token: string): boolean {
-    if (!/[A-Za-z]/.test(token) || token.startsWith("//")) {
+    if (!/[^/.]/.test(token)) {
         return false;
     }
 
@@ -860,8 +857,9 @@ function languageOf(dir: string | undefined): Features["language"] {
 }
 
 /**
- * A named path as a `/`-separated path inside `dir`: an absolute one only when it is inside `dir`, a relative one only
- * when it stays inside. Undefined otherwise: no file outside the repository is ever read.
+ * A named path as a `/`-separated path inside `dir`, by its text: an absolute one only when it is inside `dir`, a
+ * relative one only when it stays inside. Undefined otherwise. The risk globs match this text; a file read also needs
+ * `realInside`.
  */
 function insideRepo(dir: string, path: string): string | undefined {
     const root = resolve(dir);
@@ -875,12 +873,38 @@ function insideRepo(dir: string, path: string): string | undefined {
     return rel.split(sep).join("/");
 }
 
-/** The globs of a folder's `.github/risk-paths.json`, or undefined when it is absent, unreadable or not a list. */
-function riskGlobs(dir: string): string[] | undefined {
+/**
+ * `target` as the file system resolves it (symbolic links followed), when that is inside `realRoot` (the folder's own
+ * resolved path); else undefined. Every file read of `features` goes through it: a link to a place outside the
+ * repository is never followed.
+ */
+function realInside(realRoot: string, target: string): string | undefined {
+    let real: string;
+
     try {
-        const parsed = JSON.parse(
-            readFileSync(join(dir, ".github", "risk-paths.json"), "utf8"),
-        ) as { paths?: unknown } | null;
+        real = realpathSync(target);
+    } catch {
+        return undefined;
+    }
+
+    const rel = relative(realRoot, real);
+
+    return rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel) ? undefined : real;
+}
+
+/**
+ * The globs of a folder's `.github/risk-paths.json`, or undefined when it is absent, unreadable, not a list, or a link
+ * to a file outside the folder.
+ */
+function riskGlobs(dir: string, realRoot: string): string[] | undefined {
+    const file = realInside(realRoot, join(dir, ".github", "risk-paths.json"));
+
+    if (file === undefined) {
+        return undefined;
+    }
+
+    try {
+        const parsed = JSON.parse(readFileSync(file, "utf8")) as { paths?: unknown } | null;
 
         if (!Array.isArray(parsed?.paths)) {
             return undefined;
@@ -1014,8 +1038,9 @@ export function matchRiskGlob(glob: string, path: string): boolean {
 /**
  * The facts of a delegation known when it starts (version 1): Jev's judgments when `analysis` is given, and what the
  * brief and the repository folders show. It makes no network call and never throws. It reads only the folders'
- * marker files, their risk paths lists, and the folders of named paths inside them. The brief is masked first
- * (`maskBrief`), so a URL or a host never counts as a path.
+ * marker files, their risk paths lists, and the folders of named paths inside them, each by its resolved path: a
+ * symbolic link to a place outside a folder is never followed. The brief is masked first (`maskBrief`), so a URL or a
+ * host never counts as a path.
  */
 export function features(
     brief: string,
@@ -1035,20 +1060,28 @@ export function features(
 
         const token = cleanToken(raw);
 
+        // A roster repository is a repository and, by its `/`, a path too: the 2 counts are separate.
         if (roster.has(token.toLowerCase())) {
             repos.add(token.toLowerCase());
-        } else if (isPathToken(token)) {
+        }
+
+        if (isPathToken(token)) {
             paths.add(token);
         }
     }
 
-    const dirs = repoDirs.filter((dir) => dir !== "" && folderAt(dir) !== undefined);
-    const named = [...paths].slice(0, MAX_PATHS_READ);
+    // Each folder with its resolved path: the reads below never leave it, through a symbolic link either.
+    const dirs = repoDirs.flatMap((dir) => {
+        const real = dir === "" || folderAt(dir) === undefined ? undefined : realInside(dir, dir);
+
+        return real === undefined ? [] : [{ dir, real }];
+    });
+    const named = [...paths];
     let riskPathNamed: boolean | null = null;
     let testsBeside: boolean | null = null;
 
-    for (const dir of dirs) {
-        const globs = riskGlobs(dir);
+    for (const { dir, real } of dirs) {
+        const globs = riskGlobs(dir, real);
 
         if (globs === undefined) {
             continue;
@@ -1056,6 +1089,7 @@ export function features(
 
         riskPathNamed ??= false;
 
+        // The globs match the path's text: no file is read for it.
         for (const path of named) {
             const rel = insideRepo(dir, path);
 
@@ -1068,7 +1102,10 @@ export function features(
     if (named.length > 0 && dirs.length > 0) {
         testsBeside = false;
 
-        for (const dir of dirs) {
+        // Each folder is read once, however many named paths share it.
+        const read = new Set<string>();
+
+        for (const { dir, real } of dirs) {
             for (const path of named) {
                 const rel = insideRepo(dir, path);
 
@@ -1077,12 +1114,20 @@ export function features(
                 }
 
                 const full = join(dir, rel);
-                const folder = folderAt(full) ?? folderAt(dirname(full));
+                const self = realInside(real, full);
+                const folder =
+                    self !== undefined && folderAt(self) !== undefined
+                        ? self
+                        : realInside(real, dirname(full));
+
+                if (folder === undefined || read.has(folder) || folderAt(folder) === undefined) {
+                    continue;
+                }
+
+                read.add(folder);
 
                 try {
-                    testsBeside =
-                        folder !== undefined &&
-                        readdirSync(folder).some((name) => TEST_FILE.test(name));
+                    testsBeside = readdirSync(folder).some((name) => TEST_FILE.test(name));
                 } catch {
                     // An unreadable folder holds no test that counts.
                 }

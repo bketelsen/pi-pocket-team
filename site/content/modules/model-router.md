@@ -10,7 +10,7 @@ The code keeps Brian's 3 rules:
 
 1. **Shadow mode only.** The router records its suggestion. It never changes a model, a worker, or a thinking level. The linked session still starts on the profile model, exactly as it does without the router.
 2. **The brief goes to Jev masked.** URLs, emails, IP addresses, network host names, the host names in `~/.ssh/config`, and secret-like tokens become `[url]`, `[email]`, `[ip]`, `[host]` and `[secret]` before the call. A repository name such as `bketelsen/pi-pocket` and a file name such as `team.ts` stay.
-3. **Every delegation, and a named worker still wins.** The router runs on every `team_delegate` delegation, a night shift or not (a plan start has none). When `night_shift.worker` names a model, that worker runs, and the route records the worker so the audit can compare the 2. The route changes no model, no worker and no tool result.
+3. **Every delegation, and a named worker still wins.** The router runs on every `team_delegate` delegation, a night shift or not (a plan start and a Clerk start have none). When `night_shift.worker` names a model, that worker runs, and the route records the worker so the audit can compare the 2. The route changes no model, no worker and no tool result.
 
 ## Settings
 

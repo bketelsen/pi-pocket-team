@@ -1,7 +1,7 @@
 // The model router's pure parts: the masking, the Jev body and answer, the decision, the tiers file, the record's line,
 // and the one HTTP call (with a fake fetch: no network). Nothing here starts a server or reads a real file.
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -1074,7 +1074,7 @@ test("features: briefChars counts the brief's characters before masking, by code
     );
 });
 
-test("features: pathsNamed counts distinct paths, and never a URL, a host or a roster repository", () => {
+test("features: pathsNamed counts distinct tokens with a `/` or a file extension, and never a URL or a host", () => {
     const brief = [
         "Change `model-router.ts` and team.ts:120, then docs/modules/model-router.md.",
         "Read ./team.ts again (team.ts), and audit/checks.mjs:10:4.",
@@ -1083,13 +1083,19 @@ test("features: pathsNamed counts distinct paths, and never a URL, a host or a r
     ].join("\n");
     const counted = features(brief, [], undefined, { roster: ["bketelsen/pi-pocket-team"] });
 
-    // model-router.ts, team.ts, docs/modules/model-router.md, audit/checks.mjs.
-    assert.equal(counted.pathsNamed, 4);
+    // model-router.ts, team.ts, docs/modules/model-router.md, audit/checks.mjs, bketelsen/pi-pocket-team (a roster
+    // repository holds a `/`: it is a path too, and the 2 counts are separate) and 1.8/3.
+    assert.equal(counted.pathsNamed, 6);
     assert.equal(counted.reposNamed, 1);
 
-    // Without the roster, a repository name holds a `/`: it counts as a path.
     assert.equal(features("bketelsen/pi-pocket-team", []).pathsNamed, 1);
     assert.equal(features("", []).pathsNamed, 0);
+    assert.equal(features("2026/12 and 数据/2026", []).pathsNamed, 2, "no letter is needed");
+    assert.equal(
+        features("a / b, ./ and ..", []).pathsNamed,
+        0,
+        "only slashes and dots name nothing",
+    );
     // An SSH host name is masked first: it is no path.
     assert.equal(
         features("frostbox.sh", [], undefined, { hostNames: ["frostbox.sh"] }).pathsNamed,
@@ -1335,7 +1341,8 @@ test("every route records features and the brief's hash: shadow, off, no key, an
     const base = {
         v: 1,
         briefChars: [...brief].length,
-        pathsNamed: 1,
+        // store.go, and frostyard/test (a roster repository holds a `/`).
+        pathsNamed: 2,
         reposNamed: 1,
         language: "go",
         riskPathNamed: null,
@@ -1417,5 +1424,66 @@ test("a route with no folders and no roster still records the brief's features",
         });
     } finally {
         off.dispose();
+    }
+});
+
+test("features: every path counts for the risk and test flags, not only the first 50", async () => {
+    const repo = await repoWith({
+        ".github/risk-paths.json": RISK_LIST,
+        "model-router.ts": "",
+        "pkg/store_test.go": "",
+    });
+    const ordinary = Array.from({ length: 50 }, (_, index) => `docs/n${String(index)}.md`).join(
+        " ",
+    );
+
+    try {
+        const risk = features(`${ordinary} model-router.ts`, [repo.dir]);
+
+        assert.equal(risk.pathsNamed, 51);
+        assert.equal(risk.riskPathNamed, true, "the 51st path is a risk path");
+
+        const tests = features(`${ordinary} pkg/store.go`, [repo.dir]);
+
+        assert.equal(tests.testsBeside, true, "a test beside the 51st path");
+    } finally {
+        await repo.done();
+    }
+});
+
+test("features: a symbolic link out of the folder is never followed", async () => {
+    const outside = await repoWith({
+        "x.test.ts": "",
+        "risk-paths.json": RISK_LIST,
+        ".github/risk-paths.json": RISK_LIST,
+    });
+    const repo = await repoWith({ "go.mod": "module x" });
+    const linkedList = await repoWith({ "go.mod": "module x" });
+
+    try {
+        // A folder link: a named path through it would read the outside folder.
+        await symlink(outside.dir, join(repo.dir, "linked"));
+        assert.equal(features("Change linked/x.ts", [repo.dir]).testsBeside, false);
+        assert.equal(features("Look in linked/", [repo.dir]).testsBeside, false);
+
+        // A linked list, and a linked `.github` folder: neither is read.
+        await mkdir(join(linkedList.dir, ".github"));
+        await symlink(
+            join(outside.dir, "risk-paths.json"),
+            join(linkedList.dir, ".github", "risk-paths.json"),
+        );
+        assert.equal(features("Change model-router.ts", [linkedList.dir]).riskPathNamed, null);
+        await symlink(join(outside.dir, ".github"), join(repo.dir, ".github"));
+        assert.equal(features("Change model-router.ts", [repo.dir]).riskPathNamed, null);
+
+        // A link that stays inside the folder is read as usual.
+        await mkdir(join(linkedList.dir, "src"));
+        await writeFile(join(linkedList.dir, "src", "a_test.go"), "");
+        await symlink(join(linkedList.dir, "src"), join(linkedList.dir, "alias"));
+        assert.equal(features("Change alias/a.go", [linkedList.dir]).testsBeside, true);
+    } finally {
+        await repo.done();
+        await linkedList.done();
+        await outside.done();
     }
 });
