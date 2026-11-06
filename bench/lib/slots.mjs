@@ -23,13 +23,16 @@ export async function halogenConcurrency(data) {
     return Number.isInteger(value) && value >= 1 ? value : 1;
 }
 
-/** The cap of a provider: `maxProvider` when given (load test only), else halogen's file, else 2. */
+/**
+ * The cap of a provider. Every provider but halogen: 2, whatever `maxProvider` says. Halogen: `maxProvider` when
+ * given (`--max-provider` or `BENCH_MAX_PROVIDER`, load test only), else the `concurrency` of `halogen.json`.
+ */
 export async function providerCap(data, provider, maxProvider) {
-    if (maxProvider != null) {
-        return maxProvider;
+    if (provider !== "halogen") {
+        return MAX_PROVIDER;
     }
 
-    return provider === "halogen" ? halogenConcurrency(data) : MAX_PROVIDER;
+    return maxProvider != null ? maxProvider : halogenConcurrency(data);
 }
 
 /** The pid that a slot file holds, or null. */

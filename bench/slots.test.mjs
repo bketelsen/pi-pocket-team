@@ -76,6 +76,17 @@ test("halogen's cap comes from halogen.json, 1 by default", async () => {
     assert.ok(await tryAcquire(data, "halogen", { ...as(3006), maxProvider: 4 }));
 });
 
+test("--max-provider raises only halogen's cap: other providers stay at 2", async () => {
+    const data = fresh();
+    const override = (pid) => ({ ...as(pid), maxProvider: 4 });
+
+    assert.ok(await tryAcquire(data, "github-copilot", override(4001)));
+    assert.ok(await tryAcquire(data, "github-copilot", override(4002)));
+    assert.equal(await tryAcquire(data, "github-copilot", override(4003)), null);
+    assert.ok(await tryAcquire(data, "halogen", override(4004)));
+    assert.ok(await tryAcquire(data, "halogen", override(4005)));
+});
+
 test("a slot file of a dead process is free (real pids)", async () => {
     const data = fresh();
     const dead = spawnSync(process.execPath, ["-e", "0"]).pid;

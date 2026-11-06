@@ -14,6 +14,18 @@ export function killGroup(pid, signal) {
     }
 }
 
+/**
+ * The usage limit that a run has reached, or null: "cost" for a priced model at or over `costLeft`, "tokens" for an
+ * unpriced model at or over `tokensLeft`. The usage includes compaction (see `usageTracker`).
+ */
+export function limitReached({ priced, usage, costLeft, tokensLeft }) {
+    if (priced) {
+        return usage.cost >= costLeft ? "cost" : null;
+    }
+
+    return usage.tokens >= tokensLeft ? "tokens" : null;
+}
+
 /** The children running now, so a signal to the runner can end them. */
 export const running = new Set();
 
@@ -75,7 +87,8 @@ export function runLogged({ bin, args, logFile, timeoutMs, killGraceMs = 10_000 
 
 /**
  * Run Pi in the sandbox and read its JSON stream. Each line goes to `eventsFile` (mode 0600) as it comes.
- * Limits: `wallMs`; `costLeft` for a priced model, `tokensLeft` for an unpriced one. At a limit the whole group
+ * Limits: `wallMs`; `costLeft` for a priced model, `tokensLeft` for an unpriced one, reached at or over them
+ * (`limitReached`). At a limit the whole group
  * gets SIGTERM, then SIGKILL after `killGraceMs`.
  * Returns `{ summary, code, signal, limit, wallMs, error }` (`limit`: null, "wall", "cost" or "tokens").
  */
@@ -129,10 +142,10 @@ export function runStreamed({
 
             const usage = tracker.usage();
 
-            if (priced && usage.cost > costLeft) {
-                stop("cost");
-            } else if (!priced && usage.tokens > tokensLeft) {
-                stop("tokens");
+            const reached = limitReached({ priced, usage, costLeft, tokensLeft });
+
+            if (reached) {
+                stop(reached);
             }
         };
 

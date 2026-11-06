@@ -10,8 +10,11 @@ import {
     readFileSync,
     writeFileSync,
 } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
+import { allowanceSpent } from "./lib/runner.mjs";
+import { limitReached } from "./lib/proc.mjs";
 import { rm } from "node:fs/promises";
 import {
     BENCH,
@@ -35,8 +38,12 @@ let fixture;
 let manifest;
 const markers = { cost: sleepMarker(), wall: sleepMarker() };
 
+const gate = {};
+
 before(async () => {
     fixture = makeFixture();
+    gate.started = join(fixture.root, "gate-started");
+    gate.open = join(fixture.root, "gate-open");
     manifest = writeManifest(fixture, [
         fixtureTask(fixture, "ok", { name: "ok" }),
         fixtureTask(fixture, "ok-again", { name: "ok" }),
@@ -47,6 +54,12 @@ before(async () => {
         fixtureTask(fixture, "no-final", { name: "no-final" }),
         fixtureTask(fixture, "bad-setup", { name: "ok" }, { setup: "exit 1" }),
         fixtureTask(fixture, "budget", { name: "ok" }),
+        fixtureTask(fixture, "compaction", { name: "compaction" }),
+        fixtureTask(fixture, "gate", { name: "gate", started: gate.started, gate: gate.open }),
+        fixtureTask(fixture, "lock-dead", { name: "ok" }),
+        fixtureTask(fixture, "retry-tight", { name: "error-then-ok" }),
+        fixtureTask(fixture, "exact-cost", { name: "ok" }),
+        fixtureTask(fixture, "exact-tokens", { name: "ok" }),
     ]);
     await setBudget(fixture, 100);
 });
@@ -60,6 +73,23 @@ const run = (task, model = PRICED, extra = []) =>
         [...fixtureArgs(fixture, manifest), "--task", task, "--model", model, ...extra],
         testEnv(fixture),
     );
+
+const SLUG = PRICED.replaceAll("/", "__");
+
+/** The settled entries of 1 task in the spend file. */
+const entriesOf = (task) => spend().entries.filter((e) => e.task === task);
+
+/** Run with the halogen lease of thread T1064 in the fixture's lease dir. */
+async function withLease(fn) {
+    mkdirSync(join(fixture.leases, "halogen"), { recursive: true });
+    writeFileSync(join(fixture.leases, "halogen", "info"), "resource=halogen\nthread=T1064\n");
+
+    try {
+        return await fn();
+    } finally {
+        await rm(join(fixture.leases, "halogen"), { recursive: true, force: true });
+    }
+}
 
 /** The spend file of the fixture. */
 const spend = () => JSON.parse(readFileSync(join(fixture.data, "spend.json"), "utf8"));
@@ -236,6 +266,12 @@ test("a provider error is retried once on a fresh clone; both tries count", asyn
     assert.deepEqual(JSON.parse(readFileSync(join(record.workDir, "fresh.json"), "utf8")), {
         try1Present: false,
     });
+
+    // 1 reservation for the attempt, settled once with both tries.
+    assert.deepEqual(
+        entriesOf("error-then-ok").map((e) => [e.tries, e.cost, e.tokens, e.priced]),
+        [[2, 0.02, 300, true]],
+    );
 });
 
 test("a provider error on the retry too: failure provider", async () => {
@@ -272,7 +308,11 @@ test("a failing setup is a harness failure: 3 tries, then exit 3", async () => {
         record.tryLog.map((entry) => entry.outcome),
         ["harness", "harness", "harness"],
     );
-    assert.equal(spend().reservations.length, 0, "every try settled");
+    assert.equal(spend().reservations.length, 0, "the attempt settled");
+    assert.deepEqual(
+        entriesOf("bad-setup").map((e) => [e.tries, e.cost]),
+        [[3, 0]],
+    );
 });
 
 test("the budget guard refuses with exit 2 and spends nothing", async () => {
@@ -285,6 +325,149 @@ test("the budget guard refuses with exit 2 and spends nothing", async () => {
     assert.equal(result.code, 2, result.stderr);
     assert.match(result.stderr, /budget refused/);
     assert.deepEqual(spend(), before);
-    assert.equal(existsSync(join(fixture.data, "runs", "pilot", "budget")), false);
+    assert.equal(existsSync(join(fixture.data, "runs", "pilot", "budget", SLUG)), false);
+    assert.equal(existsSync(join(fixture.data, "runs", "pilot", "budget", `${SLUG}.lock`)), false);
     assert.ok(!readdirSync(join(fixture.results, "pilot")).includes("budget"));
+});
+
+test("compaction usage reaches the result and the settled spend", async () => {
+    const before = spend().settled;
+    const result = await run("compaction");
+
+    assert.equal(result.code, 0, result.stderr);
+
+    const record = readResult(fixture, "pilot", "compaction", PRICED);
+
+    // Compaction: 1000 + 200 tokens, $0.05; then the message: 150 tokens, $0.01.
+    assert.equal(record.usage.cost, 0.06);
+    assert.equal(record.usage.tokens, 1350);
+    assert.equal(record.tryLog[0].cost, 0.06);
+    assert.deepEqual(
+        entriesOf("compaction").map((e) => [e.cost, e.tokens]),
+        [[0.06, 1350]],
+    );
+    assert.equal(Math.round((spend().settled - before) * 1e6) / 1e6, 0.06);
+});
+
+test("2 runs of the same attempt at once: only 1 runs Pi, the other exits 1", async () => {
+    const first = run("gate");
+
+    await waitFor(() => existsSync(gate.started), 20_000, "Pi of the first run to start");
+
+    const second = await run("gate");
+
+    assert.equal(second.code, 1, second.stdout + second.stderr);
+    assert.match(second.stderr, /attempt already running: stage pilot, task gate/);
+
+    writeFileSync(gate.open, "");
+
+    const done = await first;
+
+    assert.equal(done.code, 0, done.stderr);
+    assert.deepEqual(readdirSync(join(fixture.data, "runs", "pilot", "gate", SLUG)), ["try-1"]);
+    assert.equal(existsSync(join(fixture.data, "runs", "pilot", "gate", `${SLUG}.lock`)), false);
+    assert.equal(entriesOf("gate").length, 1);
+});
+
+test("an attempt lock of a dead pid is free", async () => {
+    const lock = join(fixture.data, "runs", "pilot", "lock-dead", `${SLUG}.lock`);
+    const dead = spawnSync(process.execPath, ["-e", "0"]).pid;
+
+    mkdirSync(lock, { recursive: true });
+    writeFileSync(join(lock, "pid"), String(dead));
+
+    const result = await run("lock-dead");
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(readResult(fixture, "pilot", "lock-dead", PRICED).failure, null);
+    assert.equal(existsSync(lock), false);
+});
+
+test("a retry is not refused by the budget after a paid try (1 reservation per attempt)", async () => {
+    const now = spend();
+    // The cap takes all that is left: a second reservation would be refused.
+    const free = Math.round((now.budget - now.settled) * 1e6) / 1e6;
+    const result = await run("retry-tight", PRICED, ["--cost-limit", String(free)]);
+
+    assert.equal(result.code, 0, result.stderr);
+
+    const record = readResult(fixture, "pilot", "retry-tight", PRICED);
+
+    assert.equal(record.tries, 2);
+    assert.equal(record.failure, null);
+    assert.deepEqual(
+        entriesOf("retry-tight").map((e) => [e.tries, e.cost]),
+        [[2, 0.02]],
+    );
+});
+
+test("a zero limit for the limit that counts is a usage error", async (t) => {
+    const cases = {
+        "--cost-limit 0 for a priced model": [
+            PRICED,
+            "--cost-limit",
+            "0",
+            /--cost-limit must be above 0/,
+        ],
+        "--token-limit 0 for an unpriced model": [
+            UNPRICED,
+            "--token-limit",
+            "0",
+            /--token-limit must be above 0/,
+        ],
+    };
+
+    for (const [name, [model, flag, value, message]] of Object.entries(cases)) {
+        await t.test(name, async () => {
+            const result = await withLease(() => run("ok", model, [flag, value]));
+
+            assert.equal(result.code, 1, result.stdout + result.stderr);
+            assert.match(result.stderr, message);
+        });
+    }
+});
+
+test("a priced run that reaches the cost limit exactly is a limit", async () => {
+    const result = await run("exact-cost", PRICED, ["--cost-limit", "0.01"]);
+
+    assert.equal(result.code, 0, result.stderr);
+
+    const record = readResult(fixture, "pilot", "exact-cost", PRICED);
+
+    assert.equal(record.usage.cost, 0.01);
+    assert.equal(record.failure, "limit");
+});
+
+test("an unpriced run that reaches the token limit exactly is a limit", async () => {
+    const result = await withLease(() => run("exact-tokens", UNPRICED, ["--token-limit", "150"]));
+
+    assert.equal(result.code, 0, result.stderr);
+
+    const record = readResult(fixture, "pilot", "exact-tokens", UNPRICED);
+
+    assert.equal(record.usage.tokens, 150);
+    assert.equal(record.failure, "limit");
+});
+
+test("the limit checks stop at the boundary, and no retry starts on a used-up allowance", () => {
+    const usage = { cost: 8, tokens: 4_000_000 };
+
+    assert.equal(limitReached({ priced: true, usage, costLeft: 8, tokensLeft: 1 }), "cost");
+    assert.equal(limitReached({ priced: true, usage, costLeft: 8.01, tokensLeft: 1 }), null);
+    assert.equal(
+        limitReached({ priced: false, usage, costLeft: 0, tokensLeft: 4_000_000 }),
+        "tokens",
+    );
+    assert.equal(limitReached({ priced: false, usage, costLeft: 0, tokensLeft: 4_000_001 }), null);
+
+    const limits = { wallMs: 1000, costUsd: 8, tokens: 4_000_000 };
+
+    assert.equal(allowanceSpent(limits, { wallMs: 1000, cost: 0, tokens: 0 }, true), "wall");
+    assert.equal(allowanceSpent(limits, { wallMs: 999, cost: 8, tokens: 0 }, true), "cost");
+    assert.equal(allowanceSpent(limits, { wallMs: 999, cost: 7.99, tokens: 9e9 }, true), null);
+    assert.equal(
+        allowanceSpent(limits, { wallMs: 0, cost: 9, tokens: 4_000_000 }, false),
+        "tokens",
+    );
+    assert.equal(allowanceSpent(limits, { wallMs: 0, cost: 9, tokens: 3_999_999 }, false), null);
 });

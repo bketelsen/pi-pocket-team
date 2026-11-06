@@ -30,12 +30,12 @@ node bench/report.mjs --stage pilot
 
 ## Exit codes of `run.mjs`
 
-| Code | Meaning                                                                                                                                         |
-| ---- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
-| 0    | Attempt recorded (also a failed attempt, a limit, or a result that exists: then it prints `exists` and does nothing).                           |
-| 1    | Usage error: a bad argument, an unknown task or model, a model not in `bench/models.json`, halogen without the lease, `bwrap` missing.          |
-| 2    | Budget refused, or a DeepSeek attempt in DeepSeek's peak hours. Nothing is spent.                                                               |
-| 3    | Harness failure after 3 tries (setup failed, auth pre-flight failed, or Pi ended before any assistant message). The result has `harness: true`. |
+| Code | Meaning                                                                                                                                                                                                                                                                                    |
+| ---- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| 0    | Attempt recorded (also a failed attempt, a limit, or a result that exists: then it prints `exists` and does nothing).                                                                                                                                                                      |
+| 1    | Usage error: a bad argument, an unknown task or model, a model not in `bench/models.json`, halogen without the lease, `bwrap` missing, a limit of 0 for the limit that counts (`--cost-limit` of a priced model, `--token-limit` of an unpriced one), or the same attempt already running. |
+| 2    | Budget refused, or a DeepSeek attempt in DeepSeek's peak hours. Nothing is spent.                                                                                                                                                                                                          |
+| 3    | Harness failure after 3 tries (setup failed, auth pre-flight failed, or Pi ended before any assistant message). The result has `harness: true`.                                                                                                                                            |
 
 `--dry-run` validates everything and prints the bwrap argv and the budget state; it reserves, clones and starts nothing, and needs no `bwrap`, data dir or auth file.
 
@@ -65,7 +65,8 @@ Before each try of an OAuth provider, the runner refreshes the token on the host
 
 ## Limits and retries
 
-- Per attempt: 45 minutes of Pi wall time; $8 of list cost for a priced model, 4,000,000 tokens for an unpriced one. The limits count over all tries of the attempt. At a limit: SIGTERM to the process group, SIGKILL after 10 s, `failure: "limit"`.
+- Per attempt: 45 minutes of Pi wall time; $8 of list cost for a priced model, 4,000,000 tokens for an unpriced one. The limits count over all tries of the attempt, and a limit is reached at its value (not only above it). The usage includes automatic compaction (`compaction_end` `result.usage`). At a limit: SIGTERM to the process group, SIGKILL after 10 s, `failure: "limit"`. A retry does not start when the attempt's allowance is used up: `failure: "limit"`.
+- Budget: an attempt reserves its cap once (the cost limit for a priced model, $0 for an unpriced one), keeps it across its retries, and settles the sum of all its tries once at the end (the entry holds `tries`). A priced model always settles its real cost; an unpriced model settles $0 and keeps its tokens.
 - A provider error (`stopReason: "error"` on the last assistant message): 1 retry on a fresh clone; then `failure: "provider"`.
 - A harness failure: 2 repeats on a fresh clone, then `harness: true` and exit 3.
 - A stream with no final event, or with an assistant message that did not end: `usage.partial: true`.
@@ -75,7 +76,9 @@ Before each try of an OAuth provider, the runner refreshes the token on the host
 
 The data dir is `$BENCH_DATA`, else `~/.local/share/pi-pocket-team/bench` (folders 0700, files 0600). It holds `spend.json` (the budget), `slots/`, `halogen.json`, `agent/`, `agent-files/` and `runs/<stage>/<task>/<model-slug>[--<run-id>]/try-<n>/` with `work/`, `session/`, `cache/`, `events.jsonl` and `stderr.log`. Run folders are kept; a new run of the same attempt continues the try numbers. Result files go to `bench/results/` (ignored by git) or `--results`.
 
-Concurrency: at most 4 tries on the host and 2 per provider; halogen at most the `concurrency` of `halogen.json` (1 before the load test). Halogen needs the lease: `~/.pi/agent/bin/lease take halogen T1064 "bench"` (`batch.mjs` and `load-test.mjs` take it themselves).
+Attempt lock: `runs/<stage>/<task>/<model-slug>[--<run-id>].lock` (with the pid) is held from before the result-exists check until the result is written; a second runner of the same attempt exits 1. A lock of a dead pid is free.
+
+Concurrency: at most 4 tries on the host and 2 per provider; halogen at most the `concurrency` of `halogen.json` (1 before the load test). `--max-provider` and `BENCH_MAX_PROVIDER` (load test only) change only halogen's cap. Halogen needs the lease: `~/.pi/agent/bin/lease take halogen T1064 "bench"` (`batch.mjs` and `load-test.mjs` take it themselves).
 
 ## Tests
 

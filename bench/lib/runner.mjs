@@ -34,6 +34,7 @@ import {
 } from "./manifest.mjs";
 import { addUsage, zeroUsage } from "./stream.mjs";
 import { killAll, runLogged, runStreamed } from "./proc.mjs";
+import { takeAttemptLock } from "./lock.mjs";
 
 /** The limits of an attempt. */
 export const LIMITS = {
@@ -145,6 +146,22 @@ export async function prepare(argv, env = process.env) {
     }
 
     const [, repoName] = task.repo.split("/");
+    const limits = {
+        wallMs: numberOption(values, "wall-limit", LIMITS.wallMs),
+        costUsd: numberOption(values, "cost-limit", LIMITS.costUsd),
+        tokens: numberOption(values, "token-limit", LIMITS.tokens, { integer: true }),
+        setupMs: numberOption(values, "setup-timeout", LIMITS.setupMs),
+        killGraceMs: numberOption(values, "kill-grace", LIMITS.killGraceMs),
+    };
+
+    // The limit that counts must leave room for a try: a priced model's cost, an unpriced model's tokens.
+    if (model.priced && !(limits.costUsd > 0)) {
+        throw new UsageError(`--cost-limit must be above 0 for the priced model ${model.id}`);
+    }
+
+    if (!model.priced && !(limits.tokens > 0)) {
+        throw new UsageError(`--token-limit must be above 0 for the unpriced model ${model.id}`);
+    }
 
     return {
         task,
@@ -165,13 +182,7 @@ export async function prepare(argv, env = process.env) {
         maxProvider,
         slotPollMs:
             Number(env.BENCH_SLOT_POLL_MS) > 0 ? Number(env.BENCH_SLOT_POLL_MS) : SLOT_POLL_MS,
-        limits: {
-            wallMs: numberOption(values, "wall-limit", LIMITS.wallMs),
-            costUsd: numberOption(values, "cost-limit", LIMITS.costUsd),
-            tokens: numberOption(values, "token-limit", LIMITS.tokens, { integer: true }),
-            setupMs: numberOption(values, "setup-timeout", LIMITS.setupMs),
-            killGraceMs: numberOption(values, "kill-grace", LIMITS.killGraceMs),
-        },
+        limits,
         env,
     };
 }
@@ -270,12 +281,28 @@ async function prepareAgentDir(ctx) {
     await writeFile(join(files, "settings.json"), "{}\n", { mode: 0o600 });
 }
 
-/** The cap that 1 try reserves: the cost limit for a priced model, 0 for an unpriced one. */
+/** The cap that an attempt reserves once, for all its tries: the cost limit for a priced model, 0 for an unpriced one. */
 const capOf = (ctx) => (ctx.model.priced ? ctx.limits.costUsd : 0);
 
 /**
- * 1 try: reserve, take the slots, pre-flight, clone, setup, then Pi. The reservation is settled and the slots are
- * released whatever happens. Returns the try's log line, its usage and stream, or `{ outcome: "budget" }`.
+ * The attempt allowance that the tries so far have used up, or null: "wall", or "cost" for a priced model, or
+ * "tokens" for an unpriced one. A retry starts only when this is null.
+ */
+export function allowanceSpent(limits, used, priced) {
+    if (used.wallMs >= limits.wallMs) {
+        return "wall";
+    }
+
+    if (priced) {
+        return used.cost >= limits.costUsd ? "cost" : null;
+    }
+
+    return used.tokens >= limits.tokens ? "tokens" : null;
+}
+
+/**
+ * 1 try: take the slots, pre-flight, clone, setup, then Pi. The slots are released whatever happens.
+ * Returns the try's log line, its usage and its stream.
  */
 async function runTry(ctx, tryNo, used, prompt, log) {
     const paths = tryPaths(ctx, tryNo);
@@ -288,125 +315,141 @@ async function runTry(ctx, tryNo, used, prompt, log) {
         exitCode: null,
         signal: null,
     };
+    let usage = zeroUsage();
+    let stream = null;
+
+    await privateDir(paths.dir);
+    await privateDir(paths.session);
+
+    for (const cache of ["go", "npm", "pip"]) {
+        await privateDir(join(paths.cache, cache));
+    }
+
+    const slots = await acquireSlots(ctx.data, ctx.provider, {
+        maxProvider: ctx.maxProvider,
+        wait: () => delay(ctx.slotPollMs),
+    });
+
+    try {
+        const harness = (why) => {
+            log(`try ${tryNo}: harness failure: ${why}`);
+            entry.outcome = "harness";
+
+            return { entry, usage, stream };
+        };
+
+        if (
+            ctx.authPreflight &&
+            (await authType(paths.auth, ctx.provider)) === "oauth" &&
+            !(await authPreflight(ctx))
+        ) {
+            return harness("auth pre-flight failed");
+        }
+
+        try {
+            await scratchClone({
+                checkout: ctx.checkout,
+                work: paths.work,
+                parent: ctx.task.parent,
+                merge: ctx.task.merge,
+            });
+        } catch (error) {
+            return harness(`scratch clone: ${error.message.split("\n")[0]}`);
+        }
+
+        const sandbox = (command) => bwrapArgs(paths, { tryNo, command });
+        const setup = await runLogged({
+            bin: ctx.bwrap,
+            args: sandbox(setupCommand(ctx.task.setup)),
+            logFile: paths.stderr,
+            timeoutMs: ctx.limits.setupMs,
+            killGraceMs: ctx.limits.killGraceMs,
+        });
+
+        if (setup.code !== 0) {
+            return harness(
+                setup.timedOut
+                    ? "setup timed out"
+                    : `setup failed (exit ${setup.code ?? setup.signal ?? setup.error})`,
+            );
+        }
+
+        const run = await runStreamed({
+            bin: ctx.bwrap,
+            args: sandbox(piCommand(ctx.model.id, prompt)),
+            eventsFile: paths.events,
+            logFile: paths.stderr,
+            wallMs: ctx.limits.wallMs - used.wallMs,
+            priced: ctx.model.priced,
+            costLeft: ctx.limits.costUsd - used.cost,
+            tokensLeft: ctx.limits.tokens - used.tokens,
+            killGraceMs: ctx.limits.killGraceMs,
+        });
+
+        usage = run.summary.usage;
+        stream = run.summary.stream;
+        Object.assign(entry, {
+            wallMs: run.wallMs,
+            cost: usage.cost,
+            tokens: usage.tokens,
+            exitCode: run.code,
+            signal: run.signal,
+        });
+
+        if (run.limit) {
+            log(`try ${tryNo}: ${run.limit} limit reached`);
+            entry.outcome = "limit";
+        } else if (!run.summary.sawAssistantStart) {
+            return harness(
+                `Pi ended before any assistant message (exit ${run.code ?? run.signal ?? run.error})`,
+            );
+        } else if (run.summary.providerError) {
+            log(`try ${tryNo}: provider error`);
+            entry.outcome = "provider";
+        } else {
+            entry.outcome = "ok";
+        }
+
+        return { entry, usage, stream };
+    } finally {
+        await slots.release();
+    }
+}
+
+/**
+ * Run the tries of an attempt and write its result. Returns the exit code. The attempt reserves its cap once, keeps
+ * it across its retries, and settles the sum of all tries once at the end, whatever happens.
+ */
+export async function runAttempt(ctx, log = console.error) {
     const reservation = await reserve(ctx.data, {
         task: ctx.task.id,
         model: ctx.model.id,
         stage: ctx.stage,
-        try: tryNo,
+        priced: Boolean(ctx.model.priced),
         cap: capOf(ctx),
     });
 
     if (!reservation.ok) {
-        return { entry: { ...entry, outcome: "budget" }, reason: reservation.reason };
+        log(reservation.reason);
+
+        return 2;
     }
 
-    let usage = zeroUsage();
-    let stream = null;
+    const tally = { usage: zeroUsage(), tries: 0 };
 
     try {
-        await privateDir(paths.dir);
-        await privateDir(paths.session);
-
-        for (const cache of ["go", "npm", "pip"]) {
-            await privateDir(join(paths.cache, cache));
-        }
-
-        const slots = await acquireSlots(ctx.data, ctx.provider, {
-            maxProvider: ctx.maxProvider,
-            wait: () => delay(ctx.slotPollMs),
-        });
-
-        try {
-            const harness = (why) => {
-                log(`try ${tryNo}: harness failure: ${why}`);
-                entry.outcome = "harness";
-
-                return { entry, usage, stream };
-            };
-
-            if (
-                ctx.authPreflight &&
-                (await authType(paths.auth, ctx.provider)) === "oauth" &&
-                !(await authPreflight(ctx))
-            ) {
-                return harness("auth pre-flight failed");
-            }
-
-            try {
-                await scratchClone({
-                    checkout: ctx.checkout,
-                    work: paths.work,
-                    parent: ctx.task.parent,
-                    merge: ctx.task.merge,
-                });
-            } catch (error) {
-                return harness(`scratch clone: ${error.message.split("\n")[0]}`);
-            }
-
-            const sandbox = (command) => bwrapArgs(paths, { tryNo, command });
-            const setup = await runLogged({
-                bin: ctx.bwrap,
-                args: sandbox(setupCommand(ctx.task.setup)),
-                logFile: paths.stderr,
-                timeoutMs: ctx.limits.setupMs,
-                killGraceMs: ctx.limits.killGraceMs,
-            });
-
-            if (setup.code !== 0) {
-                return harness(
-                    setup.timedOut
-                        ? "setup timed out"
-                        : `setup failed (exit ${setup.code ?? setup.signal ?? setup.error})`,
-                );
-            }
-
-            const run = await runStreamed({
-                bin: ctx.bwrap,
-                args: sandbox(piCommand(ctx.model.id, prompt)),
-                eventsFile: paths.events,
-                logFile: paths.stderr,
-                wallMs: ctx.limits.wallMs - used.wallMs,
-                priced: ctx.model.priced,
-                costLeft: ctx.limits.costUsd - used.cost,
-                tokensLeft: ctx.limits.tokens - used.tokens,
-                killGraceMs: ctx.limits.killGraceMs,
-            });
-
-            usage = run.summary.usage;
-            stream = run.summary.stream;
-            Object.assign(entry, {
-                wallMs: run.wallMs,
-                cost: usage.cost,
-                tokens: usage.tokens,
-                exitCode: run.code,
-                signal: run.signal,
-            });
-
-            if (run.limit) {
-                log(`try ${tryNo}: ${run.limit} limit reached`);
-                entry.outcome = "limit";
-            } else if (!run.summary.sawAssistantStart) {
-                return harness(
-                    `Pi ended before any assistant message (exit ${run.code ?? run.signal ?? run.error})`,
-                );
-            } else if (run.summary.providerError) {
-                log(`try ${tryNo}: provider error`);
-                entry.outcome = "provider";
-            } else {
-                entry.outcome = "ok";
-            }
-
-            return { entry, usage, stream };
-        } finally {
-            await slots.release();
-        }
+        return await runTries(ctx, tally, log);
     } finally {
-        await settle(ctx.data, reservation.id, { cost: usage.cost, tokens: usage.tokens });
+        await settle(ctx.data, reservation.id, {
+            cost: tally.usage.cost,
+            tokens: tally.usage.tokens,
+            tries: tally.tries,
+        });
     }
 }
 
-/** Run the tries of an attempt and write its result. Returns the exit code. */
-export async function runAttempt(ctx, log = console.error) {
+/** The tries of an attempt, and its result file. `tally` holds the usage and tries so far, for the settlement. */
+async function runTries(ctx, tally, log) {
     const prompt = await promptOf(ctx.task);
     const startedAt = new Date().toISOString();
     const used = { wallMs: 0, cost: 0, tokens: 0 };
@@ -423,16 +466,20 @@ export async function runAttempt(ctx, log = console.error) {
     await prepareAgentDir(ctx);
 
     for (;;) {
-        const result = await runTry(ctx, tryNo, used, prompt, log);
+        const spent = tryLog.length ? allowanceSpent(ctx.limits, used, ctx.model.priced) : null;
 
-        if (result.entry.outcome === "budget") {
-            log(result.reason);
-
-            return 2;
+        if (spent) {
+            log(`no retry: the attempt's ${spent} allowance is used up`);
+            failure = "limit";
+            break;
         }
+
+        const result = await runTry(ctx, tryNo, used, prompt, log);
 
         tryLog.push(result.entry);
         usage = addUsage(usage, result.usage);
+        tally.usage = usage;
+        tally.tries = tryLog.length;
         stream = result.stream ?? stream;
         workDir = tryPaths(ctx, tryNo).work;
         used.wallMs += result.entry.wallMs;
@@ -533,6 +580,26 @@ async function dryRun(ctx) {
     return 0;
 }
 
+/** A usage error as exit 1; any other error is thrown. */
+function usageFail(error) {
+    if (error instanceof UsageError) {
+        console.error(`${error.message}\n${USAGE}`);
+
+        return 1;
+    }
+
+    throw error;
+}
+
+/** Halogen needs the lease of thread T1064. */
+async function checkLease(ctx, env) {
+    if (ctx.provider === "halogen" && !(await holdsHalogenLease(env))) {
+        throw new UsageError(
+            `halogen needs the lease: ~/.pi/agent/bin/lease take halogen T1064 "bench" (looked in ${leaseDir(env)})`,
+        );
+    }
+}
+
 /** The runner's main: returns the exit code. */
 export async function main(argv = process.argv.slice(2), env = process.env) {
     let ctx;
@@ -540,23 +607,46 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
     try {
         ctx = await prepare(argv, env);
 
+        if (ctx.dryRun) {
+            await checkLease(ctx, env);
+
+            return await dryRun(ctx);
+        }
+    } catch (error) {
+        return usageFail(error);
+    }
+
+    // The attempt lock comes before the result-exists check and the try selection, and holds until the result is
+    // written: 2 runners of the same attempt never run at once.
+    const lock = await takeAttemptLock(ctx.data, ctx.ids);
+
+    if (!lock.ok) {
+        console.error(
+            `attempt already running: stage ${ctx.stage}, task ${ctx.task.id}, model ${ctx.model.id}${ctx.runId ? `, run id ${ctx.runId}` : ""} (pid ${lock.pid} holds ${lock.path})`,
+        );
+
+        return 1;
+    }
+
+    try {
+        return await runLocked(ctx, env);
+    } finally {
+        await lock.release();
+    }
+}
+
+/** The runner's work under the attempt lock. */
+async function runLocked(ctx, env) {
+    try {
         const file = resultPath(ctx.results, ctx.ids);
 
-        if (!ctx.dryRun && existsSync(file)) {
+        if (existsSync(file)) {
             console.log(`exists ${file}`);
 
             return 0;
         }
 
-        if (ctx.provider === "halogen" && !(await holdsHalogenLease(env))) {
-            throw new UsageError(
-                `halogen needs the lease: ~/.pi/agent/bin/lease take halogen T1064 "bench" (looked in ${leaseDir(env)})`,
-            );
-        }
-
-        if (ctx.dryRun) {
-            return await dryRun(ctx);
-        }
+        await checkLease(ctx, env);
 
         const bwrap = findProgram(ctx.bwrap, env);
 
@@ -577,13 +667,7 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
             }
         }
     } catch (error) {
-        if (error instanceof UsageError) {
-            console.error(`${error.message}\n${USAGE}`);
-
-            return 1;
-        }
-
-        throw error;
+        return usageFail(error);
     }
 
     if (inPeak(ctx.model, new Date())) {

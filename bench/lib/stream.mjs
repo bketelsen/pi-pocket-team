@@ -1,6 +1,7 @@
 // Reading Pi's JSON event stream: strict LF framing on bytes, usage totals, and stream timing.
 // The authoritative usage of an assistant message is `message_end.message.usage`; while it streams, the latest
-// `message_update.usage` is its cumulative usage. Total = the ended messages + the in-flight one.
+// `message_update.usage` is its cumulative usage. Total = the ended messages + the in-flight one + the usage of each
+// `compaction_end` (`result.usage`).
 
 /**
  * A byte splitter: `push(chunk)` returns the complete lines (LF only, an optional CR before it stripped), `end()`
@@ -157,6 +158,13 @@ export function usageTracker() {
                         messages.push({ ...message, endAt: at, output: usage.output });
                         open = null;
                         inflight = null;
+                    }
+
+                    break;
+                case "compaction_end":
+                    // Automatic compaction calls the model too: its usage counts like an assistant message's.
+                    if (event.result?.usage) {
+                        ended = addUsage(ended, normalUsage(event.result.usage));
                     }
 
                     break;

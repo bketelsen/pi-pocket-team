@@ -76,6 +76,32 @@ test("a complete run is not partial; stopReason error on the last message is a p
     assert.equal(summary.providerError, true);
 });
 
+test("compaction usage (compaction_end result.usage) counts in the total", () => {
+    const tracker = usageTracker();
+
+    tracker.push({ type: "compaction_start", reason: "threshold" }, 0);
+    tracker.push(
+        {
+            type: "compaction_end",
+            reason: "threshold",
+            result: { usage: usage(1000, 200, 0.05, 30) },
+        },
+        1,
+    );
+    assert.equal(tracker.usage().cost, 0.05);
+    assert.equal(tracker.usage().tokens, 1230);
+
+    // An aborted compaction has no result.
+    tracker.push({ type: "compaction_end", reason: "threshold", aborted: true }, 2);
+    tracker.push({ type: "message_start", message: { role: "assistant" } }, 3);
+    tracker.push(
+        { type: "message_end", message: { role: "assistant", usage: usage(100, 50, 0.01) } },
+        4,
+    );
+    assert.equal(tracker.usage().cost, 0.06);
+    assert.equal(tracker.usage().tokens, 1380);
+});
+
 test("a run with no assistant message", () => {
     const summary = usageTracker().summary();
 

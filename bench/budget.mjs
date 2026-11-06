@@ -40,7 +40,7 @@ if (command === "set") {
 
     for (const r of spend.reservations) {
         console.log(
-            `  reserved $${r.cap} ${r.stage} ${r.task} ${r.model} try ${r.try} pid ${r.pid} at ${r.at}`,
+            `  reserved $${r.cap} ${r.stage} ${r.task} ${r.model}${r.priced === false ? " (unpriced)" : ""} pid ${r.pid} at ${r.at}`,
         );
     }
 } else if (command === "reap") {

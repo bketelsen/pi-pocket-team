@@ -1,6 +1,7 @@
 // The budget guard: `<data>/spend.json` holds the budget, the settled spend, open reservations and settled entries.
 // Every read-modify-write holds the lock `spend.json.lock` (a mkdir lock, stale after 60 s) and writes the file
-// atomically. A try reserves its cap before it starts and settles its real list cost after it ends.
+// atomically. An attempt reserves its cap once before its first try, keeps it across its retries, and settles the
+// real list cost of all its tries once at the end.
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { pidAlive, privateDir, readJson, withDirLock, writeJsonAtomic } from "./common.mjs";
@@ -70,10 +71,11 @@ export function setBudget(data, budget, options) {
 }
 
 /**
- * Reserve `cap` dollars for 1 try. Refused when no budget is set, or when settled + reserved + cap > budget.
+ * Reserve `cap` dollars for 1 attempt (all its tries). Refused when no budget is set, or when
+ * settled + reserved + cap > budget. `priced` is false only for a model with no list price.
  * Returns `{ ok: true, id }` or `{ ok: false, reason }`.
  */
-export function reserve(data, { task, model, stage, try: tryNo, cap, pid = process.pid }, options) {
+export function reserve(data, { task, model, stage, priced, cap, pid = process.pid }, options) {
     return update(
         data,
         (spend) => {
@@ -100,7 +102,7 @@ export function reserve(data, { task, model, stage, try: tryNo, cap, pid = proce
                 task,
                 model,
                 stage,
-                try: tryNo,
+                priced: Boolean(priced),
                 cap,
                 pid,
                 at: new Date().toISOString(),
@@ -112,8 +114,14 @@ export function reserve(data, { task, model, stage, try: tryNo, cap, pid = proce
     );
 }
 
-/** Settle a reservation: remove it and add an entry with its real cost and tokens. */
-export function settle(data, id, { cost, tokens }, options) {
+/** A reservation's model is priced (older reservations have no flag: a cap above 0 meant priced). */
+const isPriced = (r) => (typeof r.priced === "boolean" ? r.priced : r.cap > 0);
+
+/**
+ * Settle a reservation: remove it and add an entry with the real cost and tokens of the attempt's tries. A priced
+ * model's real cost counts even when its cap was 0; an unpriced model settles 0, and its tokens are kept.
+ */
+export function settle(data, id, { cost, tokens, tries }, options) {
     return update(
         data,
         (spend) => {
@@ -124,7 +132,7 @@ export function settle(data, id, { cost, tokens }, options) {
             }
 
             const [r] = spend.reservations.splice(index, 1);
-            const real = r.cap === 0 ? 0 : usd(cost);
+            const real = isPriced(r) ? usd(Number(cost) || 0) : 0;
 
             spend.settled = usd(spend.settled + real);
             spend.entries.push({
@@ -132,7 +140,8 @@ export function settle(data, id, { cost, tokens }, options) {
                 task: r.task,
                 model: r.model,
                 stage: r.stage,
-                try: r.try,
+                priced: isPriced(r),
+                tries,
                 cost: real,
                 tokens,
                 at: new Date().toISOString(),
@@ -145,7 +154,7 @@ export function settle(data, id, { cost, tokens }, options) {
 }
 
 /**
- * Settle each reservation whose pid is dead at its full cap (the try's real cost is unknown).
+ * Settle each reservation whose pid is dead at its full cap (the attempt's real cost is unknown).
  * Returns the reaped reservations.
  */
 export function reap(data, { alive = pidAlive } = {}, options) {
@@ -161,7 +170,8 @@ export function reap(data, { alive = pidAlive } = {}, options) {
                     task: r.task,
                     model: r.model,
                     stage: r.stage,
-                    try: r.try,
+                    priced: isPriced(r),
+                    tries: null,
                     cost: r.cap,
                     tokens: null,
                     reaped: true,

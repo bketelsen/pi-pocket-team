@@ -90,6 +90,41 @@ switch (scenario.name) {
         break;
     }
 
+    case "compaction":
+        // Automatic compaction: a model call whose usage comes only in compaction_end.
+        emit({ type: "compaction_start", reason: "threshold" });
+        emit({
+            type: "compaction_end",
+            reason: "threshold",
+            result: {
+                summary: "s",
+                firstKeptEntryId: "e",
+                tokensBefore: 1,
+                usage: usage(1000, 200, 0.05),
+            },
+            aborted: false,
+            willRetry: false,
+        });
+        whole(usage(100, 50, 0.01));
+        break;
+
+    case "gate": {
+        // Tell the test that Pi runs (a host path: only behind the fake bwrap), then wait for its gate file.
+        writeFileSync(scenario.started, String(process.pid));
+        assistantStart();
+        const timer = setInterval(() => {
+            if (existsSync(scenario.gate)) {
+                clearInterval(timer);
+                const u = usage(100, 50, 0.01);
+
+                assistantEnd(u, "stop");
+                finish();
+            }
+        }, 20);
+
+        break;
+    }
+
     case "cost":
         background();
         assistantStart();
