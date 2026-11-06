@@ -15,7 +15,7 @@ import {
     until,
 } from "./_pocket/test/helpers.ts";
 import assert from "node:assert/strict";
-import { cpSync, mkdirSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
 import { fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
@@ -28,6 +28,7 @@ import {
     type NudgeFact,
     type ObservedSnap,
     type PrFact,
+    type SharedRead,
     type Thread,
     DeskNudges,
     DeskObserved,
@@ -117,6 +118,135 @@ describe("SyncRunner", () => {
         hold.resolve();
         assert.deepEqual(await Promise.all([first, one, two]), ["first", "follow-up", "follow-up"]);
         assert.equal(runs, 1);
+    });
+
+    test("requests of 3 sources during a sync mark 1 follow-up: 1 read, each caller gets its own result", async () => {
+        const runner = new SyncRunner();
+        const hold = deferred();
+        let reads = 0;
+        const log: string[] = [];
+
+        const read = async () => {
+            reads += 1;
+            await settle();
+
+            return { now: 5, items: [1, 2] };
+        };
+
+        const running = runner.run(1, "sweeper", async (shared) => {
+            await shared(read);
+            await hold.promise;
+            log.push("running");
+
+            return "running";
+        });
+
+        const own = (name: string) => async (shared: SharedRead) => {
+            const facts = await shared(read);
+
+            // A work that changes its facts changes only its own copy.
+            facts.items.push(name.length);
+            log.push(`${name}:${String(facts.items.length)}`);
+
+            return `${name} result`;
+        };
+
+        const sweeper = runner.run(1, "sweeper", own("sweeper"));
+        const sync = runner.run(1, "sync", own("sync"));
+        const nudge = runner.run(1, "nudge", own("nudge"));
+        const sync2 = runner.run(1, "sync", own("never"));
+
+        assert.deepEqual(runner.waiting(1), ["sweeper", "sync", "nudge"], "1 follow-up batch");
+        assert.equal(sync2, sync, "the same source joins with the same promise");
+
+        hold.resolve();
+        assert.deepEqual(await Promise.all([running, sweeper, sync, nudge, sync2]), [
+            "running",
+            "sweeper result",
+            "sync result",
+            "nudge result",
+            "sync result",
+        ]);
+        assert.equal(reads, 2, "1 read for the running sync, 1 for the whole follow-up");
+        assert.deepEqual(log, ["running", "sweeper:3", "sync:3", "nudge:3"]);
+        assert.equal(runner.busy(1), false);
+    });
+
+    test("a failed shared read reaches each work of the batch that reads; the lane goes on", async () => {
+        const runner = new SyncRunner();
+        const hold = deferred();
+        let reads = 0;
+
+        const failing = async () => {
+            reads += 1;
+
+            throw new Error("gh down");
+        };
+
+        const running = runner.run(1, "sweeper", () => hold.promise);
+        const a = runner.run(1, "sync", (shared) => shared(failing));
+        const b = runner.run(1, "nudge", (shared) => shared(failing));
+        const c = runner.run(1, "view", async () => "no read");
+
+        hold.resolve();
+        await running;
+        await assert.rejects(a, /gh down/);
+        await assert.rejects(b, /gh down/);
+        assert.equal(await c, "no read");
+        assert.equal(reads, 1);
+        assert.equal(await runner.run(1, "sync", async () => "after"), "after");
+    });
+
+    test("every prepare of a batch runs before its first read; a prepare that throws rejects only its own work", async () => {
+        const runner = new SyncRunner();
+        const hold = deferred();
+        const log: string[] = [];
+        const running = runner.run(1, "sweeper", () => hold.promise);
+        const sync = runner.run(1, "sync", async (shared) => {
+            await shared(async () => {
+                log.push("read");
+            });
+            log.push("sync:commit");
+
+            return "sync";
+        });
+        const nudge = runner.run(
+            1,
+            "nudge",
+            async (shared) => {
+                await shared(async () => {
+                    log.push("never: the batch read already");
+                });
+                log.push("nudge:commit");
+
+                return "nudge";
+            },
+            {
+                prepare: async () => {
+                    log.push("nudge:claim");
+                },
+            },
+        );
+        let ran = false;
+        const failing = runner.run(
+            1,
+            "view",
+            async () => {
+                ran = true;
+            },
+            {
+                prepare: async () => {
+                    throw new Error("claim failed");
+                },
+            },
+        );
+
+        hold.resolve();
+        await running;
+        assert.deepEqual(await Promise.all([sync, nudge]), ["sync", "nudge"]);
+        await assert.rejects(failing, /claim failed/);
+        assert.equal(ran, false, "its work never runs");
+        assert.deepEqual(log, ["nudge:claim", "read", "sync:commit", "nudge:commit"]);
     });
 
     test("different sources queue first in, first out; another supervisor has its own lane", async () => {
@@ -319,6 +449,51 @@ describe("nudgeSupervisors", () => {
 
         assert.deepEqual(nudgeSupervisors(watch(), fact(0), T0), [SUPERVISOR]);
         assert.deepEqual(nudgeSupervisors(watch(true), fact(0), T0), []);
+    });
+
+    test("check_suite numbers: a thread or a watch on any of them matches, not only the first", () => {
+        const state = stateOf([
+            threadOf({ prs: { "frostyard/test#12": { via: "attached", state: "OPEN" } } }),
+            threadOf({
+                id: "T2",
+                supervisor: 42,
+                watch: {
+                    checkOn: "2026-12-01",
+                    check: "it merged",
+                    setAt: T0,
+                    setBy: "brian",
+                    key: "k",
+                    on: { kind: "pr", ref: "frostyard/test#30", event: "merged" },
+                },
+            }),
+        ]);
+        const suite = fact(0, {
+            event: "check_suite",
+            action: "completed",
+            number: 4,
+            numbers: [4, 12, 30],
+            sha: SHA1,
+        });
+
+        assert.deepEqual(nudgeSupervisors(state, suite, T0), [SUPERVISOR, 42]);
+        assert.deepEqual(nudgeSupervisors(state, { ...suite, numbers: [4] }, T0), []);
+
+        // The desk takes it: matched; more than 20 numbers, or a bad one, is invalid.
+        const taken = takeNudges(emptyNudges(), state, [suite], T0);
+
+        assert.equal(taken.result.outcomes[UUIDS[0]!], "matched");
+        assert.deepEqual(taken.result.supervisors, [SUPERVISOR, 42]);
+
+        const many = Array.from({ length: 21 }, (_, index) => index + 1);
+        const bad = takeNudges(
+            emptyNudges(),
+            state,
+            [fact(1, { numbers: many }), fact(2, { numbers: [12, 0] })],
+            T0,
+        );
+
+        assert.equal(bad.result.outcomes[UUIDS[1]!], "invalid");
+        assert.equal(bad.result.outcomes[UUIDS[2]!], "invalid");
     });
 
     test("a sha with no number matches a PR head of a live thread", () => {
@@ -1302,5 +1477,100 @@ describe("nudge in Pocket", () => {
             ]),
             [["frostyard/test", 7, "pr", "head", Date.parse("2026-11-10T11:00:00Z")]],
         );
+    });
+
+    test("a nudge in a batch after desk sync claims before the shared read: a delivery during the read waits for the next sync", async () => {
+        const runner = sharedRunnerOfApp();
+        const supervisor = Number(supervisorId);
+        const key = String(supervisor);
+        const hold = join(root, "gh-hold");
+        const reading = join(root, "gh-reading");
+        const api = deskApi()!;
+
+        // The fake gh waits while `hold` exists, and marks that a read waits.
+        writeFileSync(
+            fakeGh,
+            `#!/bin/sh\nif [ -f ${JSON.stringify(hold)} ]; then touch ${JSON.stringify(reading)}; while [ -f ${JSON.stringify(hold)} ]; do sleep 0.02; done; fi\ncat ${JSON.stringify(fixturePath)}\n`,
+            { mode: 0o755 },
+        );
+
+        try {
+            let release: (() => void) | undefined;
+            const held = runner.run(supervisor, "test", async () => {
+                await new Promise<void>((resolve) => {
+                    release = resolve;
+                });
+            });
+
+            await until(() => release !== undefined, "the test work holds the lane");
+
+            // 1: desk sync waits in the lane first.
+            const call = say(
+                app,
+                supervisorId,
+                `run-tool desk ${JSON.stringify({ action: "sync" })}`,
+            );
+
+            await until(() => runner.waiting(supervisor).includes("sync"), "desk sync waits");
+
+            // 2: a nudge that is due at once (no gap: no last sync), whose task joins the same batch after it.
+            await app.harness.commit(async (tx) => {
+                delete (await tx.doc(DeskNudges)).last[key];
+            }, context);
+
+            const first = facts(1, 300);
+
+            await app.harness.commit(async (tx) => {
+                await api.nudge!(tx, first, Date.now() + shift - 30_000);
+            }, context);
+            await until(
+                () => runner.waiting(supervisor).join(",") === "sync,nudge",
+                "the nudge joins the batch after desk sync",
+            );
+
+            // 3: the batch starts; its read waits at gh.
+            writeFileSync(hold, "");
+            release!();
+            await held;
+            await until(() => existsSync(reading), "the batch's read waits at gh");
+            await until(
+                async () => (await nudgesNow()).running[key] !== undefined,
+                "the nudge claimed before the read",
+            );
+
+            // 4: a delivery during the read.
+            const second = facts(1, 301);
+
+            await app.harness.commit(async (tx) => {
+                await api.nudge!(tx, second, Date.now() + shift);
+            }, context);
+
+            rmSync(hold);
+            await call;
+            await until(
+                async () => (await nudgesNow()).running[key] === undefined,
+                "the nudged sync committed",
+            );
+
+            const nudges = await nudgesNow();
+            const sync = nudges.syncs[nudges.syncs.length - 1]!;
+
+            assert.deepEqual(
+                sync.deliveries.map((one) => one.id),
+                [first[0]!.delivery],
+                "the sync covers only the delivery claimed before its read",
+            );
+            assert.deepEqual(
+                nudges.pending[key]?.deliveries.map((one) => one.id),
+                [second[0]!.delivery],
+                "the delivery during the read waits for the next sync",
+            );
+        } finally {
+            rmSync(hold, { force: true });
+            rmSync(reading, { force: true });
+            writeFileSync(fakeGh, `#!/bin/sh\ncat ${JSON.stringify(fixturePath)}\n`, {
+                mode: 0o755,
+            });
+        }
     });
 });

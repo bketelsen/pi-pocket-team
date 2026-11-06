@@ -13,7 +13,7 @@ Files: `github-hooks.ts`. It works with the Desk module; with the desk off, it o
 
 `/github-hooks` shows the listener, the receiver, the secret state (never its value), the counts by outcome, the last accepted delivery, the facts that wait for the desk, and each alarm. Only the owner runs it.
 
-For a report over many days, `node audit/github-hooks.mjs --since <go-live time>` (in a checkout of this repository) reads Pocket's database read-only and prints the deliveries by outcome, the delays from delivery to sync and from GitHub change to sweep, and the alarms.
+For a report over many days, `node audit/github-hooks.mjs --since <go-live time>` (in a checkout of this repository) reads Pocket's database read-only and prints the deliveries by outcome, the delays from delivery to sync and from GitHub change to sweep, and the alarms, with the count of coverage misses in the window (exact from the time the miss log began, else marked "at least").
 
 ## What it accepts
 
@@ -31,7 +31,7 @@ A reload hands the receiver to the new code. With the module turned off, the rec
 
 ## Alarms
 
-Silence raises nothing: a quiet weekend is normal. The coverage alarm compares the changes the desk's sweep saw with the deliveries: 2 changes of 1 class (state, labels, review, head, CI) in 1 repository with no matching delivery within 24 hours raise a warning for that repository and class. Only a change after the coverage of its repository began counts: a new installation raises nothing for the changes before it. Other alarms: the port could not be bound, the secret is missing or short, the dedupe set is full, and no receiver runs.
+Silence raises nothing: a quiet weekend is normal. The coverage alarm compares the changes the desk's sweep saw with the deliveries: 2 changes of 1 class (state, labels, review, head, CI) in 1 repository with no matching delivery within 24 hours raise a warning for that repository and class. Only a change after the coverage of its repository began counts: a new installation raises nothing for the changes before it. Only a matching delivery clears a raised alarm: a suspend and unsuspend, or a repository removed and added again, does not. Other alarms: the port could not be bound, the secret is missing or short, the dedupe set is full, and no receiver runs.
 
 ## Read more
 
