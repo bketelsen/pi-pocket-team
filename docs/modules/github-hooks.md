@@ -134,8 +134,8 @@ node audit/github-hooks.mjs --since <ISO time or ms> [--until <ISO time or ms>] 
 
 - `x.github-hooks.deliveries`: the log entries with `at` in the window, by outcome, and the `accepted` ones by event; the all-time `counts`, `dropped` and `last`. When the log holds 2000 entries and its oldest is after `--since`, it says that the log is cut.
 - `x.desk.nudges`: each entry of `syncs` whose `started` is in the window. A sync with `committed` 0 counts as failed. For the others, the delay `committed - at` of each delivery: n, median, P90 and max, in seconds.
-- `x.desk.observed`: each change with `at` above 0, the delay `seen - at`, by class (`state`, `labels`, `review`, `head`, `ci`), in 2 groups: the baseline (`seen` before `--since`) and after (`seen` in the window): n, median and P90. It says the oldest `seen` the document still holds (it keeps the newest 2000 changes, so the baseline is short).
-- `x.github-hooks.alarms`: each system and coverage alarm with its raise and clear times, and the count of coverage misses in the window (from `misses`, which keeps 24 hours, and from each coverage alarm's own `misses`).
+- `x.desk.observed`: each change with `at` above 0, the delay `seen - at`, by class (`state`, `labels`, `review`, `head`, `ci`), in 2 groups: the baseline (`seen` before `--since`) and after (`seen` in the window): n, median and P90. `seen` is the time the sweep started, not the time of its read, so a delay is an estimate; a change after the start (`at` after `seen`, a negative delay) is counted apart as `negative`, and is not in the median or P90. It says the oldest `seen` the document still holds (it keeps the newest 2000 changes, so the baseline is short).
+- `x.github-hooks.alarms`: each system and coverage alarm with its raise and clear times, and the count of coverage misses in the window (from `misses`, which keeps 24 hours, and from each coverage alarm's own `misses`). 1 miss is 1 time in a list, and the misses of 1 sweep share 1 time, so a time can count more than once. The 2 lists can hold the same misses: for each repository, class and time, the count is the larger of the 2 lists' counts.
 
 ## Test hooks
 

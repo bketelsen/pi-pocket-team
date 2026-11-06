@@ -190,10 +190,81 @@ describe("summarize", () => {
 
         assert.equal(observed.changes, 5);
         assert.equal(observed.oldestSeen, SINCE - 10 * MINUTE);
-        assert.deepEqual(observed.baseline.state, { n: 2, median: 420, p90: 600, max: 600 });
-        assert.deepEqual(observed.after.state, { n: 1, median: 30, p90: 30, max: 30 });
-        assert.deepEqual(observed.after.labels, { n: 0 }, "at 0: no delay");
-        assert.deepEqual(observed.after.ci, { n: 0 }, "seen at --until: outside");
+        assert.deepEqual(observed.baseline.state, {
+            n: 2,
+            median: 420,
+            p90: 600,
+            max: 600,
+            negative: 0,
+        });
+        assert.deepEqual(observed.after.state, { n: 1, median: 30, p90: 30, max: 30, negative: 0 });
+        assert.deepEqual(observed.after.labels, { n: 0, negative: 0 }, "at 0: no delay");
+        assert.deepEqual(observed.after.ci, { n: 0, negative: 0 }, "seen at --until: outside");
+    });
+
+    test("observed: a change after the sweep's start (at > seen) is counted apart as negative, out of the median and P90", () => {
+        const change = (cls: string, at: number, seen: number) => ({
+            repo: "frostyard/x",
+            number: 1,
+            kind: "pr",
+            class: cls,
+            at,
+            seen,
+        });
+        const summary = summarize(
+            {
+                observed: {
+                    last: {},
+                    changes: [
+                        change("head", SINCE + HOUR - MINUTE, SINCE + HOUR),
+                        change("head", SINCE + HOUR + 20 * SECOND, SINCE + HOUR),
+                        change("head", SINCE + 2 * HOUR + SECOND, SINCE + 2 * HOUR),
+                        change("review", SINCE - MINUTE + SECOND, SINCE - MINUTE),
+                    ],
+                },
+            },
+            window,
+        );
+        const observed = summary.observed as {
+            baseline: Record<string, unknown>;
+            after: Record<string, unknown>;
+        };
+
+        assert.deepEqual(observed.after.head, { n: 1, median: 60, p90: 60, max: 60, negative: 2 });
+        assert.deepEqual(observed.baseline.review, { n: 0, negative: 1 });
+
+        const markdown = formatMarkdown(summary);
+
+        assert.match(markdown, /\| head \| 0 \| - \| - \| 0 \| 1 \| 60 \| 60 \| 2 \|/);
+        assert.match(markdown, /\| review \| 0 \| - \| - \| 1 \| 0 \| - \| - \| 0 \|/);
+        assert.match(
+            markdown,
+            /seen is the sweep's start time: a delay is an estimate, and a change after the start \(negative\) is counted apart\./,
+        );
+    });
+
+    test("alarms: misses that share 1 time are each counted; the 2 lists merge by the larger count of each time", () => {
+        const T = SINCE + HOUR;
+        const misses = (fromMisses: number[], fromAlarm: number[]) =>
+            (
+                summarize(
+                    {
+                        alarms: {
+                            system: {},
+                            coverage: { "frostyard/x|ci": { raised: T, misses: fromAlarm } },
+                            misses: { "frostyard/x|ci": fromMisses },
+                            evaluated: {},
+                        },
+                    },
+                    window,
+                ).alarms as { missesInWindow: number }
+            ).missesInWindow;
+
+        assert.equal(misses([T, T], [T, T, T]), 3);
+        assert.equal(misses([T], [T, T]), 2);
+        assert.equal(misses([T, T], []), 2);
+        assert.equal(misses([T, T, T + 1], [T, T + 2]), 4);
+        assert.equal(misses([T, SINCE - 1, SINCE - 1], [UNTIL, UNTIL]), 1, "outside the window");
     });
 
     test("alarms: each system and coverage alarm with its times; misses in the window counted once", () => {
@@ -347,6 +418,7 @@ describe("end to end", () => {
                 median: 300,
                 p90: 300,
                 max: 300,
+                negative: 0,
             });
             assert.deepEqual(summary.alarms, { system: [], coverage: [], missesInWindow: 0 });
 

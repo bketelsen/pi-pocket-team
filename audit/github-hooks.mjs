@@ -160,35 +160,73 @@ export function summarize(docs, { since, until }) {
             CLASSES.forEach((name) => (group[name] = []));
         }
 
-        for (const change of changes.filter((each) => each.at > 0)) {
-            const group =
-                change.seen < since ? groups.baseline : inWindow(change.seen) ? groups.after : null;
+        // `seen` is the sweep's start time, not the time of its read: a change after the start gives a negative
+        // delay. Those are counted apart, and kept out of the median and P90.
+        const negative = { baseline: {}, after: {} };
 
-            group?.[change.class]?.push(change.seen - change.at);
+        for (const change of changes.filter((each) => each.at > 0)) {
+            const name =
+                change.seen < since ? "baseline" : inWindow(change.seen) ? "after" : undefined;
+
+            if (name === undefined || groups[name][change.class] === undefined) {
+                continue;
+            }
+
+            if (change.seen < change.at) {
+                count(negative[name], change.class);
+            } else {
+                groups[name][change.class].push(change.seen - change.at);
+            }
         }
+
+        const withNegative = (name) =>
+            Object.fromEntries(
+                CLASSES.map((cls) => [
+                    cls,
+                    { ...stats(groups[name][cls]), negative: negative[name][cls] ?? 0 },
+                ]),
+            );
 
         const seen = changes.map((change) => change.seen).filter(Number.isFinite);
 
         out.observed = {
             changes: changes.length,
             ...(seen.length === 0 ? {} : { oldestSeen: Math.min(...seen) }),
-            baseline: Object.fromEntries(
-                CLASSES.map((name) => [name, stats(groups.baseline[name])]),
-            ),
-            after: Object.fromEntries(CLASSES.map((name) => [name, stats(groups.after[name])])),
+            baseline: withNegative("baseline"),
+            after: withNegative("after"),
         };
     }
 
     if (alarms === undefined) {
         out.alarms = { absent: true };
     } else {
-        // The misses: `misses` keeps 24 hours; a coverage alarm keeps the misses that raised it.
-        const misses = new Set();
-        const note = (key, times) =>
-            (times ?? []).filter(inWindow).forEach((at) => misses.add(`${key}|${String(at)}`));
+        // The misses: `misses` keeps 24 hours; a coverage alarm keeps the misses that raised it. 1 miss is 1 time in a
+        // list, and the changes of 1 sweep share 1 time: `[T, T]` is 2 misses. The 2 lists can hold the same misses, so
+        // each repository, class and time counts the larger of its 2 counts, never their sum and never 1 for all.
+        const tally = (times) => {
+            const counts = new Map();
 
-        Object.entries(alarms.misses ?? {}).forEach(([key, times]) => note(key, times));
-        Object.entries(alarms.coverage ?? {}).forEach(([key, alarm]) => note(key, alarm.misses));
+            (Array.isArray(times) ? times : [])
+                .filter(inWindow)
+                .forEach((at) => counts.set(at, (counts.get(at) ?? 0) + 1));
+
+            return counts;
+        };
+
+        const keys = new Set([
+            ...Object.keys(alarms.misses ?? {}),
+            ...Object.keys(alarms.coverage ?? {}),
+        ]);
+        let missesInWindow = 0;
+
+        for (const key of keys) {
+            const fromMisses = tally(alarms.misses?.[key]);
+            const fromAlarm = tally(alarms.coverage?.[key]?.misses);
+
+            for (const at of new Set([...fromMisses.keys(), ...fromAlarm.keys()])) {
+                missesInWindow += Math.max(fromMisses.get(at) ?? 0, fromAlarm.get(at) ?? 0);
+            }
+        }
 
         const list = (map) =>
             Object.entries(map ?? {})
@@ -203,7 +241,7 @@ export function summarize(docs, { since, until }) {
         out.alarms = {
             system: list(alarms.system),
             coverage: list(alarms.coverage),
-            missesInWindow: misses.size,
+            missesInWindow,
         };
     }
 
@@ -277,22 +315,24 @@ export function formatMarkdown(summary) {
         lines.push(
             `- Changes held: ${String(observed.changes)}; the oldest seen: ${time(observed.oldestSeen)}. Baseline: seen before --since; after: seen in the window. Only changes with a GitHub time.`,
             "",
-            "| class | baseline n | median s | P90 s | after n | median s | P90 s |",
-            "| ----- | ---------- | -------- | ----- | ------- | -------- | ----- |",
+            "| class | baseline n | median s | P90 s | negative | after n | median s | P90 s | negative |",
+            "| ----- | ---------- | -------- | ----- | -------- | ------- | -------- | ----- | -------- |",
         );
 
         for (const name of CLASSES) {
             const cells = (one) =>
-                one.n === 0
-                    ? "0 | - | -"
-                    : `${String(one.n)} | ${String(one.median)} | ${String(one.p90)}`;
+                `${one.n === 0 ? "0 | - | -" : `${String(one.n)} | ${String(one.median)} | ${String(one.p90)}`} | ${String(one.negative)}`;
 
             lines.push(
                 `| ${name} | ${cells(observed.baseline[name])} | ${cells(observed.after[name])} |`,
             );
         }
 
-        lines.push("");
+        lines.push(
+            "",
+            "seen is the sweep's start time: a delay is an estimate, and a change after the start (negative) is counted apart.",
+            "",
+        );
     }
 
     lines.push(`## Alarms (\`${KINDS.alarms}\`)`, "");
