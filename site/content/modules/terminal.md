@@ -33,7 +33,7 @@ Every route is the owner's, and each handler checks it too: guests, viewers and 
 
 ## Read more
 
-The README section is [Terminal](https://github.com/bketelsen/pi-pocket-team#terminal). The tests are `terminal.test.ts` for the server side, and `terminal-web.test.js` for the browser module.
+The reference page is [Terminal](https://github.com/bketelsen/pi-pocket-team/blob/main/docs/modules/terminal.md). The tests are `terminal.test.ts` for the server side, and `terminal-web.test.js` for the browser module.
 
 ## Polling and paste
 

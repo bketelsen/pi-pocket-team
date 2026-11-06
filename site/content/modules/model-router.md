@@ -55,4 +55,4 @@ Parts of `model-router.ts` are adapted from **pi-jev-model-router 0.9.0**, MIT L
 
 ## Read more
 
-The README section is [Model router (shadow)](https://github.com/bketelsen/pi-pocket-team#model-router-shadow), with [settings](https://github.com/bketelsen/pi-pocket-team#settings), [what is sent](https://github.com/bketelsen/pi-pocket-team#what-is-sent), [tiers](https://github.com/bketelsen/pi-pocket-team#tiers) and [the record](https://github.com/bketelsen/pi-pocket-team#the-record).
+The reference page is [Model router (shadow)](https://github.com/bketelsen/pi-pocket-team/blob/main/docs/modules/model-router.md), with [settings](https://github.com/bketelsen/pi-pocket-team/blob/main/docs/modules/model-router.md#settings), [what is sent](https://github.com/bketelsen/pi-pocket-team/blob/main/docs/modules/model-router.md#what-is-sent), [tiers](https://github.com/bketelsen/pi-pocket-team/blob/main/docs/modules/model-router.md#tiers) and [the record](https://github.com/bketelsen/pi-pocket-team/blob/main/docs/modules/model-router.md#the-record).

@@ -35,7 +35,7 @@ Anything else is a 404: `../`, absolute paths, `.git/config`, and files outside 
 
 ## Read more
 
-The README section is [Homewiki](https://github.com/bketelsen/pi-pocket-team#homewiki).
+The reference page is [Homewiki](https://github.com/bketelsen/pi-pocket-team/blob/main/docs/modules/homewiki.md).
 
 ## Tests
 

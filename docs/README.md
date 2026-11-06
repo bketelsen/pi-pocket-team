@@ -49,6 +49,22 @@ These are the designs of the Desk and Team features, each with its status line. 
   PR 3 built; sections 15 to 17 name what is left)
 - [pocket-journal.md](plans/pocket-journal.md): a daily note of the team's finished work, in frostnotes
 
+### Module reference
+
+The full reference of each module: what it does, its settings, routes, stored data, limits and tests. The user site
+summarizes these pages.
+
+- [modules/overview.md](modules/overview.md): the modules and their files, and the direction
+- [modules/team.md](modules/team.md): Team: named agents, delegation, repository ownership, agent homes and memory
+- [modules/desk.md](modules/desk.md): Desk: threads, asks, the sweep, `seed.json`, the page and the Dashboard
+- [modules/night-shift.md](modules/night-shift.md): Night shift: commands, the start time, rounds, stops and limits
+- [modules/model-router.md](modules/model-router.md): Model router (shadow): settings, what is sent, tiers, the record
+- [modules/homewiki.md](modules/homewiki.md): Homewiki: the Wiki rail page
+- [modules/terminal.md](modules/terminal.md): Terminal: the shell page and its limits
+- [modules/daily-audit.md](modules/daily-audit.md): the daily audit script
+- [modules/home-seed.md](modules/home-seed.md): the agent home seed script
+- [setup.md](setup.md): the requirements, the setup and tests of a checkout, and the install
+
 ### Runbooks
 
 - [team-vm-cutover.md](team-vm-cutover.md): the 2026-10-27 move of the Pi Pocket server, its drop-ins and the
