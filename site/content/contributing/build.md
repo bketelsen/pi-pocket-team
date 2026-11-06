@@ -54,4 +54,4 @@ Installs and server restarts are the owner's: `npm run install-check` first, the
 
 ## Read more
 
-The README sections are [Setup and test](https://github.com/bketelsen/pi-pocket-team#setup-and-test) and [Install into your Pi Pocket](https://github.com/bketelsen/pi-pocket-team#install-into-your-pi-pocket). The repository's own rules for a change, with the docs, the risk paths and the corrections, are in `AGENTS.md`.
+The reference sections are [Setup and test](https://github.com/bketelsen/pi-pocket-team/blob/main/docs/setup.md#setup-and-test) and [Install into your Pi Pocket](https://github.com/bketelsen/pi-pocket-team/blob/main/docs/setup.md#install-into-your-pi-pocket). The repository's own rules for a change, with the docs, the risk paths and the corrections, are in `AGENTS.md`.

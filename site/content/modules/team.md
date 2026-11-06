@@ -55,6 +55,6 @@ Pi Pocket's memory has 2 scopes: a project, and everywhere. Team adds a third la
 
 ## Read more
 
-The full detail is in the README: [Team](https://github.com/bketelsen/pi-pocket-team#team), [writing an agent profile](https://github.com/bketelsen/pi-pocket-team#writing-an-agent-profile), [repository ownership](https://github.com/bketelsen/pi-pocket-team#repository-ownership), [agent homes](https://github.com/bketelsen/pi-pocket-team#agent-homes), [agent memory](https://github.com/bketelsen/pi-pocket-team#agent-memory) and [prototype boundaries](https://github.com/bketelsen/pi-pocket-team#prototype-boundaries).
+The full detail is in the reference page: [Team](https://github.com/bketelsen/pi-pocket-team/blob/main/docs/modules/team.md), [writing an agent profile](https://github.com/bketelsen/pi-pocket-team/blob/main/docs/modules/team.md#writing-an-agent-profile), [repository ownership](https://github.com/bketelsen/pi-pocket-team/blob/main/docs/modules/team.md#repository-ownership), [agent homes](https://github.com/bketelsen/pi-pocket-team/blob/main/docs/modules/team.md#agent-homes), [agent memory](https://github.com/bketelsen/pi-pocket-team/blob/main/docs/modules/team.md#agent-memory) and [prototype boundaries](https://github.com/bketelsen/pi-pocket-team/blob/main/docs/modules/team.md#prototype-boundaries).
 
 The Desk is where a delegation's thread lives: see [Desk](desk.md).

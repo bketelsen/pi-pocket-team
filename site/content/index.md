@@ -89,4 +89,4 @@ pi-pocket-team is a set of drop-in extensions for [Pi Pocket](https://github.com
 
 ## Where the detail is
 
-These pages summarize. The full detail, with every setting, limit and test, is in the [README](https://github.com/bketelsen/pi-pocket-team#readme). The maintainer contracts, the design notes, the ADRs and the plans are in [docs/](https://github.com/bketelsen/pi-pocket-team/tree/main/docs).
+These pages summarize. The full detail, with every setting, limit and test, is in the [module reference](https://github.com/bketelsen/pi-pocket-team/blob/main/docs/modules/overview.md). The maintainer contracts, the design notes, the ADRs and the plans are in [docs/](https://github.com/bketelsen/pi-pocket-team/tree/main/docs).

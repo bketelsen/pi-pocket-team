@@ -9,7 +9,7 @@ The modules are source files in this repository. They run inside your own Pi Poc
 - Node.js 24, the one Pocket runs on.
 - A Pi Pocket checkout for the tests, `../pi-pocket` by default. Set `PI_POCKET_CHECKOUT` to another path.
 
-The same list, with the reasons, is in the README under [Requirements](https://github.com/bketelsen/pi-pocket-team#requirements).
+The same list, with the reasons, is in [Requirements](https://github.com/bketelsen/pi-pocket-team/blob/main/docs/setup.md#requirements).
 
 ## Set up a checkout
 

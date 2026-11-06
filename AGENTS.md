@@ -1,6 +1,6 @@
 # Brian's Pi Pocket extensions
 
-This is Brian's extension project: drop-in modules for his running Pi Pocket server. See README.md for what each module does. The docs start at [docs/README.md](docs/README.md).
+This is Brian's extension project: drop-in modules for his running Pi Pocket server. See [docs/modules/overview.md](docs/modules/overview.md) for what each module does: each module has a reference page there. The docs start at [docs/README.md](docs/README.md).
 
 This file (`AGENTS.md`) is the canonical agent instruction file. `CLAUDE.md`, `GEMINI.md`, `.cursorrules` and `.github/copilot-instructions.md` are relative symlinks to it, and `.claude/skills` is a symlink to `.agents/skills/` ([ADR-0002](docs/adr/0002-agent-portable-instruction-surface.md)). Edit only the canonical paths.
 
@@ -57,4 +57,5 @@ The docs that came before this shape (`docs/*.md`, `docs/plans/*.md`, `docs/team
 - A new doc gets a line in the index in [docs/README.md](docs/README.md); `make verify` fails on a doc under `docs/` that the index does not link.
 - Cross-links go both ways: an ADR links the design docs and specs it shapes; a design doc links its ADRs and specs; a spec links its ADRs and design doc; a plan links what it builds. When you touch a doc, check its links and add the back-links. Use relative paths.
 - Write absolute dates, not relative ones.
-- The user site (`site/content/`, built by `make site`) summarizes `README.md` for users. Check each fact about behavior against the code, not only against the README: where a secret goes, the exceptions of a command or an option (for example the DeepSeek wait of a night shift), and what is a page and what is a command. A change to that behavior changes the page in the same PR. `test/site-pages.test.mjs` checks that each page's front matter parses: quote a value that holds `: `.
+- `README.md` follows core's README spec for the kind `extension` (row B17): what it is, its status, the site, what it does, install, develop, where to go next, at most 1000 words. The detail of each module goes on its page in `docs/modules/`, and a change to a module's behavior changes that page and the site page in the same PR. Check it with core's `.agents/skills/frostyard-readme/scripts/check-readme.mjs`.
+- The user site (`site/content/`, built by `make site`) summarizes the module reference (`docs/modules/`) for users. Check each fact about behavior against the code, not only against the reference: where a secret goes, the exceptions of a command or an option (for example the DeepSeek wait of a night shift), and what is a page and what is a command. A change to that behavior changes the page in the same PR. `test/site-pages.test.mjs` checks that each page's front matter parses: quote a value that holds `: `.
