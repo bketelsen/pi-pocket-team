@@ -61,6 +61,7 @@ summarizes these pages.
 - [modules/model-router.md](modules/model-router.md): Model router (shadow): settings, what is sent, tiers, the record
 - [modules/homewiki.md](modules/homewiki.md): Homewiki: the Wiki rail page
 - [modules/terminal.md](modules/terminal.md): Terminal: the shell page and its limits
+- [modules/github-hooks.md](modules/github-hooks.md): GitHub hooks: the webhook listener, its checks, facts, documents and alarms
 - [modules/daily-audit.md](modules/daily-audit.md): the daily audit script
 - [modules/home-seed.md](modules/home-seed.md): the agent home seed script
 - [setup.md](setup.md): the requirements, the setup and tests of a checkout, and the install

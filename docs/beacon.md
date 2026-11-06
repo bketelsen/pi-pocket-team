@@ -35,25 +35,27 @@ Rules:
 
 What exists today:
 
-| Fact                                                                                           | Where it is recorded                                                                              |
-| ---------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
-| Desk thread life: start, close, `why`, `outcome`, PRs, issues, plan task                       | `x.desk.threads` (`Thread` in `desk.ts`)                                                          |
-| Thread events                                                                                  | `thread.events`, the newest 50 only                                                               |
-| Agent reports                                                                                  | `x.desk.reports`, on the thread session                                                           |
-| Asks to Brian, his answers, rewrites, his `why` and his marks                                  | `thread.asks` (`Ask` in `desk.ts`)                                                                |
-| PR lifecycle: created, merged, closed, reopened                                                | `PrFact` in `x.desk.dashboard` (`_desk-dashboard.ts`)                                             |
-| Tokens and cost, by session, UTC day and `provider/model`                                      | `x.desk.usage` (`_desk-usage.ts`), Desk-linked sessions and their subagents                       |
-| Router suggestion: kind, tier, model, thinking, named worker                                   | `thread.route` (`ThreadRoute`), from `model-router.ts`, shadow only                               |
-| Night-shift rounds, verdicts, check results, worker, stop reason                               | `x.night-shift.goal` (`Goal`, `RoundRecord`)                                                      |
-| A stop after 3 same check failures, and its failing jobs (`goal.stopChecks`)                   | `goal.why` (#108), `SAME_FAILURES`; audit: `metrics.Q1.stops.goals[].checks`, `flakyKeys`         |
-| Subagent spawns and sends: model, name, tools, brief                                           | Pocket's entries; `audit/sources.mjs` keeps 300 characters of a brief                             |
-| Finished work: 1 entry per thread closed done (`completed`, `verified`), when `journal` is set | PocketJournal: the `x.desk.journal` task writes it to frostnotes (`docs/plans/pocket-journal.md`) |
-| Each day's findings and metrics                                                                | `findings.json` of the daily audit, 1 folder per day                                              |
-| `plan` tool calls and refusals of each planning session (pi-pocket-team#119)                   | Pocket's entries; `loadPlanSessions` in `audit/sources.mjs` keeps 600 characters of a refusal     |
-| Tool calls of a planning session that name `desk.ts` or `pi-pocket/src` (source reads)         | Pocket's entries; `loadPlanSessions` keeps the tool name only, no argument text                   |
-| PR refs and reviewed head of each `subagent` spawn and send                                    | Pocket's entries; `loadReviewCalls` keeps the refs, the PR numbers and the head SHA, no text      |
-| Reviewer answers: the verdict (`Ready`, `Not ready`) and the labels of the blocking items      | Pocket's entries; `loadReviewAnswers` in `audit/sources.mjs` keeps no answer text                 |
-| Guard of each blocking point: test, `AGENTS.md` rule, corrections line after the reviewed head | `metrics.Q1.blockers.points[].guard` in `findings.json`; a final result is not fetched again      |
+| Fact                                                                                            | Where it is recorded                                                                              |
+| ----------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
+| Desk thread life: start, close, `why`, `outcome`, PRs, issues, plan task                        | `x.desk.threads` (`Thread` in `desk.ts`)                                                          |
+| Thread events                                                                                   | `thread.events`, the newest 50 only                                                               |
+| Agent reports                                                                                   | `x.desk.reports`, on the thread session                                                           |
+| Asks to Brian, his answers, rewrites, his `why` and his marks                                   | `thread.asks` (`Ask` in `desk.ts`)                                                                |
+| PR lifecycle: created, merged, closed, reopened                                                 | `PrFact` in `x.desk.dashboard` (`_desk-dashboard.ts`)                                             |
+| Tokens and cost, by session, UTC day and `provider/model`                                       | `x.desk.usage` (`_desk-usage.ts`), Desk-linked sessions and their subagents                       |
+| Router suggestion: kind, tier, model, thinking, named worker                                    | `thread.route` (`ThreadRoute`), from `model-router.ts`, shadow only                               |
+| Night-shift rounds, verdicts, check results, worker, stop reason                                | `x.night-shift.goal` (`Goal`, `RoundRecord`)                                                      |
+| A stop after 3 same check failures, and its failing jobs (`goal.stopChecks`)                    | `goal.why` (#108), `SAME_FAILURES`; audit: `metrics.Q1.stops.goals[].checks`, `flakyKeys`         |
+| Subagent spawns and sends: model, name, tools, brief                                            | Pocket's entries; `audit/sources.mjs` keeps 300 characters of a brief                             |
+| Finished work: 1 entry per thread closed done (`completed`, `verified`), when `journal` is set  | PocketJournal: the `x.desk.journal` task writes it to frostnotes (`docs/plans/pocket-journal.md`) |
+| Each day's findings and metrics                                                                 | `findings.json` of the daily audit, 1 folder per day                                              |
+| `plan` tool calls and refusals of each planning session (pi-pocket-team#119)                    | Pocket's entries; `loadPlanSessions` in `audit/sources.mjs` keeps 600 characters of a refusal     |
+| Tool calls of a planning session that name `desk.ts` or `pi-pocket/src` (source reads)          | Pocket's entries; `loadPlanSessions` keeps the tool name only, no argument text                   |
+| PR refs and reviewed head of each `subagent` spawn and send                                     | Pocket's entries; `loadReviewCalls` keeps the refs, the PR numbers and the head SHA, no text      |
+| Reviewer answers: the verdict (`Ready`, `Not ready`) and the labels of the blocking items       | Pocket's entries; `loadReviewAnswers` in `audit/sources.mjs` keeps no answer text                 |
+| Guard of each blocking point: test, `AGENTS.md` rule, corrections line after the reviewed head  | `metrics.Q1.blockers.points[].guard` in `findings.json`; a final result is not fetched again      |
+| GitHub webhook deliveries: each accepted fact and refusal, counts by outcome, the last delivery | `x.github-hooks.deliveries` (`github-hooks.ts`), the newest 2000; no free text                    |
+| Webhook alarms: system (`bind-failed`, `secret-missing`, …) and coverage, raised and cleared    | `x.github-hooks.alarms` (`github-hooks.ts`); the audit does not read it yet                       |
 
 Gaps:
 

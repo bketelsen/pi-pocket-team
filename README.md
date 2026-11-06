@@ -23,6 +23,8 @@ of a server who works with a team of named agents. It is written for Brian Ketel
   [Homewiki](https://bketelsen.github.io/pi-pocket-team/modules/homewiki/).
 - **Terminal.** The "Terminal" rail page: a login shell as the server's user, owner-only. See
   [Terminal](https://bketelsen.github.io/pi-pocket-team/modules/terminal/).
+- **GitHub hooks.** A listener for signed GitHub webhook deliveries: checked facts, no GitHub text, wake the desk
+  early. See [GitHub hooks](https://bketelsen.github.io/pi-pocket-team/modules/github-hooks/).
 - **Daily audit and home seed.** Scripts that report on a day of the team's work, and make each agent's home folder.
   See [daily audit](docs/modules/daily-audit.md) and [home seed](docs/modules/home-seed.md).
 
