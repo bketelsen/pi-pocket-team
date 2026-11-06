@@ -1,0 +1,607 @@
+{
+    "source": "synthetic: @octokit/webhooks-examples installation.created.json, set to the checked fields of live delivery c9b01200-da0f-11f1-9cbc-6c24b78f2d54 (2026-11-06)",
+    "headers": {
+        "Content-Type": "application/json",
+        "User-Agent": "GitHub-Hookshot/synthetic",
+        "X-GitHub-Delivery": "c9b01200-da0f-11f1-9cbc-6c24b78f2d54",
+        "X-GitHub-Event": "installation",
+        "X-GitHub-Hook-ID": "0",
+        "X-GitHub-Hook-Installation-Target-ID": "0",
+        "X-GitHub-Hook-Installation-Target-Type": "integration"
+    },
+    "payload": {
+        "action": "created",
+        "installation": {
+            "id": 179353214,
+            "account": {
+                "login": "frostyard",
+                "id": 21031067,
+                "node_id": "MDQ6VXNlcjIxMDMxMDY3",
+                "avatar_url": "https://avatars1.githubusercontent.com/u/21031067?v=4",
+                "gravatar_id": "",
+                "url": "https://api.github.com/users/Codertocat",
+                "html_url": "https://github.com/Codertocat",
+                "followers_url": "https://api.github.com/users/Codertocat/followers",
+                "following_url": "https://api.github.com/users/Codertocat/following{/other_user}",
+                "gists_url": "https://api.github.com/users/Codertocat/gists{/gist_id}",
+                "starred_url": "https://api.github.com/users/Codertocat/starred{/owner}{/repo}",
+                "subscriptions_url": "https://api.github.com/users/Codertocat/subscriptions",
+                "organizations_url": "https://api.github.com/users/Codertocat/orgs",
+                "repos_url": "https://api.github.com/users/Codertocat/repos",
+                "events_url": "https://api.github.com/users/Codertocat/events{/privacy}",
+                "received_events_url": "https://api.github.com/users/Codertocat/received_events",
+                "type": "User",
+                "site_admin": false
+            },
+            "repository_selection": "all",
+            "access_tokens_url": "https://api.github.com/app/installations/957387/access_tokens",
+            "repositories_url": "https://api.github.com/installation/repositories",
+            "html_url": "https://github.com/settings/installations/957387",
+            "app_id": 29310,
+            "target_id": 21031067,
+            "target_type": "User",
+            "permissions": {
+                "administration": "write",
+                "checks": "write",
+                "contents": "write",
+                "deployments": "write",
+                "issues": "write",
+                "pages": "write",
+                "pull_requests": "write",
+                "repository_hooks": "write",
+                "repository_projects": "write",
+                "statuses": "write",
+                "metadata": "read",
+                "vulnerability_alerts": "read"
+            },
+            "events": [],
+            "created_at": 1557933591,
+            "updated_at": 1557933591,
+            "single_file_name": null,
+            "suspended_at": null,
+            "suspended_by": null
+        },
+        "repositories": [
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "cayo",
+                "full_name": "frostyard/cayo",
+                "private": false
+            },
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "snowdesktop",
+                "full_name": "frostyard/snowdesktop",
+                "private": false
+            },
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "www-snowlinux",
+                "full_name": "frostyard/www-snowlinux",
+                "private": false
+            },
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "homebrew-tap",
+                "full_name": "frostyard/homebrew-tap",
+                "private": false
+            },
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "assets",
+                "full_name": "frostyard/assets",
+                "private": false
+            },
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "logomenu",
+                "full_name": "frostyard/logomenu",
+                "private": false
+            },
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "hotedge",
+                "full_name": "frostyard/hotedge",
+                "private": false
+            },
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "demo-repository",
+                "full_name": "frostyard/demo-repository",
+                "private": false
+            },
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "snow-bootc",
+                "full_name": "frostyard/snow-bootc",
+                "private": false
+            },
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "debian-bootc-gnome",
+                "full_name": "frostyard/debian-bootc-gnome",
+                "private": false
+            },
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "debian-bootc-core",
+                "full_name": "frostyard/debian-bootc-core",
+                "private": false
+            },
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "bootc",
+                "full_name": "frostyard/bootc",
+                "private": false
+            },
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "snow-live-installer",
+                "full_name": "frostyard/snow-live-installer",
+                "private": false
+            },
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "first-setup",
+                "full_name": "frostyard/first-setup",
+                "private": false
+            },
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "snowfield-bootc",
+                "full_name": "frostyard/snowfield-bootc",
+                "private": false
+            },
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "shared-build-scripts",
+                "full_name": "frostyard/shared-build-scripts",
+                "private": false
+            },
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "titanoboa",
+                "full_name": "frostyard/titanoboa",
+                "private": false
+            },
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "chairlift",
+                "full_name": "frostyard/chairlift",
+                "private": false
+            },
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "brew",
+                "full_name": "frostyard/brew",
+                "private": false
+            },
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "nbc",
+                "full_name": "frostyard/nbc",
+                "private": false
+            },
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "igloo-old",
+                "full_name": "frostyard/igloo-old",
+                "private": false
+            },
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "snowdrift",
+                "full_name": "frostyard/snowdrift",
+                "private": false
+            },
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "frostyard.github.io",
+                "full_name": "frostyard/frostyard.github.io",
+                "private": false
+            },
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "plow",
+                "full_name": "frostyard/plow",
+                "private": false
+            },
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "snosi",
+                "full_name": "frostyard/snosi",
+                "private": false
+            },
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "repogen",
+                "full_name": "frostyard/repogen",
+                "private": false
+            },
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "updex",
+                "full_name": "frostyard/updex",
+                "private": false
+            },
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "incus",
+                "full_name": "frostyard/incus",
+                "private": false
+            },
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "pm",
+                "full_name": "frostyard/pm",
+                "private": false
+            },
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "bootc-debian",
+                "full_name": "frostyard/bootc-debian",
+                "private": false
+            },
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "ubuntu-intune",
+                "full_name": "frostyard/ubuntu-intune",
+                "private": false
+            },
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "intuneme",
+                "full_name": "frostyard/intuneme",
+                "private": false
+            },
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "gchlog",
+                "full_name": "frostyard/gchlog",
+                "private": false
+            },
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "std",
+                "full_name": "frostyard/std",
+                "private": false
+            },
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "clix",
+                "full_name": "frostyard/clix",
+                "private": false
+            },
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "frostyard-ai",
+                "full_name": "frostyard/frostyard-ai",
+                "private": false
+            },
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "yeti",
+                "full_name": "frostyard/yeti",
+                "private": false
+            },
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "snowkit",
+                "full_name": "frostyard/snowkit",
+                "private": false
+            },
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "rime",
+                "full_name": "frostyard/rime",
+                "private": false
+            },
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "rime-testbed",
+                "full_name": "frostyard/rime-testbed",
+                "private": false
+            },
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "changelog-generator",
+                "full_name": "frostyard/changelog-generator",
+                "private": false
+            },
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "mentat",
+                "full_name": "frostyard/mentat",
+                "private": false
+            },
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "oldfirn",
+                "full_name": "frostyard/oldfirn",
+                "private": false
+            },
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "bootc-installer",
+                "full_name": "frostyard/bootc-installer",
+                "private": false
+            },
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "fisherman",
+                "full_name": "frostyard/fisherman",
+                "private": false
+            },
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "dakota-iso",
+                "full_name": "frostyard/dakota-iso",
+                "private": false
+            },
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "pilothouse",
+                "full_name": "frostyard/pilothouse",
+                "private": false
+            },
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "frostyard-org",
+                "full_name": "frostyard/frostyard-org",
+                "private": false
+            },
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "design-system",
+                "full_name": "frostyard/design-system",
+                "private": false
+            },
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "mill",
+                "full_name": "frostyard/mill",
+                "private": false
+            },
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "mafia",
+                "full_name": "frostyard/mafia",
+                "private": false
+            },
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "testsuite",
+                "full_name": "frostyard/testsuite",
+                "private": false
+            },
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "lab",
+                "full_name": "frostyard/lab",
+                "private": false
+            },
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "firn",
+                "full_name": "frostyard/firn",
+                "private": false
+            },
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "core",
+                "full_name": "frostyard/core",
+                "private": false
+            },
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "caddyscope",
+                "full_name": "frostyard/caddyscope",
+                "private": false
+            },
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "snowcat",
+                "full_name": "frostyard/snowcat",
+                "private": false
+            },
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "snowcat-cockpit",
+                "full_name": "frostyard/snowcat-cockpit",
+                "private": false
+            },
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "omarchy-apps",
+                "full_name": "frostyard/omarchy-apps",
+                "private": false
+            },
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "bobsled-alpha",
+                "full_name": "frostyard/bobsled-alpha",
+                "private": false
+            },
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "bobsled",
+                "full_name": "frostyard/bobsled",
+                "private": false
+            },
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "oto-dock",
+                "full_name": "frostyard/oto-dock",
+                "private": false
+            },
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "nsl",
+                "full_name": "frostyard/nsl",
+                "private": false
+            },
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "apt-publisher",
+                "full_name": "frostyard/apt-publisher",
+                "private": false
+            },
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "igloo",
+                "full_name": "frostyard/igloo",
+                "private": false
+            },
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "flatpak-index",
+                "full_name": "frostyard/flatpak-index",
+                "private": false
+            },
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "frostmail",
+                "full_name": "frostyard/frostmail",
+                "private": false
+            },
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "frostnotes",
+                "full_name": "frostyard/frostnotes",
+                "private": false
+            },
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "lodge",
+                "full_name": "frostyard/lodge",
+                "private": false
+            },
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "porter",
+                "full_name": "frostyard/porter",
+                "private": false
+            },
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "frostread",
+                "full_name": "frostyard/frostread",
+                "private": false
+            },
+            {
+                "id": 186853002,
+                "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMwMDI=",
+                "name": "problem-intake",
+                "full_name": "frostyard/problem-intake",
+                "private": false
+            }
+        ],
+        "sender": {
+            "login": "bketelsen",
+            "id": 21031067,
+            "node_id": "MDQ6VXNlcjIxMDMxMDY3",
+            "avatar_url": "https://avatars1.githubusercontent.com/u/21031067?v=4",
+            "gravatar_id": "",
+            "url": "https://api.github.com/users/Codertocat",
+            "html_url": "https://github.com/Codertocat",
+            "followers_url": "https://api.github.com/users/Codertocat/followers",
+            "following_url": "https://api.github.com/users/Codertocat/following{/other_user}",
+            "gists_url": "https://api.github.com/users/Codertocat/gists{/gist_id}",
+            "starred_url": "https://api.github.com/users/Codertocat/starred{/owner}{/repo}",
+            "subscriptions_url": "https://api.github.com/users/Codertocat/subscriptions",
+            "organizations_url": "https://api.github.com/users/Codertocat/orgs",
+            "repos_url": "https://api.github.com/users/Codertocat/repos",
+            "events_url": "https://api.github.com/users/Codertocat/events{/privacy}",
+            "received_events_url": "https://api.github.com/users/Codertocat/received_events",
+            "type": "User",
+            "site_admin": false
+        }
+    },
+    "expect": {
+        "status": 202,
+        "outcome": "accepted",
+        "fact": {
+            "delivery": "c9b01200-da0f-11f1-9cbc-6c24b78f2d54",
+            "event": "installation",
+            "sender": "bketelsen",
+            "action": "created",
+            "installation": {
+                "id": 179353214,
+                "account": "frostyard",
+                "selection": "all",
+                "repositories": []
+            }
+        }
+    }
+}

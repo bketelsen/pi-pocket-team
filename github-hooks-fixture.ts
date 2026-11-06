@@ -1,6 +1,6 @@
 // Test helpers of the github-hooks tests: the @octokit/webhooks-examples payloads in test/fixtures/github-hooks/, moved
 // to an allowed owner, and hostile text put into every free-text field (in the test, never in the fixture files); and
-// the real deliveries in test/fixtures/github-hooks/real/ (see the README there), with their free-text strings.
+// the live deliveries in test/fixtures/github-hooks/live/ (synthetic: see the README there), with their free-text strings.
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
@@ -96,24 +96,24 @@ export function withHostileText(payload: Record<string, unknown>): Record<string
     return copy;
 }
 
-// ─── Real deliveries ─────────────────────────────────────────────────────────
+// ─── Live deliveries ─────────────────────────────────────────────────────────
 
-/** The folder of the real deliveries, copied from GitHub's "Recent Deliveries" page. */
-export const REAL_DIR = join(FIXTURES, "real");
+/** The folder of the live deliveries: synthetic payloads, each set to the checked fields of 1 delivery the live module recorded. */
+export const LIVE_DIR = join(FIXTURES, "live");
 
-/** The outcomes a first delivery of a real payload can have, and the status of each. */
-const REAL_OUTCOMES: Record<string, number> = {
+/** The outcomes a first delivery of a live-delivery fixture can have, and the status of each. */
+const LIVE_OUTCOMES: Record<string, number> = {
     accepted: 202,
     ignored: 200,
     unprocessable: 422,
     ping: 200,
 };
 
-/** 1 real delivery: its file, its headers as GitHub sent them, its payload, and what the live module recorded. */
-export type RealDelivery = {
+/** 1 live-delivery fixture: its file, its headers, its synthetic payload, and what the live module recorded. */
+export type LiveDelivery = {
     /** The file name. */
     name: string;
-    /** "<App name>, Recent Deliveries, <date>". */
+    /** How the file was made: the example it starts from, and the live delivery it mirrors. */
     source: string;
     headers: Record<string, string>;
     payload: Record<string, unknown>;
@@ -127,8 +127,8 @@ export type RealDelivery = {
 
 const SIGNATURE_HEADERS = new Set(["x-hub-signature", "x-hub-signature-256"]);
 
-/** A header of a real delivery, by its name in any case. */
-export function realHeader(delivery: { headers: Record<string, string> }, name: string) {
+/** A header of a live-delivery fixture, by its name in any case. */
+export function liveHeader(delivery: { headers: Record<string, string> }, name: string) {
     const found = Object.entries(delivery.headers).find(
         ([key]) => key.toLowerCase() === name.toLowerCase(),
     );
@@ -137,12 +137,12 @@ export function realHeader(delivery: { headers: Record<string, string> }, name: 
 }
 
 /**
- * Every real delivery in `dir` (`*.json`, sorted by name), with its shape checked. It throws when a file has a
+ * Every live-delivery fixture in `dir` (`*.json`, sorted by name), with its shape checked. It throws when a file has a
  * signature header, or misses `headers`, `payload`, `X-GitHub-Event`, `X-GitHub-Delivery`, `expect.status` or
- * `expect.outcome`, or when `expect` does not fit the outcome. The repositories stay as they are: a real payload has
- * owner `frostyard` or `bketelsen` already.
+ * `expect.outcome`, or when `expect` does not fit the outcome. The repositories stay as they are: each payload has
+ * owner `frostyard` or `bketelsen` already, as its live delivery had.
  */
-export function realDeliveries(dir = REAL_DIR): RealDelivery[] {
+export function liveDeliveries(dir = LIVE_DIR): LiveDelivery[] {
     const names = existsSync(dir)
         ? readdirSync(dir)
               .filter((name) => name.endsWith(".json"))
@@ -151,10 +151,10 @@ export function realDeliveries(dir = REAL_DIR): RealDelivery[] {
 
     return names.map((name) => {
         const fail = (why: string): never => {
-            throw new Error(`real delivery ${name}: ${why}`);
+            throw new Error(`live delivery ${name}: ${why}`);
         };
 
-        const file = JSON.parse(readFileSync(join(dir, name), "utf8")) as Partial<RealDelivery>;
+        const file = JSON.parse(readFileSync(join(dir, name), "utf8")) as Partial<LiveDelivery>;
         const object = (value: unknown) =>
             value !== null && typeof value === "object" && !Array.isArray(value);
 
@@ -184,14 +184,14 @@ export function realDeliveries(dir = REAL_DIR): RealDelivery[] {
             }
         }
 
-        const event = realHeader({ headers }, "X-GitHub-Event");
-        const delivery = realHeader({ headers }, "X-GitHub-Delivery");
+        const event = liveHeader({ headers }, "X-GitHub-Event");
+        const delivery = liveHeader({ headers }, "X-GitHub-Delivery");
 
         if (typeof event !== "string" || typeof delivery !== "string") {
             fail("no X-GitHub-Event or X-GitHub-Delivery header");
         }
 
-        const status = REAL_OUTCOMES[expect!.outcome];
+        const status = LIVE_OUTCOMES[expect!.outcome];
 
         if (status !== expect!.status) {
             fail(`outcome ${expect!.outcome} with status ${String(expect!.status)}`);

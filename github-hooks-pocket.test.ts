@@ -10,9 +10,9 @@
 // - Pending markers: a crash between the commit and `nudge` is recovered at the next load; the desk API reappearing
 //   hands them over; a second `nudge` of the same delivery does nothing: the "pending markers" tests.
 // - Facts: hostile text leaves no trace in any `x.github-hooks.*` document: "hostile text".
-// - Real deliveries (task t4): each file in test/fixtures/github-hooks/real/, with its real headers and a test
-//   signature, gets its recorded status, outcome and fact; a redelivery (same id, same body) is a duplicate with 1
-//   fact entry and 1 desk nudge; no free text of any real payload is in any `x.github-hooks.*` document: "real
+// - Live deliveries (task t4): each file in test/fixtures/github-hooks/live/, with its headers and a test signature,
+//   gets the status, outcome and fact the live module recorded; a redelivery (same id, same body) is a duplicate with
+//   1 fact entry and 1 desk nudge; no free text of any payload is in any `x.github-hooks.*` document: "live
 //   deliveries replay".
 // - Nudge, the desk absent is no error: "the desk off".
 // - The turn-off rule: the receiver waits in memory with no commit, and runs the new code when the module is on again.
@@ -50,12 +50,12 @@ import {
     toNudgeFact,
 } from "./github-hooks.ts";
 import {
-    type RealDelivery,
+    type LiveDelivery,
     HOSTILE,
-    REAL_DIR,
+    LIVE_DIR,
     fixture,
     freeText,
-    realDeliveries,
+    liveDeliveries,
     withHostileText,
 } from "./github-hooks-fixture.ts";
 
@@ -100,10 +100,10 @@ function post(event: string, payload: unknown, id = randomUUID()): Promise<Answe
 }
 
 /**
- * 1 real delivery over loopback, with the headers GitHub sent (not its length, host or connection) and a signature
+ * 1 live-delivery fixture over loopback, with its headers (not its length, host or connection) and a signature
  * made here with the test secret over the exact body bytes (`JSON.stringify(payload)`).
  */
-function postReal(delivery: RealDelivery): Promise<Answer> {
+function postLive(delivery: LiveDelivery): Promise<Answer> {
     const own = new Set(["host", "connection", "content-length", "transfer-encoding"]);
 
     return send(
@@ -326,12 +326,12 @@ test("end to end: a signed delivery is accepted, the desk takes it by nudge, and
     );
 });
 
-test("real deliveries replay: the recorded status, outcome and fact; a redelivery is a duplicate; no free text kept", async () => {
-    const real = realDeliveries();
+test("live deliveries replay: the recorded status, outcome and fact; a redelivery is a duplicate; no free text kept", async () => {
+    const live = liveDeliveries();
 
     assert.ok(
-        real.length > 0,
-        `no real delivery in ${REAL_DIR}: add the files (test/fixtures/github-hooks/README.md, "Real deliveries")`,
+        live.length > 0,
+        `no live delivery in ${LIVE_DIR}: add the files (test/fixtures/github-hooks/README.md, "Live deliveries")`,
     );
 
     type Entry = { delivery?: string; outcome: string; fact?: HookFact };
@@ -341,14 +341,14 @@ test("real deliveries replay: the recorded status, outcome and fact; a redeliver
             (entry) => entry.delivery === id,
         );
 
-    for (const delivery of real) {
+    for (const delivery of live) {
         const { name, delivery: id, expect } = delivery;
 
-        assert.equal((await postReal(delivery)).status, expect.status, name);
+        assert.equal((await postLive(delivery)).status, expect.status, name);
 
         if (expect.outcome === "ping") {
             assert.deepEqual(await ofId(id), [], `${name}: ping records only its log line`);
-            assert.equal((await postReal(delivery)).status, 200, `${name}: a ping again`);
+            assert.equal((await postLive(delivery)).status, 200, `${name}: a ping again`);
             continue;
         }
 
@@ -360,7 +360,7 @@ test("real deliveries replay: the recorded status, outcome and fact; a redeliver
         );
 
         if (expect.outcome === "unprocessable") {
-            assert.equal((await postReal(delivery)).status, 422, `${name}: refused again`);
+            assert.equal((await postLive(delivery)).status, 422, `${name}: refused again`);
             continue;
         }
 
@@ -387,7 +387,7 @@ test("real deliveries replay: the recorded status, outcome and fact; a redeliver
         const took = (await deskSeen())[id];
 
         // GitHub's "Redeliver": the same id and the same body.
-        assert.equal((await postReal(delivery)).status, 200, `${name}: redelivered`);
+        assert.equal((await postLive(delivery)).status, 200, `${name}: redelivered`);
 
         const entries = await ofId(id);
 
@@ -403,7 +403,7 @@ test("real deliveries replay: the recorded status, outcome and fact; a redeliver
 
     await until(async () => (await markers()).length === 0, "the desk took every fact");
 
-    const free = real.flatMap((delivery) => freeText(delivery.payload));
+    const free = live.flatMap((delivery) => freeText(delivery.payload));
 
     for (const token of [SeenDoc, DeliveriesDoc, PendingDoc, AlarmsDoc, CoverageDoc, ReceiverDoc]) {
         const text = JSON.stringify(await snap(token));

@@ -1,12 +1,12 @@
 {
-    "source": "PLACEHOLDER, not a real delivery",
+    "source": "synthetic: @octokit/webhooks-examples ping.json, set to the checked fields of live delivery b528f89c-da0f-11f1-95f5-5d10d438c0de (2026-11-06)",
     "headers": {
         "Content-Type": "application/json",
-        "User-Agent": "GitHub-Hookshot/0000000",
-        "X-GitHub-Delivery": "602bef93-a9bb-414e-bc35-ab4c2f3f4c23",
+        "User-Agent": "GitHub-Hookshot/synthetic",
+        "X-GitHub-Delivery": "b528f89c-da0f-11f1-95f5-5d10d438c0de",
         "X-GitHub-Event": "ping",
-        "X-GitHub-Hook-ID": "100000001",
-        "X-GitHub-Hook-Installation-Target-ID": "1000001",
+        "X-GitHub-Hook-ID": "0",
+        "X-GitHub-Hook-Installation-Target-ID": "0",
         "X-GitHub-Hook-Installation-Target-Type": "integration"
     },
     "payload": {
@@ -38,7 +38,7 @@
             "id": 186853261,
             "node_id": "MDEwOlJlcG9zaXRvcnkxODY4NTMyNjE=",
             "name": "Hello-World",
-            "full_name": "bketelsen/pi-pocket-team",
+            "full_name": "Octocoders/Hello-World",
             "private": false,
             "owner": {
                 "login": "Octocoders",
