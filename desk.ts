@@ -8,6 +8,16 @@
  * then writes what changed in one commit. Its task, `x.desk.sweeper`, runs one sweep per supervisor, sleeps 10 minutes,
  * and sweeps again; it ends when that supervisor has no thread that is not closed.
  *
+ * Each sync of a supervisor (the sweeper, `desk sync`, the page's view sweep, and a nudged sync) runs its "gather, then
+ * commit" in that supervisor's serialized lane (`SyncRunner`, 1 per data folder, shared across reloads): an older read
+ * never commits after a newer one. A request during a sync waits, or joins the 1 follow-up of its source that waits; a
+ * view sweep skips a busy lane.
+ *
+ * A hooks module hands GitHub webhook facts to `nudge` on the API below, in its own commit. A matched supervisor gets 1
+ * early sync by the durable task `x.desk.nudge`: coalesced over 20 seconds, at most 1 in 60 seconds. `x.desk.nudges`
+ * holds the delivery ids it took, the waiting nudges, and the beacon of each nudged sync (delivery times, commit time).
+ * `x.desk.observed` holds the changes each sweep saw on PRs and queued issues, for the hooks' coverage alarm.
+ *
  * The truth is two documents. `x.desk.threads` is app-wide. `x.desk.reports` holds one thread session's reports, on
  * that session. They are stored data: never rename a kind or change what a field means; add fields beside them.
  *
@@ -6298,6 +6308,10 @@ export type PrFact = {
     readyAt: number;
     /** When the head commit was committed: 0 when unknown. */
     headAt: number;
+    /** When it merged, in ms: 0 when unknown or not merged. */
+    mergedAt: number;
+    /** When it closed (merged or not), in ms: 0 when unknown or open. */
+    closedAt: number;
     /**
      * 1 entry for each review and each comment the read got: when it came, whether it requests changes, and whether its
      * body marks a blocking point. Empty when the read did not ask for them.
@@ -6409,7 +6423,7 @@ function splitRef(ref: string): { repo: string; number: number } {
     return { repo: match[1]!, number: Number(match[2]) };
 }
 
-const PR_FIELDS = `number title url state isDraft createdAt mergedAt closedAt headRefName mergeable reviewDecision author { login } labels(first: 20) { nodes { name } } commits(last: 1) { nodes { commit { oid committedDate statusCheckRollup { state contexts(first: ${String(GITHUB_CHECKS)}) { totalCount nodes { __typename ... on CheckRun { name conclusion status startedAt } ... on StatusContext { context state } } } } } } }`;
+const PR_FIELDS = `number title url state isDraft createdAt mergedAt closedAt headRefName mergeable reviewDecision author { login } labels(first: 20) { totalCount nodes { name } } commits(last: 1) { nodes { commit { oid committedDate statusCheckRollup { state contexts(first: ${String(GITHUB_CHECKS)}) { totalCount nodes { __typename ... on CheckRun { name conclusion status startedAt } ... on StatusContext { context state } } } } } } }`;
 
 /**
  * The fields of an attached PR: `PR_FIELDS`, the label events, the reviews, and the comments. Only the pinned parts of
@@ -6610,6 +6624,8 @@ function prFact(
             ready: labelsOf(node).includes(READY_LABEL),
             readyAt: readyLabelAt(node),
             headAt: milliseconds(first?.commit?.committedDate),
+            mergedAt: milliseconds(node.mergedAt),
+            closedAt: milliseconds(node.closedAt),
             feedback: feedbackOf(node),
             failing: failingChecks(contexts?.nodes),
             archived,
@@ -6624,14 +6640,20 @@ function prFact(
 }
 
 /**
- * A PR node's labels for a watch: the full list a watched pin read (`watchLabels`, up to 100, with `labelsCut` when
- * GitHub has more), else the first 20 of the list every read has.
+ * A PR node's labels for a watch: the full list a watched pin read (`watchLabels`, up to 100), else the first 20 of the
+ * list every read has. Either way `labelsCut` when GitHub has more (`totalCount` above the names read): a label that is
+ * not in a cut list is not known to be absent.
  */
 function watchLabelsOf(node: Record<string, unknown>): Pick<PrFact, "labels" | "labelsCut"> {
     const all = node.watchLabels as { totalCount?: unknown; nodes?: unknown } | null | undefined;
 
     if (all === null || typeof all !== "object" || !Array.isArray(all.nodes)) {
-        return { labels: labelsOf(node) };
+        const labels = labelsOf(node);
+        const total = (node.labels as { totalCount?: unknown } | null | undefined)?.totalCount;
+
+        return typeof total === "number" && total > labels.length
+            ? { labels, labelsCut: true }
+            : { labels };
     }
 
     const labels = labelsOf({ labels: all });
@@ -19453,7 +19475,11 @@ export type PlanCommitApi = {
     commit: <T>(change: (tx: Tx) => T | Promise<T>, context: Context) => Promise<T>;
 };
 
-/** What `team.ts` uses: on `globalThis[Symbol.for("pi-pocket-team.desk")]`, so it finds the live version. */
+/**
+ * What `team.ts`, `night-shift.ts` and a hooks module use: on `globalThis[Symbol.for("pi-pocket-team.desk")]`, so each
+ * finds the live version. Each method that writes takes the caller's `tx`: a module commits only in a route, a tool, a
+ * command, a task, or a caller's commit.
+ */
 export type DeskApi = {
     version: 1;
     open: (
@@ -19538,6 +19564,14 @@ export type DeskApi = {
           }
         | undefined
     >;
+    /**
+     * Take validated GitHub webhook facts (`NudgeFact`, at most 500) in the caller's commit: each matched supervisor gets
+     * 1 early sync, the same as `desk sync`, coalesced over 20 seconds and at most 1 in 60 seconds, by a durable
+     * `x.desk.nudge` task. Idempotent by delivery id: a fact the desk took before is `duplicate` and changes nothing.
+     * It reads no table, so the caller calls it after its own table reads in that commit. An older desk has none: a
+     * caller then only records its facts.
+     */
+    nudge?: (tx: Tx, facts: NudgeFact[], now?: number) => Promise<NudgeResult>;
 };
 
 // ─── PocketJournal: 1 daily note of finished work, in frostnotes ────────────
@@ -20148,12 +20182,735 @@ const reply = (text: string) => ({ output: [{ type: "text" as const, text }] });
 /** A thread as a plain value: a commit's draft is not usable after its commit. */
 const copyThread = (thread: Thread): Thread => JSON.parse(JSON.stringify(thread)) as Thread;
 
+// ─── Nudges: early syncs from webhook facts, and the serialized sync runner ──
+
+/**
+ * 1 fact from a GitHub webhook delivery, as a hooks module hands it to `nudge`: code-built, checked fields only, no free
+ * text. The desk reads GitHub itself in the sync it schedules: the fact only decides when to read.
+ */
+export type NudgeFact = {
+    /** `X-GitHub-Delivery`: a UUID. Required: `nudge` is idempotent by it. */
+    delivery: string;
+    /** When the delivery came, in ms. Absent: the time of the `nudge` call. */
+    at?: number;
+    /** `pull_request`, `pull_request_review`, `check_suite`, `status`, `issues`, ... */
+    event: string;
+    action?: string;
+    /** "owner/name". */
+    repo: string;
+    /** The PR or issue number: an integer from 1 to 2^31-1. */
+    number?: number;
+    label?: string;
+    /** A commit oid: 40 lowercase hex characters. */
+    sha?: string;
+    branch?: string;
+};
+
+/** What `nudge` did with 1 fact. */
+export type NudgeOutcome = "matched" | "unmatched" | "duplicate" | "invalid";
+
+/** What `nudge` did: each fact's outcome by delivery id, and the supervisors it matched, sorted. */
+export type NudgeResult = { outcomes: Record<string, NudgeOutcome>; supervisors: number[] };
+
+/** Nudges that come within this time after the first one join 1 sync. */
+export const NUDGE_WINDOW_MS = 20_000;
+/** At most 1 nudged sync per supervisor in this time. */
+export const NUDGE_GAP_MS = 60_000;
+/** How long a delivery id stays in `seen`. */
+export const NUDGE_SEEN_MS = 72 * 3600_000;
+/** The most delivery ids in `seen`: the oldest go first. */
+export const NUDGE_SEEN_MAX = 20_000;
+/** The most delivery records 1 pending or running entry keeps: its `count` counts all. */
+export const NUDGE_DELIVERIES_MAX = 200;
+/** The nudged syncs the beacon keeps, newest last. */
+export const NUDGE_SYNCS_KEPT = 500;
+/** The most facts 1 `nudge` call takes. */
+export const NUDGE_FACTS_MAX = 500;
+/** A pending entry this far past its due time with a recorded task gets a new task: the old one is lost. */
+export const NUDGE_LOST_MS = 10 * 60_000;
+/** The observed changes kept, newest last. */
+export const OBSERVED_KEPT = 2000;
+/** An observed PR or issue that no sweep read for this long leaves `last`. */
+export const OBSERVED_FORGET_MS = 30 * 24 * 3600_000;
+
+/** 1 delivery that a nudged sync covers: its id, and when it came. Stored data: never rename a field. */
+export type NudgeDelivery = { id: string; at: number };
+
+/** The nudges and the nudged syncs. Stored data: never rename the kind or change what a field means. */
+export type DeskNudgesState = {
+    /** Delivery id → when the desk took it: a second `nudge` of the same id changes nothing. */
+    seen: Record<string, number>;
+    /**
+     * By supervisor id: the nudges that wait for a sync. `first`: when the first came; `due`: when the sync may start
+     * (`nudgeDue`); `count`: every nudge it took; `deliveries`: the first `NUDGE_DELIVERIES_MAX` of them.
+     */
+    pending: Record<
+        string,
+        { first: number; due: number; count: number; deliveries: NudgeDelivery[] }
+    >;
+    /** By supervisor id: the nudges whose sync runs now. `started`: when the sync took them. */
+    running: Record<string, { started: number; count: number; deliveries: NudgeDelivery[] }>;
+    /** By supervisor id: when its last nudged sync started. */
+    last: Record<string, number>;
+    /** By supervisor id: its live `x.desk.nudge` task id. */
+    tasks: Record<string, string>;
+    /**
+     * The beacon: 1 record for each nudged sync, newest last, at most `NUDGE_SYNCS_KEPT`. `started`: when it took its
+     * nudges; `committed`: when its sweep committed, 0 when it failed; `error`: why it failed, 1 line of 200 characters.
+     */
+    syncs: {
+        supervisor: number;
+        count: number;
+        deliveries: NudgeDelivery[];
+        started: number;
+        committed: number;
+        error?: string;
+    }[];
+    /** The facts that matched no supervisor. */
+    unmatched: number;
+};
+
+/** The nudges, app-wide as `x.desk.threads` is. */
+export const DeskNudges = defineDoc<DeskNudgesState>({
+    kind: "x.desk.nudges",
+    version: 1,
+    checkpointWhen: () => false,
+    scope: "session",
+    initial: () => ({
+        seen: {},
+        pending: {},
+        running: {},
+        last: {},
+        tasks: {},
+        syncs: [],
+        unmatched: 0,
+    }),
+});
+
+/** A class of change on a PR or an issue, as a webhook event class has it. */
+export type ObservedClass = "state" | "labels" | "review" | "head" | "ci";
+
+/**
+ * 1 change a sweep saw on a PR or an issue: `at` is GitHub's time of it, 0 when unknown; `seen` is the sweep's `now`.
+ * Stored data: never rename a field.
+ */
+export type ObservedChange = {
+    repo: string;
+    number: number;
+    kind: "pr" | "issue";
+    class: ObservedClass;
+    at: number;
+    seen: number;
+};
+
+/**
+ * What the last sweep saw of 1 PR or issue. A field the read did not give keeps the value of an earlier read. Stored
+ * data: never rename a field.
+ */
+export type ObservedSnap = {
+    state: string;
+    head?: string;
+    /** Sorted. For an issue: its counted queue signals. */
+    labels?: string[];
+    checks?: string;
+    review?: string;
+    reviewedAt?: number;
+    seen: number;
+};
+
+/** The observed changes. Stored data: never rename the kind or change what a field means. */
+export type DeskObservedState = {
+    /** By ref, in lower case ("owner/name#12"): what the last sweep saw. */
+    last: Record<string, ObservedSnap>;
+    /** Newest last, at most `OBSERVED_KEPT`. */
+    changes: ObservedChange[];
+};
+
+/** The changes the sweeps saw, for the hooks' coverage alarm: app-wide. */
+export const DeskObserved = defineDoc<DeskObservedState>({
+    kind: "x.desk.observed",
+    version: 1,
+    checkpointWhen: () => false,
+    scope: "session",
+    initial: () => ({ last: {}, changes: [] }),
+});
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const SHA = /^[0-9a-f]{40}$/;
+/** The labels that put an issue in the queue: an `issues` fact with one of them nudges every supervisor. */
+const QUEUE_LABELS = new Set(["agent-queue", "agent-urgent", "needs-plan"]);
+
+/** A fact `nudge` can use: a UUID delivery, a repository name, and a number and a sha in their patterns. */
+function validNudgeFact(fact: NudgeFact): boolean {
+    return (
+        fact !== null &&
+        typeof fact === "object" &&
+        typeof fact.delivery === "string" &&
+        UUID.test(fact.delivery) &&
+        typeof fact.repo === "string" &&
+        isRepoName(fact.repo) &&
+        (fact.number === undefined ||
+            (Number.isInteger(fact.number) && fact.number >= 1 && fact.number <= 2 ** 31 - 1)) &&
+        (fact.sha === undefined || (typeof fact.sha === "string" && SHA.test(fact.sha)))
+    );
+}
+
+/** When a nudged sync may start: 20 seconds after the first nudge, and 60 seconds after the last nudged sync. */
+export function nudgeDue(first: number, last: number | undefined): number {
+    return Math.max(first + NUDGE_WINDOW_MS, (last ?? Number.NEGATIVE_INFINITY) + NUDGE_GAP_MS);
+}
+
+/**
+ * The supervisors 1 fact concerns, sorted: a thread that is not closed (or closed and `reopenable`) holds its ref as a
+ * PR or a linked issue, or its sha as a PR head (a fact with no number); a watch with no result waits for that PR; or
+ * the fact is about the issue queue (a queued ref, or a queue label on an issue), which every sweep reads, so every
+ * supervisor with a sweeper record. Refs compare without case.
+ */
+export function nudgeSupervisors(state: DeskState, fact: NudgeFact, now: number): number[] {
+    const found = new Set<number>();
+    const ref =
+        fact.number === undefined ? undefined : `${fact.repo}#${String(fact.number)}`.toLowerCase();
+
+    for (const thread of Object.values(state.threads)) {
+        const supervisor = thread.supervisor;
+
+        if (supervisor === undefined) {
+            continue;
+        }
+
+        const live = thread.state !== "closed" || reopenable(thread, now);
+
+        if (
+            ref !== undefined &&
+            live &&
+            (Object.keys(thread.prs).some((key) => key.toLowerCase() === ref) ||
+                (thread.issues ?? []).some((key) => key.toLowerCase() === ref))
+        ) {
+            found.add(supervisor);
+        }
+
+        const on = thread.watch?.result === undefined ? thread.watch?.on : undefined;
+
+        if (ref !== undefined && on?.kind === "pr" && on.ref.toLowerCase() === ref) {
+            found.add(supervisor);
+        }
+
+        if (
+            fact.sha !== undefined &&
+            fact.number === undefined &&
+            live &&
+            Object.values(thread.prs).some((link) => link.head === fact.sha)
+        ) {
+            found.add(supervisor);
+        }
+    }
+
+    const queued =
+        (ref !== undefined &&
+            (state.issues?.items ?? []).some((item) => item.ref.toLowerCase() === ref)) ||
+        (fact.event === "issues" && fact.label !== undefined && QUEUE_LABELS.has(fact.label));
+
+    if (queued) {
+        for (const key of Object.keys(state.sweepers ?? {})) {
+            const supervisor = Number(key);
+
+            if (Number.isInteger(supervisor)) {
+                found.add(supervisor);
+            }
+        }
+    }
+
+    return [...found].sort((a, b) => a - b);
+}
+
+/** Drop the delivery ids older than `NUDGE_SEEN_MS`, then the oldest above `NUDGE_SEEN_MAX`. */
+function pruneSeen(nudges: DeskNudgesState, now: number): void {
+    const kept = Object.entries(nudges.seen).filter(([, at]) => now - at <= NUDGE_SEEN_MS);
+
+    if (kept.length === Object.keys(nudges.seen).length && kept.length <= NUDGE_SEEN_MAX) {
+        return;
+    }
+
+    kept.sort((a, b) => a[1] - b[1]);
+    nudges.seen = Object.fromEntries(kept.slice(Math.max(0, kept.length - NUDGE_SEEN_MAX)));
+}
+
+/**
+ * Take a batch of facts into the nudges document: each fact's outcome, a pending entry for each matched supervisor
+ * (`count` and the first `NUDGE_DELIVERIES_MAX` deliveries), and the supervisors of this call that need a new
+ * `x.desk.nudge` task (`start`): a pending entry with no task, or one more than `NUDGE_LOST_MS` past its due time (a
+ * lost task heals at the next new nudge for its supervisor; a second task is harmless, because its sync goes through
+ * the runner and claims only what is due). A call with no new delivery (duplicates and invalid facts only) changes
+ * nothing. More than `NUDGE_FACTS_MAX` facts is an error.
+ */
+export function takeNudges(
+    nudges: DeskNudgesState,
+    state: DeskState,
+    facts: NudgeFact[],
+    now: number,
+): { result: NudgeResult; start: number[] } {
+    if (!Array.isArray(facts) || facts.length > NUDGE_FACTS_MAX) {
+        throw new Error(`nudge takes at most ${String(NUDGE_FACTS_MAX)} facts in 1 call.`);
+    }
+
+    // A delivery id the desk took within `NUDGE_SEEN_MS`: an older entry is pruned at the next new delivery.
+    const seen = (id: string) => {
+        const at = nudges.seen[id];
+
+        return at !== undefined && now - at <= NUDGE_SEEN_MS;
+    };
+
+    // Only a call that takes a new delivery writes: a call of duplicates and invalid facts changes nothing.
+    if (facts.some((fact) => validNudgeFact(fact) && !seen(fact.delivery.toLowerCase()))) {
+        pruneSeen(nudges, now);
+    }
+
+    const outcomes: Record<string, NudgeOutcome> = {};
+    const matched = new Set<number>();
+
+    const note = (id: string, outcome: NudgeOutcome) => {
+        // The first fact of an id in 1 call says what happened to it: a repeat in the same call is not news.
+        outcomes[id] ??= outcome;
+    };
+
+    for (const fact of facts) {
+        if (!validNudgeFact(fact)) {
+            note(String((fact as { delivery?: unknown } | null)?.delivery ?? ""), "invalid");
+            continue;
+        }
+
+        const id = fact.delivery.toLowerCase();
+
+        if (seen(id)) {
+            note(id, "duplicate");
+            continue;
+        }
+
+        nudges.seen[id] = now;
+
+        const supervisors = nudgeSupervisors(state, fact, now);
+
+        if (supervisors.length === 0) {
+            nudges.unmatched += 1;
+            note(id, "unmatched");
+            continue;
+        }
+
+        note(id, "matched");
+
+        const at = typeof fact.at === "number" && Number.isFinite(fact.at) ? fact.at : now;
+
+        for (const supervisor of supervisors) {
+            const key = String(supervisor);
+
+            matched.add(supervisor);
+            nudges.pending[key] ??= {
+                first: now,
+                due: nudgeDue(now, nudges.last[key]),
+                count: 0,
+                deliveries: [],
+            };
+
+            const entry = nudges.pending[key];
+
+            entry.count += 1;
+
+            if (entry.deliveries.length < NUDGE_DELIVERIES_MAX) {
+                entry.deliveries.push({ id, at });
+            }
+        }
+    }
+
+    // Only the supervisors this call matched: a lost task heals at the next new nudge for its supervisor.
+    const start = [...matched]
+        .filter((supervisor) => {
+            const key = String(supervisor);
+            const entry = nudges.pending[key];
+
+            return (
+                entry !== undefined &&
+                (nudges.tasks[key] === undefined || now - entry.due > NUDGE_LOST_MS)
+            );
+        })
+        .sort((a, b) => a - b);
+
+    return { result: { outcomes, supervisors: [...matched].sort((a, b) => a - b) }, start };
+}
+
+/**
+ * A nudged sync's claim of 1 supervisor's nudges. It always takes a `running` entry that a restart left (its sync did
+ * not commit). It takes the `pending` entry only when it is due (`now >= due`): then the entries merge into `running`,
+ * at most `NUDGE_DELIVERIES_MAX` deliveries, and `last` is `now`, so the next pending entry waits `NUDGE_GAP_MS`. A
+ * pending entry that is not due stays, and `last` stays. False: nothing taken, so no sync.
+ */
+export function claimNudges(nudges: DeskNudgesState, key: string, now: number): boolean {
+    const pending = nudges.pending[key];
+    const running = nudges.running[key];
+    const due = pending !== undefined && now >= pending.due;
+
+    if (!due && running === undefined) {
+        return false;
+    }
+
+    const taken = due ? pending : undefined;
+
+    nudges.running[key] = {
+        started: taken === undefined ? running!.started : now,
+        count: (running?.count ?? 0) + (taken?.count ?? 0),
+        deliveries: [...(running?.deliveries ?? []), ...(taken?.deliveries ?? [])]
+            .slice(0, NUDGE_DELIVERIES_MAX)
+            .map((one) => ({ id: one.id, at: one.at })),
+    };
+
+    if (taken !== undefined) {
+        delete nudges.pending[key];
+        nudges.last[key] = now;
+    }
+
+    return true;
+}
+
+/** 1 line of 200 characters at most: an error for the beacon. */
+function nudgeError(error: unknown): string {
+    const text = error instanceof Error ? error.message : String(error);
+
+    return text.replace(/\s+/g, " ").trim().slice(0, 200) || "the sync failed";
+}
+
+/** Sorted, with no repeat. */
+const sortedSet = (values: readonly string[]): string[] => [...new Set(values)].sort();
+
+const sameList = (a: readonly string[], b: readonly string[]): boolean =>
+    a.length === b.length && a.every((each, index) => each === b[index]);
+
+/**
+ * What 1 sweep's read of a PR changed, by class, and the new snapshot. No `prev`: a baseline only, no change. A field
+ * the read did not give (no head, cut labels, no checks, no review time) keeps its earlier value.
+ */
+export function observePr(
+    prev: ObservedSnap | undefined,
+    fact: PrFact,
+    now: number,
+): { snap: ObservedSnap; changes: ObservedChange[] } {
+    const labels =
+        fact.labels !== undefined && fact.labelsCut !== true
+            ? sortedSet(fact.labels)
+            : prev?.labels;
+    const head = fact.head !== "" ? fact.head : prev?.head;
+    const checks = fact.checks !== "" ? fact.checks : prev?.checks;
+    const reviewedAt = fact.reviewedAt ?? prev?.reviewedAt;
+    const snap: ObservedSnap = {
+        state: fact.state,
+        ...(head === undefined ? {} : { head }),
+        ...(labels === undefined ? {} : { labels }),
+        ...(checks === undefined ? {} : { checks }),
+        review: fact.review,
+        ...(reviewedAt === undefined ? {} : { reviewedAt }),
+        seen: now,
+    };
+
+    if (prev === undefined) {
+        return { snap, changes: [] };
+    }
+
+    const changes: ObservedChange[] = [];
+    const change = (kind: ObservedClass, at: number) =>
+        changes.push({
+            repo: fact.repo,
+            number: fact.number,
+            kind: "pr",
+            class: kind,
+            at,
+            seen: now,
+        });
+
+    if (prev.state !== fact.state) {
+        change(
+            "state",
+            fact.state === "MERGED" ? fact.mergedAt : fact.state === "CLOSED" ? fact.closedAt : 0,
+        );
+    }
+
+    if (
+        prev.labels !== undefined &&
+        fact.labels !== undefined &&
+        fact.labelsCut !== true &&
+        !sameList(prev.labels, sortedSet(fact.labels))
+    ) {
+        const added = !prev.labels.includes(READY_LABEL) && fact.labels.includes(READY_LABEL);
+
+        change("labels", added && fact.readyAt > 0 ? fact.readyAt : 0);
+    }
+
+    if (
+        prev.head !== undefined &&
+        prev.head !== "" &&
+        fact.head !== "" &&
+        prev.head !== fact.head
+    ) {
+        change("head", fact.headAt);
+    }
+
+    if (fact.checks !== "" && prev.checks !== fact.checks) {
+        change("ci", 0);
+    }
+
+    const grew =
+        prev.reviewedAt !== undefined &&
+        fact.reviewedAt !== undefined &&
+        fact.reviewedAt > prev.reviewedAt;
+
+    if ((prev.review !== undefined && prev.review !== fact.review) || grew) {
+        change("review", grew ? (fact.reviewedAt ?? 0) : 0);
+    }
+
+    return { snap, changes };
+}
+
+/**
+ * What 1 sweep's read of a queued issue changed: its open state (`state`), and its counted signals (`labels`, at the
+ * item's `at`). No `prev`: a baseline only. A cut read keeps the earlier signals: a signal that is not there proves
+ * nothing.
+ */
+export function observeIssue(
+    prev: ObservedSnap | undefined,
+    issue: JudgedIssue,
+    now: number,
+): { snap: ObservedSnap; changes: ObservedChange[] } {
+    const signals = issue.cut ? prev?.labels : sortedSet(issue.item?.signals ?? []);
+    const snap: ObservedSnap = {
+        state: issue.open ? "OPEN" : "CLOSED",
+        ...(signals === undefined ? {} : { labels: signals }),
+        seen: now,
+    };
+    const parsed = REF.exec(issue.ref);
+
+    if (prev === undefined || parsed === null) {
+        return { snap, changes: [] };
+    }
+
+    const repo = parsed[1]!;
+    const number = Number(parsed[2]);
+    const changes: ObservedChange[] = [];
+
+    if (prev.state !== snap.state) {
+        changes.push({ repo, number, kind: "issue", class: "state", at: 0, seen: now });
+    }
+
+    if (
+        !issue.cut &&
+        prev.labels !== undefined &&
+        signals !== undefined &&
+        !sameList(prev.labels, signals)
+    ) {
+        changes.push({
+            repo,
+            number,
+            kind: "issue",
+            class: "labels",
+            at: issue.item === undefined ? 0 : issue.item.at,
+            seen: now,
+        });
+    }
+
+    return { snap, changes };
+}
+
+/**
+ * Record 1 sweep's observed changes (`x.desk.observed`): each PR of the GitHub read (the pinned ones, then the open lists,
+ * once per ref without case), and each issue of a queue read that worked. Changes go newest last, at most
+ * `OBSERVED_KEPT`; a ref no sweep read for `OBSERVED_FORGET_MS` leaves `last`.
+ */
+export function recordObserved(
+    observed: DeskObservedState,
+    github: GitHubFacts | undefined,
+    queue: QueueRead | undefined,
+    now: number,
+): void {
+    const done = new Set<string>();
+    const added: ObservedChange[] = [];
+
+    const take = (key: string, read: { snap: ObservedSnap; changes: ObservedChange[] }) => {
+        observed.last[key] = read.snap;
+        added.push(...read.changes);
+    };
+
+    if (github !== undefined) {
+        const prs = [
+            ...Object.values(github.prs),
+            ...Object.values(github.repos).flatMap((repo) => repo.open),
+        ];
+
+        for (const fact of prs) {
+            const key = fact.ref.toLowerCase();
+
+            if (done.has(key)) {
+                continue;
+            }
+
+            done.add(key);
+            take(key, observePr(observed.last[key], fact, now));
+        }
+    }
+
+    if (queue !== undefined && queue.error === undefined && queue.off !== true) {
+        for (const issue of [...queue.found, ...Object.values(queue.checked)]) {
+            const key = issue.ref.toLowerCase();
+
+            if (done.has(key) || issue.gone === true) {
+                continue;
+            }
+
+            done.add(key);
+            take(key, observeIssue(observed.last[key], issue, now));
+        }
+    }
+
+    if (added.length > 0) {
+        observed.changes.push(...added);
+    }
+
+    if (observed.changes.length > OBSERVED_KEPT) {
+        observed.changes = observed.changes.slice(observed.changes.length - OBSERVED_KEPT);
+    }
+
+    for (const [key, snap] of Object.entries(observed.last)) {
+        if (now - snap.seen > OBSERVED_FORGET_MS) {
+            delete observed.last[key];
+        }
+    }
+}
+
+type SyncJob = {
+    source: string;
+    work: () => Promise<unknown>;
+    promise: Promise<unknown>;
+    resolve: (value: unknown) => void;
+    reject: (error: unknown) => void;
+};
+
+/**
+ * 1 serialized sync lane per supervisor: a sync ("gather, then commit `applySweep`") starts only after the one before it
+ * ended, so an older read never commits after a newer one. A request while the lane is busy is a follow-up: it joins a
+ * queued work of the same source that has not started (the same promise; its own work never runs), else it queues.
+ * A rejection reaches only the callers of that work; the lane goes on.
+ */
+export class SyncRunner {
+    readonly #lanes = new Map<number, { running?: SyncJob; waiting: SyncJob[] }>();
+
+    run<T>(supervisor: number, source: string, work: () => Promise<T>): Promise<T> {
+        let lane = this.#lanes.get(supervisor);
+
+        if (lane === undefined) {
+            lane = { waiting: [] };
+            this.#lanes.set(supervisor, lane);
+        }
+
+        const joined = lane.waiting.find((job) => job.source === source);
+
+        if (joined !== undefined) {
+            return joined.promise as Promise<T>;
+        }
+
+        let resolve!: (value: unknown) => void;
+        let reject!: (error: unknown) => void;
+        const promise = new Promise<unknown>((yes, no) => {
+            resolve = yes;
+            reject = no;
+        });
+
+        lane.waiting.push({ source, work, promise, resolve, reject });
+        this.#pump(supervisor);
+
+        return promise as Promise<T>;
+    }
+
+    /** Run `work` only when the lane is idle: else `undefined` at once, and `work` never runs. */
+    tryRun<T>(supervisor: number, source: string, work: () => Promise<T>): Promise<T | undefined> {
+        return this.busy(supervisor)
+            ? Promise.resolve(undefined)
+            : this.run(supervisor, source, work);
+    }
+
+    /** A work runs, or waits, for this supervisor. */
+    busy(supervisor: number): boolean {
+        const lane = this.#lanes.get(supervisor);
+
+        return lane !== undefined && (lane.running !== undefined || lane.waiting.length > 0);
+    }
+
+    /** The sources of the works that wait for this supervisor, in order: for tests and the page. */
+    waiting(supervisor: number): string[] {
+        return (this.#lanes.get(supervisor)?.waiting ?? []).map((job) => job.source);
+    }
+
+    #pump(supervisor: number): void {
+        const lane = this.#lanes.get(supervisor);
+
+        if (lane === undefined || lane.running !== undefined) {
+            return;
+        }
+
+        const job = lane.waiting.shift();
+
+        if (job === undefined) {
+            this.#lanes.delete(supervisor);
+
+            return;
+        }
+
+        lane.running = job;
+
+        void (async () => {
+            try {
+                job.resolve(await job.work());
+            } catch (error) {
+                job.reject(error);
+            } finally {
+                lane.running = undefined;
+                this.#pump(supervisor);
+            }
+        })();
+    }
+}
+
+/** Where the runners live: 1 for each Pi Pocket data folder, shared by every load of this module in the process. */
+const RUNNER = Symbol.for("pi-pocket-team.desk.runner");
+
+/** The runner's shape: a load with another version makes a new runner. */
+export const SYNC_RUNNER_VERSION = 1;
+
+/** The data folder's runner: the one an earlier load of this module made, when its version is this one. */
+export function sharedRunner(dataDir: string): SyncRunner {
+    const shared = globalThis as unknown as Record<
+        symbol,
+        Map<string, { version: number; runner: SyncRunner }> | undefined
+    >;
+    const runners = (shared[RUNNER] ??= new Map());
+    const slot = runners.get(dataDir);
+
+    if (slot?.version === SYNC_RUNNER_VERSION) {
+        return slot.runner;
+    }
+
+    const runner = new SyncRunner();
+
+    runners.set(dataDir, { version: SYNC_RUNNER_VERSION, runner });
+
+    return runner;
+}
+
 /** Its tool returns `output`, so it needs version 2 of the extension API. */
 export const pocketApi = 2;
 
 export default function createDesk(host: Host, web: Web) {
     /** The plan stores' locks, shared with every other instance of this module in the process. */
     const locks = planLocks();
+    /**
+     * The serialized sync lanes, shared with every other load of this module for this data folder: each "gather, then
+     * commit `applySweep`" (the sweeper, `desk sync`, the page's view sweep, a nudged sync) runs in its supervisor's lane.
+     */
+    const runner = sharedRunner(host.dataDir);
 
     /** The desk's document, as a plan flow needs it: read, and 1 commit that takes the state. */
     type PlanAccess = {
@@ -20929,6 +21686,7 @@ export default function createDesk(host: Host, web: Web) {
         publishPlans: async (api, context) => {
             await publishAll(accessOf(api, context));
         },
+        nudge: (tx, facts, now = Date.now()) => takeNudgesInto(tx, facts, now),
     };
     const shared = globalThis as unknown as Record<symbol, DeskApi | undefined>;
 
@@ -24298,6 +25056,13 @@ export default function createDesk(host: Host, web: Web) {
         // An OK is for a full desk: after this sweep's threads moved, an unused OK lapses when the desk has room.
         lapseGrants(state, cap, now);
 
+        // The changes this sweep saw on PRs and queued issues, for the hooks' coverage alarm: never a failed sweep.
+        try {
+            recordObserved(await tx.doc(DeskObserved), facts.github, facts.queue, now);
+        } catch {
+            // The next sweep records again: a missed change is a missed comparison, not a wrong one.
+        }
+
         return { events };
     };
 
@@ -24571,6 +25336,38 @@ export default function createDesk(host: Host, web: Web) {
         gh: () => process.env.PI_POCKET_DESK_GH ?? "gh",
     });
 
+    /**
+     * A sweeper's next phase, decided in the commit of its sweep: sleep `SWEEP_SLEEP_MS`, or end (and drop its record)
+     * when its supervisor has no thread that is not closed, no quiet-wake mark or ready PR to watch, and no consult in
+     * flight.
+     */
+    const sweeperNext = (state: DeskState, supervisor: number, taskId: string, now: number) => {
+        const open = Object.values(state.threads).some(
+            (thread) => thread.supervisor === supervisor && thread.state !== "closed",
+        );
+        // A quiet-wake mark, or a ready PR on a recently closed thread, keeps the sweeper: both need a later sweep.
+        const watched =
+            quietWatched(state, supervisor, now) || readyWatched(state, supervisor, now);
+        // A consult in flight (a start, or an identity to recover) keeps the sweeper: only a sweep tries it.
+        const consulting = consultsPending(state, supervisor, now);
+
+        if (!open && !watched && !consulting) {
+            if (state.sweepers?.[String(supervisor)] === taskId) {
+                delete state.sweepers[String(supervisor)];
+            }
+
+            return {
+                status: "terminal" as const,
+                outcome: { status: "completed" as const, result: null },
+            };
+        }
+
+        return {
+            status: "running" as const,
+            checkpoint: { phase: "sleep" as const, until: now + SWEEP_SLEEP_MS },
+        };
+    };
+
     type SweeperInput = { supervisor: number };
     type SweeperState = { phase: "sweep" } | { phase: "sleep"; until: number };
 
@@ -24594,18 +25391,6 @@ export default function createDesk(host: Host, web: Web) {
                     runtime.commit(change, context),
                 );
 
-                let facts: SweepFacts;
-
-                try {
-                    facts = await gather(supervisor, runtime, runtime.now(), context);
-                } catch (error) {
-                    await recordSweepError(Number(supervisor), error, runtime.now(), (change) =>
-                        runtime.commit(change, context),
-                    );
-
-                    throw error;
-                }
-
                 // The threads that closed out in the commit below: their agents hear about it after the commit, so a
                 // restart before the send loses nothing (the next sweep finds them again, because `run.closeout` is
                 // unset). The key makes a repeated send act once.
@@ -24616,170 +25401,197 @@ export default function createDesk(host: Host, web: Web) {
                 // The `ready-for-human` removals still to do: the ones decided in this commit, and any an earlier sweep
                 // could not finish. A removal and a send act once by their key.
                 const unready: UnreadyWork[] = [];
-
-                const sweepCommit = runtime.commit(async (tx) => {
-                    const state = await tx.doc(DeskThreads);
-                    // Read before any table write of this commit: Durable refuses a table read after one. The dashboard
-                    // never fails a sweep: a failed read is unknown, and an unknown answer starts no collector.
-                    let collectorLive: boolean | undefined;
-
-                    try {
-                        collectorLive = await dashboard.collectorLive(tx);
-                    } catch {
-                        collectorLive = undefined;
-                    }
-
-                    await applySweep(tx, state, Number(supervisor), facts);
-                    await startMissingSweepers(tx);
-
-                    // Entries that wait with no writer (the journal was off, then on again): a writer starts again.
-                    await resumeJournal(tx, Number(supervisor));
-
-                    for (const thread of Object.values(state.threads)) {
-                        if (thread.supervisor !== Number(supervisor)) {
-                            continue;
-                        }
-
-                        const key = closeoutKey(thread);
-
-                        if (key !== undefined && thread.address !== undefined) {
-                            closedOut.push({
-                                id: thread.id,
-                                address: thread.address,
-                                key,
-                                // The sweep scanned the session in this commit: the wake-up comes after this entry.
-                                entry: numberOr(thread.run.lastUserEntry) ?? 0,
-                            });
-                        }
-                    }
-
-                    for (const thread of Object.values(state.threads)) {
-                        // A parked thread sends nothing: an entry from before the park waits until Brian wakes it.
-                        if (thread.supervisor !== Number(supervisor) || thread.state !== "open") {
-                            continue;
-                        }
-
-                        for (const [key, entry] of Object.entries(repairsOf(thread))) {
-                            const parsed = parseRepairKey(key);
-
-                            if (entry.sent || parsed === undefined) {
-                                continue;
-                            }
-
-                            repairs.push({
-                                id: thread.id,
-                                key,
-                                ref: parsed.ref,
-                                state: parsed.state,
-                                // A copy: the document's own array is not readable after the commit.
-                                failing: [...(thread.prs[parsed.ref]?.failing ?? [])],
-                                to: entry.to,
-                                why: entry.why,
-                                ...(thread.address === undefined
-                                    ? {}
-                                    : { address: thread.address }),
-                                ...(thread.session === undefined
-                                    ? {}
-                                    : { session: thread.session as ConversationId }),
-                                ...(entry.to === "odrade" && thread.session !== undefined
-                                    ? await (async () => {
-                                          const back = await addressOf(
-                                              tx,
-                                              thread,
-                                              thread.session as ConversationId,
-                                          );
-
-                                          return back === undefined ? {} : { back };
-                                      })()
-                                    : {}),
-                            });
-                        }
-                    }
-
-                    for (const thread of Object.values(state.threads)) {
-                        // A parked thread sends nothing: the same rule as the repair wake-up.
-                        if (thread.supervisor !== Number(supervisor) || thread.state !== "open") {
-                            continue;
-                        }
-
-                        for (const [key, entry] of Object.entries(unreadyOf(thread))) {
-                            if (entry.sent) {
-                                continue;
-                            }
-
-                            const parts = key.split(":");
-
-                            if (parts.length < 3 || parts[0] !== "unready") {
-                                continue;
-                            }
-
-                            unready.push({
-                                id: thread.id,
-                                key,
-                                ref: parts.slice(1, -1).join(":"),
-                                why: entry.why,
-                                to: entry.to,
-                                removed: entry.removed,
-                                ...(thread.address === undefined
-                                    ? {}
-                                    : { address: thread.address }),
-                            });
-                        }
-                    }
-
-                    // The dashboard's collector, after every table read of this commit (a task is a table write): it
-                    // only reads the threads, and it starts no agent.
-                    try {
-                        await dashboard.ensureCollector(
-                            tx,
-                            Number(supervisor),
-                            Collector,
-                            collectorLive,
-                        );
-                    } catch {
-                        // The next sweep tries again.
-                    }
-
-                    const open = Object.values(state.threads).some(
-                        (thread) =>
-                            thread.supervisor === Number(supervisor) && thread.state !== "closed",
-                    );
-                    // A quiet-wake mark, or a ready PR on a recently closed thread, keeps the sweeper: both need a later
-                    // sweep.
-                    const watched =
-                        quietWatched(state, Number(supervisor), runtime.now()) ||
-                        readyWatched(state, Number(supervisor), runtime.now());
-
-                    // A consult in flight (a start, or an identity to recover) keeps the sweeper: only a sweep tries it.
-                    const consulting = consultsPending(state, Number(supervisor), runtime.now());
-
-                    if (!open && !watched && !consulting) {
-                        if (
-                            state.sweepers?.[String(Number(supervisor))] === String(runtime.taskId)
-                        ) {
-                            delete state.sweepers[String(Number(supervisor))];
-                        }
-
-                        return {
-                            status: "terminal",
-                            outcome: { status: "completed", result: null },
-                        };
-                    }
-
-                    return {
-                        status: "running",
-                        checkpoint: { phase: "sleep", until: runtime.now() + SWEEP_SLEEP_MS },
-                    };
-                }, context);
+                // Whether this task's own work ran in the lane: a request that joined another sweeper's queued work
+                // (never 2 sweepers of 1 supervisor, but a lost record can make one) commits only its own next phase.
+                let ran = false;
 
                 try {
-                    await sweepCommit;
+                    await runner.run(Number(supervisor), "sweeper", async () => {
+                        ran = true;
+                        let facts: SweepFacts;
+
+                        try {
+                            facts = await gather(supervisor, runtime, runtime.now(), context);
+                        } catch (error) {
+                            await recordSweepError(
+                                Number(supervisor),
+                                error,
+                                runtime.now(),
+                                (change) => runtime.commit(change, context),
+                            );
+
+                            throw error;
+                        }
+
+                        const sweepCommit = runtime.commit(async (tx) => {
+                            const state = await tx.doc(DeskThreads);
+                            // Read before any table write of this commit: Durable refuses a table read after one. The dashboard
+                            // never fails a sweep: a failed read is unknown, and an unknown answer starts no collector.
+                            let collectorLive: boolean | undefined;
+
+                            try {
+                                collectorLive = await dashboard.collectorLive(tx);
+                            } catch {
+                                collectorLive = undefined;
+                            }
+
+                            await applySweep(tx, state, Number(supervisor), facts);
+                            await startMissingSweepers(tx);
+
+                            // Entries that wait with no writer (the journal was off, then on again): a writer starts again.
+                            await resumeJournal(tx, Number(supervisor));
+
+                            for (const thread of Object.values(state.threads)) {
+                                if (thread.supervisor !== Number(supervisor)) {
+                                    continue;
+                                }
+
+                                const key = closeoutKey(thread);
+
+                                if (key !== undefined && thread.address !== undefined) {
+                                    closedOut.push({
+                                        id: thread.id,
+                                        address: thread.address,
+                                        key,
+                                        // The sweep scanned the session in this commit: the wake-up comes after this entry.
+                                        entry: numberOr(thread.run.lastUserEntry) ?? 0,
+                                    });
+                                }
+                            }
+
+                            for (const thread of Object.values(state.threads)) {
+                                // A parked thread sends nothing: an entry from before the park waits until Brian wakes it.
+                                if (
+                                    thread.supervisor !== Number(supervisor) ||
+                                    thread.state !== "open"
+                                ) {
+                                    continue;
+                                }
+
+                                for (const [key, entry] of Object.entries(repairsOf(thread))) {
+                                    const parsed = parseRepairKey(key);
+
+                                    if (entry.sent || parsed === undefined) {
+                                        continue;
+                                    }
+
+                                    repairs.push({
+                                        id: thread.id,
+                                        key,
+                                        ref: parsed.ref,
+                                        state: parsed.state,
+                                        // A copy: the document's own array is not readable after the commit.
+                                        failing: [...(thread.prs[parsed.ref]?.failing ?? [])],
+                                        to: entry.to,
+                                        why: entry.why,
+                                        ...(thread.address === undefined
+                                            ? {}
+                                            : { address: thread.address }),
+                                        ...(thread.session === undefined
+                                            ? {}
+                                            : { session: thread.session as ConversationId }),
+                                        ...(entry.to === "odrade" && thread.session !== undefined
+                                            ? await (async () => {
+                                                  const back = await addressOf(
+                                                      tx,
+                                                      thread,
+                                                      thread.session as ConversationId,
+                                                  );
+
+                                                  return back === undefined ? {} : { back };
+                                              })()
+                                            : {}),
+                                    });
+                                }
+                            }
+
+                            for (const thread of Object.values(state.threads)) {
+                                // A parked thread sends nothing: the same rule as the repair wake-up.
+                                if (
+                                    thread.supervisor !== Number(supervisor) ||
+                                    thread.state !== "open"
+                                ) {
+                                    continue;
+                                }
+
+                                for (const [key, entry] of Object.entries(unreadyOf(thread))) {
+                                    if (entry.sent) {
+                                        continue;
+                                    }
+
+                                    const parts = key.split(":");
+
+                                    if (parts.length < 3 || parts[0] !== "unready") {
+                                        continue;
+                                    }
+
+                                    unready.push({
+                                        id: thread.id,
+                                        key,
+                                        ref: parts.slice(1, -1).join(":"),
+                                        why: entry.why,
+                                        to: entry.to,
+                                        removed: entry.removed,
+                                        ...(thread.address === undefined
+                                            ? {}
+                                            : { address: thread.address }),
+                                    });
+                                }
+                            }
+
+                            // The dashboard's collector, after every table read of this commit (a task is a table write): it
+                            // only reads the threads, and it starts no agent.
+                            try {
+                                await dashboard.ensureCollector(
+                                    tx,
+                                    Number(supervisor),
+                                    Collector,
+                                    collectorLive,
+                                );
+                            } catch {
+                                // The next sweep tries again.
+                            }
+
+                            return sweeperNext(
+                                state,
+                                Number(supervisor),
+                                String(runtime.taskId),
+                                runtime.now(),
+                            );
+                        }, context);
+
+                        try {
+                            await sweepCommit;
+                        } catch (error) {
+                            await recordSweepError(
+                                Number(supervisor),
+                                error,
+                                runtime.now(),
+                                (change) => runtime.commit(change, context),
+                            );
+
+                            throw error;
+                        }
+                    });
                 } catch (error) {
-                    await recordSweepError(Number(supervisor), error, runtime.now(), (change) =>
-                        runtime.commit(change, context),
+                    if (ran) {
+                        throw error;
+                    }
+                }
+
+                if (!ran) {
+                    await runtime.commit(
+                        async (tx) =>
+                            sweeperNext(
+                                await tx.doc(DeskThreads),
+                                Number(supervisor),
+                                String(runtime.taskId),
+                                runtime.now(),
+                            ),
+                        context,
                     );
 
-                    throw error;
+                    return;
                 }
 
                 for (const wake of closedOut) {
@@ -25016,6 +25828,276 @@ export default function createDesk(host: Host, web: Web) {
         for (const supervisor of supervisors) {
             await startSweeper(tx, supervisor);
         }
+    };
+
+    type NudgeInput = { supervisor: number };
+    type NudgeState = { phase: "wait" } | { phase: "sync" };
+
+    /**
+     * After a nudged sync, or a sync that found nothing: wait again when new nudges came (a follow-up), else end, and
+     * drop the task record when it is this task's.
+     */
+    const nudgeNext = (nudges: DeskNudgesState, key: string, taskId: string) => {
+        if (nudges.pending[key] !== undefined) {
+            return { status: "running" as const, checkpoint: { phase: "wait" as const } };
+        }
+
+        if (nudges.tasks[key] === taskId) {
+            delete nudges.tasks[key];
+        }
+
+        return {
+            status: "terminal" as const,
+            outcome: { status: "completed" as const, result: null },
+        };
+    };
+
+    /**
+     * 1 nudged sync per supervisor at a time: `wait` sleeps (a durable sleep) until the pending nudges are due; `sync`
+     * takes them (`running`, `last`), runs the same sync as `desk sync` in the supervisor's lane, records it in the
+     * beacon (`syncs`), and waits again when nudges came meanwhile. A failed sync is recorded too, and the task goes on:
+     * it never ends failed with its record left in `tasks`.
+     */
+    const NudgeTask = defineTask<NudgeInput, NudgeState, null>({
+        name: "x.desk.nudge",
+        version: 1,
+        initial: () => ({ phase: "wait" }),
+        phases: {
+            wait: async (task, runtime, context) => {
+                const key = String(task.input.supervisor);
+
+                await runtime.commit(async (tx) => {
+                    const nudges = await tx.doc(DeskNudges);
+                    const pending = nudges.pending[key];
+
+                    if (pending === undefined && nudges.running[key] === undefined) {
+                        return nudgeNext(nudges, key, String(runtime.taskId));
+                    }
+
+                    // The same durable sleep as `runtime.sleepUntil`, decided in the commit that read the due time.
+                    if (pending !== undefined && runtime.now() < pending.due) {
+                        return {
+                            status: "sleeping",
+                            until: pending.due,
+                            checkpoint: { phase: "wait" },
+                        };
+                    }
+
+                    return { status: "running", checkpoint: { phase: "sync" } };
+                }, context);
+            },
+            sync: async (task, runtime, context) => {
+                const supervisor = task.input.supervisor;
+                const key = String(supervisor);
+                // A sync ran in this invocation: the steps after it follow.
+                let synced = false;
+
+                try {
+                    await runner.run(supervisor, "nudge", async () => {
+                        let claimed = false;
+
+                        // The claim (`claimNudges`): a `running` entry a restart left, and the pending nudges
+                        // when they are due. A pending entry not due yet waits: a restart never skips the gap.
+                        await runtime.commit(async (tx) => {
+                            claimed = claimNudges(await tx.doc(DeskNudges), key, runtime.now());
+
+                            return undefined;
+                        }, context);
+
+                        if (!claimed) {
+                            return;
+                        }
+
+                        synced = true;
+
+                        // The beacon record, from the `running` entry, in the commit that ends the sync.
+                        const done = (nudges: DeskNudgesState, error?: string) => {
+                            const running = nudges.running[key];
+
+                            if (running !== undefined) {
+                                nudges.syncs.push({
+                                    supervisor,
+                                    count: running.count,
+                                    deliveries: running.deliveries.map((one) => ({
+                                        id: one.id,
+                                        at: one.at,
+                                    })),
+                                    started: running.started,
+                                    committed: error === undefined ? runtime.now() : 0,
+                                    ...(error === undefined ? {} : { error }),
+                                });
+
+                                if (nudges.syncs.length > NUDGE_SYNCS_KEPT) {
+                                    nudges.syncs = nudges.syncs.slice(
+                                        nudges.syncs.length - NUDGE_SYNCS_KEPT,
+                                    );
+                                }
+                            }
+
+                            delete nudges.running[key];
+                        };
+
+                        try {
+                            // Before the reads: a session the desk archived comes back for a thread that opened again.
+                            // Inside the try: a failure here is a failed sync with its beacon record, not a `running`
+                            // entry left behind.
+                            await earlyArchive(
+                                supervisor,
+                                runtime,
+                                runtime.now(),
+                                context,
+                                (change) => runtime.commit(change, context),
+                            );
+
+                            const facts = await gather(
+                                supervisor as ConversationId,
+                                runtime,
+                                runtime.now(),
+                                context,
+                            );
+
+                            await runtime.commit(async (tx) => {
+                                // As `desk sync`: read first, start last, and a dashboard failure is no failed sync.
+                                const live = await dashboard
+                                    .collectorLive(tx)
+                                    .catch(() => undefined);
+
+                                await applySweep(tx, await tx.doc(DeskThreads), supervisor, facts);
+                                await startMissingSweepers(tx);
+                                await resumeJournal(tx, supervisor);
+                                await dashboard
+                                    .ensureCollector(tx, supervisor, Collector, live)
+                                    .catch(() => undefined);
+                                done(await tx.doc(DeskNudges));
+
+                                return undefined;
+                            }, context);
+                        } catch (error) {
+                            await recordSweepError(supervisor, error, runtime.now(), (change) =>
+                                runtime.commit(change, context),
+                            );
+                            await runtime.commit(async (tx) => {
+                                done(await tx.doc(DeskNudges), nudgeError(error));
+
+                                return undefined;
+                            }, context);
+                        }
+                    });
+                } catch {
+                    // A work this one joined failed, or the failure record did not commit: the decision below still
+                    // runs, and a `running` entry left joins the next claim.
+                }
+
+                if (synced) {
+                    // The same steps as after `desk sync`, each in its own try: none fails the task.
+                    try {
+                        await sweepWorktrees(
+                            supervisor,
+                            runtime,
+                            runtime.now(),
+                            context,
+                            (change) => runtime.commit(change, context),
+                        );
+                    } catch {
+                        // The next sweep tries again.
+                    }
+
+                    try {
+                        await autoArchive(supervisor, runtime, runtime.now(), context, (change) =>
+                            runtime.commit(change, context),
+                        );
+                    } catch {
+                        // The next sweep tries again.
+                    }
+
+                    try {
+                        await retryConsults(
+                            accessOfTask(runtime, context),
+                            {
+                                read: runtime,
+                                commit: async <T>(
+                                    change: (tx: Tx) => T | Promise<T>,
+                                ): Promise<T> => {
+                                    let out: T | undefined;
+
+                                    await runtime.commit(async (tx) => {
+                                        out = await change(tx);
+
+                                        return undefined;
+                                    }, context);
+
+                                    return out as T;
+                                },
+                                context,
+                            },
+                            supervisor,
+                            () => runtime.now(),
+                        );
+                    } catch {
+                        // The next sweep tries again.
+                    }
+
+                    try {
+                        web.send("changed", {});
+                        await exportNow(runtime, context);
+                    } catch {
+                        // The next sweep exports again.
+                    }
+                }
+
+                // Last, so the steps above can still commit: wait for a follow-up, or end.
+                await runtime.commit(
+                    async (tx) => nudgeNext(await tx.doc(DeskNudges), key, String(runtime.taskId)),
+                    context,
+                );
+            },
+        },
+        abort: async (task, runtime, context) =>
+            runtime.commit(async (tx) => {
+                const nudges = await tx.doc(DeskNudges);
+                const key = String(task.input.supervisor);
+
+                if (nudges.tasks[key] === String(runtime.taskId)) {
+                    delete nudges.tasks[key];
+                }
+
+                return { status: "terminal", outcome: { status: "aborted" } };
+            }, context),
+    });
+
+    /**
+     * `nudge`: take the facts into `x.desk.nudges` in the caller's commit, and start 1 `x.desk.nudge` task for each
+     * supervisor that needs one. No table read: the caller calls it after its own table reads in that commit. A
+     * supervisor whose session is gone gets no task; its nudges wait, and the next nudge tries again.
+     */
+    const takeNudgesInto = async (
+        tx: Tx,
+        facts: NudgeFact[],
+        now: number,
+    ): Promise<NudgeResult> => {
+        const nudges = await tx.doc(DeskNudges);
+        const { result, start } = takeNudges(nudges, await tx.doc(DeskThreads), facts, now);
+
+        for (const supervisor of start) {
+            try {
+                const task = await tx.createTask(
+                    NudgeTask,
+                    { supervisor },
+                    {
+                        ownership: { kind: "conversation" },
+                        conversationId: supervisor as ConversationId,
+                        background: true,
+                        abandonOnRestart: false,
+                    },
+                );
+
+                nudges.tasks[String(supervisor)] = String(task);
+            } catch {
+                // No such session: no task now.
+            }
+        }
+
+        return result;
     };
 
     type NotifyInput = { supervisor: number; text: string; requestId: string };
@@ -26151,18 +27233,26 @@ export default function createDesk(host: Host, web: Web) {
                 viewSweeps.set(supervisor, now);
 
                 try {
-                    const facts = await gather(
-                        supervisor as ConversationId,
-                        { snapshot: request.snapshot },
-                        now,
-                        request.context,
-                    );
+                    // Only in an idle lane: a sync that runs or waits for this supervisor brings the news itself.
+                    const done = await runner.tryRun(supervisor, "view", async () => {
+                        const facts = await gather(
+                            supervisor as ConversationId,
+                            { snapshot: request.snapshot },
+                            now,
+                            request.context,
+                        );
 
-                    await request.commit(async (tx) => {
-                        await applySweep(tx, await tx.doc(DeskThreads), supervisor, facts);
+                        await request.commit(async (tx) => {
+                            await applySweep(tx, await tx.doc(DeskThreads), supervisor, facts);
+                        });
+
+                        return true;
                     });
-                    web.send("changed", {});
-                    swept = true;
+
+                    if (done === true) {
+                        web.send("changed", {});
+                        swept = true;
+                    }
                 } catch {
                     // A failed sweep must not fail the page.
                 }
@@ -28895,44 +29985,46 @@ export default function createDesk(host: Host, web: Web) {
                     api.commit(change, context),
                 );
 
-                let result: { events: number };
-
-                try {
-                    const facts = await gather(
-                        supervisor as ConversationId,
-                        api,
-                        Date.now(),
-                        context,
-                    );
-
-                    result = await api.commit(async (tx) => {
-                        // As in the sweep: read first, start last, and a failure is no failed sync. A desk with only
-                        // closed threads has no sweeper: a sync starts the dashboard's collector.
-                        const live = await dashboard.collectorLive(tx).catch(() => undefined);
-                        const swept = await applySweep(
-                            tx,
-                            await tx.doc(DeskThreads),
-                            supervisor,
-                            facts,
+                // In the supervisor's lane: a sync that comes while another runs waits for it, or joins the 1 sync
+                // that already waits after it, and gets its result.
+                const result = await runner.run(supervisor, "sync", async () => {
+                    try {
+                        const facts = await gather(
+                            supervisor as ConversationId,
+                            api,
+                            Date.now(),
+                            context,
                         );
 
-                        await startMissingSweepers(tx);
-                        // Entries that wait with no writer: a sync starts one too, also with no open thread.
-                        await resumeJournal(tx, supervisor);
-                        await dashboard
-                            .ensureCollector(tx, supervisor, Collector, live)
-                            .catch(() => undefined);
+                        return await api.commit(async (tx) => {
+                            // As in the sweep: read first, start last, and a failure is no failed sync. A desk with only
+                            // closed threads has no sweeper: a sync starts the dashboard's collector.
+                            const live = await dashboard.collectorLive(tx).catch(() => undefined);
+                            const swept = await applySweep(
+                                tx,
+                                await tx.doc(DeskThreads),
+                                supervisor,
+                                facts,
+                            );
 
-                        return swept;
-                    }, context);
-                } catch (error) {
-                    // A failed sync is on the desk until a good sweep: the sync still fails as before.
-                    await recordSweepError(supervisor, error, Date.now(), (change) =>
-                        api.commit(change, context),
-                    );
+                            await startMissingSweepers(tx);
+                            // Entries that wait with no writer: a sync starts one too, also with no open thread.
+                            await resumeJournal(tx, supervisor);
+                            await dashboard
+                                .ensureCollector(tx, supervisor, Collector, live)
+                                .catch(() => undefined);
 
-                    throw error;
-                }
+                            return swept;
+                        }, context);
+                    } catch (error) {
+                        // A failed sync is on the desk until a good sweep: the sync still fails as before.
+                        await recordSweepError(supervisor, error, Date.now(), (change) =>
+                            api.commit(change, context),
+                        );
+
+                        throw error;
+                    }
+                });
 
                 // The worktrees of this supervisor's closed threads: git runs outside the commit above.
                 await sweepWorktrees(Number(supervisor), api, Date.now(), context, (change) =>
@@ -29987,7 +31079,7 @@ export default function createDesk(host: Host, web: Web) {
         name: "desk",
         tools: [tool, planTool],
         hooks: [consultGuard, noTeamReport, noClerkMerge, reminder],
-        tasks: [Sweeper, Notify, Digest, Journal, PlanWake, PlanSendTask, Collector],
+        tasks: [Sweeper, NudgeTask, Notify, Digest, Journal, PlanWake, PlanSendTask, Collector],
         sections: [
             // Only a supervisor's session gets it. No clock text: the section changes when the desk changes.
             section("desk", async (input, context) => {

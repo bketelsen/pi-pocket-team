@@ -5361,6 +5361,8 @@ const prFact = (patch: Partial<PrFact> = {}): PrFact => ({
     ready: false,
     readyAt: 0,
     headAt: 0,
+    mergedAt: 0,
+    closedAt: 0,
     feedback: [],
     failing: [],
     archived: false,
@@ -6157,7 +6159,8 @@ describe("the label ready-for-human: the read", () => {
         const repoPart = query.slice(query.indexOf("r0:"), query.indexOf("p0:"));
         const pinnedPart = query.slice(query.indexOf("p0:"));
 
-        assert.match(query, /labels\(first: 20\) \{ nodes \{ name \} \}/);
+        // The count says whether the 20 names are all: a cut list proves no label absent (`labelsCut`).
+        assert.match(query, /labels\(first: 20\) \{ totalCount nodes \{ name \} \}/);
         assert.match(query, /commits\(last: 1\) \{ nodes \{ commit \{ oid committedDate/);
         assert.match(repoPart, /labels\(first: 20\)/, "every PR says its labels");
         assert.doesNotMatch(repoPart, /timelineItems|reviews\(last|comments\(last/);
