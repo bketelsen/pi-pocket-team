@@ -15,7 +15,7 @@ import {
     until,
 } from "./_pocket/test/helpers.ts";
 import assert from "node:assert/strict";
-import { cpSync, mkdirSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
 import { fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
@@ -195,6 +195,58 @@ describe("SyncRunner", () => {
         assert.equal(await c, "no read");
         assert.equal(reads, 1);
         assert.equal(await runner.run(1, "sync", async () => "after"), "after");
+    });
+
+    test("every prepare of a batch runs before its first read; a prepare that throws rejects only its own work", async () => {
+        const runner = new SyncRunner();
+        const hold = deferred();
+        const log: string[] = [];
+        const running = runner.run(1, "sweeper", () => hold.promise);
+        const sync = runner.run(1, "sync", async (shared) => {
+            await shared(async () => {
+                log.push("read");
+            });
+            log.push("sync:commit");
+
+            return "sync";
+        });
+        const nudge = runner.run(
+            1,
+            "nudge",
+            async (shared) => {
+                await shared(async () => {
+                    log.push("never: the batch read already");
+                });
+                log.push("nudge:commit");
+
+                return "nudge";
+            },
+            {
+                prepare: async () => {
+                    log.push("nudge:claim");
+                },
+            },
+        );
+        let ran = false;
+        const failing = runner.run(
+            1,
+            "view",
+            async () => {
+                ran = true;
+            },
+            {
+                prepare: async () => {
+                    throw new Error("claim failed");
+                },
+            },
+        );
+
+        hold.resolve();
+        await running;
+        assert.deepEqual(await Promise.all([sync, nudge]), ["sync", "nudge"]);
+        await assert.rejects(failing, /claim failed/);
+        assert.equal(ran, false, "its work never runs");
+        assert.deepEqual(log, ["nudge:claim", "read", "sync:commit", "nudge:commit"]);
     });
 
     test("different sources queue first in, first out; another supervisor has its own lane", async () => {
@@ -1425,5 +1477,100 @@ describe("nudge in Pocket", () => {
             ]),
             [["frostyard/test", 7, "pr", "head", Date.parse("2026-11-10T11:00:00Z")]],
         );
+    });
+
+    test("a nudge in a batch after desk sync claims before the shared read: a delivery during the read waits for the next sync", async () => {
+        const runner = sharedRunnerOfApp();
+        const supervisor = Number(supervisorId);
+        const key = String(supervisor);
+        const hold = join(root, "gh-hold");
+        const reading = join(root, "gh-reading");
+        const api = deskApi()!;
+
+        // The fake gh waits while `hold` exists, and marks that a read waits.
+        writeFileSync(
+            fakeGh,
+            `#!/bin/sh\nif [ -f ${JSON.stringify(hold)} ]; then touch ${JSON.stringify(reading)}; while [ -f ${JSON.stringify(hold)} ]; do sleep 0.02; done; fi\ncat ${JSON.stringify(fixturePath)}\n`,
+            { mode: 0o755 },
+        );
+
+        try {
+            let release: (() => void) | undefined;
+            const held = runner.run(supervisor, "test", async () => {
+                await new Promise<void>((resolve) => {
+                    release = resolve;
+                });
+            });
+
+            await until(() => release !== undefined, "the test work holds the lane");
+
+            // 1: desk sync waits in the lane first.
+            const call = say(
+                app,
+                supervisorId,
+                `run-tool desk ${JSON.stringify({ action: "sync" })}`,
+            );
+
+            await until(() => runner.waiting(supervisor).includes("sync"), "desk sync waits");
+
+            // 2: a nudge that is due at once (no gap: no last sync), whose task joins the same batch after it.
+            await app.harness.commit(async (tx) => {
+                delete (await tx.doc(DeskNudges)).last[key];
+            }, context);
+
+            const first = facts(1, 300);
+
+            await app.harness.commit(async (tx) => {
+                await api.nudge!(tx, first, Date.now() + shift - 30_000);
+            }, context);
+            await until(
+                () => runner.waiting(supervisor).join(",") === "sync,nudge",
+                "the nudge joins the batch after desk sync",
+            );
+
+            // 3: the batch starts; its read waits at gh.
+            writeFileSync(hold, "");
+            release!();
+            await held;
+            await until(() => existsSync(reading), "the batch's read waits at gh");
+            await until(
+                async () => (await nudgesNow()).running[key] !== undefined,
+                "the nudge claimed before the read",
+            );
+
+            // 4: a delivery during the read.
+            const second = facts(1, 301);
+
+            await app.harness.commit(async (tx) => {
+                await api.nudge!(tx, second, Date.now() + shift);
+            }, context);
+
+            rmSync(hold);
+            await call;
+            await until(
+                async () => (await nudgesNow()).running[key] === undefined,
+                "the nudged sync committed",
+            );
+
+            const nudges = await nudgesNow();
+            const sync = nudges.syncs[nudges.syncs.length - 1]!;
+
+            assert.deepEqual(
+                sync.deliveries.map((one) => one.id),
+                [first[0]!.delivery],
+                "the sync covers only the delivery claimed before its read",
+            );
+            assert.deepEqual(
+                nudges.pending[key]?.deliveries.map((one) => one.id),
+                [second[0]!.delivery],
+                "the delivery during the read waits for the next sync",
+            );
+        } finally {
+            rmSync(hold, { force: true });
+            rmSync(reading, { force: true });
+            writeFileSync(fakeGh, `#!/bin/sh\ncat ${JSON.stringify(fixturePath)}\n`, {
+                mode: 0o755,
+            });
+        }
     });
 });

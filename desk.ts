@@ -21293,9 +21293,17 @@ export function recordObserved(
  */
 export type SharedRead = <F>(read: () => Promise<F>) => Promise<F>;
 
+/**
+ * `prepare`: a step that must come before the batch's read, such as a claim of what the work covers. Every `prepare` of
+ * a batch runs, in order, before the first work of the batch starts, so a work never covers what came after its read
+ * began. A `prepare` that throws rejects only its own work, which then never runs.
+ */
+export type SyncOptions = { prepare?: () => Promise<void> };
+
 type SyncJob = {
     source: string;
     work: (shared: SharedRead) => Promise<unknown>;
+    prepare?: () => Promise<void>;
     promise: Promise<unknown>;
     resolve: (value: unknown) => void;
     reject: (error: unknown) => void;
@@ -21310,7 +21318,8 @@ type SyncBatch = { jobs: SyncJob[] };
  * batch, and every later request joins that mark: a request of a source already in it gets the same promise (its own
  * work never runs); a request of another source adds its work to the batch. The batch runs its works 1 after the
  * other, each with its own commit and its own result, and all of them share 1 read (`SharedRead`): 1 GitHub read for
- * the follow-up, whatever came meanwhile. A rejection reaches only the callers of that work; the lane goes on.
+ * the follow-up, whatever came meanwhile. Every `prepare` of the batch (`SyncOptions`) runs before its first work, so
+ * before its read. A rejection reaches only the callers of that work; the lane goes on.
  */
 export class SyncRunner {
     readonly #lanes = new Map<number, { running?: SyncBatch; waiting?: SyncBatch }>();
@@ -21319,6 +21328,7 @@ export class SyncRunner {
         supervisor: number,
         source: string,
         work: (shared: SharedRead) => Promise<T>,
+        options: SyncOptions = {},
     ): Promise<T> {
         let lane = this.#lanes.get(supervisor);
 
@@ -21340,7 +21350,14 @@ export class SyncRunner {
             reject = no;
         });
 
-        (lane.waiting ??= { jobs: [] }).jobs.push({ source, work, promise, resolve, reject });
+        (lane.waiting ??= { jobs: [] }).jobs.push({
+            source,
+            work,
+            ...(options.prepare === undefined ? {} : { prepare: options.prepare }),
+            promise,
+            resolve,
+            reject,
+        });
         this.#pump(supervisor);
 
         return promise as Promise<T>;
@@ -21406,7 +21423,19 @@ export class SyncRunner {
             };
 
             try {
+                // Every prepare first: none of them comes after the batch's read began.
+                const ready: SyncJob[] = [];
+
                 for (const job of batch.jobs) {
+                    try {
+                        await job.prepare?.();
+                        ready.push(job);
+                    } catch (error) {
+                        job.reject(error);
+                    }
+                }
+
+                for (const job of ready) {
                     try {
                         job.resolve(await job.work(shared));
                     } catch (error) {
@@ -26443,99 +26472,113 @@ export default function createDesk(host: Host, web: Web) {
                 let synced = false;
 
                 try {
-                    await runner.run(supervisor, "nudge", async (shared) => {
-                        let claimed = false;
+                    let claimed = false;
 
-                        // The claim (`claimNudges`): a `running` entry a restart left, and the pending nudges
-                        // when they are due. A pending entry not due yet waits: a restart never skips the gap.
+                    // The claim (`claimNudges`): a `running` entry a restart left, and the pending nudges when they
+                    // are due. A pending entry not due yet waits: a restart never skips the gap. It is the lane's
+                    // `prepare`: it runs before the batch's shared read begins, so a delivery that comes during that
+                    // read stays pending for the next sync, and is never recorded as covered by an older read.
+                    const claim = async () => {
                         await runtime.commit(async (tx) => {
                             claimed = claimNudges(await tx.doc(DeskNudges), key, runtime.now());
 
                             return undefined;
                         }, context);
+                    };
 
-                        if (!claimed) {
-                            return;
-                        }
-
-                        synced = true;
-
-                        // The beacon record, from the `running` entry, in the commit that ends the sync.
-                        const done = (nudges: DeskNudgesState, error?: string) => {
-                            const running = nudges.running[key];
-
-                            if (running !== undefined) {
-                                nudges.syncs.push({
-                                    supervisor,
-                                    count: running.count,
-                                    deliveries: running.deliveries.map((one) => ({
-                                        id: one.id,
-                                        at: one.at,
-                                    })),
-                                    started: running.started,
-                                    committed: error === undefined ? runtime.now() : 0,
-                                    ...(error === undefined ? {} : { error }),
-                                });
-
-                                if (nudges.syncs.length > NUDGE_SYNCS_KEPT) {
-                                    nudges.syncs = nudges.syncs.slice(
-                                        nudges.syncs.length - NUDGE_SYNCS_KEPT,
-                                    );
-                                }
+                    await runner.run(
+                        supervisor,
+                        "nudge",
+                        async (shared) => {
+                            if (!claimed) {
+                                return;
                             }
 
-                            delete nudges.running[key];
-                        };
+                            synced = true;
 
-                        try {
-                            // Before the reads: a session the desk archived comes back for a thread that opened again.
-                            // Inside the try: a failure here is a failed sync with its beacon record, not a `running`
-                            // entry left behind.
-                            await earlyArchive(
-                                supervisor,
-                                runtime,
-                                runtime.now(),
-                                context,
-                                (change) => runtime.commit(change, context),
-                            );
+                            // The beacon record, from the `running` entry, in the commit that ends the sync.
+                            const done = (nudges: DeskNudgesState, error?: string) => {
+                                const running = nudges.running[key];
 
-                            // The batch's 1 read: a sync that runs in the same batch before this one read it.
-                            const facts = await shared(() =>
-                                gather(
-                                    supervisor as ConversationId,
+                                if (running !== undefined) {
+                                    nudges.syncs.push({
+                                        supervisor,
+                                        count: running.count,
+                                        deliveries: running.deliveries.map((one) => ({
+                                            id: one.id,
+                                            at: one.at,
+                                        })),
+                                        started: running.started,
+                                        committed: error === undefined ? runtime.now() : 0,
+                                        ...(error === undefined ? {} : { error }),
+                                    });
+
+                                    if (nudges.syncs.length > NUDGE_SYNCS_KEPT) {
+                                        nudges.syncs = nudges.syncs.slice(
+                                            nudges.syncs.length - NUDGE_SYNCS_KEPT,
+                                        );
+                                    }
+                                }
+
+                                delete nudges.running[key];
+                            };
+
+                            try {
+                                // Before the reads: a session the desk archived comes back for a thread that opened again.
+                                // Inside the try: a failure here is a failed sync with its beacon record, not a `running`
+                                // entry left behind.
+                                await earlyArchive(
+                                    supervisor,
                                     runtime,
                                     runtime.now(),
                                     context,
-                                ),
-                            );
+                                    (change) => runtime.commit(change, context),
+                                );
 
-                            await runtime.commit(async (tx) => {
-                                // As `desk sync`: read first, start last, and a dashboard failure is no failed sync.
-                                const live = await dashboard
-                                    .collectorLive(tx)
-                                    .catch(() => undefined);
+                                // The batch's 1 read: a sync that runs in the same batch before this one read it.
+                                const facts = await shared(() =>
+                                    gather(
+                                        supervisor as ConversationId,
+                                        runtime,
+                                        runtime.now(),
+                                        context,
+                                    ),
+                                );
 
-                                await applySweep(tx, await tx.doc(DeskThreads), supervisor, facts);
-                                await startMissingSweepers(tx);
-                                await resumeJournal(tx, supervisor);
-                                await dashboard
-                                    .ensureCollector(tx, supervisor, Collector, live)
-                                    .catch(() => undefined);
-                                done(await tx.doc(DeskNudges));
+                                await runtime.commit(async (tx) => {
+                                    // As `desk sync`: read first, start last, and a dashboard failure is no failed sync.
+                                    const live = await dashboard
+                                        .collectorLive(tx)
+                                        .catch(() => undefined);
 
-                                return undefined;
-                            }, context);
-                        } catch (error) {
-                            await recordSweepError(supervisor, error, runtime.now(), (change) =>
-                                runtime.commit(change, context),
-                            );
-                            await runtime.commit(async (tx) => {
-                                done(await tx.doc(DeskNudges), nudgeError(error));
+                                    await applySweep(
+                                        tx,
+                                        await tx.doc(DeskThreads),
+                                        supervisor,
+                                        facts,
+                                    );
+                                    await startMissingSweepers(tx);
+                                    await resumeJournal(tx, supervisor);
+                                    await dashboard
+                                        .ensureCollector(tx, supervisor, Collector, live)
+                                        .catch(() => undefined);
+                                    done(await tx.doc(DeskNudges));
 
-                                return undefined;
-                            }, context);
-                        }
-                    });
+                                    return undefined;
+                                }, context);
+                            } catch (error) {
+                                await recordSweepError(supervisor, error, runtime.now(), (change) =>
+                                    runtime.commit(change, context),
+                                );
+                                await runtime.commit(async (tx) => {
+                                    done(await tx.doc(DeskNudges), nudgeError(error));
+
+                                    return undefined;
+                                }, context);
+                            }
+                        },
+                        { prepare: claim },
+                    );
                 } catch {
                     // A work this one joined failed, or the failure record did not commit: the decision below still
                     // runs, and a `running` entry left joins the next claim.

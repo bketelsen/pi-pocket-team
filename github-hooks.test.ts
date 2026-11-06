@@ -2270,6 +2270,52 @@ describe("The coverage alarm", () => {
         assert.equal(state.alarms.coverage["frostyard/nsl|labels"]?.cleared, T0 + 9 * H);
     });
 
+    test("rule G2: an upgrade after a suspend and unsuspend under the old version: began comes from the log, the real alarm stays", () => {
+        const T0 = NOW - 20 * H;
+        const T5 = NOW - 10 * H;
+        // Stored by the version before began: the unsuspend at T5 gave a new start; the alarm is from the coverage at T0.
+        const coverage: CoverageState = { ...legacy(ALL, {}), since: { "account:frostyard": T5 } };
+        const state = alarms();
+        const real = [T0 + H, T0 + 2 * H];
+
+        state.coverage["frostyard/nsl|labels"] = { raised: T0 + 4 * H, misses: [...real] };
+        state.misses["frostyard/nsl|labels"] = [...real];
+
+        evaluateCoverage(
+            { last: {}, changes: [] },
+            coverage,
+            state,
+            T0 + 23 * H,
+            logOf({ at: T0, installation: 9 }, { at: T5, installation: 9 }),
+        );
+        assert.deepEqual(
+            coverage.began,
+            { "account:frostyard": T0 },
+            "the installation's first entry",
+        );
+        assert.equal(state.coverage["frostyard/nsl|labels"]?.cleared, undefined);
+        assert.deepEqual(state.misses["frostyard/nsl|labels"], real);
+
+        // A log that dropped entries proves nothing: began is 0, and nothing is cleared.
+        const cut = logOf({ at: T5, installation: 9 });
+        const coverage2: CoverageState = { ...legacy(ALL, {}), since: { "account:frostyard": T5 } };
+        const state2 = alarms();
+
+        cut.counts = { accepted: 5000 };
+        state2.coverage["frostyard/nsl|labels"] = { raised: T0 + 4 * H, misses: [...real] };
+        evaluateCoverage({ last: {}, changes: [] }, coverage2, state2, T0 + 23 * H, cut);
+        assert.deepEqual(coverage2.began, { "account:frostyard": 0 });
+        assert.equal(state2.coverage["frostyard/nsl|labels"]?.cleared, undefined);
+
+        // A delivery commit migrates it too, before it changes a start.
+        const docs3 = docs();
+
+        docs3.coverage = { ...legacy(ALL, {}), since: { "account:frostyard": T5 } };
+        docs3.deliveries = logOf({ at: T0, installation: 9 });
+        repoFact(docs3, T0 + 22 * H, "frostyard/nsl");
+        assert.equal(docs3.coverage.began?.["account:frostyard"], T0);
+    });
+
     test("rule G: a selected repository removed and added again keeps its real alarm and misses", () => {
         const state = docs();
         const T0 = NOW - 20 * H;
