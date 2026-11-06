@@ -6,7 +6,8 @@ import tseslint from "typescript-eslint";
 export default [
     {
         // The vendored xterm.js is not this project code: neither linter reads it (nor .prettierignore). The same
-        // holds for the copies from bketelsen/agentic-template and frostyard/core (`make verify` pins 2 of them).
+        // holds for the copies from bketelsen/agentic-template and frostyard/core (`make verify` pins 2 of them), and
+        // for the build output of `make site` and of the site's virtual environment.
         ignores: [
             "node_modules/**",
             "_pocket/**",
@@ -15,6 +16,8 @@ export default [
             "scripts/check-corrections.mjs",
             "scripts/lib/**",
             "test/check-template.test.mjs",
+            "site/dist/**",
+            "build/**",
         ],
     },
     {

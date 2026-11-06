@@ -1,3 +1,5 @@
 node_modules
 _pocket.d.ts
 _pocket
+site/dist/
+build/

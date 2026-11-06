@@ -10,3 +10,6 @@ test/check-template.test.mjs
 .agents/
 .claude/
 docs/*/TEMPLATE.md
+.github/workflows/site.yml
+site/properdocs.yml
+site/content/stylesheets/
