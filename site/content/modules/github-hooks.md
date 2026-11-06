@@ -31,7 +31,7 @@ A reload hands the receiver to the new code. With the module turned off, the rec
 
 ## Alarms
 
-Silence raises nothing: a quiet weekend is normal. The coverage alarm compares the changes the desk's sweep saw with the deliveries: 2 changes of 1 class (state, labels, review, head, CI) in 1 repository with no matching delivery within 24 hours raise a warning for that repository and class. Other alarms: the port could not be bound, the secret is missing or short, the dedupe set is full, and no receiver runs.
+Silence raises nothing: a quiet weekend is normal. The coverage alarm compares the changes the desk's sweep saw with the deliveries: 2 changes of 1 class (state, labels, review, head, CI) in 1 repository with no matching delivery within 24 hours raise a warning for that repository and class. Only a change after the coverage of its repository began counts: a new installation raises nothing for the changes before it. Other alarms: the port could not be bound, the secret is missing or short, the dedupe set is full, and no receiver runs.
 
 ## Read more
 

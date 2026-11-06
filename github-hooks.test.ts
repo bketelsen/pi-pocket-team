@@ -24,6 +24,18 @@
 //   caller, and the maintenance under a busy inbox: "The receiver loop".
 // - Alarm: silence raises nothing, 2 misses raise 1 repository and class only, another class or repository does not
 //   clear it: "The coverage alarm".
+// - Coverage start (`since`): a change before the coverage of its repository began is no miss, an installation or an
+//   added repository starts it, a removed one ends it, stored data with no start gets one and a false alarm is cleared:
+//   "The coverage alarm".
+// - PR #141 cross-review: rule A (`0` is unknown: no evidence or a log that dropped entries), rule B (the migration from
+//   the delivery log, before a delivery writes a start), rule D (a repository inherits the account start; re-review 1
+//   replaced the rest of D and E by D2) and rule F (a stored miss compares its change's time):
+//   the "rule ..." tests in "The coverage alarm".
+// - PR #141 re-review 1: rule D2 (each delivery that changes the coverage syncs the starts: a kept repository inherits
+//   the account start, an ended coverage ends its start at once) and rule B2 (a legacy selected repository starts no
+//   later than its own earliest entry): the "rule D2" and "rule B2" tests in "The coverage alarm".
+// - PR #141 re-review 2: a repository fact first ends a start whose 30-day coverage expired, then starts it again: "rule
+//   D2: a fact that renews 30-day coverage after it expired between 2 evaluations starts it again".
 // - Secret file: missing, short, changed mtime: "The secret source", and 503 in "Secret".
 // - Live deliveries (task t4): each file in test/fixtures/github-hooks/live/ gives its recorded fact or refusal, with
 //   no free text of its payload in the fact, and the loader refuses a signature or a missing part: "Live deliveries";
@@ -39,6 +51,7 @@ import { after, before, describe, test } from "node:test";
 import {
     type AlarmsState,
     type CoverageState,
+    type DeliveriesState,
     type DeliveryJob,
     type HookDocs,
     type HookFact,
@@ -68,6 +81,7 @@ import {
     INBOX_MAX,
     NUDGE_RETRY_MS,
     COVERAGE_EVERY_MS,
+    COVERED_MS,
     REFUSAL_FLUSH_MS,
 } from "./github-hooks.ts";
 import {
@@ -1622,6 +1636,8 @@ describe("The coverage alarm", () => {
         recent: [],
         installations: { "1": { account: "frostyard", selection: "all", repos: [] } },
         repos: { "bketelsen/b": NOW - H },
+        // Coverage that began long ago: every change below counts.
+        since: { "account:frostyard": 0, "bketelsen/b": 0 },
     });
     const alarms = (): AlarmsState => ({ system: {}, coverage: {}, misses: {}, evaluated: {} });
     const change = (repo: string, number: number, cls: string, seen: number, at = 0) => ({
@@ -1633,12 +1649,544 @@ describe("The coverage alarm", () => {
         seen,
     });
 
+    const noLog = (): DeliveriesState => ({ log: [], counts: {}, dropped: 0 });
+    /** A delivery log of accepted entries, as the delivery commit writes them. */
+    const logOf = (
+        ...entries: { at: number; repo?: string; installation?: number }[]
+    ): DeliveriesState => ({
+        log: entries.map((each, index) => ({
+            delivery: `log-${String(index)}`,
+            at: each.at,
+            event: each.installation === undefined ? "pull_request" : "installation",
+            ...(each.repo === undefined ? {} : { repo: each.repo }),
+            outcome: "accepted" as const,
+            status: 202,
+            fact: {
+                delivery: `log-${String(index)}`,
+                at: each.at,
+                event: each.installation === undefined ? "pull_request" : "installation",
+                ...(each.repo === undefined ? {} : { repo: each.repo }),
+                ...(each.installation === undefined
+                    ? {}
+                    : { installation: { id: each.installation, account: "frostyard" } }),
+            },
+        })),
+        counts: { accepted: entries.length },
+        dropped: 0,
+    });
+    /** Apply 1 installation fact at `at` to `state`. */
+    const install = (
+        state: HookDocs,
+        at: number,
+        event: string,
+        action: string,
+        installation: HookFact["installation"],
+    ) =>
+        applyDelivery(
+            state,
+            job(
+                { at },
+                {
+                    event,
+                    action,
+                    repo: undefined,
+                    number: undefined,
+                    label: undefined,
+                    installation,
+                },
+            ),
+            at,
+            { nudge: false },
+        );
+    /** Apply 1 accepted repository fact (a label, class labels) at `at` to `state`. */
+    const repoFact = (state: HookDocs, at: number, repo: string) =>
+        applyDelivery(state, job({ at }, { repo }), at, { nudge: false });
+    const legacy = (
+        installations: CoverageState["installations"],
+        repos: Record<string, number>,
+        recent: CoverageState["recent"] = [],
+    ): CoverageState => ({ recent, installations, repos });
+    const ALL = { "9": { account: "frostyard", selection: "all", repos: [] } };
+
+    test("an all installation at T: changes before T are no miss and raise nothing; deleted ends the start", () => {
+        const state = docs();
+        const T = NOW - 3 * H;
+
+        install(state, T, "installation", "created", {
+            id: 9,
+            account: "frostyard",
+            selection: "all",
+            repositories: [],
+        });
+        assert.deepEqual(state.coverage.since, { "account:frostyard": T });
+
+        const observed: ObservedState = {
+            last: {},
+            changes: [
+                change("frostyard/nsl", 1, "labels", T - 2 * H),
+                change("frostyard/nsl", 2, "labels", T - H),
+                // GitHub's time is before T; the desk saw it after T: its time is GitHub's.
+                change("frostyard/nsl", 3, "labels", T + 10 * 60_000, T - 10 * 60_000),
+            ],
+        };
+
+        assert.deepEqual(
+            evaluateCoverage(observed, state.coverage, state.alarms, NOW, state.deliveries),
+            [],
+        );
+        assert.deepEqual(state.alarms.misses, {});
+        assert.deepEqual(state.alarms.coverage, {});
+        assert.equal(Object.keys(state.alarms.evaluated).length, 3, "each is evaluated once");
+
+        install(state, NOW, "installation", "deleted", { id: 9, account: "frostyard" });
+        assert.equal(state.coverage.since?.["account:frostyard"], undefined, "ended at once");
+    });
+
+    test("an all installation at T: 2 changes after T with no fact raise the alarm; only they are misses", () => {
+        const state = docs();
+        const T = NOW - 3 * H;
+
+        install(state, T, "installation", "created", {
+            id: 9,
+            account: "frostyard",
+            selection: "all",
+            repositories: [],
+        });
+
+        const observed: ObservedState = {
+            last: {},
+            changes: [
+                change("frostyard/nsl", 5, "labels", T - 2 * H),
+                change("frostyard/nsl", 1, "labels", T + H),
+                change("frostyard/nsl", 6, "labels", T - H),
+                change("frostyard/nsl", 2, "labels", T + 2 * H, T + 2 * H),
+            ],
+        };
+
+        assert.deepEqual(
+            evaluateCoverage(observed, state.coverage, state.alarms, NOW, state.deliveries),
+            ["frostyard/nsl|labels"],
+        );
+        assert.deepEqual(state.alarms.misses["frostyard/nsl|labels"], [T + H, T + 2 * H]);
+    });
+
+    test("rule B: stored data with no since migrates from the installation's log entry and clears an alarm whose misses are all before it", () => {
+        const T = NOW - 3 * H;
+        const coverage = legacy(ALL, {});
+        const state = alarms();
+
+        // A false alarm: its misses are before the installation. A real one: 1 miss after it.
+        state.coverage["frostyard/nsl|labels"] = { raised: T + 76_000, misses: [T - 2 * H, T - H] };
+        state.misses["frostyard/nsl|labels"] = [T - 2 * H, T - H];
+        state.coverage["frostyard/nsl|state"] = { raised: T + 2 * H, misses: [T - H, T + 2 * H] };
+        state.misses["frostyard/nsl|state"] = [T - H, T + 2 * H];
+
+        assert.deepEqual(
+            evaluateCoverage(
+                { last: {}, changes: [] },
+                coverage,
+                state,
+                NOW,
+                logOf({ at: T, installation: 9 }),
+            ),
+            [],
+        );
+        assert.deepEqual(coverage.since, { "account:frostyard": T });
+        assert.equal(
+            state.coverage["frostyard/nsl|labels"]?.cleared,
+            NOW,
+            "the false alarm is cleared",
+        );
+        assert.equal(state.misses["frostyard/nsl|labels"], undefined);
+        assert.equal(
+            state.coverage["frostyard/nsl|state"]?.cleared,
+            undefined,
+            "the real alarm stays",
+        );
+        assert.deepEqual(state.misses["frostyard/nsl|state"], [T + 2 * H]);
+    });
+
+    test("a selected installation: a repository added later starts at the added time; a removed one loses its start", () => {
+        const state = docs();
+        const T1 = NOW - 10 * H;
+        const T2 = NOW - 5 * H;
+
+        install(state, T1, "installation", "created", {
+            id: 5,
+            account: "bketelsen",
+            selection: "selected",
+            repositories: ["bketelsen/a"],
+        });
+        assert.deepEqual(state.coverage.since, { "bketelsen/a": T1 });
+        install(state, T2, "installation_repositories", "added", {
+            id: 5,
+            account: "bketelsen",
+            added: ["bketelsen/C"],
+            removed: ["bketelsen/a"],
+        });
+        assert.deepEqual(
+            state.coverage.since,
+            { "bketelsen/c": T2 },
+            "a has no fact: it ends at once",
+        );
+
+        const observed: ObservedState = {
+            last: {},
+            changes: [
+                change("bketelsen/c", 1, "state", T2 - 2 * H),
+                change("bketelsen/c", 2, "state", T2 - H),
+            ],
+        };
+
+        assert.deepEqual(
+            evaluateCoverage(observed, state.coverage, state.alarms, NOW, state.deliveries),
+            [],
+        );
+        assert.deepEqual(state.alarms.misses, {});
+        assert.deepEqual(state.coverage.since, { "bketelsen/c": T2 });
+
+        observed.changes.push(
+            change("bketelsen/c", 3, "state", T2 + H),
+            change("bketelsen/c", 4, "state", T2 + 2 * H),
+        );
+        assert.deepEqual(
+            evaluateCoverage(observed, state.coverage, state.alarms, NOW, state.deliveries),
+            ["bketelsen/c|state"],
+        );
+    });
+
+    test("rule F: a stored miss of a change with at < T < seen is before the start: the cleanup drops it and clears its alarm", () => {
+        const T = NOW - 3 * H;
+        const coverage: CoverageState = { ...legacy(ALL, {}), since: { "account:frostyard": T } };
+        const state = alarms();
+        const seen = [T + 10 * 60_000, T + 20 * 60_000];
+
+        // Stored misses hold the time the sweep saw each change; GitHub's time of each is before T.
+        state.coverage["frostyard/nsl|labels"] = { raised: T + 30 * 60_000, misses: [...seen] };
+        state.misses["frostyard/nsl|labels"] = [...seen];
+
+        const observed: ObservedState = {
+            last: {},
+            changes: [
+                change("frostyard/nsl", 1, "labels", seen[0]!, T - 10 * 60_000),
+                change("frostyard/nsl", 2, "labels", seen[1]!, T - 5 * 60_000),
+            ],
+        };
+
+        assert.deepEqual(evaluateCoverage(observed, coverage, state, NOW, noLog()), []);
+        assert.equal(state.coverage["frostyard/nsl|labels"]?.cleared, NOW);
+        assert.equal(state.misses["frostyard/nsl|labels"], undefined);
+    });
+
+    test("rule D: a removed selected repository with a fact in 30 days keeps its start, and a real miss after the start counts", () => {
+        const state = docs();
+        const T0 = NOW - 10 * H;
+        const T1 = NOW - 8 * H;
+        const T2 = NOW - 6 * H;
+
+        install(state, T0, "installation", "created", {
+            id: 5,
+            account: "bketelsen",
+            selection: "selected",
+            repositories: ["bketelsen/a"],
+        });
+        repoFact(state, T1, "bketelsen/a");
+        install(state, T2, "installation_repositories", "removed", {
+            id: 5,
+            account: "bketelsen",
+            added: [],
+            removed: ["bketelsen/a"],
+        });
+        assert.equal(state.coverage.since?.["bketelsen/a"], T0);
+
+        const observed: ObservedState = {
+            last: {},
+            changes: [
+                change("bketelsen/a", 1, "state", NOW - 9 * H),
+                change("bketelsen/a", 2, "state", NOW - 3 * H),
+            ],
+        };
+
+        assert.deepEqual(
+            evaluateCoverage(observed, state.coverage, state.alarms, NOW, state.deliveries),
+            ["bketelsen/a|state"],
+        );
+        assert.equal(state.coverage.since?.["bketelsen/a"], T0, "still covered by its fact");
+    });
+
+    test("rule D: all to selected: a kept repository keeps the account start", () => {
+        const state = docs();
+        const T0 = NOW - 10 * H;
+        const T1 = NOW - 8 * H;
+        const T2 = NOW - 6 * H;
+
+        install(state, T0, "installation", "created", {
+            id: 9,
+            account: "frostyard",
+            selection: "all",
+            repositories: [],
+        });
+        repoFact(state, T1, "frostyard/nsl");
+        assert.equal(state.coverage.since?.["frostyard/nsl"], T0, "the account start is inherited");
+        install(state, T2, "installation_repositories", "removed", {
+            id: 9,
+            account: "frostyard",
+            selection: "selected",
+            added: [],
+            removed: ["frostyard/other"],
+        });
+
+        const observed: ObservedState = {
+            last: {},
+            changes: [
+                change("frostyard/nsl", 1, "state", T0 + 30 * 60_000),
+                change("frostyard/nsl", 2, "state", T0 + H),
+            ],
+        };
+
+        assert.deepEqual(
+            evaluateCoverage(observed, state.coverage, state.alarms, NOW, state.deliveries),
+            ["frostyard/nsl|state"],
+        );
+        assert.deepEqual(state.coverage.since, { "frostyard/nsl": T0 });
+    });
+
+    test("rule B: a legacy document migrates from the log before a delivery writes a start: an installation or a repository fact at T2 gets T0", () => {
+        const T0 = NOW - 10 * H;
+        const T2 = NOW - 2 * H;
+        const first = docs();
+
+        first.coverage = legacy(ALL, {});
+        first.deliveries = logOf({ at: T0, installation: 9 });
+        install(first, T2, "installation", "new_permissions_accepted", {
+            id: 9,
+            account: "frostyard",
+            selection: "all",
+            repositories: [],
+        });
+        assert.deepEqual(first.coverage.since, { "account:frostyard": T0 });
+
+        const second = docs();
+
+        second.coverage = legacy({}, { "frostyard/nsl": T0 });
+        second.deliveries = logOf({ at: T0, repo: "frostyard/nsl" });
+        repoFact(second, T2, "frostyard/nsl");
+        assert.deepEqual(second.coverage.since, { "frostyard/nsl": T0 });
+    });
+
+    test("rule B: a legacy start comes from the installation's log entry, not the first repository fact: real misses stay", () => {
+        const T0 = NOW - 10 * H;
+        const misses = [NOW - 8 * H, NOW - 7 * H];
+        const T2 = NOW - 5 * H;
+        const coverage = legacy(ALL, { "frostyard/nsl": T2 }, [
+            { repo: "frostyard/nsl", number: 5, class: "state", at: T2 },
+        ]);
+        const state = alarms();
+
+        state.coverage["frostyard/nsl|labels"] = { raised: misses[1]!, misses: [...misses] };
+        state.misses["frostyard/nsl|labels"] = [...misses];
+        evaluateCoverage(
+            { last: {}, changes: [] },
+            coverage,
+            state,
+            NOW,
+            logOf({ at: T0, installation: 9 }, { at: T2, repo: "frostyard/nsl" }),
+        );
+        assert.deepEqual(coverage.since, { "account:frostyard": T0, "frostyard/nsl": T0 });
+        assert.equal(state.coverage["frostyard/nsl|labels"]?.cleared, undefined);
+        assert.deepEqual(state.misses["frostyard/nsl|labels"], misses);
+    });
+
+    test("rule A: a legacy document with no log evidence, or a log that dropped entries, starts at 0: nothing is dropped or cleared", () => {
+        const T0 = NOW - 10 * H;
+        const misses = [NOW - 8 * H, NOW - 7 * H];
+        const T2 = NOW - 5 * H;
+        const truncated = logOf({ at: T0, installation: 9 }, { at: T2, repo: "frostyard/nsl" });
+
+        truncated.counts = { accepted: 5000 };
+
+        for (const log of [noLog(), truncated]) {
+            const coverage = legacy(ALL, { "frostyard/nsl": T2 }, [
+                { repo: "frostyard/nsl", number: 5, class: "state", at: T2 },
+            ]);
+            const state = alarms();
+
+            state.coverage["frostyard/nsl|labels"] = { raised: misses[1]!, misses: [...misses] };
+            state.misses["frostyard/nsl|labels"] = [...misses];
+            evaluateCoverage({ last: {}, changes: [] }, coverage, state, NOW, log);
+            assert.deepEqual(coverage.since, { "account:frostyard": 0, "frostyard/nsl": 0 });
+            assert.equal(state.coverage["frostyard/nsl|labels"]?.cleared, undefined);
+            assert.deepEqual(state.misses["frostyard/nsl|labels"], misses);
+        }
+    });
+
+    test("rule D2: all to selected through installation_repositories: a kept repository with no fact keeps the account start", () => {
+        const state = docs();
+        const T = NOW - 10 * H;
+        const T3 = NOW - 4 * H;
+
+        install(state, T, "installation", "created", {
+            id: 9,
+            account: "frostyard",
+            selection: "all",
+            repositories: ["frostyard/a", "frostyard/b"],
+        });
+        install(state, T3, "installation_repositories", "removed", {
+            id: 9,
+            account: "frostyard",
+            selection: "selected",
+            added: [],
+            removed: ["frostyard/b"],
+        });
+        assert.deepEqual(state.coverage.since, { "frostyard/a": T });
+
+        const observed: ObservedState = {
+            last: {},
+            changes: [
+                change("frostyard/a", 1, "state", T - 2 * H),
+                change("frostyard/a", 2, "state", T - H),
+                change("frostyard/a", 3, "state", T + H),
+                change("frostyard/a", 4, "state", T + 3 * H),
+            ],
+        };
+
+        assert.deepEqual(
+            evaluateCoverage(observed, state.coverage, state.alarms, NOW, state.deliveries),
+            ["frostyard/a|state"],
+        );
+        assert.deepEqual(state.alarms.misses["frostyard/a|state"], [T + H, T + 3 * H]);
+        assert.deepEqual(state.coverage.since, { "frostyard/a": T });
+    });
+
+    test("rule D2: a suspend ends the start at once, and an unsuspend before the next evaluation starts again at its own time", () => {
+        const state = docs();
+        const T0 = NOW - 20 * H;
+        const T1 = NOW - 8 * H;
+        const T2 = NOW - 5 * H;
+
+        install(state, T0, "installation", "created", {
+            id: 9,
+            account: "frostyard",
+            selection: "all",
+            repositories: [],
+        });
+        install(state, T1, "installation", "suspend", {
+            id: 9,
+            account: "frostyard",
+            selection: "all",
+        });
+        assert.deepEqual(state.coverage.since, {});
+        install(state, T2, "installation", "unsuspend", {
+            id: 9,
+            account: "frostyard",
+            selection: "all",
+        });
+        assert.deepEqual(state.coverage.since, { "account:frostyard": T2 });
+
+        const observed: ObservedState = {
+            last: {},
+            changes: [
+                change("frostyard/nsl", 1, "state", T1 + H),
+                change("frostyard/nsl", 2, "state", T1 + 2 * H),
+            ],
+        };
+
+        assert.deepEqual(
+            evaluateCoverage(observed, state.coverage, state.alarms, NOW, state.deliveries),
+            [],
+        );
+        assert.deepEqual(state.alarms.misses, {});
+        assert.deepEqual(state.coverage.since, { "account:frostyard": T2 });
+    });
+
+    test("rule B2: a legacy selected repository starts at its own earliest entry when its installation's first entry is later", () => {
+        const T0 = NOW - 10 * H;
+        const misses = [NOW - 8 * H, NOW - 7 * H];
+        const T2 = NOW - 5 * H;
+        const coverage = legacy(
+            { "5": { account: "frostyard", selection: "selected", repos: ["frostyard/nsl"] } },
+            { "frostyard/nsl": T0 },
+        );
+        const state = alarms();
+
+        state.coverage["frostyard/nsl|labels"] = { raised: misses[1]!, misses: [...misses] };
+        state.misses["frostyard/nsl|labels"] = [...misses];
+        // The first entry of installation 5 in the log is a new_permissions_accepted at T2.
+        evaluateCoverage(
+            { last: {}, changes: [] },
+            coverage,
+            state,
+            NOW,
+            logOf({ at: T0, repo: "frostyard/nsl" }, { at: T2, installation: 5 }),
+        );
+        assert.deepEqual(coverage.since, { "frostyard/nsl": T0 });
+        assert.equal(state.coverage["frostyard/nsl|labels"]?.cleared, undefined);
+        assert.deepEqual(state.misses["frostyard/nsl|labels"], misses);
+    });
+
+    test("rule D2: a fact that renews 30-day coverage after it expired between 2 evaluations starts it again", () => {
+        const state = docs();
+        const S = 1000 * H;
+        const expiry = S + COVERED_MS;
+        const F = expiry + 3 * H;
+
+        // Only the 30-day rule covers bketelsen/x: its first fact starts it at S.
+        repoFact(state, S, "bketelsen/x");
+        evaluateCoverage(
+            { last: {}, changes: [] },
+            state.coverage,
+            state.alarms,
+            expiry - 5 * 60_000,
+            state.deliveries,
+        );
+        assert.deepEqual(
+            state.coverage.since,
+            { "bketelsen/x": S },
+            "still covered just before the expiry",
+        );
+
+        // The coverage expires; 2 label changes come with no delivery; then a ci fact renews it before the next evaluation.
+        const observed: ObservedState = {
+            last: {},
+            changes: [
+                change("bketelsen/x", 1, "labels", expiry + H),
+                change("bketelsen/x", 2, "labels", expiry + 2 * H),
+            ],
+        };
+
+        applyDelivery(
+            state,
+            job(
+                { at: F },
+                {
+                    event: "status",
+                    action: undefined,
+                    repo: "bketelsen/x",
+                    number: undefined,
+                    label: undefined,
+                    sha: "f".repeat(40),
+                },
+            ),
+            F,
+            { nudge: false },
+        );
+        assert.deepEqual(
+            evaluateCoverage(observed, state.coverage, state.alarms, F + H, state.deliveries),
+            [],
+        );
+        assert.deepEqual(state.coverage.since, { "bketelsen/x": F });
+        assert.deepEqual(state.alarms.misses, {});
+    });
+
     test("24 hours of silence raise nothing", () => {
         const state = alarms();
         const observed: ObservedState = { last: {}, changes: [] };
 
         for (let hour = 0; hour <= 24; hour += 1) {
-            assert.deepEqual(evaluateCoverage(observed, covered(), state, NOW + hour * H), []);
+            assert.deepEqual(
+                evaluateCoverage(observed, covered(), state, NOW + hour * H, noLog()),
+                [],
+            );
         }
 
         assert.deepEqual(state.coverage, {});
@@ -1657,13 +2205,18 @@ describe("The coverage alarm", () => {
             ],
         };
 
-        assert.deepEqual(evaluateCoverage(observed, covered(), state, NOW), ["frostyard/a|labels"]);
+        assert.deepEqual(evaluateCoverage(observed, covered(), state, NOW, noLog()), [
+            "frostyard/a|labels",
+        ]);
         assert.deepEqual(Object.keys(state.coverage), ["frostyard/a|labels"]);
         assert.equal(state.misses["bketelsen/b|state"]?.length, 1, "1 miss raises nothing");
         assert.equal(state.misses["someone/else|labels"], undefined, "not covered");
 
         // Each change is checked once.
-        assert.deepEqual(evaluateCoverage(observed, covered(), state, NOW + 5 * 60_000), []);
+        assert.deepEqual(
+            evaluateCoverage(observed, covered(), state, NOW + 5 * 60_000, noLog()),
+            [],
+        );
         assert.equal(state.misses["frostyard/a|labels"]?.length, 2);
     });
 
@@ -1677,7 +2230,7 @@ describe("The coverage alarm", () => {
             ],
         };
 
-        assert.deepEqual(evaluateCoverage(observed, covered(), state, NOW), []);
+        assert.deepEqual(evaluateCoverage(observed, covered(), state, NOW, noLog()), []);
         assert.deepEqual(state.misses, {});
     });
 
@@ -1703,13 +2256,13 @@ describe("The coverage alarm", () => {
             ],
         };
 
-        assert.deepEqual(evaluateCoverage(observed, coverage, state, NOW), []);
+        assert.deepEqual(evaluateCoverage(observed, coverage, state, NOW, noLog()), []);
         assert.deepEqual(state.misses, {});
 
         // A fact outside the window does not match.
         coverage.recent = [{ repo: "frostyard/a", number: 5, class: "state", at: NOW - 20 * H }];
         observed.changes = [change("frostyard/A", 5, "state", NOW - H, NOW - 2 * H)];
-        evaluateCoverage(observed, coverage, state, NOW);
+        evaluateCoverage(observed, coverage, state, NOW, noLog());
         assert.equal(state.misses["frostyard/a|state"]?.length, 1);
     });
 
@@ -1729,6 +2282,7 @@ describe("The coverage alarm", () => {
             coverage,
             state,
             NOW,
+            noLog(),
         );
         assert.deepEqual(state.misses, {});
     });
@@ -1758,6 +2312,7 @@ describe("The coverage alarm", () => {
             coverage,
             state,
             NOW,
+            noLog(),
         );
         assert.equal(state.misses["frostyard/a|ci"]?.length, 1, "a miss");
     });

@@ -657,6 +657,12 @@ export type CoverageState = {
     installations: Record<string, { account: string; selection: string; repos: string[] }>;
     /** Repository (lower case) → when its last accepted fact came. */
     repos: Record<string, number>;
+    /**
+     * When the coverage of a key began: a repository (`owner/name`, lower case), or `account:<owner>` (lower case) for an
+     * `all` installation. The coverage alarm counts only a change at or after this time. Absent (a document stored before
+     * this field) or a key absent: the evaluation writes it (see `evaluateCoverage`).
+     */
+    since?: Record<string, number>;
 };
 
 /** The receiver task of record. Stored data. */
@@ -846,6 +852,128 @@ export function clearSystem(alarms: AlarmsState, name: SystemAlarm, at: number):
     return true;
 }
 
+/** The `since` key of an account with an `all` installation. */
+const accountKey = (owner: string) => `account:${owner.toLowerCase()}`;
+
+/** The owner of a repository key (`owner/name`). */
+const ownerOf = (repo: string) => repo.slice(0, repo.indexOf("/"));
+
+/**
+ * The 1-time migration of a coverage document stored before `since`: when `since` is absent, build it from the evidence
+ * in the delivery log (accepted entries only), never later than the evidence proves. An `all` installation: its account
+ * starts at the installation's earliest log entry. Each repository of a `selected` installation: the earlier of the
+ * installation's earliest entry and the repository's own earliest entry (the installation's alone when the repository has
+ * none; `0` when the installation has none). A repository that `repos` covers and no `selected` installation lists: its
+ * earliest accepted entry, and no later than the start of its account when an `all` installation covers it (the
+ * account's start when it has no entry of its own). No evidence, or a log that dropped entries: `0`, unknown (the change
+ * always counts). With `since` present, nothing changes. Returns `since`.
+ */
+export function ensureSince(
+    coverage: CoverageState,
+    deliveries: DeliveriesState,
+): Record<string, number> {
+    if (coverage.since !== undefined) {
+        return coverage.since;
+    }
+
+    const accepted = deliveries.log.filter((entry) => entry.outcome === "accepted");
+    const total = Object.values(deliveries.counts).reduce((sum, count) => sum + count, 0);
+    // The log keeps the newest entries only: once it dropped one, its earliest entry proves no start.
+    const complete = total <= deliveries.log.length;
+
+    /** The time of the earliest accepted entry that matches; undefined when none does. */
+    const first = (match: (entry: DeliveryEntry) => boolean): number | undefined => {
+        let found: number | undefined;
+
+        for (const entry of accepted) {
+            if (match(entry) && (found === undefined || entry.at < found)) {
+                found = entry.at;
+            }
+        }
+
+        return found;
+    };
+
+    const ofRepo = (repo: string) => first((entry) => entry.repo?.toLowerCase() === repo);
+    const since: Record<string, number> = {};
+
+    const lower = (key: string, at: number) => {
+        since[key] = since[key] === undefined ? at : Math.min(since[key], at);
+    };
+
+    for (const [id, installation] of Object.entries(coverage.installations)) {
+        const evidence = complete
+            ? (first((entry) => String(entry.fact?.installation?.id) === id) ?? 0)
+            : 0;
+
+        if (installation.selection === "all") {
+            lower(accountKey(installation.account), evidence);
+        } else {
+            for (const key of installation.repos) {
+                const repo = key.toLowerCase();
+                const own = ofRepo(repo);
+
+                lower(
+                    repo,
+                    evidence === 0 || own === undefined ? evidence : Math.min(evidence, own),
+                );
+            }
+        }
+    }
+
+    for (const key of Object.keys(coverage.repos)) {
+        const repo = key.toLowerCase();
+
+        if (since[repo] !== undefined) {
+            continue;
+        }
+
+        const at = complete ? (ofRepo(repo) ?? 0) : 0;
+        const account = since[accountKey(ownerOf(repo))];
+
+        // No entry of its own (a complete log): the account's start is the only evidence.
+        since[repo] = account === undefined ? at : at === 0 ? account : Math.min(at, account);
+    }
+
+    coverage.since = since;
+
+    return coverage.since;
+}
+
+/**
+ * The starts follow the coverage at each delivery that changes it (an installation fact, an accepted repository fact).
+ * The covered set is `coveredRepos(coverage, at)`. First each covered key with no start gets one: a repository starts at
+ * the earlier of `at` and its account's start when `since` holds that account key (also when this same delivery ends
+ * the account: the coverage went on), else at `at`; an account starts at `at`. Then each start of a key that covers no
+ * more goes: its coverage ended at this delivery, and a later coverage begins again.
+ */
+function syncStarts(coverage: CoverageState, at: number): void {
+    const since = (coverage.since ??= {});
+    const { repos, accounts } = coveredRepos(coverage, at);
+
+    for (const repo of repos) {
+        if (since[repo] === undefined) {
+            const account = since[accountKey(ownerOf(repo))];
+
+            since[repo] = account === undefined ? at : Math.min(at, account);
+        }
+    }
+
+    for (const owner of accounts) {
+        since[accountKey(owner)] ??= at;
+    }
+
+    for (const key of Object.keys(since)) {
+        const covers = key.startsWith("account:")
+            ? accounts.has(key.slice("account:".length))
+            : repos.has(key);
+
+        if (!covers) {
+            delete since[key];
+        }
+    }
+}
+
 function updateInstallations(coverage: CoverageState, fact: HookFact): void {
     const facts = fact.installation;
 
@@ -859,11 +987,12 @@ function updateInstallations(coverage: CoverageState, fact: HookFact): void {
     if (fact.event === "installation") {
         if (fact.action === "deleted" || fact.action === "suspend") {
             delete coverage.installations[key];
+            syncStarts(coverage, fact.at);
 
             return;
         }
 
-        coverage.installations[key] = {
+        const entry = {
             account: facts.account,
             selection: facts.selection ?? known?.selection ?? "selected",
             repos:
@@ -871,6 +1000,9 @@ function updateInstallations(coverage: CoverageState, fact: HookFact): void {
                     ? facts.repositories.map((repo) => repo.toLowerCase())
                     : (known?.repos ?? []),
         };
+
+        coverage.installations[key] = entry;
+        syncStarts(coverage, fact.at);
 
         return;
     }
@@ -891,6 +1023,7 @@ function updateInstallations(coverage: CoverageState, fact: HookFact): void {
 
     entry.repos = [...repos].sort();
     coverage.installations[key] = entry;
+    syncStarts(coverage, fact.at);
 }
 
 /**
@@ -968,6 +1101,8 @@ export function applyDelivery(
         return result("ignored", { cleared });
     }
 
+    // Migrate a coverage document stored before `since` from the log as it was, before this commit writes any start.
+    ensureSince(docs.coverage, docs.deliveries);
     recordEntries(docs.deliveries, [entry("accepted", job.fact)]);
     docs.deliveries.last = job.at;
 
@@ -998,7 +1133,10 @@ export function applyDelivery(
             docs.coverage.recent.splice(0, docs.coverage.recent.length - RECENT_MAX);
         }
 
+        // First end a start whose coverage expired before this fact (on the coverage before it), then start it again.
+        syncStarts(docs.coverage, fact.at);
         docs.coverage.repos[repo] = fact.at;
+        syncStarts(docs.coverage, fact.at);
 
         const key = `${repo}|${change}`;
 
@@ -1047,18 +1185,74 @@ export function coveredRepos(
 
 /**
  * Evaluate the coverage alarm (every 5 minutes): each observed change of a covered repository that is 30 minutes to 24
- * hours old, and not checked before, is checked once against the accepted facts. No match is a miss; 2 misses of 1
- * repository and class within 24 hours raise its alarm. Silence alone raises nothing: no rule looks at the time since the
- * last delivery. Returns the keys ("repo|class") it raised. Pure, apart from the documents it changes.
+ * hours old, and not checked before, is checked once against the accepted facts. A change before the coverage of its
+ * repository began (`since`: the earliest start of its repository key and its account key; `0` is unknown) is no miss.
+ * No match is a miss; 2 misses of 1 repository and class within 24 hours raise its alarm. Silence alone raises nothing:
+ * no rule looks at the time since the last delivery. First a document stored before `since` is migrated from the
+ * delivery log (`ensureSince`), and the start of a key that covers no more goes; then the misses before the start are
+ * dropped, and a raised alarm whose every miss is before the start is cleared. Returns the keys ("repo|class") it
+ * raised. Pure, apart from the documents it changes (never the deliveries).
  */
 export function evaluateCoverage(
     observed: ObservedState,
     coverage: CoverageState,
     alarms: AlarmsState,
     now: number,
+    deliveries: DeliveriesState,
 ): string[] {
+    const since = ensureSince(coverage, deliveries);
     const { repos, accounts } = coveredRepos(coverage, now);
     const raised: string[] = [];
+
+    // Only here does a start end: the start of a key that covers no more goes, so a later coverage begins again.
+    for (const key of Object.keys(since)) {
+        const covers = key.startsWith("account:")
+            ? accounts.has(key.slice("account:".length))
+            : repos.has(key);
+
+        if (!covers) {
+            delete since[key];
+        }
+    }
+
+    /** When the coverage of a repository began: `0` when it is unknown (a covered key with no start) or not covered. */
+    const startOf = (repo: string): number => {
+        const owner = ownerOf(repo);
+        const starts = [
+            ...(repos.has(repo) ? [since[repo] ?? 0] : []),
+            ...(accounts.has(owner) ? [since[accountKey(owner)] ?? 0] : []),
+        ];
+
+        return starts.length === 0 ? 0 : Math.min(...starts);
+    };
+
+    const timeOf = (change: { at: number; seen: number }) =>
+        change.at > 0 ? change.at : change.seen;
+
+    /**
+     * A stored miss (the `seen` time of its change) is before the start when the observed changes of that repository and
+     * class seen at that time all have their own time before it; with no such change, the miss time itself is compared.
+     */
+    const missBefore = (key: string, miss: number): boolean => {
+        const [repo = "", change = ""] = key.split("|");
+        const start = startOf(repo);
+
+        if (start === 0) {
+            return false;
+        }
+
+        const seenThen = (observed.changes ?? []).filter(
+            (each) =>
+                typeof each?.repo === "string" &&
+                each.repo.toLowerCase() === repo &&
+                each.class === change &&
+                each.seen === miss,
+        );
+
+        return seenThen.length === 0
+            ? miss < start
+            : seenThen.every((each) => timeOf(each) < start);
+    };
 
     for (const [key, at] of Object.entries(alarms.evaluated)) {
         if (now - at > CHANGE_MAX_AGE_MS + HOUR) {
@@ -1067,12 +1261,23 @@ export function evaluateCoverage(
     }
 
     for (const [key, times] of Object.entries(alarms.misses)) {
-        const kept = times.filter((at) => now - at <= MISS_WINDOW_MS);
+        const kept = times.filter((at) => now - at <= MISS_WINDOW_MS && !missBefore(key, at));
 
         if (kept.length === 0) {
             delete alarms.misses[key];
         } else {
             alarms.misses[key] = kept;
+        }
+    }
+
+    // A raised alarm whose every miss came before the coverage began is false: it is cleared.
+    for (const [key, alarm] of Object.entries(alarms.coverage)) {
+        if (
+            raisedNow(alarm) &&
+            alarm.misses.length > 0 &&
+            alarm.misses.every((at) => missBefore(key, at))
+        ) {
+            alarm.cleared = now;
         }
     }
 
@@ -1082,7 +1287,7 @@ export function evaluateCoverage(
         }
 
         const repo = change.repo.toLowerCase();
-        const owner = repo.slice(0, repo.indexOf("/"));
+        const owner = ownerOf(repo);
         const age = now - change.seen;
 
         if (!(repos.has(repo) || accounts.has(owner))) {
@@ -1100,6 +1305,11 @@ export function evaluateCoverage(
         }
 
         alarms.evaluated[changeKey] = now;
+
+        // A change before the coverage of its repository began: no delivery could exist for it.
+        if (timeOf(change) < startOf(repo)) {
+            continue;
+        }
 
         const from = (change.at > 0 ? change.at : change.seen - 6 * HOUR) - 5 * MINUTE;
         const to = change.seen + 30 * MINUTE;
@@ -2428,6 +2638,7 @@ export default function createGithubHooks(host: Host, web: Web) {
                 await tx.doc(CoverageDoc),
                 await tx.doc(AlarmsDoc),
                 runtime.now(),
+                await tx.doc(DeliveriesDoc),
             );
 
             return undefined;
