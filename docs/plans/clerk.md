@@ -52,17 +52,21 @@ digest, the desk splits the items:
 
 The Clerk handles, with no message to Odrade:
 
-1. **Merges and verified results.** It adds 1 dated line to `decisions/decided.md` (newest first, with the
-   thread id and OBSERVED or AGENT-REPORTED), for a merge it checked with `gh pr view` or a watch result it
-   recorded.
+1. **Merges and verified results.** It checks a merge that a report claims with `gh pr view`. It writes
+   no merge, install or watch result in `decisions/decided.md`: the Desk records them. It copies only
+   Brian's decisions (ask answers) into `decided.md`: 1 dated line, newest first, with the ask id.
 2. **After-merge checks.** For a due watch, it sends the check to the thread's agent with `desk send`. For
-   the agent's report, it records `desk result`.
+   the agent's report, it records `desk result`. It never records a pass that closes a plan task's thread
+   while its PR is open.
 3. **Close-outs.** A close-out report that says the work is done and nothing remains needs no answer: the
-   sweep closes the thread. A question in a close-out report about the after-merge steps it answers with
-   `desk send`, from the thread's brief and `decided.md`.
+   sweep closes the thread. Exceptions: a review result and a shift report (any line of a night, day or
+   afternoon shift) always go to Odrade, also when they say done, because they start her next step. A
+   question in a close-out report about the after-merge steps it answers with `desk send`, from the
+   thread's brief and `decided.md`.
 4. **Found PRs.** It attaches a found PR to the thread whose agent and repository match (`desk attach`).
-5. **The desk folder.** It commits `desk/` and `decisions/` in the desk folder after each batch, with a
-   short message. It never adds a remote or pushes.
+5. **The desk folder.** It commits `decisions/` only, after each batch, with a short message
+   (`git commit -- decisions/`). It never commits `desk/`: the Desk module commits it (`exportCommit`).
+   It never adds a remote or pushes.
 6. **A handled report.** When `desk read` shows `Handled:`, the supervisor acted on the thread after its
    newest report, so that report needs no escalation: the digest leaves it out, and the Clerk does too.
 
@@ -74,9 +78,15 @@ It escalates to Odrade with `desk escalate` (1 call for each item: `thread`, `te
 - a conflict between agents, threads or decisions;
 - anything that needs a new ask to Brian (only Odrade files asks);
 - a report that is blocked, failed, or asks for a decision;
+- every review result (owner review, cross-review, re-review or plan review), with its PR and the
+  author's thread, or "unknown";
+- every finished shift line (night, day or afternoon);
 - a found session or folder (attach or drop is a judgement);
 - a silent session whose last answer is not a report;
 - anything it is not sure of.
+
+It uses `urgent: true` for a blocked or failed report, a red check on a PR with `ready-for-human`, and a
+conflict.
 
 The drop rule (`escalationDrop` in `desk.ts`). The cause of an escalation is the time of the news that
 caused it: when the Clerk got the thread's news in a digest taken at most 60 minutes before the call, the
