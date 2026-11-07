@@ -2193,6 +2193,16 @@ export default function createTeam(host: Host, web: Web) {
         },
         startShift: async (request) => {
             const source = request.supervisor as ConversationId;
+            /** Pocket gave a session: an error after it is an unknown outcome, never a refusal. */
+            let admitted = false;
+
+            // A board row needs its desk thread, its open with the board's limit, and no OK: with no desk, nothing starts.
+            if (deskApi() === undefined) {
+                return {
+                    error: "The desk module is off: a board row starts only with its desk thread. Brian turns the desk on in Menu → Extensions.",
+                    unknown: false,
+                };
+            }
 
             try {
                 const identity = await resolveIdentity(
@@ -2222,6 +2232,9 @@ export default function createTeam(host: Host, web: Web) {
                         supervisor,
                         supervisorId: identity.persona.id,
                         limit: request.limit,
+                        admitted: () => {
+                            admitted = true;
+                        },
                     },
                     {
                         agent: request.agent,
@@ -2254,7 +2267,7 @@ export default function createTeam(host: Host, web: Web) {
                 ) {
                     return {
                         error: "The desk module is off: a board row needs its desk thread.",
-                        unknown: false,
+                        unknown: admitted,
                     };
                 }
 
@@ -2265,20 +2278,27 @@ export default function createTeam(host: Host, web: Web) {
                     replay: result.replay,
                 };
             } catch (error) {
-                const failed = error as {
+                // Any value can be thrown, null and undefined too: read its marks only from an object.
+                const failed = (typeof error === "object" && error !== null ? error : {}) as {
                     message?: unknown;
                     startThrew?: unknown;
                     startError?: unknown;
                     closedBefore?: unknown;
                     deskFull?: unknown;
                 };
-                // A thrown start may have admitted the session; so may a start whose thread the desk failed for it.
-                const unknown = failed.startThrew === true || failed.closedBefore === true;
+                // A thrown start may have admitted the session; so may a start whose thread the desk failed for it, and
+                // any error after Pocket gave the session.
+                const unknown =
+                    admitted || failed.startThrew === true || failed.closedBefore === true;
+                const words =
+                    failed.startThrew === true
+                        ? failed.startError
+                        : typeof failed.message === "string" && failed.message !== ""
+                          ? failed.message
+                          : `the start failed with ${String(error)}`;
 
                 return {
-                    error: String(
-                        failed.startThrew === true ? failed.startError : (failed.message ?? error),
-                    ),
+                    error: String(words),
                     unknown,
                     ...(failed.deskFull === true ? { deskFull: true as const } : {}),
                 };
@@ -3058,6 +3078,11 @@ export default function createTeam(host: Host, web: Web) {
         /** The router's memo for this start: a tool call's own; none keeps it in memory for this 1 call. */
         memo?: RouteMemo<ThreadRoute>;
         limit?: { reserve: number };
+        /**
+         * Called once Pocket's start gave a session (or a replay found one): an error after it leaves a session that
+         * Pocket admitted. The board's start reads it; the tool's errors do not change.
+         */
+        admitted?: () => void;
     };
 
     /** A delegation's checked arguments: the title is the thread's, and `shift` is the one value of its 2 names. */
@@ -3502,6 +3527,9 @@ export default function createTeam(host: Host, web: Web) {
                 { startThrew: true, startError: started.error },
             );
         }
+
+        // From here on, Pocket admitted the session: an error later (the bind, the goal, a notify) leaves it running.
+        deps.admitted?.();
 
         // A bound session from a replay: no bind, no route and no goal again.
         if (replay !== undefined && opened !== undefined) {

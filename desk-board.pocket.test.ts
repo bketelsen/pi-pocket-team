@@ -22,7 +22,7 @@ import {
     until,
 } from "./_pocket/test/helpers.ts";
 import { boardRows } from "./_desk-board.ts";
-import { capView, DeskThreads, type DeskState } from "./desk.ts";
+import { capView, DeskReports, DeskThreads, type DeskState } from "./desk.ts";
 import { GoalDoc } from "./night-shift.ts";
 import { RUN_END, turnTexts } from "./scripted-turn-fixture.ts";
 import type { TeamApi, TeamStartShiftRequest } from "./team.ts";
@@ -342,6 +342,88 @@ describe("Team startShift", () => {
         }
     });
 
+    test("an error after Pocket admitted the session (the bind commit throws) is unknown", async () => {
+        const source = await supervisor();
+        let admitted = false;
+        let thrown = false;
+        const wrapped = wrapStart(async (real, ...args) => {
+            const started = await real(...args);
+
+            admitted = true;
+
+            return started;
+        });
+        const sessions = app.sessions().length;
+
+        try {
+            const result = await startShift({
+                supervisor: Number(source),
+                key: "x.desk.board:907:1",
+                commit: async <T>(change: (tx: Tx) => T | Promise<T>): Promise<T> => {
+                    // The first commit after the start is the bind: it fails once.
+                    if (admitted && !thrown) {
+                        thrown = true;
+
+                        throw new Error("the bind commit fell over");
+                    }
+
+                    return app.harness.commit(change, context);
+                },
+            });
+
+            assert.deepEqual(result, { error: "the bind commit fell over", unknown: true });
+            assert.equal(thrown, true, "the bind commit threw");
+            assert.equal(app.sessions().length, sessions + 1, "Pocket admitted 1 session");
+        } finally {
+            wrapped.restore();
+        }
+    });
+
+    test("with no desk API nothing starts, and the result is a refusal", async () => {
+        const source = await supervisor();
+        const shared = globalThis as unknown as Record<symbol, unknown>;
+        const desk = shared[Symbol.for("pi-pocket-team.desk")];
+        const sessions = app.sessions().length;
+        const threads = Object.keys((await deskState()).threads).length;
+
+        delete shared[Symbol.for("pi-pocket-team.desk")];
+
+        try {
+            const result = await startShift({
+                supervisor: Number(source),
+                key: "x.desk.board:908:1",
+            });
+
+            assert("error" in result, JSON.stringify(result));
+            assert.equal(result.unknown, false);
+            assert.match(result.error, /The desk module is off/);
+        } finally {
+            shared[Symbol.for("pi-pocket-team.desk")] = desk;
+        }
+
+        assert.equal(app.sessions().length, sessions, "no session");
+        assert.equal(Object.keys((await deskState()).threads).length, threads, "no thread");
+    });
+
+    test("a dependency that rejects with null or undefined gives an error result, never a throw", async () => {
+        const source = await supervisor();
+
+        for (const [index, value] of [null, undefined].entries()) {
+            const sessions = app.sessions().length;
+            const result = await startShift({
+                supervisor: Number(source),
+                key: `x.desk.board:909:${String(index + 1)}`,
+                commit: () => Promise.reject(value),
+            });
+
+            assert("error" in result, JSON.stringify(result));
+            assert.equal(typeof result.error, "string");
+            assert.match(result.error, new RegExp(`the start failed with ${String(value)}`));
+            assert.equal(result.unknown, false, "it failed before any start");
+            assert.equal(app.sessions().length, sessions, "no session");
+        }
+    });
+
     test("the board's limit: the open refuses at cap minus reserve, and an unused OK stays unused", async () => {
         const source = await supervisor();
         const counted = capView(await deskState(), 100, Date.now()).counted;
@@ -538,18 +620,36 @@ describe("the board in Pi Pocket", () => {
             ];
 
             assert(thread?.session !== undefined);
+
+            const child = thread.session as unknown as ConversationId;
+            const goalOf = async () => (await app.harness.snapshot(GoalDoc, child, context))?.goal;
+
+            // `round` moves before a round is sent: wait for 3 completed rounds, the shift's end, its report on the
+            // desk, and the child and the supervisor at rest. Only then count.
+            await until(
+                async () => {
+                    const goal = await goalOf();
+
+                    return goal?.status === "ended" && goal.rounds.length >= 3;
+                },
+                "3 completed rounds and the shift's end",
+                120_000,
+            );
             await until(
                 async () =>
-                    ((
-                        await app.harness.snapshot(
-                            GoalDoc,
-                            thread.session as unknown as ConversationId,
-                            context,
-                        )
-                    )?.goal?.round ?? 0) >= 3,
-                "3 rounds",
+                    ((await app.harness.snapshot(DeskReports, child, context))?.reports ?? []).some(
+                        (report) => report.from === "night-shift",
+                    ),
+                "the shift's report on the desk",
                 60_000,
             );
+            await until(() => !app.isBusy(child), "the child at rest", 60_000);
+            await until(() => !app.isBusy(source), "the supervisor at rest", 60_000);
+
+            const goal = await goalOf();
+
+            assert.equal(goal?.rounds.length, 3, "3 completed rounds");
+            assert.equal(goal?.round, 3);
             assert.equal((await userTexts(source)).filter((text) => RUN_END.test(text)).length, 0);
         },
     );

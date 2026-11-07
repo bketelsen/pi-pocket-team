@@ -28,7 +28,7 @@ A session with a supervisor identity uses `desk`; another session is refused.
 - `archive`: the one-time sweep of the idle sessions of closed threads.
 - `board`, `board_add`, `board_edit`, `board_drop`, `board_pick`, `board_unpick`, `board_launch`, `board_reopen`, `board_resolve`: the goal board (below).
 
-An agent session can use `read`, `watch` and `result` on its own thread only, and `board`, `board_add`, `board_edit` and `board_drop` on its own proposed rows. A Clerk has its own smaller list, and escalates to its supervisor with `desk escalate`: the desk drops an escalation of news the supervisor already acted on or got, and puts the rest in her next digest, or sends it at once with `urgent: true`.
+An agent session can use `read`, `watch` and `result` on its own thread only. On the goal board, an agent reads its supervisor's board with `board`, adds its own proposals with `board_add`, and edits or drops only its own proposed rows with `board_edit` and `board_drop`. A Clerk has its own smaller list, and escalates to its supervisor with `desk escalate`: the desk drops an escalation of news the supervisor already acted on or got, and puts the rest in her next digest, or sends it at once with `urgent: true`.
 
 ## Asks, watches and the cap
 

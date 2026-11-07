@@ -504,25 +504,62 @@ function wallTime(
     return guess - offsetAt(first, zone);
 }
 
-/** The next time the clock in `zone` shows `hour:minute`, after `now`. */
-export function nextClockTime(hour: number, minute: number, now: number, zone: string): number {
-    const today = partsIn(now, zone);
-    const at = wallTime(today.year, today.month, today.day, hour, minute, zone);
+/**
+ * Every instant of 1 local date and time in `zone`, earliest first: 2 on a fall-back day for a time in the repeated
+ * hour, else 1. A time that the zone skips (a spring-forward gap) has none; it gives `wallTime`'s instant, as before.
+ */
+function wallTimes(
+    year: number,
+    month: number,
+    day: number,
+    hour: number,
+    minute: number,
+    zone: string,
+): number[] {
+    const guess = Date.UTC(year, month - 1, day, hour, minute);
+    const found = new Set<number>();
 
-    if (at > now) {
-        return at;
+    // The offsets in force a day before and a day after cover both sides of a change on that date.
+    for (const probe of [guess - 86_400_000, guess, guess + 86_400_000]) {
+        const at = guess - offsetAt(probe, zone);
+        const p = partsIn(at, zone);
+
+        if (
+            p.year === year &&
+            p.month === month &&
+            p.day === day &&
+            p.hour === hour &&
+            p.minute === minute
+        ) {
+            found.add(at);
+        }
     }
 
-    const tomorrow = new Date(Date.UTC(today.year, today.month - 1, today.day + 1));
+    return found.size === 0
+        ? [wallTime(year, month, day, hour, minute, zone)]
+        : [...found].sort((a, b) => a - b);
+}
 
-    return wallTime(
-        tomorrow.getUTCFullYear(),
-        tomorrow.getUTCMonth() + 1,
-        tomorrow.getUTCDate(),
-        hour,
-        minute,
-        zone,
-    );
+/**
+ * The next time the clock in `zone` shows `hour:minute`, after `now`: the smallest such instant. On a fall-back day a
+ * time in the repeated hour has 2 instants, and the second one counts too.
+ */
+export function nextClockTime(hour: number, minute: number, now: number, zone: string): number {
+    const today = partsIn(now, zone);
+    const tomorrow = new Date(Date.UTC(today.year, today.month - 1, today.day + 1));
+    const candidates = [
+        ...wallTimes(today.year, today.month, today.day, hour, minute, zone),
+        ...wallTimes(
+            tomorrow.getUTCFullYear(),
+            tomorrow.getUTCMonth() + 1,
+            tomorrow.getUTCDate(),
+            hour,
+            minute,
+            zone,
+        ),
+    ];
+
+    return candidates.find((at) => at > now) ?? (candidates.at(-1) as number);
 }
 
 /** Local midnight in `zone` of the day that holds `now`. */
