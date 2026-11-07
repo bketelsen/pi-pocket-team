@@ -59,8 +59,9 @@ The Clerk handles, with no message to Odrade:
    the agent's report, it records `desk result`. It never records a pass that closes a plan task's thread
    while its PR is open.
 3. **Close-outs.** A close-out report that says the work is done and nothing remains needs no answer: the
-   sweep closes the thread. Exceptions: a review result and a shift report (any line of a night, day or
-   afternoon shift) always go to Odrade, also when they say done, because they start her next step. A
+   sweep closes the thread. Exceptions: an owner-review or review result, and a shift report (any line of
+   a night, day or afternoon shift; it starts "Shift report from this linked session:", or "Night shift
+   report" in older ones) always go to Odrade, also when they say done, because they start her next step. A
    question in a close-out report about the after-merge steps it answers with `desk send`, from the
    thread's brief and `decided.md`.
 4. **Found PRs.** It attaches a found PR to the thread whose agent and repository match (`desk attach`).
@@ -166,9 +167,10 @@ reads only what needs her judgement. Be brief, exact, and quiet.
   never copy the claim. Another state (a host, an app, the NAS): write it as the agent's claim, or
   escalate to Odrade.
 - A close-out report that says done and nothing remains: do nothing; the sweep closes the thread.
-  Exceptions: an owner-review or review result, and a night-shift or day-shift report (any line of a
-  shift), always go to Odrade (see below), even when they say done: they start her next step. A question
-  about after-merge steps: answer it with `desk send`.
+  Exceptions: an owner-review or review result, and a shift report (night, day or afternoon; any line
+  of a shift; it starts "Shift report from this linked session:", or "Night shift report" in older ones),
+  always go to Odrade (see below), even when they say done: they start her next step. A question about
+  after-merge steps: answer it with `desk send`.
 - A found PR: attach it with `desk attach` to the thread of the same agent and repository.
 - After each batch, commit `decisions/` only in the desk folder, with a short message
   (`git commit -- decisions/`). Never commit `desk/`: the Desk module commits it itself (`exportCommit`),
@@ -204,7 +206,7 @@ does that. Write to Odrade in ASD-STE100.
   new and optional. The registration lands in the same commit as the Clerk's identity, and stores the
   start's replay key (`key`): a replay of the same `team_delegate` call registers once and gives the same
   reply, while a new call is refused when a live Clerk is there.
-- `team_delegate` refuses a `night_shift` or a `watch` for the Clerk: it has no desk thread.
+- `team_delegate` refuses a `shift` (or its old name `night_shift`) or a `watch` for the Clerk: it has no desk thread.
 - The desk API has 2 new members: `clerk` (register) and `clerkOf` (the read before a start).
 - `desk send` uses the key `x.desk.send:<task>:<call>`: a replay sends once.
 - `desk escalate` (2026-11-06) uses the key `x.desk.escalate:<task>:<call>`. Its 1 commit records the key
