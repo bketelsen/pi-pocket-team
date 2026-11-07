@@ -3062,18 +3062,56 @@ const isReopen = (event) => String(event.key).startsWith("reopened") || isAskReo
 
 /**
  * Whether the session did work in the interval (`from`, `to`]: an `edit` or `write` call of the session itself
- * (`editTimes`, null when unknown), or a worker spawn (not a cross-review) of the session.
+ * (`editTimes`, null when unknown), a worker spawn (not a cross-review) of the session, or a send to a worker it spawned
+ * before (`sendTimes`, see `workerSendTimes`).
  */
 const workedBetween = (evidence, from, to) =>
-    [...(evidence.editTimes ?? []), ...evidence.spawnTimes].some((at) => at > from && at <= to);
+    [...(evidence.editTimes ?? []), ...evidence.spawnTimes, ...(evidence.sendTimes ?? [])].some(
+        (at) => at > from && at <= to,
+    );
+
+/** An event that closes a done thread in `desk.ts`: the sweep's `closed:<now>`, or a passed watch's `watch:pass:<key>`. */
+const isDoneClose = (event) =>
+    String(event.key).startsWith("closed:") || String(event.key).startsWith("watch:pass:");
+
+/**
+ * The times of a session's `subagent` sends to a worker: a send counts when the latest spawn of the same name in the
+ * session, before it, is no cross-review spawn. A send with no earlier spawn of its name does not count. `calls` are
+ * Q1's review calls (`loadReviewCalls`: every spawn and send, in order).
+ */
+function workerSendTimes(calls, session) {
+    const lastSpawn = new Map();
+    const times = [];
+    const own = calls
+        .filter((call) => call.c === session && typeof call.at === "number")
+        .sort((a, b) => a.at - b.at);
+
+    for (const call of own) {
+        if (call.action === "spawn") {
+            lastSpawn.set(call.name, call);
+        } else if (call.action === "send") {
+            const spawned = lastSpawn.get(call.name);
+
+            if (spawned !== undefined && !isCrossReviewSpawn(spawned)) {
+                times.push(call.at);
+            }
+        }
+    }
+
+    return times;
+}
 
 /**
  * The kinds of the reopenings of a thread, each kind once: `rework` and `notRework`. A `report` reopening is `work`
- * when the session worked (`evidence`, see `workedBetween`) after the last `closed:` event before it: the desk names
- * the report first, even when the worker also changed files. With no such close event, or no evidence, it stays
- * `report`.
+ * when the session worked (`evidence`, see `workedBetween`) after the latest close of the done thread before it
+ * (`isDoneClose`): the desk names the report first, even when the worker also changed files. With no such close event,
+ * or no evidence, it stays `report`.
  */
-function reopenKindsOf(data, thread, evidence = { editTimes: null, spawnTimes: [] }) {
+function reopenKindsOf(
+    data,
+    thread,
+    evidence = { editTimes: null, spawnTimes: [], sendTimes: [] },
+) {
     const events = eventsByThread(data).get(thread.id) ?? [];
     const kinds = new Set(
         events.filter(isReopen).map((event) => {
@@ -3084,8 +3122,12 @@ function reopenKindsOf(data, thread, evidence = { editTimes: null, spawnTimes: [
             }
 
             const close = events
-                .filter((other) => String(other.key).startsWith("closed:") && other.at < event.at)
-                .at(-1);
+                .filter((other) => isDoneClose(other) && other.at < event.at)
+                .reduce(
+                    (latest, other) =>
+                        latest === undefined || other.at > latest.at ? other : latest,
+                    undefined,
+                );
 
             return close !== undefined && workedBetween(evidence, close.at, event.at)
                 ? "work"
@@ -3328,6 +3370,16 @@ export function checkR2(data, ctx) {
             : null;
     const editsSource = !data.sourceErrors?.parentEdits && Array.isArray(data.parentEdits);
     const editsOf = new Map(editsSource ? data.parentEdits.map((row) => [row.c, row.edits]) : []);
+    const callsBySession = new Map();
+
+    for (const call of data.reviewCalls ?? []) {
+        if (!callsBySession.has(call.c)) {
+            callsBySession.set(call.c, []);
+        }
+
+        callsBySession.get(call.c).push(call);
+    }
+
     const editTimesOf = new Map(
         editsSource
             ? data.parentEdits
@@ -3397,8 +3449,12 @@ export function checkR2(data, ctx) {
             .map(([ref]) => ref);
         const costRows = (data.routeCosts ?? []).filter((row) => row.c === thread.session);
         // The evidence of work after a close, for a `report` reopening: the session's own edits (unknown without the
-        // `parentEdits` source) and its worker spawns.
+        // `parentEdits` source), its worker spawns, and its sends to a worker (none without the `reviews` source).
         const evidence = {
+            sendTimes:
+                thread.session === undefined || data.sourceErrors?.reviews
+                    ? []
+                    : workerSendTimes(callsBySession.get(thread.session) ?? [], thread.session),
             editTimes:
                 thread.session === undefined ? null : (editTimesOf.get(thread.session) ?? null),
             spawnTimes:

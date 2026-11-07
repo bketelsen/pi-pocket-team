@@ -4450,3 +4450,116 @@ test("R2: an ask that reopened the thread is an ask reopening, in both event for
         {},
     );
 });
+
+/** A thread closed done 19 days ago with a PR merged 20 days ago, its events, and more data. */
+const reworkTotals = (events: object[], over: object = {}) =>
+    r2Totals(
+        [r2Thread("T1", { prs: { "acme/widgets#1": r2Link("MERGED") }, daysAgo: 19 })],
+        r2Ctx(r2Earlier([r2Pr(1, 20)])),
+        { events, ...over },
+    );
+
+const daysBack = (days: number) => NOW - days * DAY;
+
+const reportReopen = (days: number) =>
+    event(
+        "T1",
+        daysBack(days),
+        `reopened:${daysBack(days)}`,
+        "reopened: a report after a supervisor message",
+    );
+
+const editsAt = (...days: number[]) => ({
+    parentEdits: [{ c: 101, firstAnswerAt: null, edits: 0, editTimes: days.map(daysBack) }],
+});
+
+test("R2: a report reopening counts work after the latest close of the done thread, closed: or watch:pass:", () => {
+    // (a) A watch passed and closed the thread; no `closed:` event came before.
+    const watchClose = event(
+        "T1",
+        daysBack(25),
+        "watch:pass:x.desk.watch:1",
+        "watch passed (odrade): ok",
+    );
+
+    assert.deepEqual(reworkTotals([watchClose, reportReopen(23)], editsAt(24)).reopenedBy, {
+        work: 1,
+    });
+    assert.deepEqual(reworkTotals([watchClose, reportReopen(23)], editsAt()).reopenedNotRework, {
+        report: 1,
+    });
+
+    // (b) 2 close cycles: work came after close 1, before reopen 1; reopen 2 needs work after close 2.
+    const cycles = [
+        event("T1", daysBack(40), `closed:${daysBack(40)}`, "closed: all parts closed"),
+        event(
+            "T1",
+            daysBack(38),
+            `reopened:acme/widgets#2:${daysBack(38)}`,
+            "reopened: acme/widgets#2 attached by Clerk",
+        ),
+        event("T1", daysBack(30), `closed:${daysBack(30)}`, "closed: all parts closed"),
+        reportReopen(28),
+    ];
+    const before = reworkTotals(cycles, editsAt(39));
+
+    assert.deepEqual(outcomeOfR2(before), ["accepted"]);
+    assert.deepEqual(before.reopenedNotRework, { attached: 1, report: 1 });
+    assert.deepEqual(before.reopenedBy, {});
+
+    const after = reworkTotals(cycles, editsAt(39, 29));
+
+    assert.deepEqual(outcomeOfR2(after), ["notAccepted"]);
+    assert.deepEqual(after.reopenedBy, { work: 1 });
+    assert.deepEqual(after.reopenedNotRework, { attached: 1 });
+});
+
+test("R2: a send to a reused worker after the close is work; a send to a cross-review reviewer is not", () => {
+    const events = [
+        event("T1", daysBack(25), `closed:${daysBack(25)}`, "closed: all parts closed"),
+        reportReopen(23),
+    ];
+    const call = (action: string, name: string, days: number, over: object = {}) => ({
+        id: days,
+        c: 101,
+        at: daysBack(days),
+        action,
+        name,
+        refs: [],
+        bare: [],
+        head: null,
+        ...(action === "spawn"
+            ? {
+                  model: "deepseek/deepseek-flash",
+                  tools: ["read", "bash", "edit"],
+                  review: false,
+                  brief: "Fix it",
+              }
+            : {}),
+        ...over,
+    });
+    const reviewer = { tools: ["read", "bash"], review: true, brief: "Review the PR" };
+
+    // The worker was spawned before the close; the repair goes to it after the close.
+    const worker = reworkTotals(events, {
+        reviewCalls: [call("spawn", "coder", 40), call("send", "coder", 24)],
+    });
+
+    assert.deepEqual(outcomeOfR2(worker), ["notAccepted"]);
+    assert.deepEqual(worker.reopenedBy, { work: 1 });
+
+    // A send to a reviewer, a send with no earlier spawn of its name, and a failed reviews source: no evidence.
+    for (const over of [
+        { reviewCalls: [call("spawn", "rv", 40, reviewer), call("send", "rv", 24)] },
+        { reviewCalls: [call("send", "coder", 24), call("spawn", "coder", 22)] },
+        {
+            reviewCalls: [call("spawn", "coder", 40), call("send", "coder", 24)],
+            sourceErrors: { reviews: "no such table" },
+        },
+    ]) {
+        const totals = reworkTotals(events, over);
+
+        assert.deepEqual(outcomeOfR2(totals), ["accepted"], JSON.stringify(over));
+        assert.deepEqual(totals.reopenedNotRework, { report: 1 }, JSON.stringify(over));
+    }
+});
