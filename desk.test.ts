@@ -35,6 +35,7 @@ import { after, before, describe, test } from "node:test";
 import { fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import { defineDoc, type ConversationId, LiveDoc, type TaskId } from "@earendil-works/pi-durable";
 import { ScheduleDoc, SubagentsDoc } from "./_pocket/src/server/docs.ts";
+import { RUN_END, turnTexts } from "./scripted-turn-fixture.ts";
 import {
     acceptsOpen,
     askAnswerKind,
@@ -251,6 +252,52 @@ import { createHandler } from "./_pocket/src/server/http.ts";
 import type { Host } from "./_pocket.d.ts";
 
 // ─── The rules ───────────────────────────────────────────────────────────────
+
+test("the scripted model reads each user message of the turn, without run-end answers", () => {
+    const runEnd = (head: string) =>
+        `${head}\n<linked-session-message>\nok\n</linked-session-message>`;
+    const forms = [
+        runEnd("Linked session session-1 finished its run. Below is its final answer."),
+        runEnd("[from: Brian] Linked session session-1 failed: its run gave up after 3 tries."),
+        runEnd(
+            "[from: Brian] [via linked session session-2] Linked session session-1 was stopped before it answered.",
+        ),
+        runEnd("[via linked session session-2] Linked session session-1 finished its run."),
+    ];
+
+    for (const form of forms) {
+        assert.match(form, RUN_END);
+    }
+
+    const request = {
+        messages: [
+            { role: "system", content: "You are Pi." },
+            { role: "user", content: "an older message" },
+            { role: "assistant", content: [{ type: "text", text: "echo" }] },
+            { role: "user", content: [{ type: "text", text: "desk sync test" }] },
+            ...forms.map((content) => ({ role: "user", content })),
+            { role: "system", content: "The desk section." },
+        ],
+    };
+
+    assert.deepEqual(turnTexts(request), ["desk sync test"]);
+    assert.deepEqual(
+        turnTexts({
+            messages: [
+                { role: "user", content: "first" },
+                {
+                    role: "user",
+                    content: [
+                        { type: "text", text: "sec" },
+                        { type: "text", text: "ond" },
+                    ],
+                },
+            ],
+        }),
+        ["second", "first"],
+    );
+    assert.deepEqual(turnTexts({ messages: [{ role: "toolResult", content: "ok" }] }), []);
+});
 
 test("linkedSend keeps follow-up delivery arguments", async () => {
     const source = 42 as ConversationId;
@@ -10866,6 +10913,20 @@ const script: Parameters<typeof scriptedModel>[0] = (request) => {
         return answer(text.includes("Filed T") ? "Should I merge #106?" : "ok");
     }
 
+    // Each user message of the turn, newest first: a run-end answer can share the turn with the test's message.
+    for (const each of turnTexts(request as never)) {
+        const step = scriptStep(each, request);
+
+        if (step !== undefined) {
+            return step;
+        }
+    }
+
+    return answer(`echo: ${text.slice(0, 40)}`);
+};
+
+/** The script's step for 1 user message's text: undefined when no branch matches it. */
+function scriptStep(text: string, request: unknown): ReturnType<typeof script> | undefined {
     // The delegation's first message to the linked session: the queue test holds this answer, so the session works.
     if (heldAnswer !== undefined && text.includes("Task from the source session:")) {
         return heldAnswer.then(() => answer("ok"));
@@ -11325,8 +11386,8 @@ const script: Parameters<typeof scriptedModel>[0] = (request) => {
         return call("desk", { action: "attach", ref: issueAttachRef, thread: issueAttachThread });
     }
 
-    return answer(`echo: ${text.slice(0, 40)}`);
-};
+    return undefined;
+}
 
 const model = scriptedModel(script);
 
@@ -25249,13 +25310,18 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
                 assert.deepEqual(seen[1], seen[0], "the same request id and text");
                 assert.match(seen[0]?.text ?? "", /\[desk\] the Clerk escalates \(urgent\): go/);
                 assert.doesNotMatch(seen[0]?.text ?? "", /stale/);
-                assert.equal(
+
+                const delivered = async () =>
                     (await modelTexts(app, source)).filter((each) =>
                         each.includes("[desk] the Clerk escalates (urgent): go"),
-                    ).length,
-                    1,
-                    "delivered once",
+                    ).length;
+
+                // A run-end answer of a linked session can hold the supervisor busy: the digest waits in its queue.
+                await until(
+                    async () => (await delivered()) > 0,
+                    "the digest in the supervisor's chat",
                 );
+                assert.equal(await delivered(), 1, "delivered once");
 
                 const after = await deskState();
 
@@ -26899,6 +26965,10 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
             try {
                 const source = await supervisor("archive-027");
 
+                // An open thread of an earlier test keeps a sweeper that runs on the app's own host: on Pi Pocket
+                // 0.28.0 that host has the archive call, so its auto pass would set `since` here. Only this stub's
+                // passes may run in this test.
+                await quiet([]);
                 await setArchive(undefined);
                 await closedThread(source, stub, 3 * DAY);
                 await stub.sync(source);
