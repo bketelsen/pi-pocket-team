@@ -4070,32 +4070,95 @@ test("R2: reopenedBy counts the kinds of reopening of the reopened threads, from
     assert.equal(metrics.totals.accepted, 1);
 });
 
-test("R2: the eligible share of routed night shifts", () => {
+test("R2: the eligible share of routed night shifts; an unknown risk path (null, or no features) is not eligible", () => {
     const bench = { repo: "frostyard/nsl" };
+    const noRisk = { riskPathNamed: false };
     const threads = [
-        routed("T1", { features: { riskPathNamed: false } }, bench),
-        routed("T2", { worker: "x/model" }, bench),
-        routed("T3", {}),
+        routed("T1", { features: noRisk }, bench),
+        routed("T2", { worker: "x/model", features: noRisk }, bench),
+        routed("T3", { features: noRisk }),
         routed("T4", { features: { riskPathNamed: true } }, bench),
-        routed("T5", {}, bench),
-        routed("T6", { kind: undefined, features: { kind: "debug" } }, bench),
-        routed("T7", { kind: "review" }, bench),
+        routed("T5", { features: noRisk }, bench),
+        routed("T6", { kind: undefined, features: { kind: "debug", riskPathNamed: false } }, bench),
+        routed("T7", { kind: "review", features: noRisk }, bench),
+        // The router could not read a risk-path list: unknown.
+        routed("T8", { features: { riskPathNamed: null } }, bench),
+        // An older route with no features: unknown.
+        routed("T9", {}, bench),
     ];
     // T5 is no night shift.
-    const goals = [101, 102, 103, 104, 106, 107].map((session) => ({
+    const goals = [101, 102, 103, 104, 106, 107, 108, 109].map((session) => ({
         session,
         goal: { status: "done" },
     }));
     const metrics = checkR2(emptyData({ threads: threadMap(...threads), goals }), r2Ctx()).metrics;
 
     assert.ok(R2_BENCH_REPOS.includes("frostyard/nsl"));
-    assert.deepEqual(metrics.eligible, { nightShifts: 6, eligible: 2, share: 0.33 });
+    assert.deepEqual(metrics.eligible, { nightShifts: 8, eligible: 2, share: 0.25 });
     assert.equal(metrics.totals.eligible, 2);
     assert.deepEqual(checkR2(emptyData(), r2Ctx()).metrics.eligible, {
         nightShifts: 0,
         eligible: 0,
         share: null,
     });
+});
+
+test("R2: a stored revert of a PR with no Q1 record of its own makes the thread not accepted", () => {
+    const prs = { "acme/widgets#1": r2Link("MERGED") };
+    // Only the revert PR has a record: it reverts #1 explicitly, 10 days after #1 merged.
+    const c = r2Ctx(r2Earlier([r2Pr(2, 20, { title: "Undo", reverts: ["acme/widgets#1"] })]));
+    const github = (daysAgo: number) => ({
+        github: {
+            botPrs: [],
+            prs: { "acme/widgets#1": { mergedAt: new Date(NOW - daysAgo * DAY).toISOString() } },
+            checkRuns: {},
+            autoDelete: {},
+        },
+    });
+
+    // The merge time from this run's GitHub read.
+    const fromGithub = r2Totals([r2Thread("T1", { prs, daysAgo: 29 })], c, github(30));
+
+    assert.deepEqual(outcomeOfR2(fromGithub), ["notAccepted"]);
+    assert.equal(fromGithub.notAcceptedWhy.reverted, 1);
+
+    // The merge time from the close.
+    const fromClose = r2Totals([r2Thread("T1", { prs, daysAgo: 30 })], c);
+
+    assert.deepEqual(outcomeOfR2(fromClose), ["notAccepted"]);
+    assert.equal(fromClose.notAcceptedWhy.reverted, 1);
+
+    // A title revert needs the record of the PR it reverts, for its title: no record, no revert.
+    const byTitle = r2Ctx(
+        r2Earlier([r2Pr(2, 20, { title: 'Revert "Change 1"', revertsTitle: "Change 1" })]),
+    );
+
+    assert.deepEqual(outcomeOfR2(r2Totals([r2Thread("T1", { prs, daysAgo: 30 })], byTitle)), [
+        "accepted",
+    ]);
+});
+
+test("R2: the revert window ends 14 days after the thread's last merge, for a revert of any of its PRs", () => {
+    // Day 0 is 30 days before NOW: PR A merges on day 0, PR B on day 10.
+    const prs = { "acme/widgets#1": r2Link("MERGED"), "acme/widgets#2": r2Link("MERGED") };
+    const revertOfA = (day: number) =>
+        r2Ctx(
+            r2Earlier([
+                r2Pr(1, 30),
+                r2Pr(2, 20),
+                r2Pr(3, 30 - day, { title: "Undo A", reverts: ["acme/widgets#1"] }),
+            ]),
+        );
+
+    // Day 20: 20 days after A, but 10 days after the last merge.
+    const inside = r2Totals([r2Thread("T1", { prs, daysAgo: 19 })], revertOfA(20));
+
+    assert.deepEqual(outcomeOfR2(inside), ["notAccepted"]);
+    assert.equal(inside.notAcceptedWhy.reverted, 1);
+    // Day 26: 16 days after the last merge.
+    assert.deepEqual(outcomeOfR2(r2Totals([r2Thread("T1", { prs, daysAgo: 19 })], revertOfA(26))), [
+        "accepted",
+    ]);
 });
 
 test("R2: rows group by tier rule, tier, arm and assigned worker, and sort by count", () => {

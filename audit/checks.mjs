@@ -2996,8 +2996,8 @@ const msOf = (value) => {
 };
 
 /**
- * The reasons of a thread that is not accepted. `r2Outcome` tests them in this order: `dropped`, `reopened`, then, PR
- * by PR, `closedPr` and `reverted`; a thread counts in the first reason found only.
+ * The reasons of a thread that is not accepted. `r2Outcome` tests them in this order: `dropped`, `reopened`,
+ * `closedPr` (any PR), then `reverted`; a thread counts in the first reason found only.
  */
 const R2_WHY = ["dropped", "closedPr", "reverted", "reopened"];
 
@@ -3108,26 +3108,54 @@ function r2Outcome(data, thread, refs, prs, reverts, ctx) {
             fromClose = true;
         }
 
-        const late = (reverts.get(ref) ?? []).every((revert) => {
+        merges.push(at);
+    }
+
+    // The window ends 14 days after the LAST merge of the thread (its close with no merge time). A revert of any PR of
+    // the thread at or before that end, or at a time not known, makes it not accepted; a later revert does not count.
+    const end = (merges.length > 0 ? Math.max(...merges) : closed.at) + window;
+    const reverted = refs.some((ref) =>
+        (reverts.get(ref) ?? []).some((revert) => {
             const revertAt = msOf(revert.at);
 
-            return revertAt !== null && revertAt > at + window;
-        });
+            return revertAt === null || revertAt <= end;
+        }),
+    );
 
-        if (!late) {
-            return { outcome: "notAccepted", why: "reverted", fromClose };
-        }
-
-        merges.push(at);
+    if (reverted) {
+        return { outcome: "notAccepted", why: "reverted", fromClose };
     }
 
     if (unknown) {
         return { outcome: "unknown", fromClose };
     }
 
-    const end = (merges.length > 0 ? Math.max(...merges) : closed.at) + window;
-
     return { outcome: ctx.now < end ? "pending" : "accepted", fromClose };
+}
+
+/**
+ * R2's reverts: Q1's (`revertsOf`), and also each explicit `reverts` target of a merged revert PR that has no record
+ * of its own. R2 can know from the desk link alone that such a target merged. A title revert still needs the record,
+ * for its title. Q1 does not use this: its output does not change.
+ */
+function r2Reverts(prs) {
+    const reverted = revertsOf(prs);
+
+    for (const revert of prs) {
+        if (revert.state !== "merged" || !Array.isArray(revert.reverts)) {
+            continue;
+        }
+
+        for (const ref of revert.reverts) {
+            const list = reverted.get(ref) ?? [];
+
+            if (ref !== revert.ref && !list.includes(revert)) {
+                reverted.set(ref, [...list, revert]);
+            }
+        }
+    }
+
+    return reverted;
 }
 
 /** The R2 numbers of some thread records: 1 row without its keys, or the totals. */
@@ -3200,20 +3228,22 @@ function r2Numbers(list) {
  * finding.
  *
  * Accepted: closed as done (`completed`, `verified`, or no outcome), no reopening (a watch's reopen verifies the
- * work: it does not count), every PR merged, and no revert (Q1's
- * revert detection) within 14 days of the PR's merge; it is `pending` until 14 days after the last merge (or the
- * close, with no PR). A PR state comes from the desk link, else from Q1's stored day records; an unknown one makes the
- * thread `unknown`. `notAcceptedWhy` counts each not accepted thread in its first reason (`R2_WHY`), and `reopenedBy`
- * the kinds of reopening of the `reopened` ones (`reopenKind`; a thread counts each kind once). Rounds and blocking
- * points come from Q1's `prRounds` and `blockers`, hand fixes from `parentEdits`: each is null (unknown) when its
- * source is missing, and rounds and blocking points are null for a thread with no PR. No GitHub call: Q1's stored records only.
+ * work: it does not count), every PR merged, and no revert of any of its PRs (Q1's revert detection, and an explicit
+ * revert of a PR with no record of its own) within 14 days of the thread's last merge; it is `pending` until then (14
+ * days after the close, with no PR). A PR state comes from the desk link, else from Q1's stored day records; an
+ * unknown one makes the thread `unknown`. `notAcceptedWhy` counts each not accepted thread in its first reason
+ * (`R2_WHY`), and `reopenedBy` the kinds of reopening of the `reopened` ones (`reopenKind`; a thread counts each kind
+ * once). Rounds and blocking points come from Q1's `prRounds` and `blockers` (the last 30 days only), hand fixes from
+ * `parentEdits`: each is null (unknown) when its source is missing, and rounds and blocking points are null for a
+ * thread with no PR. No GitHub call: Q1's stored records only.
  *
  * `eligible` is the share of routed night shifts a routed worker could take: no named worker, a Jev kind of
- * `R2_KINDS`, a bench repository, and no risk path named.
+ * `R2_KINDS`, a bench repository, and a route that says no risk path is named (`riskPathNamed: false`; `null` or no
+ * `features` is unknown, not eligible).
  */
 export function checkR2(data, ctx) {
     const prRecords = r2Records(ctx);
-    const reverts = revertsOf([...prRecords.values()]);
+    const reverts = r2Reverts([...prRecords.values()]);
     const q1 = ctx.results?.Q1?.metrics;
     const roundsByRef =
         q1?.prRounds?.available === true && Array.isArray(q1.prRounds.prs)
@@ -3254,7 +3284,8 @@ export function checkR2(data, ctx) {
             !nonEmpty(route.worker) &&
             R2_KINDS.includes(kind) &&
             R2_BENCH_REPOS.includes(thread.repo) &&
-            route.features?.riskPathNamed !== true;
+            // `null` (no risk-path list could be read) and no `features` (an older route) are unknown: not eligible.
+            route.features?.riskPathNamed === false;
 
         if (nightShift) {
             eligible.nightShifts += 1;

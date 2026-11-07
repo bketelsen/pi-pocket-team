@@ -1015,7 +1015,10 @@ test("the metrics show R2's table after the R1 lines, a rate only from 10 decide
         }),
     );
 
-    assert.match(markdown, /- Routes: 1 recorded[^\n]*\n- R2: routed threads end to end/);
+    assert.match(
+        markdown,
+        /- Routes: 1 recorded[^\n]*\n- R2: routed threads end to end \(20 threads, 14-day revert window; rounds: last 30 days\)\./,
+    );
     assert.match(
         markdown,
         /\n\| tier rule \| tier \| arm \| assigned \| count \| accepted \| pending \| unknown \| decided \| rate \| cost per accepted \| median rounds \| hand fixes \| deviations \|\n\|---/,

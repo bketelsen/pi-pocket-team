@@ -349,7 +349,7 @@ const cell = (value) =>
 const r2Lines = (r2) => {
     const rows = r2.rows ?? [];
     const lines = [
-        `- R2: routed threads end to end (${plural(r2.routes, "thread")}, ${r2.windowDays}-day revert window).`,
+        `- R2: routed threads end to end (${plural(r2.routes, "thread")}, ${r2.windowDays}-day revert window; rounds: last 30 days).`,
         "",
         "| tier rule | tier | arm | assigned | count | accepted | pending | unknown | decided | rate | cost per accepted | median rounds | hand fixes | deviations |",
         "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
