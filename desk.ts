@@ -20384,22 +20384,21 @@ export function liveSupervisors(state: Readonly<DeskState> | undefined): number[
 }
 
 /**
- * The supervisor whose board receipts hold `key` (an agent's call key, `x.desk.board:<task>:<call>`), when exactly 1
- * does; else undefined. A replayed agent call binds to it, so it replays on the board it changed, also after that
- * supervisor stopped being live. The old field `board.keys` names no supervisor and gets no new key, so it is not read.
+ * The supervisors whose board receipts hold `key` (an agent's call key, `x.desk.board:<task>:<call>`), sorted. A
+ * replayed agent call binds to the 1 holder, so it replays on the board it changed, also after that supervisor stopped
+ * being live; with more than 1 holder it is refused and changes nothing. The old field `board.keys` names no
+ * supervisor and gets no new key, so it is not read.
  */
-export function receiptSupervisor(
+export function receiptSupervisors(
     doc: Readonly<BoardReceiptsDoc> | undefined,
     key: string,
-): number | undefined {
-    const holders = Object.entries(doc?.supervisors ?? {}).flatMap(([id, state]) =>
-        state?.receipts?.some((each) => each.key === key) === true ? [Number(id)] : [],
-    );
-    const [only] = holders;
-
-    return holders.length === 1 && only !== undefined && Number.isSafeInteger(only) && only > 0
-        ? only
-        : undefined;
+): number[] {
+    return Object.entries(doc?.supervisors ?? {})
+        .flatMap(([id, state]) =>
+            state?.receipts?.some((each) => each.key === key) === true ? [Number(id)] : [],
+        )
+        .filter((id) => Number.isSafeInteger(id) && id > 0)
+        .sort((a, b) => a - b);
 }
 
 /** The supervisor the Board view opens on: the first of `supervisors` with a sweeper, else the first, else null. */
@@ -31783,13 +31782,20 @@ export default function createDesk(host: Host, web: Web) {
                 // An agent's board is the 1 live supervisor (`liveSupervisors`): with none, or more than 1, it is refused.
                 // A replayed change binds to the supervisor whose receipt holds its key, live or not.
                 let owner = supervisor;
-                const replayed =
+                const holders =
                     agent && args.action !== "board"
-                        ? receiptSupervisor(await api.snapshot(BoardReceipts, context), callKey)
-                        : undefined;
+                        ? receiptSupervisors(await api.snapshot(BoardReceipts, context), callKey)
+                        : [];
 
-                if (agent && replayed !== undefined) {
-                    owner = replayed;
+                if (holders.length > 1) {
+                    // A key on 2 boards is no replay to trust: no new change either.
+                    throw new Error(
+                        `This call's key has receipts on ${String(holders.length)} boards (${holders.map(String).join(", ")}), so it is not replayed and changes nothing. Ask your supervisor with team_message.`,
+                    );
+                }
+
+                if (agent && holders[0] !== undefined) {
+                    owner = holders[0];
                 } else if (agent) {
                     const known = liveSupervisors(state);
 

@@ -1780,6 +1780,71 @@ const launchSuite = (label: string, instant: number, untilAt: number) =>
             }
         });
 
+        test("an agent's call whose key has receipts on 2 boards is refused, and no board changes", async () => {
+            await closeAll();
+
+            mkdirSync(join(root, "teg-ambiguous-session"), { recursive: true });
+
+            const agentSession = Number(await newSession(app, join(root, "teg-ambiguous-session")));
+
+            personas.set(agentSession, { id: "teg", name: "Teg", role: "agent" });
+
+            const saved = await deskState();
+            const callId = "call-ambiguous-receipts";
+            const key = `x.desk.board:task-board:${callId}`;
+            const receipt = { key, at: Date.now(), result: "Added: the first try" };
+            const savedReceipts = structuredClone(
+                (await app.harness.snapshot(BoardReceipts, context))?.supervisors ?? {},
+            );
+
+            // Retired 1745 and 1746 both hold the call's receipt; 4242 is the 1 live supervisor.
+            await app.harness.commit(async (tx) => {
+                const state = await tx.doc(DeskThreads);
+                const receipts = await tx.doc(BoardReceipts);
+
+                state.sweepers = { "4242": "task-test" };
+                state.clerks = {};
+                for (const id of ["1745", "1746"]) {
+                    receipts.supervisors[id] = {
+                        receipts: [...(receipts.supervisors[id]?.receipts ?? []), receipt],
+                    };
+                }
+            }, context);
+
+            try {
+                const rowsBefore = (await deskState()).board?.rows.length ?? 0;
+                const rows4242 = (await rowsOf(4242)).length;
+
+                await assert.rejects(
+                    desk.tool(
+                        agentSession,
+                        { action: "board_add", fields: { ...FIELDS, agent: undefined } },
+                        callId,
+                    ),
+                    /This call's key has receipts on 2 boards \(1745, 1746\), so it is not replayed and changes nothing/,
+                );
+                assert.equal((await deskState()).board?.rows.length ?? 0, rowsBefore, "no new row");
+                assert.equal((await rowsOf(4242)).length, rows4242, "4242 gets no row");
+            } finally {
+                await app.harness.commit(async (tx) => {
+                    const state = await tx.doc(DeskThreads);
+                    const receipts = await tx.doc(BoardReceipts);
+
+                    state.sweepers = saved.sweepers ?? {};
+                    state.clerks = saved.clerks ?? {};
+                    for (const id of ["1745", "1746"]) {
+                        const before = savedReceipts[id];
+
+                        if (before === undefined) {
+                            delete receipts.supervisors[id];
+                        } else {
+                            receipts.supervisors[id] = before;
+                        }
+                    }
+                }, context);
+            }
+        });
+
         test("the Clerk gets only board", async () => {
             const supervisor = await supervisorSession();
 
