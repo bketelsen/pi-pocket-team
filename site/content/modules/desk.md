@@ -26,8 +26,9 @@ A session with a supervisor identity uses `desk`; another session is refused.
 - `ask`, `answer`, `rewrite`, `withdraw`: file a question for Brian, record his words, give an open ask new words, or end one he need not answer.
 - `watch`, `result`: sleep a thread until a date or an event, and record the pass or the fail.
 - `archive`: the one-time sweep of the idle sessions of closed threads.
+- `board`, `board_add`, `board_edit`, `board_drop`, `board_pick`, `board_unpick`, `board_launch`, `board_reopen`, `board_resolve`: the goal board (below).
 
-An agent session can use `read`, `watch` and `result` on its own thread only. A Clerk has its own smaller list, and escalates to its supervisor with `desk escalate`: the desk drops an escalation of news the supervisor already acted on or got, and puts the rest in her next digest, or sends it at once with `urgent: true`.
+An agent session can use `read`, `watch` and `result` on its own thread only. On the goal board, an agent reads its supervisor's board with `board`, adds its own proposals with `board_add`, and edits or drops only its own proposed rows with `board_edit` and `board_drop`. A Clerk has its own smaller list, and escalates to its supervisor with `desk escalate`: the desk drops an escalation of news the supervisor already acted on or got, and puts the rest in her next digest, or sends it at once with `urgent: true`.
 
 ## Asks, watches and the cap
 
@@ -53,6 +54,17 @@ A hooks module can hand the desk facts of GitHub webhook deliveries with `nudge`
 
 The sweep also wakes an agent when every PR on its thread is merged or closed, tells a session once when its PR conflicts or its checks fail, removes the label `ready-for-human` when the PR changes after it, and archives the idle sessions of closed threads.
 
+## The goal board
+
+Each supervisor has 1 board of shift rows: goal runs at any hour, each with an agent, an optional repository, a title, the task, a stop condition, at most `max` rounds, and an `until` time (optional: `start`, `worker`, a PR check, a kind, a note and an order). Agents add their own proposals as rows, Odrade orders and notes them, Brian picks, and 1 launch request starts the picks in code, under the limits. No model launches a run.
+
+- **States.** `proposed` → `picked` → `waiting` (a launch request) → `starting` → `launched`, `failed` or `unknown`; a full desk sends a row back to `waiting`. A row can be dropped before it starts, unpicked, and reopened after a failure. An edit of a picked or waiting row sends it back to `proposed`.
+- **Revisions.** Each row has a `rev`, 1 more at each edit. A pick, an unpick and a launch name each row with the `rev` they read; another `rev` is refused: `Row 3 changed (rev 4 now): read it with desk board, then pick again.` A replayed tool call changes nothing.
+- **Who does what.** The supervisor changes its own rows only. An agent adds rows for itself, without note or order, to the 1 supervisor the desk knows, and changes or drops only its own proposed rows. A Clerk only reads the board. Picks, launches, reopens and resolves are the supervisor's.
+- **Times.** In the server's zone, through the shift module. At the pick, the run's end is the next time the clock shows `until` (and its start the next `start`); the run gets a length (`for`), so no time moves to the next day. A row with less than 10 minutes left fails.
+- **The launch pass.** A launch request, each sweep and each `desk sync` run 1 pass: first the rows a restart left `starting`, then the waiting rows in order. At most `atOnce` rows run at once; the day's rounds stay within `rounds`; and the board never takes the last `reserve` slots below the cap, nor Brian's OKs. A row that does not fit waits for a later sweep, and its supervisor's sweeper stays for it.
+- **Results.** A started row is `launched`, with its thread. A refusal (a model not allowed, a bad PR check, no such repository) is `failed`, with Team's words. A start that threw is `unknown`: it is never tried again by itself, and `board_resolve` binds the session's thread or fails the row. Each failed and unknown row sends the supervisor 1 `[desk] board row …` message at once.
+
 ## Run-end answers
 
 Since Pi Pocket 0.28.0, when a linked session's run ends, Pocket sends its final answer to the session that started it, and that message starts a run there. The supervisor starts every desk-tracked session, and the reports already come by `team_message`, so the desk turns these answers off for each supervisor: Pocket's `linkedSessions.reports` with `take: false` (Pi Pocket 0.28.0-bk.1 and later). It holds for every session the supervisor started, old, new and archived. A `team_work` start from an agent's home keeps its answers: an agent's home is no supervisor.
@@ -68,9 +80,9 @@ Install the files, then turn on **Desk** in **Menu → Extensions**. Team must b
 
 ## Settings and storage
 
-`PI_POCKET_DESK_CONFIG` names the config file, default `~/.config/pi-pocket-team/desk.json`, and every part reads it each time, so a change needs no restart. Its keys include `authors`, `ownAuthors`, `cap`, `export`, `exportCommit`, `digest`, `queue`, `journal`, `plans` and `archive`.
+`PI_POCKET_DESK_CONFIG` names the config file, default `~/.config/pi-pocket-team/desk.json`, and every part reads it each time, so a change needs no restart. Its keys include `authors`, `ownAuthors`, `cap`, `export`, `exportCommit`, `digest`, `queue`, `journal`, `plans`, `archive` and `board` (the goal board's limits: `atOnce` 8, `rounds` 250, `reserve` 2 and `keep` 14 days by default; a value out of its bounds falls back to its default with 1 warning).
 
-These Pocket documents hold the desk: `x.desk.threads` (the app-wide desk), `x.desk.reports` (one thread session's full reports), `x.desk.nudges` (the delivery ids the desk took, the waiting nudges, and for each nudged sync its delivery times and its commit time) and `x.desk.observed` (the changes the sweeps saw, for the hooks' coverage alarm). They are stored data: never rename a kind or change what a field means. The page and its routes are owner-only.
+These Pocket documents hold the desk: `x.desk.threads` (the app-wide desk, with the goal board), `x.desk.reports` (one thread session's full reports), `x.desk.nudges` (the delivery ids the desk took, the waiting nudges, and for each nudged sync its delivery times and its commit time) and `x.desk.observed` (the changes the sweeps saw, for the hooks' coverage alarm). They are stored data: never rename a kind or change what a field means. The page and its routes are owner-only.
 
 ## Read more
 

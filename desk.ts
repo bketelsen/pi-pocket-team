@@ -74,6 +74,7 @@ import type { Host, Web, WebRequest } from "./_pocket.d.ts";
 import type * as DashboardModule from "./_desk-dashboard.ts";
 import type * as MetricsModule from "./_desk-metrics.ts";
 import type * as UsageModule from "./_desk-usage.ts";
+import type * as BoardModule from "./_desk-board.ts";
 
 /** Keep linked-session sends as follow-up work on Pi Pocket 0.28, as they were on 0.27. */
 export async function linkedSend(
@@ -104,6 +105,10 @@ const metrics = (await import(
 const usageDocs = (await import(
     new URL(`./_desk-usage.ts${new URL(import.meta.url).search}`, import.meta.url).href
 )) as typeof UsageModule;
+/** The goal board's pure rules (`_desk-board.ts`), loaded the same way. */
+const boardRules = (await import(
+    new URL(`./_desk-board.ts${new URL(import.meta.url).search}`, import.meta.url).href
+)) as typeof BoardModule;
 
 /** Where another module finds this one's live API. */
 const API = Symbol.for("pi-pocket-team.desk");
@@ -784,6 +789,11 @@ export type DeskState = {
      * also across a reload or a restart. Absent until the first such warning.
      */
     reportsOffNoticed?: Record<string, number>;
+    /**
+     * The goal board (`_desk-board.ts`): shift rows of each supervisor, from a proposal to a launched run. `next` is the
+     * next row id; `keys` the last calls' replay keys. Absent until the first row.
+     */
+    board?: BoardModule.Board;
 };
 
 /** One plan's state: the shape of its thread's work. Stored data: never rename a field. */
@@ -1520,6 +1530,11 @@ export type OpenRequest = {
      * text and its revision name the thread. Absent: the next id.
      */
     id?: string;
+    /**
+     * A start from the goal board: the open refuses with `deskFull` when the counted threads are at or above the cap
+     * minus `reserve`, and never uses an OK, so an ordinary delegation keeps the last free slots and Brian's OKs.
+     */
+    limit?: { reserve: number };
 };
 
 export type BindRequest = { session: number; address: string; at: number };
@@ -17964,6 +17979,8 @@ export function queueExport(
 }
 
 const CONSULT_STARTS = Symbol.for("pi-pocket-team.desk.consult-starts");
+/** The goal board's row ids whose start runs now: shared by every instance of this module in the process. */
+const BOARD_STARTS = Symbol.for("pi-pocket-team.desk.board-starts");
 
 /**
  * The consult start keys whose start runs now, shared by every instance of this module in the process: the call and
@@ -21035,6 +21052,31 @@ type TeamApi = {
         message: string;
         key: string;
     }) => Promise<{ session: number; address: string; model?: string }>;
+    /**
+     * Start 1 shift of the goal board (`team.ts`'s `TeamStartShiftRequest`): as `team_delegate` with `shift`, from the
+     * supervisor's session, under the board's key, with the board's limit on the desk's open. It never throws. An
+     * older Team has none: the board launches nothing.
+     */
+    startShift?: (request: {
+        supervisor: number;
+        read: Pick<DocumentReader, "snapshot">;
+        commit: <T>(change: (tx: Tx) => T | Promise<T>) => Promise<T>;
+        context: Context;
+        key: string;
+        agent: string;
+        repository?: string;
+        title: string;
+        task: string;
+        shift: {
+            objective?: string;
+            stop_when: string;
+            max: number;
+            for: string;
+            worker?: string;
+            pr_check?: BoardModule.BoardPrCheck;
+        };
+        limit: { reserve: number };
+    }) => Promise<BoardModule.BoardStartResult>;
 };
 
 const teamApi = (): TeamApi | undefined =>
@@ -22427,7 +22469,19 @@ export default function createDesk(host: Host, web: Web) {
             const view = capView(state, cap, request.at);
             let grant: Grant | undefined;
 
-            if (view.full) {
+            // A board start: its own limit below the cap, and no OK. The refusal rolls back with this commit.
+            if (request.limit !== undefined) {
+                const room = cap - Math.max(0, Math.floor(request.limit.reserve));
+
+                if (view.counted >= room) {
+                    throw Object.assign(
+                        new Error(
+                            `The desk has no room for a board start: ${String(view.counted)} of ${String(cap)} threads count, and ${String(cap - room)} stay free for other work.`,
+                        ),
+                        { deskFull: true },
+                    );
+                }
+            } else if (view.full) {
                 grant = [...view.grants].sort(
                     (a, b) => a.at - b.at || a.key.localeCompare(b.key),
                 )[0];
@@ -22788,6 +22842,11 @@ export default function createDesk(host: Host, web: Web) {
             conversationId: ConversationId,
             context: Context,
         ) => Promise<{ status: string } | undefined>;
+        /** The shift module's zone: the goal board's times are in it. */
+        zone?: () => string;
+        /** The goal board's clock math. An older shift module has none: the board refuses a pick. */
+        nextClockTime?: (hour: number, minute: number, now: number, zone: string) => number;
+        localMidnight?: (now: number, zone: string) => number;
     };
 
     const nightShiftApi = (): NightShiftApi | undefined =>
@@ -23931,6 +23990,9 @@ export default function createDesk(host: Host, web: Web) {
         plans: PlansConfig;
         /** The archive of closed threads' sessions: `auto` false turns the auto pass off (`archive.auto`, default true). */
         archive: { auto: boolean };
+        /** The goal board's limits (`board`), each in its bounds; `boardWarnings` names each value that fell back. */
+        board: BoardModule.BoardSettings;
+        boardWarnings: string[];
     }> {
         try {
             const value = JSON.parse(await readFile(configFile(), "utf8")) as {
@@ -23944,6 +24006,7 @@ export default function createDesk(host: Host, web: Web) {
                 journal?: unknown;
                 plans?: unknown;
                 archive?: unknown;
+                board?: unknown;
             } | null;
             const authors = Array.isArray(value?.authors)
                 ? value.authors.filter(
@@ -23971,6 +24034,7 @@ export default function createDesk(host: Host, web: Web) {
             const digest = digestConfig(value?.digest);
             // The journal is off without a usable `journal` key: a missing one, or one whose `url` is not a notes endpoint.
             const journal = journalConfig(value?.journal);
+            const board = boardRules.boardSettings(value?.board);
 
             return {
                 authors,
@@ -23982,6 +24046,8 @@ export default function createDesk(host: Host, web: Web) {
                 archive: {
                     auto: (value?.archive as { auto?: unknown } | null | undefined)?.auto !== false,
                 },
+                board: board.settings,
+                boardWarnings: board.warnings,
                 ...(journal === undefined ? {} : { journal }),
                 ...(exported === undefined ? {} : { export: exported }),
                 ...(exported !== undefined && value?.exportCommit === true
@@ -23997,9 +24063,24 @@ export default function createDesk(host: Host, web: Web) {
                 queue: undefined,
                 plans: plansConfig(undefined, undefined),
                 archive: { auto: true },
+                board: { ...boardRules.BOARD_DEFAULTS },
+                boardWarnings: [],
             };
         }
     }
+
+    // The board's limits in desk.json: each value out of its bounds falls back to its default, with 1 warning here.
+    void deskConfig()
+        .then((config) => {
+            for (const warning of config.boardWarnings) {
+                try {
+                    host.notice("warning", warning);
+                } catch {
+                    // A notice that cannot show must not fail the load.
+                }
+            }
+        })
+        .catch(() => undefined);
 
     /** The export speaks at most once an hour: a failed export must not fill the notices. */
     let exportNoticeAt = 0;
@@ -26550,8 +26631,10 @@ export default function createDesk(host: Host, web: Web) {
             quietWatched(state, supervisor, now) || readyWatched(state, supervisor, now);
         // A consult in flight (a start, or an identity to recover) keeps the sweeper: only a sweep tries it.
         const consulting = consultsPending(state, supervisor, now);
+        // A board row waiting, starting or unknown keeps it too: only a sweep's launch pass moves it on.
+        const boarded = boardRules.boardKeepsSweeper(state.board, supervisor);
 
-        if (!open && !watched && !consulting) {
+        if (!open && !watched && !consulting && !boarded) {
             if (state.sweepers?.[String(supervisor)] === taskId) {
                 delete state.sweepers[String(supervisor)];
             }
@@ -26755,6 +26838,13 @@ export default function createDesk(host: Host, web: Web) {
                                 // The next sweep tries again.
                             }
 
+                            // The board's old rows leave `keep` days after their last change.
+                            boardRules.pruneBoard(
+                                state.board,
+                                runtime.now(),
+                                (await deskConfig()).board.keep,
+                            );
+
                             return sweeperNext(
                                 state,
                                 Number(supervisor),
@@ -26923,6 +27013,18 @@ export default function createDesk(host: Host, web: Web) {
                     // The next sweep tries again: the consult is still starting.
                 }
 
+                // The goal board: 1 launch pass after the sweep's commit, so a row that waits launches when a run ends.
+                try {
+                    await boardPass(
+                        accessOfTask(runtime, context),
+                        runtimeDeps(runtime, context),
+                        Number(supervisor),
+                        () => runtime.now(),
+                    );
+                } catch {
+                    // The next sweep tries again: the rows still wait.
+                }
+
                 web.send("changed", {});
                 await exportNow(runtime, context);
             },
@@ -26979,7 +27081,8 @@ export default function createDesk(host: Host, web: Web) {
             !open &&
             !quietWatched(state, supervisor, Date.now()) &&
             !readyWatched(state, supervisor, Date.now()) &&
-            !consultsPending(state, supervisor, Date.now())
+            !consultsPending(state, supervisor, Date.now()) &&
+            !boardRules.boardKeepsSweeper(state.board, supervisor)
         ) {
             return;
         }
@@ -30553,10 +30656,475 @@ export default function createDesk(host: Host, web: Web) {
         return lines.join("\n");
     };
 
+    // ─── The goal board ──────────────────────────────────────────────────────
+
+    /** The shift module's zone and clock math, for the board's times: none when the module is off or too old. */
+    const boardClock = (): BoardModule.BoardClock | undefined => {
+        const ns = nightShiftApi();
+
+        if (
+            ns?.zone === undefined ||
+            ns.nextClockTime === undefined ||
+            ns.localMidnight === undefined
+        ) {
+            return undefined;
+        }
+
+        return {
+            zone: ns.zone(),
+            nextClockTime: ns.nextClockTime,
+            midnight: ns.localMidnight,
+        };
+    };
+
+    /** Local midnight of `now`: the shift module's, else the server's own. */
+    const boardMidnight = (now: number): number => {
+        const clock = boardClock();
+
+        if (clock !== undefined) {
+            return clock.midnight(now, clock.zone);
+        }
+
+        const day = new Date(now);
+
+        day.setHours(0, 0, 0, 0);
+
+        return day.getTime();
+    };
+
+    /**
+     * Whether a launched row's run still works: its thread is not closed, and its shift has not ended. A thread whose
+     * shift no sweep has seen yet runs.
+     */
+    const boardRowRuns =
+        (state: Readonly<DeskState>): BoardModule.RowRuns =>
+        (row) => {
+            const thread = row.thread === undefined ? undefined : state.threads[row.thread];
+
+            if (thread === undefined || thread.state === "closed") {
+                return false;
+            }
+
+            const shift = thread.run.shift;
+
+            return shift === undefined || shiftWorks(shift);
+        };
+
+    /** The supervisors the desk knows: a thread's, a sweeper's or a Clerk's, by conversation id. */
+    const knownSupervisors = (state: Readonly<DeskState> | undefined): number[] =>
+        [
+            ...new Set([
+                ...Object.values(state?.threads ?? {}).flatMap((thread) =>
+                    thread.supervisor === undefined ? [] : [thread.supervisor],
+                ),
+                ...Object.keys(state?.sweepers ?? {}).map(Number),
+                ...Object.keys(state?.clerks ?? {}).map(Number),
+            ]),
+        ]
+            .filter((id) => Number.isSafeInteger(id) && id > 0)
+            .sort((a, b) => a - b);
+
+    /** The row ids whose start runs now in this process, shared by every load: 2 passes never start 1 row at once. */
+    const boardStarts = (): Set<number> => {
+        const shared = globalThis as unknown as Record<symbol, Set<number> | undefined>;
+
+        shared[BOARD_STARTS] ??= new Set<number>();
+
+        return shared[BOARD_STARTS];
+    };
+
+    /** The 1 message for a `failed` or `unknown` row, at once through `x.desk.notify`, in the caller's commit. */
+    const notifyBoard = async (tx: Tx, row: BoardModule.BoardRow): Promise<void> => {
+        await tx.createTask(
+            Notify,
+            {
+                supervisor: row.supervisor,
+                text: boardRules.boardNotifyText(row),
+                requestId: `x.desk.board-notify:${String(row.id)}:${String(row.attempts.length)}:${String(row.changedAt)}`,
+            },
+            {
+                ownership: { kind: "conversation" },
+                conversationId: row.supervisor as ConversationId,
+                background: true,
+                abandonOnRestart: false,
+            },
+        );
+    };
+
+    /** The limits now, for 1 supervisor. */
+    const boardLimits = async (state: Readonly<DeskState> | undefined, supervisor: number) => {
+        const now = Date.now();
+        const { cap, board: settings } = await deskConfig();
+        const view = capView(state, cap, now);
+
+        return boardRules.limitsLine({
+            settings,
+            running:
+                state === undefined
+                    ? 0
+                    : boardRules.runningCount(state.board, supervisor, boardRowRuns(state)),
+            cap,
+            counted: view.counted,
+            rounds: boardRules.roundsToday(state?.board, supervisor, boardMidnight(now)),
+        });
+    };
+
+    /** A time as people read it, in the shift module's zone. */
+    const boardLabel = (ms: number): string => {
+        const zone = boardClock()?.zone;
+
+        return new Intl.DateTimeFormat("en-US", {
+            ...(zone === undefined ? {} : { timeZone: zone }),
+            hourCycle: "h23",
+            month: "short",
+            day: "numeric",
+            hour: "2-digit",
+            minute: "2-digit",
+            timeZoneName: "short",
+        }).format(ms);
+    };
+
+    /** `desk board`: the limits now, then the supervisor's rows in launch order. */
+    const boardText = async (
+        state: Readonly<DeskState> | undefined,
+        supervisor: number,
+    ): Promise<string> => {
+        const rows = boardRules.boardRows(state?.board, supervisor);
+        const lines = rows.map((row) => {
+            const thread = row.thread === undefined ? undefined : state?.threads[row.thread];
+
+            return boardRules.rowLine(
+                row,
+                boardLabel,
+                thread === undefined ? undefined : { id: thread.id, next: nextActor(thread) },
+            );
+        });
+
+        return [
+            `Board limits: ${await boardLimits(state, supervisor)}.`,
+            ...(lines.length === 0 ? ["The board has no rows."] : lines),
+        ].join("\n");
+    };
+
+    /**
+     * 1 board operation, from the tool or the page: the move in 1 commit, with the call's replay key (a replay changes
+     * nothing and gives the first text), the pruning, and for a launch the sweeper. The page's routes call this too.
+     * Gives the text, and whether a launch moved rows to `waiting`; or the refusal with its status.
+     */
+    const applyBoardOp = async (
+        access: PlanAccess,
+        actor: BoardModule.BoardActor,
+        op: BoardModule.BoardOp,
+        key: string,
+    ): Promise<{ text: string; replay: boolean; launch: boolean } | BoardModule.BoardRefusal> => {
+        const team = teamApi();
+        const roster = ((await team?.roster().catch(() => [])) ?? []).map((member) => ({
+            id: member.id,
+            role: member.role,
+            repositories: member.repositories ?? {},
+        }));
+        const models = (() => {
+            try {
+                return host.subagentModels();
+            } catch {
+                return [];
+            }
+        })();
+        const clock = boardClock();
+        const { board: settings } = await deskConfig();
+
+        return access.commit(async (state, tx) => {
+            const now = Date.now();
+            const known = boardRules.boardReplay(state.board, key);
+
+            if (known !== undefined) {
+                return { text: known, replay: true, launch: false };
+            }
+
+            state.board ??= { next: 1, rows: [] };
+            boardRules.pruneBoard(state.board, now, settings.keep);
+
+            const done = boardRules.boardOp(
+                state.board,
+                actor,
+                op,
+                {
+                    roster,
+                    models,
+                    ...(clock === undefined ? {} : { clock }),
+                    threadSupervisor: (id) => threadById(state, id)?.supervisor,
+                },
+                now,
+            );
+
+            if ("status" in done) {
+                return done;
+            }
+
+            const verb = {
+                add: "Added",
+                edit: "Changed",
+                drop: "Dropped",
+                pick: "Picked",
+                unpick: "Unpicked",
+                launch: "Waiting to launch",
+                reopen: "Reopened",
+                resolve: "Resolved",
+            }[op.op];
+            const text = [
+                done.rows.length === 0 ? `${verb}: no rows.` : `${verb}:`,
+                ...done.rows.map((row) => {
+                    const thread = row.thread === undefined ? undefined : state.threads[row.thread];
+
+                    return boardRules.rowLine(
+                        row,
+                        boardLabel,
+                        thread === undefined
+                            ? undefined
+                            : { id: thread.id, next: nextActor(thread) },
+                    );
+                }),
+            ].join("\n");
+
+            boardRules.keepBoardKey(state.board, key, text, now);
+
+            // A launch request keeps a sweeper: each sweep runs 1 pass, so a row that waits launches later.
+            if (op.op === "launch" && done.rows.length > 0) {
+                await startSweeper(tx, actor.supervisor);
+            }
+
+            return { text, replay: false, launch: op.op === "launch" && done.rows.length > 0 };
+        });
+    };
+
+    /**
+     * 1 launch pass of 1 supervisor's board, from a launch request or a sweep. First each `starting` row (a restart
+     * between its claim and its record) starts again under its attempt's key, before any limit. Then the `waiting` rows,
+     * in launch order: each claim is 1 commit that reads the board again (`claimRow`), then Team's `startShift` under
+     * the attempt's key, then 1 commit records the result. A full desk or `atOnce` running stops the pass. Passes may
+     * overlap: a claim reads the row again, and a row whose start runs in this process is skipped. Gives 1 line per row
+     * it touched.
+     */
+    const boardPass = async (
+        access: PlanPublish,
+        deps: ConsultStartDeps,
+        supervisor: number,
+        now: () => number,
+    ): Promise<string[]> => {
+        const startShift = teamApi()?.startShift;
+        const before = await access.read();
+        const mine = boardRules.boardRows(before?.board, supervisor);
+
+        if (!mine.some((row) => row.state === "waiting" || row.state === "starting")) {
+            return [];
+        }
+
+        if (startShift === undefined) {
+            return [
+                "The Team module cannot start a shift now (it is off or too old): the rows wait.",
+            ];
+        }
+
+        const { board: settings } = await deskConfig();
+        const running = boardStarts();
+        const lines: string[] = [];
+
+        /** Start 1 claimed row's attempt `n`, and record what happened. Gives whether the pass goes on. */
+        const startRow = async (id: number, n: number): Promise<boolean> => {
+            const row = (await access.read())?.board?.rows.find((each) => each.id === id);
+            const attempt = row?.attempts.at(-1);
+
+            if (
+                row === undefined ||
+                row.state !== "starting" ||
+                attempt === undefined ||
+                attempt.n !== n
+            ) {
+                return true;
+            }
+
+            const minutes = Math.max(
+                1,
+                attempt.minutes ?? Math.floor(((row.untilAt ?? now()) - attempt.at) / 60_000),
+            );
+            let result: BoardModule.BoardStartResult;
+
+            try {
+                result = await startShift({
+                    supervisor,
+                    read: deps.read,
+                    commit: deps.commit,
+                    context: deps.context,
+                    key: boardRules.boardStartKey(id, n),
+                    agent: row.agent,
+                    ...(row.repo === undefined ? {} : { repository: row.repo }),
+                    title: row.title,
+                    task: row.task,
+                    shift: {
+                        ...(row.objective === undefined ? {} : { objective: row.objective }),
+                        stop_when: row.stopWhen,
+                        max: row.max,
+                        for: `${String(minutes)}m`,
+                        ...(row.worker === undefined ? {} : { worker: row.worker }),
+                        ...(row.prCheck === undefined ? {} : { pr_check: row.prCheck }),
+                    },
+                    limit: { reserve: settings.reserve },
+                });
+            } catch (error) {
+                // Team's start never throws; if it does, it may have admitted the session.
+                result = { error: (error as Error).message, unknown: true };
+            }
+
+            let recorded: BoardModule.BoardRowState | undefined;
+
+            await access.commit(async (state, tx) => {
+                recorded = undefined;
+
+                if (state.board === undefined) {
+                    return;
+                }
+
+                recorded = boardRules.recordStart(state.board, id, n, result, now());
+
+                const fresh = state.board.rows.find((each) => each.id === id);
+
+                if ((recorded === "failed" || recorded === "unknown") && fresh !== undefined) {
+                    await notifyBoard(tx, fresh);
+                }
+            });
+
+            lines.push(
+                `#${String(id)} ${recorded ?? "unchanged"}${"thread" in result ? `: ${result.thread}` : `: ${result.error}`}`,
+            );
+
+            return !("deskFull" in result && result.deskFull === true);
+        };
+
+        /** Run 1 row's work with its id held in this process; skip it when another pass holds it. */
+        const held = async (id: number, work: () => Promise<boolean>): Promise<boolean> => {
+            if (running.has(id)) {
+                return true;
+            }
+
+            running.add(id);
+
+            try {
+                return await work();
+            } finally {
+                running.delete(id);
+            }
+        };
+
+        // 1. Recovery: a starting row starts again under the same key, before any limit check.
+        for (const row of mine.filter((each) => each.state === "starting")) {
+            const n = row.attempts.at(-1)?.n;
+
+            if (n === undefined) {
+                continue;
+            }
+
+            if (!(await held(row.id, () => startRow(row.id, n)))) {
+                return lines;
+            }
+        }
+
+        // 2. The waiting rows, in launch order.
+        const waiting = boardRules
+            .boardRows((await access.read())?.board, supervisor)
+            .filter((row) => row.state === "waiting")
+            .map((row) => row.id);
+
+        for (const id of waiting) {
+            const go = await held(id, async () => {
+                let claim: BoardModule.BoardClaim | undefined;
+
+                await access.commit(async (state, tx) => {
+                    claim = undefined;
+
+                    if (state.board === undefined) {
+                        return;
+                    }
+
+                    const at = now();
+
+                    claim = boardRules.claimRow(state.board, id, at, {
+                        settings,
+                        midnight: boardMidnight(at),
+                        runs: boardRowRuns(state),
+                    });
+
+                    const row = state.board.rows.find((each) => each.id === id);
+
+                    if (claim.claim === "failed" && row !== undefined) {
+                        await notifyBoard(tx, row);
+                    }
+                });
+
+                const decided = claim as BoardModule.BoardClaim | undefined;
+
+                if (
+                    decided === undefined ||
+                    decided.claim === "gone" ||
+                    decided.claim === "later"
+                ) {
+                    return true;
+                }
+
+                if (decided.claim === "full") {
+                    lines.push(
+                        `#${String(id)} waits: ${String(settings.atOnce)} rows run at once.`,
+                    );
+
+                    return false;
+                }
+
+                if (decided.claim === "failed") {
+                    lines.push(`#${String(id)} failed: ${decided.error}`);
+
+                    return true;
+                }
+
+                return startRow(id, decided.n);
+            });
+
+            if (!go) {
+                break;
+            }
+        }
+
+        return lines;
+    };
+
+    /** The desk's access and Team's deps for a pass from a task's `runtime`, as the consult retries take them. */
+    const runtimeDeps = (
+        runtime: {
+            snapshot: DocumentReader["snapshot"];
+            commit: (
+                change: (tx: Tx) => undefined | Promise<undefined>,
+                context: Context,
+            ) => Promise<void>;
+        },
+        context: Context,
+    ): ConsultStartDeps => ({
+        read: runtime,
+        commit: async <T>(change: (tx: Tx) => T | Promise<T>): Promise<T> => {
+            let out: T | undefined;
+
+            await runtime.commit(async (tx) => {
+                out = await change(tx);
+
+                return undefined;
+            }, context);
+
+            return out as T;
+        },
+        context,
+    });
+
     const tool = defineTool({
         name: "desk",
         description:
-            "The desk of threads for work the team runs in the background. A supervisor session can use every action; a Clerk can use list, read, sync, attach, detach, watch, result, send, issues, and escalate for its supervisor's threads; an agent session can use read, watch, and result on its own thread only. Actions: list (one line per open thread), read (one thread in full), sync (observe the threads now, with linked sessions, Shift, git, and GitHub), seed (import a seed.json file one time), attach (put a PR, a queued issue, or all of another thread's work, on one thread), detach (take a PR off a thread for good: the sweep does not attach or find it again; only attach brings it back), own (mark a found PR thread as Brian's own: it closes, and no sweep finds its PR again), ask (file a question for Brian on a thread, or on a new one; never for a plain merge: Ready to merge on the Desk page lists those), rewrite (give an open ask new words, and new options or none: an agent's ask is filed as it wrote it, so make it clear for Brian), withdraw (end an open ask that Brian need not answer, with words saying why, or with into to merge it into another open ask), answer (record Brian's words for an ask), watch (set a dated check on a thread: it sleeps until that date, or until its optional on event, and does not count toward the cap; a thread closed as done in the last 7 days opens again for it, and sleeps), result (record that check's pass, which closes the thread, or its fail, which opens it again: a pass is refused while the thread has an open ask), send (send 1 message from the supervisor's session to a thread's agent), issues (read the issues Brian queued on GitHub: read only), escalate (Clerk only: 1 escalation to the supervisor; the desk drops it when the supervisor already acted on the thread or got its news directly, and else puts it in her next digest, or sends it at once with urgent: true), archive (supervisor only: a dry run that lists the idle sessions of threads closed 2 days ago or more that the desk can archive, with the skips and their reasons; with apply: true, archive the sessions of a dry run of the last 60 minutes that still pass every rule; it archives, it never deletes).",
+            "The desk of threads for work the team runs in the background. A supervisor session can use every action; a Clerk can use list, read, sync, attach, detach, watch, result, send, issues, and escalate for its supervisor's threads; an agent session can use read, watch, and result on its own thread only. Actions: list (one line per open thread), read (one thread in full), sync (observe the threads now, with linked sessions, Shift, git, and GitHub), seed (import a seed.json file one time), attach (put a PR, a queued issue, or all of another thread's work, on one thread), detach (take a PR off a thread for good: the sweep does not attach or find it again; only attach brings it back), own (mark a found PR thread as Brian's own: it closes, and no sweep finds its PR again), ask (file a question for Brian on a thread, or on a new one; never for a plain merge: Ready to merge on the Desk page lists those), rewrite (give an open ask new words, and new options or none: an agent's ask is filed as it wrote it, so make it clear for Brian), withdraw (end an open ask that Brian need not answer, with words saying why, or with into to merge it into another open ask), answer (record Brian's words for an ask), watch (set a dated check on a thread: it sleeps until that date, or until its optional on event, and does not count toward the cap; a thread closed as done in the last 7 days opens again for it, and sleeps), result (record that check's pass, which closes the thread, or its fail, which opens it again: a pass is refused while the thread has an open ask), send (send 1 message from the supervisor's session to a thread's agent), issues (read the issues Brian queued on GitHub: read only), escalate (Clerk only: 1 escalation to the supervisor; the desk drops it when the supervisor already acted on the thread or got its news directly, and else puts it in her next digest, or sends it at once with urgent: true), archive (supervisor only: a dry run that lists the idle sessions of threads closed 2 days ago or more that the desk can archive, with the skips and their reasons; with apply: true, archive the sessions of a dry run of the last 60 minutes that still pass every rule; it archives, it never deletes). The goal board (shift rows of 1 supervisor, launched by the desk under the limits): board (anyone, the Clerk too: the rows in launch order with their rev, state, times and thread, and the limits now), board_add (fields: the supervisor adds any row; an agent adds only its own, as proposed, without note or order), board_edit (row, fields) and board_drop (row) (the supervisor on its rows; an agent only on its own proposed rows, not agent, note or order), and supervisor only: board_pick (rows), board_unpick (rows), board_launch (rows, or none for every picked row: they wait, and the desk starts them), board_reopen (row: a failed row back to proposed), board_resolve (row, and thread for an unknown row whose session started, or nothing to fail it). A rev that differs from the row's is refused: read the board again.",
         parameters: Type.Object({
             action: Type.Union([
                 Type.Literal("list"),
@@ -30576,11 +31144,20 @@ export default function createDesk(host: Host, web: Web) {
                 Type.Literal("issues"),
                 Type.Literal("archive"),
                 Type.Literal("escalate"),
+                Type.Literal("board"),
+                Type.Literal("board_add"),
+                Type.Literal("board_edit"),
+                Type.Literal("board_drop"),
+                Type.Literal("board_pick"),
+                Type.Literal("board_unpick"),
+                Type.Literal("board_launch"),
+                Type.Literal("board_reopen"),
+                Type.Literal("board_resolve"),
             ]),
             thread: Type.Optional(
                 Type.String({
                     description:
-                        "read: a thread id, such as T13; an agent may leave it out for its own thread; attach: the target thread; watch, result: the thread to change; send: the thread whose agent gets the message; own: the found thread; escalate: the thread the item is about (optional)",
+                        "read: a thread id, such as T13; an agent may leave it out for its own thread; attach: the target thread; watch, result: the thread to change; send: the thread whose agent gets the message; own: the found thread; escalate: the thread the item is about (optional); board_resolve: the thread an unknown row started",
                 }),
             ),
             ref: Type.Optional(
@@ -30657,6 +31234,36 @@ export default function createDesk(host: Host, web: Web) {
                         "escalate: true when the supervisor must get it at once; else it goes in her next digest",
                 }),
             ),
+            row: Type.Optional(
+                Type.Number({
+                    description:
+                        "board_edit, board_drop, board_reopen, board_resolve: the row id, such as 3",
+                }),
+            ),
+            rows: Type.Optional(
+                Type.Array(
+                    Type.Object({
+                        row: Type.Number({ description: "the row id" }),
+                        rev: Type.Number({
+                            description: "the row's rev as desk board showed it",
+                        }),
+                    }),
+                    {
+                        description:
+                            "board_pick, board_unpick, board_launch: the rows with the rev you read; board_launch without rows launches every picked row",
+                    },
+                ),
+            ),
+            fields: Type.Optional(
+                Type.Object(
+                    {},
+                    {
+                        additionalProperties: true,
+                        description:
+                            "board_add, board_edit: row fields: agent (roster id), repo (owner/name), title (1 to 120), task (1 to 6000), objective (up to 3000), stopWhen (1 to 3000), max (1 to 100 rounds), until (HH:MM), start (HH:MM), worker (provider/model), prCheck ({ pr, repo, checks, label }), kind (goal, hygiene, grooming, sweep, feature or quality), note (up to 500), order (a number); null clears an optional field in an edit",
+                    },
+                ),
+            ),
         }),
         replay: "safe",
         execute: async (args, api, context) => {
@@ -30724,8 +31331,19 @@ export default function createDesk(host: Host, web: Web) {
                     );
                 }
 
+                if (args.action.startsWith("board_")) {
+                    throw new Error(
+                        `The Clerk reads the board with desk board; only the supervisor changes it. Escalate to ${await supervisorName()} with desk escalate.`,
+                    );
+                }
+
                 supervisor = registered;
-            } else if (agent && !watching && args.action !== "read") {
+            } else if (
+                agent &&
+                !watching &&
+                args.action !== "read" &&
+                !args.action.startsWith("board")
+            ) {
                 throw new Error(
                     `Only a session assigned a supervisor identity can use the desk. An agent can use only read, watch, and result, on its own thread. For ${args.action}, ask ${await supervisorName()} with team_message to the return address in your first message; your task is in that message.`,
                 );
@@ -30738,6 +31356,112 @@ export default function createDesk(host: Host, web: Web) {
                 thread.session === session;
 
             const looked = `supervisor:${String(supervisor)}`;
+
+            if (args.action === "board" || args.action.startsWith("board_")) {
+                const state = await api.snapshot(DeskThreads, context);
+                // An agent's board is the 1 supervisor the desk knows: with none, or more than 1, it is refused.
+                let owner = supervisor;
+
+                if (agent) {
+                    const known = knownSupervisors(state);
+
+                    if (known.length !== 1 || known[0] === undefined) {
+                        throw new Error(
+                            known.length === 0
+                                ? `The desk knows no supervisor yet, so this board call has none to bind to. Ask ${await supervisorName()} with team_message.`
+                                : `The desk knows ${String(known.length)} supervisors (${known.map(String).join(", ")}), so this board call cannot tell whose board it is. Ask your supervisor with team_message.`,
+                        );
+                    }
+
+                    owner = known[0];
+                }
+
+                if (args.action === "board") {
+                    return reply(await boardText(state, owner));
+                }
+
+                const actor: BoardModule.BoardActor = agent
+                    ? { kind: "agent", supervisor: owner, agent: persona.id }
+                    : { kind: "supervisor", supervisor: owner, by: persona.id };
+                const op: BoardModule.BoardOp | undefined =
+                    args.action === "board_add"
+                        ? { op: "add", fields: args.fields }
+                        : args.action === "board_edit"
+                          ? { op: "edit", row: args.row, fields: args.fields }
+                          : args.action === "board_drop"
+                            ? { op: "drop", row: args.row }
+                            : args.action === "board_pick"
+                              ? { op: "pick", rows: args.rows }
+                              : args.action === "board_unpick"
+                                ? { op: "unpick", rows: args.rows }
+                                : args.action === "board_launch"
+                                  ? {
+                                        op: "launch",
+                                        ...(args.rows === undefined ? {} : { rows: args.rows }),
+                                    }
+                                  : args.action === "board_reopen"
+                                    ? { op: "reopen", row: args.row }
+                                    : args.action === "board_resolve"
+                                      ? {
+                                            op: "resolve",
+                                            row: args.row,
+                                            ...(args.thread === undefined
+                                                ? {}
+                                                : { thread: args.thread }),
+                                        }
+                                      : undefined;
+
+                if (op === undefined) {
+                    throw new Error(`${args.action} is not a board action.`);
+                }
+
+                if (
+                    op.op !== "add" &&
+                    op.op !== "launch" &&
+                    args.row === undefined &&
+                    args.rows === undefined
+                ) {
+                    throw new Error(
+                        `${args.action} needs ${op.op === "pick" || op.op === "unpick" ? "rows" : "row"}.`,
+                    );
+                }
+
+                const done = await applyBoardOp(
+                    accessOf(api, context),
+                    actor,
+                    op,
+                    `x.desk.board:${String(api.taskId)}:${String(api.callId)}`,
+                );
+
+                if ("status" in done) {
+                    throw new Error(done.error);
+                }
+
+                web.send("changed", {});
+
+                if (!done.launch) {
+                    return reply(done.text);
+                }
+
+                // A launch request runs 1 pass at once; the sweeper runs the next ones.
+                const passed = await boardPass(
+                    accessOf(api, context),
+                    { read: api, commit: (change) => api.commit(change, context), context },
+                    owner,
+                    () => Date.now(),
+                );
+
+                web.send("changed", {});
+
+                return reply(
+                    [
+                        done.text,
+                        ...(passed.length === 0
+                            ? ["Launch pass: no row started now."]
+                            : ["Launch pass:", ...passed]),
+                    ].join("\n"),
+                );
+            }
 
             /**
              * A commit that writes desk state the page shows: the page's tabs hear `changed` once it returned, never
@@ -31596,6 +32320,14 @@ export default function createDesk(host: Host, web: Web) {
                     () => Date.now(),
                 );
 
+                // The goal board: 1 launch pass after the sync's commit, as after a sweep's.
+                const launched = await boardPass(
+                    accessOf(api, context),
+                    { read: api, commit: (change) => api.commit(change, context), context },
+                    Number(supervisor),
+                    () => Date.now(),
+                ).catch(() => []);
+
                 web.send("changed", {});
                 await exportNow(api, context);
 
@@ -31605,7 +32337,7 @@ export default function createDesk(host: Host, web: Web) {
                 const lines = githubLines(state, Date.now());
 
                 return reply(
-                    `${lines.length === 0 ? "" : `${lines.join("\n")}\n`}${listText(state, Date.now())}\n\n${events}`,
+                    `${lines.length === 0 ? "" : `${lines.join("\n")}\n`}${listText(state, Date.now())}\n\n${events}${launched.length === 0 ? "" : `\nBoard launch pass:\n${launched.join("\n")}`}`,
                 );
             }
 

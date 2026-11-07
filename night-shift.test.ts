@@ -209,6 +209,54 @@ describe("parsing", () => {
         );
     });
 
+    test("a repeated hour on a fall-back day: the second instant counts, for the clock, until and start", () => {
+        // 2026-11-01: 01:00 to 02:00 runs twice in New York, first EDT (05:00Z to 06:00Z), then EST (06:00Z to 07:00Z).
+        // Between the 2 instants of 01:30 (01:45 EDT): the next 01:30 is the EST one.
+        assert.equal(
+            nextClockTime(1, 30, Date.UTC(2026, 10, 1, 5, 45), ZONE),
+            Date.UTC(2026, 10, 1, 6, 30),
+        );
+        // During the second hour, before 01:30 EST: the same instant.
+        assert.equal(
+            nextClockTime(1, 30, Date.UTC(2026, 10, 1, 6, 10), ZONE),
+            Date.UTC(2026, 10, 1, 6, 30),
+        );
+        // Before the first instant: the first one; after the second: tomorrow.
+        assert.equal(
+            nextClockTime(1, 30, Date.UTC(2026, 10, 1, 4, 0), ZONE),
+            Date.UTC(2026, 10, 1, 5, 30),
+        );
+        assert.equal(
+            nextClockTime(1, 30, Date.UTC(2026, 10, 1, 6, 45), ZONE),
+            Date.UTC(2026, 10, 2, 6, 30),
+        );
+
+        // A spring-forward gap keeps its answer: 02:30 does not exist on 2027-03-14.
+        assert.equal(
+            nextClockTime(2, 30, Date.UTC(2027, 2, 14, 5, 0), ZONE),
+            Date.UTC(2027, 2, 14, 6, 30),
+        );
+        assert.equal(
+            nextClockTime(2, 30, Date.UTC(2027, 2, 14, 6, 50), ZONE),
+            Date.UTC(2027, 2, 15, 6, 30),
+        );
+
+        // The shift's own until and start use the same rule.
+        const until = parseArgs("until 01:30: a; stop when b", Date.UTC(2026, 10, 1, 5, 45), ZONE);
+
+        assert(until.kind === "set");
+        assert.equal(until.goal.deadline, Date.UTC(2026, 10, 1, 6, 30));
+
+        const start = parseArgs(
+            "start 01:30 for 1h: a; stop when b",
+            Date.UTC(2026, 10, 1, 6, 10),
+            ZONE,
+        );
+
+        assert(start.kind === "set");
+        assert.equal(start.goal.start, Date.UTC(2026, 10, 1, 6, 30));
+    });
+
     test("start: round 1 waits for a clock time, and the options come in any order", () => {
         const parsed = parseArgs("start 06:00 until 17:00 max 40: a; stop when b", now, ZONE);
 
