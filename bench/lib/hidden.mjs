@@ -12,7 +12,8 @@
 //   runs nothing, and a pattern that names the parent runs all its subtests. The pattern `^(?:a|b)$` therefore runs
 //   exactly the named top-level tests of the named files.
 // - Go: a top-level `func TestX(t *testing.T)` declared in a hidden file; `-run '^(?:TestX)$'` runs it and its
-//   subtests, 1 `go test` per package.
+//   subtests, 1 `go test` per package. A file belongs to the module of the nearest `go.mod` at or above its folder; a
+//   package of a nested module runs as `go -C <module folder> test ... ./<folder in the module>`.
 // - pytest: a node id (`file::Class::name`), given to pytest as it is.
 
 /** A support file of the hidden tests. */
@@ -177,6 +178,72 @@ const dirOf = (file) => (file.includes("/") ? file.slice(0, file.lastIndexOf("/"
 /** A Go package argument for a folder. */
 const goPackage = (dir) => (dir === "." ? "./" : `./${dir}`);
 
+/** A word as written when it needs no quotes (a plain path), else single-quoted. */
+const plainWord = (text) => (/^[A-Za-z0-9_./-]+$/.test(text) ? text : shellQuote(text));
+
+/** The folders at and above a file's folder, nearest first, `.` last. */
+export function folderChain(file) {
+    const chain = [];
+    let dir = dirOf(file);
+
+    while (dir !== ".") {
+        chain.push(dir);
+        dir = dirOf(dir);
+    }
+
+    chain.push(".");
+
+    return chain;
+}
+
+/**
+ * The Go module of a file: the nearest folder at or above the file's folder that holds a `go.mod`. `goMods`: module
+ * folder -> module path (null for a `go.mod` with no `module` line), for every folder of the tree that holds a
+ * `go.mod`. Returns `{ dir, module, pkgDir }` (`pkgDir`: the file's folder relative to the module folder), or null
+ * when no folder above the file holds a `go.mod`.
+ */
+export function goModuleOf(file, goMods) {
+    const dir = folderChain(file).find((d) => Object.hasOwn(goMods, d));
+
+    if (dir === undefined) {
+        return null;
+    }
+
+    const own = dirOf(file);
+    const pkgDir = dir === "." ? own : own === dir ? "." : own.slice(dir.length + 1);
+
+    return { dir, module: goMods[dir], pkgDir };
+}
+
+/**
+ * The Go test files grouped by package: `[{ moduleDir, pkgDir, names }]` in the order of `files`; a file with no
+ * module (or a module with no path) or no names is left out. Without `goMods`, every file is in the root module.
+ */
+function goGroups(files, goNames, goMods) {
+    const groups = new Map();
+
+    for (const file of files) {
+        const names = goNames[file] ?? [];
+        const mod = goMods ? goModuleOf(file, goMods) : { dir: ".", pkgDir: dirOf(file) };
+
+        if (!names.length || !mod || (goMods && !mod.module)) {
+            continue;
+        }
+
+        const key = `${mod.dir}\0${mod.pkgDir}`;
+        const group = groups.get(key) ?? { moduleDir: mod.dir, pkgDir: mod.pkgDir, names: [] };
+
+        group.names.push(...names);
+        groups.set(key, group);
+    }
+
+    return [...groups.values()];
+}
+
+/** `go test` of a package, with `-C <module folder>` for a nested module (the root module keeps `go test`). */
+const goTest = (prefix, moduleDir, flags, pkgDir) =>
+    `${prefix}go ${moduleDir === "." ? "" : `-C ${plainWord(moduleDir)} `}test ${flags} ${goPackage(pkgDir)}`;
+
 /** The `func TestX(t *testing.T)` names of a Go test file. */
 export function goTestNames(text) {
     return [
@@ -188,9 +255,15 @@ export function goTestNames(text) {
 
 /**
  * The discovery command of 1 language: it runs every test of the hidden files with a machine-readable reporter.
- * Go: `go test -json` per package, limited to the names the files declare (`goNames`: file -> names).
+ * Go: `go test -json` per package, limited to the names the files declare (`goNames`: file -> names); `goMods`
+ * (module folder -> module path, `goModuleOf`) puts each package in its own module, and without it every file is in
+ * the root module.
  */
-export function discoveryCommand(language, files, { prefix = "", goNames = {} } = {}) {
+export function discoveryCommand(
+    language,
+    files,
+    { prefix = "", goNames = {}, goMods = null } = {},
+) {
     if (language === "node") {
         // 1 run per file, after a marker line: Node's TAP gives no location for a test that passes.
         return files
@@ -202,19 +275,13 @@ export function discoveryCommand(language, files, { prefix = "", goNames = {} } 
     }
 
     if (language === "go") {
-        const byDir = new Map();
-
-        for (const file of files) {
-            const names = goNames[file] ?? [];
-
-            if (names.length) {
-                byDir.set(dirOf(file), [...(byDir.get(dirOf(file)) ?? []), ...names]);
-            }
-        }
-
-        const parts = [...byDir].map(
-            ([dir, names]) =>
-                `${prefix}go test -json -count=1 -run ${shellQuote(exactPattern(names))} ${goPackage(dir)}`,
+        const parts = goGroups(files, goNames, goMods).map(({ moduleDir, pkgDir, names }) =>
+            goTest(
+                prefix,
+                moduleDir,
+                `-json -count=1 -run ${shellQuote(exactPattern(names))}`,
+                pkgDir,
+            ),
         );
 
         return parts.length ? parts.join("; ") : null;
@@ -229,9 +296,11 @@ export function discoveryCommand(language, files, { prefix = "", goNames = {} } 
 
 /**
  * The hidden command: it runs only the valid names. `valid`: `[{ file, language, names }]` with at least 1 name.
- * Languages run in the order node, go, python, joined with `&&`.
+ * Languages run in the order node, go, python, joined with `&&`. Go: the packages of the root module first (in the
+ * order of their folders), then those of nested modules by module folder and folder (`goMods` as in
+ * `discoveryCommand`).
  */
-export function hiddenCommand(valid, { prefix = "" } = {}) {
+export function hiddenCommand(valid, { prefix = "", goMods = null } = {}) {
     const parts = [];
     const node = valid.filter((v) => v.language === "node" && v.names.length);
 
@@ -243,15 +312,38 @@ export function hiddenCommand(valid, { prefix = "" } = {}) {
         );
     }
 
-    const byDir = new Map();
+    const go = valid.filter((v) => v.language === "go" && v.names.length);
+    const groups = goGroups(
+        go.map((v) => v.file),
+        Object.fromEntries(go.map((v) => [v.file, v.names])),
+        goMods,
+    );
 
-    for (const v of valid.filter((v) => v.language === "go" && v.names.length)) {
-        byDir.set(dirOf(v.file), [...(byDir.get(dirOf(v.file)) ?? []), ...v.names]);
-    }
+    // The root module's packages keep the order (and the text) of a repository with 1 module.
+    const root = groups
+        .filter((g) => g.moduleDir === ".")
+        .map((g) => [g.pkgDir, g.names])
+        .sort();
+    const nested = groups
+        .filter((g) => g.moduleDir !== ".")
+        .sort((a, b) =>
+            a.moduleDir === b.moduleDir
+                ? a.pkgDir.localeCompare(b.pkgDir, "en")
+                : a.moduleDir.localeCompare(b.moduleDir, "en"),
+        )
+        .map((g) => [g.moduleDir, g.pkgDir, g.names]);
 
-    for (const [dir, names] of [...byDir].sort()) {
+    for (const [moduleDir, pkgDir, names] of [
+        ...root.map(([pkgDir, names]) => [".", pkgDir, names]),
+        ...nested,
+    ]) {
         parts.push(
-            `${prefix}go test -count=1 -run ${shellQuote(exactPattern([...new Set(names)].sort()))} ${goPackage(dir)}`,
+            goTest(
+                prefix,
+                moduleDir,
+                `-count=1 -run ${shellQuote(exactPattern([...new Set(names)].sort()))}`,
+                pkgDir,
+            ),
         );
     }
 
@@ -708,20 +800,23 @@ export function dropSharedNames(valid, dropped) {
 }
 
 /**
- * The Go outcome per hidden file: `goNames` (file -> declared names) and the module path give each name its package.
- * Returns `{ units, broken }` like `nodeOutcome` (a file is broken when its package did not build).
+ * The Go outcome per hidden file: `goNames` (file -> declared names) and the module give each name its package.
+ * `goMods` (module folder -> module path, `goModuleOf`) maps each file to the import path of its own module; without
+ * it, every file is in the root module `module`. Returns `{ units, broken }` like `nodeOutcome` (a file is broken when
+ * its package did not build).
  */
-export function goFileOutcome(text, { files, goNames, module }) {
+export function goFileOutcome(text, { files, goNames, module = null, goMods = null }) {
     const { tests, broken: pkgs } = goOutcome(text);
     const units = new Map();
     const broken = new Set();
 
     for (const file of files) {
-        const pkg = goImportPath(module, dirOf(file));
+        const mod = goMods ? goModuleOf(file, goMods) : { dir: ".", module, pkgDir: dirOf(file) };
+        const pkg = mod?.module ? goImportPath(mod.module, mod.pkgDir) : null;
         const map = new Map();
 
         for (const name of goNames[file] ?? []) {
-            const status = tests.get(`${pkg}\0${name}`);
+            const status = pkg ? tests.get(`${pkg}\0${name}`) : null;
 
             if (status) {
                 map.set(name, status);
@@ -882,8 +977,8 @@ const isAssignment = (w) => /^[A-Za-z_][A-Za-z0-9_]*=/.test(w.raw);
 
 /**
  * The runner of a segment's words: `{ kind, at }` where `at` is the index of the word after which the reporter goes
- * (`go test`: after `test`; `node --test`: after `--test`; pytest: at the end), or null. The words before the program
- * may only be environment assignments.
+ * (`go test` and `go -C <dir> test` or `go -C=<dir> test`: after `test`; `node --test`: after `--test`; pytest: at the
+ * end), or null. The words before the program may only be environment assignments. `cd` is no runner.
  */
 function runnerOf(words) {
     let p = 0;
@@ -895,8 +990,12 @@ function runnerOf(words) {
     const program = words[p]?.value;
     const base = program?.split("/").pop();
 
-    if (program === "go" && words[p + 1]?.value === "test") {
-        return { kind: "go", at: p + 1 };
+    if (program === "go") {
+        // `-C` must be go's first flag: `go -C dir test` or `go -C=dir test` (a nested module's folder).
+        const flag = words[p + 1]?.value;
+        const test = flag === "-C" ? p + 3 : flag?.startsWith("-C=") ? p + 2 : p + 1;
+
+        return words[test]?.value === "test" ? { kind: "go", at: test } : null;
     }
 
     if (base === "node") {

@@ -17,10 +17,11 @@ import {
     writeJsonAtomic,
 } from "./common.mjs";
 import { scratchClone } from "./clone.mjs";
-import { COMMAND_MS, failText, makeCache, runInSandbox } from "./exec.mjs";
+import { COMMAND_MS, failText, makeCache, runInSandbox, stageAll } from "./exec.mjs";
 import {
     fileAt,
     fetchOrigin,
+    gitText,
     hasCommit,
     nameStatus,
     overlayFiles,
@@ -32,6 +33,7 @@ import {
     classify,
     discoveryCommand,
     dropSharedNames,
+    folderChain,
     goFileOutcome,
     goModule,
     goTestNames,
@@ -45,7 +47,15 @@ import {
     testLanguage,
 } from "./hidden.mjs";
 import { TASK_FIELDS, UsageError, loadManifest } from "./manifest.mjs";
-import { BENCH_REPOS, SEED, benchRepo, readRoster, rosterDir, seededShuffle } from "./owners.mjs";
+import {
+    BENCH_REPOS,
+    SEED,
+    benchRepo,
+    commandLimits,
+    readRoster,
+    rosterDir,
+    seededShuffle,
+} from "./owners.mjs";
 import { pocketDb, readThreads, routeJudgments } from "./pocket.mjs";
 import { checkoutOf } from "./runner.mjs";
 import { DEFAULTS, findProgram } from "./sandbox.mjs";
@@ -63,9 +73,13 @@ export const stratumOf = (size) => (size <= 50 ? "small" : size <= 300 ? "medium
 
 /**
  * The version of the validation: a cached validation of another version runs again. Version 2: the overlay keeps
- * each file's mode from the reference tree.
+ * each file's mode from the reference tree. Version 3: the parent tree stages the hidden files (`git add -A`) before
+ * the discovery and the hidden command, and a Go test file runs in the module of its nearest `go.mod`. (A new parent
+ * rule needs no new version: the parent is part of the key.) Version 4: an outcome records each timed-out step
+ * (`timedOutSteps`: the discovery runs and the staging too) and is then never cached; an entry of version 3 has no
+ * such record, so it may hide a discovery that timed out.
  */
-export const VALIDATION_VERSION = 2;
+export const VALIDATION_VERSION = 4;
 
 /** The cache key of a candidate's validation. */
 export const validationKey = ({ merge, parent, commands, brief, route }) =>
@@ -75,8 +89,38 @@ export const validationKey = ({ merge, parent, commands, brief, route }) =>
 const isValidationError = (outcome) =>
     String(outcome?.reason ?? "").startsWith("validation error:");
 
+/**
+ * True when a step of a validation timed out: a setup, the check, the hidden command at the merge or the parent, a
+ * discovery run of the hidden tests, or the staging at the parent (`timedOutSteps`). A timeout says how loaded the
+ * host was, or that the limit was too short, not what the commit does (a discovery that timed out finds no valid
+ * name, and the task loses its S2): such an outcome is never cached or reused (earlier runs cached it), so a later
+ * run, or a longer limit, validates it again.
+ */
+const timedOut = (outcome) =>
+    (outcome?.timedOutSteps?.length ?? 0) > 0 ||
+    /\(timed out\)$/.test(String(outcome?.reason ?? "")) ||
+    Object.keys(STEP_NAMES).some((step) => outcome?.validation?.[step] === "timed out");
+
+/** Record a timed-out sandbox run of a validation in `ctx.timedOutSteps` (when the caller keeps such a record). */
+const noteTimeout = (ctx, run, step) => {
+    if (run?.timedOut) {
+        ctx.timedOutSteps?.push(step);
+    }
+};
+
+/**
+ * The most commits `gh pr view --json commits` returns (it asks GitHub for the first 100). A PR with this many may have
+ * more: its list may be incomplete, so the parent rule (`parentOf`) cannot tell a rebase merge, and the candidate is
+ * dropped (a bench task that large is out of scope).
+ */
+export const GH_COMMITS_CAP = 100;
+
+/** The drop reason of a PR whose commit list may be incomplete. */
+export const TOO_MANY_COMMITS =
+    "the PR has 100 or more commits: the list may be incomplete, so its parent is unknown";
+
 /** The `gh pr view` fields the harvester reads. */
-export const PR_FIELDS = "mergeCommit,mergedAt,files,additions,deletions,state,headRefOid";
+export const PR_FIELDS = "mergeCommit,mergedAt,files,additions,deletions,state,headRefOid,commits";
 
 /** 1 day in milliseconds. */
 const DAY = 86_400_000;
@@ -208,12 +252,15 @@ export async function mapLimit(items, limit, fn) {
 /** The cache folder of a repository's candidates in the data dir. */
 const cacheDir = (data, repo) => join(data, "harvest-cache", ...repo.split("/"));
 
-/** The facts of a PR from `gh pr view` (cached once merged: they no longer change). */
+/**
+ * The facts of a PR from `gh pr view` (cached once merged: they no longer change). A cached entry with no `commits`
+ * (written before the parent rule read them) is read again.
+ */
 export async function prFacts(ctx, repo, number) {
     const file = join(cacheDir(ctx.data, repo), `${number}.gh.json`);
     const cached = await readJson(file, null);
 
-    if (cached) {
+    if (cached && Array.isArray(cached.commits)) {
         return cached;
     }
 
@@ -228,6 +275,12 @@ export async function prFacts(ctx, repo, number) {
         deletions: Number(raw.deletions) || 0,
         headRefOid: raw.headRefOid ?? null,
         files: (raw.files ?? []).map((f) => ({ path: f.path, changeType: f.changeType ?? null })),
+        // The PR's commits, oldest first: the parent rule tells a rebase merge from a squash merge by them.
+        commits: (raw.commits ?? []).map((c) => ({
+            oid: c.oid ?? null,
+            headline: c.messageHeadline ?? "",
+            authoredDate: c.authoredDate ?? null,
+        })),
     };
 
     if (facts.state === "MERGED") {
@@ -235,6 +288,95 @@ export async function prFacts(ctx, repo, number) {
     }
 
     return facts;
+}
+
+/**
+ * True when a commit's message has the PR commit's headline: its first line, or its first paragraph as 1 line (git's
+ * subject), or a headline that GitHub cut with "…" at the start of the first line.
+ */
+function sameHeadline(message, headline) {
+    const text = String(headline ?? "").trim();
+    const first = String(message).split("\n")[0].trim();
+    const subject = String(message)
+        .trim()
+        .split(/\n\s*\n/)[0]
+        .split("\n")
+        .map((l) => l.trim())
+        .join(" ");
+
+    if (!text) {
+        return false;
+    }
+
+    if (text === first || text === subject) {
+        return true;
+    }
+
+    return text.endsWith("…") && first.startsWith(text.slice(0, -1).trimEnd());
+}
+
+/**
+ * True when `chain` (the commits of the first-parent chain that ends at the merge commit, oldest first: `{ message,
+ * authorDate }`) is the PR's `commits` (oldest first: `{ headline, authoredDate }` as `prFacts` keeps them, or
+ * `{ messageHeadline, authoredDate }` as `gh` gives them) rebased: the same count, and in order the same headline and
+ * the same author date.
+ */
+export function isRebaseOf(chain, commits) {
+    return (
+        chain.length === commits.length &&
+        chain.every((c, i) => {
+            const at = Date.parse(c.authorDate);
+
+            return (
+                Number.isFinite(at) &&
+                at === Date.parse(commits[i].authoredDate) &&
+                sameHeadline(c.message, commits[i].headline ?? commits[i].messageHeadline)
+            );
+        })
+    );
+}
+
+/**
+ * The parent of a merged PR: the commit its change applies to. `commits`: the PR's commits, oldest first (`prFacts`).
+ * - A merge commit (2 or more parents): its first parent.
+ * - 1 parent and a PR of N >= 2 commits: when the last N commits of the first-parent chain that ends at the merge
+ *   commit are the PR's commits rebased (`isRebaseOf`), it is a rebase merge, and the parent is the commit before
+ *   them (`<merge>~N`). Else it is a squash merge: `<merge>^1`.
+ * - 1 parent and a PR of 1 commit (a squash or a rebase): `<merge>^1`.
+ * Host git, read only, in the local checkout only. `git`: (cwd, args) -> text.
+ */
+export async function parentOf(checkout, merge, commits = [], git = gitText) {
+    const parents = (await git(checkout, ["rev-list", "--parents", "-n", "1", merge]))
+        .trim()
+        .split(/\s+/)
+        .slice(1);
+    const n = commits.length;
+
+    if (parents.length === 1 && n >= 2) {
+        const log = await git(checkout, [
+            "log",
+            "--first-parent",
+            `--max-count=${n}`,
+            "--format=%aI%x1f%B%x1e",
+            merge,
+        ]);
+        const chain = log
+            .split("\x1e")
+            .map((entry) => entry.replace(/^\n/, ""))
+            .filter((entry) => entry.includes("\x1f"))
+            .map((entry) => {
+                const [authorDate, message] = entry.split("\x1f");
+
+                return { authorDate, message };
+            })
+            .reverse();
+
+        if (isRebaseOf(chain, commits)) {
+            return revParse(checkout, `${merge}~${n}`);
+        }
+    }
+
+    return revParse(checkout, `${merge}^1`);
 }
 
 /** The SHA-256 of a text, in hex. */
@@ -254,7 +396,7 @@ export async function commandsAt(checkout, merge) {
 }
 
 /** Run a discovery command and return its output (the junit file for pytest). */
-async function discover(ctx, { work, cache, command, language, logFile }) {
+async function discover(ctx, { work, cache, command, language, logFile, at }) {
     if (language === "python") {
         await rm(join(cache, "hidden-junit.xml"), { force: true });
     }
@@ -267,6 +409,8 @@ async function discover(ctx, { work, cache, command, language, logFile }) {
         logFile,
     });
 
+    noteTimeout(ctx, run, `the discovery of the ${language} hidden tests at ${at ?? "a tree"}`);
+
     if (language === "python") {
         return readFile(join(cache, JUNIT.replace(/^\/cache\//, "")), "utf8").catch(() => "");
     }
@@ -277,28 +421,57 @@ async function discover(ctx, { work, cache, command, language, logFile }) {
 /**
  * The outcome of 1 language's hidden tests in a tree: its discovery command (with the machine-readable reporter)
  * run in the sandbox, then parsed per file (`{ units, broken }`). Null when the language has no discovery command.
+ * `at` names the tree ("the merge", "the parent") in a timeout record.
  */
 export async function languageOutcome(
     ctx,
-    { language, files, goNames, module, prefix, tree, logFile },
+    { language, files, goNames, goMods, prefix, tree, logFile, at },
 ) {
-    const command = discoveryCommand(language, files, { prefix, goNames });
+    // Go: a file in no module (no `go.mod` at or above its folder) is left out; with none left, no command.
+    const command = discoveryCommand(language, files, { prefix, goNames, goMods });
 
-    if (!command || (language === "go" && !module)) {
+    if (!command) {
         return null;
     }
 
-    const text = await discover(ctx, { ...tree, command, language, logFile });
+    const text = await discover(ctx, { ...tree, command, language, logFile, at });
 
     if (language === "node") {
         return nodeOutcome(text, files);
     }
 
     if (language === "go") {
-        return goFileOutcome(text, { files, goNames, module });
+        return goFileOutcome(text, { files, goNames, goMods });
     }
 
     return pytestOutcome(text, files);
+}
+
+/**
+ * The Go modules of `files` at `rev` in the local checkout (host git, read only): module folder -> module path (null
+ * for a `go.mod` with no `module` line), for each folder at or above a file's folder that holds a `go.mod`.
+ */
+export async function goModulesAt(checkout, rev, files) {
+    const mods = {};
+    const seen = new Set();
+
+    for (const file of files) {
+        for (const dir of folderChain(file)) {
+            if (seen.has(dir)) {
+                continue;
+            }
+
+            seen.add(dir);
+
+            const text = await fileAt(checkout, rev, dir === "." ? "go.mod" : `${dir}/go.mod`);
+
+            if (text !== null) {
+                mods[dir] = goModule(text);
+            }
+        }
+    }
+
+    return mods;
 }
 
 /**
@@ -324,11 +497,24 @@ export async function findHidden(
         files: [...tests.map((t) => t.file), ...support],
         work: parentTree.work,
     });
+    // The copied files are staged, as S2 stages them: harvest, revalidation and scoring see the same index.
+    const staged = await stageAll(ctx.sandbox, {
+        ...parentTree,
+        timeoutMs: ctx.timeouts.hidden,
+        logFile,
+        step: "the staging of the hidden tests at the parent",
+    });
+
+    noteTimeout(ctx, staged, "the staging of the hidden tests at the parent");
 
     const languages = [...new Set(tests.map((t) => t.language))].sort();
     const valid = [];
     const dropped = [];
-    const goModPath = goModule(await fileAt(checkout, merge, "go.mod"));
+    const goMods = await goModulesAt(
+        checkout,
+        merge,
+        tests.filter((t) => t.language === "go").map((t) => t.file),
+    );
 
     for (const language of languages) {
         const files = tests.filter((t) => t.language === language).map((t) => t.file);
@@ -340,14 +526,18 @@ export async function findHidden(
             }
         }
 
-        const facts = { language, files, goNames, module: goModPath, prefix, logFile };
-        const atMerge = await languageOutcome(ctx, { ...facts, tree: mergeTree });
+        const facts = { language, files, goNames, goMods, prefix, logFile };
+        const atMerge = await languageOutcome(ctx, { ...facts, tree: mergeTree, at: "the merge" });
 
         if (!atMerge) {
             continue;
         }
 
-        const atParent = await languageOutcome(ctx, { ...facts, tree: parentTree });
+        const atParent = await languageOutcome(ctx, {
+            ...facts,
+            tree: parentTree,
+            at: "the parent",
+        });
         const result = classify({ files, parent: atParent, merge: atMerge });
 
         if (language === "node") {
@@ -376,7 +566,12 @@ export async function findHidden(
         ...support.map((file) => ({ file, names: [] })),
     ].sort((a, b) => a.file.localeCompare(b.file));
 
-    return { hiddenTests, hiddenCommand: hiddenCommand(valid, { prefix }), dropped, languages };
+    return {
+        hiddenTests,
+        hiddenCommand: hiddenCommand(valid, { prefix, goMods }),
+        dropped,
+        languages,
+    };
 }
 
 /** The step names of the validation, as the log's header lines name them. */
@@ -400,8 +595,15 @@ const treesOf = (base) => ({
  * parent). Returns `{ ok, reason, fields, validation }`; `fields` are the task fields the validation found. The
  * result is cached in the data dir by the merge commit, the commands and the brief.
  */
-export async function validateCandidate(ctx, candidate) {
+export async function validateCandidate(baseCtx, candidate) {
     const { repo, number, thread, checkout, merge, parent } = candidate;
+    // The repository's own limits for the check and the hidden tests, unless the caller gives explicit ones.
+    // `timedOutSteps`: each sandbox run of this validation that timed out (an outcome with one is never cached).
+    const ctx = {
+        ...baseCtx,
+        timeouts: commandLimits(baseCtx.timeouts, repo),
+        timedOutSteps: [],
+    };
     const commands = await commandsAt(checkout, merge);
     const key = validationKey({
         merge,
@@ -413,7 +615,7 @@ export async function validateCandidate(ctx, candidate) {
     const cacheFile = join(cacheDir(ctx.data, repo), `${number}.json`);
     const cached = await readJson(cacheFile, null);
 
-    if (cached?.key === key && !isValidationError(cached.outcome)) {
+    if (cached?.key === key && !isValidationError(cached.outcome) && !timedOut(cached.outcome)) {
         return { ...cached.outcome, cached: true };
     }
 
@@ -421,7 +623,13 @@ export async function validateCandidate(ctx, candidate) {
     const logFile = join(cacheDir(ctx.data, repo), `${number}.log`);
     const trees = treesOf(base);
     const validation = { at: new Date(ctx.now()).toISOString(), commands };
-    const outcome = (ok, reason, fields = null) => ({ ok, reason, fields, validation });
+    const outcome = (ok, reason, fields = null) => ({
+        ok,
+        reason,
+        fields,
+        validation,
+        timedOutSteps: ctx.timedOutSteps,
+    });
     let result;
 
     await removeTree(base);
@@ -444,6 +652,7 @@ export async function validateCandidate(ctx, candidate) {
                 });
 
                 validation[name] = run.ok ? "pass" : failText(run);
+                noteTimeout(ctx, run, STEP_NAMES[name]);
 
                 return run.ok;
             };
@@ -507,6 +716,8 @@ export async function validateCandidate(ctx, candidate) {
 
                 validation.hiddenMerge = atMerge.ok ? "pass" : failText(atMerge);
                 validation.hiddenParent = atParent.ok ? "pass" : failText(atParent);
+                noteTimeout(ctx, atMerge, STEP_NAMES.hiddenMerge);
+                noteTimeout(ctx, atParent, STEP_NAMES.hiddenParent);
 
                 if (!atMerge.ok || atParent.ok || atParent.timedOut) {
                     validation.hiddenNote =
@@ -531,8 +742,8 @@ export async function validateCandidate(ctx, candidate) {
         await cleanupTree(base, ctx.log);
     }
 
-    // An unexpected error is not cached: a later run validates the candidate again.
-    if (!isValidationError(result)) {
+    // An unexpected error or a timeout is not cached: a later run validates the candidate again.
+    if (!isValidationError(result) && !timedOut(result)) {
         await writeJsonAtomic(cacheFile, { key, outcome: result });
     }
 
@@ -624,6 +835,8 @@ export async function harvestRepo(ctx, repo, list, dropped) {
             drop(c, `merged outside the window (${facts.mergedAt})`);
         } else if (!(await hasCommit(checkout, facts.merge))) {
             drop(c, `the merge commit ${facts.merge} is not in the local checkout`);
+        } else if ((facts.commits?.length ?? 0) >= GH_COMMITS_CAP) {
+            drop(c, TOO_MANY_COMMITS);
         } else {
             const size = facts.additions + facts.deletions;
 
@@ -631,7 +844,7 @@ export async function harvestRepo(ctx, repo, list, dropped) {
                 ...c,
                 checkout,
                 merge: facts.merge,
-                parent: await revParse(checkout, `${facts.merge}^1`),
+                parent: await parentOf(checkout, facts.merge, facts.commits ?? []),
                 size,
             });
         }
@@ -760,7 +973,11 @@ export async function namedTestsInvalid(ctx, { task, checkout, trees, logFile })
         return { error: commands.error };
     }
 
-    const module = goModule(await fileAt(checkout, task.merge, "go.mod"));
+    const goMods = await goModulesAt(
+        checkout,
+        task.merge,
+        byLanguage("go").map((t) => t.file),
+    );
     const run = async (tree, command) =>
         (
             await runInSandbox(ctx.sandbox, {
@@ -780,7 +997,7 @@ export async function namedTestsInvalid(ctx, { task, checkout, trees, logFile })
             return goFileOutcome(await run(tree, commands.go.join("; ") || "true"), {
                 files,
                 goNames,
-                module,
+                goMods,
             });
         }
 
@@ -838,7 +1055,9 @@ export const revalidateLog = (data, taskId) =>
  * pass at the merge, and fail at the parent (after its setup) with the task's hidden files copied over it. Returns the
  * validation entry `{ at, ok, reason, log, ... }`; `log` holds each command's stderr, and a failed command's stdout.
  */
-export async function revalidateTask(ctx, task, checkout) {
+export async function revalidateTask(baseCtx, task, checkout) {
+    // The repository's own limits for the check and the hidden tests, unless the caller gives explicit ones.
+    const ctx = { ...baseCtx, timeouts: commandLimits(baseCtx.timeouts, task.repo) };
     const base = join(ctx.data, "harvest-work", "revalidate", task.id);
     const trees = treesOf(base);
     const logFile = revalidateLog(ctx.data, task.id);
@@ -906,6 +1125,13 @@ export async function revalidateTask(ctx, task, checkout) {
                 rev: task.merge,
                 files: task.hiddenTests.map((t) => t.file),
                 work: trees.parent.work,
+            });
+            // The copied files are staged, as the harvest and S2 stage them (a failure is logged only).
+            await stageAll(ctx.sandbox, {
+                ...trees.parent,
+                timeoutMs: ctx.timeouts.hidden,
+                logFile,
+                step: "the staging of the hidden tests at the parent",
             });
 
             const atParent = await step("hiddenParent", trees.parent, task.hiddenCommand, "hidden");
@@ -980,7 +1206,10 @@ export async function revalidate(ctx, file, { checkoutOf }) {
     return failed ? 1 : 0;
 }
 
-/** The default limits of the harvester's commands. */
+/**
+ * The default limits of the harvester's commands, for a repository with no limit of its own (`commandLimits` in
+ * `bench/lib/owners.mjs` gives each repository's).
+ */
 export const TIMEOUTS = { setup: COMMAND_MS, check: COMMAND_MS, hidden: COMMAND_MS };
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -1059,7 +1288,8 @@ export async function harvestMain(argv, env = process.env, deps = {}) {
                 miseInstalls: resolve(values["mise-installs"] ?? DEFAULTS.miseInstalls),
                 killGraceMs: deps.killGraceMs,
             },
-            timeouts: { ...TIMEOUTS, ...deps.timeouts },
+            // Only explicit limits here: each validation adds its repository's (`commandLimits`).
+            timeouts: { ...deps.timeouts },
         };
 
         if (values.revalidate) {

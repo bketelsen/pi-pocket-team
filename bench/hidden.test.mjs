@@ -12,6 +12,7 @@ import {
     discoveryCommand,
     escapeRegex,
     goFileOutcome,
+    goModuleOf,
     goOutcome,
     goTestNames,
     hiddenCommand,
@@ -115,6 +116,110 @@ test("go: test names, discovery and hidden commands", () => {
         ]),
         "go test -count=1 -run '^(?:TestA)$' ./ && go test -count=1 -run '^(?:TestB|TestC)$' ./pkg",
     );
+});
+
+// `go -C kit test -json ...` of a nested module `example.com/lodge/kit` (times cut): TestCall fails by t.Fatalf at the
+// parent and passes at the merge.
+const GO_KIT_PARENT = [
+    '{"Action":"run","Package":"example.com/lodge/kit/jsonrpc","Test":"TestCall"}',
+    '{"Action":"output","Package":"example.com/lodge/kit/jsonrpc","Test":"TestCall","Output":"--- FAIL: TestCall (0.00s)\\n"}',
+    '{"Action":"fail","Package":"example.com/lodge/kit/jsonrpc","Test":"TestCall","Elapsed":0}',
+    '{"Action":"fail","Package":"example.com/lodge/kit/jsonrpc","Elapsed":0.01}',
+].join("\n");
+const GO_KIT_MERGE =
+    '{"Action":"pass","Package":"example.com/lodge/kit/jsonrpc","Test":"TestCall","Elapsed":0}';
+
+/** The modules of a repository with a nested Go module in `kit/`. */
+const LODGE = { ".": "example.com/lodge", kit: "example.com/lodge/kit" };
+
+test("go: a hidden file of a nested module runs with go -C and maps to its own module's package", () => {
+    const files = ["kit/jsonrpc/client_test.go"];
+    const goNames = { "kit/jsonrpc/client_test.go": ["TestCall"] };
+
+    assert.deepEqual(goModuleOf("kit/jsonrpc/client_test.go", LODGE), {
+        dir: "kit",
+        module: "example.com/lodge/kit",
+        pkgDir: "jsonrpc",
+    });
+    assert.deepEqual(goModuleOf("kit/kit_test.go", LODGE), {
+        dir: "kit",
+        module: "example.com/lodge/kit",
+        pkgDir: ".",
+    });
+    assert.deepEqual(goModuleOf("kitchen/a_test.go", LODGE), {
+        dir: ".",
+        module: "example.com/lodge",
+        pkgDir: "kitchen",
+    });
+    assert.equal(goModuleOf("a_test.go", { kit: "example.com/lodge/kit" }), null);
+    assert.equal(
+        discoveryCommand("go", files, { goNames, goMods: LODGE }),
+        "go -C kit test -json -count=1 -run '^(?:TestCall)$' ./jsonrpc",
+    );
+
+    const parent = goFileOutcome(GO_KIT_PARENT, { files, goNames, goMods: LODGE });
+    const merge = goFileOutcome(GO_KIT_MERGE, { files, goNames, goMods: LODGE });
+
+    assert.equal(parent.units.get(files[0]).get("TestCall"), "assertion");
+    assert.equal(merge.units.get(files[0]).get("TestCall"), "pass");
+    assert.deepEqual([...classify({ files, parent, merge }).valid], [[files[0], ["TestCall"]]]);
+    assert.equal(
+        hiddenCommand(
+            [
+                { file: "kit/jsonrpc/client_test.go", language: "go", names: ["TestCall"] },
+                { file: "kit/kit_test.go", language: "go", names: ["TestKit"] },
+                { file: "cmd/x_test.go", language: "go", names: ["TestX"] },
+            ],
+            { goMods: LODGE },
+        ),
+        "go test -count=1 -run '^(?:TestX)$' ./cmd && go -C kit test -count=1 -run '^(?:TestKit)$' ./ && go -C kit test -count=1 -run '^(?:TestCall)$' ./jsonrpc",
+    );
+});
+
+test("go: with the root module only, the commands are as before, with or without the modules", () => {
+    const goNames = { "a_test.go": ["TestA"], "pkg/b_test.go": ["TestB", "TestC"] };
+    const valid = [
+        { file: "pkg/b_test.go", language: "go", names: ["TestB"] },
+        { file: "pkg/c_test.go", language: "go", names: ["TestC"] },
+        { file: "a_test.go", language: "go", names: ["TestA"] },
+    ];
+    const goMods = { ".": "example.com/gox" };
+
+    for (const options of [{}, { goMods }]) {
+        assert.equal(
+            discoveryCommand("go", ["a_test.go", "pkg/b_test.go"], { goNames, ...options }),
+            "go test -json -count=1 -run '^(?:TestA)$' ./; go test -json -count=1 -run '^(?:TestB|TestC)$' ./pkg",
+        );
+        assert.equal(
+            hiddenCommand(valid, options),
+            "go test -count=1 -run '^(?:TestA)$' ./ && go test -count=1 -run '^(?:TestB|TestC)$' ./pkg",
+        );
+    }
+
+    const merge = goFileOutcome(GO_MERGE, {
+        files: ["ok/a_test.go"],
+        goNames: { "ok/a_test.go": ["TestAdd"] },
+        goMods: { ".": "example.com/gox" },
+    });
+
+    assert.equal(merge.units.get("ok/a_test.go").get("TestAdd"), "pass");
+});
+
+test("revalidation reporters: go -C <dir> test and go -C=<dir> test get -json after test; cd is no runner", () => {
+    assert.deepEqual(reporterCommands("go -C kit test -count=1 -run X ./jsonrpc"), {
+        node: [],
+        go: ["go -C kit test '-json' -count=1 -run X ./jsonrpc"],
+        python: [],
+    });
+    assert.deepEqual(reporterCommands("GOFLAGS=-mod=mod go -C=kit test -run 'X' ./jsonrpc").go, [
+        "GOFLAGS=-mod=mod go -C=kit test '-json' -run 'X' ./jsonrpc",
+    ]);
+    assert.deepEqual(reporterCommands("cd kit && go test ./jsonrpc"), {
+        error: "cannot add a reporter to the hidden command: cd kit",
+    });
+    assert.deepEqual(reporterCommands("go -C kit vet ./jsonrpc"), {
+        error: "cannot add a reporter to the hidden command: go -C kit vet ./jsonrpc",
+    });
 });
 
 // pytest's junit XML: an assertion failure, an exception, a setup error, a pass, a parametrized pass in a class,

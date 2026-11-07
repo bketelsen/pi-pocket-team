@@ -8,8 +8,13 @@ import { join } from "node:path";
 import { after, before, test } from "node:test";
 import {
     PER_STRATUM,
+    PR_FIELDS,
+    TOO_MANY_COMMITS,
     VALIDATION_VERSION,
     commandsAt,
+    goModulesAt,
+    parentOf,
+    revalidateTask,
     validateCandidate,
     validationKey,
     harvest,
@@ -19,10 +24,20 @@ import {
     stratumOrder,
 } from "./lib/harvest.mjs";
 import { loadManifest } from "./lib/manifest.mjs";
-import { readRoster, repositoriesOf, seededShuffle } from "./lib/owners.mjs";
+import { commandMsOf, readRoster, repositoriesOf, seededShuffle } from "./lib/owners.mjs";
+import { COMMAND_MS } from "./lib/exec.mjs";
 import { delegationTask, goalBrief, readThreads } from "./lib/pocket.mjs";
-import { FAKE_BWRAP, makeFixture, runScript, testEnv } from "./fixtures/helpers.mjs";
-import { fakeGh, makeExtraRepo, makeNodeRepo, makePocketDb, wrapped } from "./fixtures/harvest.mjs";
+import { FAKE_BWRAP, git, makeFixture, runScript, testEnv } from "./fixtures/helpers.mjs";
+import {
+    fakeGh,
+    makeExtraRepo,
+    makeMergeShapes,
+    makeNestedGoRepo,
+    makeNodeRepo,
+    makePocketDb,
+    makeTrackedRepo,
+    wrapped,
+} from "./fixtures/harvest.mjs";
 import { cleanupTree, removeTree } from "./lib/common.mjs";
 
 const REPO = "bketelsen/pi-pocket-team";
@@ -618,7 +633,11 @@ test("a cached validation error is never reused: the candidate is validated agai
         route: null,
     });
 
-    assert.equal(VALIDATION_VERSION, 2, "the overlay's modes changed the validation");
+    assert.equal(
+        VALIDATION_VERSION,
+        4,
+        "the timeout record (discovery, staging) changed the validation",
+    );
     mkdirSync(join(data, "harvest-cache", "bketelsen", "pi-pocket-team"), { recursive: true });
     writeFileSync(
         join(data, "harvest-cache", "bketelsen", "pi-pocket-team", "77.json"),
@@ -737,5 +756,502 @@ test("a failed fetch does not stop the harvest: the repository is harvested with
             [ref(repo, 5)],
             repo,
         );
+    }
+});
+
+test("the parent of a rebase merge is the commit before the PR's rebased commits", async () => {
+    const shapes = makeMergeShapes(join(fixture.root, "merge-shapes"));
+    const { rebase } = shapes;
+
+    assert.equal(await parentOf(shapes.repo, rebase.merge, rebase.commits), rebase.parent);
+    assert.notEqual(rebase.parent, git(shapes.repo, "rev-parse", `${rebase.merge}^1`));
+});
+
+test("the parent of a squash merge of 3 commits and of a merge commit stays the first parent", async () => {
+    const shapes = makeMergeShapes(join(fixture.root, "merge-shapes-2"));
+
+    for (const shape of ["squash", "merge"]) {
+        const { merge, parent, commits } = shapes[shape];
+
+        assert.equal(await parentOf(shapes.repo, merge, commits), parent, shape);
+        assert.equal(parent, git(shapes.repo, "rev-parse", `${merge}^1`), shape);
+    }
+
+    // A PR of 1 commit, or with no commits known: the first parent.
+    const { merge, commits } = shapes.rebase;
+
+    assert.equal(
+        await parentOf(shapes.repo, merge, commits.slice(1)),
+        git(shapes.repo, "rev-parse", `${merge}^1`),
+    );
+    assert.equal(
+        await parentOf(shapes.repo, merge, []),
+        git(shapes.repo, "rev-parse", `${merge}^1`),
+    );
+});
+
+test("a harvest reads the PR's commits and validates a rebase merge at its real parent; an old gh cache is read again", async () => {
+    const shapes = makeMergeShapes(join(fixture.root, "merge-shapes-3"));
+    const prs = {};
+    const list = [];
+
+    const pr = (n, shape) => {
+        prs[`${REPO}#${n}`] = {
+            state: "MERGED",
+            mergedAt: "2026-10-05T00:00:00Z",
+            mergeCommit: { oid: shapes[shape].merge },
+            additions: 10,
+            deletions: 0,
+            commits: shapes[shape].commits,
+        };
+        list.push({
+            thread: {
+                id: `T${n}`,
+                nightShift: true,
+                brief: "b",
+                briefSource: "night-shift",
+                route: null,
+            },
+            pr: `${REPO}#${n}`,
+            number: n,
+            repo: REPO,
+        });
+    };
+
+    pr(1, "rebase");
+    pr(2, "squash");
+    pr(3, "merge");
+
+    const parents = {};
+    const ctx = stubContext(fakeGh({ prs }), async (_ctx, c) => {
+        parents[c.number] = c.parent;
+
+        return {
+            ok: true,
+            validation: {},
+            fields: {
+                parent: c.parent,
+                setup: "true",
+                check: "true",
+                hiddenTests: [],
+                hiddenCommand: null,
+                features: null,
+            },
+        };
+    });
+
+    // A gh cache of an earlier harvest, with no commits: it is read again.
+    mkdirSync(join(ctx.data, "harvest-cache", "bketelsen", "pi-pocket-team"), { recursive: true });
+    writeFileSync(
+        join(ctx.data, "harvest-cache", "bketelsen", "pi-pocket-team", "1.gh.json"),
+        JSON.stringify({ ...prs[`${REPO}#1`], merge: shapes.rebase.merge, commits: undefined }),
+    );
+    ctx.checkouts = { [REPO]: shapes.repo };
+
+    const manifest = await harvestRepo(ctx, REPO, list, []);
+
+    assert.ok(PR_FIELDS.split(",").includes("commits"));
+    assert.deepEqual(parents, {
+        1: shapes.rebase.parent,
+        2: shapes.squash.parent,
+        3: shapes.merge.parent,
+    });
+    assert.equal(manifest.tasks.find((t) => t.pr === `${REPO}#1`).parent, shapes.rebase.parent);
+});
+
+test("Go modules: each hidden file belongs to the nearest go.mod at or above its folder", async () => {
+    const go = makeNestedGoRepo(join(fixture.root, "nested-go"));
+
+    assert.deepEqual(
+        await goModulesAt(go.repo, go.rev, [
+            "kit/jsonrpc/client_test.go",
+            "kit/kit_test.go",
+            "cmd/x_test.go",
+        ]),
+        { ".": "example.com/lodge", kit: "example.com/lodge/kit" },
+    );
+    assert.deepEqual(await goModulesAt(go.repo, go.rev, ["cmd/x_test.go"]), {
+        ".": "example.com/lodge",
+    });
+});
+
+/** A validation context of the fake bwrap in its own data dir. */
+const validationContext = (data) => ({
+    data,
+    now: () => NOW,
+    log: () => {},
+    rosterNames: [REPO],
+    hostNames: [],
+    sandbox: {
+        bwrap: FAKE_BWRAP,
+        pocket: fixture.pocket,
+        miseInstalls: join(fixture.root, "no-mise"),
+        data,
+    },
+    timeouts: { setup: 60_000, check: 60_000, hidden: 60_000 },
+});
+
+test("the harvest stages the hidden files at the parent: a test that needs its file in git ls-files is valid", async () => {
+    const tracked = makeTrackedRepo(join(fixture.root, "tracked-repo"));
+    const result = await validateCandidate(validationContext(join(fixture.root, "tracked-data")), {
+        repo: REPO,
+        number: 90,
+        thread: { id: "T90", brief: "Fix add.", route: null, nightShift: false },
+        checkout: tracked.repo,
+        merge: tracked.merge,
+        parent: tracked.parent,
+    });
+
+    assert.equal(result.ok, true, result.reason);
+    assert.deepEqual(result.fields.hiddenTests, [{ file: "tracked.test.mjs", names: ["tracked"] }]);
+    assert.equal(
+        result.fields.hiddenCommand,
+        "PI_POCKET_CHECKOUT=/pocket node --test --test-name-pattern='^(?:tracked)$' 'tracked.test.mjs'",
+    );
+});
+
+test("--revalidate stages the hidden files at the parent: a test that needs its file in git ls-files passes", async () => {
+    const tracked = makeTrackedRepo(join(fixture.root, "tracked-reval-repo"));
+    const file = join(fixture.root, "reviewed-tracked.json");
+
+    writeFileSync(
+        file,
+        JSON.stringify({
+            schema: 1,
+            repo: REPO,
+            checkout: tracked.repo,
+            tasks: [
+                {
+                    id: "tracked-1",
+                    repo: REPO,
+                    thread: "T1",
+                    pr: `${REPO}#1`,
+                    parent: tracked.parent,
+                    merge: tracked.merge,
+                    brief: "Fix add.",
+                    briefSource: "delegation",
+                    setup: "PI_POCKET_CHECKOUT=/pocket node link.mjs",
+                    check: "PI_POCKET_CHECKOUT=/pocket make test",
+                    hiddenTests: [{ file: "tracked.test.mjs", names: ["tracked"] }],
+                    hiddenCommand:
+                        "PI_POCKET_CHECKOUT=/pocket node --test --test-name-pattern='^(?:tracked)$' 'tracked.test.mjs'",
+                    size: 10,
+                    features: null,
+                    owner: { keep: true, reason: "", scopeMatches: true, commandsConfirmed: true },
+                },
+            ],
+            validation: {},
+        }),
+    );
+
+    const result = await runScript(
+        "harvest.mjs",
+        ["--revalidate", file, "--bwrap", FAKE_BWRAP, "--pocket", fixture.pocket],
+        testEnv(fixture, { BENCH_DATA: join(fixture.root, "reval-tracked-data") }),
+    );
+    const entry = JSON.parse(readFileSync(file, "utf8")).validation["tracked-1"];
+
+    assert.equal(result.code, 0, result.stdout + result.stderr);
+    assert.equal(entry.ok, true, entry.reason);
+    assert.equal(entry.hiddenNames, "pass");
+});
+
+test("a repository's own command limit: fleet's check and hidden tests get 30 minutes, setup and others 10", async () => {
+    const FLEET = "bketelsen/fleet";
+
+    const limits = async (repo) => {
+        const data = join(fixture.root, `limit-data-${repo.replace("/", "-")}`);
+        const runs = [];
+        const ctx = validationContext(data);
+
+        delete ctx.timeouts;
+        ctx.sandbox.onRun = ({ step, timeoutMs }) => runs.push([step ?? "discovery", timeoutMs]);
+
+        const candidate = {
+            repo,
+            number: 91,
+            thread: { id: "T91", brief: "Fix add.", route: null, nightShift: false },
+            checkout: node.repo,
+            merge: node.merge,
+            parent: node.parent,
+        };
+
+        // A validation cached under the old limit timed out: it is not reused.
+        mkdirSync(join(data, "harvest-cache", ...repo.split("/")), { recursive: true });
+        writeFileSync(
+            join(data, "harvest-cache", ...repo.split("/"), "91.json"),
+            JSON.stringify({
+                key: validationKey({
+                    merge: node.merge,
+                    parent: node.parent,
+                    commands: await commandsAt(node.repo, node.merge),
+                    brief: "Fix add.",
+                    route: null,
+                }),
+                outcome: {
+                    ok: false,
+                    reason: "check failed at the merge (timed out)",
+                    fields: null,
+                    validation: { checkMerge: "timed out" },
+                },
+            }),
+        );
+
+        const result = await validateCandidate(ctx, candidate);
+
+        assert.equal(result.cached, undefined, `${repo}: a cached timeout is validated again`);
+        assert.equal(result.ok, true, result.reason);
+
+        const fields = result.fields;
+        const entry = await revalidateTask(
+            {
+                ...ctx,
+                sandbox: {
+                    ...ctx.sandbox,
+                    onRun: ({ step, timeoutMs }) =>
+                        runs.push([`reval ${step ?? "discovery"}`, timeoutMs]),
+                },
+            },
+            {
+                id: `limit-${repo.replace("/", "-")}`,
+                repo,
+                parent: node.parent,
+                merge: node.merge,
+                setup: fields.setup,
+                check: fields.check,
+                hiddenTests: fields.hiddenTests,
+                hiddenCommand: fields.hiddenCommand,
+            },
+            node.repo,
+        );
+
+        assert.equal(entry.ok, true, entry.reason);
+
+        return Object.fromEntries(runs);
+    };
+
+    const LONG = 30 * 60_000;
+
+    assert.equal(commandMsOf(FLEET), LONG);
+    assert.equal(commandMsOf(REPO), COMMAND_MS);
+
+    for (const [repo, limit] of [
+        [FLEET, LONG],
+        [REPO, COMMAND_MS],
+    ]) {
+        const runs = await limits(repo);
+
+        for (const step of [
+            "check at the merge",
+            "hidden command at the merge",
+            "hidden command at the parent",
+            "discovery",
+            "reval check at the merge",
+            "reval hidden command at the merge",
+            "reval hidden command at the parent",
+            "reval discovery",
+        ]) {
+            assert.equal(runs[step], limit, `${repo}: ${step}`);
+        }
+
+        for (const step of [
+            "setup at the merge",
+            "setup at the parent",
+            "reval setup at the parent",
+        ]) {
+            assert.equal(runs[step], COMMAND_MS, `${repo}: ${step}`);
+        }
+    }
+});
+
+test("a PR with 100 or more commits is dropped: gh lists at most 100, so its parent is unknown", async () => {
+    const shapes = makeMergeShapes(join(fixture.root, "merge-shapes-cap"));
+    const commits = (count) =>
+        Array.from({ length: count }, (_, i) => ({
+            oid: i.toString(16).padStart(40, "0"),
+            messageHeadline: `commit ${i}`,
+            authoredDate: "2026-10-01T10:00:00Z",
+        }));
+    const prs = {};
+    const list = [100, 99].map((count, i) => {
+        const n = 60 + i;
+
+        prs[`${REPO}#${n}`] = {
+            state: "MERGED",
+            mergedAt: "2026-10-05T00:00:00Z",
+            mergeCommit: { oid: shapes.rebase.merge },
+            additions: 10,
+            deletions: 0,
+            commits: commits(count),
+        };
+
+        return {
+            thread: {
+                id: `T${n}`,
+                nightShift: true,
+                brief: "b",
+                briefSource: "night-shift",
+                route: null,
+            },
+            pr: `${REPO}#${n}`,
+            number: n,
+            repo: REPO,
+        };
+    });
+    const validated = [];
+    const ctx = stubContext(fakeGh({ prs }), async (_ctx, c) => {
+        validated.push(c.number);
+
+        return {
+            ok: true,
+            validation: {},
+            fields: {
+                parent: c.parent,
+                setup: "true",
+                check: "true",
+                hiddenTests: [],
+                hiddenCommand: null,
+                features: null,
+            },
+        };
+    });
+
+    ctx.checkouts = { [REPO]: shapes.repo };
+
+    const manifest = await harvestRepo(ctx, REPO, list, []);
+
+    assert.equal(
+        TOO_MANY_COMMITS,
+        "the PR has 100 or more commits: the list may be incomplete, so its parent is unknown",
+    );
+    assert.deepEqual(manifest.dropped, [
+        { thread: "T60", pr: `${REPO}#60`, reason: TOO_MANY_COMMITS },
+    ]);
+    assert.deepEqual(validated, [61], "a PR of 99 commits is still a candidate");
+});
+
+test("the parent rule: a headline that GitHub cut with … matches its full subject", async () => {
+    const shapes = makeMergeShapes(join(fixture.root, "merge-shapes-cut"));
+    const { merge, parent, commits } = shapes.rebase;
+    const cut = commits.map((c) => ({
+        ...c,
+        messageHeadline: `${c.messageHeadline.slice(0, 8)}…`,
+    }));
+
+    assert.equal(cut[0].messageHeadline, "rebase o…");
+    assert.equal(await parentOf(shapes.repo, merge, cut), parent);
+
+    // A cut headline that is not the start of the subject does not match.
+    const wrong = commits.map((c) => ({ ...c, messageHeadline: "other…" }));
+
+    assert.equal(
+        await parentOf(shapes.repo, merge, wrong),
+        git(shapes.repo, "rev-parse", `${merge}^1`),
+    );
+});
+
+test("the parent rule: a squash-merged PR with a merge commit inside it keeps <merge>^1", async () => {
+    const repo = join(fixture.root, "pr-with-merge");
+
+    const commit = (file, subject, date) => {
+        writeFileSync(join(repo, file), `${subject}\n`);
+        git(repo, "add", ".");
+        git(repo, "commit", "--quiet", "-m", subject, `--date=${date}`);
+
+        return git(repo, "rev-parse", "HEAD");
+    };
+
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init", "--quiet", "--initial-branch=main");
+    commit("a.txt", "seed", "2026-09-01T10:00:00Z");
+    git(repo, "checkout", "--quiet", "-b", "pr");
+    commit("p.txt", "pr one", "2026-10-01T10:00:00Z");
+    git(repo, "checkout", "--quiet", "main");
+    commit("b.txt", "main moves on", "2026-10-01T11:00:00Z");
+    git(repo, "checkout", "--quiet", "pr");
+    git(repo, "merge", "--quiet", "--no-ff", "-m", "Merge branch 'main' into pr", "main");
+
+    const inside = git(repo, "log", "-1", "--format=%aI");
+
+    commit("p.txt", "pr two", "2026-10-01T12:00:00Z");
+    git(repo, "checkout", "--quiet", "main");
+
+    const before = git(repo, "rev-parse", "HEAD");
+
+    git(repo, "merge", "--quiet", "--squash", "pr");
+    git(repo, "commit", "--quiet", "-m", "The PR (#4)", "--date=2026-10-01T13:00:00Z");
+
+    const merge = git(repo, "rev-parse", "HEAD");
+    const commits = [
+        ["pr one", "2026-10-01T10:00:00Z"],
+        ["Merge branch 'main' into pr", inside],
+        ["pr two", "2026-10-01T12:00:00Z"],
+    ].map(([messageHeadline, authoredDate]) => ({ messageHeadline, authoredDate }));
+
+    assert.equal(await parentOf(repo, merge, commits), before);
+});
+
+/**
+ * A bwrap that hangs on the hidden-test discovery (the Node TAP reporter) of 1 tree (`at`: "merge" or "parent") and
+ * passes every other run to the fake bwrap: the validation's own limit ends the hang.
+ */
+function hangingBwrap(at) {
+    const file = join(fixture.root, `hang-${at}-bwrap.sh`);
+
+    writeFileSync(
+        file,
+        [
+            "#!/bin/sh",
+            'case " $* " in',
+            `    *"/${at}/work /work "*"--test-reporter=tap"*) exec sleep 600 ;;`,
+            "esac",
+            `exec '${FAKE_BWRAP}' "$@"`,
+            "",
+        ].join("\n"),
+    );
+    chmodSync(file, 0o755);
+
+    return file;
+}
+
+test("a discovery that times out (at the merge, at the parent) is recorded, not cached, and validated again", async () => {
+    for (const at of ["merge", "parent"]) {
+        const data = join(fixture.root, `discovery-timeout-${at}`);
+        const candidate = {
+            repo: REPO,
+            number: 92,
+            thread: { id: "T92", brief: "Fix add.", route: null, nightShift: false },
+            checkout: node.repo,
+            merge: node.merge,
+            parent: node.parent,
+        };
+        const hung = validationContext(data);
+
+        hung.sandbox.bwrap = hangingBwrap(at);
+        hung.sandbox.killGraceMs = 1000;
+        hung.timeouts = { ...hung.timeouts, hidden: 5_000 };
+
+        const first = await validateCandidate(hung, candidate);
+        const cacheFile = join(data, "harvest-cache", "bketelsen", "pi-pocket-team", "92.json");
+
+        assert.equal(first.ok, true, first.reason);
+        assert.equal(first.fields.hiddenCommand, null, `${at}: no valid name was found`);
+        assert.deepEqual(
+            first.timedOutSteps,
+            [`the discovery of the node hidden tests at the ${at}`],
+            at,
+        );
+        assert.equal(existsSync(cacheFile), false, `${at}: the outcome is not cached`);
+
+        // A second harvest validates again (no cached outcome), and finds the hidden tests.
+        const second = await validateCandidate(validationContext(data), candidate);
+
+        assert.equal(second.cached, undefined, at);
+        assert.deepEqual(second.timedOutSteps, []);
+        assert.equal(
+            second.fields.hiddenCommand,
+            "PI_POCKET_CHECKOUT=/pocket node --test --test-name-pattern='^(?:adds)$' 'add.test.mjs'",
+        );
+        assert.equal(existsSync(cacheFile), true, `${at}: an outcome with no timeout is cached`);
     }
 });
