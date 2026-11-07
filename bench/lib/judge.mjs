@@ -2,6 +2,7 @@
 // CLI in the sandbox with no tool. Each try reserves $1 under the budget guard and settles its real list cost; the
 // judge cost is never part of an attempt's usage. A missing or unparsable answer gets 2 more tries; then the judge
 // is pending (judged again later), never a fail.
+import { createHash } from "node:crypto";
 import { readFile, writeFile } from "node:fs/promises";
 import { existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
@@ -19,6 +20,31 @@ export const JUDGES = ["openai/gpt-6.1-sol", "github-copilot/claude-opus-5.5"];
 
 /** The judge prompt, version 1. */
 export const JUDGE_PROMPT = join(BENCH_DIR, "judge-v1.md");
+
+/**
+ * The SHA-256 of `bench/judge-v1.md` at its freeze (`bench/judge-v1.calibration.md`). The judges' calibration holds
+ * for this text only: a changed rubric is a new file (`judge-v2.md`) with a new calibration.
+ */
+export const JUDGE_PROMPT_SHA256 =
+    "226b28d93da03b2879a9fc2a23bb386ea899b07ce4a673754d787f63f9cde0ce";
+
+/** The error of a judge prompt whose hash is not the frozen one. */
+export const JUDGE_PROMPT_CHANGED =
+    "bench/judge-v1.md changed after its freeze; a changed rubric is judge-v2.md and needs a new calibration";
+
+/** The SHA-256 hex of a file. */
+export async function fileSha256(file) {
+    return createHash("sha256")
+        .update(await readFile(file))
+        .digest("hex");
+}
+
+/** Throw `JUDGE_PROMPT_CHANGED` when the judge prompt file (default `JUDGE_PROMPT`) is not the frozen text. */
+export async function checkJudgePrompt(file = JUDGE_PROMPT) {
+    if ((await fileSha256(file)) !== JUDGE_PROMPT_SHA256) {
+        throw new Error(JUDGE_PROMPT_CHANGED);
+    }
+}
 
 /** The most characters of a diff in the judge's input. */
 export const DIFF_LIMIT = 60_000;
@@ -48,9 +74,68 @@ export const JUDGE_MIN_EXPIRY = "30m";
 export const JUDGE_MESSAGE =
     "Grade the submitted change in the attached file by its rubric. Answer with 1 JSON object only, and nothing before or after it.";
 
+/** The folders whose files are test files. */
+const TEST_FOLDERS = new Set(["test", "tests", "__tests__", "testdata", "fixtures"]);
+
+/**
+ * True for a test file: a path with a folder `test`, `tests`, `__tests__`, `testdata` or `fixtures`, or a base name
+ * `*_test.go`, `*_test.py`, `test_*.py`, `*.test.<ext>` or `*.spec.<ext>` (ext: js, mjs, cjs, ts, mts, cts, jsx, tsx).
+ */
+export function isTestPath(path) {
+    const parts = String(path ?? "").split("/");
+    const base = parts.pop();
+
+    return (
+        parts.some((part) => TEST_FOLDERS.has(part)) ||
+        /_test\.(?:go|py)$/.test(base) ||
+        /^test_.*\.py$/.test(base) ||
+        /\.(?:test|spec)\.(?:js|mjs|cjs|ts|mts|cts|jsx|tsx)$/.test(base)
+    );
+}
+
+/** The path of a file section of a diff: the `b/` path of its `diff --git` line (the `a/` path when none parses). */
+const sectionPath = (section) => {
+    const end = section.indexOf("\n");
+    const line = end < 0 ? section : section.slice(0, end);
+    const match = /^diff --git a\/(.+?) b\/(.+)$/.exec(line);
+
+    return match ? match[2] : line.slice("diff --git ".length);
+};
+
+/**
+ * A diff with its test files last: the text before the first `diff --git ` line stays first, then the non-test file
+ * sections, then the test file sections, each group in its original order. Git sorts files by path, so test files
+ * (`desk-x.test.ts` before `desk.ts`) can fill a cut and hide the code they test.
+ */
+export function testsLast(diff) {
+    const text = String(diff ?? "");
+    const starts = [...text.matchAll(/^diff --git /gm)].map((m) => m.index);
+
+    if (starts.length < 2) {
+        return text;
+    }
+
+    const head = text.slice(0, starts[0]);
+    const sections = starts.map((start, i) => text.slice(start, starts[i + 1] ?? text.length));
+    const ordered = [
+        ...sections.filter((section) => !isTestPath(sectionPath(section))),
+        ...sections.filter((section) => isTestPath(sectionPath(section))),
+    ];
+
+    // Only the original last section can lack its final newline; elsewhere it would join 2 lines.
+    return (
+        head +
+        ordered
+            .map((section, i) =>
+                i < ordered.length - 1 && !section.endsWith("\n") ? `${section}\n` : section,
+            )
+            .join("")
+    );
+}
+
 /**
  * A diff for the judge: as it is up to `DIFF_LIMIT` characters; a longer one becomes its `--stat`, a blank line, and
- * its first `DIFF_LIMIT` characters, with `cut: true`.
+ * the first `DIFF_LIMIT` characters of the diff with its test files last (`testsLast`), with `cut: true`.
  */
 export function cutDiff(diff, stat) {
     const text = String(diff ?? "");
@@ -59,7 +144,10 @@ export function cutDiff(diff, stat) {
         return { text, cut: false };
     }
 
-    return { text: `${String(stat ?? "").trimEnd()}\n\n${text.slice(0, DIFF_LIMIT)}`, cut: true };
+    return {
+        text: `${String(stat ?? "").trimEnd()}\n\n${testsLast(text).slice(0, DIFF_LIMIT)}`,
+        cut: true,
+    };
 }
 
 /** A stat of a unified diff (files, lines added and removed), for a diff that has no `git diff --stat`. */
@@ -98,19 +186,30 @@ const cutNote = (cut, what) =>
 /** An S1 or S2 result in words. */
 const checkWords = (value, none) => (value === true ? "passed" : value === false ? "failed" : none);
 
+/** The reference note of an item with no merged change (a calibration item). */
+export const NO_REFERENCE_NOTE =
+    "No merged change is given for this item: grade the submitted change by the task and the repository alone.";
+
+/** S1 and S2 of a calibration call: the owners who labelled the items saw only the brief and the diff. */
+export const CALIBRATION_CHECK = "not run for this item";
+
 /**
  * The judge's input: the template with the brief, S1, S2, the 2 diffs and their cut notes. No model name goes in.
- * `submitted` and `reference` are `{ text, cut }` from `cutDiff`.
+ * `submitted` and `reference` are `{ text, cut }` from `cutDiff`; `reference: null` gives no merged change (the note
+ * `NO_REFERENCE_NOTE` and the diff "(none)"). `calibration: true` gives `CALIBRATION_CHECK` for S1 and S2.
  */
-export function renderPrompt(template, { brief, s1, s2, submitted, reference }) {
+export function renderPrompt(
+    template,
+    { brief, s1, s2, submitted, reference, calibration = false },
+) {
     const values = {
         BRIEF: String(brief ?? "").trim(),
-        S1: checkWords(s1, "not run"),
-        S2: checkWords(s2, "none: this task has no hidden test"),
+        S1: calibration ? CALIBRATION_CHECK : checkWords(s1, "not run"),
+        S2: calibration ? CALIBRATION_CHECK : checkWords(s2, "none: this task has no hidden test"),
         SUBMITTED_NOTE: cutNote(submitted.cut, "submitted"),
         SUBMITTED_DIFF: submitted.text.trim() === "" ? "(no change)" : submitted.text,
-        REFERENCE_NOTE: cutNote(reference.cut, "merged"),
-        REFERENCE_DIFF: reference.text,
+        REFERENCE_NOTE: reference === null ? NO_REFERENCE_NOTE : cutNote(reference.cut, "merged"),
+        REFERENCE_DIFF: reference === null ? "(none)" : reference.text,
     };
 
     return template.replace(/\{\{([A-Z0-9_]+)\}\}/g, (whole, name) => values[name] ?? whole);
@@ -283,10 +382,14 @@ function firstTry(dir) {
 
 /**
  * Run 1 judge: up to `JUDGE_TRIES` tries until it answers 1 parsable JSON object. `ctx`: `{ data, bwrap, pocket,
- * agentSrc, miseInstalls, authPreflight, killGraceMs, wallMs, spawn? }` (`spawn` replaces the pre-flight's in tests). `dir`: the judge's folder in the data dir.
- * Returns `{ model, grade, reasons, tries, cost, pending, refused }`; `refused` when the budget guard refused a try.
+ * agentSrc, miseInstalls, authPreflight, killGraceMs, wallMs, spawn?, judgePromptFile? }` (`spawn` replaces the
+ * pre-flight's in tests; `judgePromptFile` replaces `JUDGE_PROMPT` in the freeze check). `dir`: the judge's folder in
+ * the data dir. Returns `{ model, grade, reasons, tries, cost, pending, refused }`; `refused` when the budget guard
+ * refused a try. Throws `JUDGE_PROMPT_CHANGED`, before any try, when the judge prompt is not the frozen text.
  */
 export async function runJudge(ctx, { model, prompt, dir, task, stage }) {
+    await checkJudgePrompt(ctx.judgePromptFile ?? JUDGE_PROMPT);
+
     const provider = providerOf(model);
     const out = {
         model,

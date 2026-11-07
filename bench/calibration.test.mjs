@@ -1,6 +1,7 @@
-// The judge calibration sets: from fixture findings files and a fake gh, 8 blind held-out diffs per owner (4 at a
-// Not-ready head, 4 at the merged head), a separate key, 20 development pairs from other PRs, private files, and
-// the same output for the same seed. No network.
+// The judge calibration sets: from fixture findings files, a fixture Pocket database and a fake gh, 8 blind held-out
+// diffs per owner (4 at a Not-ready head, 4 at the merged head), a separate key, 20 development pairs from other PRs,
+// briefs from the desk thread (never the PR body), private files, the same output for the same seed, and no write
+// over owner labels. No network.
 import assert from "node:assert/strict";
 import {
     mkdirSync,
@@ -14,16 +15,33 @@ import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
-import { calibrationMain, loadPoints } from "./lib/calibration.mjs";
+import { calibrationMain, loadPoints, threadBriefs } from "./lib/calibration.mjs";
 import { DIFF_LIMIT } from "./lib/judge.mjs";
 import { BENCH_REPOS, OWNERS, reposOf } from "./lib/owners.mjs";
-import { fakeGh } from "./fixtures/harvest.mjs";
+import { fakeGh, makePocketDb, wrapped } from "./fixtures/harvest.mjs";
 
 let root;
 const sha = (seed) => seed.repeat(40).slice(0, 40);
 const prs = {};
 const diffs = {};
 const findings = [];
+const threads = {};
+const messages = {};
+let db;
+let contestedFindings;
+
+/** The body of every fixture PR: a cross-review history that tells the label. */
+const LEAK = "Initial review at abc1234: Not ready, 2 blocking points, fixed in def5678.";
+
+/** A desk thread `T<n>` (session n) that names `refs`; its brief is the task of its first message, or none. */
+function addThread(n, refs, brief = `Brief of ${refs[0]}.`) {
+    threads[`T${n}`] = {
+        id: `T${n}`,
+        session: n,
+        prs: Object.fromEntries(refs.map((ref) => [ref, {}])),
+    };
+    messages[n] = brief === null ? "A message with no wrapper marker." : wrapped(brief);
+}
 
 /** 1 PR with blocking points: `notReady` heads, a final head, a base; a diff for each head. */
 function addPr(repo, number, { notReady = [`${number}a`], merged = true, big = false } = {}) {
@@ -37,7 +55,7 @@ function addPr(repo, number, { notReady = [`${number}a`], merged = true, big = f
         baseRefOid: base,
         mergeCommit: { oid: sha(`m${number}`) },
         title: `PR ${number}`,
-        body: `Body of ${ref}.`,
+        body: `${LEAK} Body of ${ref}.`,
     };
 
     for (const h of [...notReady.map(sha), head]) {
@@ -46,7 +64,22 @@ function addPr(repo, number, { notReady = [`${number}a`], merged = true, big = f
             : `diff --git a/f b/f\n+${ref} at ${h}\n`;
     }
 
+    addThread(number, [ref]);
+
     return notReady.map((n) => ({ ref, head: sha(n), state: "merged", item: "1" }));
+}
+
+/** Write a findings file of `points`; returns its path. */
+function writeFindings(name, points) {
+    const dir = join(root, "reports", `${name}-daily-audit`);
+
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+        join(dir, "findings.json"),
+        JSON.stringify({ metrics: { Q1: { blockers: { points } } } }),
+    );
+
+    return join(dir, "findings.json");
 }
 
 before(() => {
@@ -88,37 +121,45 @@ before(() => {
     // The same point in 2 files counts once.
     day2.push(day1[0]);
 
-    const write = (name, points) => {
-        const dir = join(root, "reports", `${name}-daily-audit`);
+    findings.push(writeFindings("2026-11-01", day1), writeFindings("2026-11-02", day2));
 
-        mkdirSync(dir, { recursive: true });
-        writeFileSync(
-            join(dir, "findings.json"),
-            JSON.stringify({ metrics: { Q1: { blockers: { points } } } }),
-        );
-        findings.push(join(dir, "findings.json"));
-    };
+    // PRs that the desk does not give a brief for: named by 2 threads, named by a thread with 2 PRs, or by a thread
+    // with no brief. Their points are in a findings file of their own (the "only eligible" test).
+    const contested = [];
 
-    write("2026-11-01", day1);
-    write("2026-11-02", day2);
+    for (const number of [900, 901, 902, 903, 904]) {
+        contested.push(...addPr("frostyard/snosi", number));
+    }
+
+    addThread(905, ["frostyard/snosi#900"], "A second thread on #900.");
+    addThread(901, ["frostyard/snosi#901", "frostyard/snosi#999"]);
+    addThread(903, ["frostyard/snosi#903"], null);
+    contestedFindings = writeFindings("2026-11-03", contested);
+    db = makePocketDb(join(root, "pocket.sqlite"), { threads, messages });
 });
 
 after(() => rm(root, { recursive: true, force: true }));
 
-/** Build into `out`; returns the exit code and the files as JSON. */
-async function build(out, gh = fakeGh({ prs, diffs })) {
+/** Build into `out`; returns the exit code, the logs and a reader of the files as JSON. */
+async function run(out, { gh = fakeGh({ prs, diffs }), files = findings } = {}) {
     const logs = [];
     const code = await calibrationMain(
-        [...findings.flatMap((f) => ["--findings", f]), "--out", out],
+        [...files.flatMap((f) => ["--findings", f]), "--out", out, "--db", db],
         process.env,
         { gh, log: (line) => logs.push(line), print: () => {} },
     );
-    const read = (path) => JSON.parse(readFileSync(join(out, path), "utf8"));
+
+    return { code, logs, gh, read: (path) => JSON.parse(readFileSync(join(out, path), "utf8")) };
+}
+
+/** Build into `out`; returns the exit code and the files as JSON. */
+async function build(out, gh) {
+    const { code, logs, read } = await run(out, { gh });
 
     return {
         code,
         logs,
-        gh,
+        gh: gh ?? null,
         heldOut: Object.fromEntries(OWNERS.map((o) => [o, read(join("held-out", `${o}.json`))])),
         key: read("held-out-key.json").key,
         dev: read("dev.json").items,
@@ -134,7 +175,8 @@ test("points: the union of the files, 1 per ref@head, merged only", async () => 
 
 test("8 blind held-out diffs per owner, 4 Not-ready and 4 merged; 20 development pairs from other PRs", async () => {
     const out = join(root, "out");
-    const { code, heldOut, key, dev, gh, logs } = await build(out);
+    const gh = fakeGh({ prs, diffs });
+    const { code, heldOut, key, dev, logs } = await build(out, gh);
 
     assert.equal(code, 0, logs.join("\n"));
 
@@ -150,16 +192,21 @@ test("8 blind held-out diffs per owner, 4 Not-ready and 4 merged; 20 development
         for (const item of items) {
             assert.deepEqual(Object.keys(item).sort(), [
                 "brief",
+                "briefSource",
                 "diff",
                 "diffCut",
                 "id",
                 "label",
                 "pr",
                 "repo",
+                "thread",
             ]);
             assert.equal(item.label, null);
             assert.ok(repos.has(item.repo), `${item.repo} is ${owner}'s`);
-            assert.match(item.brief, /^PR \d+\n\nBody of /);
+            assert.equal(item.brief, `Brief of ${item.pr}.`, "the thread's brief");
+            assert.equal(item.thread, `T${item.pr.split("#")[1]}`);
+            assert.equal(item.briefSource, "delegation");
+            assert.doesNotMatch(JSON.stringify(item), /Initial review|Not ready|Body of/);
             heldPrs.add(item.pr);
         }
 
@@ -185,6 +232,10 @@ test("8 blind held-out diffs per owner, 4 Not-ready and 4 merged; 20 development
         assert.equal(pair.base, prs[pair.pr].baseRefOid, "1 base for both diffs");
         assert.equal(pair.mergedHead, prs[pair.pr].headRefOid);
         assert.notEqual(pair.notReadyHead, pair.mergedHead);
+        assert.equal(pair.brief, `Brief of ${pair.pr}.`, "the thread's brief");
+        assert.equal(pair.thread, `T${pair.pr.split("#")[1]}`);
+        assert.equal(pair.briefSource, "delegation");
+        assert.doesNotMatch(JSON.stringify(pair), /Initial review|Body of/);
         assert.match(pair.notReadyDiff, new RegExp(`at ${pair.notReadyHead}`));
         assert.match(pair.mergedDiff, new RegExp(`at ${pair.mergedHead}`));
     }
@@ -223,6 +274,76 @@ test("a diff over 60,000 characters is cut with a stat", async () => {
     for (const [, diff] of cut) {
         assert.match(diff, /^ x \| \+\d+ -0\n 1 files changed/);
         assert.ok(diff.length <= DIFF_LIMIT + 200);
+    }
+});
+
+test("only a PR whose 1 thread names only it, with a brief, is chosen; the PR body is never the brief", async () => {
+    const briefs = threadBriefs(
+        Object.values(threads).map((t) => ({
+            id: t.id,
+            prs: Object.keys(t.prs),
+            brief: messages[t.session].includes("Task from") ? "b" : null,
+            briefSource: "delegation",
+        })),
+    );
+
+    assert.equal(briefs.has("frostyard/snosi#900"), false, "named by 2 threads");
+    assert.equal(briefs.has("frostyard/snosi#901"), false, "its thread names 2 PRs");
+    assert.equal(briefs.has("frostyard/snosi#903"), false, "its thread has no brief");
+    assert.equal(briefs.get("frostyard/snosi#902").thread, "T902");
+
+    // Only #902 and #904 can give a pair, though GitHub has all 5 merged with a diff for each head.
+    const { code, read, gh } = await run(join(root, "contested"), { files: [contestedFindings] });
+
+    assert.equal(code, 0);
+    assert.deepEqual(
+        read("dev.json")
+            .items.map((p) => [p.pr, p.thread, p.brief])
+            .sort(),
+        [
+            ["frostyard/snosi#902", "T902", "Brief of frostyard/snosi#902."],
+            ["frostyard/snosi#904", "T904", "Brief of frostyard/snosi#904."],
+        ],
+    );
+    assert.ok(
+        gh.calls.every((args) => !/^(900|901|903)$/.test(args[2])),
+        "no gh call for a PR with no thread brief",
+    );
+});
+
+test("a held-out set with owner labels in --out is never written over", async () => {
+    const out = join(root, "labelled");
+
+    assert.equal((await run(out)).code, 0);
+    // A second build over unlabelled sets is fine.
+    assert.equal((await run(out)).code, 0);
+
+    const file = join(out, "held-out", `${OWNERS[0]}.json`);
+    const labelled = JSON.parse(readFileSync(file, "utf8"));
+
+    labelled.items[3].label = "fail";
+    writeFileSync(file, JSON.stringify(labelled));
+
+    const before = Object.fromEntries(
+        ["dev.json", "held-out-key.json", join("held-out", `${OWNERS[0]}.json`)].map((f) => [
+            f,
+            readFileSync(join(out, f), "utf8"),
+        ]),
+    );
+    const gh = fakeGh({ prs, diffs });
+    const { code, logs } = await run(out, { gh });
+
+    assert.equal(code, 1);
+    assert.match(
+        logs.join("\n"),
+        new RegExp(
+            `refused: .*holds owner labels \\(${OWNERS[0]}\\.json: ${labelled.items[3].id}\\)`,
+        ),
+    );
+    assert.equal(gh.calls.length, 0, "refused before any gh call");
+
+    for (const [f, text] of Object.entries(before)) {
+        assert.equal(readFileSync(join(out, f), "utf8"), text, `${f} is unchanged`);
     }
 });
 
