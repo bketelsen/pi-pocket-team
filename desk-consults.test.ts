@@ -22,6 +22,7 @@ import {
     scriptedModel,
     until,
 } from "./_pocket/test/helpers.ts";
+import { turnTexts } from "./scripted-turn-fixture.ts";
 import { createHandler } from "./_pocket/src/server/http.ts";
 import createDesk, {
     addConsults,
@@ -1549,6 +1550,20 @@ const model = scriptedModel((request) => {
         return answer("ok");
     }
 
+    // Each user message of the turn, newest first: a run-end answer can share the turn with the test's message.
+    for (const each of turnTexts(request as never)) {
+        const step = modelStep(each);
+
+        if (step !== undefined) {
+            return step;
+        }
+    }
+
+    return answer(`echo: ${text}`);
+});
+
+/** The model's step for 1 user message's text: undefined when no branch matches it. */
+function modelStep(text: string): ReturnType<typeof answer> | undefined {
     if (text.includes("[plan-consult ")) {
         return consultStep(text);
     }
@@ -1569,8 +1584,8 @@ const model = scriptedModel((request) => {
         });
     }
 
-    return answer(`echo: ${text}`);
-});
+    return undefined;
+}
 
 /** Run one of a module's commands in a session, as the owner. */
 function command(id: ConversationId, name: string, args: string) {
