@@ -959,3 +959,111 @@ test("Q1's lines: review rounds, 3-failure stops and CI reruns follow decided ac
     assert.match(missing, /- 3-failure stops: not available \(no such table\)\./);
     assert.match(missing, /- CI reruns: no flaky scan\./);
 });
+
+test("the metrics show R2's table after the R1 lines, a rate only from 10 decided, and nothing with 0 routes", () => {
+    const row = (over = {}) => ({
+        tierRule: "v1",
+        tier: "high",
+        arm: "router",
+        assigned: "deepseek/deepseek-flash",
+        count: 12,
+        open: 0,
+        accepted: 9,
+        notAccepted: 1,
+        pending: 1,
+        unknown: 1,
+        decided: 10,
+        acceptedRate: 0.9,
+        costPerAccepted: 1.5,
+        medianRounds: 2,
+        blockers: 1,
+        handFixRate: 0.25,
+        handFixKnown: 8,
+        deviations: 1,
+        closeAsMergeTime: 0,
+        eligible: 3,
+        workers: {},
+        thinking: {},
+        ...over,
+    });
+    const r2 = (rows: object[]) => ({
+        routes: 20,
+        sources: { q1: true, parentEdits: true },
+        windowDays: 14,
+        rows,
+        eligible: { nightShifts: 8, eligible: 3, share: 0.38 },
+        totals: row({
+            notAcceptedWhy: { dropped: 1, closedPr: 2, reverted: 0, reopened: 4 },
+            reopenedBy: { other: 1, attached: 3 },
+        }),
+    });
+    const markdown = renderReport(
+        baseReport({
+            metrics: {
+                R1: { routes: 1, cells: [] },
+                R2: r2([
+                    row(),
+                    row({
+                        arm: "control",
+                        decided: 9,
+                        accepted: 8,
+                        acceptedRate: null,
+                        handFixRate: null,
+                    }),
+                ]),
+            },
+        }),
+    );
+
+    assert.match(markdown, /- Routes: 1 recorded[^\n]*\n- R2: routed threads end to end/);
+    assert.match(
+        markdown,
+        /\n\| tier rule \| tier \| arm \| assigned \| count \| accepted \| pending \| unknown \| decided \| rate \| cost per accepted \| median rounds \| hand fixes \| deviations \|\n\|---/,
+    );
+    assert.match(
+        markdown,
+        /\n\| v1 \| high \| router \| deepseek\/deepseek-flash \| 12 \| 9 \| 1 \| 1 \| 10 \| 90% \| \$1\.50 \| 2 \| 25% of 8 \| 1 \|\n/,
+    );
+    // 9 decided: no rate.
+    assert.match(
+        markdown,
+        /\n\| v1 \| high \| control \| [^\n]* \| 9 \| - \| \$1\.50 \| 2 \| - \| 1 \|\n/,
+    );
+    assert.match(
+        markdown,
+        /\n- Not accepted: 1 dropped, 2 closed PR, 0 reverted, 4 reopened \(by kind: attached 3, other 1\)\.\n- Eligible night shifts: 3 of 8 \(38%\)\./,
+    );
+    assert.doesNotMatch(markdown, /more rows in findings\.json/);
+
+    const many = renderReport(
+        baseReport({
+            metrics: { R2: r2(Array.from({ length: 12 }, (_, i) => row({ arm: `arm${i}` }))) },
+        }),
+    );
+
+    assert.equal(many.split("\n").filter((line) => line.startsWith("| v1 |")).length, 10);
+    assert.match(many, /- 2 more rows in findings\.json\./);
+
+    assert.doesNotMatch(
+        renderReport(baseReport({ metrics: { R2: { ...r2([]), routes: 0 } } })),
+        /R2:|Eligible night shifts/,
+    );
+    assert.doesNotMatch(renderReport(baseReport({ metrics: {} })), /R2:/);
+    // No thread is not accepted: no line.
+    assert.doesNotMatch(
+        renderReport(
+            baseReport({
+                metrics: {
+                    R2: {
+                        ...r2([row()]),
+                        totals: row({
+                            notAccepted: 0,
+                            notAcceptedWhy: { dropped: 0, closedPr: 0, reverted: 0, reopened: 0 },
+                        }),
+                    },
+                },
+            }),
+        ),
+        /Not accepted:/,
+    );
+});

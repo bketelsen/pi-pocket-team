@@ -26,6 +26,7 @@ import {
     loadBlockerGuards,
     loadGithub,
     loadGoalStops,
+    loadParentEdits,
     loadPlanSessions,
     loadReviewAnswers,
     loadReviewCalls,
@@ -3132,4 +3133,105 @@ test("loadData and Q1: a spawn 60 days ago with a send and a blocking answer 29 
         ]),
         [["acme/w#5", SHA_B, "1"]],
     );
+});
+
+test("loadParentEdits: edit and write calls after the first subagent answer of each session, and no text", () => {
+    const { pocketDir } = setup();
+    const call = (id: string, name: string) => ({
+        type: "toolCall",
+        id,
+        name,
+        arguments: { path: "/x/secret-path.ts", content: "body" },
+    });
+
+    addRows(pocketDir, (db) => {
+        // Not an answer: the mark is not at the start, so it does not start the count.
+        insertUser(db, 900, SESSION_T1, NOW - 11 * HOUR, "Quote: [subagent rv answered] Ready");
+        // Before the first answer: not counted.
+        insertEntry(db, 901, SESSION_T1, NOW - 10 * HOUR, [call("e1", "edit")]);
+        insertUser(db, 902, SESSION_T1, NOW - 9 * HOUR, "[subagent w answered] Done.");
+        insertEntry(db, 903, SESSION_T1, NOW - 8 * HOUR, [call("e2", "edit")]);
+        insertEntry(db, 904, SESSION_T1, NOW - 7 * HOUR, [
+            call("e3", "write"),
+            call("e4", "edit"),
+            call("e5", "read"),
+        ]);
+        // A later answer does not move the start.
+        insertUser(db, 905, SESSION_T1, NOW - 6 * HOUR, "[subagent rv answered] Ready");
+        // No answer in this session: its edits do not count.
+        insertEntry(db, 906, SESSION_T2, NOW - HOUR, [call("e6", "edit")]);
+    });
+
+    const db = openPocket(path.join(pocketDir, "pocket.sqlite"));
+    const rows = loadParentEdits(db, new Set([SESSION_T2, SESSION_T1, 999]));
+    const empty = loadParentEdits(db, []);
+
+    db.close();
+
+    assert.deepEqual(rows, [
+        { c: SESSION_T1, firstAnswerAt: NOW - 9 * HOUR, edits: 3 },
+        { c: SESSION_T2, firstAnswerAt: null, edits: 0 },
+        { c: 999, firstAnswerAt: null, edits: 0 },
+    ]);
+    assert.ok(!JSON.stringify(rows).includes("secret-path"));
+    assert.deepEqual(empty, []);
+});
+
+test("loadData: the routed sessions get parent edit rows, and a spawn row has its thinking", () => {
+    const { pocketDir, odradeDir, homesDir, run } = setup();
+
+    addRows(pocketDir, (db) => {
+        insertEntry(db, 910, SESSION_T1, NOW - HOUR, [
+            {
+                type: "toolCall",
+                id: "s1",
+                name: "subagent",
+                arguments: {
+                    action: "spawn",
+                    name: "flash",
+                    model: "deepseek/deepseek-flash",
+                    thinking: "high",
+                    message: "work",
+                },
+            },
+        ]);
+    });
+
+    const data = loadData({
+        pocketDir,
+        odradeDir,
+        homesDir,
+        now: NOW,
+        hours: 24,
+        useGithub: false,
+        run,
+    });
+
+    assert.equal(data.sourceErrors.parentEdits, undefined);
+    // T1 is the only routed thread: its session 11 gets a row.
+    assert.deepEqual(data.parentEdits, [{ c: SESSION_T1, firstAnswerAt: null, edits: 0 }]);
+    assert.deepEqual(
+        data.routeSpawns.map((spawn: { model: string; thinking: string | null }) => [
+            spawn.model,
+            spawn.thinking,
+        ]),
+        [
+            ["old/model", null],
+            ["deepseek/deepseek-flash", "high"],
+        ],
+    );
+
+    const root = tmp();
+    const none = loadData({
+        pocketDir: path.join(root, "nowhere"),
+        odradeDir: path.join(root, "nowhere"),
+        homesDir: path.join(root, "nowhere"),
+        now: NOW,
+        hours: 24,
+        useGithub: false,
+        run: () => "",
+    });
+
+    assert.ok(none.sourceErrors.parentEdits);
+    assert.deepEqual(none.parentEdits, []);
 });
