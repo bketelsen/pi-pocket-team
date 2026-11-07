@@ -11,9 +11,10 @@ import {
     writeFileSync,
 } from "node:fs";
 import { spawnSync } from "node:child_process";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
-import { allowanceSpent } from "./lib/runner.mjs";
+import { allowanceSpent, checkoutOf } from "./lib/runner.mjs";
 import { limitReached } from "./lib/proc.mjs";
 import { rm } from "node:fs/promises";
 import {
@@ -127,6 +128,50 @@ test("a dry run of each pilot task exits 0 with no data dir and no bwrap", async
     }
 
     assert.equal(existsSync(data), false, "a dry run makes no data dir");
+});
+
+test("the checkout: --checkout, else the manifest's checkout, else ~/projects/<name>", async () => {
+    const task = { repo: "frostyard/nsl" };
+
+    assert.equal(checkoutOf("/x/y", { checkout: "/a/b" }, task), "/x/y");
+    assert.equal(checkoutOf(undefined, { checkout: "/a/b" }, task), "/a/b");
+    assert.equal(
+        checkoutOf(undefined, { checkout: "~/projects/frostyard/nsl" }, task),
+        join(homedir(), "projects", "frostyard", "nsl"),
+    );
+    assert.equal(checkoutOf(undefined, {}, task), join(homedir(), "projects", "nsl"));
+
+    const file = join(fixture.root, "with-checkout.json");
+
+    writeFileSync(
+        file,
+        JSON.stringify({
+            schema: 1,
+            checkout: fixture.repo,
+            tasks: [fixtureTask(fixture, "ok", { name: "ok" })],
+        }),
+    );
+
+    const result = await runScript(
+        "run.mjs",
+        [
+            "--manifest",
+            file,
+            "--task",
+            "ok",
+            "--model",
+            PRICED,
+            "--stage",
+            "pilot",
+            "--dry-run",
+            "--results",
+            fixture.results,
+        ],
+        testEnv(fixture),
+    );
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.match(result.stdout, new RegExp(`^checkout: ${fixture.repo} at `, "m"));
 });
 
 test("usage errors exit 1", async (t) => {

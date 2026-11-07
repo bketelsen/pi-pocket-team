@@ -3,9 +3,10 @@
 // model providers, the halogen LAN endpoint and module registries must stay reachable; /etc/hosts maps GitHub to
 // 127.0.0.1.
 import { existsSync, readdirSync, realpathSync, statSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, relative, sep } from "node:path";
-import { BENCH_DIR } from "./common.mjs";
+import { BENCH_DIR, writeAtomic } from "./common.mjs";
 
 /** The variables a sandbox may hold; nothing else is set (no GH_TOKEN, no SSH_AUTH_SOCK). */
 export const ALLOWED_ENV = [
@@ -87,12 +88,22 @@ export function nodePlacement(execPath, installs) {
 
 /**
  * The bwrap argv (without `bwrap` itself) for 1 command of a try.
- * `paths`: { work, session, cache, agentDir, settings, models, auth, header, hosts, pocket, miseInstalls }.
+ * `paths`: { work, session, cache, agentDir, settings, models, auth, header, hosts, pocket, miseInstalls, passwd,
+ * group, overlay?, trustedGit? }.
  * `exists` and `realpath` are injectable, so a dry run in CI builds the same argv with no host file.
+ * `agent: false` leaves out the `/agent` mounts and `PI_CODING_AGENT_DIR`: a check or hidden-test command needs no
+ * credential, so it gets none (`paths` then needs no agent files). With no `paths.session`, `/session` is left out.
  */
 export function bwrapArgs(
     paths,
-    { tryNo, command, execPath = process.execPath, exists = existsSync, realpath = realpathSync },
+    {
+        tryNo,
+        command,
+        agent = true,
+        execPath = process.execPath,
+        exists = existsSync,
+        realpath = realpathSync,
+    },
 ) {
     const installs = paths.miseInstalls && exists(paths.miseInstalls) ? paths.miseInstalls : null;
     const node = nodePlacement(execPath, installs);
@@ -147,9 +158,14 @@ export function bwrapArgs(
         "/tmp",
         "--tmpfs",
         "/home/bench",
+        // A writable `/run`: tools create folders such as `/run/systemd/` there.
+        "--tmpfs",
+        "/run",
     ];
 
-    for (const etc of ["/etc/ssl", "/etc/pki"]) {
+    // `/etc/alternatives` holds only links into `/usr`; without it, a `/usr/bin` tool that is such a link (`awk`,
+    // `which` on Debian and Fedora hosts) is missing in the sandbox.
+    for (const etc of ["/etc/ssl", "/etc/pki", "/etc/alternatives"]) {
         if (exists(etc)) {
             args.push("--ro-bind", etc, etc);
         }
@@ -167,6 +183,15 @@ export function bwrapArgs(
         "/etc/hosts",
     );
 
+    // The sandbox's own user (see `identityFiles`); a caller with no such paths gets no bind.
+    if (paths.passwd) {
+        args.push("--ro-bind", paths.passwd, "/etc/passwd");
+    }
+
+    if (paths.group) {
+        args.push("--ro-bind", paths.group, "/etc/group");
+    }
+
     if (installs) {
         args.push("--ro-bind", installs, "/tools");
     }
@@ -175,40 +200,51 @@ export function bwrapArgs(
         args.push("--ro-bind", ...node.bind);
     }
 
-    args.push(
-        "--ro-bind",
-        paths.pocket,
-        "/pocket",
-        "--bind",
-        paths.agentDir,
-        "/agent",
-        "--ro-bind",
-        paths.header,
-        "/agent/AGENTS.md",
-        "--ro-bind",
-        paths.settings,
-        "/agent/settings.json",
-        "--ro-bind",
-        paths.models,
-        "/agent/models.json",
-        "--bind",
-        paths.auth,
-        "/agent/auth.json",
-        "--bind",
-        paths.work,
-        "/work",
-        "--bind",
-        paths.session,
-        "/session",
-        "--bind",
-        paths.cache,
-        "/cache",
-        "--chdir",
-        "/work",
-    );
+    args.push("--ro-bind", paths.pocket, "/pocket");
+
+    if (agent) {
+        args.push(
+            "--bind",
+            paths.agentDir,
+            "/agent",
+            "--ro-bind",
+            paths.header,
+            "/agent/AGENTS.md",
+            "--ro-bind",
+            paths.settings,
+            "/agent/settings.json",
+            "--ro-bind",
+            paths.models,
+            "/agent/models.json",
+            "--bind",
+            paths.auth,
+            "/agent/auth.json",
+        );
+    }
+
+    args.push("--bind", paths.work, "/work");
+
+    if (paths.session) {
+        args.push("--bind", paths.session, "/session");
+    }
+
+    args.push("--bind", paths.cache, "/cache");
+
+    // A staging folder of trusted files (the reference's hidden tests), copied over `/work` inside the sandbox.
+    if (paths.overlay) {
+        args.push("--ro-bind", paths.overlay, "/overlay");
+    }
+
+    // The bench's own git directory for the submitted diff (a disposable clone at the parent): the worker's `.git`
+    // is never read.
+    if (paths.trustedGit) {
+        args.push("--bind", paths.trustedGit, "/trusted.git");
+    }
+
+    args.push("--chdir", "/work");
 
     const env = {
-        PI_CODING_AGENT_DIR: "/agent",
+        ...(agent ? { PI_CODING_AGENT_DIR: "/agent" } : {}),
         HOME: "/home/bench",
         PATH: pathDirs.join(":"),
         GOMODCACHE: "/cache/go",
@@ -221,10 +257,46 @@ export function bwrapArgs(
         args.push("--setenv", key, value);
     }
 
-    args.push("--", ...command);
+    // Every command runs under umask 022, as on CI and a developer's machine (the server's own umask is 0077, and
+    // a test that writes a 0644 file would get 0600). The command's words go to `exec` as they are, with no other
+    // shell parsing; the bench's data files are written on the host with their own modes.
+    args.push("--", ...UMASK_WRAPPER, ...command);
 
     return args;
 }
+
+/** The sandbox's `/etc/passwd` and `/etc/group` in the data dir. */
+export const identityPaths = (data) => ({
+    passwd: join(data, "agent-files", "passwd"),
+    group: join(data, "agent-files", "group"),
+});
+
+/**
+ * Write the sandbox's `/etc/passwd` and `/etc/group` (mode 0600, atomically, only when missing or different): 1 user
+ * `bench` with the host's uid and gid, home `/home/bench`. Without them, `os.userInfo()` fails in the sandbox
+ * (`uv_os_get_passwd returned ENOENT`), and so does any code that calls it. bwrap keeps the host uid, because it does
+ * not unshare the user namespace. Returns the paths for `bwrapArgs`.
+ */
+export async function identityFiles(data, { uid = process.getuid(), gid = process.getgid() } = {}) {
+    const paths = identityPaths(data);
+    const wanted = {
+        passwd: `bench:x:${uid}:${gid}:bench:/home/bench:/bin/bash\n`,
+        group: `bench:x:${gid}:\n`,
+    };
+
+    for (const [name, text] of Object.entries(wanted)) {
+        const now = await readFile(paths[name], "utf8").catch(() => null);
+
+        if (now !== text) {
+            await writeAtomic(paths[name], text);
+        }
+    }
+
+    return paths;
+}
+
+/** The start of every sandbox command: a shell that sets umask 022, then runs the command's words as they are. */
+export const UMASK_WRAPPER = ["/bin/sh", "-c", 'umask 022 && exec "$@"', "sh"];
 
 /** The Pi command of an attempt, inside the sandbox. */
 export const piCommand = (model, prompt) => [

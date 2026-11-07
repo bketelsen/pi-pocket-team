@@ -331,7 +331,7 @@ test("self-preference: each judge's grade of its own family against the other ju
         r("github-copilot/gpt-6-luna", [4, 3]),
         r("github-copilot/gpt-6.1-sol", [4, 2]),
         r("github-copilot/claude-sonnet-5.5", [2, 4]),
-        r("anthropic/claude-haiku-5-5", [3, null]),
+        r("github-copilot/claude-haiku-5.5", [3, null]),
         r("deepseek/deepseek-flash", [1, 1]),
     ]);
 

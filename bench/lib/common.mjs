@@ -2,7 +2,18 @@
 // The bench keeps its private files (spend, slots, run dirs, transcripts) in the data dir, mode 0700 for folders and
 // 0600 for files; only the result files go to the repository's ignored `bench/results/`.
 import { mkdirSync, readFileSync } from "node:fs";
-import { mkdir, readFile, rename, rmdir, stat, writeFile } from "node:fs/promises";
+import {
+    chmod,
+    lstat,
+    mkdir,
+    readFile,
+    readdir,
+    rename,
+    rm,
+    rmdir,
+    stat,
+    writeFile,
+} from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
@@ -175,4 +186,63 @@ export function median(values) {
     const middle = Math.floor(sorted.length / 2);
 
     return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
+}
+
+/** Add the owner's write and search permission to a folder and every folder below it; links are not followed. */
+async function makeWritable(path) {
+    let info;
+
+    try {
+        info = await lstat(path);
+    } catch {
+        return;
+    }
+
+    if (!info.isDirectory()) {
+        return;
+    }
+
+    await chmod(path, (info.mode & 0o7777) | 0o700).catch(() => {});
+
+    let names = [];
+
+    try {
+        names = await readdir(path);
+    } catch {
+        return;
+    }
+
+    for (const name of names) {
+        await makeWritable(join(path, name));
+    }
+}
+
+/**
+ * Remove a scratch tree or cache (a missing path is fine). Go writes its module cache read-only, so a plain `rm`
+ * fails with EACCES or EPERM: then the owner's write permission goes on every folder below the path (`chmod -R u+w`,
+ * no symbolic link followed), and `rm` runs again.
+ */
+export async function removeTree(path) {
+    try {
+        await rm(path, { recursive: true, force: true });
+    } catch (error) {
+        if (error.code !== "EACCES" && error.code !== "EPERM") {
+            throw error;
+        }
+
+        await makeWritable(path);
+        await rm(path, { recursive: true, force: true });
+    }
+}
+
+/**
+ * `removeTree` for a cleanup (a `finally`): a failure is logged with its path and error, and never thrown, so it
+ * cannot hide the real outcome or stop the work around it.
+ */
+export async function cleanupTree(path, log = (line) => console.error(line)) {
+    try {
+        await removeTree(path);
+    } catch (error) {
+        log(`cleanup: cannot remove ${path}: ${error.message.split("\n")[0]}`);
+    }
 }

@@ -3,7 +3,8 @@
 import { DatabaseSync } from "node:sqlite";
 import { HOUR, MINUTE } from "../common.mjs";
 
-const SCHEMA = [
+/** The tables of the fixture (the bench's harvest tests build their own database with them). */
+export const SCHEMA = [
     `CREATE TABLE entries (
         id INTEGER PRIMARY KEY,
         conversation_id INTEGER NOT NULL,
