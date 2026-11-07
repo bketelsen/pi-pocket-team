@@ -2,7 +2,7 @@
 // with hidden tests), a small Pocket database with Pocket's tables, and a fake `gh`. Nothing here reads the real
 // Pocket database, GitHub or a model.
 import { DatabaseSync } from "node:sqlite";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { SCHEMA } from "../../audit/fixtures/pocket-db.mjs";
 import { git } from "./helpers.mjs";
@@ -62,6 +62,58 @@ export function makeNodeRepo(repo) {
     });
     git(repo, "add", ".");
     git(repo, "commit", "--quiet", "-m", "fix add, add mul");
+    git(repo, "checkout", "--quiet", "main");
+    git(repo, "merge", "--quiet", "--no-ff", "-m", "Merge the fix", "fix");
+
+    return { repo, parent, merge: git(repo, "rev-parse", "HEAD") };
+}
+
+/**
+ * A second repository of the same shape whose PR adds hidden tests with needs of their own: `tool.test.mjs` runs the
+ * support script `fixtures/sum.sh` (mode 100755), and `feature.test.mjs` passes only with `FEATURE=1` in its
+ * environment. At the parent, both fail by an assertion (the sum is wrong). Returns `{ repo, parent, merge }`.
+ */
+export function makeExtraRepo(repo) {
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init", "--quiet", "--initial-branch=main");
+    writeFiles(repo, {
+        "package.json": `${JSON.stringify({ name: "extra", private: true, type: "module", scripts: { link: "node link.mjs" } })}\n`,
+        "link.mjs": "// The fixture's link step: nothing to link.\n",
+        "lib.mjs": "export const add = (a, b) => a - b;\n",
+    });
+    git(repo, "add", ".");
+    git(repo, "commit", "--quiet", "-m", "parent");
+
+    const parent = git(repo, "rev-parse", "HEAD");
+
+    git(repo, "checkout", "--quiet", "-b", "fix");
+    writeFiles(repo, {
+        "lib.mjs": "export const add = (a, b) => a + b;\n",
+        "fixtures/sum.sh": "#!/bin/sh\necho 3\n",
+        "tool.test.mjs": [
+            'import assert from "node:assert/strict";',
+            'import { execFileSync } from "node:child_process";',
+            'import { test } from "node:test";',
+            'import { add } from "./lib.mjs";',
+            "",
+            'test("tool", () => assert.equal(String(add(1, 2)), execFileSync("./fixtures/sum.sh", { encoding: "utf8" }).trim()));',
+            "",
+        ].join("\n"),
+        "feature.test.mjs": [
+            'import assert from "node:assert/strict";',
+            'import { test } from "node:test";',
+            'import { add } from "./lib.mjs";',
+            "",
+            'test("feature", () => {',
+            "    assert.equal(add(1, 2), 3);",
+            '    assert.equal(process.env.FEATURE, "1");',
+            "});",
+            "",
+        ].join("\n"),
+    });
+    chmodSync(join(repo, "fixtures", "sum.sh"), 0o755);
+    git(repo, "add", ".");
+    git(repo, "commit", "--quiet", "-m", "fix add, add tests");
     git(repo, "checkout", "--quiet", "main");
     git(repo, "merge", "--quiet", "--no-ff", "-m", "Merge the fix", "fix");
 

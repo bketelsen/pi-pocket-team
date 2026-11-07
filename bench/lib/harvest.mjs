@@ -8,7 +8,14 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { parseArgs, promisify } from "node:util";
 import { features, sshHostNames } from "../../model-router.ts";
-import { dataDir, privateDir, readJson, writeJsonAtomic } from "./common.mjs";
+import {
+    cleanupTree,
+    dataDir,
+    privateDir,
+    readJson,
+    removeTree,
+    writeJsonAtomic,
+} from "./common.mjs";
 import { scratchClone } from "./clone.mjs";
 import { COMMAND_MS, failText, makeCache, runInSandbox } from "./exec.mjs";
 import {
@@ -34,6 +41,7 @@ import {
     parseNameStatus,
     proposeCommands,
     pytestOutcome,
+    reporterCommands,
     testLanguage,
 } from "./hidden.mjs";
 import { TASK_FIELDS, UsageError, loadManifest } from "./manifest.mjs";
@@ -401,7 +409,7 @@ export async function validateCandidate(ctx, candidate) {
     const outcome = (ok, reason, fields = null) => ({ ok, reason, fields, validation });
     let result;
 
-    await rm(base, { recursive: true, force: true });
+    await removeTree(base);
     await privateDir(cacheDir(ctx.data, repo));
     await rm(logFile, { force: true });
 
@@ -505,10 +513,13 @@ export async function validateCandidate(ctx, candidate) {
     } catch (error) {
         result = outcome(false, `validation error: ${error.message.split("\n")[0]}`);
     } finally {
-        await rm(base, { recursive: true, force: true });
+        await cleanupTree(base, ctx.log);
     }
 
-    await writeJsonAtomic(cacheFile, { key, outcome: result });
+    // An unexpected error is not cached: a later run validates the candidate again.
+    if (!result.reason?.startsWith("validation error:")) {
+        await writeJsonAtomic(cacheFile, { key, outcome: result });
+    }
 
     return result;
 }
@@ -619,7 +630,7 @@ export async function harvestRepo(ctx, repo, list, dropped) {
             const outcomes = await mapLimit(batch, ctx.parallel, (c) => {
                 ctx.log(`${c.pr}: validating (${stratum}, ${c.thread.briefSource})`);
 
-                return (ctx.validate ?? validateCandidate)(ctx, c);
+                return validateSafely(ctx, c);
             });
 
             batch.forEach((c, i) => {
@@ -651,6 +662,22 @@ export async function harvestRepo(ctx, repo, list, dropped) {
     }
 
     return manifest;
+}
+
+/**
+ * Validate 1 candidate; an unexpected error (thrown anywhere, a cleanup too) drops this candidate with a reason, and
+ * the harvest goes on with the next.
+ */
+export async function validateSafely(ctx, candidate) {
+    try {
+        return await (ctx.validate ?? validateCandidate)(ctx, candidate);
+    } catch (error) {
+        return {
+            ok: false,
+            reason: `validation error: ${String(error?.message ?? error).split("\n")[0]}`,
+            validation: {},
+        };
+    }
 }
 
 /** The manifest file of a repository: `<out>/<github owner>/<name>.json`. */
@@ -694,36 +721,69 @@ export async function harvest(ctx, threads) {
 
 /**
  * The named tests of a task's `hiddenTests` that are not valid: each must fail by an assertion at the parent (the
- * tree holds the hidden files) and pass at the merge, by the same reporters and rules as the harvest. Returns
- * `[{ file, name, reason }]`.
+ * tree holds the hidden files) and pass at the merge, by the same reporters and rules as the harvest. The discovery
+ * is the reviewed `hiddenCommand` itself with a reporter added at each runner (`reporterCommands`), so the owner's
+ * settings (an environment variable, `-tags`, a loader, a venv path) stay. Returns `[{ file, name, reason }]`, or
+ * `{ error }` when a segment of the command has no runner to add a reporter to.
  */
 export async function namedTestsInvalid(ctx, { task, checkout, trees, logFile }) {
     const named = task.hiddenTests.filter((t) => t.names.length && testLanguage(t.file));
-    const { prefix } = await commandsAt(checkout, task.merge);
+    const byLanguage = (language) => named.filter((t) => testLanguage(t.file) === language);
+    const commands = reporterCommands(task.hiddenCommand, {
+        nodeFiles: byLanguage("node").map((t) => t.file),
+    });
+
+    if (commands.error) {
+        return { error: commands.error };
+    }
+
     const module = goModule(await fileAt(checkout, task.merge, "go.mod"));
+    const run = async (tree, command) =>
+        (
+            await runInSandbox(ctx.sandbox, {
+                ...tree,
+                command,
+                timeoutMs: ctx.timeouts.hidden,
+                logFile,
+            })
+        ).stdout;
+
+    const outcome = async (language, tree, files, goNames) => {
+        if (language === "node") {
+            return nodeOutcome(await run(tree, commands.node.join("; ") || "true"), files);
+        }
+
+        if (language === "go") {
+            return goFileOutcome(await run(tree, commands.go.join("; ") || "true"), {
+                files,
+                goNames,
+                module,
+            });
+        }
+
+        for (const { junit } of commands.python) {
+            await rm(join(tree.cache, junit.replace(/^\/cache\//, "")), { force: true });
+        }
+
+        await run(tree, commands.python.map((p) => p.command).join("; ") || "true");
+
+        const xml = await Promise.all(
+            commands.python.map(({ junit }) =>
+                readFile(join(tree.cache, junit.replace(/^\/cache\//, "")), "utf8").catch(() => ""),
+            ),
+        );
+
+        return pytestOutcome(xml.join("\n"), files);
+    };
+
     const invalid = [];
 
     for (const language of [...new Set(named.map((t) => testLanguage(t.file)))].sort()) {
-        const entries = named.filter((t) => testLanguage(t.file) === language);
+        const entries = byLanguage(language);
         const files = entries.map((t) => t.file);
         const goNames = Object.fromEntries(entries.map((t) => [t.file, t.names]));
-        const facts = { language, files, goNames, module, prefix, logFile };
-        const atMerge = await languageOutcome(ctx, { ...facts, tree: trees.merge });
-        const atParent = atMerge && (await languageOutcome(ctx, { ...facts, tree: trees.parent }));
-
-        if (!atMerge || !atParent) {
-            invalid.push(
-                ...entries.flatMap((t) =>
-                    t.names.map((name) => ({
-                        file: t.file,
-                        name,
-                        reason: "cannot be run by name",
-                    })),
-                ),
-            );
-            continue;
-        }
-
+        const atMerge = await outcome(language, trees.merge, files, goNames);
+        const atParent = await outcome(language, trees.parent, files, goNames);
         const { valid, dropped } = classify({ files, parent: atParent, merge: atMerge });
 
         for (const t of entries) {
@@ -778,7 +838,7 @@ export async function revalidateTask(ctx, task, checkout) {
         return run;
     };
 
-    await rm(base, { recursive: true, force: true });
+    await removeTree(base);
     await privateDir(base);
 
     try {
@@ -839,6 +899,13 @@ export async function revalidateTask(ctx, task, checkout) {
             // must fail by an assertion at the parent and pass at the merge, as the harvest classifies it.
             const invalid = await namedTestsInvalid(ctx, { task, checkout, trees, logFile });
 
+            if (invalid.error) {
+                entry.hiddenNames = "fail";
+                entry.reason = invalid.error;
+
+                return entry;
+            }
+
             entry.hiddenNames = invalid.length ? "fail" : "pass";
 
             if (invalid.length) {
@@ -859,7 +926,7 @@ export async function revalidateTask(ctx, task, checkout) {
 
         return entry;
     } finally {
-        await rm(base, { recursive: true, force: true });
+        await cleanupTree(base, ctx.log ?? ((line) => console.error(line)));
     }
 }
 

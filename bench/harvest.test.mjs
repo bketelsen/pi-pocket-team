@@ -2,7 +2,7 @@
 // night shifts and other delegations, a validation of a fixture PR behind the fake bwrap (hidden tests kept and
 // dropped), the written manifest, the validation cache, and `--revalidate`. No network and no real gh.
 import assert from "node:assert/strict";
-import { mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
@@ -18,7 +18,8 @@ import { loadManifest } from "./lib/manifest.mjs";
 import { readRoster, repositoriesOf, seededShuffle } from "./lib/owners.mjs";
 import { delegationTask, goalBrief, readThreads } from "./lib/pocket.mjs";
 import { FAKE_BWRAP, makeFixture, runScript, testEnv } from "./fixtures/helpers.mjs";
-import { fakeGh, makeNodeRepo, makePocketDb, wrapped } from "./fixtures/harvest.mjs";
+import { fakeGh, makeExtraRepo, makeNodeRepo, makePocketDb, wrapped } from "./fixtures/harvest.mjs";
+import { cleanupTree, removeTree } from "./lib/common.mjs";
 
 const REPO = "bketelsen/pi-pocket-team";
 const NOW = Date.UTC(2026, 10, 7, 12, 0);
@@ -455,4 +456,141 @@ test("roster: repositories and checkout folders from the profiles' front matter"
     assert.deepEqual(roster.names, ["bketelsen/fleet", "frostyard/x"]);
     assert.equal(roster.checkouts["bketelsen/fleet"], "/home/x/projects/fleet");
     assert.equal(roster.checkouts["frostyard/x"], "/abs/x");
+});
+
+test("--revalidate keeps the reviewed hidden command's settings: a test that needs FEATURE=1 is accepted", async () => {
+    const extra = makeExtraRepo(join(fixture.root, "extra-repo"));
+    const file = join(fixture.root, "reviewed-extra.json");
+
+    writeFileSync(
+        file,
+        JSON.stringify({
+            schema: 1,
+            repo: REPO,
+            checkout: extra.repo,
+            tasks: [
+                {
+                    id: "extra-1",
+                    repo: REPO,
+                    thread: "T1",
+                    pr: `${REPO}#1`,
+                    parent: extra.parent,
+                    merge: extra.merge,
+                    brief: "Fix add.",
+                    briefSource: "delegation",
+                    setup: "PI_POCKET_CHECKOUT=/pocket node link.mjs",
+                    check: "true",
+                    hiddenTests: [{ file: "feature.test.mjs", names: ["feature"] }],
+                    hiddenCommand:
+                        "FEATURE=1 PI_POCKET_CHECKOUT=/pocket node --test --test-name-pattern='^(?:feature)$' 'feature.test.mjs'",
+                    size: 10,
+                    features: null,
+                    owner: { keep: true, reason: "", scopeMatches: true, commandsConfirmed: true },
+                },
+            ],
+            validation: {},
+        }),
+    );
+
+    const result = await runScript(
+        "harvest.mjs",
+        ["--revalidate", file, "--bwrap", FAKE_BWRAP, "--pocket", fixture.pocket],
+        testEnv(fixture, { BENCH_DATA: join(fixture.root, "reval-extra-data") }),
+    );
+    const entry = JSON.parse(readFileSync(file, "utf8")).validation["extra-1"];
+
+    assert.equal(result.code, 0, result.stdout + result.stderr);
+    assert.equal(entry.ok, true, entry.reason);
+    assert.equal(entry.hiddenNames, "pass");
+});
+
+test("a scratch tree with a read-only folder and a read-only file (as Go's module cache) is removed", async () => {
+    const tree = join(fixture.root, "readonly-tree");
+    const deep = join(tree, "cache", "go", "mod@v1");
+
+    mkdirSync(deep, { recursive: true });
+    writeFileSync(join(deep, "CONTRIBUTORS"), "x\n");
+    chmodSync(join(deep, "CONTRIBUTORS"), 0o444);
+    chmodSync(deep, 0o555);
+    chmodSync(join(tree, "cache", "go"), 0o555);
+    await removeTree(tree);
+    assert.equal(existsSync(tree), false);
+    await removeTree(tree);
+
+    // A cleanup that cannot remove a path logs it and does not throw.
+    const locked = join(fixture.root, "locked");
+    const lines = [];
+
+    mkdirSync(join(locked, "inner"), { recursive: true });
+    chmodSync(locked, 0o555);
+
+    try {
+        await cleanupTree(join(locked, "inner"), (line) => lines.push(line));
+        assert.match(lines[0] ?? "", /^cleanup: cannot remove .*inner: /);
+    } finally {
+        chmodSync(locked, 0o755);
+    }
+});
+
+test("a candidate whose validation throws is dropped with a reason, and the next candidate is still validated", async () => {
+    const prs = {};
+    const list = [1, 2].map((n) => {
+        prs[`${REPO}#${n}`] = {
+            state: "MERGED",
+            mergedAt: "2026-10-01T00:00:00Z",
+            mergeCommit: { oid: node.merge },
+            additions: 10,
+            deletions: 0,
+        };
+
+        return {
+            thread: {
+                id: `T${n}`,
+                nightShift: true,
+                brief: "b",
+                briefSource: "night-shift",
+                route: null,
+            },
+            pr: `${REPO}#${n}`,
+            number: n,
+            repo: REPO,
+        };
+    });
+    const validated = [];
+    const manifest = await harvestRepo(
+        stubContext(
+            fakeGh({ prs }),
+            async (_ctx, c) => {
+                validated.push(c.number);
+
+                if (validated.length === 1) {
+                    throw new Error("EACCES: permission denied, unlink 'x'\nstack");
+                }
+
+                return {
+                    ok: true,
+                    validation: {},
+                    fields: {
+                        parent: node.parent,
+                        setup: "true",
+                        check: "true",
+                        hiddenTests: [],
+                        hiddenCommand: null,
+                        features: null,
+                    },
+                };
+            },
+            { parallel: 1 },
+        ),
+        REPO,
+        list,
+        [],
+    );
+
+    assert.equal(validated.length, 2);
+    assert.equal(manifest.tasks.length, 1);
+    assert.deepEqual(
+        manifest.dropped.map((d) => d.reason),
+        ["validation error: EACCES: permission denied, unlink 'x'"],
+    );
 });

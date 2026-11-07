@@ -739,3 +739,91 @@ export function goFileOutcome(text, { files, goNames, module }) {
 
     return { units, broken };
 }
+
+// ---------------------------------------------------------------------------------------------------------------
+// Reporters added to a reviewed hidden command (`--revalidate`)
+// ---------------------------------------------------------------------------------------------------------------
+
+/** Split a shell command at `&&` outside quotes; each part trimmed. */
+export function splitAnd(command) {
+    const parts = [];
+    let quote = null;
+    let start = 0;
+    const text = String(command);
+
+    for (let i = 0; i < text.length; i += 1) {
+        const c = text[i];
+
+        if (quote) {
+            if (c === "\\" && quote === '"') {
+                i += 1;
+            } else if (c === quote) {
+                quote = null;
+            }
+        } else if (c === "\\") {
+            i += 1;
+        } else if (c === "'" || c === '"') {
+            quote = c;
+        } else if (c === "&" && text[i + 1] === "&") {
+            parts.push(text.slice(start, i).trim());
+            start = i + 2;
+            i += 1;
+        }
+    }
+
+    parts.push(text.slice(start).trim());
+
+    return parts.filter((part) => part !== "");
+}
+
+/** A word of a command as it can be written: plain, or in single or double quotes. */
+const wordPattern = (word) => {
+    const body = escapeRegex(word);
+
+    return new RegExp(`(^|\\s)(?:'${body}'|"${body}"|${body})(?=\\s|$)`, "g");
+};
+
+/** The pytest junit file of discovery segment `i`, in the sandbox's cache. */
+export const junitOf = (i) => `/cache/hidden-junit-${i}.xml`;
+
+/**
+ * The discovery commands of a reviewed hidden command: each `&&` segment keeps every word (the environment prefix,
+ * the flags, a loader), and gets the machine-readable reporter at its runner: `go test` gets `-json`; `node --test`
+ * gets the TAP reporter and runs 1 named file at a time after a marker line (`FILE_MARK`); pytest gets
+ * `--junitxml=<junitOf(i)>`. `nodeFiles`: the named Node files. Returns `{ node: [cmd], go: [cmd], python: [{ command,
+ * junit }] }`, or `{ error }` for a segment with no runner found.
+ */
+export function reporterCommands(hiddenCommand, { nodeFiles = [] } = {}) {
+    const out = { node: [], go: [], python: [] };
+
+    for (const [i, segment] of splitAnd(hiddenCommand).entries()) {
+        if (/(^|\s)go\s+test(?=\s|$)/.test(segment)) {
+            out.go.push(segment.replace(/(^|\s)go\s+test(?=\s|$)/, "$1go test -json"));
+        } else if (/(^|\s)node(?=\s)/.test(segment) && /(^|\s)--test(?=\s|$)/.test(segment)) {
+            const bare = segment
+                .replace(/(^|\s)--test-reporter(?:-destination)?(?:=\S+|\s+\S+)(?=\s|$)/g, "$1")
+                .replace(/(^|\s)--test(?=\s|$)/, "$1--test --test-reporter=tap");
+            const present = nodeFiles.filter((file) => wordPattern(file).test(segment));
+            const others = present
+                .reduce((text, file) => text.replace(wordPattern(file), "$1"), bare)
+                .trimEnd();
+
+            for (const file of present) {
+                out.node.push(
+                    `printf '%s\\n' ${shellQuote(`${FILE_MARK}${file}`)}; ${others} ${shellQuote(file)}`,
+                );
+            }
+        } else if (/(^|[\s/])(?:pytest|py\.test)(?=\s|$)/.test(segment)) {
+            const junit = junitOf(i);
+
+            out.python.push({
+                command: `${segment.replace(/(^|\s)--junitxml(?:=\S+|\s+\S+)(?=\s|$)/g, "$1").trimEnd()} --junitxml=${junit}`,
+                junit,
+            });
+        } else {
+            return { error: `cannot add a reporter to the hidden command: ${segment}` };
+        }
+    }
+
+    return out;
+}

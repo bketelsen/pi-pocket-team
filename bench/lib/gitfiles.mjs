@@ -1,7 +1,7 @@
 // Git reads of the harvester and the scorer in a local checkout (no fetch unless asked), and the copy of the hidden
 // test files from the merge commit over a tree.
 import { execFile } from "node:child_process";
-import { lstat, mkdir, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, rm, symlink, writeFile } from "node:fs/promises";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 
@@ -82,8 +82,8 @@ async function isLink(path) {
  * Copy `files` (paths in the repository) as they are at `rev` in `checkout` over the tree `work`, on the host. Only
  * for a tree the bench made itself (the harvester's scratch clones, a staging folder): a worker's tree is overlaid
  * inside the sandbox (`bench/lib/score.mjs`). A path that leaves `work`, or that meets a symbolic link on its way
- * (a folder or the file itself), is refused: `mkdir` and `writeFile` would follow it. `git` (cwd, args) -> Buffer is
- * injectable.
+ * (a folder or the file itself), is refused: `mkdir` and `writeFile` would follow it. Each file gets its mode at
+ * `rev` (0755, 0644; a symbolic link of the reference is written as a link). `git` (cwd, args) -> Buffer is injectable.
  */
 export async function overlayFiles({ checkout, rev, files, work, git = gitBuffer }) {
     const root = resolve(work);
@@ -103,9 +103,38 @@ export async function overlayFiles({ checkout, rev, files, work, git = gitBuffer
             }
         }
 
+        const mode = await modeAt(checkout, rev, file, git);
         const content = await git(checkout, ["show", `${rev}:${file}`]);
 
         await mkdir(dirname(target), { recursive: true });
-        await writeFile(target, content);
+
+        if (mode === "120000") {
+            // A symbolic link of the reference: written as a link (its blob is the target), in the bench's own tree.
+            await rm(target, { force: true });
+            await symlink(content.toString("utf8"), target);
+        } else {
+            await writeFile(target, content);
+            await chmod(target, FILE_MODES[mode]);
+        }
     }
+}
+
+/** The file modes of git's regular files. */
+const FILE_MODES = { 100644: 0o644, 100755: 0o755 };
+
+/**
+ * A file's git mode at `rev` (`git ls-tree`): `100644`, `100755` or `120000`. Any other (a submodule, a folder, no
+ * entry) is refused.
+ */
+export async function modeAt(checkout, rev, file, git = gitBuffer) {
+    const entry = (await git(checkout, ["ls-tree", "-z", rev, "--", file])).toString("utf8");
+    const mode = /^(\d{6}) /.exec(entry)?.[1];
+
+    if (mode !== "120000" && !(mode in FILE_MODES)) {
+        throw new Error(
+            `hidden file ${file} has the mode ${mode ?? "none"} at ${rev}: not a file or a link`,
+        );
+    }
+
+    return mode;
 }

@@ -34,7 +34,7 @@ import {
 import { authPreflight, authPreflightArgs } from "./lib/runner.mjs";
 import { hostGit, s0Of, scoreMain, toolCalls } from "./lib/score.mjs";
 import { FAKE_BWRAP, bwrapWorks, git, makeFixture } from "./fixtures/helpers.mjs";
-import { makeNodeRepo } from "./fixtures/harvest.mjs";
+import { makeExtraRepo, makeNodeRepo } from "./fixtures/harvest.mjs";
 
 const REPO = "bketelsen/pi-pocket-team";
 const NOW = Date.UTC(2026, 10, 7, 12, 0);
@@ -79,7 +79,15 @@ const taskOf = (id, answers, extra = {}) => ({
  */
 async function attempt(
     task,
-    { change = {}, events = [], events2 = null, prepare = null, result = {}, budget = 100 } = {},
+    {
+        change = {},
+        events = [],
+        events2 = null,
+        prepare = null,
+        result = {},
+        budget = 100,
+        repo = node,
+    } = {},
 ) {
     const root = join(fixture.root, task.id);
     const data = join(root, "data");
@@ -87,7 +95,7 @@ async function attempt(
     const work = join(tryDir, "work");
 
     mkdirSync(join(tryDir, "cache"), { recursive: true });
-    await scratchClone({ checkout: node.repo, work, parent: node.parent, merge: node.merge });
+    await scratchClone({ checkout: repo.repo, work, parent: repo.parent, merge: repo.merge });
 
     for (const [file, text] of Object.entries(change)) {
         writeFileSync(join(work, file), text);
@@ -113,7 +121,7 @@ async function attempt(
 
     const manifest = join(root, "manifest.json");
 
-    writeFileSync(manifest, JSON.stringify({ schema: 1, checkout: node.repo, tasks: [task] }));
+    writeFileSync(manifest, JSON.stringify({ schema: 1, checkout: repo.repo, tasks: [task] }));
 
     const file = join(root, "results", "github-copilot__gpt-6-luna.json");
 
@@ -745,4 +753,102 @@ test("the host overlay (the harvester's own trees) refuses a path through a symb
         /symbolic link/,
     );
     assert.equal(existsSync(join(outside, "data.json")), false);
+});
+
+test("the submitted diff uses trusted git metadata: the worker's clean filter and `-diff` change nothing", async () => {
+    const task = taskOf("trusted-diff", { default: [GOOD(3)] });
+    const paths = await attempt(task, {
+        change: FIX,
+        prepare: (work) => {
+            git(work, "config", "filter.x.clean", "sh -c 'echo REPLACED'");
+            writeFileSync(join(work, ".gitattributes"), "* filter=x -diff\n");
+        },
+    });
+    const { code, result } = await score(paths);
+    const diff = readFileSync(result.diffFile, "utf8");
+
+    assert.equal(code, 0);
+    assert.match(diff, /^\+export const add = \(a, b\) => a \+ b;$/m, "the real content is judged");
+    assert.match(diff, /^\+a new file$/m);
+    assert.match(
+        diff,
+        /^\+\* filter=x -diff$/m,
+        "the worker's .gitattributes is a plain file of the change",
+    );
+    assert.doesNotMatch(diff, /REPLACED/);
+    assert.doesNotMatch(diff, /^Binary files/m);
+});
+
+test("a broken worker index (a lock and a corrupt index) does not stop the diff or the grades", async () => {
+    const task = taskOf("broken-index", { default: [GOOD(3)] });
+    const paths = await attempt(task, {
+        change: FIX,
+        prepare: (work) => {
+            writeFileSync(join(work, ".git", "index.lock"), "");
+            writeFileSync(join(work, ".git", "index"), "not an index");
+        },
+    });
+    const { code, result } = await score(paths);
+
+    assert.equal(code, 0);
+    assert.deepEqual(result.grades, [3, 3]);
+    assert.match(readFileSync(result.diffFile, "utf8"), /\+export const add/);
+    assert.equal(result.scoreError, undefined);
+});
+
+test("a scoring error after S0 saves S0 to S2 with scoreError and exits 3; a later run finishes and clears it", async () => {
+    const task = taskOf("score-error", { default: [GOOD(4)] });
+    const paths = await attempt(task, { change: FIX });
+    const failed = await score(paths, [], {
+        submittedDiff: async () => {
+            throw new Error("the submitted diff failed (timed out)\nmore");
+        },
+    });
+
+    assert.equal(failed.code, 3);
+    assert.deepEqual(failed.result.s0, { protocol: false, leakTry: false });
+    assert.equal(failed.result.s1, true);
+    assert.equal(failed.result.s2, true);
+    assert.equal(failed.result.judgePending, true);
+    assert.equal(failed.result.scoreError, "the submitted diff failed (timed out)");
+
+    const again = await score(paths);
+
+    assert.equal(again.code, 0);
+    assert.deepEqual(again.result.grades, [4, 4]);
+    assert.equal(again.result.judgePending, false);
+    assert.equal("scoreError" in again.result, false);
+    assert.match(readFileSync(again.result.diffFile, "utf8"), /\+export const add/);
+});
+
+test("S2 keeps the reference's file modes: an executable support script runs", async () => {
+    const extra = makeExtraRepo(join(fixture.root, "extra-repo"));
+    const task = taskOf(
+        "exec-support",
+        { default: [GOOD(3)] },
+        {
+            parent: extra.parent,
+            merge: extra.merge,
+            check: "true",
+            hiddenTests: [
+                { file: "fixtures/sum.sh", names: [] },
+                { file: "tool.test.mjs", names: ["tool"] },
+            ],
+            hiddenCommand: "node --test --test-name-pattern='^(?:tool)$' 'tool.test.mjs'",
+        },
+    );
+    let original;
+    const paths = await attempt(task, {
+        repo: extra,
+        change: FIX,
+        prepare: (work) => {
+            original = work;
+        },
+    });
+    const before = treeHash(original);
+    const { code, result } = await score(paths);
+
+    assert.equal(code, 0);
+    assert.equal(result.s2, true, result.s2Detail);
+    assert.equal(treeHash(original), before, "the submitted tree is unchanged");
 });

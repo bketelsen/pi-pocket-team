@@ -107,11 +107,11 @@ export function lastLines(text, count = STDOUT_TAIL_LINES) {
  * hosts?, killGraceMs? }`. Returns what `runCaptured` returns; `ok` is exit 0 in time. When the command fails and
  * `step` names it, the last 200 lines of its stdout go to `logFile` after a header line (stderr is there already;
  * npm and the test reporters print their failures on stdout). `overlay`: a host folder bound read-only at `/overlay`. `argv`: a
- * program and its arguments, instead of the shell command.
+ * program and its arguments, instead of the shell command. `trustedGit`: a git directory bound at `/trusted.git`.
  */
 export async function runInSandbox(
     sandbox,
-    { work, cache, command, argv, timeoutMs = COMMAND_MS, logFile, step, overlay },
+    { work, cache, command, argv, timeoutMs = COMMAND_MS, logFile, step, overlay, trustedGit },
 ) {
     if (!sandbox.data) {
         throw new Error(
@@ -127,6 +127,7 @@ export async function runInSandbox(
         miseInstalls: sandbox.miseInstalls,
         ...(await identityFiles(sandbox.data)),
         ...(overlay ? { overlay } : {}),
+        ...(trustedGit ? { trustedGit } : {}),
     };
     const args = bwrapArgs(paths, {
         tryNo: 0,
