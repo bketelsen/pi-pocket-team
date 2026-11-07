@@ -62,7 +62,10 @@ for (const key of ["PI_CODING_AGENT_DIR", "GOMODCACHE", "npm_config_cache", "PIP
 
 const child = spawn(
     command === "node" ? process.execPath : command,
-    args.map((arg) => (arg.startsWith("/") ? map(arg) : arg)),
+    // An `@/path` argument (Pi's file argument) names a sandbox path too.
+    args.map((arg) =>
+        arg.startsWith("/") ? map(arg) : arg.startsWith("@/") ? `@${map(arg.slice(1))}` : arg,
+    ),
     { cwd: map(chdir), env: childEnv, stdio: "inherit" },
 );
 

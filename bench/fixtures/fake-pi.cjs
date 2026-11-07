@@ -1,12 +1,17 @@
 #!/usr/bin/env node
 // A fake `pi` for the bench tests: it prints JSON events like Pi's `--mode json` stream. The scenario is a line
-// `SCENARIO {json}` in the prompt (the last argument); `BENCH_TRY` is the try number. It never calls a model.
+// `SCENARIO {json}` in the prompt (the last argument, or the file of an `@file` argument and the message after it, as
+// a judge gets them); `BENCH_TRY` is the try number. It never calls a model.
 "use strict";
 
 const { spawn, spawnSync } = require("node:child_process");
-const { existsSync, writeFileSync } = require("node:fs");
+const { appendFileSync, existsSync, readFileSync, writeFileSync } = require("node:fs");
 
-const prompt = process.argv.at(-1) ?? "";
+const fileArg = process.argv.slice(2).find((arg) => arg.startsWith("@"));
+const lastArg = process.argv.at(-1) ?? "";
+const prompt = fileArg
+    ? `${readFileSync(fileArg.slice(1), "utf8")}\n${lastArg.startsWith("@") ? "" : lastArg}`
+    : lastArg;
 const line = prompt.split("\n").find((l) => l.startsWith("SCENARIO "));
 const scenario = line ? JSON.parse(line.slice("SCENARIO ".length)) : { name: "ok" };
 const tryNo = Number(process.env.BENCH_TRY);
@@ -166,6 +171,7 @@ switch (scenario.name) {
             return {
                 status: r.status,
                 error: r.error?.code ?? null,
+                stdout: (r.stdout ?? "").slice(0, 300),
                 stderr: (r.stderr ?? "").slice(0, 300),
             };
         };
@@ -179,9 +185,36 @@ switch (scenario.name) {
                 hostHome: existsSync(scenario.hostHome),
                 envKeys: Object.keys(process.env),
                 pid1: existsSync("/proc/1/cmdline"),
+                user: run("node", ["-e", "console.log(require('os').userInfo().username)"]),
             }),
         );
         whole(usage(100, 50, 0.01));
+        break;
+    }
+
+    case "judge": {
+        // A judge: the answer of try `BENCH_TRY` for this `--model` (the last answer repeats), as assistant text.
+        const model = process.argv[process.argv.indexOf("--model") + 1].replace(/:high$/, "");
+        const answers = scenario.answers[model] ?? scenario.answers.default ?? [];
+        const text = answers[Math.min(tryNo, answers.length) - 1] ?? "";
+        const u = usage(1000, 100, scenario.cost ?? 0.02);
+
+        if (scenario.log) {
+            appendFileSync(scenario.log, `${model} ${tryNo}\n`);
+        }
+
+        assistantStart();
+        update(u);
+        emit({
+            type: "message_end",
+            message: {
+                role: "assistant",
+                content: [{ type: "text", text }],
+                usage: u,
+                stopReason: "stop",
+            },
+        });
+        finish();
         break;
     }
 

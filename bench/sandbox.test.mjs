@@ -1,13 +1,22 @@
 // The sandbox: the bwrap argv (everywhere), and with the real bwrap (skipped where it cannot run): a fake `pi`
 // tries to read a host file and to reach github.com, looks for the home folder, and lists its environment.
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
-import { ALLOWED_ENV, bwrapArgs, nodePlacement, piCommand } from "./lib/sandbox.mjs";
+import { makeCache, runInSandbox } from "./lib/exec.mjs";
 import {
+    ALLOWED_ENV,
+    DEFAULTS,
+    bwrapArgs,
+    identityFiles,
+    nodePlacement,
+    piCommand,
+} from "./lib/sandbox.mjs";
+import {
+    FAKE_BWRAP,
     PRICED,
     bwrapWorks,
     fixtureArgs,
@@ -35,6 +44,8 @@ const HOST_PATHS = {
     hosts: "/r/bench/hosts",
     pocket: "/p/pi-pocket",
     miseInstalls: "/h/mise/installs",
+    passwd: "/x/agent-files/passwd",
+    group: "/x/agent-files/group",
 };
 
 test("the bwrap argv has the required flags, mounts and only the allowed variables", () => {
@@ -78,6 +89,8 @@ test("the bwrap argv has the required flags, mounts and only the allowed variabl
         "/etc/resolv.conf": "/run/resolv.conf",
         "/etc/nsswitch.conf": "/etc/nsswitch.conf",
         "/etc/hosts": "/r/bench/hosts",
+        "/etc/passwd": "/x/agent-files/passwd",
+        "/etc/group": "/x/agent-files/group",
         "/tools": "/h/mise/installs",
         "/pocket": "/p/pi-pocket",
         "/agent/AGENTS.md": "/r/bench/header-v1.md",
@@ -95,6 +108,97 @@ test("the bwrap argv has the required flags, mounts and only the allowed variabl
     assert.equal(args[args.indexOf("--chdir") + 1], "/work");
     assert.deepEqual(args.slice(end + 1, end + 3), ["node", "/pocket/node_modules/.bin/pi"]);
     assert.ok(args.slice(end + 1).includes(`${PRICED}:high`));
+});
+
+test("a caller with no passwd or group path gets no /etc/passwd or /etc/group bind", () => {
+    const { passwd, group, ...old } = HOST_PATHS;
+    const args = bwrapArgs(old, {
+        tryNo: 1,
+        command: ["true"],
+        exists: () => true,
+        realpath: (path) => path,
+    });
+
+    assert.ok(passwd && group);
+    assert.ok(!args.includes("/etc/passwd"));
+    assert.ok(!args.includes("/etc/group"));
+});
+
+test("the identity files: 1 user bench with the host's uid and gid, mode 0600, written again only when they differ", async () => {
+    const data = mkdtempSync(join(tmpdir(), "bench-identity-"));
+
+    try {
+        const paths = await identityFiles(data, { uid: 1234, gid: 567 });
+
+        assert.equal(
+            readFileSync(paths.passwd, "utf8"),
+            "bench:x:1234:567:bench:/home/bench:/bin/bash\n",
+        );
+        assert.equal(readFileSync(paths.group, "utf8"), "bench:x:567:\n");
+        assert.equal(statSync(paths.passwd).mode & 0o777, 0o600);
+
+        const inode = statSync(paths.passwd).ino;
+
+        await identityFiles(data, { uid: 1234, gid: 567 });
+        assert.equal(statSync(paths.passwd).ino, inode, "the same content is not written again");
+        await identityFiles(data, { uid: 1235, gid: 567 });
+        assert.match(readFileSync(paths.passwd, "utf8"), /^bench:x:1235:567:/);
+    } finally {
+        await rm(data, { recursive: true, force: true });
+    }
+});
+
+test("a failed sandbox command adds the last 200 lines of its stdout to its log, after a header that names the step", async () => {
+    const root = mkdtempSync(join(tmpdir(), "bench-tail-"));
+    const work = join(root, "work");
+    const cache = await makeCache(join(root, "cache"));
+    const logFile = join(root, "x.log");
+    const sandbox = {
+        bwrap: FAKE_BWRAP,
+        pocket: root,
+        miseInstalls: join(root, "no-mise"),
+        data: root,
+    };
+
+    mkdirSync(work);
+
+    try {
+        const failed = await runInSandbox(sandbox, {
+            work,
+            cache,
+            command: "for i in $(seq 1 250); do echo out-$i; done; echo err-line >&2; exit 3",
+            logFile,
+            step: "check at the merge",
+        });
+        const log = readFileSync(logFile, "utf8");
+
+        assert.equal(failed.ok, false);
+        assert.match(log, /^err-line$/m, "stderr is in the log");
+        assert.match(
+            log,
+            /^--- check at the merge failed \(exit 3\): the last 200 lines of its stdout ---$/m,
+        );
+        assert.match(log, /^out-51$/m);
+        assert.match(log, /^out-250$/m);
+        assert.doesNotMatch(log, /^out-50$/m);
+
+        const passed = await runInSandbox(sandbox, {
+            work,
+            cache,
+            command: "echo fine",
+            logFile,
+            step: "setup at the merge",
+        });
+
+        assert.equal(passed.ok, true);
+        assert.equal(readFileSync(logFile, "utf8"), log, "a command that passes adds no stdout");
+        await assert.rejects(
+            runInSandbox({ ...sandbox, data: undefined }, { work, cache, command: "true" }),
+            /sandbox\.data/,
+        );
+    } finally {
+        await rm(root, { recursive: true, force: true });
+    }
 });
 
 test("node outside the mise installs is bound at /node, never at its host path", () => {
@@ -169,6 +273,49 @@ test(
         assert.deepEqual(extra, []);
         assert.ok(!probe.envKeys.includes("GH_TOKEN"));
         assert.ok(!probe.envKeys.includes("SSH_AUTH_SOCK"));
+        assert.equal(probe.user.status, 0, probe.user.stderr);
+        assert.equal(probe.user.stdout.trim(), "bench", "os.userInfo() works inside");
+    },
+);
+
+test(
+    "bwrap: a check command sees the user bench, and still no host file under the home folder",
+    { skip },
+    async () => {
+        const work = join(fixture.root, "check-work");
+        const cache = join(fixture.root, "check-cache");
+
+        mkdirSync(work, { recursive: true });
+        await makeCache(cache);
+
+        const run = (command) =>
+            runInSandbox(
+                {
+                    bwrap: "bwrap",
+                    pocket: fixture.pocket,
+                    miseInstalls: DEFAULTS.miseInstalls,
+                    data: fixture.data,
+                },
+                { work, cache, command, timeoutMs: 30_000 },
+            );
+        const user = await run(`node -e "console.log(require('os').userInfo().username)"`);
+
+        assert.equal(user.code, 0);
+        assert.equal(user.stdout.trim(), "bench");
+
+        const ids = await run("id -u; id -g; ls /agent 2>&1 || true");
+
+        assert.deepEqual(ids.stdout.split("\n").slice(0, 2), [
+            String(process.getuid()),
+            String(process.getgid()),
+        ]);
+        assert.match(ids.stdout, /No such file/, "no /agent for a check");
+        assert.notEqual((await run(`cat ${secret}`)).code, 0, "the host file is not readable");
+        assert.notEqual(
+            (await run(`ls ${homedir()}`)).code,
+            0,
+            "the home folder does not exist inside",
+        );
     },
 );
 

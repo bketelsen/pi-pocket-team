@@ -81,7 +81,7 @@ export const UNPRICED_MODELS = new Set([
 /** The 10 candidate models of stage 1, each on its 1 provider route (the plan's section Candidates). */
 export const CANDIDATES = [
     "github-copilot/gpt-6-luna",
-    "anthropic/claude-haiku-5-5",
+    "github-copilot/claude-haiku-5.5",
     "deepseek/deepseek-flash",
     "halogen/halogen-qwen3.8-flash-next",
     "github-copilot/mai-code-2-flash",
@@ -471,7 +471,11 @@ export function compareAll(byTask, models, reference, taskIds, prob = probGapWit
     );
 }
 
-/** The judges, in the order of `grades`: [0] openai/gpt-6.1-sol, [1] anthropic/claude-opus-5-5. */
+/**
+ * The judges' families, in the order of `grades`: [0] openai (`openai/gpt-6.1-sol`), [1] anthropic (Claude Opus 5.5,
+ * run through the route `github-copilot/claude-opus-5.5`, because the route `anthropic/claude-opus-5-5` returns HTTP
+ * 400 for the Pi CLI; the family is the model's, not the route's).
+ */
 export const JUDGE_FAMILIES = ["openai", "anthropic"];
 
 /** A model's family for the self-preference report, from its id. */

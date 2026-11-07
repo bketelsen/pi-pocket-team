@@ -22,7 +22,15 @@ import {
 import { describeSpend, readSpend, reserve, settle } from "./budget.mjs";
 import { SLOT_POLL_MS, acquireSlots } from "./slots.mjs";
 import { scratchClone } from "./clone.mjs";
-import { DEFAULTS, bwrapArgs, findProgram, piCommand, setupCommand } from "./sandbox.mjs";
+import {
+    DEFAULTS,
+    bwrapArgs,
+    findProgram,
+    identityFiles,
+    identityPaths,
+    piCommand,
+    setupCommand,
+} from "./sandbox.mjs";
 import {
     UsageError,
     holdsHalogenLease,
@@ -97,6 +105,24 @@ function numberOption(values, name, fallback, { integer = false } = {}) {
     return value;
 }
 
+/**
+ * The local checkout of a task's repository: the `--checkout` option, else the manifest's top-level `checkout` (a
+ * harvested manifest names the roster's folder), else `~/projects/<name>`.
+ */
+export function checkoutOf(option, manifest, task) {
+    if (option) {
+        return resolve(option);
+    }
+
+    if (typeof manifest?.checkout === "string" && manifest.checkout !== "") {
+        return resolve(manifest.checkout.replace(/^~(?=\/)/, homedir()));
+    }
+
+    const [, repoName] = String(task.repo).split("/");
+
+    return resolve(join(homedir(), "projects", repoName ?? task.repo));
+}
+
 /** Parse and check the arguments, the manifest task and the model. */
 export async function prepare(argv, env = process.env) {
     let values;
@@ -145,7 +171,6 @@ export async function prepare(argv, env = process.env) {
         throw new UsageError("--max-provider must be an integer >= 1");
     }
 
-    const [, repoName] = task.repo.split("/");
     const limits = {
         wallMs: numberOption(values, "wall-limit", LIMITS.wallMs),
         costUsd: numberOption(values, "cost-limit", LIMITS.costUsd),
@@ -173,7 +198,7 @@ export async function prepare(argv, env = process.env) {
         dryRun: Boolean(values["dry-run"]),
         data: dataDir(env),
         results: resultsDir(values.results),
-        checkout: resolve(values.checkout ?? join(homedir(), "projects", repoName ?? task.repo)),
+        checkout: checkoutOf(values.checkout, manifest, task),
         pocket: resolve(values.pocket ?? DEFAULTS.pocket),
         agentSrc: resolve(values["agent-src"] ?? DEFAULTS.agentSrc),
         miseInstalls: resolve(values["mise-installs"] ?? DEFAULTS.miseInstalls),
@@ -206,6 +231,7 @@ export function tryPaths(ctx, tryNo) {
         hosts: DEFAULTS.hosts,
         pocket: ctx.pocket,
         miseInstalls: ctx.miseInstalls,
+        ...identityPaths(ctx.data),
     };
 }
 
@@ -224,29 +250,33 @@ export async function authType(authFile, provider) {
     return typeof type === "string" ? type : null;
 }
 
+/** The minimum token life of the runner's pre-flight: it covers an attempt's 45 minutes. */
+export const RUNNER_MIN_EXPIRY = "60m";
+
+/** The argv (after node) of the auth pre-flight of `ctx.provider`, for a token with at least `minExpiry` left. */
+export const authPreflightArgs = (ctx, minExpiry = RUNNER_MIN_EXPIRY) => [
+    join(ctx.pocket, "node_modules", ".bin", "pi"),
+    "auth",
+    "print-bearer-token",
+    "--provider",
+    ctx.provider,
+    "--min-expiry",
+    minExpiry,
+];
+
 /**
- * Refresh an OAuth token on the host, under the host's own lock, so the sandbox needs no refresh for 45 minutes.
+ * Refresh an OAuth token on the host, under the host's own lock, so the sandbox needs no refresh while it runs.
+ * `minExpiry` is the token life the caller needs (default: the runner's 60 minutes); an OpenAI OAuth token never has
+ * 60 minutes left, so a shorter caller asks for less. `spawn` is injectable for tests.
  * The token is printed to stdout, which is ignored: never read, logged or stored.
  */
-export function authPreflight(ctx) {
+export function authPreflight(ctx, { minExpiry = RUNNER_MIN_EXPIRY, spawn: start = spawn } = {}) {
     return new Promise((done) => {
-        const child = spawn(
-            process.execPath,
-            [
-                join(ctx.pocket, "node_modules", ".bin", "pi"),
-                "auth",
-                "print-bearer-token",
-                "--provider",
-                ctx.provider,
-                "--min-expiry",
-                "60m",
-            ],
-            {
-                stdio: "ignore",
-                env: { ...process.env, PI_CODING_AGENT_DIR: ctx.agentSrc },
-                timeout: 120_000,
-            },
-        );
+        const child = start(process.execPath, authPreflightArgs(ctx, minExpiry), {
+            stdio: "ignore",
+            env: { ...process.env, PI_CODING_AGENT_DIR: ctx.agentSrc },
+            timeout: 120_000,
+        });
 
         child.on("error", () => done(false));
         child.on("close", (code) => done(code === 0));
@@ -269,8 +299,11 @@ function firstTry(ctx) {
     return used.length ? Math.max(...used) + 1 : 1;
 }
 
-/** The shared agent dir: bind targets for the files mounted over it, and `settings.json` = `{}`. */
-async function prepareAgentDir(ctx) {
+/**
+ * The shared agent dir: bind targets for the files mounted over it, and `settings.json` = `{}`; and the sandbox's
+ * `/etc/passwd` and `/etc/group` (`identityFiles`).
+ */
+export async function prepareAgentDir(ctx) {
     const agent = await privateDir(join(ctx.data, "agent"));
     const files = await privateDir(join(ctx.data, "agent-files"));
 
@@ -279,6 +312,7 @@ async function prepareAgentDir(ctx) {
     }
 
     await writeFile(join(files, "settings.json"), "{}\n", { mode: 0o600 });
+    await identityFiles(ctx.data);
 }
 
 /** The cap that an attempt reserves once, for all its tries: the cost limit for a priced model, 0 for an unpriced one. */
