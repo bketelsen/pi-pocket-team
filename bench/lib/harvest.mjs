@@ -75,9 +75,11 @@ export const stratumOf = (size) => (size <= 50 ? "small" : size <= 300 ? "medium
  * The version of the validation: a cached validation of another version runs again. Version 2: the overlay keeps
  * each file's mode from the reference tree. Version 3: the parent tree stages the hidden files (`git add -A`) before
  * the discovery and the hidden command, and a Go test file runs in the module of its nearest `go.mod`. (A new parent
- * rule needs no new version: the parent is part of the key.)
+ * rule needs no new version: the parent is part of the key.) Version 4: an outcome records each timed-out step
+ * (`timedOutSteps`: the discovery runs and the staging too) and is then never cached; an entry of version 3 has no
+ * such record, so it may hide a discovery that timed out.
  */
-export const VALIDATION_VERSION = 3;
+export const VALIDATION_VERSION = 4;
 
 /** The cache key of a candidate's validation. */
 export const validationKey = ({ merge, parent, commands, brief, route }) =>
@@ -88,13 +90,23 @@ const isValidationError = (outcome) =>
     String(outcome?.reason ?? "").startsWith("validation error:");
 
 /**
- * True when a step of a validation timed out (a setup, the check, or the hidden command at the merge or the parent).
- * A timeout says how loaded the host was, or that the limit was too short, not what the commit does: such an outcome
- * is never cached or reused (earlier runs cached it), so a later run, or a longer limit, validates it again.
+ * True when a step of a validation timed out: a setup, the check, the hidden command at the merge or the parent, a
+ * discovery run of the hidden tests, or the staging at the parent (`timedOutSteps`). A timeout says how loaded the
+ * host was, or that the limit was too short, not what the commit does (a discovery that timed out finds no valid
+ * name, and the task loses its S2): such an outcome is never cached or reused (earlier runs cached it), so a later
+ * run, or a longer limit, validates it again.
  */
 const timedOut = (outcome) =>
+    (outcome?.timedOutSteps?.length ?? 0) > 0 ||
     /\(timed out\)$/.test(String(outcome?.reason ?? "")) ||
     Object.keys(STEP_NAMES).some((step) => outcome?.validation?.[step] === "timed out");
+
+/** Record a timed-out sandbox run of a validation in `ctx.timedOutSteps` (when the caller keeps such a record). */
+const noteTimeout = (ctx, run, step) => {
+    if (run?.timedOut) {
+        ctx.timedOutSteps?.push(step);
+    }
+};
 
 /**
  * The most commits `gh pr view --json commits` returns (it asks GitHub for the first 100). A PR with this many may have
@@ -384,7 +396,7 @@ export async function commandsAt(checkout, merge) {
 }
 
 /** Run a discovery command and return its output (the junit file for pytest). */
-async function discover(ctx, { work, cache, command, language, logFile }) {
+async function discover(ctx, { work, cache, command, language, logFile, at }) {
     if (language === "python") {
         await rm(join(cache, "hidden-junit.xml"), { force: true });
     }
@@ -397,6 +409,8 @@ async function discover(ctx, { work, cache, command, language, logFile }) {
         logFile,
     });
 
+    noteTimeout(ctx, run, `the discovery of the ${language} hidden tests at ${at ?? "a tree"}`);
+
     if (language === "python") {
         return readFile(join(cache, JUNIT.replace(/^\/cache\//, "")), "utf8").catch(() => "");
     }
@@ -407,10 +421,11 @@ async function discover(ctx, { work, cache, command, language, logFile }) {
 /**
  * The outcome of 1 language's hidden tests in a tree: its discovery command (with the machine-readable reporter)
  * run in the sandbox, then parsed per file (`{ units, broken }`). Null when the language has no discovery command.
+ * `at` names the tree ("the merge", "the parent") in a timeout record.
  */
 export async function languageOutcome(
     ctx,
-    { language, files, goNames, goMods, prefix, tree, logFile },
+    { language, files, goNames, goMods, prefix, tree, logFile, at },
 ) {
     // Go: a file in no module (no `go.mod` at or above its folder) is left out; with none left, no command.
     const command = discoveryCommand(language, files, { prefix, goNames, goMods });
@@ -419,7 +434,7 @@ export async function languageOutcome(
         return null;
     }
 
-    const text = await discover(ctx, { ...tree, command, language, logFile });
+    const text = await discover(ctx, { ...tree, command, language, logFile, at });
 
     if (language === "node") {
         return nodeOutcome(text, files);
@@ -483,12 +498,14 @@ export async function findHidden(
         work: parentTree.work,
     });
     // The copied files are staged, as S2 stages them: harvest, revalidation and scoring see the same index.
-    await stageAll(ctx.sandbox, {
+    const staged = await stageAll(ctx.sandbox, {
         ...parentTree,
         timeoutMs: ctx.timeouts.hidden,
         logFile,
         step: "the staging of the hidden tests at the parent",
     });
+
+    noteTimeout(ctx, staged, "the staging of the hidden tests at the parent");
 
     const languages = [...new Set(tests.map((t) => t.language))].sort();
     const valid = [];
@@ -510,13 +527,17 @@ export async function findHidden(
         }
 
         const facts = { language, files, goNames, goMods, prefix, logFile };
-        const atMerge = await languageOutcome(ctx, { ...facts, tree: mergeTree });
+        const atMerge = await languageOutcome(ctx, { ...facts, tree: mergeTree, at: "the merge" });
 
         if (!atMerge) {
             continue;
         }
 
-        const atParent = await languageOutcome(ctx, { ...facts, tree: parentTree });
+        const atParent = await languageOutcome(ctx, {
+            ...facts,
+            tree: parentTree,
+            at: "the parent",
+        });
         const result = classify({ files, parent: atParent, merge: atMerge });
 
         if (language === "node") {
@@ -577,7 +598,12 @@ const treesOf = (base) => ({
 export async function validateCandidate(baseCtx, candidate) {
     const { repo, number, thread, checkout, merge, parent } = candidate;
     // The repository's own limits for the check and the hidden tests, unless the caller gives explicit ones.
-    const ctx = { ...baseCtx, timeouts: commandLimits(baseCtx.timeouts, repo) };
+    // `timedOutSteps`: each sandbox run of this validation that timed out (an outcome with one is never cached).
+    const ctx = {
+        ...baseCtx,
+        timeouts: commandLimits(baseCtx.timeouts, repo),
+        timedOutSteps: [],
+    };
     const commands = await commandsAt(checkout, merge);
     const key = validationKey({
         merge,
@@ -597,7 +623,13 @@ export async function validateCandidate(baseCtx, candidate) {
     const logFile = join(cacheDir(ctx.data, repo), `${number}.log`);
     const trees = treesOf(base);
     const validation = { at: new Date(ctx.now()).toISOString(), commands };
-    const outcome = (ok, reason, fields = null) => ({ ok, reason, fields, validation });
+    const outcome = (ok, reason, fields = null) => ({
+        ok,
+        reason,
+        fields,
+        validation,
+        timedOutSteps: ctx.timedOutSteps,
+    });
     let result;
 
     await removeTree(base);
@@ -620,6 +652,7 @@ export async function validateCandidate(baseCtx, candidate) {
                 });
 
                 validation[name] = run.ok ? "pass" : failText(run);
+                noteTimeout(ctx, run, STEP_NAMES[name]);
 
                 return run.ok;
             };
@@ -683,6 +716,8 @@ export async function validateCandidate(baseCtx, candidate) {
 
                 validation.hiddenMerge = atMerge.ok ? "pass" : failText(atMerge);
                 validation.hiddenParent = atParent.ok ? "pass" : failText(atParent);
+                noteTimeout(ctx, atMerge, STEP_NAMES.hiddenMerge);
+                noteTimeout(ctx, atParent, STEP_NAMES.hiddenParent);
 
                 if (!atMerge.ok || atParent.ok || atParent.timedOut) {
                     validation.hiddenNote =

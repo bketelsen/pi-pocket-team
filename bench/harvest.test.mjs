@@ -635,8 +635,8 @@ test("a cached validation error is never reused: the candidate is validated agai
 
     assert.equal(
         VALIDATION_VERSION,
-        3,
-        "the staging of the hidden files and the Go modules changed the validation",
+        4,
+        "the timeout record (discovery, staging) changed the validation",
     );
     mkdirSync(join(data, "harvest-cache", "bketelsen", "pi-pocket-team"), { recursive: true });
     writeFileSync(
@@ -1189,4 +1189,69 @@ test("the parent rule: a squash-merged PR with a merge commit inside it keeps <m
     ].map(([messageHeadline, authoredDate]) => ({ messageHeadline, authoredDate }));
 
     assert.equal(await parentOf(repo, merge, commits), before);
+});
+
+/**
+ * A bwrap that hangs on the hidden-test discovery (the Node TAP reporter) of 1 tree (`at`: "merge" or "parent") and
+ * passes every other run to the fake bwrap: the validation's own limit ends the hang.
+ */
+function hangingBwrap(at) {
+    const file = join(fixture.root, `hang-${at}-bwrap.sh`);
+
+    writeFileSync(
+        file,
+        [
+            "#!/bin/sh",
+            'case " $* " in',
+            `    *"/${at}/work /work "*"--test-reporter=tap"*) exec sleep 600 ;;`,
+            "esac",
+            `exec '${FAKE_BWRAP}' "$@"`,
+            "",
+        ].join("\n"),
+    );
+    chmodSync(file, 0o755);
+
+    return file;
+}
+
+test("a discovery that times out (at the merge, at the parent) is recorded, not cached, and validated again", async () => {
+    for (const at of ["merge", "parent"]) {
+        const data = join(fixture.root, `discovery-timeout-${at}`);
+        const candidate = {
+            repo: REPO,
+            number: 92,
+            thread: { id: "T92", brief: "Fix add.", route: null, nightShift: false },
+            checkout: node.repo,
+            merge: node.merge,
+            parent: node.parent,
+        };
+        const hung = validationContext(data);
+
+        hung.sandbox.bwrap = hangingBwrap(at);
+        hung.sandbox.killGraceMs = 1000;
+        hung.timeouts = { ...hung.timeouts, hidden: 5_000 };
+
+        const first = await validateCandidate(hung, candidate);
+        const cacheFile = join(data, "harvest-cache", "bketelsen", "pi-pocket-team", "92.json");
+
+        assert.equal(first.ok, true, first.reason);
+        assert.equal(first.fields.hiddenCommand, null, `${at}: no valid name was found`);
+        assert.deepEqual(
+            first.timedOutSteps,
+            [`the discovery of the node hidden tests at the ${at}`],
+            at,
+        );
+        assert.equal(existsSync(cacheFile), false, `${at}: the outcome is not cached`);
+
+        // A second harvest validates again (no cached outcome), and finds the hidden tests.
+        const second = await validateCandidate(validationContext(data), candidate);
+
+        assert.equal(second.cached, undefined, at);
+        assert.deepEqual(second.timedOutSteps, []);
+        assert.equal(
+            second.fields.hiddenCommand,
+            "PI_POCKET_CHECKOUT=/pocket node --test --test-name-pattern='^(?:adds)$' 'add.test.mjs'",
+        );
+        assert.equal(existsSync(cacheFile), true, `${at}: an outcome with no timeout is cached`);
+    }
 });
