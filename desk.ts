@@ -6790,18 +6790,29 @@ export function reopenReason(
 }
 
 /**
- * A parked thread that this sweep gave an event goes back to open, with the event "woke: <that event>". `before` is
- * its event count when the sweep began: the park event is older, so it never wakes a thread by itself.
+ * A parked thread that this sweep gave an event goes back to open, with the event "woke: <that event>". `before` is the
+ * set of its event keys when the sweep began (an event key is unique on its thread: `addEvent` refuses a repeat), so an
+ * event added at the cap of 50, which pushes the oldest out and leaves the length as it was, still counts. The older
+ * form, its event count, stays for callers that have no keys. The park event is older, so it never wakes a thread by
+ * itself.
  */
-export function wakeParked(thread: Thread, before: number, now: number): boolean {
+export function wakeParked(
+    thread: Thread,
+    before: number | ReadonlySet<string>,
+    now: number,
+): boolean {
     if (thread.state !== "parked") {
         return false;
     }
 
+    const fresh =
+        typeof before === "number"
+            ? thread.events.slice(before)
+            : thread.events.filter((event) => !before.has(event.key));
     // A repair event never wakes a parked thread: Brian parks drafts that conflict or fail on purpose.
-    const added = thread.events
-        .slice(before)
-        .filter((event) => !event.key.startsWith("repair") && !event.key.startsWith("reparked:"));
+    const added = fresh.filter(
+        (event) => !event.key.startsWith("repair") && !event.key.startsWith("reparked:"),
+    );
 
     if (added.length === 0) {
         return false;
@@ -25077,8 +25088,13 @@ export default function createDesk(host: Host, web: Web) {
         const usersBefore = new Map(
             closedDone.map((thread) => [thread.id, thread.run.lastUserEntry]),
         );
+        // The event keys of each thread before this sweep: a parked thread wakes on a key that is new, never on the list's
+        // length, which stays at 50 when a new event pushes the oldest out.
         const eventsBefore = new Map(
-            [...open, ...closedDone].map((thread) => [thread.id, thread.events.length]),
+            [...open, ...closedDone].map((thread) => [
+                thread.id,
+                new Set(thread.events.map((event) => event.key)),
+            ]),
         );
 
         // The worktrees that hold a thread: a linked worktree's work is not in its folder's own counts. A branch of a
@@ -25547,7 +25563,13 @@ export default function createDesk(host: Host, web: Web) {
                 continue;
             }
 
-            if (wakeParked(thread, eventsBefore.get(thread.id) ?? thread.events.length, now)) {
+            if (
+                wakeParked(
+                    thread,
+                    eventsBefore.get(thread.id) ?? new Set(thread.events.map((event) => event.key)),
+                    now,
+                )
+            ) {
                 events += 1;
             }
         }
@@ -25779,6 +25801,12 @@ export default function createDesk(host: Host, web: Web) {
             addresses.add(session.address);
 
             if (addEvent(found, "found", "found: a linked session with no thread", now)) {
+                events += 1;
+            }
+
+            // Its last run failed: the queue says so in this commit, not "found session, attach or drop". The stored
+            // thread, not the literal: the document keeps its own copy of what is set.
+            if (applyRunFailed(state.threads[id]!, session.failed, now)) {
                 events += 1;
             }
         }

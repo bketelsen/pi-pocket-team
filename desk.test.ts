@@ -2583,6 +2583,29 @@ describe("wakeParked", () => {
         assert.equal(thread.events.at(-1)?.text, "woke: the session is idle");
     });
 
+    test("with a key set, a new event at the 50-event cap wakes a parked thread", () => {
+        const thread = placed(deskOf(), 100);
+
+        thread.state = "parked";
+        thread.events = Array.from({ length: 50 }, (_, index) => ({
+            at: index + 1,
+            key: `old:${String(index)}`,
+            text: `event ${String(index)}`,
+        }));
+
+        const before = new Set(thread.events.map((event) => event.key));
+
+        assert.equal(wakeParked(thread, before, 200), false, "no new event: still parked");
+
+        // The list keeps 50: the new event pushes the oldest out, and the length stays.
+        applyRunFailed(thread, "gave up", 150);
+        assert.equal(thread.events.length, 50);
+
+        assert.equal(wakeParked(thread, before, 200), true);
+        assert.equal(thread.state, "open");
+        assert.equal(thread.events.at(-1)?.text, "woke: run failed: gave up");
+    });
+
     test("a repair event, or a park again, never wakes a parked thread", () => {
         const thread = placed(deskOf(), 100);
 
@@ -26555,6 +26578,102 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
             } finally {
                 stub.restore();
                 writeFileSync(configPath, JSON.stringify({ digest: { minutes: 0 }, cap: 100 }));
+            }
+        });
+
+        test("a sync wakes a parked thread with 50 events on its failed run", async () => {
+            const stub = archiveDesk();
+
+            try {
+                const source = await supervisor("failed-parked");
+                const session = await conversation();
+
+                made += 1;
+
+                const address = `session-parked-${String(made)}`;
+                let id = "";
+
+                await app.harness.commit(async (tx) => {
+                    const state = await tx.doc(DeskThreads);
+                    const opened = openThread(state, {
+                        key: `x.test.failed-parked:${String(made)}:${String(Date.now())}`,
+                        supervisor: Number(source),
+                        agents: ["duncan"],
+                        title: "failed parked test",
+                        at: Date.now() - 1000,
+                    }).thread;
+                    const stored = state.threads[opened.id]!;
+
+                    id = opened.id;
+                    stored.session = session;
+                    stored.address = address;
+                    stored.state = "parked";
+                    stored.run = { busy: false, archived: false };
+                    stored.events = Array.from({ length: 50 }, (_, index) => ({
+                        at: index + 1,
+                        key: `old:${String(index)}`,
+                        text: `event ${String(index)}`,
+                    }));
+                    delete stored.cwd;
+                }, context);
+                stub.listed.set(address, {
+                    address,
+                    busy: false,
+                    archived: false,
+                    failed: "the provider refused",
+                });
+
+                await stub.sync(source);
+
+                const woken = await threadOf(id);
+
+                assert.equal(woken?.state, "open");
+                assert.equal(
+                    woken?.events.some(
+                        (each) => each.text === "woke: run failed: the provider refused",
+                    ),
+                    true,
+                );
+                assert.equal(odradeReason(woken!), "run failed: the provider refused");
+            } finally {
+                stub.restore();
+            }
+        });
+
+        test("a sync that finds a session whose run failed gives the found thread run failed", async () => {
+            const stub = archiveDesk();
+
+            try {
+                const source = await supervisor("failed-found");
+
+                // The first sweep records the baseline: a session there before it is no found work.
+                await stub.sync(source);
+                made += 1;
+
+                const address = `session-found-${String(made)}`;
+
+                stub.listed.set(address, {
+                    address,
+                    busy: false,
+                    archived: false,
+                    failed: "the model\nrefused",
+                });
+
+                await stub.sync(source);
+
+                const found = Object.values((await deskState())?.threads ?? {}).find(
+                    (each) => each.key === `found:session:${address}`,
+                );
+
+                assert(found !== undefined, "the sweep found the session");
+                assert.equal(found.run.failed, "the model refused");
+                assert.equal(
+                    found.events.some((each) => each.text === "run failed: the model refused"),
+                    true,
+                );
+                assert.equal(odradeReason(found), "run failed: the model refused");
+            } finally {
+                stub.restore();
             }
         });
 
