@@ -1069,6 +1069,111 @@ describe("the Desk page's board routes", () => {
         assert.equal(first.data.supervisor, first.data.supervisors[0]);
     });
 
+    test("GET board: only live supervisors, the one with a sweeper by default, and their session titles", async () => {
+        const call = await routes();
+        const retired = Number(await knownSupervisor());
+        const live = Number(await knownSupervisor());
+        const swept = Number(await knownSupervisor());
+
+        assert(retired < live && live < swept, "the ids rise in the order the sessions start");
+        await app.commands.updateSession(retired as ConversationId, owner(app), {
+            title: "Retired supervisor",
+        });
+        await app.commands.updateSession(swept as ConversationId, owner(app), {
+            title: "Odrade live",
+        });
+
+        const saved = structuredClone(await deskState());
+
+        // 1 commit: the retired supervisor's threads and every other thread close, no row stays open, and only the
+        // last supervisor has a sweeper.
+        await app.harness.commit(async (tx) => {
+            const state = await tx.doc(DeskThreads);
+
+            for (const thread of Object.values(state.threads)) {
+                if (
+                    thread.state !== "closed" &&
+                    thread.supervisor !== live &&
+                    thread.supervisor !== swept
+                ) {
+                    thread.state = "closed";
+                    thread.closed = { at: Date.now(), why: "dropped", by: "desk" };
+                }
+            }
+
+            for (const row of state.board?.rows ?? []) {
+                if (row.state !== "launched" && row.state !== "failed" && row.state !== "dropped") {
+                    row.state = "dropped";
+                }
+            }
+
+            state.sweepers = { [String(swept)]: "task-test" };
+            state.clerks = {};
+        }, context);
+
+        try {
+            const got = await call("board");
+
+            assert.equal(got.status, 200, JSON.stringify(got.data));
+            assert.deepEqual(
+                got.data.supervisors,
+                [live, swept],
+                "the retired supervisor is not listed",
+            );
+            assert.equal(
+                got.data.supervisor,
+                swept,
+                "the default is the supervisor with a sweeper",
+            );
+            assert.equal(got.data.titles[String(swept)], "Odrade live");
+            assert.equal(got.data.titles[String(retired)], undefined);
+            assert.equal(
+                (await call(`board?supervisor=${String(retired)}`)).data.supervisor,
+                swept,
+                "a retired supervisor asked for gives the default",
+            );
+            assert.equal((await call(`board?supervisor=${String(live)}`)).data.supervisor, live);
+        } finally {
+            await app.harness.commit(async (tx) => {
+                const state = await tx.doc(DeskThreads);
+
+                for (const thread of Object.values(state.threads)) {
+                    const before = saved.threads[thread.id];
+
+                    if (before !== undefined) {
+                        thread.state = before.state;
+
+                        if (before.closed === undefined) {
+                            delete thread.closed;
+                        } else {
+                            thread.closed = before.closed;
+                        }
+                    }
+                }
+
+                for (const row of state.board?.rows ?? []) {
+                    const before = saved.board?.rows.find((each) => each.id === row.id);
+
+                    if (before !== undefined) {
+                        row.state = before.state;
+                    }
+                }
+
+                if (saved.sweepers === undefined) {
+                    delete state.sweepers;
+                } else {
+                    state.sweepers = saved.sweepers;
+                }
+
+                if (saved.clerks === undefined) {
+                    delete state.clerks;
+                } else {
+                    state.clerks = saved.clerks;
+                }
+            }, context);
+        }
+    });
+
     test("POST board: pick, unpick, edit, drop, reopen and resolve each answer 200 with the rows", async () => {
         const call = await routes();
         const source = await knownSupervisor();

@@ -48,7 +48,13 @@ import {
     type BoardRow,
 } from "./_desk-board.ts";
 import { localMidnight, nextClockTime } from "./night-shift.ts";
-import createDesk, { BoardReceipts, capView, DeskThreads, type DeskState } from "./desk.ts";
+import createDesk, {
+    BoardReceipts,
+    capView,
+    DeskThreads,
+    type DeskState,
+    openThread,
+} from "./desk.ts";
 
 // ─── Fixtures ────────────────────────────────────────────────────────────────
 
@@ -1644,6 +1650,68 @@ const launchSuite = (label: string, instant: number, untilAt: number) =>
                 await app.harness.commit(async (tx) => {
                     const state = await tx.doc(DeskThreads);
 
+                    state.sweepers = saved.sweepers ?? {};
+                    state.clerks = saved.clerks ?? {};
+
+                    for (const thread of Object.values(state.threads)) {
+                        thread.supervisor =
+                            saved.threads[thread.id]?.supervisor ?? thread.supervisor;
+                    }
+                }, context);
+            }
+        });
+
+        test("an agent's row binds to the live supervisor: a retired one with only closed threads does not count", async () => {
+            await closeAll();
+
+            mkdirSync(join(root, "teg-retired-session"), { recursive: true });
+
+            const agentSession = Number(await newSession(app, join(root, "teg-retired-session")));
+
+            personas.set(agentSession, { id: "teg", name: "Teg", role: "agent" });
+
+            const saved = await deskState();
+
+            // 1745 is retired: every thread is its own (1 more, closed, so it has at least 1), and every thread is
+            // closed. 4242 is live by its sweeper record.
+            const added = await app.harness.commit(async (tx) => {
+                const state = await tx.doc(DeskThreads);
+                const { id } = openThread(state, {
+                    key: "board-test:retired-supervisor",
+                    supervisor: 1745,
+                    agents: ["teg"],
+                    title: "A retired supervisor's thread",
+                    at: Date.now(),
+                }).thread;
+                // The stored thread, not the object openThread made: the document keeps its own copy.
+                const thread = state.threads[id] ?? assert.fail("the retired supervisor's thread");
+
+                thread.state = "closed";
+                thread.closed = { at: Date.now(), why: "done", by: "desk" };
+                state.sweepers = { "4242": "task-test" };
+                state.clerks = {};
+
+                for (const each of Object.values(state.threads)) {
+                    each.supervisor = 1745;
+                }
+
+                return thread.id;
+            }, context);
+
+            try {
+                const text = await desk.tool(agentSession, {
+                    action: "board_add",
+                    fields: { ...FIELDS, agent: undefined },
+                });
+
+                assert.match(text, /rev 1 proposed · teg/);
+                assert.equal((await rowsOf(4242)).at(-1)?.by, "teg");
+                assert.deepEqual(await rowsOf(1745), [], "the retired supervisor gets no row");
+            } finally {
+                await app.harness.commit(async (tx) => {
+                    const state = await tx.doc(DeskThreads);
+
+                    delete state.threads[added];
                     state.sweepers = saved.sweepers ?? {};
                     state.clerks = saved.clerks ?? {};
 

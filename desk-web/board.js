@@ -29,7 +29,7 @@ const ACT_LABELS = {
 export const newBoardKey = (act, now = Date.now()) =>
     `${String(now)}-board-${String(act).replace(/[^A-Za-z0-9_-]/g, "-")}-${Math.random().toString(36).slice(2, 10)}`;
 
-/** The read of 1 supervisor's board: the first one when none is chosen. */
+/** The read of 1 supervisor's board: the desk's default (`GET board`) when none is chosen. */
 export const boardPath = (supervisor) =>
     supervisor === null || supervisor === undefined
         ? "board"
@@ -121,6 +121,15 @@ export const rowStateText = (row) =>
             ? [`error: ${row.error}`]
             : []),
     ].join(" · ");
+
+/** The label of 1 supervisor in the board's choice: its session title and id, else its conversation id. */
+export const supervisorLabel = (id, titles) => {
+    const title = titles?.[String(id)];
+
+    return typeof title === "string" && title.trim() !== ""
+        ? `${title} (${String(id)})`
+        : `Supervisor conversation ${String(id)}`;
+};
 
 /** The header's line: the limits now, or why there is no board. */
 export const limitsText = (board) =>
@@ -489,7 +498,7 @@ export function boardMarkup(html, view, ctl) {
                       >
                           ${supervisors.map(
                               (id) =>
-                                  html`<option value=${String(id)}>Supervisor conversation ${id}</option>`,
+                                  html`<option value=${String(id)}>${supervisorLabel(id, board?.titles ?? {})}</option>`,
                           )}
                       </select>`
                     : null

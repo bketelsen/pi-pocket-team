@@ -3313,6 +3313,23 @@ test("Board: the supervisor choice shows with more than 1 supervisor, and reads 
     assert.doesNotMatch(boardScreen(single).out, /<select/);
 });
 
+// Through the markup only, with no import of the label helper: on a board.js without titles, this test fails on its
+// assertions, not on a missing export.
+test("Board: a supervisor's option is its session title and id, else its conversation id", async () => {
+    const options = async (titles) =>
+        boardScreen(
+            await loadedBoard(
+                boardApi({ board: { ...boardAnswer(), supervisors: [7, 9, 11], titles } }),
+            ),
+        ).out;
+    const out = await options({ 9: "Odrade", 11: "  " });
+
+    assert.match(out, /<option value=9>Odrade \(9\)<\/option>/);
+    assert.match(out, /<option value=7>Supervisor conversation 7<\/option>/);
+    assert.match(out, /<option value=11>Supervisor conversation 11<\/option>/);
+    assert.match(await options(undefined), /<option value=9>Supervisor conversation 9<\/option>/);
+});
+
 test("Board: with no supervisor, 1 line says so, and no act posts", async () => {
     const api = boardApi({ board: { supervisors: [], supervisor: null, rows: [], limits: null } });
     const ctl = await loadedBoard(api);
