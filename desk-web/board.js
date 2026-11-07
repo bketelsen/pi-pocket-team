@@ -203,14 +203,26 @@ export function boardController(api, { onChange = () => {}, make = newBoardKey }
         try {
             const board = await api(boardPath(view.chosen));
 
+            // A chosen selection follows the board the route gave (none chosen stays none: the route's first): the select and
+            // the acts name 1 supervisor.
             if (current()) {
-                set({ board, loading: false });
+                set({
+                    board,
+                    chosen: view.chosen === null ? null : (board?.supervisor ?? null),
+                    loading: false,
+                });
             }
 
             return board;
         } catch (failure) {
+            // A failed read keeps the board on the screen, so the selection goes back to it: the select never names
+            // a supervisor whose board the acts do not post to.
             if (current()) {
-                set({ error: failure?.message ?? String(failure), loading: false });
+                set({
+                    error: failure?.message ?? String(failure),
+                    loading: false,
+                    chosen: view.board?.supervisor ?? view.chosen,
+                });
             }
 
             return undefined;
@@ -226,7 +238,9 @@ export function boardController(api, { onChange = () => {}, make = newBoardKey }
             view.loading ||
             body === null ||
             supervisor === null ||
-            supervisor === undefined
+            supervisor === undefined ||
+            // The select names another supervisor than the board on the screen: no act until they match.
+            (view.chosen !== null && view.chosen !== supervisor)
         ) {
             return;
         }

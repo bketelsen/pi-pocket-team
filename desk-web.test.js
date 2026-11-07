@@ -3491,3 +3491,49 @@ test("Board: a POST answer for supervisor A that comes after the choice of B cha
     await first;
     assert.equal(ctl.view().board.supervisor, 9);
 });
+
+test("Board: a failed read of another supervisor's board puts the selection back on the board shown, and no act goes to it under another name", async () => {
+    const pending = [];
+    const calls = [];
+
+    const api = (path, body) => {
+        calls.push(body === undefined ? ["GET", path] : ["POST", path, body]);
+
+        return new Promise((resolve, reject) => {
+            pending.push({ path, resolve, reject });
+        });
+    };
+
+    const settle = async (path, how, value) => {
+        const at = pending.findIndex((each) => each.path === path);
+
+        assert(at >= 0, `a pending ${path}`);
+        pending.splice(at, 1)[0][how](value);
+        await new Promise((resolve) => setImmediate(resolve));
+    };
+
+    const boardA = {
+        ...boardAnswer([boardRow({ id: 3, rev: 1, state: "picked", title: "A row" })]),
+        supervisors: [7, 9],
+    };
+    const ctl = boardController(api, { make: keyMaker() });
+    const loaded = ctl.load();
+
+    await settle("board", "resolve", boardA);
+    await loaded;
+
+    const choosing = ctl.choose(9);
+
+    await settle("board?supervisor=9", "reject", new Error("The read failed."));
+    await choosing;
+
+    // The board on the screen is still A's, and the select names A again, with the error.
+    assert.equal(ctl.view().board.supervisor, 7);
+    assert.equal(ctl.view().chosen, 7);
+    assert.equal(ctl.view().error, "The read failed.");
+    assert.match(boardScreen(ctl).out, /aria-label="The supervisor's board" value=7 /);
+
+    // An act goes to the board that the select and the screen both name.
+    void ctl.launch();
+    assert.deepEqual(calls.at(-1).slice(0, 2), ["POST", "board/7"]);
+});
