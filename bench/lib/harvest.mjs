@@ -47,7 +47,15 @@ import {
     testLanguage,
 } from "./hidden.mjs";
 import { TASK_FIELDS, UsageError, loadManifest } from "./manifest.mjs";
-import { BENCH_REPOS, SEED, benchRepo, readRoster, rosterDir, seededShuffle } from "./owners.mjs";
+import {
+    BENCH_REPOS,
+    SEED,
+    benchRepo,
+    commandLimits,
+    readRoster,
+    rosterDir,
+    seededShuffle,
+} from "./owners.mjs";
 import { pocketDb, readThreads, routeJudgments } from "./pocket.mjs";
 import { checkoutOf } from "./runner.mjs";
 import { DEFAULTS, findProgram } from "./sandbox.mjs";
@@ -78,6 +86,26 @@ export const validationKey = ({ merge, parent, commands, brief, route }) =>
 /** True when a cached outcome is an unexpected error: it is never reused (earlier versions cached such errors). */
 const isValidationError = (outcome) =>
     String(outcome?.reason ?? "").startsWith("validation error:");
+
+/**
+ * True when a step of a validation timed out (a setup, the check, or the hidden command at the merge or the parent).
+ * A timeout says how loaded the host was, or that the limit was too short, not what the commit does: such an outcome
+ * is never cached or reused (earlier runs cached it), so a later run, or a longer limit, validates it again.
+ */
+const timedOut = (outcome) =>
+    /\(timed out\)$/.test(String(outcome?.reason ?? "")) ||
+    Object.keys(STEP_NAMES).some((step) => outcome?.validation?.[step] === "timed out");
+
+/**
+ * The most commits `gh pr view --json commits` returns (it asks GitHub for the first 100). A PR with this many may have
+ * more: its list may be incomplete, so the parent rule (`parentOf`) cannot tell a rebase merge, and the candidate is
+ * dropped (a bench task that large is out of scope).
+ */
+export const GH_COMMITS_CAP = 100;
+
+/** The drop reason of a PR whose commit list may be incomplete. */
+export const TOO_MANY_COMMITS =
+    "the PR has 100 or more commits: the list may be incomplete, so its parent is unknown";
 
 /** The `gh pr view` fields the harvester reads. */
 export const PR_FIELDS = "mergeCommit,mergedAt,files,additions,deletions,state,headRefOid,commits";
@@ -546,8 +574,10 @@ const treesOf = (base) => ({
  * parent). Returns `{ ok, reason, fields, validation }`; `fields` are the task fields the validation found. The
  * result is cached in the data dir by the merge commit, the commands and the brief.
  */
-export async function validateCandidate(ctx, candidate) {
+export async function validateCandidate(baseCtx, candidate) {
     const { repo, number, thread, checkout, merge, parent } = candidate;
+    // The repository's own limits for the check and the hidden tests, unless the caller gives explicit ones.
+    const ctx = { ...baseCtx, timeouts: commandLimits(baseCtx.timeouts, repo) };
     const commands = await commandsAt(checkout, merge);
     const key = validationKey({
         merge,
@@ -559,7 +589,7 @@ export async function validateCandidate(ctx, candidate) {
     const cacheFile = join(cacheDir(ctx.data, repo), `${number}.json`);
     const cached = await readJson(cacheFile, null);
 
-    if (cached?.key === key && !isValidationError(cached.outcome)) {
+    if (cached?.key === key && !isValidationError(cached.outcome) && !timedOut(cached.outcome)) {
         return { ...cached.outcome, cached: true };
     }
 
@@ -677,8 +707,8 @@ export async function validateCandidate(ctx, candidate) {
         await cleanupTree(base, ctx.log);
     }
 
-    // An unexpected error is not cached: a later run validates the candidate again.
-    if (!isValidationError(result)) {
+    // An unexpected error or a timeout is not cached: a later run validates the candidate again.
+    if (!isValidationError(result) && !timedOut(result)) {
         await writeJsonAtomic(cacheFile, { key, outcome: result });
     }
 
@@ -770,6 +800,8 @@ export async function harvestRepo(ctx, repo, list, dropped) {
             drop(c, `merged outside the window (${facts.mergedAt})`);
         } else if (!(await hasCommit(checkout, facts.merge))) {
             drop(c, `the merge commit ${facts.merge} is not in the local checkout`);
+        } else if ((facts.commits?.length ?? 0) >= GH_COMMITS_CAP) {
+            drop(c, TOO_MANY_COMMITS);
         } else {
             const size = facts.additions + facts.deletions;
 
@@ -988,7 +1020,9 @@ export const revalidateLog = (data, taskId) =>
  * pass at the merge, and fail at the parent (after its setup) with the task's hidden files copied over it. Returns the
  * validation entry `{ at, ok, reason, log, ... }`; `log` holds each command's stderr, and a failed command's stdout.
  */
-export async function revalidateTask(ctx, task, checkout) {
+export async function revalidateTask(baseCtx, task, checkout) {
+    // The repository's own limits for the check and the hidden tests, unless the caller gives explicit ones.
+    const ctx = { ...baseCtx, timeouts: commandLimits(baseCtx.timeouts, task.repo) };
     const base = join(ctx.data, "harvest-work", "revalidate", task.id);
     const trees = treesOf(base);
     const logFile = revalidateLog(ctx.data, task.id);
@@ -1137,7 +1171,10 @@ export async function revalidate(ctx, file, { checkoutOf }) {
     return failed ? 1 : 0;
 }
 
-/** The default limits of the harvester's commands. */
+/**
+ * The default limits of the harvester's commands, for a repository with no limit of its own (`commandLimits` in
+ * `bench/lib/owners.mjs` gives each repository's).
+ */
 export const TIMEOUTS = { setup: COMMAND_MS, check: COMMAND_MS, hidden: COMMAND_MS };
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -1216,7 +1253,8 @@ export async function harvestMain(argv, env = process.env, deps = {}) {
                 miseInstalls: resolve(values["mise-installs"] ?? DEFAULTS.miseInstalls),
                 killGraceMs: deps.killGraceMs,
             },
-            timeouts: { ...TIMEOUTS, ...deps.timeouts },
+            // Only explicit limits here: each validation adds its repository's (`commandLimits`).
+            timeouts: { ...deps.timeouts },
         };
 
         if (values.revalidate) {

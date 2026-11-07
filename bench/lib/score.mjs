@@ -17,11 +17,12 @@ import {
     writeJsonAtomic,
 } from "./common.mjs";
 import { scratchClone } from "./clone.mjs";
-import { COMMAND_MS, failText, makeCache, runInSandbox, stageAll, stageNote } from "./exec.mjs";
+import { failText, makeCache, runInSandbox, stageAll, stageNote } from "./exec.mjs";
 import { gitBuffer, overlayFiles } from "./gitfiles.mjs";
 import { goModule } from "./hidden.mjs";
 import { JUDGES, JUDGE_PROMPT, cutDiff, renderPrompt, runJudge } from "./judge.mjs";
 import { UsageError, loadManifest } from "./manifest.mjs";
+import { commandLimits } from "./owners.mjs";
 import { checkoutOf } from "./runner.mjs";
 import { DEFAULTS, findProgram } from "./sandbox.mjs";
 
@@ -495,7 +496,19 @@ export async function scoreResult(ctx, file, result, { task, manifest }) {
     }
 
     try {
-        return await scoreAfterS0(ctx, { file, result, task, checkout, git, attempt, judgesOnly });
+        // The repository's own limit for S1 and S2 (and their staging and copy steps, and the submitted diff), unless
+        // the caller gives explicit ones.
+        const limited = { ...ctx, timeouts: commandLimits(ctx.timeouts, task.repo) };
+
+        return await scoreAfterS0(limited, {
+            file,
+            result,
+            task,
+            checkout,
+            git,
+            attempt,
+            judgesOnly,
+        });
     } catch (error) {
         // The scores so far stay; the judges wait; a later run (judges only, when S1 and S2 are done) goes on.
         result.judgePending = true;
@@ -780,7 +793,8 @@ const SCORE_OPTIONS = {
 
 /**
  * The scorer's main: returns the exit code. `deps`: `now`, `log`, `judges`, `timeouts`, `killGraceMs`, `judgeWallMs`,
- * `git` (the host git of the local checkout) and `submittedDiff` replace the defaults in tests.
+ * `git` (the host git of the local checkout) and `submittedDiff` replace the defaults in tests; `onRun` sees each
+ * sandbox run (`runInSandbox`). An explicit `timeouts.check` or `timeouts.hidden` wins over the repository's limit.
  */
 export async function scoreMain(argv, env = process.env, deps = {}) {
     const log = deps.log ?? ((line) => console.error(line));
@@ -833,7 +847,14 @@ export async function scoreMain(argv, env = process.env, deps = {}) {
 
         const pocket = resolve(values.pocket ?? DEFAULTS.pocket);
         const miseInstalls = resolve(values["mise-installs"] ?? DEFAULTS.miseInstalls);
-        const sandbox = { bwrap, pocket, miseInstalls, data, killGraceMs: deps.killGraceMs };
+        const sandbox = {
+            bwrap,
+            pocket,
+            miseInstalls,
+            data,
+            killGraceMs: deps.killGraceMs,
+            onRun: deps.onRun,
+        };
         const ctx = {
             data,
             sandbox,
@@ -844,7 +865,8 @@ export async function scoreMain(argv, env = process.env, deps = {}) {
             judges: deps.judges,
             git: deps.git,
             submittedDiff: deps.submittedDiff,
-            timeouts: { check: COMMAND_MS, hidden: COMMAND_MS, ...deps.timeouts },
+            // Only explicit limits here: `scoreResult` adds the repository's (`commandLimits`).
+            timeouts: { ...deps.timeouts },
             judgeCtx: {
                 data,
                 bwrap,

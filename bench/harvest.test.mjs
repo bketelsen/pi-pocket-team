@@ -9,10 +9,12 @@ import { after, before, test } from "node:test";
 import {
     PER_STRATUM,
     PR_FIELDS,
+    TOO_MANY_COMMITS,
     VALIDATION_VERSION,
     commandsAt,
     goModulesAt,
     parentOf,
+    revalidateTask,
     validateCandidate,
     validationKey,
     harvest,
@@ -22,7 +24,8 @@ import {
     stratumOrder,
 } from "./lib/harvest.mjs";
 import { loadManifest } from "./lib/manifest.mjs";
-import { readRoster, repositoriesOf, seededShuffle } from "./lib/owners.mjs";
+import { commandMsOf, readRoster, repositoriesOf, seededShuffle } from "./lib/owners.mjs";
+import { COMMAND_MS } from "./lib/exec.mjs";
 import { delegationTask, goalBrief, readThreads } from "./lib/pocket.mjs";
 import { FAKE_BWRAP, git, makeFixture, runScript, testEnv } from "./fixtures/helpers.mjs";
 import {
@@ -951,4 +954,239 @@ test("--revalidate stages the hidden files at the parent: a test that needs its 
     assert.equal(result.code, 0, result.stdout + result.stderr);
     assert.equal(entry.ok, true, entry.reason);
     assert.equal(entry.hiddenNames, "pass");
+});
+
+test("a repository's own command limit: fleet's check and hidden tests get 30 minutes, setup and others 10", async () => {
+    const FLEET = "bketelsen/fleet";
+
+    const limits = async (repo) => {
+        const data = join(fixture.root, `limit-data-${repo.replace("/", "-")}`);
+        const runs = [];
+        const ctx = validationContext(data);
+
+        delete ctx.timeouts;
+        ctx.sandbox.onRun = ({ step, timeoutMs }) => runs.push([step ?? "discovery", timeoutMs]);
+
+        const candidate = {
+            repo,
+            number: 91,
+            thread: { id: "T91", brief: "Fix add.", route: null, nightShift: false },
+            checkout: node.repo,
+            merge: node.merge,
+            parent: node.parent,
+        };
+
+        // A validation cached under the old limit timed out: it is not reused.
+        mkdirSync(join(data, "harvest-cache", ...repo.split("/")), { recursive: true });
+        writeFileSync(
+            join(data, "harvest-cache", ...repo.split("/"), "91.json"),
+            JSON.stringify({
+                key: validationKey({
+                    merge: node.merge,
+                    parent: node.parent,
+                    commands: await commandsAt(node.repo, node.merge),
+                    brief: "Fix add.",
+                    route: null,
+                }),
+                outcome: {
+                    ok: false,
+                    reason: "check failed at the merge (timed out)",
+                    fields: null,
+                    validation: { checkMerge: "timed out" },
+                },
+            }),
+        );
+
+        const result = await validateCandidate(ctx, candidate);
+
+        assert.equal(result.cached, undefined, `${repo}: a cached timeout is validated again`);
+        assert.equal(result.ok, true, result.reason);
+
+        const fields = result.fields;
+        const entry = await revalidateTask(
+            {
+                ...ctx,
+                sandbox: {
+                    ...ctx.sandbox,
+                    onRun: ({ step, timeoutMs }) =>
+                        runs.push([`reval ${step ?? "discovery"}`, timeoutMs]),
+                },
+            },
+            {
+                id: `limit-${repo.replace("/", "-")}`,
+                repo,
+                parent: node.parent,
+                merge: node.merge,
+                setup: fields.setup,
+                check: fields.check,
+                hiddenTests: fields.hiddenTests,
+                hiddenCommand: fields.hiddenCommand,
+            },
+            node.repo,
+        );
+
+        assert.equal(entry.ok, true, entry.reason);
+
+        return Object.fromEntries(runs);
+    };
+
+    const LONG = 30 * 60_000;
+
+    assert.equal(commandMsOf(FLEET), LONG);
+    assert.equal(commandMsOf(REPO), COMMAND_MS);
+
+    for (const [repo, limit] of [
+        [FLEET, LONG],
+        [REPO, COMMAND_MS],
+    ]) {
+        const runs = await limits(repo);
+
+        for (const step of [
+            "check at the merge",
+            "hidden command at the merge",
+            "hidden command at the parent",
+            "discovery",
+            "reval check at the merge",
+            "reval hidden command at the merge",
+            "reval hidden command at the parent",
+            "reval discovery",
+        ]) {
+            assert.equal(runs[step], limit, `${repo}: ${step}`);
+        }
+
+        for (const step of [
+            "setup at the merge",
+            "setup at the parent",
+            "reval setup at the parent",
+        ]) {
+            assert.equal(runs[step], COMMAND_MS, `${repo}: ${step}`);
+        }
+    }
+});
+
+test("a PR with 100 or more commits is dropped: gh lists at most 100, so its parent is unknown", async () => {
+    const shapes = makeMergeShapes(join(fixture.root, "merge-shapes-cap"));
+    const commits = (count) =>
+        Array.from({ length: count }, (_, i) => ({
+            oid: i.toString(16).padStart(40, "0"),
+            messageHeadline: `commit ${i}`,
+            authoredDate: "2026-10-01T10:00:00Z",
+        }));
+    const prs = {};
+    const list = [100, 99].map((count, i) => {
+        const n = 60 + i;
+
+        prs[`${REPO}#${n}`] = {
+            state: "MERGED",
+            mergedAt: "2026-10-05T00:00:00Z",
+            mergeCommit: { oid: shapes.rebase.merge },
+            additions: 10,
+            deletions: 0,
+            commits: commits(count),
+        };
+
+        return {
+            thread: {
+                id: `T${n}`,
+                nightShift: true,
+                brief: "b",
+                briefSource: "night-shift",
+                route: null,
+            },
+            pr: `${REPO}#${n}`,
+            number: n,
+            repo: REPO,
+        };
+    });
+    const validated = [];
+    const ctx = stubContext(fakeGh({ prs }), async (_ctx, c) => {
+        validated.push(c.number);
+
+        return {
+            ok: true,
+            validation: {},
+            fields: {
+                parent: c.parent,
+                setup: "true",
+                check: "true",
+                hiddenTests: [],
+                hiddenCommand: null,
+                features: null,
+            },
+        };
+    });
+
+    ctx.checkouts = { [REPO]: shapes.repo };
+
+    const manifest = await harvestRepo(ctx, REPO, list, []);
+
+    assert.equal(
+        TOO_MANY_COMMITS,
+        "the PR has 100 or more commits: the list may be incomplete, so its parent is unknown",
+    );
+    assert.deepEqual(manifest.dropped, [
+        { thread: "T60", pr: `${REPO}#60`, reason: TOO_MANY_COMMITS },
+    ]);
+    assert.deepEqual(validated, [61], "a PR of 99 commits is still a candidate");
+});
+
+test("the parent rule: a headline that GitHub cut with … matches its full subject", async () => {
+    const shapes = makeMergeShapes(join(fixture.root, "merge-shapes-cut"));
+    const { merge, parent, commits } = shapes.rebase;
+    const cut = commits.map((c) => ({
+        ...c,
+        messageHeadline: `${c.messageHeadline.slice(0, 8)}…`,
+    }));
+
+    assert.equal(cut[0].messageHeadline, "rebase o…");
+    assert.equal(await parentOf(shapes.repo, merge, cut), parent);
+
+    // A cut headline that is not the start of the subject does not match.
+    const wrong = commits.map((c) => ({ ...c, messageHeadline: "other…" }));
+
+    assert.equal(
+        await parentOf(shapes.repo, merge, wrong),
+        git(shapes.repo, "rev-parse", `${merge}^1`),
+    );
+});
+
+test("the parent rule: a squash-merged PR with a merge commit inside it keeps <merge>^1", async () => {
+    const repo = join(fixture.root, "pr-with-merge");
+
+    const commit = (file, subject, date) => {
+        writeFileSync(join(repo, file), `${subject}\n`);
+        git(repo, "add", ".");
+        git(repo, "commit", "--quiet", "-m", subject, `--date=${date}`);
+
+        return git(repo, "rev-parse", "HEAD");
+    };
+
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init", "--quiet", "--initial-branch=main");
+    commit("a.txt", "seed", "2026-09-01T10:00:00Z");
+    git(repo, "checkout", "--quiet", "-b", "pr");
+    commit("p.txt", "pr one", "2026-10-01T10:00:00Z");
+    git(repo, "checkout", "--quiet", "main");
+    commit("b.txt", "main moves on", "2026-10-01T11:00:00Z");
+    git(repo, "checkout", "--quiet", "pr");
+    git(repo, "merge", "--quiet", "--no-ff", "-m", "Merge branch 'main' into pr", "main");
+
+    const inside = git(repo, "log", "-1", "--format=%aI");
+
+    commit("p.txt", "pr two", "2026-10-01T12:00:00Z");
+    git(repo, "checkout", "--quiet", "main");
+
+    const before = git(repo, "rev-parse", "HEAD");
+
+    git(repo, "merge", "--quiet", "--squash", "pr");
+    git(repo, "commit", "--quiet", "-m", "The PR (#4)", "--date=2026-10-01T13:00:00Z");
+
+    const merge = git(repo, "rev-parse", "HEAD");
+    const commits = [
+        ["pr one", "2026-10-01T10:00:00Z"],
+        ["Merge branch 'main' into pr", inside],
+        ["pr two", "2026-10-01T12:00:00Z"],
+    ].map(([messageHeadline, authoredDate]) => ({ messageHeadline, authoredDate }));
+
+    assert.equal(await parentOf(repo, merge, commits), before);
 });

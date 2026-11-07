@@ -1026,3 +1026,35 @@ test("a failed staging does not stop S1: it is logged, the check runs, and a fai
     );
     assert.equal(result.s2Detail, "pass");
 });
+
+test("S1 and S2 run with the repository's own command limit; an explicit limit wins", async () => {
+    const limitsOf = async (id, repo, deps = {}) => {
+        const runs = {};
+        const paths = await attempt(taskOf(id, { default: [GOOD(3)] }, { repo }), { change: FIX });
+        const { code, result } = await score(paths, [], {
+            onRun: ({ step, timeoutMs }) => {
+                runs[step] = timeoutMs;
+            },
+            ...deps,
+        });
+
+        assert.equal(code, 0);
+        assert.equal(result.s1, true, result.s1Detail);
+        assert.equal(result.s2, true, result.s2Detail);
+
+        return runs;
+    };
+
+    const fleet = await limitsOf("limit-fleet", "bketelsen/fleet");
+    const own = await limitsOf("limit-own", REPO);
+    const explicit = await limitsOf("limit-explicit", "bketelsen/fleet", {
+        timeouts: { check: 120_000, hidden: 120_000 },
+    });
+
+    assert.equal(fleet["S1, the check"], 30 * 60_000);
+    assert.equal(fleet["S2, the hidden command"], 30 * 60_000);
+    assert.equal(own["S1, the check"], 10 * 60_000);
+    assert.equal(own["S2, the hidden command"], 10 * 60_000);
+    assert.equal(explicit["S1, the check"], 120_000);
+    assert.equal(explicit["S2, the hidden command"], 120_000);
+});

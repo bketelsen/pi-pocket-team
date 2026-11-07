@@ -108,6 +108,8 @@ export function lastLines(text, count = STDOUT_TAIL_LINES) {
  * `step` names it, the last 200 lines of its stdout go to `logFile` after a header line (stderr is there already;
  * npm and the test reporters print their failures on stdout). `overlay`: a host folder bound read-only at `/overlay`. `argv`: a
  * program and its arguments, instead of the shell command. `trustedGit`: a git directory bound at `/trusted.git`.
+ * `sandbox.onRun`, when set, gets `{ step, timeoutMs, command, argv }` of each run before it starts (tests record the
+ * limits with it).
  */
 export async function runInSandbox(
     sandbox,
@@ -129,6 +131,9 @@ export async function runInSandbox(
         ...(overlay ? { overlay } : {}),
         ...(trustedGit ? { trustedGit } : {}),
     };
+
+    sandbox.onRun?.({ step, timeoutMs, command, argv });
+
     const args = bwrapArgs(paths, {
         tryNo: 0,
         command: argv ?? ["bash", "-c", command],
