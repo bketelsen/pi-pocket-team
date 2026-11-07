@@ -974,3 +974,55 @@ test("a submodule that the parent tracks (a gitlink) is judged as its submitted 
     );
     assert.match(diff, /^-Subproject commit [0-9a-f]{40}$/m, "the gitlink's removal");
 });
+
+test("S1 and S2 stage new files: a check and a hidden command that need them in git ls-files pass", async () => {
+    const task = taskOf(
+        "staged",
+        { default: [GOOD(3)] },
+        {
+            check: "git ls-files --error-unmatch NEW.md",
+            // The worker's new file and the hidden tests copied over the tree are both in the index.
+            hiddenCommand:
+                "git ls-files --error-unmatch NEW.md add.test.mjs fixtures/data.json && node --test --test-name-pattern='^(?:adds)$' 'add.test.mjs'",
+        },
+    );
+    const paths = await attempt(task, { change: { ...FIX, "NEW.md": "a new file\n" } });
+    const before = treeHash(paths.work);
+    const { code, result } = await score(paths);
+
+    assert.equal(code, 0);
+    assert.equal(result.s1, true, result.s1Detail);
+    assert.equal(result.s2, true, result.s2Detail);
+    assert.equal(treeHash(paths.work), before, "the submitted tree is unchanged, its index too");
+    assert.equal(git(paths.work, "status", "--porcelain", "--", "NEW.md"), "?? NEW.md");
+});
+
+test("a failed staging does not stop S1: it is logged, the check runs, and a failed check notes it", async () => {
+    const task = taskOf(
+        "stage-fails",
+        { default: [GOOD(1)] },
+        { check: "git ls-files --error-unmatch NEW.md" },
+    );
+    const paths = await attempt(task, {
+        change: { ...FIX, "NEW.md": "a new file\n" },
+        prepare: (work) => writeFileSync(join(work, ".git", "index.lock"), ""),
+    });
+    const { code, result } = await score(paths);
+    const log = readFileSync(
+        join(paths.data, "score", "stage1", "stage-fails", "github-copilot__gpt-6-luna.score.log"),
+        "utf8",
+    );
+
+    assert.equal(code, 0);
+    assert.equal(result.s1, false);
+    assert.match(result.s1Detail, /^exit 1; the staging of new files failed \(exit 128\)$/);
+    assert.match(log, /^--- S1, the staging of new files failed \(exit 128\)/m);
+    assert.match(log, /^--- S1, the check failed \(exit 1\)/m, "the check ran after it");
+    assert.match(log, /^--- S2, the staging of new files failed \(exit 128\)/m);
+    assert.equal(
+        result.s2,
+        true,
+        "S2's copy holds the lock too: its staging fails, its command runs",
+    );
+    assert.equal(result.s2Detail, "pass");
+});

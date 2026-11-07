@@ -8,8 +8,11 @@ import { join } from "node:path";
 import { after, before, test } from "node:test";
 import {
     PER_STRATUM,
+    PR_FIELDS,
     VALIDATION_VERSION,
     commandsAt,
+    goModulesAt,
+    parentOf,
     validateCandidate,
     validationKey,
     harvest,
@@ -21,8 +24,17 @@ import {
 import { loadManifest } from "./lib/manifest.mjs";
 import { readRoster, repositoriesOf, seededShuffle } from "./lib/owners.mjs";
 import { delegationTask, goalBrief, readThreads } from "./lib/pocket.mjs";
-import { FAKE_BWRAP, makeFixture, runScript, testEnv } from "./fixtures/helpers.mjs";
-import { fakeGh, makeExtraRepo, makeNodeRepo, makePocketDb, wrapped } from "./fixtures/harvest.mjs";
+import { FAKE_BWRAP, git, makeFixture, runScript, testEnv } from "./fixtures/helpers.mjs";
+import {
+    fakeGh,
+    makeExtraRepo,
+    makeMergeShapes,
+    makeNestedGoRepo,
+    makeNodeRepo,
+    makePocketDb,
+    makeTrackedRepo,
+    wrapped,
+} from "./fixtures/harvest.mjs";
 import { cleanupTree, removeTree } from "./lib/common.mjs";
 
 const REPO = "bketelsen/pi-pocket-team";
@@ -618,7 +630,11 @@ test("a cached validation error is never reused: the candidate is validated agai
         route: null,
     });
 
-    assert.equal(VALIDATION_VERSION, 2, "the overlay's modes changed the validation");
+    assert.equal(
+        VALIDATION_VERSION,
+        3,
+        "the staging of the hidden files and the Go modules changed the validation",
+    );
     mkdirSync(join(data, "harvest-cache", "bketelsen", "pi-pocket-team"), { recursive: true });
     writeFileSync(
         join(data, "harvest-cache", "bketelsen", "pi-pocket-team", "77.json"),
@@ -738,4 +754,201 @@ test("a failed fetch does not stop the harvest: the repository is harvested with
             repo,
         );
     }
+});
+
+test("the parent of a rebase merge is the commit before the PR's rebased commits", async () => {
+    const shapes = makeMergeShapes(join(fixture.root, "merge-shapes"));
+    const { rebase } = shapes;
+
+    assert.equal(await parentOf(shapes.repo, rebase.merge, rebase.commits), rebase.parent);
+    assert.notEqual(rebase.parent, git(shapes.repo, "rev-parse", `${rebase.merge}^1`));
+});
+
+test("the parent of a squash merge of 3 commits and of a merge commit stays the first parent", async () => {
+    const shapes = makeMergeShapes(join(fixture.root, "merge-shapes-2"));
+
+    for (const shape of ["squash", "merge"]) {
+        const { merge, parent, commits } = shapes[shape];
+
+        assert.equal(await parentOf(shapes.repo, merge, commits), parent, shape);
+        assert.equal(parent, git(shapes.repo, "rev-parse", `${merge}^1`), shape);
+    }
+
+    // A PR of 1 commit, or with no commits known: the first parent.
+    const { merge, commits } = shapes.rebase;
+
+    assert.equal(
+        await parentOf(shapes.repo, merge, commits.slice(1)),
+        git(shapes.repo, "rev-parse", `${merge}^1`),
+    );
+    assert.equal(
+        await parentOf(shapes.repo, merge, []),
+        git(shapes.repo, "rev-parse", `${merge}^1`),
+    );
+});
+
+test("a harvest reads the PR's commits and validates a rebase merge at its real parent; an old gh cache is read again", async () => {
+    const shapes = makeMergeShapes(join(fixture.root, "merge-shapes-3"));
+    const prs = {};
+    const list = [];
+
+    const pr = (n, shape) => {
+        prs[`${REPO}#${n}`] = {
+            state: "MERGED",
+            mergedAt: "2026-10-05T00:00:00Z",
+            mergeCommit: { oid: shapes[shape].merge },
+            additions: 10,
+            deletions: 0,
+            commits: shapes[shape].commits,
+        };
+        list.push({
+            thread: {
+                id: `T${n}`,
+                nightShift: true,
+                brief: "b",
+                briefSource: "night-shift",
+                route: null,
+            },
+            pr: `${REPO}#${n}`,
+            number: n,
+            repo: REPO,
+        });
+    };
+
+    pr(1, "rebase");
+    pr(2, "squash");
+    pr(3, "merge");
+
+    const parents = {};
+    const ctx = stubContext(fakeGh({ prs }), async (_ctx, c) => {
+        parents[c.number] = c.parent;
+
+        return {
+            ok: true,
+            validation: {},
+            fields: {
+                parent: c.parent,
+                setup: "true",
+                check: "true",
+                hiddenTests: [],
+                hiddenCommand: null,
+                features: null,
+            },
+        };
+    });
+
+    // A gh cache of an earlier harvest, with no commits: it is read again.
+    mkdirSync(join(ctx.data, "harvest-cache", "bketelsen", "pi-pocket-team"), { recursive: true });
+    writeFileSync(
+        join(ctx.data, "harvest-cache", "bketelsen", "pi-pocket-team", "1.gh.json"),
+        JSON.stringify({ ...prs[`${REPO}#1`], merge: shapes.rebase.merge, commits: undefined }),
+    );
+    ctx.checkouts = { [REPO]: shapes.repo };
+
+    const manifest = await harvestRepo(ctx, REPO, list, []);
+
+    assert.ok(PR_FIELDS.split(",").includes("commits"));
+    assert.deepEqual(parents, {
+        1: shapes.rebase.parent,
+        2: shapes.squash.parent,
+        3: shapes.merge.parent,
+    });
+    assert.equal(manifest.tasks.find((t) => t.pr === `${REPO}#1`).parent, shapes.rebase.parent);
+});
+
+test("Go modules: each hidden file belongs to the nearest go.mod at or above its folder", async () => {
+    const go = makeNestedGoRepo(join(fixture.root, "nested-go"));
+
+    assert.deepEqual(
+        await goModulesAt(go.repo, go.rev, [
+            "kit/jsonrpc/client_test.go",
+            "kit/kit_test.go",
+            "cmd/x_test.go",
+        ]),
+        { ".": "example.com/lodge", kit: "example.com/lodge/kit" },
+    );
+    assert.deepEqual(await goModulesAt(go.repo, go.rev, ["cmd/x_test.go"]), {
+        ".": "example.com/lodge",
+    });
+});
+
+/** A validation context of the fake bwrap in its own data dir. */
+const validationContext = (data) => ({
+    data,
+    now: () => NOW,
+    log: () => {},
+    rosterNames: [REPO],
+    hostNames: [],
+    sandbox: {
+        bwrap: FAKE_BWRAP,
+        pocket: fixture.pocket,
+        miseInstalls: join(fixture.root, "no-mise"),
+        data,
+    },
+    timeouts: { setup: 60_000, check: 60_000, hidden: 60_000 },
+});
+
+test("the harvest stages the hidden files at the parent: a test that needs its file in git ls-files is valid", async () => {
+    const tracked = makeTrackedRepo(join(fixture.root, "tracked-repo"));
+    const result = await validateCandidate(validationContext(join(fixture.root, "tracked-data")), {
+        repo: REPO,
+        number: 90,
+        thread: { id: "T90", brief: "Fix add.", route: null, nightShift: false },
+        checkout: tracked.repo,
+        merge: tracked.merge,
+        parent: tracked.parent,
+    });
+
+    assert.equal(result.ok, true, result.reason);
+    assert.deepEqual(result.fields.hiddenTests, [{ file: "tracked.test.mjs", names: ["tracked"] }]);
+    assert.equal(
+        result.fields.hiddenCommand,
+        "PI_POCKET_CHECKOUT=/pocket node --test --test-name-pattern='^(?:tracked)$' 'tracked.test.mjs'",
+    );
+});
+
+test("--revalidate stages the hidden files at the parent: a test that needs its file in git ls-files passes", async () => {
+    const tracked = makeTrackedRepo(join(fixture.root, "tracked-reval-repo"));
+    const file = join(fixture.root, "reviewed-tracked.json");
+
+    writeFileSync(
+        file,
+        JSON.stringify({
+            schema: 1,
+            repo: REPO,
+            checkout: tracked.repo,
+            tasks: [
+                {
+                    id: "tracked-1",
+                    repo: REPO,
+                    thread: "T1",
+                    pr: `${REPO}#1`,
+                    parent: tracked.parent,
+                    merge: tracked.merge,
+                    brief: "Fix add.",
+                    briefSource: "delegation",
+                    setup: "PI_POCKET_CHECKOUT=/pocket node link.mjs",
+                    check: "PI_POCKET_CHECKOUT=/pocket make test",
+                    hiddenTests: [{ file: "tracked.test.mjs", names: ["tracked"] }],
+                    hiddenCommand:
+                        "PI_POCKET_CHECKOUT=/pocket node --test --test-name-pattern='^(?:tracked)$' 'tracked.test.mjs'",
+                    size: 10,
+                    features: null,
+                    owner: { keep: true, reason: "", scopeMatches: true, commandsConfirmed: true },
+                },
+            ],
+            validation: {},
+        }),
+    );
+
+    const result = await runScript(
+        "harvest.mjs",
+        ["--revalidate", file, "--bwrap", FAKE_BWRAP, "--pocket", fixture.pocket],
+        testEnv(fixture, { BENCH_DATA: join(fixture.root, "reval-tracked-data") }),
+    );
+    const entry = JSON.parse(readFileSync(file, "utf8")).validation["tracked-1"];
+
+    assert.equal(result.code, 0, result.stdout + result.stderr);
+    assert.equal(entry.ok, true, entry.reason);
+    assert.equal(entry.hiddenNames, "pass");
 });

@@ -17,7 +17,7 @@ import {
     writeJsonAtomic,
 } from "./common.mjs";
 import { scratchClone } from "./clone.mjs";
-import { COMMAND_MS, failText, makeCache, runInSandbox } from "./exec.mjs";
+import { COMMAND_MS, failText, makeCache, runInSandbox, stageAll, stageNote } from "./exec.mjs";
 import { gitBuffer, overlayFiles } from "./gitfiles.mjs";
 import { goModule } from "./hidden.mjs";
 import { JUDGES, JUDGE_PROMPT, cutDiff, renderPrompt, runJudge } from "./judge.mjs";
@@ -534,6 +534,15 @@ async function scoreAfterS0(ctx, { file, result, task, checkout, git, attempt, j
 
             await copyTree(result.workDir, s1Tree);
 
+            // New files of the worker are untracked: stage them, so a check that lists files with `git ls-files`
+            // sees them as a commit holds them. A failure is logged, and the check runs anyway.
+            const s1Staged = await stageAll(ctx.sandbox, {
+                work: s1Tree,
+                cache,
+                timeoutMs: ctx.timeouts.check,
+                logFile,
+                step: "S1, the staging of new files",
+            });
             const s1 = await runInSandbox(ctx.sandbox, {
                 work: s1Tree,
                 cache,
@@ -544,7 +553,7 @@ async function scoreAfterS0(ctx, { file, result, task, checkout, git, attempt, j
             });
 
             result.s1 = s1.ok;
-            result.s1Detail = s1.ok ? "pass" : failText(s1);
+            result.s1Detail = s1.ok ? "pass" : `${failText(s1)}${stageNote(s1Staged)}`;
             await cleanupTree(s1Tree, ctx.log);
 
             if (task.hiddenCommand) {
@@ -580,6 +589,16 @@ async function scoreAfterS0(ctx, { file, result, task, checkout, git, attempt, j
                           logFile,
                           step: "S2, the copy of the hidden tests",
                       });
+                // The worker's new files and the hidden tests are staged, as at S1 (a failure is logged only).
+                const s2Staged = !copied.ok
+                    ? null
+                    : await stageAll(ctx.sandbox, {
+                          work: s2Tree,
+                          cache,
+                          timeoutMs: ctx.timeouts.hidden,
+                          logFile,
+                          step: "S2, the staging of new files",
+                      });
                 const s2 = !copied.ok
                     ? copied
                     : await runInSandbox(ctx.sandbox, {
@@ -598,7 +617,7 @@ async function scoreAfterS0(ctx, { file, result, task, checkout, git, attempt, j
                       ? `the removal of the hidden tests' destinations failed (${failText(cleared)})`
                       : !copied.ok
                         ? `the copy of the hidden tests failed (${failText(copied)})`
-                        : failText(s2);
+                        : `${failText(s2)}${stageNote(s2Staged)}`;
             } else {
                 result.s2 = null;
             }

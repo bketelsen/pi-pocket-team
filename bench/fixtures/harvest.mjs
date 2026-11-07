@@ -121,6 +121,146 @@ export function makeExtraRepo(repo) {
 }
 
 /**
+ * A repository of the same shape whose PR adds `tracked.test.mjs`: its test `tracked` first runs
+ * `git ls-files --error-unmatch tracked.test.mjs` (an error, not an assertion, when the file is untracked), then
+ * checks the sum (an assertion at the parent). Returns `{ repo, parent, merge }`.
+ */
+export function makeTrackedRepo(repo) {
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init", "--quiet", "--initial-branch=main");
+    writeFiles(repo, {
+        "package.json": `${JSON.stringify({ name: "tracked", private: true, type: "module", scripts: { link: "node link.mjs" } })}\n`,
+        "link.mjs": "// The fixture's link step: nothing to link.\n",
+        Makefile: "test:\n\tnode --test\n",
+        "lib.mjs": "export const add = (a, b) => a - b;\n",
+    });
+    git(repo, "add", ".");
+    git(repo, "commit", "--quiet", "-m", "parent");
+
+    const parent = git(repo, "rev-parse", "HEAD");
+
+    git(repo, "checkout", "--quiet", "-b", "fix");
+    writeFiles(repo, {
+        "lib.mjs": "export const add = (a, b) => a + b;\n",
+        "tracked.test.mjs": [
+            'import assert from "node:assert/strict";',
+            'import { execFileSync } from "node:child_process";',
+            'import { test } from "node:test";',
+            'import { add } from "./lib.mjs";',
+            "",
+            'test("tracked", () => {',
+            '    execFileSync("git", ["ls-files", "--error-unmatch", "tracked.test.mjs"], { stdio: "ignore" });',
+            "    assert.equal(add(1, 2), 3);",
+            "});",
+            "",
+        ].join("\n"),
+    });
+    git(repo, "add", ".");
+    git(repo, "commit", "--quiet", "-m", "fix add, add a test");
+    git(repo, "checkout", "--quiet", "main");
+    git(repo, "merge", "--quiet", "--no-ff", "-m", "Merge the fix", "fix");
+
+    return { repo, parent, merge: git(repo, "rev-parse", "HEAD") };
+}
+
+/**
+ * A repository with the 3 shapes of a GitHub merge on `main`, one after another: a rebase merge of a PR of 2 commits
+ * (the 2 commits on `main`, with their author dates), a squash merge of a PR of 3 commits (1 new commit), and a merge
+ * commit of a PR of 2 commits. Each shape is `{ merge, parent, commits }`; `commits` is the PR's commits as
+ * `gh pr view --json commits` gives them (the oids of the branch before the rebase or the squash).
+ */
+export function makeMergeShapes(repo) {
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init", "--quiet", "--initial-branch=main");
+
+    const commit = (file, subject, date) => {
+        writeFiles(repo, { [file]: `${subject}\n` });
+        git(repo, "add", ".");
+        git(repo, "commit", "--quiet", "-m", subject, "-m", "A body line.", `--date=${date}`);
+
+        return git(repo, "rev-parse", "HEAD");
+    };
+
+    const ghCommit = (subject, date, i) => ({
+        oid: String(i).repeat(40),
+        messageHeadline: subject,
+        authoredDate: date,
+        authors: [{ login: "bench", name: "bench" }],
+    });
+
+    commit("a.txt", "seed", "2026-09-01T10:00:00Z");
+
+    const base = commit("b.txt", "base", "2026-09-02T10:00:00Z");
+    // A rebase merge: the PR's 2 commits, rewritten on main with their subjects and author dates.
+    const rebased = [
+        ["rebase one", "2026-10-01T10:00:00Z"],
+        ["rebase two", "2026-10-01T11:00:00Z"],
+    ];
+
+    rebased.forEach(([subject, date]) => commit("r.txt", subject, date));
+
+    const rebase = {
+        merge: git(repo, "rev-parse", "HEAD"),
+        parent: base,
+        commits: rebased.map(([subject, date], i) => ghCommit(subject, date, i + 1)),
+    };
+    // A squash merge: the PR's 3 commits became 1 commit on main.
+    const squashed = [
+        ["squash one", "2026-10-02T10:00:00Z"],
+        ["squash two", "2026-10-02T11:00:00Z"],
+        ["squash three", "2026-10-02T12:00:00Z"],
+    ];
+    const squash = {
+        parent: rebase.merge,
+        merge: commit("s.txt", "Squash the PR (#2)", "2026-10-02T13:00:00Z"),
+        commits: squashed.map(([subject, date], i) => ghCommit(subject, date, i + 4)),
+    };
+    // A merge commit of a PR of 2 commits.
+    const merged = [
+        ["merge one", "2026-10-03T10:00:00Z"],
+        ["merge two", "2026-10-03T11:00:00Z"],
+    ];
+
+    git(repo, "checkout", "--quiet", "-b", "pr");
+    merged.forEach(([subject, date]) => commit("m.txt", subject, date));
+    git(repo, "checkout", "--quiet", "main");
+    commit("main.txt", "main moves on", "2026-10-03T12:00:00Z");
+
+    const mainHead = git(repo, "rev-parse", "HEAD");
+
+    git(repo, "merge", "--quiet", "--no-ff", "-m", "Merge the PR (#3)", "pr");
+
+    const merge = {
+        merge: git(repo, "rev-parse", "HEAD"),
+        parent: mainHead,
+        commits: merged.map(([subject, date], i) => ghCommit(subject, date, i + 7)),
+    };
+
+    return { repo, rebase, squash, merge };
+}
+
+/**
+ * A Go repository with a nested module: `go.mod` (module `example.com/lodge`) and `kit/go.mod` (module
+ * `example.com/lodge/kit`), a test file of each, and `kit/jsonrpc/client_test.go`. 1 commit; returns `{ repo, rev }`.
+ * No Go toolchain is needed: the tests read the files only.
+ */
+export function makeNestedGoRepo(repo) {
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init", "--quiet", "--initial-branch=main");
+    writeFiles(repo, {
+        "go.mod": "module example.com/lodge\n\ngo 1.24\n",
+        "cmd/x_test.go": "package cmd\n",
+        "kit/go.mod": "module example.com/lodge/kit\n\ngo 1.24\n",
+        "kit/kit_test.go": "package kit\n",
+        "kit/jsonrpc/client_test.go": "package jsonrpc\n",
+    });
+    git(repo, "add", ".");
+    git(repo, "commit", "--quiet", "-m", "two modules");
+
+    return { repo, rev: git(repo, "rev-parse", "HEAD") };
+}
+
+/**
  * A repository whose parent commit tracks a submodule at `mod` (a gitlink, mode 160000, to the seed commit; no
  * network, no `.gitmodules`), and a PR that changes only `README.md`. Returns `{ repo, parent, merge }`.
  */

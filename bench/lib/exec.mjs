@@ -1,7 +1,7 @@
 // Commands of the harvester and the scorer: 1 command in the bwrap sandbox with no credential (setup, check,
 // hidden tests), with a timeout that ends its whole process group, its stdout captured and its stderr in a log.
 import { spawn } from "node:child_process";
-import { closeSync, openSync } from "node:fs";
+import { closeSync, lstatSync, openSync } from "node:fs";
 import { appendFile, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { killGroup, running } from "./proc.mjs";
@@ -159,3 +159,37 @@ export async function runInSandbox(
 /** A one-line account of a failed command. */
 export const failText = (run) =>
     run.timedOut ? "timed out" : `exit ${run.code ?? run.signal ?? run.error ?? "unknown"}`;
+
+/**
+ * `git add -A` in `/work`, run inside the sandbox with no hook and no fsmonitor. The worker leaves its new files
+ * untracked (the bench header tells it not to commit), and the hidden tests are copied over a tree: a repository test
+ * that lists files with `git ls-files` must see them as a commit would hold them.
+ */
+export const STAGE_ALL = [
+    "git",
+    "-c",
+    "core.hooksPath=/dev/null",
+    "-c",
+    "core.fsmonitor=false",
+    "add",
+    "-A",
+];
+
+/**
+ * Stage every change of a tree (`STAGE_ALL`) in the sandbox, only when the tree has a `.git` (a folder, a file or a
+ * link). Returns the run, or null when there is no `.git`. A failure is not fatal: `step` puts it in `logFile`, and
+ * the caller runs its next command anyway (with no index, git sees the files as untracked, as before).
+ */
+export async function stageAll(sandbox, { work, cache, timeoutMs, logFile, step }) {
+    try {
+        lstatSync(join(work, ".git"));
+    } catch {
+        return null;
+    }
+
+    return runInSandbox(sandbox, { work, cache, argv: STAGE_ALL, timeoutMs, logFile, step });
+}
+
+/** The note of a failed staging, for the detail of the step after it, or "". */
+export const stageNote = (staged) =>
+    staged && !staged.ok ? `; the staging of new files failed (${failText(staged)})` : "";
