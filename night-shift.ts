@@ -47,7 +47,7 @@ import {
 import type { CommandContext, Host, Web } from "./_pocket.d.ts";
 
 /** Keep linked-session sends as follow-up work on Pi Pocket 0.28, as they were on 0.27. */
-async function linkedSend(
+export async function linkedSend(
     host: Host,
     source: ConversationId,
     request: { to: string; message: string },
@@ -64,7 +64,7 @@ async function linkedSend(
  * Pi Durable 1.5 watch listeners receive `{ kind: "value", value, ops, retired }` calls. Older releases give the
  * plain document value. A failed call carries no document value, so it stays open and this listener does nothing.
  */
-function watchDocumentValue<T>(argument: unknown): T | null | undefined {
+export function watchDocumentValue<T>(argument: unknown): T | null | undefined {
     if (typeof argument === "object" && argument !== null) {
         const call = argument as {
             kind?: unknown;

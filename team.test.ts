@@ -22,6 +22,7 @@ import { join } from "node:path";
 import { after, test } from "node:test";
 import { fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import { createHandler } from "./_pocket/src/server/http.ts";
+import type { Host } from "./_pocket.d.ts";
 import {
     delegationWorktree,
     FRONT_DOOR_DESK_OFF,
@@ -30,7 +31,43 @@ import {
     pickSupervisor,
     roster,
     teamMessageProblems,
+    linkedSend,
 } from "./team.ts";
+
+test("linkedSend keeps follow-up delivery arguments", async () => {
+    const source = 42 as import("@earendil-works/pi-durable").ConversationId;
+    const key = "team-compatible";
+    const request = { to: "session-worker", message: "continue" };
+    let call:
+        | {
+              source: import("@earendil-works/pi-durable").ConversationId;
+              request: { to: string; message: string; steer?: boolean };
+              key: string;
+          }
+        | undefined;
+    const host = {
+        linkedSessions: {
+            send: async (
+                sentSource: import("@earendil-works/pi-durable").ConversationId,
+                sentRequest: { to: string; message: string; steer?: boolean },
+                sentKey: string,
+            ) => {
+                call = { source: sentSource, request: sentRequest, key: sentKey };
+
+                return { answers: true };
+            },
+        },
+    } as unknown as Host;
+
+    const result = await linkedSend(host, source, request, key);
+
+    assert.equal(result, undefined);
+    assert.deepEqual(call, {
+        source,
+        request: { ...request, steer: false },
+        key,
+    });
+});
 
 after(cleanUp);
 const definitions = join(root, "agents");

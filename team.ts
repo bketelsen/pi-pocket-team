@@ -28,7 +28,7 @@ import {
 import type { Host, Web } from "./_pocket.d.ts";
 
 /** Keep linked-session sends as follow-up work on Pi Pocket 0.28, as they were on 0.27. */
-async function linkedSend(
+export async function linkedSend(
     host: Host,
     source: ConversationId,
     request: { to: string; message: string },
