@@ -106,11 +106,12 @@ export function lastLines(text, count = STDOUT_TAIL_LINES) {
  * own `/etc/passwd` and `/etc/group` (made in `sandbox.data` first). `sandbox`: `{ bwrap, pocket, miseInstalls, data,
  * hosts?, killGraceMs? }`. Returns what `runCaptured` returns; `ok` is exit 0 in time. When the command fails and
  * `step` names it, the last 200 lines of its stdout go to `logFile` after a header line (stderr is there already;
- * npm and the test reporters print their failures on stdout).
+ * npm and the test reporters print their failures on stdout). `overlay`: a host folder bound read-only at `/overlay`. `argv`: a
+ * program and its arguments, instead of the shell command.
  */
 export async function runInSandbox(
     sandbox,
-    { work, cache, command, timeoutMs = COMMAND_MS, logFile, step },
+    { work, cache, command, argv, timeoutMs = COMMAND_MS, logFile, step, overlay },
 ) {
     if (!sandbox.data) {
         throw new Error(
@@ -125,8 +126,13 @@ export async function runInSandbox(
         pocket: sandbox.pocket,
         miseInstalls: sandbox.miseInstalls,
         ...(await identityFiles(sandbox.data)),
+        ...(overlay ? { overlay } : {}),
     };
-    const args = bwrapArgs(paths, { tryNo: 0, command: ["bash", "-c", command], agent: false });
+    const args = bwrapArgs(paths, {
+        tryNo: 0,
+        command: argv ?? ["bash", "-c", command],
+        agent: false,
+    });
     const run = await runCaptured({
         bin: sandbox.bwrap,
         args,

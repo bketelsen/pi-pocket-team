@@ -4,17 +4,21 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import {
+    chmodSync,
+    existsSync,
     lstatSync,
     mkdirSync,
     readFileSync,
     readdirSync,
     readlinkSync,
+    symlinkSync,
     writeFileSync,
 } from "node:fs";
 import { rm } from "node:fs/promises";
 import { join, relative } from "node:path";
 import { after, before, test } from "node:test";
 import { readSpend, setBudget } from "./lib/budget.mjs";
+import { overlayFiles } from "./lib/gitfiles.mjs";
 import { scratchClone } from "./lib/clone.mjs";
 import { EventEmitter } from "node:events";
 import {
@@ -28,8 +32,8 @@ import {
     runJudge,
 } from "./lib/judge.mjs";
 import { authPreflight, authPreflightArgs } from "./lib/runner.mjs";
-import { s0Of, scoreMain, toolCalls } from "./lib/score.mjs";
-import { FAKE_BWRAP, makeFixture } from "./fixtures/helpers.mjs";
+import { hostGit, s0Of, scoreMain, toolCalls } from "./lib/score.mjs";
+import { FAKE_BWRAP, bwrapWorks, git, makeFixture } from "./fixtures/helpers.mjs";
 import { makeNodeRepo } from "./fixtures/harvest.mjs";
 
 const REPO = "bketelsen/pi-pocket-team";
@@ -73,7 +77,10 @@ const taskOf = (id, answers, extra = {}) => ({
  * An attempt of `task` in its own data dir: a scratch clone at the parent with `change` applied (files), its events
  * (Pi JSON lines) in `try-1/events.jsonl`, a manifest and a result file. Returns the paths.
  */
-async function attempt(task, { change = {}, events = [], result = {}, budget = 100 } = {}) {
+async function attempt(
+    task,
+    { change = {}, events = [], events2 = null, prepare = null, result = {}, budget = 100 } = {},
+) {
     const root = join(fixture.root, task.id);
     const data = join(root, "data");
     const tryDir = join(data, "runs", "stage1", task.id, "github-copilot__gpt-6-luna", "try-1");
@@ -90,6 +97,19 @@ async function attempt(task, { change = {}, events = [], result = {}, budget = 1
         join(tryDir, "events.jsonl"),
         events.map((e) => JSON.stringify(e)).join("\n") + "\n",
     );
+
+    // A second try: its own Pi run, with its own events.
+    if (events2) {
+        mkdirSync(join(tryDir, "..", "try-2"), { recursive: true });
+        writeFileSync(
+            join(tryDir, "..", "try-2", "events.jsonl"),
+            events2.map((e) => JSON.stringify(e)).join("\n") + "\n",
+        );
+    }
+
+    if (prepare) {
+        await prepare(work);
+    }
 
     const manifest = join(root, "manifest.json");
 
@@ -127,7 +147,12 @@ async function attempt(task, { change = {}, events = [], result = {}, budget = 1
             grades: null,
             diffCut: null,
             judgePending: null,
-            tryLog: [{ try: 1, outcome: "ok" }],
+            tryLog: events2
+                ? [
+                      { try: 1, outcome: "provider" },
+                      { try: 2, outcome: "ok" },
+                  ]
+                : [{ try: 1, outcome: "ok" }],
             ...result,
         }),
     );
@@ -137,7 +162,7 @@ async function attempt(task, { change = {}, events = [], result = {}, budget = 1
 }
 
 /** Run the scorer on an attempt. */
-const score = (paths, extra = []) => {
+const score = (paths, extra = [], deps = {}) => {
     const lines = [];
 
     return scoreMain(
@@ -156,7 +181,7 @@ const score = (paths, extra = []) => {
             ...extra,
         ],
         { ...process.env, BENCH_DATA: paths.data },
-        { now: () => NOW, log: (line) => lines.push(line), killGraceMs: 2000 },
+        { now: () => NOW, log: (line) => lines.push(line), killGraceMs: 2000, ...deps },
     ).then((code) => ({ code, lines, result: JSON.parse(readFileSync(paths.file, "utf8")) }));
 };
 
@@ -590,4 +615,134 @@ test("the auth pre-flight: the runner asks for 60 minutes of token life, a judge
 
     assert.equal(verdict.pending, true);
     assert.ok(lines.every((line) => /auth pre-flight failed/.test(line)));
+});
+
+test("S0 reads each try on its own: an auth read in try 2 with the call id of an ordinary call in try 1 counts", async () => {
+    const task = taskOf("two-tries", { default: [GOOD(4)] });
+    const paths = await attempt(task, {
+        change: FIX,
+        events: [toolStart("call_1", "bash", { command: "ls" })],
+        events2: [toolStart("call_1", "read", { path: "/agent/auth.json" })],
+    });
+    const { code, result } = await score(paths);
+
+    assert.equal(code, 0);
+    assert.deepEqual(result.s0, { protocol: true, leakTry: false });
+    assert.equal(result.failure, "protocol");
+});
+
+/**
+ * A submitted tree whose git config runs commands: a clean filter on every file and an fsmonitor hook. Each writes
+ * `sentinel` when it runs. `markOnly`: write it only when the variable `BENCH_HOST_MARK` is set (the test sets it in
+ * its own environment, which host git inherits and the sandbox's cleared environment does not).
+ */
+function hostileGit(work, sentinel, { markOnly }) {
+    const guard = markOnly ? `[ -n "$BENCH_HOST_MARK" ] && ` : "";
+    const hook = join(work, ".git", "fsmonitor-hook");
+
+    writeFileSync(hook, `#!/bin/sh\n${guard}touch '${sentinel}.fsmonitor'\nexit 1\n`);
+    chmodSync(hook, 0o755);
+    git(work, "config", "filter.x.clean", `sh -c '${guard}touch "${sentinel}.filter"; cat'`);
+    git(work, "config", "core.fsmonitor", hook);
+    writeFileSync(join(work, ".gitattributes"), "* filter=x\n");
+}
+
+test("the submitted diff runs git only in the sandbox: host git never runs in a worker's tree", async (t) => {
+    const task = taskOf("hostile-git", { default: [GOOD(3)] });
+    const sentinel = join(fixture.root, "hostile-git-ran");
+    const paths = await attempt(task, {
+        change: FIX,
+        prepare: (work) => hostileGit(work, sentinel, { markOnly: true }),
+    });
+    const cwds = [];
+
+    process.env.BENCH_HOST_MARK = "1";
+    t.after(() => delete process.env.BENCH_HOST_MARK);
+
+    const { code, result } = await score(paths, [], {
+        git: (cwd, args) => {
+            cwds.push(cwd);
+
+            return hostGit(cwd, args);
+        },
+    });
+
+    assert.equal(code, 0);
+    assert.equal(existsSync(`${sentinel}.filter`), false, "no clean filter ran on the host");
+    assert.equal(existsSync(`${sentinel}.fsmonitor`), false, "no fsmonitor ran on the host");
+    assert.ok(cwds.length > 0);
+    assert.deepEqual([...new Set(cwds)], [node.repo], "host git runs only in the local checkout");
+    assert.match(readFileSync(result.diffFile, "utf8"), /\+export const add = \(a, b\) => a \+ b;/);
+});
+
+const skipBwrap = bwrapWorks() ? false : "bwrap cannot run here (missing, or no user namespaces)";
+
+test(
+    "real bwrap: a worker's clean filter and fsmonitor reach no host file",
+    { skip: skipBwrap },
+    async () => {
+        const task = taskOf("hostile-git-bwrap", { default: [GOOD(3)] });
+        const sentinel = join(fixture.root, "hostile-git-bwrap-ran");
+        const paths = await attempt(task, {
+            change: FIX,
+            prepare: (work) => hostileGit(work, sentinel, { markOnly: false }),
+        });
+        const { code, result } = await score(paths, ["--bwrap", "bwrap"]);
+
+        assert.equal(code, 0, JSON.stringify(result));
+        assert.equal(existsSync(`${sentinel}.filter`), false);
+        assert.equal(existsSync(`${sentinel}.fsmonitor`), false);
+        assert.equal(result.s1, true);
+        assert.equal(typeof result.diffFile, "string");
+    },
+);
+
+test(
+    "real bwrap: S2's copy of the hidden tests follows no symbolic link out of the copy",
+    { skip: skipBwrap },
+    async () => {
+        const sentinel = join(fixture.root, "s2-sentinel.txt");
+
+        writeFileSync(sentinel, "keep\n");
+
+        // A hidden-test path that is a link to a host file.
+        const fileLink = await attempt(taskOf("s2-file-link", { default: [GOOD(3)] }), {
+            change: FIX,
+            prepare: (work) => symlinkSync(sentinel, join(work, "add.test.mjs")),
+        });
+        // A folder of a hidden-test path that is a link to the original submitted tree.
+        let original;
+        const dirLink = await attempt(taskOf("s2-dir-link", { default: [GOOD(3)] }), {
+            change: FIX,
+            prepare: (work) => {
+                original = work;
+                symlinkSync(work, join(work, "fixtures"));
+            },
+        });
+        const before = treeHash(original);
+
+        for (const paths of [fileLink, dirLink]) {
+            const { code } = await score(paths, ["--bwrap", "bwrap"]);
+
+            assert.equal(code, 0);
+        }
+
+        assert.equal(readFileSync(sentinel, "utf8"), "keep\n", "the host file is unchanged");
+        assert.equal(treeHash(original), before, "the submitted tree is unchanged");
+        assert.equal(existsSync(join(original, "data.json")), false);
+    },
+);
+
+test("the host overlay (the harvester's own trees) refuses a path through a symbolic link", async () => {
+    const work = join(fixture.root, "overlay-link");
+    const outside = join(fixture.root, "overlay-outside");
+
+    mkdirSync(work, { recursive: true });
+    mkdirSync(outside, { recursive: true });
+    symlinkSync(outside, join(work, "fixtures"));
+    await assert.rejects(
+        overlayFiles({ checkout: node.repo, rev: node.merge, files: ["fixtures/data.json"], work }),
+        /symbolic link/,
+    );
+    assert.equal(existsSync(join(outside, "data.json")), false);
 });

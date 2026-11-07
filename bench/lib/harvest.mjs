@@ -34,6 +34,7 @@ import {
     parseNameStatus,
     proposeCommands,
     pytestOutcome,
+    testLanguage,
 } from "./hidden.mjs";
 import { TASK_FIELDS, UsageError, loadManifest } from "./manifest.mjs";
 import { BENCH_REPOS, SEED, benchRepo, readRoster, rosterDir, seededShuffle } from "./owners.mjs";
@@ -255,6 +256,33 @@ async function discover(ctx, { work, cache, command, language, logFile }) {
 }
 
 /**
+ * The outcome of 1 language's hidden tests in a tree: its discovery command (with the machine-readable reporter)
+ * run in the sandbox, then parsed per file (`{ units, broken }`). Null when the language has no discovery command.
+ */
+export async function languageOutcome(
+    ctx,
+    { language, files, goNames, module, prefix, tree, logFile },
+) {
+    const command = discoveryCommand(language, files, { prefix, goNames });
+
+    if (!command || (language === "go" && !module)) {
+        return null;
+    }
+
+    const text = await discover(ctx, { ...tree, command, language, logFile });
+
+    if (language === "node") {
+        return nodeOutcome(text, files);
+    }
+
+    if (language === "go") {
+        return goFileOutcome(text, { files, goNames, module });
+    }
+
+    return pytestOutcome(text, files);
+}
+
+/**
  * Find the hidden tests of a task: the PR's test and support files copied from the merge over the parent tree (it
  * holds them afterwards), each language's tests run at both, then the valid names. Returns `{ hiddenTests,
  * hiddenCommand, dropped, languages }`; with no valid name, `hiddenTests: []` and `hiddenCommand: null`.
@@ -293,28 +321,14 @@ export async function findHidden(
             }
         }
 
-        const command = discoveryCommand(language, files, { prefix, goNames });
+        const facts = { language, files, goNames, module: goModPath, prefix, logFile };
+        const atMerge = await languageOutcome(ctx, { ...facts, tree: mergeTree });
 
-        if (!command || (language === "go" && !goModPath)) {
+        if (!atMerge) {
             continue;
         }
 
-        const outcome = async (tree) => {
-            const text = await discover(ctx, { ...tree, command, language, logFile });
-
-            if (language === "node") {
-                return nodeOutcome(text, files);
-            }
-
-            if (language === "go") {
-                return goFileOutcome(text, { files, goNames, module: goModPath });
-            }
-
-            return pytestOutcome(text, files);
-        };
-
-        const atMerge = await outcome(mergeTree);
-        const atParent = await outcome(parentTree);
+        const atParent = await languageOutcome(ctx, { ...facts, tree: parentTree });
         const result = classify({ files, parent: atParent, merge: atMerge });
 
         if (language === "node") {
@@ -678,6 +692,60 @@ export async function harvest(ctx, threads) {
 // --revalidate
 // ---------------------------------------------------------------------------------------------------------------
 
+/**
+ * The named tests of a task's `hiddenTests` that are not valid: each must fail by an assertion at the parent (the
+ * tree holds the hidden files) and pass at the merge, by the same reporters and rules as the harvest. Returns
+ * `[{ file, name, reason }]`.
+ */
+export async function namedTestsInvalid(ctx, { task, checkout, trees, logFile }) {
+    const named = task.hiddenTests.filter((t) => t.names.length && testLanguage(t.file));
+    const { prefix } = await commandsAt(checkout, task.merge);
+    const module = goModule(await fileAt(checkout, task.merge, "go.mod"));
+    const invalid = [];
+
+    for (const language of [...new Set(named.map((t) => testLanguage(t.file)))].sort()) {
+        const entries = named.filter((t) => testLanguage(t.file) === language);
+        const files = entries.map((t) => t.file);
+        const goNames = Object.fromEntries(entries.map((t) => [t.file, t.names]));
+        const facts = { language, files, goNames, module, prefix, logFile };
+        const atMerge = await languageOutcome(ctx, { ...facts, tree: trees.merge });
+        const atParent = atMerge && (await languageOutcome(ctx, { ...facts, tree: trees.parent }));
+
+        if (!atMerge || !atParent) {
+            invalid.push(
+                ...entries.flatMap((t) =>
+                    t.names.map((name) => ({
+                        file: t.file,
+                        name,
+                        reason: "cannot be run by name",
+                    })),
+                ),
+            );
+            continue;
+        }
+
+        const { valid, dropped } = classify({ files, parent: atParent, merge: atMerge });
+
+        for (const t of entries) {
+            for (const name of t.names) {
+                if (valid.get(t.file)?.includes(name)) {
+                    continue;
+                }
+
+                const why = dropped.find((d) => d.file === t.file && d.name === name);
+
+                invalid.push({
+                    file: t.file,
+                    name,
+                    reason: why?.reason ?? "did not run at the parent or the merge",
+                });
+            }
+        }
+    }
+
+    return invalid;
+}
+
 /** The log of a task's revalidation: kept after its scratch trees are removed. */
 export const revalidateLog = (data, taskId) =>
     join(data, "harvest-cache", "revalidate", `${taskId}.log`);
@@ -763,6 +831,21 @@ export async function revalidateTask(ctx, task, checkout) {
                 entry.reason = atParent.ok
                     ? "the hidden command passes at the parent"
                     : "the hidden command timed out at the parent";
+
+                return entry;
+            }
+
+            // A non-zero exit at the parent is not enough (a test that does not load fails too): each named test
+            // must fail by an assertion at the parent and pass at the merge, as the harvest classifies it.
+            const invalid = await namedTestsInvalid(ctx, { task, checkout, trees, logFile });
+
+            entry.hiddenNames = invalid.length ? "fail" : "pass";
+
+            if (invalid.length) {
+                entry.invalidNames = invalid;
+                entry.reason = invalid
+                    .map(({ file, name, reason }) => `hidden test ${file} "${name}" ${reason}`)
+                    .join("; ");
 
                 return entry;
             }

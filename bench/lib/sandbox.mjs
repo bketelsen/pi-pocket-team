@@ -89,7 +89,7 @@ export function nodePlacement(execPath, installs) {
 /**
  * The bwrap argv (without `bwrap` itself) for 1 command of a try.
  * `paths`: { work, session, cache, agentDir, settings, models, auth, header, hosts, pocket, miseInstalls, passwd,
- * group }.
+ * group, overlay? }.
  * `exists` and `realpath` are injectable, so a dry run in CI builds the same argv with no host file.
  * `agent: false` leaves out the `/agent` mounts and `PI_CODING_AGENT_DIR`: a check or hidden-test command needs no
  * credential, so it gets none (`paths` then needs no agent files). With no `paths.session`, `/session` is left out.
@@ -223,7 +223,14 @@ export function bwrapArgs(
         args.push("--bind", paths.session, "/session");
     }
 
-    args.push("--bind", paths.cache, "/cache", "--chdir", "/work");
+    args.push("--bind", paths.cache, "/cache");
+
+    // A staging folder of trusted files (the reference's hidden tests), copied over `/work` inside the sandbox.
+    if (paths.overlay) {
+        args.push("--ro-bind", paths.overlay, "/overlay");
+    }
+
+    args.push("--chdir", "/work");
 
     const env = {
         ...(agent ? { PI_CODING_AGENT_DIR: "/agent" } : {}),

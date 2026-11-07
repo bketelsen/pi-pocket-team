@@ -1,8 +1,8 @@
 // Git reads of the harvester and the scorer in a local checkout (no fetch unless asked), and the copy of the hidden
 // test files from the merge commit over a tree.
 import { execFile } from "node:child_process";
-import { mkdir, writeFile } from "node:fs/promises";
-import { dirname, relative, resolve, sep } from "node:path";
+import { lstat, mkdir, writeFile } from "node:fs/promises";
+import { dirname, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 
 const run = promisify(execFile);
@@ -69,19 +69,41 @@ const inside = (child, parent) => {
     return rel !== "" && !rel.startsWith("..") && !rel.startsWith(sep);
 };
 
-/**
- * Copy `files` (paths in the repository) as they are at `rev` in `checkout` over the tree `work`. A path that leaves
- * `work` is refused.
- */
-export async function overlayFiles({ checkout, rev, files, work }) {
-    for (const file of files) {
-        const target = resolve(work, file);
+/** True when `path` exists as a symbolic link. */
+async function isLink(path) {
+    try {
+        return (await lstat(path)).isSymbolicLink();
+    } catch {
+        return false;
+    }
+}
 
-        if (!inside(target, resolve(work))) {
+/**
+ * Copy `files` (paths in the repository) as they are at `rev` in `checkout` over the tree `work`, on the host. Only
+ * for a tree the bench made itself (the harvester's scratch clones, a staging folder): a worker's tree is overlaid
+ * inside the sandbox (`bench/lib/score.mjs`). A path that leaves `work`, or that meets a symbolic link on its way
+ * (a folder or the file itself), is refused: `mkdir` and `writeFile` would follow it. `git` (cwd, args) -> Buffer is
+ * injectable.
+ */
+export async function overlayFiles({ checkout, rev, files, work, git = gitBuffer }) {
+    const root = resolve(work);
+
+    for (const file of files) {
+        const target = resolve(root, file);
+
+        if (!inside(target, root)) {
             throw new Error(`hidden file ${file} is outside the tree`);
         }
 
-        const content = await gitBuffer(checkout, ["show", `${rev}:${file}`]);
+        const parts = relative(root, target).split(sep);
+
+        for (let i = 1; i <= parts.length; i += 1) {
+            if (await isLink(join(root, ...parts.slice(0, i)))) {
+                throw new Error(`hidden file ${file} meets a symbolic link in the tree`);
+            }
+        }
+
+        const content = await git(checkout, ["show", `${rev}:${file}`]);
 
         await mkdir(dirname(target), { recursive: true });
         await writeFile(target, content);

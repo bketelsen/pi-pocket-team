@@ -9,7 +9,7 @@ import { basename, dirname, join, posix, resolve } from "node:path";
 import { parseArgs, promisify } from "node:util";
 import { BENCH_DIR, dataDir, privateDir, writeAtomic, writeJsonAtomic } from "./common.mjs";
 import { COMMAND_MS, failText, makeCache, runInSandbox } from "./exec.mjs";
-import { fileAt, gitText, overlayFiles } from "./gitfiles.mjs";
+import { gitBuffer, overlayFiles } from "./gitfiles.mjs";
 import { goModule } from "./hidden.mjs";
 import { JUDGES, JUDGE_PROMPT, cutDiff, renderPrompt, runJudge } from "./judge.mjs";
 import { UsageError, loadManifest } from "./manifest.mjs";
@@ -111,6 +111,9 @@ export function s0Of(calls, { prNumber, repo, module = null }) {
     return { protocol, leakTry };
 }
 
+/** The tool calls of each try's events (text, or null for a missing file), each try parsed on its own. */
+export const callsOfTries = (texts) => texts.filter(Boolean).flatMap((text) => toolCalls(text));
+
 /** The event files of an attempt's tries: `try-<n>/events.jsonl` beside the try of `workDir`. */
 export function eventFiles(result) {
     const base = dirname(dirname(result.workDir));
@@ -205,31 +208,95 @@ async function copyTree(from, to) {
     await execFileP("cp", ["-a", "--reflink=auto", from, to]);
 }
 
-/** The submitted diff: in a copy of the tree, `git add -A`, then `git diff --cached <parent>` and its stat. */
-export async function submittedDiff(workDir, parent, scratch) {
+/** Host git in a trusted folder (the local checkout only): `(cwd, args) -> Buffer`. */
+export const hostGit = gitBuffer;
+
+/** Git in the sandbox, with no fsmonitor and no hooks. */
+const SANDBOX_GIT = "git -c core.fsmonitor=false -c core.hooksPath=/dev/null";
+
+/** The diff options of the submitted diff: no external diff driver, no textconv, no color. */
+const DIFF_OPTIONS = "--no-ext-diff --no-textconv --no-color";
+
+/**
+ * The submitted diff: in a copy of the tree, `git add -A`, then `git diff --cached <parent>` and its stat. The worker
+ * controls the tree's `.git/config` and `.gitattributes` (a clean filter, an fsmonitor command, a textconv or a diff
+ * driver run a command), so git runs only inside the sandbox with no credential, on the copy; the diff and the stat
+ * come back on stdout. Host git never runs in a worker's tree.
+ */
+export async function submittedDiff(ctx, workDir, parent, scratch) {
     const copy = join(scratch, "diff");
+    const cache = join(scratch, "diff-cache");
+
+    if (!/^[0-9a-f]{40}$/.test(parent)) {
+        throw new Error(`not a commit id: ${parent}`);
+    }
 
     await copyTree(workDir, copy);
+    await rm(cache, { recursive: true, force: true });
+    await makeCache(cache);
 
     try {
-        await gitText(copy, ["add", "-A"]);
+        const run = async (command, step) => {
+            const result = await runInSandbox(ctx.sandbox, {
+                work: copy,
+                cache,
+                command,
+                timeoutMs: ctx.timeouts.check,
+                logFile: ctx.logFile,
+                step,
+            });
 
-        return {
-            diff: await gitText(copy, ["diff", "--cached", parent]),
-            stat: await gitText(copy, ["diff", "--cached", "--stat", parent]),
+            if (!result.ok) {
+                throw new Error(`${step} failed (${failText(result)})`);
+            }
+
+            return result.stdout;
         };
+
+        const stat = await run(
+            `${SANDBOX_GIT} add -A && ${SANDBOX_GIT} diff --cached ${DIFF_OPTIONS} --stat ${parent}`,
+            "the submitted diff's stat",
+        );
+        const diff = await run(
+            `${SANDBOX_GIT} diff --cached ${DIFF_OPTIONS} ${parent}`,
+            "the submitted diff",
+        );
+
+        return { diff, stat };
     } finally {
         await rm(copy, { recursive: true, force: true });
+        await rm(cache, { recursive: true, force: true });
     }
 }
 
-/** The reference diff: `git diff <parent> <merge>` in the local checkout, and its stat. */
-export async function referenceDiff(checkout, parent, merge) {
+/** The reference diff: `git diff <parent> <merge>` in the local checkout (trusted), and its stat. */
+export async function referenceDiff(checkout, parent, merge, git = hostGit) {
     return {
-        diff: await gitText(checkout, ["diff", parent, merge]),
-        stat: await gitText(checkout, ["diff", "--stat", parent, merge]),
+        diff: (
+            await git(checkout, ["diff", "--no-ext-diff", "--no-textconv", parent, merge])
+        ).toString("utf8"),
+        stat: (
+            await git(checkout, ["diff", "--no-ext-diff", "--no-textconv", "--stat", parent, merge])
+        ).toString("utf8"),
     };
 }
+
+/**
+ * Stage the reference's hidden-test files for S2: written on the host from the local checkout (trusted content) into
+ * a fresh folder that holds no symbolic link. The sandbox binds it read-only at `/overlay` and copies it over its
+ * `/work` (`OVERLAY_COPY`): the worker's tree may hold symbolic links, and inside the sandbox they reach neither the
+ * host nor the submitted tree.
+ */
+export async function stageOverlay({ checkout, rev, files, staging, git = hostGit }) {
+    await rm(staging, { recursive: true, force: true });
+    await privateDir(staging);
+    await overlayFiles({ checkout, rev, files, work: staging, git });
+
+    return staging;
+}
+
+/** The copy of the staged hidden-test files over `/work`, inside the sandbox, before the hidden command. */
+export const OVERLAY_COPY = ["cp", "-R", "--remove-destination", "/overlay/.", "/work/"];
 
 /** The diff files of an attempt in the data dir. */
 const diffPaths = (data, result, attempt) => {
@@ -247,13 +314,13 @@ const diffPaths = (data, result, attempt) => {
 const readOr = (file) => readFile(file, "utf8").catch(() => null);
 
 /**
- * Score 1 result file. `ctx`: `{ data, bwrap, pocket, agentSrc, miseInstalls, authPreflight, force, now, log,
- * timeouts, judges, checkout }` and `task`, `manifest`. Returns the exit code.
+ * Score 1 result file. `ctx`: `{ data, sandbox, judgeCtx, force, now, log, timeouts, judges, checkout, git? }` and `task`, `manifest`. Returns the exit code.
  */
 export async function scoreResult(ctx, file, result, { task, manifest }) {
     const attempt = basename(file, ".json");
     const paths = diffPaths(ctx.data, result, attempt);
     const checkout = checkoutOf(ctx.checkout, manifest, task);
+    const git = ctx.git ?? hostGit;
     const judgesOnly =
         !ctx.force && result.judgePending === true && result.s0 && typeof result.s1 === "boolean";
     const save = () => writeJsonAtomic(file, result);
@@ -263,9 +330,11 @@ export async function scoreResult(ctx, file, result, { task, manifest }) {
     if (!judgesOnly) {
         const events = await Promise.all(eventFiles(result).map(readOr));
         const prNumber = Number(String(task.pr).split("#")[1]) || null;
-        const module = goModule(await fileAt(checkout, task.parent, "go.mod"));
+        const goMod = await git(checkout, ["show", `${task.parent}:go.mod`]).catch(() => null);
+        const module = goModule(goMod?.toString("utf8"));
 
-        result.s0 = s0Of(toolCalls(events.filter(Boolean).join("\n")), {
+        // Each try's calls on their own: call ids of 2 Pi runs can repeat, and a merge by id would hide a call.
+        result.s0 = s0Of(callsOfTries(events), {
             prNumber,
             repo: task.repo,
             module,
@@ -305,6 +374,8 @@ export async function scoreResult(ctx, file, result, { task, manifest }) {
             const logFile = join(scratch, "..", `${attempt}.score.log`);
             const s1Tree = join(scratch, "s1");
 
+            ctx.logFile = logFile;
+
             await copyTree(result.workDir, s1Tree);
 
             const s1 = await runInSandbox(ctx.sandbox, {
@@ -322,34 +393,50 @@ export async function scoreResult(ctx, file, result, { task, manifest }) {
 
             if (task.hiddenCommand) {
                 const s2Tree = join(scratch, "s2");
-
-                await copyTree(result.workDir, s2Tree);
-                await overlayFiles({
+                const staging = await stageOverlay({
                     checkout,
                     rev: task.merge,
                     files: task.hiddenTests.map((t) => t.file),
-                    work: s2Tree,
+                    staging: join(scratch, "overlay"),
+                    git,
                 });
 
-                const s2 = await runInSandbox(ctx.sandbox, {
+                await copyTree(result.workDir, s2Tree);
+
+                const copied = await runInSandbox(ctx.sandbox, {
                     work: s2Tree,
                     cache,
-                    command: task.hiddenCommand,
+                    overlay: staging,
+                    argv: OVERLAY_COPY,
                     timeoutMs: ctx.timeouts.hidden,
                     logFile,
-                    step: "S2, the hidden command",
+                    step: "S2, the copy of the hidden tests",
                 });
+                const s2 = !copied.ok
+                    ? copied
+                    : await runInSandbox(ctx.sandbox, {
+                          work: s2Tree,
+                          cache,
+                          command: task.hiddenCommand,
+                          timeoutMs: ctx.timeouts.hidden,
+                          logFile,
+                          step: "S2, the hidden command",
+                      });
 
                 result.s2 = s2.ok;
-                result.s2Detail = s2.ok ? "pass" : failText(s2);
+                result.s2Detail = s2.ok
+                    ? "pass"
+                    : copied.ok
+                      ? failText(s2)
+                      : `the copy of the hidden tests failed (${failText(copied)})`;
             } else {
                 result.s2 = null;
             }
 
-            const own = await submittedDiff(result.workDir, task.parent, scratch);
+            const own = await submittedDiff(ctx, result.workDir, task.parent, scratch);
 
             submitted = own;
-            reference = await referenceDiff(checkout, task.parent, task.merge);
+            reference = await referenceDiff(checkout, task.parent, task.merge, git);
             await writeAtomic(paths.submitted, own.diff);
             await writeAtomic(paths.submittedStat, own.stat);
             await writeAtomic(paths.reference, reference.diff);
@@ -370,17 +457,29 @@ export async function scoreResult(ctx, file, result, { task, manifest }) {
         reference = await read(paths.reference, paths.referenceStat);
 
         if (submitted.diff === null) {
-            submitted = await submittedDiff(
-                result.workDir,
-                task.parent,
-                join(ctx.data, "score", "diff-" + attempt),
+            const scratch = join(ctx.data, "score", result.stage, result.task, `${attempt}-diff`);
+
+            ctx.logFile = join(
+                ctx.data,
+                "score",
+                result.stage,
+                result.task,
+                `${attempt}.score.log`,
             );
+            await privateDir(scratch);
+
+            try {
+                submitted = await submittedDiff(ctx, result.workDir, task.parent, scratch);
+            } finally {
+                await rm(scratch, { recursive: true, force: true });
+            }
+
             await writeAtomic(paths.submitted, submitted.diff);
             await writeAtomic(paths.submittedStat, submitted.stat);
         }
 
         if (reference.diff === null) {
-            reference = await referenceDiff(checkout, task.parent, task.merge);
+            reference = await referenceDiff(checkout, task.parent, task.merge, git);
             await writeAtomic(paths.reference, reference.diff);
             await writeAtomic(paths.referenceStat, reference.stat);
         }
@@ -484,8 +583,8 @@ const SCORE_OPTIONS = {
 };
 
 /**
- * The scorer's main: returns the exit code. `deps`: `now`, `log`, `judges`, `timeouts`, `killGraceMs` and `judgeWallMs`
- * replace the defaults in tests.
+ * The scorer's main: returns the exit code. `deps`: `now`, `log`, `judges`, `timeouts`, `killGraceMs`, `judgeWallMs`
+ * and `git` (the host git of the local checkout) replace the defaults in tests.
  */
 export async function scoreMain(argv, env = process.env, deps = {}) {
     const log = deps.log ?? ((line) => console.error(line));
@@ -547,6 +646,7 @@ export async function scoreMain(argv, env = process.env, deps = {}) {
             now: deps.now ?? Date.now,
             log,
             judges: deps.judges,
+            git: deps.git,
             timeouts: { check: COMMAND_MS, hidden: COMMAND_MS, ...deps.timeouts },
             judgeCtx: {
                 data,

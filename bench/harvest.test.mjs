@@ -372,6 +372,20 @@ test("--revalidate runs a file's commands again, writes validation, and keeps th
         hiddenCommand: "true",
         owner: { keep: false, reason: "dropped", scopeMatches: false, commandsConfirmed: false },
     });
+    // An owner names a test that imports an API the reference made: the hidden command passes at the merge and
+    // exits non-zero at the parent, but the test does not load there.
+    manifest.tasks.push({
+        ...task,
+        id: "pi-pocket-team-10-api",
+        hiddenTests: [
+            { file: "add.test.mjs", names: ["adds"] },
+            { file: "fixtures/data.json", names: [] },
+            { file: "mul.test.mjs", names: ["multiplies"] },
+        ],
+        hiddenCommand:
+            "PI_POCKET_CHECKOUT=/pocket node --test --test-name-pattern='^(?:adds|multiplies)$' 'add.test.mjs' 'mul.test.mjs'",
+        owner: { keep: false, reason: "checked", scopeMatches: true, commandsConfirmed: true },
+    });
     manifest.validation = {};
 
     const file = join(fixture.root, "reviewed.json");
@@ -398,6 +412,18 @@ test("--revalidate runs a file's commands again, writes validation, and keeps th
         "the revalidation's log outlives its scratch trees",
     );
     assert.equal(after1.validation["pi-pocket-team-10-bad"].ok, false);
+    assert.equal(after1.validation["pi-pocket-team-10-api"].hiddenMerge, "pass");
+    assert.equal(after1.validation["pi-pocket-team-10-api"].hiddenParent, "exit 1");
+    assert.equal(after1.validation["pi-pocket-team-10-api"].ok, false);
+    assert.equal(
+        after1.validation["pi-pocket-team-10-api"].reason,
+        'hidden test mul.test.mjs "multiplies" does not compile or load at the parent',
+    );
+    assert.match(
+        first.stdout,
+        /^FAIL pi-pocket-team-10-api: hidden test mul\.test\.mjs "multiplies"/m,
+    );
+    assert.equal(after1.validation["pi-pocket-team-10"].hiddenNames, "pass");
 
     // The owner keeps the bad task: the revalidation fails.
     after1.tasks[1].owner.keep = true;
