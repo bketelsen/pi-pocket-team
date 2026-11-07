@@ -2,8 +2,10 @@
 // frozen rubric `bench/judge-v1.md`, with the brief and the diff only (no merged change, no S1 or S2: the owners who
 // labelled the held-out set saw the same). A judge passes the development set when it grades the merged diff higher
 // than the Not-ready diff in 15 or more of 20 pairs, and the held-out set when its pass (grade 3 or more) agrees with
-// the owner's label on 80% or more of the counted items. Each verdict is saved, so a run can resume; the key of the
-// held-out set (`held-out-key.json`) is never read.
+// the owner's label on 80% or more of the counted items of the complete set (40 items). Each verdict is saved with the
+// hashes of the rubric and of its input, so a run can resume, and a rebuilt set that gives an id a new diff or brief
+// is judged again; the key of the held-out set (`held-out-key.json`) is never read.
+import { createHash } from "node:crypto";
 import { existsSync, readdirSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
@@ -17,12 +19,17 @@ import {
     renderPrompt,
     runJudge,
 } from "./judge.mjs";
+import { HELD_OUT_PER_OWNER } from "./calibration.mjs";
 import { UsageError } from "./manifest.mjs";
+import { OWNERS } from "./owners.mjs";
 import { DEFAULTS, findProgram } from "./sandbox.mjs";
 
 /** The pairs the development set needs, and the pairs a judge must grade the merged diff higher in. */
 export const DEV_REQUIRED = 20;
 export const DEV_THRESHOLD = 15;
+
+/** The items of a complete held-out set, before exclusions: 8 per owner. */
+export const HELD_OUT_REQUIRED = HELD_OUT_PER_OWNER * OWNERS.length;
 
 /** The share of counted held-out items a judge must agree on with the owners. */
 export const AGREEMENT = 0.8;
@@ -85,6 +92,21 @@ export const calibrationPrompt = (template, { brief, diff, cut }) =>
         calibration: true,
     });
 
+/** The SHA-256 hex of a text. */
+const sha256 = (text) => createHash("sha256").update(text).digest("hex");
+
+/**
+ * A saved verdict that holds for this call: the same judge, item id, part, rubric hash and input hash (the SHA-256
+ * of the rendered prompt), so a rebuilt set that reuses an id with another diff or brief is judged again.
+ */
+export const verdictMatches = (verdict, { model, id, part, inputSha256 }) =>
+    Boolean(verdict) &&
+    verdict.judge === model &&
+    verdict.item === id &&
+    (verdict.part ?? null) === (part ?? null) &&
+    verdict.promptSha256 === JUDGE_PROMPT_SHA256 &&
+    verdict.inputSha256 === inputSha256;
+
 /** A grade that is a judge's pass. */
 const passes = (grade) => grade >= PASS_GRADE;
 
@@ -125,7 +147,8 @@ export function devResult(pairs, verdictOf) {
 /**
  * The held-out result of 1 judge: agreement of its pass (grade 3 or more) with the owner's label on the counted items
  * (all but `exclude`), against ceil(0.8 x counted); the agreement on all items too, for reference; the confusion
- * counts of the counted items (owner pass or fail x judge pass or fail); pending items agree with nothing.
+ * counts of the counted items (owner pass or fail x judge pass or fail); pending items agree with nothing. A set with
+ * other than `HELD_OUT_REQUIRED` items (before exclusions) is incomplete and never passes.
  */
 export function heldOutResult(items, verdictOf, exclude = new Set()) {
     const confusion = {
@@ -165,13 +188,17 @@ export function heldOutResult(items, verdictOf, exclude = new Set()) {
 
     const threshold = Math.ceil(AGREEMENT * counted);
 
+    const complete = items.length === HELD_OUT_REQUIRED;
+
     return {
         items: items.length,
+        required: HELD_OUT_REQUIRED,
+        complete,
         counted,
         excluded: items.length - counted,
         agree,
         threshold,
-        pass: counted > 0 && agree >= threshold,
+        pass: complete && counted > 0 && agree >= threshold,
         agreeAll,
         confusion,
         pending,
@@ -264,8 +291,8 @@ async function readSets(dir, set) {
 export const JUDGE_CALIBRATION_USAGE = `usage: node bench/judge-calibration.mjs [--dir <calibration dir>] [--set dev|held-out|all]
          [--exclude <item id>]... [--bwrap <path>] [--pocket <dir>] [--agent-src <dir>] [--mise-installs <dir>]
          [--no-auth-preflight]
-exit codes: 0 the run completed (each judge passes or fails), 1 usage error (also an unlabelled held-out item),
-            2 budget refused (the verdicts so far are saved; run again)`;
+exit codes: 0 the run completed (each judge passes or fails), 1 usage error (also an incomplete held-out set or
+            an unlabelled held-out item), 2 budget refused (the verdicts so far are saved; run again)`;
 
 const OPTIONS = {
     dir: { type: "string" },
@@ -313,6 +340,13 @@ export async function judgeCalibrationMain(argv, env = process.env, deps = {}) {
             }
         }
 
+        // The thresholds hold for the complete set: an incomplete one stops the run before any judge call.
+        if (sets.heldOut && sets.heldOut.length !== HELD_OUT_REQUIRED) {
+            throw new UsageError(
+                `the held-out set is incomplete: ${sets.heldOut.length} items, not ${HELD_OUT_REQUIRED} (${HELD_OUT_PER_OWNER} per owner); it cannot pass, so no judge runs`,
+            );
+        }
+
         // Agreement is with the owners' labels: an item with no label stops the run before any judge call.
         const unlabelled = (sets.heldOut ?? [])
             .filter((item) => item.label !== "pass" && item.label !== "fail")
@@ -358,7 +392,11 @@ export async function judgeCalibrationMain(argv, env = process.env, deps = {}) {
 
         for (const call of callsOf(sets, judges)) {
             const file = verdictPath(dir, call.model, call.id, call.part);
-            const before = await readJson(file, null);
+            const prompt = calibrationPrompt(template, call);
+            const inputSha256 = sha256(prompt);
+            const saved = await readJson(file, null);
+            // A verdict of another input (a rebuilt set) is judged again and overwritten; its tries do not carry.
+            const before = verdictMatches(saved, { ...call, inputSha256 }) ? saved : null;
             const name = `${call.model} ${call.id}${call.part ? ` ${call.part}` : ""}`;
 
             if (gradeOf(before) !== null) {
@@ -374,9 +412,13 @@ export async function judgeCalibrationMain(argv, env = process.env, deps = {}) {
                 continue;
             }
 
+            if (saved && !before) {
+                log(`${name}: the saved verdict is of another input: judged again`);
+            }
+
             const verdict = await runJudge(judgeCtx, {
                 model: call.model,
-                prompt: calibrationPrompt(template, call),
+                prompt,
                 dir: join(
                     data,
                     "judges",
@@ -387,12 +429,13 @@ export async function judgeCalibrationMain(argv, env = process.env, deps = {}) {
                 task: call.id,
                 stage: CALIBRATION_STAGE,
             });
-            const saved = {
+            const next = {
                 schema: 1,
                 judge: call.model,
                 item: call.id,
                 part: call.part,
                 promptSha256: JUDGE_PROMPT_SHA256,
+                inputSha256,
                 grade: verdict.grade,
                 reasons: verdict.reasons,
                 tries: (before?.tries ?? 0) + verdict.tries,
@@ -402,8 +445,8 @@ export async function judgeCalibrationMain(argv, env = process.env, deps = {}) {
             };
 
             await privateDir(join(file, ".."));
-            await writeJsonAtomic(file, saved);
-            verdicts.set(keyOf(call.model, call.id, call.part), saved);
+            await writeJsonAtomic(file, next);
+            verdicts.set(keyOf(call.model, call.id, call.part), next);
             refused = verdict.refused;
             log(
                 `${name}: ${verdict.pending ? (refused ? "budget refused" : "pending") : `grade ${verdict.grade}`}`,

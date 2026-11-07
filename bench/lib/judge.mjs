@@ -93,19 +93,75 @@ export function isTestPath(path) {
     );
 }
 
-/** The path of a file section of a diff: the `b/` path of its `diff --git` line (the `a/` path when none parses). */
-const sectionPath = (section) => {
+/** The C-style escapes of a quoted path that git writes, as bytes. */
+const ESCAPES = { a: 7, b: 8, t: 9, n: 10, v: 11, f: 12, r: 13, '"': 34, "\\": 92 };
+
+/**
+ * A path as git writes it in a `diff --git` line: as it is, or, for a path with special characters, in double quotes
+ * with C-style escapes (`\\`, `\"`, `\t`, `\n`, and octal `\NNN` bytes of UTF-8), decoded to its text.
+ */
+export function unquotePath(token) {
+    const value = String(token ?? "");
+
+    if (!(value.length >= 2 && value.startsWith('"') && value.endsWith('"'))) {
+        return value;
+    }
+
+    const body = value.slice(1, -1);
+    const bytes = [];
+
+    for (let i = 0; i < body.length; i += 1) {
+        const c = body[i];
+
+        if (c !== "\\") {
+            bytes.push(...Buffer.from(c, "utf8"));
+            continue;
+        }
+
+        const octal = /^[0-7]{1,3}/.exec(body.slice(i + 1))?.[0];
+        const next = body[i + 1] ?? "";
+
+        if (octal) {
+            bytes.push(parseInt(octal, 8) & 0xff);
+            i += octal.length;
+        } else if (Object.hasOwn(ESCAPES, next)) {
+            bytes.push(ESCAPES[next]);
+            i += 1;
+        } else {
+            bytes.push(92);
+        }
+    }
+
+    return Buffer.from(bytes).toString("utf8");
+}
+
+/** A `diff --git` line: 2 path tokens, each a C-style quoted string or plain text. */
+const QUOTED = String.raw`"(?:[^"\\]|\\.)*"`;
+const GIT_HEADER = new RegExp(`^diff --git (${QUOTED}|a/.+?) (${QUOTED}|b/.+)$`);
+
+/**
+ * The path of a file section of a diff: the `b/` path of its `diff --git` line, quoted or not, decoded (the rest of
+ * the line when none parses). The section's text is not changed.
+ */
+export function sectionPath(section) {
     const end = section.indexOf("\n");
     const line = end < 0 ? section : section.slice(0, end);
-    const match = /^diff --git a\/(.+?) b\/(.+)$/.exec(line);
+    const match = GIT_HEADER.exec(line);
 
-    return match ? match[2] : line.slice("diff --git ".length);
-};
+    if (!match) {
+        return line.slice("diff --git ".length);
+    }
+
+    const path = unquotePath(match[2]);
+
+    return path.startsWith("b/") ? path.slice(2) : path;
+}
 
 /**
  * A diff with its test files last: the text before the first `diff --git ` line stays first, then the non-test file
  * sections, then the test file sections, each group in its original order. Git sorts files by path, so test files
- * (`desk-x.test.ts` before `desk.ts`) can fill a cut and hide the code they test.
+ * (`desk-x.test.ts` before `desk.ts`) can fill a cut and hide the code they test. It keeps each section's text; it
+ * can add 1 newline between sections (after a section with no final newline that is no longer last).
  */
 export function testsLast(diff) {
     const text = String(diff ?? "");

@@ -22,7 +22,9 @@ import {
     isTestPath,
     renderPrompt,
     runJudge,
+    sectionPath,
     testsLast,
+    unquotePath,
 } from "./lib/judge.mjs";
 
 const sha256 = (text) => createHash("sha256").update(text).digest("hex");
@@ -95,6 +97,33 @@ test("a cut diff shows the non-test files first, each group in its order; a diff
     const small = `${section("a.test.ts", 3)}${section("a.ts", 3)}`;
 
     assert.deepEqual(cutDiff(small, diffStat(small)), { text: small, cut: false });
+});
+
+test("a quoted git path is decoded: a cut diff with a quoted test file first shows the production file first", () => {
+    // git quotes a path with special characters: C-style escapes, octal bytes of UTF-8 (\303\251 is "é").
+    const quoted = String.raw`"a/\303\251.test.ts" "b/\303\251.test.ts"`;
+    const tests = `diff --git ${quoted}\nindex 0000000..1111111 100644\n${"+test\n".repeat(DIFF_LIMIT / 4)}`;
+    const code = section("é.ts", 50, "code");
+    const diff = `${tests}${code}`;
+    const { text, cut } = cutDiff(diff, "stat");
+
+    assert.equal(cut, true);
+    assert.ok(
+        text.startsWith(`stat\n\n${code}diff --git ${quoted}\n`),
+        "the production section first",
+    );
+    // The sections keep their text: the quoted header is not rewritten.
+    assert.equal(testsLast(diff), `${code}${tests}`);
+
+    assert.equal(sectionPath(`diff --git ${quoted}\n`), "é.test.ts");
+    assert.equal(
+        sectionPath(String.raw`diff --git "a/t\"x\ty\\z.ts" "b/t\"x\ty\\z.spec.ts"` + "\n"),
+        't"x\ty\\z.spec.ts',
+    );
+    assert.equal(sectionPath(String.raw`diff --git a/a.ts "b/test s/\303\251.ts"`), "test s/é.ts");
+    assert.equal(sectionPath("diff --git a/a b.ts b/a b.ts\n"), "a b.ts");
+    assert.equal(unquotePath(String.raw`"\n\101"`), "\nA");
+    assert.equal(unquotePath("plain"), "plain");
 });
 
 test("a normal S3 prompt renders byte for byte as before the calibration change", () => {
