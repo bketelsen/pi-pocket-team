@@ -1838,6 +1838,25 @@ test("R1: a success rate needs 10 threads in the cell", () => {
     assert.equal(ten.successRate, 0.7);
 });
 
+test("R1: a route with a brief hash counts only on a night shift; an older route counts as before", () => {
+    const hash = "a".repeat(64);
+    const data = emptyData({
+        threads: threadMap(
+            // A night shift's new route: its session has a goal.
+            routed("T1", { briefHash: hash }),
+            // A delegation that is no night shift: a new route, and no goal.
+            routed("T2", { briefHash: hash, kind: "plan" }),
+            // An older route (no hash): always a night shift's, counted with or without its goal.
+            routed("T3", { kind: "debug" }),
+        ),
+        goals: [{ session: 101, goal: { status: "ended", reason: "done", round: 1 } }],
+    });
+    const result = checkR1(data, ctx);
+
+    assert.equal(result.metrics.routes, 2);
+    assert.deepEqual(result.metrics.cells.map((cell) => cell.kind).sort(), ["debug", "implement"]);
+});
+
 test("R1: the model used is the goal's worker, else the most common spawn model", () => {
     const data = emptyData({
         threads: threadMap(
