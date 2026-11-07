@@ -1804,6 +1804,7 @@ const launchSuite = (label: string, instant: number, untilAt: number) =>
 
                 state.sweepers = { "4242": "task-test" };
                 state.clerks = {};
+
                 for (const id of ["1745", "1746"]) {
                     receipts.supervisors[id] = {
                         receipts: [...(receipts.supervisors[id]?.receipts ?? []), receipt],
@@ -1832,6 +1833,7 @@ const launchSuite = (label: string, instant: number, untilAt: number) =>
 
                     state.sweepers = saved.sweepers ?? {};
                     state.clerks = saved.clerks ?? {};
+
                     for (const id of ["1745", "1746"]) {
                         const before = savedReceipts[id];
 
