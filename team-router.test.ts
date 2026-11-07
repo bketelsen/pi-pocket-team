@@ -17,6 +17,7 @@ import {
     until,
 } from "./_pocket/test/helpers.ts";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
 import { cpSync } from "node:fs";
 import { join } from "node:path";
@@ -25,6 +26,7 @@ import { fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi
 import type { ConversationId } from "@earendil-works/pi-durable";
 import { DeskThreads, type Thread, threadOfSession } from "./desk.ts";
 import { GoalDoc, type Goal } from "./night-shift.ts";
+import { ROUTE_GUARD_MS, type RouteMemo, routeOnce } from "./team.ts";
 
 const TASK = "Tend the test repository";
 const ROUTER = Symbol.for("pi-pocket-team.model-router");
@@ -35,7 +37,23 @@ const SHADOW_LINE =
 const WORKER_LINE = "Route: high: acme/suggested (implement 1.9); named faux/faux-2 runs; shadow";
 const EXPLICIT_LINE = "Route: worker faux/faux-2 named by the supervisor; the router did not run";
 
-/** A route as the router module publishes one. With a `worker`, the route carries it, and says so in its line. */
+/** The features a fake router gives: the shape of the router's `Features`, version 1. */
+const FEATURES = {
+    v: 1,
+    briefChars: 42,
+    pathsNamed: 1,
+    reposNamed: 1,
+    language: "other",
+    riskPathNamed: null,
+    testsBeside: false,
+};
+
+const sha256 = (text: string) => createHash("sha256").update(text, "utf8").digest("hex");
+
+/**
+ * A route as the router module publishes one. With a `worker`, the route carries it, and says so in its line. It
+ * carries features and no `briefHash`: team.ts adds the hash for a router that keeps none.
+ */
 const shadowRoute = (worker?: string) => ({
     mode: "shadow",
     status: "shadow",
@@ -51,18 +69,42 @@ const shadowRoute = (worker?: string) => ({
     thinking: "medium",
     profileModel: "faux/faux-2",
     ...(worker === undefined ? {} : { worker }),
+    features: {
+        ...FEATURES,
+        kind: "implement",
+        complexity: 1.8,
+        capability: 1.9,
+        deepReasoning: 0.4,
+        demand: 1.9,
+    },
     reason: "shadow: recorded only",
     at: Date.now(),
     line: worker === undefined ? SHADOW_LINE : WORKER_LINE,
 });
 
-type RouterCall = { brief: string; startAt: number; profileModel?: string; worker?: string };
+type RouterCall = {
+    brief: string;
+    startAt: number;
+    profileModel?: string;
+    worker?: string;
+    repoDirs?: string[];
+    roster?: string[];
+};
 type ExplicitCall = { worker: string; profileModel?: string };
 
-/** A fake router on the global the module publishes: it answers, throws, or never answers. Version 1 is the old API. */
-function fakeRouter(behaviour: "ok" | "throw" | "hang" = "ok", version = 2) {
+/**
+ * A fake router on the global the module publishes: it answers, throws, never answers, records the mode off, or
+ * records Jev's failure (as the real router does: features with no Jev fields, and the brief's hash). Version 1 is the
+ * old API; version 3 also publishes `features`.
+ */
+function fakeRouter(behaviour: "ok" | "throw" | "hang" | "off" | "jev-failed" = "ok", version = 3) {
     const calls: RouterCall[] = [];
     const explicitCalls: ExplicitCall[] = [];
+    const featureCalls: {
+        brief: string;
+        repoDirs: readonly string[];
+        roster?: readonly string[];
+    }[] = [];
     const shared = globalThis as unknown as Record<symbol, unknown>;
 
     shared[ROUTER] = {
@@ -78,8 +120,47 @@ function fakeRouter(behaviour: "ok" | "throw" | "hang" = "ok", version = 2) {
                 return new Promise(() => {});
             }
 
+            if (behaviour === "off") {
+                return {
+                    mode: "off",
+                    status: "off",
+                    ...(request.worker === undefined ? {} : { worker: request.worker }),
+                    features: FEATURES,
+                    briefHash: sha256(request.brief),
+                    reason: "the router's mode is off",
+                    at: Date.now(),
+                    line: "Route: off (the router's mode is off); nothing changes",
+                };
+            }
+
+            if (behaviour === "jev-failed") {
+                return {
+                    mode: "shadow",
+                    status: "failed",
+                    ...(request.worker === undefined ? {} : { worker: request.worker }),
+                    features: FEATURES,
+                    briefHash: sha256(request.brief),
+                    reason: "Jev returned the status 500",
+                    at: Date.now(),
+                    line: "Route: failed (Jev returned the status 500); no worker named, nothing changes",
+                };
+            }
+
             return shadowRoute(request.worker);
         },
+        ...(version >= 3
+            ? {
+                  features: (
+                      brief: string,
+                      repoDirs: readonly string[],
+                      roster?: readonly string[],
+                  ) => {
+                      featureCalls.push({ brief, repoDirs, roster });
+
+                      return FEATURES;
+                  },
+              }
+            : {}),
         explicit: (request: ExplicitCall) => {
             explicitCalls.push(request);
 
@@ -98,6 +179,7 @@ function fakeRouter(behaviour: "ok" | "throw" | "hang" = "ok", version = 2) {
     return {
         calls,
         explicitCalls,
+        featureCalls,
         remove: () => {
             delete shared[ROUTER];
         },
@@ -316,6 +398,12 @@ describe("a delegated night shift and the model router", () => {
             );
             assert.equal(router.calls[0].profileModel, "faux/faux-2");
             assert.equal(typeof router.calls[0].startAt, "number");
+            assert.deepEqual(router.calls[0].repoDirs, [repo], "the roster checkout");
+            assert.deepEqual(
+                router.calls[0].roster,
+                ["frostyard/test"],
+                "the roster's repositories",
+            );
             assert.equal(router.explicitCalls.length, 0);
 
             const goal = (await goalOf(linked))!;
@@ -327,6 +415,17 @@ describe("a delegated night shift and the model router", () => {
             assert(thread, "the delegation opened a desk thread");
             assert.equal(thread.route?.status, "shadow");
             assert.equal(thread.route?.model, "acme/suggested");
+            assert.equal(
+                thread.route?.features?.kind,
+                "implement",
+                "the router's features are kept",
+            );
+            assert.equal(thread.route?.features?.pathsNamed, 1);
+            assert.equal(
+                thread.route?.briefHash,
+                sha256(router.calls[0].brief),
+                "team.ts adds the hash a router did not keep",
+            );
             assert.equal(
                 thread.events.filter((event) => event.key === "route").length,
                 1,
@@ -470,6 +569,15 @@ describe("a delegated night shift and the model router", () => {
             assert.equal(route?.status, "failed");
             assert.equal(route?.reason, "the router failed");
             assert.equal(route?.model, undefined, "a failed route suggests no model");
+            assert.deepEqual(
+                route?.features,
+                FEATURES,
+                "the features still record, with no Jev field",
+            );
+            assert.equal(route?.briefHash, sha256(router.calls[0].brief));
+            assert.deepEqual(router.featureCalls, [
+                { brief: router.calls[0].brief, repoDirs: [repo], roster: ["frostyard/test"] },
+            ]);
             assert.match(
                 (await modelTexts(app, source)).join("\n"),
                 /Route: failed \(the router failed\); no worker named, nothing changes/,
@@ -597,19 +705,223 @@ describe("a delegated night shift and the model router", () => {
         }
     });
 
-    test("a delegation with no night shift asks the router nothing", async () => {
+    test("a delegation with no night shift records a route, and its result and model are as before", async () => {
         const router = fakeRouter();
 
         try {
-            const { linked } = await delegate("route-plain", "plain route test");
+            const { source, linked } = await delegate("route-plain", "plain route test");
 
             await until(() => !app.isBusy(linked), "the linked task to settle", 20_000);
 
-            assert.equal(router.calls.length, 0);
-            assert.equal(router.explicitCalls.length, 0);
-            assert.equal((await threadOf(linked))?.route, undefined);
+            assert.equal(router.calls.length, 1, "the router ran once");
+            assert.equal(router.calls[0].brief, TASK, "the task is the brief");
+            assert.equal(router.calls[0].worker, undefined, "no night shift: no worker");
+            assert.deepEqual(router.calls[0].repoDirs, [repo]);
+
+            const thread = await threadOf(linked);
+
+            assert.equal(thread?.route?.status, "shadow");
+            assert.equal(thread?.route?.worker, undefined);
+            assert.equal(thread?.route?.features?.v, 1);
+            assert.equal(thread?.route?.briefHash, sha256(TASK));
+            assert.equal(
+                thread?.events.filter((event) => event.key === "route").length,
+                1,
+                "1 route event",
+            );
+            assert.equal(await goalOf(linked), undefined, "no goal");
+
+            const result = (await modelTexts(app, source)).find((text) =>
+                text.includes("Assigned to"),
+            );
+
+            assert.equal(result?.includes("Route:"), false, "the result names no route");
+            assert.equal(
+                app.sessions().find((session) => session.id === Number(linked))?.model,
+                "faux-2",
+            );
         } finally {
             router.remove();
         }
+    });
+
+    test("with the router off, a delegation records why, and the features", async () => {
+        const router = fakeRouter("off");
+
+        try {
+            const { linked } = await delegate("route-off", "plain route test");
+
+            await until(() => !app.isBusy(linked), "the linked task to settle", 20_000);
+
+            const route = (await threadOf(linked))?.route;
+
+            assert.equal(route?.status, "off");
+            assert.equal(route?.reason, "the router's mode is off");
+            assert.deepEqual(route?.features, FEATURES);
+            assert.equal(route?.briefHash, sha256(TASK));
+            assert.equal(route?.kind, undefined, "no Jev field");
+        } finally {
+            router.remove();
+        }
+    });
+
+    test("a Jev failure records why, and the features with no Jev field", async () => {
+        const router = fakeRouter("jev-failed");
+
+        try {
+            const { linked } = await delegate("route-jev", "plain route test");
+
+            await until(() => !app.isBusy(linked), "the linked task to settle", 20_000);
+
+            const route = (await threadOf(linked))?.route;
+
+            assert.equal(route?.status, "failed");
+            assert.equal(route?.reason, "Jev returned the status 500");
+            assert.deepEqual(route?.features, FEATURES);
+            assert.equal(route?.features?.kind, undefined);
+            assert.equal(route?.briefHash, sha256(TASK));
+            assert.equal(
+                router.featureCalls.length,
+                0,
+                "the router's own route holds the features",
+            );
+        } finally {
+            router.remove();
+        }
+    });
+
+    test("the model, the worker and the result are the same with and without the router", async () => {
+        /**
+         * A result with its session address and thread id taken out, and the route's line, which a night shift's result
+         * names when there is a route: what is left must not change.
+         */
+        const resultOf = async (source: ConversationId, line?: string) =>
+            (await modelTexts(app, source))
+                .find((text) => text.includes("Assigned to"))!
+                .replace(/session-[0-9a-f-]+/g, "<address>")
+                .replace(/Thread T\d+/g, "Thread <id>")
+                .replace(line === undefined ? /^$/ : ` ${line}.`, "");
+
+        const run = async (name: string, words: string) => {
+            const { source, linked } = await delegate(name, words);
+
+            await until(() => !app.isBusy(linked), "the linked task to settle", 20_000);
+
+            const route = (await threadOf(linked))?.route;
+
+            return {
+                model: app.sessions().find((session) => session.id === Number(linked))?.model,
+                worker: (await goalOf(linked))?.worker,
+                result: await resultOf(source, route?.line),
+                route,
+            };
+        };
+
+        for (const words of ["worker route night shift test", "plain route test"]) {
+            const router = fakeRouter();
+            let routed;
+
+            try {
+                routed = await run(`same-routed-${words.length}`, words);
+            } finally {
+                router.remove();
+            }
+
+            const plain = await run(`same-plain-${words.length}`, words);
+
+            assert.notEqual(routed.route, undefined, "the router recorded a route");
+            assert.equal(plain.route, undefined, "no router, no route");
+            assert.equal(routed.model, plain.model, `${words}: the session's model`);
+            assert.equal(routed.worker, plain.worker, `${words}: the worker`);
+            assert.equal(routed.result, plain.result, `${words}: the result`);
+        }
+    });
+});
+
+describe("routeOnce: 1 route for 1 call, over every replay", () => {
+    /** A memo in memory, as a tool call's memo keeps it. */
+    function memoryMemo<R>(route?: R, started?: boolean) {
+        const held: { route?: R; started?: boolean } = { route, started };
+
+        const memo: RouteMemo<R> = {
+            stored: async () => held.route,
+            keep: async (value) => (held.route = value),
+            started: async () => held.started,
+            start: async () => (held.started = true),
+        };
+
+        return { memo, held };
+    }
+
+    type Recorded = { status: string; reason?: string; features?: object; briefHash?: string };
+
+    test("a replay of an older memo, with no features, gives it back as it is, and asks nothing", async () => {
+        const older: Recorded = { status: "shadow", reason: "shadow: recorded only" };
+        const { memo, held } = memoryMemo<Recorded>(older, true);
+        let asked = 0;
+        const route = await routeOnce<Recorded>(
+            memo,
+            async () => {
+                asked += 1;
+
+                return { status: "shadow", features: FEATURES, briefHash: "x" };
+            },
+            (reason) => ({ status: "failed", reason }),
+        );
+
+        assert.equal(asked, 0, "the router is not asked again");
+        assert.deepEqual(route, { status: "shadow", reason: "shadow: recorded only" });
+        assert.equal("features" in route, false, "no features are added to an older route");
+        assert.equal(held.route, older, "the memo is not written again");
+    });
+
+    test("a first call asks once and keeps the answer; a restart after the started mark asks nothing", async () => {
+        const first = memoryMemo<Recorded>();
+        const answer = { status: "shadow", features: FEATURES, briefHash: "h" };
+        let asked = 0;
+
+        const ask = async () => {
+            asked += 1;
+
+            return answer;
+        };
+
+        const failed = (reason: string): Recorded => ({ status: "failed", reason });
+
+        assert.deepEqual(await routeOnce(first.memo, ask, failed), answer);
+        assert.equal(first.held.started, true);
+        assert.deepEqual(
+            await routeOnce(first.memo, ask, failed),
+            answer,
+            "a replay reads the memo",
+        );
+        assert.equal(asked, 1);
+
+        const restarted = memoryMemo<Recorded>(undefined, true);
+
+        assert.deepEqual(await routeOnce(restarted.memo, ask, failed), {
+            status: "failed",
+            reason: "interrupted by a server restart",
+        });
+        assert.equal(asked, 1, "nothing is asked after a restart");
+    });
+
+    test("a router that throws or takes too long gives a failed route, and the memo keeps it", async () => {
+        const failed = (reason: string): Recorded => ({ status: "failed", reason });
+        const thrown = memoryMemo<Recorded>();
+
+        assert.deepEqual(
+            await routeOnce(thrown.memo, async () => Promise.reject(new Error("x")), failed),
+            { status: "failed", reason: "the router failed" },
+        );
+        assert.equal(thrown.held.route?.reason, "the router failed");
+
+        const slow = memoryMemo<Recorded>();
+
+        assert.deepEqual(await routeOnce(slow.memo, () => new Promise(() => {}), failed, 10), {
+            status: "failed",
+            reason: "the router took more than 0.01 s",
+        });
+        assert.equal(ROUTE_GUARD_MS, 4000, "the guard a delegation gets");
     });
 });

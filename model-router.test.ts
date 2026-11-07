@@ -1,7 +1,7 @@
 // The model router's pure parts: the masking, the Jev body and answer, the decision, the tiers file, the record's line,
 // and the one HTTP call (with a fake fetch: no network). Nothing here starts a server or reads a real file.
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -14,11 +14,14 @@ import {
     TIERS,
     TIMEOUT_MS,
     type RouterApi,
+    briefHash,
     classify,
     decide,
+    features,
     inDeepseekPeak,
     jevBody,
     maskBrief,
+    matchRiskGlob,
     parseAnalysis,
     readTiers,
     routeLine,
@@ -26,6 +29,7 @@ import {
 } from "./model-router.ts";
 import createModelRouter from "./model-router.ts";
 import type { Host, Web } from "./_pocket.d.ts";
+import { matchGlob } from "./scripts/lib/risk-paths.mjs";
 
 // 12:00 UTC: outside DeepSeek's peak hours.
 const NOON = Date.UTC(2026, 9, 23, 12, 0);
@@ -849,12 +853,13 @@ test("the module skips a model it cannot resolve, and a named worker needs no ca
     }
 });
 
-test("the module publishes version 2, and keeps `explicit` for an older team.ts", () => {
+test("the module publishes version 3, and keeps `explicit` for an older team.ts", () => {
     const router = loadRouter({ mode: "shadow", typesafeApiKey: KEY }, []);
 
     try {
-        assert.equal(router.api.version, 2);
+        assert.equal(router.api.version, 3);
         assert.equal(typeof router.api.explicit, "function");
+        assert.equal(typeof router.api.features, "function");
     } finally {
         router.dispose();
     }
@@ -982,5 +987,534 @@ test("a failed or off route beside a named worker carries the worker", async () 
         off.dispose();
     } finally {
         fetchStub.restore();
+    }
+});
+
+// ─── Features ───────────────────────────────────────────────────────────────
+
+/** A temporary folder with `files` (path → text) in it; the return value removes it. */
+async function repoWith(
+    files: Record<string, string>,
+): Promise<{ dir: string; done: () => Promise<void> }> {
+    const dir = await mkdtemp(join(tmpdir(), "router-features-"));
+
+    for (const [path, text] of Object.entries(files)) {
+        await mkdir(join(dir, path, ".."), { recursive: true });
+        await writeFile(join(dir, path), text);
+    }
+
+    return { dir, done: () => rm(dir, { recursive: true, force: true }) };
+}
+
+const RISK_LIST = JSON.stringify({
+    schema_version: 1,
+    paths: [
+        { glob: "model-router.ts", why: "secrets" },
+        { glob: ".github/workflows/**", why: "CI" },
+        { glob: "scripts/{lib,bin}/*.mjs", why: "the gate" },
+    ],
+});
+
+test("features: the Jev fields come from the analysis, at 2 decimals, and the demand is the route's", () => {
+    const judged = features(
+        "Fix it",
+        [],
+        analysis({ complexity: 1.8, capability: 1.5, deepReasoning: 0.4 }),
+    );
+
+    assert.equal(judged.v, 1);
+    assert.equal(judged.kind, "implement");
+    assert.equal(judged.complexity, 1.8);
+    assert.equal(judged.capability, 1.5);
+    assert.equal(judged.deepReasoning, 0.4);
+    // 0.55 × 1.8 + 0.45 × 1.5 = 1.665: the demand `decide` gives the route.
+    assert.equal(judged.demand, 1.67);
+    assert.equal(
+        judged.demand,
+        decide(analysis({ complexity: 1.8, capability: 1.5, deepReasoning: 0.4 }), {
+            allowed: ["github-copilot/claude-sonnet-5.5"],
+            unusable: new Set(),
+            at: NOON,
+            tiers: DEFAULT_TIERS,
+        }).demand,
+    );
+
+    // A plan floors at `high` (2), as the route's demand does.
+    assert.equal(
+        features("x", [], analysis({ kind: "plan", complexity: 0, capability: 0 })).demand,
+        2,
+    );
+});
+
+test("features: without an analysis, no Jev field is there at all", () => {
+    const plain = features("Fix it", []);
+
+    for (const field of ["kind", "complexity", "capability", "deepReasoning", "demand"]) {
+        assert.equal(field in plain, false, `${field} is absent`);
+    }
+
+    assert.deepEqual(plain, {
+        v: 1,
+        briefChars: 6,
+        pathsNamed: 0,
+        reposNamed: 0,
+        language: "unknown",
+        riskPathNamed: null,
+        testsBeside: null,
+    });
+});
+
+test("features: briefChars counts the brief's characters before masking, by code point", () => {
+    assert.equal(features("", []).briefChars, 0);
+    assert.equal(features("héllo 🚀", []).briefChars, 7);
+    assert.equal(
+        features("see https://example.com/a/b", []).briefChars,
+        "see https://example.com/a/b".length,
+        "the URL counts as written, not as [url]",
+    );
+});
+
+test("features: pathsNamed counts distinct tokens with a `/` or a file extension, and never a URL or a host", () => {
+    const brief = [
+        "Change `model-router.ts` and team.ts:120, then docs/modules/model-router.md.",
+        "Read ./team.ts again (team.ts), and audit/checks.mjs:10:4.",
+        "Not https://example.com/a/b, not //cdn.example.com/x, not 10.0.0.1/24, not acme.example.info.",
+        "Not bketelsen/pi-pocket-team#82, nor the version 1.8/3, nor plain words.",
+    ].join("\n");
+    const counted = features(brief, [], undefined, { roster: ["bketelsen/pi-pocket-team"] });
+
+    // model-router.ts, team.ts, docs/modules/model-router.md, audit/checks.mjs, bketelsen/pi-pocket-team (a roster
+    // repository holds a `/`: it is a path too, and the 2 counts are separate) and 1.8/3.
+    assert.equal(counted.pathsNamed, 6);
+    assert.equal(counted.reposNamed, 1);
+
+    assert.equal(features("bketelsen/pi-pocket-team", []).pathsNamed, 1);
+    assert.equal(features("", []).pathsNamed, 0);
+    assert.equal(features("2026/12 and 数据/2026", []).pathsNamed, 2, "no letter is needed");
+    assert.equal(
+        features("a / b, ./ and ..", []).pathsNamed,
+        0,
+        "only slashes and dots name nothing",
+    );
+    // An SSH host name is masked first: it is no path.
+    assert.equal(
+        features("frostbox.sh", [], undefined, { hostNames: ["frostbox.sh"] }).pathsNamed,
+        0,
+    );
+});
+
+test("features: reposNamed counts distinct roster repositories, in any case, with a PR number too", () => {
+    const roster = ["bketelsen/pi-pocket-team", "frostyard/core"];
+
+    assert.equal(
+        features(
+            "bketelsen/pi-pocket-team#82 and Bketelsen/Pi-Pocket-Team, `frostyard/core`'s ADR, frostyard/other",
+            [],
+            undefined,
+            { roster },
+        ).reposNamed,
+        2,
+    );
+    assert.equal(features("bketelsen/pi-pocket-team", []).reposNamed, 0, "no roster: 0");
+    assert.equal(features("nothing here", [], undefined, { roster }).reposNamed, 0);
+});
+
+test("features: the language comes from the first folder's marker files, in order", async () => {
+    const cases: [Record<string, string>, string][] = [
+        [{ "go.mod": "module x", "package.json": "{}" }, "go"],
+        [{ "tsconfig.json": "{}", "package.json": "{}" }, "ts"],
+        [{ "package.json": "{}" }, "js"],
+        [{ "pyproject.toml": "" }, "python"],
+        [{ "requirements.txt": "" }, "python"],
+        [{ "README.md": "" }, "other"],
+    ];
+
+    for (const [files, language] of cases) {
+        const repo = await repoWith(files);
+
+        try {
+            assert.equal(features("x", [repo.dir]).language, language, JSON.stringify(files));
+        } finally {
+            await repo.done();
+        }
+    }
+
+    const go = await repoWith({ "go.mod": "module x" });
+    const js = await repoWith({ "package.json": "{}" });
+
+    try {
+        assert.equal(features("x", [js.dir, go.dir]).language, "js", "the first folder decides");
+    } finally {
+        await go.done();
+        await js.done();
+    }
+
+    assert.equal(features("x", []).language, "unknown", "no folder");
+    assert.equal(features("x", [join(tmpdir(), "router-no-such-folder")]).language, "unknown");
+});
+
+test("features: riskPathNamed matches named paths against the folder's risk paths list", async () => {
+    const repo = await repoWith({
+        ".github/risk-paths.json": RISK_LIST,
+        "model-router.ts": "",
+        "team.ts": "",
+    });
+    const bare = await repoWith({ "team.ts": "" });
+    const broken = await repoWith({ ".github/risk-paths.json": "{ not json" });
+
+    try {
+        assert.equal(features("Change model-router.ts", [repo.dir]).riskPathNamed, true);
+        assert.equal(features("Edit .github/workflows/ci.yml", [repo.dir]).riskPathNamed, true);
+        assert.equal(
+            features("Edit scripts/bin/x.mjs", [repo.dir]).riskPathNamed,
+            true,
+            "a brace group",
+        );
+        assert.equal(
+            features(`Edit ${join(repo.dir, "model-router.ts")}`, [repo.dir]).riskPathNamed,
+            true,
+            "an absolute path inside the folder",
+        );
+        assert.equal(features("Change team.ts", [repo.dir]).riskPathNamed, false);
+        assert.equal(
+            features("No path at all", [repo.dir]).riskPathNamed,
+            false,
+            "a list, and no path",
+        );
+        assert.equal(
+            features("Change ../x/model-router.ts", [repo.dir]).riskPathNamed,
+            false,
+            "a path that leaves the folder never matches",
+        );
+        assert.equal(features("Change model-router.ts", [bare.dir]).riskPathNamed, null, "no list");
+        assert.equal(
+            features("Change model-router.ts", [broken.dir]).riskPathNamed,
+            null,
+            "no valid list",
+        );
+        assert.equal(features("Change model-router.ts", []).riskPathNamed, null, "no folder");
+        assert.equal(
+            features("Change model-router.ts", [bare.dir, repo.dir]).riskPathNamed,
+            true,
+            "any folder's list",
+        );
+    } finally {
+        await repo.done();
+        await bare.done();
+        await broken.done();
+    }
+});
+
+test("features: testsBeside looks for a test file in each named path's folder", async () => {
+    const repo = await repoWith({
+        "team.ts": "",
+        "team.test.ts": "",
+        "audit/checks.mjs": "",
+        "audit/checks.test.mjs": "",
+        "pkg/store/store.go": "",
+        "pkg/store/store_test.go": "",
+        "py/app.py": "",
+        "py/test_app.py": "",
+        "docs/modules/model-router.md": "",
+        "web/index.js": "",
+        "web/index.test.js": "",
+    });
+
+    try {
+        assert.equal(
+            features("Change team.ts", [repo.dir]).testsBeside,
+            true,
+            "*.test.ts at the root",
+        );
+        assert.equal(
+            features("Change audit/checks.mjs", [repo.dir]).testsBeside,
+            true,
+            "*.test.mjs",
+        );
+        assert.equal(
+            features("Change pkg/store/store.go", [repo.dir]).testsBeside,
+            true,
+            "*_test.go",
+        );
+        assert.equal(features("Change py/app.py", [repo.dir]).testsBeside, true, "test_*.py");
+        assert.equal(
+            features("Look in pkg/store/", [repo.dir]).testsBeside,
+            true,
+            "a named folder",
+        );
+        assert.equal(
+            features("Change docs/modules/model-router.md", [repo.dir]).testsBeside,
+            false,
+        );
+        assert.equal(
+            features("Change web/index.js", [repo.dir]).testsBeside,
+            false,
+            "*.test.js is not one of the 4 patterns",
+        );
+        assert.equal(
+            features("Change docs/modules/model-router.md and team.ts", [repo.dir]).testsBeside,
+            true,
+            "any named path",
+        );
+        assert.equal(features("Change nothing", [repo.dir]).testsBeside, null, "no path named");
+        assert.equal(features("Change team.ts", []).testsBeside, null, "no folder");
+        assert.equal(
+            features("Change /etc/passwd", [repo.dir]).testsBeside,
+            false,
+            "a path outside the folder is never read",
+        );
+    } finally {
+        await repo.done();
+    }
+});
+
+test("matchRiskGlob matches as the vendored risk-paths matcher does", () => {
+    const globs = [
+        "Makefile",
+        "*.ts",
+        "scripts/lib/**",
+        ".github/workflows/**",
+        "**/secrets/*.json",
+        "docs/**/x.md",
+        "src/{a,b}/*.go",
+        "a?c.txt",
+        "{broken",
+        "broken}",
+        "{a}",
+        "dots.in.name",
+    ];
+    const paths = [
+        "Makefile",
+        "makefile",
+        "team.ts",
+        "dir/team.ts",
+        "scripts/lib/risk-paths.mjs",
+        "scripts/lib",
+        "scripts/library/x",
+        ".github/workflows/ci.yml",
+        ".github/workflows/a/b.yml",
+        "secrets/k.json",
+        "x/y/secrets/k.json",
+        "docs/x.md",
+        "docs/a/b/x.md",
+        "src/a/main.go",
+        "src/c/main.go",
+        "abc.txt",
+        "ac.txt",
+        "dotsXinXname",
+        "dots.in.name",
+        "",
+    ];
+
+    for (const glob of globs) {
+        for (const path of paths) {
+            assert.equal(
+                matchRiskGlob(glob, path),
+                matchGlob(glob, path),
+                `${glob} against ${JSON.stringify(path)}`,
+            );
+        }
+    }
+});
+
+test("briefHash is the SHA-256 hex of the brief as given", () => {
+    assert.equal(
+        briefHash("abc"),
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+    );
+    assert.notEqual(
+        briefHash("Fix 10.0.0.1"),
+        briefHash("Fix [ip]"),
+        "the brief is not masked first",
+    );
+});
+
+test("every route records features and the brief's hash: shadow, off, no key, and a Jev failure", async () => {
+    const repo = await repoWith({ "go.mod": "module x", "store_test.go": "", "store.go": "" });
+    const brief = "Fix store.go in frostyard/test at https://example.com/x";
+    const request = {
+        brief,
+        startAt: NOON,
+        repoDirs: [repo.dir],
+        roster: ["frostyard/test"],
+    };
+    const base = {
+        v: 1,
+        briefChars: [...brief].length,
+        // store.go, and frostyard/test (a roster repository holds a `/`).
+        pathsNamed: 2,
+        reposNamed: 1,
+        language: "go",
+        riskPathNamed: null,
+        testsBeside: true,
+    };
+    const ok = stubFetch(async () => new Response(JSON.stringify(ANSWER)));
+
+    try {
+        const shadow = loadRouter({ mode: "shadow", typesafeApiKey: KEY }, [
+            "github-copilot/claude-sonnet-5.5",
+        ]);
+        const route = await shadow.api.route(request);
+
+        assert.equal(route.status, "shadow");
+        assert.deepEqual(route.features, {
+            v: 1,
+            kind: "implement",
+            complexity: 2,
+            capability: 2,
+            deepReasoning: 0.3,
+            demand: route.demand,
+            ...base,
+        });
+        assert.equal(route.briefHash, briefHash(brief));
+        assert.equal(route.line.includes("features"), false, "the line is as before");
+        assert.equal(JSON.stringify(route).includes("example.com"), false, "no brief text is kept");
+        shadow.dispose();
+
+        const off = loadRouter({ mode: "off", typesafeApiKey: KEY }, []);
+        const offRoute = await off.api.route(request);
+
+        assert.equal(offRoute.status, "off");
+        assert.deepEqual(offRoute.features, base, "off: the features without Jev");
+        assert.equal(offRoute.briefHash, briefHash(brief));
+        off.dispose();
+
+        const keyless = loadRouter({ mode: "shadow" }, []);
+
+        assert.deepEqual((await keyless.api.route(request)).features, base);
+        keyless.dispose();
+        assert.equal(ok.calls.length, 1, "off and keyless call nothing");
+    } finally {
+        ok.restore();
+    }
+
+    const failing = stubFetch(async () => new Response("{}", { status: 500 }));
+
+    try {
+        const router = loadRouter({ mode: "shadow", typesafeApiKey: KEY }, [
+            "github-copilot/claude-sonnet-5.5",
+        ]);
+        const failed = await router.api.route(request);
+
+        assert.equal(failed.status, "failed");
+        assert.deepEqual(failed.features, base, "a Jev failure: the features without Jev");
+        assert.equal(failed.briefHash, briefHash(brief));
+        assert.deepEqual(router.api.features(brief, [repo.dir], ["frostyard/test"]), base);
+        router.dispose();
+    } finally {
+        failing.restore();
+        await repo.done();
+    }
+});
+
+test("a route with no folders and no roster still records the brief's features", async () => {
+    const off = loadRouter({ mode: "off" }, []);
+
+    try {
+        const route = await off.api.route({ brief: "Fix team.ts", startAt: NOON });
+
+        assert.deepEqual(route.features, {
+            v: 1,
+            briefChars: 11,
+            pathsNamed: 1,
+            reposNamed: 0,
+            language: "unknown",
+            riskPathNamed: null,
+            testsBeside: null,
+        });
+    } finally {
+        off.dispose();
+    }
+});
+
+test("features: every path counts for the risk and test flags, not only the first 50", async () => {
+    const repo = await repoWith({
+        ".github/risk-paths.json": RISK_LIST,
+        "model-router.ts": "",
+        "pkg/store_test.go": "",
+    });
+    const ordinary = Array.from({ length: 50 }, (_, index) => `docs/n${String(index)}.md`).join(
+        " ",
+    );
+
+    try {
+        const risk = features(`${ordinary} model-router.ts`, [repo.dir]);
+
+        assert.equal(risk.pathsNamed, 51);
+        assert.equal(risk.riskPathNamed, true, "the 51st path is a risk path");
+
+        const tests = features(`${ordinary} pkg/store.go`, [repo.dir]);
+
+        assert.equal(tests.testsBeside, true, "a test beside the 51st path");
+    } finally {
+        await repo.done();
+    }
+});
+
+test("features: a symbolic link out of the folder is never followed", async () => {
+    const outside = await repoWith({
+        "x.test.ts": "",
+        "risk-paths.json": RISK_LIST,
+        ".github/risk-paths.json": RISK_LIST,
+    });
+    const repo = await repoWith({ "go.mod": "module x" });
+    const linkedList = await repoWith({ "go.mod": "module x" });
+
+    try {
+        // A folder link: a named path through it would read the outside folder.
+        await symlink(outside.dir, join(repo.dir, "linked"));
+        assert.equal(features("Change linked/x.ts", [repo.dir]).testsBeside, false);
+        assert.equal(features("Look in linked/", [repo.dir]).testsBeside, false);
+
+        // A linked list, and a linked `.github` folder: neither is read.
+        await mkdir(join(linkedList.dir, ".github"));
+        await symlink(
+            join(outside.dir, "risk-paths.json"),
+            join(linkedList.dir, ".github", "risk-paths.json"),
+        );
+        assert.equal(features("Change model-router.ts", [linkedList.dir]).riskPathNamed, null);
+        await symlink(join(outside.dir, ".github"), join(repo.dir, ".github"));
+        assert.equal(features("Change model-router.ts", [repo.dir]).riskPathNamed, null);
+
+        // A link that stays inside the folder is read as usual.
+        await mkdir(join(linkedList.dir, "src"));
+        await writeFile(join(linkedList.dir, "src", "a_test.go"), "");
+        await symlink(join(linkedList.dir, "src"), join(linkedList.dir, "alias"));
+        assert.equal(features("Change alias/a.go", [linkedList.dir]).testsBeside, true);
+    } finally {
+        await repo.done();
+        await linkedList.done();
+        await outside.done();
+    }
+});
+
+test("features: a folder reached through a symbolic link has the features of its real path", async () => {
+    const repo = await repoWith({
+        "go.mod": "module x",
+        ".github/risk-paths.json": RISK_LIST,
+        "model-router.ts": "",
+        "pkg/store_test.go": "",
+    });
+    const parent = await mkdtemp(join(tmpdir(), "router-link-parent-"));
+    const linked = join(parent, "checkout");
+
+    try {
+        await symlink(repo.dir, linked);
+
+        const brief = "Change model-router.ts and pkg/store.go";
+        const real = features(brief, [repo.dir]);
+
+        assert.equal(real.riskPathNamed, true);
+        assert.equal(real.testsBeside, true);
+        assert.deepEqual(features(brief, [linked]), real, "the root's link changes nothing");
+
+        // A link in a parent folder: the same.
+        const below = join(parent, "via");
+
+        await symlink(join(repo.dir, ".."), below);
+        assert.deepEqual(features(brief, [join(below, repo.dir.split("/").at(-1)!)]), real);
+    } finally {
+        await rm(parent, { recursive: true, force: true });
+        await repo.done();
     }
 });

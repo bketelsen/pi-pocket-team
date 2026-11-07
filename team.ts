@@ -476,6 +476,79 @@ export async function discardWorktree(worktree: DelegationWorktree): Promise<voi
     }
 }
 
+/** The memo of a delegation's route: the first answer, when the call runs again. Stored data: never rename it. */
+export const ROUTE_MEMO = "x.team.route";
+/** Set before the router is asked: a restart finds it and no answer, and asks nothing more. Stored data. */
+export const ROUTE_STARTED = "x.team.route.started";
+/** The longest a route may hold a delegation: past it, the delegation goes on with a failed route. */
+export const ROUTE_GUARD_MS = 4000;
+
+/** `work`, or undefined when it takes longer than `ms`: a slow router never holds a delegation. */
+export async function withinMs<T>(work: Promise<T>, ms: number): Promise<T | undefined> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const guard = new Promise<undefined>((resolve) => {
+        timer = setTimeout(() => resolve(undefined), ms);
+    });
+
+    try {
+        return await Promise.race([work, guard]);
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+/** The SHA-256 hex of a brief as it was given, not masked: the router's `briefHash`. */
+export const routeBriefHash = (brief: string): string =>
+    createHash("sha256").update(brief, "utf8").digest("hex");
+
+/**
+ * A tool call's 2 route memos: the route (`ROUTE_MEMO`), which `keep` writes once and gives back, and the started mark
+ * (`ROUTE_STARTED`).
+ */
+export type RouteMemo<R> = {
+    stored: () => Promise<R | undefined>;
+    keep: (route: R) => Promise<R>;
+    started: () => Promise<boolean | undefined>;
+    start: () => Promise<unknown>;
+};
+
+/**
+ * 1 route for 1 tool call, asked at most once over every replay. A stored answer comes back as it is: an older memo,
+ * with no features, stays as it was written. A restart between the started mark and the answer gives
+ * `failed("interrupted by a server restart")`, and asks nothing: the router may have run, and a second call would spend
+ * money twice. An answer that throws, or takes longer than `guardMs`, gives `failed` with the reason. The memo keeps
+ * whichever comes, so a replay asks nothing.
+ */
+export async function routeOnce<R>(
+    memo: RouteMemo<R>,
+    ask: () => Promise<R>,
+    failed: (reason: string) => R,
+    guardMs = ROUTE_GUARD_MS,
+): Promise<R> {
+    const stored = await memo.stored();
+
+    if (stored !== undefined) {
+        return stored;
+    }
+
+    if ((await memo.started()) === true) {
+        return await memo.keep(failed("interrupted by a server restart"));
+    }
+
+    await memo.start();
+
+    let answer: R | undefined;
+    let reason = `the router took more than ${String(guardMs / 1000)} s`;
+
+    try {
+        answer = await withinMs(ask(), guardMs);
+    } catch {
+        reason = "the router failed";
+    }
+
+    return await memo.keep(answer ?? failed(reason));
+}
+
 /**
  * Where a task runs: a repository's folder, the agent's home, or its workspace. `home` says the folder is a home, which
  * never gets a worktree. An agent with 1 repository and an agent whose only folder is its home need no name.
@@ -1422,6 +1495,19 @@ export default function createTeam(host: Host, web: Web) {
         return agent;
     };
 
+    /** Every repository name on the roster, for the router's features: none when the roster cannot be read. */
+    const rosterRepositories = async (): Promise<string[]> => {
+        try {
+            return [
+                ...new Set(
+                    (await roster(directory)).flatMap((agent) => Object.keys(agent.repositories)),
+                ),
+            ];
+        } catch {
+            return [];
+        }
+    };
+
     /** Whether a folder is an agent's home, by real paths: a home never gets a worktree. */
     const isHomeFolder = async (folder: string): Promise<boolean> => {
         const here = await realPathOr(folder);
@@ -1636,10 +1722,30 @@ export default function createTeam(host: Host, web: Web) {
         jevModel?: string;
         jevId?: string;
         latencyMs?: number;
+        /** The delegation's facts known at its start (the router's `Features`, version 1). An older route has none. */
+        features?: RouteFeatures;
+        /** The SHA-256 hex of the brief as it was given, not masked. An older route has none. */
+        briefHash?: string;
         reason: string;
         notes?: string[];
         at: number;
         line: string;
+    };
+
+    /** The router's `Features`, version 1: a copy of the shape. Stored data: never rename a field. */
+    type RouteFeatures = {
+        v: 1;
+        kind?: string;
+        complexity?: number;
+        capability?: number;
+        deepReasoning?: number;
+        demand?: number;
+        briefChars: number;
+        pathsNamed: number;
+        reposNamed: number;
+        language: "go" | "ts" | "js" | "python" | "other" | "unknown";
+        riskPathNamed: boolean | null;
+        testsBeside: boolean | null;
     };
 
     /**
@@ -1653,8 +1759,16 @@ export default function createTeam(host: Host, web: Web) {
             startAt: number;
             profileModel?: string;
             worker?: string;
+            repoDirs?: readonly string[];
+            roster?: readonly string[];
         }) => Promise<ThreadRoute>;
         explicit: (request: { worker: string; profileModel?: string }) => ThreadRoute;
+        /** Version 3: the brief's features with no Jev fields, for a route this module records itself. */
+        features?: (
+            brief: string,
+            repoDirs: readonly string[],
+            roster?: readonly string[],
+        ) => RouteFeatures;
     };
 
     const routerApi = (): RouterApi | undefined =>
@@ -1662,57 +1776,63 @@ export default function createTeam(host: Host, web: Web) {
             Symbol.for("pi-pocket-team.model-router")
         ];
 
-    /** The router's memo for one delegation: the first answer, when the call runs again. */
-    const ROUTE_MEMO = "x.team.route";
-    /** Set before the router is asked: a restart finds it and no answer, and asks nothing more. */
-    const ROUTE_STARTED = "x.team.route.started";
-    /** The longest a route may hold a delegation: past it, the delegation goes on with no route. */
-    const ROUTE_GUARD_MS = 4000;
+    /** What the router reads about 1 delegation: its brief, its repository folders, and the roster's repositories. */
+    type RouteInput = {
+        brief: string;
+        startAt: number;
+        worker?: string;
+        repoDirs: string[];
+        roster: string[];
+    };
 
-    /** `work`, or undefined when it takes longer than `ms`: a slow router never holds a delegation. */
-    async function withinMs<T>(work: Promise<T>, ms: number): Promise<T | undefined> {
-        let timer: ReturnType<typeof setTimeout> | undefined;
-        const guard = new Promise<undefined>((resolve) => {
-            timer = setTimeout(() => resolve(undefined), ms);
-        });
+    /**
+     * A route with no suggestion: the delegation goes on as it would without the router, and the line says why. It
+     * carries the brief's hash, and its features when the router gives them (a router of version 3).
+     */
+    function failedRoute(
+        reason: string,
+        persona: Persona,
+        input: RouteInput,
+        router: RouterApi,
+    ): ThreadRoute {
+        let features: RouteFeatures | undefined;
 
         try {
-            return await Promise.race([work, guard]);
-        } finally {
-            clearTimeout(timer);
+            features = router.features?.(input.brief, input.repoDirs, input.roster);
+        } catch {
+            features = undefined;
         }
-    }
 
-    /** A route with no suggestion: the delegation goes on as it would without the router, and the line says why. */
-    function failedRoute(reason: string, persona: Persona, worker?: string): ThreadRoute {
         return {
             mode: "shadow",
             status: "failed",
             ...(persona.model === undefined ? {} : { profileModel: persona.model }),
-            ...(worker === undefined ? {} : { worker }),
+            ...(input.worker === undefined ? {} : { worker: input.worker }),
+            ...(features === undefined ? {} : { features }),
+            briefHash: routeBriefHash(input.brief),
             reason,
             at: Date.now(),
             line:
-                worker === undefined
+                input.worker === undefined
                     ? `Route: failed (${reason}); no worker named, nothing changes`
-                    : `Route: failed, named ${worker} runs (${reason})`,
+                    : `Route: failed, named ${input.worker} runs (${reason})`,
         };
     }
 
     /**
-     * The model router's shadow suggestion for one night shift: a record only, never a model. A worker the supervisor
-     * named still wins and still runs: the router is asked all the same, and the route carries the `worker`, so the
-     * audit can compare the suggestion with the named worker. Only an older router (a version below 2) does not take a
-     * worker: it records `explicit` and does not run. The answer is a memo keyed by the call, for both cases, so a
-     * replay reads the first answer and Jev is never asked twice. A router that throws, or takes more than 4 s, gives
-     * a `failed` route (so the audit counts it): the delegation goes on as it would without the router.
+     * The model router's shadow record for one delegation, a night shift or not: a record only, never a model. A worker
+     * the supervisor named still wins and still runs: the router is asked all the same, and the route carries the
+     * `worker`, so the audit can compare the suggestion with the named worker. Only an older router (a version below 2)
+     * does not take a worker: it records `explicit` and does not run. The answer is a memo keyed by the call
+     * (`routeOnce`), so a replay reads the first answer and Jev is never asked twice. A router that throws, or takes
+     * more than 4 s, gives a `failed` route (so the audit counts it): the delegation goes on as it would without the
+     * router. Every new route carries the brief's hash; a memo an older `team.ts` wrote replays as it is.
      */
-    async function shiftRoute(
+    async function delegationRoute(
         api: ToolExecutionApi,
         context: Context,
-        request: DelegatedGoal,
+        input: RouteInput,
         persona: Persona,
-        brief: string,
     ): Promise<ThreadRoute | undefined> {
         const router = routerApi();
 
@@ -1721,51 +1841,33 @@ export default function createTeam(host: Host, web: Web) {
         }
 
         try {
-            if (request.worker !== undefined && router.version < 2) {
-                return router.explicit({ worker: request.worker, profileModel: persona.model });
+            if (input.worker !== undefined && router.version < 2) {
+                return router.explicit({ worker: input.worker, profileModel: persona.model });
             }
 
-            const stored = await api.memo<ThreadRoute>(ROUTE_MEMO, context);
-
-            if (stored !== undefined) {
-                return stored;
-            }
-
-            // The call is set up before it is made. A restart between the 2 finds this memo and no answer: the router
-            // may still have run, so a second call would spend money twice and could pick another model for the same
-            // work. That replay records a failed route instead, and asks Jev nothing.
-            if ((await api.memo<boolean>(ROUTE_STARTED, context)) === true) {
-                return await api.memo<ThreadRoute>(
-                    ROUTE_MEMO,
-                    failedRoute("interrupted by a server restart", persona, request.worker),
-                    context,
-                );
-            }
-
-            await api.memo<boolean>(ROUTE_STARTED, true, context);
-
-            let answer: ThreadRoute | undefined;
-            let reason = `the router took more than ${String(ROUTE_GUARD_MS / 1000)} s`;
-
-            try {
-                answer = await withinMs(
-                    router.route({
-                        brief,
-                        startAt: request.start ?? Date.now(),
+            return await routeOnce<ThreadRoute>(
+                {
+                    stored: () => api.memo<ThreadRoute>(ROUTE_MEMO, context),
+                    keep: (route) => api.memo<ThreadRoute>(ROUTE_MEMO, route, context),
+                    started: () => api.memo<boolean>(ROUTE_STARTED, context),
+                    start: () => api.memo<boolean>(ROUTE_STARTED, true, context),
+                },
+                async () => {
+                    const answer = await router.route({
+                        brief: input.brief,
+                        startAt: input.startAt,
                         profileModel: persona.model,
-                        ...(request.worker === undefined ? {} : { worker: request.worker }),
-                    }),
-                    ROUTE_GUARD_MS,
-                );
-            } catch {
-                reason = "the router failed";
-            }
+                        ...(input.worker === undefined ? {} : { worker: input.worker }),
+                        repoDirs: input.repoDirs,
+                        roster: input.roster,
+                    });
 
-            // The router's own answer, or a failure in its shape: the memo keeps either, so a replay asks nothing.
-            return await api.memo<ThreadRoute>(
-                ROUTE_MEMO,
-                answer ?? failedRoute(reason, persona, request.worker),
-                context,
+                    // An older router keeps no hash: the record ties the route to its brief all the same.
+                    return answer.briefHash === undefined
+                        ? { ...answer, briefHash: routeBriefHash(input.brief) }
+                        : answer;
+                },
+                (reason) => failedRoute(reason, persona, input, router),
             );
         } catch {
             return undefined;
@@ -3208,27 +3310,40 @@ export default function createTeam(host: Host, web: Web) {
             // A task text that names an open plan: the desk could not check a delegation that does not name its plan.
             const warned = opened?.warning === undefined ? "" : ` ${opened.warning}`;
 
-            // The model router's shadow suggestion for this night shift: a record only, never a model. It runs for every
-            // night shift, also when the supervisor named the worker (the route then carries the `worker`, and the
-            // named worker still wins and still runs: nothing here changes the session's model or `goal.worker`), and
-            // only when the router module is on. Without a route, the delegation is exactly as it is without the router.
-            const route =
-                shift === undefined || night_shift === undefined
-                    ? undefined
-                    : await shiftRoute(
-                          api,
-                          context,
-                          shift.request,
-                          persona,
-                          `${night_shift.objective ?? task}\n\nStop when: ${night_shift.stop_when}`,
-                      );
+            // A plan's brief comes before the task: a delivery names the plan, its task and its acceptance lines.
+            const firstTask = opened?.plan === undefined ? task : `${opened.plan.brief}\n\n${task}`;
+            // The model router's shadow record for this delegation: a record only, never a model. It runs for every
+            // delegation, a night shift or not, also when the supervisor named the worker (the route then carries the
+            // `worker`, and the named worker still wins and still runs: nothing here changes the session's model,
+            // `goal.worker` or the result), and only when the router module is on. A night shift's brief is its
+            // objective and stop condition; another delegation's is its task as the session gets it, the plan's brief
+            // first. The features read the roster checkout of the delegation's repository: none for a home or a
+            // workspace. Without a route, the delegation is exactly as it is without the router.
+            const route = await delegationRoute(
+                api,
+                context,
+                {
+                    brief:
+                        shift === undefined || night_shift === undefined
+                            ? firstTask
+                            : `${night_shift.objective ?? task}\n\nStop when: ${night_shift.stop_when}`,
+                    startAt: shift?.request.start ?? Date.now(),
+                    ...(shift?.request.worker === undefined
+                        ? {}
+                        : { worker: shift.request.worker }),
+                    repoDirs:
+                        target.repo === undefined || target.folder === undefined
+                            ? []
+                            : [target.folder],
+                    roster: await rosterRepositories(),
+                },
+                persona,
+            );
 
             // The owner's profile names the model, and the owner's allowed list permits it: neither is Pi's choice.
             // Not allowed: the source's model, as before, said in the result. Allowed but unusable now: core refuses
             // the start, and Pi is told not to try another model.
             const preferred = allowedModel(persona);
-            // A plan's brief comes before the task: a delivery names the plan, its task and its acceptance lines.
-            const firstTask = opened?.plan === undefined ? task : `${opened.plan.brief}\n\n${task}`;
             const request = {
                 title: `${persona.name}: ${title}`.slice(0, 120),
                 message:

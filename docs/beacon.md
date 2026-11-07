@@ -43,7 +43,7 @@ What exists today:
 | Asks to Brian, his answers, rewrites, his `why` and his marks                                   | `thread.asks` (`Ask` in `desk.ts`)                                                                |
 | PR lifecycle: created, merged, closed, reopened                                                 | `PrFact` in `x.desk.dashboard` (`_desk-dashboard.ts`)                                             |
 | Tokens and cost, by session, UTC day and `provider/model`                                       | `x.desk.usage` (`_desk-usage.ts`), Desk-linked sessions and their subagents                       |
-| Router suggestion: kind, tier, model, thinking, named worker                                    | `thread.route` (`ThreadRoute`), from `model-router.ts`, shadow only                               |
+| Router suggestion: kind, tier, model, thinking, named worker; features and brief hash           | `thread.route` (`ThreadRoute`), from `model-router.ts`, shadow only, on every delegation          |
 | Night-shift rounds, verdicts, check results, worker, stop reason                                | `x.night-shift.goal` (`Goal`, `RoundRecord`)                                                      |
 | A stop after 3 same check failures, and its failing jobs (`goal.stopChecks`)                    | `goal.why` (#108), `SAME_FAILURES`; audit: `metrics.Q1.stops.goals[].checks`, `flakyKeys`         |
 | Subagent spawns and sends: model, name, tools, brief                                            | Pocket's entries; `audit/sources.mjs` keeps 300 characters of a brief                             |
@@ -63,7 +63,10 @@ Gaps:
   versions of a prompt cannot be compared.
 - **Model and thinking level actually used.** The router records what it would pick, and the goal records the named
   `worker`. No module of this repository records the thinking level asked for or used per session.
-- **Router coverage.** A route is recorded only for a delegated night shift, not for other delegations.
+- **Router coverage.** Closed: a route, with the brief's features (version 1) and its SHA-256 (`briefHash`), is
+  recorded on every `team_delegate` delegation, not only a night shift (a plan start and a Clerk start
+  have none). R1 still counts night
+  shifts only.
 - **Wall time and rounds are partial.** A goal keeps only its newest 30 rounds (`KEPT_ROUNDS`), and a new goal in the
   same session writes over the old one. A thread keeps only its newest 50 events.
 - **Cross-review verdict.** Partly closed: the audit parses each reviewer answer for its verdict and its blocking

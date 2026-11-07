@@ -1803,7 +1803,7 @@ function outcomeOf(thread) {
 const zeroNamedStats = () => ({ count: 0, open: 0, success: 0, notSuccess: 0, suggestionRan: 0 });
 
 /**
- * R1: the model router's shadow records, joined to what happened. Each cell is 1 (kind, suggested tier, suggested
+ * R1: the model router's shadow records of night shifts, joined to what happened. Each cell is 1 (kind, suggested tier, suggested
  * model, status, named worker, model used): how many threads, how many are open, how many closed as done, how many did
  * not, the goals' statuses, the rounds and the cost, and the reopenings. `named` is the model the supervisor named
  * (`route.worker`), or `-` when none was named: since the router also runs beside a named worker, the named worker
@@ -1825,6 +1825,12 @@ export function checkR1(data, ctx) {
         const route = thread.route;
 
         if (!route || typeof route !== "object") {
+            continue;
+        }
+
+        // R1 measures night shifts. Since routes carry `briefHash`, every delegation gets one: a new route counts here
+        // only when its session has a night-shift goal. An older route (no `briefHash`) was always a night shift's.
+        if (route.briefHash !== undefined && goalOfThread(data, thread) === undefined) {
             continue;
         }
 

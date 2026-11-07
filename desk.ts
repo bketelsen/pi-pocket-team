@@ -322,11 +322,37 @@ export type ThreadRoute = {
     jevModel?: string;
     jevId?: string;
     latencyMs?: number;
+    /**
+     * The delegation's facts known at its start (the router's `Features`, version 1), on every route a router of
+     * version 3 or later recorded, a night shift or not. An older route has none.
+     */
+    features?: RouteFeatures;
+    /** The SHA-256 hex of the brief as it was given, not masked. An older route has none. */
+    briefHash?: string;
     reason: string;
     notes?: string[];
     at: number;
     /** The 1 line that went to the supervisor and to the thread's events. */
     line: string;
+};
+
+/**
+ * The router's `Features`, version 1 (`model-router.ts`): a copy of the shape. Stored data: never rename a field or
+ * change what one means. The Jev fields are absent when Jev did not answer.
+ */
+export type RouteFeatures = {
+    v: 1;
+    kind?: string;
+    complexity?: number;
+    capability?: number;
+    deepReasoning?: number;
+    demand?: number;
+    briefChars: number;
+    pathsNamed: number;
+    reposNamed: number;
+    language: "go" | "ts" | "js" | "python" | "other" | "unknown";
+    riskPathNamed: boolean | null;
+    testsBeside: boolean | null;
 };
 
 /** One piece of work the team runs. Stored data: never rename a field or change what it means. */
@@ -1714,7 +1740,10 @@ export function routeThread(state: DeskState, key: string, route: ThreadRoute): 
         return thread;
     }
 
-    thread.route = { ...route };
+    thread.route = {
+        ...route,
+        ...(route.features === undefined ? {} : { features: { ...route.features } }),
+    };
     addEvent(thread, "route", oneLine(route.line), route.at);
 
     return thread;
