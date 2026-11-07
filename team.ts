@@ -10,7 +10,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "nod
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import type { Context } from "@earendil-works/chord";
-import { Type } from "@earendil-works/pi-ai";
+import { Type } from "typebox";
 import { parseFrontmatter } from "@earendil-works/pi-coding-agent";
 import {
     AgentDoc,
@@ -26,6 +26,18 @@ import {
     type Tx,
 } from "@earendil-works/pi-durable";
 import type { Host, Web } from "./_pocket.d.ts";
+
+/** Keep linked-session sends as follow-up work on Pi Pocket 0.28, as they were on 0.27. */
+async function linkedSend(
+    host: Host,
+    source: ConversationId,
+    request: { to: string; message: string },
+    key: string,
+): Promise<void> {
+    const compatible = { ...request, steer: false };
+
+    await host.linkedSessions.send(source, compatible, key);
+}
 
 /** A named identity's role: the supervisor, its desk Clerk, or an agent. */
 type Role = "supervisor" | "clerk" | "agent";
@@ -3671,7 +3683,8 @@ export default function createTeam(host: Host, web: Web) {
             }
 
             if (filed?.held !== true) {
-                await host.linkedSessions.send(
+                await linkedSend(
+                    host,
                     api.conversationId,
                     { to: args.to, message: filed?.line ?? text },
                     key,

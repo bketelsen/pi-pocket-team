@@ -46,7 +46,7 @@ import { homedir } from "node:os";
 import { dirname, isAbsolute, join, sep } from "node:path";
 import { promisify } from "node:util";
 import type { Context, JsonValue } from "@earendil-works/chord";
-import { Type } from "@earendil-works/pi-ai";
+import { Type } from "typebox";
 import {
     McpClient,
     McpHttpError,
@@ -74,6 +74,18 @@ import type { Host, Web, WebRequest } from "./_pocket.d.ts";
 import type * as DashboardModule from "./_desk-dashboard.ts";
 import type * as MetricsModule from "./_desk-metrics.ts";
 import type * as UsageModule from "./_desk-usage.ts";
+
+/** Keep linked-session sends as follow-up work on Pi Pocket 0.28, as they were on 0.27. */
+async function linkedSend(
+    host: Host,
+    source: ConversationId,
+    request: { to: string; message: string },
+    key: string,
+): Promise<void> {
+    const compatible = { ...request, steer: false };
+
+    await host.linkedSessions.send(source, compatible, key);
+}
 
 /**
  * The dashboard helper, loaded fresh with each load of this module: Pocket does not reload a `_` helper by itself. In
@@ -25714,7 +25726,8 @@ export default function createDesk(host: Host, web: Web) {
 
         try {
             if (work.to === "agent" && work.address !== undefined) {
-                await host.linkedSessions.send(
+                await linkedSend(
+                    host,
                     supervisor,
                     {
                         to: work.address,
@@ -25729,7 +25742,8 @@ export default function createDesk(host: Host, web: Web) {
                 work.session !== undefined &&
                 work.back !== undefined
             ) {
-                await host.linkedSessions.send(
+                await linkedSend(
+                    host,
                     work.session,
                     {
                         to: work.back,
@@ -25872,7 +25886,8 @@ export default function createDesk(host: Host, web: Web) {
         if (failure === undefined) {
             try {
                 if (work.to === "agent" && work.address !== undefined) {
-                    await host.linkedSessions.send(
+                    await linkedSend(
+                        host,
                         supervisor,
                         {
                             to: work.address,
@@ -26206,7 +26221,8 @@ export default function createDesk(host: Host, web: Web) {
                     let failure: string | undefined;
 
                     try {
-                        await host.linkedSessions.send(
+                        await linkedSend(
+                            host,
                             supervisor,
                             { to: wake.address, message: closeoutMessage(wake.id) },
                             `x.desk.closeout:${wake.key}`,
@@ -27144,7 +27160,8 @@ export default function createDesk(host: Host, web: Web) {
                 let failed = false;
 
                 try {
-                    await host.linkedSessions.send(
+                    await linkedSend(
+                        host,
                         task.input.supervisor as ConversationId,
                         { to: checkpoint.to, message: message.text },
                         message.requestId,
@@ -27256,8 +27273,9 @@ export default function createDesk(host: Host, web: Web) {
                     task.state.checkpoint,
                     task.input,
                     runtime.now(),
-                    (supervisor, request, requestId) =>
-                        host.linkedSessions.send(supervisor as ConversationId, request, requestId),
+                    async (supervisor, request, requestId) => {
+                        await linkedSend(host, supervisor as ConversationId, request, requestId);
+                    },
                     () => runtime.now(),
                 );
 
@@ -30785,7 +30803,8 @@ export default function createDesk(host: Host, web: Web) {
 
                 // From the supervisor's session, and the send's key makes a replay act once, as a close-out does.
                 try {
-                    await host.linkedSessions.send(
+                    await linkedSend(
+                        host,
                         supervisor as ConversationId,
                         { to: found.address, message: found.text },
                         key,
