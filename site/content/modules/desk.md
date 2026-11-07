@@ -53,6 +53,15 @@ A hooks module can hand the desk facts of GitHub webhook deliveries with `nudge`
 
 The sweep also wakes an agent when every PR on its thread is merged or closed, tells a session once when its PR conflicts or its checks fail, removes the label `ready-for-human` when the PR changes after it, and archives the idle sessions of closed threads.
 
+## Run-end answers
+
+Since Pi Pocket 0.28.0, when a linked session's run ends, Pocket sends its final answer to the session that started it, and that message starts a run there. The supervisor starts every desk-tracked session, and the reports already come by `team_message`, so the desk turns these answers off for each supervisor: Pocket's `linkedSessions.reports` with `take: false` (Pi Pocket 0.28.0-bk.1 and later). It holds for every session the supervisor started, old, new and archived. A `team_work` start from an agent's home keeps its answers: an agent's home is no supervisor.
+
+- **When.** Team turns it off before each desk-tracked start: a delegated task, a night shift, the Clerk, a plan start (from `team_delegate` or the page's **New plan**) and a plan consult. The desk also checks each supervisor at the first desk commit after a load (a sweep, a page view, or `desk list`), with 1 task `x.desk.reports-off` for each supervisor that has none.
+- **Once.** A call that works is recorded in `reportsOff` (its time and the Pocket version), and that supervisor is never called again. The live task of each supervisor is in `reportsOffTasks`.
+- **A failure.** A refused call (plan mode, a spend limit, another person's turn) gives 1 warning notice in the supervisor's session, at most 1 an hour, and the next sweep tries again. On a Pi Pocket 0.28 with no switch, the supervisor gets 1 warning for each load: `Automatic run-end answers are on: this session gets each linked session's run end.`
+- **The line.** `desk list` and the prompt section say `Run-end answers: off since <time>`, or `Run-end answers: on (<reason>)` on Pi Pocket 0.28 and later: `Pi Pocket <version> has no switch`, `the switch failed: <error>`, or `the switch is not set yet`. An older Pi Pocket with no record shows no line.
+
 ## Turn it on
 
 Install the files, then turn on **Desk** in **Menu → Extensions**. Team must be on too: the `desk` tool reads identities and the roster through Team's API, and refuses with "The Team module is off." when Team is not loaded. Both modules reload into the running server; no restart is needed.

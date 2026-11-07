@@ -254,6 +254,13 @@ import {
     type WorktreeFact,
 } from "./desk.ts";
 import createDesk, { linkedSend } from "./desk.ts";
+import {
+    deskSupervisors,
+    reportsOffActions,
+    reportsOffKey,
+    runEndLine,
+    sendsRunEndAnswers,
+} from "./desk.ts";
 import createTeam, { Identity, taskTitle } from "./team.ts";
 import { createHandler } from "./_pocket/src/server/http.ts";
 import type { Host } from "./_pocket.d.ts";
@@ -593,6 +600,160 @@ describe("boundSupervisors", () => {
             [4, 3],
         );
         assert.deepEqual(boundSupervisors(undefined), []);
+    });
+});
+
+describe("run-end answers", () => {
+    /** A desk with supervisor 7 on a thread, 3 on a sweeper, 9 on a Clerk, and 7 again on all three. */
+    const supervised = (): DeskState => {
+        const state = empty();
+        const a = open(state, "run-end:a", 10).thread;
+        const b = open(state, "run-end:b", 20).thread;
+
+        a.supervisor = 7;
+        b.supervisor = 7;
+        state.sweepers = { "3": "task-3", "7": "task-7" };
+        state.clerks = {
+            "9": { session: 90, address: "session-90", agent: "clerk", at: 1 },
+            "7": { session: 70, address: "session-70", agent: "clerk", at: 1 },
+        };
+
+        return state;
+    };
+
+    test("the key of the host call names the supervisor", () => {
+        assert.equal(reportsOffKey(7), "x.desk.reports-off:7");
+    });
+
+    test("the supervisors: threads, sweepers and Clerks, each once, in order", () => {
+        assert.deepEqual(deskSupervisors(supervised()), [3, 7, 9]);
+        assert.deepEqual(deskSupervisors(empty()), []);
+        assert.deepEqual(deskSupervisors(undefined), []);
+    });
+
+    test("Pi Pocket 0.28 and later sends run-end answers; a suffix is ignored, junk is not a release", () => {
+        assert.equal(sendsRunEndAnswers("0.27.0"), false);
+        assert.equal(sendsRunEndAnswers("0.28.0"), true);
+        assert.equal(sendsRunEndAnswers("0.28.0-bk.1"), true);
+        assert.equal(sendsRunEndAnswers("1.0.0"), true);
+        assert.equal(sendsRunEndAnswers("junk"), false);
+        assert.equal(sendsRunEndAnswers(""), false);
+        assert.equal(sendsRunEndAnswers(undefined), false);
+    });
+
+    test("the line: off since the switch worked, on with its reason, or no line", () => {
+        const state = supervised();
+        const at = Date.UTC(2026, 10, 7, 12, 0, 0);
+
+        state.reportsOff = { "7": { at, pocket: "0.28.0" } };
+
+        // Off: on any release, also one with no switch now.
+        assert.equal(
+            runEndLine(state, 7, { pocketVersion: "0.28.0", hasMethod: true }),
+            "Run-end answers: off since 2026-11-07T12:00:00.000Z",
+        );
+        assert.equal(
+            runEndLine(state, 7, { pocketVersion: "0.27.0", hasMethod: false }),
+            "Run-end answers: off since 2026-11-07T12:00:00.000Z",
+        );
+        // On, with each reason.
+        assert.equal(
+            runEndLine(state, 3, { pocketVersion: "0.28.0", hasMethod: false }),
+            "Run-end answers: on (Pi Pocket 0.28.0 has no switch)",
+        );
+        assert.equal(
+            runEndLine(state, 3, {
+                pocketVersion: "0.28.0-bk.1",
+                hasMethod: true,
+                error: "This session is in plan mode.",
+            }),
+            "Run-end answers: on (the switch failed: This session is in plan mode.)",
+        );
+        assert.equal(
+            runEndLine(state, 3, { pocketVersion: "0.28.0-bk.1", hasMethod: true }),
+            "Run-end answers: on (the switch is not set yet)",
+        );
+
+        // A long error is 1 line of 200 characters at most.
+        const long = runEndLine(state, 3, {
+            pocketVersion: "0.28.0",
+            hasMethod: true,
+            error: `first\nsecond ${"x".repeat(400)}`,
+        });
+
+        assert.match(long ?? "", /^Run-end answers: on \(the switch failed: first second x+\)$/);
+        assert.ok((long ?? "").length <= 250);
+        // No line: an older release, and no entry.
+        assert.equal(
+            runEndLine(state, 3, { pocketVersion: "0.27.0", hasMethod: false }),
+            undefined,
+        );
+        assert.equal(
+            runEndLine(undefined, 3, { pocketVersion: "0.27.0", hasMethod: false }),
+            undefined,
+        );
+    });
+
+    test("the load pass: start each supervisor with no entry and no task, when the host has the switch", () => {
+        const state = supervised();
+
+        assert.deepEqual(
+            reportsOffActions(state, {
+                pocketVersion: "0.28.0",
+                hasMethod: true,
+                warned: new Set(),
+            }),
+            { start: [3, 7, 9], warn: [] },
+        );
+
+        state.reportsOff = { "7": { at: 1, pocket: "0.28.0" } };
+        state.reportsOffTasks = { "9": "task-9" };
+
+        assert.deepEqual(
+            reportsOffActions(state, {
+                pocketVersion: "0.28.0",
+                hasMethod: true,
+                warned: new Set(),
+            }),
+            { start: [3], warn: [] },
+        );
+    });
+
+    test("the load pass: warn each supervisor once on 0.28 with no switch, and nothing on 0.27", () => {
+        const state = supervised();
+        const warned = new Set<number>();
+        const first = reportsOffActions(state, {
+            pocketVersion: "0.28.0",
+            hasMethod: false,
+            warned,
+        });
+
+        assert.deepEqual(first, { start: [], warn: [3, 7, 9] });
+
+        for (const id of first.warn) {
+            warned.add(id);
+        }
+
+        assert.deepEqual(
+            reportsOffActions(state, { pocketVersion: "0.28.0", hasMethod: false, warned }),
+            { start: [], warn: [] },
+        );
+        assert.deepEqual(
+            reportsOffActions(state, {
+                pocketVersion: "0.28.0",
+                hasMethod: false,
+                warned: new Set([7]),
+            }),
+            { start: [], warn: [3, 9] },
+        );
+        assert.deepEqual(
+            reportsOffActions(state, {
+                pocketVersion: "0.27.0",
+                hasMethod: false,
+                warned: new Set(),
+            }),
+            { start: [], warn: [] },
+        );
     });
 });
 
