@@ -1,0 +1,296 @@
+{
+    "schema": 1,
+    "version": 1,
+    "seed": 1064,
+    "strata": {
+        "small": "<=50",
+        "medium": "51-300",
+        "large": ">300"
+    },
+    "inputs": [
+        {
+            "file": "~/agents/sheeana/bench/pi-pocket-team.json",
+            "repo": "bketelsen/pi-pocket-team",
+            "kept": 22,
+            "keptSha256": "4251e628343150b56ac1a58ef89632d6a495c35b7256c1614e8f913de343c7a3"
+        },
+        {
+            "file": "~/agents/irulan/bench/frostmail.json",
+            "repo": "frostyard/frostmail",
+            "kept": 4,
+            "keptSha256": "f4696b0aa382bfaa72644f0bba2628142208165e1d60ae1b05ea8201d261e30e"
+        },
+        {
+            "file": "~/agents/irulan/bench/lodge.json",
+            "repo": "frostyard/lodge",
+            "kept": 1,
+            "keptSha256": "884cc94d7d75e95bdbe12b4acaf3da0613f33c5896aad137390f2f608147fa45"
+        },
+        {
+            "file": "~/agents/irulan/bench/porter.json",
+            "repo": "frostyard/porter",
+            "kept": 1,
+            "keptSha256": "9e40da68e2680561ae16fadf8b6febf09d328aaae1587bce237b9e4ae9261eb0"
+        },
+        {
+            "file": "~/agents/lucilla/bench/updex.json",
+            "repo": "frostyard/updex",
+            "kept": 5,
+            "keptSha256": "42e304d6c901dc49ea3f2f0250b7836003b1add8f169b14fcc93b5dd9ebf7f13"
+        },
+        {
+            "file": "~/agents/lucilla/bench/core.json",
+            "repo": "frostyard/core",
+            "kept": 11,
+            "keptSha256": "29dcf87ccd6db3bf0119485427e04722265532767e635d98ef25cf9969ae8fab"
+        },
+        {
+            "file": "~/agents/duncan/bench/nsl.json",
+            "repo": "frostyard/nsl",
+            "kept": 9,
+            "keptSha256": "124bf98e65d22a448289705c4cbf69c8f0db4160d3a4ff3d03471d3cab68ebfe"
+        },
+        {
+            "file": "~/agents/duncan/bench/chairlift.json",
+            "repo": "frostyard/chairlift",
+            "kept": 6,
+            "keptSha256": "de4e497b99b7844e2f3a66de486ae7e3a96e6878fafce7c94be174eb8e28ca42"
+        },
+        {
+            "file": "~/agents/teg/bench/fleet.json",
+            "repo": "bketelsen/fleet",
+            "kept": 11,
+            "keptSha256": "68af220ae235a906f58924d9fe98c0f9b90e1b18b1f532611a10ad59cdbd2334"
+        }
+    ],
+    "counts": {
+        "kept": 70,
+        "calibration": 12,
+        "stage1": 36,
+        "stage2": 22,
+        "byStratum": {
+            "small": {
+                "kept": 12,
+                "calibration": 4,
+                "stage1": 8,
+                "stage2": 0
+            },
+            "medium": {
+                "kept": 22,
+                "calibration": 4,
+                "stage1": 16,
+                "stage2": 2
+            },
+            "large": {
+                "kept": 36,
+                "calibration": 4,
+                "stage1": 12,
+                "stage2": 20
+            }
+        },
+        "byOwner": {
+            "sheeana": {
+                "kept": 22,
+                "calibration": 0,
+                "stage1": 9,
+                "stage2": 13
+            },
+            "irulan": {
+                "kept": 6,
+                "calibration": 3,
+                "stage1": 3,
+                "stage2": 0
+            },
+            "lucilla": {
+                "kept": 16,
+                "calibration": 3,
+                "stage1": 8,
+                "stage2": 5
+            },
+            "duncan": {
+                "kept": 15,
+                "calibration": 3,
+                "stage1": 8,
+                "stage2": 4
+            },
+            "teg": {
+                "kept": 11,
+                "calibration": 3,
+                "stage1": 8,
+                "stage2": 0
+            }
+        }
+    },
+    "calibration": {
+        "owners": {
+            "irulan": {
+                "heldOut": [
+                    "frostmail-141",
+                    "frostmail-130"
+                ],
+                "dev": [
+                    "frostmail-144"
+                ],
+                "short": 0
+            },
+            "lucilla": {
+                "heldOut": [
+                    "core-174",
+                    "core-190"
+                ],
+                "dev": [
+                    "updex-474"
+                ],
+                "short": 0
+            },
+            "duncan": {
+                "heldOut": [
+                    "chairlift-258",
+                    "chairlift-255"
+                ],
+                "dev": [
+                    "nsl-67"
+                ],
+                "short": 0
+            },
+            "teg": {
+                "heldOut": [
+                    "fleet-72",
+                    "fleet-93"
+                ],
+                "dev": [
+                    "fleet-113"
+                ],
+                "short": 0
+            }
+        },
+        "ids": [
+            "core-174",
+            "core-190",
+            "updex-474",
+            "frostmail-141",
+            "chairlift-258",
+            "fleet-72",
+            "fleet-93",
+            "chairlift-255",
+            "frostmail-130",
+            "fleet-113",
+            "nsl-67",
+            "frostmail-144"
+        ]
+    },
+    "stage1": {
+        "status": "ready",
+        "ids": [
+            "pi-pocket-team-104",
+            "nsl-89",
+            "pi-pocket-team-81",
+            "chairlift-276",
+            "pi-pocket-team-70",
+            "pi-pocket-team-116",
+            "fleet-108",
+            "updex-457",
+            "fleet-89",
+            "pi-pocket-team-53",
+            "fleet-104",
+            "fleet-103",
+            "pi-pocket-team-79",
+            "nsl-68",
+            "nsl-75",
+            "nsl-77",
+            "porter-25",
+            "updex-481",
+            "nsl-76",
+            "updex-480",
+            "pi-pocket-team-72",
+            "fleet-109",
+            "lodge-40",
+            "pi-pocket-team-100",
+            "core-197",
+            "core-193",
+            "nsl-74",
+            "fleet-100",
+            "core-170",
+            "fleet-120",
+            "fleet-118",
+            "frostmail-135",
+            "pi-pocket-team-84",
+            "core-212",
+            "nsl-70",
+            "core-214"
+        ],
+        "byStratum": {
+            "small": 8,
+            "medium": 16,
+            "large": 12
+        },
+        "byOwner": {
+            "sheeana": 9,
+            "irulan": 3,
+            "lucilla": 8,
+            "duncan": 8,
+            "teg": 8
+        },
+        "fills": [
+            {
+                "to": "small",
+                "from": "medium",
+                "count": 4
+            }
+        ],
+        "swaps": [
+            {
+                "out": "pi-pocket-team-113",
+                "in": "fleet-120",
+                "stratum": "large"
+            },
+            {
+                "out": "pi-pocket-team-117",
+                "in": "fleet-118",
+                "stratum": "large"
+            }
+        ],
+        "outsideRange": [
+            "sheeana",
+            "irulan"
+        ]
+    },
+    "stage2": {
+        "ids": [
+            "pi-pocket-team-117",
+            "pi-pocket-team-113",
+            "pi-pocket-team-126",
+            "pi-pocket-team-66",
+            "pi-pocket-team-67",
+            "pi-pocket-team-77",
+            "nsl-73",
+            "chairlift-254",
+            "pi-pocket-team-78",
+            "chairlift-253",
+            "chairlift-257",
+            "pi-pocket-team-45",
+            "pi-pocket-team-73",
+            "pi-pocket-team-99",
+            "pi-pocket-team-107",
+            "core-205",
+            "pi-pocket-team-56",
+            "core-189",
+            "pi-pocket-team-118",
+            "core-194",
+            "core-191",
+            "updex-469"
+        ],
+        "byStratum": {
+            "small": 0,
+            "medium": 2,
+            "large": 20
+        },
+        "byOwner": {
+            "sheeana": 13,
+            "irulan": 0,
+            "lucilla": 5,
+            "duncan": 4,
+            "teg": 0
+        }
+    }
+}

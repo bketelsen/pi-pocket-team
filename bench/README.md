@@ -2,25 +2,29 @@
 
 The replay bench replays merged tasks on candidate models, each attempt in a `bwrap` sandbox, to measure cost, tokens, wall time and quality. The contract is the T1064 plan ("Route workers by measured task complexity"), sections "Pre-registration", "Bench", "Scoring" (the result schema) and "Cost and budget".
 
-Nothing here is a Pi Pocket module: `install.mjs` does not install it.
+Nothing here is a Pi Pocket module: `install.mjs` does not install it. The order of the work, from the pool gate to
+router v3, is in [docs/plans/router-bench.md](../docs/plans/router-bench.md).
 
 ## Scripts
 
-| Script                  | What it does                                                                                                                                                          |
-| ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `bench/run.mjs`         | 1 attempt of 1 model on 1 manifest task: budget reserve, slots, auth pre-flight, scratch clone, setup, then Pi in the sandbox. Writes 1 result file. Idempotent.      |
-| `bench/batch.mjs`       | Every (task, model) pair of a manifest as `run.mjs` children, `--parallel` at a time. Holds the halogen lease when halogen is in the batch. Prints a table per model. |
-| `bench/load-test.mjs`   | Halogen only, under the lease: levels 1 to 4 of parallel attempts, then the halogen concurrency (highest level with no error and each attempt at 70% of level 1).     |
-| `bench/report.mjs`      | A stage's summary per model: attempts, failures by kind, list cost, tokens, median and max wall time, and the total cost.                                             |
-| `bench/budget.mjs`      | The budget guard: `set --budget <usd>`, `show`, `reap` (settles reservations of dead runners at their full cap).                                                      |
-| `bench/harvest.mjs`     | Candidate tasks from the desk: 1 manifest per bench repository, validated in the sandbox. `--revalidate <file>` runs a file's commands again.                         |
-| `bench/score.mjs`       | S0 to S3 of 1 result file: protocol, the repository check, the hidden tests, and the 2 judges. Adds the scores to the result file.                                    |
-| `bench/calibration.mjs` | The judge calibration sets: 20 development pairs and 8 blind held-out diffs per owner, from the daily audit's blocking review points.                                 |
-| `bench/judge-v1.md`     | The judge prompt: the rubric, the brief, S1, S2, the submitted diff and the reference diff ("1 accepted solution, not the only one").                                 |
-| `bench/pilot.json`      | The pilot manifest: 3 pi-pocket-team tasks (small, medium, large), picked by hand.                                                                                    |
-| `bench/models.json`     | The 10 candidate models; `priced: false` for a model with no list price; `peakUtc` for DeepSeek's peak hours.                                                         |
-| `bench/header-v1.md`    | The bench header: the first part of every prompt, and `/agent/AGENTS.md` in the sandbox.                                                                              |
-| `bench/hosts`           | The sandbox's `/etc/hosts`: GitHub's hosts go to 127.0.0.1.                                                                                                           |
+| Script                  | What it does                                                                                                                                                                                      |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `bench/run.mjs`         | 1 attempt of 1 model on 1 manifest task: budget reserve, slots, auth pre-flight, scratch clone, setup, then Pi in the sandbox. Writes 1 result file. Idempotent.                                  |
+| `bench/batch.mjs`       | Every (task, model) pair of a manifest as `run.mjs` children, `--parallel` at a time. Holds the halogen lease when halogen is in the batch. Prints a table per model.                             |
+| `bench/load-test.mjs`   | Halogen only, under the lease: levels 1 to 4 of parallel attempts, then the halogen concurrency (highest level with no error and each attempt at 70% of level 1).                                 |
+| `bench/report.mjs`      | A stage's summary per model: attempts, failures by kind, list cost, tokens, median and max wall time, and the total cost.                                                                         |
+| `bench/budget.mjs`      | The budget guard: `set --budget <usd>`, `show`, `reap` (settles reservations of dead runners at their full cap).                                                                                  |
+| `bench/harvest.mjs`     | Candidate tasks from the desk: 1 manifest per bench repository, validated in the sandbox. `--revalidate <file>` runs a file's commands again.                                                     |
+| `bench/score.mjs`       | S0 to S3 of 1 result file: protocol, the repository check, the hidden tests, and the 2 judges. Adds the scores to the result file.                                                                |
+| `bench/calibration.mjs` | The judge calibration sets: 20 development pairs and 8 blind held-out diffs per owner, from the daily audit's blocking review points.                                                             |
+| `bench/judge-v1.md`     | The judge prompt: the rubric, the brief, S1, S2, the submitted diff and the reference diff ("1 accepted solution, not the only one").                                                             |
+| `bench/pool.mjs`        | The pool gate: writes `bench/pool-v1.json`, the 3 disjoint sets of kept tasks (calibration, stage 1, stage 2 = R). Frozen once written; `--grow` appends new kept tasks to R, `--check` compares. |
+| `bench/pool-v1.json`    | The frozen pool (written by `bench/pool.mjs`; deterministic, so Prettier leaves it alone).                                                                                                        |
+| `bench/analyze.mjs`     | The pre-registered statistics: `--stage 1`, `--stage 2`, `--simulate`, and `--branch` (the stage 2 branch of R before any stage 2 run). Runs no model.                                            |
+| `bench/pilot.json`      | The pilot manifest: 3 pi-pocket-team tasks (small, medium, large), picked by hand.                                                                                                                |
+| `bench/models.json`     | The 10 candidate models; `priced: false` for a model with no list price; `peakUtc` for DeepSeek's peak hours.                                                                                     |
+| `bench/header-v1.md`    | The bench header: the first part of every prompt, and `/agent/AGENTS.md` in the sandbox.                                                                                                          |
+| `bench/hosts`           | The sandbox's `/etc/hosts`: GitHub's hosts go to 127.0.0.1.                                                                                                                                       |
 
 Examples:
 
@@ -34,7 +38,33 @@ node bench/harvest.mjs --since 2026-09-01 --parallel 2
 node bench/harvest.mjs --revalidate ~/agents/sheeana/bench/pi-pocket-team.json
 node bench/score.mjs --result bench/results/stage1/<task>/<model-slug>.json
 node bench/calibration.mjs
+node bench/pool.mjs
+node bench/pool.mjs --check
+node bench/pool.mjs --grow
+node bench/analyze.mjs --branch $(for f in ~/agents/*/bench/*.json; do printf -- '--manifest %s ' "$f"; done)
 ```
+
+## Pool gate
+
+`node bench/pool.mjs [--homes <dir>] [--manifest <file>]... [--pilot <file>] [--out <file>] [--grow | --check]` reads
+the owners' reviewed manifests (default: `~/agents/<owner>/bench/<repository name>.json` for each bench repository;
+`--manifest`, repeated, replaces the list), keeps the kept tasks, and writes `bench/pool-v1.json`: seed 1064, the
+tasks sorted by id and shuffled 1 time (the rank); calibration (3 per owner except Sheeana: 2 held-out and 1 dev, 1
+per size stratum where the owner has one); stage 1 (36 tasks, 12 per stratum with the neighbour fills, owners
+balanced toward 6 to 8 by a greedy pass, then a swap pass inside each stratum that records `swaps`; `wait` under 30
+tasks left); and R (every other kept task, in rank order). A missing
+manifest, a non-bench repository, a repeated id and a pilot PR are errors. Once written, the file is frozen: a run
+whose result differs exits 1 and writes nothing; `--grow` keeps calibration and stage 1 and appends each new kept
+task to R (`stage2.rounds`); `--check` writes nothing. It prints the counts per set, by stratum and by owner. The rules
+and the choices behind them: [docs/plans/router-bench.md](../docs/plans/router-bench.md), "Pool v1".
+
+`bench/analyze.mjs` reads the pool: `--stage 1` refuses a result outside the pool's stage 1 set (when
+`bench/pool-v1.json` exists, or `--pool` names a file); `--stage 2` takes R from it, in its order, and refuses a result
+outside R. `node bench/analyze.mjs --branch --manifest <file>... [--pool bench/pool-v1.json] [--rule bench/rule-v1.json] [--stage1 bench/results/stage1/summary.json]`
+predicts the tier of each R task with the frozen rule and writes `bench/results/stage2/branch.json` and `branch.md`:
+the counts, the branch (`confirm`, `merge`, `constant` or `wait`), each group's bands, n, deciding tasks (its first n
+in R's order) and models. Stage 2 decides by the same branch, and a result for a task or a model outside it is an
+error.
 
 ## Exit codes of `run.mjs`
 

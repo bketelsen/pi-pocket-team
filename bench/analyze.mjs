@@ -24,13 +24,19 @@
 //
 //   node bench/analyze.mjs --stage 1 --manifest <file> [--manifest <file> ...] [--results bench/results]
 //       [--models <a,b,...>]   (default: the 10 CANDIDATES; every task needs a result of each)
-//   node bench/analyze.mjs --stage 2 --manifest <file> ... [--rule bench/rule-v1.json]
+//   node bench/analyze.mjs --stage 2 --manifest <file> ... [--rule bench/rule-v1.json] [--pool bench/pool-v1.json]
 //       [--stage1 bench/results/stage1/summary.json] [--simulation bench/results/simulation.json]
+//   node bench/analyze.mjs --branch --manifest <file> ... [--pool bench/pool-v1.json] [--rule bench/rule-v1.json]
+//       [--stage1 bench/results/stage1/summary.json]   (writes bench/results/stage2/branch.json and branch.md)
 //   node bench/analyze.mjs --simulate [--reps 2000] [--draws 100000] [--discordance 0.2] [--pb 0.7]
 //       [--rescue 1] [--out <file>]
 //
-// Manifests are the owners' reviewed files: only kept tasks count. Stage 2 needs the frozen rule, the stage 1
-// summary and the simulation report (its threshold); it refuses a task that stage 1 used.
+// Manifests are the owners' reviewed files: only kept tasks count. The pool (`bench/pool.mjs`) fixes each stage's
+// tasks: stage 1 refuses a result outside its stage 1 set (when the pool file exists or `--pool` names it); stage 2
+// takes R from it, in its order, and refuses a result outside R. Stage 2 needs the frozen rule, the stage 1 summary
+// and the simulation report (its threshold); it refuses a task that stage 1 used. Before any stage 2 run, `--branch`
+// predicts the tiers of R and writes the branch (confirm, merge, constant only, or wait) with each group's deciding
+// tasks and models; stage 2 then decides by the same branch.
 //
 // The simulation's defaults are the plan's assumptions (about 20% discordant pairs, B passes 70%); run it again
 // with the discordance that stage 1 measures before stage 2 starts.
@@ -68,6 +74,11 @@ export const H2_TOLERANCE = 0.05;
 export const H3_SAVING = 0.15;
 
 export const BANDS = ["easy", "medium", "hard"];
+/** The 2 groups that stage 2's branch can merge: a band with its neighbour (never easy with hard). */
+export const MERGE_GROUPS = [
+    ["easy", "medium"],
+    ["medium", "hard"],
+];
 export const EASY_SHARE = 0.7;
 export const HARD_SHARE = 0.3;
 
@@ -1079,14 +1090,10 @@ export function analyzeStage1({ tasks, results, options = {} }) {
 
     const decide = (pricing) => {
         const priced = indexAttempts(results.map((r) => toAttempt(r, pricing)));
-        const tiers = {};
 
-        for (const band of BANDS) {
-            const ids = tierTasks[band];
-
+        const tierOn = (ids) => {
             if (ids.length === 0) {
-                tiers[band] = { n: 0, b1: null, shortlist: [], stats: [], vsB1: {} };
-                continue;
+                return { n: 0, b1: null, shortlist: [], stats: [], vsB1: {} };
             }
 
             const stats = models.map((m) => modelStats(priced, m, ids));
@@ -1098,8 +1105,18 @@ export function analyzeStage1({ tasks, results, options = {} }) {
                 .slice(0, SHORTLIST_SIZE)
                 .map((s) => s.model);
 
-            tiers[band] = { n: ids.length, b1, shortlist, stats, vsB1 };
-        }
+            return { n: ids.length, b1, shortlist, stats, vsB1 };
+        };
+
+        const tiers = Object.fromEntries(BANDS.map((band) => [band, tierOn(tierTasks[band])]));
+        // The 2 groups that stage 2 can merge (its branch, step 2), each on the union of its 2 true bands, the same
+        // way as a band's tier.
+        const groups = Object.fromEntries(
+            MERGE_GROUPS.map((bands) => [
+                bands.join("+"),
+                tierOn(usable.filter((id) => bands.includes(bandByTask[id]))),
+            ]),
+        );
 
         let c1 = null;
         let best = null;
@@ -1115,7 +1132,7 @@ export function analyzeStage1({ tasks, results, options = {} }) {
                     ?.model ?? null;
         }
 
-        return { tiers, overall: { n: solved.length, best, c1, stats: overall, vsBest } };
+        return { tiers, groups, overall: { n: solved.length, best, c1, stats: overall, vsBest } };
     };
 
     // With no usable task there is nothing to measure, and a rule fit on no rows has no thresholds.
@@ -1202,10 +1219,17 @@ export function analyzeStage1({ tasks, results, options = {} }) {
         bandCounts: counts,
         majorityBand,
         tiers: standin.tiers,
+        groups: standin.groups,
         overall: standin.overall,
         zeroPricing: {
             tiers: Object.fromEntries(
                 BANDS.map((b) => [b, { b1: zero.tiers[b].b1, shortlist: zero.tiers[b].shortlist }]),
+            ),
+            groups: Object.fromEntries(
+                Object.entries(zero.groups).map(([key, g]) => [
+                    key,
+                    { b1: g.b1, shortlist: g.shortlist },
+                ]),
             ),
             c1: zero.overall.c1,
         },
@@ -1312,20 +1336,153 @@ export function decideTier(byTask, models, usable, options = {}) {
 }
 
 /**
- * Stage 2. `tasks`: `{ id, repo, features, predictedTier? }` (fresh tasks only); the tier comes from the frozen
- * `rule`, or from `predictedTier` without one; a stored tier that the rule contradicts is an error. `stage1`: the
- * stage 1 summary: its task ids (stage 2 refuses them), its majority band (H1) and, when it has tiers, each tier's
- * expected models (B1, the shortlist and C1). `options.threshold`: the simulation's threshold.
+ * The stage 2 branch (pre-registered), from the predicted tier counts of R before any stage 2 run, in this order:
+ * 1. a band with `minPaired` (30) or more tasks is a group alone; 2. only the bands that step 1 left merge, pairwise,
+ * and only with a band that step 1 also left: medium with the larger of easy and hard (a tie: easy); easy and hard
+ * only with medium (never with each other); a band with no partner stays alone. A merged pair with `minPaired` or more
+ * is confirmed as 1 group. 3. No group confirmed, and R is `minPaired` or more: `constant` (stage 2 confirms only the
+ * constant policy over all R). 4. R under `minPaired`: `wait`. Each group's n is the smaller of `tierN` (60) and its
+ * count. `branch`: `confirm` when every confirmed group is 1 band, `merge` when a confirmed group has 2.
  */
-export function analyzeStage2({ tasks, results, rule = null, stage1 = null, options: given = {} }) {
+export function stage2Branch(counts, options = {}) {
+    const minPaired = options.minPaired ?? MIN_PAIRED;
+    const tierN = options.tierN ?? TIER_N;
+    const c = {};
+
+    for (const band of BANDS) {
+        const x = counts?.[band] ?? 0;
+
+        if (!Number.isInteger(x) || x < 0) {
+            throw new Error(`the count of ${band} must be a whole number of 0 or more`);
+        }
+
+        c[band] = x;
+    }
+
+    const R = BANDS.reduce((a, b) => a + c[b], 0);
+
+    if (R < minPaired) {
+        return { branch: "wait", counts: c, R, groups: [] };
+    }
+
+    const group = (bands) => {
+        const count = bands.reduce((a, b) => a + c[b], 0);
+
+        return { bands, count, n: Math.min(tierN, count), confirmed: count >= minPaired };
+    };
+
+    // Step 1: each band of minPaired or more alone.
+    const groups = BANDS.filter((b) => c[b] >= minPaired).map((b) => group([b]));
+    // Step 2: the bands left merge pairwise, through medium only.
+    const left = BANDS.filter((b) => c[b] < minPaired);
+    const merged = new Set();
+
+    if (left.includes("medium")) {
+        const ends = ["easy", "hard"].filter((b) => left.includes(b));
+
+        if (ends.length) {
+            const partner = ends.length === 1 ? ends[0] : c.hard > c.easy ? "hard" : "easy";
+            const bands = partner === "easy" ? ["easy", "medium"] : ["medium", "hard"];
+
+            groups.push(group(bands));
+
+            for (const b of bands) {
+                merged.add(b);
+            }
+        }
+    }
+
+    for (const b of left) {
+        if (!merged.has(b)) {
+            groups.push(group([b]));
+        }
+    }
+
+    groups.sort((x, y) => BANDS.indexOf(x.bands[0]) - BANDS.indexOf(y.bands[0]));
+    const confirmed = groups.filter((g) => g.confirmed);
+    const branch =
+        confirmed.length === 0
+            ? "constant"
+            : confirmed.some((g) => g.bands.length === 2)
+              ? "merge"
+              : "confirm";
+
+    return { branch, counts: c, R, groups };
+}
+
+/**
+ * Stage 1's model set for the constant branch: the best model over all solved stage 1 tasks (B1 of the constant
+ * policy) and C1. Null when the summary has no overall figures.
+ */
+export function constantModelsFrom(stage1) {
+    if (!stage1?.overall) {
+        return null;
+    }
+
+    if (typeof stage1.overall.best !== "string") {
+        throw new Error(
+            "the stage 1 summary is not valid: the constant branch needs overall.best to name a model",
+        );
+    }
+
+    return [...new Set([stage1.overall.best, stage1.overall.c1].filter(Boolean))].sort();
+}
+
+/**
+ * Stage 1's model set for a stage 2 group (at most 4): 1 band, as `tierModelsFrom`; 2 bands, the group's B1 and
+ * shortlist from `groups` (on the union of the 2 bands' stage 1 tasks) and C1; `"constant"`, as `constantModelsFrom`.
+ * Null when the summary has no tiers. A merged group needs its entry in `groups`: an older summary has none.
+ */
+export function groupModelsFrom(stage1, bands) {
+    if (bands === "constant") {
+        return constantModelsFrom(stage1);
+    }
+
+    if (bands.length === 1) {
+        return tierModelsFrom(stage1, bands[0]);
+    }
+
+    if (!stage1?.tiers) {
+        return null;
+    }
+
+    const key = bands.join("+");
+    const group = stage1.groups?.[key];
+
+    if (
+        !group ||
+        !(group.b1 === null || typeof group.b1 === "string") ||
+        !Array.isArray(group.shortlist) ||
+        group.shortlist.some((m) => typeof m !== "string")
+    ) {
+        throw new Error(
+            `the stage 1 summary is not valid: the ${key} group needs groups.${key} with b1 and a shortlist`,
+        );
+    }
+
+    return [...new Set([group.b1, ...group.shortlist, stage1.overall?.c1].filter(Boolean))].sort();
+}
+
+const setLabel = (set) =>
+    set.key === "constant"
+        ? "the constant policy"
+        : set.bands.length === 1
+          ? `the ${set.key} tier`
+          : `the ${set.key} group`;
+
+/**
+ * The stage 2 plan, before any result: the predicted tier of each task (the frozen `rule`, or `predictedTier`
+ * without one; a stored tier that the rule contradicts is an error), the tasks in the pool's order (`options.pool`:
+ * R's ids; without it, the order of `tasks`), the counts, the branch (`stage2Branch`) and the deciding sets: for each
+ * confirmed group, its first n tasks in that order and its models; for the constant branch, all R tasks and the
+ * models B1 and C1. It refuses a stage 1 task (stage 2 uses fresh tasks only).
+ */
+export function stage2Plan({ tasks, rule = null, stage1 = null, options = {} }) {
     checkTasks(tasks);
 
     if (rule !== null) {
         validateRule(rule);
     }
-
-    // The cells do not depend on the pricing: 1 cache serves both pricings.
-    const options = { ...given, prob: given.prob ?? memoProb() };
 
     const tierOf = (t) => {
         if (!rule) {
@@ -1351,42 +1508,219 @@ export function analyzeStage2({ tasks, results, rule = null, stage1 = null, opti
         throw new Error(`stage 2 must use fresh tasks; stage 1 used ${reused.join(", ")}`);
     }
 
-    const tierById = new Map(tasks.map((t) => [t.id, tierOf(t)]));
+    let ordered = tasks;
 
-    for (const t of tasks) {
+    if (options.pool) {
+        const pool = options.pool;
+        const byId = new Map(tasks.map((t) => [t.id, t]));
+        const inPool = new Set(pool);
+        const outside = tasks.filter((t) => !inPool.has(t.id)).map((t) => t.id);
+        const missing = pool.filter((id) => !byId.has(id));
+
+        if (inPool.size !== pool.length) {
+            throw new Error("the pool's R repeats a task id");
+        }
+
+        if (outside.length) {
+            throw new Error(`stage 2 tasks not in the pool's R: ${outside.join(", ")}`);
+        }
+
+        if (missing.length) {
+            throw new Error(
+                `tasks of the pool's R with no kept manifest task: ${missing.join(", ")}`,
+            );
+        }
+
+        ordered = pool.map((id) => byId.get(id));
+    }
+
+    const tierById = new Map(ordered.map((t) => [t.id, tierOf(t)]));
+
+    for (const t of ordered) {
         if (!BANDS.includes(tierById.get(t.id))) {
             throw new Error(`task ${t.id} has no predicted tier`);
         }
     }
 
+    const counts = Object.fromEntries(
+        BANDS.map((b) => [b, ordered.filter((t) => tierById.get(t.id) === b).length]),
+    );
+    const branch = stage2Branch(counts, options);
+    const idsOf = (bands) =>
+        ordered.filter((t) => bands.includes(tierById.get(t.id))).map((t) => t.id);
+    const sets =
+        branch.branch === "constant"
+            ? [
+                  {
+                      key: "constant",
+                      bands: [...BANDS],
+                      ids: ordered.map((t) => t.id),
+                      models: groupModelsFrom(stage1, "constant"),
+                  },
+              ]
+            : branch.groups
+                  .filter((g) => g.confirmed)
+                  .map((g) => ({
+                      key: g.bands.join("+"),
+                      bands: g.bands,
+                      ids: idsOf(g.bands).slice(0, g.n),
+                      models: groupModelsFrom(stage1, g.bands),
+                  }));
+
+    return { ...branch, order: ordered.map((t) => t.id), tierById, sets };
+}
+
+/** The branch record of a plan: the counts, the branch, each group, and each deciding set's task ids and models. */
+export function branchRecord(plan) {
+    const setOf = new Map(plan.sets.map((s) => [s.key, s]));
+
+    return {
+        branch: plan.branch,
+        counts: plan.counts,
+        R: plan.R,
+        groups: plan.groups.map((g) => {
+            const set = setOf.get(g.bands.join("+"));
+
+            return set ? { ...g, ids: set.ids, models: set.models } : g;
+        }),
+        ...(setOf.has("constant")
+            ? {
+                  constant: {
+                      n: setOf.get("constant").ids.length,
+                      ids: setOf.get("constant").ids,
+                      models: setOf.get("constant").models,
+                  },
+              }
+            : {}),
+    };
+}
+
+/**
+ * Stage 2. `tasks`: `{ id, repo, features, predictedTier? }` (fresh tasks only, R); the plan (`stage2Plan`) gives
+ * the predicted tiers, the branch and the deciding sets. `stage1`: the stage 1 summary: its task ids (stage 2 refuses
+ * them), its majority band (H1) and, when it has tiers, each group's expected models. `options.threshold`: the
+ * simulation's threshold; `options.pool`: R's ids, in the pool's order. A result for a task or a model outside the
+ * branch's deciding sets is an error. Branch `wait`: no decision, and no result is expected. Branch `constant`: the
+ * constant policy (B1 against C1) over all R; H1 and H3 are not tested. Branches `confirm` and `merge`: each band of
+ * a confirmed group gets the group's decision, an unconfirmed band none.
+ */
+export function analyzeStage2({ tasks, results, rule = null, stage1 = null, options: given = {} }) {
+    // The cells do not depend on the pricing: 1 cache serves both pricings.
+    const options = { ...given, prob: given.prob ?? memoProb() };
+    const plan = stage2Plan({ tasks, rule, stage1, options });
+    const branch = branchRecord(plan);
+    const settings = {
+        margin: options.margin ?? MARGIN,
+        draws: options.draws ?? DRAWS,
+        seed: SEED,
+        threshold: options.threshold ?? CLOSE_THRESHOLD,
+        minPaired: options.minPaired ?? MIN_PAIRED,
+        tierN: options.tierN ?? TIER_N,
+    };
+
+    if (plan.branch === "wait") {
+        const ran = [...new Set(results.map((r) => r.task))];
+
+        if (ran.length) {
+            throw new Error(
+                `stage 2 waits for the pool (R = ${plan.R}, under ${settings.minPaired}), but has results for ${ran.join(", ")}`,
+            );
+        }
+
+        return { stage: 2, settings, branch, counts: plan.counts, R: plan.R };
+    }
+
+    const setOf = new Map();
+
+    for (const set of plan.sets) {
+        for (const id of set.ids) {
+            setOf.set(id, set);
+        }
+    }
+
+    const outside = [...new Set(results.map((r) => r.task))].filter((id) => !setOf.has(id));
+
+    if (outside.length) {
+        throw new Error(
+            `results for tasks outside the stage 2 branch (${plan.branch}): ${outside.join(", ")}`,
+        );
+    }
+
+    for (const set of plan.sets) {
+        if (set.models) {
+            checkModels(
+                results.filter((r) => setOf.get(r.task) === set),
+                set.models,
+                setLabel(set),
+            );
+        }
+    }
+
+    const notTested = { result: "not tested (pool)" };
+
     const run = (pricing) => {
         const attempts = results.map((r) => toAttempt(r, pricing));
         const byTask = indexAttempts(attempts);
-        const tiers = {};
+        const groups = {};
         const usableAll = [];
         const solvedAll = [];
         const droppedAll = [];
         const incompleteAll = [];
 
-        for (const band of BANDS) {
-            const ids = tasks.filter((t) => tierById.get(t.id) === band).map((t) => t.id);
-            const tierResults = results.filter((r) => ids.includes(r.task));
-            const expected = tierModelsFrom(stage1, band);
-            const models = expected ?? modelsIn(attempts.filter((a) => ids.includes(a.task)));
-
-            if (expected) {
-                checkModels(tierResults, expected, `the ${band} tier`);
-            }
-
-            const { usable, dropped, incomplete } = usableTasks(byTask, ids, models);
-            const tier = decideTier(byTask, models, usable, options);
+        for (const set of plan.sets) {
+            const models =
+                set.models ?? modelsIn(attempts.filter((a) => setOf.get(a.task) === set));
+            const { usable, dropped, incomplete } = usableTasks(byTask, set.ids, models);
+            const decided = decideTier(byTask, models, usable, options);
 
             usableAll.push(...usable);
-            solvedAll.push(...tier.ids);
+            solvedAll.push(...decided.ids);
             droppedAll.push(...dropped);
             incompleteAll.push(...incomplete);
-            tiers[band] = { ...tier, dropped, incomplete };
+            groups[set.key] = { bands: set.bands, ...decided, dropped, incomplete };
         }
+
+        const common = {
+            byTask,
+            groups,
+            usable: usableAll,
+            dropped: droppedAll,
+            incomplete: incompleteAll,
+        };
+
+        if (plan.branch === "constant") {
+            // Only the constant policy is confirmed: every band gets its pick, or the set's status.
+            const g = groups.constant;
+            const model = g.status === "decided" ? g.pick : null;
+            const action = g.status === "decided" ? "constant" : g.status;
+
+            return {
+                ...common,
+                constant: { ...g, model },
+                h3: notTested,
+                decisions: Object.fromEntries(BANDS.map((b) => [b, { action, model }])),
+            };
+        }
+
+        const keyOf = (band) => plan.groups.find((g) => g.bands.includes(band)).bands.join("+");
+        const tiers = Object.fromEntries(
+            BANDS.map((band) => {
+                const key = keyOf(band);
+
+                return [
+                    band,
+                    groups[key]
+                        ? { group: key, ...groups[key] }
+                        : {
+                              group: key,
+                              status: "unconfirmed",
+                              count: plan.counts[band],
+                              n: 0,
+                              ids: [],
+                          },
+                ];
+            }),
+        );
 
         // The constant policy: over all solved stage 2 tasks, among the models that ran on every one of them.
         const everywhere = modelsIn(attempts).filter((m) =>
@@ -1395,8 +1729,8 @@ export function analyzeStage2({ tasks, results, rule = null, stage1 = null, opti
         const constant = decideSet(byTask, everywhere, solvedAll, { ...options, minPaired: 1 });
         const constantModel = constant.status === "decided" ? constant.pick : null;
 
-        // H3: the tier policy against the constant policy, on the tasks of the decided tiers.
-        const decided = BANDS.filter((b) => tiers[b].status === "decided");
+        // H3: the tier policy against the constant policy, on the tasks of the decided groups.
+        const decided = plan.sets.map((s) => s.key).filter((k) => groups[k].status === "decided");
         let h3 = { result: "inconclusive", reason: "no decided tier, or no constant policy" };
 
         if (decided.length && constantModel) {
@@ -1404,12 +1738,12 @@ export function analyzeStage2({ tasks, results, rule = null, stage1 = null, opti
             let passes = 0;
             const ids = [];
 
-            for (const band of decided) {
-                const c = costOn(byTask, tiers[band].pick, tiers[band].ids);
+            for (const key of decided) {
+                const c = costOn(byTask, groups[key].pick, groups[key].ids);
 
                 cost += c.cost;
                 passes += c.passes;
-                ids.push(...tiers[band].ids);
+                ids.push(...groups[key].ids);
             }
 
             const tierCpp = passes ? cost / passes : Infinity;
@@ -1447,14 +1781,11 @@ export function analyzeStage2({ tasks, results, rule = null, stage1 = null, opti
         );
 
         return {
-            byTask,
+            ...common,
             tiers,
             constant: { ...constant, model: constantModel },
             h3,
             decisions,
-            usable: usableAll,
-            dropped: droppedAll,
-            incomplete: incompleteAll,
         };
     };
 
@@ -1469,8 +1800,11 @@ export function analyzeStage2({ tasks, results, rule = null, stage1 = null, opti
     }
 
     // H1: the frozen rule's tier against the stage 2 band (from the models that ran on the task), and the stage 1
-    // majority band against the same.
-    let h1 = { result: "inconclusive", reason: "no stage 1 majority band" };
+    // majority band against the same. The constant branch does not test it.
+    let h1 =
+        plan.branch === "constant"
+            ? notTested
+            : { result: "inconclusive", reason: "no stage 1 majority band" };
     const observed = {};
 
     for (const id of standin.usable) {
@@ -1480,11 +1814,11 @@ export function analyzeStage2({ tasks, results, rule = null, stage1 = null, opti
         observed[id] = bandOf(passes, row.size);
     }
 
-    if (stage1?.majorityBand && standin.usable.length) {
+    if (plan.branch !== "constant" && stage1?.majorityBand && standin.usable.length) {
         const ids = standin.usable;
         const hard = (b) => (b === "unsolved" ? "hard" : b);
         const ruleAcc =
-            ids.filter((id) => tierById.get(id) === hard(observed[id])).length / ids.length;
+            ids.filter((id) => plan.tierById.get(id) === hard(observed[id])).length / ids.length;
         const baseAcc =
             ids.filter((id) => stage1.majorityBand === hard(observed[id])).length / ids.length;
 
@@ -1501,13 +1835,8 @@ export function analyzeStage2({ tasks, results, rule = null, stage1 = null, opti
 
     return {
         stage: 2,
-        settings: {
-            margin: options.margin ?? MARGIN,
-            draws: options.draws ?? DRAWS,
-            seed: SEED,
-            threshold: options.threshold ?? CLOSE_THRESHOLD,
-            minPaired: options.minPaired ?? MIN_PAIRED,
-        },
+        settings,
+        branch,
         ...rest,
         observedBands: observed,
         zeroPricing: { decisions: zero.decisions, constant: zero.constant.model },
@@ -1774,31 +2103,109 @@ export function stage1Markdown(s) {
     return `${lines.join("\n")}\n`;
 }
 
+const groupLine = (g) =>
+    `| ${g.bands.join("+")} | ${g.count} | ${g.confirmed ? g.n : "-"} | ${g.confirmed ? "confirmed" : "not confirmed"} |`;
+
 export function stage2Markdown(s) {
+    const b = s.branch;
     const lines = [
         `# Bench stage 2`,
         ``,
-        `| Tier | Tasks | Status | B | Pick | Decision |`,
-        `| --- | --- | --- | --- | --- | --- |`,
+        `Branch: ${b.branch}. R: ${b.R} (easy ${b.counts.easy}, medium ${b.counts.medium}, hard ${b.counts.hard}).`,
     ];
 
-    for (const band of BANDS) {
-        const t = s.tiers[band];
-        const d = s.decisions[band];
-
+    if (b.branch === "wait") {
         lines.push(
-            `| ${band} | ${t.n} | ${t.status} | ${t.b ?? "-"} | ${t.pick ?? "-"} | ${d.action} ${d.model ?? ""} |`,
+            ``,
+            `R is under ${s.settings.minPaired}: stage 2 waits for the pool; no decision.`,
         );
+
+        return `${lines.join("\n")}\n`;
     }
 
-    lines.push(``, `Constant policy: ${s.constant.model ?? "-"}.`);
-    lines.push(`H1: ${s.h1.result}. H3: ${s.h3.result}.`);
+    lines.push(``, `| Group | Tasks | n | Status |`, `| --- | --- | --- | --- |`);
+
+    for (const g of b.groups) {
+        lines.push(groupLine(g));
+    }
+
+    if (b.branch === "constant") {
+        const c = s.constant;
+
+        lines.push(
+            ``,
+            `Constant policy over all R: ${c.n} tasks, status ${c.status}, B ${c.b ?? "-"}, pick ${c.pick ?? "-"}.`,
+            ``,
+            `| Tier | Decision |`,
+            `| --- | --- |`,
+        );
+
+        for (const band of BANDS) {
+            const d = s.decisions[band];
+
+            lines.push(`| ${band} | ${d.action} ${d.model ?? ""} |`);
+        }
+
+        lines.push(``, `H1: ${s.h1.result}. H3: ${s.h3.result}.`);
+    } else {
+        lines.push(
+            ``,
+            `| Tier | Group | Tasks | Status | B | Pick | Decision |`,
+            `| --- | --- | --- | --- | --- | --- | --- |`,
+        );
+
+        for (const band of BANDS) {
+            const t = s.tiers[band];
+            const d = s.decisions[band];
+
+            lines.push(
+                `| ${band} | ${t.group} | ${t.n} | ${t.status} | ${t.b ?? "-"} | ${t.pick ?? "-"} | ${d.action} ${d.model ?? ""} |`,
+            );
+        }
+
+        lines.push(``, `Constant policy: ${s.constant.model ?? "-"}.`);
+        lines.push(`H1: ${s.h1.result}. H3: ${s.h3.result}.`);
+    }
 
     if (s.pricingDiffers.length) {
         lines.push(
             ``,
             `At $0 for unpriced models the result differs in: ${s.pricingDiffers.join(", ")}.`,
         );
+    }
+
+    return `${lines.join("\n")}\n`;
+}
+
+/** The branch file's Markdown: the counts, the branch, and each group's bands, n, deciding tasks and models. */
+export function branchMarkdown(record) {
+    const lines = [
+        `# Bench stage 2 branch`,
+        ``,
+        `Branch: ${record.branch}. R: ${record.R} (easy ${record.counts.easy}, medium ${record.counts.medium}, hard ${record.counts.hard}).`,
+        ``,
+        `| Group | Tasks | n | Status |`,
+        `| --- | --- | --- | --- |`,
+        ...record.groups.map(groupLine),
+    ];
+    const sets = [
+        ...record.groups.filter((g) => g.ids).map((g) => [g.bands.join("+"), g]),
+        ...(record.constant ? [["constant policy (all R)", record.constant]] : []),
+    ];
+
+    for (const [name, set] of sets) {
+        lines.push(
+            ``,
+            `## ${name}: ${set.ids.length} deciding tasks`,
+            ``,
+            `Models: ${set.models ? set.models.join(", ") : "-"}.`,
+            ``,
+            `Tasks: ${set.ids.join(", ")}.`,
+        );
+    }
+
+    if (record.branch === "wait") {
+        lines.push(``, `R is under the minimum: stage 2 waits for the pool.`);
     }
 
     return `${lines.join("\n")}\n`;
@@ -1876,6 +2283,27 @@ export function thresholdFromSimulation(report) {
     return chooseThreshold(report.rows);
 }
 
+/**
+ * A pool file (`bench/pool.mjs`): the stage 1 ids and R (`stage2.ids`), lists of task ids with no id in both. Gives
+ * the pool, or throws.
+ */
+export function validatePool(pool) {
+    const ids = (list) => Array.isArray(list) && list.every((id) => typeof id === "string");
+
+    if (!pool || typeof pool !== "object" || !ids(pool.stage1?.ids) || !ids(pool.stage2?.ids)) {
+        throw new Error("the pool is not valid: stage1.ids and stage2.ids must list task ids");
+    }
+
+    const r = new Set(pool.stage2.ids);
+    const both = pool.stage1.ids.filter((id) => r.has(id));
+
+    if (both.length || r.size !== pool.stage2.ids.length) {
+        throw new Error(`the pool is not valid: a task id repeats ${both.join(", ")}`.trim());
+    }
+
+    return pool;
+}
+
 /** Every result file under `dir` (`<task-id>/<model-slug>.json`). */
 export function readResults(dir) {
     const out = [];
@@ -1948,6 +2376,10 @@ function parseArgs(argv) {
             args.rescue = Number(value());
         } else if (a === "--simulate") {
             args.simulate = true;
+        } else if (a === "--branch") {
+            args.branch = true;
+        } else if (a === "--pool") {
+            args.pool = value();
         } else {
             throw new Error(`unknown argument ${a}`);
         }
@@ -1997,7 +2429,7 @@ export function main(argv, { root = process.cwd(), log = console.log } = {}) {
         return 0;
     }
 
-    if (args.stage !== "1" && args.stage !== "2") {
+    if (!args.branch && args.stage !== "1" && args.stage !== "2") {
         throw new Error("--stage must be 1 or 2");
     }
 
@@ -2011,6 +2443,70 @@ export function main(argv, { root = process.cwd(), log = console.log } = {}) {
 
     checkTasks(tasks);
     const resultsRoot = resolve(root, args.results ?? "bench/results");
+    const need = args.branch ? "the branch" : `stage ${args.stage}`;
+
+    const readJson = (path, what) => {
+        if (!existsSync(path)) {
+            throw new Error(`${need} needs ${what}: ${path} does not exist`);
+        }
+
+        return JSON.parse(readFileSync(path, "utf8"));
+    };
+
+    // The pool (bench/pool.mjs): stage 2 and the branch need it; stage 1 checks against it when it exists or is given.
+    const poolPath = resolve(root, args.pool ?? "bench/pool-v1.json");
+    const pool =
+        args.branch || args.stage === "2" || args.pool || existsSync(poolPath)
+            ? validatePool(readJson(poolPath, "the pool"))
+            : null;
+    const byId = new Map(tasks.map((t) => [t.id, t]));
+
+    // R, in the pool's order: every task of it must be a kept manifest task.
+    const poolR = () => {
+        const missing = pool.stage2.ids.filter((id) => !byId.has(id));
+
+        if (missing.length) {
+            throw new Error(
+                `tasks of the pool's R with no kept manifest task: ${missing.join(", ")}`,
+            );
+        }
+
+        return pool.stage2.ids.map((id) => byId.get(id));
+    };
+
+    const readStage1 = () =>
+        validateStage1Summary(
+            readJson(
+                resolve(root, args.stage1 ?? join(resultsRoot, "stage1", "summary.json")),
+                "the stage 1 summary",
+            ),
+        );
+    const readRule = () =>
+        validateRule(readJson(resolve(root, args.rule ?? "bench/rule-v1.json"), "the frozen rule"));
+
+    if (args.branch) {
+        // The branch before any stage 2 run: the frozen rule's tiers of R, the counts, the groups and their models.
+        const plan = stage2Plan({
+            tasks: poolR(),
+            rule: readRule(),
+            stage1: readStage1(),
+            options: { pool: pool.stage2.ids },
+        });
+        const record = {
+            ...branchRecord(plan),
+            predictedTiers: Object.fromEntries(plan.order.map((id) => [id, plan.tierById.get(id)])),
+        };
+        const dir = join(resultsRoot, "stage2");
+        const markdown = branchMarkdown(record);
+
+        mkdirSync(dir, { recursive: true });
+        writeFileSync(join(dir, "branch.json"), `${JSON.stringify(record, null, 4)}\n`);
+        writeFileSync(join(dir, "branch.md"), markdown);
+        log(markdown);
+
+        return 0;
+    }
+
     const stageDir = join(resultsRoot, `stage${args.stage}`);
     const results = readResults(stageDir);
     // The pool holds more tasks than a stage runs: the stage's tasks are those with a result in its folder.
@@ -2022,19 +2518,24 @@ export function main(argv, { root = process.cwd(), log = console.log } = {}) {
     }
 
     const ran = new Set(results.map((r) => r.task));
-    const stageTasks = tasks.filter((t) => ran.has(t.id));
 
-    if (stageTasks.length === 0) {
-        throw new Error(`no results in ${stageDir}`);
+    if (pool) {
+        const set = new Set(args.stage === "1" ? pool.stage1.ids : pool.stage2.ids);
+        const outside = [...ran].filter((id) => !set.has(id));
+
+        if (outside.length) {
+            throw new Error(
+                `results for tasks outside the pool's ${args.stage === "1" ? "stage 1 set" : "R"}: ${outside.join(", ")}`,
+            );
+        }
     }
 
-    const readJson = (path, what) => {
-        if (!existsSync(path)) {
-            throw new Error(`stage 2 needs ${what}: ${path} does not exist`);
-        }
+    // Stage 1: the tasks with a result. Stage 2: all of R, in the pool's order (the branch needs every tier count).
+    const stageTasks = args.stage === "2" ? poolR() : tasks.filter((t) => ran.has(t.id));
 
-        return JSON.parse(readFileSync(path, "utf8"));
-    };
+    if (args.stage === "1" && stageTasks.length === 0) {
+        throw new Error(`no results in ${stageDir}`);
+    }
 
     let summary;
     let markdown;
@@ -2049,15 +2550,8 @@ export function main(argv, { root = process.cwd(), log = console.log } = {}) {
     } else {
         // Confirmation needs the frozen rule (the tiers), the stage 1 summary (fresh tasks, the model sets, H1) and
         // the simulation run before stage 2 (the threshold).
-        const rule = validateRule(
-            readJson(resolve(root, args.rule ?? "bench/rule-v1.json"), "the frozen rule"),
-        );
-        const stage1 = validateStage1Summary(
-            readJson(
-                resolve(root, args.stage1 ?? join(resultsRoot, "stage1", "summary.json")),
-                "the stage 1 summary",
-            ),
-        );
+        const rule = readRule();
+        const stage1 = readStage1();
         const simulation = readJson(
             resolve(root, args.simulation ?? join(resultsRoot, "simulation.json")),
             "the simulation report",
@@ -2069,7 +2563,7 @@ export function main(argv, { root = process.cwd(), log = console.log } = {}) {
             results,
             rule,
             stage1,
-            options: { threshold },
+            options: { threshold, pool: pool.stage2.ids },
         });
         markdown = stage2Markdown(summary);
     }

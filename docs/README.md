@@ -48,6 +48,8 @@ These are the designs of the Desk and Team features, each with its status line. 
 - [plan-threads.md](plans/plan-threads.md): plan threads, an idea becomes a settled plan before work starts (PR 1 to
   PR 3 built; sections 15 to 17 name what is left)
 - [pocket-journal.md](plans/pocket-journal.md): a daily note of the team's finished work, in frostnotes
+- [router-bench.md](plans/router-bench.md): the router bench, from the pool gate to router v3 (`bench/pool.mjs`,
+  `bench/analyze.mjs`)
 
 ### Module reference
 
