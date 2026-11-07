@@ -29,6 +29,8 @@ import {
     thresholdFromSimulation,
     familyOf,
     fitOrdinal,
+    groupModelsFrom,
+    stage2Branch,
     forwardSelect,
     gamma,
     main,
@@ -46,7 +48,8 @@ import {
 } from "./analyze.mjs";
 
 // ---------------------------------------------------------------------------------------------------------------
-// The fixture: 12 tasks x 3 models, with known counts.
+// The fixture: 12 tasks x 3 models, with known counts. A larger fixture (the command line's stage 2) repeats the 12
+// in order: t13 behaves as t01, t25 as t01, and so on.
 //
 // - easy t01-t06: all 3 pass. big grades 4, mid and halogen 3.5. B = big; mid and halogen are close enough
 //   (n11 = 6: P = 0.80579 >= 0.8). The pick is mid ($0.04) at the stand-in price, halogen at $0.
@@ -61,10 +64,12 @@ const MID = "test/mid";
 const HALOGEN = "halogen/halogen-qwen3.8-flash-next";
 const MODELS = [BIG, MID, HALOGEN];
 
-const ids = Array.from({ length: 12 }, (_, i) => `t${String(i + 1).padStart(2, "0")}`);
+const idsOf = (count) =>
+    Array.from({ length: count }, (_, i) => `t${String(i + 1).padStart(2, "0")}`);
+const baseOf = (id) => ((Number(id.slice(1)) - 1) % 12) + 1;
 
 const tierOfFixture = (id) => {
-    const n = Number(id.slice(1));
+    const n = baseOf(id);
 
     return n <= 6 ? "easy" : n <= 8 ? "medium" : "hard";
 };
@@ -75,8 +80,8 @@ const FEATURES = {
     hard: { kind: "debug", briefChars: 4000, complexity: 3 },
 };
 
-const fixtureTasks = () =>
-    ids.map((id, i) => ({
+const fixtureTasks = (count = 12) =>
+    idsOf(count).map((id, i) => ({
         id,
         repo: `owner/r${(i % 3) + 1}`,
         features: { ...FEATURES[tierOfFixture(id)], language: "go" },
@@ -88,7 +93,7 @@ const fail = (grades = [1, 1]) => ({ s1: false, s2: false, grades });
 
 function outcome(id, model) {
     const tier = tierOfFixture(id);
-    const n = Number(id.slice(1));
+    const n = baseOf(id);
 
     if (tier === "easy") {
         return pass(model === BIG ? [4, 4] : [3, 4]);
@@ -139,7 +144,8 @@ function result(id, model, stage = "stage2") {
     };
 }
 
-const fixtureResults = (stage) => ids.flatMap((id) => MODELS.map((m) => result(id, m, stage)));
+const fixtureResults = (stage, count = 12) =>
+    idsOf(count).flatMap((id) => MODELS.map((m) => result(id, m, stage)));
 
 // ---------------------------------------------------------------------------------------------------------------
 // The sampler and the posterior.
@@ -405,10 +411,12 @@ test("an unsolved task counts as hard for the rule and drops from every pick", (
     assert.equal(s1.overall.n, 11);
     assert.equal(bandIndex(s1.bands.t12), 2);
 
+    // minPaired 2: each fixture band (6, 2 and 4 tasks) is a confirmed group alone, as each tier was before the
+    // branch rule; with 3, medium (2) would be unconfirmed and get no stage 2 run.
     const s2 = analyzeStage2({
         tasks: fixtureTasks(),
         results: results("stage2"),
-        options: { minPaired: 3 },
+        options: { minPaired: 2 },
     });
 
     assert.deepEqual(s2.tiers.hard.unsolved, ["t12"]);
@@ -427,14 +435,19 @@ test("stage 1 drops a task with a harness failure from every comparison", () => 
     assert.equal(s.tiers.easy.vsB1[MID].n11, 5);
 });
 
-test("stage 2 on the fixture: B, picks, today, inconclusive, the constant policy, H1 and H3", () => {
+test("stage 2 on the fixture: B, picks, today, the constant policy, H1 and H3", () => {
     const stage1 = { bands: {}, majorityBand: "easy" };
+    // minPaired 2, so the branch confirms each fixture band alone (6, 2 and 4 tasks). Before the branch rule this test
+    // used 4, and medium (2 tasks) was "inconclusive"; under the branch rule a band under the minimum gets no stage 2
+    // run at all ("unconfirmed", tested below), so medium is now decided on its 2 tasks.
     const s = analyzeStage2({
         tasks: fixtureTasks(),
         results: fixtureResults("stage2"),
         stage1,
-        options: { minPaired: 4 },
+        options: { minPaired: 2 },
     });
+
+    assert.equal(s.branch.branch, "confirm");
 
     const easy = s.tiers.easy;
 
@@ -446,8 +459,10 @@ test("stage 2 on the fixture: B, picks, today, inconclusive, the constant policy
     assert.equal(easy.close[HALOGEN].ok, true);
     assert.equal(easy.pick, MID);
 
-    assert.equal(s.tiers.medium.status, "inconclusive");
+    // medium: only big passes; mid and halogen are far from it.
+    assert.equal(s.tiers.medium.status, "decided");
     assert.equal(s.tiers.medium.n, 2);
+    assert.equal(s.tiers.medium.pick, BIG);
 
     const hard = s.tiers.hard;
 
@@ -464,14 +479,15 @@ test("stage 2 on the fixture: B, picks, today, inconclusive, the constant policy
     assert.equal(s.constant.close[MID].ok, false);
     assert.equal(s.constant.model, BIG);
 
-    // H3: mid on the easy tier ($0.04 a pass) against big ($2 a pass).
+    // H3: mid on the easy tier ($0.24 for 6 passes) and big on medium ($4 for 2) against big on both ($16 for 8):
+    // 1 - 0.53 / 2.
     assert.equal(s.h3.result, "holds");
-    assert.deepEqual(s.h3.tiers, ["easy"]);
-    assert.ok(Math.abs(s.h3.saving - 0.98) < 1e-9);
+    assert.deepEqual(s.h3.tiers, ["easy", "medium"]);
+    assert.ok(Math.abs(s.h3.saving - 0.735) < 1e-9);
 
     assert.deepEqual(s.decisions, {
         easy: { action: "pick", model: MID },
-        medium: { action: "inconclusive", model: null },
+        medium: { action: "pick", model: BIG },
         hard: { action: "today", model: null },
     });
     assert.deepEqual(s.zeroPricing.decisions.easy, { action: "pick", model: HALOGEN });
@@ -496,10 +512,12 @@ test("stage 2: when H3 fails, every decided tier gets the constant policy", () =
 
         return r;
     });
-    const s = analyzeStage2({ tasks: fixtureTasks(), results, options: { minPaired: 4 } });
+    // minPaired 2: medium (2 tasks) is decided too (big), so H3 counts it: halogen $10.80 for 6 passes and big $4
+    // for 2, against big $16 for 8: 1 - 1.85 / 2 = 7.5% (10% on easy alone, before the branch rule).
+    const s = analyzeStage2({ tasks: fixtureTasks(), results, options: { minPaired: 2 } });
 
     assert.equal(s.tiers.easy.pick, HALOGEN);
-    assert.ok(Math.abs(s.h3.saving - 0.1) < 1e-9);
+    assert.ok(Math.abs(s.h3.saving - 0.075) < 1e-9);
     assert.equal(s.h3.result, "fails");
     assert.deepEqual(s.decisions.easy, { action: "constant", model: BIG });
     // At $0 for halogen the tier policy saves everything: the priced result is the one deployed, and both show.
@@ -508,12 +526,19 @@ test("stage 2: when H3 fails, every decided tier gets the constant policy", () =
     assert.equal(s.h1.result, "inconclusive");
 });
 
-test("stage 2 at the pre-registered minimum of 30 tasks: every fixture tier is inconclusive", () => {
-    const s = analyzeStage2({ tasks: fixtureTasks(), results: fixtureResults("stage2") });
+test("stage 2 at the pre-registered minimum of 30 tasks: the 12-task fixture waits, and refuses its results", () => {
+    // Before the branch rule every tier was "inconclusive" here; now R = 12 is under 30, so stage 2 waits and runs
+    // nothing: a result is an error, and no result is needed.
+    assert.throws(
+        () => analyzeStage2({ tasks: fixtureTasks(), results: fixtureResults("stage2") }),
+        /stage 2 waits for the pool \(R = 12, under 30\)/,
+    );
+    const s = analyzeStage2({ tasks: fixtureTasks(), results: [] });
 
-    for (const band of BANDS) {
-        assert.equal(s.decisions[band].action, "inconclusive");
-    }
+    assert.equal(s.branch.branch, "wait");
+    assert.equal(s.R, 12);
+    assert.deepEqual(s.counts, { easy: 6, medium: 2, hard: 4 });
+    assert.equal(s.decisions, undefined);
 });
 
 test("stage 2 refuses a stage 1 task and a task with no tier", () => {
@@ -800,8 +825,15 @@ const FIXTURE_STAGE1 = {
         medium: { b1: BIG, shortlist: [MID] },
         hard: { b1: BIG, shortlist: [MID] },
     },
-    overall: { c1: HALOGEN },
+    groups: {
+        "easy+medium": { b1: BIG, shortlist: [MID] },
+        "medium+hard": { b1: BIG, shortlist: [MID] },
+    },
+    overall: { best: BIG, c1: HALOGEN },
 };
+
+/** The command line's stage 2 fixture: 60 tasks (the 12 repeated 5 times): easy 30, medium 10, hard 20. */
+const STAGE2_COUNT = 60;
 
 /** A simulation report whose rate at 0.8 is above 20% at tier size 30: stage 2 must use 0.9. */
 const STRICT_SIMULATION = {
@@ -817,8 +849,9 @@ const STRICT_SIMULATION = {
 };
 
 function writeBench(root, stage) {
+    const count = stage === "stage2" ? STAGE2_COUNT : 12;
     const manifest = join(root, "manifest.json");
-    const tasks = fixtureTasks().map((t) => {
+    const tasks = fixtureTasks(count).map((t) => {
         const { predictedTier: _tier, ...rest } = t;
 
         return { ...rest, owner: KEPT };
@@ -826,7 +859,7 @@ function writeBench(root, stage) {
 
     writeFileSync(manifest, JSON.stringify({ tasks }));
 
-    for (const r of fixtureResults(stage)) {
+    for (const r of fixtureResults(stage, count)) {
         const dir = join(root, "bench", "results", stage, r.task);
 
         mkdirSync(dir, { recursive: true });
@@ -837,6 +870,10 @@ function writeBench(root, stage) {
         writeFileSync(join(root, "rule.json"), JSON.stringify(FIXTURE_RULE));
         writeFileSync(join(root, "stage1.json"), JSON.stringify(FIXTURE_STAGE1));
         writeFileSync(join(root, "simulation.json"), JSON.stringify(STRICT_SIMULATION));
+        writeFileSync(
+            join(root, "pool.json"),
+            JSON.stringify({ stage1: { status: "ready", ids: [] }, stage2: { ids: idsOf(count) } }),
+        );
     }
 
     return manifest;
@@ -853,6 +890,8 @@ const STAGE2_FLAGS = [
     "stage1.json",
     "--simulation",
     "simulation.json",
+    "--pool",
+    "pool.json",
 ];
 
 test("the command line writes the stage 1 summary and freezes rule-v1.json once", () => {
@@ -981,11 +1020,15 @@ test("the command line: stage 2 uses the frozen rule, the stage 1 model sets and
         );
 
         assert.equal(summary.settings.threshold, CLOSE_THRESHOLD_STRICT);
-        assert.equal(summary.tiers.easy.n, 6);
-        assert.equal(summary.tiers.hard.n, 4);
+        // 60 tasks: easy 30 is confirmed alone; medium 10 and hard 20 merge into 1 group of 30 (the merge branch).
+        assert.equal(summary.branch.branch, "merge");
+        assert.equal(summary.tiers.easy.n, 30);
+        assert.equal(summary.tiers.hard.group, "medium+hard");
+        assert.equal(summary.tiers.hard.n, 30);
+        assert.deepEqual(summary.decisions.medium, summary.decisions.hard);
 
         // Each input is required.
-        for (const flag of ["--rule", "--stage1", "--simulation"]) {
+        for (const flag of ["--rule", "--stage1", "--simulation", "--pool"]) {
             const flags = [...STAGE2_FLAGS];
 
             flags[flags.indexOf(flag) + 1] = "missing.json";
@@ -1180,7 +1223,7 @@ test("stage 2: a stored tier that the frozen rule contradicts is an error; the r
     const results = fixtureResults("stage2");
 
     assert.equal(
-        analyzeStage2({ tasks, results, rule: FIXTURE_RULE, options: { minPaired: 4 } }).tiers.easy
+        analyzeStage2({ tasks, results, rule: FIXTURE_RULE, options: { minPaired: 2 } }).tiers.easy
             .n,
         6,
     );
@@ -1196,8 +1239,10 @@ test("stage 2: a stored tier that the frozen rule contradicts is an error; the r
         tasks: bare,
         results,
         rule: FIXTURE_RULE,
-        options: { minPaired: 4 },
+        options: { minPaired: 2 },
     });
+
+    assert.deepEqual(byRule.branch.counts, { easy: 6, medium: 2, hard: 4 });
 
     assert.deepEqual(
         BANDS.map((b) => byRule.tiers[b].ids.length + byRule.tiers[b].unsolved.length),
@@ -1213,7 +1258,7 @@ test("stage 2: a model of the stage 1 set with no result leaves the tier's tasks
         tasks: fixtureTasks(),
         results: fixtureResults("stage2"),
         stage1,
-        options: { minPaired: 4 },
+        options: { minPaired: 2 },
     });
 
     assert.deepEqual(s.tiers.hard.incomplete, ["t09", "t10", "t11", "t12"]);
@@ -1430,5 +1475,457 @@ test("re-review 1: --simulate refuses counts and shares out of range", () => {
         ["--rescue", "-0.5"],
     ]) {
         assert.throws(() => main(["--simulate", ...flags], { log }), /must be/, flags.join(" "));
+    }
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// The stage 2 branch (confirm, merge, constant only, wait) and the pool.
+// ---------------------------------------------------------------------------------------------------------------
+
+test("the branch: each reading of the pre-registered steps", () => {
+    const branch = (easy, medium, hard) => stage2Branch({ easy, medium, hard });
+    const groups = (b) => b.groups.map((g) => [g.bands.join("+"), g.count, g.n, g.confirmed]);
+
+    // R under 30: wait.
+    assert.deepEqual(branch(10, 10, 9), {
+        branch: "wait",
+        counts: { easy: 10, medium: 10, hard: 9 },
+        R: 29,
+        groups: [],
+    });
+    // Each band of 30 or more alone, n capped at 60.
+    assert.equal(branch(70, 30, 45).branch, "confirm");
+    assert.deepEqual(groups(branch(70, 30, 45)), [
+        ["easy", 70, 60, true],
+        ["medium", 30, 30, true],
+        ["hard", 45, 45, true],
+    ]);
+    // Medium merges with the larger left neighbour; a tie goes to easy.
+    assert.deepEqual(groups(branch(12, 20, 15)), [
+        ["easy", 12, 12, false],
+        ["medium+hard", 35, 35, true],
+    ]);
+    assert.deepEqual(groups(branch(15, 20, 15)), [
+        ["easy+medium", 35, 35, true],
+        ["hard", 15, 15, false],
+    ]);
+    assert.equal(branch(15, 20, 15).branch, "merge");
+    // Only bands that step 1 left merge: medium alone at 30 leaves easy and hard unmerged (never with each other).
+    assert.deepEqual(groups(branch(20, 30, 20)), [
+        ["easy", 20, 20, false],
+        ["medium", 30, 30, true],
+        ["hard", 20, 20, false],
+    ]);
+    assert.equal(branch(20, 30, 20).branch, "confirm");
+    // An end band left with medium in step 1 merges with medium; the other end stays.
+    assert.deepEqual(groups(branch(40, 10, 5)), [
+        ["easy", 40, 40, true],
+        ["medium+hard", 15, 15, false],
+    ]);
+    // No group reaches 30 and R is 30 or more: the constant policy only.
+    assert.equal(branch(10, 10, 10).branch, "constant");
+    assert.deepEqual(groups(branch(10, 10, 10)), [
+        ["easy+medium", 20, 20, false],
+        ["hard", 10, 10, false],
+    ]);
+    // The options.
+    assert.equal(stage2Branch({ easy: 6, medium: 2, hard: 4 }, { minPaired: 4 }).branch, "confirm");
+    assert.equal(stage2Branch({ easy: 40, medium: 0, hard: 0 }, { tierN: 25 }).groups[0].n, 25);
+    assert.throws(() => stage2Branch({ easy: 1.5 }), /whole number/);
+});
+
+const SB = "x/best";
+const SC = "x/cheap";
+const SO = "x/other";
+
+/** Tasks of the given tiers, ids `<prefix><i>`. */
+const tierTasks = (prefix, tier, count) =>
+    Array.from({ length: count }, (_, i) => ({
+        id: `${prefix}${String(i).padStart(3, "0")}`,
+        repo: "owner/r",
+        predictedTier: tier,
+    }));
+
+/** A synthetic result: every model passes; the cheap model costs a tenth. */
+const synth = (task, model) => ({
+    task,
+    model,
+    wallMs: 1000,
+    usage: { input: 0, output: 0, cacheRead: 0, cost: model === SC ? 0.1 : 1 },
+    s0: { protocol: false },
+    s1: true,
+    s2: null,
+    grades: [4, 4],
+});
+
+const STAGE1_SYNTH = {
+    tasks: { ids: ["old-1"] },
+    majorityBand: "easy",
+    tiers: Object.fromEntries(BANDS.map((b) => [b, { b1: SB, shortlist: [] }])),
+    groups: {
+        "easy+medium": { b1: SB, shortlist: [] },
+        "medium+hard": { b1: SB, shortlist: [] },
+    },
+    overall: { best: SB, c1: SC },
+};
+
+test("the confirm branch: a tier of 30 or more alone, its first 60 tasks in the pool's order decide", () => {
+    const tasks = tierTasks("e", "easy", 70);
+    // The pool's order: reversed, so the deciding tasks are e069 down to e010.
+    const pool = tasks.map((t) => t.id).reverse();
+    const deciding = pool.slice(0, 60);
+    const results = deciding.flatMap((id) => [synth(id, SB), synth(id, SC)]);
+    const s = analyzeStage2({
+        tasks,
+        results,
+        stage1: STAGE1_SYNTH,
+        options: { pool, draws: 2000 },
+    });
+
+    assert.equal(s.branch.branch, "confirm");
+    assert.deepEqual(s.branch.groups[0].ids, deciding);
+    assert.deepEqual(s.branch.groups[0].models, [SB, SC]);
+    assert.equal(s.tiers.easy.n, 60);
+    assert.equal(s.tiers.easy.pick, SC);
+    assert.deepEqual(s.decisions.medium, { action: "unconfirmed", model: null });
+    assert.equal(s.tiers.medium.status, "unconfirmed");
+
+    // A result of a task past the cap, or of a model outside the tier's set: an error.
+    assert.throws(
+        () =>
+            analyzeStage2({
+                tasks,
+                results: [...results, synth("e000", SB)],
+                stage1: STAGE1_SYNTH,
+                options: { pool, draws: 2000 },
+            }),
+        /outside the stage 2 branch \(confirm\): e000/,
+    );
+    assert.throws(
+        () =>
+            analyzeStage2({
+                tasks,
+                results: [...results, synth("e069", SO)],
+                stage1: STAGE1_SYNTH,
+                options: { pool, draws: 2000 },
+            }),
+        /not expected in the easy tier: x\/other/,
+    );
+    // The pool and the tasks must be the same set.
+    assert.throws(
+        () => analyzeStage2({ tasks, results, options: { pool: pool.slice(1) } }),
+        /not in the pool's R: e069/,
+    );
+    assert.throws(
+        () => analyzeStage2({ tasks, results, options: { pool: [...pool, "ghost"] } }),
+        /no kept manifest task: ghost/,
+    );
+});
+
+test("the merge branch: 2 small bands become 1 group of 30 or more, and both get the same pick", () => {
+    const tasks = [
+        ...tierTasks("e", "easy", 20),
+        ...tierTasks("m", "medium", 15),
+        ...tierTasks("h", "hard", 40),
+    ];
+    const results = tasks.flatMap((t) => [synth(t.id, SB), synth(t.id, SC)]);
+    const s = analyzeStage2({ tasks, results, stage1: STAGE1_SYNTH, options: { draws: 2000 } });
+
+    assert.equal(s.branch.branch, "merge");
+    assert.deepEqual(
+        s.branch.groups.map((g) => [g.bands.join("+"), g.n, g.confirmed]),
+        [
+            ["easy+medium", 35, true],
+            ["hard", 40, true],
+        ],
+    );
+    assert.equal(s.groups["easy+medium"].n, 35);
+    assert.equal(s.groups["easy+medium"].pick, SC);
+    assert.deepEqual(s.tiers.easy, s.tiers.medium);
+    assert.equal(s.tiers.medium.group, "easy+medium");
+    assert.deepEqual(s.decisions.easy, s.decisions.medium);
+    assert.equal(s.decisions.easy.model, SC);
+    assert.deepEqual(s.h3.tiers, ["easy+medium", "hard"]);
+
+    // The group's models come from the stage 1 group: an older summary with no groups is refused.
+    const { groups: _g, ...old } = STAGE1_SYNTH;
+
+    assert.throws(
+        () => analyzeStage2({ tasks, results, stage1: old, options: { draws: 2000 } }),
+        /groups\.easy\+medium/,
+    );
+    assert.deepEqual(groupModelsFrom(STAGE1_SYNTH, ["easy", "medium"]), [SB, SC]);
+    assert.deepEqual(groupModelsFrom(STAGE1_SYNTH, "constant"), [SB, SC]);
+    assert.equal(groupModelsFrom(null, ["easy", "medium"]), null);
+});
+
+test("the constant branch: R of 30 or more and no group of 30; B1 against C1 over all R, H1 and H3 not tested", () => {
+    const tasks = [
+        ...tierTasks("e", "easy", 10),
+        ...tierTasks("m", "medium", 10),
+        ...tierTasks("h", "hard", 10),
+    ];
+    const results = tasks.flatMap((t) => [synth(t.id, SB), synth(t.id, SC)]);
+    const s = analyzeStage2({ tasks, results, stage1: STAGE1_SYNTH, options: { draws: 2000 } });
+
+    assert.equal(s.branch.branch, "constant");
+    assert.equal(s.branch.constant.n, 30);
+    assert.deepEqual(s.branch.constant.models, [SB, SC]);
+    assert.equal(s.constant.n, 30);
+    assert.equal(s.constant.model, SC);
+
+    for (const band of BANDS) {
+        assert.deepEqual(s.decisions[band], { action: "constant", model: SC });
+    }
+
+    assert.deepEqual(s.h1, { result: "not tested (pool)" });
+    assert.deepEqual(s.h3, { result: "not tested (pool)" });
+    assert.throws(
+        () =>
+            analyzeStage2({
+                tasks,
+                results: [...results, synth("e000", SO)],
+                stage1: STAGE1_SYNTH,
+                options: { draws: 2000 },
+            }),
+        /not expected in the constant policy: x\/other/,
+    );
+});
+
+test("the wait branch: R under 30 needs no result, and gives no decision", () => {
+    const tasks = [...tierTasks("e", "easy", 20), ...tierTasks("h", "hard", 9)];
+    const s = analyzeStage2({ tasks, results: [], stage1: STAGE1_SYNTH });
+
+    assert.deepEqual(s.branch, {
+        branch: "wait",
+        counts: { easy: 20, medium: 0, hard: 9 },
+        R: 29,
+        groups: [],
+    });
+    assert.equal(s.decisions, undefined);
+    assert.equal(s.tiers, undefined);
+});
+
+test("stage 1 gives the 2 merge groups, on the union of their true bands", () => {
+    const s = analyzeStage1({
+        tasks: fixtureTasks(),
+        results: fixtureResults("stage1"),
+        options: { fitRule: false },
+    });
+
+    // easy+medium: all 12 fixture tasks (easy 6, medium 6): as the overall figures, mid at 0.59517 is shortlisted.
+    assert.equal(s.groups["easy+medium"].n, 12);
+    assert.equal(s.groups["easy+medium"].b1, BIG);
+    assert.deepEqual(s.groups["easy+medium"].shortlist, [MID]);
+    // medium+hard: no hard task, so the same as medium alone.
+    assert.equal(s.groups["medium+hard"].n, 6);
+    assert.deepEqual(s.groups["medium+hard"].shortlist, s.tiers.medium.shortlist);
+    assert.deepEqual(s.zeroPricing.groups["medium+hard"], { b1: BIG, shortlist: [] });
+});
+
+test("the command line: --branch writes branch.json and branch.md from the pool, and runs no model", () => {
+    const root = mkdtempSync(join(tmpdir(), "bench-analyze-"));
+
+    const log = () => {};
+
+    try {
+        writeBench(root, "stage2");
+        const flags = [
+            "--branch",
+            "--manifest",
+            "manifest.json",
+            "--rule",
+            "rule.json",
+            "--stage1",
+            "stage1.json",
+            "--pool",
+            "pool.json",
+        ];
+
+        assert.equal(main(flags, { root, log }), 0);
+        const branch = JSON.parse(
+            readFileSync(join(root, "bench/results/stage2/branch.json"), "utf8"),
+        );
+
+        assert.equal(branch.branch, "merge");
+        assert.deepEqual(branch.counts, { easy: 30, medium: 10, hard: 20 });
+        assert.deepEqual(
+            branch.groups.map((g) => [g.bands.join("+"), g.n, g.models]),
+            [
+                ["easy", 30, [HALOGEN, BIG, MID].sort()],
+                ["medium+hard", 30, [HALOGEN, BIG, MID].sort()],
+            ],
+        );
+        assert.deepEqual(
+            branch.groups[0].ids,
+            idsOf(STAGE2_COUNT).filter((id) => tierOfFixture(id) === "easy"),
+        );
+        assert.equal(branch.predictedTiers.t07, "medium");
+        assert.ok(
+            readFileSync(join(root, "bench/results/stage2/branch.md"), "utf8").includes(
+                "Branch: merge",
+            ),
+        );
+        assert.equal(existsSync(join(root, "bench/results/stage2/summary.json")), false);
+
+        // A task of R that no kept manifest task names is an error.
+        writeFileSync(
+            join(root, "pool.json"),
+            JSON.stringify({
+                stage1: { ids: [] },
+                stage2: { ids: [...idsOf(STAGE2_COUNT), "ghost"] },
+            }),
+        );
+        assert.throws(() => main(flags, { root, log }), /no kept manifest task: ghost/);
+        // Stage 2 refuses a result for a task outside R.
+        writeFileSync(
+            join(root, "pool.json"),
+            JSON.stringify({ stage1: { ids: [] }, stage2: { ids: idsOf(STAGE2_COUNT - 1) } }),
+        );
+        assert.throws(() => main(STAGE2_FLAGS, { root, log }), /outside the pool's R: t60/);
+    } finally {
+        rmSync(root, { recursive: true });
+    }
+});
+
+test("the command line: stage 1 with a pool refuses a result outside the pool's stage 1 set", () => {
+    const root = mkdtempSync(join(tmpdir(), "bench-analyze-"));
+
+    const log = () => {};
+
+    try {
+        writeBench(root, "stage1");
+        mkdirSync(join(root, "bench"), { recursive: true });
+        // The default pool file is read when it exists.
+        writeFileSync(
+            join(root, "bench/pool-v1.json"),
+            JSON.stringify({ stage1: { ids: idsOf(11) }, stage2: { ids: [] } }),
+        );
+        const flags = ["--stage", "1", "--manifest", "manifest.json", ...MODELS_FLAG];
+
+        assert.throws(() => main(flags, { root, log }), /outside the pool's stage 1 set: t12/);
+        writeFileSync(
+            join(root, "bench/pool-v1.json"),
+            JSON.stringify({ stage1: { ids: idsOf(12) }, stage2: { ids: [] } }),
+        );
+        assert.equal(main([...flags], { root, log }), 0);
+        assert.throws(
+            () => main([...flags, "--pool", "missing.json"], { root, log }),
+            /stage 1 needs the pool/,
+        );
+    } finally {
+        rmSync(root, { recursive: true });
+    }
+});
+
+test("stage 2 with an empty R (every task left went to stage 1) is the wait branch, not an error", () => {
+    let s;
+
+    assert.doesNotThrow(() => {
+        s = analyzeStage2({ tasks: [], results: [], stage1: STAGE1_SYNTH, options: { pool: [] } });
+    });
+
+    assert.deepEqual(s.branch, {
+        branch: "wait",
+        counts: { easy: 0, medium: 0, hard: 0 },
+        R: 0,
+        groups: [],
+    });
+    assert.equal(s.R, 0);
+    assert.equal(s.decisions, undefined);
+    // A result is an error, as for any wait; a repeated id stays an error.
+    assert.throws(
+        () => analyzeStage2({ tasks: [], results: [synth("e000", SB)], options: { pool: [] } }),
+        /stage 2 waits for the pool \(R = 0, under 30\)/,
+    );
+    assert.throws(
+        () =>
+            analyzeStage2({
+                tasks: [...tierTasks("e", "easy", 1), ...tierTasks("e", "easy", 1)],
+                results: [],
+            }),
+        /task ids repeat: e000/,
+    );
+});
+
+test("the command line: --branch with an empty R writes the wait branch", () => {
+    const root = mkdtempSync(join(tmpdir(), "bench-analyze-"));
+
+    const log = () => {};
+
+    try {
+        writeBench(root, "stage2");
+        writeFileSync(
+            join(root, "pool.json"),
+            JSON.stringify({ stage1: { ids: idsOf(STAGE2_COUNT) }, stage2: { ids: [] } }),
+        );
+        const flags = [
+            "--branch",
+            "--manifest",
+            "manifest.json",
+            "--rule",
+            "rule.json",
+            "--stage1",
+            "stage1.json",
+            "--pool",
+            "pool.json",
+        ];
+
+        let code;
+
+        assert.doesNotThrow(() => {
+            code = main(flags, { root, log });
+        });
+        assert.equal(code, 0);
+        const branch = JSON.parse(
+            readFileSync(join(root, "bench/results/stage2/branch.json"), "utf8"),
+        );
+
+        assert.equal(branch.branch, "wait");
+        assert.equal(branch.R, 0);
+        assert.deepEqual(branch.groups, []);
+    } finally {
+        rmSync(root, { recursive: true });
+    }
+});
+
+test("the command line: --stage 2 with no results writes the wait summary, for an empty R and for R under 30", () => {
+    for (const [r, label] of [
+        [0, "an empty R"],
+        [12, "R under 30"],
+    ]) {
+        const root = mkdtempSync(join(tmpdir(), "bench-analyze-"));
+
+        const log = () => {};
+
+        try {
+            writeBench(root, "stage2");
+            rmSync(join(root, "bench/results/stage2"), { recursive: true });
+            writeFileSync(
+                join(root, "pool.json"),
+                JSON.stringify({ stage1: { ids: [] }, stage2: { ids: idsOf(r) } }),
+            );
+            let code;
+
+            assert.doesNotThrow(() => {
+                code = main(STAGE2_FLAGS, { root, log });
+            }, label);
+            assert.equal(code, 0, label);
+            const summary = JSON.parse(
+                readFileSync(join(root, "bench/results/stage2/summary.json"), "utf8"),
+            );
+
+            assert.equal(summary.branch.branch, "wait", label);
+            assert.equal(summary.R, r, label);
+            assert.equal(summary.decisions, undefined, label);
+            assert.ok(
+                readFileSync(join(root, "bench/results/stage2/summary.md"), "utf8").includes(
+                    "Branch: wait",
+                ),
+                label,
+            );
+        } finally {
+            rmSync(root, { recursive: true });
+        }
     }
 });

@@ -13,3 +13,6 @@ docs/*/TEMPLATE.md
 .github/workflows/site.yml
 site/properdocs.yml
 site/content/stylesheets/
+
+# Written by bench/pool.mjs, byte for byte (its --check compares the bytes).
+bench/pool-v1.json
