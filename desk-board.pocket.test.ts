@@ -1,9 +1,11 @@
 // The goal board in Pi Pocket, with the real Team, desk and shift modules and a scripted model: Team's `startShift`
 // (its frozen result, a replay, the refusals, a thrown start, and the board's limit on the desk's open), then rows
 // launched with `desk board_launch` from a supervisor's session, whose threads carry shift goals with the rows' task,
-// stop condition, rounds and length. No test reaches Brian's data or the network.
+// stop condition, rounds and length; then the Desk page's board routes (`GET board`, `POST board/:conversation`) on a
+// local HTTP server, with the owner's token and a guest's. No test reaches Brian's data or the network.
 import assert from "node:assert/strict";
 import { cpSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { createServer } from "node:http";
 import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
 import { fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
@@ -21,6 +23,7 @@ import {
     scriptedModel,
     until,
 } from "./_pocket/test/helpers.ts";
+import { createHandler } from "./_pocket/src/server/http.ts";
 import { boardRows } from "./_desk-board.ts";
 import { capView, DeskReports, DeskThreads, type DeskState } from "./desk.ts";
 import { GoalDoc } from "./night-shift.ts";
@@ -238,10 +241,44 @@ before(async () => {
     await app.setExtensionEnabled(owner(app), "night-shift.ts", true);
 });
 
+let server: ReturnType<typeof createServer> | undefined;
+
 after(async () => {
+    if (server !== undefined) {
+        await new Promise<void>((resolve) => server?.close(() => resolve()));
+    }
+
     await app?.close();
     cleanUp();
 });
+
+/** The desk's page routes on a local server, with the owner's token, or another person's. */
+async function routes(): Promise<
+    (path: string, body?: object, token?: string) => Promise<{ status: number; data: any }>
+> {
+    if (server === undefined) {
+        server = createServer(
+            createHandler({ app, listen: { host: "127.0.0.1", port: 0 }, restart: () => {} }),
+        );
+        await new Promise<void>((resolve) => server!.listen(0, "127.0.0.1", resolve));
+    }
+
+    const base = `http://127.0.0.1:${(server.address() as { port: number }).port}/api/x/desk/`;
+
+    return async (path, body, token = app.config.ownerToken) => {
+        const response = await fetch(base + path, {
+            method: body === undefined ? "GET" : "POST",
+            headers: {
+                authorization: `Bearer ${token}`,
+                "x-pocket": "1",
+                "content-type": "application/json",
+            },
+            ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+        });
+
+        return { status: response.status, data: await response.json() };
+    };
+}
 
 describe("Team startShift", () => {
     test("the frozen result: thread, session, address and replay; the same key gives it back with replay", async () => {
@@ -723,4 +760,417 @@ describe("the board in Pi Pocket", () => {
             assert.equal((await userTexts(source)).filter((text) => RUN_END.test(text)).length, 0);
         },
     );
+});
+
+/** The desk API's thread open, as the routes' tests use it. */
+type DeskOpen = { open: (tx: Tx, request: object) => Promise<unknown> };
+
+describe("the Desk page's board routes", () => {
+    let keys = 0;
+    /** A new page key: 8 to 100 characters. */
+    const key = () => `page-key-${String((keys += 1)).padStart(4, "0")}`;
+
+    /** A supervisor the desk knows: Odrade's session, with 1 open thread of its own, opened through the desk's API. */
+    async function knownSupervisor(): Promise<ConversationId> {
+        const source = await supervisor();
+        const desk = (globalThis as unknown as Record<symbol, DeskOpen | undefined>)[
+            Symbol.for("pi-pocket-team.desk")
+        ];
+
+        assert(desk !== undefined, "the desk is on");
+        await app.harness.commit(
+            (tx) =>
+                desk.open(tx, {
+                    key: `board-page-thread:${String(source)}`,
+                    supervisor: Number(source),
+                    agents: ["teg"],
+                    title: "Board page test",
+                    task: "A thread that makes the supervisor known.",
+                    at: Date.now(),
+                }),
+            context,
+        );
+        assert(
+            Object.values((await deskState()).threads).some(
+                (thread) => thread.supervisor === Number(source),
+            ),
+            "the supervisor has a thread",
+        );
+
+        return source;
+    }
+
+    /** Add 1 row with the tool, as the supervisor, and give its id. */
+    async function addRow(source: ConversationId, fields: object = {}): Promise<number> {
+        await runTool(source, "desk", {
+            action: "board_add",
+            fields: {
+                agent: "teg",
+                title: "page row",
+                task: "BOARD-PAGE tend the tests",
+                stopWhen: "the tests pass",
+                max: 2,
+                until: untilSoon(),
+                ...fields,
+            },
+        });
+
+        return Math.max(
+            ...boardRows((await deskState()).board, Number(source)).map((row) => row.id),
+        );
+    }
+
+    /** A row of the stored board. */
+    const stored = async (id: number) =>
+        (await deskState()).board?.rows.find((row) => row.id === id) ??
+        assert.fail(`row ${String(id)}`);
+
+    /** Set a row's state in the store: the states that only a pass gives (failed, unknown). */
+    const setState = (id: number, state: "failed" | "unknown") =>
+        app.harness.commit(async (tx) => {
+            const row = (await tx.doc(DeskThreads)).board?.rows.find((each) => each.id === id);
+
+            assert(row !== undefined);
+            row.state = state;
+            row.error = `a ${state} start`;
+        }, context);
+
+    test("GET board: the supervisors, the chosen one, its rows in launch order with their fields, and the limits", async () => {
+        const call = await routes();
+        const source = await knownSupervisor();
+        const late = await addRow(source, { title: "late row", order: 50 });
+        const early = await addRow(source, { title: "early row", order: 5, note: "first" });
+        const got = await call(`board?supervisor=${String(source)}`);
+
+        assert.equal(got.status, 200, JSON.stringify(got.data));
+        assert(got.data.supervisors.includes(Number(source)));
+        assert.deepEqual(
+            got.data.supervisors,
+            [...got.data.supervisors].sort((a: number, b: number) => a - b),
+        );
+        assert.equal(got.data.supervisor, Number(source));
+        assert.deepEqual(
+            got.data.rows.map((row: { id: number }) => row.id),
+            [early, late],
+        );
+
+        const row = await stored(early);
+
+        assert.deepEqual(got.data.rows[0], {
+            id: early,
+            rev: 1,
+            state: "proposed",
+            agent: "teg",
+            title: "early row",
+            task: "BOARD-PAGE tend the tests",
+            stopWhen: "the tests pass",
+            max: 2,
+            until: row.until,
+            kind: "goal",
+            note: "first",
+            order: 5,
+            by: "odrade",
+            attempts: [],
+        });
+        assert.match(
+            got.data.limits.line,
+            /^8 at once, 0 running · cap 100, \d+ count, 2 kept free · 0 of 250 rounds today$/,
+        );
+        assert.deepEqual(
+            { ...got.data.limits, line: undefined, counted: undefined },
+            {
+                line: undefined,
+                atOnce: 8,
+                running: 0,
+                cap: 100,
+                counted: undefined,
+                reserve: 2,
+                rounds: 0,
+                roundsMax: 250,
+            },
+        );
+
+        // A supervisor the desk does not know: the first one.
+        const first = await call("board?supervisor=999999");
+
+        assert.equal(first.data.supervisor, first.data.supervisors[0]);
+    });
+
+    test("POST board: pick, unpick, edit, drop, reopen and resolve each answer 200 with the rows", async () => {
+        const call = await routes();
+        const source = await knownSupervisor();
+        const one = await addRow(source, { title: "row one" });
+        const two = await addRow(source, { title: "row two" });
+        const post = (body: object) => call(`board/${String(source)}`, { key: key(), ...body });
+        const stateOf = (
+            answer: { data: { rows: { id: number; state: string; rev: number }[] } },
+            id: number,
+        ) => answer.data.rows.find((row) => row.id === id);
+
+        const pick = await post({ op: "pick", rows: [{ row: one, rev: 1 }] });
+
+        assert.equal(pick.status, 200, JSON.stringify(pick.data));
+        assert.equal(stateOf(pick, one)?.state, "picked");
+        assert.equal(pick.data.replay, false);
+        assert.deepEqual(pick.data.pass, []);
+        assert.match(pick.data.text, /^Picked:/);
+        assert.match(pick.data.limits.line, /at once/);
+
+        const unpick = await post({ op: "unpick", rows: [{ row: one, rev: 1 }] });
+
+        assert.equal(unpick.status, 200, JSON.stringify(unpick.data));
+        assert.equal(stateOf(unpick, one)?.state, "proposed");
+
+        const edit = await post({
+            op: "edit",
+            row: one,
+            rev: 1,
+            fields: { max: 3, until: "07:15" },
+        });
+
+        assert.equal(edit.status, 200, JSON.stringify(edit.data));
+        assert.deepEqual(
+            {
+                rev: (await stored(one)).rev,
+                max: (await stored(one)).max,
+                until: (await stored(one)).until,
+            },
+            { rev: 2, max: 3, until: "07:15" },
+        );
+
+        const drop = await post({ op: "drop", row: two, rev: 1 });
+
+        assert.equal(drop.status, 200, JSON.stringify(drop.data));
+        assert.equal(stateOf(drop, two)?.state, "dropped");
+
+        await setState(one, "failed");
+
+        const reopen = await post({ op: "reopen", row: one, rev: 2 });
+
+        assert.equal(reopen.status, 200, JSON.stringify(reopen.data));
+        assert.equal(stateOf(reopen, one)?.state, "proposed");
+
+        await setState(one, "unknown");
+
+        const resolve = await post({ op: "resolve", row: one, rev: (await stored(one)).rev });
+
+        assert.equal(resolve.status, 200, JSON.stringify(resolve.data));
+        assert.equal(stateOf(resolve, one)?.state, "failed");
+        assert.equal((await stored(one)).by, "odrade", "the page does not change who added it");
+    });
+
+    test("POST board: 400 for a bad op, a bad key, a missing rev and a bad field; nothing changes", async () => {
+        const call = await routes();
+        const source = await knownSupervisor();
+        const row = await addRow(source);
+        const path = `board/${String(source)}`;
+
+        for (const op of ["add", "frobnicate", undefined]) {
+            const bad = await call(path, { op, key: key(), fields: {} });
+
+            assert.equal(bad.status, 400, JSON.stringify(bad.data));
+            assert.match(
+                JSON.stringify(bad.data),
+                /op must be 1 of pick, unpick, edit, drop, launch, reopen, resolve/,
+            );
+        }
+
+        for (const badKey of [undefined, "short", "has space in it", "x".repeat(101)]) {
+            const bad = await call(path, { op: "drop", row, rev: 1, key: badKey });
+
+            assert.equal(bad.status, 400, JSON.stringify(bad.data));
+            assert.match(JSON.stringify(bad.data), /Board needs key/);
+        }
+
+        const noRev = await call(path, { op: "drop", row, key: key() });
+
+        assert.equal(noRev.status, 400, JSON.stringify(noRev.data));
+
+        const noRows = await call(path, { op: "launch", key: key() });
+
+        assert.equal(noRows.status, 400, JSON.stringify(noRows.data));
+
+        const field = await call(path, {
+            op: "edit",
+            row,
+            rev: 1,
+            key: key(),
+            fields: { max: 0, until: "07:00" },
+        });
+
+        assert.equal(field.status, 400, JSON.stringify(field.data));
+        assert.deepEqual(
+            {
+                state: (await stored(row)).state,
+                rev: (await stored(row)).rev,
+                max: (await stored(row)).max,
+            },
+            { state: "proposed", rev: 1, max: 2 },
+        );
+    });
+
+    test("POST board: 403 for a conversation that is no supervisor's, and for another supervisor's row", async () => {
+        const call = await routes();
+        const source = await knownSupervisor();
+        const row = await addRow(source);
+        const folder = join(root, "no-supervisor");
+
+        mkdirSync(folder, { recursive: true });
+
+        const plain = await newSession(app, folder);
+        const none = await call(`board/${String(plain)}`, { op: "drop", row, rev: 1, key: key() });
+
+        assert.equal(none.status, 403, JSON.stringify(none.data));
+        assert.match(
+            JSON.stringify(none.data),
+            new RegExp(`Conversation ${String(plain)} is not a supervisor's`),
+        );
+
+        const other = await knownSupervisor();
+        const theirs = await call(`board/${String(other)}`, {
+            op: "drop",
+            row,
+            rev: 1,
+            key: key(),
+        });
+
+        assert.equal(theirs.status, 403, JSON.stringify(theirs.data));
+        assert.match(JSON.stringify(theirs.data), /There is no row/);
+        assert.equal((await stored(row)).state, "proposed");
+    });
+
+    test("POST board: 409 for a stale rev and for a wrong state", async () => {
+        const call = await routes();
+        const source = await knownSupervisor();
+        const row = await addRow(source);
+        const path = `board/${String(source)}`;
+        const stale = await call(path, { op: "pick", rows: [{ row, rev: 9 }], key: key() });
+
+        assert.equal(stale.status, 409, JSON.stringify(stale.data));
+        assert.match(
+            JSON.stringify(stale.data),
+            new RegExp(`Row ${String(row)} changed \\(rev 1 now\\)`),
+        );
+
+        const staleDrop = await call(path, { op: "drop", row, rev: 2, key: key() });
+
+        assert.equal(staleDrop.status, 409, JSON.stringify(staleDrop.data));
+
+        const wrong = await call(path, { op: "reopen", row, rev: 1, key: key() });
+
+        assert.equal(wrong.status, 409, JSON.stringify(wrong.data));
+        assert.match(JSON.stringify(wrong.data), /is proposed/);
+        assert.equal((await stored(row)).state, "proposed");
+    });
+
+    test("POST board: a repeated POST with the same key changes nothing, and answers the rows with replay", async () => {
+        const call = await routes();
+        const source = await knownSupervisor();
+        const row = await addRow(source);
+        const body = { op: "edit", row, rev: 1, fields: { max: 4, until: "07:00" }, key: key() };
+        const first = await call(`board/${String(source)}`, body);
+
+        assert.equal(first.status, 200, JSON.stringify(first.data));
+        assert.equal(first.data.replay, false);
+
+        const again = await call(`board/${String(source)}`, body);
+
+        assert.equal(again.status, 200, JSON.stringify(again.data));
+        assert.equal(again.data.replay, true);
+        assert.equal(again.data.text, first.data.text);
+        assert.deepEqual(again.data.rows, first.data.rows);
+        assert.equal((await stored(row)).rev, 2, "1 edit, not 2");
+    });
+
+    test("a guest gets 403 on GET board and on POST board/:conversation", async () => {
+        const call = await routes();
+        const source = await knownSupervisor();
+        const row = await addRow(source);
+        const guest = app.config.addUser("Board guest", "guest");
+        const read = await call("board", undefined, guest.token);
+
+        assert.equal(read.status, 403, JSON.stringify(read.data));
+        assert.match(JSON.stringify(read.data), /Only the owner can use the goal board/);
+
+        const act = await call(
+            `board/${String(source)}`,
+            { op: "drop", row, rev: 1, key: key() },
+            guest.token,
+        );
+
+        assert.equal(act.status, 403, JSON.stringify(act.data));
+        assert.match(JSON.stringify(act.data), /Only the owner can use the goal board/);
+        assert.equal((await stored(row)).state, "proposed");
+    });
+
+    test("2 picked rows launched by the page route give 2 threads whose goals hold the rows' task, stop, max and for", async () => {
+        const call = await routes();
+        const source = await knownSupervisor();
+        const path = `board/${String(source)}`;
+        const ids = [
+            await addRow(source, {
+                agent: "teg",
+                title: "page one",
+                task: "PAGE-ONE fix the flaky test",
+                stopWhen: "teg is done",
+            }),
+            await addRow(source, {
+                agent: "lucilla",
+                title: "page two",
+                task: "PAGE-TWO update the docs",
+                stopWhen: "lucilla is done",
+            }),
+        ];
+        const pick = await call(path, {
+            op: "pick",
+            rows: ids.map((row) => ({ row, rev: 1 })),
+            key: key(),
+        });
+
+        assert.equal(pick.status, 200, JSON.stringify(pick.data));
+
+        const launch = await call(path, {
+            op: "launch",
+            rows: ids.map((row) => ({ row, rev: 1 })),
+            key: key(),
+        });
+
+        assert.equal(launch.status, 200, JSON.stringify(launch.data));
+        assert.equal(launch.data.pass.length, 2, JSON.stringify(launch.data.pass));
+
+        const shown = launch.data.rows.filter((row: { id: number }) => ids.includes(row.id));
+
+        assert.deepEqual(
+            shown.map((row: { state: string }) => row.state),
+            ["launched", "launched"],
+        );
+
+        for (const view of shown) {
+            assert.match(view.thread, /^T\d+$/);
+            assert.equal(typeof view.next, "string", "the thread's next actor");
+
+            const row = await stored(view.id);
+            const thread = (await deskState()).threads[row.thread ?? ""];
+
+            assert(thread?.session !== undefined, "the thread has its session");
+
+            const goal = (
+                await app.harness.snapshot(
+                    GoalDoc,
+                    thread.session as unknown as ConversationId,
+                    context,
+                )
+            )?.goal;
+
+            assert.equal(goal?.objective, row.task);
+            assert.equal(goal?.stop, row.stopWhen);
+            assert.equal(goal?.maxRounds, row.max);
+            assert(goal?.deadline !== undefined && row.untilAt !== undefined);
+            assert(
+                Math.abs(goal.deadline - row.untilAt) <= 60_000,
+                `${String(goal.deadline)} ${String(row.untilAt)}`,
+            );
+            assert.equal(thread.key, `x.desk.board:${String(row.id)}:1`);
+        }
+    });
 });
