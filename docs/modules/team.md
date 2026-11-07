@@ -145,6 +145,14 @@ Pi Pocket sets the child's actual working directory before the first request: pr
 - There is no automatic review workflow, scheduled duties, imported MCP setup, or shared notebook. This is a test of whether named people and task delegation are enough, before deciding what else is worth carrying over.
 - Moving the app locally does not change a provider's content policies.
 
+## Shifts from the Desk's goal board
+
+The Desk's goal board starts its rows through Team, never through a model: `startShift` on Team's global API (`Symbol.for("pi-pocket-team.team")`). It is the same start as `team_delegate` with `shift`, from the supervisor's session: the persona, the worktree, the desk thread, the identity, the allowed model (the agent's profile model when the owner allows it for subagents, else the supervisor's), and the goal. `team_delegate` and `startShift` share 1 function, `delegate(deps, args)` in `team.ts`; `deps` holds the source session, the key, the commit, the context, the reader, the router's memo, and the optional `limit`.
+
+- **The request:** `{ supervisor, read, commit, context, key, agent, repository?, title, task, shift: { objective?, stop_when, max, for, worker?, pr_check? }, limit: { reserve } }`. The board gives `for` (a length of time), never `until` or `start`. With `limit`, the desk's open refuses at the cap minus `reserve` and never uses an OK, and a refusal is not recorded for the page's **Allow 1**.
+- **The result:** `{ thread, session, address, replay }`, or `{ error, unknown }` (with `deskFull: true` when the desk's open refused at the limit). `unknown` is true only when Pocket's `linkedSessions.start` threw, or the thread of the key closed before its session was bound (a thrown start of an earlier try): Pocket may have admitted the session. Team's own refusals (a model not on the allowed list, a bad `pr_check`, no such repository, a source that is not a supervisor's) give `unknown: false`, in `team_delegate`'s words. It never throws.
+- **A replay** with the same key returns the first result with `replay: true`, and starts nothing again. `team_delegate`'s results, errors, replay and key (`x.team.delegate:<task>:<call>`) do not change. A board start's router record is kept in memory for the call only (a tool call keeps it in its memo).
+
 ## Agent memory
 
 Pi Pocket's memory has two scopes: a project (one repository or folder) and everywhere. An agent that owns several repositories gets its lessons split between them, and everywhere reaches every session. Team adds a third layer: lessons for one named agent. They apply in every session that carries that identity, linked tasks included, in whatever folder.
