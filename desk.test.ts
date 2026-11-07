@@ -260,6 +260,7 @@ import {
     defaultBoardSupervisor,
     deskSupervisors,
     liveSupervisors,
+    receiptSupervisor,
     REPORTS_OFF_TASK_STALE_MS,
     reportsOffActions,
     reportsOffKey,
@@ -702,6 +703,23 @@ describe("run-end answers", () => {
         );
         assert.deepEqual(liveSupervisors(empty()), []);
         assert.deepEqual(liveSupervisors(undefined), []);
+    });
+
+    test("the receipt's supervisor: the 1 supervisor whose receipts hold the key, else none", () => {
+        const receipt = (key: string) => ({ key, at: 1, result: "done" });
+        const doc = {
+            supervisors: {
+                "1745": { receipts: [receipt("x.desk.board:t:1"), receipt("x.desk.board:t:both")] },
+                "4242": { receipts: [receipt("x.desk.board:t:2"), receipt("x.desk.board:t:both")] },
+            },
+        };
+
+        assert.equal(receiptSupervisor(doc, "x.desk.board:t:1"), 1745);
+        assert.equal(receiptSupervisor(doc, "x.desk.board:t:2"), 4242);
+        assert.equal(receiptSupervisor(doc, "x.desk.board:t:3"), undefined);
+        assert.equal(receiptSupervisor(doc, "x.desk.board:t:both"), undefined, "2 holders: none");
+        assert.equal(receiptSupervisor({ supervisors: {} }, "x.desk.board:t:1"), undefined);
+        assert.equal(receiptSupervisor(undefined, "x.desk.board:t:1"), undefined);
     });
 
     test("the board's default supervisor: the one with a sweeper, also when it is not the lowest; else the first", () => {

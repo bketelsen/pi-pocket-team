@@ -1348,6 +1348,64 @@ describe("the Desk page's board routes", () => {
         assert.equal((await stored(row)).state, "proposed");
     });
 
+    test("POST board: a supervisor live only by its last row replays its drop after it is no longer live; a new change gets 403", async () => {
+        const call = await routes();
+        const source = await supervisor();
+        const id = Number(source);
+        const row = await addRow(source);
+        const sweeper = (await deskState()).sweepers?.[String(id)];
+
+        // R is live only by its row: no sweeper record (removed here, put back after), no Clerk, no open thread.
+        if (sweeper !== undefined) {
+            await app.harness.commit(async (tx) => {
+                delete (await tx.doc(DeskThreads)).sweepers?.[String(id)];
+            }, context);
+        }
+
+        try {
+            const state = await deskState();
+
+            assert.equal(state.sweepers?.[String(id)], undefined, "no sweeper record");
+            assert.equal(state.clerks?.[String(id)], undefined, "no Clerk");
+            assert(
+                !Object.values(state.threads).some(
+                    (thread) => thread.supervisor === id && thread.state !== "closed",
+                ),
+                "no open thread",
+            );
+            assert((await call("board")).data.supervisors.includes(id), "live by its row");
+
+            const k = key();
+            const body = { op: "drop", row, rev: 1, key: k };
+            const first = await call(`board/${String(id)}`, body);
+
+            assert.equal(first.status, 200, JSON.stringify(first.data));
+            assert(!(await call("board")).data.supervisors.includes(id), "no longer live");
+
+            const again = await call(`board/${String(id)}`, body);
+
+            assert.equal(again.status, 200, JSON.stringify(again.data));
+            assert.equal(again.data.replay, true);
+            assert.equal((await stored(row)).state, "dropped");
+
+            const fresh = await call(`board/${String(id)}`, { ...body, key: key() });
+
+            assert.equal(fresh.status, 403, JSON.stringify(fresh.data));
+            assert.match(
+                JSON.stringify(fresh.data),
+                new RegExp(`Conversation ${String(id)} is not a supervisor's`),
+            );
+        } finally {
+            if (sweeper !== undefined) {
+                await app.harness.commit(async (tx) => {
+                    const state = await tx.doc(DeskThreads);
+
+                    state.sweepers = { ...state.sweepers, [String(id)]: sweeper };
+                }, context);
+            }
+        }
+    });
+
     test("POST board: 409 for a stale rev and for a wrong state", async () => {
         const call = await routes();
         const source = await knownSupervisor();

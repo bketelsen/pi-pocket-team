@@ -20383,6 +20383,25 @@ export function liveSupervisors(state: Readonly<DeskState> | undefined): number[
     return [...ids].sort((a, b) => a - b);
 }
 
+/**
+ * The supervisor whose board receipts hold `key` (an agent's call key, `x.desk.board:<task>:<call>`), when exactly 1
+ * does; else undefined. A replayed agent call binds to it, so it replays on the board it changed, also after that
+ * supervisor stopped being live. The old field `board.keys` names no supervisor and gets no new key, so it is not read.
+ */
+export function receiptSupervisor(
+    doc: Readonly<BoardReceiptsDoc> | undefined,
+    key: string,
+): number | undefined {
+    const holders = Object.entries(doc?.supervisors ?? {}).flatMap(([id, state]) =>
+        state?.receipts?.some((each) => each.key === key) === true ? [Number(id)] : [],
+    );
+    const [only] = holders;
+
+    return holders.length === 1 && only !== undefined && Number.isSafeInteger(only) && only > 0
+        ? only
+        : undefined;
+}
+
 /** The supervisor the Board view opens on: the first of `supervisors` with a sweeper, else the first, else null. */
 export function defaultBoardSupervisor(
     state: Readonly<DeskState> | undefined,
@@ -31419,9 +31438,21 @@ export default function createDesk(host: Host, web: Web) {
 
             const key = pageKey(request, "Board");
             const supervisor = Number(request.conversation.id);
-            const known = liveSupervisors(await request.snapshot(DeskThreads, request.context));
+            const callKey = `x.desk.board:page:${String(supervisor)}:${key}`;
+            const state = await request.snapshot(DeskThreads, request.context);
+            const known = liveSupervisors(state);
+            // A conversation that is no longer live still replays a key that has a receipt: a new change needs a live
+            // supervisor.
+            const replays = async () =>
+                boardRules.boardReplay(
+                    (await request.snapshot(BoardReceipts, request.context))?.supervisors[
+                        String(supervisor)
+                    ],
+                    state?.board,
+                    callKey,
+                ) !== undefined;
 
-            if (!known.includes(supervisor)) {
+            if (!known.includes(supervisor) && !(await replays())) {
                 throw web.error(
                     403,
                     `Conversation ${String(supervisor)} is not a supervisor's: ${known.length === 0 ? "the desk knows no supervisor yet" : `the desk knows ${known.map(String).join(", ")}`}.`,
@@ -31467,7 +31498,7 @@ export default function createDesk(host: Host, web: Web) {
                 accessOfRequest(request),
                 { kind: "supervisor", supervisor, by: "brian" },
                 boardOp,
-                `x.desk.board:page:${String(supervisor)}:${key}`,
+                callKey,
                 // The key starts with the page's time: an expired key never acts again.
                 (now) => boardRules.boardPageKeyRefusal(key, now),
             );
@@ -31747,10 +31778,19 @@ export default function createDesk(host: Host, web: Web) {
 
             if (args.action === "board" || args.action.startsWith("board_")) {
                 const state = await api.snapshot(DeskThreads, context);
+                // The call's key: a replay finds its receipt by it.
+                const callKey = `x.desk.board:${String(api.taskId)}:${String(api.callId)}`;
                 // An agent's board is the 1 live supervisor (`liveSupervisors`): with none, or more than 1, it is refused.
+                // A replayed change binds to the supervisor whose receipt holds its key, live or not.
                 let owner = supervisor;
+                const replayed =
+                    agent && args.action !== "board"
+                        ? receiptSupervisor(await api.snapshot(BoardReceipts, context), callKey)
+                        : undefined;
 
-                if (agent) {
+                if (agent && replayed !== undefined) {
+                    owner = replayed;
+                } else if (agent) {
                     const known = liveSupervisors(state);
 
                     if (known.length !== 1 || known[0] === undefined) {
@@ -31814,12 +31854,7 @@ export default function createDesk(host: Host, web: Web) {
                     );
                 }
 
-                const done = await applyBoardOp(
-                    accessOf(api, context),
-                    actor,
-                    op,
-                    `x.desk.board:${String(api.taskId)}:${String(api.callId)}`,
-                );
+                const done = await applyBoardOp(accessOf(api, context), actor, op, callKey);
 
                 if ("status" in done) {
                     throw new Error(done.error);
