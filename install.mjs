@@ -27,6 +27,7 @@ const MODULES = [
     "_desk-usage.ts",
     "_desk-dashboard.ts",
     "_desk-metrics.ts",
+    "_desk-board.ts",
     "desk.ts",
     "desk-web",
     "terminal.ts",

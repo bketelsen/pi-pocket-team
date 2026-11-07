@@ -1248,7 +1248,13 @@ before(async () => {
     cpSync(join(import.meta.dirname, "team.ts"), join(dropIns, "team.ts"));
     cpSync(join(import.meta.dirname, "team-web"), join(dropIns, "team-web"), { recursive: true });
 
-    for (const each of ["desk.ts", "_desk-usage.ts", "_desk-dashboard.ts", "_desk-metrics.ts"]) {
+    for (const each of [
+        "desk.ts",
+        "_desk-usage.ts",
+        "_desk-dashboard.ts",
+        "_desk-metrics.ts",
+        "_desk-board.ts",
+    ]) {
         cpSync(join(import.meta.dirname, each), join(dropIns, each));
     }
 

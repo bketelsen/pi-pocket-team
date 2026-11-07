@@ -98,7 +98,13 @@ const extensions = join(root, "data", "extensions");
 
 mkdirSync(extensions, { recursive: true });
 
-for (const file of ["desk.ts", "_desk-usage.ts", "_desk-dashboard.ts", "_desk-metrics.ts"]) {
+for (const file of [
+    "desk.ts",
+    "_desk-usage.ts",
+    "_desk-dashboard.ts",
+    "_desk-metrics.ts",
+    "_desk-board.ts",
+]) {
     cpSync(join(import.meta.dirname, file), join(extensions, file));
 }
 

@@ -525,6 +525,13 @@ export function nextClockTime(hour: number, minute: number, now: number, zone: s
     );
 }
 
+/** Local midnight in `zone` of the day that holds `now`. */
+export function localMidnight(now: number, zone: string): number {
+    const today = partsIn(now, zone);
+
+    return wallTime(today.year, today.month, today.day, 0, 0, zone);
+}
+
 /** DeepSeek's peak hours in UTC: 01:00-04:00 and 06:00-10:00. The end of the window holding `now`, or undefined. */
 export function deepseekStart(now: number): number | undefined {
     const at = new Date(now);
@@ -1601,6 +1608,12 @@ export type NightShiftApi = {
     notifyChanged: (conversationId: ConversationId) => void;
     standing: typeof standing;
     zone: () => string;
+    /**
+     * The clock math the desk's goal board uses, in this module's zone rules: the next time the clock shows
+     * `hour:minute` after `now`, and local midnight of the day that holds `now`. An older module has neither.
+     */
+    nextClockTime?: typeof nextClockTime;
+    localMidnight?: typeof localMidnight;
     /** A goal as the desk's sweep reads it. */
     goal: (
         read: DocumentReader,
@@ -2859,6 +2872,8 @@ export default function createNightShift(host: Host, web: Web) {
         notifyChanged,
         standing,
         zone,
+        nextClockTime,
+        localMidnight,
         goal: async (read, conversationId, context) => {
             const goal = (await read.snapshot(GoalDoc, conversationId, context))?.goal;
 
