@@ -1,0 +1,72 @@
+{
+    "schema": 1,
+    "stage": "pilot",
+    "tasks": [
+        {
+            "id": "pilot-small",
+            "repo": "bketelsen/pi-pocket-team",
+            "thread": "T942",
+            "pr": "bketelsen/pi-pocket-team#127",
+            "parent": "22f9c9a620aa4e34503b78afb03c1b69be51bf55",
+            "merge": "66db28c70f8f217fe32600b61cc59c9fbde3066e",
+            "brief": "Night line 7 (hygiene). Find and fix the flaky test of issue #115 (ci.yml Test, runs 40980615501 and 41846660970; also the Upstream run 41477736019 failure: terminal.test.ts '2 tabs: the slow one holds the shell back and loses no character'). Start from the hypothesis that it is that timing test. Fix the race in the test (wait on an event, not a timer). Test-only: do not change terminal.ts behavior. Show the flake before the fix if you can (a loop that fails), and 20 passes in a row after. Rules: branches and PRs only; humans merge; no --admin; no force-push (only --force-with-lease on your own unmerged PR branch); no deploy; stop BLOCKED at once when only Brian can go on. Worker by the clock: run `date` before each subagent spawn: 20:00-23:00 and 01:00-05:00 EST use github-copilot/claude-sonnet-5.5, other times deepseek/deepseek-flash. PRs: cross-review per ~/.pi/agent/skills/cross-review/SKILL.md, revert test before the label, risk:high rules. Stop early when the same CI failure comes 3 times. Remove your worktrees at the end (never --force). The summary names the coder model(s) and ends with 'ASKS FOR BRIAN:'. Must not break: existing tests and CI on main.",
+            "briefSource": "delegation",
+            "setup": "PI_POCKET_CHECKOUT=/pocket node link.mjs",
+            "check": "npm test",
+            "hiddenTests": [],
+            "hiddenCommand": null,
+            "size": 10,
+            "features": null,
+            "owner": {
+                "keep": true,
+                "reason": "pilot, picked by hand",
+                "scopeMatches": true,
+                "commandsConfirmed": true
+            }
+        },
+        {
+            "id": "pilot-medium",
+            "repo": "bketelsen/pi-pocket-team",
+            "thread": "T529",
+            "pr": "bketelsen/pi-pocket-team#85",
+            "parent": "212cb16657dfca69b288366eed24610ee5e45056",
+            "merge": "433d2b1dc21d551ab8e707fa9ee0c520790938e1",
+            "brief": "Brian decided (T520a, 2026-10-29 20:13): in night-shift.ts, pr_check with checks \"required\" falls back to all checks when the repository has no required checks. Facts: prCheckCommand() (about line 613-670) builds \"gh pr checks<where> --required\"; in a repo whose main ruleset has no required status check, gh exits 1 with \"no required checks reported\" (seen on pi-pocket-team, lab, pilothouse, frostyard-org, repogen, snosi). Change: the built command passes when --required passes, or when its output says \"no required checks reported\" and \"gh pr checks<where>\" (all checks) passes. A real failure of a required check still fails. Keep the command under MAX_COMMAND, keep quoting safe (no user text in the shell except pr and repo, already validated). Say in the round text which branch passed. Tests for: required pass; required fail; no required checks + all pass; no required checks + one fails; pending checks. Update docs and the tool description. Run npm test, npm run typecheck, npm run lint, npm run install-check. Do not install. Open PRs #83 (team.ts) and #84 (ci.yml) do not touch night-shift.ts; rebase if one merges first.\n\nRULES (night shift 2026-10-29, they end at 06:45 on 2026-10-30): Work ends in PRs; Brian merges. No push to main (except homewiki, by its AGENTS.md). No --admin, no force-push, no tag, no release, no settings. Take a lease before a shared test resource (~/.pi/agent/bin/lease take|renew|release RESOURCE THREAD \"note\"; renew every 30 minutes; release at the end). Before a PR is ready, follow ~/.pi/agent/skills/cross-review/SKILL.md; add ready-for-human only when CI is green and the review is Ready at the head. Hygiene follows ~/.pi/agent/skills/repo-hygiene/SKILL.md. Stop BLOCKED at once when only Brian can go on. Remove your worktree at the end (git worktree remove, never --force), except one that holds an open PR: name it. No secrets anywhere. Write the summary in ASD-STE100. End it with \"ASKS FOR BRIAN:\" and 1 line per decision, or \"ASKS FOR BRIAN: none\".",
+            "briefSource": "delegation",
+            "setup": "PI_POCKET_CHECKOUT=/pocket node link.mjs",
+            "check": "npm test",
+            "hiddenTests": [],
+            "hiddenCommand": null,
+            "size": 298,
+            "features": null,
+            "owner": {
+                "keep": true,
+                "reason": "pilot, picked by hand",
+                "scopeMatches": true,
+                "commandsConfirmed": true
+            }
+        },
+        {
+            "id": "pilot-large",
+            "repo": "bketelsen/pi-pocket-team",
+            "thread": "T520",
+            "pr": "bketelsen/pi-pocket-team#83",
+            "parent": "ee275ddb813e8abefa02858111606cf52bbfeacd",
+            "merge": "212cb16657dfca69b288366eed24610ee5e45056",
+            "brief": "Brian wants the model router (model-router.ts, PR #82, installed 10-29 19:29, shadow mode) to record a suggestion for every night shift. Now team.ts shiftRoute() returns router.explicit() when a worker is named, and Jev is not called. Every night line names a worker, so the router records almost nothing. Change: when a worker is named, still ask Jev (same masking, same 3.5 s / 4 s limits, same memos so a replay never calls twice) and record the suggestion beside the named worker, for example status \"shadow\" with the named worker and the suggested tier and model, or a new field. The named worker still wins and nothing changes the model (T503d). Keep the desk event line short. Make audit check R1 compare the suggestion with the named worker and the outcome. Update tests and docs. Run npm test, npm run typecheck, npm run lint, npm run install-check. Do not install. The PR description gives Brian the install steps.\n\nRULES (night shift 2026-10-29, they end at 06:45 on 2026-10-30): Work ends in PRs; Brian merges. No push to main (except homewiki, by its AGENTS.md). No --admin, no force-push, no tag, no release, no settings. Take a lease before a shared test resource (~/.pi/agent/bin/lease take|renew|release RESOURCE THREAD \"note\"; renew every 30 minutes; release at the end). Before a PR is ready, follow ~/.pi/agent/skills/cross-review/SKILL.md; add ready-for-human only when CI is green and the review is Ready at the head. Hygiene follows ~/.pi/agent/skills/repo-hygiene/SKILL.md. Stop BLOCKED at once when only Brian can go on. Remove your worktree at the end (git worktree remove, never --force), except one that holds an open PR: name it. No secrets anywhere. Write the summary in ASD-STE100. End it with \"ASKS FOR BRIAN:\" and 1 line per decision, or \"ASKS FOR BRIAN: none\".",
+            "briefSource": "delegation",
+            "setup": "PI_POCKET_CHECKOUT=/pocket node link.mjs",
+            "check": "npm test",
+            "hiddenTests": [],
+            "hiddenCommand": null,
+            "size": 659,
+            "features": null,
+            "owner": {
+                "keep": true,
+                "reason": "pilot, picked by hand",
+                "scopeMatches": true,
+                "commandsConfirmed": true
+            }
+        }
+    ]
+}
