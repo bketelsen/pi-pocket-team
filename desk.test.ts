@@ -48,6 +48,8 @@ import {
     failThread,
     listText,
     openThread,
+    gitBlobSha,
+    initialPlanText,
     parseSeed,
     readText,
     routeThread,
@@ -81,6 +83,11 @@ import {
     isStale,
     nextActor,
     odradeReason,
+    failedLine,
+    applyRunFailed,
+    applyConsultFailed,
+    failedRunSupervisor,
+    type Consult,
     waitsText,
     waitsNeedLive,
     answeredText,
@@ -1436,6 +1443,177 @@ describe("nextActor", () => {
     });
 });
 
+describe("a linked session's failed run", () => {
+    test("failedLine keeps a non-empty string only, on 1 line, at most 300 characters", () => {
+        assert.equal(failedLine({ failed: "the model gave up" }), "the model gave up");
+        assert.equal(failedLine({ failed: "" }), undefined);
+        assert.equal(failedLine({ failed: "  \n " }), undefined);
+        assert.equal(failedLine({ failed: 42 }), undefined);
+        assert.equal(failedLine({ failed: null }), undefined);
+        assert.equal(failedLine({}), undefined, "Pi Pocket 0.27.0 gives no failed");
+        assert.equal(failedLine({ failed: "x".repeat(400) }), "x".repeat(300));
+        assert.equal(
+            failedLine({ failed: "the provider said:\n  429 too many\nrequests" }),
+            "the provider said: 429 too many requests",
+        );
+    });
+
+    test("applyRunFailed sets the line with 1 event, adds none for the same line, and clears with none", () => {
+        const failing = thread({ run: { busy: false } });
+
+        assert.equal(applyRunFailed(failing, "the model gave up", 10), true);
+        assert.equal(failing.run.failed, "the model gave up");
+        assert.deepEqual(failing.events, [
+            { at: 10, key: "run-failed:10", text: "run failed: the model gave up" },
+        ]);
+
+        assert.equal(applyRunFailed(failing, "the model gave up", 11), false, "the same line");
+        assert.equal(failing.events.length, 1);
+
+        assert.equal(applyRunFailed(failing, "a tool hung", 12), true, "another line");
+        assert.equal(failing.run.failed, "a tool hung");
+        assert.equal(failing.events.length, 2);
+        assert.equal(failing.events[1]?.text, "run failed: a tool hung");
+
+        assert.equal(applyRunFailed(failing, undefined, 13), false, "a clear");
+        assert.equal(Object.hasOwn(failing.run, "failed"), false);
+        assert.equal(failing.events.length, 2);
+    });
+
+    test("nextActor: an idle session's failed run waits on Odrade, after an open ask", () => {
+        assert.equal(nextActor(thread({ run: { busy: false, failed: "gave up" } })), "odrade");
+        // A session that works again is the agent's, by the normal rule.
+        assert.equal(nextActor(thread({ run: { busy: true, failed: "gave up" } })), "agent");
+        // An archived session: the field changes nothing.
+        assert.equal(
+            nextActor(thread({ run: { busy: false, archived: true, failed: "gave up" } })),
+            nextActor(thread({ run: { busy: false, archived: true } })),
+        );
+        assert.equal(
+            nextActor(
+                thread({
+                    asks: [{ id: "T1a", text: "Which?", at: 1 }],
+                    run: { busy: false, failed: "gave up" },
+                }),
+            ),
+            "brian",
+        );
+        assert.equal(
+            nextActor(thread({ origin: "plan", run: { busy: false, failed: "gave up" } })),
+            "odrade",
+        );
+        assert.equal(nextActor(thread({ origin: "plan", run: { busy: false } })), "agent");
+    });
+
+    test("odradeReason: run failed first, for a task and a plan thread; not parked, not busy", () => {
+        assert.equal(
+            odradeReason(thread({ run: { busy: false, failed: "gave up" } })),
+            "run failed: gave up",
+        );
+        assert.equal(
+            odradeReason(thread({ origin: "plan", run: { busy: false, failed: "gave up" } })),
+            "run failed: gave up",
+        );
+        assert.equal(
+            odradeReason(thread({ state: "parked", run: { busy: false, failed: "gave up" } })),
+            undefined,
+        );
+        assert.equal(odradeReason(thread({ run: { busy: true, failed: "gave up" } })), undefined);
+        // A failure outranks a due watch, in nextActor's order.
+        const due = thread({
+            run: { busy: false, failed: "gave up" },
+            watch: {
+                checkOn: "2099-01-01",
+                check: "the blob sweep",
+                setAt: 1,
+                setBy: "brian",
+                key: "watch:1",
+                dueAt: 2,
+            },
+        });
+
+        assert.equal(odradeReason(due), "run failed: gave up");
+        assert.equal(waitsText([due]), "T1: run failed: gave up");
+    });
+
+    test("a failed run holds an idle, reported thread open until it clears", () => {
+        const failing = thread({ run: { busy: false, failed: "gave up" } });
+        const held = closeCheck(failing, facts());
+
+        assert.equal(held.close, false);
+        assert.deepEqual(held.open, ["its last run failed"]);
+
+        applyRunFailed(failing, undefined, 2);
+        assert.deepEqual(closeCheck(failing, facts()), { close: true, open: [] });
+    });
+
+    test("applyConsultFailed sets the consult's line with 1 plan-thread event, and clears with none", () => {
+        const plan = thread({ id: "T9", origin: "plan" });
+        const consult: Consult = {
+            id: "k1",
+            agent: "bellonda",
+            question: "Which store?",
+            key: "consult:1",
+            nonce: "n1",
+            at: 1,
+            session: 41,
+            address: "session-k1",
+            state: "running",
+        };
+
+        assert.equal(applyConsultFailed(plan, consult, "gave up", 10), true);
+        assert.equal(consult.failed, "gave up");
+        assert.equal(consult.state, "running");
+        assert.deepEqual(plan.events, [
+            {
+                at: 10,
+                key: "consult-run-failed:k1:10",
+                text: "consult k1 (bellonda) run failed: gave up",
+            },
+        ]);
+
+        assert.equal(applyConsultFailed(plan, consult, "gave up", 11), false, "the same line");
+        assert.equal(plan.events.length, 1);
+
+        assert.equal(applyConsultFailed(plan, consult, undefined, 12), false, "a clear");
+        assert.equal(Object.hasOwn(consult, "failed"), false);
+        assert.equal(consult.state, "running");
+        assert.equal(plan.events.length, 1);
+    });
+
+    test("failedRunSupervisor: only a known session's own failed run", () => {
+        const known = (session: number) => (session === 7 ? 3 : undefined);
+
+        assert.equal(
+            failedRunSupervisor({ conversationId: 70, session: 7, outcome: "failed" }, known),
+            undefined,
+            "a subagent's run",
+        );
+        assert.equal(
+            failedRunSupervisor({ conversationId: 7, session: 7, outcome: "done" }, known),
+            undefined,
+        );
+        assert.equal(
+            failedRunSupervisor({ conversationId: 7, session: 7, outcome: "aborted" }, known),
+            undefined,
+        );
+        assert.equal(
+            failedRunSupervisor({ conversationId: 7, session: 7 }, known),
+            undefined,
+            "Pi Pocket 0.27.0 gives no outcome",
+        );
+        assert.equal(
+            failedRunSupervisor({ conversationId: 7, session: 7, outcome: "failed" }, known),
+            3,
+        );
+        assert.equal(
+            failedRunSupervisor({ conversationId: 8, session: 8, outcome: "failed" }, known),
+            undefined,
+            "an unknown session",
+        );
+    });
+});
+
 describe("reportBlocks", () => {
     test("a stop reason, BLOCKED in capitals, a blocked line, or a decision is blocked", () => {
         assert.equal(reportBlocks("anything", "blocked"), true);
@@ -2403,6 +2581,29 @@ describe("wakeParked", () => {
         assert.equal(wakeParked(thread, 1, 200), true);
         assert.equal(thread.state, "open");
         assert.equal(thread.events.at(-1)?.text, "woke: the session is idle");
+    });
+
+    test("with a key set, a new event at the 50-event cap wakes a parked thread", () => {
+        const thread = placed(deskOf(), 100);
+
+        thread.state = "parked";
+        thread.events = Array.from({ length: 50 }, (_, index) => ({
+            at: index + 1,
+            key: `old:${String(index)}`,
+            text: `event ${String(index)}`,
+        }));
+
+        const before = new Set(thread.events.map((event) => event.key));
+
+        assert.equal(wakeParked(thread, before, 200), false, "no new event: still parked");
+
+        // The list keeps 50: the new event pushes the oldest out, and the length stays.
+        applyRunFailed(thread, "gave up", 150);
+        assert.equal(thread.events.length, 50);
+
+        assert.equal(wakeParked(thread, before, 200), true);
+        assert.equal(thread.state, "open");
+        assert.equal(thread.events.at(-1)?.text, "woke: run failed: gave up");
     });
 
     test("a repair event, or a park again, never wakes a parked thread", () => {
@@ -25996,8 +26197,15 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
          * The desk module alone, with a host whose linked sessions list, send, and archive (when `archive` is not
          * false), as Pi Pocket 0.28.0's do: the same key acts once and returns the first result.
          */
-        const archiveDesk = (options: { archive?: boolean } = {}) => {
-            const listed = new Map<string, { address: string; busy: boolean; archived: boolean }>();
+        const archiveDesk = (options: { archive?: boolean; on?: boolean } = {}) => {
+            const listed = new Map<
+                string,
+                { address: string; busy: boolean; archived: boolean; failed?: string }
+            >();
+            /** The `run.ended` listeners the desk added, when `on` is true. */
+            const runEnded: ((event: object) => unknown)[] = [];
+            /** The events the desk sent to its page's tabs. */
+            const sent: string[] = [];
             const calls: { source: number; to: string; archived?: boolean; key: string }[] = [];
             const results = new Map<string, { archived: boolean; repeating: number }>();
             const control: {
@@ -26011,12 +26219,22 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
             } = {};
             /** Each list read: the archived state of each address, as that read gave it. */
             const reads: Record<string, boolean>[] = [];
+            /** The desk's routes, by "METHOD path". */
+            const routes = new Map<string, (request: object) => Promise<unknown>>();
             const stubWeb = {
                 conversationRoute() {},
-                route() {},
+                route(
+                    method: string,
+                    path: string,
+                    handler: (request: object) => Promise<unknown>,
+                ) {
+                    routes.set(`${method} ${path}`, handler);
+                },
                 client() {},
                 command() {},
-                send() {},
+                send(event: string) {
+                    sent.push(event);
+                },
                 onDispose() {},
                 error: (status: number, message: string) =>
                     Object.assign(new Error(message), { status }),
@@ -26086,6 +26304,17 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
                     },
                     ...(options.archive === false ? {} : { archive }),
                 },
+                ...(options.on === true
+                    ? {
+                          on: (event: string, listener: (data: object) => unknown) => {
+                              if (event === "run.ended") {
+                                  runEnded.push(listener);
+                              }
+
+                              return () => {};
+                          },
+                      }
+                    : {}),
             };
             const shared = globalThis as unknown as Record<symbol, unknown>;
             const saved = shared[Symbol.for("pi-pocket-team.desk")];
@@ -26125,6 +26354,18 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
 
             return {
                 listed,
+                runEnded,
+                sent,
+                /** A page's `GET threads`: its view sweep, then the view. */
+                view: () =>
+                    routes.get("GET threads")!({
+                        snapshot: (...rest: unknown[]) =>
+                            Reflect.apply(app.harness.snapshot, app.harness, rest),
+                        commit: (change: never) => app.harness.commit(change, context),
+                        context,
+                        params: {},
+                        query: new URLSearchParams(),
+                    }),
                 calls,
                 reads,
                 archive,
@@ -26203,6 +26444,351 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
         };
 
         const threadOf = async (id: string) => (await deskState())?.threads[id];
+
+        test("a sync records a session's failed run, waits on Odrade, and clears it; the listener only prompts", async () => {
+            const stub = archiveDesk({ on: true });
+
+            // The digest on: its queue records the reason.
+            writeFileSync(configPath, JSON.stringify({ digest: { minutes: 15 }, cap: 100 }));
+
+            try {
+                const source = await supervisor("failed-run");
+                const session = await conversation();
+
+                made += 1;
+
+                const address = `session-failed-${String(made)}`;
+                let id = "";
+
+                await app.harness.commit(async (tx) => {
+                    const state = await tx.doc(DeskThreads);
+                    const opened = openThread(state, {
+                        key: `x.test.failed:${String(made)}:${String(Date.now())}`,
+                        supervisor: Number(source),
+                        agents: ["duncan"],
+                        title: "failed run test",
+                        at: Date.now() - 1000,
+                    }).thread;
+                    const stored = state.threads[opened.id]!;
+
+                    id = opened.id;
+                    stored.session = session;
+                    stored.address = address;
+                    stored.state = "open";
+                    stored.run = { busy: false };
+                    delete stored.cwd;
+                }, context);
+                stub.listed.set(address, {
+                    address,
+                    busy: false,
+                    archived: false,
+                    failed: "the provider\nrefused",
+                });
+
+                // A thread closed as done an hour ago: the sweep copies the fact, with no event, as `busy`.
+                const done = await closedThread(source, stub, 3600_000);
+
+                stub.listed.set(done.address, {
+                    address: done.address,
+                    busy: false,
+                    archived: false,
+                    failed: "out of credit",
+                });
+
+                await stub.sync(source);
+
+                const closedFailing = await threadOf(done.id);
+
+                assert.equal(closedFailing?.state, "closed");
+                assert.equal(closedFailing?.run.failed, "out of credit");
+                assert.equal(
+                    closedFailing?.events.some((each) => each.text.startsWith("run failed")),
+                    false,
+                    "a closed thread's copy adds no event",
+                );
+
+                const failing = await threadOf(id);
+
+                assert.equal(failing?.run.failed, "the provider refused");
+                assert.equal(
+                    failing?.events.filter(
+                        (each) => each.text === "run failed: the provider refused",
+                    ).length,
+                    1,
+                );
+                assert.equal(nextActor(failing!), "odrade");
+                assert.equal(odradeReason(failing!), "run failed: the provider refused");
+                assert.equal(
+                    (await deskState())?.digests?.[String(source)]?.queued[id],
+                    "run failed: the provider refused",
+                    "the digest queue's reason",
+                );
+
+                // A page view a moment after the sync does not sweep: the threads are fresh.
+                stub.listed.set(address, {
+                    address,
+                    busy: false,
+                    archived: false,
+                    failed: "a tool hung",
+                });
+                await stub.view();
+                assert.equal((await threadOf(id))?.run.failed, "the provider refused");
+
+                // The listener: a subagent's run sends nothing; the session's own failed run prompts the page once.
+                assert.equal(stub.runEnded.length, 1);
+
+                const before = stub.sent.length;
+
+                stub.runEnded[0]!({ conversationId: session + 1000, session, outcome: "failed" });
+                assert.equal(stub.sent.length, before, "a subagent's run sends nothing");
+                stub.runEnded[0]!({ conversationId: session, session, outcome: "failed" });
+                assert.deepEqual(stub.sent.slice(before), ["changed"]);
+
+                // The prompted supervisor is due at once: the next page view sweeps, past the freshness wait.
+                await stub.view();
+                assert.equal((await threadOf(id))?.run.failed, "a tool hung");
+
+                // The next list has no failure: the field goes, with no event.
+                stub.listed.set(address, { address, busy: false, archived: false });
+                stub.listed.set(done.address, {
+                    address: done.address,
+                    busy: false,
+                    archived: false,
+                });
+                await stub.sync(source);
+
+                const closedCleared = await threadOf(done.id);
+
+                assert.equal(Object.hasOwn(closedCleared!.run, "failed"), false);
+                assert.equal(
+                    closedCleared?.events.some((each) => each.text.startsWith("run failed")),
+                    false,
+                );
+
+                const cleared = await threadOf(id);
+
+                assert.equal(Object.hasOwn(cleared!.run, "failed"), false);
+                assert.deepEqual(
+                    cleared?.events
+                        .filter((each) => each.text.startsWith("run failed"))
+                        .map((each) => each.text),
+                    ["run failed: the provider refused", "run failed: a tool hung"],
+                    "the clear adds no event",
+                );
+            } finally {
+                stub.restore();
+                writeFileSync(configPath, JSON.stringify({ digest: { minutes: 0 }, cap: 100 }));
+            }
+        });
+
+        test("a sync wakes a parked thread with 50 events on its failed run", async () => {
+            const stub = archiveDesk();
+
+            try {
+                const source = await supervisor("failed-parked");
+                const session = await conversation();
+
+                made += 1;
+
+                const address = `session-parked-${String(made)}`;
+                let id = "";
+
+                await app.harness.commit(async (tx) => {
+                    const state = await tx.doc(DeskThreads);
+                    const opened = openThread(state, {
+                        key: `x.test.failed-parked:${String(made)}:${String(Date.now())}`,
+                        supervisor: Number(source),
+                        agents: ["duncan"],
+                        title: "failed parked test",
+                        at: Date.now() - 1000,
+                    }).thread;
+                    const stored = state.threads[opened.id]!;
+
+                    id = opened.id;
+                    stored.session = session;
+                    stored.address = address;
+                    stored.state = "parked";
+                    stored.run = { busy: false, archived: false };
+                    stored.events = Array.from({ length: 50 }, (_, index) => ({
+                        at: index + 1,
+                        key: `old:${String(index)}`,
+                        text: `event ${String(index)}`,
+                    }));
+                    delete stored.cwd;
+                }, context);
+                stub.listed.set(address, {
+                    address,
+                    busy: false,
+                    archived: false,
+                    failed: "the provider refused",
+                });
+
+                await stub.sync(source);
+
+                const woken = await threadOf(id);
+
+                assert.equal(woken?.state, "open");
+                assert.equal(
+                    woken?.events.some(
+                        (each) => each.text === "woke: run failed: the provider refused",
+                    ),
+                    true,
+                );
+                assert.equal(odradeReason(woken!), "run failed: the provider refused");
+            } finally {
+                stub.restore();
+            }
+        });
+
+        test("a sync that finds a session whose run failed gives the found thread run failed", async () => {
+            const stub = archiveDesk();
+
+            try {
+                const source = await supervisor("failed-found");
+
+                // The first sweep records the baseline: a session there before it is no found work.
+                await stub.sync(source);
+                made += 1;
+
+                const address = `session-found-${String(made)}`;
+
+                stub.listed.set(address, {
+                    address,
+                    busy: false,
+                    archived: false,
+                    failed: "the model\nrefused",
+                });
+
+                await stub.sync(source);
+
+                const found = Object.values((await deskState())?.threads ?? {}).find(
+                    (each) => each.key === `found:session:${address}`,
+                );
+
+                assert(found !== undefined, "the sweep found the session");
+                assert.equal(found.run.failed, "the model refused");
+                assert.equal(
+                    found.events.some((each) => each.text === "run failed: the model refused"),
+                    true,
+                );
+                assert.equal(odradeReason(found), "run failed: the model refused");
+            } finally {
+                stub.restore();
+            }
+        });
+
+        test("a sync records a consult session's failed run on the consult and the plan thread; the listener prompts for it", async () => {
+            const stub = archiveDesk({ on: true });
+
+            try {
+                const source = await supervisor("failed-consult");
+                const planSession = await conversation();
+                const consultSession = await conversation();
+
+                made += 1;
+
+                const planAddress = `session-plan-${String(made)}`;
+                const consultAddress = `session-consult-${String(made)}`;
+                let id = "";
+
+                await app.harness.commit(async (tx) => {
+                    const state = await tx.doc(DeskThreads);
+                    const text = initialPlanText(
+                        "T1",
+                        "failed consult",
+                        "A consult whose run fails.",
+                    );
+                    const opened = openThread(state, {
+                        key: `x.test.failed-consult:${String(made)}:${String(Date.now())}`,
+                        supervisor: Number(source),
+                        agents: [],
+                        title: "failed consult",
+                        at: Date.now() - 1000,
+                        plan: {
+                            start: {
+                                idea: "A consult whose run fails.",
+                                lead: "lucilla",
+                                root: join(root, "plans-failed-consult"),
+                                text,
+                                rev: gitBlobSha(text),
+                            },
+                        },
+                    }).thread;
+                    const stored = state.threads[opened.id]!;
+                    const plan = state.plans![opened.id]!;
+
+                    id = opened.id;
+                    stored.state = "open";
+                    stored.session = planSession;
+                    stored.address = planAddress;
+                    stored.run = { busy: true };
+                    delete plan.pending;
+                    plan.consults = [
+                        {
+                            id: "k1",
+                            agent: "bellonda",
+                            question: "Which store?",
+                            key: `consult:${String(made)}`,
+                            nonce: "0".repeat(31) + "1",
+                            at: Date.now(),
+                            session: consultSession,
+                            address: consultAddress,
+                            state: "running",
+                        },
+                    ];
+                }, context);
+                stub.listed.set(planAddress, { address: planAddress, busy: true, archived: false });
+                stub.listed.set(consultAddress, {
+                    address: consultAddress,
+                    busy: false,
+                    archived: false,
+                    failed: "the model\nrefused",
+                });
+
+                await stub.sync(source);
+
+                const consultOf = async () => (await deskState())?.plans?.[id]?.consults[0];
+                const failing = await consultOf();
+                const consultEvents = async () =>
+                    (await threadOf(id))?.events
+                        .filter((each) => each.key.startsWith("consult-run-failed:"))
+                        .map((each) => each.text);
+
+                assert.equal(failing?.failed, "the model refused");
+                assert.equal(failing?.state, "running");
+                assert.deepEqual(await consultEvents(), [
+                    "consult k1 (bellonda) run failed: the model refused",
+                ]);
+
+                // The listener knows the consult's session: its own failed run prompts the page once.
+                const before = stub.sent.length;
+
+                stub.runEnded[0]!({
+                    conversationId: consultSession,
+                    session: consultSession,
+                    outcome: "failed",
+                });
+                assert.deepEqual(stub.sent.slice(before), ["changed"]);
+
+                // The next list has no failure: the field goes, with no event, and the state stays.
+                stub.listed.set(consultAddress, {
+                    address: consultAddress,
+                    busy: false,
+                    archived: false,
+                });
+                await stub.sync(source);
+
+                const cleared = await consultOf();
+
+                assert.equal(Object.hasOwn(cleared!, "failed"), false);
+                assert.equal(cleared?.state, "running");
+                assert.deepEqual(await consultEvents(), [
+                    "consult k1 (bellonda) run failed: the model refused",
+                ]);
+            } finally {
+                stub.restore();
+            }
+        });
 
         test("the first auto pass sets since and archives nothing; a thread closed before since stays", async () => {
             const stub = archiveDesk();
