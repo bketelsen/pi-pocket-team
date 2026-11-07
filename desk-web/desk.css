@@ -1506,3 +1506,140 @@
     min-width: 0;
     overflow-wrap: anywhere;
 }
+
+/* ─── The Board (the goal board) ────────────────────────────────────────── */
+
+.board-page {
+    overflow-wrap: anywhere;
+}
+
+/* The header wraps on a phone: the title keeps its word, the limits and Launch picks go below it. */
+.board-page .board-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 4px 12px;
+}
+
+.board-page .board-head h1 {
+    flex: none;
+    overflow-wrap: normal;
+}
+
+.board-page .board-head .board-limits {
+    flex: 1 1 220px;
+    margin: 0;
+}
+
+.board-row-head > span {
+    display: block;
+}
+
+.board-head .board-supervisor {
+    display: block;
+    width: 100%;
+    box-sizing: border-box;
+    margin-top: 8px;
+}
+
+.board-rows {
+    margin: 12px 0 0;
+    padding: 0;
+    list-style: none;
+}
+
+.board-row {
+    margin: 0 0 10px;
+    padding: 10px 12px;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    background: var(--card);
+}
+
+.board-row.board-picked {
+    border-color: var(--accent);
+}
+
+.board-row.board-failed,
+.board-row.board-unknown {
+    border-color: var(--err);
+}
+
+.board-row.board-launched {
+    border-color: var(--ok);
+}
+
+.board-row-head {
+    display: flex;
+    flex-direction: column;
+    /* Pocket centres a button's content: a row's lines start at its left edge, each the row's full width. */
+    align-items: stretch;
+    justify-content: flex-start;
+    gap: 2px;
+    width: 100%;
+    padding: 0;
+    border: 0;
+    background: none;
+    color: var(--text);
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+}
+
+.board-row-head:focus-visible,
+.board-page button:focus-visible,
+.board-page select:focus-visible,
+.board-page input:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+}
+
+.board-title {
+    font-weight: 600;
+}
+
+.board-state {
+    color: var(--muted);
+}
+
+.board-failed .board-state,
+.board-unknown .board-state {
+    color: var(--err);
+}
+
+.board-detail {
+    margin: 8px 0 0;
+}
+
+.board-detail dt {
+    color: var(--muted);
+    font-size: 12px;
+}
+
+.board-detail dd {
+    margin: 0 0 6px;
+    white-space: pre-wrap;
+}
+
+.board-form {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin-top: 8px;
+}
+
+.board-field {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.board-field .desk-reason {
+    flex: none;
+    width: 100%;
+    box-sizing: border-box;
+}
+
+.board-notice {
+    margin: 8px 0 0;
+}

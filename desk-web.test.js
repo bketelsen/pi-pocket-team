@@ -96,6 +96,19 @@ import {
     withOwner,
     withRepo,
 } from "./desk-web/dashboard.js";
+import {
+    actBody,
+    boardAct,
+    boardController,
+    boardKeyFor,
+    boardMarkup,
+    boardPath,
+    launchBody,
+    limitsText,
+    makeBoard,
+    rowActs,
+    rowStateText,
+} from "./desk-web/board.js";
 
 const NOW = Date.now();
 
@@ -1524,12 +1537,18 @@ test("a 409 on the plan's Drop loads the plan again, and the error says so and s
 
 // ─── The Dashboard view's helpers ────────────────────────────────────────────
 
-test("the operational view is the default: the page opens on Desk, with the Dashboard 1 tap away", async () => {
+test("the operational view is the default: the page opens on Desk, with the Dashboard and the Board 1 tap away", async () => {
     const out = await render(viewWith(null));
 
     assert.match(out, /role="group" aria-label="Desk view"/);
     assert.match(out, /data-tab="desk" aria-pressed=true onClick=\[fn\] > Desk </);
     assert.match(out, /data-tab="dashboard" aria-pressed=false onClick=\[fn\] > Dashboard </);
+    assert.match(out, /data-tab="board" aria-pressed=false onClick=\[fn\] > Board </);
+    assert.deepEqual(
+        [...out.matchAll(/data-tab="([a-z]+)"/g)].map((match) => match[1]),
+        ["desk", "dashboard", "board"],
+        "Board is the third tab",
+    );
     assert.match(out, /<h1>Desk<\/h1>/);
     assert.doesNotMatch(out, /dash-controls/);
 });
@@ -2839,4 +2858,682 @@ test("an app with no panels adds none, and the page still draws", async () => {
     });
 
     assert.match(out, /Plans <span class="desk-count">0/);
+});
+
+// ─── The Board view (the goal board) ─────────────────────────────────────────
+
+const LIMITS_LINE = "8 at once, 3 running · cap 16, 9 count, 2 kept free · 120 of 250 rounds today";
+
+/** 1 board row as `GET board` gives it. */
+const boardRow = (patch = {}) => ({
+    id: 1,
+    rev: 1,
+    state: "proposed",
+    agent: "teg",
+    repo: "frostyard/teg",
+    title: "Tend teg",
+    task: "Fix the flaky tests.",
+    stopWhen: "CI is green",
+    max: 20,
+    until: "06:45",
+    kind: "goal",
+    order: 10,
+    by: "teg",
+    attempts: [],
+    ...patch,
+});
+
+/** A board of supervisor 7, in launch order: 1 row in each state the page acts on, and 1 launched. */
+const boardAnswer = (rows) => ({
+    supervisors: [7],
+    supervisor: 7,
+    rows: rows ?? [
+        boardRow({ id: 3, rev: 2, title: "Row three", note: "first", order: 5 }),
+        boardRow({ id: 1, rev: 1, state: "picked", title: "Row one", kind: "sweep" }),
+        boardRow({ id: 4, rev: 3, state: "waiting", title: "Row four", order: 40 }),
+        boardRow({
+            id: 5,
+            rev: 1,
+            state: "failed",
+            title: "Row five",
+            error: "over the day's round budget",
+            order: 50,
+        }),
+        boardRow({
+            id: 6,
+            rev: 4,
+            state: "unknown",
+            title: "Row six",
+            error: "it threw",
+            order: 60,
+        }),
+        boardRow({
+            id: 7,
+            rev: 1,
+            state: "launched",
+            title: "Row seven",
+            thread: "T12",
+            next: "agent",
+            order: 70,
+        }),
+        boardRow({ id: 8, rev: 2, state: "picked", title: "Row eight", order: 80 }),
+    ],
+    limits: {
+        line: LIMITS_LINE,
+        atOnce: 8,
+        running: 3,
+        cap: 16,
+        counted: 9,
+        reserve: 2,
+        rounds: 120,
+        roundsMax: 250,
+    },
+});
+
+/** `html` that keeps each handler, so a test can tap a button by its `data-act`. */
+const tapHtml = () => {
+    const handlers = [];
+    const flat = (value) =>
+        Array.isArray(value)
+            ? value.map(flat).join("")
+            : typeof value === "function"
+              ? `[fn${String(handlers.push(value) - 1)}]`
+              : value === null || value === undefined
+                ? ""
+                : String(value);
+    const tag = (strings, ...values) =>
+        strings.reduce(
+            (out, text, index) => out + text + (index < values.length ? flat(values[index]) : ""),
+            "",
+        );
+
+    return { tag, handlers };
+};
+
+/** The markup of the controller's view now, and a tap on the button whose `data-act` is `act`. */
+const boardScreen = (ctl) => {
+    const { tag, handlers } = tapHtml();
+    const out = boardMarkup(tag, ctl.view(), ctl).replace(/\s+/g, " ");
+
+    return {
+        out,
+        tap: (act) => {
+            const found = new RegExp(`data-act="?${act}"? [^>]*?onClick=\\[fn(\\d+)\\]`).exec(out);
+
+            assert(found !== null, `a button ${act} in: ${out}`);
+
+            return handlers[Number(found[1])]();
+        },
+        has: (act) => new RegExp(`data-act="?${act}"? `).test(out),
+    };
+};
+
+/** A fake `pocket.api` for the board: `board` answers the GET, `post` each POST (a value, an Error, or a function). */
+const boardApi = ({
+    board = boardAnswer(),
+    post = (body) => ({ ...boardAnswer(), pass: [], body }),
+} = {}) => {
+    const calls = [];
+
+    return {
+        calls,
+        posts: () => calls.filter((call) => call[0] === "POST"),
+        call: async (path, body) => {
+            calls.push(body === undefined ? ["GET", path] : ["POST", path, body]);
+
+            if (body === undefined) {
+                return typeof board === "function" ? board() : board;
+            }
+
+            const answer = typeof post === "function" ? await post(body) : post;
+
+            if (answer instanceof Error) {
+                throw answer;
+            }
+
+            return answer;
+        },
+    };
+};
+
+/** Keys k1, k2, … in the order they are made. */
+const keyMaker = () => {
+    let made = 0;
+
+    return () => `key-000${String((made += 1))}`;
+};
+
+/** A loaded controller on a fake API. */
+const loadedBoard = async (api) => {
+    const ctl = boardController(api.call, { make: keyMaker() });
+
+    await ctl.load();
+
+    return ctl;
+};
+
+test("Board: the rows in launch order, with the limits line, each with its facts, note, state and rev", async () => {
+    const api = boardApi();
+    const ctl = await loadedBoard(api);
+    const { out } = boardScreen(ctl);
+
+    assert.deepEqual(api.calls, [["GET", "board"]]);
+    assert.match(out, /<h1>Board<\/h1>/);
+    assert.ok(out.includes(LIMITS_LINE), "the limits line");
+
+    const order = [
+        "#3 Row three",
+        "#1 Row one",
+        "#4 Row four",
+        "#5 Row five",
+        "#6 Row six",
+        "#7 Row seven",
+        "#8 Row eight",
+    ].map((title) => out.indexOf(title));
+
+    assert(
+        order.every((at) => at >= 0),
+        JSON.stringify(order),
+    );
+    assert.deepEqual(
+        order,
+        [...order].sort((a, b) => a - b),
+        "the rows in the answer's order",
+    );
+    assert.ok(out.includes("teg frostyard/teg · goal · max 20 · until 06:45"));
+    assert.ok(out.includes("teg frostyard/teg · sweep · max 20 · until 06:45"));
+    assert.ok(out.includes("Note: first"));
+    assert.ok(out.includes("proposed · rev 2"));
+    assert.ok(out.includes("launched · rev 1 · T12 (next: agent)"));
+    assert.ok(out.includes("failed · rev 1 · error: over the day's round budget"));
+    assert.ok(out.includes("unknown · rev 4 · error: it threw"));
+    assert.doesNotMatch(out, /Task<\/dt>/, "the task is closed until a tap");
+});
+
+test("Board: a tap on a row opens its task, objective and stop condition", async () => {
+    const ctl = await loadedBoard(
+        boardApi({ board: boardAnswer([boardRow({ id: 3, objective: "Keep CI green." })]) }),
+    );
+
+    boardScreen(ctl).tap("open:3");
+
+    const { out } = boardScreen(ctl);
+
+    assert.match(out, /aria-expanded=true/);
+    assert.match(out, /<dt>Task<\/dt> <dd>Fix the flaky tests\.<\/dd>/);
+    assert.match(out, /<dt>Objective<\/dt><dd>Keep CI green\.<\/dd>/);
+    assert.match(out, /<dt>Stop when<\/dt> <dd>CI is green<\/dd>/);
+});
+
+test("Board: each state shows its acts: proposed pick, edit, drop; picked unpick, edit, drop; waiting drop; failed reopen; unknown resolve", () => {
+    const ops = (state) => rowActs({ state }).map((act) => act.op);
+
+    assert.deepEqual(ops("proposed"), ["pick", "edit", "drop"]);
+    assert.deepEqual(ops("picked"), ["unpick", "edit", "drop"]);
+    assert.deepEqual(ops("waiting"), ["drop"]);
+    assert.deepEqual(ops("failed"), ["reopen"]);
+    assert.deepEqual(ops("unknown"), ["resolve"]);
+    assert.deepEqual(ops("starting"), []);
+    assert.deepEqual(ops("launched"), []);
+    assert.deepEqual(ops("dropped"), []);
+});
+
+test("Board: Pick, Unpick, Drop and Reopen each post once, with the rev the page shows and 1 key", async () => {
+    const cases = [
+        ["pick:3", { op: "pick", rows: [{ row: 3, rev: 2 }] }],
+        ["unpick:1", { op: "unpick", rows: [{ row: 1, rev: 1 }] }],
+        ["drop:4", { op: "drop", row: 4, rev: 3 }],
+        ["drop:3", { op: "drop", row: 3, rev: 2 }],
+        ["reopen:5", { op: "reopen", row: 5, rev: 1 }],
+    ];
+
+    for (const [act, body] of cases) {
+        const api = boardApi();
+        const ctl = await loadedBoard(api);
+
+        await boardScreen(ctl).tap(act);
+
+        assert.deepEqual(api.posts(), [["POST", "board/7", { ...body, key: "key-0001" }]], act);
+    }
+});
+
+test("Board: Edit changes only max and until, and posts once with the shown rev", async () => {
+    const api = boardApi();
+    const ctl = await loadedBoard(api);
+
+    await boardScreen(ctl).tap("edit:3");
+    assert.equal(api.posts().length, 0, "Edit opens the form; it posts nothing");
+
+    const form = boardScreen(ctl).out;
+
+    assert.match(form, /value=20/);
+    assert.match(form, /value=06:45/);
+    ctl.editField("max", "12");
+    ctl.editField("until", "07:30");
+    await boardScreen(ctl).tap("save:3");
+
+    assert.deepEqual(api.posts(), [
+        [
+            "POST",
+            "board/7",
+            { op: "edit", row: 3, rev: 2, fields: { max: 12, until: "07:30" }, key: "key-0001" },
+        ],
+    ]);
+    assert.equal(ctl.view().editing, null, "a done edit closes the form");
+});
+
+test("Board: Resolve binds a thread, or fails the row; each posts once with the shown rev", async () => {
+    const bind = boardApi();
+    const ctl = await loadedBoard(bind);
+
+    await boardScreen(ctl).tap("resolve:6");
+    assert.equal(bind.posts().length, 0, "Resolve opens the form");
+    ctl.resolveField(" T12 ");
+    await boardScreen(ctl).tap("bind:6");
+    assert.deepEqual(bind.posts(), [
+        ["POST", "board/7", { op: "resolve", row: 6, rev: 4, thread: "T12", key: "key-0001" }],
+    ]);
+
+    const fail = boardApi();
+    const other = await loadedBoard(fail);
+
+    await boardScreen(other).tap("resolve:6");
+    await boardScreen(other).tap("fail:6");
+    assert.deepEqual(fail.posts(), [
+        ["POST", "board/7", { op: "resolve", row: 6, rev: 4, key: "key-0001" }],
+    ]);
+});
+
+test("Board: Launch picks posts once, with every picked row and its shown rev; it is off with no pick", async () => {
+    const api = boardApi();
+    const ctl = await loadedBoard(api);
+    const screen = boardScreen(ctl);
+
+    assert.match(screen.out, /data-act="launch" disabled=false/);
+    assert.match(screen.out, /Launch picks \(2\)/);
+    await screen.tap("launch");
+    assert.deepEqual(api.posts(), [
+        [
+            "POST",
+            "board/7",
+            {
+                op: "launch",
+                rows: [
+                    { row: 1, rev: 1 },
+                    { row: 8, rev: 2 },
+                ],
+                key: "key-0001",
+            },
+        ],
+    ]);
+
+    const none = await loadedBoard(boardApi({ board: boardAnswer([boardRow({ id: 3 })]) }));
+
+    assert.match(boardScreen(none).out, /data-act="launch" disabled=true/);
+    assert.equal(launchBody([boardRow()]), null);
+    await none.launch();
+});
+
+test("Board: a second tap while the act runs posts nothing; a failed act keeps its key; a done act gets a new key", async () => {
+    let open;
+    let answer;
+    const api = boardApi({
+        post: () =>
+            new Promise((resolve) => {
+                open = resolve;
+            }).then(() => answer),
+    });
+    const ctl = await loadedBoard(api);
+    const first = boardScreen(ctl).tap("pick:3");
+
+    assert.match(boardScreen(ctl).out, /data-act=pick:3 disabled=true/);
+    // Not awaited: with no guard, this second act would wait on its own post.
+    void ctl.act(actBody(boardAnswer().rows[0], "pick"));
+    assert.equal(api.posts().length, 1, "1 post while the act runs");
+    answer = Object.assign(new Error("The desk did not answer."), { status: 502 });
+    open();
+    await first;
+    assert.match(boardScreen(ctl).out, /error-box" role="alert">The desk did not answer\./);
+
+    const again = boardScreen(ctl).tap("pick:3");
+
+    answer = { ...boardAnswer(), pass: [] };
+    open();
+    await again;
+
+    const third = boardScreen(ctl).tap("pick:3");
+
+    open();
+    await third;
+    assert.deepEqual(
+        api.posts().map((call) => call[2].key),
+        ["key-0001", "key-0001", "key-0002"],
+    );
+});
+
+test("Board: a 409 shows its message and loads the board again", async () => {
+    const newer = boardAnswer([boardRow({ id: 3, rev: 5, title: "Row three, changed" })]);
+    let reads = 0;
+    const api = boardApi({
+        board: () => {
+            reads += 1;
+
+            return reads === 1 ? boardAnswer() : newer;
+        },
+        post: conflict("Row 3 changed (rev 5 now): read it with desk board, then pick again."),
+    });
+    const ctl = await loadedBoard(api);
+
+    await boardScreen(ctl).tap("pick:3");
+    assert.deepEqual(api.calls, [
+        ["GET", "board"],
+        ["POST", "board/7", { op: "pick", rows: [{ row: 3, rev: 2 }], key: "key-0001" }],
+        ["GET", "board"],
+    ]);
+
+    const { out } = boardScreen(ctl);
+
+    assert.ok(
+        out.includes(
+            "Row 3 changed (rev 5 now): read it with desk board, then pick again. The board is loaded again.",
+        ),
+    );
+    assert.ok(out.includes("Row three, changed"));
+    assert.ok(out.includes("proposed · rev 5"));
+});
+
+test("boardAct: a 409 loads again and the error says so; another error only shows; success gives the answer", async () => {
+    const stale = fakeApi({
+        "board/7": conflict("Row 3 is waiting: pick takes a proposed row."),
+        board: { rows: [] },
+    });
+
+    assert.deepEqual(await boardAct(stale.call, () => stale.call("board"), 7, { op: "pick" }), {
+        ok: false,
+        error: "Row 3 is waiting: pick takes a proposed row. The board is loaded again.",
+        reloaded: { rows: [] },
+    });
+    assert.deepEqual(stale.calls, [
+        ["POST", "board/7", { op: "pick" }],
+        ["GET", "board"],
+    ]);
+
+    const bad = fakeApi({
+        "board/7": Object.assign(new Error("max must be 1 to 100."), { status: 400 }),
+    });
+
+    assert.deepEqual(await boardAct(bad.call, () => bad.call("board"), 7, { op: "edit" }), {
+        ok: false,
+        error: "max must be 1 to 100.",
+    });
+    assert.equal(bad.calls.length, 1, "a 400 loads nothing");
+
+    const ok = fakeApi({ "board/7": { rows: [1] } });
+
+    assert.deepEqual(await boardAct(ok.call, () => ok.call("board"), 7, { op: "drop" }), {
+        ok: true,
+        answer: { rows: [1] },
+    });
+});
+
+test("Board: the supervisor choice shows with more than 1 supervisor, and reads that board", async () => {
+    const api = boardApi({ board: { ...boardAnswer(), supervisors: [7, 9] } });
+    const ctl = await loadedBoard(api);
+
+    assert.match(boardScreen(ctl).out, /<option value=9>Supervisor conversation 9<\/option>/);
+    await ctl.choose(9);
+    assert.deepEqual(api.calls.at(-1), ["GET", "board?supervisor=9"]);
+    assert.equal(boardPath(null), "board");
+
+    const single = await loadedBoard(boardApi());
+
+    assert.doesNotMatch(boardScreen(single).out, /<select/);
+});
+
+test("Board: with no supervisor, 1 line says so, and no act posts", async () => {
+    const api = boardApi({ board: { supervisors: [], supervisor: null, rows: [], limits: null } });
+    const ctl = await loadedBoard(api);
+
+    assert.ok(boardScreen(ctl).out.includes("The desk knows no supervisor yet"));
+    assert.equal(limitsText({ supervisor: 7, limits: { line: LIMITS_LINE } }), LIMITS_LINE);
+    await ctl.act({ op: "launch", rows: [{ row: 1, rev: 1 }] });
+    assert.equal(api.posts().length, 0);
+});
+
+test("Board keys and texts: 1 key per act, another rev is another act; the state line", () => {
+    const keys = {};
+    const make = keyMaker();
+    const body = actBody(boardRow({ id: 3, rev: 2 }), "drop");
+
+    assert.equal(boardKeyFor(keys, 7, body, make), "key-0001");
+    assert.equal(boardKeyFor(keys, 7, body, make), "key-0001");
+    assert.equal(
+        boardKeyFor(keys, 7, actBody(boardRow({ id: 3, rev: 3 }), "drop"), make),
+        "key-0002",
+    );
+    assert.equal(rowStateText(boardRow({ state: "waiting", rev: 4 })), "waiting · rev 4");
+    assert.deepEqual(actBody(boardRow(), "edit", { max: "x", until: "6" }).fields, {
+        max: "x",
+        until: "6",
+    });
+});
+
+test("makeBoard: the view reads at once, reads again on changed, and stops listening when it unmounts", async () => {
+    const reads = [];
+    const listeners = [];
+    const offs = [];
+    const cleanups = [];
+    const disposes = [];
+    const { tag } = tapHtml();
+    const Board = makeBoard({
+        html: tag,
+        useState: (value) => [value, () => {}],
+        useRef: () => ({ current: null }),
+        useEffect: (effect) => cleanups.push(effect()),
+        api: async (path) => {
+            reads.push(path);
+
+            return boardAnswer();
+        },
+        on: (event, listener) => {
+            listeners.push([event, listener]);
+
+            return () => offs.push(event);
+        },
+        onDispose: (dispose) => disposes.push(dispose),
+    });
+
+    assert.equal(disposes.length, 1, "1 dispose for the module");
+    assert.match(Board(), /Loading the board/);
+    assert.deepEqual(reads, ["board"]);
+    assert.deepEqual(
+        listeners.map(([event]) => event),
+        ["changed"],
+    );
+    listeners[0][1]();
+    assert.deepEqual(reads, ["board", "board"]);
+    cleanups[0]();
+    assert.deepEqual(offs, ["changed"], "the listener goes with the view");
+});
+
+test("Board: Edit and Resolve post the rev their form opened on, also after a reload gave a newer rev", async () => {
+    /** A board whose rows move to a newer rev at each read after the first. */
+    const moving = () => {
+        let reads = 0;
+
+        return boardApi({
+            board: () => {
+                reads += 1;
+
+                return boardAnswer([
+                    boardRow({ id: 3, rev: reads === 1 ? 1 : 2, title: "Row three" }),
+                    boardRow({
+                        id: 6,
+                        rev: reads === 1 ? 4 : 5,
+                        state: "unknown",
+                        title: "Row six",
+                    }),
+                ]);
+            },
+        });
+    };
+
+    const edits = moving();
+    const ctl = await loadedBoard(edits);
+
+    await boardScreen(ctl).tap("edit:3");
+    ctl.editField("max", "9");
+    // A `changed` event reads the board again while the form is open: row 3 is rev 2 now.
+    await ctl.load();
+    assert.ok(boardScreen(ctl).out.includes("proposed · rev 2"));
+    await boardScreen(ctl).tap("save:3");
+    assert.deepEqual(edits.posts(), [
+        [
+            "POST",
+            "board/7",
+            { op: "edit", row: 3, rev: 1, fields: { max: 9, until: "06:45" }, key: "key-0001" },
+        ],
+    ]);
+
+    const resolves = moving();
+    const other = await loadedBoard(resolves);
+
+    await boardScreen(other).tap("resolve:6");
+    await other.load();
+    assert.ok(boardScreen(other).out.includes("unknown · rev 5"));
+    other.resolveField("T12");
+    await boardScreen(other).tap("bind:6");
+    assert.deepEqual(resolves.posts(), [
+        ["POST", "board/7", { op: "resolve", row: 6, rev: 4, thread: "T12", key: "key-0001" }],
+    ]);
+});
+
+test("Board: a POST answer for supervisor A that comes after the choice of B changes nothing on B's board", async () => {
+    const pending = [];
+    const calls = [];
+
+    const api = (path, body) => {
+        calls.push(body === undefined ? ["GET", path] : ["POST", path, body]);
+
+        return new Promise((resolve) => {
+            pending.push({ path, resolve });
+        });
+    };
+
+    /** End the pending call for `path` with `answer`, then let the controller take it. */
+    const answer = async (path, value) => {
+        const at = pending.findIndex((each) => each.path === path);
+
+        assert(at >= 0, `a pending ${path}`);
+        pending.splice(at, 1)[0].resolve(value);
+        await new Promise((resolve) => setImmediate(resolve));
+    };
+
+    const boardA = {
+        ...boardAnswer([boardRow({ id: 3, rev: 1, title: "A row" })]),
+        supervisors: [7, 9],
+    };
+    const boardB = {
+        ...boardAnswer([boardRow({ id: 30, rev: 1, title: "B row" })]),
+        supervisors: [7, 9],
+        supervisor: 9,
+    };
+    const ctl = boardController(api, { make: keyMaker() });
+    const loaded = ctl.load();
+
+    await answer("board", boardA);
+    await loaded;
+
+    const acting = boardScreen(ctl).tap("pick:3");
+
+    assert.match(boardScreen(ctl).out, /aria-label="The supervisor's board" value=7 disabled=true/);
+
+    const choosing = ctl.choose(9);
+
+    assert.match(boardScreen(ctl).out, /data-act="launch" disabled=true/, "no act while B loads");
+    await answer("board?supervisor=9", boardB);
+    await choosing;
+    await answer("board/7", {
+        ...boardAnswer([boardRow({ id: 3, rev: 1, state: "picked", title: "A row" })]),
+        pass: [],
+    });
+    await acting;
+
+    assert.equal(ctl.view().board.supervisor, 9);
+    assert.deepEqual(
+        ctl.view().board.rows.map((row) => row.title),
+        ["B row"],
+    );
+    assert.equal(ctl.view().busy, false);
+    assert.deepEqual(
+        calls.map((call) => call.slice(0, 2)),
+        [
+            ["GET", "board"],
+            ["POST", "board/7"],
+            ["GET", "board?supervisor=9"],
+        ],
+    );
+
+    // A GET of an earlier selection is dropped too: choose 7, then 9, and the answer for 7 comes last.
+    const first = ctl.choose(7);
+
+    // No act while a board loads: its buttons are off, and an act posts nothing.
+    assert.match(boardScreen(ctl).out, /data-act=pick:30 disabled=true/);
+    // Not awaited: with no guard, this act would wait on its own post.
+    void ctl.act(actBody(boardB.rows[0], "pick"));
+    assert.equal(calls.filter((call) => call[0] === "POST").length, 1, "no post while loading");
+
+    const second = ctl.choose(9);
+
+    await answer("board?supervisor=9", boardB);
+    await second;
+    await answer("board?supervisor=7", boardA);
+    await first;
+    assert.equal(ctl.view().board.supervisor, 9);
+});
+
+test("Board: a failed read of another supervisor's board puts the selection back on the board shown, and no act goes to it under another name", async () => {
+    const pending = [];
+    const calls = [];
+
+    const api = (path, body) => {
+        calls.push(body === undefined ? ["GET", path] : ["POST", path, body]);
+
+        return new Promise((resolve, reject) => {
+            pending.push({ path, resolve, reject });
+        });
+    };
+
+    const settle = async (path, how, value) => {
+        const at = pending.findIndex((each) => each.path === path);
+
+        assert(at >= 0, `a pending ${path}`);
+        pending.splice(at, 1)[0][how](value);
+        await new Promise((resolve) => setImmediate(resolve));
+    };
+
+    const boardA = {
+        ...boardAnswer([boardRow({ id: 3, rev: 1, state: "picked", title: "A row" })]),
+        supervisors: [7, 9],
+    };
+    const ctl = boardController(api, { make: keyMaker() });
+    const loaded = ctl.load();
+
+    await settle("board", "resolve", boardA);
+    await loaded;
+
+    const choosing = ctl.choose(9);
+
+    await settle("board?supervisor=9", "reject", new Error("The read failed."));
+    await choosing;
+
+    // The board on the screen is still A's, and the select names A again, with the error.
+    assert.equal(ctl.view().board.supervisor, 7);
+    assert.equal(ctl.view().chosen, 7);
+    assert.equal(ctl.view().error, "The read failed.");
+    assert.match(boardScreen(ctl).out, /aria-label="The supervisor's board" value=7 /);
+
+    // An act goes to the board that the select and the screen both name.
+    void ctl.launch();
+    assert.deepEqual(calls.at(-1).slice(0, 2), ["POST", "board/7"]);
 });

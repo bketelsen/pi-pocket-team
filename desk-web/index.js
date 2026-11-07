@@ -2,6 +2,7 @@
 // is owner-only: the page, its routes, and the rail badge.
 
 import { renderAskText } from "./ask-text.js";
+import { makeBoard } from "./board.js";
 import { makeDashboard } from "./dashboard.js";
 
 export const pocketApi = 1;
@@ -875,6 +876,8 @@ export default function setup(pocket) {
 
     // The owner-only Dashboard view: the page is owner-only, and so is its route.
     const Dashboard = makeDashboard(pocket);
+    // The owner-only Board view (the goal board): the page is owner-only, and its routes answer 403 to anyone else.
+    const Board = makeBoard(pocket);
 
     /**
      * The Desk file sheet: 1 desk file (a report, a plan, a decision) from a path in an ask, read only. It reads
@@ -2167,8 +2170,8 @@ export default function setup(pocket) {
     }
 
     /**
-     * The 2 views of the page: the operational desk (the default each time the page opens) and the Dashboard. Each
-     * view draws its own copy of the switch, so the pressed button gets the focus back after a switch.
+     * The 3 views of the page: the operational desk (the default each time the page opens), the Dashboard and the
+     * Board. Each view draws its own copy of the switch, so the pressed button gets the focus back after a switch.
      */
     const switchTo = (setTab, next) => {
         setTab(next);
@@ -2194,6 +2197,15 @@ export default function setup(pocket) {
                 onClick=${() => switchTo(setTab, "dashboard")}
             >
                 Dashboard
+            </button>
+            <button
+                type="button"
+                class="desk-tab"
+                data-tab="board"
+                aria-pressed=${tab === "board" ? "true" : "false"}
+                onClick=${() => switchTo(setTab, "board")}
+            >
+                Board
             </button>
         </div>`;
 
@@ -2556,6 +2568,13 @@ export default function setup(pocket) {
             return html`<div class="dash-page">
                 <div class="dash-tabs-wrap">${viewTabs(tab, setTab)}</div>
                 <${Dashboard} onOpenThread=${(thread) => setOpenId(thread)} />
+            </div>`;
+        }
+
+        if (tab === "board") {
+            return html`<div class="desk board-page">
+                ${viewTabs(tab, setTab)}
+                <${Board} />
             </div>`;
         }
 
