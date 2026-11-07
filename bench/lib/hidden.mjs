@@ -744,84 +744,257 @@ export function goFileOutcome(text, { files, goNames, module }) {
 // Reporters added to a reviewed hidden command (`--revalidate`)
 // ---------------------------------------------------------------------------------------------------------------
 
-/** Split a shell command at `&&` outside quotes; each part trimmed. */
-export function splitAnd(command) {
-    const parts = [];
-    let quote = null;
-    let start = 0;
+/** The reason of a hidden command that revalidation cannot parse. */
+const unsupported = (what) =>
+    `the hidden command uses shell syntax that revalidation does not support: ${what}`;
+
+/**
+ * A hidden command as `&&` segments of shell words, quote-aware: single quotes, double quotes, backslash escapes.
+ * Each word is `{ value, raw }`: `value` is the word as the shell gives it (quotes removed, no expansion), `raw` the
+ * text as written (it keeps an expansion such as `$PATH` as the shell would do it). Only `&&` joins segments. A list
+ * or pipe operator (`;`, `||`, `|`, `&`), a newline, a redirection (`<`, `>`), a subshell or group (`(`, `)`), or a
+ * command substitution (a backtick, `$(`, also inside double quotes) gives `{ error }`.
+ */
+export function shellSegments(command) {
     const text = String(command);
+    const segments = [[]];
+    let word = null;
+    let quote = null;
+
+    const start = (i) => {
+        word ??= { value: "", from: i };
+    };
+
+    const end = (i) => {
+        if (word) {
+            segments.at(-1).push({ value: word.value, raw: text.slice(word.from, i) });
+            word = null;
+        }
+    };
 
     for (let i = 0; i < text.length; i += 1) {
         const c = text[i];
 
-        if (quote) {
-            if (c === "\\" && quote === '"') {
-                i += 1;
-            } else if (c === quote) {
+        if (quote === "'") {
+            if (c === "'") {
                 quote = null;
+            } else {
+                word.value += c;
             }
-        } else if (c === "\\") {
-            i += 1;
-        } else if (c === "'" || c === '"') {
-            quote = c;
-        } else if (c === "&" && text[i + 1] === "&") {
-            parts.push(text.slice(start, i).trim());
-            start = i + 2;
-            i += 1;
+
+            continue;
         }
+
+        if (quote === '"') {
+            if (c === "`" || (c === "$" && text[i + 1] === "(")) {
+                return { error: unsupported(c === "`" ? "`" : "$(") };
+            }
+
+            if (c === '"') {
+                quote = null;
+            } else if (c === "\\" && i + 1 < text.length && '$`"\\\n'.includes(text[i + 1])) {
+                word.value += text[i + 1];
+                i += 1;
+            } else {
+                word.value += c;
+            }
+
+            continue;
+        }
+
+        if (c === "\\") {
+            if (text[i + 1] === "\n" || i + 1 >= text.length) {
+                return { error: unsupported("a backslash at the end of a line") };
+            }
+
+            start(i);
+            word.value += text[i + 1];
+            i += 1;
+            continue;
+        }
+
+        if (c === "'" || c === '"') {
+            start(i);
+            quote = c;
+            continue;
+        }
+
+        if (c === "\n") {
+            return { error: unsupported("a newline") };
+        }
+
+        if (c === " " || c === "\t") {
+            end(i);
+            continue;
+        }
+
+        if (c === "&") {
+            if (text[i + 1] === "&") {
+                end(i);
+                segments.push([]);
+                i += 1;
+                continue;
+            }
+
+            return { error: unsupported("&") };
+        }
+
+        if (c === "|") {
+            return { error: unsupported(text[i + 1] === "|" ? "||" : "|") };
+        }
+
+        if (";<>()`".includes(c)) {
+            return { error: unsupported(c) };
+        }
+
+        if (c === "$" && text[i + 1] === "(") {
+            return { error: unsupported("$(") };
+        }
+
+        start(i);
+        word.value += c;
     }
 
-    parts.push(text.slice(start).trim());
+    if (quote) {
+        return { error: unsupported(`an unclosed ${quote === "'" ? "single" : "double"} quote`) };
+    }
 
-    return parts.filter((part) => part !== "");
+    end(text.length);
+
+    if (segments.some((segment) => segment.length === 0)) {
+        return { error: unsupported("an empty command around &&") };
+    }
+
+    return { segments };
 }
 
-/** A word of a command as it can be written: plain, or in single or double quotes. */
-const wordPattern = (word) => {
-    const body = escapeRegex(word);
+/** A word that the bench adds, quoted for the shell. */
+const added = (value) => ({ value, raw: shellQuote(value) });
 
-    return new RegExp(`(^|\\s)(?:'${body}'|"${body}"|${body})(?=\\s|$)`, "g");
-};
+/** A segment's words as shell text: each word as it was written, each added word quoted. */
+const shellText = (words) => words.map((w) => w.raw).join(" ");
 
 /** The pytest junit file of discovery segment `i`, in the sandbox's cache. */
 export const junitOf = (i) => `/cache/hidden-junit-${i}.xml`;
 
+/** An environment assignment word (`NAME=value`) as written: its name is plain text. */
+const isAssignment = (w) => /^[A-Za-z_][A-Za-z0-9_]*=/.test(w.raw);
+
 /**
- * The discovery commands of a reviewed hidden command: each `&&` segment keeps every word (the environment prefix,
- * the flags, a loader), and gets the machine-readable reporter at its runner: `go test` gets `-json`; `node --test`
- * gets the TAP reporter and runs 1 named file at a time after a marker line (`FILE_MARK`); pytest gets
- * `--junitxml=<junitOf(i)>`. `nodeFiles`: the named Node files. Returns `{ node: [cmd], go: [cmd], python: [{ command,
- * junit }] }`, or `{ error }` for a segment with no runner found.
+ * The runner of a segment's words: `{ kind, at }` where `at` is the index of the word after which the reporter goes
+ * (`go test`: after `test`; `node --test`: after `--test`; pytest: at the end), or null. The words before the program
+ * may only be environment assignments.
+ */
+function runnerOf(words) {
+    let p = 0;
+
+    while (p < words.length && isAssignment(words[p])) {
+        p += 1;
+    }
+
+    const program = words[p]?.value;
+    const base = program?.split("/").pop();
+
+    if (program === "go" && words[p + 1]?.value === "test") {
+        return { kind: "go", at: p + 1 };
+    }
+
+    if (base === "node") {
+        const test = words.findIndex((w, i) => i > p && w.value === "--test");
+
+        return test > 0 ? { kind: "node", at: test, program: p } : null;
+    }
+
+    if (base === "pytest" || base === "py.test") {
+        return { kind: "python", at: words.length - 1 };
+    }
+
+    if (
+        /^python[0-9.]*$/.test(base ?? "") &&
+        words[p + 1]?.value === "-m" &&
+        words[p + 2]?.value === "pytest"
+    ) {
+        return { kind: "python", at: words.length - 1 };
+    }
+
+    return null;
+}
+
+/**
+ * The discovery commands of a reviewed hidden command: each `&&` segment keeps every word as written (the
+ * environment assignments, the flags, a loader, a name pattern), and gets the machine-readable reporter as a word at
+ * its runner: `go test` gets `-json` after `test`; `node --test` gets `--test-reporter=tap` after `--test` (a reporter
+ * of the owner's is taken out) and runs 1 named file at a time after a marker line (`FILE_MARK`); pytest gets
+ * `--junitxml=<junitOf(i)>` at the end (a `--junitxml` of the owner's is taken out). `nodeFiles`: the named Node files.
+ * Returns `{ node: [cmd], go: [cmd], python: [{ command, junit }] }`, or `{ error }`.
  */
 export function reporterCommands(hiddenCommand, { nodeFiles = [] } = {}) {
+    const parsed = shellSegments(hiddenCommand);
+
+    if (parsed.error) {
+        return { error: parsed.error };
+    }
+
     const out = { node: [], go: [], python: [] };
 
-    for (const [i, segment] of splitAnd(hiddenCommand).entries()) {
-        if (/(^|\s)go\s+test(?=\s|$)/.test(segment)) {
-            out.go.push(segment.replace(/(^|\s)go\s+test(?=\s|$)/, "$1go test -json"));
-        } else if (/(^|\s)node(?=\s)/.test(segment) && /(^|\s)--test(?=\s|$)/.test(segment)) {
-            const bare = segment
-                .replace(/(^|\s)--test-reporter(?:-destination)?(?:=\S+|\s+\S+)(?=\s|$)/g, "$1")
-                .replace(/(^|\s)--test(?=\s|$)/, "$1--test --test-reporter=tap");
-            const present = nodeFiles.filter((file) => wordPattern(file).test(segment));
-            const others = present
-                .reduce((text, file) => text.replace(wordPattern(file), "$1"), bare)
-                .trimEnd();
+    for (const [i, words] of parsed.segments.entries()) {
+        const runner = runnerOf(words);
+
+        if (!runner) {
+            return { error: `cannot add a reporter to the hidden command: ${shellText(words)}` };
+        }
+
+        if (runner.kind === "go") {
+            out.go.push(
+                shellText([
+                    ...words.slice(0, runner.at + 1),
+                    added("-json"),
+                    ...words.slice(runner.at + 1),
+                ]),
+            );
+        } else if (runner.kind === "node") {
+            const kept = [];
+
+            for (let k = 0; k < words.length; k += 1) {
+                const value = words[k].value;
+
+                if (k > runner.program && /^--test-reporter(?:-destination)?$/.test(value)) {
+                    k += 1;
+                } else if (k > runner.program && /^--test-reporter(?:-destination)?=/.test(value)) {
+                    // The owner's reporter: the bench's TAP reporter takes its place.
+                } else if (k > runner.program && nodeFiles.includes(value)) {
+                    // A named file: each runs on its own below.
+                } else {
+                    kept.push(words[k]);
+
+                    if (k === runner.at) {
+                        kept.push(added("--test-reporter=tap"));
+                    }
+                }
+            }
+
+            const present = nodeFiles.filter((file) =>
+                words.some((w, k) => k > runner.program && w.value === file),
+            );
 
             for (const file of present) {
                 out.node.push(
-                    `printf '%s\\n' ${shellQuote(`${FILE_MARK}${file}`)}; ${others} ${shellQuote(file)}`,
+                    `printf '%s\\n' ${shellQuote(`${FILE_MARK}${file}`)}; ${shellText([...kept, added(file)])}`,
                 );
             }
-        } else if (/(^|[\s/])(?:pytest|py\.test)(?=\s|$)/.test(segment)) {
-            const junit = junitOf(i);
-
-            out.python.push({
-                command: `${segment.replace(/(^|\s)--junitxml(?:=\S+|\s+\S+)(?=\s|$)/g, "$1").trimEnd()} --junitxml=${junit}`,
-                junit,
-            });
         } else {
-            return { error: `cannot add a reporter to the hidden command: ${segment}` };
+            const junit = junitOf(i);
+            const kept = [];
+
+            for (let k = 0; k < words.length; k += 1) {
+                if (words[k].value === "--junitxml") {
+                    k += 1;
+                } else if (!words[k].value.startsWith("--junitxml=")) {
+                    kept.push(words[k]);
+                }
+            }
+
+            out.python.push({ command: shellText([...kept, added(`--junitxml=${junit}`)]), junit });
         }
     }
 

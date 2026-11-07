@@ -8,6 +8,10 @@ import { join } from "node:path";
 import { after, before, test } from "node:test";
 import {
     PER_STRATUM,
+    VALIDATION_VERSION,
+    commandsAt,
+    validateCandidate,
+    validationKey,
     harvest,
     harvestRepo,
     selectCandidates,
@@ -592,5 +596,65 @@ test("a candidate whose validation throws is dropped with a reason, and the next
     assert.deepEqual(
         manifest.dropped.map((d) => d.reason),
         ["validation error: EACCES: permission denied, unlink 'x'"],
+    );
+});
+
+test("a cached validation error is never reused: the candidate is validated again", async () => {
+    const data = join(fixture.root, "rr5-data");
+    const thread = { id: "T77", brief: "Fix add.", route: null, nightShift: false };
+    const candidate = {
+        repo: REPO,
+        number: 77,
+        thread,
+        checkout: node.repo,
+        merge: node.merge,
+        parent: node.parent,
+    };
+    const key = validationKey({
+        merge: node.merge,
+        parent: node.parent,
+        commands: await commandsAt(node.repo, node.merge),
+        brief: thread.brief,
+        route: null,
+    });
+
+    assert.equal(VALIDATION_VERSION, 2, "the overlay's modes changed the validation");
+    mkdirSync(join(data, "harvest-cache", "bketelsen", "pi-pocket-team"), { recursive: true });
+    writeFileSync(
+        join(data, "harvest-cache", "bketelsen", "pi-pocket-team", "77.json"),
+        JSON.stringify({
+            key,
+            outcome: {
+                ok: false,
+                reason: "validation error: EACCES from an earlier run",
+                fields: null,
+                validation: {},
+            },
+        }),
+    );
+
+    const result = await validateCandidate(
+        {
+            data,
+            now: () => NOW,
+            log: () => {},
+            rosterNames: [REPO],
+            hostNames: [],
+            sandbox: {
+                bwrap: FAKE_BWRAP,
+                pocket: fixture.pocket,
+                miseInstalls: join(fixture.root, "no-mise"),
+                data,
+            },
+            timeouts: { setup: 60_000, check: 60_000, hidden: 60_000 },
+        },
+        candidate,
+    );
+
+    assert.equal(result.cached, undefined, "not the cached outcome");
+    assert.equal(result.ok, true, result.reason);
+    assert.equal(
+        result.fields.hiddenCommand,
+        "PI_POCKET_CHECKOUT=/pocket node --test --test-name-pattern='^(?:adds)$' 'add.test.mjs'",
     );
 });

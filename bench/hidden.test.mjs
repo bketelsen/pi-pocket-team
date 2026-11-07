@@ -21,6 +21,7 @@ import {
     parseNameStatus,
     proposeCommands,
     pytestOutcome,
+    reporterCommands,
 } from "./lib/hidden.mjs";
 
 // `go test -json -count=1 ./ok ./broken` of go 1.27 (times cut): `broken` does not build; in `ok`, TestAdd fails by
@@ -310,4 +311,90 @@ test("node: the name pattern runs exactly the named top-level tests (Node 24 beh
     );
 
     assert.doesNotMatch(child.stdout, /ok \d+ - child/);
+});
+
+test("revalidation reporters: words found by a quote-aware tokenizer; only && joins segments", async (t) => {
+    const nodeFiles = ["a.test.mjs", "b.test.mjs"];
+    const quoted = "node --test --test-name-pattern='^(?:a go test b)$' 'a.test.mjs'";
+
+    // Text inside a quoted name pattern is no runner: this stays a Node command.
+    assert.deepEqual(reporterCommands(quoted, { nodeFiles }), {
+        node: [
+            "printf '%s\\n' '# bench-file: a.test.mjs'; node --test '--test-reporter=tap' --test-name-pattern='^(?:a go test b)$' 'a.test.mjs'",
+        ],
+        go: [],
+        python: [],
+    });
+
+    for (const [command, what] of [
+        ["node --test 'a.test.mjs'; go test ./p", ";"],
+        ["go test ./p || true", "||"],
+        ["go test ./p | tee x", "|"],
+        ["go test ./p & wait", "&"],
+        ["go test ./p\ngo test ./q", "a newline"],
+        ["go test `pwd`", "`"],
+        ['go test "$(pwd)"', "$("],
+    ]) {
+        assert.deepEqual(
+            reporterCommands(command, { nodeFiles }),
+            {
+                error: `the hidden command uses shell syntax that revalidation does not support: ${what}`,
+            },
+            command,
+        );
+    }
+
+    assert.deepEqual(
+        reporterCommands(
+            "FEATURE=1 node --test --test-reporter spec 'a.test.mjs' && go test -tags 'x y' ./p",
+            {
+                nodeFiles,
+            },
+        ),
+        {
+            node: [
+                "printf '%s\\n' '# bench-file: a.test.mjs'; FEATURE=1 node --test '--test-reporter=tap' 'a.test.mjs'",
+            ],
+            go: ["go test '-json' -tags 'x y' ./p"],
+            python: [],
+        },
+        "2 segments, each with its reporter",
+    );
+    assert.deepEqual(reporterCommands("make test", { nodeFiles }), {
+        error: "cannot add a reporter to the hidden command: make test",
+    });
+    assert.deepEqual(
+        reporterCommands(
+            "PATH=/cache/venv/bin:$PATH /cache/venv/bin/python -m pytest -q 't.py::a' --junitxml o.xml",
+        ),
+        {
+            node: [],
+            go: [],
+            python: [
+                {
+                    command:
+                        "PATH=/cache/venv/bin:$PATH /cache/venv/bin/python -m pytest -q 't.py::a' '--junitxml=/cache/hidden-junit-0.xml'",
+                    junit: "/cache/hidden-junit-0.xml",
+                },
+            ],
+        },
+    );
+
+    // The quoted pattern runs for real, as the reviewed command names it.
+    const dir = mkdtempSync(join(tmpdir(), "bench-reporter-"));
+    const env = { ...process.env };
+
+    delete env.NODE_TEST_CONTEXT;
+    t.after(() => rm(dir, { recursive: true, force: true }));
+    writeFileSync(
+        join(dir, "a.test.mjs"),
+        'import { test } from "node:test";\ntest("a go test b", () => {});\ntest("other", () => {});\n',
+    );
+
+    const [command] = reporterCommands(quoted, { nodeFiles }).node;
+    const out = spawnSync("bash", ["-c", command], { cwd: dir, encoding: "utf8", env }).stdout;
+
+    assert.deepEqual(Object.fromEntries(nodeOutcome(out, ["a.test.mjs"]).units.get("a.test.mjs")), {
+        "a go test b": "pass",
+    });
 });

@@ -61,8 +61,19 @@ export const STRATA = ["small", "medium", "large"];
 /** The stratum of a size: up to 50, 51 to 300, over 300. */
 export const stratumOf = (size) => (size <= 50 ? "small" : size <= 300 ? "medium" : "large");
 
-/** The version of the validation: a cached validation of another version runs again. */
-export const VALIDATION_VERSION = 1;
+/**
+ * The version of the validation: a cached validation of another version runs again. Version 2: the overlay keeps
+ * each file's mode from the reference tree.
+ */
+export const VALIDATION_VERSION = 2;
+
+/** The cache key of a candidate's validation. */
+export const validationKey = ({ merge, parent, commands, brief, route }) =>
+    sha(JSON.stringify([VALIDATION_VERSION, merge, parent, commands, brief, route]));
+
+/** True when a cached outcome is an unexpected error: it is never reused (earlier versions cached such errors). */
+const isValidationError = (outcome) =>
+    String(outcome?.reason ?? "").startsWith("validation error:");
 
 /** The `gh pr view` fields the harvester reads. */
 export const PR_FIELDS = "mergeCommit,mergedAt,files,additions,deletions,state,headRefOid";
@@ -392,13 +403,17 @@ const treesOf = (base) => ({
 export async function validateCandidate(ctx, candidate) {
     const { repo, number, thread, checkout, merge, parent } = candidate;
     const commands = await commandsAt(checkout, merge);
-    const key = sha(
-        JSON.stringify([VALIDATION_VERSION, merge, parent, commands, thread.brief, thread.route]),
-    );
+    const key = validationKey({
+        merge,
+        parent,
+        commands,
+        brief: thread.brief,
+        route: thread.route,
+    });
     const cacheFile = join(cacheDir(ctx.data, repo), `${number}.json`);
     const cached = await readJson(cacheFile, null);
 
-    if (cached?.key === key) {
+    if (cached?.key === key && !isValidationError(cached.outcome)) {
         return { ...cached.outcome, cached: true };
     }
 
@@ -517,7 +532,7 @@ export async function validateCandidate(ctx, candidate) {
     }
 
     // An unexpected error is not cached: a later run validates the candidate again.
-    if (!result.reason?.startsWith("validation error:")) {
+    if (!isValidationError(result)) {
         await writeJsonAtomic(cacheFile, { key, outcome: result });
     }
 

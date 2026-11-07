@@ -852,3 +852,93 @@ test("S2 keeps the reference's file modes: an executable support script runs", a
     assert.equal(result.s2, true, result.s2Detail);
     assert.equal(treeHash(original), before, "the submitted tree is unchanged");
 });
+
+test("a nested repository in the submitted tree is judged as its source, not as a gitlink", async () => {
+    const task = taskOf("nested-repo", { default: [GOOD(3)] });
+    const paths = await attempt(task, {
+        change: FIX,
+        prepare: (work) => {
+            const sub = join(work, "sub");
+
+            mkdirSync(sub);
+            git(sub, "init", "--quiet");
+            writeFileSync(join(sub, "inner.mjs"), "export const nested = 1;\n");
+            git(sub, "add", ".");
+            git(sub, "commit", "--quiet", "-m", "nested");
+            writeFileSync(join(sub, "inner.mjs"), "export const nested = 2;\n");
+            mkdirSync(join(work, "mod"));
+            writeFileSync(join(work, "mod", ".git"), "gitdir: /nowhere\n");
+            writeFileSync(join(work, "mod", "file.txt"), "a submodule-like folder\n");
+        },
+    });
+    const { code, result } = await score(paths);
+    const diff = readFileSync(result.diffFile, "utf8");
+
+    assert.equal(code, 0);
+    assert.match(
+        diff,
+        /^\+export const nested = 2;$/m,
+        "the nested source, with its uncommitted change",
+    );
+    assert.match(diff, /^\+a submodule-like folder$/m);
+    assert.doesNotMatch(diff, /Subproject commit/);
+    assert.doesNotMatch(diff, /gitdir:/);
+    assert.ok(
+        existsSync(join(paths.work, "sub", ".git")),
+        "the submitted tree keeps its nested repository",
+    );
+});
+
+test("a submitted tree with no .git of its own is scored: S0, S1, S2, the diff and the grades", async () => {
+    const task = taskOf("no-git", { default: [GOOD(3)] });
+    const paths = await attempt(task, {
+        change: FIX,
+        prepare: (work) => rm(join(work, ".git"), { recursive: true, force: true }),
+    });
+    const { code, result } = await score(paths);
+
+    assert.equal(code, 0);
+    assert.deepEqual(result.s0, { protocol: false, leakTry: false });
+    assert.equal(result.s1, true);
+    assert.equal(result.s2, true);
+    assert.deepEqual(result.grades, [3, 3]);
+    assert.match(readFileSync(result.diffFile, "utf8"), /\+export const add = \(a, b\) => a \+ b;/);
+});
+
+test("S2 puts a reference file where the submitted tree has a folder; the submitted tree does not change", async () => {
+    const task = taskOf("folder-at-path", { default: [GOOD(3)] });
+    let original;
+    const paths = await attempt(task, {
+        change: FIX,
+        prepare: (work) => {
+            original = work;
+            mkdirSync(join(work, "fixtures", "data.json"), { recursive: true });
+            writeFileSync(
+                join(work, "fixtures", "data.json", "inner.txt"),
+                "a folder where the reference has a file\n",
+            );
+            mkdirSync(join(work, "add.test.mjs"));
+            writeFileSync(join(work, "add.test.mjs", "x.txt"), "x\n");
+        },
+    });
+    const before = treeHash(original);
+    const { code, result } = await score(paths);
+
+    assert.equal(code, 0);
+    assert.equal(result.s2, true, `the hidden tests ran: ${result.s2Detail}`);
+    assert.equal(treeHash(original), before);
+});
+
+test("the host overlay (the harvester's own trees) replaces a folder with the reference's file", async () => {
+    const work = join(fixture.root, "overlay-folder");
+
+    mkdirSync(join(work, "fixtures", "data.json"), { recursive: true });
+    writeFileSync(join(work, "fixtures", "data.json", "inner.txt"), "x\n");
+    await overlayFiles({
+        checkout: node.repo,
+        rev: node.merge,
+        files: ["fixtures/data.json"],
+        work,
+    });
+    assert.equal(readFileSync(join(work, "fixtures", "data.json"), "utf8"), '{ "a": 1, "b": 2 }\n');
+});

@@ -4,6 +4,7 @@ import { execFile } from "node:child_process";
 import { chmod, lstat, mkdir, rm, symlink, writeFile } from "node:fs/promises";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
+import { removeTree } from "./common.mjs";
 
 const run = promisify(execFile);
 
@@ -107,6 +108,11 @@ export async function overlayFiles({ checkout, rev, files, work, git = gitBuffer
         const content = await git(checkout, ["show", `${rev}:${file}`]);
 
         await mkdir(dirname(target), { recursive: true });
+
+        // A folder where the reference has a file or a link goes first (`writeFile` and `symlink` cannot replace it).
+        if ((await lstat(target).catch(() => null))?.isDirectory()) {
+            await removeTree(target);
+        }
 
         if (mode === "120000") {
             // A symbolic link of the reference: written as a link (its blob is the target), in the bench's own tree.

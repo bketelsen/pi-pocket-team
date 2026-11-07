@@ -3,7 +3,7 @@
 // Contract: the plan's section "Scoring". Exit codes: 0 scored (also with a judge pending), 1 usage error, 2 budget
 // refused, 3 scoring error (the result is saved with the scores so far and `scoreError`; run again).
 import { execFile } from "node:child_process";
-import { existsSync, readdirSync, statSync } from "node:fs";
+import { existsSync, lstatSync, readdirSync, statSync } from "node:fs";
 import { chmod, readFile } from "node:fs/promises";
 import { basename, dirname, join, posix, resolve } from "node:path";
 import { parseArgs, promisify } from "node:util";
@@ -243,6 +243,23 @@ const trustedGit = (parent, ...args) => [
     ...args,
 ];
 
+/** The removal of every `.git` (folder or file) below `/work`, in the sandbox; links are not followed. */
+export const NESTED_GIT_REMOVAL = [
+    "find",
+    "/work",
+    "-mindepth",
+    "1",
+    "-name",
+    ".git",
+    "-prune",
+    "-exec",
+    "rm",
+    "-rf",
+    "--",
+    "{}",
+    "+",
+];
+
 /** The diff options of the submitted diff: no external diff driver, no textconv, always text, no color. */
 const DIFF_OPTIONS = ["--no-ext-diff", "--no-textconv", "--text", "--no-color"];
 
@@ -286,6 +303,10 @@ export async function submittedDiff(ctx, { workDir, parent, checkout, scratch })
             return result.stdout;
         };
 
+        // Every `.git` below the root (a nested repository's folder, a submodule's file) goes too, inside the
+        // sandbox: else `add -A` stages that folder as a gitlink, and the diff shows a commit id, not the source that
+        // S1 and S2 ran.
+        await run(NESTED_GIT_REMOVAL, "the removal of nested .git entries");
         await run(trustedGit(parent, "add", "-A"), "the submitted diff's git add");
 
         const stat = await run(
@@ -331,6 +352,27 @@ export async function stageOverlay({ checkout, rev, files, staging, git = hostGi
     return staging;
 }
 
+/**
+ * The removal, inside the sandbox, of each staged path's destination in `/work` (`rm -rf --`, 1 argument per path).
+ * A path must be relative and stay inside `/work`.
+ */
+export function clearDestinations(files) {
+    return [
+        "rm",
+        "-rf",
+        "--",
+        ...files.map((file) => {
+            const path = posix.normalize(`/work/${file}`);
+
+            if (path === "/work" || !path.startsWith("/work/") || posix.isAbsolute(file)) {
+                throw new Error(`hidden file ${file} is outside the tree`);
+            }
+
+            return path;
+        }),
+    ];
+}
+
 /** The copy of the staged hidden-test files over `/work`, inside the sandbox, before the hidden command. */
 export const OVERLAY_COPY = [
     "cp",
@@ -351,6 +393,15 @@ const diffPaths = (data, result, attempt) => {
         reference: join(dir, "reference.diff"),
         referenceStat: join(dir, "reference.stat"),
     };
+};
+
+/** True when `path` is a folder (a link to one is not). */
+const isFolder = (path) => {
+    try {
+        return lstatSync(path).isDirectory();
+    } catch {
+        return false;
+    }
 };
 
 /** Read a file, or null. */
@@ -410,7 +461,8 @@ export async function scoreResult(ctx, file, result, { task, manifest }) {
             return 0;
         }
 
-        if (!result.workDir || !existsSync(join(result.workDir, ".git"))) {
+        // The tree must be there; its own `.git` is not needed (the diff uses trusted git metadata).
+        if (!result.workDir || !isFolder(result.workDir)) {
             throw new UsageError(`the submitted tree is missing: ${result.workDir}`);
         }
 
@@ -483,15 +535,27 @@ async function scoreAfterS0(ctx, { file, result, task, checkout, git, attempt, j
 
                 await copyTree(result.workDir, s2Tree);
 
-                const copied = await runInSandbox(ctx.sandbox, {
+                // The worker's tree may hold a folder (or a file, or a link) where the reference has a file: each staged
+                // path's destination goes first, path by path (`cp` cannot put a file over a folder).
+                const cleared = await runInSandbox(ctx.sandbox, {
                     work: s2Tree,
                     cache,
-                    overlay: staging,
-                    argv: OVERLAY_COPY,
+                    argv: clearDestinations(task.hiddenTests.map((t) => t.file)),
                     timeoutMs: ctx.timeouts.hidden,
                     logFile,
-                    step: "S2, the copy of the hidden tests",
+                    step: "S2, the removal of the hidden tests' destinations",
                 });
+                const copied = !cleared.ok
+                    ? cleared
+                    : await runInSandbox(ctx.sandbox, {
+                          work: s2Tree,
+                          cache,
+                          overlay: staging,
+                          argv: OVERLAY_COPY,
+                          timeoutMs: ctx.timeouts.hidden,
+                          logFile,
+                          step: "S2, the copy of the hidden tests",
+                      });
                 const s2 = !copied.ok
                     ? copied
                     : await runInSandbox(ctx.sandbox, {
@@ -506,9 +570,11 @@ async function scoreAfterS0(ctx, { file, result, task, checkout, git, attempt, j
                 result.s2 = s2.ok;
                 result.s2Detail = s2.ok
                     ? "pass"
-                    : copied.ok
-                      ? failText(s2)
-                      : `the copy of the hidden tests failed (${failText(copied)})`;
+                    : !cleared.ok
+                      ? `the removal of the hidden tests' destinations failed (${failText(cleared)})`
+                      : !copied.ok
+                        ? `the copy of the hidden tests failed (${failText(copied)})`
+                        : failText(s2);
             } else {
                 result.s2 = null;
             }
