@@ -5,7 +5,10 @@
 //   4 at the final merged head, blind (no field tells which); the key is a separate file.
 // - Development set: 20 pairs (the Not-ready diff and the merged diff of 1 PR, from the same base) from PRs that the
 //   held-out set does not use, in any repository.
-// Diffs come from GitHub's compare API (read only). Every choice is seeded (mulberry32, seed 1064).
+// A PR is eligible only when its desk thread gives the brief (the harvester's rule: exactly 1 thread names the PR,
+// that thread names no other PR, and it has a brief). The PR body is never used: it often records the cross-review
+// history and the final head, which would show the label. Diffs come from GitHub's compare API (read only). Every
+// choice is seeded (mulberry32, seed 1064).
 import { execFile } from "node:child_process";
 import { existsSync, readdirSync } from "node:fs";
 import { readFile } from "node:fs/promises";
@@ -13,9 +16,10 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { parseArgs, promisify } from "node:util";
 import { dataDir, privateDir, writeJsonAtomic } from "./common.mjs";
-import { cutDiff, diffStat } from "./judge.mjs";
+import { cutDiff, diffStat, sectionPath } from "./judge.mjs";
 import { UsageError } from "./manifest.mjs";
 import { OWNERS, SEED, reposOf, seededShuffle } from "./owners.mjs";
+import { pocketDb, readThreads } from "./pocket.mjs";
 
 const execFileP = promisify(execFile);
 
@@ -23,8 +27,8 @@ const execFileP = promisify(execFile);
 export const HELD_OUT_PER_OWNER = 8;
 export const DEV_PAIRS = 20;
 
-/** The `gh pr view` fields of a calibration PR. */
-export const CALIBRATION_FIELDS = "headRefOid,baseRefOid,mergeCommit,title,body,state";
+/** The `gh pr view` fields of a calibration PR (no title or body: the brief comes from the desk thread). */
+export const CALIBRATION_FIELDS = "headRefOid,baseRefOid,mergeCommit,state";
 
 /** The default findings files: every `~/agents/odrade/reports/*-daily-audit/findings.json`. */
 export function defaultFindings(reports = join(homedir(), "agents", "odrade", "reports")) {
@@ -85,8 +89,8 @@ export async function realGh(args) {
 }
 
 /**
- * A reader of PRs and diffs over `gh`, with memos: `pr(ref)` gives `{ state, head, base, title, body }` (null when
- * gh fails); `diff(repo, base, head)` gives the compare diff text (null when gh fails).
+ * A reader of PRs and diffs over `gh`, with memos: `pr(ref)` gives `{ state, head, base, merge }` (null when gh
+ * fails); `diff(repo, base, head)` gives the compare diff text (null when gh fails).
  */
 export function githubReader(gh, log) {
     const prs = new Map();
@@ -115,8 +119,6 @@ export function githubReader(gh, log) {
                         head: raw.headRefOid ?? null,
                         base: raw.baseRefOid ?? null,
                         merge: raw.mergeCommit?.oid ?? null,
-                        title: raw.title ?? "",
-                        body: raw.body ?? "",
                     });
                 } catch (error) {
                     log(`${ref}: gh pr view failed: ${error.message.split("\n")[0]}`);
@@ -154,10 +156,52 @@ export function githubReader(gh, log) {
 }
 
 /**
- * A PR that can give a pair: merged on GitHub, with a base, and a Not-ready head that is not its final head. Returns
- * `{ ref, repo, number, info, notReadyHead }` or null. When several Not-ready heads qualify, a seeded pick.
+ * The briefs of the desk: a map from a PR ref (lower case) to `{ thread, brief, briefSource }`, for each PR that
+ * exactly 1 thread names, when that thread names exactly 1 PR and has a brief (the rule of a bench task in
+ * `selectCandidates`, in any repository). `threads`: from `loadThreads`.
  */
-async function eligible(reader, ref, heads, seed) {
+export function threadBriefs(threads) {
+    const claims = new Map();
+
+    for (const thread of threads) {
+        for (const ref of new Set(thread.prs.map((r) => r.toLowerCase()))) {
+            claims.set(ref, (claims.get(ref) ?? 0) + 1);
+        }
+    }
+
+    const briefs = new Map();
+
+    for (const thread of threads) {
+        if (thread.prs.length !== 1 || !thread.brief) {
+            continue;
+        }
+
+        const ref = thread.prs[0].toLowerCase();
+
+        if (claims.get(ref) === 1) {
+            briefs.set(ref, {
+                thread: thread.id,
+                brief: thread.brief,
+                briefSource: thread.briefSource,
+            });
+        }
+    }
+
+    return briefs;
+}
+
+/**
+ * A PR that can give a pair: its desk thread gives its brief (`briefs`, from `threadBriefs`), merged on GitHub, with
+ * a base, and a Not-ready head that is not its final head. Returns `{ ref, repo, number, info, notReadyHead, brief }`
+ * or null. When several Not-ready heads qualify, a seeded pick.
+ */
+async function eligible(reader, briefs, ref, heads, seed) {
+    const brief = briefs.get(ref.toLowerCase());
+
+    if (!brief) {
+        return null;
+    }
+
     const info = await reader.pr(ref);
 
     if (!info || info.state !== "MERGED" || !info.head || !info.base) {
@@ -170,21 +214,50 @@ async function eligible(reader, ref, heads, seed) {
         return null;
     }
 
-    return { ref, ...parseRef(ref), info, notReadyHead: seededShuffle(notReady, seed)[0] };
+    return { ref, ...parseRef(ref), info, notReadyHead: seededShuffle(notReady, seed)[0], brief };
 }
 
-/** A PR's brief: its title and body. */
-const briefOf = (info) => `${info.title}\n\n${info.body}`.trim();
-
-/** A diff cut for the judge: `{ text, cut }`. */
-const cut = (diff) => cutDiff(diff, diffStat(diff));
+/**
+ * True for a file that records the review of a change, not the change: `.memory/` holds the corrections log
+ * (`.memory/corrections.jsonl`), whose lines name the review round and the finding that a fix answers. Shown in a
+ * calibration diff, it tells that a later review happened, so it can show the label.
+ */
+export const isReviewRecord = (path) => /^\.memory\//.test(String(path ?? ""));
 
 /**
- * Build both sets. `points`: from `loadPoints`. Returns `{ heldOut: { owner: items }, key, dev, warnings }` (nothing
- * written).
+ * A diff without the file sections of review records (`isReviewRecord`): the text before the first `diff --git `
+ * line and every other section stay as they are.
  */
-export async function buildCalibration({ points, gh, log = () => {}, seed = SEED }) {
+export function withoutReviewRecords(diff) {
+    const text = String(diff ?? "");
+    const starts = [...text.matchAll(/^diff --git /gm)].map((m) => m.index);
+
+    if (starts.length === 0) {
+        return text;
+    }
+
+    const sections = starts.map((start, i) => text.slice(start, starts[i + 1] ?? text.length));
+
+    return (
+        text.slice(0, starts[0]) +
+        sections.filter((section) => !isReviewRecord(sectionPath(section))).join("")
+    );
+}
+
+/** A diff for the judge and the owners, with no review record, cut: `{ text, cut }`. */
+const cut = (diff) => {
+    const shown = withoutReviewRecords(diff);
+
+    return cutDiff(shown, diffStat(shown));
+};
+
+/**
+ * Build both sets. `points`: from `loadPoints`; `threads`: from `loadThreads`. Returns `{ heldOut: { owner: items },
+ * key, dev, warnings }` (nothing written).
+ */
+export async function buildCalibration({ points, threads, gh, log = () => {}, seed = SEED }) {
     const reader = githubReader(gh, log);
+    const briefs = threadBriefs(threads);
     const warnings = [];
     const heldOut = {};
     const key = {};
@@ -207,7 +280,7 @@ export async function buildCalibration({ points, gh, log = () => {}, seed = SEED
                 break;
             }
 
-            const pr = await eligible(reader, ref, points.get(ref), seed);
+            const pr = await eligible(reader, briefs, ref, points.get(ref), seed);
 
             if (pr) {
                 chosen.push(pr);
@@ -235,7 +308,9 @@ export async function buildCalibration({ points, gh, log = () => {}, seed = SEED
                 item: {
                     repo: pr.repo,
                     pr: pr.ref,
-                    brief: briefOf(pr.info),
+                    thread: pr.brief.thread,
+                    brief: pr.brief.brief,
+                    briefSource: pr.brief.briefSource,
                     diff: text,
                     diffCut,
                     label: null,
@@ -266,7 +341,7 @@ export async function buildCalibration({ points, gh, log = () => {}, seed = SEED
             break;
         }
 
-        const pr = await eligible(reader, ref, points.get(ref), seed);
+        const pr = await eligible(reader, briefs, ref, points.get(ref), seed);
 
         if (!pr) {
             continue;
@@ -286,7 +361,9 @@ export async function buildCalibration({ points, gh, log = () => {}, seed = SEED
             id: `dev-${String(dev.length + 1).padStart(2, "0")}`,
             repo: pr.repo,
             pr: pr.ref,
-            brief: briefOf(pr.info),
+            thread: pr.brief.thread,
+            brief: pr.brief.brief,
+            briefSource: pr.brief.briefSource,
             base: pr.info.base,
             notReadyHead: pr.notReadyHead,
             mergedHead: pr.info.head,
@@ -324,10 +401,48 @@ export async function writeCalibration(out, { heldOut, key, dev }, seed = SEED) 
     return [...files, join(out, "held-out-key.json"), join(out, "dev.json")];
 }
 
-export const CALIBRATION_USAGE =
-    "usage: node bench/calibration.mjs [--findings <findings.json>]... [--out <dir>]";
+/**
+ * The held-out items in `<out>/held-out/*.json` that hold an owner label (a label that is not null), as
+ * `owner-file: id` lines. A file that does not parse counts too: its labels cannot be checked.
+ */
+export async function labelledItems(out) {
+    const dir = join(out, "held-out");
 
-/** The builder's main: returns the exit code. `deps.gh`, `deps.log` and `deps.print` replace the real ones in tests. */
+    if (!existsSync(dir)) {
+        return [];
+    }
+
+    const found = [];
+
+    for (const name of readdirSync(dir)
+        .filter((n) => n.endsWith(".json"))
+        .sort()) {
+        let items;
+
+        try {
+            items = JSON.parse(await readFile(join(dir, name), "utf8"))?.items ?? [];
+        } catch {
+            found.push(`${name}: does not parse`);
+            continue;
+        }
+
+        for (const item of Array.isArray(items) ? items : []) {
+            if (item?.label !== null && item?.label !== undefined) {
+                found.push(`${name}: ${item.id}`);
+            }
+        }
+    }
+
+    return found;
+}
+
+export const CALIBRATION_USAGE =
+    "usage: node bench/calibration.mjs [--findings <findings.json>]... [--out <dir>] [--db <pocket.sqlite>]";
+
+/**
+ * The builder's main: returns the exit code (0 written, 1 usage error or labelled sets in `--out`). `deps.gh`,
+ * `deps.log`, `deps.print` and `deps.readThreads` replace the real ones in tests.
+ */
 export async function calibrationMain(argv, env = process.env, deps = {}) {
     const log = deps.log ?? ((line) => console.error(line));
 
@@ -337,7 +452,11 @@ export async function calibrationMain(argv, env = process.env, deps = {}) {
         try {
             ({ values } = parseArgs({
                 args: argv,
-                options: { findings: { type: "string", multiple: true }, out: { type: "string" } },
+                options: {
+                    findings: { type: "string", multiple: true },
+                    out: { type: "string" },
+                    db: { type: "string" },
+                },
                 allowPositionals: false,
             }));
         } catch (error) {
@@ -352,9 +471,21 @@ export async function calibrationMain(argv, env = process.env, deps = {}) {
             throw new UsageError("no findings file found");
         }
 
-        const points = await loadPoints(files);
-        const sets = await buildCalibration({ points, gh: deps.gh ?? realGh, log });
         const out = resolve(values.out ?? join(dataDir(env), "calibration"));
+        const labelled = await labelledItems(out);
+
+        // The owners' labels are the only copy of their review: a new build never writes over them.
+        if (labelled.length) {
+            log(
+                `refused: ${join(out, "held-out")} holds owner labels (${labelled.join(", ")}); move the folder away, or give another --out`,
+            );
+
+            return 1;
+        }
+
+        const points = await loadPoints(files);
+        const threads = (deps.readThreads ?? readThreads)(values.db ?? pocketDb(env));
+        const sets = await buildCalibration({ points, threads, gh: deps.gh ?? realGh, log });
         const written = await writeCalibration(out, sets);
 
         for (const file of written) {
