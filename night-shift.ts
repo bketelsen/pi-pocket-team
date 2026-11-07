@@ -46,6 +46,49 @@ import {
 } from "@earendil-works/pi-durable";
 import type { CommandContext, Host, Web } from "./_pocket.d.ts";
 
+/** Keep linked-session sends as follow-up work on Pi Pocket 0.28, as they were on 0.27. */
+export async function linkedSend(
+    host: Host,
+    source: ConversationId,
+    request: { to: string; message: string },
+    key: string,
+): Promise<void> {
+    const compatible = { ...request, steer: false };
+
+    await host.linkedSessions.send(source, compatible, key);
+}
+
+// ─── Watch compatibility ─────────────────────────────────────────────────────
+
+/**
+ * Pi Durable 1.5 watch listeners receive `{ kind: "value", value, ops, retired }` calls. Older releases give the
+ * plain document value. A failed call carries no document value, so it stays open and this listener does nothing.
+ */
+export function watchDocumentValue<T>(argument: unknown): T | null | undefined {
+    if (typeof argument === "object" && argument !== null) {
+        const call = argument as {
+            kind?: unknown;
+            value?: unknown;
+            ops?: unknown;
+            retired?: unknown;
+        };
+
+        if (call.kind === "failed") {
+            return undefined;
+        }
+
+        if (
+            call.kind === "value" &&
+            Object.prototype.hasOwnProperty.call(call, "ops") &&
+            Object.prototype.hasOwnProperty.call(call, "retired")
+        ) {
+            return call.value as T | null;
+        }
+    }
+
+    return argument as T | null;
+}
+
 // ─── Limits ──────────────────────────────────────────────────────────────────
 
 export const DEFAULT_ROUNDS = 20;
@@ -1710,7 +1753,13 @@ export default function createNightShift(host: Host, web: Web) {
 
         try {
             if (watch !== undefined) {
-                const look = async (value: Readonly<{ goal?: Goal }> | null) => {
+                const look = async (argument: unknown) => {
+                    const value = watchDocumentValue<Readonly<{ goal?: Goal }> | null>(argument);
+
+                    if (value === undefined) {
+                        return;
+                    }
+
                     if (
                         value?.goal?.driver !== String(runtime.taskId) ||
                         value.goal.status !== "running"
@@ -1799,8 +1848,10 @@ export default function createNightShift(host: Host, web: Web) {
 
         try {
             if (watch !== undefined) {
-                const strand = async (live: NonNullable<typeof watch>["value"]) => {
-                    if (live !== null && live.run === undefined) {
+                const strand = async (argument: unknown) => {
+                    const live = watchDocumentValue<NonNullable<typeof watch>["value"]>(argument);
+
+                    if (live !== undefined && live !== null && live.run === undefined) {
                         const abort = submission.abort(context);
 
                         withdrawing = abort;
@@ -1900,7 +1951,15 @@ export default function createNightShift(host: Host, web: Web) {
 
                     try {
                         if (watch !== undefined) {
-                            const look = async (value: Readonly<{ goal?: Goal }> | null) => {
+                            const look = async (argument: unknown) => {
+                                const value = watchDocumentValue<Readonly<{ goal?: Goal }> | null>(
+                                    argument,
+                                );
+
+                                if (value === undefined) {
+                                    return;
+                                }
+
                                 if (
                                     value?.goal?.driver !== String(runtime.taskId) ||
                                     value.goal.status !== "running"
@@ -2330,7 +2389,8 @@ export default function createNightShift(host: Host, web: Web) {
                     );
                 } else if (report !== undefined && found.filed?.held !== true) {
                     try {
-                        await host.linkedSessions.send(
+                        await linkedSend(
+                            host,
                             id,
                             { to: found.address, message: found.filed?.line ?? report },
                             `x.night-shift.report:${runtime.taskId}`,
@@ -2572,7 +2632,8 @@ export default function createNightShift(host: Host, web: Web) {
         }
 
         try {
-            await host.linkedSessions.send(
+            await linkedSend(
+                host,
                 ctx.conversationId,
                 {
                     to: address,
