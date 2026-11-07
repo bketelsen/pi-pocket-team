@@ -2232,6 +2232,7 @@ export default function createTeam(host: Host, web: Web) {
                         supervisor,
                         supervisorId: identity.persona.id,
                         limit: request.limit,
+                        needsDesk: true,
                         admitted: () => {
                             admitted = true;
                         },
@@ -3083,6 +3084,8 @@ export default function createTeam(host: Host, web: Web) {
          * Pocket admitted. The board's start reads it; the tool's errors do not change.
          */
         admitted?: () => void;
+        /** The start needs the desk's open (its thread, its limit): with no desk API, it is refused before any setup. */
+        needsDesk?: true;
     };
 
     /** A delegation's checked arguments: the title is the thread's, and `shift` is the one value of its 2 names. */
@@ -3181,6 +3184,14 @@ export default function createTeam(host: Host, web: Web) {
         const key = deps.key;
         const desk = deskApi();
 
+        // A start that needs the desk (the goal board's) takes the API it reads here: with none, nothing is set up and
+        // nothing starts. Without the dep, a delegation with the desk off works as before.
+        if (deps.needsDesk === true && desk === undefined) {
+            throw new Error(
+                "The desk module is off: a board row starts only with its desk thread. Brian turns the desk on in Menu → Extensions.",
+            );
+        }
+
         /**
          * Start a linked session. A thrown start is an unknown outcome: Pocket may have admitted the first message,
          * so the desk thread is failed with the reason, and a thread's task stays delegated.
@@ -3199,16 +3210,23 @@ export default function createTeam(host: Host, web: Web) {
 
                 return { session: started.session as ConversationId, address: started.address };
             } catch (error) {
+                // Any value can be thrown, null and undefined too: an Error keeps its own words, as before.
+                const why =
+                    error instanceof Error
+                        ? error.message
+                        : typeof (error as { message?: unknown } | null | undefined)?.message ===
+                            "string"
+                          ? String((error as { message: string }).message)
+                          : `the start failed with ${String(error)}`;
+
                 try {
-                    await deps.commit(async (tx) =>
-                        desk?.fail(tx, key, (error as Error).message, Date.now()),
-                    );
+                    await deps.commit(async (tx) => desk?.fail(tx, key, why, Date.now()));
                     desk?.changed?.();
                 } catch {
                     // The start's refusal is what the model must see: the desk marks the thread later.
                 }
 
-                return { error: (error as Error).message };
+                return { error: why };
             }
         };
 

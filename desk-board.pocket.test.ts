@@ -405,6 +405,76 @@ describe("Team startShift", () => {
         assert.equal(Object.keys((await deskState()).threads).length, threads, "no thread");
     });
 
+    test("a start that admits a session and then throws null or undefined is unknown, with its thread failed", async () => {
+        const source = await supervisor();
+
+        for (const [index, value] of [null, undefined].entries()) {
+            const key = `x.desk.board:910:${String(index + 1)}`;
+            const wrapped = wrapStart(async (real, ...args) => {
+                await real(...args);
+
+                // Pocket admitted the session, then rejected with no Error.
+                throw value;
+            });
+            const sessions = app.sessions().length;
+
+            try {
+                const result = await startShift({ supervisor: Number(source), key });
+
+                assert("error" in result, JSON.stringify(result));
+                assert.equal(result.unknown, true, `${String(value)}: unknown`);
+                assert.equal(result.error, `the start failed with ${String(value)}`);
+                assert.equal(app.sessions().length, sessions + 1, "1 session");
+            } finally {
+                wrapped.restore();
+            }
+
+            const thread = Object.values((await deskState()).threads).find(
+                (each) => each.key === key,
+            );
+
+            assert.equal(thread?.state, "closed", "the desk failed the thread");
+            assert.equal(typeof thread?.closed?.why, "string");
+        }
+    });
+
+    test("a desk that unloads before delegate reads it: no session, no thread, a refusal", async () => {
+        const source = await supervisor();
+        const shared = globalThis as unknown as Record<symbol, unknown>;
+        const desk = shared[Symbol.for("pi-pocket-team.desk")];
+        const sessions = app.sessions().length;
+        const threads = Object.keys((await deskState()).threads).length;
+        let removed = false;
+
+        try {
+            const result = await startShift({
+                supervisor: Number(source),
+                key: "x.desk.board:911:1",
+                // The desk unloads during the identity read: after startShift's own check, before delegate's.
+                read: {
+                    snapshot: ((...args: unknown[]) => {
+                        if (!removed) {
+                            removed = true;
+                            delete shared[Symbol.for("pi-pocket-team.desk")];
+                        }
+
+                        return Reflect.apply(app.harness.snapshot, app.harness, args);
+                    }) as typeof app.harness.snapshot,
+                },
+            });
+
+            assert.equal(removed, true, "the desk unloaded during the call");
+            assert("error" in result, JSON.stringify(result));
+            assert.equal(result.unknown, false);
+            assert.match(result.error, /The desk module is off/);
+        } finally {
+            shared[Symbol.for("pi-pocket-team.desk")] = desk;
+        }
+
+        assert.equal(app.sessions().length, sessions, "no session");
+        assert.equal(Object.keys((await deskState()).threads).length, threads, "no thread");
+    });
+
     test("a dependency that rejects with null or undefined gives an error result, never a throw", async () => {
         const source = await supervisor();
 
