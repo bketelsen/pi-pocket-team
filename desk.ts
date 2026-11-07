@@ -773,10 +773,17 @@ export type DeskState = {
      */
     reportsOff?: Record<string, { at: number; pocket: string }>;
     /**
-     * By supervisor id: the live `x.desk.reports-off` task id, so a second start while 1 runs finds it. The task
-     * removes its own entry when it ends. Absent until the first such task.
+     * By supervisor id: the `x.desk.reports-off` task that runs for it (`task`, the task id) and when it was made
+     * (`at`), so a second start while 1 runs finds it. The task removes its own entry when it ends. A record older than
+     * `REPORTS_OFF_TASK_STALE_MS` is stale (a task the scheduler ended with no cleanup, such as a faulted one): the next
+     * load pass starts a new task and replaces it. Absent until the first such task.
      */
-    reportsOffTasks?: Record<string, string>;
+    reportsOffTasks?: Record<string, { task: string; at: number }>;
+    /**
+     * By supervisor id: the time of the last warning notice of a failed switch, so a failure warns at most once an hour,
+     * also across a reload or a restart. Absent until the first such warning.
+     */
+    reportsOffNoticed?: Record<string, number>;
 };
 
 /** One plan's state: the shape of its thread's work. Stored data: never rename a field. */
@@ -20214,13 +20221,43 @@ export function runEndLine(
 }
 
 /**
+ * A `reportsOffTasks` record older than this is stale: its task ended with no cleanup (the scheduler can fault a task,
+ * which runs neither its last commit nor its abort), and the next load pass starts the supervisor again. 10 minutes.
+ */
+export const REPORTS_OFF_TASK_STALE_MS = 10 * 60_000;
+
+/** A failed switch warns a supervisor at most once in this time: 1 hour. */
+export const REPORTS_OFF_NOTICE_MS = 3600_000;
+
+/**
+ * Whether a supervisor's `reportsOffTasks` record stands for a task that may still run: it has the stored shape and is
+ * not older than `REPORTS_OFF_TASK_STALE_MS`.
+ */
+function reportsOffTaskLive(record: unknown, now: number): boolean {
+    const value = record as { task?: unknown; at?: unknown } | undefined;
+
+    return (
+        typeof value === "object" &&
+        value !== null &&
+        typeof value.task === "string" &&
+        typeof value.at === "number" &&
+        now - value.at < REPORTS_OFF_TASK_STALE_MS
+    );
+}
+
+/**
  * What a load pass does: `start` the supervisors to switch (the host has the switch, and the supervisor has no entry and
- * no task), or `warn` the ones not warned yet (a release that sends run-end answers but has no switch). An older release
- * with no switch: nothing.
+ * no live task: a task record older than `REPORTS_OFF_TASK_STALE_MS` is stale), or `warn` the ones not warned yet (a
+ * release that sends run-end answers but has no switch). An older release with no switch: nothing.
  */
 export function reportsOffActions(
     state: DeskState | undefined,
-    facts: { pocketVersion: string | undefined; hasMethod: boolean; warned: ReadonlySet<number> },
+    facts: {
+        pocketVersion: string | undefined;
+        hasMethod: boolean;
+        warned: ReadonlySet<number>;
+        now: number;
+    },
 ): { start: number[]; warn: number[] } {
     const supervisors = deskSupervisors(state);
 
@@ -20229,7 +20266,7 @@ export function reportsOffActions(
             start: supervisors.filter(
                 (id) =>
                     state?.reportsOff?.[String(id)] === undefined &&
-                    state?.reportsOffTasks?.[String(id)] === undefined,
+                    !reportsOffTaskLive(state?.reportsOffTasks?.[String(id)], facts.now),
             ),
             warn: [],
         };
@@ -22123,8 +22160,6 @@ export default function createDesk(host: Host, web: Web) {
 
     /** By supervisor: the last error of the switch, for the `Run-end answers:` line. In memory: a load starts clean. */
     const reportsOffErrors = new Map<number, string>();
-    /** By supervisor: the time of the last failure notice, so a failure warns at most once an hour. */
-    const reportsOffNoticed = new Map<number, number>();
     /** The supervisors this load warned that their release sends run-end answers and has no switch. */
     const reportsOffWarned = new Set<number>();
 
@@ -22194,11 +22229,32 @@ export default function createDesk(host: Host, web: Web) {
 
             reportsOffErrors.set(supervisor, line);
 
-            const now = Date.now();
-            const last = reportsOffNoticed.get(supervisor);
+            // The warning is claimed in the desk's document first, so the hour holds across a reload or a restart. A
+            // claim commit that throws sends no notice.
+            let claimed = false;
 
-            if (last === undefined || now - last >= 3600_000) {
-                reportsOffNoticed.set(supervisor, now);
+            try {
+                const now = Date.now();
+
+                await access.commit((fresh) => {
+                    // A commit that runs again starts over: only the attempt that lands decides.
+                    claimed = false;
+
+                    const last = fresh.reportsOffNoticed?.[String(supervisor)];
+
+                    if (typeof last === "number" && now - last < REPORTS_OFF_NOTICE_MS) {
+                        return;
+                    }
+
+                    fresh.reportsOffNoticed ??= {};
+                    fresh.reportsOffNoticed[String(supervisor)] = now;
+                    claimed = true;
+                });
+            } catch {
+                claimed = false;
+            }
+
+            if (claimed) {
                 host.notice(
                     "warning",
                     `The desk could not turn off automatic run-end answers here: ${line}. The next sweep tries again.`,
@@ -26936,7 +26992,7 @@ export default function createDesk(host: Host, web: Web) {
     const reportsOffDone = (state: DeskState, supervisor: number, taskId: string): void => {
         const key = String(supervisor);
 
-        if (state.reportsOffTasks?.[key] === taskId) {
+        if (state.reportsOffTasks?.[key]?.task === taskId) {
             delete state.reportsOffTasks[key];
         }
     };
@@ -26988,6 +27044,7 @@ export default function createDesk(host: Host, web: Web) {
             pocketVersion: host.pocketVersion,
             hasMethod: reportsMethod() !== undefined,
             warned: reportsOffWarned,
+            now: Date.now(),
         });
 
         for (const supervisor of actions.start) {
@@ -27003,8 +27060,10 @@ export default function createDesk(host: Host, web: Web) {
                     },
                 );
 
+                // A stale record is replaced: a second task is safe, because the host call has the same key and acts once,
+                // and the record of the switch is set only when it is absent.
                 state.reportsOffTasks ??= {};
-                state.reportsOffTasks[String(supervisor)] = String(task);
+                state.reportsOffTasks[String(supervisor)] = { task: String(task), at: Date.now() };
             } catch {
                 // No such session: no task now.
             }

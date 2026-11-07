@@ -256,6 +256,7 @@ import {
 import createDesk, { linkedSend } from "./desk.ts";
 import {
     deskSupervisors,
+    REPORTS_OFF_TASK_STALE_MS,
     reportsOffActions,
     reportsOffKey,
     runEndLine,
@@ -604,6 +605,9 @@ describe("boundSupervisors", () => {
 });
 
 describe("run-end answers", () => {
+    /** The load pass's clock: a fixed time, no wall clock. */
+    const NOW = Date.UTC(2026, 10, 7, 12, 0, 0);
+
     /** A desk with supervisor 7 on a thread, 3 on a sweeper, 9 on a Clerk, and 7 again on all three. */
     const supervised = (): DeskState => {
         const state = empty();
@@ -702,18 +706,20 @@ describe("run-end answers", () => {
                 pocketVersion: "0.28.0",
                 hasMethod: true,
                 warned: new Set(),
+                now: NOW,
             }),
             { start: [3, 7, 9], warn: [] },
         );
 
         state.reportsOff = { "7": { at: 1, pocket: "0.28.0" } };
-        state.reportsOffTasks = { "9": "task-9" };
+        state.reportsOffTasks = { "9": { task: "task-9", at: NOW } };
 
         assert.deepEqual(
             reportsOffActions(state, {
                 pocketVersion: "0.28.0",
                 hasMethod: true,
                 warned: new Set(),
+                now: NOW,
             }),
             { start: [3], warn: [] },
         );
@@ -726,6 +732,7 @@ describe("run-end answers", () => {
             pocketVersion: "0.28.0",
             hasMethod: false,
             warned,
+            now: NOW,
         });
 
         assert.deepEqual(first, { start: [], warn: [3, 7, 9] });
@@ -735,7 +742,12 @@ describe("run-end answers", () => {
         }
 
         assert.deepEqual(
-            reportsOffActions(state, { pocketVersion: "0.28.0", hasMethod: false, warned }),
+            reportsOffActions(state, {
+                pocketVersion: "0.28.0",
+                hasMethod: false,
+                warned,
+                now: NOW,
+            }),
             { start: [], warn: [] },
         );
         assert.deepEqual(
@@ -743,6 +755,7 @@ describe("run-end answers", () => {
                 pocketVersion: "0.28.0",
                 hasMethod: false,
                 warned: new Set([7]),
+                now: NOW,
             }),
             { start: [], warn: [3, 9] },
         );
@@ -751,9 +764,36 @@ describe("run-end answers", () => {
                 pocketVersion: "0.27.0",
                 hasMethod: false,
                 warned: new Set(),
+                now: NOW,
             }),
             { start: [], warn: [] },
         );
+    });
+    test("the load pass: a fresh task record skips the supervisor; a stale one starts it again", () => {
+        const state = supervised();
+        const facts = (now: number) => ({
+            pocketVersion: "0.28.0-bk.1",
+            hasMethod: true,
+            warned: new Set<number>(),
+            now,
+        });
+
+        state.reportsOff = { "7": { at: 1, pocket: "0.28.0" } };
+        state.reportsOffTasks = { "3": { task: "task-3", at: NOW } };
+
+        // A record of the last 10 minutes stands for a task that may still run.
+        assert.deepEqual(reportsOffActions(state, facts(NOW)), { start: [9], warn: [] });
+        assert.deepEqual(reportsOffActions(state, facts(NOW + REPORTS_OFF_TASK_STALE_MS - 1)), {
+            start: [9],
+            warn: [],
+        });
+        // An older record is stale: its task ended with no cleanup (a faulted task runs neither its commit nor its
+        // abort), so the supervisor starts again.
+        assert.deepEqual(reportsOffActions(state, facts(NOW + REPORTS_OFF_TASK_STALE_MS)), {
+            start: [3, 9],
+            warn: [],
+        });
+        assert.equal(REPORTS_OFF_TASK_STALE_MS, 10 * 60_000);
     });
 });
 

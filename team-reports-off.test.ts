@@ -760,6 +760,60 @@ describe("run-end answers with the desk", { skip: SKIP }, () => {
         assert.equal(warnings(), 1, "no warning after the call worked");
     });
 
+    test("a reload of the desk keeps the 1-hour limit of the failure warning", async () => {
+        const supervisor = await session("rt-reload");
+        const symbol = Symbol.for("pi-pocket-team.desk");
+
+        type ReportsOff = (
+            api: { snapshot: unknown; commit: unknown },
+            context: unknown,
+            supervisor: number,
+        ) => Promise<void>;
+        const deskNow = () =>
+            (globalThis as unknown as Record<symbol, { reportsOff: ReportsOff } | undefined>)[
+                symbol
+            ] ?? assert.fail("the desk publishes its API");
+        const api = {
+            snapshot: (...args: unknown[]) =>
+                Reflect.apply(app.harness.snapshot, app.harness, args),
+            commit: (...args: unknown[]) => Reflect.apply(app.harness.commit, app.harness, args),
+        };
+        const warnings = () =>
+            notices.filter(
+                (each) =>
+                    each.level === "warning" &&
+                    each.conversationId === Number(supervisor.id) &&
+                    /could not turn off automatic run-end answers/.test(each.message),
+            ).length;
+
+        await app.commands.setPlan(supervisor.id, owner(app), true);
+
+        try {
+            const before = deskNow();
+
+            await before.reportsOff(api, context, Number(supervisor.id));
+            assert.equal(warnings(), 1, "the first failure warns");
+            assert.equal(
+                typeof (await deskState())?.reportsOffNoticed?.[String(Number(supervisor.id))],
+                "number",
+                "the warning's time is stored",
+            );
+
+            // A reload: the desk module loads again, with nothing in memory from the load before.
+            await app.setExtensionEnabled(owner(app), "desk.ts", false);
+            await app.setExtensionEnabled(owner(app), "desk.ts", true);
+
+            const after = deskNow();
+
+            assert.notEqual(after, before, "the desk loaded again");
+            await after.reportsOff(api, context, Number(supervisor.id));
+            assert.equal(callsFor(supervisor.id), 2, "both calls reached Pocket");
+            assert.equal(warnings(), 1, "no second warning within the hour, also after a reload");
+        } finally {
+            await app.commands.setPlan(supervisor.id, owner(app), false);
+        }
+    });
+
     // Last: it restarts the app with its clock moved ahead, and the page's server keeps the first instance.
     test("a Clerk that takes 2 digests sends the supervisor nothing", async () => {
         const supervisor = await session("rt-clerk");
