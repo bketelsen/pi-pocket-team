@@ -21,12 +21,14 @@ import type { FauxResponseStep } from "@earendil-works/pi-ai";
 import { fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import { type ConversationId, LiveDoc, type TaskId } from "@earendil-works/pi-durable";
 import { SubagentsDoc } from "./_pocket/src/server/docs.ts";
+import type { Host } from "./_pocket.d.ts";
 import {
     checkFingerprint,
     deepseekStart,
     DEFAULT_ROUNDS,
     type CheckResult,
     failedChecks,
+    linkedSend,
     type Goal,
     GoalDoc,
     nextClockTime,
@@ -40,6 +42,7 @@ import {
     SUBAGENT_WAIT_MS,
     summaryMessage,
     waiting,
+    watchDocumentValue,
 } from "./night-shift.ts";
 import { statusItem } from "./night-shift-web/index.js";
 
@@ -47,6 +50,67 @@ const ZONE = "America/New_York";
 
 // These tests compute server clock times in ZONE, so the process runs in ZONE.
 process.env.TZ = ZONE;
+
+// ─── Compatibility ───────────────────────────────────────────────────────────
+
+describe("Pi Pocket compatibility", () => {
+    test("watchDocumentValue accepts Pi Durable 1.5 calls and plain 1.4 values", () => {
+        const goal = { objective: "compatibility" };
+        const plain = { goal };
+
+        assert.deepEqual(
+            watchDocumentValue<{ goal: typeof goal }>({
+                kind: "value",
+                value: plain,
+                ops: [],
+                retired: false,
+            }),
+            plain,
+        );
+        assert.equal(watchDocumentValue<typeof plain>(plain), plain);
+        assert.equal(watchDocumentValue<null>(null), null);
+        assert.equal(watchDocumentValue({ kind: "failed", error: new Error("x") }), undefined);
+
+        const malformed = { kind: "value", value: { goal } };
+
+        assert.equal(watchDocumentValue(malformed), malformed);
+    });
+
+    test("linkedSend keeps follow-up delivery arguments", async () => {
+        const source = 42 as ConversationId;
+        const key = "night-shift-compatible";
+        const request = { to: "session-worker", message: "continue" };
+        let call:
+            | {
+                  source: ConversationId;
+                  request: { to: string; message: string; steer?: boolean };
+                  key: string;
+              }
+            | undefined;
+        const host = {
+            linkedSessions: {
+                send: async (
+                    sentSource: ConversationId,
+                    sentRequest: { to: string; message: string; steer?: boolean },
+                    sentKey: string,
+                ) => {
+                    call = { source: sentSource, request: sentRequest, key: sentKey };
+
+                    return { answers: true };
+                },
+            },
+        } as unknown as Host;
+
+        const result = await linkedSend(host, source, request, key);
+
+        assert.equal(result, undefined);
+        assert.deepEqual(call, {
+            source,
+            request: { ...request, steer: false },
+            key,
+        });
+    });
+});
 
 // ─── Parsing ─────────────────────────────────────────────────────────────────
 

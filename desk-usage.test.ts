@@ -876,11 +876,19 @@ describe("entry rules", () => {
 /** A MemoryStorage with tables written directly, and a Session over it for the documents. */
 async function durableWorld() {
     const storage = new MemoryStorage();
-    const session: Session = createSession(storage);
+    let session: Session | undefined;
+    const currentSession = () => (session ??= createSession(storage));
     const ids = async () => Number(await storage.mintId());
 
     const write = async (writes: unknown[]) => {
-        await storage.commit(writes as never, context);
+        // Pi Durable 1.4 used a flat batch; 1.5 wraps it in a batch and adds a receipt callback.
+        const args = storage.commit.length >= 3 ? [[writes], () => {}, context] : [writes, context];
+
+        await Reflect.apply(storage.commit, storage, args);
+
+        // Pi Durable 1.5 caches conversation records only through Session publications.
+        // Reopen after direct fixture writes, so every later read sees the records behind it.
+        session = createSession(storage);
     };
 
     const entry = async (
@@ -928,7 +936,7 @@ async function durableWorld() {
         ]);
 
         if (byTaskId !== undefined) {
-            await session.commit(async (tx) => {
+            await currentSession().commit(async (tx) => {
                 const ledger = await tx.doc(UsageDoc, conversationId as ConversationId);
                 const old = ledger.models["faux/faux-1"];
 
@@ -947,10 +955,10 @@ async function durableWorld() {
     };
 
     const deps: UsageDeps = {
-        readUsage: () => session.snapshot(DeskUsage, context),
-        readLedger: (id) => session.snapshot(UsageDoc, id as ConversationId, context),
+        readUsage: () => currentSession().snapshot(DeskUsage, context),
+        readLedger: (id) => currentSession().snapshot(UsageDoc, id as ConversationId, context),
         commit: async (change) => {
-            await session.commit(async (tx) => {
+            await currentSession().commit(async (tx) => {
                 await change(tx, (await tx.doc(DeskUsage)) as UsageState);
             }, context);
 
@@ -958,7 +966,16 @@ async function durableWorld() {
         },
     };
 
-    return { storage, session, ids, write, entry, deps };
+    return {
+        storage,
+        get session(): Session {
+            return currentSession();
+        },
+        ids,
+        write,
+        entry,
+        deps,
+    };
 }
 
 describe("fork, import and child semantics on Pi Durable's storage", () => {
@@ -1855,25 +1872,34 @@ describe("the usage step in a collector pass", () => {
 
 const reply = (text: string) => fauxAssistantMessage([fauxText(text)]);
 
-/** Pi, scripted: it starts a subagent when asked, and the subagent answers. */
+/** Pi, scripted: it loads the subagent tool when needed, starts one, and reads the subagent's answer. */
+let searchingSubagent = false;
 const model = scriptedModel((request) => {
     const { role, text } = lastText(request as never);
 
     if (role === "toolResult") {
+        if (searchingSubagent) {
+            searchingSubagent = false;
+
+            return fauxAssistantMessage(
+                [
+                    fauxToolCall("codemode", {
+                        code: 'return await tools.subagent({ action: "spawn", name: "helper", message: "say hi please" })',
+                    }),
+                ],
+                { stopReason: "toolUse" },
+            );
+        }
+
         return reply("started");
     }
 
     if (text.includes("start a helper")) {
-        return fauxAssistantMessage(
-            [
-                fauxToolCall("subagent", {
-                    action: "spawn",
-                    name: "helper",
-                    message: "say hi please",
-                }),
-            ],
-            { stopReason: "toolUse" },
-        );
+        searchingSubagent = true;
+
+        return fauxAssistantMessage([fauxToolCall("tool_search", { query: "subagent" })], {
+            stopReason: "toolUse",
+        });
     }
 
     if (text.includes("say hi please")) {

@@ -245,11 +245,47 @@ import {
     type Thread,
     type WorktreeFact,
 } from "./desk.ts";
-import createDesk from "./desk.ts";
+import createDesk, { linkedSend } from "./desk.ts";
 import createTeam, { Identity, taskTitle } from "./team.ts";
 import { createHandler } from "./_pocket/src/server/http.ts";
+import type { Host } from "./_pocket.d.ts";
 
 // ─── The rules ───────────────────────────────────────────────────────────────
+
+test("linkedSend keeps follow-up delivery arguments", async () => {
+    const source = 42 as ConversationId;
+    const key = "desk-compatible";
+    const request = { to: "session-worker", message: "continue" };
+    let call:
+        | {
+              source: ConversationId;
+              request: { to: string; message: string; steer?: boolean };
+              key: string;
+          }
+        | undefined;
+    const host = {
+        linkedSessions: {
+            send: async (
+                sentSource: ConversationId,
+                sentRequest: { to: string; message: string; steer?: boolean },
+                sentKey: string,
+            ) => {
+                call = { source: sentSource, request: sentRequest, key: sentKey };
+
+                return { answers: true };
+            },
+        },
+    } as unknown as Host;
+
+    const result = await linkedSend(host, source, request, key);
+
+    assert.equal(result, undefined);
+    assert.deepEqual(call, {
+        source,
+        request: { ...request, steer: false },
+        key,
+    });
+});
 
 const empty = (): DeskState => ({ next: { T: 1, F: 1 }, threads: {}, grants: [], seen: {} });
 
