@@ -4,8 +4,13 @@ import { readFileSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { mulberry32 } from "../analyze.mjs";
+import { COMMAND_MS } from "./exec.mjs";
 
-/** The bench repositories: repository, language, owner (roster id). */
+/**
+ * The bench repositories: repository, language, owner (roster id), and an optional `commandMinutes`: the time limit of
+ * the repository's check and hidden-test commands, when its suite needs more than `COMMAND_MS` (fleet's check takes
+ * about 10 minutes on a quiet host, and more under load).
+ */
 export const BENCH_REPOS = [
     { repo: "bketelsen/pi-pocket-team", language: "ts", owner: "sheeana" },
     { repo: "frostyard/frostmail", language: "go", owner: "irulan" },
@@ -15,7 +20,7 @@ export const BENCH_REPOS = [
     { repo: "frostyard/core", language: "js", owner: "lucilla" },
     { repo: "frostyard/nsl", language: "go", owner: "duncan" },
     { repo: "frostyard/chairlift", language: "go", owner: "duncan" },
-    { repo: "bketelsen/fleet", language: "python", owner: "teg" },
+    { repo: "bketelsen/fleet", language: "python", owner: "teg", commandMinutes: 30 },
 ];
 
 /** The owners, in a fixed order. */
@@ -27,6 +32,25 @@ export const SEED = 1064;
 /** The bench entry of a repository (case-insensitive), or undefined. */
 export const benchRepo = (repo) =>
     BENCH_REPOS.find((entry) => entry.repo.toLowerCase() === String(repo).toLowerCase());
+
+/** The time limit of a repository's check and hidden-test commands, in ms: its `commandMinutes`, else `COMMAND_MS`. */
+export const commandMsOf = (repo) => {
+    const minutes = benchRepo(repo)?.commandMinutes;
+
+    return minutes ? minutes * 60_000 : COMMAND_MS;
+};
+
+/**
+ * The command limits of a repository's harvest, revalidation or scoring: `{ setup, check, hidden }` in ms. The
+ * precedence, for each kind: an explicit limit in `timeouts` (a caller's or a test's `deps.timeouts`) first; then, for
+ * the check and the hidden tests, the repository's own limit (`commandMsOf`); then `COMMAND_MS`. Setup has no
+ * repository limit.
+ */
+export const commandLimits = (timeouts = {}, repo) => ({
+    setup: timeouts.setup ?? COMMAND_MS,
+    check: timeouts.check ?? commandMsOf(repo),
+    hidden: timeouts.hidden ?? commandMsOf(repo),
+});
 
 /** The bench repositories of an owner. */
 export const reposOf = (owner) =>
