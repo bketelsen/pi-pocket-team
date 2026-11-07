@@ -123,16 +123,16 @@ const script: Parameters<typeof scriptedModel>[0] = (request) => {
             });
         }
 
-        if (text.startsWith("[night-shift] The night shift has stopped")) {
+        if (text.startsWith("[shift] The shift has stopped")) {
             return answer("Summary: 3 rounds ran.\n\nASKS FOR BRIAN: none");
         }
 
-        if (text.startsWith("[night-shift] Round")) {
+        if (text.startsWith("[shift] Round")) {
             return answer("STATUS: CONTINUE: more to do");
         }
 
-        if (text.includes("This task runs as a night shift")) {
-            return answer("Night shift noted.");
+        if (text.includes("This task runs as a shift")) {
+            return answer("Shift noted.");
         }
 
         if (text.includes("[plan-consult ")) {
@@ -538,8 +538,8 @@ describe("run-end answers with the desk", { skip: SKIP }, () => {
         // The first message, 3 rounds and the summary ran: a round can share a turn with the one before.
         const texts = (await userTexts(child)).join("\n");
 
-        assert.match(texts, /\[night-shift\] Round 3 of 3/);
-        assert.match(texts, /\[night-shift\] The night shift has stopped/);
+        assert.match(texts, /\[shift\] Round 3 of 3/);
+        assert.match(texts, /\[shift\] The shift has stopped/);
         await threeOutcomes(child);
         await heardNothing(supervisor, since);
     });

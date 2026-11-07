@@ -1049,7 +1049,7 @@ export function checkE3(data, ctx) {
                 (entry) =>
                     entry.at > from &&
                     entry.at < to &&
-                    !/^\[night-shift\]|^\[subagent |^\[scheduled\]/.test(entry.text),
+                    !/^\[(?:shift|night-shift)\]|^\[subagent |^\[scheduled\]/.test(entry.text),
             );
         };
 
@@ -1094,7 +1094,7 @@ export function checkE3(data, ctx) {
                       makeFinding({
                           check: "E3",
                           severity: "medium",
-                          text: `${twins.length} of ${shiftReports} night shift reports have a team_message from the same session within 30 min (the agent reported twice)`,
+                          text: `${twins.length} of ${shiftReports} shift reports have a team_message from the same session within 30 min (the agent reported twice)`,
                           evidence: twins.map(
                               (twin) => `${twin.label}: ${twin.gap} min apart, ${iso(twin.at)}`,
                           ),
@@ -2394,7 +2394,7 @@ function q1Stops(data, ctx) {
                 check: "Q1",
                 subject: `stops:repo:${repo}`,
                 severity: "medium",
-                text: `${row.last7} night-shift goals of ${repo} stopped in the last ${Q1_STOP_THRESHOLDS.days} days because the same check failure came 3 times in a row (${row.stops} in 30 days)`,
+                text: `${row.last7} shift goals of ${repo} stopped in the last ${Q1_STOP_THRESHOLDS.days} days because the same check failure came 3 times in a row (${row.stops} in 30 days)`,
                 evidence: recent.map(
                     (goal) =>
                         `${iso(goal.at)} goal ${goal.id} in session ${goal.session}${goal.thread === null ? "" : ` desk/${goal.thread}.md`}`,

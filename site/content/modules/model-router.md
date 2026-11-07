@@ -10,7 +10,7 @@ The code keeps Brian's 3 rules:
 
 1. **Shadow mode only.** The router records its suggestion. It never changes a model, a worker, or a thinking level. The linked session still starts on the profile model, exactly as it does without the router.
 2. **The brief goes to Jev masked.** URLs, emails, IP addresses, network host names, the host names in `~/.ssh/config`, and secret-like tokens become `[url]`, `[email]`, `[ip]`, `[host]` and `[secret]` before the call. A repository name such as `bketelsen/pi-pocket` and a file name such as `team.ts` stay.
-3. **Every delegation, and a named worker still wins.** The router runs on every `team_delegate` delegation, a night shift or not (a plan start and a Clerk start have none). When `night_shift.worker` names a model, that worker runs, and the route records the worker so the audit can compare the 2. The route changes no model, no worker and no tool result.
+3. **Every delegation, and a named worker still wins.** The router runs on every `team_delegate` delegation, a shift or not (a plan start and a Clerk start have none). When `shift.worker` names a model, that worker runs, and the route records the worker so the audit can compare the 2. The route changes no model, no worker and no tool result.
 
 ## Settings
 
@@ -43,7 +43,7 @@ With a named worker the line is shorter, and it says which model really runs. A 
 
 Every new route also carries `features` (version 1) and `briefHash`, the SHA-256 of the brief: off and failed routes too. The features are Jev's judgments (absent when Jev did not answer), the brief's length, the paths and roster repositories it names, the repository's language, whether a named path is a risk path, and whether a test file sits beside a named path. They keep counts and flags, never brief text. The reference page lists each field.
 
-The daily audit's check **R1** counts the routes of night shifts only. It joins every such route with what happened: the count, the open threads, the successes, the goals' statuses, the median rounds and cost, and the reopenings, grouped by kind, suggested tier and model, status, the named worker, and the model that really ran. A success rate shows only for 10 threads or more, and R1 makes no finding. The check **R2** measures every routed thread end to end, by the arm it was assigned: whether the work was accepted (merged, not reopened for rework, and not reverted within 14 days; the rules are in the [daily audit reference](https://github.com/bketelsen/pi-pocket-team/blob/main/docs/modules/daily-audit.md)), the cost per accepted thread, the review rounds and hand fixes, and whether the worker that ran matched the assigned one.
+The daily audit's check **R1** counts the routes of shifts only. It joins every such route with what happened: the count, the open threads, the successes, the goals' statuses, the median rounds and cost, and the reopenings, grouped by kind, suggested tier and model, status, the named worker, and the model that really ran. A success rate shows only for 10 threads or more, and R1 makes no finding. The check **R2** measures every routed thread end to end, by the arm it was assigned: whether the work was accepted (merged, not reopened for rework, and not reverted within 14 days; the rules are in the [daily audit reference](https://github.com/bketelsen/pi-pocket-team/blob/main/docs/modules/daily-audit.md)), the cost per accepted thread, the review rounds and hand fixes, and whether the worker that ran matched the assigned one.
 
 ## Limits
 

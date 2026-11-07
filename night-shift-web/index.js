@@ -1,5 +1,5 @@
-// Night shift's browser module: an item in the status line under the message box, while the session has a night
-// shift (or had one in the last hours), and a sheet with its rounds. `night-shift.ts` serves the goal and says when it
+// Shift's browser module: an item in the status line under the message box, while the session has a shift (or had
+// one in the last hours), and a sheet with its rounds. `night-shift.ts` serves the goal and says when it
 // changes.
 
 export const pocketApi = 1;
@@ -9,23 +9,23 @@ export function statusItem(goal) {
     const rounds = `${goal.round}/${goal.maxRounds}`;
 
     if (goal.status === "running" && goal.waiting) {
-        return { text: `Night shift waiting until ${goal.startLabel}`, short: "Night: waits" };
+        return { text: `Shift waiting until ${goal.startLabel}`, short: "Shift: waits" };
     }
 
     switch (goal.status) {
         case "running":
             return {
-                text: `Night shift ${rounds}${goal.deadlineLabel ? ` · until ${goal.deadlineLabel}` : ""}`,
-                short: `Night ${rounds}`,
+                text: `Shift ${rounds}${goal.deadlineLabel ? ` · until ${goal.deadlineLabel}` : ""}`,
+                short: `Shift ${rounds}`,
             };
         case "summary":
-            return { text: "Night shift: summary", short: "Night: summary" };
+            return { text: "Shift: summary", short: "Shift: summary" };
         case "paused":
-            return { text: `Night shift paused ${rounds}`, short: "Night: paused", tone: "warn" };
+            return { text: `Shift paused ${rounds}`, short: "Shift: paused", tone: "warn" };
         default:
             return {
-                text: `Night shift ${goal.reasonWord ?? "ended"} ${rounds}`,
-                short: `Night: ${goal.reasonWord ?? "ended"}`,
+                text: `Shift ${goal.reasonWord ?? "ended"} ${rounds}`,
+                short: `Shift: ${goal.reasonWord ?? "ended"}`,
                 tone: goal.reason === "failed" ? "error" : "muted",
             };
     }
@@ -108,13 +108,13 @@ export default function setup(pocket) {
         }
 
         if (!goal) {
-            return html`<p class="muted">No night shift in this session.</p>`;
+            return html`<p class="muted">No shift in this session.</p>`;
         }
 
         return html`<pre class="mono small" style="white-space: pre-wrap">${goal.card}</pre>`;
     }
 
-    pocket.sheet({ id: "goal", title: "Night shift", component: Goal });
+    pocket.sheet({ id: "goal", title: "Shift", component: Goal });
 
     const stop = pocket.on("changed", ({ conversation }) => {
         if (conversation === pocket.conversationId()) {

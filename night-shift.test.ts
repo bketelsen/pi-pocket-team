@@ -392,7 +392,7 @@ describe("parsing", () => {
                 round: 0,
                 maxRounds: 40,
             }).text,
-            "Night shift waiting until 06:00 EDT",
+            "Shift waiting until 06:00 EDT",
         );
     });
 
@@ -478,7 +478,10 @@ describe("parsing", () => {
         assert.equal(personOf("wake up"), "A person");
         assert.equal(personOf("[from: Brian] wake up"), "Brian");
         assert.equal(personOf([{ type: "text", text: "[from: Ann] hi" }]), "Ann");
+        assert.equal(personOf("[shift] Round 2 of 20."), undefined);
+        // Older entries hold the old prefix: still no person.
         assert.equal(personOf("[night-shift] Round 2 of 20."), undefined);
+        assert.equal(personOf("[shifts] not this module's"), "A person");
         assert.equal(personOf("[from: Brian] [via linked session session-1] do it"), undefined);
         assert.equal(personOf("[via PR watch] checks failed"), undefined);
         assert.equal(personOf("[scheduled] standup"), undefined);
@@ -494,7 +497,7 @@ describe("parsing", () => {
 
         assert.equal(
             statusItem({ ...goal, status: "running" }).text,
-            "Night shift 3/30 · until 07:00 EDT",
+            "Shift 3/30 · until 07:00 EDT",
         );
         assert.equal(statusItem({ ...goal, status: "paused" }).tone, "warn");
         assert.equal(
@@ -539,14 +542,14 @@ const route: FauxResponseStep = async (request, options) => {
         return say("Wrote it.\nSTATUS: DONE: the file is there");
     }
 
-    if (text.startsWith("[night-shift] The night shift has stopped")) {
+    if (text.startsWith("[shift] The shift has stopped")) {
         return say("Summary for the morning: I did the rounds. Nothing is left.");
     }
 
-    const round = /^\[night-shift\] Round (\d+) of/.exec(text);
+    const round = /^\[shift\] Round (\d+) of/.exec(text);
     const scenario = /Objective: (scenario-[a-z-]+)/.exec(text)?.[1];
 
-    if (round === null && JSON.stringify(request).includes("This session runs a night shift")) {
+    if (round === null && JSON.stringify(request).includes("This session runs a shift")) {
         sectionBeforeRound = true;
     }
 
@@ -556,7 +559,7 @@ const route: FauxResponseStep = async (request, options) => {
 
     const n = Number(round[1]);
 
-    if (JSON.stringify(request).includes("This session runs a night shift")) {
+    if (JSON.stringify(request).includes("This session runs a shift")) {
         sectioned.add(`${scenario} ${n}`);
         sectionRequest = JSON.stringify(request);
     }
@@ -676,8 +679,8 @@ async function session(name: string): Promise<ConversationId> {
     return current;
 }
 
-function command(id: ConversationId, args: string, user = owner(app)) {
-    const commandId = app.webs.commands().find((each) => each.name === "night-shift")?.id;
+function command(id: ConversationId, args: string, user = owner(app), name = "team-shift") {
+    const commandId = app.webs.commands().find((each) => each.name === name)?.id;
 
     return app.extensionCommands.run(id, user, { commandId, args, requestId: crypto.randomUUID() });
 }
@@ -691,7 +694,7 @@ function refused(result: { status?: string; message?: string }, words: RegExp): 
 const goalOf = async (id: ConversationId): Promise<Goal | undefined> =>
     (await app.harness.snapshot(GoalDoc, id, context))?.goal;
 
-async function settled(id: ConversationId, what = "the night shift to end"): Promise<Goal> {
+async function settled(id: ConversationId, what = "the shift to end"): Promise<Goal> {
     await until(
         async () => {
             const goal = await goalOf(id);
@@ -727,8 +730,8 @@ async function sent(id: ConversationId): Promise<string[]> {
     return page.items
         .filter((entry) => entry.kind === "pi.user")
         .map((entry) => JSON.stringify(entry.model))
-        .filter((text) => text.includes("[night-shift]"))
-        .map((text) => /\[night-shift\] (Round \d+|The night shift has stopped)/.exec(text)![1]!)
+        .filter((text) => text.includes("[shift]"))
+        .map((text) => /\[shift\] (Round \d+|The shift has stopped)/.exec(text)![1]!)
         .reverse();
 }
 
@@ -803,7 +806,7 @@ describe("stop reasons", () => {
         const id = await session("done");
         const card = await command(id, "max 5: scenario-done; stop when it works");
 
-        assert.match(JSON.stringify(card), /Night shift set/);
+        assert.match(JSON.stringify(card), /Shift set/);
         const goal = await settled(id);
 
         assert.equal(goal.reason, "done");
@@ -816,7 +819,7 @@ describe("stop reasons", () => {
                 ["done", "it works"],
             ],
         );
-        assert.deepEqual(await sent(id), ["Round 1", "Round 2", "The night shift has stopped"]);
+        assert.deepEqual(await sent(id), ["Round 1", "Round 2", "The shift has stopped"]);
         assert.equal(goal.driver, undefined);
     });
 
@@ -832,12 +835,19 @@ describe("stop reasons", () => {
             "Round 1",
             "Round 2",
             "Round 3",
-            "The night shift has stopped",
+            "The shift has stopped",
         ]);
         assert(
             sectioned.has("scenario-max 1") && sectioned.has("scenario-max 3"),
             "the section while it runs",
         );
+        // The prompt section names the feature "shift" only.
+        const section = /This session runs a shift.*?when your task allows it\./.exec(
+            sectionRequest,
+        )?.[0];
+
+        assert.ok(section !== undefined, "the section's text");
+        assert.doesNotMatch(section, /night[\s_-]?shift/i);
         const view = await (await app.harness.conversation(id, context))!.context(context);
 
         assert.match(JSON.stringify(view.messages), /Last round you said CONTINUE: more/);
@@ -853,7 +863,7 @@ describe("stop reasons", () => {
         shift = 0;
         assert.equal(goal.reason, "deadline");
         assert.equal(goal.round, 1, "the clock passed the deadline during round 1");
-        assert.deepEqual(await sent(id), ["Round 1", "The night shift has stopped"]);
+        assert.deepEqual(await sent(id), ["Round 1", "The shift has stopped"]);
     });
 
     test("blocked", async () => {
@@ -864,7 +874,7 @@ describe("stop reasons", () => {
 
         assert.equal(goal.reason, "blocked");
         assert.match(goal.why!, /the token is missing/);
-        assert.deepEqual(await sent(id), ["Round 1", "The night shift has stopped"]);
+        assert.deepEqual(await sent(id), ["Round 1", "The shift has stopped"]);
     });
 
     test("a person's message pauses it, and resume goes on", async () => {
@@ -894,7 +904,7 @@ describe("stop reasons", () => {
         assert.match(JSON.stringify(resumed), /resumed/);
         goal = await settled(id);
         assert.equal(goal.reason, "max-rounds");
-        assert.deepEqual(await sent(id), ["Round 1", "Round 2", "The night shift has stopped"]);
+        assert.deepEqual(await sent(id), ["Round 1", "Round 2", "The shift has stopped"]);
     });
 
     test("a background task's message does not pause it", async () => {
@@ -917,7 +927,7 @@ describe("stop reasons", () => {
 
         assert.equal(goal.status, "ended");
         assert.equal(goal.reason, "max-rounds");
-        assert.deepEqual(await sent(id), ["Round 1", "Round 2", "The night shift has stopped"]);
+        assert.deepEqual(await sent(id), ["Round 1", "Round 2", "The shift has stopped"]);
     });
 
     test("Stop", async () => {
@@ -934,7 +944,7 @@ describe("stop reasons", () => {
         assert.deepEqual(await sent(id), ["Round 1"]);
     });
 
-    test("/night-shift stop: the round that runs finishes, and no other starts", async () => {
+    test("/team-shift stop: the round that runs finishes, and no other starts", async () => {
         const id = await session("command");
 
         await command(id, "scenario-command; stop when never");
@@ -1305,7 +1315,7 @@ describe("restarts", () => {
             "Round 1",
             "Round 2",
             "Round 3",
-            "The night shift has stopped",
+            "The shift has stopped",
         ]);
         assert.deepEqual(
             goal.rounds.map((round) => round.n),
@@ -1371,7 +1381,7 @@ describe("Pi's own subagents", () => {
         const goal = await settled(id);
 
         assert.equal(goal.reason, "done");
-        assert.deepEqual(await sent(id), ["Round 1", "Round 2", "The night shift has stopped"]);
+        assert.deepEqual(await sent(id), ["Round 1", "Round 2", "The shift has stopped"]);
     });
 
     test("the cap: after an hour of waiting, the round goes even while it works", async () => {
@@ -1396,7 +1406,7 @@ describe("Pi's own subagents", () => {
 
             assert.equal(goal.reason, "done");
             assert.equal(goal.round, 2);
-            assert.deepEqual(await sent(id), ["Round 1", "Round 2", "The night shift has stopped"]);
+            assert.deepEqual(await sent(id), ["Round 1", "Round 2", "The shift has stopped"]);
         } finally {
             shift = 0;
         }
@@ -1436,7 +1446,7 @@ describe("Pi's own subagents", () => {
             goal.rounds.map((round) => round.n),
             [1, 2],
         );
-        assert.deepEqual(await sent(id), ["Round 1", "Round 2", "The night shift has stopped"]);
+        assert.deepEqual(await sent(id), ["Round 1", "Round 2", "The shift has stopped"]);
     });
 
     test("a person's message during the wait pauses the shift", async () => {
@@ -1531,13 +1541,13 @@ describe("start", () => {
 
             assert.equal(goal.reason, "max-rounds");
             assert.equal(goal.round, 2);
-            assert.deepEqual(await sent(id), ["Round 1", "Round 2", "The night shift has stopped"]);
+            assert.deepEqual(await sent(id), ["Round 1", "Round 2", "The shift has stopped"]);
         } finally {
             shift = 0;
         }
     });
 
-    test("/night-shift stop cancels a waiting goal", async () => {
+    test("/team-shift stop cancels a waiting goal", async () => {
         const id = await session("cancel-wait");
         const { hhmm } = soon();
 
@@ -1553,5 +1563,89 @@ describe("start", () => {
         assert.equal(goal.status, "ended");
         assert.equal(goal.reason, "stopped");
         assert.deepEqual(await sent(id), []);
+    });
+});
+
+describe("the command names", () => {
+    /** The words of a run's answer: a card's output, or a toast's message (a refusal is a toast). */
+    const words = (result: { output?: string; message?: string }) =>
+        result.output ?? result.message ?? "";
+    const RENAMED = "`/night-shift` is now `/team-shift`.";
+
+    test("/team-shift sets, shows, stops and resumes a goal, and says only its own name", async () => {
+        const id = await session("names-team-shift");
+        const { hhmm } = soon();
+        const run = (args: string) => command(id, args, owner(app), "team-shift");
+
+        const set = await run(`start ${hhmm} max 2: scenario-names; stop when never`);
+
+        assert.match(words(set), /^Shift set\. Round 1 starts at /);
+        assert.match(
+            words(await run("status")),
+            /^Shift: waiting until [\s\S]*\/team-shift stop cancels it\./,
+        );
+        assert.match(words(await run("stop")), /^Shift cancelled by /);
+        assert.equal((await goalOf(id))?.status, "ended");
+        assert.match(
+            words(await run("status")),
+            /^Shift: ended at starting: [\s\S]*\/team-shift resume goes on\./,
+        );
+        assert.match(words(await run("resume")), /^Shift resumed by /);
+        assert.equal((await goalOf(id))?.status, "running");
+        assert.match(words(await run("stop")), /^Shift cancelled by /);
+        await until(async () => (await drivers(id)) === 0, "the waiting driver to end", 10_000);
+        assert.match(words(await run("help")), /^\/team-shift \[start 06:00\]/);
+
+        for (const answer of [set, await run("status"), await run("help")]) {
+            assert.doesNotMatch(words(answer), /night[\s_-]?shift/i);
+        }
+    });
+
+    test("/night-shift, the old name, does the same, and each answer says the new name first", async () => {
+        const id = await session("names-night-shift");
+        const { hhmm } = soon();
+        const run = (args: string) => command(id, args, owner(app), "night-shift");
+
+        const set = await run(`start ${hhmm} max 2: scenario-names; stop when never`);
+
+        assert.equal(set.status, "done");
+        assert.ok(words(set).startsWith(`${RENAMED}\nShift set. Round 1 starts at `), words(set));
+        assert.ok(words(await run("status")).startsWith(`${RENAMED}\nShift: waiting until `));
+
+        // A refusal made with web.error: its words say the new name first too.
+        const refusal = await run("resume");
+
+        assert.equal(refusal.status, "failed");
+        assert.equal(words(refusal), `${RENAMED}\nThe shift runs already.`);
+
+        const unparsed = await run("max 0: a; stop when b");
+
+        assert.equal(unparsed.status, "failed");
+        assert.ok(words(unparsed).startsWith(`${RENAMED}\n`), words(unparsed));
+
+        assert.ok(words(await run("stop")).startsWith(`${RENAMED}\nShift cancelled by `));
+        assert.equal((await goalOf(id))?.status, "ended");
+        assert.ok(words(await run("resume")).startsWith(`${RENAMED}\nShift resumed by `));
+        assert.equal((await goalOf(id))?.status, "running");
+        assert.ok(words(await run("stop")).startsWith(`${RENAMED}\nShift cancelled by `));
+        await until(async () => (await drivers(id)) === 0, "the waiting driver to end", 10_000);
+
+        // A toast: no goal runs now.
+        const toast = await run("stop");
+
+        assert.equal(toast.type, "toast");
+        assert.equal(words(toast), `${RENAMED}\nNo shift runs here.`);
+        assert.ok(words(await run("help")).startsWith(`${RENAMED}\n/team-shift [start 06:00]`));
+    });
+
+    test("both commands are registered, and the alias says it is the old name", () => {
+        const names = app.webs.commands().map((each) => each.name);
+
+        assert.ok(names.includes("team-shift"));
+        assert.ok(names.includes("night-shift"));
+        assert.match(
+            app.webs.commands().find((each) => each.name === "night-shift")!.description,
+            /old name of \/team-shift/,
+        );
     });
 });

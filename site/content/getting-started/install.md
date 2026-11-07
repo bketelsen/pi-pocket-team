@@ -51,5 +51,5 @@ The owner turns each module on in **Menu → Extensions**, and the owner restart
 
 ## Next
 
-- [Team](../modules/team.md) is the module to turn on first: the Desk and night shifts read its identities and its roster.
+- [Team](../modules/team.md) is the module to turn on first: the Desk and shifts read its identities and its roster.
 - [Build and test](../contributing/build.md) names every check the repository runs.

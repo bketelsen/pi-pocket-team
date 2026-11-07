@@ -991,21 +991,23 @@ test("E3: a team_message that answers a new request after the shift report is no
     assert.equal(result.metrics.shiftReports, 3);
 });
 
-test("E3: the shift's own entries between the report and the message do not make it an answer", () => {
-    const data = e3Pairs((i) => [
-        { id: `u${i}a`, at: ago(3 * HOUR) + 5 * MINUTE, text: "[night-shift] Round 2 of 4." },
-        {
-            id: `u${i}b`,
-            at: ago(3 * HOUR) + 15 * MINUTE,
-            text: "[subagent x answered, no reply needed] ok",
-        },
-    ]);
-    const result = checkE3(data, ctx);
+for (const prefix of ["[shift]", "[night-shift]"]) {
+    test(`E3: the shift's own entries (${prefix}) between the report and the message do not make it an answer`, () => {
+        const data = e3Pairs((i) => [
+            { id: `u${i}a`, at: ago(3 * HOUR) + 5 * MINUTE, text: `${prefix} Round 2 of 4.` },
+            {
+                id: `u${i}b`,
+                at: ago(3 * HOUR) + 15 * MINUTE,
+                text: "[subagent x answered, no reply needed] ok",
+            },
+        ]);
+        const result = checkE3(data, ctx);
 
-    assert.deepEqual(ids(result), ["E3"]);
-    assert.equal(result.pairs.length, 3);
-    assert.equal(result.metrics.answeredAfterShift, 0);
-});
+        assert.deepEqual(ids(result), ["E3"]);
+        assert.equal(result.pairs.length, 3);
+        assert.equal(result.metrics.answeredAfterShift, 0);
+    });
+}
 
 test("E3: a person's message between the shift report and the team_message makes it an answer", () => {
     const data = e3Pairs((i) => [
@@ -2759,7 +2761,7 @@ test("Q1 stops: 2 stops of 1 repository in 7 days are a finding; with 1 older th
 
     assert.equal(finding.severity, "medium");
     assert.equal(finding.cases, 2);
-    assert.match(finding.text, /^2 night-shift goals of acme\/widgets stopped in the last 7 days/);
+    assert.match(finding.text, /^2 shift goals of acme\/widgets stopped in the last 7 days/);
     assert.deepEqual(finding.evidence, [
         `${new Date(ago(3 * DAY)).toISOString().slice(0, 16)}Z goal g2 in session ${t1.session} desk/T1.md`,
         `${new Date(ago(DAY)).toISOString().slice(0, 16)}Z goal g1 in session ${t1.session} desk/T1.md`,

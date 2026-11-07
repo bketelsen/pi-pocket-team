@@ -9630,10 +9630,9 @@ describe("with the Pi Pocket app", () => {
             async () =>
                 (await modelTexts(app, shifted.session as ConversationId)).some(
                     (each) =>
-                        each.includes("1 PR for this task") &&
-                        each.includes("runs as a night shift"),
+                        each.includes("1 PR for this task") && each.includes("runs as a shift"),
                 ),
-            "the brief with the night shift",
+            "the brief with the shift",
             20_000,
         );
 

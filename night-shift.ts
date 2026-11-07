@@ -1,7 +1,7 @@
 /**
- * Night shift: Pi works on an objective in rounds while you sleep, and stops when it says the stop condition holds
+ * Shift: Pi works on an objective in rounds while the people are away, and stops when it says the stop condition holds
  * (and an optional check command passes), at a round limit, at a deadline, when a person writes, at Stop, or at a
- * spend limit. Then it writes a summary for the morning. Start one with /night-shift.
+ * spend limit. Then it writes a summary for the morning. Start one with /team-shift.
  *
  * How it works. Pocket's own "Done when" (src/server/goals.ts) drives its rounds from an `onYield` hook. A drop-in's
  * hook gets only reads and memos (no commits), and a command cannot start Pi, so this module drives its rounds from a
@@ -24,6 +24,15 @@
  *
  * The same check failure `SAME_FAILURES` times in a row (by `checkFingerprint`) stops a goal as `blocked`, with a
  * detail: no new stop reason, because the reason is stored data.
+ *
+ * Names. The user-facing name is "shift": the command `/team-shift` (Pi Pocket requires a `-` in an extension command
+ * name), the `team_delegate` argument `shift`, and the round prefix `[shift]`. The goal runs at any hour, not only at
+ * night. The file, the folder `night-shift-web/`, the module name `night-shift`, the global symbol
+ * `pi-pocket-team.night-shift`, the document kind `x.night-shift.goal`, the task name `x.night-shift.driver`, the
+ * request ids and keys `x.night-shift.*` and `p:…:x-night-shift-…`, and the report value `from: "night-shift"` keep the
+ * old name "night-shift": they are stored data or live identity. A new module name is a new module in Pi Pocket: it
+ * must be turned on again, and a running goal's driver would lose its module. `/night-shift` and `night_shift` stay as
+ * aliases, and the readers of the round prefix accept the old `[night-shift]` too, because old entries hold it.
  */
 import { createHash, randomUUID } from "node:crypto";
 import type { Context } from "@earendil-works/chord";
@@ -44,7 +53,7 @@ import {
     type TaskRuntime,
     type Tx,
 } from "@earendil-works/pi-durable";
-import type { CommandContext, Host, Web } from "./_pocket.d.ts";
+import type { Command, CommandContext, Host, Web } from "./_pocket.d.ts";
 
 /** Keep linked-session sends as follow-up work on Pi Pocket 0.28, as they were on 0.27. */
 export async function linkedSend(
@@ -116,7 +125,9 @@ export const SUBAGENT_POLL_MS = 15_000;
 /** The longest `decide` waits for them before one round: after it, the round goes anyway. */
 export const SUBAGENT_WAIT_MS = 60 * 60_000;
 
-const PREFIX = "[night-shift]";
+const PREFIX = "[shift]";
+/** The first line of each answer of `/night-shift`, the old name of `/team-shift`. */
+const RENAMED = "`/night-shift` is now `/team-shift`.";
 /** Where another module finds this one's live API: a global, never an import. */
 const API = Symbol.for("pi-pocket-team.night-shift");
 /** Where this module finds the desk's live API: a global, never an import. */
@@ -440,8 +451,8 @@ export type Parsed =
     | { kind: "error"; message: string };
 
 export const USAGE =
-    "/night-shift [start 06:00] [until 07:00 | for 8h] [max 30] [with provider/model] [check `npm test`]: <objective>; stop when <condition>\n" +
-    "/night-shift status | stop | resume";
+    "/team-shift [start 06:00] [until 07:00 | for 8h] [max 30] [with provider/model] [check `npm test`]: <objective>; stop when <condition>\n" +
+    "/team-shift status | stop | resume";
 
 /** The wall-clock parts of `ms` in `zone`. */
 function partsIn(ms: number, zone: string) {
@@ -572,7 +583,7 @@ const CHECK = /^check\s+`([^`]*)`/i;
 const WITH = /^with\s+([A-Za-z0-9._-]+\/[A-Za-z0-9._:-]*[A-Za-z0-9._-])(?=[\s:]|$)/i;
 const STOP_WHEN = /\bstop\s+(?:only\s+)?when\b/gi;
 
-/** What the options of `/night-shift` set, and the text after them. */
+/** What the options of `/team-shift` set, and the text after them. */
 export type GoalOptions = {
     maxRounds?: number;
     check?: string;
@@ -724,7 +735,7 @@ export function parseOptions(
 }
 
 /**
- * Parse what follows `/night-shift`. Options come first, in any order; then an optional `:`, then the objective and
+ * Parse what follows `/team-shift`. Options come first, in any order; then an optional `:`, then the objective and
  * the stop condition, split at the last "stop when" (or "stop only when").
  */
 export function parseArgs(input: string, now: number, zone: string): Parsed {
@@ -804,7 +815,7 @@ export function parseArgs(input: string, now: number, zone: string): Parsed {
     };
 }
 
-// ─── A PR check for a delegated night shift ─────────────────────────────────
+// ─── A PR check for a delegated shift ───────────────────────────────────────
 
 /**
  * A PR check that `team_delegate` can ask for, in place of a check command. The module builds the command from these
@@ -852,35 +863,35 @@ export function prCheckCommand(check: PrCheck): string | { error: string } {
     const which = check.checks ?? "required";
 
     if (pr !== undefined && (typeof pr !== "number" || !Number.isSafeInteger(pr) || pr < 1)) {
-        return { error: "night_shift.pr_check.pr must be a whole number of 1 or more." };
+        return { error: "shift.pr_check.pr must be a whole number of 1 or more." };
     }
 
     if (repo !== undefined && (typeof repo !== "string" || !PR_REPO.test(repo))) {
         return {
-            error: "night_shift.pr_check.repo must be owner/name, such as bketelsen/x: letters, digits, . _ and - only.",
+            error: "shift.pr_check.repo must be owner/name, such as bketelsen/x: letters, digits, . _ and - only.",
         };
     }
 
     // `gh` reads the current branch's PR only with no `--repo`: with one, it needs the number.
     if (repo !== undefined && pr === undefined) {
         return {
-            error: "night_shift.pr_check.repo needs pr: gh finds the current branch's PR only without a repo.",
+            error: "shift.pr_check.repo needs pr: gh finds the current branch's PR only without a repo.",
         };
     }
 
     if (which !== "required" && which !== "all" && which !== "none") {
-        return { error: 'night_shift.pr_check.checks must be "required", "all" or "none".' };
+        return { error: 'shift.pr_check.checks must be "required", "all" or "none".' };
     }
 
     if (label !== undefined && (typeof label !== "string" || !PR_LABEL.test(label))) {
         return {
-            error: "night_shift.pr_check.label must be 1 to 50 characters: a letter or digit first, then letters, digits, spaces and . _ : / + - only.",
+            error: "shift.pr_check.label must be 1 to 50 characters: a letter or digit first, then letters, digits, spaces and . _ : / + - only.",
         };
     }
 
     if (which === "none" && label === undefined) {
         return {
-            error: 'night_shift.pr_check.checks "none" needs a label: with neither, there is nothing to check.',
+            error: 'shift.pr_check.checks "none" needs a label: with neither, there is nothing to check.',
         };
     }
 
@@ -913,7 +924,7 @@ export function prCheckCommand(check: PrCheck): string | { error: string } {
 
     if (command === "" || command.length > MAX_COMMAND) {
         return {
-            error: `night_shift.pr_check builds a command of 1 to ${MAX_COMMAND} characters: this one is ${command.length}.`,
+            error: `shift.pr_check builds a command of 1 to ${MAX_COMMAND} characters: this one is ${command.length}.`,
         };
     }
 
@@ -933,7 +944,7 @@ export function checkNote(check: CheckResult | undefined): string | undefined {
         .at(-1);
 }
 
-/** The fields of `night_shift` in the `team_delegate` tool. */
+/** The fields of `shift` (alias `night_shift`) in the `team_delegate` tool. */
 export type DelegatedFields = {
     objective: string;
     stop_when: string;
@@ -971,9 +982,9 @@ const OPTION_ALONE = {
 } as const;
 
 /**
- * The goal request for a night shift that `team_delegate` starts. Each option comes from its own field, so a field
+ * The goal request for a shift that `team_delegate` starts. Each option comes from its own field, so a field
  * cannot carry a second option: the free check never comes from this path (only the owner sets one, with
- * `/night-shift`). The 1 exception is `pr_check`, a structured PR check: `prCheckCommand` builds a fixed `gh` command
+ * `/team-shift`). The 1 exception is `pr_check`, a structured PR check: `prCheckCommand` builds a fixed `gh` command
  * from validated values, so no model-chosen shell runs. The options combine here, so `until` after `start`, `for` from
  * `start`, and one of `until`/`for` hold as usual.
  */
@@ -1014,7 +1025,7 @@ export function delegatedRequest(
             options.worker !== fields.worker.trim()
         ) {
             return {
-                error: "night_shift.worker must be only a provider/model, such as github-copilot/claude-sonnet-5.5.",
+                error: "shift.worker must be only a provider/model, such as github-copilot/claude-sonnet-5.5.",
             };
         }
 
@@ -1037,7 +1048,7 @@ export function delegatedRequest(
             !OPTION_ALONE[name].only(options)
         ) {
             return {
-                error: `night_shift.${name} must be only ${OPTION_ALONE[name].word}.`,
+                error: `shift.${name} must be only ${OPTION_ALONE[name].word}.`,
             };
         }
 
@@ -1052,8 +1063,7 @@ export function delegatedRequest(
 
     if ("error" in options || options.rest !== "" || options.check !== undefined) {
         return {
-            error:
-                "error" in options ? options.error : "night_shift must not carry another option.",
+            error: "error" in options ? options.error : "shift must not carry another option.",
         };
     }
 
@@ -1117,7 +1127,7 @@ const FROM = /^\[from: ([^\]\n]{1,60})\] /;
  * `[via …]`), schedules, subagent reports, Done when's checks, and the end of a background task (Pocket 0.24's
  * `BACKGROUND_PREFIX`, `[background] `).
  */
-const AUTOMATED = /^\[(?:night-shift\]|via |scheduled\]|subagent |goal\] |background\] )/;
+const AUTOMATED = /^\[(?:shift\]|night-shift\]|via |scheduled\]|subagent |goal\] |background\] )/;
 
 function textOf(content: unknown): string {
     if (typeof content === "string") {
@@ -1285,7 +1295,7 @@ export function summaryMessage(goal: Goal): string {
             : `It took ${goal.round} of ${goal.maxRounds} rounds, with subagents on ${goal.worker}.`;
 
     return [
-        `${PREFIX} The night shift has stopped: ${goal.why}. ${rounds}`,
+        `${PREFIX} The shift has stopped: ${goal.why}. ${rounds}`,
         "Do not start new work. Write the summary for the morning, in three short parts: what you did, what is left, and why the work stopped.",
         ...(goal.delegated === undefined
             ? []
@@ -1303,7 +1313,7 @@ function reportMessage(goal: Goal, text: string): string {
     const progress =
         goal.worker === undefined ? "" : `\nRounds: ${goal.round}, worker: ${goal.worker}.`;
 
-    return `Night shift report from this linked session: stopped at round ${goal.round} of ${goal.maxRounds}: ${goal.why ?? "it stopped"}.${progress}\n\n${text}`;
+    return `Shift report from this linked session: stopped at round ${goal.round} of ${goal.maxRounds}: ${goal.why ?? "it stopped"}.${progress}\n\n${text}`;
 }
 
 const VERDICT_WORD: Record<Verdict, string> = {
@@ -1325,7 +1335,7 @@ const REASON_WORD: Record<StopReason, string> = {
     failed: "failed",
 };
 
-/** Whether `/night-shift resume` can go on with a goal: it stopped, not done, with rounds and time left. */
+/** Whether `/team-shift resume` can go on with a goal: it stopped, not done, with rounds and time left. */
 export function resumable(goal: Goal, now: number): boolean {
     return (
         (goal.status === "paused" || goal.status === "ended") &&
@@ -1379,11 +1389,11 @@ export function standing(goal: Goal, now: number): string {
 
 export function statusCard(goal: Goal | undefined, now: number): string {
     if (goal === undefined) {
-        return `No night shift in this session.\n${USAGE}`;
+        return `No shift in this session.\n${USAGE}`;
     }
 
     const lines = [
-        `Night shift: ${standing(goal, now)}.`,
+        `Shift: ${standing(goal, now)}.`,
         `Objective: ${goal.objective}`,
         `Stop when: ${goal.stop}`,
         ...(goal.check === undefined ? [] : [`Check: ${goal.check}`]),
@@ -1410,13 +1420,13 @@ export function statusCard(goal: Goal | undefined, now: number): string {
     }
 
     if (waiting(goal, now)) {
-        lines.push("/night-shift stop cancels it.");
+        lines.push("/team-shift stop cancels it.");
     } else if (goal.status === "running" || goal.status === "summary") {
         lines.push(
-            "/night-shift stop ends it after the current round. Stop ends the current round now.",
+            "/team-shift stop ends it after the current round. Stop ends the current round now.",
         );
     } else if (resumable(goal, now)) {
-        lines.push("/night-shift resume goes on.");
+        lines.push("/team-shift resume goes on.");
     }
 
     return lines.join("\n");
@@ -1676,19 +1686,15 @@ export default function createNightShift(host: Host, web: Web) {
         }
 
         if (goal.status === "paused") {
-            host.notice(
-                "warning",
-                `Night shift paused: ${goal.why}. /night-shift resume goes on.`,
-                id,
-            );
+            host.notice("warning", `Shift paused: ${goal.why}. /team-shift resume goes on.`, id);
         } else if (goal.status === "ended") {
             host.notice(
                 goal.reason === "failed" ? "error" : "info",
-                `Night shift ended: ${goal.why}.`,
+                `Shift ended: ${goal.why}.`,
                 id,
             );
         } else if (goal.status === "summary") {
-            host.notice("info", `Night shift stopped: ${goal.why}. Pi writes the summary.`, id);
+            host.notice("info", `Shift stopped: ${goal.why}. Pi writes the summary.`, id);
         }
     }
 
@@ -2112,7 +2118,7 @@ export default function createNightShift(host: Host, web: Web) {
                 await runtime.commit(async (tx) => {
                     const goal = (await tx.doc(GoalDoc, id)).goal;
 
-                    // Stopped with /night-shift stop, or another goal: the round's answer is nobody's to count.
+                    // Stopped with /team-shift stop, or another goal: the round's answer is nobody's to count.
                     if (
                         goal?.driver !== String(runtime.taskId) ||
                         goal.status !== "running" ||
@@ -2384,7 +2390,7 @@ export default function createNightShift(host: Host, web: Web) {
                 if (found.address === undefined) {
                     host.notice(
                         "warning",
-                        "The night shift could not report: this session has no source session.",
+                        "The shift could not report: this session has no source session.",
                         id,
                     );
                 } else if (report !== undefined && found.filed?.held !== true) {
@@ -2398,7 +2404,7 @@ export default function createNightShift(host: Host, web: Web) {
                     } catch (error) {
                         host.notice(
                             "warning",
-                            `The night shift report did not go: ${(error as Error).message}`,
+                            `The shift report did not go: ${(error as Error).message}`,
                             id,
                         );
                     }
@@ -2488,7 +2494,7 @@ export default function createNightShift(host: Host, web: Web) {
         }
 
         if (doc.goal?.status === "running" || doc.goal?.status === "summary") {
-            throw new Error("A night shift runs here. /night-shift stop ends it first.");
+            throw new Error("A shift runs here. /team-shift stop ends it first.");
         }
 
         const unallowed = workerProblem(request.worker);
@@ -2506,9 +2512,7 @@ export default function createNightShift(host: Host, web: Web) {
         }
 
         if (plan) {
-            throw new Error(
-                "Plan mode is on. Turn it off first: a night shift works, it does not plan.",
-            );
+            throw new Error("Plan mode is on. Turn it off first: a shift works, it does not plan.");
         }
 
         const held = host.heldBack(id);
@@ -2558,7 +2562,7 @@ export default function createNightShift(host: Host, web: Web) {
         if (await planModeOn(ctx)) {
             throw web.error(
                 409,
-                "Plan mode is on. Turn it off first: a night shift works, it does not plan.",
+                "Plan mode is on. Turn it off first: a shift works, it does not plan.",
             );
         }
 
@@ -2566,10 +2570,7 @@ export default function createNightShift(host: Host, web: Web) {
             const doc = await tx.doc(GoalDoc, ctx.conversationId);
 
             if (doc.goal?.status === "running" || doc.goal?.status === "summary") {
-                throw web.error(
-                    409,
-                    "A night shift is running here. /night-shift stop ends it first.",
-                );
+                throw web.error(409, "A shift is running here. /team-shift stop ends it first.");
             }
 
             const goal: Goal = {
@@ -2599,7 +2600,7 @@ export default function createNightShift(host: Host, web: Web) {
 
         return {
             type: "card" as const,
-            output: `Night shift set. ${begins}\n${statusCard(goal, Date.now())}`,
+            output: `Shift set. ${begins}\n${statusCard(goal, Date.now())}`,
         };
     }
 
@@ -2614,7 +2615,7 @@ export default function createNightShift(host: Host, web: Web) {
         } catch (error) {
             host.notice(
                 "warning",
-                `The night shift report did not go: ${(error as Error).message}`,
+                `The shift report did not go: ${(error as Error).message}`,
                 ctx.conversationId,
             );
 
@@ -2624,7 +2625,7 @@ export default function createNightShift(host: Host, web: Web) {
         if (address === undefined) {
             host.notice(
                 "warning",
-                "The night shift could not report: this session has no source session.",
+                "The shift could not report: this session has no source session.",
                 ctx.conversationId,
             );
 
@@ -2639,7 +2640,7 @@ export default function createNightShift(host: Host, web: Web) {
                     to: address,
                     message: reportMessage(
                         goal,
-                        `${ctx.user.name} stopped it with /night-shift stop.`,
+                        `${ctx.user.name} stopped it with /team-shift stop.`,
                     ),
                 },
                 `x.night-shift.report:stop:${goal.id}:${goal.round}`,
@@ -2647,7 +2648,7 @@ export default function createNightShift(host: Host, web: Web) {
         } catch (error) {
             host.notice(
                 "warning",
-                `The night shift report did not go: ${(error as Error).message}`,
+                `The shift report did not go: ${(error as Error).message}`,
                 ctx.conversationId,
             );
         }
@@ -2675,7 +2676,7 @@ export default function createNightShift(host: Host, web: Web) {
             return {
                 type: "toast" as const,
                 level: "info" as const,
-                message: "No night shift runs here.",
+                message: "No shift runs here.",
             };
         }
 
@@ -2688,13 +2689,13 @@ export default function createNightShift(host: Host, web: Web) {
         if (goal.round === 0) {
             return {
                 type: "card" as const,
-                output: `Night shift cancelled by ${ctx.user.name} before round 1.`,
+                output: `Shift cancelled by ${ctx.user.name} before round 1.`,
             };
         }
 
         return {
             type: "card" as const,
-            output: `Night shift stopped by ${ctx.user.name} at round ${goal.round} of ${goal.maxRounds}. A round that runs now finishes; Stop ends it at once.`,
+            output: `Shift stopped by ${ctx.user.name} at round ${goal.round} of ${goal.maxRounds}. A round that runs now finishes; Stop ends it at once.`,
         };
     }
 
@@ -2707,7 +2708,7 @@ export default function createNightShift(host: Host, web: Web) {
         }
 
         if (before?.check !== undefined && ctx.user.role !== "owner") {
-            throw web.error(403, "Only the owner can resume a night shift with a check command.");
+            throw web.error(403, "Only the owner can resume a shift with a check command.");
         }
 
         const held = host.heldBack(ctx.conversationId);
@@ -2719,7 +2720,7 @@ export default function createNightShift(host: Host, web: Web) {
         if (await planModeOn(ctx)) {
             throw web.error(
                 409,
-                "Plan mode is on. Turn it off first: a night shift works, it does not plan.",
+                "Plan mode is on. Turn it off first: a shift works, it does not plan.",
             );
         }
 
@@ -2728,15 +2729,15 @@ export default function createNightShift(host: Host, web: Web) {
             const goal = doc.goal;
 
             if (goal === undefined) {
-                throw web.error(404, "No night shift here to resume.");
+                throw web.error(404, "No shift here to resume.");
             }
 
             if (goal.status === "running" || goal.status === "summary") {
-                throw web.error(409, "The night shift runs already.");
+                throw web.error(409, "The shift runs already.");
             }
 
             if (goal.reason === "done") {
-                throw web.error(409, "That night shift is done. Set a new one.");
+                throw web.error(409, "That shift is done. Set a new one.");
             }
 
             if (goal.round >= goal.maxRounds) {
@@ -2762,41 +2763,72 @@ export default function createNightShift(host: Host, web: Web) {
 
         return {
             type: "card" as const,
-            output: `Night shift resumed by ${ctx.user.name}.\n${statusCard(goal, Date.now())}`,
+            output: `Shift resumed by ${ctx.user.name}.\n${statusCard(goal, Date.now())}`,
         };
     }
 
-    web.command("night-shift", {
+    const ARGS =
+        "[start 06:00] [until 07:00] [max 30] [with provider/model] [check `cmd`]: <objective>; stop when <condition> | status | stop | resume";
+
+    /** What `/team-shift` does: `/night-shift`, its old name, runs the same handler. */
+    const handle: Command["handler"] = async (args, ctx) => {
+        const parsed = parseArgs(args, Date.now(), zone());
+
+        switch (parsed.kind) {
+            case "error":
+                throw web.error(400, parsed.message);
+            case "help":
+                return {
+                    type: "card",
+                    output: [
+                        USAGE,
+                        "Example: /team-shift until 07:00 max 30: migrate the API to v2; stop when all tests pass and the PR is open",
+                        "Example: /team-shift start 06:00 until 17:00 max 40: <objective>; stop when <condition>",
+                        "Example: /team-shift with github-copilot/claude-sonnet-5.5 until 07:00 max 25: <objective>; stop when <condition>",
+                        "`for` counts from `start` when it is given, else from now.",
+                        "`with provider/model`: run the work in subagents on that model. It must be in Providers → Models for subagents. With `with deepseek/…` and no start, round 1 waits for the end of DeepSeek's peak hours (01:00–04:00 and 06:00–10:00 UTC).",
+                    ].join("\n"),
+                };
+            case "status":
+                return { type: "card", output: statusCard(await current(ctx), Date.now()) };
+            case "stop":
+                return stop(ctx);
+            case "resume":
+                return resume(ctx);
+            case "set":
+                return set(parsed.goal, ctx);
+        }
+    };
+
+    web.command("team-shift", {
         description:
             "Pi works on an objective in rounds until a stop condition, a round limit, or a deadline",
-        args: "[start 06:00] [until 07:00] [max 30] [with provider/model] [check `cmd`]: <objective>; stop when <condition> | status | stop | resume",
+        args: ARGS,
+        scope: "conversation",
+        handler: handle,
+    });
+
+    // The old name stays as an alias: the same handler, and each answer says the new name first.
+    web.command("night-shift", {
+        description: "The old name of /team-shift: it does the same, and says the new name",
+        args: ARGS,
         scope: "conversation",
         handler: async (args, ctx) => {
-            const parsed = parseArgs(args, Date.now(), zone());
+            try {
+                const result = await handle(args, ctx);
 
-            switch (parsed.kind) {
-                case "error":
-                    throw web.error(400, parsed.message);
-                case "help":
-                    return {
-                        type: "card",
-                        output: [
-                            USAGE,
-                            "Example: /night-shift until 07:00 max 30: migrate the API to v2; stop when all tests pass and the PR is open",
-                            "Example: /night-shift start 06:00 until 17:00 max 40: <objective>; stop when <condition>",
-                            "Example: /night-shift with github-copilot/claude-sonnet-5.5 until 07:00 max 25: <objective>; stop when <condition>",
-                            "`for` counts from `start` when it is given, else from now.",
-                            "`with provider/model`: run the work in subagents on that model. It must be in Providers → Models for subagents. With `with deepseek/…` and no start, round 1 waits for the end of DeepSeek's peak hours (01:00–04:00 and 06:00–10:00 UTC).",
-                        ].join("\n"),
-                    };
-                case "status":
-                    return { type: "card", output: statusCard(await current(ctx), Date.now()) };
-                case "stop":
-                    return stop(ctx);
-                case "resume":
-                    return resume(ctx);
-                case "set":
-                    return set(parsed.goal, ctx);
+                return result.type === "card"
+                    ? { ...result, output: `${RENAMED}\n${result.output}` }
+                    : { ...result, message: `${RENAMED}\n${result.message}` };
+            } catch (error) {
+                const status = (error as { status?: unknown }).status;
+
+                // A refusal made with `web.error` reaches the person with its words: they say the new name too.
+                if (typeof status === "number") {
+                    throw web.error(status, `${RENAMED}\n${(error as Error).message}`);
+                }
+
+                throw error;
             }
         },
     });
@@ -2868,7 +2900,7 @@ export default function createNightShift(host: Host, web: Web) {
                 ].join(", ");
 
                 return [
-                    "This session runs a night shift: you work on the objective below in rounds while the people are away. Each round starts with a message that begins with [night-shift].",
+                    "This session runs a shift: you work on the objective below in rounds while the people are away. Each round starts with a message that begins with [shift].",
                     `<objective>\n${host.text.defang(goal.objective)}\n</objective>`,
                     `<stop-condition>\n${host.text.defang(goal.stop)}\n</stop-condition>`,
                     `Limits: ${limits}.`,

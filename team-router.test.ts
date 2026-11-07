@@ -198,16 +198,16 @@ const model = scriptedModel((request) => {
         return answer("ok");
     }
 
-    if (text.startsWith("[night-shift] The night shift has stopped")) {
+    if (text.startsWith("[shift] The shift has stopped")) {
         return answer("SUMMARY-TEXT");
     }
 
-    if (text.startsWith("[night-shift] Round")) {
+    if (text.startsWith("[shift] Round")) {
         return answer("STATUS: DONE: it works");
     }
 
-    if (text.includes("This task runs as a night shift")) {
-        return answer("Night shift noted. I start in round 1.");
+    if (text.includes("This task runs as a shift")) {
+        return answer("Shift noted. I start in round 1.");
     }
 
     if (text.endsWith("worker route night shift test")) {

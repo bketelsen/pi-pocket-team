@@ -104,6 +104,8 @@ test("briefs: a night shift's goal; a delegation's task only, without the wrappe
     assert.equal(byId.T2.nightShift, false);
     assert.equal(byId.T8.brief, null, "no marker line: no brief");
     assert.equal(delegationTask("no marker"), null);
+    assert.equal(delegationTask(wrapped("Old words.", { nightShift: true })), "Old words.");
+    assert.equal(delegationTask(wrapped("New words.", { shift: true })), "New words.");
     assert.equal(goalBrief({ objective: "Do it.", stop: "" }), "Do it.");
 });
 

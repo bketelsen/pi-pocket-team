@@ -415,7 +415,7 @@ const r2Lines = (r2) => {
 
     if (e) {
         lines.push(
-            `- Eligible night shifts: ${e.eligible} of ${e.nightShifts}${e.share === null ? "" : ` (${Math.round(e.share * 100)}%)`}.`,
+            `- Eligible shifts: ${e.eligible} of ${e.nightShifts}${e.share === null ? "" : ` (${Math.round(e.share * 100)}%)`}.`,
         );
     }
 

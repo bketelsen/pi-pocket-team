@@ -339,8 +339,11 @@ export function makePocketDb(file, { threads, goals = {}, messages = {} }) {
     return file;
 }
 
-/** A delegation's first message, as Team wraps it: the identity block, the marker line, the task, the end tag. */
-export const wrapped = (task, { nightShift = false } = {}) =>
+/**
+ * A delegation's first message, as Team wraps it: the identity block, the marker line, the task, the end tag. `shift`
+ * adds the paragraph of a shift; `nightShift` adds its older words.
+ */
+export const wrapped = (task, { nightShift = false, shift = false } = {}) =>
     [
         "[via linked session session-x] Message from linked session session-x, written by another session's agent.",
         "<linked-session-message>",
@@ -355,6 +358,12 @@ export const wrapped = (task, { nightShift = false } = {}) =>
             ? [
                   "",
                   "This task runs as a night shift. Round 1 comes as a separate message that starts with [night-shift].",
+              ]
+            : []),
+        ...(shift
+            ? [
+                  "",
+                  "This task runs as a shift. Round 1 comes as a separate message that starts with [shift].",
               ]
             : []),
         "</linked-session-message>",

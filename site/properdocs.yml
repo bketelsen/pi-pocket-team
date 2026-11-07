@@ -6,7 +6,7 @@
 
 site_name: pi-pocket-team
 site_url: https://bketelsen.github.io/pi-pocket-team/
-site_description: "Drop-in extensions for Pi Pocket: named agents, a desk of background work, night shifts, a wiki page, a terminal page and a shadow model router."
+site_description: "Drop-in extensions for Pi Pocket: named agents, a desk of background work, shifts, a wiki page, a terminal page and a shadow model router."
 site_author: Brian Ketelsen
 copyright: pi-pocket-team is MIT licensed.
 
@@ -30,7 +30,7 @@ nav:
   - Modules:
       - Team: modules/team.md
       - Homewiki: modules/homewiki.md
-      - Night shift: modules/night-shift.md
+      - Shift: modules/shift.md
       - Model router: modules/model-router.md
       - Desk: modules/desk.md
       - Terminal: modules/terminal.md

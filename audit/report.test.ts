@@ -1035,7 +1035,7 @@ test("the metrics show R2's table after the R1 lines, a rate only from 10 decide
     );
     assert.match(
         markdown,
-        /\n- Not accepted: 1 dropped, 2 closed PR, 0 reverted, 4 reopened for rework \(by kind: work 3, busy 1\)\.\n- Reopenings that are not rework: attached 8, sweep 2\.\n- Eligible night shifts: 3 of 8 \(38%\)\./,
+        /\n- Not accepted: 1 dropped, 2 closed PR, 0 reverted, 4 reopened for rework \(by kind: work 3, busy 1\)\.\n- Reopenings that are not rework: attached 8, sweep 2\.\n- Eligible shifts: 3 of 8 \(38%\)\./,
     );
     assert.doesNotMatch(markdown, /more rows in findings\.json/);
 
@@ -1050,7 +1050,7 @@ test("the metrics show R2's table after the R1 lines, a rate only from 10 decide
 
     assert.doesNotMatch(
         renderReport(baseReport({ metrics: { R2: { ...r2([]), routes: 0 } } })),
-        /R2:|Eligible night shifts/,
+        /R2:|Eligible shifts/,
     );
     assert.doesNotMatch(renderReport(baseReport({ metrics: {} })), /R2:/);
     // No thread is not accepted: no line.

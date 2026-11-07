@@ -79,14 +79,14 @@ When the folder is the top of a git work tree, each delegation gets its own work
 
 For non-repository work, a `workspace` supplies a working folder: the Clerk's profile has `workspace: ~/agents/odrade`. An agent with neither repositories nor a workspace inherits the source folder. All mapped paths are absolute or begin with `~/` and must exist when a task starts; delegation does not silently clone or create folders.
 
-The tool takes an optional `night_shift` object, `{ objective?, stop_when, start?, until?, for?, max?, worker?, pr_check? }`: the linked session then runs a night-shift goal in rounds and reports back to Odrade's session when it stops. A night shift from the tool cannot have a free check command. `pr_check` is the only check it takes: a structured PR check, and the module builds the `gh` command. `worker` is the provider/model for subagents, such as `github-copilot/claude-sonnet-5.5`; it must be in the owner's allowed list for subagents. See [Delegated night shifts](night-shift.md#delegated-night-shifts).
+The tool takes an optional `shift` object, `{ objective?, stop_when, start?, until?, for?, max?, worker?, pr_check? }`: the linked session then runs a shift goal in rounds and reports back to Odrade's session when it stops. `night_shift` is its old name, with the same fields; a call that gives both is refused with `Give shift or night_shift, not both.`, before anything starts. A shift from the tool cannot have a free check command. `pr_check` is the only check it takes: a structured PR check, and the module builds the `gh` command. `worker` is the provider/model for subagents, such as `github-copilot/claude-sonnet-5.5`; it must be in the owner's allowed list for subagents. See [Delegated shifts](shift.md#delegated-shifts).
 
 ```json
 {
     "agent": "duncan",
     "repository": "frostyard/nsl",
     "task": "Tend the release branch",
-    "night_shift": {
+    "shift": {
         "objective": "Fix the flaky login tests",
         "stop_when": "the suite passes 3 times in a row",
         "start": "06:00",
