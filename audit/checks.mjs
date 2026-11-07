@@ -3001,33 +3001,71 @@ const msOf = (value) => {
  */
 const R2_WHY = ["dropped", "closedPr", "reverted", "reopened"];
 
+/** The kinds of reopening that are rework: only these make a routed thread not accepted (reason `reopened`). */
+export const R2_REWORK_KINDS = ["checks", "work", "busy"];
+
+/** The exact texts of the reopen events that `desk.ts` writes with a fixed reason. */
+const REOPEN_TEXTS = {
+    "reopened: new work in its session": "work",
+    "reopened: work in its folder after a supervisor message": "work",
+    "reopened: its session is busy": "busy",
+    "reopened: a PR it made is open": "sweep",
+    "reopened: a report after a supervisor message": "report",
+};
+
 /**
- * The kind of a reopen event (`desk.ts`): `attached` (a PR attached to the closed thread), `checks` (a PR of it is
- * conflicting or failing), `ask` (a plan ask reopened: key `reopened:reopen:<key>`), or `other`.
+ * The kind of a reopen event, from its key and text as `desk.ts` writes them. Rework (`R2_REWORK_KINDS`): `checks` (a
+ * PR of the thread is conflicting or failing), `work` (new work in its session, or work in its folder after a
+ * supervisor message), `busy` (its session ran again after the close). Not rework: `watch` (key `reopened:watch:`, a
+ * watch that verifies the work), `ask` (key `reopened:reopen:`, a plan ask reopened), `attached` (a PR attached by an
+ * actor), `sweep` (the sweep found a PR it made), `report` (a report after a supervisor message), and `other` (any
+ * other text: an unknown text is not rework).
  */
 function reopenKind(event) {
     const key = String(event.key);
-    const text = String(event.text ?? "");
+    const text = String(event.text ?? "").trim();
 
-    if (/^reopened: \S+ attached by /.test(text)) {
-        return "attached";
-    }
-
-    if (/^reopened: \S+ is (conflicting|failing)$/.test(text)) {
-        return "checks";
+    if (key.startsWith("reopened:watch:")) {
+        return "watch";
     }
 
     if (key.startsWith("reopened:reopen:")) {
         return "ask";
     }
 
+    if (/^reopened: \S+ is (conflicting|failing)$/.test(text)) {
+        return "checks";
+    }
+
+    if (REOPEN_TEXTS[text] !== undefined) {
+        return REOPEN_TEXTS[text];
+    }
+
+    if (/^reopened: \S+ attached by /.test(text)) {
+        return "attached";
+    }
+
     return "other";
+}
+
+/** The kinds of the reopenings of a thread, each kind once: `rework` and `notRework`. */
+function reopenKindsOf(data, thread) {
+    const kinds = new Set(
+        (eventsByThread(data).get(thread.id) ?? [])
+            .filter((event) => String(event.key).startsWith("reopened"))
+            .map(reopenKind),
+    );
+
+    return {
+        rework: [...kinds].filter((kind) => R2_REWORK_KINDS.includes(kind)),
+        notRework: [...kinds].filter((kind) => !R2_REWORK_KINDS.includes(kind)),
+    };
 }
 
 /**
  * How a routed thread ended for R2: `open`, `accepted`, `notAccepted`, `pending` or `unknown` (see `checkR2`),
  * whether a merge time came from the close, and for `notAccepted` the first reason found (`why`, 1 of `R2_WHY`) and,
- * for `reopened`, the kinds of its reopenings (`reopenedBy`).
+ * for `reopened`, the rework kinds of its reopenings (`reopenedBy`). Only a rework reopening counts.
  */
 function r2Outcome(data, thread, refs, prs, reverts, ctx) {
     const closed = thread.closed;
@@ -3057,19 +3095,11 @@ function r2Outcome(data, thread, refs, prs, reverts, ctx) {
         return { outcome: "unknown" };
     }
 
-    // A watch reopens a done thread to verify it (`reopened:watch:` in `desk.ts`): that is no rework.
-    const reopens = (eventsByThread(data).get(thread.id) ?? []).filter(
-        (event) =>
-            String(event.key).startsWith("reopened") &&
-            !String(event.key).startsWith("reopened:watch:"),
-    );
+    // Only a rework reopening counts: an attach, a watch, a sweep, a report or a plan ask reopening is bookkeeping.
+    const { rework } = reopenKindsOf(data, thread);
 
-    if (reopens.length > 0) {
-        return {
-            outcome: "notAccepted",
-            why: "reopened",
-            reopenedBy: [...new Set(reopens.map(reopenKind))],
-        };
+    if (rework.length > 0) {
+        return { outcome: "notAccepted", why: "reopened", reopenedBy: rework };
     }
 
     let unknown = false;
@@ -3181,6 +3211,7 @@ function r2Numbers(list) {
     const thinking = {};
     const notAcceptedWhy = Object.fromEntries(R2_WHY.map((why) => [why, 0]));
     const reopenedBy = {};
+    const reopenedNotRework = {};
 
     for (const item of list) {
         item.models.forEach((model) => bump(workers, model));
@@ -3191,6 +3222,7 @@ function r2Numbers(list) {
         }
 
         item.reopenedBy.forEach((kind) => bump(reopenedBy, kind));
+        item.reopenedNotRework.forEach((kind) => bump(reopenedNotRework, kind));
     }
 
     return {
@@ -3200,6 +3232,7 @@ function r2Numbers(list) {
         notAccepted,
         notAcceptedWhy,
         reopenedBy,
+        reopenedNotRework,
         pending: count("pending"),
         unknown: count("unknown"),
         decided,
@@ -3230,13 +3263,13 @@ function r2Numbers(list) {
  * many review rounds and parent hand fixes, and whether the worker that ran matched the assigned one. It makes no
  * finding.
  *
- * Accepted: closed as done (`completed`, `verified`, or no outcome), no reopening (a watch's reopen verifies the
- * work: it does not count), every PR merged, and no revert of any of its PRs (Q1's revert detection, and an explicit
+ * Accepted: closed as done (`completed`, `verified`, or no outcome), no rework reopening (`R2_REWORK_KINDS`), every
+ * PR merged, and no revert of any of its PRs (Q1's revert detection, and an explicit
  * revert of a PR with no record of its own) within 14 days of the thread's last merge; it is `pending` until then (14
  * days after the close, with no PR). A PR state comes from the desk link, else from Q1's stored day records; an
  * unknown one makes the thread `unknown`. `notAcceptedWhy` counts each not accepted thread in its first reason
- * (`R2_WHY`), and `reopenedBy` the kinds of reopening of the `reopened` ones (`reopenKind`; a thread counts each kind
- * once). Rounds and blocking points come from Q1's `prRounds` and `blockers` (the last 30 days only), hand fixes from
+ * (`R2_WHY`), and `reopenedBy` the rework kinds of the `reopened` ones (`reopenKind`; a thread counts each kind once),
+ * and `reopenedNotRework` the other kinds of every thread's reopenings. Rounds and blocking points come from Q1's `prRounds` and `blockers` (the last 30 days only), hand fixes from
  * `parentEdits`: each is null (unknown) when its source is missing, and rounds and blocking points are null for a
  * thread with no PR. No GitHub call: Q1's stored records only.
  *
@@ -3330,6 +3363,7 @@ export function checkR2(data, ctx) {
             fromClose,
             why,
             reopenedBy,
+            reopenedNotRework: reopenKindsOf(data, thread).notRework,
             nightShift,
             eligible: isEligible,
             deviation,

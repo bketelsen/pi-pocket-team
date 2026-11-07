@@ -36,6 +36,7 @@ import {
     checkP1,
     checkR1,
     checkR2,
+    R2_REWORK_KINDS,
     R2_BENCH_REPOS,
     R2_THRESHOLDS,
     Q1_ROUND_THRESHOLDS,
@@ -3765,11 +3766,13 @@ test("R2: a revert within 14 days, a reopening, a PR closed unmerged and a drop 
     ]);
     // Reverted 20 days after the merge: too late to count.
     assert.deepEqual(outcomeOfR2(r2Totals([r2Thread("T1", { prs })], revertAt(10))), ["accepted"]);
-    // Reopened.
+    // Reopened for rework.
     assert.deepEqual(
         outcomeOfR2(
             r2Totals([r2Thread("T1")], r2Ctx(), {
-                events: [event("T1", NOW - 35 * DAY, "reopened:queue", "reopened")],
+                events: [
+                    event("T1", NOW - 35 * DAY, "reopened:2", "reopened: its session is busy"),
+                ],
             }),
         ),
         ["notAccepted"],
@@ -3997,7 +4000,7 @@ test("R2: notAcceptedWhy counts each thread that is not accepted in the first re
     assert.equal(totals.notAccepted, 6);
     assert.equal(totals.accepted, 1);
     assert.deepEqual(totals.notAcceptedWhy, { dropped: 3, closedPr: 1, reverted: 1, reopened: 1 });
-    assert.deepEqual(totals.reopenedBy, { other: 1 });
+    assert.deepEqual(totals.reopenedBy, { work: 1 });
     assert.deepEqual(r2Totals([]).notAcceptedWhy, {
         dropped: 0,
         closedPr: 0,
@@ -4006,68 +4009,131 @@ test("R2: notAcceptedWhy counts each thread that is not accepted in the first re
     });
 });
 
-test("R2: reopenedBy counts the kinds of reopening of the reopened threads, from the event key and text", () => {
+test("R2: a thread reopened only by a PR attach is accepted", () => {
+    const totals = r2Totals(
+        [r2Thread("T1", { prs: { "frostyard/x#1": r2Link("MERGED") }, daysAgo: 19 })],
+        r2Ctx(r2Earlier([r2Pr(1, 20, { ref: "frostyard/x#1" })])),
+        {
+            events: [
+                event(
+                    "T1",
+                    NOW - 19 * DAY + HOUR,
+                    "reopened:frostyard/x#1:1",
+                    "reopened: frostyard/x#1 attached by clerk",
+                ),
+            ],
+        },
+    );
+
+    assert.deepEqual(outcomeOfR2(totals), ["accepted"]);
+    assert.deepEqual(totals.reopenedNotRework, { attached: 1 });
+    assert.deepEqual(totals.reopenedBy, {});
+});
+
+test("R2: each reopen event has its kind, and only checks, work and busy make a thread not accepted", () => {
+    const cases: [string, string, string, string][] = [
+        ["reopened:1", "reopened: acme/widgets#1 is conflicting", "checks", "notAccepted"],
+        ["reopened:1", "reopened: acme/widgets#1 is failing", "checks", "notAccepted"],
+        ["reopened:1", "reopened: new work in its session", "work", "notAccepted"],
+        [
+            "reopened:1",
+            "reopened: work in its folder after a supervisor message",
+            "work",
+            "notAccepted",
+        ],
+        ["reopened:1", "reopened: its session is busy", "busy", "notAccepted"],
+        ["reopened:watch:x.desk.watch:1:c/1", "reopened: watch set by odrade", "watch", "accepted"],
+        [
+            "reopened:acme/widgets#2:1",
+            "reopened: acme/widgets#2 attached by Clerk",
+            "attached",
+            "accepted",
+        ],
+        ["reopened:1", "reopened: a PR it made is open", "sweep", "accepted"],
+        ["reopened:1", "reopened: a report after a supervisor message", "report", "accepted"],
+        [
+            "reopened:reopen:k1",
+            "Brian reopened T1a (section Scope): the answer was yes",
+            "ask",
+            "accepted",
+        ],
+        ["reopened:1", "reopened: a reason no one knows", "other", "accepted"],
+    ];
+
+    assert.deepEqual(R2_REWORK_KINDS, ["checks", "work", "busy"]);
+
+    for (const [key, text, kind, outcome] of cases) {
+        const totals = r2Totals([r2Thread("T1")], r2Ctx(), {
+            events: [event("T1", NOW - 35 * DAY, key, text)],
+        });
+        const rework = R2_REWORK_KINDS.includes(kind);
+
+        assert.deepEqual(outcomeOfR2(totals), [outcome], text);
+        assert.deepEqual(totals.reopenedBy, rework ? { [kind]: 1 } : {}, text);
+        assert.deepEqual(totals.reopenedNotRework, rework ? {} : { [kind]: 1 }, text);
+        assert.equal(totals.notAcceptedWhy.reopened, rework ? 1 : 0, text);
+    }
+});
+
+test("R2: reopenedBy counts the rework kinds of the reopened threads; reopenedNotRework the other kinds of every thread", () => {
     const at = NOW - 35 * DAY;
+    const attach = (id: string, n: number) =>
+        event(
+            id,
+            at + n,
+            `reopened:acme/widgets#${n}:${n}`,
+            `reopened: acme/widgets#${n} attached by Clerk`,
+        );
     const metrics = checkR2(
         emptyData({
             threads: threadMap(
                 r2Thread("T1"),
                 r2Thread("T2"),
-                r2Thread("T3"),
-                r2Thread("T4", { outcome: "verified" }),
-                r2Thread("T5", { why: "dropped", outcome: null }),
+                r2Thread("T3", { outcome: "verified" }),
+                r2Thread("T4", { why: "dropped", outcome: null }),
+                routed("T5"),
             ),
             events: [
-                event(
-                    "T1",
-                    at,
-                    "reopened:acme/widgets#2:1",
-                    "reopened: acme/widgets#2 attached by Clerk",
-                ),
-                event("T1", at + 1, "reopened:2", "reopened: a report after a supervisor message"),
-                // The same kind twice counts once.
-                event(
-                    "T1",
-                    at + 2,
-                    "reopened:acme/widgets#3:3",
-                    "reopened: acme/widgets#3 attached by Clerk",
-                ),
-                event("T2", at, "reopened:4", "reopened: acme/widgets#1 is failing"),
+                // Rework and bookkeeping: rework wins; the same kind twice counts once.
+                event("T1", at, "reopened:1", "reopened: new work in its session"),
+                event("T1", at + 1, "reopened:2", "reopened: its session is busy"),
+                event("T1", at + 2, "reopened:3", "reopened: new work in its session"),
+                attach("T1", 4),
+                attach("T1", 5),
+                event("T2", at, "reopened:6", "reopened: acme/widgets#1 is failing"),
                 event(
                     "T3",
-                    at,
-                    "reopened:reopen:k1",
-                    "Brian reopened T3a (section Scope): the answer was yes",
-                ),
-                // A watch's reopen is no reopening.
-                event(
-                    "T4",
                     at,
                     "reopened:watch:x.desk.watch:1:c/1",
                     "reopened: watch set by odrade",
                 ),
-                // A dropped thread counts as dropped: its reopenings are not counted.
-                event(
-                    "T5",
-                    at,
-                    "reopened:acme/widgets#4:5",
-                    "reopened: acme/widgets#4 attached by Clerk",
-                ),
+                event("T3", at + 1, "reopened:7", "reopened: a PR it made is open"),
+                // A dropped thread counts as dropped: its rework reopening is not in reopenedBy.
+                event("T4", at, "reopened:8", "reopened: its session is busy"),
+                attach("T4", 9),
+                // An open thread's bookkeeping reopenings count too.
+                event("T5", at, "reopened:10", "reopened: a report after a supervisor message"),
             ],
         }),
         r2Ctx(),
     ).metrics;
-    const expected = { attached: 1, other: 1, checks: 1, ask: 1 };
 
     assert.deepEqual(metrics.totals.notAcceptedWhy, {
         dropped: 1,
         closedPr: 0,
         reverted: 0,
-        reopened: 3,
+        reopened: 2,
     });
-    assert.deepEqual(metrics.totals.reopenedBy, expected);
-    assert.deepEqual(metrics.rows[0]!.reopenedBy, expected);
+    assert.deepEqual(metrics.totals.reopenedBy, { work: 1, busy: 1, checks: 1 });
+    assert.deepEqual(metrics.totals.reopenedNotRework, {
+        attached: 2,
+        watch: 1,
+        sweep: 1,
+        report: 1,
+    });
+    assert.deepEqual(metrics.rows[0]!.reopenedNotRework, metrics.totals.reopenedNotRework);
     assert.equal(metrics.totals.accepted, 1);
+    assert.equal(metrics.totals.open, 1);
 });
 
 test("R2: the eligible share of routed night shifts; an unknown risk path (null, or no features) is not eligible", () => {
