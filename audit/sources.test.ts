@@ -3135,7 +3135,7 @@ test("loadData and Q1: a spawn 60 days ago with a send and a blocking answer 29 
     );
 });
 
-test("loadParentEdits: edit and write calls after the first subagent answer of each session, and no text", () => {
+test("loadParentEdits: edit and write calls after the first subagent answer of each session, the times of all of them, and no text", () => {
     const { pocketDir } = setup();
     const call = (id: string, name: string) => ({
         type: "toolCall",
@@ -3169,9 +3169,15 @@ test("loadParentEdits: edit and write calls after the first subagent answer of e
     db.close();
 
     assert.deepEqual(rows, [
-        { c: SESSION_T1, firstAnswerAt: NOW - 9 * HOUR, edits: 3 },
-        { c: SESSION_T2, firstAnswerAt: null, edits: 0 },
-        { c: 999, firstAnswerAt: null, edits: 0 },
+        // `editTimes` holds every edit and write call, also those before the first answer: 1 time per call.
+        {
+            c: SESSION_T1,
+            firstAnswerAt: NOW - 9 * HOUR,
+            edits: 3,
+            editTimes: [NOW - 10 * HOUR, NOW - 8 * HOUR, NOW - 7 * HOUR, NOW - 7 * HOUR],
+        },
+        { c: SESSION_T2, firstAnswerAt: null, edits: 0, editTimes: [NOW - HOUR] },
+        { c: 999, firstAnswerAt: null, edits: 0, editTimes: [] },
     ]);
     assert.ok(!JSON.stringify(rows).includes("secret-path"));
     assert.deepEqual(empty, []);
@@ -3209,7 +3215,9 @@ test("loadData: the routed sessions get parent edit rows, and a spawn row has it
 
     assert.equal(data.sourceErrors.parentEdits, undefined);
     // T1 is the only routed thread: its session 11 gets a row.
-    assert.deepEqual(data.parentEdits, [{ c: SESSION_T1, firstAnswerAt: null, edits: 0 }]);
+    assert.deepEqual(data.parentEdits, [
+        { c: SESSION_T1, firstAnswerAt: null, edits: 0, editTimes: [] },
+    ]);
     assert.deepEqual(
         data.routeSpawns.map((spawn: { model: string; thinking: string | null }) => [
             spawn.model,

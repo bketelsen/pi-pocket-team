@@ -4326,3 +4326,127 @@ test("runChecks: R2 runs after Q1 and reads its day record; the other checks kee
         "totals",
     ]);
 });
+
+test("R2: a report reopening after work in the session since the close is rework; a report alone is bookkeeping", () => {
+    const closeAt = NOW - 25 * DAY;
+    const reopenAt = NOW - 23 * DAY;
+    const run = (over: object) =>
+        r2Totals(
+            [r2Thread("T1", { prs: { "acme/widgets#1": r2Link("MERGED") }, daysAgo: 19 })],
+            r2Ctx(r2Earlier([r2Pr(1, 20)])),
+            {
+                events: [
+                    event("T1", closeAt, `closed:${closeAt}`, "closed: all parts closed"),
+                    event(
+                        "T1",
+                        reopenAt,
+                        `reopened:${reopenAt}`,
+                        "reopened: a report after a supervisor message",
+                    ),
+                ],
+                ...over,
+            },
+        );
+    const edits = (times: number[]) => ({
+        parentEdits: [{ c: 101, firstAnswerAt: null, edits: 0, editTimes: times }],
+    });
+
+    // An edit of the session between the close and the reopen.
+    const edited = run(edits([NOW - 24 * DAY]));
+
+    assert.deepEqual(outcomeOfR2(edited), ["notAccepted"]);
+    assert.equal(edited.notAcceptedWhy.reopened, 1);
+    assert.deepEqual(edited.reopenedBy, { work: 1 });
+    assert.deepEqual(edited.reopenedNotRework, {});
+
+    // No edit and no worker spawn: a report-only reply is bookkeeping.
+    const alone = run(edits([]));
+
+    assert.deepEqual(outcomeOfR2(alone), ["accepted"]);
+    assert.deepEqual(alone.reopenedNotRework, { report: 1 });
+    assert.deepEqual(alone.reopenedBy, {});
+
+    // An edit before the close, or after the reopen, is no evidence.
+    assert.deepEqual(outcomeOfR2(run(edits([NOW - 26 * DAY, NOW - 22 * DAY]))), ["accepted"]);
+
+    // A worker spawn is the only evidence; the parentEdits source failed.
+    const spawned = run({
+        parentEdits: [],
+        sourceErrors: { parentEdits: "no such table" },
+        routeSpawns: [spawn({ c: 101, at: NOW - 24 * DAY })],
+    });
+
+    assert.deepEqual(outcomeOfR2(spawned), ["notAccepted"]);
+    assert.deepEqual(spawned.reopenedBy, { work: 1 });
+
+    // A cross-review spawn is no work.
+    assert.deepEqual(
+        outcomeOfR2(
+            run({
+                routeSpawns: [
+                    spawn({ c: 101, at: NOW - 24 * DAY, tools: ["read", "bash"], review: true }),
+                ],
+            }),
+        ),
+        ["accepted"],
+    );
+
+    // No `closed:` event before the reopen: no interval, so no evidence.
+    assert.deepEqual(
+        outcomeOfR2(
+            r2Totals(
+                [r2Thread("T1", { prs: { "acme/widgets#1": r2Link("MERGED") }, daysAgo: 19 })],
+                r2Ctx(r2Earlier([r2Pr(1, 20)])),
+                {
+                    events: [
+                        event(
+                            "T1",
+                            reopenAt,
+                            `reopened:${reopenAt}`,
+                            "reopened: a report after a supervisor message",
+                        ),
+                    ],
+                    ...edits([NOW - 24 * DAY]),
+                },
+            ),
+        ),
+        ["accepted"],
+    );
+});
+
+test("R2: an ask that reopened the thread is an ask reopening, in both event forms; an ordinary ask is no reopening", () => {
+    const at = NOW - 35 * DAY;
+
+    const kindsOf = (key: string, text: string) => {
+        const totals = r2Totals([r2Thread("T1")], r2Ctx(), {
+            events: [event("T1", at, key, text)],
+        });
+
+        assert.deepEqual(outcomeOfR2(totals), ["accepted"], text);
+
+        return totals.reopenedNotRework;
+    };
+
+    // A plan ask reopened.
+    assert.deepEqual(
+        kindsOf("reopened:reopen:k1", "Brian reopened T1a (section Scope): the answer was yes"),
+        { ask: 1 },
+    );
+    // `addAsk` reopened the closed thread, with and without a sender.
+    assert.deepEqual(
+        kindsOf(
+            `ask:T1a:${at}`,
+            "ask T1a from Duncan Idaho reopened the thread: Merge it? [yes | no]",
+        ),
+        { ask: 1 },
+    );
+    assert.deepEqual(kindsOf(`ask:T1b:${at}`, "ask T1b reopened the thread: Merge it?"), {
+        ask: 1,
+    });
+    // An ordinary ask, even one whose question names the words.
+    assert.deepEqual(kindsOf(`ask:T1c:${at}`, "ask T1c from Lucilla: Merge it?"), {});
+    assert.deepEqual(
+        kindsOf(`ask:T1d:${at}`, "ask T1d: the build reopened the thread: is that fine?"),
+        {},
+    );
+});

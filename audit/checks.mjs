@@ -3017,9 +3017,10 @@ const REOPEN_TEXTS = {
  * The kind of a reopen event, from its key and text as `desk.ts` writes them. Rework (`R2_REWORK_KINDS`): `checks` (a
  * PR of the thread is conflicting or failing), `work` (new work in its session, or work in its folder after a
  * supervisor message), `busy` (its session ran again after the close). Not rework: `watch` (key `reopened:watch:`, a
- * watch that verifies the work), `ask` (key `reopened:reopen:`, a plan ask reopened), `attached` (a PR attached by an
- * actor), `sweep` (the sweep found a PR it made), `report` (a report after a supervisor message), and `other` (any
- * other text: an unknown text is not rework).
+ * watch that verifies the work), `ask` (key `reopened:reopen:`, a plan ask reopened, or key `ask:` with the text of an
+ * ask that reopened the thread), `attached` (a PR attached by an actor), `sweep` (the sweep found a PR it made),
+ * `report` (a report after a supervisor message; `reopenKindsOf` makes it `work` when the session worked after the
+ * close), and `other` (any other text: an unknown text is not rework).
  */
 function reopenKind(event) {
     const key = String(event.key);
@@ -3029,7 +3030,7 @@ function reopenKind(event) {
         return "watch";
     }
 
-    if (key.startsWith("reopened:reopen:")) {
+    if (key.startsWith("reopened:reopen:") || isAskReopen(event)) {
         return "ask";
     }
 
@@ -3048,12 +3049,48 @@ function reopenKind(event) {
     return "other";
 }
 
-/** The kinds of the reopenings of a thread, each kind once: `rework` and `notRework`. */
-function reopenKindsOf(data, thread) {
+/**
+ * An ask that reopened a closed thread (`addAsk` in `desk.ts`): key `ask:<id>:<time>`, text `ask <id>[ from <name>]
+ * reopened the thread: <text>`. An ordinary ask (`ask <id>[ from <name>]: <text>`) is no reopening.
+ */
+const isAskReopen = (event) =>
+    String(event.key).startsWith("ask:") &&
+    /^ask \S+(?: from [^:]*)? reopened the thread: /.test(String(event.text ?? ""));
+
+/** An event that reopens a closed thread: a `reopened` key, or an ask that reopened it. */
+const isReopen = (event) => String(event.key).startsWith("reopened") || isAskReopen(event);
+
+/**
+ * Whether the session did work in the interval (`from`, `to`]: an `edit` or `write` call of the session itself
+ * (`editTimes`, null when unknown), or a worker spawn (not a cross-review) of the session.
+ */
+const workedBetween = (evidence, from, to) =>
+    [...(evidence.editTimes ?? []), ...evidence.spawnTimes].some((at) => at > from && at <= to);
+
+/**
+ * The kinds of the reopenings of a thread, each kind once: `rework` and `notRework`. A `report` reopening is `work`
+ * when the session worked (`evidence`, see `workedBetween`) after the last `closed:` event before it: the desk names
+ * the report first, even when the worker also changed files. With no such close event, or no evidence, it stays
+ * `report`.
+ */
+function reopenKindsOf(data, thread, evidence = { editTimes: null, spawnTimes: [] }) {
+    const events = eventsByThread(data).get(thread.id) ?? [];
     const kinds = new Set(
-        (eventsByThread(data).get(thread.id) ?? [])
-            .filter((event) => String(event.key).startsWith("reopened"))
-            .map(reopenKind),
+        events.filter(isReopen).map((event) => {
+            const kind = reopenKind(event);
+
+            if (kind !== "report") {
+                return kind;
+            }
+
+            const close = events
+                .filter((other) => String(other.key).startsWith("closed:") && other.at < event.at)
+                .at(-1);
+
+            return close !== undefined && workedBetween(evidence, close.at, event.at)
+                ? "work"
+                : kind;
+        }),
     );
 
     return {
@@ -3067,7 +3104,7 @@ function reopenKindsOf(data, thread) {
  * whether a merge time came from the close, and for `notAccepted` the first reason found (`why`, 1 of `R2_WHY`) and,
  * for `reopened`, the rework kinds of its reopenings (`reopenedBy`). Only a rework reopening counts.
  */
-function r2Outcome(data, thread, refs, prs, reverts, ctx) {
+function r2Outcome(data, thread, refs, prs, reverts, ctx, evidence) {
     const closed = thread.closed;
     const window = R2_THRESHOLDS.windowDays * DAY;
 
@@ -3096,7 +3133,7 @@ function r2Outcome(data, thread, refs, prs, reverts, ctx) {
     }
 
     // Only a rework reopening counts: an attach, a watch, a sweep, a report or a plan ask reopening is bookkeeping.
-    const { rework } = reopenKindsOf(data, thread);
+    const { rework } = reopenKindsOf(data, thread, evidence);
 
     if (rework.length > 0) {
         return { outcome: "notAccepted", why: "reopened", reopenedBy: rework };
@@ -3291,6 +3328,13 @@ export function checkR2(data, ctx) {
             : null;
     const editsSource = !data.sourceErrors?.parentEdits && Array.isArray(data.parentEdits);
     const editsOf = new Map(editsSource ? data.parentEdits.map((row) => [row.c, row.edits]) : []);
+    const editTimesOf = new Map(
+        editsSource
+            ? data.parentEdits
+                  .filter((row) => Array.isArray(row.editTimes))
+                  .map((row) => [row.c, row.editTimes])
+            : [],
+    );
     const groups = new Map();
     const items = [];
     const eligible = { nightShifts: 0, eligible: 0, share: null };
@@ -3352,18 +3396,28 @@ export function checkR2(data, ctx) {
             .filter(([, link]) => link?.via !== "window")
             .map(([ref]) => ref);
         const costRows = (data.routeCosts ?? []).filter((row) => row.c === thread.session);
+        // The evidence of work after a close, for a `report` reopening: the session's own edits (unknown without the
+        // `parentEdits` source) and its worker spawns.
+        const evidence = {
+            editTimes:
+                thread.session === undefined ? null : (editTimesOf.get(thread.session) ?? null),
+            spawnTimes:
+                thread.session === undefined
+                    ? []
+                    : spawns.map((spawn) => spawn.at).filter((at) => typeof at === "number"),
+        };
         const {
             outcome,
             fromClose = false,
             why,
             reopenedBy = [],
-        } = r2Outcome(data, thread, refs, prRecords, reverts, ctx);
+        } = r2Outcome(data, thread, refs, prRecords, reverts, ctx, evidence);
         const item = {
             outcome,
             fromClose,
             why,
             reopenedBy,
-            reopenedNotRework: reopenKindsOf(data, thread).notRework,
+            reopenedNotRework: reopenKindsOf(data, thread, evidence).notRework,
             nightShift,
             eligible: isEligible,
             deviation,
