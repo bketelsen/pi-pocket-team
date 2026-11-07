@@ -1,8 +1,13 @@
 # The tests need a Pi Pocket checkout: link.mjs symlinks node_modules, _pocket.d.ts and _pocket into the
-# checkout at PI_POCKET_CHECKOUT. Here we clone the public Pi Pocket repository at tag v0.27.0 into the
-# runner's temporary folder, install its dependencies, and point the links at it. Then the job runs the gate,
-# make ci. Actions are pinned by commit SHA, and the token can only read (frostyard/core ADR-0021).
-# The ruleset requires the check "Test": keep the job's name.
+# checkout at PI_POCKET_CHECKOUT. The job "pocket" clones each pinned Pi Pocket release of the matrix into the
+# runner's temporary folder, installs its dependencies, points the links at it, and runs the gate, make ci:
+#   - upstream TannerMidd/pi-pocket at v0.27.0, the release to roll back to;
+#   - the fork bketelsen/pi-pocket at v0.28.0-bk.1, the server's release: upstream v0.28.0 plus the patches listed
+#     in BK-PATCHES.md on its branch bk/v0.28.0.
+# Each entry also names the tag's commit, and the job fails when the clone is another one. Actions are pinned by
+# commit SHA, and the token can only read (frostyard/core ADR-0021).
+# The ruleset requires the check "Test". A matrix job gets 1 check for each entry, named with the entry, so the job
+# "Test" waits for every entry and passes only when all of them pass: keep its name.
 name: CI
 
 on:
@@ -17,12 +22,22 @@ concurrency:
     cancel-in-progress: true
 
 jobs:
-    test:
-        name: Test
+    pocket:
+        name: Test on Pi Pocket ${{ matrix.ref }}
         runs-on: ubuntu-latest
         timeout-minutes: 20
         permissions:
             contents: read
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                    - repository: TannerMidd/pi-pocket
+                      ref: v0.27.0
+                      commit: 50194aa38eb368ef2cb8599d44fba81b05ed5263
+                    - repository: bketelsen/pi-pocket
+                      ref: v0.28.0-bk.1
+                      commit: ad3d00df43b544b8c8903f8a0ef5d422c5f4da07
         steps:
             - name: Check out this repository
               uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -42,8 +57,15 @@ jobs:
             - name: Set the Pi Pocket checkout path
               run: echo "PI_POCKET_CHECKOUT=$RUNNER_TEMP/pi-pocket" >> "$GITHUB_ENV"
 
-            - name: Clone Pi Pocket v0.27.0
-              run: git clone --depth 1 --branch v0.27.0 https://github.com/TannerMidd/pi-pocket.git "$PI_POCKET_CHECKOUT"
+            - name: Clone Pi Pocket ${{ matrix.ref }} from ${{ matrix.repository }}
+              env:
+                  REPOSITORY: ${{ matrix.repository }}
+                  REF: ${{ matrix.ref }}
+                  COMMIT: ${{ matrix.commit }}
+              run: |
+                  git clone --depth 1 --branch "$REF" "https://github.com/$REPOSITORY.git" "$PI_POCKET_CHECKOUT"
+                  # A tag can move: the job tests only the commit pinned here.
+                  test "$(git -C "$PI_POCKET_CHECKOUT" rev-parse HEAD)" = "$COMMIT"
 
             - name: Install Pi Pocket dependencies
               working-directory: ${{ runner.temp }}/pi-pocket
@@ -56,3 +78,18 @@ jobs:
               run: make ci BASE="$BASE"
               env:
                   BASE: ${{ github.event.pull_request.base.sha || '' }}
+
+    test:
+        name: Test
+        needs: pocket
+        if: ${{ always() }}
+        runs-on: ubuntu-latest
+        timeout-minutes: 5
+        permissions: {}
+        steps:
+            - name: Every Pi Pocket release of the matrix passed
+              env:
+                  RESULT: ${{ needs.pocket.result }}
+              run: |
+                  echo "Pocket matrix: $RESULT"
+                  test "$RESULT" = success
