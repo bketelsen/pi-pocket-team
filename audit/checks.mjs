@@ -3075,6 +3075,7 @@ function r2Outcome(data, thread, refs, prs, reverts, ctx) {
     let unknown = false;
     let fromClose = false;
     const merges = [];
+    const mergedRefs = [];
 
     for (const ref of refs) {
         const desk = thread.prs[ref]?.state;
@@ -3109,12 +3110,14 @@ function r2Outcome(data, thread, refs, prs, reverts, ctx) {
         }
 
         merges.push(at);
+        mergedRefs.push(ref);
     }
 
-    // The window ends 14 days after the LAST merge of the thread (its close with no merge time). A revert of any PR of
-    // the thread at or before that end, or at a time not known, makes it not accepted; a later revert does not count.
+    // The window ends 14 days after the LAST merge of the thread (its close with no merge time). A revert of any merged
+    // PR of the thread at or before that end, or at a time not known, makes it not accepted; a later revert does not count.
     const end = (merges.length > 0 ? Math.max(...merges) : closed.at) + window;
-    const reverted = refs.some((ref) =>
+    // Only a PR known to be merged: an unknown PR state stays unknown, even when a stored revert names it.
+    const reverted = mergedRefs.some((ref) =>
         (reverts.get(ref) ?? []).some((revert) => {
             const revertAt = msOf(revert.at);
 

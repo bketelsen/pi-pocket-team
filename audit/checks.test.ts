@@ -4138,6 +4138,31 @@ test("R2: a stored revert of a PR with no Q1 record of its own makes the thread 
     ]);
 });
 
+test("R2: a stored revert of a PR whose state is unknown leaves the thread unknown; a known merged PR reverted is not accepted", () => {
+    // Only the revert PR has a record: it reverts #1 explicitly, inside the window.
+    const c = r2Ctx(r2Earlier([r2Pr(2, 20, { title: "Undo", reverts: ["acme/widgets#1"] })]));
+
+    for (const link of [r2Link(), r2Link("OPEN"), r2Link("MISSING"), r2Link("FROZEN")]) {
+        const totals = r2Totals([r2Thread("T1", { prs: { "acme/widgets#1": link } })], c);
+
+        assert.deepEqual(outcomeOfR2(totals), ["unknown"], JSON.stringify(link));
+        assert.equal(totals.notAcceptedWhy.reverted, 0);
+    }
+
+    // PR A merged and reverted inside the window, PR B missing: the known revert wins.
+    const totals = r2Totals(
+        [
+            r2Thread("T1", {
+                prs: { "acme/widgets#1": r2Link("MERGED"), "acme/widgets#3": r2Link("MISSING") },
+            }),
+        ],
+        c,
+    );
+
+    assert.deepEqual(outcomeOfR2(totals), ["notAccepted"]);
+    assert.equal(totals.notAcceptedWhy.reverted, 1);
+});
+
 test("R2: the revert window ends 14 days after the thread's last merge, for a revert of any of its PRs", () => {
     // Day 0 is 30 days before NOW: PR A merges on day 0, PR B on day 10.
     const prs = { "acme/widgets#1": r2Link("MERGED"), "acme/widgets#2": r2Link("MERGED") };
