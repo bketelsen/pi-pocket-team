@@ -121,6 +121,33 @@ export function makeExtraRepo(repo) {
 }
 
 /**
+ * A repository whose parent commit tracks a submodule at `mod` (a gitlink, mode 160000, to the seed commit; no
+ * network, no `.gitmodules`), and a PR that changes only `README.md`. Returns `{ repo, parent, merge }`.
+ */
+export function makeSubmoduleRepo(repo) {
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init", "--quiet", "--initial-branch=main");
+    writeFiles(repo, { "README.md": "seed\n" });
+    git(repo, "add", ".");
+    git(repo, "commit", "--quiet", "-m", "seed");
+
+    const seed = git(repo, "rev-parse", "HEAD");
+
+    git(repo, "update-index", "--add", "--cacheinfo", `160000,${seed},mod`);
+    git(repo, "commit", "--quiet", "-m", "parent: a submodule at mod");
+
+    const parent = git(repo, "rev-parse", "HEAD");
+
+    git(repo, "checkout", "--quiet", "-b", "fix");
+    writeFiles(repo, { "README.md": "the reference\n" });
+    git(repo, "commit", "--quiet", "-am", "the reference change");
+    git(repo, "checkout", "--quiet", "main");
+    git(repo, "merge", "--quiet", "--no-ff", "-m", "Merge the reference", "fix");
+
+    return { repo, parent, merge: git(repo, "rev-parse", "HEAD") };
+}
+
+/**
  * A Pocket database with a desk (`threads`: id -> thread), night-shift goals (`goals`: session -> goal) and the first
  * user message of sessions (`messages`: session -> text).
  */

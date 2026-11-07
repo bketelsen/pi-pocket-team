@@ -260,6 +260,13 @@ export const NESTED_GIT_REMOVAL = [
     "+",
 ];
 
+/** The paths of the gitlinks (mode 160000) in `git ls-files -s -z` output. */
+export const gitlinkPaths = (text) =>
+    String(text)
+        .split("\0")
+        .filter((entry) => entry.startsWith("160000 "))
+        .map((entry) => entry.slice(entry.indexOf("\t") + 1));
+
 /** The diff options of the submitted diff: no external diff driver, no textconv, always text, no color. */
 const DIFF_OPTIONS = ["--no-ext-diff", "--no-textconv", "--text", "--no-color"];
 
@@ -307,6 +314,23 @@ export async function submittedDiff(ctx, { workDir, parent, checkout, scratch })
         // sandbox: else `add -A` stages that folder as a gitlink, and the diff shows a commit id, not the source that
         // S1 and S2 ran.
         await run(NESTED_GIT_REMOVAL, "the removal of nested .git entries");
+
+        // A submodule that the parent tracks is a gitlink (mode 160000) in the trusted index, and `add -A` keeps it
+        // a gitlink: it leaves the index (only the index) first, so its folder is staged as ordinary files.
+        const gitlinks = gitlinkPaths(
+            await run(
+                trustedGit(parent, "ls-files", "-s", "-z"),
+                "the submitted diff's index list",
+            ),
+        );
+
+        if (gitlinks.length) {
+            await run(
+                trustedGit(parent, "update-index", "--force-remove", "--", ...gitlinks),
+                "the removal of gitlinks from the index",
+            );
+        }
+
         await run(trustedGit(parent, "add", "-A"), "the submitted diff's git add");
 
         const stat = await run(

@@ -34,7 +34,7 @@ import {
 import { authPreflight, authPreflightArgs } from "./lib/runner.mjs";
 import { hostGit, s0Of, scoreMain, toolCalls } from "./lib/score.mjs";
 import { FAKE_BWRAP, bwrapWorks, git, makeFixture } from "./fixtures/helpers.mjs";
-import { makeExtraRepo, makeNodeRepo } from "./fixtures/harvest.mjs";
+import { makeExtraRepo, makeNodeRepo, makeSubmoduleRepo } from "./fixtures/harvest.mjs";
 
 const REPO = "bketelsen/pi-pocket-team";
 const NOW = Date.UTC(2026, 10, 7, 12, 0);
@@ -941,4 +941,36 @@ test("the host overlay (the harvester's own trees) replaces a folder with the re
         work,
     });
     assert.equal(readFileSync(join(work, "fixtures", "data.json"), "utf8"), '{ "a": 1, "b": 2 }\n');
+});
+
+test("a submodule that the parent tracks (a gitlink) is judged as its submitted source", async () => {
+    const sub = makeSubmoduleRepo(join(fixture.root, "submodule-repo"));
+    const task = taskOf(
+        "gitlink",
+        { default: [GOOD(3)] },
+        {
+            parent: sub.parent,
+            merge: sub.merge,
+            check: "true",
+            hiddenTests: [],
+            hiddenCommand: null,
+        },
+    );
+    const paths = await attempt(task, {
+        repo: sub,
+        prepare: (work) => {
+            mkdirSync(join(work, "mod"), { recursive: true });
+            writeFileSync(join(work, "mod", "source.mjs"), "export const fromSubmodule = 2;\n");
+        },
+    });
+    const { code, result } = await score(paths);
+    const diff = readFileSync(result.diffFile, "utf8");
+
+    assert.equal(code, 0);
+    assert.match(
+        diff,
+        /^\+export const fromSubmodule = 2;$/m,
+        "the submodule folder's source is judged",
+    );
+    assert.match(diff, /^-Subproject commit [0-9a-f]{40}$/m, "the gitlink's removal");
 });

@@ -158,9 +158,14 @@ export function bwrapArgs(
         "/tmp",
         "--tmpfs",
         "/home/bench",
+        // A writable `/run`: tools create folders such as `/run/systemd/` there.
+        "--tmpfs",
+        "/run",
     ];
 
-    for (const etc of ["/etc/ssl", "/etc/pki"]) {
+    // `/etc/alternatives` holds only links into `/usr`; without it, a `/usr/bin` tool that is such a link (`awk`,
+    // `which` on Debian and Fedora hosts) is missing in the sandbox.
+    for (const etc of ["/etc/ssl", "/etc/pki", "/etc/alternatives"]) {
         if (exists(etc)) {
             args.push("--ro-bind", etc, etc);
         }
@@ -252,7 +257,10 @@ export function bwrapArgs(
         args.push("--setenv", key, value);
     }
 
-    args.push("--", ...command);
+    // Every command runs under umask 022, as on CI and a developer's machine (the server's own umask is 0077, and
+    // a test that writes a 0644 file would get 0600). The command's words go to `exec` as they are, with no other
+    // shell parsing; the bench's data files are written on the host with their own modes.
+    args.push("--", ...UMASK_WRAPPER, ...command);
 
     return args;
 }
@@ -286,6 +294,9 @@ export async function identityFiles(data, { uid = process.getuid(), gid = proces
 
     return paths;
 }
+
+/** The start of every sandbox command: a shell that sets umask 022, then runs the command's words as they are. */
+export const UMASK_WRAPPER = ["/bin/sh", "-c", 'umask 022 && exec "$@"', "sh"];
 
 /** The Pi command of an attempt, inside the sandbox. */
 export const piCommand = (model, prompt) => [

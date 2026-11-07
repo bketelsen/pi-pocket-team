@@ -1,7 +1,14 @@
 // The sandbox: the bwrap argv (everywhere), and with the real bwrap (skipped where it cannot run): a fake `pi`
 // tries to read a host file and to reach github.com, looks for the home folder, and lists its environment.
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import {
+    mkdirSync,
+    mkdtempSync,
+    readFileSync,
+    readlinkSync,
+    statSync,
+    writeFileSync,
+} from "node:fs";
 import { rm } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
@@ -86,6 +93,7 @@ test("the bwrap argv has the required flags, mounts and only the allowed variabl
     assert.deepEqual(roBinds, {
         "/usr": "/usr",
         "/etc/ssl": "/etc/ssl",
+        "/etc/alternatives": "/etc/alternatives",
         "/etc/resolv.conf": "/run/resolv.conf",
         "/etc/nsswitch.conf": "/etc/nsswitch.conf",
         "/etc/hosts": "/r/bench/hosts",
@@ -106,8 +114,33 @@ test("the bwrap argv has the required flags, mounts and only the allowed variabl
     assert.equal(env.BENCH_TRY, "2");
     assert.equal(env.PI_CODING_AGENT_DIR, "/agent");
     assert.equal(args[args.indexOf("--chdir") + 1], "/work");
-    assert.deepEqual(args.slice(end + 1, end + 3), ["node", "/pocket/node_modules/.bin/pi"]);
-    assert.ok(args.slice(end + 1).includes(`${PRICED}:high`));
+    // The umask wrapper, then the command's words unchanged.
+    assert.deepEqual(args.slice(end + 1, end + 5), [
+        "/bin/sh",
+        "-c",
+        'umask 022 && exec "$@"',
+        "sh",
+    ]);
+    assert.deepEqual(args.slice(end + 5), piCommand(PRICED, "brief"));
+    assert.deepEqual(
+        args.flatMap((arg, i) => (arg === "--tmpfs" ? [args[i + 1]] : [])),
+        ["/tmp", "/home/bench", "/run"],
+    );
+});
+
+test("/etc/alternatives is bound only when it exists", () => {
+    const argv = (exists) =>
+        bwrapArgs(HOST_PATHS, {
+            tryNo: 1,
+            command: ["true"],
+            exists,
+            realpath: (path) => path,
+        });
+    const bound = (args) =>
+        args.some((arg, i) => arg === "--ro-bind" && args[i + 1] === "/etc/alternatives");
+
+    assert.equal(bound(argv(() => true)), true);
+    assert.equal(bound(argv((path) => path !== "/etc/alternatives")), false);
 });
 
 test("a caller with no passwd or group path gets no /etc/passwd or /etc/group bind", () => {
@@ -326,3 +359,63 @@ test("bwrap: a limit ends the whole sandbox", { skip }, async () => {
     assert.equal(readResult(fixture, "pilot", "cost", PRICED).failure, "limit");
     await waitFor(() => processesWith(marker).length === 0, 10_000, "the sandboxed child to end");
 });
+
+/** Run 1 command in the real sandbox with no credential, in a fresh folder. */
+async function gapRun(command) {
+    const work = join(fixture.root, "gaps-work");
+    const cache = join(fixture.root, "gaps-cache");
+
+    mkdirSync(work, { recursive: true });
+    await makeCache(cache);
+
+    return runInSandbox(
+        {
+            bwrap: "bwrap",
+            pocket: fixture.pocket,
+            miseInstalls: DEFAULTS.miseInstalls,
+            data: fixture.data,
+        },
+        { work, cache, command, timeoutMs: 30_000 },
+    );
+}
+
+test("bwrap: umask 022 and a writable /run inside the sandbox", { skip }, async () => {
+    const created = await gapRun("touch /tmp/new-file && stat -c %a /tmp/new-file");
+
+    assert.equal(created.code, 0);
+    assert.equal(created.stdout.trim(), "644", "a new file gets mode 0644 (umask 022)");
+    assert.equal(
+        (await gapRun("mkdir -p /run/x/y && test -d /run/x/y")).code,
+        0,
+        "/run is writable",
+    );
+    assert.equal(
+        (await gapRun("grep -q ' /run tmpfs ' /proc/self/mounts")).code,
+        0,
+        "/run is a tmpfs of its own",
+    );
+});
+
+/** True when the host's `/usr/bin/awk` is a link into `/etc/alternatives`. */
+const awkIsAlternative = () => {
+    try {
+        return readlinkSync("/usr/bin/awk").startsWith("/etc/alternatives/");
+    } catch {
+        return false;
+    }
+};
+
+test(
+    "bwrap: a /usr/bin tool that links into /etc/alternatives runs (awk)",
+    {
+        skip:
+            skip ||
+            (awkIsAlternative() ? false : "/usr/bin/awk is no link into /etc/alternatives here"),
+    },
+    async () => {
+        const awk = await gapRun("awk 'BEGIN{print 1}'");
+
+        assert.equal(awk.code, 0);
+        assert.equal(awk.stdout.trim(), "1");
+    },
+);

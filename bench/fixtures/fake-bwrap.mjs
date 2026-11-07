@@ -52,6 +52,13 @@ const map = (path) => {
 };
 
 const [command, ...args] = argv.slice(i + 1);
+
+// The sandbox's umask wrapper (`/bin/sh -c 'umask 022 && exec "$@"' sh <command...>`): its command `node` is this
+// Node, as a bare `node` command is.
+if (command === "/bin/sh" && args[0] === "-c" && args[2] === "sh" && args[3] === "node") {
+    args[3] = process.execPath;
+}
+
 const childEnv = { ...env, PATH: process.env.PATH, HOME: tmpdir() };
 
 for (const key of ["PI_CODING_AGENT_DIR", "GOMODCACHE", "npm_config_cache", "PIP_CACHE_DIR"]) {
