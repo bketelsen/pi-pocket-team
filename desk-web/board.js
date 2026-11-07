@@ -21,9 +21,13 @@ const ACT_LABELS = {
     resolve: "Resolve",
 };
 
-/** A new key for 1 act: letters, digits and "-", as the board's route takes it (8 to 100 characters). */
-export const newBoardKey = (act) =>
-    `board-${String(act).replace(/[^A-Za-z0-9_-]/g, "-")}-${Math.random().toString(36).slice(2, 10)}-${Date.now().toString(36)}`;
+/**
+ * A new key for 1 act: the page's time in ms first, then "-" and a random part (`<ms>-<random>`), in letters, digits and
+ * "-", as the board's route takes it (8 to 100 characters). The route refuses a key whose time is 30 days old or more
+ * than 10 minutes ahead (409), so an expired key never acts again.
+ */
+export const newBoardKey = (act, now = Date.now()) =>
+    `${String(now)}-board-${String(act).replace(/[^A-Za-z0-9_-]/g, "-")}-${Math.random().toString(36).slice(2, 10)}`;
 
 /** The read of 1 supervisor's board: the first one when none is chosen. */
 export const boardPath = (supervisor) =>
@@ -145,8 +149,10 @@ export const boardAct = async (api, reload, conversation, body) => {
                 .then(reload)
                 .catch(() => undefined);
 
+            // A 409 changed nothing and kept no receipt: the act's next tap takes a new key (`conflict`).
             return {
                 ok: false,
+                conflict: true,
                 error: `${failure.message} The board is loaded again.`,
                 ...(reloaded === undefined ? {} : { reloaded }),
             };
@@ -269,6 +275,12 @@ export function boardController(api, { onChange = () => {}, make = newBoardKey }
                 notice: passText(done.answer.pass),
             });
         } else {
+            // A refusal of a 409 (a stale rev, a wrong state, a key too old to replay) acted on nothing: the next tap is
+            // a new act with a new key, so a key the route refuses as too old is never sent again.
+            if (done.conflict === true) {
+                forgetBoardKey(keys, supervisor, body);
+            }
+
             set({ busy: false, error: done.error });
         }
     };

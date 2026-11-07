@@ -995,8 +995,16 @@ export type TeamStartShiftRequest = {
         objective?: string;
         stop_when: string;
         max: number;
-        /** A length of time, such as 90m: the board gives no `until` or `start`. */
-        for: string;
+        /**
+         * The board row's end, an absolute time in epoch ms: the shift's deadline is this instant, in every path (a
+         * start wait, the DeepSeek peak wait, a late recovery). The board gives no `until`, `for` or `start`.
+         */
+        until_at?: number;
+        /**
+         * The old length of time, such as 90m, from a desk older than `until_at`: accepted for 1 install window, only
+         * when `until_at` is absent. Remove it when the desk and Team are installed together.
+         */
+        for?: string;
         worker?: string;
         pr_check?: {
             pr?: number;
@@ -1708,6 +1716,8 @@ export default function createTeam(host: Host, web: Web) {
         start?: string;
         until?: string;
         for?: string;
+        /** The absolute stop in epoch ms: only `startShift` (the desk's board) sets it, never `team_delegate`. */
+        until_at?: number;
         max?: number;
         worker?: string;
         pr_check?: {
@@ -2250,7 +2260,12 @@ export default function createTeam(host: Host, web: Web) {
                                 : { objective: request.shift.objective }),
                             stop_when: request.shift.stop_when,
                             max: request.shift.max,
-                            for: request.shift.for,
+                            // `until_at` is the board's end; `for` only from a desk older than it.
+                            ...(request.shift.until_at !== undefined
+                                ? { until_at: request.shift.until_at }
+                                : request.shift.for === undefined
+                                  ? {}
+                                  : { for: request.shift.for }),
                             ...(request.shift.worker === undefined
                                 ? {}
                                 : { worker: request.shift.worker }),
@@ -2285,12 +2300,16 @@ export default function createTeam(host: Host, web: Web) {
                     startThrew?: unknown;
                     startError?: unknown;
                     closedBefore?: unknown;
+                    threadBefore?: unknown;
                     deskFull?: unknown;
                 };
                 // A thrown start may have admitted the session; so may a start whose thread the desk failed for it, and
                 // any error after Pocket gave the session.
                 const unknown =
-                    admitted || failed.startThrew === true || failed.closedBefore === true;
+                    admitted ||
+                    failed.startThrew === true ||
+                    failed.closedBefore === true ||
+                    failed.threadBefore === true;
                 const words =
                     failed.startThrew === true
                         ? failed.startError
@@ -2402,6 +2421,12 @@ export default function createTeam(host: Host, web: Web) {
         if (fields.pr_check !== undefined && ns.version < 2) {
             throw new Error(
                 "The shift module (night-shift.ts) is too old for pr_check: Brian must install the new version.",
+            );
+        }
+
+        if (fields.until_at !== undefined && ns.version < 3) {
+            throw new Error(
+                "The shift module (night-shift.ts) is too old for a board row's end: Brian must install the new version.",
             );
         }
 
@@ -3356,7 +3381,20 @@ export default function createTeam(host: Host, web: Web) {
             };
         }
 
-        const shift = night_shift === undefined ? undefined : shiftFor(night_shift, task, source);
+        let shift: ReturnType<typeof shiftFor> | undefined;
+
+        try {
+            shift = night_shift === undefined ? undefined : shiftFor(night_shift, task, source);
+        } catch (error) {
+            // A thread already holds this key (a start that opened it, then stopped before its bind, as at a restart):
+            // Pocket may have admitted its session, so the board must not take this refusal for "nothing started".
+            if (known !== undefined && typeof error === "object" && error !== null) {
+                Object.assign(error, { threadBefore: true });
+            }
+
+            throw error;
+        }
+
         // Each delegation works in its own worktree beside the main checkout: 2 jobs in 1 repository share no folder
         // and no branch. A folder that is not a repository works as it did before, and a worktree that cannot be
         // made does not fail the delegation: the result says why, and the task runs in the main checkout.
@@ -3722,6 +3760,15 @@ export default function createTeam(host: Host, web: Web) {
             }
 
             const night_shift = args.shift ?? args.night_shift;
+
+            // The absolute stop belongs to the desk's goal board (`startShift`): a model never sets it.
+            if (
+                night_shift !== undefined &&
+                (night_shift as Record<string, unknown>).until_at !== undefined
+            ) {
+                throw new Error("shift.until_at is not a team_delegate field.");
+            }
+
             const starting = plan?.start === true;
             const delivering = plan !== undefined && !starting;
 

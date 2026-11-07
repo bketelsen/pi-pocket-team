@@ -38,7 +38,10 @@ export type BoardAttempt = {
     outcome?: "started" | "cap" | "refused" | "unknown";
     thread?: string;
     error?: string;
-    /** The run's length in minutes, fixed at the claim: a recovery of the attempt gives the same `for`. */
+    /**
+     * The minutes from the claim to the row's until. Stored data: kept, but it no longer drives the run. The start
+     * sends the row's `untilAt` as the shift's absolute stop `until_at`.
+     */
     minutes?: number;
 };
 
@@ -83,8 +86,18 @@ export type BoardRow = {
 /** A replayed call: its key, when, and the text it gave. */
 export type BoardKey = { key: string; at: number; text: string };
 
-/** The board on `x.desk.threads`. `keys` holds the last `BOARD_KEYS` calls' keys, so a replay changes nothing. */
+/**
+ * The board on `x.desk.threads`. `keys` is the old place of the replay keys: it is read as a fallback (a key written
+ * before `x.desk.board-receipts`), gets no new key, and loses its entries older than `BOARD_KEY_MS` when a commit
+ * touches the board. Stored data: never rename it.
+ */
 export type Board = { next: number; rows: BoardRow[]; keys?: BoardKey[] };
+
+/** 1 board call's receipt in `x.desk.board-receipts`: its key, when, and the text it gave. */
+export type BoardReceipt = { key: string; at: number; result: string };
+
+/** 1 supervisor's receipts in `x.desk.board-receipts`. Stored data: never rename a field. */
+export type BoardReceiptsState = { receipts: BoardReceipt[] };
 
 // ─── Limits and settings ─────────────────────────────────────────────────────
 
@@ -94,8 +107,10 @@ export const MAX_BOARD_OBJECTIVE = 3000;
 export const MAX_BOARD_STOP = 3000;
 export const MAX_BOARD_NOTE = 500;
 export const MAX_BOARD_ROUNDS = 100;
-/** The replay keys kept. */
-export const BOARD_KEYS = 200;
+/** How long a board call's receipt is kept, by age only (no count limit): 30 days. */
+export const BOARD_KEY_MS = 30 * 24 * 3600_000;
+/** How far ahead of the server's clock a page key's time may be: 10 minutes. */
+export const BOARD_KEY_AHEAD_MS = 10 * 60_000;
 /** A row with less time than this left to its until at its claim fails. */
 export const BOARD_MIN_LEFT_MS = 10 * 60_000;
 
@@ -793,7 +808,7 @@ export function boardOp(
             if (row.state !== "proposed" && row.state !== "picked" && row.state !== "waiting") {
                 return refuse(
                     row.state === "starting"
-                        ? `Row ${String(row.id)} is starting: it cannot be dropped. Stop its run in its own session (/shift stop or Stop).`
+                        ? `Row ${String(row.id)} is starting: it cannot be dropped. Stop its run in its own session (/team-shift stop or Stop).`
                         : `Row ${String(row.id)} is ${row.state}: drop takes a proposed, picked or waiting row.`,
                     409,
                 );
@@ -940,19 +955,98 @@ export function boardOp(
 
 // ─── Replay keys ─────────────────────────────────────────────────────────────
 
-/** The text a replayed call gave, or undefined for a new call. */
-export function boardReplay(board: Board | undefined, key: string): string | undefined {
-    return board?.keys?.find((each) => each.key === key)?.text;
+/**
+ * The text a replayed call gave, or undefined for a new call: its receipt in `x.desk.board-receipts`, else (a key
+ * written before that document) its entry in the old `board.keys`.
+ */
+export function boardReplay(
+    receipts: BoardReceiptsState | undefined,
+    board: Board | undefined,
+    key: string,
+): string | undefined {
+    return (
+        receipts?.receipts.find((each) => each.key === key)?.result ??
+        board?.keys?.find((each) => each.key === key)?.text
+    );
 }
 
-/** Keep a call's key and its text: the newest `BOARD_KEYS` stay. */
-export function keepBoardKey(board: Board, key: string, text: string, now: number): void {
-    board.keys ??= [];
-    board.keys.push({ key, at: now, text });
+/**
+ * Keep a call's receipt, in the commit of its change: the receipts older than `BOARD_KEY_MS` go first. There is no
+ * count limit, so a replay after any number of other calls still finds its receipt.
+ */
+export function keepBoardReceipt(
+    receipts: BoardReceiptsState,
+    key: string,
+    result: string,
+    now: number,
+): void {
+    receipts.receipts = receipts.receipts.filter((each) => now - each.at < BOARD_KEY_MS);
+    receipts.receipts.push({ key, at: now, result });
+}
 
-    if (board.keys.length > BOARD_KEYS) {
-        board.keys.splice(0, board.keys.length - BOARD_KEYS);
+/**
+ * Keep a call's receipt for its supervisor in `x.desk.board-receipts` (`supervisors`, keyed by the supervisor's
+ * conversation id), in the commit of its change. Every supervisor's receipts older than `BOARD_KEY_MS` go first, and a
+ * supervisor with none left goes; there is no count limit.
+ */
+export function keepBoardReceipts(
+    supervisors: Record<string, BoardReceiptsState>,
+    supervisor: string,
+    key: string,
+    result: string,
+    now: number,
+): void {
+    for (const [id, receipts] of Object.entries(supervisors)) {
+        if (id === supervisor) {
+            continue;
+        }
+
+        receipts.receipts = receipts.receipts.filter((each) => now - each.at < BOARD_KEY_MS);
+
+        if (receipts.receipts.length === 0) {
+            delete supervisors[id];
+        }
     }
+
+    supervisors[supervisor] ??= { receipts: [] };
+    keepBoardReceipt(supervisors[supervisor], key, result, now);
+}
+
+/** Drop the old `board.keys` entries older than `BOARD_KEY_MS`; the field goes when it is empty. */
+export function pruneBoardKeys(board: Board, now: number): void {
+    if (board.keys === undefined) {
+        return;
+    }
+
+    board.keys = board.keys.filter((each) => now - each.at < BOARD_KEY_MS);
+
+    if (board.keys.length === 0) {
+        delete board.keys;
+    }
+}
+
+/** The refusal of a page key that is too old to replay, or not made by the Board view. */
+export const BOARD_KEY_TOO_OLD = "This request is too old to replay: load the board again.";
+
+/**
+ * Whether a page POST's key may act: it starts with the page's time in ms (`<ms>-<random>`), and that time is less
+ * than 30 days old and at most `BOARD_KEY_AHEAD_MS` ahead of `now`. Else the 409 refusal, so an expired key never acts
+ * again. The age limit is `BOARD_KEY_MS` less `BOARD_KEY_AHEAD_MS`: a key whose time was up to 10 minutes ahead of its
+ * receipt's is refused before that receipt is pruned.
+ */
+export function boardPageKeyRefusal(key: string, now: number): BoardRefusal | undefined {
+    const match = /^([0-9]{1,16})-./.exec(key);
+    const at = match === null ? NaN : Number(match[1]);
+
+    if (
+        !Number.isSafeInteger(at) ||
+        now - at >= BOARD_KEY_MS - BOARD_KEY_AHEAD_MS ||
+        at - now > BOARD_KEY_AHEAD_MS
+    ) {
+        return { error: BOARD_KEY_TOO_OLD, status: 409 };
+    }
+
+    return undefined;
 }
 
 // ─── The launch pass's rules ─────────────────────────────────────────────────

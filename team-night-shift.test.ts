@@ -188,6 +188,98 @@ describe("delegatedRequest", () => {
             /limited to 3000 characters/,
         );
     });
+
+    test("until_at is the deadline exactly: a start wait and the DeepSeek peak wait do not move it", () => {
+        const untilAt = Date.UTC(2026, 9, 22, 10, 45);
+        const plain = delegatedRequest(
+            { objective: "a", stop_when: "b", until_at: untilAt },
+            now,
+            ZONE,
+        );
+
+        assert(!("error" in plain));
+        assert.equal(plain.deadline, untilAt);
+        assert.equal(plain.deadlineLabel, "06:45 EDT");
+        assert.equal(plain.start, undefined);
+
+        const started = delegatedRequest(
+            { objective: "a", stop_when: "b", start: "06:00", until_at: untilAt },
+            now,
+            ZONE,
+        );
+
+        assert(!("error" in started));
+        assert.equal(started.start, Date.UTC(2026, 9, 22, 10, 0));
+        assert.equal(started.deadline, untilAt);
+
+        // 03:00 EDT is 07:00 UTC: inside DeepSeek's peak, which ends at 10:00 UTC.
+        const peak = Date.UTC(2026, 9, 22, 7, 0);
+        const peakEnd = Date.UTC(2026, 9, 22, 8, 30);
+        const deep = delegatedRequest(
+            {
+                objective: "a",
+                stop_when: "b",
+                worker: "deepseek/deepseek-flash",
+                until_at: peakEnd,
+            },
+            peak,
+            ZONE,
+        );
+
+        assert(!("error" in deep));
+        assert.equal(deep.start, Date.UTC(2026, 9, 22, 10, 0));
+        assert.equal(deep.startWhy, "deepseek-peak");
+        // No refusal here: the wait ends after the deadline, and the driver then stops with `deadline`.
+        assert.equal(deep.deadline, peakEnd);
+    });
+
+    test("until_at is refused with until or for, at or before now, past 24 hours, or not a number", () => {
+        const later = now + 3600_000;
+
+        for (const fields of [
+            { objective: "a", stop_when: "b", until_at: later, until: "07:00" },
+            { objective: "a", stop_when: "b", until_at: later, for: "2h" },
+        ]) {
+            const request = delegatedRequest(fields, now, ZONE);
+
+            assert("error" in request, JSON.stringify(fields));
+            assert.match(request.error, /Give one deadline: until_at, until or for/);
+        }
+
+        const past = delegatedRequest({ objective: "a", stop_when: "b", until_at: now }, now, ZONE);
+
+        assert("error" in past);
+        assert.match(past.error, /has passed/);
+
+        const far = delegatedRequest(
+            { objective: "a", stop_when: "b", until_at: now + 24 * 3600_000 + 60_000 },
+            now,
+            ZONE,
+        );
+
+        assert("error" in far);
+        assert.match(far.error, /1 minute to 24 hours away/);
+        assert(
+            !(
+                "error" in
+                delegatedRequest(
+                    { objective: "a", stop_when: "b", until_at: now + 24 * 3600_000 },
+                    now,
+                    ZONE,
+                )
+            ),
+        );
+
+        for (const value of [Number.NaN, Number.POSITIVE_INFINITY, "later"]) {
+            const odd = delegatedRequest(
+                { objective: "a", stop_when: "b", until_at: value as number },
+                now,
+                ZONE,
+            );
+
+            assert("error" in odd, String(value));
+        }
+    });
 });
 
 // ─── The PR check ───────────────────────────────────────────────────────────

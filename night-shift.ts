@@ -995,6 +995,11 @@ export type DelegatedFields = {
     start?: string;
     until?: string;
     for?: string;
+    /**
+     * The absolute stop, in epoch milliseconds: the goal's deadline is this instant. Only Team's `startShift` (the
+     * desk's goal board) sets it; the `team_delegate` tool has no such field. A wait before round 1 never moves it.
+     */
+    until_at?: number;
     max?: number;
     worker?: string;
     pr_check?: PrCheck;
@@ -1030,7 +1035,8 @@ const OPTION_ALONE = {
  * cannot carry a second option: the free check never comes from this path (only the owner sets one, with
  * `/team-shift`). The 1 exception is `pr_check`, a structured PR check: `prCheckCommand` builds a fixed `gh` command
  * from validated values, so no model-chosen shell runs. The options combine here, so `until` after `start`, `for` from
- * `start`, and one of `until`/`for` hold as usual.
+ * `start`, and one of `until`/`for` hold as usual. `until_at` is an absolute stop in place of `until` or `for`: the
+ * deadline is that instant, and a `start` or the DeepSeek peak wait does not move it.
  */
 export function delegatedRequest(
     fields: DelegatedFields,
@@ -1052,6 +1058,26 @@ export function delegatedRequest(
         return {
             error: `The objective and the stop condition are limited to ${MAX_TEXT} characters.`,
         };
+    }
+
+    const untilAt = fields.until_at;
+
+    if (untilAt !== undefined) {
+        if (fields.until !== undefined || fields.for !== undefined) {
+            return { error: "Give one deadline: until_at, until or for." };
+        }
+
+        if (typeof untilAt !== "number" || !Number.isFinite(untilAt)) {
+            return { error: "shift.until_at must be a time in epoch milliseconds." };
+        }
+
+        if (untilAt <= now) {
+            return { error: `shift.until_at ${clockLabel(untilAt, zone)} has passed.` };
+        }
+
+        if (untilAt - now > MAX_HOURS * 3600_000) {
+            return { error: `A deadline must be 1 minute to ${MAX_HOURS} hours away.` };
+        }
     }
 
     const parts: string[] = [];
@@ -1124,6 +1150,14 @@ export function delegatedRequest(
         check = built;
     }
 
+    // The absolute stop: no wait before round 1 moves it. A wait that ends at or after it ends the goal with no round.
+    const deadline =
+        untilAt !== undefined
+            ? { deadline: untilAt, deadlineLabel: clockLabel(untilAt, zone) }
+            : options.deadline === undefined
+              ? {}
+              : { deadline: options.deadline, deadlineLabel: options.deadlineLabel };
+
     return {
         objective,
         stop,
@@ -1136,9 +1170,7 @@ export function delegatedRequest(
                   startLabel: options.startLabel,
                   ...(options.startWhy === undefined ? {} : { startWhy: options.startWhy }),
               }),
-        ...(options.deadline === undefined
-            ? {}
-            : { deadline: options.deadline, deadlineLabel: options.deadlineLabel }),
+        ...deadline,
         ...(options.worker === undefined ? {} : { worker: options.worker }),
     };
 }
@@ -1633,7 +1665,8 @@ const SUMMARIZED = new Set<StopReason>(["done", "max-rounds", "deadline", "block
 
 /** What `team.ts` uses: on `globalThis[Symbol.for("pi-pocket-team.night-shift")]`, so it finds the live version. */
 export type NightShiftApi = {
-    version: 2;
+    /** Version 3: `delegatedRequest` takes `until_at` (an absolute stop, from the desk's goal board). */
+    version: 3;
     delegatedRequest: typeof delegatedRequest;
     setDelegated: (
         tx: Tx,
@@ -2903,7 +2936,8 @@ export default function createNightShift(host: Host, web: Web) {
 
     // Another module finds this version here. A new version sets its own before the old one's cleanup runs.
     const api: NightShiftApi = {
-        version: 2,
+        // Version 3 takes `until_at` in `delegatedRequest`.
+        version: 3,
         delegatedRequest,
         setDelegated,
         notifyChanged,
