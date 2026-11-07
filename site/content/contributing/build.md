@@ -35,7 +35,7 @@ The tests run each module inside a real Pi Pocket app built by the checkout's te
 
 - `team-memory.test.ts` checks agent memory's rules directly and through the app, with fixture agent profiles.
 - `night-shift.test.ts` runs shifts against a scripted model, restarts included, through `/team-shift` and its old name `/night-shift`.
-- `shift-names.test.ts` fails on a literal in the modules that still names the feature "night shift", except the stored names, identities and aliases on its list.
+- `shift-names.test.ts` fails on a literal in the modules, or prose in the docs and the site (outside code), that still names the feature "night shift", except the stored names, identities, aliases and old-name notes on its lists.
 - `npm run preview` (`preview.ts`) opens an isolated app with sample lessons, to look at the panel.
 
 ## Build this site

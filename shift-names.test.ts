@@ -232,3 +232,130 @@ test("each allowed literal still occurs, as often as the list says", () => {
         );
     }
 });
+
+// The docs: prose that names the current feature says shift too. Code spans and fenced blocks hold stored names and
+// identifiers (`x.night-shift.goal`, `night-shift.ts`), so the scan skips them. The pattern allows any white space,
+// a line break too, between the 2 words.
+const DOC_OLD_NAME = /night[\s_-]*shifts?/gi;
+
+const markdown = (folder: string): string[] =>
+    readdirSync(join(here, folder), { recursive: true, encoding: "utf8" })
+        .filter((name) => name.endsWith(".md"))
+        .sort()
+        .map((name) => `${folder}/${name}`);
+
+const DOCS = [
+    "README.md",
+    "AGENTS.md",
+    "bench/README.md",
+    "docs/README.md",
+    "docs/beacon.md",
+    "docs/setup.md",
+    ...markdown("docs/modules"),
+    ...markdown("site/content"),
+    "site/properdocs.yml",
+];
+
+/** Prose that may name the old feature: the file, how many times, and why. */
+const DOC_ALLOWED: Allowed[] = [
+    {
+        file: "docs/modules/night-shift.md",
+        text: "night shift",
+        count: 2,
+        why: "the old path of the page: its title and its 1 line say the feature has a new name",
+    },
+    {
+        file: "docs/modules/shift.md",
+        text: "night shift",
+        count: 1,
+        why: "the section Old names says what the feature was called",
+    },
+    {
+        file: "site/content/modules/shift.md",
+        text: "night shift",
+        count: 1,
+        why: "the section Old names says what the feature was called",
+    },
+    {
+        file: "docs/setup.md",
+        text: "night shift",
+        count: 1,
+        why: "it says what shift-names.test.ts looks for",
+    },
+    {
+        file: "site/content/contributing/build.md",
+        text: "night shift",
+        count: 1,
+        why: "it says what shift-names.test.ts looks for",
+    },
+    {
+        file: "AGENTS.md",
+        text: "night-shift",
+        count: 1,
+        why: "the rule that stored names keep the old name names it",
+    },
+    {
+        file: "docs/modules/shift.md",
+        text: "night-shift",
+        count: 1,
+        why: "the section Old names says which names keep it",
+    },
+    {
+        file: "docs/README.md",
+        text: "night-shift",
+        count: 2,
+        why: "the index links the old path of the page, modules/night-shift.md (its text and its target)",
+    },
+];
+
+/** Every prose mention of the old feature in a Markdown or YAML text, outside code, with white space as 1 space. */
+function oldNamesInProse(text: string): string[] {
+    const prose = text
+        .replace(/^(```|~~~)[^\n]*\n[\s\S]*?^\1[^\n]*$/gm, "")
+        .replace(/`[^`\n]*`/g, "");
+
+    return [...prose.matchAll(DOC_OLD_NAME)].map((match) =>
+        match[0].replace(/\s+/g, " ").toLowerCase(),
+    );
+}
+
+test("the docs scan finds a name split over 2 lines, and skips code spans and fenced blocks", () => {
+    assert.deepEqual(
+        oldNamesInProse(
+            [
+                "R1 still counts night",
+                "  shifts only. A `night-shift.ts` file and a `x.night-shift.goal` kind.",
+                "```text",
+                "/night-shift status",
+                "```",
+                "A Night-shift goal.",
+            ].join("\n"),
+        ),
+        ["night shifts", "night-shift"],
+    );
+});
+
+test("no doc names the current feature night shift, except the old names it explains", () => {
+    const unexpected: string[] = [];
+
+    for (const file of DOCS) {
+        const found = oldNamesInProse(readFileSync(join(here, file), "utf8"));
+        const allowed = DOC_ALLOWED.filter((each) => each.file === file);
+
+        for (const text of found) {
+            if (!allowed.some((each) => each.text === text)) {
+                unexpected.push(`${file}: ${JSON.stringify(text)}`);
+            }
+        }
+
+        for (const each of allowed) {
+            assert.equal(
+                found.filter((text) => text === each.text).length,
+                each.count,
+                `${file}: ${JSON.stringify(each.text)} (${each.why})`,
+            );
+        }
+    }
+
+    assert.deepEqual(unexpected, [], "say shift in the doc, or add the mention with its reason");
+});
