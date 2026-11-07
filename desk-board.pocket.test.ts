@@ -959,6 +959,37 @@ describe("the Desk page's board routes", () => {
         assert.equal((await stored(one)).by, "odrade", "the page does not change who added it");
     });
 
+    test("POST board: resolve with a thread of the same supervisor launches the unknown row with that thread", async () => {
+        const call = await routes();
+        const source = await knownSupervisor();
+        const thread =
+            Object.values((await deskState()).threads).find(
+                (each) => each.supervisor === Number(source),
+            )?.id ?? assert.fail("the supervisor's thread");
+        const row = await addRow(source, { title: "resolve row" });
+
+        await setState(row, "unknown");
+
+        const resolve = await call(`board/${String(source)}`, {
+            op: "resolve",
+            row,
+            rev: (await stored(row)).rev,
+            thread,
+            key: key(),
+        });
+
+        assert.equal(resolve.status, 200, JSON.stringify(resolve.data));
+
+        const shown = resolve.data.rows.find((each: { id: number }) => each.id === row);
+
+        assert.equal(shown?.state, "launched");
+        assert.equal(shown?.thread, thread);
+        assert.equal(typeof shown?.next, "string", "the thread's next actor");
+        assert.equal((await stored(row)).state, "launched");
+        assert.equal((await stored(row)).thread, thread);
+        assert.equal((await stored(row)).error, undefined);
+    });
+
     test("POST board: 400 for a bad op, a bad key, a missing rev and a bad field; nothing changes", async () => {
         const call = await routes();
         const source = await knownSupervisor();

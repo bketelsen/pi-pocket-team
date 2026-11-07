@@ -124,6 +124,10 @@ export const limitsText = (board) =>
         ? "The desk knows no supervisor yet: there is no board to show."
         : (board.limits?.line ?? "");
 
+/** A row with the rev of its open form (`draft`), when the form is that row's: Save posts the rev the form opened on. */
+export const draftRow = (row, draft) =>
+    draft?.row === row.id && typeof draft.rev === "number" ? { ...row, rev: draft.rev } : row;
+
 /** The pass's lines after a launch, as 1 notice, or "" when the pass touched no row. */
 export const passText = (pass) =>
     (pass ?? []).length === 0 ? "" : `Launch pass: ${pass.join("; ")}`;
@@ -156,15 +160,21 @@ export const boardAct = async (api, reload, conversation, body) => {
 
 /**
  * The Board view's state and its acts. `api` is `pocket.api`; `onChange` runs after each change. An act runs once at a
- * time: a tap while one runs does nothing.
+ * time: a tap while one runs does nothing. A choice of another supervisor starts a new selection (`selection`): an
+ * answer, GET or POST, that comes for an earlier selection is dropped, so it never lands on another supervisor's board.
+ * While the new board loads (`loading`), the acts are off. An Edit or Resolve form keeps the rev it opened on, and its
+ * Save posts that rev: a row that changed since is refused (409), never overwritten.
  */
 export function boardController(api, { onChange = () => {}, make = newBoardKey } = {}) {
     const keys = {};
     let stopped = false;
     let reads = 0;
+    /** The selection: 1 more at each choice of a supervisor. */
+    let selection = 0;
     let view = {
         board: null,
         chosen: null,
+        loading: false,
         error: "",
         notice: "",
         busy: false,
@@ -186,18 +196,21 @@ export function boardController(api, { onChange = () => {}, make = newBoardKey }
         reads += 1;
 
         const mine = reads;
+        const chosen = selection;
+        /** Whether this read is still the newest one of the selection shown now. */
+        const current = () => mine === reads && chosen === selection;
 
         try {
             const board = await api(boardPath(view.chosen));
 
-            if (mine === reads) {
-                set({ board });
+            if (current()) {
+                set({ board, loading: false });
             }
 
             return board;
         } catch (failure) {
-            if (mine === reads) {
-                set({ error: failure?.message ?? String(failure) });
+            if (current()) {
+                set({ error: failure?.message ?? String(failure), loading: false });
             }
 
             return undefined;
@@ -208,15 +221,29 @@ export function boardController(api, { onChange = () => {}, make = newBoardKey }
     const act = async (body) => {
         const supervisor = view.board?.supervisor;
 
-        if (view.busy || body === null || supervisor === null || supervisor === undefined) {
+        if (
+            view.busy ||
+            view.loading ||
+            body === null ||
+            supervisor === null ||
+            supervisor === undefined
+        ) {
             return;
         }
 
         const key = boardKeyFor(keys, supervisor, body, make);
+        const chosen = selection;
 
         set({ busy: true, error: "", notice: "" });
 
         const done = await boardAct(api, load, supervisor, { ...body, key });
+
+        // The answer of an earlier selection, or of another supervisor's board: it changes no row on the screen.
+        if (chosen !== selection || view.board?.supervisor !== supervisor) {
+            set({ busy: false });
+
+            return;
+        }
 
         if (done.ok) {
             forgetBoardKey(keys, supervisor, body);
@@ -238,22 +265,38 @@ export function boardController(api, { onChange = () => {}, make = newBoardKey }
         act,
         launch: () => act(launchBody(view.board?.rows)),
         choose: (supervisor) => {
-            set({ chosen: supervisor, open: null, editing: null, resolving: null, error: "" });
+            selection += 1;
+            set({
+                chosen: supervisor,
+                loading: true,
+                open: null,
+                editing: null,
+                resolving: null,
+                error: "",
+                notice: "",
+            });
 
             return load();
         },
         toggle: (id) => set({ open: view.open === id ? null : id }),
         edit: (row) =>
             set({
-                editing: { row: row.id, max: String(row.max), until: row.until },
+                editing: { row: row.id, rev: row.rev, max: String(row.max), until: row.until },
                 resolving: null,
             }),
         editField: (name, value) => set({ editing: { ...view.editing, [name]: value } }),
-        saveEdit: (row) => act(actBody(row, "edit", view.editing ?? {})),
-        resolve: (row) => set({ resolving: { row: row.id, thread: "" }, editing: null }),
+        // The rev the form opened on, not the one on the screen now: a change since is a 409.
+        saveEdit: (row) => act(actBody(draftRow(row, view.editing), "edit", view.editing ?? {})),
+        resolve: (row) =>
+            set({ resolving: { row: row.id, rev: row.rev, thread: "" }, editing: null }),
         resolveField: (value) => set({ resolving: { ...view.resolving, thread: value } }),
-        sendResolve: (row) => act(actBody(row, "resolve", { thread: view.resolving?.thread })),
-        failRow: (row) => act(actBody(row, "resolve")),
+        sendResolve: (row) =>
+            act(
+                actBody(draftRow(row, view.resolving), "resolve", {
+                    thread: view.resolving?.thread,
+                }),
+            ),
+        failRow: (row) => act(actBody(draftRow(row, view.resolving), "resolve")),
         cancel: () => set({ editing: null, resolving: null }),
         stop: () => {
             stopped = true;
@@ -277,7 +320,7 @@ export function boardMarkup(html, view, ctl) {
                       type="button"
                       class="button"
                       data-act=${`edit:${String(row.id)}`}
-                      disabled=${view.busy}
+                      disabled=${view.busy || view.loading}
                       onClick=${() => ctl.edit(row)}
                   >
                       ${label}
@@ -287,7 +330,7 @@ export function boardMarkup(html, view, ctl) {
                         type="button"
                         class="button"
                         data-act=${`resolve:${String(row.id)}`}
-                        disabled=${view.busy}
+                        disabled=${view.busy || view.loading}
                         onClick=${() => ctl.resolve(row)}
                     >
                         ${label}
@@ -296,7 +339,7 @@ export function boardMarkup(html, view, ctl) {
                         type="button"
                         class="button"
                         data-act=${`${op}:${String(row.id)}`}
-                        disabled=${view.busy}
+                        disabled=${view.busy || view.loading}
                         onClick=${() => ctl.act(actBody(row, op))}
                     >
                         ${label}
@@ -332,7 +375,7 @@ export function boardMarkup(html, view, ctl) {
                     type="button"
                     class="button primary"
                     data-act=${`save:${String(row.id)}`}
-                    disabled=${view.busy}
+                    disabled=${view.busy || view.loading}
                     onClick=${() => ctl.saveEdit(row)}
                 >
                     Save
@@ -357,7 +400,7 @@ export function boardMarkup(html, view, ctl) {
                     type="button"
                     class="button primary"
                     data-act=${`bind:${String(row.id)}`}
-                    disabled=${view.busy || view.resolving.thread.trim() === ""}
+                    disabled=${view.busy || view.loading || view.resolving.thread.trim() === ""}
                     onClick=${() => ctl.sendResolve(row)}
                 >
                     Launched with this thread
@@ -366,7 +409,7 @@ export function boardMarkup(html, view, ctl) {
                     type="button"
                     class="button"
                     data-act=${`fail:${String(row.id)}`}
-                    disabled=${view.busy}
+                    disabled=${view.busy || view.loading}
                     onClick=${() => ctl.failRow(row)}
                 >
                     Fail it
@@ -414,7 +457,8 @@ export function boardMarkup(html, view, ctl) {
                     ? html`<select
                           class="desk-reason board-supervisor"
                           aria-label="The supervisor's board"
-                          value=${String(board.supervisor)}
+                          value=${String(view.chosen ?? board.supervisor)}
+                          disabled=${view.busy || view.loading}
                           onChange=${(event) => void ctl.choose(Number(event.currentTarget.value))}
                       >
                           ${supervisors.map(
@@ -429,7 +473,7 @@ export function boardMarkup(html, view, ctl) {
                     type="button"
                     class="button primary"
                     data-act="launch"
-                    disabled=${view.busy || picked.length === 0}
+                    disabled=${view.busy || view.loading || picked.length === 0}
                     onClick=${() => ctl.launch()}
                 >
                     Launch picks${picked.length === 0 ? "" : ` (${String(picked.length)})`}

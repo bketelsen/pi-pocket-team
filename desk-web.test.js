@@ -3355,3 +3355,139 @@ test("makeBoard: the view reads at once, reads again on changed, and stops liste
     cleanups[0]();
     assert.deepEqual(offs, ["changed"], "the listener goes with the view");
 });
+
+test("Board: Edit and Resolve post the rev their form opened on, also after a reload gave a newer rev", async () => {
+    /** A board whose rows move to a newer rev at each read after the first. */
+    const moving = () => {
+        let reads = 0;
+
+        return boardApi({
+            board: () => {
+                reads += 1;
+
+                return boardAnswer([
+                    boardRow({ id: 3, rev: reads === 1 ? 1 : 2, title: "Row three" }),
+                    boardRow({
+                        id: 6,
+                        rev: reads === 1 ? 4 : 5,
+                        state: "unknown",
+                        title: "Row six",
+                    }),
+                ]);
+            },
+        });
+    };
+
+    const edits = moving();
+    const ctl = await loadedBoard(edits);
+
+    await boardScreen(ctl).tap("edit:3");
+    ctl.editField("max", "9");
+    // A `changed` event reads the board again while the form is open: row 3 is rev 2 now.
+    await ctl.load();
+    assert.ok(boardScreen(ctl).out.includes("proposed · rev 2"));
+    await boardScreen(ctl).tap("save:3");
+    assert.deepEqual(edits.posts(), [
+        [
+            "POST",
+            "board/7",
+            { op: "edit", row: 3, rev: 1, fields: { max: 9, until: "06:45" }, key: "key-0001" },
+        ],
+    ]);
+
+    const resolves = moving();
+    const other = await loadedBoard(resolves);
+
+    await boardScreen(other).tap("resolve:6");
+    await other.load();
+    assert.ok(boardScreen(other).out.includes("unknown · rev 5"));
+    other.resolveField("T12");
+    await boardScreen(other).tap("bind:6");
+    assert.deepEqual(resolves.posts(), [
+        ["POST", "board/7", { op: "resolve", row: 6, rev: 4, thread: "T12", key: "key-0001" }],
+    ]);
+});
+
+test("Board: a POST answer for supervisor A that comes after the choice of B changes nothing on B's board", async () => {
+    const pending = [];
+    const calls = [];
+
+    const api = (path, body) => {
+        calls.push(body === undefined ? ["GET", path] : ["POST", path, body]);
+
+        return new Promise((resolve) => {
+            pending.push({ path, resolve });
+        });
+    };
+
+    /** End the pending call for `path` with `answer`, then let the controller take it. */
+    const answer = async (path, value) => {
+        const at = pending.findIndex((each) => each.path === path);
+
+        assert(at >= 0, `a pending ${path}`);
+        pending.splice(at, 1)[0].resolve(value);
+        await new Promise((resolve) => setImmediate(resolve));
+    };
+
+    const boardA = {
+        ...boardAnswer([boardRow({ id: 3, rev: 1, title: "A row" })]),
+        supervisors: [7, 9],
+    };
+    const boardB = {
+        ...boardAnswer([boardRow({ id: 30, rev: 1, title: "B row" })]),
+        supervisors: [7, 9],
+        supervisor: 9,
+    };
+    const ctl = boardController(api, { make: keyMaker() });
+    const loaded = ctl.load();
+
+    await answer("board", boardA);
+    await loaded;
+
+    const acting = boardScreen(ctl).tap("pick:3");
+
+    assert.match(boardScreen(ctl).out, /aria-label="The supervisor's board" value=7 disabled=true/);
+
+    const choosing = ctl.choose(9);
+
+    assert.match(boardScreen(ctl).out, /data-act="launch" disabled=true/, "no act while B loads");
+    await answer("board?supervisor=9", boardB);
+    await choosing;
+    await answer("board/7", {
+        ...boardAnswer([boardRow({ id: 3, rev: 1, state: "picked", title: "A row" })]),
+        pass: [],
+    });
+    await acting;
+
+    assert.equal(ctl.view().board.supervisor, 9);
+    assert.deepEqual(
+        ctl.view().board.rows.map((row) => row.title),
+        ["B row"],
+    );
+    assert.equal(ctl.view().busy, false);
+    assert.deepEqual(
+        calls.map((call) => call.slice(0, 2)),
+        [
+            ["GET", "board"],
+            ["POST", "board/7"],
+            ["GET", "board?supervisor=9"],
+        ],
+    );
+
+    // A GET of an earlier selection is dropped too: choose 7, then 9, and the answer for 7 comes last.
+    const first = ctl.choose(7);
+
+    // No act while a board loads: its buttons are off, and an act posts nothing.
+    assert.match(boardScreen(ctl).out, /data-act=pick:30 disabled=true/);
+    // Not awaited: with no guard, this act would wait on its own post.
+    void ctl.act(actBody(boardB.rows[0], "pick"));
+    assert.equal(calls.filter((call) => call[0] === "POST").length, 1, "no post while loading");
+
+    const second = ctl.choose(9);
+
+    await answer("board?supervisor=9", boardB);
+    await second;
+    await answer("board?supervisor=7", boardA);
+    await first;
+    assert.equal(ctl.view().board.supervisor, 9);
+});
