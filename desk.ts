@@ -765,6 +765,25 @@ export type DeskState = {
          */
         drops?: Record<string, { id: string; reason: string }>;
     };
+    /**
+     * By supervisor id: the supervisor's session takes no run-end answers of the linked sessions it started
+     * (`host.linkedSessions.reports` with `take: false`, since Pi Pocket 0.28.0-bk.1). `at`: the time of the call
+     * that worked; `pocket`: `host.pocketVersion` then. A supervisor with an entry is never called again. Absent until
+     * the first call that worked.
+     */
+    reportsOff?: Record<string, { at: number; pocket: string }>;
+    /**
+     * By supervisor id: the `x.desk.reports-off` task that runs for it (`task`, the task id) and when it was made
+     * (`at`), so a second start while 1 runs finds it. The task removes its own entry when it ends. A record older than
+     * `REPORTS_OFF_TASK_STALE_MS` is stale (a task the scheduler ended with no cleanup, such as a faulted one): the next
+     * load pass starts a new task and replaces it. Absent until the first such task.
+     */
+    reportsOffTasks?: Record<string, { task: string; at: number }>;
+    /**
+     * By supervisor id: the time of the last warning notice of a failed switch, so a failure warns at most once an hour,
+     * also across a reload or a restart. Absent until the first such warning.
+     */
+    reportsOffNoticed?: Record<string, number>;
 };
 
 /** One plan's state: the shape of its thread's work. Stored data: never rename a field. */
@@ -20113,6 +20132,157 @@ export type ConsultView = {
     canStop: boolean;
 };
 
+// ─── Run-end answers: the supervisor's switch ────────────────────────────────
+
+/** The replay key of the host call that turns a supervisor's run-end answers off. */
+export const reportsOffKey = (supervisor: number): string =>
+    `x.desk.reports-off:${String(supervisor)}`;
+
+/**
+ * The desk's supervisors: each conversation id that is a thread's `supervisor`, a key of `sweepers`, or a key of
+ * `clerks`. Numbers, each once, in order.
+ */
+export function deskSupervisors(state: DeskState | undefined): number[] {
+    if (state === undefined) {
+        return [];
+    }
+
+    const ids = new Set<number>();
+
+    const add = (value: unknown) => {
+        const id = typeof value === "string" && value.trim() !== "" ? Number(value) : value;
+
+        if (typeof id === "number" && Number.isInteger(id) && id > 0) {
+            ids.add(id);
+        }
+    };
+
+    for (const thread of Object.values(state.threads)) {
+        add(thread.supervisor);
+    }
+
+    for (const key of Object.keys(state.sweepers ?? {})) {
+        add(key);
+    }
+
+    for (const key of Object.keys(state.clerks ?? {})) {
+        add(key);
+    }
+
+    return [...ids].sort((a, b) => a - b);
+}
+
+/**
+ * Whether a Pi Pocket release sends a lead the run-end answer of each linked session it started: 0.28 and later. A
+ * suffix (`-bk.1`) is ignored; a version that does not parse is false.
+ */
+export function sendsRunEndAnswers(pocketVersion: string | undefined): boolean {
+    const match = /^v?(\d+)\.(\d+)(?:\.\d+)?(?:[-+].*)?$/.exec(pocketVersion?.trim() ?? "");
+
+    if (match === null) {
+        return false;
+    }
+
+    const major = Number(match[1]);
+    const minor = Number(match[2]);
+
+    return major > 0 || minor >= 28;
+}
+
+/** What the desk knows of the host: its release, whether it has the switch, and the last error of the switch. */
+export type RunEndFacts = { pocketVersion: string | undefined; hasMethod: boolean; error?: string };
+
+/**
+ * The `Run-end answers:` line of `desk list` and of the desk section: off since the time the switch worked; on, with
+ * why, on a release that sends them; no line on an older release with no entry.
+ */
+export function runEndLine(
+    state: DeskState | undefined,
+    supervisor: number,
+    facts: RunEndFacts,
+): string | undefined {
+    const off = state?.reportsOff?.[String(supervisor)];
+
+    if (off !== undefined) {
+        return `Run-end answers: off since ${iso(off.at)}`;
+    }
+
+    if (!sendsRunEndAnswers(facts.pocketVersion)) {
+        return undefined;
+    }
+
+    const reason = !facts.hasMethod
+        ? `Pi Pocket ${facts.pocketVersion ?? ""} has no switch`
+        : facts.error !== undefined
+          ? `the switch failed: ${facts.error.replace(/\s+/g, " ").trim()}`.slice(0, 200).trimEnd()
+          : "the switch is not set yet";
+
+    return `Run-end answers: on (${reason})`;
+}
+
+/**
+ * A `reportsOffTasks` record older than this is stale: its task ended with no cleanup (the scheduler can fault a task,
+ * which runs neither its last commit nor its abort), and the next load pass starts the supervisor again. 10 minutes.
+ */
+export const REPORTS_OFF_TASK_STALE_MS = 10 * 60_000;
+
+/** A failed switch warns a supervisor at most once in this time: 1 hour. */
+export const REPORTS_OFF_NOTICE_MS = 3600_000;
+
+/**
+ * Whether a supervisor's `reportsOffTasks` record stands for a task that may still run: it has the stored shape and is
+ * not older than `REPORTS_OFF_TASK_STALE_MS`.
+ */
+function reportsOffTaskLive(record: unknown, now: number): boolean {
+    const value = record as { task?: unknown; at?: unknown } | undefined;
+
+    return (
+        typeof value === "object" &&
+        value !== null &&
+        typeof value.task === "string" &&
+        typeof value.at === "number" &&
+        now - value.at < REPORTS_OFF_TASK_STALE_MS
+    );
+}
+
+/**
+ * What a load pass does: `start` the supervisors to switch (the host has the switch, and the supervisor has no entry and
+ * no live task: a task record older than `REPORTS_OFF_TASK_STALE_MS` is stale), or `warn` the ones not warned yet (a
+ * release that sends run-end answers but has no switch). An older release with no switch: nothing.
+ */
+export function reportsOffActions(
+    state: DeskState | undefined,
+    facts: {
+        pocketVersion: string | undefined;
+        hasMethod: boolean;
+        warned: ReadonlySet<number>;
+        now: number;
+    },
+): { start: number[]; warn: number[] } {
+    const supervisors = deskSupervisors(state);
+
+    if (facts.hasMethod) {
+        return {
+            start: supervisors.filter(
+                (id) =>
+                    state?.reportsOff?.[String(id)] === undefined &&
+                    !reportsOffTaskLive(state?.reportsOffTasks?.[String(id)], facts.now),
+            ),
+            warn: [],
+        };
+    }
+
+    if (sendsRunEndAnswers(facts.pocketVersion)) {
+        return { start: [], warn: supervisors.filter((id) => !facts.warned.has(id)) };
+    }
+
+    return { start: [], warn: [] };
+}
+
+/** The warning of a supervisor's session whose Pi Pocket sends run-end answers and has no switch. */
+export const RUN_END_ON_WARNING =
+    "Automatic run-end answers are on: this session gets each linked session's run end.";
+
 // ─── The API other modules use ───────────────────────────────────────────────
 
 /** A report to file on a thread. `to` must be the supervisor's address for the thread's session. */
@@ -20245,6 +20415,13 @@ export type DeskApi = {
      * caller then only records its facts.
      */
     nudge?: (tx: Tx, facts: NudgeFact[], now?: number) => Promise<NudgeResult>;
+    /**
+     * Turn a supervisor's run-end answers off (`host.linkedSessions.reports` with `take: false`), once, and record it
+     * in `reportsOff`. `team.ts` calls it before each desk-tracked start, never inside a commit. It never throws: a
+     * failure is 1 warning notice in the supervisor's session (at most 1 an hour), and the next sweep tries again. An
+     * older desk has none: skip the call.
+     */
+    reportsOff?: (api: PlanCommitApi, context: Context, supervisor: number) => Promise<void>;
 };
 
 // ─── PocketJournal: 1 daily note of finished work, in frostnotes ────────────
@@ -21964,6 +22141,131 @@ export default function createDesk(host: Host, web: Web) {
         return { plan: { id: other.thread, brief: planTaskBrief(other, title, graph, task) } };
     };
 
+    // ─── Run-end answers: the supervisor's switch ───────────────────────────────
+
+    /** Pocket's switch (`reports`, since 0.28.0-bk.1), or undefined on a release that has none. */
+    type ReportsSwitch = (
+        source: ConversationId,
+        request: { take: boolean },
+        key: string,
+    ) => Promise<{ take: boolean }>;
+
+    const reportsMethod = (): ReportsSwitch | undefined => {
+        const linked = host.linkedSessions as unknown as { reports?: unknown };
+
+        return typeof linked.reports === "function"
+            ? (linked.reports as ReportsSwitch).bind(host.linkedSessions)
+            : undefined;
+    };
+
+    /** By supervisor: the last error of the switch, for the `Run-end answers:` line. In memory: a load starts clean. */
+    const reportsOffErrors = new Map<number, string>();
+    /** The supervisors this load warned that their release sends run-end answers and has no switch. */
+    const reportsOffWarned = new Set<number>();
+
+    /** What the desk knows now of a supervisor's run-end answers, for `runEndLine`. */
+    const runEndFacts = (supervisor: number): RunEndFacts => {
+        const error = reportsOffErrors.get(supervisor);
+
+        return {
+            pocketVersion: host.pocketVersion,
+            hasMethod: reportsMethod() !== undefined,
+            ...(error === undefined ? {} : { error }),
+        };
+    };
+
+    /**
+     * Turn a supervisor's run-end answers off, once: the host call goes outside any commit, under the supervisor's
+     * replay key, and a call that worked is recorded in `reportsOff`. A supervisor with an entry, or a host with no
+     * switch, is not called. A throw, or an answer that is not `take: false`, is kept for the line and gives 1 warning
+     * notice an hour at most. It never throws.
+     */
+    const switchReportsOff = async (access: PlanPublish, supervisor: number): Promise<void> => {
+        try {
+            const state = await access.read();
+
+            if (state?.reportsOff?.[String(supervisor)] !== undefined) {
+                return;
+            }
+
+            const reports = reportsMethod();
+
+            if (reports === undefined) {
+                return;
+            }
+
+            let error: string | undefined;
+
+            try {
+                const result = await reports(
+                    supervisor as ConversationId,
+                    { take: false },
+                    reportsOffKey(supervisor),
+                );
+
+                if (result?.take !== false) {
+                    error = "the host did not turn the answers off";
+                }
+            } catch (thrown) {
+                error = thrown instanceof Error ? thrown.message : String(thrown);
+            }
+
+            if (error === undefined) {
+                const at = Date.now();
+
+                await access.commit((fresh) => {
+                    fresh.reportsOff ??= {};
+                    fresh.reportsOff[String(supervisor)] ??= {
+                        at,
+                        pocket: host.pocketVersion,
+                    };
+                });
+                reportsOffErrors.delete(supervisor);
+
+                return;
+            }
+
+            const line = error.replace(/\s+/g, " ").trim().slice(0, 200).trimEnd();
+
+            reportsOffErrors.set(supervisor, line);
+
+            // The warning is claimed in the desk's document first, so the hour holds across a reload or a restart. A
+            // claim commit that throws sends no notice.
+            let claimed = false;
+
+            try {
+                const now = Date.now();
+
+                await access.commit((fresh) => {
+                    // A commit that runs again starts over: only the attempt that lands decides.
+                    claimed = false;
+
+                    const last = fresh.reportsOffNoticed?.[String(supervisor)];
+
+                    if (typeof last === "number" && now - last < REPORTS_OFF_NOTICE_MS) {
+                        return;
+                    }
+
+                    fresh.reportsOffNoticed ??= {};
+                    fresh.reportsOffNoticed[String(supervisor)] = now;
+                    claimed = true;
+                });
+            } catch {
+                claimed = false;
+            }
+
+            if (claimed) {
+                host.notice(
+                    "warning",
+                    `The desk could not turn off automatic run-end answers here: ${line}. The next sweep tries again.`,
+                    supervisor as ConversationId,
+                );
+            }
+        } catch {
+            // A read or a commit that failed: the next sweep tries again.
+        }
+    };
+
     const published: DeskApi = {
         version: 1,
         open: async (tx, request) => {
@@ -22449,6 +22751,9 @@ export default function createDesk(host: Host, web: Web) {
             await publishAll(accessOf(api, context));
         },
         nudge: (tx, facts, now = Date.now()) => takeNudgesInto(tx, facts, now),
+        reportsOff: async (api, context, supervisor) => {
+            await switchReportsOff(accessOf(api, context), supervisor);
+        },
     };
     const shared = globalThis as unknown as Record<symbol, DeskApi | undefined>;
 
@@ -26680,6 +26985,96 @@ export default function createDesk(host: Host, web: Web) {
         state.sweepers[key] = String(task);
     };
 
+    type ReportsOffInput = { supervisor: number };
+    type ReportsOffState = { phase: "switch" };
+
+    /** End a `x.desk.reports-off` task: drop its record when it is this task's. */
+    const reportsOffDone = (state: DeskState, supervisor: number, taskId: string): void => {
+        const key = String(supervisor);
+
+        if (state.reportsOffTasks?.[key]?.task === taskId) {
+            delete state.reportsOffTasks[key];
+        }
+    };
+
+    /**
+     * 1 call of the run-end switch for 1 supervisor (`switchReportsOff`), then the task ends and drops its record from
+     * `reportsOffTasks`. A restart calls again under the same replay key, which changes nothing at the host. A failure is
+     * the switch's own notice: the task still ends, and the next load pass starts another.
+     */
+    const ReportsOff = defineTask<ReportsOffInput, ReportsOffState, null>({
+        name: "x.desk.reports-off",
+        version: 1,
+        initial: () => ({ phase: "switch" }),
+        phases: {
+            switch: async (task, runtime, context) => {
+                await switchReportsOff(accessOfTask(runtime, context), task.input.supervisor);
+                await runtime.commit(async (tx) => {
+                    reportsOffDone(
+                        await tx.doc(DeskThreads),
+                        task.input.supervisor,
+                        String(runtime.taskId),
+                    );
+
+                    return { status: "terminal", outcome: { status: "completed", result: null } };
+                }, context);
+            },
+        },
+        abort: (task, runtime, context) =>
+            runtime.commit(async (tx) => {
+                reportsOffDone(
+                    await tx.doc(DeskThreads),
+                    task.input.supervisor,
+                    String(runtime.taskId),
+                );
+
+                return { status: "terminal", outcome: { status: "aborted" } };
+            }, context),
+    });
+
+    /**
+     * The load pass of the run-end switch, in the caller's commit: 1 `x.desk.reports-off` task for each supervisor with
+     * no `reportsOff` entry and no task, when the host has the switch; else 1 warning per supervisor and load, when the
+     * release sends run-end answers. The extension API gives a module no commit at load, so the first desk commit
+     * after a load that can start tasks runs it: the sweep, the page's view, and `desk list`.
+     */
+    const startReportsOff = async (tx: Tx): Promise<void> => {
+        const state = await tx.doc(DeskThreads);
+        const actions = reportsOffActions(state, {
+            pocketVersion: host.pocketVersion,
+            hasMethod: reportsMethod() !== undefined,
+            warned: reportsOffWarned,
+            now: Date.now(),
+        });
+
+        for (const supervisor of actions.start) {
+            try {
+                const task = await tx.createTask(
+                    ReportsOff,
+                    { supervisor },
+                    {
+                        ownership: { kind: "conversation" },
+                        conversationId: supervisor as ConversationId,
+                        background: true,
+                        abandonOnRestart: false,
+                    },
+                );
+
+                // A stale record is replaced: a second task is safe, because the host call has the same key and acts once,
+                // and the record of the switch is set only when it is absent.
+                state.reportsOffTasks ??= {};
+                state.reportsOffTasks[String(supervisor)] = { task: String(task), at: Date.now() };
+            } catch {
+                // No such session: no task now.
+            }
+        }
+
+        for (const supervisor of actions.warn) {
+            reportsOffWarned.add(supervisor);
+            host.notice("warning", RUN_END_ON_WARNING, supervisor as ConversationId);
+        }
+    };
+
     /**
      * A sweeper for every supervisor that has a thread that is not closed: a thread made before this part, or by another
      * supervisor's sweep, must not wait for its own session to look. `startSweeper` does nothing when one is recorded.
@@ -26714,6 +27109,9 @@ export default function createDesk(host: Host, web: Web) {
         for (const supervisor of supervisors) {
             await startSweeper(tx, supervisor);
         }
+
+        // The run-end switch of each supervisor, at the first such commit after a load and at each sweep.
+        await startReportsOff(tx);
     };
 
     type NudgeInput = { supervisor: number };
@@ -30341,6 +30739,7 @@ export default function createDesk(host: Host, web: Web) {
 
                     state.seen[looked] = Date.now();
                     await startSweeper(tx, supervisor);
+                    await startReportsOff(tx);
 
                     return listText(state, Date.now());
                 }, context);
@@ -30351,11 +30750,13 @@ export default function createDesk(host: Host, web: Web) {
                 const first = `Counted: ${String(view.counted)} of ${String(view.cap)}${waiting === 0 ? "" : ` (${String(waiting)} extra allowed)`}${view.waiting === 0 ? "" : ` (${view.waiting === 1 ? "1 delegation waits" : `${String(view.waiting)} delegations wait`})`}`;
 
                 const queued = issuesSummary(snapshot);
+                const runEnd = runEndLine(snapshot, supervisor, runEndFacts(supervisor));
 
                 return reply(
                     [
                         ...(queued === undefined ? [] : [queued]),
                         first,
+                        ...(runEnd === undefined ? [] : [runEnd]),
                         ...githubLines(snapshot, Date.now()),
                         text,
                     ].join("\n"),
@@ -32215,7 +32616,17 @@ export default function createDesk(host: Host, web: Web) {
         name: "desk",
         tools: [tool, planTool],
         hooks: [consultGuard, noTeamReport, noClerkMerge, reminder],
-        tasks: [Sweeper, NudgeTask, Notify, Digest, Journal, PlanWake, PlanSendTask, Collector],
+        tasks: [
+            Sweeper,
+            NudgeTask,
+            Notify,
+            Digest,
+            Journal,
+            PlanWake,
+            PlanSendTask,
+            Collector,
+            ReportsOff,
+        ],
         sections: [
             // Only a supervisor's session gets it. No clock text: the section changes when the desk changes.
             section("desk", async (input, context) => {
@@ -32281,6 +32692,7 @@ export default function createDesk(host: Host, web: Web) {
                 const { cap, digest } = await deskConfig();
                 const capped = capView(state, cap, now);
                 const clerk = clerkOf(state, supervisor);
+                const runEnd = runEndLine(state, supervisor, runEndFacts(supervisor));
                 const events = mine
                     .flatMap((thread) =>
                         thread.events
@@ -32312,6 +32724,7 @@ export default function createDesk(host: Host, web: Web) {
                               `Ready to merge: ${ready.join(", ")}. Brian merges them from the Desk page: file no ask for a merge.`,
                           ]),
                     `Counted: ${String(capped.counted)} of ${String(capped.cap)}.`,
+                    ...(runEnd === undefined ? [] : [runEnd]),
                     ...githubLines(state, now),
                     ...(capped.full
                         ? [

@@ -1610,6 +1610,9 @@ export default function createTeam(host: Host, web: Web) {
             }
         }
 
+        // The supervisor takes no run-end answers of the sessions it starts: the desk sets it before the start.
+        await desk?.reportsOff?.(api, context, supervisor);
+
         const started = await host.linkedSessions.start(
             api.conversationId,
             {
@@ -2048,6 +2051,18 @@ export default function createTeam(host: Host, web: Web) {
             },
             context: Context,
         ) => Promise<void>;
+        /**
+         * Turn the supervisor's run-end answers off, once (Pi Pocket's `linkedSessions.reports`). Called before each
+         * desk-tracked start, never inside a commit. It never throws. An older desk has none: skip the call.
+         */
+        reportsOff?: (
+            api: {
+                snapshot: DocumentReader["snapshot"];
+                commit: <T>(change: (tx: Tx) => T | Promise<T>, context: Context) => Promise<T>;
+            },
+            context: Context,
+            supervisor: number,
+        ) => Promise<void>;
     };
 
     const deskApi = (): DeskApi | undefined =>
@@ -2159,6 +2174,17 @@ export default function createTeam(host: Host, web: Web) {
             }
 
             const model = allowedModel(persona);
+
+            // The supervisor takes no run-end answers of the sessions it starts: the desk sets it before the start.
+            await deskApi()?.reportsOff?.(
+                {
+                    snapshot: request.read.snapshot.bind(request.read),
+                    commit: (change) => request.commit(change),
+                },
+                request.context,
+                request.supervisor,
+            );
+
             const started = await host.linkedSessions.start(
                 supervisor,
                 {
@@ -2736,6 +2762,17 @@ export default function createTeam(host: Host, web: Web) {
 
         let started: { session: ConversationId | number; address: string };
 
+        // The supervisor takes no run-end answers of the sessions it starts: the desk sets it before the start, for the
+        // tool's start and the page's alike.
+        await desk.reportsOff?.(
+            {
+                snapshot: deps.read.snapshot.bind(deps.read),
+                commit: (change) => deps.commit(change),
+            },
+            deps.context,
+            Number(deps.supervisor),
+        );
+
         try {
             started = await deps.start(request, key);
         } catch (error) {
@@ -3039,6 +3076,9 @@ export default function createTeam(host: Host, web: Web) {
                 cwd?: string;
                 model?: string;
             }): Promise<{ session: ConversationId; address: string } | { error: string }> => {
+                // The supervisor takes no run-end answers of the sessions it starts: the desk sets it before the start.
+                await desk?.reportsOff?.(api, context, Number(api.conversationId));
+
                 try {
                     const started = await host.linkedSessions.start(
                         api.conversationId,
