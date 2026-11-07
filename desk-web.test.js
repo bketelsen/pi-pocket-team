@@ -106,6 +106,7 @@ import {
     launchBody,
     limitsText,
     makeBoard,
+    newBoardKey,
     rowActs,
     rowStateText,
 } from "./desk-web/board.js";
@@ -3242,6 +3243,27 @@ test("Board: a 409 shows its message and loads the board again", async () => {
     assert.ok(out.includes("proposed · rev 5"));
 });
 
+test("Board: after a 409 the same act takes a new key, so a key too old to replay is not sent again", async () => {
+    let posts = 0;
+    const api = boardApi({
+        post: () => {
+            posts += 1;
+
+            return posts === 1
+                ? conflict("This request is too old to replay: load the board again.")
+                : { rows: boardAnswer().rows, limits: boardAnswer().limits, pass: [] };
+        },
+    });
+    const ctl = await loadedBoard(api);
+
+    await boardScreen(ctl).tap("pick:3");
+    await boardScreen(ctl).tap("pick:3");
+
+    const keys = api.calls.filter((call) => call[0] === "POST").map((call) => call[2].key);
+
+    assert.deepEqual(keys, ["key-0001", "key-0002"]);
+});
+
 test("boardAct: a 409 loads again and the error says so; another error only shows; success gives the answer", async () => {
     const stale = fakeApi({
         "board/7": conflict("Row 3 is waiting: pick takes a proposed row."),
@@ -3250,6 +3272,7 @@ test("boardAct: a 409 loads again and the error says so; another error only show
 
     assert.deepEqual(await boardAct(stale.call, () => stale.call("board"), 7, { op: "pick" }), {
         ok: false,
+        conflict: true,
         error: "Row 3 is waiting: pick takes a proposed row. The board is loaded again.",
         reloaded: { rows: [] },
     });
@@ -3298,6 +3321,17 @@ test("Board: with no supervisor, 1 line says so, and no act posts", async () => 
     assert.equal(limitsText({ supervisor: 7, limits: { line: LIMITS_LINE } }), LIMITS_LINE);
     await ctl.act({ op: "launch", rows: [{ row: 1, rev: 1 }] });
     assert.equal(api.posts().length, 0);
+});
+
+test("Board keys start with the page's time in ms: <ms>-<random>, as the route takes it", () => {
+    const at = Date.UTC(2026, 10, 7, 20, 0);
+    const key = newBoardKey("pick", at);
+
+    assert.match(key, /^1794[0-9]{9}-board-pick-[a-z0-9]+$/);
+    assert.ok(key.startsWith(`${String(at)}-`));
+    assert.match(key, /^[A-Za-z0-9_-]{8,100}$/);
+    assert.notEqual(newBoardKey("pick", at), key, "a random part");
+    assert.match(newBoardKey("a b/c"), /^[0-9]+-board-a-b-c-[a-z0-9]+$/);
 });
 
 test("Board keys and texts: 1 key per act, another rev is another act; the state line", () => {

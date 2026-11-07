@@ -36,6 +36,7 @@ import {
     parseVerdict,
     personOf,
     nextFailures,
+    type NightShiftApi,
     roundMessage,
     standing,
     statusCard,
@@ -1611,6 +1612,65 @@ describe("start", () => {
         assert.equal(goal.status, "ended");
         assert.equal(goal.reason, "stopped");
         assert.deepEqual(await sent(id), []);
+    });
+
+    test("until_at: a wait that ends at or after the deadline stops with deadline, and no round runs", async () => {
+        const id = await session("until-at-wait");
+        const { hhmm, start } = soon();
+        const api = (globalThis as unknown as Record<symbol, NightShiftApi | undefined>)[
+            Symbol.for("pi-pocket-team.night-shift")
+        ];
+
+        assert.ok(api !== undefined, "the shift module's API");
+        assert.equal(api.version, 3);
+
+        // A board row's end before its start: delegatedRequest keeps both, so the deadline does not move.
+        const untilAt = start - 30 * 60_000;
+        const request = api.delegatedRequest(
+            {
+                objective: "scenario-until-at",
+                stop_when: "never",
+                start: hhmm,
+                until_at: untilAt,
+                max: 3,
+            },
+            Date.now(),
+            ZONE,
+        );
+
+        assert(!("error" in request));
+        assert.equal(request.deadline, untilAt);
+        assert.equal(request.start, start);
+
+        try {
+            await app.harness.commit(
+                (tx) =>
+                    api.setDelegated(
+                        tx,
+                        id,
+                        request,
+                        { by: "owner", byName: "Owner", supervisor: "Odrade" },
+                        "x.test.until-at",
+                    ),
+                context,
+            );
+            await until(async () => (await drivers(id)) === 1, "the waiting driver", 10_000);
+            assert.equal((await goalOf(id))!.round, 0);
+
+            // The server comes back after start, so after the deadline: the goal ends, and round 1 never goes.
+            await app.close();
+            shift = start - Date.now() + 60_000;
+            app = await openApp(model, dataDir, () => Date.now() + shift);
+            const goal = await settled(id);
+
+            assert.equal(goal.status, "ended");
+            assert.equal(goal.reason, "deadline");
+            assert.equal(goal.round, 0);
+            assert.equal(goal.deadline, untilAt);
+            assert.deepEqual(await sent(id), ["The shift has stopped"]);
+        } finally {
+            shift = 0;
+        }
     });
 });
 

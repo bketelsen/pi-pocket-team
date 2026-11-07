@@ -26,22 +26,29 @@ import {
     boardReplay,
     boardRows,
     boardSettings,
+    BOARD_KEY_AHEAD_MS,
+    BOARD_KEY_MS,
+    BOARD_KEY_TOO_OLD,
+    boardPageKeyRefusal,
     claimRow,
-    keepBoardKey,
+    keepBoardReceipt,
+    keepBoardReceipts,
     pickTimes,
+    pruneBoardKeys,
     pruneBoard,
     recordStart,
     roundsToday,
     staleText,
     type Board,
     type BoardActor,
+    type BoardReceiptsState,
     type BoardClock,
     type BoardMember,
     type BoardOpContext,
     type BoardRow,
 } from "./_desk-board.ts";
 import { localMidnight, nextClockTime } from "./night-shift.ts";
-import createDesk, { capView, DeskThreads, type DeskState } from "./desk.ts";
+import createDesk, { BoardReceipts, capView, DeskThreads, type DeskState } from "./desk.ts";
 
 // ─── Fixtures ────────────────────────────────────────────────────────────────
 
@@ -370,7 +377,7 @@ describe("board rows: states and moves", () => {
 
         assert.match(
             refusal(boardOp(board, SUPERVISOR, ops.drop(row), opContext(), LATE)).error,
-            /Row 1 is starting: it cannot be dropped\. Stop its run in its own session \(\/shift stop or Stop\)\./,
+            /Row 1 is starting: it cannot be dropped\. Stop its run in its own session \(\/team-shift stop or Stop\)\./,
         );
     });
 
@@ -554,21 +561,103 @@ describe("board rows: revisions", () => {
         assert.equal(row.state, "proposed");
     });
 
-    test("the replay keys: a kept key gives its text, and the newest 200 stay", () => {
-        const board = emptyBoard();
+    test("the receipts: a receipt replays after 250 later receipts and at 29 days; at 30 days it is pruned", () => {
+        const receipts: BoardReceiptsState = { receipts: [] };
+        const DAY = 24 * 3600_000;
 
-        for (let index = 0; index < 205; index += 1) {
-            keepBoardKey(
-                board,
+        keepBoardReceipt(receipts, "x.desk.board:task:first", "first text", 0);
+
+        for (let index = 0; index < 250; index += 1) {
+            keepBoardReceipt(
+                receipts,
                 `x.desk.board:task:${String(index)}`,
                 `text ${String(index)}`,
-                index,
+                1 + index,
             );
         }
 
-        assert.equal(board.keys?.length, 200);
-        assert.equal(boardReplay(board, "x.desk.board:task:4"), undefined);
-        assert.equal(boardReplay(board, "x.desk.board:task:204"), "text 204");
+        // No count limit: every receipt younger than 30 days stays.
+        assert.equal(receipts.receipts.length, 251);
+        assert.equal(boardReplay(receipts, undefined, "x.desk.board:task:first"), "first text");
+        assert.equal(boardReplay(receipts, undefined, "x.desk.board:task:none"), undefined);
+
+        keepBoardReceipt(receipts, "x.desk.board:task:day-29", "day 29", 29 * DAY);
+        assert.equal(boardReplay(receipts, undefined, "x.desk.board:task:first"), "first text");
+
+        // The next write at 30 days prunes the first receipt (and only the ones that are 30 days old).
+        keepBoardReceipt(receipts, "x.desk.board:task:day-30", "day 30", BOARD_KEY_MS);
+        assert.equal(boardReplay(receipts, undefined, "x.desk.board:task:first"), undefined);
+        assert.equal(boardReplay(receipts, undefined, "x.desk.board:task:0"), "text 0");
+        assert.equal(receipts.receipts.length, 252);
+    });
+
+    test("the receipts by supervisor: a write prunes every supervisor's old receipts; an empty supervisor goes", () => {
+        const supervisors: Record<string, BoardReceiptsState> = {};
+
+        keepBoardReceipts(supervisors, "7", "x.desk.board:task:a", "a", 0);
+        keepBoardReceipts(supervisors, "9", "x.desk.board:task:b", "b", 1000);
+        keepBoardReceipts(supervisors, "9", "x.desk.board:task:c", "c", 2000);
+        assert.deepEqual(Object.keys(supervisors).sort(), ["7", "9"]);
+        assert.equal(boardReplay(supervisors["7"], undefined, "x.desk.board:task:b"), undefined);
+
+        keepBoardReceipts(supervisors, "9", "x.desk.board:task:d", "d", BOARD_KEY_MS + 1000);
+        assert.deepEqual(
+            Object.keys(supervisors),
+            ["9"],
+            "supervisor 7's only receipt was 30 days old",
+        );
+        assert.deepEqual(
+            supervisors["9"]?.receipts.map((each) => each.key),
+            ["x.desk.board:task:c", "x.desk.board:task:d"],
+        );
+    });
+
+    test("the old board.keys: still a replay fallback, never written, pruned at 30 days", () => {
+        const board: Board = {
+            ...emptyBoard(),
+            keys: [
+                { key: "x.desk.board:task:old", at: 0, text: "old text" },
+                { key: "x.desk.board:task:newer", at: 1000, text: "newer text" },
+            ],
+        };
+        const receipts: BoardReceiptsState = { receipts: [] };
+
+        assert.equal(boardReplay(receipts, board, "x.desk.board:task:old"), "old text");
+        keepBoardReceipt(receipts, "x.desk.board:task:new", "new text", 5);
+        assert.equal(board.keys?.length, 2, "a new receipt goes to x.desk.board-receipts");
+
+        pruneBoardKeys(board, BOARD_KEY_MS);
+        assert.deepEqual(
+            board.keys?.map((each) => each.key),
+            ["x.desk.board:task:newer"],
+        );
+        pruneBoardKeys(board, BOARD_KEY_MS + 1000);
+        assert.equal(board.keys, undefined);
+    });
+
+    test("the page key time: <ms>-<random>, less than 30 days old, at most 10 minutes ahead", () => {
+        const now = Date.UTC(2026, 10, 7, 20, 0);
+        const DAY = 24 * 3600_000;
+        const key = (at: number) => `${String(at)}-board-pick-abc12345`;
+        const tooOld = { error: BOARD_KEY_TOO_OLD, status: 409 };
+
+        assert.equal(BOARD_KEY_TOO_OLD, "This request is too old to replay: load the board again.");
+        assert.equal(boardPageKeyRefusal(key(now), now), undefined);
+        assert.equal(boardPageKeyRefusal(key(now - 29 * DAY), now), undefined);
+        assert.equal(boardPageKeyRefusal(key(now + BOARD_KEY_AHEAD_MS), now), undefined);
+        assert.deepEqual(boardPageKeyRefusal(key(now - 31 * DAY), now), tooOld);
+        assert.deepEqual(boardPageKeyRefusal(key(now - BOARD_KEY_MS), now), tooOld);
+        assert.deepEqual(boardPageKeyRefusal(key(now + 11 * 60_000), now), tooOld);
+
+        // A key that does not start with the page's time is refused: the old form, and other mistakes.
+        for (const odd of [
+            "board-pick-abc12345-mh3k2a1b",
+            "abc-1234567890",
+            `${String(now)}board`,
+            `-${String(now)}-x`,
+        ]) {
+            assert.deepEqual(boardPageKeyRefusal(odd, now), tooOld, odd);
+        }
     });
 });
 
@@ -1015,7 +1104,7 @@ type StartRequest = {
     agent: string;
     title: string;
     task: string;
-    shift: { stop_when: string; max: number; for: string; worker?: string };
+    shift: { stop_when: string; max: number; until_at: number; worker?: string };
     limit: { reserve: number };
 };
 
@@ -1375,6 +1464,66 @@ const launchSuite = (label: string, instant: number, untilAt: number) =>
             assert.match(lines[2] ?? "", /: Second$/);
         });
 
+        test("a board_add replayed after 250 other board calls gives its first text and adds no row; the receipt is in x.desk.board-receipts", async () => {
+            const supervisor = await supervisorSession();
+            const first = await desk.tool(
+                supervisor,
+                { action: "board_add", fields: FIELDS },
+                "kept-250",
+            );
+            const row = (await rowsOf(supervisor))[0]!;
+
+            for (let index = 0; index < 250; index += 1) {
+                await desk.tool(supervisor, {
+                    action: "board_edit",
+                    row: row.id,
+                    fields: { title: `Title ${String(index)}` },
+                });
+            }
+
+            const again = await desk.tool(
+                supervisor,
+                { action: "board_add", fields: FIELDS },
+                "kept-250",
+            );
+
+            assert.equal(again, first);
+            assert.equal((await rowsOf(supervisor)).length, 1, "no second row");
+
+            const receipts = (await app.harness.snapshot(BoardReceipts, context))?.supervisors[
+                String(supervisor)
+            ];
+
+            assert.equal(receipts?.receipts.length, 251);
+            assert.equal(receipts?.receipts[0]?.key, "x.desk.board:task-board:kept-250");
+            assert.equal(receipts?.receipts[0]?.result, first);
+            assert.equal(
+                (await deskState()).board?.keys?.some(
+                    (each) => each.key === "x.desk.board:task-board:kept-250",
+                ) ?? false,
+                false,
+                "no new key in board.keys",
+            );
+
+            // A key in the old board.keys (written before x.desk.board-receipts) still replays.
+            await app.harness.commit(async (tx) => {
+                const board = (await tx.doc(DeskThreads)).board!;
+
+                board.keys = [
+                    {
+                        key: "x.desk.board:task-board:legacy",
+                        at: Date.now(),
+                        text: "the legacy text",
+                    },
+                ];
+            }, context);
+            assert.equal(
+                await desk.tool(supervisor, { action: "board_add", fields: FIELDS }, "legacy"),
+                "the legacy text",
+            );
+            assert.equal((await rowsOf(supervisor)).length, 1, "no row from the legacy replay");
+        });
+
         test("a replayed tool call changes nothing and gives the same text", async () => {
             const supervisor = await supervisorSession();
             const first = await desk.tool(
@@ -1578,12 +1727,13 @@ const launchSuite = (label: string, instant: number, untilAt: number) =>
                 starts.slice(-2).map((each) => each.key),
                 [`x.desk.board:${String(ids[0])}:1`, `x.desk.board:${String(ids[1])}:1`],
             );
-            // The run's length comes from untilAt, from the same clock as the pick and the claim.
+            // The run stops at untilAt, from the same clock as the pick: the start sends it as the absolute until_at.
             assert.equal(rows[1]?.untilAt, untilAt);
-            assert.equal(
-                starts.at(-1)?.shift.for,
-                `${String(Math.floor((untilAt - instant) / 60_000))}m`,
+            assert.deepEqual(
+                starts.slice(-2).map((each) => each.shift.until_at),
+                [untilAt, untilAt],
             );
+            assert.equal("for" in starts.at(-1)!.shift, false, "no for");
 
             // While both runs work, a sweep launches nothing.
             await desk.tool(supervisor, { action: "sync" });
@@ -1850,7 +2000,7 @@ const launchSuite = (label: string, instant: number, untilAt: number) =>
                 agent: "teg",
                 title: "Row 0",
                 task: FIELDS.task,
-                shift: { stop_when: "x", max: 20, for: "120m" },
+                shift: { stop_when: "x", max: 20, until_at: Date.now() + 120 * 60_000 },
                 limit: { reserve: 0 },
             });
 
@@ -1872,6 +2022,7 @@ const launchSuite = (label: string, instant: number, untilAt: number) =>
             desk = stubDesk();
 
             const before = sessions.size;
+            const startsBefore = starts.length;
 
             await desk.tool(supervisor, { action: "sync" });
 
@@ -1879,6 +2030,11 @@ const launchSuite = (label: string, instant: number, untilAt: number) =>
 
             assert.equal(row.state, "launched");
             assert.equal(row.thread, thread.id, "the same thread");
+            // The recovered start carries the row's own end, not a new length from a late clock.
+            assert.equal(starts.length, startsBefore + 1);
+            assert.equal(starts.at(-1)?.key, key);
+            assert.equal(starts.at(-1)?.shift.until_at, row.untilAt);
+            assert.equal("for" in starts.at(-1)!.shift, false, "no for");
             assert.equal(sessions.size, before, "1 session");
             assert.equal(row.attempts.length, 1);
             assert.equal(row.attempts[0]?.outcome, "started");

@@ -118,6 +118,12 @@ const ALLOWED: Allowed[] = [
     },
     {
         file: "team.ts",
+        text: "The shift module (night-shift.ts) is too old for a board row's end: Brian must install the new version.",
+        count: 1,
+        why: "the file name of the module to install",
+    },
+    {
+        file: "team.ts",
         text: "The old name of shift, with the same fields. Give shift or night_shift, not both.",
         count: 1,
         why: "the description of the alias argument night_shift",

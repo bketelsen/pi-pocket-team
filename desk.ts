@@ -19,7 +19,8 @@
  * `x.desk.observed` holds the changes each sweep saw on PRs and queued issues, for the hooks' coverage alarm.
  *
  * The truth is two documents. `x.desk.threads` is app-wide. `x.desk.reports` holds one thread session's reports, on
- * that session. They are stored data: never rename a kind or change what a field means; add fields beside them.
+ * that session. `x.desk.board-receipts` (app-wide) holds the goal board's call receipts, by supervisor, for 30 days.
+ * They are stored data: never rename a kind or change what a field means; add fields beside them.
  *
  * Desk news goes to the supervisor in a digest: 1 message at most once in each interval (`x.desk.digest`), except the
  * kinds that go at once. An interval of 0 minutes turns it off, and every path works as it did before it.
@@ -1086,6 +1087,23 @@ export const DeskReports = defineDoc<DeskReportsState>({
     history: "latest",
     fork: "current",
     initial: () => ({ reports: [] }),
+});
+
+/**
+ * The receipts of the goal board's calls (each tool call and each page POST that changes a board), by supervisor: the
+ * key of `supervisors` is the supervisor's conversation id. Each is written in the commit of its change, so a replay
+ * gives the first text and changes nothing. 1 app-wide document, as `x.desk.threads` is: a board call works also for
+ * a supervisor id whose conversation is gone. Kept by age only, 30 days (`BOARD_KEY_MS`), with no count limit; a
+ * supervisor with no receipt left goes. Stored data: never rename a field.
+ */
+export type BoardReceiptsDoc = { supervisors: Record<string, BoardModule.BoardReceiptsState> };
+
+export const BoardReceipts = defineDoc<BoardReceiptsDoc>({
+    kind: "x.desk.board-receipts",
+    version: 1,
+    checkpointWhen: () => false,
+    scope: "session",
+    initial: () => ({ supervisors: {} }),
 });
 
 /**
@@ -21192,7 +21210,8 @@ type TeamApi = {
             objective?: string;
             stop_when: string;
             max: number;
-            for: string;
+            /** The row's end, an absolute time in epoch ms: Team sets the shift's deadline to it, in every path. */
+            until_at: number;
             worker?: string;
             pr_check?: BoardModule.BoardPrCheck;
         };
@@ -30944,13 +30963,15 @@ export default function createDesk(host: Host, web: Web) {
     /**
      * 1 board operation, from the tool or the page: the move in 1 commit, with the call's replay key (a replay changes
      * nothing and gives the first text), the pruning, and for a launch the sweeper. The page's routes call this too.
-     * Gives the text, and whether a launch moved rows to `waiting`; or the refusal with its status.
+     * Gives the text, and whether a launch moved rows to `waiting`; or the refusal with its status. `admit` (the page's
+     * key time rule) runs after the replay lookup, so a kept receipt still answers, and before any change.
      */
     const applyBoardOp = async (
         access: PlanAccess,
         actor: BoardModule.BoardActor,
         op: BoardModule.BoardOp,
         key: string,
+        admit?: (now: number) => BoardModule.BoardRefusal | undefined,
     ): Promise<{ text: string; replay: boolean; launch: boolean } | BoardModule.BoardRefusal> => {
         const team = teamApi();
         const roster = ((await team?.roster().catch(() => [])) ?? []).map((member) => ({
@@ -30970,14 +30991,27 @@ export default function createDesk(host: Host, web: Web) {
 
         return access.commit(async (state, tx) => {
             const now = Date.now();
-            const known = boardRules.boardReplay(state.board, key);
+            // The receipts of this supervisor's board, in this commit: a replay reads them, a change writes 1.
+            const stored = await tx.doc(BoardReceipts);
+            const known = boardRules.boardReplay(
+                stored.supervisors[String(actor.supervisor)],
+                state.board,
+                key,
+            );
 
             if (known !== undefined) {
                 return { text: known, replay: true, launch: false };
             }
 
+            const refused = admit?.(now);
+
+            if (refused !== undefined) {
+                return refused;
+            }
+
             state.board ??= { next: 1, rows: [] };
             boardRules.pruneBoard(state.board, now, settings.keep);
+            boardRules.pruneBoardKeys(state.board, now);
 
             const done = boardRules.boardOp(
                 state.board,
@@ -31021,7 +31055,13 @@ export default function createDesk(host: Host, web: Web) {
                 }),
             ].join("\n");
 
-            boardRules.keepBoardKey(state.board, key, text, now);
+            boardRules.keepBoardReceipts(
+                stored.supervisors,
+                String(actor.supervisor),
+                key,
+                text,
+                now,
+            );
 
             // A launch request keeps a sweeper: each sweep runs 1 pass, so a row that waits launches later.
             if (op.op === "launch" && done.rows.length > 0) {
@@ -31078,10 +31118,6 @@ export default function createDesk(host: Host, web: Web) {
                 return true;
             }
 
-            const minutes = Math.max(
-                1,
-                attempt.minutes ?? Math.floor(((row.untilAt ?? now()) - attempt.at) / 60_000),
-            );
             let result: BoardModule.BoardStartResult;
 
             try {
@@ -31099,7 +31135,8 @@ export default function createDesk(host: Host, web: Web) {
                         ...(row.objective === undefined ? {} : { objective: row.objective }),
                         stop_when: row.stopWhen,
                         max: row.max,
-                        for: `${String(minutes)}m`,
+                        // The absolute stop: no wait before round 1 and no late recovery moves it.
+                        until_at: row.untilAt ?? attempt.at,
                         ...(row.worker === undefined ? {} : { worker: row.worker }),
                         ...(row.prCheck === undefined ? {} : { pr_check: row.prCheck }),
                     },
@@ -31386,6 +31423,8 @@ export default function createDesk(host: Host, web: Web) {
                 { kind: "supervisor", supervisor, by: "brian" },
                 boardOp,
                 `x.desk.board:page:${String(supervisor)}:${key}`,
+                // The key starts with the page's time: an expired key never acts again.
+                (now) => boardRules.boardPageKeyRefusal(key, now),
             );
 
             if ("status" in done) {

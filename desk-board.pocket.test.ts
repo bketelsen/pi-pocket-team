@@ -15,6 +15,7 @@ import {
     cleanUp,
     context,
     lastText,
+    modelTexts,
     newSession,
     openApp,
     owner,
@@ -25,7 +26,7 @@ import {
 } from "./_pocket/test/helpers.ts";
 import { createHandler } from "./_pocket/src/server/http.ts";
 import { boardRows } from "./_desk-board.ts";
-import { capView, DeskReports, DeskThreads, type DeskState } from "./desk.ts";
+import { BoardReceipts, capView, DeskReports, DeskThreads, type DeskState } from "./desk.ts";
 import { GoalDoc } from "./night-shift.ts";
 import { RUN_END, turnTexts } from "./scripted-turn-fixture.ts";
 import type { TeamApi, TeamStartShiftRequest } from "./team.ts";
@@ -121,7 +122,7 @@ async function supervisor(): Promise<ConversationId> {
 const runTool = (id: ConversationId, name: string, args: object) =>
     say(app, id, `run-tool ${name} ${JSON.stringify(args)}`);
 
-/** Team's start as the desk calls it, on this app's harness. */
+/** Team's start as the desk calls it, on this app's harness: the row ends 90 minutes from now by default. */
 const startShift = (patch: Partial<TeamStartShiftRequest> & { supervisor: number; key: string }) =>
     team().startShift!({
         read: app.harness,
@@ -130,7 +131,7 @@ const startShift = (patch: Partial<TeamStartShiftRequest> & { supervisor: number
         agent: "teg",
         title: "Board start",
         task: "BOARD-TASK tend the tests",
-        shift: { stop_when: "the tests pass", max: 2, for: "90m" },
+        shift: { stop_when: "the tests pass", max: 2, until_at: Date.now() + 90 * 60_000 },
         limit: { reserve: 0 },
         ...patch,
     });
@@ -318,7 +319,12 @@ describe("Team startShift", () => {
         const worker = await startShift({
             supervisor: Number(source),
             key: "x.desk.board:901:1",
-            shift: { stop_when: "x", max: 2, for: "90m", worker: "faux/faux-1" },
+            shift: {
+                stop_when: "x",
+                max: 2,
+                until_at: Date.now() + 90 * 60_000,
+                worker: "faux/faux-1",
+            },
         });
 
         assert.deepEqual(worker, {
@@ -329,7 +335,12 @@ describe("Team startShift", () => {
         const check = await startShift({
             supervisor: Number(source),
             key: "x.desk.board:902:1",
-            shift: { stop_when: "x", max: 2, for: "90m", pr_check: { label: "bad;label" } },
+            shift: {
+                stop_when: "x",
+                max: 2,
+                until_at: Date.now() + 90 * 60_000,
+                pr_check: { label: "bad;label" },
+            },
         });
 
         assert("error" in check && check.unknown === false, JSON.stringify(check));
@@ -359,6 +370,170 @@ describe("Team startShift", () => {
         assert("error" in refused);
         assert.match(refused.error, /is not a supervisor's/);
         assert.equal(app.sessions().length, sessions + 1, "only the test's own session");
+    });
+
+    test("until_at is the goal's deadline exactly, also when the start comes long after the claim", async () => {
+        const source = await supervisor();
+        const desk = (globalThis as unknown as Record<symbol, DeskOpen | undefined>)[
+            Symbol.for("pi-pocket-team.desk")
+        ];
+
+        assert(desk !== undefined, "the desk is on");
+
+        // A late recovery: the key's thread opened before a restart, with no session bound yet. The row's end is not
+        // a length from now: the deadline is that instant, whenever the start comes.
+        const key = "x.desk.board:920:1";
+        const untilAt = Date.now() + 37 * 60_000;
+
+        await app.harness.commit(
+            (tx) =>
+                desk.open(tx, {
+                    key,
+                    supervisor: Number(source),
+                    agents: ["teg"],
+                    title: "Board start",
+                    task: "BOARD-TASK tend the tests",
+                    at: Date.now(),
+                }),
+            context,
+        );
+
+        const sessions = app.sessions().length;
+        const late = await startShift({
+            supervisor: Number(source),
+            key,
+            shift: { stop_when: "the tests pass", max: 2, until_at: untilAt },
+        });
+
+        assert(!("error" in late), JSON.stringify(late));
+        assert.equal(app.sessions().length, sessions + 1, "1 session");
+        assert.equal(
+            Object.values((await deskState()).threads).filter((thread) => thread.key === key)
+                .length,
+            1,
+            "the same thread",
+        );
+
+        const goal = (
+            await app.harness.snapshot(GoalDoc, late.session as unknown as ConversationId, context)
+        )?.goal;
+
+        assert.equal(goal?.deadline, untilAt);
+
+        // The same key again (a recovery after the bind): a replay, the same deadline, no new session.
+        const again = await startShift({
+            supervisor: Number(source),
+            key,
+            shift: { stop_when: "the tests pass", max: 2, until_at: untilAt + 3600_000 },
+        });
+
+        assert.deepEqual(again, { ...late, replay: true });
+        assert.equal(app.sessions().length, sessions + 1);
+        assert.equal(
+            (
+                await app.harness.snapshot(
+                    GoalDoc,
+                    late.session as unknown as ConversationId,
+                    context,
+                )
+            )?.goal?.deadline,
+            untilAt,
+        );
+    });
+
+    test("an until_at in the past is a refusal, and no session starts", async () => {
+        const source = await supervisor();
+        const sessions = app.sessions().length;
+        const past = await startShift({
+            supervisor: Number(source),
+            key: "x.desk.board:921:1",
+            shift: { stop_when: "x", max: 2, until_at: Date.now() - 60_000 },
+        });
+
+        assert("error" in past, JSON.stringify(past));
+        assert.equal(past.unknown, false);
+        assert.match(past.error, /shift\.until_at .* has passed\./);
+        assert.equal(app.sessions().length, sessions, "no session");
+    });
+
+    test("a refusal after the key's thread opened (a recovery past until_at) is unknown: Pocket may have its session", async () => {
+        const source = await supervisor();
+        const desk = (globalThis as unknown as Record<symbol, DeskOpen | undefined>)[
+            Symbol.for("pi-pocket-team.desk")
+        ];
+
+        assert(desk !== undefined, "the desk is on");
+
+        // The first try opened the thread, and a restart came before its bind; the recovery comes after the row's end.
+        const key = "x.desk.board:923:1";
+
+        await app.harness.commit(
+            (tx) =>
+                desk.open(tx, {
+                    key,
+                    supervisor: Number(source),
+                    agents: ["teg"],
+                    title: "Board start",
+                    task: "BOARD-TASK tend the tests",
+                    at: Date.now(),
+                }),
+            context,
+        );
+
+        const late = await startShift({
+            supervisor: Number(source),
+            key,
+            shift: { stop_when: "x", max: 2, until_at: Date.now() - 60_000 },
+        });
+
+        assert("error" in late, JSON.stringify(late));
+        assert.equal(
+            late.unknown,
+            true,
+            "not a plain refusal: the row must not fail as if nothing started",
+        );
+        assert.match(late.error, /shift\.until_at .* has passed\./);
+    });
+
+    test("an older desk's for still starts a shift, for 1 install window", async () => {
+        const source = await supervisor();
+        const before = Date.now();
+        const old = await startShift({
+            supervisor: Number(source),
+            key: "x.desk.board:922:1",
+            shift: { stop_when: "x", max: 2, for: "90m" } as TeamStartShiftRequest["shift"],
+        });
+
+        assert(!("error" in old), JSON.stringify(old));
+
+        const goal = (
+            await app.harness.snapshot(GoalDoc, old.session as unknown as ConversationId, context)
+        )?.goal;
+
+        assert(goal?.deadline !== undefined);
+        assert(goal.deadline >= before + 90 * 60_000 && goal.deadline <= Date.now() + 90 * 60_000);
+    });
+
+    test("team_delegate refuses shift.until_at: only the board sets it", async () => {
+        const source = await supervisor();
+        const sessions = app.sessions().length;
+
+        for (const name of ["shift", "night_shift"]) {
+            await runTool(source, "team_delegate", {
+                agent: "teg",
+                task: "UNTIL-AT from a model",
+                [name]: { stop_when: "x", until_at: Date.now() + 3600_000 },
+            });
+        }
+
+        const said = (await modelTexts(app, source)).join("\n");
+
+        assert.equal(
+            said.split("shift.until_at is not a team_delegate field.").length - 1,
+            2,
+            said.slice(-2000),
+        );
+        assert.equal(app.sessions().length, sessions, "no session");
     });
 
     test("a thrown start is unknown: Pocket may have admitted the session", async () => {
@@ -646,12 +821,9 @@ describe("the board in Pi Pocket", () => {
             assert.equal(goal?.objective, row.task);
             assert.equal(goal?.stop, row.stopWhen);
             assert.equal(goal?.maxRounds, row.max);
-            // `for` is untilAt minus the launch time, in whole minutes: the deadline is within 1 minute of untilAt.
-            assert(goal?.deadline !== undefined && row.untilAt !== undefined);
-            assert(
-                Math.abs(goal.deadline - row.untilAt) <= 60_000,
-                `${String(goal.deadline)} ${String(row.untilAt)}`,
-            );
+            // The start sends untilAt as the absolute stop until_at: the deadline is untilAt exactly.
+            assert(row.untilAt !== undefined);
+            assert.equal(goal?.deadline, row.untilAt);
             assert.equal(thread.key, `x.desk.board:${String(row.id)}:1`);
         }
     });
@@ -767,8 +939,9 @@ type DeskOpen = { open: (tx: Tx, request: object) => Promise<unknown> };
 
 describe("the Desk page's board routes", () => {
     let keys = 0;
-    /** A new page key: 8 to 100 characters. */
-    const key = () => `page-key-${String((keys += 1)).padStart(4, "0")}`;
+    /** A new page key, as the Board view makes it: the page's time in ms, then a random part (8 to 100 characters). */
+    const key = (at = Date.now()) =>
+        `${String(at)}-page-key-${String((keys += 1)).padStart(4, "0")}`;
 
     /** A supervisor the desk knows: Odrade's session, with 1 open thread of its own, opened through the desk's API. */
     async function knownSupervisor(): Promise<ConversationId> {
@@ -1113,6 +1286,105 @@ describe("the Desk page's board routes", () => {
         assert.equal((await stored(row)).rev, 2, "1 edit, not 2");
     });
 
+    test("POST board: a POST replayed after 250 other calls answers replay and changes nothing; the receipt is in x.desk.board-receipts", async () => {
+        const call = await routes();
+        const source = await knownSupervisor();
+        const row = await addRow(source);
+        const other = await addRow(source, { title: "other row" });
+        const path = `board/${String(source)}`;
+        const body = { op: "drop", row, rev: 1, key: key() };
+        const first = await call(path, body);
+
+        assert.equal(first.status, 200, JSON.stringify(first.data));
+        assert.equal(first.data.replay, false);
+
+        for (let rev = 1; rev <= 250; rev += 1) {
+            const edit = await call(path, {
+                op: "edit",
+                row: other,
+                rev,
+                fields: { title: `other ${String(rev)}` },
+                key: key(),
+            });
+
+            assert.equal(edit.status, 200, JSON.stringify(edit.data));
+        }
+
+        const before = await stored(row);
+        const again = await call(path, body);
+
+        assert.equal(again.status, 200, JSON.stringify(again.data));
+        assert.equal(again.data.replay, true);
+        assert.equal(again.data.text, first.data.text);
+        assert.deepEqual(await stored(row), before, "nothing changed");
+        assert.equal((await stored(other)).rev, 251);
+
+        const receipts =
+            (await app.harness.snapshot(BoardReceipts, context))?.supervisors[String(source)]
+                ?.receipts ?? [];
+
+        assert(
+            receipts.some((each) => each.key === `x.desk.board:page:${String(source)}:${body.key}`),
+        );
+        assert.equal(
+            (await deskState()).board?.keys?.some((each) => each.key.endsWith(body.key)) ?? false,
+            false,
+            "no new key in board.keys",
+        );
+    });
+
+    test("POST board: a key time 31 days old or 11 minutes ahead gets 409; a key in the old board.keys still replays", async () => {
+        const call = await routes();
+        const source = await knownSupervisor();
+        const row = await addRow(source);
+        const path = `board/${String(source)}`;
+
+        for (const at of [Date.now() - 31 * 24 * 3600_000, Date.now() + 11 * 60_000]) {
+            const refused = await call(path, { op: "drop", row, rev: 1, key: key(at) });
+
+            assert.equal(refused.status, 409, JSON.stringify(refused.data));
+            assert.match(
+                JSON.stringify(refused.data),
+                /This request is too old to replay: load the board again\./,
+            );
+        }
+
+        assert.equal((await stored(row)).state, "proposed", "nothing changed");
+
+        // A page key from before x.desk.board-receipts, in the old form, kept in board.keys: its replay still answers.
+        const legacy = "board-drop-abc12345-legacy";
+
+        await app.harness.commit(async (tx) => {
+            const board = (await tx.doc(DeskThreads)).board!;
+
+            board.keys = [
+                ...(board.keys ?? []),
+                {
+                    key: `x.desk.board:page:${String(source)}:${legacy}`,
+                    at: Date.now(),
+                    text: "the legacy text",
+                },
+            ];
+        }, context);
+
+        const replayed = await call(path, { op: "drop", row, rev: 1, key: legacy });
+
+        assert.equal(replayed.status, 200, JSON.stringify(replayed.data));
+        assert.equal(replayed.data.replay, true);
+        assert.equal(replayed.data.text, "the legacy text");
+        assert.equal((await stored(row)).state, "proposed", "nothing changed");
+
+        // The same old form with no stored key is refused: it cannot carry the page's time.
+        const unknown = await call(path, {
+            op: "drop",
+            row,
+            rev: 1,
+            key: "board-drop-abc12345-new",
+        });
+
+        assert.equal(unknown.status, 409, JSON.stringify(unknown.data));
+    });
+
     test("a guest gets 403 on GET board and on POST board/:conversation", async () => {
         const call = await routes();
         const source = await knownSupervisor();
@@ -1196,11 +1468,8 @@ describe("the Desk page's board routes", () => {
             assert.equal(goal?.objective, row.task);
             assert.equal(goal?.stop, row.stopWhen);
             assert.equal(goal?.maxRounds, row.max);
-            assert(goal?.deadline !== undefined && row.untilAt !== undefined);
-            assert(
-                Math.abs(goal.deadline - row.untilAt) <= 60_000,
-                `${String(goal.deadline)} ${String(row.untilAt)}`,
-            );
+            assert(row.untilAt !== undefined);
+            assert.equal(goal?.deadline, row.untilAt, "the deadline is untilAt exactly");
             assert.equal(thread.key, `x.desk.board:${String(row.id)}:1`);
         }
     });
