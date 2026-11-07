@@ -658,3 +658,84 @@ test("a cached validation error is never reused: the candidate is validated agai
         "PI_POCKET_CHECKOUT=/pocket node --test --test-name-pattern='^(?:adds)$' 'add.test.mjs'",
     );
 });
+
+test("a failed fetch does not stop the harvest: the repository is harvested without it, and the next one too", async () => {
+    const fleet = "bketelsen/fleet";
+    const ref = (repo, n) => `${repo}#${n}`;
+    const prs = {};
+    const threads = [REPO, fleet].map((repo, i) => {
+        prs[ref(repo, 5)] = {
+            state: "MERGED",
+            mergedAt: "2026-10-01T00:00:00Z",
+            mergeCommit: { oid: node.merge },
+            additions: 10,
+            deletions: 0,
+        };
+
+        return {
+            id: `T${50 + i}`,
+            session: 500 + i,
+            prs: [ref(repo, 5)],
+            route: null,
+            nightShift: false,
+            brief: "Fix add.",
+            briefSource: "delegation",
+        };
+    });
+    const fetched = [];
+    const lines = [];
+    const out = join(fixture.root, "fetch-out");
+    const written = await harvest(
+        {
+            ...stubContext(fakeGh({ prs }), async () => ({
+                ok: true,
+                validation: {},
+                fields: {
+                    parent: node.parent,
+                    setup: "true",
+                    check: "true",
+                    hiddenTests: [],
+                    hiddenCommand: null,
+                    features: null,
+                },
+            })),
+            log: (line) => lines.push(line),
+            repos: new Set([REPO, fleet]),
+            out,
+            checkouts: { [REPO]: node.repo, [fleet]: node.repo },
+            fetch: true,
+            fetchRepo: async (checkout) => {
+                fetched.push(checkout);
+
+                if (fetched.length === 1) {
+                    throw new Error(
+                        "could not read Username for 'https://github.com': terminal prompts disabled\nmore",
+                    );
+                }
+            },
+        },
+        threads,
+    );
+
+    assert.equal(fetched.length, 2, "both repositories tried their fetch");
+    assert.deepEqual(
+        lines.filter((line) => /fetch failed/.test(line)),
+        [
+            `${REPO}: fetch failed, harvested without it: could not read Username for 'https://github.com': terminal prompts disabled`,
+        ],
+    );
+    assert.equal(written.length, 2);
+
+    for (const [repo, file] of [
+        [REPO, join(out, "bketelsen", "pi-pocket-team.json")],
+        [fleet, join(out, "bketelsen", "fleet.json")],
+    ]) {
+        const manifest = await loadManifest(file);
+
+        assert.deepEqual(
+            manifest.tasks.map((t) => t.pr),
+            [ref(repo, 5)],
+            repo,
+        );
+    }
+});

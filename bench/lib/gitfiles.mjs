@@ -16,6 +16,23 @@ const gitEnv = () => ({
     GIT_TERMINAL_PROMPT: "0",
 });
 
+/**
+ * `git fetch --quiet origin` in a trusted local checkout, with the host's own git config (its credential helper, such
+ * as gh, for a private repository) and no terminal prompt. Every other git call of the bench runs with no system or
+ * global config (`gitEnv`).
+ */
+export async function fetchOrigin(checkout) {
+    const env = { ...process.env, GIT_TERMINAL_PROMPT: "0" };
+
+    delete env.GIT_CONFIG_GLOBAL;
+    delete env.GIT_CONFIG_NOSYSTEM;
+    await run("git", ["fetch", "--quiet", "origin"], {
+        cwd: checkout,
+        env,
+        maxBuffer: 64 * 1024 * 1024,
+    });
+}
+
 /** Run git in a folder; returns stdout as a Buffer. */
 export async function gitBuffer(cwd, args) {
     const { stdout } = await run("git", args, {

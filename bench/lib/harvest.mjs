@@ -20,7 +20,7 @@ import { scratchClone } from "./clone.mjs";
 import { COMMAND_MS, failText, makeCache, runInSandbox } from "./exec.mjs";
 import {
     fileAt,
-    gitBuffer,
+    fetchOrigin,
     hasCommit,
     nameStatus,
     overlayFiles,
@@ -590,7 +590,15 @@ export async function harvestRepo(ctx, repo, list, dropped) {
     }
 
     if (ctx.fetch && list.length) {
-        await gitBuffer(checkout, ["fetch", "--quiet", "origin"]);
+        // A failed fetch (a private repository with no credential, no network) does not stop the harvest: it goes on
+        // with the commits the checkout has, and a candidate whose merge commit is missing is dropped as usual.
+        try {
+            await (ctx.fetchRepo ?? fetchOrigin)(checkout);
+        } catch (error) {
+            ctx.log(
+                `${repo}: fetch failed, harvested without it: ${String(error?.message ?? error).split("\n")[0]}`,
+            );
+        }
     }
 
     const strata = new Map(STRATA.map((s) => [s, []]));
