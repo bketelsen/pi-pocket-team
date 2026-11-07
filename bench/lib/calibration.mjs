@@ -16,7 +16,7 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { parseArgs, promisify } from "node:util";
 import { dataDir, privateDir, writeJsonAtomic } from "./common.mjs";
-import { cutDiff, diffStat } from "./judge.mjs";
+import { cutDiff, diffStat, sectionPath } from "./judge.mjs";
 import { UsageError } from "./manifest.mjs";
 import { OWNERS, SEED, reposOf, seededShuffle } from "./owners.mjs";
 import { pocketDb, readThreads } from "./pocket.mjs";
@@ -217,8 +217,39 @@ async function eligible(reader, briefs, ref, heads, seed) {
     return { ref, ...parseRef(ref), info, notReadyHead: seededShuffle(notReady, seed)[0], brief };
 }
 
-/** A diff cut for the judge: `{ text, cut }`. */
-const cut = (diff) => cutDiff(diff, diffStat(diff));
+/**
+ * True for a file that records the review of a change, not the change: `.memory/` holds the corrections log
+ * (`.memory/corrections.jsonl`), whose lines name the review round and the finding that a fix answers. Shown in a
+ * calibration diff, it tells that a later review happened, so it can show the label.
+ */
+export const isReviewRecord = (path) => /^\.memory\//.test(String(path ?? ""));
+
+/**
+ * A diff without the file sections of review records (`isReviewRecord`): the text before the first `diff --git `
+ * line and every other section stay as they are.
+ */
+export function withoutReviewRecords(diff) {
+    const text = String(diff ?? "");
+    const starts = [...text.matchAll(/^diff --git /gm)].map((m) => m.index);
+
+    if (starts.length === 0) {
+        return text;
+    }
+
+    const sections = starts.map((start, i) => text.slice(start, starts[i + 1] ?? text.length));
+
+    return (
+        text.slice(0, starts[0]) +
+        sections.filter((section) => !isReviewRecord(sectionPath(section))).join("")
+    );
+}
+
+/** A diff for the judge and the owners, with no review record, cut: `{ text, cut }`. */
+const cut = (diff) => {
+    const shown = withoutReviewRecords(diff);
+
+    return cutDiff(shown, diffStat(shown));
+};
 
 /**
  * Build both sets. `points`: from `loadPoints`; `threads`: from `loadThreads`. Returns `{ heldOut: { owner: items },

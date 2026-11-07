@@ -15,7 +15,12 @@ import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
-import { calibrationMain, loadPoints, threadBriefs } from "./lib/calibration.mjs";
+import {
+    calibrationMain,
+    loadPoints,
+    threadBriefs,
+    withoutReviewRecords,
+} from "./lib/calibration.mjs";
 import { DIFF_LIMIT } from "./lib/judge.mjs";
 import { BENCH_REPOS, OWNERS, reposOf } from "./lib/owners.mjs";
 import { fakeGh, makePocketDb, wrapped } from "./fixtures/harvest.mjs";
@@ -381,4 +386,18 @@ test("an owner with fewer PRs gets fewer items and a warning", async () => {
     assert.deepEqual(items.map((i) => key[i.id].label).sort(), ["merged", "notReady", "notReady"]);
     assert.ok(logs.some((line) => /warning: teg: 3 held-out diffs, not 8/.test(line)));
     assert.ok(BENCH_REPOS.length > 0);
+});
+
+test("a review record (.memory/) is not in a shown diff: its lines name the review rounds", () => {
+    const code = "diff --git a/x.go b/x.go\n--- a/x.go\n+++ b/x.go\n@@ -1 +1 @@\n-a\n+b\n";
+    const record =
+        'diff --git a/.memory/corrections.jsonl b/.memory/corrections.jsonl\n--- a/.memory/corrections.jsonl\n+++ b/.memory/corrections.jsonl\n@@ -1 +1,2 @@\n {"a":1}\n+{"evidence":"cross-review re-review 1 finding 2"}\n';
+    const quoted =
+        'diff --git "a/.memory/n\\303\\251.md" "b/.memory/n\\303\\251.md"\n--- "a/.memory/n\\303\\251.md"\n+++ "b/.memory/n\\303\\251.md"\n@@ -0,0 +1 @@\n+x\n';
+    const docs =
+        "diff --git a/docs/memory.md b/docs/memory.md\n@@ -0,0 +1 @@\n+.memory/ is a folder\n";
+
+    assert.equal(withoutReviewRecords(record + code + quoted + docs), code + docs);
+    assert.equal(withoutReviewRecords(code), code);
+    assert.equal(withoutReviewRecords(""), "");
 });
