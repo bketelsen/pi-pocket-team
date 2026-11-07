@@ -1665,8 +1665,9 @@ export default function createTeam(host: Host, web: Web) {
     };
 
     /**
-     * The `night_shift` argument: a goal for the linked session. It has no check command of its own: `pr_check` is a
-     * structured PR check, and the night-shift module builds its `gh` command from validated values.
+     * The `shift` argument (its old name `night_shift` stays as an alias): a goal for the linked session. It has no
+     * check command of its own: `pr_check` is a structured PR check, and the night-shift module builds its `gh` command
+     * from validated values.
      */
     type NightShiftArg = Omit<DelegatedFields, "objective"> & { objective?: string };
 
@@ -1835,7 +1836,7 @@ export default function createTeam(host: Host, web: Web) {
     }
 
     /**
-     * The model router's shadow record for one delegation, a night shift or not: a record only, never a model. A worker
+     * The model router's shadow record for one delegation, a shift or not: a record only, never a model. A worker
      * the supervisor named still wins and still runs: the router is asked all the same, and the route carries the
      * `worker`, so the audit can compare the suggestion with the named worker. Only an older router (a version below 2)
      * does not take a worker: it records `explicit` and does not run. The answer is a memo keyed by the call
@@ -2217,7 +2218,7 @@ export default function createTeam(host: Host, web: Web) {
         }
     });
 
-    /** The fields of a delegated night shift, checked: its options go through the night-shift parser. */
+    /** The fields of a delegated shift, checked: its options go through the night-shift parser. */
     const shiftFor = (
         fields: NightShiftArg,
         task: string,
@@ -2227,13 +2228,13 @@ export default function createTeam(host: Host, web: Web) {
 
         if (ns === undefined) {
             throw new Error(
-                "The night-shift module is off. Brian turns it on in Menu → Extensions.",
+                "The shift module (night-shift.ts) is off. Brian turns it on in Menu → Extensions.",
             );
         }
 
         if (fields.pr_check !== undefined && ns.version < 2) {
             throw new Error(
-                "The night-shift module is too old for pr_check: Brian must install the new version.",
+                "The shift module (night-shift.ts) is too old for pr_check: Brian must install the new version.",
             );
         }
 
@@ -2259,20 +2260,20 @@ export default function createTeam(host: Host, web: Web) {
         const by = host.requesterOf(source);
 
         if (by === undefined) {
-            throw new Error("A night shift needs the person it works for, and this call has none.");
+            throw new Error("A shift needs the person it works for, and this call has none.");
         }
 
         return { ns, request, by };
     };
 
-    /** The first message of a linked session that runs a night shift. */
+    /** The first message of a linked session that runs a shift. */
     const delegatedText = (
         persona: Persona,
         task: string,
         request: DelegatedGoal,
         worktree?: DelegationWorktree,
     ) =>
-        `${taskText(persona, task, worktree)}\n\nThis task runs as a night shift. Round 1 comes as a separate message that starts with [night-shift], ${request.startLabel === undefined ? "now" : `at ${request.startLabel}`}. Answer this message with one short line only, and do the work in the rounds. The night shift reports to the source session by itself when it stops: do not send a report with team_message. A decision you need from Brian is the one exception: send it at once with team_message, status working or blocked, and the decision in its asks.`;
+        `${taskText(persona, task, worktree)}\n\nThis task runs as a shift. Round 1 comes as a separate message that starts with [shift], ${request.startLabel === undefined ? "now" : `at ${request.startLabel}`}. Answer this message with one short line only, and do the work in the rounds. The shift reports to the source session by itself when it stops: do not send a report with team_message. A decision you need from Brian is the one exception: send it at once with team_message, status working or blocked, and the decision in its asks.`;
 
     /** Tell the tabs that a session's identity changed: the id only, so each tab asks the route (which checks access). */
     const identityChanged = (conversationId: ConversationId) =>
@@ -2815,10 +2816,88 @@ export default function createTeam(host: Host, web: Web) {
         };
     };
 
+    /** The fields of the `shift` argument of `team_delegate`, and of `night_shift`, its old name. */
+    const shiftArgument = (description: string) =>
+        Type.Object(
+            {
+                objective: Type.Optional(
+                    Type.String({
+                        maxLength: 3000,
+                        description:
+                            "What to work on; the task when omitted. Say the stop condition in stop_when, not here.",
+                    }),
+                ),
+                stop_when: Type.String({ minLength: 1, maxLength: 3000 }),
+                start: Type.Optional(
+                    Type.String({
+                        description:
+                            "06:00 or 6am: round 1 waits until the next such time on the server clock, at most 24 hours ahead",
+                    }),
+                ),
+                until: Type.Optional(Type.String()),
+                for: Type.Optional(
+                    Type.String({ description: "8h, 90m, 7h30m; counts from start" }),
+                ),
+                max: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
+                worker: Type.Optional(
+                    Type.String({
+                        description:
+                            "provider/model for subagents, from the owner's allowed list for subagents, e.g. github-copilot/claude-sonnet-5.5",
+                    }),
+                ),
+                pr_check: Type.Optional(
+                    Type.Object(
+                        {
+                            pr: Type.Optional(
+                                Type.Integer({
+                                    minimum: 1,
+                                    description:
+                                        "The PR number. Omit to check the PR of the current branch of the linked session's folder.",
+                                }),
+                            ),
+                            repo: Type.Optional(
+                                Type.String({
+                                    pattern:
+                                        "^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$",
+                                    description:
+                                        "The repository of the PR, owner/name, e.g. bketelsen/x. Needs pr. Omit when the folder is the PR's repository.",
+                                }),
+                            ),
+                            checks: Type.Optional(
+                                Type.Union(
+                                    [
+                                        Type.Literal("required"),
+                                        Type.Literal("all"),
+                                        Type.Literal("none"),
+                                    ],
+                                    {
+                                        description:
+                                            'Which checks must pass: "required" (the default; when the repository requires no checks, all checks), "all", or "none" with a label.',
+                                    },
+                                ),
+                            ),
+                            label: Type.Optional(
+                                Type.String({
+                                    maxLength: 50,
+                                    description:
+                                        "A label the PR must have, such as ready-for-human. Letters, digits, spaces and . _ : / + - only.",
+                                }),
+                            ),
+                        },
+                        {
+                            description:
+                                "A PR check that must pass after Pi says DONE. This is not a shell command: it runs gh pr checks and gh pr view, read only, in the linked session's folder. A free check command is refused.",
+                        },
+                    ),
+                ),
+            },
+            { description },
+        );
+
     const delegate = defineTool({
         name: "team_delegate",
         description:
-            "Supervisor only: give a self-contained task to a named agent in their repository folder. Choose a repository from the roster if the agent owns more than one. Runs on the agent's profile model when the owner allows it for subagents, otherwise on your model (the roster shows each agent's model); thinking is yours, or the nearest level the model has. Returns an address without waiting for completion. With night_shift, the linked session runs a night-shift goal in rounds, and its report comes back here by itself when it stops. A night shift takes no free check command, and team_delegate refuses one. It can take pr_check instead: a structured PR check that runs gh pr checks and gh pr view, read only, in the linked session's folder after Pi says DONE, and must pass. With watch, the desk thread sleeps until the check's date: it does not count toward the cap, and a check result closes it. With watch.on, an event (a thread closes, a PR merges, gets a label or a review) makes the check due before its date. With plan, start a plan (plan.start with repository home: a planning session in the lead agent's home) or deliver 1 task of an approved plan (plan.id and plan.task).",
+            "Supervisor only: give a self-contained task to a named agent in their repository folder. Choose a repository from the roster if the agent owns more than one. Runs on the agent's profile model when the owner allows it for subagents, otherwise on your model (the roster shows each agent's model); thinking is yours, or the nearest level the model has. Returns an address without waiting for completion. With shift, the linked session runs a shift goal in rounds, and its report comes back here by itself when it stops. A shift takes no free check command, and team_delegate refuses one. It can take pr_check instead: a structured PR check that runs gh pr checks and gh pr view, read only, in the linked session's folder after Pi says DONE, and must pass. With watch, the desk thread sleeps until the check's date: it does not count toward the cap, and a check result closes it. With watch.on, an event (a thread closes, a PR merges, gets a label or a review) makes the check due before its date. With plan, start a plan (plan.start with repository home: a planning session in the lead agent's home) or deliver 1 task of an approved plan (plan.id and plan.task).",
         parameters: Type.Object({
             agent: Type.String(),
             task: Type.String({ minLength: 1, maxLength: 6000 }),
@@ -2835,79 +2914,15 @@ export default function createTeam(host: Host, web: Web) {
                         "Owned repository name from the roster, e.g. frostyard/nsl. Omit when the agent has only one repository or a non-repository workspace.",
                 }),
             ),
+            shift: Type.Optional(
+                shiftArgument(
+                    "A goal for the linked session: it runs as a shift, in rounds, until stop_when holds or a limit ends it.",
+                ),
+            ),
             night_shift: Type.Optional(
-                Type.Object({
-                    objective: Type.Optional(
-                        Type.String({
-                            maxLength: 3000,
-                            description:
-                                "What to work on; the task when omitted. Say the stop condition in stop_when, not here.",
-                        }),
-                    ),
-                    stop_when: Type.String({ minLength: 1, maxLength: 3000 }),
-                    start: Type.Optional(
-                        Type.String({
-                            description:
-                                "06:00 or 6am: round 1 waits until the next such time on the server clock, at most 24 hours ahead",
-                        }),
-                    ),
-                    until: Type.Optional(Type.String()),
-                    for: Type.Optional(
-                        Type.String({ description: "8h, 90m, 7h30m; counts from start" }),
-                    ),
-                    max: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
-                    worker: Type.Optional(
-                        Type.String({
-                            description:
-                                "provider/model for subagents, from the owner's allowed list for subagents, e.g. github-copilot/claude-sonnet-5.5",
-                        }),
-                    ),
-                    pr_check: Type.Optional(
-                        Type.Object(
-                            {
-                                pr: Type.Optional(
-                                    Type.Integer({
-                                        minimum: 1,
-                                        description:
-                                            "The PR number. Omit to check the PR of the current branch of the linked session's folder.",
-                                    }),
-                                ),
-                                repo: Type.Optional(
-                                    Type.String({
-                                        pattern:
-                                            "^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$",
-                                        description:
-                                            "The repository of the PR, owner/name, e.g. bketelsen/x. Needs pr. Omit when the folder is the PR's repository.",
-                                    }),
-                                ),
-                                checks: Type.Optional(
-                                    Type.Union(
-                                        [
-                                            Type.Literal("required"),
-                                            Type.Literal("all"),
-                                            Type.Literal("none"),
-                                        ],
-                                        {
-                                            description:
-                                                'Which checks must pass: "required" (the default; when the repository requires no checks, all checks), "all", or "none" with a label.',
-                                        },
-                                    ),
-                                ),
-                                label: Type.Optional(
-                                    Type.String({
-                                        maxLength: 50,
-                                        description:
-                                            "A label the PR must have, such as ready-for-human. Letters, digits, spaces and . _ : / + - only.",
-                                    }),
-                                ),
-                            },
-                            {
-                                description:
-                                    "A PR check that must pass after Pi says DONE. This is not a shell command: it runs gh pr checks and gh pr view, read only, in the linked session's folder. A free check command is refused.",
-                            },
-                        ),
-                    ),
-                }),
+                shiftArgument(
+                    "The old name of shift, with the same fields. Give shift or night_shift, not both.",
+                ),
             ),
             plan: Type.Optional(
                 Type.Object(
@@ -2966,7 +2981,15 @@ export default function createTeam(host: Host, web: Web) {
         }),
         replay: "safe",
         execute: async (args, api, context) => {
-            const { agent, task, repository, night_shift, plan } = args;
+            const { agent, task, repository, plan } = args;
+
+            // `night_shift` is the old name of `shift`. Both at once is refused before anything starts; the rest of the
+            // call reads 1 value.
+            if (args.shift !== undefined && args.night_shift !== undefined) {
+                throw new Error("Give shift or night_shift, not both.");
+            }
+
+            const night_shift = args.shift ?? args.night_shift;
             const starting = plan?.start === true;
             const delivering = plan !== undefined && !starting;
             /** The whole-plan check: the lead, in its home, with no repository and no worktree. */
@@ -2989,7 +3012,7 @@ export default function createTeam(host: Host, web: Web) {
 
                 if (starting && night_shift !== undefined) {
                     throw new Error(
-                        "A plan start takes no night_shift: the planning session plans the work, and the task threads do it.",
+                        "A plan start takes no shift: the planning session plans the work, and the task threads do it.",
                     );
                 }
 
@@ -3023,11 +3046,11 @@ export default function createTeam(host: Host, web: Web) {
             }
 
             // The check runs unasked, with the owner's rights, and Lancet Guard does not see it: only the owner sets one,
-            // with /night-shift in the session itself. `pr_check` is the exception: a fixed, read-only `gh` command
+            // with /team-shift in the session itself. `pr_check` is the exception: a fixed, read-only `gh` command
             // that the night-shift module builds from validated values.
             if (night_shift !== undefined && Object.hasOwn(night_shift, "check")) {
                 throw new Error(
-                    "A night shift from team_delegate cannot have a check command: the check does not go through Lancet Guard. Use pr_check for a PR goal, or Brian sets a check with /night-shift in the session.",
+                    "A shift from team_delegate cannot have a check command: the check does not go through Lancet Guard. Use pr_check for a PR goal, or Brian sets a check with /team-shift in the session.",
                 );
             }
 
@@ -3149,7 +3172,7 @@ export default function createTeam(host: Host, web: Web) {
             if (persona.role === "clerk") {
                 // A Clerk is 1 long-lived session with no desk thread: neither option has anything to attach to.
                 if (night_shift !== undefined) {
-                    throw new Error("A Clerk runs until it is archived: it takes no night shift.");
+                    throw new Error("A Clerk runs until it is archived: it takes no shift.");
                 }
 
                 if (args.watch !== undefined) {
@@ -3243,7 +3266,7 @@ export default function createTeam(host: Host, web: Web) {
                 made === undefined
             ) {
                 throw new Error(
-                    "night_shift.pr_check needs pr when the task has no worktree of its own: the current branch is not the task's branch.",
+                    "shift.pr_check needs pr when the task has no worktree of its own: the current branch is not the task's branch.",
                 );
             }
 
@@ -3365,9 +3388,9 @@ export default function createTeam(host: Host, web: Web) {
             // A plan's brief comes before the task: a delivery names the plan, its task and its acceptance lines.
             const firstTask = opened?.plan === undefined ? task : `${opened.plan.brief}\n\n${task}`;
             // The model router's shadow record for this delegation: a record only, never a model. It runs for every
-            // delegation, a night shift or not, also when the supervisor named the worker (the route then carries the
+            // delegation, a shift or not, also when the supervisor named the worker (the route then carries the
             // `worker`, and the named worker still wins and still runs: nothing here changes the session's model,
-            // `goal.worker` or the result), and only when the router module is on. A night shift's brief is its
+            // `goal.worker` or the result), and only when the router module is on. A shift's brief is its
             // objective and stop condition; another delegation's is its task as the session gets it, the plan's brief
             // first. The features read the roster checkout of the delegation's repository: none for a home or a
             // workspace. Without a route, the delegation is exactly as it is without the router.
@@ -3475,7 +3498,7 @@ export default function createTeam(host: Host, web: Web) {
                 goal.deadlineLabel === undefined ? "no deadline" : `until ${goal.deadlineLabel}`;
 
             return reply(
-                `Assigned to ${persona.name} at ${started.address}, on ${modelText(persona)}.${thread}${notMade === "" ? "" : ` ${notMade}`} Night shift set there: at most ${goal.maxRounds} rounds, ${begins}, ${ends}.${route === undefined ? "" : ` ${route.line}.`} Its report arrives here when it stops; do not poll. /night-shift status in that session shows it.${noDesk}${warned}`,
+                `Assigned to ${persona.name} at ${started.address}, on ${modelText(persona)}.${thread}${notMade === "" ? "" : ` ${notMade}`} Shift set there: at most ${goal.maxRounds} rounds, ${begins}, ${ends}.${route === undefined ? "" : ` ${route.line}.`} Its report arrives here when it stops; do not poll. /team-shift status in that session shows it.${noDesk}${warned}`,
             );
         },
     });

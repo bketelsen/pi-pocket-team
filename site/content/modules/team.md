@@ -36,7 +36,7 @@ When the folder is the top of a git work tree, each delegation gets its own work
 
 `repository: "home"` starts the task in the agent's own home instead, with no worktree. `team_work` does the same from inside an agent's home: it starts a linked session in a fresh worktree of 1 of its own repositories.
 
-Before each desk-tracked start (a task, a night shift, the Clerk, a plan, a plan consult), Team asks the desk to turn off the supervisor's run-end answers (Pi Pocket 0.28.0-bk.1 and later): the reports come by `team_message`, so a linked session's run end does not wake the supervisor. `team_work` and the Team panel's start do not ask, so their lead keeps its answers, unless that lead is a desk supervisor.
+Before each desk-tracked start (a task, a shift, the Clerk, a plan, a plan consult), Team asks the desk to turn off the supervisor's run-end answers (Pi Pocket 0.28.0-bk.1 and later): the reports come by `team_message`, so a linked session's run end does not wake the supervisor. `team_work` and the Team panel's start do not ask, so their lead keeps its answers, unless that lead is a desk supervisor.
 
 ## Agent memory
 

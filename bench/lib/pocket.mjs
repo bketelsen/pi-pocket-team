@@ -14,12 +14,15 @@ export const TASK_MARK = "Task from the source session:";
 /** The end of the delegation wrapper. */
 const WRAPPER_END = "</linked-session-message>";
 
-/** The paragraph a night-shift delegation adds after the task. */
-const NIGHT_SHIFT_TAIL = "This task runs as a night shift.";
+/**
+ * The start of the paragraph a shift delegation adds after the task: the new words, and the old ones that older first
+ * messages hold.
+ */
+const NIGHT_SHIFT_TAILS = ["This task runs as a shift.", "This task runs as a night shift."];
 
 /**
  * The task of a delegation's first message: the text after the line `Task from the source session:` and before
- * `</linked-session-message>`, with a trailing night-shift paragraph taken off. The agent identity block and the
+ * `</linked-session-message>`, with a trailing shift paragraph taken off. The agent identity block and the
  * wrapper are not part of it (the router's `features()` sees only the task too). Null when the marker is missing or
  * the task is empty.
  */
@@ -38,7 +41,7 @@ export function delegationTask(text) {
         task = task.slice(0, end);
     }
 
-    const tail = task.lastIndexOf(`\n${NIGHT_SHIFT_TAIL}`);
+    const tail = Math.max(...NIGHT_SHIFT_TAILS.map((words) => task.lastIndexOf(`\n${words}`)));
 
     if (tail >= 0) {
         task = task.slice(0, tail);

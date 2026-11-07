@@ -10,6 +10,7 @@ import {
     archiveEventText,
     archiveKey,
     archivePending,
+    archiveReasonText,
     archiveRestores,
     archivedFact,
     archivesOf,
@@ -466,6 +467,13 @@ describe("the archive's facts step", () => {
         );
     });
 
+    test("a person reads the shift skips as shift; the stored values keep the old name", () => {
+        assert.equal(archiveReasonText("night-shift"), "shift");
+        assert.equal(archiveReasonText("night-shift-unknown"), "shift-unknown");
+        assert.equal(archiveReasonText("busy"), "busy");
+        assert.equal(archiveReasonText("schedule-unknown"), "schedule-unknown");
+    });
+
     test("F4: a session with a schedule is not archived", () => {
         const binding = oneBinding();
 
@@ -744,7 +752,7 @@ describe("the archive's pending and reopen work", () => {
                 "auto",
                 NOW,
             ),
-            "session archived (auto): closed 3d ago; idle, no open ask, no night shift, no schedule, folder clean",
+            "session archived (auto): closed 3d ago; idle, no open ask, no shift, no schedule, folder clean",
         );
         assert.equal(
             archiveEventText(
@@ -752,7 +760,7 @@ describe("the archive's pending and reopen work", () => {
                 "sweep",
                 NOW,
             ),
-            "consult k2 session archived (sweep): closed 2d ago; idle, no open ask, no night shift, no schedule, no folder",
+            "consult k2 session archived (sweep): closed 2d ago; idle, no open ask, no shift, no schedule, no folder",
         );
     });
 });

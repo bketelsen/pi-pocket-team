@@ -4,7 +4,7 @@
  * report "done". A supervisor session uses the `desk` tool (`list`, `read`, `seed`, `sync`). The page, the cap, asks,
  * and the export come in later parts.
  *
- * The sweep has two halves. It reads the world outside any commit (linked sessions, Night shift goals, `git status`),
+ * The sweep has two halves. It reads the world outside any commit (linked sessions, shift goals, `git status`),
  * then writes what changed in one commit. Its task, `x.desk.sweeper`, runs one sweep per supervisor, sleeps 10 minutes,
  * and sweeps again; it ends when that supervisor has no thread that is not closed.
  *
@@ -25,7 +25,7 @@
  * kinds that go at once. An interval of 0 minutes turns it off, and every path works as it did before it.
  *
  * Other modules find this one through `globalThis[Symbol.for("pi-pocket-team.desk")]`, never through an import: an
- * import would keep a stale copy after a reload. With this module off, Team and Night shift work as before.
+ * import would keep a stale copy after a reload. With this module off, Team and Shift work as before.
  */
 import { execFile } from "node:child_process";
 import { constants as fsConstants } from "node:fs";
@@ -4149,7 +4149,7 @@ export function closeCheck(thread: Thread, facts: CloseFacts): { close: boolean;
     const shift = thread.run.shift;
 
     if (shiftWorks(shift)) {
-        open.push(`the night shift is ${String(shift)}`);
+        open.push(`the shift is ${String(shift)}`);
     }
 
     const folder = folderOf(thread);
@@ -4273,6 +4273,18 @@ export type ArchiveSkipReason =
     | "folder-dirty"
     | "folder-unpushed"
     | "unbound";
+
+/**
+ * The words that show a skip reason to a person. The values `night-shift` and `night-shift-unknown` are stored (in a
+ * thread's pending archives and its events) and compared, so they keep the old name; the feature is called "shift".
+ */
+export function archiveReasonText(reason: ArchiveSkipReason): string {
+    return reason === "night-shift"
+        ? "shift"
+        : reason === "night-shift-unknown"
+          ? "shift-unknown"
+          : reason;
+}
 
 /** One session the rules skipped, and why. */
 export type ArchiveSkip = { session: number; thread?: string; reason: ArchiveSkipReason };
@@ -4634,7 +4646,7 @@ export function archiveDecide(
             continue;
         }
 
-        // F3: no running night shift; an unknown read fails closed.
+        // F3: no running shift; an unknown read fails closed.
         if (!Object.hasOwn(facts.shifts, key)) {
             skip("night-shift-unknown");
             continue;
@@ -4855,7 +4867,7 @@ export function archiveEventText(
             ? `consult ${candidate.consult} session archived`
             : "session archived";
 
-    return `${head} (${by}): closed ${String(days)}d ago; idle, no open ask, no night shift, no schedule, ${folder}`;
+    return `${head} (${by}): closed ${String(days)}d ago; idle, no open ask, no shift, no schedule, ${folder}`;
 }
 
 /**
@@ -11276,9 +11288,10 @@ export function grantText(
 
 // ─── The chat's "desk ok" ───────────────────────────────────────────────────
 
-// Copied from night-shift.ts: a message written by a person, not by a linked session, a schedule, or a task.
+// Copied from night-shift.ts: a message written by a person, not by a linked session, a schedule, or a task. A round
+// of a shift starts with `[shift]`; older entries hold `[night-shift]`.
 const FROM = /^\[from: ([^\]\n]{1,60})\] /;
-const AUTOMATED = /^\[(?:night-shift\]|via |scheduled\]|subagent |goal\] |desk\] )/;
+const AUTOMATED = /^\[(?:shift\]|night-shift\]|via |scheduled\]|subagent |goal\] |desk\] )/;
 
 /** A message's writer and its words without the `[from: …]` prefix; no writer when nobody typed it. */
 export function personAndBody(content: unknown): { person?: string; body: string } {
@@ -13477,7 +13490,7 @@ export type ShortLineRequest = {
 export function shortLine(thread: Thread, request: ShortLineRequest): string {
     const who =
         request.from === "night-shift"
-            ? "night shift report"
+            ? "shift report"
             : `${thread.agents[0] ?? "an agent"} reported`;
     const chars = request.text.length.toLocaleString("en-US");
     const head = (repo: boolean) =>
@@ -23327,7 +23340,7 @@ export default function createDesk(host: Host, web: Web) {
                             addEvent(
                                 thread,
                                 `archive-withdrawn:${work.key}`,
-                                `archive withdrawn: ${withdrawn}`,
+                                `archive withdrawn: ${archiveReasonText(withdrawn)}`,
                                 now,
                             );
                             result.withdrawn.push({
@@ -25490,7 +25503,7 @@ export default function createDesk(host: Host, web: Web) {
                                 addEvent(
                                     thread,
                                     `shift:none:${String(now)}`,
-                                    "the night shift is gone",
+                                    "the shift is gone",
                                     now,
                                 )
                             ) {
@@ -25504,7 +25517,7 @@ export default function createDesk(host: Host, web: Web) {
                             addEvent(
                                 thread,
                                 `shift:${status}:${String(now)}`,
-                                `the night shift is ${status}`,
+                                `the shift is ${status}`,
                                 now,
                             )
                         ) {
@@ -30461,7 +30474,7 @@ export default function createDesk(host: Host, web: Web) {
         const lines = [
             `Archive dry run: ${count === 1 ? "1 session" : `${String(count)} sessions`} can be archived (threads closed 2 days ago or more). Nothing changed.`,
             `By kind: ${count === 0 ? "none" : countsText(decided.archive.map((each) => each.kind))}.`,
-            `Skipped: ${all.length === 0 ? "none" : countsText(all.map((each) => each.reason))}.`,
+            `Skipped: ${all.length === 0 ? "none" : countsText(all.map((each) => archiveReasonText(each.reason)))}.`,
             ...decided.archive.map(
                 (each) =>
                     `- ${each.thread} ${each.consult === undefined ? each.kind : `${each.kind} ${each.consult}`} ${each.address} closed ${String(Math.floor((now - each.closedAt) / 86_400_000))}d ago: ${each.title}`,
@@ -30532,7 +30545,9 @@ export default function createDesk(host: Host, web: Web) {
                   ]),
             ...(skipped.length === 0
                 ? []
-                : [`Not archived now: ${countsText(skipped.map((each) => each.reason))}.`]),
+                : [
+                      `Not archived now: ${countsText(skipped.map((each) => archiveReasonText(each.reason)))}.`,
+                  ]),
         ];
 
         return lines.join("\n");
@@ -30541,7 +30556,7 @@ export default function createDesk(host: Host, web: Web) {
     const tool = defineTool({
         name: "desk",
         description:
-            "The desk of threads for work the team runs in the background. A supervisor session can use every action; a Clerk can use list, read, sync, attach, detach, watch, result, send, issues, and escalate for its supervisor's threads; an agent session can use read, watch, and result on its own thread only. Actions: list (one line per open thread), read (one thread in full), sync (observe the threads now, with linked sessions, Night shift, git, and GitHub), seed (import a seed.json file one time), attach (put a PR, a queued issue, or all of another thread's work, on one thread), detach (take a PR off a thread for good: the sweep does not attach or find it again; only attach brings it back), own (mark a found PR thread as Brian's own: it closes, and no sweep finds its PR again), ask (file a question for Brian on a thread, or on a new one; never for a plain merge: Ready to merge on the Desk page lists those), rewrite (give an open ask new words, and new options or none: an agent's ask is filed as it wrote it, so make it clear for Brian), withdraw (end an open ask that Brian need not answer, with words saying why, or with into to merge it into another open ask), answer (record Brian's words for an ask), watch (set a dated check on a thread: it sleeps until that date, or until its optional on event, and does not count toward the cap; a thread closed as done in the last 7 days opens again for it, and sleeps), result (record that check's pass, which closes the thread, or its fail, which opens it again: a pass is refused while the thread has an open ask), send (send 1 message from the supervisor's session to a thread's agent), issues (read the issues Brian queued on GitHub: read only), escalate (Clerk only: 1 escalation to the supervisor; the desk drops it when the supervisor already acted on the thread or got its news directly, and else puts it in her next digest, or sends it at once with urgent: true), archive (supervisor only: a dry run that lists the idle sessions of threads closed 2 days ago or more that the desk can archive, with the skips and their reasons; with apply: true, archive the sessions of a dry run of the last 60 minutes that still pass every rule; it archives, it never deletes).",
+            "The desk of threads for work the team runs in the background. A supervisor session can use every action; a Clerk can use list, read, sync, attach, detach, watch, result, send, issues, and escalate for its supervisor's threads; an agent session can use read, watch, and result on its own thread only. Actions: list (one line per open thread), read (one thread in full), sync (observe the threads now, with linked sessions, Shift, git, and GitHub), seed (import a seed.json file one time), attach (put a PR, a queued issue, or all of another thread's work, on one thread), detach (take a PR off a thread for good: the sweep does not attach or find it again; only attach brings it back), own (mark a found PR thread as Brian's own: it closes, and no sweep finds its PR again), ask (file a question for Brian on a thread, or on a new one; never for a plain merge: Ready to merge on the Desk page lists those), rewrite (give an open ask new words, and new options or none: an agent's ask is filed as it wrote it, so make it clear for Brian), withdraw (end an open ask that Brian need not answer, with words saying why, or with into to merge it into another open ask), answer (record Brian's words for an ask), watch (set a dated check on a thread: it sleeps until that date, or until its optional on event, and does not count toward the cap; a thread closed as done in the last 7 days opens again for it, and sleeps), result (record that check's pass, which closes the thread, or its fail, which opens it again: a pass is refused while the thread has an open ask), send (send 1 message from the supervisor's session to a thread's agent), issues (read the issues Brian queued on GitHub: read only), escalate (Clerk only: 1 escalation to the supervisor; the desk drops it when the supervisor already acted on the thread or got its news directly, and else puts it in her next digest, or sends it at once with urgent: true), archive (supervisor only: a dry run that lists the idle sessions of threads closed 2 days ago or more that the desk can archive, with the skips and their reasons; with apply: true, archive the sessions of a dry run of the last 60 minutes that still pass every rule; it archives, it never deletes).",
         parameters: Type.Object({
             action: Type.Union([
                 Type.Literal("list"),

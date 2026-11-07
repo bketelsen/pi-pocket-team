@@ -1,6 +1,6 @@
 ---
 title: pi-pocket-team
-description: "Drop-in extensions for Pi Pocket: named agents, a desk of background work, night shifts, a wiki page, a terminal page and a shadow model router."
+description: "Drop-in extensions for Pi Pocket: named agents, a desk of background work, shifts, a wiki page, a terminal page and a shadow model router."
 hide:
     - navigation
     - toc
@@ -12,7 +12,7 @@ hide:
 
 # pi-pocket-team
 
-<p class="fy-hero__lede">Drop-in extensions for Pi Pocket, written for Brian Ketelsen's own server and shared as they are. Seven modules extend one server: named agents that delegate work, a desk that keeps the work in the background, GitHub webhooks that wake the desk, night shifts, a wiki page, a terminal page, and a shadow router that only records.</p>
+<p class="fy-hero__lede">Drop-in extensions for Pi Pocket, written for Brian Ketelsen's own server and shared as they are. Seven modules extend one server: named agents that delegate work, a desk that keeps the work in the background, GitHub webhooks that wake the desk, shifts that work in rounds at any hour, a wiki page, a terminal page, and a shadow router that only records.</p>
 
 [Install into Pi Pocket →](getting-started/install.md){ .md-button .md-button--primary }
 [Build and test](contributing/build.md){ .md-button }
@@ -39,11 +39,11 @@ pi-pocket-team is a set of drop-in extensions for [Pi Pocket](https://github.com
 
     The "Wiki" rail page: a Markdown wiki checkout rendered live from disk, read-only and owner-only.
 
-- **[Night shift](modules/night-shift.md)**
+- **[Shift](modules/shift.md)**
 
     ***
 
-    Pi works on an objective in rounds while you sleep, until a stop condition, a round limit or a deadline, then writes a summary.
+    `/team-shift`: Pi works on an objective in rounds, at any hour, until a stop condition, a round limit or a deadline, then writes a summary.
 
 - **[Model router](modules/model-router.md)**
 

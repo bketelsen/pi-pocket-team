@@ -248,7 +248,7 @@ describe("prCheckCommand", () => {
         );
 
         assert("error" in bad);
-        assert.match(bad.error, /^night_shift\.pr_check/);
+        assert.match(bad.error, /^shift\.pr_check/);
     });
 
     test("a value that could write shell is refused", () => {
@@ -285,7 +285,7 @@ describe("prCheckCommand", () => {
             const built = prCheckCommand(pr_check);
 
             assert(typeof built !== "string", JSON.stringify(pr_check));
-            assert.match(built.error, /^night_shift\.pr_check/, JSON.stringify(pr_check));
+            assert.match(built.error, /^shift\.pr_check/, JSON.stringify(pr_check));
         }
 
         // 50 characters is the longest label that fits.
@@ -550,8 +550,10 @@ describe("checkNote and statusCard", () => {
 
 /** How far the app's clock is ahead: a test moves it past a start time. */
 let shift = 0;
-/** The start time the scripted model puts in a delegated night shift. */
+/** The start time the scripted model puts in a delegated shift. */
 let waitStart = "";
+/** The description of `team_delegate`, as the model last got it. */
+let delegateDescription: string | undefined;
 let app: App;
 
 const answer = (text: string) => fauxAssistantMessage([fauxText(text)]);
@@ -564,16 +566,24 @@ const teamCall = (args: object) =>
  */
 const model = scriptedModel((request) => {
     const { role, text } = lastText(request as never);
+    // The tool declarations travel in the request's messages: the description is 1 JSON string there.
+    const declared = /Supervisor only: give a self-contained task(?:[^"\\]|\\.)*/.exec(
+        JSON.stringify(request),
+    )?.[0];
+
+    if (declared !== undefined) {
+        delegateDescription = declared;
+    }
 
     if (role === "toolResult") {
         return answer("ok");
     }
 
-    if (text.startsWith("[night-shift] The night shift has stopped")) {
+    if (text.startsWith("[shift] The shift has stopped")) {
         return answer(SUMMARY);
     }
 
-    if (text.startsWith("[night-shift] Round")) {
+    if (text.startsWith("[shift] Round")) {
         const objective = /Objective: [^\n]*/.exec(text)?.[0] ?? "";
 
         return answer(
@@ -583,8 +593,27 @@ const model = scriptedModel((request) => {
         );
     }
 
-    if (text.includes("This task runs as a night shift")) {
-        return answer("Night shift noted. I start in round 1.");
+    if (text.includes("This task runs as a shift")) {
+        return answer("Shift noted. I start in round 1.");
+    }
+
+    if (text.endsWith("new name delegation")) {
+        return teamCall({
+            agent: "duncan",
+            repository: "frostyard/test",
+            task: TASK,
+            shift: { stop_when: "the work is done", start: waitStart },
+        });
+    }
+
+    if (text.endsWith("both names delegation")) {
+        return teamCall({
+            agent: "duncan",
+            repository: "frostyard/test",
+            task: TASK,
+            shift: { stop_when: "the work is done" },
+            night_shift: { stop_when: "the work is done" },
+        });
     }
 
     if (text.endsWith("allowed worker night shift test")) {
@@ -778,7 +807,7 @@ async function settled(id: ConversationId): Promise<Goal> {
 
             return goal?.status === "ended" || goal?.status === "paused";
         },
-        "the night shift to stop",
+        "the shift to stop",
         20_000,
     );
 
@@ -827,9 +856,58 @@ describe("delegated goals", () => {
         assert.equal(goal.stop, "the work is done");
         assert.equal(goal.maxRounds, 20);
 
-        const card = await command(linked, "night-shift", "status");
+        const card = await command(linked, "team-shift", "status");
 
-        assert.match(JSON.stringify(card), /Night shift/);
+        assert.match(JSON.stringify(card), /Shift: /);
+    });
+
+    test("shift starts a shift, and night_shift, its old name, still starts one", async () => {
+        waitStart = soon();
+
+        for (const [name, text] of [
+            ["names-shift", "new name delegation"],
+            ["names-night-shift", "wait night shift test"],
+        ] as const) {
+            const { source, linked } = await delegateShift(name, text);
+
+            await until(async () => (await goalOf(linked)) !== undefined, "the goal", 20_000);
+            const goal = (await goalOf(linked))!;
+
+            assert.equal(goal.status, "running", text);
+            assert.equal(goal.delegated?.supervisor, "Odrade", text);
+            assert.equal(goal.stop, "the work is done", text);
+            assert.equal(goal.round, 0, `${text}: it waits for its start`);
+            await until(() => !app.isBusy(source), "the supervisor to settle", 20_000);
+            const said = (await modelTexts(app, source)).join("\n");
+
+            assert.match(said, /Shift set there: at most 20 rounds, round 1 starts at /, text);
+            assert.match(said, /\/team-shift status in that session shows it\./, text);
+            await command(linked, "team-shift", "stop");
+        }
+    });
+
+    test("shift and night_shift together are refused: no linked session starts", async () => {
+        const source = await supervisor("names-both");
+        const before = app.sessions().length;
+
+        await say(app, source, "both names delegation");
+        assert.match(
+            (await modelTexts(app, source)).join("\n"),
+            /Give shift or night_shift, not both\./,
+        );
+        assert.equal(app.sessions().length, before);
+        assert.equal(linkedTo(source).length, 0);
+    });
+
+    test("the team_delegate description names the feature shift only", () => {
+        assert.ok(delegateDescription !== undefined, "the model got team_delegate");
+        assert.match(delegateDescription, /With shift, the linked session runs a shift goal/);
+        assert.match(
+            delegateDescription,
+            /\(plan\.id and plan\.task\)\.$/,
+            "the whole description",
+        );
+        assert.doesNotMatch(delegateDescription, /night[\s_-]?shift/i);
     });
 
     test("the summary answer reaches the supervisor session by itself", async () => {
@@ -856,7 +934,7 @@ describe("delegated goals", () => {
 
         assert.match(
             JSON.stringify(report?.model),
-            /Night shift report from this linked session: stopped at round 1 of 20: /,
+            /Shift report from this linked session: stopped at round 1 of 20: /,
         );
         assert.equal(linkedTo(source).length, 1, "one linked session for one delegate call");
     });
@@ -916,7 +994,7 @@ describe("delegated goals", () => {
         await say(app, source, "check night shift test");
         assert.match(
             (await modelTexts(app, source)).join("\n"),
-            /cannot have a check command: the check does not go through Lancet Guard\. Use pr_check for a PR goal, or Brian sets a check with \/night-shift in the session\./,
+            /cannot have a check command: the check does not go through Lancet Guard\. Use pr_check for a PR goal, or Brian sets a check with \/team-shift in the session\./,
         );
         assert.equal(app.sessions().length, before);
     });
@@ -949,7 +1027,7 @@ describe("delegated goals", () => {
         await say(app, source, "bare pr check night shift test");
         assert.match(
             (await modelTexts(app, source)).join("\n"),
-            /night_shift\.pr_check needs pr when the task has no worktree of its own: the current branch is not the task's branch\./,
+            /shift\.pr_check needs pr when the task has no worktree of its own: the current branch is not the task's branch\./,
         );
         assert.equal(app.sessions().length, before);
         assert.equal(linkedTo(source).length, 0);
@@ -1022,7 +1100,7 @@ describe("delegated goals", () => {
                 (await entries(linked)).items.filter(
                     (entry) =>
                         entry.kind === "pi.user" &&
-                        JSON.stringify(entry.model).includes("[night-shift] Round"),
+                        JSON.stringify(entry.model).includes("[shift] Round"),
                 ).length,
                 0,
                 "no round before start",

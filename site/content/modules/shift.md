@@ -1,14 +1,14 @@
-# Night shift
+# Shift
 
-"Do X overnight while I sleep. Stop only when Y." Pi works in rounds; after each round's answer the module decides whether to go on. When the goal stops, Pi writes a summary for the morning: what it did, what is left, and why it stopped.
+"Do X while I am away. Stop only when Y." Pi works in rounds, at any hour; after each round's answer the module decides whether to go on. When the goal stops, Pi writes a summary: what it did, what is left, and why it stopped.
 
-Files: `night-shift.ts` (the command, the prompt section, the driver task and 1 route) and `night-shift-web/` (the status-line item and its sheet). There is no page: you type `/night-shift` in a conversation, and the status-line item under the message box opens the rounds.
+Files: `night-shift.ts` (the command, the prompt section, the driver task and 1 route) and `night-shift-web/` (the status-line item and its sheet). There is no page: you type `/team-shift` in a conversation, and the status-line item under the message box opens the rounds.
 
 ## Use it
 
 ```text
-/night-shift [start 06:00] [until 07:00 | for 8h] [max 30] [with provider/model] [check `npm test`]: <objective>; stop when <condition>
-/night-shift status | stop | resume
+/team-shift [start 06:00] [until 07:00 | for 8h] [max 30] [with provider/model] [check `npm test`]: <objective>; stop when <condition>
+/team-shift status | stop | resume
 ```
 
 - Options come first, in any order, then an optional `:`, then the objective. The text splits at the last "stop when" (or "stop only when").
@@ -22,14 +22,14 @@ Files: `night-shift.ts` (the command, the prompt section, the driver task and 1 
 Examples:
 
 ```text
-/night-shift until 07:00 max 30: migrate the API client to v2; stop when all tests pass and the PR is open
-/night-shift start 06:00 until 17:00 max 40: <objective>; stop when <condition>
-/night-shift for 6h check `npm test`: fix the flaky login tests; stop only when the suite passes 3 times in a row
+/team-shift until 07:00 max 30: migrate the API client to v2; stop when all tests pass and the PR is open
+/team-shift start 06:00 until 17:00 max 40: <objective>; stop when <condition>
+/team-shift for 6h check `npm test`: fix the flaky login tests; stop only when the suite passes 3 times in a row
 ```
 
 ## How a round goes
 
-1. The module sends a message, `[night-shift] Round N of M…`, with the objective, the stop condition, the deadline, and what happened last round.
+1. The module sends a message, `[shift] Round N of M…`, with the objective, the stop condition, the deadline, and what happened last round.
 2. A prompt section tells Pi to end every answer with `STATUS: DONE|CONTINUE|BLOCKED: <reason>`, to say DONE only when the condition holds, and never to work around Lancet Guard or plan mode.
 3. Pi's answer decides: DONE ends the goal (after the check passes, when there is one); BLOCKED ends it; CONTINUE, or no status line, goes on. Pi judges the condition itself: no other model is asked.
 
@@ -44,11 +44,11 @@ Examples:
 | the same check failure comes 3 times in a row | ended as blocked; summary                    |
 | a person writes in the session                | paused, with a notice; `resume`              |
 | plan mode is on                               | paused; `resume` after plan mode is off      |
-| Stop, or `/night-shift stop`                  | ended; no summary                            |
+| Stop, or `/team-shift stop`                   | ended; no summary                            |
 | a spend limit                                 | ended; no summary                            |
 | a round gets no answer (a model error)        | ended, with the error                        |
 
-The status line under the message box shows the goal, for example `Night shift 3/30 · until 07:00 EDT`, or that it waits, is paused, or how it ended. Tap it for the rounds.
+The status line under the message box shows the goal, for example `Shift 3/30 · until 07:00 EDT`, or that it waits, is paused, or how it ended. Tap it for the rounds.
 
 ## Durability
 
@@ -56,21 +56,30 @@ The rounds come from a durable task, `x.night-shift.driver`, and each step is a 
 
 State is one document per conversation, `x.night-shift.goal`. It is stored data.
 
-## Delegated night shifts
+## Delegated shifts
 
-A supervisor identity can start a night shift in the linked session that `team_delegate` makes, with its `night_shift` argument: `{ objective?, stop_when, start?, until?, for?, max?, worker?, pr_check? }`. The report comes back to the supervisor's session by itself when the goal stops.
+A supervisor identity can start a shift in the linked session that `team_delegate` makes, with its `shift` argument: `{ objective?, stop_when, start?, until?, for?, max?, worker?, pr_check? }`. The report comes back to the supervisor's session by itself when the goal stops. `night_shift` is the old name of `shift`, with the same fields; a call that gives both is refused.
 
-A night shift from the tool takes no free check command. `pr_check` is the only check it takes: a structured PR check, and the module builds the `gh` command itself from `pr`, `repo`, `checks` and `label`. Both modules must be on in **Menu → Extensions**.
+A shift from the tool takes no free check command. `pr_check` is the only check it takes: a structured PR check, and the module builds the `gh` command itself from `pr`, `repo`, `checks` and `label`. Both modules must be on in **Menu → Extensions**.
 
 ## Limits and rules
 
 - **Lancet Guard:** every tool call of every round goes through the guard. If the guard asks a person, the round waits for that person, and the deadline does not cut it short. A free check command runs unasked, with the owner's rights, and the guard does not see it, so only the owner can set or resume a goal with a free check.
 - **Plan mode:** a goal does not start in plan mode, and it pauses before a round when plan mode is on.
 - **Worker:** the model must be in the owner's allowed list for subagents. `resume` checks the list again, because it can change.
-- **Who:** anyone who can steer the session runs `/night-shift`; a check needs the owner. One goal per session.
+- **Who:** anyone who can steer the session runs `/team-shift`; a check needs the owner. One goal per session.
 - **Size:** objective and condition together are 3000 characters. A check is 2000 characters, runs for 10 minutes at most, and keeps the last 3000 characters of its output.
-- **2 internals:** night shift reads Pi Pocket's `pocket.plan` document and the request-id format `p:<person>:…`. Neither is public API, so a Pocket upgrade can break it. Both fail safe, as the reference page says.
+- **2 internals:** a shift reads Pi Pocket's `pocket.plan` document and the request-id format `p:<person>:…`. Neither is public API, so a Pocket upgrade can break it. Both fail safe, as the reference page says.
+
+## Old names
+
+The feature was called "night shift". It runs at any hour, so it is now "shift".
+
+- `/night-shift` still works: it does what `/team-shift` does, and each answer starts with "`/night-shift` is now `/team-shift`."
+- `night_shift` in `team_delegate` still works: it takes the same fields as `shift`.
+- The command is `/team-shift`, not `/shift`: Pi Pocket requires a `-` in an extension command name.
+- The file `night-shift.ts`, the folder `night-shift-web/`, the module name in **Menu → Extensions**, and the stored names (`x.night-shift.goal`, `x.night-shift.driver`) keep the old name: they are stored data or live identity.
 
 ## Read more
 
-The reference page is [Night shift](https://github.com/bketelsen/pi-pocket-team/blob/main/docs/modules/night-shift.md), with [commands](https://github.com/bketelsen/pi-pocket-team/blob/main/docs/modules/night-shift.md#commands), [a start time](https://github.com/bketelsen/pi-pocket-team/blob/main/docs/modules/night-shift.md#a-start-time), [when it stops](https://github.com/bketelsen/pi-pocket-team/blob/main/docs/modules/night-shift.md#when-it-stops), [limits and rules](https://github.com/bketelsen/pi-pocket-team/blob/main/docs/modules/night-shift.md#limits-and-rules), [delegated night shifts](https://github.com/bketelsen/pi-pocket-team/blob/main/docs/modules/night-shift.md#delegated-night-shifts) and [caveats](https://github.com/bketelsen/pi-pocket-team/blob/main/docs/modules/night-shift.md#caveats).
+The reference page is [Shift](https://github.com/bketelsen/pi-pocket-team/blob/main/docs/modules/shift.md), with [commands](https://github.com/bketelsen/pi-pocket-team/blob/main/docs/modules/shift.md#commands), [a start time](https://github.com/bketelsen/pi-pocket-team/blob/main/docs/modules/shift.md#a-start-time), [when it stops](https://github.com/bketelsen/pi-pocket-team/blob/main/docs/modules/shift.md#when-it-stops), [limits and rules](https://github.com/bketelsen/pi-pocket-team/blob/main/docs/modules/shift.md#limits-and-rules), [delegated shifts](https://github.com/bketelsen/pi-pocket-team/blob/main/docs/modules/shift.md#delegated-shifts), [old names](https://github.com/bketelsen/pi-pocket-team/blob/main/docs/modules/shift.md#old-names) and [caveats](https://github.com/bketelsen/pi-pocket-team/blob/main/docs/modules/shift.md#caveats).

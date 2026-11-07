@@ -34,7 +34,8 @@ Node is pinned in `mise.toml` and `mise.lock`; `make verify` needs Node.js 22 or
 The tests run each module inside a real Pi Pocket app built by the checkout's test harness: temporary data, test credentials, a fake model. `homewiki.test.ts` points the module at a fixture wiki with `PI_POCKET_HOMEWIKI_ROOT`, and the server never sets it, so production reads the real checkout.
 
 - `team-memory.test.ts` checks agent memory's rules directly and through the app, with fixture agent profiles.
-- `night-shift.test.ts` runs night shifts against a scripted model, restarts included.
+- `night-shift.test.ts` runs shifts against a scripted model, restarts included, through `/team-shift` and its old name `/night-shift`.
+- `shift-names.test.ts` fails on a literal in the modules, or prose in the docs and the site (outside code), that still names the feature "night shift", except the stored names, identities, aliases and old-name notes on its lists.
 - `npm run preview` (`preview.ts`) opens an isolated app with sample lessons, to look at the panel.
 
 ## Build this site

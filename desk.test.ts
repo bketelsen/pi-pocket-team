@@ -60,6 +60,7 @@ import {
     OTHER_PRS_MAX,
     seedThreads,
     shortLine,
+    personAndBody,
     detachFrom,
     ownThread,
     deskEpoch,
@@ -1347,7 +1348,7 @@ describe("closeCheck", () => {
         const running = closeCheck(thread({ run: { shift: "running" } }), facts());
 
         assert.equal(running.close, false);
-        assert.deepEqual(running.open, ["the night shift is running"]);
+        assert.deepEqual(running.open, ["the shift is running"]);
 
         const blocked = closeCheck(
             thread({ prs: merged, run: { ...sent, reportBlocked: true } }),
@@ -10683,10 +10684,17 @@ describe("shortLine", () => {
         assert.match(line, / · needs Brian · desk read T1/);
     });
 
-    test("says night shift report for a night shift", () => {
+    test("a round of a shift is no person: the new prefix and the old one", () => {
+        assert.equal(personAndBody("[shift] Round 2 of 20.").person, undefined);
+        assert.equal(personAndBody("[night-shift] Round 2 of 20.").person, undefined);
+        assert.equal(personAndBody("[from: Brian] desk ok").person, "Brian");
+        assert.equal(personAndBody("[shifts] not a round").person, "A person");
+    });
+
+    test("says shift report for a shift", () => {
         assert.equal(
             shortLine(seeded(), { from: "night-shift", text: "short", quote: "“done”" }),
-            "[desk] T1 frostyard/frostmail · night shift report (5 chars) · desk read T1 · “done”",
+            "[desk] T1 frostyard/frostmail · shift report (5 chars) · desk read T1 · “done”",
         );
     });
 
@@ -11338,11 +11346,11 @@ function scriptStep(text: string, request: unknown): ReturnType<typeof script> |
         return answer("Should I merge #107?");
     }
 
-    if (text.startsWith("[night-shift] The night shift has stopped")) {
+    if (text.startsWith("[shift] The shift has stopped")) {
         return answer(nightSummary === "" ? LONG_SUMMARY : nightSummary);
     }
 
-    if (text.startsWith("[night-shift] Round")) {
+    if (text.startsWith("[shift] Round")) {
         return answer("STATUS: DONE: it works");
     }
 
@@ -11714,6 +11722,16 @@ function scriptStep(text: string, request: unknown): ReturnType<typeof script> |
     if (text.endsWith("clerk merge test")) {
         return fauxAssistantMessage([fauxToolCall("bash", { command: "gh pr merge 7" })], {
             stopReason: "toolUse",
+        });
+    }
+
+    if (text.endsWith("desk both shift names test")) {
+        return call("team_delegate", {
+            agent: "duncan",
+            repository: "frostyard/test",
+            task: TASK,
+            shift: { stop_when: "the work is done" },
+            night_shift: { stop_when: "the work is done" },
         });
     }
 
@@ -15392,6 +15410,20 @@ describe("the desk in a Pi Pocket", () => {
         );
     });
 
+    test("shift and night_shift together are refused: no linked session and no desk thread", async () => {
+        const source = await supervisor("both-names");
+        const threads = Object.keys((await deskState())?.threads ?? {}).length;
+        const sessions = app.sessions().length;
+
+        await say(app, source, "desk both shift names test");
+        assert.match(
+            (await modelTexts(app, source)).join("\n"),
+            /Give shift or night_shift, not both\./,
+        );
+        assert.equal(app.sessions().length, sessions, "no linked session");
+        assert.equal(Object.keys((await deskState())?.threads ?? {}).length, threads, "no thread");
+    });
+
     test("a night shift's report is filed on the thread, and the chat gets one line", async () => {
         const source = await supervisor("night");
 
@@ -15406,7 +15438,7 @@ describe("the desk in a Pi Pocket", () => {
             async () =>
                 (await modelTexts(app, source))
                     .join("\n")
-                    .includes(`[desk] ${thread.id} frostyard/test · night shift report`),
+                    .includes(`[desk] ${thread.id} frostyard/test · shift report`),
             "the night shift's short line",
             30_000,
         );
@@ -15421,7 +15453,7 @@ describe("the desk in a Pi Pocket", () => {
 
         assert.match(read, /NIGHT-REPORT-END/);
         assert.match(read, /<report/);
-        assert.match(read, /Night shift report from this linked session/);
+        assert.match(read, /Shift report from this linked session/);
     });
 
     /** The desk's published API, from its global: a test watches what the other modules call on it. */
@@ -23000,7 +23032,7 @@ describe("the desk in a Pi Pocket", () => {
                 );
                 assert.equal(
                     (await modelTexts(app, source)).filter((each) =>
-                        each.includes("· night shift report ("),
+                        each.includes("· shift report ("),
                     ).length,
                     0,
                     "no line at the supervisor yet",
@@ -27059,7 +27091,7 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
                         .filter((event) => event.key === `archived:${key}`)
                         .map((event) => event.text),
                     [
-                        "session archived (auto): closed 1d ago; idle, no open ask, no night shift, no schedule, no folder",
+                        "session archived (auto): closed 1d ago; idle, no open ask, no shift, no schedule, no folder",
                     ],
                 );
                 assert.equal((await threadOf(young.id))?.run.archives, undefined);
@@ -27492,7 +27524,7 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
             }
         });
 
-        test("a pending entry that a rule now forbids is withdrawn with no call: a schedule, a busy session, an open ask", async () => {
+        test("a pending entry that a rule now forbids is withdrawn with no call: a schedule, a busy session, an open ask, an unread shift", async () => {
             const stub = archiveDesk();
 
             try {
@@ -27505,8 +27537,9 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
                 const asked = await closedThread(source, stub, 2 * DAY, (thread) => {
                     thread.asks = [{ id: `${thread.id}a`, text: "which one?", at: 1 }];
                 });
+                const unread = await closedThread(source, stub, 2 * DAY);
 
-                for (const one of [scheduled, busy, asked]) {
+                for (const one of [scheduled, busy, asked, unread]) {
                     await app.harness.commit(async (tx) => {
                         const thread = (await tx.doc(DeskThreads)).threads[one.id]!;
 
@@ -27534,6 +27567,12 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
                     };
                 }, context);
                 stub.listed.get(busy.address)!.busy = true;
+                // The shift's goal is not readable: the stored reason is `night-shift-unknown`, and the event says
+                // `shift-unknown`.
+                stub.control.snapshot = (kind, id) =>
+                    kind === "x.night-shift.goal" && Number(id) === unread.session
+                        ? Promise.reject(new Error("the goal read failed"))
+                        : undefined;
                 await stub.sync(source);
 
                 assert.equal(stub.calls.length, 0, "no call");
@@ -27542,6 +27581,7 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
                     [scheduled, "schedule"],
                     [busy, "busy"],
                     [asked, "open-ask"],
+                    [unread, "shift-unknown"],
                 ] as const) {
                     const stored = await threadOf(one.id);
 
@@ -27679,6 +27719,28 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
 
                 assert.match(text, /^Archive dry run: 0 sessions can be archived/);
                 assert.match(text, /Skipped: busy-unknown 2\./);
+            } finally {
+                stub.restore();
+            }
+        });
+
+        test("a shift read that fails keeps the session: the dry run says shift-unknown", async () => {
+            const stub = archiveDesk();
+
+            try {
+                const source = await supervisor("archive-shift-unknown");
+                const one = await closedThread(source, stub, 3 * DAY);
+
+                stub.control.snapshot = (kind, id) =>
+                    kind === "x.night-shift.goal" && Number(id) === one.session
+                        ? Promise.reject(new Error("the goal read failed"))
+                        : undefined;
+
+                const text = await stub.tool({ action: "archive" }, Number(source));
+
+                assert.match(text, /^Archive dry run: 0 sessions can be archived/);
+                assert.match(text, /Skipped: shift-unknown 1\./);
+                assert.doesNotMatch(text, /night[\s_-]?shift/i);
             } finally {
                 stub.restore();
             }

@@ -15,8 +15,8 @@ of a server who works with a team of named agents. It is written for Brian Ketel
   own memory. See [Team](https://bketelsen.github.io/pi-pocket-team/modules/team/).
 - **Desk.** One thread for each piece of background work: its agents, PRs, asks and reports, on an owner-only page.
   See [Desk](https://bketelsen.github.io/pi-pocket-team/modules/desk/).
-- **Night shift.** `/night-shift`: Pi works on an objective in rounds until a stop condition, a round limit or a
-  deadline, then writes a summary. See [Night shift](https://bketelsen.github.io/pi-pocket-team/modules/night-shift/).
+- **Shift.** `/team-shift` (old name `/night-shift`): Pi works on an objective in rounds, at any hour, until a stop
+  condition, a round limit or a deadline, then writes a summary. See [Shift](https://bketelsen.github.io/pi-pocket-team/modules/shift/).
 - **Model router.** Shadow only: it records the model it would pick for each delegation, with the brief's features, and changes nothing.
   See [Model router](https://bketelsen.github.io/pi-pocket-team/modules/model-router/).
 - **Homewiki.** The "Wiki" rail page: a Markdown wiki checkout rendered from disk, read-only and owner-only. See
