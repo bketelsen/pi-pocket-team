@@ -970,7 +970,52 @@ export type TeamApi = {
      * then refuses `plan consult`.
      */
     startConsult?: (request: TeamStartConsultRequest) => Promise<TeamStartConsultResult>;
+    /**
+     * Start 1 shift for the desk's goal board: the same start as `team_delegate` with `shift`, from the supervisor's
+     * session (persona, worktree, desk thread, identity, allowed model, the goal), under the board's key. With `limit`,
+     * the desk's open refuses at the cap minus `reserve` and never uses an OK. It never throws. An older Team has none:
+     * the desk then launches no row.
+     */
+    startShift?: (request: TeamStartShiftRequest) => Promise<TeamStartShiftResult>;
 };
+
+/** A shift from the desk's goal board: the supervisor's session is the source, and the board's key is the start's. */
+export type TeamStartShiftRequest = {
+    supervisor: number;
+    read: Pick<DocumentReader, "snapshot">;
+    commit: <T>(change: (tx: Tx) => T | Promise<T>) => Promise<T>;
+    context: Context;
+    /** The start's key: the same key finds the same thread and session again. */
+    key: string;
+    agent: string;
+    repository?: string;
+    title: string;
+    task: string;
+    shift: {
+        objective?: string;
+        stop_when: string;
+        max: number;
+        /** A length of time, such as 90m: the board gives no `until` or `start`. */
+        for: string;
+        worker?: string;
+        pr_check?: {
+            pr?: number;
+            repo?: string;
+            checks?: "required" | "all" | "none";
+            label?: string;
+        };
+    };
+    limit: { reserve: number };
+};
+
+/**
+ * What a board start did: its thread, session and address (`replay` when the key had bound them before), or why not.
+ * `unknown` is true only when Pocket's start threw (it may have admitted the session); `deskFull` when the desk's open
+ * refused at the cap minus the reserve.
+ */
+export type TeamStartShiftResult =
+    | { thread: string; session: number; address: string; replay: boolean }
+    | { error: string; unknown: boolean; deskFull?: true };
 
 /** A plan consult from the desk: the supervisor's session is the source, and the desk's message carries its marker. */
 export type TeamStartConsultRequest = {
@@ -1583,23 +1628,22 @@ export default function createTeam(host: Host, web: Web) {
         task: string,
         title: string,
         cwd: string | undefined,
-        api: ToolExecutionApi,
-        context: Context,
-    ): Promise<{ output: { type: "text"; text: string }[] }> => {
+        deps: Pick<DelegateDeps, "source" | "key" | "read" | "commit" | "context">,
+    ): Promise<DelegateResult> => {
         const model = clerkModel(persona);
         const desk = deskApi();
-        const supervisor = Number(api.conversationId);
-        const key = `x.team.delegate:${api.taskId}:${api.callId}`;
+        const supervisor = Number(deps.source);
+        const { key, context } = deps;
         const here =
             desk === undefined
                 ? undefined
-                : await api.commit((tx) => desk.clerkOf(tx, supervisor), context);
+                : await deps.commit((tx) => desk.clerkOf(tx, supervisor));
 
         // A replay of the start that made this Clerk: its session is the same one, and nothing changes.
         const replay = here !== undefined && here.key !== undefined && here.key === key;
 
         if (here !== undefined && desk !== undefined && !replay) {
-            const sessions = await host.linkedSessions.list(api.conversationId);
+            const sessions = await host.linkedSessions.list(deps.source);
             const live = sessions.find((session) => session.address === here.address);
 
             // Gone is not there: a new Clerk may start. Archived is not there either; the sweep removes it too.
@@ -1611,10 +1655,17 @@ export default function createTeam(host: Host, web: Web) {
         }
 
         // The supervisor takes no run-end answers of the sessions it starts: the desk sets it before the start.
-        await desk?.reportsOff?.(api, context, supervisor);
+        await desk?.reportsOff?.(
+            {
+                snapshot: deps.read.snapshot.bind(deps.read),
+                commit: (change) => deps.commit(change),
+            },
+            context,
+            supervisor,
+        );
 
         const started = await host.linkedSessions.start(
-            api.conversationId,
+            deps.source,
             {
                 title: `${persona.name}: ${title}`.slice(0, 120),
                 message: taskText(persona, task),
@@ -1625,7 +1676,7 @@ export default function createTeam(host: Host, web: Web) {
         );
 
         // The identity and the registration land in one durable step, under the start's replay key.
-        await api.commit(async (tx) => {
+        await deps.commit(async (tx) => {
             (await tx.doc(Identity, started.session as ConversationId)).persona ??= persona;
 
             if (desk !== undefined) {
@@ -1638,14 +1689,17 @@ export default function createTeam(host: Host, web: Web) {
                     key,
                 });
             }
-        }, context);
+        });
 
         // The desk page loads again: the Clerk is registered now.
         desk?.changed?.();
 
-        return reply(
-            `Assigned to ${persona.name} at ${started.address}, on ${model}. Routine desk news goes to the Clerk now. Send it work with team_message.${desk === undefined ? " The desk is off: the Clerk is not registered." : ""}`,
-        );
+        return {
+            text: `Assigned to ${persona.name} at ${started.address}, on ${model}. Routine desk news goes to the Clerk now. Send it work with team_message.${desk === undefined ? " The desk is off: the Clerk is not registered." : ""}`,
+            session: Number(started.session),
+            address: started.address,
+            replay: false,
+        };
     };
 
     type DelegatedFields = {
@@ -1845,8 +1899,7 @@ export default function createTeam(host: Host, web: Web) {
      * router. Every new route carries the brief's hash; a memo an older `team.ts` wrote replays as it is.
      */
     async function delegationRoute(
-        api: ToolExecutionApi,
-        context: Context,
+        memo: RouteMemo<ThreadRoute>,
         input: RouteInput,
         persona: Persona,
     ): Promise<ThreadRoute | undefined> {
@@ -1862,12 +1915,7 @@ export default function createTeam(host: Host, web: Web) {
             }
 
             return await routeOnce<ThreadRoute>(
-                {
-                    stored: () => api.memo<ThreadRoute>(ROUTE_MEMO, context),
-                    keep: (route) => api.memo<ThreadRoute>(ROUTE_MEMO, route, context),
-                    started: () => api.memo<boolean>(ROUTE_STARTED, context),
-                    start: () => api.memo<boolean>(ROUTE_STARTED, true, context),
-                },
+                memo,
                 async () => {
                     const answer = await router.route({
                         brief: input.brief,
@@ -1917,6 +1965,11 @@ export default function createTeam(host: Host, web: Web) {
                 title: string;
                 at: number;
                 watch?: { checkOn: string; check: string; by: string; on?: string };
+                /**
+                 * A start from the desk's goal board: the open refuses with `deskFull` at the cap minus `reserve`, and
+                 * never uses an OK. An older desk ignores it.
+                 */
+                limit?: { reserve: number };
                 /** The delegation's task text: the desk links the queued issues named in it. */
                 task?: string;
                 /** A plan start (the desk makes its file), or 1 task of an approved plan. */
@@ -2137,6 +2190,99 @@ export default function createTeam(host: Host, web: Web) {
                     ...(request.model === undefined ? {} : { model: request.model }),
                 },
             );
+        },
+        startShift: async (request) => {
+            const source = request.supervisor as ConversationId;
+
+            try {
+                const identity = await resolveIdentity(
+                    request.read,
+                    source,
+                    request.context,
+                    directory,
+                );
+                const supervisor = identity.persona?.name;
+
+                // The source must be the supervisor's own session, as for team_delegate.
+                if (identity.persona?.role !== "supervisor" || supervisor === undefined) {
+                    return {
+                        error: `Conversation ${String(request.supervisor)} is not a supervisor's: a board row starts from its supervisor's conversation.`,
+                        unknown: false,
+                    };
+                }
+
+                const given = flat(request.title);
+                const result = await delegate(
+                    {
+                        source,
+                        key: request.key,
+                        read: request.read,
+                        commit: request.commit,
+                        context: request.context,
+                        supervisor,
+                        supervisorId: identity.persona.id,
+                        limit: request.limit,
+                    },
+                    {
+                        agent: request.agent,
+                        task: request.task,
+                        title: given === "" ? taskTitle(request.task) : given.slice(0, 120),
+                        ...(request.repository === undefined
+                            ? {}
+                            : { repository: request.repository }),
+                        shift: {
+                            ...(request.shift.objective === undefined
+                                ? {}
+                                : { objective: request.shift.objective }),
+                            stop_when: request.shift.stop_when,
+                            max: request.shift.max,
+                            for: request.shift.for,
+                            ...(request.shift.worker === undefined
+                                ? {}
+                                : { worker: request.shift.worker }),
+                            ...(request.shift.pr_check === undefined
+                                ? {}
+                                : { pr_check: request.shift.pr_check }),
+                        },
+                    },
+                );
+
+                if (
+                    result.thread === undefined ||
+                    result.session === undefined ||
+                    result.address === undefined
+                ) {
+                    return {
+                        error: "The desk module is off: a board row needs its desk thread.",
+                        unknown: false,
+                    };
+                }
+
+                return {
+                    thread: result.thread,
+                    session: result.session,
+                    address: result.address,
+                    replay: result.replay,
+                };
+            } catch (error) {
+                const failed = error as {
+                    message?: unknown;
+                    startThrew?: unknown;
+                    startError?: unknown;
+                    closedBefore?: unknown;
+                    deskFull?: unknown;
+                };
+                // A thrown start may have admitted the session; so may a start whose thread the desk failed for it.
+                const unknown = failed.startThrew === true || failed.closedBefore === true;
+
+                return {
+                    error: String(
+                        failed.startThrew === true ? failed.startError : (failed.message ?? error),
+                    ),
+                    unknown,
+                    ...(failed.deskFull === true ? { deskFull: true as const } : {}),
+                };
+            }
         },
         startConsult: async (request) => {
             const supervisor = request.supervisor as ConversationId;
@@ -2894,7 +3040,547 @@ export default function createTeam(host: Host, web: Web) {
             { description },
         );
 
-    const delegate = defineTool({
+    /**
+     * What a delegation needs of its caller: the source session, the start's key, the reads and commits, the
+     * supervisor's name and id, and the router's memo. `team_delegate` gives its tool call's; the desk's board gives its
+     * own (`startShift`), with `limit`: the desk's open then refuses at the cap minus `reserve`, and never uses an OK.
+     */
+    type DelegateDeps = {
+        source: ConversationId;
+        key: string;
+        read: Pick<DocumentReader, "snapshot">;
+        commit: <T>(change: (tx: Tx) => T | Promise<T>) => Promise<T>;
+        context: Context;
+        /** The supervisor's name. */
+        supervisor: string;
+        /** The supervisor's roster id, for a watch's `by`. */
+        supervisorId?: string;
+        /** The router's memo for this start: a tool call's own; none keeps it in memory for this 1 call. */
+        memo?: RouteMemo<ThreadRoute>;
+        limit?: { reserve: number };
+    };
+
+    /** A delegation's checked arguments: the title is the thread's, and `shift` is the one value of its 2 names. */
+    type DelegateArgs = {
+        agent: string;
+        task: string;
+        title: string;
+        repository?: string;
+        shift?: NightShiftArg;
+        plan?: { start?: true; id?: string; task?: string; issue?: string };
+        watch?: { check_on: string; check: string; on?: string };
+    };
+
+    /** What a delegation did: the tool's text, and the thread, session and address it made or found again. */
+    type DelegateResult = {
+        text: string;
+        thread?: string;
+        session?: number;
+        address?: string;
+        replay: boolean;
+    };
+
+    /** A router memo with no store: a call with no tool memo (the desk's board) asks the router at most once here. */
+    const memoryRouteMemo = (): RouteMemo<ThreadRoute> => {
+        let stored: ThreadRoute | undefined;
+        let started = false;
+
+        return {
+            stored: async () => stored,
+            keep: async (route) => (stored = route),
+            started: async () => started,
+            start: async () => (started = true),
+        };
+    };
+
+    /**
+     * 1 delegation, after the caller's own checks: the free check refusal, the agent and its folder, the replay of a
+     * key that bound a session, a Clerk, a plan start, the worktree, the desk thread, the router's record, the start,
+     * and the binding with its shift goal. `team_delegate` and `startShift` share it. It throws the refusal; a thrown
+     * start carries `startThrew`, a full desk `deskFull`, and a thread that closed before its bind `closedBefore`.
+     */
+    const delegate = async (deps: DelegateDeps, args: DelegateArgs): Promise<DelegateResult> => {
+        const { agent, task, title, repository, plan, watch, shift: night_shift } = args;
+        const { source, context, supervisor } = deps;
+        const starting = plan?.start === true;
+        const delivering = plan !== undefined && !starting;
+        /** The whole-plan check: the lead, in its home, with no repository and no worktree. */
+        const verifying = delivering && plan.task?.trim() === "verify";
+        /** The desk's reads and commits, in the shape its API takes. */
+        const deskIo = {
+            snapshot: deps.read.snapshot.bind(deps.read),
+            commit: <T>(change: (tx: Tx) => T | Promise<T>, _at: Context) => deps.commit(change),
+        };
+
+        // The check runs unasked, with the owner's rights, and Lancet Guard does not see it: only the owner sets one,
+        // with /team-shift in the session itself. `pr_check` is the exception: a fixed, read-only `gh` command
+        // that the night-shift module builds from validated values.
+        if (night_shift !== undefined && Object.hasOwn(night_shift, "check")) {
+            throw new Error(
+                "A shift from team_delegate cannot have a check command: the check does not go through Lancet Guard. Use pr_check for a PR goal, or Brian sets a check with /team-shift in the session.",
+            );
+        }
+
+        const persona = await find(agent);
+
+        if (verifying) {
+            if (persona.home === undefined) {
+                throw new Error(
+                    `${persona.name} has no home in its profile: the whole-plan check runs in the lead agent's home, so Brian adds home to ${persona.id}.md.`,
+                );
+            }
+
+            if (repository !== undefined && repository !== "home") {
+                throw new Error(
+                    `The whole-plan check runs in the lead agent's home: leave repository out, or name "home".`,
+                );
+            }
+        }
+
+        // A plan start and the whole-plan check run in the lead's home: they name no repository, so they ask for none.
+        const target =
+            starting || verifying
+                ? {
+                      ...(persona.home === undefined ? {} : { folder: persona.home }),
+                      home: true,
+                  }
+                : taskTarget(persona, repository);
+        const cwd = target.folder;
+
+        if (persona.role === "supervisor") {
+            throw new Error("Choose a specialist from the roster.");
+        }
+
+        // The desk, when it is on: the thread opens in the same durable step's key as the start, so a replay finds
+        // it. With the desk off, delegation works as before.
+        const key = deps.key;
+        const desk = deskApi();
+
+        /**
+         * Start a linked session. A thrown start is an unknown outcome: Pocket may have admitted the first message,
+         * so the desk thread is failed with the reason, and a thread's task stays delegated.
+         */
+        const startLinked = async (request: {
+            title: string;
+            message: string;
+            cwd?: string;
+            model?: string;
+        }): Promise<{ session: ConversationId; address: string } | { error: string }> => {
+            // The supervisor takes no run-end answers of the sessions it starts: the desk sets it before the start.
+            await desk?.reportsOff?.(deskIo, context, Number(source));
+
+            try {
+                const started = await host.linkedSessions.start(source, request, key);
+
+                return { session: started.session as ConversationId, address: started.address };
+            } catch (error) {
+                try {
+                    await deps.commit(async (tx) =>
+                        desk?.fail(tx, key, (error as Error).message, Date.now()),
+                    );
+                    desk?.changed?.();
+                } catch {
+                    // The start's refusal is what the model must see: the desk marks the thread later.
+                }
+
+                return { error: (error as Error).message };
+            }
+        };
+
+        /**
+         * Whether the desk holds a folder: no `worktreeHeld` (an older desk), or a throw, keeps the worktree.
+         */
+        const deskHolds = async (path: string | undefined): Promise<boolean> => {
+            if (path === undefined || desk?.worktreeHeld === undefined) {
+                return true;
+            }
+
+            try {
+                return await desk.worktreeHeld(deskIo, context, path);
+            } catch {
+                return true;
+            }
+        };
+
+        /**
+         * A replay of a call whose session is bound does no setup again: no worktree, no open, no start, no bind.
+         * A thread that closed before any session was bound is refused. No `threadOfKey` (an older desk): go on.
+         */
+        // A desk older than this module cannot tell a replay from new work: refuse before any setup, every path.
+        if (desk !== undefined && desk.threadOfKey === undefined) {
+            throw new Error(
+                "The desk module is older than the Team module: Brian installs both from 1 checkout (npm run install-extension), then delegates again.",
+            );
+        }
+
+        const known =
+            desk?.threadOfKey === undefined
+                ? undefined
+                : await desk.threadOfKey(deps.read, context, key);
+        const early = known === undefined ? "go" : replayDecision(known);
+
+        if (early === "refuse" && known !== undefined) {
+            throw Object.assign(new Error(closedThreadRefusal(known, true)), {
+                closedBefore: true,
+            });
+        }
+
+        if (early === "replay" && known !== undefined) {
+            return {
+                text: starting
+                    ? `Plan ${known.id}: ${persona.name} leads it at ${known.address ?? ""} (a replay of this call). Nothing started again.`
+                    : `Assigned to ${persona.name} at ${known.address ?? ""} (a replay of this call: thread ${known.id}). Nothing started again.`,
+                thread: known.id,
+                ...(known.session === undefined ? {} : { session: known.session }),
+                ...(known.address === undefined ? {} : { address: known.address }),
+                replay: true,
+            };
+        }
+
+        if (persona.role === "clerk") {
+            // A Clerk is 1 long-lived session with no desk thread: neither option has anything to attach to.
+            if (night_shift !== undefined) {
+                throw new Error("A Clerk runs until it is archived: it takes no shift.");
+            }
+
+            if (watch !== undefined) {
+                throw new Error("A Clerk opens no desk thread: it takes no watch.");
+            }
+
+            if (plan !== undefined) {
+                throw new Error("A plan needs a lead agent with role agent: a Clerk is no lead.");
+            }
+
+            return await startClerk(persona, task, title, cwd, deps);
+        }
+
+        if (plan !== undefined && (desk === undefined || desk.plans !== true)) {
+            throw new Error(
+                "The desk module is off or too old for plans: Brian installs and turns on the new version.",
+            );
+        }
+
+        // A plan start: a planning session in the lead agent's home, and the desk's plan file. No worktree, no cap.
+        if (starting) {
+            if (repository !== undefined && repository !== "home") {
+                throw new Error(
+                    `A plan starts in the lead agent's home: leave repository out, or name "home". ${persona.name} works in: ${targetNames(persona).join(", ") || "no folder"}.`,
+                );
+            }
+
+            const issue = plan.issue?.trim();
+            const started = await startPlanThread(
+                {
+                    supervisor: source,
+                    read: deps.read,
+                    commit: deps.commit,
+                    context,
+                    start: (request, startKey) =>
+                        host.linkedSessions.start(source, request, startKey),
+                },
+                {
+                    key,
+                    persona,
+                    title,
+                    idea: task,
+                    source: "chat",
+                    ...(issue === undefined || issue === "" ? {} : { issue }),
+                },
+            );
+
+            if ("error" in started) {
+                throw new Error(
+                    `${started.error} Do not delegate on another model: stop and tell the user.`,
+                );
+            }
+
+            if (started.replay) {
+                return {
+                    text: `Plan ${started.id}: ${persona.name} leads it at ${started.address} (a replay of this call). Nothing started again.`,
+                    thread: started.id,
+                    session: started.session,
+                    address: started.address,
+                    replay: true,
+                };
+            }
+
+            return {
+                text: `Plan ${started.id} started: ${persona.name} leads it at ${started.address}, on ${modelText(persona)}. Brian chats there and approves on the Desk page. Do not delegate its tasks before the plan-approved news.`,
+                thread: started.id,
+                session: started.session,
+                address: started.address,
+                replay: false,
+            };
+        }
+
+        const shift = night_shift === undefined ? undefined : shiftFor(night_shift, task, source);
+        // Each delegation works in its own worktree beside the main checkout: 2 jobs in 1 repository share no folder
+        // and no branch. A folder that is not a repository works as it did before, and a worktree that cannot be
+        // made does not fail the delegation: the result says why, and the task runs in the main checkout.
+        // A home is no repository work: it never gets a worktree, or an agent's notes would split over branches.
+        const worktree =
+            cwd === undefined || target.home === true || (await isHomeFolder(cwd))
+                ? undefined
+                : await delegationWorktree(cwd, { agent: persona.id, key });
+        const where = worktree?.path ?? cwd;
+        const made =
+            worktree?.path === undefined || worktree.branch === undefined
+                ? undefined
+                : { path: worktree.path, branch: worktree.branch, checkout: worktree.checkout };
+        const notMade = worktreeFailure(worktree);
+
+        // A PR check with no number reads the current branch's PR: that is the task's branch only when this
+        // delegation made a worktree of its own.
+        if (
+            night_shift?.pr_check !== undefined &&
+            night_shift.pr_check.pr === undefined &&
+            made === undefined
+        ) {
+            throw new Error(
+                "shift.pr_check needs pr when the task has no worktree of its own: the current branch is not the task's branch.",
+            );
+        }
+
+        const repo = target.repo;
+        let opened: Awaited<ReturnType<NonNullable<DeskApi["open"]>>> | undefined;
+
+        try {
+            // A plan write that is not in its file yet finishes first: the task's brief names the approved revision.
+            if (delivering) {
+                await desk?.publishPlans?.(deskIo, context);
+            }
+
+            opened =
+                desk === undefined
+                    ? undefined
+                    : await deps.commit(async (tx) =>
+                          desk.open(tx, {
+                              key,
+                              ...(deps.limit === undefined ? {} : { limit: deps.limit }),
+                              supervisor: Number(source),
+                              agents: [persona.id],
+                              ...(delivering
+                                  ? { plan: { id: plan.id ?? "", task: plan.task ?? "" } }
+                                  : {}),
+                              ...(repo === undefined ? {} : { repo }),
+                              ...(where === undefined ? {} : { cwd: where }),
+                              ...(made === undefined ? {} : { worktree: made }),
+                              title,
+                              // Every queued issue named in the task text links to the thread.
+                              task,
+                              at: Date.now(),
+                              ...(watch === undefined
+                                  ? {}
+                                  : {
+                                        watch: {
+                                            checkOn: watch.check_on,
+                                            check: watch.check,
+                                            by: deps.supervisorId ?? supervisor,
+                                            ...(watch.on === undefined ? {} : { on: watch.on }),
+                                        },
+                                    }),
+                          }),
+                      );
+        } catch (error) {
+            // A full desk: the refusal rolled back with the open's commit, so a commit of its own records it, and
+            // the Desk page offers "Allow 1" while it waits. A failure here is swallowed: the model must see the
+            // refusal. An older desk has no `refused`: skip it.
+            if (
+                deps.limit === undefined &&
+                desk?.refused !== undefined &&
+                (error as { deskFull?: unknown } | undefined)?.deskFull === true
+            ) {
+                try {
+                    await deps.commit(async (tx) =>
+                        desk.refused?.(tx, {
+                            key,
+                            supervisor: Number(source),
+                            title,
+                            at: Date.now(),
+                        }),
+                    );
+                    desk.changed?.();
+                } catch {
+                    // The refusal is what the model must see.
+                }
+            }
+
+            // The thread never opened. A desk thread may still hold the folder (a starting one, an older one): it
+            // keeps its worktree then. Only when the desk says no, the worktree of this key goes, made or found.
+            if (!(await deskHolds(where))) {
+                await discardRefusedWorktree(worktree, where, () =>
+                    host.linkedSessions.list(source),
+                );
+            }
+
+            throw error;
+        }
+
+        // A thread this call reuses, but that is closed, takes no session: its start failed before. Its worktree is
+        // the closed thread's, and the desk's sweep removes it, so it stays here.
+        if (opened !== undefined) {
+            const refused = closedThreadRefusal(opened.thread, opened.reused);
+
+            if (refused !== undefined) {
+                throw new Error(refused);
+            }
+        }
+
+        // The new thread shows on the desk page at once, not at the next sweep.
+        if (opened !== undefined) {
+            desk?.changed?.();
+        }
+
+        // The watch's date is the one the desk resolved at open: a span such as "2w" is kept as its day.
+        const checkOn =
+            opened?.thread.watch === undefined
+                ? undefined
+                : opened.thread.watch.checkTime === undefined
+                  ? opened.thread.watch.checkOn
+                  : `${opened.thread.watch.checkOn} ${opened.thread.watch.checkTime}`;
+        const thread =
+            opened === undefined
+                ? ""
+                : checkOn === undefined
+                  ? ` Thread ${opened.thread.id}.`
+                  : ` Thread ${opened.thread.id}, watching until ${checkOn}.`;
+        // With the desk off, delegation works as before, and the result says the watch is not set.
+        const noDesk =
+            watch === undefined || desk !== undefined
+                ? ""
+                : " The desk is off: the watch is not set.";
+        // A task text that names an open plan: the desk could not check a delegation that does not name its plan.
+        const warned = opened?.warning === undefined ? "" : ` ${opened.warning}`;
+
+        // A plan's brief comes before the task: a delivery names the plan, its task and its acceptance lines.
+        const firstTask = opened?.plan === undefined ? task : `${opened.plan.brief}\n\n${task}`;
+        // The model router's shadow record for this delegation: a record only, never a model. It runs for every
+        // delegation, a shift or not, also when the supervisor named the worker (the route then carries the
+        // `worker`, and the named worker still wins and still runs: nothing here changes the session's model,
+        // `goal.worker` or the result), and only when the router module is on. A shift's brief is its
+        // objective and stop condition; another delegation's is its task as the session gets it, the plan's brief
+        // first. The features read the roster checkout of the delegation's repository: none for a home or a
+        // workspace. Without a route, the delegation is exactly as it is without the router.
+        const route = await delegationRoute(
+            deps.memo ?? memoryRouteMemo(),
+            {
+                brief:
+                    shift === undefined || night_shift === undefined
+                        ? firstTask
+                        : `${night_shift.objective ?? task}\n\nStop when: ${night_shift.stop_when}`,
+                startAt: shift?.request.start ?? Date.now(),
+                ...(shift?.request.worker === undefined ? {} : { worker: shift.request.worker }),
+                repoDirs:
+                    target.repo === undefined || target.folder === undefined ? [] : [target.folder],
+                roster: await rosterRepositories(),
+            },
+            persona,
+        );
+
+        // The owner's profile names the model, and the owner's allowed list permits it: neither is Pi's choice.
+        // Not allowed: the source's model, as before, said in the result. Allowed but unusable now: core refuses
+        // the start, and Pi is told not to try another model.
+        const preferred = allowedModel(persona);
+        const request = {
+            title: `${persona.name}: ${title}`.slice(0, 120),
+            message:
+                shift === undefined
+                    ? taskText(persona, firstTask, worktree)
+                    : delegatedText(persona, firstTask, shift.request, worktree),
+            ...(where === undefined ? {} : { cwd: where }),
+            ...(preferred === undefined ? {} : { model: preferred }),
+        };
+        const replay =
+            opened === undefined ? undefined : replayedStart(opened.thread, opened.reused);
+        const started = replay ?? (await startLinked(request));
+
+        if ("error" in started) {
+            throw Object.assign(
+                new Error(
+                    `${started.error} Do not delegate on another model: stop and tell the user.`,
+                ),
+                { startThrew: true, startError: started.error },
+            );
+        }
+
+        // A bound session from a replay: no bind, no route and no goal again.
+        if (replay !== undefined && opened !== undefined) {
+            return {
+                text: `Assigned to ${persona.name} at ${replay.address} (a replay of this call: thread ${opened.thread.id}). Nothing started again.`,
+                thread: opened.thread.id,
+                session: replay.session,
+                address: replay.address,
+                replay: true,
+            };
+        }
+
+        // The identity, the thread's binding, and the goal land in one durable step.
+        const goal = await deps.commit(async (tx) => {
+            (await tx.doc(Identity, started.session as ConversationId)).persona ??= persona;
+
+            if (desk !== undefined) {
+                await desk.bind(tx, key, {
+                    session: Number(started.session),
+                    address: started.address,
+                    at: Date.now(),
+                });
+            }
+
+            // The router's suggestion lands with the binding: a replay of the call finds it, and adds no second.
+            if (route !== undefined) {
+                await desk?.route?.(tx, key, route);
+            }
+
+            return shift === undefined
+                ? undefined
+                : shift.ns.setDelegated(
+                      tx,
+                      started.session as ConversationId,
+                      shift.request,
+                      {
+                          by: shift.by,
+                          byName: supervisor,
+                          supervisor,
+                      },
+                      key,
+                  );
+        });
+
+        // The thread is bound to its session now: the desk page loads again.
+        desk?.changed?.();
+
+        const bound = {
+            ...(opened === undefined ? {} : { thread: opened.thread.id }),
+            session: Number(started.session),
+            address: started.address,
+            replay: false,
+        };
+
+        if (shift !== undefined) {
+            shift.ns.notifyChanged(started.session as ConversationId);
+        }
+
+        if (shift === undefined || goal === undefined) {
+            return {
+                ...bound,
+                text: `Assigned to ${persona.name} at ${started.address}, on ${modelText(persona)}.${thread}${notMade === "" ? "" : ` ${notMade}`} Reports arrive when they send them; do not poll or acknowledge reports.${noDesk}${warned}`,
+            };
+        }
+
+        const begins =
+            goal.startLabel === undefined
+                ? "round 1 starts now"
+                : `round 1 starts at ${goal.startLabel}${goal.startWhy === "deepseek-peak" ? ", after DeepSeek's peak hours" : ""}`;
+        const ends =
+            goal.deadlineLabel === undefined ? "no deadline" : `until ${goal.deadlineLabel}`;
+
+        return {
+            ...bound,
+            text: `Assigned to ${persona.name} at ${started.address}, on ${modelText(persona)}.${thread}${notMade === "" ? "" : ` ${notMade}`} Shift set there: at most ${goal.maxRounds} rounds, ${begins}, ${ends}.${route === undefined ? "" : ` ${route.line}.`} Its report arrives here when it stops; do not poll. /team-shift status in that session shows it.${noDesk}${warned}`,
+        };
+    };
+
+    const delegateTool = defineTool({
         name: "team_delegate",
         description:
             "Supervisor only: give a self-contained task to a named agent in their repository folder. Choose a repository from the roster if the agent owns more than one. Runs on the agent's profile model when the owner allows it for subagents, otherwise on your model (the roster shows each agent's model); thinking is yours, or the nearest level the model has. Returns an address without waiting for completion. With shift, the linked session runs a shift goal in rounds, and its report comes back here by itself when it stops. A shift takes no free check command, and team_delegate refuses one. It can take pr_check instead: a structured PR check that runs gh pr checks and gh pr view, read only, in the linked session's folder after Pi says DONE, and must pass. With watch, the desk thread sleeps until the check's date: it does not count toward the cap, and a check result closes it. With watch.on, an event (a thread closes, a PR merges, gets a label or a review) makes the check due before its date. With plan, start a plan (plan.start with repository home: a planning session in the lead agent's home) or deliver 1 task of an approved plan (plan.id and plan.task).",
@@ -2992,8 +3678,6 @@ export default function createTeam(host: Host, web: Web) {
             const night_shift = args.shift ?? args.night_shift;
             const starting = plan?.start === true;
             const delivering = plan !== undefined && !starting;
-            /** The whole-plan check: the lead, in its home, with no repository and no worktree. */
-            const verifying = delivering && plan.task?.trim() === "verify";
 
             // A plan: a start (with repository home), or 1 task of an approved plan. Its rules come first: nothing
             // starts before they hold.
@@ -3045,460 +3729,37 @@ export default function createTeam(host: Host, web: Web) {
                 throw new Error("Only a session assigned a supervisor identity can delegate.");
             }
 
-            // The check runs unasked, with the owner's rights, and Lancet Guard does not see it: only the owner sets one,
-            // with /team-shift in the session itself. `pr_check` is the exception: a fixed, read-only `gh` command
-            // that the night-shift module builds from validated values.
-            if (night_shift !== undefined && Object.hasOwn(night_shift, "check")) {
-                throw new Error(
-                    "A shift from team_delegate cannot have a check command: the check does not go through Lancet Guard. Use pr_check for a PR goal, or Brian sets a check with /team-shift in the session.",
-                );
-            }
-
-            const persona = await find(agent);
-
-            if (verifying) {
-                if (persona.home === undefined) {
-                    throw new Error(
-                        `${persona.name} has no home in its profile: the whole-plan check runs in the lead agent's home, so Brian adds home to ${persona.id}.md.`,
-                    );
-                }
-
-                if (repository !== undefined && repository !== "home") {
-                    throw new Error(
-                        `The whole-plan check runs in the lead agent's home: leave repository out, or name "home".`,
-                    );
-                }
-            }
-
-            // A plan start and the whole-plan check run in the lead's home: they name no repository, so they ask for none.
-            const target =
-                starting || verifying
-                    ? {
-                          ...(persona.home === undefined ? {} : { folder: persona.home }),
-                          home: true,
-                      }
-                    : taskTarget(persona, repository);
-            const cwd = target.folder;
-
-            if (persona.role === "supervisor") {
-                throw new Error("Choose a specialist from the roster.");
-            }
-
-            // The desk, when it is on: the thread opens in the same durable step's key as the start, so a replay finds
-            // it. With the desk off, delegation works as before.
-            const key = `x.team.delegate:${api.taskId}:${api.callId}`;
-            const desk = deskApi();
-
-            /**
-             * Start a linked session. A thrown start is an unknown outcome: Pocket may have admitted the first message,
-             * so the desk thread is failed with the reason, and a thread's task stays delegated.
-             */
-            const startLinked = async (request: {
-                title: string;
-                message: string;
-                cwd?: string;
-                model?: string;
-            }): Promise<{ session: ConversationId; address: string } | { error: string }> => {
-                // The supervisor takes no run-end answers of the sessions it starts: the desk sets it before the start.
-                await desk?.reportsOff?.(api, context, Number(api.conversationId));
-
-                try {
-                    const started = await host.linkedSessions.start(
-                        api.conversationId,
-                        request,
-                        key,
-                    );
-
-                    return { session: started.session as ConversationId, address: started.address };
-                } catch (error) {
-                    try {
-                        await api.commit(
-                            async (tx) => desk?.fail(tx, key, (error as Error).message, Date.now()),
-                            context,
-                        );
-                        desk?.changed?.();
-                    } catch {
-                        // The start's refusal is what the model must see: the desk marks the thread later.
-                    }
-
-                    return { error: (error as Error).message };
-                }
-            };
-
-            /**
-             * Whether the desk holds a folder: no `worktreeHeld` (an older desk), or a throw, keeps the worktree.
-             */
-            const deskHolds = async (path: string | undefined): Promise<boolean> => {
-                if (path === undefined || desk?.worktreeHeld === undefined) {
-                    return true;
-                }
-
-                try {
-                    return await desk.worktreeHeld(api, context, path);
-                } catch {
-                    return true;
-                }
-            };
-
-            /**
-             * A replay of a call whose session is bound does no setup again: no worktree, no open, no start, no bind.
-             * A thread that closed before any session was bound is refused. No `threadOfKey` (an older desk): go on.
-             */
-            // A desk older than this module cannot tell a replay from new work: refuse before any setup, every path.
-            if (desk !== undefined && desk.threadOfKey === undefined) {
-                throw new Error(
-                    "The desk module is older than the Team module: Brian installs both from 1 checkout (npm run install-extension), then delegates again.",
-                );
-            }
-
-            const known =
-                desk?.threadOfKey === undefined
-                    ? undefined
-                    : await desk.threadOfKey(api, context, key);
-            const early = known === undefined ? "go" : replayDecision(known);
-
-            if (early === "refuse" && known !== undefined) {
-                throw new Error(closedThreadRefusal(known, true));
-            }
-
-            if (early === "replay" && known !== undefined) {
-                return reply(
-                    starting
-                        ? `Plan ${known.id}: ${persona.name} leads it at ${known.address ?? ""} (a replay of this call). Nothing started again.`
-                        : `Assigned to ${persona.name} at ${known.address ?? ""} (a replay of this call: thread ${known.id}). Nothing started again.`,
-                );
-            }
-
-            if (persona.role === "clerk") {
-                // A Clerk is 1 long-lived session with no desk thread: neither option has anything to attach to.
-                if (night_shift !== undefined) {
-                    throw new Error("A Clerk runs until it is archived: it takes no shift.");
-                }
-
-                if (args.watch !== undefined) {
-                    throw new Error("A Clerk opens no desk thread: it takes no watch.");
-                }
-
-                if (plan !== undefined) {
-                    throw new Error(
-                        "A plan needs a lead agent with role agent: a Clerk is no lead.",
-                    );
-                }
-
-                return await startClerk(persona, task, title, cwd, api, context);
-            }
-
-            if (plan !== undefined && (desk === undefined || desk.plans !== true)) {
-                throw new Error(
-                    "The desk module is off or too old for plans: Brian installs and turns on the new version.",
-                );
-            }
-
-            // A plan start: a planning session in the lead agent's home, and the desk's plan file. No worktree, no cap.
-            if (starting) {
-                if (repository !== undefined && repository !== "home") {
-                    throw new Error(
-                        `A plan starts in the lead agent's home: leave repository out, or name "home". ${persona.name} works in: ${targetNames(persona).join(", ") || "no folder"}.`,
-                    );
-                }
-
-                const issue = plan.issue?.trim();
-                const started = await startPlanThread(
-                    {
-                        supervisor: api.conversationId,
-                        read: api,
-                        commit: (change) => api.commit(change, context),
-                        context,
-                        start: (request, startKey) =>
-                            host.linkedSessions.start(api.conversationId, request, startKey),
-                    },
-                    {
-                        key,
-                        persona,
-                        title,
-                        idea: task,
-                        source: "chat",
-                        ...(issue === undefined || issue === "" ? {} : { issue }),
-                    },
-                );
-
-                if ("error" in started) {
-                    throw new Error(
-                        `${started.error} Do not delegate on another model: stop and tell the user.`,
-                    );
-                }
-
-                if (started.replay) {
-                    return reply(
-                        `Plan ${started.id}: ${persona.name} leads it at ${started.address} (a replay of this call). Nothing started again.`,
-                    );
-                }
-
-                return reply(
-                    `Plan ${started.id} started: ${persona.name} leads it at ${started.address}, on ${modelText(persona)}. Brian chats there and approves on the Desk page. Do not delegate its tasks before the plan-approved news.`,
-                );
-            }
-
-            const shift =
-                night_shift === undefined
-                    ? undefined
-                    : shiftFor(night_shift, task, api.conversationId);
-            // Each delegation works in its own worktree beside the main checkout: 2 jobs in 1 repository share no folder
-            // and no branch. A folder that is not a repository works as it did before, and a worktree that cannot be
-            // made does not fail the delegation: the result says why, and the task runs in the main checkout.
-            // A home is no repository work: it never gets a worktree, or an agent's notes would split over branches.
-            const worktree =
-                cwd === undefined || target.home === true || (await isHomeFolder(cwd))
-                    ? undefined
-                    : await delegationWorktree(cwd, { agent: persona.id, key });
-            const where = worktree?.path ?? cwd;
-            const made =
-                worktree?.path === undefined || worktree.branch === undefined
-                    ? undefined
-                    : { path: worktree.path, branch: worktree.branch, checkout: worktree.checkout };
-            const notMade = worktreeFailure(worktree);
-
-            // A PR check with no number reads the current branch's PR: that is the task's branch only when this
-            // delegation made a worktree of its own.
-            if (
-                night_shift?.pr_check !== undefined &&
-                night_shift.pr_check.pr === undefined &&
-                made === undefined
-            ) {
-                throw new Error(
-                    "shift.pr_check needs pr when the task has no worktree of its own: the current branch is not the task's branch.",
-                );
-            }
-
-            const repo = target.repo;
-            let opened: Awaited<ReturnType<NonNullable<DeskApi["open"]>>> | undefined;
-
-            try {
-                // A plan write that is not in its file yet finishes first: the task's brief names the approved revision.
-                if (delivering) {
-                    await desk?.publishPlans?.(api, context);
-                }
-
-                opened =
-                    desk === undefined
-                        ? undefined
-                        : await api.commit(
-                              async (tx) =>
-                                  desk.open(tx, {
-                                      key,
-                                      supervisor: Number(api.conversationId),
-                                      agents: [persona.id],
-                                      ...(delivering
-                                          ? { plan: { id: plan.id ?? "", task: plan.task ?? "" } }
-                                          : {}),
-                                      ...(repo === undefined ? {} : { repo }),
-                                      ...(where === undefined ? {} : { cwd: where }),
-                                      ...(made === undefined ? {} : { worktree: made }),
-                                      title,
-                                      // Every queued issue named in the task text links to the thread.
-                                      task,
-                                      at: Date.now(),
-                                      ...(args.watch === undefined
-                                          ? {}
-                                          : {
-                                                watch: {
-                                                    checkOn: args.watch.check_on,
-                                                    check: args.watch.check,
-                                                    by: identity?.persona?.id ?? supervisor,
-                                                    ...(args.watch.on === undefined
-                                                        ? {}
-                                                        : { on: args.watch.on }),
-                                                },
-                                            }),
-                                  }),
-                              context,
-                          );
-            } catch (error) {
-                // A full desk: the refusal rolled back with the open's commit, so a commit of its own records it, and
-                // the Desk page offers "Allow 1" while it waits. A failure here is swallowed: the model must see the
-                // refusal. An older desk has no `refused`: skip it.
-                if (
-                    desk?.refused !== undefined &&
-                    (error as { deskFull?: unknown } | undefined)?.deskFull === true
-                ) {
-                    try {
-                        await api.commit(
-                            async (tx) =>
-                                desk.refused?.(tx, {
-                                    key,
-                                    supervisor: Number(api.conversationId),
-                                    title,
-                                    at: Date.now(),
-                                }),
-                            context,
-                        );
-                        desk.changed?.();
-                    } catch {
-                        // The refusal is what the model must see.
-                    }
-                }
-
-                // The thread never opened. A desk thread may still hold the folder (a starting one, an older one): it
-                // keeps its worktree then. Only when the desk says no, the worktree of this key goes, made or found.
-                if (!(await deskHolds(where))) {
-                    await discardRefusedWorktree(worktree, where, () =>
-                        host.linkedSessions.list(api.conversationId),
-                    );
-                }
-
-                throw error;
-            }
-
-            // A thread this call reuses, but that is closed, takes no session: its start failed before. Its worktree is
-            // the closed thread's, and the desk's sweep removes it, so it stays here.
-            if (opened !== undefined) {
-                const refused = closedThreadRefusal(opened.thread, opened.reused);
-
-                if (refused !== undefined) {
-                    throw new Error(refused);
-                }
-            }
-
-            // The new thread shows on the desk page at once, not at the next sweep.
-            if (opened !== undefined) {
-                desk?.changed?.();
-            }
-
-            // The watch's date is the one the desk resolved at open: a span such as "2w" is kept as its day.
-            const checkOn =
-                opened?.thread.watch === undefined
-                    ? undefined
-                    : opened.thread.watch.checkTime === undefined
-                      ? opened.thread.watch.checkOn
-                      : `${opened.thread.watch.checkOn} ${opened.thread.watch.checkTime}`;
-            const thread =
-                opened === undefined
-                    ? ""
-                    : checkOn === undefined
-                      ? ` Thread ${opened.thread.id}.`
-                      : ` Thread ${opened.thread.id}, watching until ${checkOn}.`;
-            // With the desk off, delegation works as before, and the result says the watch is not set.
-            const noDesk =
-                args.watch === undefined || desk !== undefined
-                    ? ""
-                    : " The desk is off: the watch is not set.";
-            // A task text that names an open plan: the desk could not check a delegation that does not name its plan.
-            const warned = opened?.warning === undefined ? "" : ` ${opened.warning}`;
-
-            // A plan's brief comes before the task: a delivery names the plan, its task and its acceptance lines.
-            const firstTask = opened?.plan === undefined ? task : `${opened.plan.brief}\n\n${task}`;
-            // The model router's shadow record for this delegation: a record only, never a model. It runs for every
-            // delegation, a shift or not, also when the supervisor named the worker (the route then carries the
-            // `worker`, and the named worker still wins and still runs: nothing here changes the session's model,
-            // `goal.worker` or the result), and only when the router module is on. A shift's brief is its
-            // objective and stop condition; another delegation's is its task as the session gets it, the plan's brief
-            // first. The features read the roster checkout of the delegation's repository: none for a home or a
-            // workspace. Without a route, the delegation is exactly as it is without the router.
-            const route = await delegationRoute(
-                api,
-                context,
-                {
-                    brief:
-                        shift === undefined || night_shift === undefined
-                            ? firstTask
-                            : `${night_shift.objective ?? task}\n\nStop when: ${night_shift.stop_when}`,
-                    startAt: shift?.request.start ?? Date.now(),
-                    ...(shift?.request.worker === undefined
-                        ? {}
-                        : { worker: shift.request.worker }),
-                    repoDirs:
-                        target.repo === undefined || target.folder === undefined
-                            ? []
-                            : [target.folder],
-                    roster: await rosterRepositories(),
-                },
-                persona,
-            );
-
-            // The owner's profile names the model, and the owner's allowed list permits it: neither is Pi's choice.
-            // Not allowed: the source's model, as before, said in the result. Allowed but unusable now: core refuses
-            // the start, and Pi is told not to try another model.
-            const preferred = allowedModel(persona);
-            const request = {
-                title: `${persona.name}: ${title}`.slice(0, 120),
-                message:
-                    shift === undefined
-                        ? taskText(persona, firstTask, worktree)
-                        : delegatedText(persona, firstTask, shift.request, worktree),
-                ...(where === undefined ? {} : { cwd: where }),
-                ...(preferred === undefined ? {} : { model: preferred }),
-            };
-            const replay =
-                opened === undefined ? undefined : replayedStart(opened.thread, opened.reused);
-            const started = replay ?? (await startLinked(request));
-
-            if ("error" in started) {
-                throw new Error(
-                    `${started.error} Do not delegate on another model: stop and tell the user.`,
-                );
-            }
-
-            // A bound session from a replay: no bind, no route and no goal again.
-            if (replay !== undefined && opened !== undefined) {
-                return reply(
-                    `Assigned to ${persona.name} at ${replay.address} (a replay of this call: thread ${opened.thread.id}). Nothing started again.`,
-                );
-            }
-
-            // The identity, the thread's binding, and the goal land in one durable step.
-            const goal = await api.commit(async (tx) => {
-                (await tx.doc(Identity, started.session as ConversationId)).persona ??= persona;
-
-                if (desk !== undefined) {
-                    await desk.bind(tx, key, {
-                        session: Number(started.session),
-                        address: started.address,
-                        at: Date.now(),
-                    });
-                }
-
-                // The router's suggestion lands with the binding: a replay of the call finds it, and adds no second.
-                if (route !== undefined) {
-                    await desk?.route?.(tx, key, route);
-                }
-
-                return shift === undefined
-                    ? undefined
-                    : shift.ns.setDelegated(
-                          tx,
-                          started.session as ConversationId,
-                          shift.request,
-                          {
-                              by: shift.by,
-                              byName: supervisor,
-                              supervisor,
-                          },
-                          key,
-                      );
-            }, context);
-
-            // The thread is bound to its session now: the desk page loads again.
-            desk?.changed?.();
-
-            if (shift !== undefined) {
-                shift.ns.notifyChanged(started.session as ConversationId);
-            }
-
-            if (shift === undefined || goal === undefined) {
-                return reply(
-                    `Assigned to ${persona.name} at ${started.address}, on ${modelText(persona)}.${thread}${notMade === "" ? "" : ` ${notMade}`} Reports arrive when they send them; do not poll or acknowledge reports.${noDesk}${warned}`,
-                );
-            }
-
-            const begins =
-                goal.startLabel === undefined
-                    ? "round 1 starts now"
-                    : `round 1 starts at ${goal.startLabel}${goal.startWhy === "deepseek-peak" ? ", after DeepSeek's peak hours" : ""}`;
-            const ends =
-                goal.deadlineLabel === undefined ? "no deadline" : `until ${goal.deadlineLabel}`;
-
             return reply(
-                `Assigned to ${persona.name} at ${started.address}, on ${modelText(persona)}.${thread}${notMade === "" ? "" : ` ${notMade}`} Shift set there: at most ${goal.maxRounds} rounds, ${begins}, ${ends}.${route === undefined ? "" : ` ${route.line}.`} Its report arrives here when it stops; do not poll. /team-shift status in that session shows it.${noDesk}${warned}`,
+                (
+                    await delegate(
+                        {
+                            source: api.conversationId,
+                            key: `x.team.delegate:${api.taskId}:${api.callId}`,
+                            read: api,
+                            commit: (change) => api.commit(change, context),
+                            context,
+                            supervisor,
+                            ...(identity.persona.id === undefined
+                                ? {}
+                                : { supervisorId: identity.persona.id }),
+                            memo: {
+                                stored: () => api.memo<ThreadRoute>(ROUTE_MEMO, context),
+                                keep: (route) => api.memo<ThreadRoute>(ROUTE_MEMO, route, context),
+                                started: () => api.memo<boolean>(ROUTE_STARTED, context),
+                                start: () => api.memo<boolean>(ROUTE_STARTED, true, context),
+                            },
+                        },
+                        {
+                            agent,
+                            task,
+                            title,
+                            ...(repository === undefined ? {} : { repository }),
+                            ...(night_shift === undefined ? {} : { shift: night_shift }),
+                            ...(plan === undefined ? {} : { plan }),
+                            ...(args.watch === undefined ? {} : { watch: args.watch }),
+                        },
+                    )
+                ).text,
             );
         },
     });
@@ -4032,7 +4293,7 @@ export default function createTeam(host: Host, web: Web) {
 
     return defineExtension({
         name: "named-team",
-        tools: [delegate, work, message, list, teamMemory],
+        tools: [delegateTool, work, message, list, teamMemory],
         hooks: [homeGuard],
         sections: [
             section("named_team", async (input, context) => {
