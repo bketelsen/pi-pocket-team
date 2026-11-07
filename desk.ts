@@ -421,7 +421,10 @@ export type Thread = {
     route?: ThreadRoute;
     /**
      * Facts the sweep keeps: `returnAddress`, `reportedAt`, `reportedUserEntry`, `scanCursor`, `lastUserEntry`,
-     * `seenPrs`, `busy`, `archived`, `repoArchived` (its repository is archived, as the last read saw it), `shift`, `dirty`, `ahead`, `aheadUnknown` (why the unpushed count is unknown: it
+     * `seenPrs`, `busy`, `archived`, `failed` (why its session's last run gave up, on 1 line, at most 300 characters, as
+     * the sweep's list read saw it: Pi Pocket 0.28.0 gives it until a later run starts; absent when the run did not fail,
+     * or on an older Pi Pocket; it holds the thread open and makes it wait on Odrade while the session is idle and not
+     * archived), `repoArchived` (its repository is archived, as the last read saw it), `shift`, `dirty`, `ahead`, `aheadUnknown` (why the unpushed count is unknown: it
      * is absent when the count is known, and `ahead` then keeps its last known value), `folder`, `next`, `sweptAt`,
      * `worktrees` (the linked worktrees of its folder that hold it, `{ path, dirty, unpushed }`: a worktree of it that
      * changed, or holds unpushed commits, keeps it open, and its work is the agent's), `closeout` (the wake-up key that
@@ -889,6 +892,11 @@ export type Consult = {
      * last try began and its result is not committed yet (`consultTryActive`, held at most 10 minutes from `at`).
      */
     start?: { at: number; tries: number; error?: string; unresolved?: true; pending?: true };
+    /**
+     * Why its session's last run gave up, on 1 line, at most 300 characters, as the sweep's list read saw it (Pi Pocket
+     * 0.28.0, until a later run starts). Absent when the run did not fail. It changes no state, slot, or time limit.
+     */
+    failed?: string;
 };
 
 /** One answer from a consult. Stored data: never rename a field. */
@@ -3464,7 +3472,111 @@ export function workedFolders(
     return folders;
 }
 
-/** What keeps a thread's session part open, in words. Undefined when it is closed. */
+/** The longest line of a linked session's failed run that the desk keeps. */
+const MAX_FAILED = 300;
+
+/**
+ * Why a linked session's last run gave up, from 1 entry of `host.linkedSessions.list`: a non-empty string only, on 1
+ * line, at most 300 characters. Pi Pocket 0.28.0 gives the entry `failed`, until a later run starts; a stopped run is
+ * no failure. An older Pi Pocket gives none, so the read is a guarded cast, never the 0.28 type.
+ */
+export function failedLine(entry: object): string | undefined {
+    const failed = (entry as { failed?: unknown }).failed;
+
+    if (typeof failed !== "string") {
+        return undefined;
+    }
+
+    const line = flatLine(failed).slice(0, MAX_FAILED).trimEnd();
+
+    return line === "" ? undefined : line;
+}
+
+/**
+ * Copy a session's failed-run line to `thread.run.failed`, from the sweep's list read. A new line, or another one, adds
+ * 1 event `run failed: <line>`; no line deletes the field with no event. True when it added an event.
+ */
+export function applyRunFailed(thread: Thread, failed: string | undefined, now: number): boolean {
+    if (failed === undefined) {
+        delete thread.run.failed;
+
+        return false;
+    }
+
+    if (thread.run.failed === failed) {
+        return false;
+    }
+
+    thread.run.failed = failed;
+
+    return addEvent(thread, `run-failed:${String(now)}`, `run failed: ${failed}`, now);
+}
+
+/**
+ * Copy a consult session's failed-run line to `consult.failed`. A new line, or another one, adds 1 event on the plan
+ * thread, `consult <id> (<agent>) run failed: <line>`; no line deletes the field with no event. The consult's state,
+ * slot, and time limit do not change. True when it added an event.
+ */
+export function applyConsultFailed(
+    planThread: Thread | undefined,
+    consult: Consult,
+    failed: string | undefined,
+    now: number,
+): boolean {
+    if (failed === undefined) {
+        delete consult.failed;
+
+        return false;
+    }
+
+    if (consult.failed === failed) {
+        return false;
+    }
+
+    consult.failed = failed;
+
+    return (
+        planThread !== undefined &&
+        addEvent(
+            planThread,
+            `consult-run-failed:${consult.id}:${String(now)}`,
+            `consult ${consult.id} (${consult.agent}) run failed: ${failed}`,
+            now,
+        )
+    );
+}
+
+/**
+ * The supervisor to prompt for a `run.ended` event: a session's own run (never a subagent's) whose outcome is
+ * `failed` (Pi Pocket 0.28.0; an older one gives no outcome), and whose session the desk knows. Else undefined.
+ */
+export function failedRunSupervisor(
+    event: { conversationId: number; session: number; outcome?: unknown },
+    supervisorOf: (session: number) => number | undefined,
+): number | undefined {
+    if (event.conversationId !== event.session || event.outcome !== "failed") {
+        return undefined;
+    }
+
+    return supervisorOf(event.session);
+}
+
+/**
+ * The failed-run line that makes a thread wait on Odrade: its session's last run failed, and the session neither works
+ * now nor is archived. Undefined otherwise.
+ */
+function runFailedOf(thread: Thread): string | undefined {
+    const failed = thread.run.failed;
+
+    return typeof failed === "string" && thread.run.busy !== true && thread.run.archived !== true
+        ? failed
+        : undefined;
+}
+
+/**
+ * What keeps a thread's session part open, in words. Undefined when it is closed. An idle session whose last run failed
+ * holds it: the failure blocks the agent, so the thread must not close under it.
+ */
 function openSession(thread: Thread): string | undefined {
     if (thread.session === undefined && thread.address === undefined) {
         return undefined;
@@ -3478,6 +3590,10 @@ function openSession(thread: Thread): string | undefined {
 
     if (busy !== false) {
         return busy === true ? "its session is working" : "its session has not been seen idle";
+    }
+
+    if (typeof thread.run.failed === "string") {
+        return "its last run failed";
     }
 
     // A seeded or found thread has only an address: idle is enough.
@@ -5386,10 +5502,12 @@ export function planUnready(thread: Thread, github: GitHubFacts, now: number): n
 export type NextActor = "brian" | "agent" | "odrade" | "reviewer" | "none";
 
 /**
- * Who acts next on a thread. First match: brian, odrade (a due watch), agent (a failed watch), agent, odrade (a found
- * thread, or a report that says BLOCKED), so a thread whose report asks for a decision waits on Odrade. A silent
- * session (idle, not archived, no report after the last user entry) waits on Odrade too, unless the thread has an open
- * watch that is not due yet: the watch is the wait, and nobody is next until it is due.
+ * Who acts next on a thread. First match: brian (an open ask), odrade (its session's last run failed, and the session is
+ * idle and not archived: `run.failed`, also on a plan thread), agent (a plan thread), odrade (a due watch), agent (a
+ * failed watch), agent, odrade (a found thread, or a report that says BLOCKED), so a thread whose report asks for a
+ * decision waits on Odrade. A silent session (idle, not archived, no report after the last user entry) waits on Odrade
+ * too, unless the thread has an open watch that is not due yet: the watch is the wait, and nobody is next until it is
+ * due.
  */
 export function nextActor(thread: Thread): NextActor {
     if (thread.state === "closed") {
@@ -5398,6 +5516,11 @@ export function nextActor(thread: Thread): NextActor {
 
     if (hasOpenAsk(thread)) {
         return "brian";
+    }
+
+    // A failed run blocks the agent: Odrade looks at it, on a plan thread too. A session that works again is the agent's.
+    if (runFailedOf(thread) !== undefined) {
+        return "odrade";
     }
 
     // A plan thread waits on its planning session, which writes, asks and drafts its graph.
@@ -5499,16 +5622,27 @@ export function nextActor(thread: Thread): NextActor {
 const SILENT_SESSION = "silent session";
 
 /**
- * Why a thread waits on Odrade now, in `nextActor`'s order, in words: a due watch, a found thread, a PR GitHub cannot
- * find, a report that says blocked, else a silent session. Undefined when Odrade is not next, or the thread is parked: a
- * parked thread waits on Brian, not on her.
+ * Why a thread waits on Odrade now, in `nextActor`'s order, in words: a failed run (`run failed: <line>`, also for a plan
+ * thread), a due watch, a found thread, a PR GitHub cannot find, a report that says blocked, else a silent session.
+ * Undefined when Odrade is not next, for another plan thread, or when the thread is parked: a parked thread waits on
+ * Brian, not on her.
  */
 export function odradeReason(thread: Thread): string | undefined {
-    if (thread.state === "parked" || thread.origin === "plan") {
+    if (thread.state === "parked") {
         return undefined;
     }
 
     if (nextActor(thread) !== "odrade") {
+        return undefined;
+    }
+
+    const failed = runFailedOf(thread);
+
+    if (failed !== undefined) {
+        return `run failed: ${failed}`;
+    }
+
+    if (thread.origin === "plan") {
         return undefined;
     }
 
@@ -22333,7 +22467,14 @@ export default function createDesk(host: Host, web: Web) {
     /** The read that `gather` and Night shift's goal need: enough of a DocumentReader. */
     type Reader = Pick<DocumentReader, "snapshot">;
 
-    type SessionFact = { address: string; busy: boolean; archived: boolean; title?: string };
+    type SessionFact = {
+        address: string;
+        busy: boolean;
+        archived: boolean;
+        title?: string;
+        /** Why the session's last run gave up (`failedLine`): absent when it did not fail. */
+        failed?: string;
+    };
     type FolderFact = {
         dirty: number;
         /** The commits that no remote-tracking ref has; undefined when git could not tell, never 0. */
@@ -24296,6 +24437,38 @@ export default function createDesk(host: Host, web: Web) {
         }
     };
 
+    /**
+     * session id → its supervisor: the sessions of open threads and of plans' consults, as each supervisor's last `gather`
+     * saw them. The `run.ended` listener reads it; it has no document read.
+     */
+    const failedRunSessions = new Map<number, number>();
+    /**
+     * The supervisors that a session's failed run prompted: the next page view sweeps them at once. `gather` takes its
+     * supervisor out before its list read.
+     */
+    const failedRunPrompted = new Set<number>();
+
+    // A `host.on` listener has no document read and no commit, and it cannot wake the sleeping sweeper: it only prompts
+    // the page's view sweep for a session's own failed run. With no page open, the sweeper records it on its round.
+    if (typeof host.on === "function") {
+        web.onDispose(
+            host.on("run.ended", (event) => {
+                try {
+                    const supervisor = failedRunSupervisor(event, (session) =>
+                        failedRunSessions.get(session),
+                    );
+
+                    if (supervisor !== undefined) {
+                        failedRunPrompted.add(supervisor);
+                        web.send("changed", {});
+                    }
+                } catch {
+                    // A listener never throws: the next sweep reads the list anyway.
+                }
+            }),
+        );
+    }
+
     /** Read the world for one supervisor's sweep: its threads, their sessions, their Night shifts, and the folders. */
     const gather = async (
         supervisor: ConversationId,
@@ -24333,15 +24506,49 @@ export default function createDesk(host: Host, web: Web) {
             }
         }
 
+        // The sessions of this supervisor's open threads and of its plans' consults, for the `run.ended` listener: a
+        // failed run of one of them prompts this supervisor's view sweep. A plan is its plan thread's supervisor's.
+        for (const [session, of] of failedRunSessions) {
+            if (of === Number(supervisor)) {
+                failedRunSessions.delete(session);
+            }
+        }
+
+        for (const thread of open) {
+            if (thread.session !== undefined) {
+                failedRunSessions.set(thread.session, Number(supervisor));
+            }
+        }
+
+        for (const plan of Object.values(state?.plans ?? {})) {
+            if (threadById(state, plan.thread)?.supervisor !== Number(supervisor)) {
+                continue;
+            }
+
+            for (const consult of plan.consults ?? []) {
+                if (consult.session !== undefined) {
+                    failedRunSessions.set(consult.session, Number(supervisor));
+                }
+            }
+        }
+
+        // This read serves a prompt that waits: the list below gives the failure.
+        failedRunPrompted.delete(Number(supervisor));
+
         let sessions: SessionFact[] | undefined;
 
         try {
-            sessions = (await host.linkedSessions.list(supervisor)).map((each) => ({
-                address: each.address,
-                busy: each.busy === true,
-                archived: each.archived === true,
-                ...(each.title === undefined ? {} : { title: each.title }),
-            }));
+            sessions = (await host.linkedSessions.list(supervisor)).map((each) => {
+                const failed = failedLine(each);
+
+                return {
+                    address: each.address,
+                    busy: each.busy === true,
+                    archived: each.archived === true,
+                    ...(each.title === undefined ? {} : { title: each.title }),
+                    ...(failed === undefined ? {} : { failed }),
+                };
+            });
         } catch {
             // The list is not readable now: no facts, and no found session threads.
         }
@@ -24940,6 +25147,10 @@ export default function createDesk(host: Host, web: Web) {
                         events += 1;
                     }
                 }
+
+                if (applyRunFailed(thread, session.failed, now)) {
+                    events += 1;
+                }
             }
 
             if (thread.session !== undefined) {
@@ -25149,6 +25360,13 @@ export default function createDesk(host: Host, web: Web) {
                 thread.run.busy = session.busy;
                 // The same mask as for an open thread: a thread that reopens in this sweep routes its repairs right.
                 thread.run.archived = archivedFact(state, thread, session.archived);
+
+                // As `busy`: the fact only, with no event.
+                if (session.failed === undefined) {
+                    delete thread.run.failed;
+                } else {
+                    thread.run.failed = session.failed;
+                }
             }
         }
 
@@ -25465,6 +25683,22 @@ export default function createDesk(host: Host, web: Web) {
             if (timedOut.length > 0 && planThread !== undefined) {
                 events += timedOut.length;
                 await wakePlanAnswer(tx, state, planThread, now);
+            }
+
+            // A consult session's failed run: the fact on the consult, and 1 event on the plan thread. Its state, slot
+            // and time limit stay as they are.
+            for (const consult of plan.consults ?? []) {
+                const session =
+                    consult.address === undefined
+                        ? undefined
+                        : facts.sessions?.find((each) => each.address === consult.address);
+
+                if (
+                    session !== undefined &&
+                    applyConsultFailed(planThread, consult, session.failed, now)
+                ) {
+                    events += 1;
+                }
             }
 
             // For safety, each sweep moves the queue too (a slot freed with no move, or a higher limit): the start path
@@ -27901,6 +28135,13 @@ export default function createDesk(host: Host, web: Web) {
                 supervisors.add(supervisor);
             }
 
+            // A supervisor whose session's run failed is due at once: the page shows the failure now.
+            const prompted = new Set(failedRunPrompted);
+
+            for (const supervisor of prompted) {
+                supervisors.add(supervisor);
+            }
+
             let swept = false;
 
             for (const supervisor of supervisors) {
@@ -27914,10 +28155,12 @@ export default function createDesk(host: Host, web: Web) {
                     stale.has(supervisor) &&
                     now - (viewSweeps.get(supervisor) ?? 0) >= SWEEP_VIEW_MS;
                 // The open-thread path: a supervisor whose threads did not sweep a moment ago. A supervisor with no open
-                // thread has `mine` empty, so only a stale ready link, which has its own limit, sweeps it.
-                const openDue = mine.length > 0 && !fresh;
+                // thread has `mine` empty, so only a stale ready link, which has its own limit, or a failed-run prompt
+                // sweeps it.
+                const openDue = (mine.length > 0 && !fresh) || prompted.has(supervisor);
 
-                // 1 sweep at most. A supervisor that swept a moment ago waits, unless a stale ready link is due.
+                // 1 sweep at most. A supervisor that swept a moment ago waits, unless a stale ready link is due, or a
+                // failed run prompted it.
                 if (!openDue && !staleDue) {
                     continue;
                 }
