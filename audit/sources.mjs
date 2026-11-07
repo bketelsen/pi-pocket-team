@@ -584,12 +584,79 @@ function spawnRows(db, where, params) {
                         typeof part.arguments.message === "string"
                             ? part.arguments.message.slice(0, 300)
                             : "",
+                    thinking:
+                        typeof part.arguments.thinking === "string"
+                            ? part.arguments.thinking
+                            : null,
                 });
             }
         }
     }
 
     return out;
+}
+
+/**
+ * R2's parent hand fixes: for each of some sessions, with no time limit, the time of the first subagent answer (a user
+ * entry that `ANSWER` matches) and the number of `edit` and `write` tool calls of the session after it. A row is
+ * `{ c, firstAnswerAt, edits }`: `firstAnswerAt` is null when no subagent answered, and `edits` is then 0. Every
+ * session gets a row. No file path and no text is kept.
+ */
+export function loadParentEdits(db, sessions) {
+    const ids = [...sessions];
+
+    if (ids.length === 0) {
+        return [];
+    }
+
+    const marks = ids.map(() => "?").join(",");
+    const firstAnswer = new Map();
+
+    for (const row of db
+        .prepare(
+            `select id, conversation_id c, record from entries where json_extract(record,'$.kind')='pi.user'
+             and conversation_id in (${marks}) and record like '%[subagent %answered%'`,
+        )
+        .all(...ids)) {
+        const entry = parseEntry(row);
+        const at = entry.model?.[0]?.timestamp;
+
+        if (typeof at === "number" && ANSWER.test(textOf(entry))) {
+            firstAnswer.set(row.c, Math.min(firstAnswer.get(row.c) ?? Infinity, at));
+        }
+    }
+
+    const edits = new Map();
+
+    for (const row of db
+        .prepare(
+            `${SPAWN_SQL}conversation_id in (${marks})
+             and (record like '%"name":"edit"%' or record like '%"name":"write"%')`,
+        )
+        .all(...ids)) {
+        const first = firstAnswer.get(row.c);
+        const entry = parseEntry(row);
+        const at = entry.model?.[0]?.timestamp;
+
+        if (first === undefined || typeof at !== "number" || at <= first) {
+            continue;
+        }
+
+        const content = entry.model[0].content;
+        const count = (Array.isArray(content) ? content : []).filter(
+            (part) => part?.type === "toolCall" && (part.name === "edit" || part.name === "write"),
+        ).length;
+
+        edits.set(row.c, (edits.get(row.c) ?? 0) + count);
+    }
+
+    return ids
+        .sort((a, b) => a - b)
+        .map((c) => ({
+            c,
+            firstAnswerAt: firstAnswer.get(c) ?? null,
+            edits: edits.get(c) ?? 0,
+        }));
 }
 
 /**
@@ -1978,6 +2045,7 @@ export function loadData({
         spawns: [],
         routeCosts: [],
         routeSpawns: [],
+        parentEdits: [],
         installed: installedTimes(pocketDir),
         odrade: undefined,
         homes: [],
@@ -2017,6 +2085,7 @@ export function loadData({
             "entries",
             "costs",
             "routes",
+            "parentEdits",
             "reviews",
             "reviewAnswers",
             "goalHistory",
@@ -2028,17 +2097,22 @@ export function loadData({
 
     if (db) {
         attempt("desk", () => Object.assign(data, loadDesk(db)));
-        // R1's own read, after the desk: every routed thread's session, with no time limit (see `checkR1`).
-        attempt("routes", () => {
-            const sessions = new Set(
+        // R1's and R2's own read, after the desk: every routed thread's session, with no time limit (see `checkR1`).
+        const routedSessions = () =>
+            new Set(
                 Object.values(data.threads)
                     .filter((thread) => thread.route !== undefined && thread.session !== undefined)
                     .map((thread) => thread.session),
             );
 
+        attempt("routes", () => {
+            const sessions = routedSessions();
+
             data.routeCosts = loadRouteCosts(db, sessions);
             data.routeSpawns = loadRouteSpawns(db, sessions);
         });
+        // R2's hand fixes, in an attempt of their own: a failure here leaves R1 and R2 running, with hand fixes unknown.
+        attempt("parentEdits", () => (data.parentEdits = loadParentEdits(db, routedSessions())));
         attempt("reports", () => (data.reports = loadReports(db)));
         attempt("goals", () => (data.goals = loadGoals(db)));
         attempt("schedules", () => (data.schedules = loadSchedules(db)));

@@ -35,6 +35,9 @@ import {
     checkQ1,
     checkP1,
     checkR1,
+    checkR2,
+    R2_BENCH_REPOS,
+    R2_THRESHOLDS,
     Q1_ROUND_THRESHOLDS,
     Q1_STOP_THRESHOLDS,
     inDeepseekPeak,
@@ -2022,7 +2025,7 @@ test("runChecks: every check has an entry, and a missing source skips its checks
     const data = emptyData({ sourceErrors: { github: "disabled by --no-github" } });
     const result = runChecks(data, ctx);
 
-    assert.equal(CHECKS.length, 28);
+    assert.equal(CHECKS.length, 29);
     // P1 reads the desk's plan threads and their planning sessions.
     assert.deepEqual(
         CHECKS.find(([id]) => id === "P1"),
@@ -2443,8 +2446,10 @@ test("Q1: the day record keeps no body, reads the revert fields of merged PRs on
     assert.ok(!JSON.stringify(day).includes("secret"));
 });
 
-test("Q1: runChecks runs it last, with the date and the earlier days of its ctx", () => {
-    assert.deepEqual(CHECKS.at(-1), ["Q1", checkQ1, ["desk"]]);
+test("Q1: runChecks runs it after the other checks but R2, with the date and the earlier days of its ctx", () => {
+    // R2 reads Q1's result, so it comes after Q1.
+    assert.deepEqual(CHECKS.at(-2), ["Q1", checkQ1, ["desk"]]);
+    assert.deepEqual(CHECKS.at(-1), ["R2", checkR2, ["desk", "routes"]]);
 
     const result = runChecks(
         emptyData({ decided: todayEmpty }),
@@ -3613,4 +3618,645 @@ test("Q1 blockers: guards says how the guard read went; a loader that failed is 
     assert.equal(failed.available, true);
     assert.equal(failed.totals.points, 1);
     assert.equal(failed.points[0].state, "unknown");
+});
+
+// ---------- R2. Routed threads end to end ----------
+
+/** A routed thread, closed as done `daysAgo` days before NOW (`completed` unless `outcome` says else). */
+const r2Thread = (
+    id: string,
+    {
+        route = {},
+        prs = {},
+        daysAgo = 30,
+        why = "done",
+        outcome = "completed" as string | null,
+        over = {},
+    }: {
+        route?: object;
+        prs?: Record<string, object>;
+        daysAgo?: number;
+        why?: string;
+        outcome?: string | null;
+        over?: object;
+    } = {},
+) =>
+    routed(id, route, {
+        state: "closed",
+        closed: {
+            at: NOW - daysAgo * DAY,
+            why,
+            by: "sweep",
+            ...(outcome === null ? {} : { outcome }),
+        },
+        prs,
+        ...over,
+    });
+
+/** A desk PR link; no state when `state` is undefined. */
+const r2Link = (state?: string) => ({ via: "seen", ...(state === undefined ? {} : { state }) });
+
+/** 1 PR of a Q1 day record, decided `daysAgo` days before NOW. */
+const r2Pr = (n: number, daysAgo: number, over: Partial<Q1Pr> = {}): Q1Pr =>
+    q1Pr(n, { at: new Date(NOW - daysAgo * DAY).toISOString(), ...over });
+
+/** 1 earlier complete Q1 day, 40 days back: R2 has no 30-day limit. */
+const r2Earlier = (prs: Q1Pr[]) => [
+    { date: "2026-09-13", json: { findings: [], metrics: { Q1: { day: q1Record(prs) } } } },
+];
+
+const r2Ctx = (earlier: object[] = [], results: object = {}) => ({ ...ctx, earlier, results });
+
+/** The totals of R2 on some threads. */
+const r2Totals = (threads: object[], c = r2Ctx(), over: object = {}) =>
+    checkR2(emptyData({ threads: threadMap(...threads), ...over }), c).metrics.totals;
+
+const outcomeOfR2 = (totals: Record<string, number>) =>
+    ["open", "accepted", "notAccepted", "pending", "unknown"].filter((key) => totals[key] === 1);
+
+test("R2: a merged PR with no revert for 14 days is accepted; the merge time comes from Q1, GitHub, or the close", () => {
+    const prs = { "acme/widgets#1": r2Link("MERGED") };
+
+    // Q1's record: merged 20 days ago.
+    const fromQ1 = r2Totals(
+        [r2Thread("T1", { prs, daysAgo: 19 })],
+        r2Ctx(r2Earlier([r2Pr(1, 20)])),
+    );
+
+    assert.deepEqual(outcomeOfR2(fromQ1), ["accepted"]);
+    assert.equal(fromQ1.closeAsMergeTime, 0);
+
+    // No record: this run's GitHub read gives the merge time.
+    const fromGithub = r2Totals([r2Thread("T1", { prs, daysAgo: 19 })], r2Ctx(), {
+        github: {
+            botPrs: [],
+            prs: { "acme/widgets#1": { mergedAt: new Date(NOW - 20 * DAY).toISOString() } },
+            checkRuns: {},
+            autoDelete: {},
+        },
+    });
+
+    assert.deepEqual(outcomeOfR2(fromGithub), ["accepted"]);
+    assert.equal(fromGithub.closeAsMergeTime, 0);
+
+    // Neither: the close is the late bound.
+    const fromClose = r2Totals([r2Thread("T1", { prs, daysAgo: 20 })]);
+
+    assert.deepEqual(outcomeOfR2(fromClose), ["accepted"]);
+    assert.equal(fromClose.closeAsMergeTime, 1);
+
+    // A desk link with no state takes Q1's state.
+    assert.deepEqual(
+        outcomeOfR2(
+            r2Totals(
+                [r2Thread("T1", { prs: { "acme/widgets#1": r2Link() } })],
+                r2Ctx(r2Earlier([r2Pr(1, 20)])),
+            ),
+        ),
+        ["accepted"],
+    );
+});
+
+test("R2: before 14 days after the last merge, or the close with no PR, a thread is pending", () => {
+    const prs = { "acme/widgets#1": r2Link("MERGED") };
+
+    assert.deepEqual(
+        outcomeOfR2(
+            r2Totals([r2Thread("T1", { prs, daysAgo: 4 })], r2Ctx(r2Earlier([r2Pr(1, 5)]))),
+        ),
+        ["pending"],
+    );
+    assert.deepEqual(outcomeOfR2(r2Totals([r2Thread("T1", { daysAgo: 3 })])), ["pending"]);
+    assert.deepEqual(outcomeOfR2(r2Totals([r2Thread("T1", { daysAgo: 15 })])), ["accepted"]);
+    // A window link is not the thread's PR.
+    assert.deepEqual(
+        outcomeOfR2(
+            r2Totals([
+                r2Thread("T1", { prs: { "acme/widgets#1": { via: "window" } }, daysAgo: 15 }),
+            ]),
+        ),
+        ["accepted"],
+    );
+});
+
+test("R2: a PR state that is not known makes the thread unknown", () => {
+    for (const link of [r2Link(), r2Link("MISSING"), r2Link("FROZEN"), r2Link("OPEN")]) {
+        assert.deepEqual(
+            outcomeOfR2(r2Totals([r2Thread("T1", { prs: { "acme/widgets#1": link } })])),
+            ["unknown"],
+            JSON.stringify(link),
+        );
+    }
+
+    // Another close of a done thread is unknown too.
+    assert.deepEqual(outcomeOfR2(r2Totals([r2Thread("T1", { outcome: "odd" })])), ["unknown"]);
+});
+
+test("R2: a revert within 14 days, a reopening, a PR closed unmerged and a drop are not accepted", () => {
+    const prs = { "acme/widgets#1": r2Link("MERGED") };
+    const revertAt = (days: number) =>
+        r2Ctx(
+            r2Earlier([r2Pr(1, 30), r2Pr(2, days, { title: "Undo", reverts: ["acme/widgets#1"] })]),
+        );
+
+    // Reverted 10 days after the merge.
+    assert.deepEqual(outcomeOfR2(r2Totals([r2Thread("T1", { prs })], revertAt(20))), [
+        "notAccepted",
+    ]);
+    // Reverted 20 days after the merge: too late to count.
+    assert.deepEqual(outcomeOfR2(r2Totals([r2Thread("T1", { prs })], revertAt(10))), ["accepted"]);
+    // Reopened.
+    assert.deepEqual(
+        outcomeOfR2(
+            r2Totals([r2Thread("T1")], r2Ctx(), {
+                events: [event("T1", NOW - 35 * DAY, "reopened:queue", "reopened")],
+            }),
+        ),
+        ["notAccepted"],
+    );
+    // A watch's reopen verifies the work: it is no rework.
+    assert.deepEqual(
+        outcomeOfR2(
+            r2Totals([r2Thread("T1", { outcome: "verified" })], r2Ctx(), {
+                events: [
+                    event("T1", NOW - 35 * DAY, "reopened:watch:x.desk.watch:1:c/1", "watch set"),
+                ],
+            }),
+        ),
+        ["accepted"],
+    );
+    // A PR closed unmerged, beside a PR of unknown state.
+    assert.deepEqual(
+        outcomeOfR2(
+            r2Totals([
+                r2Thread("T1", {
+                    prs: { "acme/widgets#1": r2Link(), "acme/widgets#2": r2Link("CLOSED") },
+                }),
+            ]),
+        ),
+        ["notAccepted"],
+    );
+    // Dropped, failed, abandoned, frozen.
+    assert.deepEqual(outcomeOfR2(r2Totals([r2Thread("T1", { why: "dropped", outcome: null })])), [
+        "notAccepted",
+    ]);
+    assert.deepEqual(outcomeOfR2(r2Totals([r2Thread("T1", { why: "failed", outcome: null })])), [
+        "notAccepted",
+    ]);
+    assert.deepEqual(outcomeOfR2(r2Totals([r2Thread("T1", { outcome: "abandoned" })])), [
+        "notAccepted",
+    ]);
+    assert.deepEqual(outcomeOfR2(r2Totals([r2Thread("T1", { outcome: "frozen" })])), [
+        "notAccepted",
+    ]);
+    // Not closed.
+    assert.deepEqual(outcomeOfR2(r2Totals([routed("T1")])), ["open"]);
+});
+
+test("R2: a worker spawn on another model or thinking than the assigned one is a deviation; a cross-review is not", () => {
+    const data = emptyData({
+        threads: threadMap(
+            routed("T1", { assigned: "x/model" }),
+            routed("T2", { assigned: "x/model" }),
+            routed("T3", {}),
+            routed("T4", { assigned: "x/model", assignedThinking: "high" }),
+            routed("T5", { assigned: "p/model", profileModel: "p/model" }),
+            routed("T6", { worker: "x/model" }),
+        ),
+        routeSpawns: [
+            spawn({ c: 101, model: "y/model", thinking: null }),
+            // A cross-review on another model, and the worker on the assigned one.
+            spawn({ c: 102, model: "y/model", tools: ["read", "bash"], review: true }),
+            spawn({ c: 102, model: "x/model", thinking: "high" }),
+            // No assigned worker: nothing to deviate from.
+            spawn({ c: 103, model: "y/model" }),
+            spawn({ c: 104, model: "x/model", thinking: "low" }),
+            // No model: the parent's model, which is the assigned one.
+            spawn({ c: 105, model: null }),
+            spawn({ c: 106, model: "x/model" }),
+        ],
+    });
+    const rows = checkR2(data, r2Ctx()).metrics.rows;
+    const row = (assigned: string) => rows.find((each) => each.assigned === assigned)!;
+
+    // T1, T2, T4 and T6 (the named worker is the assigned one).
+    assert.equal(row("x/model").count, 4);
+    assert.equal(row("x/model").deviations, 2);
+    assert.deepEqual(row("x/model").workers, { "x/model": 3, "y/model": 1 });
+    assert.deepEqual(row("x/model").thinking, { "-": 2, high: 1, low: 1 });
+    assert.equal(row("-").deviations, 0);
+    assert.equal(row("p/model").deviations, 0);
+    assert.deepEqual(row("p/model").workers, { "p/model": 1 });
+    assert.equal(checkR2(data, r2Ctx()).metrics.totals.deviations, 2);
+});
+
+test("R2: the hand-fix rate counts the threads with a known edit row only", () => {
+    const threads = [routed("T1"), routed("T2"), routed("T3")];
+    const parentEdits = [
+        { c: 101, firstAnswerAt: NOW - DAY, edits: 2 },
+        { c: 102, firstAnswerAt: null, edits: 0 },
+    ];
+    const known = checkR2(
+        emptyData({ threads: threadMap(...threads), parentEdits }),
+        r2Ctx(),
+    ).metrics;
+
+    assert.equal(known.sources.parentEdits, true);
+    assert.equal(known.rows[0]!.handFixRate, 0.5);
+    assert.equal(known.rows[0]!.handFixKnown, 2);
+
+    const failed = checkR2(
+        emptyData({
+            threads: threadMap(...threads),
+            parentEdits: [],
+            sourceErrors: { parentEdits: "no such table" },
+        }),
+        r2Ctx(),
+    ).metrics;
+
+    assert.equal(failed.sources.parentEdits, false);
+    assert.equal(failed.rows[0]!.handFixRate, null);
+    assert.equal(failed.rows[0]!.handFixKnown, 0);
+});
+
+test("R2: the accepted rate shows from 10 decided threads", () => {
+    const accepted = Array.from({ length: 9 }, (_, i) => r2Thread(`T${i + 1}`));
+    const nine = r2Totals(accepted);
+
+    assert.equal(R2_THRESHOLDS.minDecided, 10);
+    assert.equal(nine.decided, 9);
+    assert.equal(nine.acceptedRate, null);
+
+    const ten = r2Totals([...accepted, r2Thread("T10", { why: "dropped", outcome: null })]);
+
+    assert.equal(ten.decided, 10);
+    assert.equal(ten.acceptedRate, 0.9);
+});
+
+test("R2: cost per accepted, median rounds and blocking points from Q1; without Q1 they are unknown", () => {
+    const threads = [
+        r2Thread("T1", {
+            prs: { "acme/widgets#1": r2Link("MERGED"), "acme/widgets#2": r2Link("MERGED") },
+        }),
+        r2Thread("T2", { prs: { "acme/widgets#3": r2Link() }, why: "dropped", outcome: null }),
+        routed("T3"),
+    ];
+    const routeCosts = [
+        { c: 101, at: NOW - 31 * DAY, cost: 1 },
+        { c: 101, at: NOW - 31 * DAY, cost: 2 },
+        { c: 102, at: NOW - 31 * DAY, cost: 1 },
+        // An open thread is not decided: its cost is not in the cost per accepted thread.
+        { c: 103, at: NOW - DAY, cost: 10 },
+    ];
+    const q1 = {
+        Q1: {
+            findings: [],
+            metrics: {
+                prRounds: {
+                    available: true,
+                    prs: [
+                        { ref: "acme/widgets#1", rounds: 2 },
+                        { ref: "acme/widgets#2", rounds: 1 },
+                        { ref: "acme/widgets#3", rounds: 4 },
+                    ],
+                },
+                blockers: {
+                    available: true,
+                    points: [{ ref: "acme/widgets#1" }, { ref: "acme/widgets#9" }],
+                },
+            },
+        },
+    };
+    const data = emptyData({ threads: threadMap(...threads), routeCosts });
+    const withQ1 = checkR2(data, r2Ctx([], q1)).metrics;
+
+    assert.equal(withQ1.sources.q1, true);
+    assert.equal(withQ1.totals.accepted, 1);
+    assert.equal(withQ1.totals.costPerAccepted, 4);
+    // T1 3 rounds, T2 4; T3 has no PR, so no rounds.
+    assert.equal(withQ1.totals.medianRounds, 3.5);
+    assert.equal(withQ1.totals.blockers, 1);
+
+    const without = checkR2(data, r2Ctx()).metrics;
+
+    assert.equal(without.sources.q1, false);
+    assert.equal(without.totals.medianRounds, null);
+    assert.equal(without.totals.blockers, null);
+    assert.equal(without.totals.costPerAccepted, 4);
+    assert.equal(r2Totals([routed("T1")]).costPerAccepted, null);
+});
+
+test("R2: a thread with no PR has no rounds and no blocking points, so it does not change medianRounds", () => {
+    const results = {
+        Q1: {
+            findings: [],
+            metrics: {
+                prRounds: { available: true, prs: [{ ref: "acme/widgets#1", rounds: 3 }] },
+                blockers: { available: true, points: [{ ref: "acme/widgets#1" }] },
+            },
+        },
+    };
+    const withPr = r2Thread("T1", { prs: { "acme/widgets#1": r2Link("MERGED") } });
+    const one = r2Totals([withPr], r2Ctx([], results));
+    const both = r2Totals([withPr, r2Thread("T2"), routed("T3")], r2Ctx([], results));
+
+    assert.equal(one.medianRounds, 3);
+    assert.equal(both.medianRounds, 3);
+    assert.equal(both.blockers, 1);
+    assert.equal(r2Totals([r2Thread("T2")], r2Ctx([], results)).medianRounds, null);
+    assert.equal(r2Totals([r2Thread("T2")], r2Ctx([], results)).blockers, null);
+});
+
+test("R2: notAcceptedWhy counts each thread that is not accepted in the first reason found", () => {
+    const merged = { "acme/widgets#1": r2Link("MERGED") };
+    const reopen = (id: string) =>
+        event(
+            id,
+            NOW - 35 * DAY,
+            `reopened:${NOW - 35 * DAY}`,
+            "reopened: new work in its session",
+        );
+    const totals = r2Totals(
+        [
+            r2Thread("T1", { why: "dropped", outcome: null }),
+            r2Thread("T2", { outcome: "abandoned" }),
+            // Reopened and a PR closed unmerged: the reopening is found first.
+            r2Thread("T3", { prs: { "acme/widgets#3": r2Link("CLOSED") } }),
+            r2Thread("T4", { prs: { "acme/widgets#4": r2Link("CLOSED") } }),
+            r2Thread("T5", { prs: merged }),
+            // Dropped and reopened: dropped is found first.
+            r2Thread("T6", { why: "failed", outcome: null }),
+            r2Thread("T7"),
+        ],
+        r2Ctx(
+            r2Earlier([r2Pr(1, 30), r2Pr(2, 25, { title: "Undo", reverts: ["acme/widgets#1"] })]),
+        ),
+        { events: [reopen("T3"), reopen("T6")] },
+    );
+
+    assert.equal(totals.notAccepted, 6);
+    assert.equal(totals.accepted, 1);
+    assert.deepEqual(totals.notAcceptedWhy, { dropped: 3, closedPr: 1, reverted: 1, reopened: 1 });
+    assert.deepEqual(totals.reopenedBy, { other: 1 });
+    assert.deepEqual(r2Totals([]).notAcceptedWhy, {
+        dropped: 0,
+        closedPr: 0,
+        reverted: 0,
+        reopened: 0,
+    });
+});
+
+test("R2: reopenedBy counts the kinds of reopening of the reopened threads, from the event key and text", () => {
+    const at = NOW - 35 * DAY;
+    const metrics = checkR2(
+        emptyData({
+            threads: threadMap(
+                r2Thread("T1"),
+                r2Thread("T2"),
+                r2Thread("T3"),
+                r2Thread("T4", { outcome: "verified" }),
+                r2Thread("T5", { why: "dropped", outcome: null }),
+            ),
+            events: [
+                event(
+                    "T1",
+                    at,
+                    "reopened:acme/widgets#2:1",
+                    "reopened: acme/widgets#2 attached by Clerk",
+                ),
+                event("T1", at + 1, "reopened:2", "reopened: a report after a supervisor message"),
+                // The same kind twice counts once.
+                event(
+                    "T1",
+                    at + 2,
+                    "reopened:acme/widgets#3:3",
+                    "reopened: acme/widgets#3 attached by Clerk",
+                ),
+                event("T2", at, "reopened:4", "reopened: acme/widgets#1 is failing"),
+                event(
+                    "T3",
+                    at,
+                    "reopened:reopen:k1",
+                    "Brian reopened T3a (section Scope): the answer was yes",
+                ),
+                // A watch's reopen is no reopening.
+                event(
+                    "T4",
+                    at,
+                    "reopened:watch:x.desk.watch:1:c/1",
+                    "reopened: watch set by odrade",
+                ),
+                // A dropped thread counts as dropped: its reopenings are not counted.
+                event(
+                    "T5",
+                    at,
+                    "reopened:acme/widgets#4:5",
+                    "reopened: acme/widgets#4 attached by Clerk",
+                ),
+            ],
+        }),
+        r2Ctx(),
+    ).metrics;
+    const expected = { attached: 1, other: 1, checks: 1, ask: 1 };
+
+    assert.deepEqual(metrics.totals.notAcceptedWhy, {
+        dropped: 1,
+        closedPr: 0,
+        reverted: 0,
+        reopened: 3,
+    });
+    assert.deepEqual(metrics.totals.reopenedBy, expected);
+    assert.deepEqual(metrics.rows[0]!.reopenedBy, expected);
+    assert.equal(metrics.totals.accepted, 1);
+});
+
+test("R2: the eligible share of routed night shifts; an unknown risk path (null, or no features) is not eligible", () => {
+    const bench = { repo: "frostyard/nsl" };
+    const noRisk = { riskPathNamed: false };
+    const threads = [
+        routed("T1", { features: noRisk }, bench),
+        routed("T2", { worker: "x/model", features: noRisk }, bench),
+        routed("T3", { features: noRisk }),
+        routed("T4", { features: { riskPathNamed: true } }, bench),
+        routed("T5", { features: noRisk }, bench),
+        routed("T6", { kind: undefined, features: { kind: "debug", riskPathNamed: false } }, bench),
+        routed("T7", { kind: "review", features: noRisk }, bench),
+        // The router could not read a risk-path list: unknown.
+        routed("T8", { features: { riskPathNamed: null } }, bench),
+        // An older route with no features: unknown.
+        routed("T9", {}, bench),
+    ];
+    // T5 is no night shift.
+    const goals = [101, 102, 103, 104, 106, 107, 108, 109].map((session) => ({
+        session,
+        goal: { status: "done" },
+    }));
+    const metrics = checkR2(emptyData({ threads: threadMap(...threads), goals }), r2Ctx()).metrics;
+
+    assert.ok(R2_BENCH_REPOS.includes("frostyard/nsl"));
+    assert.deepEqual(metrics.eligible, { nightShifts: 8, eligible: 2, share: 0.25 });
+    assert.equal(metrics.totals.eligible, 2);
+    assert.deepEqual(checkR2(emptyData(), r2Ctx()).metrics.eligible, {
+        nightShifts: 0,
+        eligible: 0,
+        share: null,
+    });
+});
+
+test("R2: a stored revert of a PR with no Q1 record of its own makes the thread not accepted", () => {
+    const prs = { "acme/widgets#1": r2Link("MERGED") };
+    // Only the revert PR has a record: it reverts #1 explicitly, 10 days after #1 merged.
+    const c = r2Ctx(r2Earlier([r2Pr(2, 20, { title: "Undo", reverts: ["acme/widgets#1"] })]));
+    const github = (daysAgo: number) => ({
+        github: {
+            botPrs: [],
+            prs: { "acme/widgets#1": { mergedAt: new Date(NOW - daysAgo * DAY).toISOString() } },
+            checkRuns: {},
+            autoDelete: {},
+        },
+    });
+
+    // The merge time from this run's GitHub read.
+    const fromGithub = r2Totals([r2Thread("T1", { prs, daysAgo: 29 })], c, github(30));
+
+    assert.deepEqual(outcomeOfR2(fromGithub), ["notAccepted"]);
+    assert.equal(fromGithub.notAcceptedWhy.reverted, 1);
+
+    // The merge time from the close.
+    const fromClose = r2Totals([r2Thread("T1", { prs, daysAgo: 30 })], c);
+
+    assert.deepEqual(outcomeOfR2(fromClose), ["notAccepted"]);
+    assert.equal(fromClose.notAcceptedWhy.reverted, 1);
+
+    // A title revert needs the record of the PR it reverts, for its title: no record, no revert.
+    const byTitle = r2Ctx(
+        r2Earlier([r2Pr(2, 20, { title: 'Revert "Change 1"', revertsTitle: "Change 1" })]),
+    );
+
+    assert.deepEqual(outcomeOfR2(r2Totals([r2Thread("T1", { prs, daysAgo: 30 })], byTitle)), [
+        "accepted",
+    ]);
+});
+
+test("R2: a stored revert of a PR whose state is unknown leaves the thread unknown; a known merged PR reverted is not accepted", () => {
+    // Only the revert PR has a record: it reverts #1 explicitly, inside the window.
+    const c = r2Ctx(r2Earlier([r2Pr(2, 20, { title: "Undo", reverts: ["acme/widgets#1"] })]));
+
+    for (const link of [r2Link(), r2Link("OPEN"), r2Link("MISSING"), r2Link("FROZEN")]) {
+        const totals = r2Totals([r2Thread("T1", { prs: { "acme/widgets#1": link } })], c);
+
+        assert.deepEqual(outcomeOfR2(totals), ["unknown"], JSON.stringify(link));
+        assert.equal(totals.notAcceptedWhy.reverted, 0);
+    }
+
+    // PR A merged and reverted inside the window, PR B missing: the known revert wins.
+    const totals = r2Totals(
+        [
+            r2Thread("T1", {
+                prs: { "acme/widgets#1": r2Link("MERGED"), "acme/widgets#3": r2Link("MISSING") },
+            }),
+        ],
+        c,
+    );
+
+    assert.deepEqual(outcomeOfR2(totals), ["notAccepted"]);
+    assert.equal(totals.notAcceptedWhy.reverted, 1);
+});
+
+test("R2: the revert window ends 14 days after the thread's last merge, for a revert of any of its PRs", () => {
+    // Day 0 is 30 days before NOW: PR A merges on day 0, PR B on day 10.
+    const prs = { "acme/widgets#1": r2Link("MERGED"), "acme/widgets#2": r2Link("MERGED") };
+    const revertOfA = (day: number) =>
+        r2Ctx(
+            r2Earlier([
+                r2Pr(1, 30),
+                r2Pr(2, 20),
+                r2Pr(3, 30 - day, { title: "Undo A", reverts: ["acme/widgets#1"] }),
+            ]),
+        );
+
+    // Day 20: 20 days after A, but 10 days after the last merge.
+    const inside = r2Totals([r2Thread("T1", { prs, daysAgo: 19 })], revertOfA(20));
+
+    assert.deepEqual(outcomeOfR2(inside), ["notAccepted"]);
+    assert.equal(inside.notAcceptedWhy.reverted, 1);
+    // Day 26: 16 days after the last merge.
+    assert.deepEqual(outcomeOfR2(r2Totals([r2Thread("T1", { prs, daysAgo: 19 })], revertOfA(26))), [
+        "accepted",
+    ]);
+});
+
+test("R2: rows group by tier rule, tier, arm and assigned worker, and sort by count", () => {
+    const metrics = checkR2(
+        emptyData({
+            threads: threadMap(
+                routed("T1", { tierRule: "v1", arm: "router", assigned: "x/model" }),
+                routed("T2", { tierRule: "v1", arm: "router", assigned: "x/model" }),
+                routed("T3", { tierRule: "v1", arm: "control", assigned: "y/model" }),
+                routed("T4", { tier: "low" }),
+            ),
+        }),
+        r2Ctx(),
+    ).metrics;
+
+    assert.equal(metrics.routes, 4);
+    assert.equal(metrics.windowDays, 14);
+    assert.deepEqual(
+        metrics.rows.map((row) => [row.tierRule, row.tier, row.arm, row.assigned, row.count]),
+        [
+            ["v1", "high", "router", "x/model", 2],
+            ["-", "low", "-", "-", 1],
+            ["v1", "high", "control", "y/model", 1],
+        ],
+    );
+    assert.deepEqual(checkR2(emptyData(), r2Ctx()).findings, []);
+});
+
+test("runChecks: R2 runs after Q1 and reads its day record; the other checks keep their metric keys", () => {
+    const node = {
+        repository: { nameWithOwner: "acme/widgets" },
+        number: 7,
+        title: "Change 7",
+        body: "",
+        mergedAt: new Date(NOW - 20 * DAY).toISOString(),
+        closedAt: new Date(NOW - 20 * DAY).toISOString(),
+        author: { login: "frostyard-machines" },
+    };
+    const result = runChecks(
+        emptyData({
+            threads: threadMap(
+                r2Thread("T1", { prs: { "acme/widgets#7": r2Link("MERGED") }, daysAgo: 1 }),
+            ),
+            decided: { ...todayEmpty, nodes: [node] },
+        }),
+        q1Ctx([]),
+    );
+
+    assert.deepEqual(Object.keys(result.metrics).slice(-2), ["Q1", "R2"]);
+    assert.equal(result.metrics.R2.sources.q1, true);
+    // Today's Q1 record gives the merge time, 20 days back: accepted, not pending.
+    assert.equal(result.metrics.R2.totals.accepted, 1);
+    assert.equal(result.metrics.R2.totals.closeAsMergeTime, 0);
+    assert.deepEqual(Object.keys(result.metrics.R1), ["routes", "cells", "named"]);
+    assert.deepEqual(Object.keys(result.metrics.Q1), [
+        "day",
+        "window",
+        "thresholds",
+        "totals",
+        "repos",
+        "agents",
+        "rounds",
+        "stops",
+        "ciReruns",
+        "prRounds",
+        "blockers",
+    ]);
+    assert.deepEqual(Object.keys(result.metrics.R2), [
+        "routes",
+        "sources",
+        "windowDays",
+        "rows",
+        "eligible",
+        "totals",
+    ]);
 });

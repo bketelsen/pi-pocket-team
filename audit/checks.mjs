@@ -2070,17 +2070,18 @@ const zeroQ1Row = () => ({
 /** The unrounded acceptance of a row, or null. */
 const q1Rate = (row) => (row.decided === 0 ? null : (row.merged - row.reverted) / row.decided);
 
-/** The refs of the merged PRs that a merged revert PR in the set reverts. */
-function revertedRefs(prs) {
+/** Each merged PR of the set that a merged revert PR in the set reverts, with the revert PRs that revert it. */
+function revertsOf(prs) {
     const merged = prs.filter((pr) => pr.state === "merged");
     const byRef = new Map(merged.map((pr) => [pr.ref, pr]));
-    const reverted = new Set();
+    const reverted = new Map();
+    const add = (ref, revert) => reverted.set(ref, [...(reverted.get(ref) ?? []), revert]);
 
     for (const revert of merged) {
         if (revert.reverts?.length > 0) {
             for (const ref of revert.reverts) {
                 if (ref !== revert.ref && byRef.has(ref)) {
-                    reverted.add(ref);
+                    add(ref, revert);
                 }
             }
         } else if (typeof revert.revertsTitle === "string") {
@@ -2090,7 +2091,7 @@ function revertedRefs(prs) {
                     repoOfRef(pr.ref) === repoOfRef(revert.ref) &&
                     pr.title === revert.revertsTitle
                 ) {
-                    reverted.add(pr.ref);
+                    add(pr.ref, revert);
                 }
             }
         }
@@ -2098,6 +2099,9 @@ function revertedRefs(prs) {
 
     return reverted;
 }
+
+/** The refs of the merged PRs that a merged revert PR in the set reverts. */
+const revertedRefs = (prs) => new Set(revertsOf(prs).keys());
 
 /** Q1's review-round thresholds: first guesses, to tune after 2 weeks of records (plan T801, "Gap 1"). */
 export const Q1_ROUND_THRESHOLDS = { median: 3, rise: 1, recentDays: 7, windowDays: 30 };
@@ -2929,6 +2933,465 @@ export function checkQ1(data, ctx) {
     };
 }
 
+// ---------- R2. Routed threads end to end ----------
+
+/** R2's thresholds: an accepted rate shows from 10 decided threads, and a merge waits 14 days for a revert. */
+export const R2_THRESHOLDS = { minDecided: 10, windowDays: 14 };
+
+/** The bench repositories: a night shift that names only these can run on a routed worker (plan section Method). */
+export const R2_BENCH_REPOS = [
+    "bketelsen/pi-pocket-team",
+    "frostyard/frostmail",
+    "frostyard/lodge",
+    "frostyard/porter",
+    "frostyard/updex",
+    "frostyard/core",
+    "frostyard/nsl",
+    "frostyard/chairlift",
+    "bketelsen/fleet",
+];
+
+/** The Jev kinds of an eligible night shift. */
+const R2_KINDS = ["implement", "debug", "refactor", "write"];
+
+const nonEmpty = (value) => typeof value === "string" && value !== "";
+
+/**
+ * The PRs of R2: every complete Q1 day record of the earlier days (no 30-day limit) and today's, 1 PR per ref, the
+ * newest record wins. Only the stored records: no GitHub call.
+ */
+function r2Records(ctx) {
+    const records = (ctx.earlier ?? [])
+        .filter((earlier) => earlier.json?.metrics?.Q1?.day?.complete === true)
+        .sort((a, b) => String(a.date).localeCompare(String(b.date)))
+        .map((earlier) => earlier.json.metrics.Q1.day);
+    const today = ctx.results?.Q1?.metrics?.day;
+
+    if (today?.complete === true) {
+        records.push(today);
+    }
+
+    const byRef = new Map();
+
+    for (const record of records) {
+        for (const pr of Array.isArray(record.prs) ? record.prs : []) {
+            if (typeof pr?.ref === "string") {
+                byRef.set(pr.ref, pr);
+            }
+        }
+    }
+
+    return byRef;
+}
+
+/** A time in ms from a number or an ISO text; null when it is neither. */
+const msOf = (value) => {
+    if (typeof value === "number" && Number.isFinite(value)) {
+        return value;
+    }
+
+    const ms = typeof value === "string" ? Date.parse(value) : NaN;
+
+    return Number.isNaN(ms) ? null : ms;
+};
+
+/**
+ * The reasons of a thread that is not accepted. `r2Outcome` tests them in this order: `dropped`, `reopened`,
+ * `closedPr` (any PR), then `reverted`; a thread counts in the first reason found only.
+ */
+const R2_WHY = ["dropped", "closedPr", "reverted", "reopened"];
+
+/**
+ * The kind of a reopen event (`desk.ts`): `attached` (a PR attached to the closed thread), `checks` (a PR of it is
+ * conflicting or failing), `ask` (a plan ask reopened: key `reopened:reopen:<key>`), or `other`.
+ */
+function reopenKind(event) {
+    const key = String(event.key);
+    const text = String(event.text ?? "");
+
+    if (/^reopened: \S+ attached by /.test(text)) {
+        return "attached";
+    }
+
+    if (/^reopened: \S+ is (conflicting|failing)$/.test(text)) {
+        return "checks";
+    }
+
+    if (key.startsWith("reopened:reopen:")) {
+        return "ask";
+    }
+
+    return "other";
+}
+
+/**
+ * How a routed thread ended for R2: `open`, `accepted`, `notAccepted`, `pending` or `unknown` (see `checkR2`),
+ * whether a merge time came from the close, and for `notAccepted` the first reason found (`why`, 1 of `R2_WHY`) and,
+ * for `reopened`, the kinds of its reopenings (`reopenedBy`).
+ */
+function r2Outcome(data, thread, refs, prs, reverts, ctx) {
+    const closed = thread.closed;
+    const window = R2_THRESHOLDS.windowDays * DAY;
+
+    if (closed === undefined) {
+        return { outcome: "open" };
+    }
+
+    if (
+        closed.why === "dropped" ||
+        closed.why === "failed" ||
+        closed.outcome === "abandoned" ||
+        closed.outcome === "frozen"
+    ) {
+        return { outcome: "notAccepted", why: "dropped" };
+    }
+
+    if (
+        closed.why !== "done" ||
+        !(
+            closed.outcome === undefined ||
+            closed.outcome === "completed" ||
+            closed.outcome === "verified"
+        )
+    ) {
+        return { outcome: "unknown" };
+    }
+
+    // A watch reopens a done thread to verify it (`reopened:watch:` in `desk.ts`): that is no rework.
+    const reopens = (eventsByThread(data).get(thread.id) ?? []).filter(
+        (event) =>
+            String(event.key).startsWith("reopened") &&
+            !String(event.key).startsWith("reopened:watch:"),
+    );
+
+    if (reopens.length > 0) {
+        return {
+            outcome: "notAccepted",
+            why: "reopened",
+            reopenedBy: [...new Set(reopens.map(reopenKind))],
+        };
+    }
+
+    let unknown = false;
+    let fromClose = false;
+    const merges = [];
+    const mergedRefs = [];
+
+    for (const ref of refs) {
+        const desk = thread.prs[ref]?.state;
+        const record = prs.get(ref);
+        const state =
+            desk === "MERGED" || desk === "CLOSED"
+                ? desk
+                : record?.state === "merged"
+                  ? "MERGED"
+                  : record?.state === "closed"
+                    ? "CLOSED"
+                    : undefined;
+
+        if (state === "CLOSED") {
+            return { outcome: "notAccepted", why: "closedPr" };
+        }
+
+        if (state !== "MERGED") {
+            // OPEN on a thread closed as done, MISSING, FROZEN, or no state at all.
+            unknown = true;
+            continue;
+        }
+
+        let at = record?.state === "merged" ? msOf(record.at) : null;
+
+        at ??= msOf(data.github?.prs?.[ref]?.mergedAt);
+
+        if (at === null) {
+            // A thread closes after its PRs merge: its close is a safe late bound.
+            at = closed.at;
+            fromClose = true;
+        }
+
+        merges.push(at);
+        mergedRefs.push(ref);
+    }
+
+    // The window ends 14 days after the LAST merge of the thread (its close with no merge time). A revert of any merged
+    // PR of the thread at or before that end, or at a time not known, makes it not accepted; a later revert does not count.
+    const end = (merges.length > 0 ? Math.max(...merges) : closed.at) + window;
+    // Only a PR known to be merged: an unknown PR state stays unknown, even when a stored revert names it.
+    const reverted = mergedRefs.some((ref) =>
+        (reverts.get(ref) ?? []).some((revert) => {
+            const revertAt = msOf(revert.at);
+
+            return revertAt === null || revertAt <= end;
+        }),
+    );
+
+    if (reverted) {
+        return { outcome: "notAccepted", why: "reverted", fromClose };
+    }
+
+    if (unknown) {
+        return { outcome: "unknown", fromClose };
+    }
+
+    return { outcome: ctx.now < end ? "pending" : "accepted", fromClose };
+}
+
+/**
+ * R2's reverts: Q1's (`revertsOf`), and also each explicit `reverts` target of a merged revert PR that has no record
+ * of its own. R2 can know from the desk link alone that such a target merged. A title revert still needs the record,
+ * for its title. Q1 does not use this: its output does not change.
+ */
+function r2Reverts(prs) {
+    const reverted = revertsOf(prs);
+
+    for (const revert of prs) {
+        if (revert.state !== "merged" || !Array.isArray(revert.reverts)) {
+            continue;
+        }
+
+        for (const ref of revert.reverts) {
+            const list = reverted.get(ref) ?? [];
+
+            if (ref !== revert.ref && !list.includes(revert)) {
+                reverted.set(ref, [...list, revert]);
+            }
+        }
+    }
+
+    return reverted;
+}
+
+/** The R2 numbers of some thread records: 1 row without its keys, or the totals. */
+function r2Numbers(list) {
+    const count = (outcome) => list.filter((item) => item.outcome === outcome).length;
+    const accepted = count("accepted");
+    const notAccepted = count("notAccepted");
+    const decided = accepted + notAccepted;
+    const decidedCost = list
+        .filter(
+            (item) =>
+                (item.outcome === "accepted" || item.outcome === "notAccepted") &&
+                item.cost !== null,
+        )
+        .reduce((sum, item) => sum + item.cost, 0);
+    const rounds = list.map((item) => item.rounds).filter((value) => value !== null);
+    const blockers = list.map((item) => item.blockers).filter((value) => value !== null);
+    const known = list.filter((item) => item.edits !== null);
+    const workers = {};
+    const thinking = {};
+    const notAcceptedWhy = Object.fromEntries(R2_WHY.map((why) => [why, 0]));
+    const reopenedBy = {};
+
+    for (const item of list) {
+        item.models.forEach((model) => bump(workers, model));
+        item.thinking.forEach((level) => bump(thinking, level));
+
+        if (item.why !== undefined) {
+            notAcceptedWhy[item.why] += 1;
+        }
+
+        item.reopenedBy.forEach((kind) => bump(reopenedBy, kind));
+    }
+
+    return {
+        count: list.length,
+        open: count("open"),
+        accepted,
+        notAccepted,
+        notAcceptedWhy,
+        reopenedBy,
+        pending: count("pending"),
+        unknown: count("unknown"),
+        decided,
+        acceptedRate:
+            decided >= R2_THRESHOLDS.minDecided
+                ? Math.round((accepted / decided) * 100) / 100
+                : null,
+        costPerAccepted: accepted === 0 ? null : dollars(decidedCost / accepted),
+        medianRounds: rounds.length === 0 ? null : median(rounds),
+        blockers: blockers.length === 0 ? null : blockers.reduce((sum, value) => sum + value, 0),
+        handFixRate:
+            known.length === 0
+                ? null
+                : Math.round((known.filter((item) => item.edits > 0).length / known.length) * 100) /
+                  100,
+        handFixKnown: known.length,
+        deviations: list.filter((item) => item.deviation).length,
+        closeAsMergeTime: list.filter((item) => item.fromClose).length,
+        eligible: list.filter((item) => item.eligible).length,
+        workers,
+        thinking,
+    };
+}
+
+/**
+ * R2: every routed desk thread (any delegation with a `route`), end to end, by the arm it was ASSIGNED (intent to
+ * treat): per (tier rule, predicted tier, arm, assigned worker), how many threads were accepted, at what cost, with how
+ * many review rounds and parent hand fixes, and whether the worker that ran matched the assigned one. It makes no
+ * finding.
+ *
+ * Accepted: closed as done (`completed`, `verified`, or no outcome), no reopening (a watch's reopen verifies the
+ * work: it does not count), every PR merged, and no revert of any of its PRs (Q1's revert detection, and an explicit
+ * revert of a PR with no record of its own) within 14 days of the thread's last merge; it is `pending` until then (14
+ * days after the close, with no PR). A PR state comes from the desk link, else from Q1's stored day records; an
+ * unknown one makes the thread `unknown`. `notAcceptedWhy` counts each not accepted thread in its first reason
+ * (`R2_WHY`), and `reopenedBy` the kinds of reopening of the `reopened` ones (`reopenKind`; a thread counts each kind
+ * once). Rounds and blocking points come from Q1's `prRounds` and `blockers` (the last 30 days only), hand fixes from
+ * `parentEdits`: each is null (unknown) when its source is missing, and rounds and blocking points are null for a
+ * thread with no PR. No GitHub call: Q1's stored records only.
+ *
+ * `eligible` is the share of routed night shifts a routed worker could take: no named worker, a Jev kind of
+ * `R2_KINDS`, a bench repository, and a route that says no risk path is named (`riskPathNamed: false`; `null` or no
+ * `features` is unknown, not eligible).
+ */
+export function checkR2(data, ctx) {
+    const prRecords = r2Records(ctx);
+    const reverts = r2Reverts([...prRecords.values()]);
+    const q1 = ctx.results?.Q1?.metrics;
+    const roundsByRef =
+        q1?.prRounds?.available === true && Array.isArray(q1.prRounds.prs)
+            ? new Map(q1.prRounds.prs.map((row) => [row.ref, row.rounds]))
+            : null;
+    const points =
+        q1?.blockers?.available === true && Array.isArray(q1.blockers.points)
+            ? q1.blockers.points
+            : null;
+    const editsSource = !data.sourceErrors?.parentEdits && Array.isArray(data.parentEdits);
+    const editsOf = new Map(editsSource ? data.parentEdits.map((row) => [row.c, row.edits]) : []);
+    const groups = new Map();
+    const items = [];
+    const eligible = { nightShifts: 0, eligible: 0, share: null };
+
+    for (const thread of Object.values(data.threads ?? {})) {
+        const route = thread.route;
+
+        if (!route || typeof route !== "object") {
+            continue;
+        }
+
+        const keys = {
+            tierRule: nonEmpty(route.tierRule) ? route.tierRule : "-",
+            tier: nonEmpty(route.tier) ? route.tier : "-",
+            arm: nonEmpty(route.arm) ? route.arm : "-",
+            assigned: nonEmpty(route.assigned)
+                ? route.assigned
+                : nonEmpty(route.worker)
+                  ? route.worker
+                  : "-",
+        };
+        const goal = goalOfThread(data, thread);
+        const nightShift = goal !== undefined;
+        const kind = nonEmpty(route.kind) ? route.kind : route.features?.kind;
+        const isEligible =
+            nightShift &&
+            !nonEmpty(route.worker) &&
+            R2_KINDS.includes(kind) &&
+            R2_BENCH_REPOS.includes(thread.repo) &&
+            // `null` (no risk-path list could be read) and no `features` (an older route) are unknown: not eligible.
+            route.features?.riskPathNamed === false;
+
+        if (nightShift) {
+            eligible.nightShifts += 1;
+            eligible.eligible += isEligible ? 1 : 0;
+        }
+
+        // The workers that ran: spawns that are not a cross-review. No model: the parent's model.
+        const spawns = (data.routeSpawns ?? []).filter(
+            (spawn) => spawn.c === thread.session && !isCrossReviewSpawn(spawn),
+        );
+        const parent = nonEmpty(route.profileModel) ? route.profileModel : "(parent)";
+        const modelOf = (spawn) => (nonEmpty(spawn.model) ? spawn.model : parent);
+        const assignedThinking = nonEmpty(route.assignedThinking)
+            ? route.assignedThinking
+            : nonEmpty(goal?.workerThinking)
+              ? goal.workerThinking
+              : null;
+        const deviation =
+            keys.assigned !== "-" &&
+            spawns.some(
+                (spawn) =>
+                    modelOf(spawn) !== keys.assigned ||
+                    (assignedThinking !== null &&
+                        typeof spawn.thinking === "string" &&
+                        spawn.thinking !== assignedThinking),
+            );
+        const refs = Object.entries(thread.prs ?? {})
+            .filter(([, link]) => link?.via !== "window")
+            .map(([ref]) => ref);
+        const costRows = (data.routeCosts ?? []).filter((row) => row.c === thread.session);
+        const {
+            outcome,
+            fromClose = false,
+            why,
+            reopenedBy = [],
+        } = r2Outcome(data, thread, refs, prRecords, reverts, ctx);
+        const item = {
+            outcome,
+            fromClose,
+            why,
+            reopenedBy,
+            nightShift,
+            eligible: isEligible,
+            deviation,
+            models: [...new Set(spawns.map(modelOf))],
+            thinking: [
+                ...new Set(
+                    spawns.map((spawn) =>
+                        typeof spawn.thinking === "string" ? spawn.thinking : "-",
+                    ),
+                ),
+            ],
+            cost: costRows.length === 0 ? null : costRows.reduce((sum, row) => sum + row.cost, 0),
+            // A thread with no PR has no rounds and no blocking points: unknown, not 0.
+            rounds:
+                roundsByRef === null || refs.length === 0
+                    ? null
+                    : refs.reduce((sum, ref) => sum + (roundsByRef.get(ref) ?? 0), 0),
+            blockers:
+                points === null || refs.length === 0
+                    ? null
+                    : points.filter((point) => refs.includes(point.ref)).length,
+            edits: editsOf.has(thread.session) ? editsOf.get(thread.session) : null,
+        };
+        const key = [keys.tierRule, keys.tier, keys.arm, keys.assigned].join("\u0000");
+
+        if (!groups.has(key)) {
+            groups.set(key, { keys, list: [] });
+        }
+
+        groups.get(key).list.push(item);
+        items.push(item);
+    }
+
+    eligible.share =
+        eligible.nightShifts === 0
+            ? null
+            : Math.round((eligible.eligible / eligible.nightShifts) * 100) / 100;
+
+    const rows = [...groups.values()]
+        .map(({ keys, list }) => ({ ...keys, ...r2Numbers(list) }))
+        .sort(
+            (a, b) =>
+                b.count - a.count ||
+                a.tierRule.localeCompare(b.tierRule) ||
+                a.tier.localeCompare(b.tier) ||
+                a.arm.localeCompare(b.arm) ||
+                a.assigned.localeCompare(b.assigned),
+        );
+
+    return {
+        findings: [],
+        metrics: {
+            routes: items.length,
+            sources: { q1: ctx.results?.Q1 !== undefined, parentEdits: editsSource },
+            windowDays: R2_THRESHOLDS.windowDays,
+            rows,
+            eligible,
+            totals: r2Numbers(items),
+        },
+    };
+}
+
 // ---------- P. Planning sessions ----------
 
 /**
@@ -3066,6 +3529,8 @@ export const CHECKS = [
     ["R1", checkR1, ["desk", "goals", "routes"]],
     ["P1", checkP1, ["desk", "planSessions"]],
     ["Q1", checkQ1, ["desk"]],
+    // R2 reads Q1's result (`ctx.results.Q1`): it runs after it.
+    ["R2", checkR2, ["desk", "routes"]],
 ];
 
 /**

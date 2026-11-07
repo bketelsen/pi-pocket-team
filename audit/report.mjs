@@ -339,6 +339,78 @@ const q1Lines = (q1) => {
     return lines;
 };
 
+/** R2 shows at most this many rows in the report; the rest are in findings.json. */
+const R2_ROWS = 10;
+
+const cell = (value) =>
+    value === null || value === undefined ? "-" : String(value).replace(/\|/g, "\\|");
+
+/** R2's table of routed threads end to end, and the eligible share of night shifts. */
+const r2Lines = (r2) => {
+    const rows = r2.rows ?? [];
+    const lines = [
+        `- R2: routed threads end to end (${plural(r2.routes, "thread")}, ${r2.windowDays}-day revert window; rounds: last 30 days).`,
+        "",
+        "| tier rule | tier | arm | assigned | count | accepted | pending | unknown | decided | rate | cost per accepted | median rounds | hand fixes | deviations |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
+        ...rows
+            .slice(0, R2_ROWS)
+            .map((row) =>
+                [
+                    "",
+                    cell(row.tierRule),
+                    cell(row.tier),
+                    cell(row.arm),
+                    cell(row.assigned),
+                    row.count,
+                    row.accepted,
+                    row.pending,
+                    row.unknown,
+                    row.decided,
+                    row.acceptedRate === null ? "-" : `${Math.round(row.acceptedRate * 100)}%`,
+                    row.costPerAccepted === null ? "-" : money(row.costPerAccepted),
+                    cell(row.medianRounds),
+                    row.handFixRate === null
+                        ? "-"
+                        : `${Math.round(row.handFixRate * 100)}% of ${row.handFixKnown}`,
+                    row.deviations,
+                    "",
+                ]
+                    .join(" | ")
+                    .trim(),
+            ),
+        "",
+    ];
+
+    if (rows.length > R2_ROWS) {
+        lines.push(`- ${rows.length - R2_ROWS} more rows in findings.json.`);
+    }
+
+    const t = r2.totals;
+
+    if (t?.notAccepted > 0 && t.notAcceptedWhy) {
+        const why = t.notAcceptedWhy;
+        const kinds = Object.entries(t.reopenedBy ?? {})
+            .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+            .map(([kind, count]) => `${kind} ${count}`)
+            .join(", ");
+
+        lines.push(
+            `- Not accepted: ${why.dropped} dropped, ${why.closedPr} closed PR, ${why.reverted} reverted, ${why.reopened} reopened${kinds === "" ? "" : ` (by kind: ${kinds})`}.`,
+        );
+    }
+
+    const e = r2.eligible;
+
+    if (e) {
+        lines.push(
+            `- Eligible night shifts: ${e.eligible} of ${e.nightShifts}${e.share === null ? "" : ` (${Math.round(e.share * 100)}%)`}.`,
+        );
+    }
+
+    return lines;
+};
+
 const metricLines = (metrics, github) => {
     const lines = [];
     const a1 = metrics.A1;
@@ -454,6 +526,10 @@ const metricLines = (metrics, github) => {
                 `- Named workers: ${named.routes} routed beside a named worker. Suggestion same as named: ${named.same.count} (success ${named.same.success} of ${named.same.count}); differs: ${named.differs.count} (success ${named.differs.success} of ${named.differs.count}).`,
             );
         }
+    }
+
+    if (metrics.R2?.routes > 0) {
+        lines.push(...r2Lines(metrics.R2));
     }
 
     const p1 = metrics.P1?.total;
