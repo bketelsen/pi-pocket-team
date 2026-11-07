@@ -599,8 +599,9 @@ function spawnRows(db, where, params) {
 /**
  * R2's parent hand fixes: for each of some sessions, with no time limit, the time of the first subagent answer (a user
  * entry that `ANSWER` matches) and the number of `edit` and `write` tool calls of the session after it. A row is
- * `{ c, firstAnswerAt, edits }`: `firstAnswerAt` is null when no subagent answered, and `edits` is then 0. Every
- * session gets a row. No file path and no text is kept.
+ * `{ c, firstAnswerAt, edits, editTimes }`: `firstAnswerAt` is null when no subagent answered, and `edits` is then 0.
+ * `editTimes` holds the sorted times of ALL the session's `edit` and `write` calls (1 time per call), for R2's
+ * evidence of work after a close. Every session gets a row. No file path and no text is kept.
  */
 export function loadParentEdits(db, sessions) {
     const ids = [...sessions];
@@ -627,6 +628,7 @@ export function loadParentEdits(db, sessions) {
     }
 
     const edits = new Map();
+    const times = new Map();
 
     for (const row of db
         .prepare(
@@ -638,7 +640,7 @@ export function loadParentEdits(db, sessions) {
         const entry = parseEntry(row);
         const at = entry.model?.[0]?.timestamp;
 
-        if (first === undefined || typeof at !== "number" || at <= first) {
+        if (typeof at !== "number") {
             continue;
         }
 
@@ -647,7 +649,13 @@ export function loadParentEdits(db, sessions) {
             (part) => part?.type === "toolCall" && (part.name === "edit" || part.name === "write"),
         ).length;
 
-        edits.set(row.c, (edits.get(row.c) ?? 0) + count);
+        if (count > 0) {
+            times.set(row.c, [...(times.get(row.c) ?? []), ...Array(count).fill(at)]);
+        }
+
+        if (first !== undefined && at > first) {
+            edits.set(row.c, (edits.get(row.c) ?? 0) + count);
+        }
     }
 
     return ids
@@ -656,6 +664,7 @@ export function loadParentEdits(db, sessions) {
             c,
             firstAnswerAt: firstAnswer.get(c) ?? null,
             edits: edits.get(c) ?? 0,
+            editTimes: (times.get(c) ?? []).sort((a, b) => a - b),
         }));
 }
 

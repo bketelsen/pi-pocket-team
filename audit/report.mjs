@@ -345,6 +345,14 @@ const R2_ROWS = 10;
 const cell = (value) =>
     value === null || value === undefined ? "-" : String(value).replace(/\|/g, "\\|");
 
+/** "kind N, kind N" by count, then by name; "" when no kind has a count. */
+const kindList = (counts) =>
+    Object.entries(counts ?? {})
+        .filter(([, count]) => count > 0)
+        .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+        .map(([kind, count]) => `${kind} ${count}`)
+        .join(", ");
+
 /** R2's table of routed threads end to end, and the eligible share of night shifts. */
 const r2Lines = (r2) => {
     const rows = r2.rows ?? [];
@@ -390,14 +398,17 @@ const r2Lines = (r2) => {
 
     if (t?.notAccepted > 0 && t.notAcceptedWhy) {
         const why = t.notAcceptedWhy;
-        const kinds = Object.entries(t.reopenedBy ?? {})
-            .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
-            .map(([kind, count]) => `${kind} ${count}`)
-            .join(", ");
+        const kinds = kindList(t.reopenedBy);
 
         lines.push(
-            `- Not accepted: ${why.dropped} dropped, ${why.closedPr} closed PR, ${why.reverted} reverted, ${why.reopened} reopened${kinds === "" ? "" : ` (by kind: ${kinds})`}.`,
+            `- Not accepted: ${why.dropped} dropped, ${why.closedPr} closed PR, ${why.reverted} reverted, ${why.reopened} reopened for rework${kinds === "" ? "" : ` (by kind: ${kinds})`}.`,
         );
+    }
+
+    const notRework = kindList(t?.reopenedNotRework);
+
+    if (notRework !== "") {
+        lines.push(`- Reopenings that are not rework: ${notRework}.`);
     }
 
     const e = r2.eligible;
