@@ -1022,8 +1022,11 @@ export function writeRule(path, rule) {
 
 const modelsIn = (attempts) => [...new Set(attempts.map((a) => a.model))].sort();
 
-/** A task id may appear once: a repeated task would count twice in every posterior. */
-export function checkTasks(tasks) {
+/**
+ * A task id may appear once: a repeated task would count twice in every posterior. An empty list is an error, except
+ * with `allowEmpty` (stage 2 planning: an empty R is a valid pool outcome, and its branch is `wait`).
+ */
+export function checkTasks(tasks, { allowEmpty = false } = {}) {
     const seen = new Set();
     const repeated = new Set();
 
@@ -1039,7 +1042,7 @@ export function checkTasks(tasks) {
         throw new Error(`task ids repeat: ${[...repeated].join(", ")}`);
     }
 
-    if (tasks.length === 0) {
+    if (tasks.length === 0 && !allowEmpty) {
         throw new Error("no tasks to analyze");
     }
 }
@@ -1478,7 +1481,8 @@ const setLabel = (set) =>
  * models B1 and C1. It refuses a stage 1 task (stage 2 uses fresh tasks only).
  */
 export function stage2Plan({ tasks, rule = null, stage1 = null, options = {} }) {
-    checkTasks(tasks);
+    // R = 0 is a valid pool outcome (30 to 36 tasks left after calibration all go to stage 1): it waits.
+    checkTasks(tasks, { allowEmpty: true });
 
     if (rule !== null) {
         validateRule(rule);

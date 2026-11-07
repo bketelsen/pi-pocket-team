@@ -1817,3 +1817,115 @@ test("the command line: stage 1 with a pool refuses a result outside the pool's 
         rmSync(root, { recursive: true });
     }
 });
+
+test("stage 2 with an empty R (every task left went to stage 1) is the wait branch, not an error", () => {
+    let s;
+
+    assert.doesNotThrow(() => {
+        s = analyzeStage2({ tasks: [], results: [], stage1: STAGE1_SYNTH, options: { pool: [] } });
+    });
+
+    assert.deepEqual(s.branch, {
+        branch: "wait",
+        counts: { easy: 0, medium: 0, hard: 0 },
+        R: 0,
+        groups: [],
+    });
+    assert.equal(s.R, 0);
+    assert.equal(s.decisions, undefined);
+    // A result is an error, as for any wait; a repeated id stays an error.
+    assert.throws(
+        () => analyzeStage2({ tasks: [], results: [synth("e000", SB)], options: { pool: [] } }),
+        /stage 2 waits for the pool \(R = 0, under 30\)/,
+    );
+    assert.throws(
+        () =>
+            analyzeStage2({
+                tasks: [...tierTasks("e", "easy", 1), ...tierTasks("e", "easy", 1)],
+                results: [],
+            }),
+        /task ids repeat: e000/,
+    );
+});
+
+test("the command line: --branch with an empty R writes the wait branch", () => {
+    const root = mkdtempSync(join(tmpdir(), "bench-analyze-"));
+
+    const log = () => {};
+
+    try {
+        writeBench(root, "stage2");
+        writeFileSync(
+            join(root, "pool.json"),
+            JSON.stringify({ stage1: { ids: idsOf(STAGE2_COUNT) }, stage2: { ids: [] } }),
+        );
+        const flags = [
+            "--branch",
+            "--manifest",
+            "manifest.json",
+            "--rule",
+            "rule.json",
+            "--stage1",
+            "stage1.json",
+            "--pool",
+            "pool.json",
+        ];
+
+        let code;
+
+        assert.doesNotThrow(() => {
+            code = main(flags, { root, log });
+        });
+        assert.equal(code, 0);
+        const branch = JSON.parse(
+            readFileSync(join(root, "bench/results/stage2/branch.json"), "utf8"),
+        );
+
+        assert.equal(branch.branch, "wait");
+        assert.equal(branch.R, 0);
+        assert.deepEqual(branch.groups, []);
+    } finally {
+        rmSync(root, { recursive: true });
+    }
+});
+
+test("the command line: --stage 2 with no results writes the wait summary, for an empty R and for R under 30", () => {
+    for (const [r, label] of [
+        [0, "an empty R"],
+        [12, "R under 30"],
+    ]) {
+        const root = mkdtempSync(join(tmpdir(), "bench-analyze-"));
+
+        const log = () => {};
+
+        try {
+            writeBench(root, "stage2");
+            rmSync(join(root, "bench/results/stage2"), { recursive: true });
+            writeFileSync(
+                join(root, "pool.json"),
+                JSON.stringify({ stage1: { ids: [] }, stage2: { ids: idsOf(r) } }),
+            );
+            let code;
+
+            assert.doesNotThrow(() => {
+                code = main(STAGE2_FLAGS, { root, log });
+            }, label);
+            assert.equal(code, 0, label);
+            const summary = JSON.parse(
+                readFileSync(join(root, "bench/results/stage2/summary.json"), "utf8"),
+            );
+
+            assert.equal(summary.branch.branch, "wait", label);
+            assert.equal(summary.R, r, label);
+            assert.equal(summary.decisions, undefined, label);
+            assert.ok(
+                readFileSync(join(root, "bench/results/stage2/summary.md"), "utf8").includes(
+                    "Branch: wait",
+                ),
+                label,
+            );
+        } finally {
+            rmSync(root, { recursive: true });
+        }
+    }
+});
