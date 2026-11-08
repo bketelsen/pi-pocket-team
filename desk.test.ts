@@ -15362,6 +15362,7 @@ describe("the issue digest kinds", () => {
             "plan-decided",
             "escalation",
             "escalation-urgent",
+            "plan-amend",
         ]);
     });
 
