@@ -314,15 +314,17 @@ const seedBoard = async (on: boolean): Promise<void> => {
             kind: "grooming",
             thread: "T151",
             launchedAt: now - 7200_000,
+            changedAt: now - 7200_000,
         }),
         row(6, "launched", "A launched row, its shift ended", {
             kind: "sweep",
             thread: "T152",
             launchedAt: now - 5400_000,
+            changedAt: now - 900_000,
         }),
         row(7, "failed", "A failed row", { error: "over the day's round budget" }),
         row(8, "unknown", "An unknown row", { error: "the start threw: no answer from the team" }),
-        row(9, "dropped", "A dropped row"),
+        row(9, "dropped", "A dropped row", { changedAt: now - 300_000 }),
     ];
 
     await app.harness.commit(async (tx) => {

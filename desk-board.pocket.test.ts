@@ -1053,6 +1053,7 @@ describe("the Desk page's board routes", () => {
             note: "first",
             order: 5,
             by: "odrade",
+            changedAt: row.changedAt,
             attempts: [],
         });
         assert.match(

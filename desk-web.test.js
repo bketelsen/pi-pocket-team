@@ -104,6 +104,7 @@ import {
     boardKeyFor,
     boardMarkup,
     boardPath,
+    boardSplit,
     launchBody,
     limitsText,
     makeBoard,
@@ -3443,6 +3444,58 @@ test("Board status: rowStatus gives 1 status for each state; a launched row runs
     assert.equal(rowStatus(undefined), "proposed");
 });
 
+test("Board split: each state goes to its side: the finishing rows to done, every other row to active in its order", () => {
+    const rows = [
+        boardRow({ id: 1, state: "proposed" }),
+        boardRow({ id: 2, state: "picked" }),
+        boardRow({ id: 3, state: "waiting" }),
+        boardRow({ id: 4, state: "starting" }),
+        boardRow({ id: 5, state: "failed" }),
+        boardRow({ id: 6, state: "unknown" }),
+        boardRow({ id: 7, state: "launched" }),
+        boardRow({ id: 8, state: "launched", thread: "T1", threadState: "open" }),
+        boardRow({ id: 9, state: "launched", thread: "T2", threadState: "closed" }),
+        boardRow({ id: 10, state: "launched", thread: "T3", shiftEnded: true }),
+        boardRow({ id: 11, state: "dropped" }),
+        boardRow({ id: 12, state: "something-new" }),
+    ];
+    const { active, done } = boardSplit(rows);
+
+    assert.deepEqual(
+        active.map((row) => row.id),
+        [1, 2, 3, 4, 5, 6, 7, 8, 12],
+        "the rows that wait for an act or run, in the input order",
+    );
+    // They carry no changedAt: each counts as 0, so the input order stays.
+    assert.deepEqual(
+        done.map((row) => row.id),
+        [9, 10, 11],
+        "the launched rows that finished and the dropped ones",
+    );
+});
+
+test("Board split: done is newest changedAt first, a missing one last, and a tie keeps the input order", () => {
+    const rows = [
+        boardRow({ id: 1, state: "dropped", changedAt: 300 }),
+        boardRow({ id: 2, state: "dropped", changedAt: 900 }),
+        boardRow({ id: 3, state: "dropped" }),
+        boardRow({ id: 4, state: "launched", thread: "T2", threadState: "closed", changedAt: 300 }),
+        boardRow({ id: 5, state: "dropped", changedAt: 900 }),
+        boardRow({ id: 6, state: "dropped", changedAt: "900" }),
+    ];
+
+    assert.deepEqual(
+        boardSplit(rows).done.map((row) => row.id),
+        [2, 5, 1, 4, 3, 6],
+    );
+    assert.deepEqual(boardSplit(rows).active, []);
+});
+
+test("Board split: no rows at all give 2 empty lists", () => {
+    assert.deepEqual(boardSplit([]), { active: [], done: [] });
+    assert.deepEqual(boardSplit(undefined), { active: [], done: [] });
+});
+
 test("Board status: the state line says running or finished for a launched row, and keeps every other state's text", () => {
     assert.equal(
         rowStateText(
@@ -3491,10 +3544,11 @@ test("Board status: each row carries its state class and its status class, and d
         "board-row board-waiting board-status-waiting",
         "board-row board-starting board-status-running",
         "board-row board-launched board-status-running",
-        "board-row board-launched board-status-finished",
-        "board-row board-launched board-status-finished",
         "board-row board-failed board-status-failed",
         "board-row board-unknown board-status-unknown",
+        // The done rows come last, in the Done fold: their changedAt is the same, so they keep the input order.
+        "board-row board-launched board-status-finished",
+        "board-row board-launched board-status-finished",
         "board-row board-dropped board-status-dropped",
     ]);
     // The state word stays on each row: color is never the only sign.
@@ -3527,6 +3581,75 @@ test("Board status: each row carries its state class and its status class, and d
 
     // A running launched row is not green: the old always-green launched rule is gone.
     assert.doesNotMatch(css, /\.board-row\.board-launched \{/);
+});
+
+test("Board: the Done fold comes after the active rows, newest first, and is closed", async () => {
+    const ctl = await loadedBoard(
+        boardApi({
+            board: boardAnswer([
+                boardRow({ id: 3, title: "Row three", changedAt: 100 }),
+                boardRow({
+                    id: 9,
+                    state: "dropped",
+                    title: "Row nine",
+                    changedAt: 200,
+                }),
+                boardRow({
+                    id: 7,
+                    state: "launched",
+                    title: "Row seven",
+                    thread: "T12",
+                    threadState: "closed",
+                    changedAt: 900,
+                }),
+                boardRow({ id: 1, title: "Row one", changedAt: 800 }),
+            ]),
+        }),
+    );
+    const screen = boardScreen(ctl);
+    const { out } = screen;
+    const at = (text) => out.indexOf(text);
+
+    assert.ok(at('<details class="board-done">') >= 0, out);
+    assert.ok(out.includes('<summary class="board-done-summary">Done (2)</summary>'), out);
+    assert.doesNotMatch(out, /<details[^>]*\bopen\b/, "the fold is closed");
+
+    // The active rows first, in the input order, then the fold with the newest change first.
+    assert.ok(at("#3 Row three") >= 0 && at("#3 Row three") < at("#1 Row one"));
+    assert.ok(at("#1 Row one") < at("<details"));
+    assert.ok(at("<details") < at("#7 Row seven"));
+    assert.ok(at("#7 Row seven") < at("#9 Row nine"));
+
+    // A row in the fold is the same row item as above: a tap on its head opens it.
+    assert.ok(screen.has("open:9"), out);
+
+    const folded = out.slice(at("<details"));
+
+    assert.match(folded, /data-act="?open:7"? /, "the fold's row has its open button");
+});
+
+test("Board: a board with no done row shows no fold", async () => {
+    const ctl = await loadedBoard(boardApi({ board: boardAnswer([boardRow({ id: 3 })]) }));
+    const { out } = boardScreen(ctl);
+
+    assert.doesNotMatch(out, /<details/);
+    assert.ok(!out.includes("Done ("), "no Done summary");
+    assert.ok(out.includes('<ol class="board-rows">'), out);
+});
+
+test("Board: a board with only done rows says no row waits or runs, and shows the fold", async () => {
+    const ctl = await loadedBoard(
+        boardApi({
+            board: boardAnswer([boardRow({ id: 9, state: "dropped", title: "Row nine" })]),
+        }),
+    );
+    const { out } = boardScreen(ctl);
+
+    assert.ok(out.includes("No row waits or runs."), out);
+    assert.ok(out.includes('<summary class="board-done-summary">Done (1)</summary>'), out);
+    assert.ok(out.includes("#9 Row nine"), out);
+    // The main list is left out, not drawn empty.
+    assert.doesNotMatch(out, /<ol class="board-rows">\s*<\/ol>/);
 });
 
 test("makeBoard: the view reads at once, reads again on changed, and stops listening when it unmounts", async () => {
