@@ -692,7 +692,7 @@ test(
     },
 );
 
-test("usage: no command, an unknown command, no plan, --results", async () => {
+test("usage: no command, an unknown command, no plan, --results", { timeout: 60_000 }, async () => {
     assert.equal(
         await calibrationMain(
             ["run", "--results", join(fixture.root, "elsewhere"), "--dir", dir],

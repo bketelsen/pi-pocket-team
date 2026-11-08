@@ -180,7 +180,9 @@ export async function calibrationMain(argv, env = process.env, deps = {}) {
         // The results of the attempts are always in `<dir>/results`: a run.mjs `--results` would put them where the
         // driver never looks.
         if (values.results !== undefined) {
-            throw new UsageError("--results is not an option here: the results go to <dir>/results");
+            throw new UsageError(
+                "--results is not an option here: the results go to <dir>/results",
+            );
         }
 
         if (positionals.length !== 1 || !["plan", "run", "status", "packs"].includes(command)) {
