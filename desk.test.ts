@@ -265,6 +265,7 @@ import {
     reportsOffActions,
     reportsOffKey,
     runEndLine,
+    RUN_END_ON_WARNING,
     sendsRunEndAnswers,
 } from "./desk.ts";
 import createTeam, { Identity, taskTitle } from "./team.ts";
@@ -891,6 +892,102 @@ describe("run-end answers", () => {
             warn: [],
         });
         assert.equal(REPORTS_OFF_TASK_STALE_MS, 10 * 60_000);
+    });
+
+    /**
+     * The desk's published `reportsOff`, on a stub host: `pocketVersion`, and a `linkedSessions` with or without the
+     * switch. It gives the notices and the switch calls the host saw.
+     */
+    const startHook = (pocketVersion: string, withSwitch: boolean) => {
+        const notices: { level: string; message: string; conversation: unknown }[] = [];
+        const calls: unknown[][] = [];
+        const stubWeb = {
+            conversationRoute() {},
+            route() {},
+            client() {},
+            command() {},
+            send() {},
+            onDispose() {},
+            error: (status: number, message: string) =>
+                Object.assign(new Error(message), { status }),
+        };
+        const stubHost = {
+            pocketVersion,
+            requesterOf: () => undefined,
+            text: { defang: (value: string) => value, quoted: () => "" },
+            notice: (level: string, message: string, conversation: unknown) => {
+                notices.push({ level, message, conversation });
+            },
+            linkedSessions: withSwitch
+                ? {
+                      reports: async (...args: unknown[]) => {
+                          calls.push(args);
+
+                          return { take: false };
+                      },
+                  }
+                : {},
+        };
+        const shared = globalThis as unknown as Record<symbol, unknown>;
+        const key = Symbol.for("pi-pocket-team.desk");
+        const saved = shared[key];
+
+        createDesk(stubHost as never, stubWeb as never);
+
+        const published = shared[key] as {
+            reportsOff?: (api: object, context: unknown, supervisor: number) => Promise<void>;
+        };
+
+        shared[key] = saved;
+
+        // No desk document yet: the hook reads nothing that the stub cannot give.
+        const api = {
+            snapshot: async () => undefined,
+            commit: async (change: (tx: object) => unknown) => change({ doc: async () => empty() }),
+        };
+        const start = (supervisor: number) =>
+            published.reportsOff!(api, { kind: "test" }, supervisor);
+
+        return { notices, calls, start };
+    };
+
+    test("before a start on 0.28 with no switch: 1 warning per supervisor and load, before any desk commit", async () => {
+        const hook = startHook("0.28.0", false);
+
+        await hook.start(35);
+        await hook.start(35);
+        await hook.start(36);
+
+        assert.deepEqual(hook.notices, [
+            { level: "warning", message: RUN_END_ON_WARNING, conversation: 35 },
+            { level: "warning", message: RUN_END_ON_WARNING, conversation: 36 },
+        ]);
+        assert.deepEqual(hook.calls, []);
+
+        // A new load warns again.
+        const reloaded = startHook("0.28.0", false);
+
+        await reloaded.start(35);
+        assert.equal(reloaded.notices.length, 1);
+    });
+
+    test("before a start on 0.27: no call and no warning", async () => {
+        const hook = startHook("0.27.0", false);
+
+        await hook.start(35);
+        assert.deepEqual(hook.notices, []);
+        assert.deepEqual(hook.calls, []);
+    });
+
+    test("before a start with the switch: no on-warning; the switch is called", async () => {
+        const hook = startHook("0.28.0-bk.1", true);
+
+        await hook.start(35);
+        assert.equal(
+            hook.notices.some((each) => each.message === RUN_END_ON_WARNING),
+            false,
+        );
+        assert.deepEqual(hook.calls, [[35, { take: false }, "x.desk.reports-off:35"]]);
     });
 });
 

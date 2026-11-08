@@ -20658,8 +20658,9 @@ export type DeskApi = {
     /**
      * Turn a supervisor's run-end answers off (`host.linkedSessions.reports` with `take: false`), once, and record it
      * in `reportsOff`. `team.ts` calls it before each desk-tracked start, never inside a commit. It never throws: a
-     * failure is 1 warning notice in the supervisor's session (at most 1 an hour), and the next sweep tries again. An
-     * older desk has none: skip the call.
+     * failure is 1 warning notice in the supervisor's session (at most 1 an hour), and the next sweep tries again. On a
+     * release that sends run-end answers and has no switch, it calls nothing and gives the supervisor's session 1 warning
+     * for each load, before the first start. An older desk has none: skip the call.
      */
     reportsOff?: (api: PlanCommitApi, context: Context, supervisor: number) => Promise<void>;
 };
@@ -22429,6 +22430,31 @@ export default function createDesk(host: Host, web: Web) {
     /** The supervisors this load warned that their release sends run-end answers and has no switch. */
     const reportsOffWarned = new Set<number>();
 
+    /**
+     * The warning of a release that sends run-end answers and has no switch, for 1 supervisor, once for each load: Team
+     * calls `reportsOff` before each desk-tracked start, so the warning comes before the first start it admits, also
+     * when no desk commit ran since the load, and also for a supervisor that the desk does not know yet. The load pass
+     * shares the same set, so a supervisor gets 1 warning for each load in all.
+     */
+    const warnRunEndOn = (supervisor: number): void => {
+        if (
+            reportsMethod() !== undefined ||
+            !sendsRunEndAnswers(host.pocketVersion) ||
+            reportsOffWarned.has(supervisor)
+        ) {
+            return;
+        }
+
+        reportsOffWarned.add(supervisor);
+
+        // `reportsOff` never throws: a notice that fails stops no start.
+        try {
+            host.notice("warning", RUN_END_ON_WARNING, supervisor as ConversationId);
+        } catch {
+            // No such session: no warning.
+        }
+    };
+
     /** What the desk knows now of a supervisor's run-end answers, for `runEndLine`. */
     const runEndFacts = (supervisor: number): RunEndFacts => {
         const error = reportsOffErrors.get(supervisor);
@@ -23030,6 +23056,7 @@ export default function createDesk(host: Host, web: Web) {
         },
         nudge: (tx, facts, now = Date.now()) => takeNudgesInto(tx, facts, now),
         reportsOff: async (api, context, supervisor) => {
+            warnRunEndOn(supervisor);
             await switchReportsOff(accessOf(api, context), supervisor);
         },
     };
