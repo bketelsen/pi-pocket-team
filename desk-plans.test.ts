@@ -73,6 +73,8 @@ import {
     planFacts,
     mergedHeads,
     planNoChange,
+    runningTasks,
+    approvalWaitText,
     recordVerify,
     failedRounds,
     planningBrief,
@@ -793,9 +795,25 @@ describe("a plan write", () => {
         assert.ok("error" in refused);
         assert.equal(
             refused.error,
-            `Plan T1 is approved: a write needs a scope change first (plan revise, or Brian's Stop and revise).`,
+            `Plan T1 is approved: a write needs a scope change first (plan revise, or Brian's Stop and revise). The planning session cannot call plan revise: ask the supervisor for a plan revise, or Brian for Stop and revise.`,
         );
         assert.equal(plan.revs.length, 1);
+    });
+
+    test("a write in building and in verifying names the way out too", () => {
+        for (const planState of ["building", "verifying"] as const) {
+            const { state, plan } = approvedPlan();
+
+            plan.state = planState;
+
+            const refused = write(state, { section: "idea", text: "A change." });
+
+            assert.ok("error" in refused);
+            assert.equal(
+                refused.error,
+                `Plan T1 is ${planState}: a write needs a scope change first (plan revise, or Brian's Stop and revise). The planning session cannot call plan revise: ask the supervisor for a plan revise, or Brian for Stop and revise.`,
+            );
+        }
     });
 
     test("a write in a finished plan says so", () => {
@@ -4856,14 +4874,50 @@ describe("a scope change", () => {
             {
                 supervisor: 7,
                 to: "session-31",
-                text: '[desk] Plan T1 is under revision ("The key moves."), by Brian. Stopped tasks: t1 (T2); the other tasks go on. Read the plan, and write the sections that change. Then draft a new graph with plan tasks: a task that is done and stays the same is carried (carried: { why }). Then call plan ready: Brian approves the new revision.',
+                text: '[desk] Plan T1 is under revision ("The key moves."), by Brian. Stopped tasks: t1 (T2); the other tasks go on. The approval waits for these running tasks to end; no second scope change can stop them while this one is in force: t3 (T3). Read the plan, and write the sections that change. Then draft a new graph with plan tasks: a task that is done and stays the same is carried (carried: { why }). Then call plan ready: Brian approves the new revision.',
                 requestId: planSendId("T1", "revise:1", "planning"),
             },
         ]);
         assert.equal(done.item.kind, "plan-revise");
         assert.equal(done.item.key, "plan-revise:T1:revise:1");
         assert.match(done.item.line, /Stopped: t1 \(T2\)\. The other tasks go on\./);
+        // The approval waits for t3, which still runs: the news says so (#178 P6).
+        assert.equal(
+            done.item.line,
+            '[desk] T1 plan under revision by Brian: "The key moves.". Stopped: t1 (T2). The other tasks go on. The approval waits for these running tasks to end; no second scope change can stop them while this one is in force: t3 (T3). No new task is delegated until Brian approves a new revision.',
+        );
         assert(state.threads.T2?.events.some((event) => event.key === "plan-stopped:revise:1"));
+    });
+
+    test("a scope change that stops every running task names no wait", () => {
+        const { state } = buildingPlan();
+        const done = revise(state, "revise:1", ["t1", "t3"]);
+
+        assert(!("error" in done) && !done.replay, "the scope change is made");
+        assert.equal(
+            done.item.line,
+            '[desk] T1 plan under revision by Brian: "The key moves.". Stopped: t1 (T2), t3 (T3). The other tasks go on. No new task is delegated until Brian approves a new revision.',
+        );
+        assert.doesNotMatch(
+            done.sends.find((send) => send.to === "session-31")?.text ?? "",
+            /approval waits/,
+        );
+    });
+
+    test("the running tasks are the tasks that hold the approval", () => {
+        const { state, plan, graph } = buildingPlan();
+
+        assert.deepEqual(runningTasks(plan), ["t1 (T2)", "t3 (T3)"]);
+        assert.equal(approvalWaitText([]), "");
+        // While a scope change is in force, a second one (Stop and revise, plan revise) is refused: the words never
+        // offer it (#181 review).
+        assert.doesNotMatch(approvalWaitText(["t3 (T3)"]), /Stop and revise/);
+
+        merged(graph, "t1", tick(6));
+        assert.deepEqual(runningTasks(plan), ["t3 (T3)"]);
+
+        revise(state, "revise:1", ["t3"]);
+        assert.deepEqual(runningTasks(plan), []);
     });
 
     test("a replay of the key changes nothing, and sends nothing", () => {
@@ -6127,6 +6181,166 @@ describe("the PR facts of a task thread", () => {
     });
 });
 
+describe("a watch's pass on a task thread with no PR (#178 P4)", () => {
+    const watched = (state: DeskState, id: string): Thread => {
+        const thread = state.threads[id] ?? assert.fail(`thread ${id}`);
+
+        assert(
+            !(
+                "error" in
+                setWatch(thread, {
+                    checkOn: "7d",
+                    check: "the task is done",
+                    by: "odrade",
+                    key: `watch:${id}`,
+                    at: tick(7),
+                })
+            ),
+        );
+
+        return thread;
+    };
+
+    const pass = (state: DeskState, thread: Thread, key = "result:1") =>
+        recordResult(
+            thread,
+            {
+                pass: true,
+                text: "done",
+                by: "odrade",
+                key,
+                at: tick(8),
+                closedBy: "desk",
+            },
+            state,
+        );
+
+    test("a pass is refused while the open attempt has no PR and no no-change", () => {
+        const { state, graph } = buildingPlan();
+        const thread = watched(state, "T2");
+        const refused = pass(state, thread);
+
+        assert.deepEqual(refused, {
+            error: "T2 delivers t1 of T1 with no PR: its session records plan nochange first, or the task is ready again when the thread closes.",
+        });
+        assert.equal(thread.state, "open");
+        assert.equal(thread.watch?.result, undefined);
+
+        // The sweep finds the thread open: the task stays delegated.
+        planFacts(state, "T1", tick(9));
+        assert.equal(taskOf(graph, "t1").state, "delegated");
+
+        // Brian's page pass is refused the same way.
+        const page = recordResult(
+            thread,
+            {
+                pass: true,
+                text: "done",
+                by: "brian",
+                key: "page:1",
+                at: tick(8),
+                closedBy: "brian",
+            },
+            state,
+        );
+
+        assert.ok("error" in page);
+        assert.match(page.error, /^T2 delivers t1 of T1 with no PR/);
+    });
+
+    test("a fail is never refused", () => {
+        const { state } = buildingPlan();
+        const thread = watched(state, "T2");
+        const failed = recordResult(
+            thread,
+            {
+                pass: false,
+                text: "not yet",
+                by: "odrade",
+                key: "result:1",
+                at: tick(8),
+                closedBy: "desk",
+            },
+            state,
+        );
+
+        assert.deepEqual(failed, { changed: true });
+    });
+
+    test("after plan nochange the pass is allowed, and the task stays done", () => {
+        const { state, graph } = buildingPlan();
+        const thread = watched(state, "T2");
+
+        assert(!("error" in noChange(state, "T2", tick(8))));
+        assert.deepEqual(pass(state, thread), { changed: true });
+        assert.equal(thread.state, "closed");
+
+        planFacts(state, "T1", tick(9));
+        assert.equal(taskOf(graph, "t1").state, "done");
+    });
+
+    test("a thread with a merged PR, or an open PR, keeps the sweep's rules", () => {
+        for (const prState of ["MERGED", "OPEN", undefined] as const) {
+            const { state } = buildingPlan();
+            const thread = watched(state, "T2");
+
+            prOn(state, "T2", "frostyard/snow#1", prState);
+            assert.deepEqual(pass(state, thread), { changed: true }, String(prState));
+        }
+    });
+
+    test("a thread with only a closed PR is refused", () => {
+        const { state } = buildingPlan();
+        const thread = watched(state, "T2");
+
+        prOn(state, "T2", "frostyard/snow#1", "CLOSED");
+        assert.ok("error" in pass(state, thread));
+    });
+
+    test("a thread that delivers no task, or an ended attempt, or a call with no state, is not refused", () => {
+        const { state } = buildingPlan();
+
+        other(state, "T5");
+        assert.deepEqual(pass(state, watched(state, "T5")), { changed: true });
+
+        const stopped = buildingPlan();
+
+        revisePlan(
+            stopped.state,
+            "T1",
+            { key: "revise:1", by: "Brian", at: tick(6), why: "The key moves.", tasks: ["t1"] },
+            quoted,
+        );
+        assert.deepEqual(pass(stopped.state, watched(stopped.state, "T2")), { changed: true });
+
+        const bare = buildingPlan();
+        const thread = watched(bare.state, "T2");
+
+        assert.deepEqual(
+            recordResult(thread, {
+                pass: true,
+                text: "done",
+                by: "odrade",
+                key: "result:1",
+                at: tick(8),
+                closedBy: "desk",
+            }),
+            { changed: true },
+        );
+    });
+
+    test("a replay of a refused key is refused again, and a replay of a pass changes nothing", () => {
+        const { state } = buildingPlan();
+        const thread = watched(state, "T2");
+
+        assert.ok("error" in pass(state, thread));
+        assert.ok("error" in pass(state, thread));
+        assert(!("error" in noChange(state, "T2", tick(8))));
+        assert.deepEqual(pass(state, thread), { changed: true });
+        assert.deepEqual(pass(state, thread), { changed: false });
+    });
+});
+
 describe("plan nochange", () => {
     test("the attempt ends no-change, the task is done, and the task after it is ready", () => {
         const { state, graph } = buildingPlan();
@@ -6495,6 +6709,15 @@ describe("the task and verify briefs", () => {
         assert.match(
             planTaskBrief(plan, "Snow ISO signing", graph, taskOf(graph, "t1")),
             /open no PR: call plan \{ action: "nochange", reason, evidence \} with the reason and the evidence/,
+        );
+    });
+
+    test("the task brief names plan nochange for a commit straight to main (#178 P4)", () => {
+        const { plan, graph } = buildingPlan();
+
+        assert.match(
+            planTaskBrief(plan, "Snow ISO signing", graph, taskOf(graph, "t1")),
+            /^When this repository takes commits straight to main and you open no PR, end with plan \{ action: "nochange", reason, evidence \}: the reason says so, and the evidence names the commit SHA\. A task thread that closes with no PR and no nochange makes the task ready again\.$/m,
         );
     });
 

@@ -2805,6 +2805,7 @@ export type ResultRequest = {
 export function recordResult(
     thread: Thread,
     request: ResultRequest,
+    state?: Readonly<DeskState>,
 ): { error: string } | { changed: boolean } {
     if (thread.origin === "plan") {
         return {
@@ -2844,6 +2845,13 @@ export function recordResult(
         };
     }
 
+    // A pass closes a plan task thread as done: with no PR and no no-change, the sweep then makes the task ready again.
+    const noPr = request.pass && state !== undefined ? taskWithNoPr(state, thread) : undefined;
+
+    if (noPr !== undefined) {
+        return { error: noPr };
+    }
+
     const text = flatLine(request.text);
 
     if (text === "" || text.length > MAX_LINE) {
@@ -2879,6 +2887,42 @@ export function recordResult(
     }
 
     return { changed: true };
+}
+
+/**
+ * Why a pass may not close this task thread now, or undefined: the thread holds the open attempt of a plan task, and
+ * has no merged PR and no PR that is open or not read yet. Its close would end the attempt `stopped` and make the task
+ * ready again (`planFacts`), so a second worker would do the task. `plan nochange` from its session ends the attempt
+ * first; a merged or open PR keeps the sweep's rules. The verification thread, an ended attempt and a plan that is done
+ * or dropped are not refused.
+ */
+export function taskWithNoPr(state: Readonly<DeskState>, thread: Thread): string | undefined {
+    const named = thread.planTask;
+
+    if (named === undefined || named.task === "verify") {
+        return undefined;
+    }
+
+    const plan = planOf(state, named.plan);
+
+    if (plan === undefined || plan.state === "done" || plan.state === "dropped") {
+        return undefined;
+    }
+
+    const task = approvedGraphOf(plan)?.tasks.find((each) => each.id === named.task);
+    const attempt = task === undefined ? undefined : openAttempt(task);
+
+    if (task === undefined || attempt?.thread !== thread.id) {
+        return undefined;
+    }
+
+    const links = Object.values(thread.prs);
+
+    if (links.some((link) => link.state === "MERGED" || prOpen(link))) {
+        return undefined;
+    }
+
+    return `${thread.id} delivers ${task.id} of ${plan.thread} with no PR: its session records plan nochange first, or the task is ready again when the thread closes.`;
 }
 
 // ─── The sweep's rules ──────────────────────────────────────────────────────
@@ -14709,7 +14753,7 @@ function writeStateProblem(plan: Plan): string | undefined {
         return `Plan ${plan.thread} is ${plan.state}.`;
     }
 
-    return `Plan ${plan.thread} is ${plan.state}: a write needs a scope change first (plan revise, or Brian's Stop and revise).`;
+    return `Plan ${plan.thread} is ${plan.state}: a write needs a scope change first (plan revise, or Brian's Stop and revise). The planning session cannot call plan revise: ask the supervisor for a plan revise, or Brian for Stop and revise.`;
 }
 
 /** The revision of the graph in `draft` state, when it was drafted for the plan's revision now. */
@@ -15775,18 +15819,42 @@ const openAttempt = (task: PlanTask): PlanTask["attempts"][number] | undefined =
     return last !== undefined && last.end === undefined ? last : undefined;
 };
 
+/**
+ * The tasks of the approved graph that hold the next approval (`approvePlan`): each one that is delegated or has an
+ * open attempt, as "t2 (T5)", in graph order.
+ */
+export function runningTasks(plan: Plan): string[] {
+    return (approvedGraphOf(plan)?.tasks ?? []).flatMap((task) => {
+        const attempt = openAttempt(task);
+
+        if (task.state !== "delegated" && attempt === undefined) {
+            return [];
+        }
+
+        return [attempt === undefined ? task.id : `${task.id} (${attempt.thread})`];
+    });
+}
+
+/** The words that name the running tasks the next approval waits for: empty when none runs. */
+export function approvalWaitText(running: readonly string[]): string {
+    return running.length === 0
+        ? ""
+        : ` The approval waits for these running tasks to end; no second scope change can stop them while this one is in force: ${running.join(", ")}.`;
+}
+
 /** The plan-revise news for the supervisor: at once, by `DIGEST_NOW`. */
 export function planReviseItem(
     plan: Plan,
     request: { key: string; by: string; at: number; why: string; tasks: readonly string[] },
     stopped: readonly string[],
     quote: (text: string, limit?: number) => string,
+    running: readonly string[] = [],
 ): DigestItem {
     return {
         key: `plan-revise:${plan.thread}:${request.key}`,
         thread: plan.thread,
         kind: "plan-revise",
-        line: `[desk] ${plan.thread} plan under revision by ${request.by}: ${quote(request.why)}. Stopped: ${stopped.length === 0 ? "none" : stopped.join(", ")}. The other tasks go on. No new task is delegated until Brian approves a new revision.`,
+        line: `[desk] ${plan.thread} plan under revision by ${request.by}: ${quote(request.why)}. Stopped: ${stopped.length === 0 ? "none" : stopped.join(", ")}. The other tasks go on.${approvalWaitText(running)} No new task is delegated until Brian approves a new revision.`,
         at: request.at,
     };
 }
@@ -15903,6 +15971,7 @@ function applyRevise(
     plan.state = "drafting";
 
     const named = stopped.length === 0 ? "none" : stopped.join(", ");
+    const running = runningTasks(plan);
 
     if (planThread !== undefined) {
         addEvent(
@@ -15914,7 +15983,7 @@ function applyRevise(
         sendTo(
             planThread,
             "planning",
-            `[desk] Plan ${plan.thread} is under revision (${quote(checked.why)}), by ${request.by}. Stopped tasks: ${named}; the other tasks go on. Read the plan, and write the sections that change. Then draft a new graph with plan tasks: a task that is done and stays the same is carried (carried: { why }). Then call plan ready: Brian approves the new revision.`,
+            `[desk] Plan ${plan.thread} is under revision (${quote(checked.why)}), by ${request.by}. Stopped tasks: ${named}; the other tasks go on.${approvalWaitText(running)} Read the plan, and write the sections that change. Then draft a new graph with plan tasks: a task that is done and stays the same is carried (carried: { why }). Then call plan ready: Brian approves the new revision.`,
         );
     }
 
@@ -15924,6 +15993,7 @@ function applyRevise(
             { ...request, why: checked.why, tasks: checked.tasks },
             stopped,
             quote,
+            running,
         ),
         sends,
     };
@@ -18464,6 +18534,7 @@ export function planTaskBrief(plan: Plan, title: string, graph: TaskGraph, task:
         task.deps.length === 0 ? "Deps: none." : `Deps: ${deps.join(", ")}.`,
         `The plan file is ${plan.file}: read it with plan { action: "read", plan: "${plan.thread}" }.`,
         `1 PR for this task. When the code already meets the criteria, open no PR: call plan { action: "nochange", reason, evidence } with the reason and the evidence.`,
+        `When this repository takes commits straight to main and you open no PR, end with plan { action: "nochange", reason, evidence }: the reason says so, and the evidence names the commit SHA. A task thread that closes with no PR and no nochange makes the task ready again.`,
     ].join("\n");
 }
 
@@ -29558,14 +29629,18 @@ export default function createDesk(host: Host, web: Web) {
                     return;
                 }
 
-                const recorded = recordResult(thread, {
-                    pass,
-                    text: words,
-                    by: "brian",
-                    key: `page:result:${String(now)}`,
-                    at: now,
-                    closedBy: "brian",
-                });
+                const recorded = recordResult(
+                    thread,
+                    {
+                        pass,
+                        text: words,
+                        by: "brian",
+                        key: `page:result:${String(now)}`,
+                        at: now,
+                        closedBy: "brian",
+                    },
+                    state,
+                );
 
                 if ("error" in recorded) {
                     throw web.error(400, recorded.error);
@@ -31602,7 +31677,7 @@ export default function createDesk(host: Host, web: Web) {
     const tool = defineTool({
         name: "desk",
         description:
-            "The desk of threads for work the team runs in the background. A supervisor session can use every action; a Clerk can use list, read, sync, attach, detach, watch, result, send, issues, and escalate for its supervisor's threads; an agent session can use read, watch, and result on its own thread only. Actions: list (one line per open thread), read (one thread in full), sync (observe the threads now, with linked sessions, Shift, git, and GitHub), seed (import a seed.json file one time), attach (put a PR, a queued issue, or all of another thread's work, on one thread), detach (take a PR off a thread for good: the sweep does not attach or find it again; only attach brings it back), own (mark a found PR thread as Brian's own: it closes, and no sweep finds its PR again), ask (file a question for Brian on a thread, or on a new one; never for a plain merge: Ready to merge on the Desk page lists those), rewrite (give an open ask new words, and new options or none: an agent's ask is filed as it wrote it, so make it clear for Brian), withdraw (end an open ask that Brian need not answer, with words saying why, or with into to merge it into another open ask), answer (record Brian's words for an ask), watch (set a dated check on a thread: it sleeps until that date, or until its optional on event, and does not count toward the cap; a thread closed as done in the last 7 days opens again for it, and sleeps), result (record that check's pass, which closes the thread, or its fail, which opens it again: a pass is refused while the thread has an open ask), send (send 1 message from the supervisor's session to a thread's agent), issues (read the issues Brian queued on GitHub: read only), escalate (Clerk only: 1 escalation to the supervisor; the desk drops it when the supervisor already acted on the thread or got its news directly, and else puts it in her next digest, or sends it at once with urgent: true), archive (supervisor only: a dry run that lists the idle sessions of threads closed 2 days ago or more that the desk can archive, with the skips and their reasons; with apply: true, archive the sessions of a dry run of the last 60 minutes that still pass every rule; it archives, it never deletes). The goal board (shift rows of 1 supervisor, launched by the desk under the limits): board (anyone, the Clerk too: the rows in launch order with their rev, state, times and thread, and the limits now), board_add (fields: the supervisor adds any row; an agent adds only its own, as proposed, without note or order), board_edit (row, fields) and board_drop (row) (the supervisor on its rows; an agent only on its own proposed rows, not agent, note or order), and supervisor only: board_pick (rows), board_unpick (rows), board_launch (rows, or none for every picked row: they wait, and the desk starts them), board_reopen (row: a failed row back to proposed), board_resolve (row, and thread for an unknown row whose session started, or nothing to fail it). A rev that differs from the row's is refused: read the board again.",
+            "The desk of threads for work the team runs in the background. A supervisor session can use every action; a Clerk can use list, read, sync, attach, detach, watch, result, send, issues, and escalate for its supervisor's threads; an agent session can use read, watch, and result on its own thread only. Actions: list (one line per open thread), read (one thread in full), sync (observe the threads now, with linked sessions, Shift, git, and GitHub), seed (import a seed.json file one time), attach (put a PR, a queued issue, or all of another thread's work, on one thread), detach (take a PR off a thread for good: the sweep does not attach or find it again; only attach brings it back), own (mark a found PR thread as Brian's own: it closes, and no sweep finds its PR again), ask (file a question for Brian on a thread, or on a new one; never for a plain merge: Ready to merge on the Desk page lists those), rewrite (give an open ask new words, and new options or none: an agent's ask is filed as it wrote it, so make it clear for Brian), withdraw (end an open ask that Brian need not answer, with words saying why, or with into to merge it into another open ask), answer (record Brian's words for an ask), watch (set a dated check on a thread: it sleeps until that date, or until its optional on event, and does not count toward the cap; a thread closed as done in the last 7 days opens again for it, and sleeps), result (record that check's pass, which closes the thread, or its fail, which opens it again: a pass is refused while the thread has an open ask, or while it delivers a plan task with no PR and no plan nochange), send (send 1 message from the supervisor's session to a thread's agent), issues (read the issues Brian queued on GitHub: read only), escalate (Clerk only: 1 escalation to the supervisor; the desk drops it when the supervisor already acted on the thread or got its news directly, and else puts it in her next digest, or sends it at once with urgent: true), archive (supervisor only: a dry run that lists the idle sessions of threads closed 2 days ago or more that the desk can archive, with the skips and their reasons; with apply: true, archive the sessions of a dry run of the last 60 minutes that still pass every rule; it archives, it never deletes). The goal board (shift rows of 1 supervisor, launched by the desk under the limits): board (anyone, the Clerk too: the rows in launch order with their rev, state, times and thread, and the limits now), board_add (fields: the supervisor adds any row; an agent adds only its own, as proposed, without note or order), board_edit (row, fields) and board_drop (row) (the supervisor on its rows; an agent only on its own proposed rows, not agent, note or order), and supervisor only: board_pick (rows), board_unpick (rows), board_launch (rows, or none for every picked row: they wait, and the desk starts them), board_reopen (row: a failed row back to proposed), board_resolve (row, and thread for an unknown row whose session started, or nothing to fail it). A rev that differs from the row's is refused: read the board again.",
         parameters: Type.Object({
             action: Type.Union([
                 Type.Literal("list"),
@@ -32315,14 +32390,18 @@ export default function createDesk(host: Host, web: Web) {
 
                     const flat = flatLine(args.text ?? "");
                     const clipped = flat.length > MAX_LINE;
-                    const recorded = recordResult(thread, {
-                        pass: args.pass === true,
-                        text: clipped ? clipLine(flat) : flat,
-                        by: persona.id,
-                        key,
-                        at,
-                        closedBy: "desk",
-                    });
+                    const recorded = recordResult(
+                        thread,
+                        {
+                            pass: args.pass === true,
+                            text: clipped ? clipLine(flat) : flat,
+                            by: persona.id,
+                            key,
+                            at,
+                            closedBy: "desk",
+                        },
+                        state,
+                    );
 
                     if ("error" in recorded) {
                         return recorded;
@@ -33406,10 +33485,11 @@ export default function createDesk(host: Host, web: Web) {
                 web.send("changed", {});
                 await exportNow(api, context);
 
-                const revising = planOf(await access.read(), plan.thread)?.revising;
+                const after = planOf(await access.read(), plan.thread);
+                const revising = after?.revising;
 
                 return reply(
-                    `Plan ${plan.thread} is under revision: back to drafting. Stopped: ${revising === undefined || revising.tasks.length === 0 ? "none" : revising.tasks.join(", ")}. The other tasks go on. No new task is delegated until Brian approves a new revision.`,
+                    `Plan ${plan.thread} is under revision: back to drafting. Stopped: ${revising === undefined || revising.tasks.length === 0 ? "none" : revising.tasks.join(", ")}. The other tasks go on.${approvalWaitText(after === undefined ? [] : runningTasks(after))} No new task is delegated until Brian approves a new revision.`,
                 );
             }
 
