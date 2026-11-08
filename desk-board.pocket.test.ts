@@ -1220,7 +1220,7 @@ describe("the Desk page's board routes", () => {
             }
 
             for (const row of state.board?.rows ?? []) {
-                if (row.state !== "launched" && row.state !== "failed" && row.state !== "dropped") {
+                if (row.state !== "launched" && row.state !== "dropped") {
                     row.state = "dropped";
                 }
             }
@@ -1536,6 +1536,111 @@ describe("the Desk page's board routes", () => {
                 JSON.stringify(fresh.data),
                 new RegExp(`Conversation ${String(id)} is not a supervisor's`),
             );
+        } finally {
+            if (sweeper !== undefined) {
+                await app.harness.commit(async (tx) => {
+                    const state = await tx.doc(DeskThreads);
+
+                    state.sweepers = { ...state.sweepers, [String(id)]: sweeper };
+                }, context);
+            }
+        }
+    });
+
+    test("GET board, Reopen and Resolve: a supervisor whose only row is failed or unknown stays live, and its row can be reopened and resolved", async () => {
+        const call = await routes();
+        const source = await supervisor();
+        const id = Number(source);
+        const row = await addRow(source, { title: "only row" });
+        const path = `board/${String(id)}`;
+        const sweeper = (await deskState()).sweepers?.[String(id)];
+
+        const listed = async () => {
+            const got = await call(`board?supervisor=${String(id)}`);
+
+            assert.equal(got.status, 200, JSON.stringify(got.data));
+
+            return {
+                listed: (got.data.supervisors as number[]).includes(id),
+                supervisor: got.data.supervisor as number | null,
+                state: (got.data.rows as { id: number; state: string }[]).find(
+                    (each) => each.id === row,
+                )?.state,
+            };
+        };
+
+        // The supervisor has only this row: no sweeper record (removed here, put back after), no Clerk, no open thread.
+        if (sweeper !== undefined) {
+            await app.harness.commit(async (tx) => {
+                delete (await tx.doc(DeskThreads)).sweepers?.[String(id)];
+            }, context);
+        }
+
+        try {
+            const state = await deskState();
+
+            assert.equal(state.sweepers?.[String(id)], undefined, "no sweeper record");
+            assert.equal(state.clerks?.[String(id)], undefined, "no Clerk");
+            assert(
+                !Object.values(state.threads).some(
+                    (thread) => thread.supervisor === id && thread.state !== "closed",
+                ),
+                "no open thread",
+            );
+            assert.deepEqual(
+                boardRows(state.board, id).map((each) => each.id),
+                [row],
+                "1 row only",
+            );
+
+            // Failed: GET lists it and opens on it; Reopen acts.
+            await setState(row, "failed");
+            assert.deepEqual(await listed(), { listed: true, supervisor: id, state: "failed" });
+
+            const reopen = await call(path, {
+                op: "reopen",
+                row,
+                rev: (await stored(row)).rev,
+                key: key(),
+            });
+
+            assert.equal(reopen.status, 200, JSON.stringify(reopen.data));
+            assert.equal((await stored(row)).state, "proposed");
+
+            // Unknown: GET lists it and opens on it; Resolve (with no thread) acts, and the failed row keeps it live.
+            await setState(row, "unknown");
+            assert.deepEqual(await listed(), { listed: true, supervisor: id, state: "unknown" });
+
+            const resolve = await call(path, {
+                op: "resolve",
+                row,
+                rev: (await stored(row)).rev,
+                key: key(),
+            });
+
+            assert.equal(resolve.status, 200, JSON.stringify(resolve.data));
+            assert.equal((await stored(row)).state, "failed");
+            assert.deepEqual(await listed(), { listed: true, supervisor: id, state: "failed" });
+
+            // Reopened and dropped, the row no longer keeps the supervisor live.
+            const again = await call(path, {
+                op: "reopen",
+                row,
+                rev: (await stored(row)).rev,
+                key: key(),
+            });
+
+            assert.equal(again.status, 200, JSON.stringify(again.data));
+
+            const drop = await call(path, {
+                op: "drop",
+                row,
+                rev: (await stored(row)).rev,
+                key: key(),
+            });
+
+            assert.equal(drop.status, 200, JSON.stringify(drop.data));
+            assert.equal((await listed()).listed, false, "a dropped row is not live");
         } finally {
             if (sweeper !== undefined) {
                 await app.harness.commit(async (tx) => {

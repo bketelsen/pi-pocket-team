@@ -643,7 +643,8 @@ describe("run-end answers", () => {
 
     /**
      * A desk with a retired supervisor 1745 (only closed threads), a live 35393 (a sweeper and a Clerk), 20 with an open
-     * thread only, 30 with only a proposed row, and 40 with only launched, dropped and failed rows.
+     * thread only, 30 with only a proposed row, 40 with only launched and dropped rows, 50 with only a failed row, and 60
+     * with only an unknown row.
      */
     const retired = (): DeskState => {
         const state = empty();
@@ -683,20 +684,21 @@ describe("run-end answers", () => {
         });
 
         state.board = {
-            next: 5,
+            next: 6,
             rows: [
                 row(1, 30, "proposed"),
                 row(2, 40, "launched"),
                 row(3, 40, "dropped"),
-                row(4, 40, "failed"),
+                row(4, 50, "failed"),
+                row(5, 60, "unknown"),
             ],
         };
 
         return state;
     };
 
-    test("the live supervisors: an open thread, a sweeper, a Clerk or a row not ended; not a retired one", () => {
-        assert.deepEqual(liveSupervisors(retired()), [20, 30, 35393]);
+    test("the live supervisors: an open thread, a sweeper, a Clerk or a row not launched or dropped; not a retired one", () => {
+        assert.deepEqual(liveSupervisors(retired()), [20, 30, 50, 60, 35393]);
         assert.deepEqual(
             deskSupervisors(retired()),
             [20, 1745, 35393],
@@ -704,6 +706,110 @@ describe("run-end answers", () => {
         );
         assert.deepEqual(liveSupervisors(empty()), []);
         assert.deepEqual(liveSupervisors(undefined), []);
+    });
+
+    /**
+     * 1 supervisor 50 with 1 closed thread and only `parts`: a board row in a state, an open thread, a sweepers key or
+     * a clerks key. The liveness rule of the goal board, 1 fact at a time.
+     */
+    const alone = (parts: {
+        row?: BoardRow["state"];
+        open?: true;
+        sweeper?: true;
+        clerk?: true;
+    }): DeskState => {
+        const state = empty();
+        const closed = open(state, "alone:closed", 10).thread;
+
+        closed.supervisor = 50;
+        closed.state = "closed";
+        closed.closed = { at: 20, why: "done", by: "sweep" };
+
+        if (parts.open === true) {
+            open(state, "alone:open", 11).thread.supervisor = 50;
+        }
+
+        if (parts.sweeper === true) {
+            state.sweepers = { "50": "task-50" };
+        }
+
+        if (parts.clerk === true) {
+            state.clerks = { "50": { session: 90, address: "session-90", agent: "clerk", at: 1 } };
+        }
+
+        if (parts.row !== undefined) {
+            state.board = {
+                next: 2,
+                rows: [
+                    {
+                        id: 1,
+                        supervisor: 50,
+                        rev: 1,
+                        state: parts.row,
+                        by: "odrade",
+                        at: 0,
+                        changedAt: 0,
+                        agent: "teg",
+                        title: "Row 1",
+                        task: "Tend the tests.",
+                        stopWhen: "CI is green",
+                        max: 20,
+                        until: "06:45",
+                        kind: "goal",
+                        order: 10,
+                        attempts: [],
+                    },
+                ],
+            };
+        }
+
+        return state;
+    };
+
+    test("the liveness rule, 1 fact at a time: each row state, an open thread, a sweeper, a Clerk, only closed threads (#167)", () => {
+        const live: BoardRow["state"][] = [
+            "proposed",
+            "picked",
+            "waiting",
+            "starting",
+            "failed",
+            "unknown",
+        ];
+        const ended: BoardRow["state"][] = ["launched", "dropped"];
+
+        for (const state of live) {
+            assert.deepEqual(
+                liveSupervisors(alone({ row: state })),
+                [50],
+                `a ${state} row is live`,
+            );
+        }
+
+        for (const state of ended) {
+            assert.deepEqual(
+                liveSupervisors(alone({ row: state })),
+                [],
+                `a ${state} row is not live`,
+            );
+        }
+
+        assert.deepEqual(liveSupervisors(alone({ open: true })), [50], "an open thread");
+        assert.deepEqual(liveSupervisors(alone({ sweeper: true })), [50], "a sweepers key");
+        assert.deepEqual(liveSupervisors(alone({ clerk: true })), [50], "a clerks key");
+        assert.deepEqual(
+            liveSupervisors(alone({})),
+            [],
+            "only closed threads and no row: a retired supervisor (#167)",
+        );
+        assert.deepEqual(deskSupervisors(alone({})), [50], "the run-end pass still keeps it");
+    });
+
+    test("the board's default supervisor: a supervisor live only by a failed or unknown row is listed and is the default when alone", () => {
+        for (const state of ["failed", "unknown"] as const) {
+            const desk = alone({ row: state });
+
+            assert.equal(defaultBoardSupervisor(desk, liveSupervisors(desk)), 50, state);
+        }
     });
 
     test("the receipts' supervisors: each supervisor whose receipts hold the key, sorted", () => {
