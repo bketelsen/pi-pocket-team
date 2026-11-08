@@ -447,7 +447,9 @@ Waiting: T560b, T560c open · c3 open · k2 running
 - `plan: { id: "T560", task: "t2" }`: deliver 1 task. The desk checks section 5.2 in the commit that opens the thread,
   and refuses with the waiting list. The task's agent and repository must match the call's. The brief gets the task,
   its acceptance lines, its deps' PRs, the approved revision, and the PR rule ("1 PR for this task; when the code
-  already meets the criteria, call `plan nochange` with the evidence, and open no PR").
+  already meets the criteria, call `plan nochange` with the evidence, and open no PR"), and the line for a repository
+  that takes commits straight to main: with no PR, the task ends with `plan nochange`, whose evidence names the commit
+  SHA (bketelsen/pi-pocket-team#178, P4).
 - `plan: { id: "T560", task: "verify" }`: the whole-plan check (section 9), to the lead, in its home.
 - With no `plan`: as today. When the task text names an open plan thread's id, the result and the thread get 1 warning
   line: "This text names plan T560 (drafting). Plan work names the plan."
@@ -473,7 +475,8 @@ Waiting: T560b, T560c open · c3 open · k2 running
   not a name in the arguments. A planning session is a linked session: Pocket refuses its `team` starts and `team_work`,
   so it cannot start repository work.
 - `write` refuses: a stale `rev` (it gives the current one: read again, merge, write again); a write to `decisions` or
-  `tasks`; a write in `approved`, `building` or `verifying` (call `revise` first); a write over 64 KB; and text with a
+  `tasks`; a write in `approved`, `building` or `verifying` (a scope change first: the refusal says that the planning
+  session cannot call `revise`, and asks the supervisor or Brian for it); a write over 64 KB; and text with a
   known secret form (`ghp_`, `github_pat_`, `sk-`, `xox`, `-----BEGIN`).
 - `write` naming an ask sets its `written` only when the ask is answered and the write touched the ask's section.
 - Every action takes the call's key (`plan:<task>:<call>`): a replayed call adds nothing.
@@ -773,7 +776,12 @@ Each line below differs from the design above, or settles what it left open, and
   no address, gets no message.
 - **Approve is refused while a task of the old approved graph is delegated** ("t3 is delegated (T575): wait for its
   end, or stop it with Stop and revise"). Decision 5 lets unnamed tasks go on; this keeps 2 workers from ever doing 1
-  task. Once the task is done, the next graph can carry it.
+  task. Once the task is done, the next graph can carry it. The scope change's news, the planning session's message
+  and the `plan revise` answer name each task that still runs ("The approval waits for these running tasks to end, or
+  for Brian's Stop and revise of them: t2 (T5).", #178 P6).
+- **A watch's pass on a task thread with no PR is refused** while its attempt is open and it has no merged PR, no PR
+  that is open or not read yet, and no `plan nochange`: the close would make the task ready again, and a second
+  delivery would do it again (#178 P4). A fail is never refused.
 - **The carry rule is checked in `plan tasks`, in `plan ready`, and again at Approve**, because the old graph can change
   after the draft (a failed round, a stopped task). `carried.why` is 1 to 300 characters on 1 line; the desk sets
   `carried.graph`. At Approve, a carried task takes its attempts from the old graph again.

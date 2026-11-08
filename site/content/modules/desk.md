@@ -33,7 +33,7 @@ An agent session can use `read`, `watch` and `result` on its own thread only. On
 ## Asks, watches and the cap
 
 - **Asks.** A decision, a host action or a device check that exists only in words is filed as an ask, `T13c`. Options give 2 to 6 choices for a pick-one decision. A done or blocked report must say its asks, and `asks: []` is the agent's word that nothing waits on Brian.
-- **Watches.** A thread sleeps until a check date, or until an event and the date as its fallback, with a 1-line check. A sleeping thread does not count toward the cap and is never stale. A pass closes the thread as done; a fail opens it again.
+- **Watches.** A thread sleeps until a check date, or until an event and the date as its fallback, with a 1-line check. A sleeping thread does not count toward the cap and is never stale. A pass closes the thread as done; a fail opens it again. A pass is refused while the thread has an open ask, and on a plan task thread with no PR and no `plan nochange`, because its close would make the task ready again.
 - **The cap.** 12 open threads count by default, and `cap` in the config file sets 1 to 100. A reviewer wait and a parked thread do not count; a found thread does. Over the cap, `team_delegate` refuses new work until Brian allows 1 more, on the page or with `desk ok` in a supervisor session.
 
 ## The sweep
