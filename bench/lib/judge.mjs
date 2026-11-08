@@ -1,7 +1,7 @@
-// S3, the judges: 2 models of 2 families grade a submitted diff by the rubric of `bench/judge-v1.md`, through the Pi
-// CLI in the sandbox with no tool. Each try reserves $1 under the budget guard and settles its real list cost; the
-// judge cost is never part of an attempt's usage. A missing or unparsable answer gets 2 more tries; then the judge
-// is pending (judged again later), never a fail.
+// S3, the judges: 2 models of 2 families grade a submitted diff by the rubric of the frozen `bench/judge-v3.md`,
+// through the Pi CLI in the sandbox with no tool. Each try reserves $1 under the budget guard and settles its real
+// list cost; the judge cost is never part of an attempt's usage. A missing or unparsable answer gets 2 more tries;
+// then the judge is pending (judged again later), never a fail.
 import { readFile, writeFile } from "node:fs/promises";
 import { existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
@@ -17,14 +17,19 @@ import { authPreflight, authType, prepareAgentDir } from "./runner.mjs";
  */
 export const JUDGES = ["openai/gpt-6.1-sol", "github-copilot/claude-opus-5.5"];
 
-/** The judge prompt, version 1. */
-export const JUDGE_PROMPT = join(BENCH_DIR, "judge-v1.md");
+/**
+ * The judge prompt, version 3: the prompt that the development rounds of the judge calibration chose
+ * (`bench/judge-calibration.md`). Versions 1 and 2 stay as the record.
+ */
+export const JUDGE_PROMPT = join(BENCH_DIR, "judge-v3.md");
 
 /**
- * The SHA-256 of the frozen judge prompt: null until the freeze, which follows the development rounds of the judge
- * calibration (`bench/judge-calibration.mjs --set dev`). The held-out set runs only with the frozen prompt.
+ * The SHA-256 of the frozen judge prompt (`bench/judge-v3.md`), set at the freeze that followed the development rounds
+ * of the judge calibration (`bench/judge-calibration.mjs --set dev`). The held-out set runs only with this prompt. A
+ * change to the prompt is a new calibration, never an edit of this value.
  */
-export const JUDGE_PROMPT_SHA256 = null;
+export const JUDGE_PROMPT_SHA256 =
+    "23c5c31c42ef09ca72dc4365d50779951c86c4339c6639caae2f4203d7872fb9";
 
 /** The most characters of a diff in the judge's input. */
 export const DIFF_LIMIT = 60_000;

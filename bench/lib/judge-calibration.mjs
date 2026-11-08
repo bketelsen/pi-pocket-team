@@ -4,8 +4,8 @@
 // owners' labels: agreement, Cohen's kappa, the false-pass and false-fail rates with 80% Wilson bounds, and the class
 // counts.
 //
-// - `--set dev`: the development items, with any prompt (`--prompt`, default `bench/judge-v1.md`); the numbers guide
-//   a prompt change and decide nothing.
+// - `--set dev`: the development items, with any prompt (`--prompt`, default the frozen `bench/judge-v3.md`); the
+//   numbers guide a prompt change and decide nothing.
 // - `--set held-out`: only with the frozen prompt (its SHA-256 is `JUDGE_PROMPT_SHA256`), and only when the counted
 //   items meet the class minimums (36 items, 10 owner fails, 10 owner passes); both are checked before any judge call.
 //   A judge passes with agreement on ceil(0.8 x counted) or more and kappa 0.6 or more; the S3 rule passes with a
