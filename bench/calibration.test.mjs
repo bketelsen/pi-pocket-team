@@ -505,187 +505,192 @@ const cli = (args) => {
     ).then((code) => ({ code, out: out.join("\n"), err: err.join("\n") }));
 };
 
-test("end to end: attempts in stage calibration, checks with no judge, replacements, pilot items, packs and keys", async () => {
-    // In this process, with the fixture's environment: every child (run.mjs, score.mjs, the lease tool) must get it.
-    const run = await cli([
-        "run",
-        "--parallel",
-        "3",
-        "--lease-bin",
-        FAKE_LEASE,
-        "--checkout",
-        fixture.repo,
-        "--pocket",
-        fixture.pocket,
-        "--agent-src",
-        fixture.agent,
-        "--no-auth-preflight",
-        "--bwrap",
-        FAKE_BWRAP,
-        "--kill-grace",
-        "2000",
-    ]);
+// A timeout: a driver that never ends (a lease that is never taken, say) fails here at once, never hangs the suite.
+test(
+    "end to end: attempts in stage calibration, checks with no judge, replacements, pilot items, packs and keys",
+    { timeout: 120_000 },
+    async () => {
+        // In this process, with the fixture's environment: every child (run.mjs, score.mjs, the lease tool) must get it.
+        const run = await cli([
+            "run",
+            "--parallel",
+            "3",
+            "--lease-bin",
+            FAKE_LEASE,
+            "--checkout",
+            fixture.repo,
+            "--pocket",
+            fixture.pocket,
+            "--agent-src",
+            fixture.agent,
+            "--no-auth-preflight",
+            "--bwrap",
+            FAKE_BWRAP,
+            "--kill-grace",
+            "2000",
+        ]);
 
-    assert.equal(run.code, 0, `${run.out}\n${run.err}`);
-    assert.ok(
-        existsSync(join(fixture.data, "runs", "calibration", "a")),
-        "the runs are in the fixture's data dir",
-    );
-    assert.deepEqual(
-        readdirSync(LEAK),
-        [],
-        "no child wrote to the data dir of this process's environment",
-    );
-    assert.match(
-        readFileSync(join(fixture.leases, "calls.log"), "utf8"),
-        /^take halogen T1064 bench calibration$/m,
-    );
+        assert.equal(run.code, 0, `${run.out}\n${run.err}`);
+        assert.ok(
+            existsSync(join(fixture.data, "runs", "calibration", "a")),
+            "the runs are in the fixture's data dir",
+        );
+        assert.deepEqual(
+            readdirSync(LEAK),
+            [],
+            "no child wrote to the data dir of this process's environment",
+        );
+        assert.match(
+            readFileSync(join(fixture.leases, "calls.log"), "utf8"),
+            /^take halogen T1064 bench calibration$/m,
+        );
 
-    const results = join(dir, "results");
-    const calibration = join(results, "calibration");
-    const read = (...parts) => JSON.parse(readFileSync(join(...parts), "utf8"));
+        const results = join(dir, "results");
+        const calibration = join(results, "calibration");
+        const read = (...parts) => JSON.parse(readFileSync(join(...parts), "utf8"));
 
-    // Every attempt of a pool task is in stage calibration; MAI-Code's provider failures stay in the record.
-    for (const task of ["a", "b", "c"]) {
-        for (const name of readdirSync(join(calibration, task))) {
-            assert.equal(read(calibration, task, name).stage, "calibration");
+        // Every attempt of a pool task is in stage calibration; MAI-Code's provider failures stay in the record.
+        for (const task of ["a", "b", "c"]) {
+            for (const name of readdirSync(join(calibration, task))) {
+                assert.equal(read(calibration, task, name).stage, "calibration");
+            }
         }
-    }
 
-    const failed = read(calibration, "a", "github-copilot__mai-code-2-flash.json");
+        const failed = read(calibration, "a", "github-copilot__mai-code-2-flash.json");
 
-    assert.equal(failed.failure, "provider");
-    assert.equal(failed.checksOnly, undefined, "a failed attempt is not checked");
+        assert.equal(failed.failure, "provider");
+        assert.equal(failed.checksOnly, undefined, "a failed attempt is not checked");
 
-    // a: MAI-Code failed, halogen (next cheap after it, not used on a) replaced it.
-    const a = read(calibration, "a", "halogen__halogen-qwen3.8-flash-next.json");
+        // a: MAI-Code failed, halogen (next cheap after it, not used on a) replaced it.
+        const a = read(calibration, "a", "halogen__halogen-qwen3.8-flash-next.json");
 
-    assert.equal(a.checksOnly, true);
-    assert.equal(a.s1, true);
-    assert.deepEqual(a.grades, [null, null]);
-    assert.equal(a.judgePending, true);
-    assert.equal(existsSync(join(fixture.data, "judges")), false, "no judge ran");
+        assert.equal(a.checksOnly, true);
+        assert.equal(a.s1, true);
+        assert.deepEqual(a.grades, [null, null]);
+        assert.equal(a.judgePending, true);
+        assert.equal(existsSync(join(fixture.data, "judges")), false, "no judge ran");
 
-    // b: MAI-Code failed, Luna replaced it (halogen is used on b).
-    assert.equal(read(calibration, "b", "github-copilot__gpt-6-luna.json").checksOnly, true);
+        // b: MAI-Code failed, Luna replaced it (halogen is used on b).
+        assert.equal(read(calibration, "b", "github-copilot__gpt-6-luna.json").checksOnly, true);
 
-    // p (pilot): Luna's pilot result is copied and checked. MAI-Code and Gemini have no pilot attempt, and Sonnet's
-    // ended in a provider failure: halogen replaces MAI-Code and Grok replaces Gemini (the 2 replacements), both
-    // with no pilot attempt either, so those slots and Sonnet's are missing.
-    const pilotCopy = read(results, "pilot", "p", "github-copilot__gpt-6-luna.json");
+        // p (pilot): Luna's pilot result is copied and checked. MAI-Code and Gemini have no pilot attempt, and Sonnet's
+        // ended in a provider failure: halogen replaces MAI-Code and Grok replaces Gemini (the 2 replacements), both
+        // with no pilot attempt either, so those slots and Sonnet's are missing.
+        const pilotCopy = read(results, "pilot", "p", "github-copilot__gpt-6-luna.json");
 
-    assert.equal(pilotCopy.stage, "pilot");
-    assert.equal(pilotCopy.checksOnly, true);
-    assert.equal(pilotCopy.s1, true, "checked again by the current manifest");
-    assert.equal(
-        read(fixture.root, "pilot-results", "pilot", "p", "github-copilot__gpt-6-luna.json").s1,
-        false,
-        "the pilot's own result never changes",
-    );
+        assert.equal(pilotCopy.stage, "pilot");
+        assert.equal(pilotCopy.checksOnly, true);
+        assert.equal(pilotCopy.s1, true, "checked again by the current manifest");
+        assert.equal(
+            read(fixture.root, "pilot-results", "pilot", "p", "github-copilot__gpt-6-luna.json").s1,
+            false,
+            "the pilot's own result never changes",
+        );
 
-    const status = await cli(["status"]);
+        const status = await cli(["status"]);
 
-    assert.equal(status.code, 0);
-    assert.match(
-        status.out,
-        /\| a \| irulan \| heldOut \| cheap: github-copilot\/gpt-6-luna -> ok; cheap: github-copilot\/mai-code-2-flash > halogen\/halogen-qwen3\.8-flash-next -> ok;/,
-    );
-    assert.match(status.out, /\| irulan \| 4 \| 8 \| 0 \|/);
+        assert.equal(status.code, 0);
+        assert.match(
+            status.out,
+            /\| a \| irulan \| heldOut \| cheap: github-copilot\/gpt-6-luna -> ok; cheap: github-copilot\/mai-code-2-flash > halogen\/halogen-qwen3\.8-flash-next -> ok;/,
+        );
+        assert.match(status.out, /\| irulan \| 4 \| 8 \| 0 \|/);
 
-    // The packs: 1 per owner, items in a seeded order, exactly the judge's input; the keys hold the models.
-    const packs = await cli(["packs"]);
+        // The packs: 1 per owner, items in a seeded order, exactly the judge's input; the keys hold the models.
+        const packs = await cli(["packs"]);
 
-    assert.equal(packs.code, 0, packs.err);
-    assert.match(packs.out, /irulan: 12 items \(4 dev, 8 held-out\): written/);
+        assert.equal(packs.code, 0, packs.err);
+        assert.match(packs.out, /irulan: 12 items \(4 dev, 8 held-out\): written/);
 
-    const pack = join(dir, "packs", "irulan");
-    const items = read(pack, "items.json").items;
-    const labels = read(pack, "labels.json");
-    const key = read(dir, "keys", "irulan.json");
+        const pack = join(dir, "packs", "irulan");
+        const items = read(pack, "items.json").items;
+        const labels = read(pack, "labels.json");
+        const key = read(dir, "keys", "irulan.json");
 
-    assert.equal(items.length, 12);
-    assert.deepEqual(
-        items.map((i) => i.id),
-        items.map((_, i) => `irulan-${String(i + 1).padStart(2, "0")}`),
-    );
+        assert.equal(items.length, 12);
+        assert.deepEqual(
+            items.map((i) => i.id),
+            items.map((_, i) => `irulan-${String(i + 1).padStart(2, "0")}`),
+        );
 
-    for (const item of items) {
-        assert.deepEqual(Object.keys(item), ITEM_FIELDS);
-        assert.deepEqual(Object.keys(item.submitted), ["text", "cut"]);
-    }
+        for (const item of items) {
+            assert.deepEqual(Object.keys(item), ITEM_FIELDS);
+            assert.deepEqual(Object.keys(item.submitted), ["text", "cut"]);
+        }
 
-    // The fixture's brief names a model (its fake-pi scenario): every other field must not.
-    const shown = JSON.stringify([items.map(({ brief, ...rest }) => rest), labels]);
+        // The fixture's brief names a model (its fake-pi scenario): every other field must not.
+        const shown = JSON.stringify([items.map(({ brief, ...rest }) => rest), labels]);
 
-    for (const model of ALL) {
-        assert.ok(!shown.includes(model), `no model id in the pack: ${model}`);
-        assert.ok(!shown.includes(model.split("/")[1]), `no model name in the pack: ${model}`);
-    }
+        for (const model of ALL) {
+            assert.ok(!shown.includes(model), `no model id in the pack: ${model}`);
+            assert.ok(!shown.includes(model.split("/")[1]), `no model name in the pack: ${model}`);
+        }
 
-    assert.doesNotMatch(shown, /cost|wallMs|tries|startedAt/);
-    assert.match(
-        readFileSync(join(pack, "items", "irulan-01.md"), "utf8"),
-        /## The submitted change[\s\S]*pi-ran\.txt[\s\S]*## The merged change[\s\S]*future\.txt/,
-    );
-    assert.deepEqual(labels.labels[0], {
-        id: "irulan-01",
-        set: items[0].set,
-        label: null,
-        note: "",
-        blind: true,
-        reason: "",
-    });
-    assert.deepEqual(Object.keys(key.items).sort(), items.map((i) => i.id).sort());
+        assert.doesNotMatch(shown, /cost|wallMs|tries|startedAt/);
+        assert.match(
+            readFileSync(join(pack, "items", "irulan-01.md"), "utf8"),
+            /## The submitted change[\s\S]*pi-ran\.txt[\s\S]*## The merged change[\s\S]*future\.txt/,
+        );
+        assert.deepEqual(labels.labels[0], {
+            id: "irulan-01",
+            set: items[0].set,
+            label: null,
+            note: "",
+            blind: true,
+            reason: "",
+        });
+        assert.deepEqual(Object.keys(key.items).sort(), items.map((i) => i.id).sort());
 
-    // The order: the items in plan order (task, then slot) shuffled 1 time with seed 1064; not the plan order.
-    const planOrder = ["a", "b", "c"].flatMap((task) =>
-        [0, 1, 2, 3].map((slot) => `${task}/${slot}`),
-    );
-    const expected = seededShuffle(planOrder, 1064);
-    const actual = items.map((i) => `${key.items[i.id].task}/${key.items[i.id].slot}`);
+        // The order: the items in plan order (task, then slot) shuffled 1 time with seed 1064; not the plan order.
+        const planOrder = ["a", "b", "c"].flatMap((task) =>
+            [0, 1, 2, 3].map((slot) => `${task}/${slot}`),
+        );
+        const expected = seededShuffle(planOrder, 1064);
+        const actual = items.map((i) => `${key.items[i.id].task}/${key.items[i.id].slot}`);
 
-    assert.deepEqual(actual, expected);
-    assert.notDeepEqual(actual, planOrder);
-    assert.equal(Object.values(key.items).filter((k) => k.set === "dev").length, 4);
-    assert.ok(Object.values(key.items).every((k) => ALL.includes(k.model)));
-    assert.equal(statSync(join(dir, "keys", "irulan.json")).mode & 0o777, 0o600);
+        assert.deepEqual(actual, expected);
+        assert.notDeepEqual(actual, planOrder);
+        assert.equal(Object.values(key.items).filter((k) => k.set === "dev").length, 4);
+        assert.ok(Object.values(key.items).every((k) => ALL.includes(k.model)));
+        assert.equal(statSync(join(dir, "keys", "irulan.json")).mode & 0o777, 0o600);
 
-    // Split by task: no task gives both dev and held-out items.
-    const sets = new Map();
+        // Split by task: no task gives both dev and held-out items.
+        const sets = new Map();
 
-    for (const entry of Object.values(key.items)) {
-        sets.set(entry.task, new Set([...(sets.get(entry.task) ?? []), entry.set]));
-    }
+        for (const entry of Object.values(key.items)) {
+            sets.set(entry.task, new Set([...(sets.get(entry.task) ?? []), entry.set]));
+        }
 
-    assert.ok([...sets.values()].every((s) => s.size === 1));
+        assert.ok([...sets.values()].every((s) => s.size === 1));
 
-    // Sheeana's pack: only Luna's pilot item (MAI-Code and Sonnet had no finished pilot attempt; Gemini none).
-    const sheeana = read(dir, "packs", "sheeana", "items.json").items;
+        // Sheeana's pack: only Luna's pilot item (MAI-Code and Sonnet had no finished pilot attempt; Gemini none).
+        const sheeana = read(dir, "packs", "sheeana", "items.json").items;
 
-    assert.equal(sheeana.length, 1);
-    assert.equal(sheeana[0].s1, true, "the item's S1 is the copy's, not the stale original's");
+        assert.equal(sheeana.length, 1);
+        assert.equal(sheeana[0].s1, true, "the item's S1 is the copy's, not the stale original's");
 
-    // The same packs again: unchanged. Labels, then other items: refused, nothing written.
-    assert.equal((await cli(["packs"])).code, 0);
+        // The same packs again: unchanged. Labels, then other items: refused, nothing written.
+        assert.equal((await cli(["packs"])).code, 0);
 
-    labels.labels[0].label = "pass";
-    writeFileSync(join(pack, "labels.json"), JSON.stringify(labels));
+        labels.labels[0].label = "pass";
+        writeFileSync(join(pack, "labels.json"), JSON.stringify(labels));
 
-    const same = await cli(["packs"]);
+        const same = await cli(["packs"]);
 
-    assert.equal(same.code, 0);
-    assert.match(same.out, /irulan: .*kept \(labelled\)/);
+        assert.equal(same.code, 0);
+        assert.match(same.out, /irulan: .*kept \(labelled\)/);
 
-    const plan = read(dir, "plan.json");
+        const plan = read(dir, "plan.json");
 
-    plan.tasks[0].set = "dev";
-    writeFileSync(join(dir, "plan.json"), JSON.stringify(plan));
+        plan.tasks[0].set = "dev";
+        writeFileSync(join(dir, "plan.json"), JSON.stringify(plan));
 
-    const changed = await cli(["packs"]);
+        const changed = await cli(["packs"]);
 
-    assert.equal(changed.code, 1);
-    assert.equal(read(pack, "labels.json").labels[0].label, "pass", "the labels stay");
-});
+        assert.equal(changed.code, 1);
+        assert.equal(read(pack, "labels.json").labels[0].label, "pass", "the labels stay");
+    },
+);
 
 test("usage: no command, an unknown command, no plan, --results", async () => {
     assert.equal(
