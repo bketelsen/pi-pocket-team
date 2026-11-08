@@ -1512,10 +1512,11 @@
 
 /*
  * The board's status tones, from the theme only (Pocket's web/style.css): blue runs, green finished, red failed, amber
- * unknown, magenta picked, gray dropped. Light themes darken --hl-*, --ok, --err and --warn, so each border and bar
- * reads at 3:1 on --card with the bundled palettes. No row has a tint: a tint lowers the --muted lines under 4.5:1. State
- * text stays in --muted or --text (4.5:1); the state word on each row says the status too, so color is never the only
- * sign.
+ * unknown, magenta picked, gray dropped. Light themes darken --hl-*, --ok, --err and --warn. The blue, magenta and green
+ * borders and bars read at 3:1 or more on --card in the bundled light themes; a few dark palettes have a red or amber
+ * under 3:1 of their own (miasma's --err: 2.1:1). No row has a tint: a tint lowers the --muted lines under the theme's
+ * own contrast on --card. State text stays in --muted or --text, as on a proposed row; the state word on each row says
+ * the status too, so color is never the only sign.
  */
 .board-page {
     overflow-wrap: anywhere;
