@@ -20346,13 +20346,25 @@ export function deskSupervisors(state: DeskState | undefined): number[] {
     return [...ids].sort((a, b) => a - b);
 }
 
-/** The board row states that end a row: a supervisor with only such rows is not live by its rows. */
-const ENDED_ROW_STATES: readonly string[] = ["launched", "failed", "dropped"];
+/**
+ * The board row states that keep a supervisor live: each state a person may still act on (pick, launch, reopen,
+ * resolve) or that the launch pass still holds. `launched` and `dropped` do not.
+ */
+const LIVE_ROW_STATES: readonly BoardModule.BoardRowState[] = [
+    "proposed",
+    "picked",
+    "waiting",
+    "starting",
+    "failed",
+    "unknown",
+];
 
 /**
- * The live supervisors: each conversation id with a thread that is not closed, a key of `sweepers`, a key of `clerks`,
- * or a board row that is not launched, failed or dropped. Safe integers above 0, each once, in order. A retired
- * supervisor session with only closed threads is not in it.
+ * The live supervisors: the 1 liveness rule of the goal board, shared by the Board view's default, an agent's
+ * `board_add` binding, `GET board` and `POST board/:conversation`. A conversation id is live with a thread that is not
+ * closed, a key of `sweepers`, a key of `clerks`, or a retained board row in a state of `LIVE_ROW_STATES` (so a
+ * supervisor whose only row is `failed` or `unknown` can still reopen or resolve it). Safe integers above 0, each once,
+ * in order. A retired supervisor session with only closed threads and no such row is not in it.
  */
 export function liveSupervisors(state: Readonly<DeskState> | undefined): number[] {
     const ids = new Set<number>();
@@ -20380,7 +20392,7 @@ export function liveSupervisors(state: Readonly<DeskState> | undefined): number[
     }
 
     for (const row of state?.board?.rows ?? []) {
-        if (!ENDED_ROW_STATES.includes(row.state)) {
+        if (LIVE_ROW_STATES.includes(row.state)) {
             add(row.supervisor);
         }
     }

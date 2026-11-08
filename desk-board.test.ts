@@ -1318,7 +1318,10 @@ const deskState = async (): Promise<DeskState> =>
 
 const rowsOf = async (supervisor: number) => boardRows((await deskState()).board, supervisor);
 
-/** Close every open thread: each test starts from a desk with no counted thread. */
+/**
+ * Close every open thread and drop every row that keeps a supervisor live (each state but `launched` and `dropped`):
+ * each test starts from a desk with no counted thread and no live supervisor by its rows.
+ */
 async function closeAll(): Promise<void> {
     await app.harness.commit(async (tx) => {
         const state = await tx.doc(DeskThreads);
@@ -1331,7 +1334,7 @@ async function closeAll(): Promise<void> {
         }
 
         for (const row of state.board?.rows ?? []) {
-            if (row.state !== "launched" && row.state !== "failed" && row.state !== "dropped") {
+            if (row.state !== "launched" && row.state !== "dropped") {
                 row.state = "dropped";
             }
         }
@@ -1723,6 +1726,98 @@ const launchSuite = (label: string, instant: number, untilAt: number) =>
             }
         });
 
+        test("an agent's row binds to a supervisor live only by a failed or unknown row; beside a second live one it is refused", async () => {
+            for (const only of ["failed", "unknown"] as const) {
+                await closeAll();
+
+                const folder = join(root, `teg-${only}-row-session`);
+
+                mkdirSync(folder, { recursive: true });
+
+                const agentSession = Number(await newSession(app, folder));
+
+                personas.set(agentSession, { id: "teg", name: "Teg", role: "agent" });
+
+                const saved = await deskState();
+                const before = (await rowsOf(5150)).length;
+
+                // 5150 has every thread (all closed), no sweeper and no Clerk, and 1 row in `only`.
+                const row = await app.harness.commit(async (tx) => {
+                    const state = await tx.doc(DeskThreads);
+                    const board = (state.board ??= { next: 1, rows: [] });
+                    const id = board.next;
+
+                    board.next += 1;
+                    board.rows.push({
+                        id,
+                        supervisor: 5150,
+                        rev: 1,
+                        state: only,
+                        by: "odrade",
+                        at: Date.now(),
+                        changedAt: Date.now(),
+                        agent: "teg",
+                        title: `A ${only} row`,
+                        task: "Tend the tests.",
+                        stopWhen: "CI is green",
+                        max: 2,
+                        until: "06:45",
+                        kind: "goal",
+                        order: id * 10,
+                        attempts: [],
+                    });
+                    state.sweepers = {};
+                    state.clerks = {};
+
+                    for (const each of Object.values(state.threads)) {
+                        each.supervisor = 5150;
+                    }
+
+                    return id;
+                }, context);
+
+                try {
+                    const text = await desk.tool(agentSession, {
+                        action: "board_add",
+                        fields: { ...FIELDS, agent: undefined },
+                    });
+
+                    assert.match(text, /rev 1 proposed · teg/, only);
+                    assert.equal((await rowsOf(5150)).length, before + 2, `${only}: bound to 5150`);
+
+                    // A second live supervisor (a sweeper): 2 known, so the agent's add is refused with the list.
+                    await app.harness.commit(async (tx) => {
+                        (await tx.doc(DeskThreads)).sweepers = { "4242": "task-test" };
+                    }, context);
+                    await assert.rejects(
+                        desk.tool(agentSession, {
+                            action: "board_add",
+                            fields: { ...FIELDS, agent: undefined },
+                        }),
+                        /The desk knows 2 supervisors \(4242, 5150\)/,
+                    );
+                } finally {
+                    await app.harness.commit(async (tx) => {
+                        const state = await tx.doc(DeskThreads);
+
+                        state.sweepers = saved.sweepers ?? {};
+                        state.clerks = saved.clerks ?? {};
+
+                        for (const each of state.board?.rows ?? []) {
+                            if (each.supervisor === 5150 && each.id >= row) {
+                                each.state = "dropped";
+                            }
+                        }
+
+                        for (const thread of Object.values(state.threads)) {
+                            thread.supervisor =
+                                saved.threads[thread.id]?.supervisor ?? thread.supervisor;
+                        }
+                    }, context);
+                }
+            }
+        });
+
         test("an agent's replayed call binds to the supervisor whose receipt holds its key, also after it retired", async () => {
             await closeAll();
 
@@ -2048,6 +2143,16 @@ const launchSuite = (label: string, instant: number, untilAt: number) =>
             // Room again: the next attempt reuses n.
             config(counted + 10, { reserve: 2 });
             await desk.tool(supervisor, { action: "sync" });
+            // The sync's pass or the sweeper's pass launches them: a row the other pass holds is skipped, and stays
+            // `starting` until that pass records it (#176).
+            await waitFor(async () => {
+                const now = await rowsOf(supervisor);
+
+                return (
+                    now[0]?.state === "launched" &&
+                    now.find((row) => row.id === second)?.state === "launched"
+                );
+            }, "both rows launched");
             rows = await rowsOf(supervisor);
             assert.equal(rows[0]?.state, "launched");
             assert.equal(rows[0]?.attempts.at(-1)?.n, 1);
