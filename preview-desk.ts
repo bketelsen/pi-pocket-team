@@ -9,7 +9,11 @@
 // and no thread of the desk has a supervisor, so no sweeper starts. The fake `gh` also fails every call. The asks
 // thread of `/preview-asks?on=1` is the 1 exception: it has a supervisor (the preview's first session), so a tap on
 // `artifact:<id>` opens a session. While it is there, a desk read can start a sweep; seed the dashboard again with
-// `/preview-fixture` if it changed, and take the thread out with `/preview-asks?on=0`.
+// `/preview-fixture` if it changed, and take the thread out with `/preview-asks?on=0`. The board of `/preview-board?on=1`
+// is the same: its threads T150 to T152 have the same supervisor (the first session), so the Board view shows its
+// rows. A board pass changes none of them: the Team module is off here, so a pass lets its waiting and starting rows
+// wait; and its threads have no session, so a sweep does not change their shift state. Take them out with
+// `/preview-board?on=0`.
 //
 // Routes beside the app's own, for the checks:
 //   /preview-login            sign in as the owner, in the preview's first session
@@ -18,6 +22,9 @@
 //   /preview-asks?on=1|0      seed thread T140 with 3 open asks in Markdown (inline code, a command block with Copy,
 //                            bold, a link, an artifact, a desk path; 1-line numbered steps with options; a long ask),
 //                            or take it out
+//   /preview-board?on=1|0     seed the first session's goal board with 1 row in each status (proposed, picked,
+//                            waiting, starting, launched and running, launched and finished by a closed thread or an
+//                            ended shift, failed, unknown, dropped) and their threads, or take them out
 //   /preview-fixture?name=N   seed variant N again (main, empty, not-started, stale, usage-unavailable, partial-usage,
 //                            residual-only, long)
 //   /preview-fail?on=1|0      make `GET dashboard` fail with a 500, or not
@@ -56,6 +63,7 @@ import {
     type Variant,
 } from "./desk-dashboard-fixture.ts";
 import { DeskThreads, type Thread, writeStore } from "./desk.ts";
+import type { BoardRow, BoardRowState } from "./_desk-board.ts";
 import { FIXTURE_PLANS, plansFixture } from "./desk-plans-fixture.ts";
 
 const fakeGh = join(root, "preview-gh");
@@ -228,6 +236,122 @@ const seedAsks = async (on: boolean): Promise<void> => {
     }, context);
 };
 
+/** The board's threads: open with a running shift, closed, and open with an ended shift. */
+const BOARD_THREADS = ["T150", "T151", "T152"] as const;
+/** The board's row ids: far above the ids a test of the page adds. */
+const BOARD_FIRST_ROW = 901;
+
+/** Put 1 board row in each status on the first session's board, with their threads; or take them out (`on` false). */
+const seedBoard = async (on: boolean): Promise<void> => {
+    const now = Date.now();
+    const until = new Date(now + 6 * 3600_000);
+    const hhmm = `${String(until.getHours()).padStart(2, "0")}:${String(until.getMinutes()).padStart(2, "0")}`;
+    const boardThread = (
+        id: string,
+        title: string,
+        state: Thread["state"],
+        shift?: string,
+    ): Thread => ({
+        id,
+        key: `preview:${id}`,
+        origin: "delegate",
+        agents: ["teg"],
+        repo: "frostyard/teg",
+        title,
+        state,
+        startedAt: now - 2 * 3600_000,
+        lastEventAt: now - 600_000,
+        supervisor: session,
+        prs: {},
+        branches: [],
+        run: shift === undefined ? {} : { shift },
+        events: [],
+        asks: [],
+        ...(state === "closed"
+            ? { closed: { at: now - 300_000, why: "done" as const, by: "desk" as const } }
+            : {}),
+    });
+    const threads = [
+        boardThread("T150", "Tend teg (preview board, running)", "open", "running"),
+        boardThread("T151", "Groom teg (preview board, closed)", "closed"),
+        boardThread("T152", "Sweep teg (preview board, shift ended)", "open", "ended"),
+    ];
+    const row = (
+        n: number,
+        state: BoardRowState,
+        title: string,
+        patch: Partial<BoardRow> = {},
+    ): BoardRow => ({
+        id: BOARD_FIRST_ROW + n,
+        supervisor: session,
+        rev: 1 + (n % 3),
+        state,
+        by: "odrade",
+        at: now - 3 * 3600_000,
+        changedAt: now - 600_000,
+        agent: "teg",
+        repo: "frostyard/teg",
+        title,
+        task: `The preview board's ${state} row.`,
+        stopWhen: "the tests pass",
+        max: 10,
+        until: hhmm,
+        kind: "goal",
+        order: (n + 1) * 10,
+        attempts: [],
+        ...patch,
+    });
+    const rows: BoardRow[] = [
+        row(0, "proposed", "A proposed row", { note: "neutral" }),
+        row(1, "picked", "A picked row", { kind: "feature" }),
+        row(2, "waiting", "A waiting row"),
+        row(3, "starting", "A starting row", { kind: "hygiene" }),
+        row(4, "launched", "A launched row, running", {
+            thread: "T150",
+            launchedAt: now - 3600_000,
+        }),
+        row(5, "launched", "A launched row, its thread closed", {
+            kind: "grooming",
+            thread: "T151",
+            launchedAt: now - 7200_000,
+        }),
+        row(6, "launched", "A launched row, its shift ended", {
+            kind: "sweep",
+            thread: "T152",
+            launchedAt: now - 5400_000,
+        }),
+        row(7, "failed", "A failed row", { error: "over the day's round budget" }),
+        row(8, "unknown", "An unknown row", { error: "the start threw: no answer from the team" }),
+        row(9, "dropped", "A dropped row"),
+    ];
+
+    await app.harness.commit(async (tx) => {
+        const state = await tx.doc(DeskThreads);
+
+        for (const id of BOARD_THREADS) {
+            delete state.threads[id];
+        }
+
+        const kept = (state.board?.rows ?? []).filter(
+            (each) => each.id < BOARD_FIRST_ROW || each.id >= BOARD_FIRST_ROW + rows.length,
+        );
+
+        state.board = {
+            ...state.board,
+            next: Math.max(state.board?.next ?? 1, BOARD_FIRST_ROW + rows.length),
+            rows: on ? [...kept, ...rows] : kept,
+        };
+
+        if (on) {
+            for (const thread of threads) {
+                state.threads[thread.id] = thread;
+            }
+
+            state.next = { ...state.next, T: Math.max(state.next.T, 153) };
+        }
+    }, context);
+};
+
 /** The variant seeded last: the thread details answer from it. */
 let seeded: Variant = "main";
 
@@ -335,6 +459,17 @@ const server = createServer((req, res) => {
 
         void seedAsks(on).then(
             () => text(res, 200, `asks ${on ? "seeded" : "gone"}`),
+            (error: unknown) => text(res, 500, String(error)),
+        );
+
+        return;
+    }
+
+    if (url.pathname === "/preview-board") {
+        const on = url.searchParams.get("on") !== "0";
+
+        void seedBoard(on).then(
+            () => text(res, 200, `board ${on ? "seeded" : "gone"}`),
             (error: unknown) => text(res, 500, String(error)),
         );
 

@@ -12695,7 +12695,10 @@ export type BoardLimits = {
     roundsMax: number;
 };
 
-/** 1 board row as the Desk page's Board view reads it: the stored fields, and the thread's next actor. */
+/**
+ * 1 board row as the Desk page's Board view reads it: the stored fields, and from the row's thread (when the desk holds it)
+ * the next actor, the thread's state, and `shiftEnded` when its shift ended. The page colors a launched row from these.
+ */
 export type BoardRowView = Pick<
     BoardModule.BoardRow,
     | "id"
@@ -12721,7 +12724,7 @@ export type BoardRowView = Pick<
     | "launchedAt"
     | "error"
     | "attempts"
-> & { next?: NextActor };
+> & { next?: NextActor; threadState?: Thread["state"]; shiftEnded?: true };
 
 /** 1 supervisor's rows for the page, in launch order. */
 export function boardRowViews(
@@ -12755,7 +12758,8 @@ export function boardRowViews(
             ...(row.launchedAt === undefined ? {} : { launchedAt: row.launchedAt }),
             ...(row.error === undefined ? {} : { error: row.error }),
             attempts: row.attempts,
-            ...(thread === undefined ? {} : { next: nextActor(thread) }),
+            ...(thread === undefined ? {} : { next: nextActor(thread), threadState: thread.state }),
+            ...(thread?.run.shift === "ended" ? { shiftEnded: true as const } : {}),
         };
     });
 }

@@ -1079,6 +1079,114 @@ describe("the Desk page's board routes", () => {
         assert.equal(first.data.supervisor, first.data.supervisors[0]);
     });
 
+    test("GET board: a launched row gives its thread's state, and shiftEnded only when the thread's shift ended", async () => {
+        const call = await routes();
+        const source = await knownSupervisor();
+        const desk = (globalThis as unknown as Record<symbol, DeskOpen | undefined>)[
+            Symbol.for("pi-pocket-team.desk")
+        ];
+
+        assert(desk !== undefined, "the desk is on");
+
+        const rows = {
+            open: await addRow(source, { title: "open row" }),
+            closed: await addRow(source, { title: "closed row" }),
+            ended: await addRow(source, { title: "ended row" }),
+            running: await addRow(source, { title: "running shift row" }),
+            proposed: await addRow(source, { title: "proposed row" }),
+        };
+        const threads: Record<string, string> = {};
+
+        for (const name of ["open", "closed", "ended", "running"]) {
+            await app.harness.commit(
+                (tx) =>
+                    desk.open(tx, {
+                        key: `board-status-thread:${String(source)}:${name}`,
+                        supervisor: Number(source),
+                        agents: ["teg"],
+                        title: `Board status ${name}`,
+                        task: "A thread of a launched row.",
+                        at: Date.now(),
+                    }),
+                context,
+            );
+            threads[name] =
+                Object.values((await deskState()).threads).find(
+                    (thread) => thread.title === `Board status ${name}`,
+                )?.id ?? assert.fail(`the thread ${name}`);
+        }
+
+        // 1 commit: 4 rows launched with their threads, open; 1 thread closed, 1 with an ended shift, 1 with a running one.
+        await app.harness.commit(async (tx) => {
+            const state = await tx.doc(DeskThreads);
+
+            for (const name of ["open", "closed", "ended", "running"] as const) {
+                const row = state.board?.rows.find((each) => each.id === rows[name]);
+
+                assert(row !== undefined);
+                row.state = "launched";
+                row.thread = threads[name];
+            }
+
+            const closed = state.threads[threads.closed ?? ""];
+            const ended = state.threads[threads.ended ?? ""];
+            const running = state.threads[threads.running ?? ""];
+
+            const open = state.threads[threads.open ?? ""];
+
+            assert(
+                open !== undefined &&
+                    closed !== undefined &&
+                    ended !== undefined &&
+                    running !== undefined,
+            );
+            // desk.open gives a starting thread: the agent's session has not reported yet.
+            open.state = "open";
+            ended.state = "open";
+            running.state = "open";
+            closed.state = "closed";
+            ended.run.shift = "ended";
+            running.run.shift = "running";
+        }, context);
+
+        const got = await call(`board?supervisor=${String(source)}`);
+
+        assert.equal(got.status, 200, JSON.stringify(got.data));
+
+        const shown = (id: number) =>
+            got.data.rows.find((row: { id: number }) => row.id === id) ??
+            assert.fail(`row ${String(id)}`);
+        const facts = (id: number) => ({
+            threadState: shown(id).threadState,
+            shiftEnded: shown(id).shiftEnded,
+            hasShiftEnded: "shiftEnded" in shown(id),
+        });
+
+        assert.deepEqual(facts(rows.open), {
+            threadState: "open",
+            shiftEnded: undefined,
+            hasShiftEnded: false,
+        });
+        assert.deepEqual(facts(rows.closed), {
+            threadState: "closed",
+            shiftEnded: undefined,
+            hasShiftEnded: false,
+        });
+        assert.deepEqual(facts(rows.ended), {
+            threadState: "open",
+            shiftEnded: true,
+            hasShiftEnded: true,
+        });
+        assert.deepEqual(facts(rows.running), {
+            threadState: "open",
+            shiftEnded: undefined,
+            hasShiftEnded: false,
+        });
+        // A row with no thread gives no thread facts.
+        assert.equal("threadState" in shown(rows.proposed), false);
+        assert.equal("shiftEnded" in shown(rows.proposed), false);
+    });
+
     test("GET board: only live supervisors, the one with a sweeper by default, and their session titles", async () => {
         const call = await routes();
         const retired = Number(await knownSupervisor());

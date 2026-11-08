@@ -112,10 +112,32 @@ export const rowFacts = (row) =>
         ...(row.worker ? [`worker ${row.worker}`] : []),
     ].join(" · ");
 
-/** A row's state on 1 line: its state and rev, then its thread and the next actor, or its error. */
+/** The row states that have a status of the same name. */
+const SAME_STATUS = new Set(["proposed", "picked", "waiting", "failed", "unknown", "dropped"]);
+
+/**
+ * A row's status, which gives its color (`board-status-<status>`): a starting row runs; a launched row runs while its
+ * thread is open (or the board gives no thread facts), and is finished when its thread closed or its shift ended. Any
+ * other state is neutral (`proposed`).
+ */
+export const rowStatus = (row) => {
+    const state = row?.state;
+
+    if (state === "starting") {
+        return "running";
+    }
+
+    if (state === "launched") {
+        return row.threadState === "closed" || row.shiftEnded === true ? "finished" : "running";
+    }
+
+    return SAME_STATUS.has(state) ? state : "proposed";
+};
+
+/** A row's state on 1 line: its state and rev (a launched row says running or finished), then its thread and the next actor, or its error. */
 export const rowStateText = (row) =>
     [
-        `${row.state} · rev ${String(row.rev)}`,
+        `${row.state === "launched" ? `launched (${rowStatus(row)})` : row.state} · rev ${String(row.rev)}`,
         ...(row.thread ? [`${row.thread}${row.next ? ` (next: ${row.next})` : ""}`] : []),
         ...((row.state === "failed" || row.state === "unknown") && row.error
             ? [`error: ${row.error}`]
@@ -454,7 +476,7 @@ export function boardMarkup(html, view, ctl) {
         </div>`;
 
     const rowItem = (row) =>
-        html`<li class=${`board-row board-${row.state}`}>
+        html`<li class=${`board-row board-${row.state} board-status-${rowStatus(row)}`}>
             <button
                 type="button"
                 class="board-row-head"
