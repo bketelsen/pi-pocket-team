@@ -181,9 +181,18 @@ test("load test: levels and rounds under the lease, then halogen.json", async ()
     const halogen = JSON.parse(readFileSync(join(fixture.data, "halogen.json"), "utf8"));
 
     assert.ok([1, 2].includes(halogen.concurrency));
-    assert.equal(halogen.table.length, 3);
+    assert.deepEqual(
+        halogen.table.map((r) => [r.level, r.round, r.attempt, r.error]),
+        [
+            [1, 1, 1, null],
+            [2, 1, 1, null],
+            [2, 1, 2, null],
+        ],
+    );
+    // The rate depends on when the runner reads each event line: on a loaded host 2 lines can come in 1 read, and then
+    // a row has no rate (#182). The rate rule and the stream timing have their own tests with fixed numbers.
     assert.ok(
-        halogen.table.every((r) => r.error === null && r.outputTps > 0),
+        halogen.table.every((r) => r.outputTps === null || r.outputTps > 0),
         JSON.stringify(halogen.table),
     );
     assert.ok(
