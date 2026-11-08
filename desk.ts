@@ -8884,11 +8884,12 @@ export function attribute(
             events: [],
         };
 
-        state.threads[id] = found;
-
+        // The found event goes on the literal before assignment: the document draft keeps its own copy of what is set.
         if (addEvent(found, "found", "found: a PR with no thread", now)) {
             events += 1;
         }
+
+        state.threads[id] = found;
     };
 
     for (const facts of Object.values(github.repos)) {
@@ -26406,12 +26407,13 @@ export default function createDesk(host: Host, web: Web) {
                 events: [],
             };
 
-            state.threads[id] = found;
-            addresses.add(session.address);
-
+            // The found event goes on the literal before assignment: the document draft keeps its own copy of what is set.
             if (addEvent(found, "found", "found: a linked session with no thread", now)) {
                 events += 1;
             }
+
+            state.threads[id] = found;
+            addresses.add(session.address);
 
             // Its last run failed: the queue says so in this commit, not "found session, attach or drop". The stored
             // thread, not the literal: the document keeps its own copy of what is set.
@@ -26491,9 +26493,7 @@ export default function createDesk(host: Host, web: Web) {
                 events: [],
             };
 
-            state.threads[id] = found;
-            worked.add(folder);
-
+            // The found event goes on the literal before assignment: the document draft keeps its own copy of what is set.
             if (
                 addEvent(
                     found,
@@ -26504,6 +26504,9 @@ export default function createDesk(host: Host, web: Web) {
             ) {
                 events += 1;
             }
+
+            state.threads[id] = found;
+            worked.add(folder);
         }
 
         // A folder that is clean now leaves the baseline: if it gets dirty again, that is new work.
