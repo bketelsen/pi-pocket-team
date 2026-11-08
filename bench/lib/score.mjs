@@ -212,6 +212,10 @@ export function fullyScored(result) {
     );
 }
 
+/** S1 is done: a boolean, or null for a task with no check (`check: null`). */
+const s1Done = (result, task) =>
+    typeof result.s1 === "boolean" || (task?.check === null && result.s1 === null);
+
 /**
  * True when a result needs no more checks-only scoring: S0 is done, and the attempt failed, or S1 (and S2 when the task
  * has one) and the submitted diff are done.
@@ -226,7 +230,7 @@ export function checksDone(result, task) {
     }
 
     return (
-        typeof result.s1 === "boolean" &&
+        s1Done(result, task) &&
         (!task?.hiddenCommand || typeof result.s2 === "boolean") &&
         typeof result.diffFile === "string" &&
         result.scoreError === undefined
@@ -470,7 +474,7 @@ export async function scoreResult(ctx, file, result, { task, manifest }) {
         !ctx.force &&
         result.judgePending === true &&
         Boolean(result.s0) &&
-        typeof result.s1 === "boolean" &&
+        s1Done(result, task) &&
         (!task.hiddenCommand || typeof result.s2 === "boolean");
     const save = () => writeJsonAtomic(file, result);
 
@@ -566,28 +570,37 @@ async function scoreAfterS0(ctx, { file, result, task, checkout, git, attempt, j
             const logFile = ctx.logFile;
             const s1Tree = join(scratch, "s1");
 
+            // A task with no check (`check: null`, the manifest says why in `checkNote`): S1 is not run.
+            if (!task.check) {
+                result.s1 = null;
+                result.s1Detail = `no check: ${task.checkNote ?? "the task has none"}`;
+            }
+
             await copyTree(result.workDir, s1Tree);
 
             // New files of the worker are untracked: stage them, so a check that lists files with `git ls-files`
             // sees them as a commit holds them. A failure is logged, and the check runs anyway.
-            const s1Staged = await stageAll(ctx.sandbox, {
-                work: s1Tree,
-                cache,
-                timeoutMs: ctx.timeouts.check,
-                logFile,
-                step: "S1, the staging of new files",
-            });
-            const s1 = await runInSandbox(ctx.sandbox, {
-                work: s1Tree,
-                cache,
-                command: task.check,
-                timeoutMs: ctx.timeouts.check,
-                logFile,
-                step: "S1, the check",
-            });
+            if (task.check) {
+                const s1Staged = await stageAll(ctx.sandbox, {
+                    work: s1Tree,
+                    cache,
+                    timeoutMs: ctx.timeouts.check,
+                    logFile,
+                    step: "S1, the staging of new files",
+                });
+                const s1 = await runInSandbox(ctx.sandbox, {
+                    work: s1Tree,
+                    cache,
+                    command: task.check,
+                    timeoutMs: ctx.timeouts.check,
+                    logFile,
+                    step: "S1, the check",
+                });
 
-            result.s1 = s1.ok;
-            result.s1Detail = s1.ok ? "pass" : `${failText(s1)}${stageNote(s1Staged)}`;
+                result.s1 = s1.ok;
+                result.s1Detail = s1.ok ? "pass" : `${failText(s1)}${stageNote(s1Staged)}`;
+            }
+
             await cleanupTree(s1Tree, ctx.log);
 
             if (task.hiddenCommand) {

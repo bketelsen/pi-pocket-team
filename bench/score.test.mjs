@@ -416,6 +416,46 @@ test("--checks-only: S0 to S2 and the diffs with no judge call; a later run with
     );
 });
 
+test("a task with no check (check: null): S1 is not run, and the checks are done", async () => {
+    const task = taskOf(
+        "no-check",
+        { default: [GOOD(4)] },
+        { check: null, checkNote: "fails at the merge" },
+    );
+    const paths = await attempt(task, { change: FIX });
+    const { code, result } = await score(paths, ["--checks-only"]);
+
+    assert.equal(code, 0);
+    assert.equal(result.s1, null);
+    assert.equal(result.s1Detail, "no check: fails at the merge");
+    assert.equal(result.s2, true, "S2 still runs");
+    assert.equal(result.checksOnly, true);
+    assert.equal(
+        existsSync(
+            join(paths.data, "score", "stage1", "no-check", "github-copilot__gpt-6-luna.score.log"),
+        ) &&
+            /S1, the check/.test(
+                readFileSync(
+                    join(
+                        paths.data,
+                        "score",
+                        "stage1",
+                        "no-check",
+                        "github-copilot__gpt-6-luna.score.log",
+                    ),
+                    "utf8",
+                ),
+            ),
+        false,
+        "no S1 command ran",
+    );
+
+    const again = await score(paths, ["--checks-only"]);
+
+    assert.equal(again.code, 0);
+    assert.equal(again.result.scoredAt, result.scoredAt, "checked already");
+});
+
 test("a wrong change fails S1 or S2; the tree with no fix fails S2", async () => {
     const task = taskOf("nofix", { default: [GOOD(1)] });
     const paths = await attempt(task, { change: { "notes.txt": "only notes\n" } });
