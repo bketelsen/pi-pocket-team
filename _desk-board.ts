@@ -592,9 +592,43 @@ export type BoardOpContext = {
     models: readonly string[];
     /** Absent: a pick is refused (the shift module is off or too old). */
     clock?: BoardClock;
+    /**
+     * The shift module's limit on the objective (the task when the row has none) plus `stopWhen`, each trimmed. Absent
+     * when the module is off or too old: then the board does not check it (the start still does).
+     */
+    shiftTextLimit?: number;
     /** The supervisor of a thread on the desk, or undefined when there is no such thread. */
     threadSupervisor: (id: string) => number | undefined;
 };
+
+/**
+ * Why a row's shift text is over the shift's limit, or undefined: it counts the text the start gives the shift, the
+ * objective (the task when the row has none) plus `stopWhen`, each trimmed.
+ */
+export function shiftTextRefusal(
+    label: string,
+    row: Pick<BoardRow, "task" | "objective" | "stopWhen">,
+    limit: number,
+): string | undefined {
+    const objective = (row.objective ?? row.task).trim().length;
+    const stop = row.stopWhen.trim().length;
+    const total = objective + stop;
+
+    if (total <= limit) {
+        return undefined;
+    }
+
+    const parts =
+        row.objective === undefined
+            ? `the task ${String(objective)}, as the objective, and stopWhen ${String(stop)}`
+            : `objective ${String(objective)} and stopWhen ${String(stop)}`;
+    const fix =
+        row.objective === undefined
+            ? "Give a short objective (the task stays the task), or shorten stopWhen."
+            : "Give a shorter objective, or shorten stopWhen.";
+
+    return `${label}: the shift's text is ${String(total)} characters (${parts}): a shift takes at most ${String(limit)}. ${fix}`;
+}
 
 /** The stale-revision refusal. */
 export function staleText(row: BoardRow): string {
@@ -748,6 +782,14 @@ export function boardOp(
                 attempts: [],
             };
 
+            if (context.shiftTextLimit !== undefined) {
+                const over = shiftTextRefusal("The new row", row, context.shiftTextLimit);
+
+                if (over !== undefined) {
+                    return refuse(over);
+                }
+            }
+
             board.next = id + 1;
             board.rows.push(row);
 
@@ -774,6 +816,26 @@ export function boardOp(
 
             if ("error" in checked) {
                 return refuse(checked.error);
+            }
+
+            // The row after this edit must stay in the shift's limit: check it before anything changes.
+            if (context.shiftTextLimit !== undefined) {
+                const objective = checked.clear.includes("objective")
+                    ? undefined
+                    : (checked.set.objective ?? row.objective);
+                const over = shiftTextRefusal(
+                    `Row ${String(row.id)}`,
+                    {
+                        task: checked.set.task ?? row.task,
+                        ...(objective === undefined ? {} : { objective }),
+                        stopWhen: checked.set.stopWhen ?? row.stopWhen,
+                    },
+                    context.shiftTextLimit,
+                );
+
+                if (over !== undefined) {
+                    return refuse(over);
+                }
             }
 
             const target = row as Record<string, unknown>;
@@ -856,6 +918,18 @@ export function boardOp(
 
                 if (row.state !== from) {
                     return wrongState(row, op.op, from);
+                }
+
+                if (op.op === "pick" && context.shiftTextLimit !== undefined) {
+                    const over = shiftTextRefusal(
+                        `Row ${String(row.id)}`,
+                        row,
+                        context.shiftTextLimit,
+                    );
+
+                    if (over !== undefined) {
+                        return refuse(over);
+                    }
                 }
 
                 if (op.op === "pick" && context.clock !== undefined) {

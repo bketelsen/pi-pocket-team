@@ -81,7 +81,7 @@ State is one document per conversation, `x.night-shift.goal` (`{ goal?: Goal }`;
 - **Plan mode:** a goal does not start in plan mode, and pauses before a round when plan mode is on. Reading plan mode uses Pocket's own `pocket.plan` document, which is not public API: if it changes, the read fails and the goal relies on Pi saying BLOCKED, as the prompt asks.
 - **Worker:** the model must be in the owner's allowed list for subagents. The command and `team_delegate` refuse another model; `resume` checks the list again, because it can change. No other model is ever used in its place.
 - **Who:** anyone who can steer the session runs `/team-shift`; a check needs the owner. One goal per session. Any session works, linked sessions included.
-- Objective and condition together: 3000 characters. Check: 2000 characters, 10 minutes, the last 3000 characters of its output.
+- Objective and condition together: 3000 characters (`SHIFT_TEXT_LIMIT`; the desk's goal board reads it as `textLimit` on the API and checks the same limit at add, edit and pick). Check: 2000 characters, 10 minutes, the last 3000 characters of its output.
 
 ## Delegated shifts
 

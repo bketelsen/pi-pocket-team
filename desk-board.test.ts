@@ -38,6 +38,7 @@ import {
     pruneBoard,
     recordStart,
     roundsToday,
+    shiftTextRefusal,
     staleText,
     type Board,
     type BoardActor,
@@ -47,7 +48,7 @@ import {
     type BoardOpContext,
     type BoardRow,
 } from "./_desk-board.ts";
-import { localMidnight, nextClockTime } from "./night-shift.ts";
+import { delegatedRequest, localMidnight, nextClockTime, SHIFT_TEXT_LIMIT } from "./night-shift.ts";
 import createDesk, {
     BoardReceipts,
     capView,
@@ -78,6 +79,7 @@ const opContext = (patch: Partial<BoardOpContext> = {}): BoardOpContext => ({
     roster: ROSTER,
     models: MODELS,
     clock: NEW_YORK,
+    shiftTextLimit: SHIFT_TEXT_LIMIT,
     threadSupervisor: (id) => (id === "T5" ? 7 : id === "T6" ? 8 : undefined),
     ...patch,
 });
@@ -97,8 +99,13 @@ const FIELDS = {
 const emptyBoard = (): Board => ({ next: 1, rows: [] });
 
 /** Add 1 row as the supervisor, and give it back. */
-function added(board: Board, fields: object = FIELDS, actor: BoardActor = SUPERVISOR): BoardRow {
-    const done = boardOp(board, actor, { op: "add", fields }, opContext(), LATE);
+function added(
+    board: Board,
+    fields: object = FIELDS,
+    actor: BoardActor = SUPERVISOR,
+    context: BoardOpContext = opContext(),
+): BoardRow {
+    const done = boardOp(board, actor, { op: "add", fields }, context, LATE);
 
     assert(!("status" in done), JSON.stringify(done));
 
@@ -234,22 +241,27 @@ describe("board rows: fields, bounds and defaults", () => {
         }
     });
 
-    test("the largest values and every optional field are kept", () => {
-        const row = added(emptyBoard(), {
-            ...FIELDS,
-            repo: "frostyard/teg",
-            title: "t".repeat(120),
-            task: "x".repeat(6000),
-            objective: "o".repeat(3000),
-            stopWhen: "s".repeat(3000),
-            max: 100,
-            start: "05:00",
-            worker: "faux/faux-2",
-            prCheck: { pr: 12, repo: "frostyard/teg", checks: "all", label: "ready-for-human" },
-            kind: "quality",
-            note: "n".repeat(500),
-            order: 5.5,
-        });
+    test("the largest values and every optional field are kept (with no shift text limit: each field's own bound)", () => {
+        const row = added(
+            emptyBoard(),
+            {
+                ...FIELDS,
+                repo: "frostyard/teg",
+                title: "t".repeat(120),
+                task: "x".repeat(6000),
+                objective: "o".repeat(3000),
+                stopWhen: "s".repeat(3000),
+                max: 100,
+                start: "05:00",
+                worker: "faux/faux-2",
+                prCheck: { pr: 12, repo: "frostyard/teg", checks: "all", label: "ready-for-human" },
+                kind: "quality",
+                note: "n".repeat(500),
+                order: 5.5,
+            },
+            SUPERVISOR,
+            opContext({ shiftTextLimit: undefined }),
+        );
 
         assert.equal(row.agent, "teg");
         assert.equal(row.repo, "frostyard/teg");
@@ -1093,6 +1105,193 @@ describe("board pruning and settings", () => {
     });
 });
 
+describe("board rows: the shift's text limit", () => {
+    const LIMIT = SHIFT_TEXT_LIMIT;
+    /** Text of `length` characters with no space: the board keeps it as it is. */
+    const chars = (length: number, letter = "x") => letter.repeat(length);
+    /** Fields whose shift text is `total` characters: the task (or `objective`) and 1000 of stopWhen. */
+    const sized = (total: number, objective = false) => ({
+        ...FIELDS,
+        ...(objective
+            ? { task: chars(6000, "t"), objective: chars(total - 1000, "o") }
+            : { task: chars(total - 1000, "t") }),
+        stopWhen: chars(1000, "s"),
+    });
+    const add = (board: Board, fields: object, context = opContext()) =>
+        boardOp(board, SUPERVISOR, { op: "add", fields }, context, LATE);
+    const edit = (board: Board, row: number, fields: object) =>
+        boardOp(board, SUPERVISOR, { op: "edit", row, fields }, opContext(), LATE);
+
+    test("an add 1 over the limit with no objective is refused with 400: the task counts as the objective; nothing changes", () => {
+        const board = emptyBoard();
+        const before = structuredClone(board);
+        const refused = refusal(add(board, sized(LIMIT + 1)));
+
+        assert.equal(refused.status, 400);
+        assert.equal(
+            refused.error,
+            `The new row: the shift's text is ${String(LIMIT + 1)} characters (the task ${String(LIMIT - 999)}, as the objective, and stopWhen 1000): a shift takes at most ${String(LIMIT)}. Give a short objective (the task stays the task), or shorten stopWhen.`,
+        );
+        assert.deepEqual(board, before);
+    });
+
+    test("an add 1 over the limit with an objective is refused: the objective counts, not the task", () => {
+        const board = emptyBoard();
+        const refused = refusal(add(board, sized(LIMIT + 1, true)));
+
+        assert.equal(refused.status, 400);
+        assert.equal(
+            refused.error,
+            `The new row: the shift's text is ${String(LIMIT + 1)} characters (objective ${String(LIMIT - 999)} and stopWhen 1000): a shift takes at most ${String(LIMIT)}. Give a shorter objective, or shorten stopWhen.`,
+        );
+        assert.deepEqual(board, emptyBoard());
+    });
+
+    test("an add at exactly the limit is accepted, with and without an objective; a 6000-character task with an objective is not counted", () => {
+        const board = emptyBoard();
+
+        assert.equal(added(board, sized(LIMIT)).task.length, LIMIT - 1000);
+        assert.equal(added(board, sized(LIMIT, true)).task.length, 6000);
+        assert.equal(board.rows.length, 2);
+    });
+
+    test("an edit that goes 1 over the limit is refused with 400 and changes nothing; an edit to exactly the limit is accepted", () => {
+        const board = emptyBoard();
+        const plain = added(board, sized(LIMIT - 1));
+        const withObjective = added(board, sized(LIMIT, true));
+        const before = structuredClone(board);
+        const over = [
+            // The task, with no objective: it counts.
+            edit(board, plain.id, { task: chars(LIMIT - 999, "t") }),
+            // The objective.
+            edit(board, withObjective.id, { objective: chars(LIMIT - 999, "o") }),
+            // stopWhen.
+            edit(board, plain.id, { stopWhen: chars(1002, "s") }),
+            // Clearing the objective: the 6000-character task counts now.
+            edit(board, withObjective.id, { objective: null }),
+        ];
+
+        for (const result of over) {
+            const refused = refusal(result);
+
+            assert.equal(refused.status, 400);
+            assert.match(
+                refused.error,
+                new RegExp(
+                    `^Row \\d: the shift's text is \\d+ characters .*at most ${String(LIMIT)}\\.`,
+                ),
+            );
+        }
+
+        assert.deepEqual(board, before, "nothing changed: rev, state and fields");
+
+        const done = edit(board, plain.id, { task: chars(LIMIT - 1000, "t") });
+
+        assert(!("status" in done), JSON.stringify(done));
+        assert.equal(plain.rev, 2);
+    });
+
+    test("an edit of only max on a row stored over the limit is refused: no edit leaves a row over it", () => {
+        const board = emptyBoard();
+        const row = added(board);
+
+        row.task = chars(LIMIT, "t");
+
+        const refused = refusal(edit(board, row.id, { max: 3 }));
+
+        assert.equal(refused.status, 400);
+        assert.equal(row.rev, 1);
+        assert.equal(row.max, FIELDS.max);
+    });
+
+    test("a pick of a row stored over the limit refuses the whole call with 400; a stored row at the limit is picked", () => {
+        const board = emptyBoard();
+        const valid = added(board);
+        const over = added(board);
+        const atLimit = added(board);
+
+        // Rows made before the board checked the limit: written to the store directly.
+        over.task = chars(LIMIT + 1 - over.stopWhen.length, "t");
+        atLimit.task = chars(LIMIT - atLimit.stopWhen.length, "t");
+
+        const refused = refusal(
+            boardOp(
+                board,
+                SUPERVISOR,
+                {
+                    op: "pick",
+                    rows: [
+                        { row: valid.id, rev: 1 },
+                        { row: over.id, rev: 1 },
+                    ],
+                },
+                opContext(),
+                LATE,
+            ),
+        );
+
+        assert.equal(refused.status, 400);
+        assert.match(
+            refused.error,
+            new RegExp(
+                `^Row ${String(over.id)}: the shift's text is ${String(LIMIT + 1)} characters`,
+            ),
+        );
+        assert.equal(valid.state, "proposed");
+        assert.equal(over.state, "proposed");
+
+        const done = boardOp(
+            board,
+            SUPERVISOR,
+            { op: "pick", rows: [{ row: atLimit.id, rev: 1 }] },
+            opContext(),
+            LATE,
+        );
+
+        assert(!("status" in done), JSON.stringify(done));
+        assert.equal(atLimit.state, "picked");
+    });
+
+    test("with no shiftTextLimit (an older shift module) an add over the limit is accepted: the start still checks it", () => {
+        const board = emptyBoard();
+        const done = add(board, sized(LIMIT + 1), opContext({ shiftTextLimit: undefined }));
+
+        assert(!("status" in done), JSON.stringify(done));
+        assert.equal(board.rows.length, 1);
+    });
+
+    test("the board refuses exactly where the shift's start refuses: the same text, the same limit", () => {
+        for (const objective of [false, true]) {
+            for (const total of [LIMIT, LIMIT + 1]) {
+                const fields = sized(total, objective);
+                const row = {
+                    task: fields.task,
+                    stopWhen: fields.stopWhen,
+                    ...("objective" in fields ? { objective: fields.objective } : {}),
+                };
+                const board = shiftTextRefusal("Row 1", row, LIMIT);
+                const start = delegatedRequest(
+                    {
+                        objective: row.objective ?? row.task,
+                        stop_when: row.stopWhen,
+                        max: 1,
+                        until_at: LATE + 3600_000,
+                    },
+                    LATE,
+                    NEW_YORK.zone,
+                );
+
+                assert.equal(
+                    board === undefined,
+                    !("error" in start),
+                    `${String(total)} ${String(objective)}`,
+                );
+                assert.equal(board === undefined, total <= LIMIT);
+            }
+        }
+    });
+});
+
 // ─── The tool and the launch pass, on Pi Pocket's harness ────────────────────
 
 /** Each run of the launch-pass suite has its own data folder. */
@@ -1223,6 +1422,7 @@ const fakeShift = {
     zone: () => "America/New_York",
     nextClockTime,
     localMidnight,
+    textLimit: SHIFT_TEXT_LIMIT,
     goal: async (_read: unknown, id: ConversationId) => {
         const status = goals.get(Number(id));
 
@@ -1471,6 +1671,25 @@ const launchSuite = (label: string, instant: number, untilAt: number) =>
                 /rev 1 proposed · teg · goal · max 20 · until 06:45 .*: First$/,
             );
             assert.match(lines[2] ?? "", /: Second$/);
+        });
+
+        test("a board_add over the shift's text limit is refused with the counted length and the limit; no row is added", async () => {
+            const supervisor = await supervisorSession();
+
+            await assert.rejects(
+                desk.tool(supervisor, {
+                    action: "board_add",
+                    fields: {
+                        ...FIELDS,
+                        task: "t".repeat(SHIFT_TEXT_LIMIT - 999),
+                        stopWhen: "s".repeat(1000),
+                    },
+                }),
+                new RegExp(
+                    `The new row: the shift's text is ${String(SHIFT_TEXT_LIMIT + 1)} characters .*a shift takes at most ${String(SHIFT_TEXT_LIMIT)}\\.`,
+                ),
+            );
+            assert.deepEqual(await rowsOf(supervisor), []);
         });
 
         test("a board_add replayed after 250 other board calls gives its first text and adds no row; the receipt is in x.desk.board-receipts", async () => {

@@ -38,6 +38,7 @@ import {
     nextFailures,
     type NightShiftApi,
     roundMessage,
+    SHIFT_TEXT_LIMIT,
     standing,
     statusCard,
     SUBAGENT_WAIT_MS,
@@ -1623,6 +1624,7 @@ describe("start", () => {
 
         assert.ok(api !== undefined, "the shift module's API");
         assert.equal(api.version, 3);
+        assert.equal(api.textLimit, SHIFT_TEXT_LIMIT, "the desk's goal board reads the limit");
 
         // A board row's end before its start: delegatedRequest keeps both, so the deadline does not move.
         const untilAt = start - 30 * 60_000;

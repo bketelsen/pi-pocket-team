@@ -106,7 +106,12 @@ export const SAME_FAILURES = 3;
 /** The longest a deadline can be from now. */
 const MAX_HOURS = 24;
 const MAX_COMMAND = 2000;
-const MAX_TEXT = 3000;
+
+/**
+ * The longest shift text: the objective and the stop condition together, each trimmed. The desk's goal board reads it
+ * as `textLimit` on the API, so it refuses a row over it at add, edit and pick.
+ */
+export const SHIFT_TEXT_LIMIT = 3000;
 /** How long a check may run. */
 const CHECK_TIMEOUT_SECONDS = 600;
 /** How much of a failing check's output Pi gets: its end, where the failures usually are. */
@@ -830,10 +835,10 @@ export function parseArgs(input: string, now: number, zone: string): Parsed {
         return { kind: "error", message: `Say the stop condition after "stop when".\n${USAGE}` };
     }
 
-    if (objective.length + stop.length > MAX_TEXT) {
+    if (objective.length + stop.length > SHIFT_TEXT_LIMIT) {
         return {
             kind: "error",
-            message: `The objective and the stop condition are limited to ${MAX_TEXT} characters.`,
+            message: `The objective and the stop condition are limited to ${SHIFT_TEXT_LIMIT} characters.`,
         };
     }
 
@@ -1054,9 +1059,9 @@ export function delegatedRequest(
         return { error: `Say the stop condition after "stop when".\n${USAGE}` };
     }
 
-    if (objective.length + stop.length > MAX_TEXT) {
+    if (objective.length + stop.length > SHIFT_TEXT_LIMIT) {
         return {
-            error: `The objective and the stop condition are limited to ${MAX_TEXT} characters.`,
+            error: `The objective and the stop condition are limited to ${SHIFT_TEXT_LIMIT} characters.`,
         };
     }
 
@@ -1684,6 +1689,11 @@ export type NightShiftApi = {
      */
     nextClockTime?: typeof nextClockTime;
     localMidnight?: typeof localMidnight;
+    /**
+     * `SHIFT_TEXT_LIMIT`: the longest objective plus stop condition, each trimmed. An older module has none: the board
+     * then leaves the check to the start.
+     */
+    textLimit?: number;
     /** A goal as the desk's sweep reads it. */
     goal: (
         read: DocumentReader,
@@ -2945,6 +2955,7 @@ export default function createNightShift(host: Host, web: Web) {
         zone,
         nextClockTime,
         localMidnight,
+        textLimit: SHIFT_TEXT_LIMIT,
         goal: async (read, conversationId, context) => {
             const goal = (await read.snapshot(GoalDoc, conversationId, context))?.goal;
 
