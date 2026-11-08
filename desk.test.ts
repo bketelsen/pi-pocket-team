@@ -257,7 +257,10 @@ import {
 import createDesk, { linkedSend } from "./desk.ts";
 import type { BoardRow } from "./_desk-board.ts";
 import {
+    defaultBoardSupervisor,
     deskSupervisors,
+    liveSupervisors,
+    receiptSupervisors,
     REPORTS_OFF_TASK_STALE_MS,
     reportsOffActions,
     reportsOffKey,
@@ -635,6 +638,98 @@ describe("run-end answers", () => {
         assert.deepEqual(deskSupervisors(supervised()), [3, 7, 9]);
         assert.deepEqual(deskSupervisors(empty()), []);
         assert.deepEqual(deskSupervisors(undefined), []);
+    });
+
+    /**
+     * A desk with a retired supervisor 1745 (only closed threads), a live 35393 (a sweeper and a Clerk), 20 with an open
+     * thread only, 30 with only a proposed row, and 40 with only launched, dropped and failed rows.
+     */
+    const retired = (): DeskState => {
+        const state = empty();
+        const old = open(state, "live:old", 10).thread;
+        const older = open(state, "live:older", 11).thread;
+        const current = open(state, "live:current", 12).thread;
+
+        old.supervisor = 1745;
+        older.supervisor = 1745;
+
+        for (const thread of [old, older]) {
+            thread.state = "closed";
+            thread.closed = { at: 20, why: "done", by: "sweep" };
+        }
+
+        current.supervisor = 20;
+        state.sweepers = { "35393": "task-35393" };
+        state.clerks = { "35393": { session: 90, address: "session-90", agent: "clerk", at: 1 } };
+
+        const row = (id: number, supervisor: number, rowState: BoardRow["state"]): BoardRow => ({
+            id,
+            supervisor,
+            rev: 1,
+            state: rowState,
+            by: "odrade",
+            at: 0,
+            changedAt: 0,
+            agent: "teg",
+            title: `Row ${String(id)}`,
+            task: "Tend the tests.",
+            stopWhen: "CI is green",
+            max: 20,
+            until: "06:45",
+            kind: "goal",
+            order: id * 10,
+            attempts: [],
+        });
+
+        state.board = {
+            next: 5,
+            rows: [
+                row(1, 30, "proposed"),
+                row(2, 40, "launched"),
+                row(3, 40, "dropped"),
+                row(4, 40, "failed"),
+            ],
+        };
+
+        return state;
+    };
+
+    test("the live supervisors: an open thread, a sweeper, a Clerk or a row not ended; not a retired one", () => {
+        assert.deepEqual(liveSupervisors(retired()), [20, 30, 35393]);
+        assert.deepEqual(
+            deskSupervisors(retired()),
+            [20, 1745, 35393],
+            "the run-end pass keeps every one",
+        );
+        assert.deepEqual(liveSupervisors(empty()), []);
+        assert.deepEqual(liveSupervisors(undefined), []);
+    });
+
+    test("the receipts' supervisors: each supervisor whose receipts hold the key, sorted", () => {
+        const receipt = (key: string) => ({ key, at: 1, result: "done" });
+        const doc = {
+            supervisors: {
+                "4242": { receipts: [receipt("x.desk.board:t:2"), receipt("x.desk.board:t:both")] },
+                "1745": { receipts: [receipt("x.desk.board:t:1"), receipt("x.desk.board:t:both")] },
+            },
+        };
+
+        assert.deepEqual(receiptSupervisors(doc, "x.desk.board:t:1"), [1745]);
+        assert.deepEqual(receiptSupervisors(doc, "x.desk.board:t:2"), [4242]);
+        assert.deepEqual(receiptSupervisors(doc, "x.desk.board:t:3"), []);
+        assert.deepEqual(receiptSupervisors(doc, "x.desk.board:t:both"), [1745, 4242]);
+        assert.deepEqual(receiptSupervisors({ supervisors: {} }, "x.desk.board:t:1"), []);
+        assert.deepEqual(receiptSupervisors(undefined, "x.desk.board:t:1"), []);
+    });
+
+    test("the board's default supervisor: the one with a sweeper, also when it is not the lowest; else the first", () => {
+        const state = retired();
+
+        assert.equal(defaultBoardSupervisor(state, liveSupervisors(state)), 35393);
+        assert.equal(defaultBoardSupervisor(state, [20, 30]), 20);
+        assert.equal(defaultBoardSupervisor(empty(), [7, 9]), 7);
+        assert.equal(defaultBoardSupervisor(state, []), null);
+        assert.equal(defaultBoardSupervisor(undefined, []), null);
     });
 
     test("Pi Pocket 0.28 and later sends run-end answers; a suffix is ignored, junk is not a release", () => {

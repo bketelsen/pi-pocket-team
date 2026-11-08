@@ -48,7 +48,13 @@ import {
     type BoardRow,
 } from "./_desk-board.ts";
 import { localMidnight, nextClockTime } from "./night-shift.ts";
-import createDesk, { BoardReceipts, capView, DeskThreads, type DeskState } from "./desk.ts";
+import createDesk, {
+    BoardReceipts,
+    capView,
+    DeskThreads,
+    type DeskState,
+    openThread,
+} from "./desk.ts";
 
 // ─── Fixtures ────────────────────────────────────────────────────────────────
 
@@ -1650,6 +1656,192 @@ const launchSuite = (label: string, instant: number, untilAt: number) =>
                     for (const thread of Object.values(state.threads)) {
                         thread.supervisor =
                             saved.threads[thread.id]?.supervisor ?? thread.supervisor;
+                    }
+                }, context);
+            }
+        });
+
+        test("an agent's row binds to the live supervisor: a retired one with only closed threads does not count", async () => {
+            await closeAll();
+
+            mkdirSync(join(root, "teg-retired-session"), { recursive: true });
+
+            const agentSession = Number(await newSession(app, join(root, "teg-retired-session")));
+
+            personas.set(agentSession, { id: "teg", name: "Teg", role: "agent" });
+
+            const saved = await deskState();
+
+            // 1745 is retired: every thread is its own (1 more, closed, so it has at least 1), and every thread is
+            // closed. 4242 is live by its sweeper record.
+            const added = await app.harness.commit(async (tx) => {
+                const state = await tx.doc(DeskThreads);
+                const { id } = openThread(state, {
+                    key: "board-test:retired-supervisor",
+                    supervisor: 1745,
+                    agents: ["teg"],
+                    title: "A retired supervisor's thread",
+                    at: Date.now(),
+                }).thread;
+                // The stored thread, not the object openThread made: the document keeps its own copy.
+                const thread = state.threads[id] ?? assert.fail("the retired supervisor's thread");
+
+                thread.state = "closed";
+                thread.closed = { at: Date.now(), why: "done", by: "desk" };
+                state.sweepers = { "4242": "task-test" };
+                state.clerks = {};
+
+                for (const each of Object.values(state.threads)) {
+                    each.supervisor = 1745;
+                }
+
+                return thread.id;
+            }, context);
+
+            try {
+                const text = await desk.tool(agentSession, {
+                    action: "board_add",
+                    fields: { ...FIELDS, agent: undefined },
+                });
+
+                assert.match(text, /rev 1 proposed · teg/);
+                assert.equal((await rowsOf(4242)).at(-1)?.by, "teg");
+                assert.deepEqual(await rowsOf(1745), [], "the retired supervisor gets no row");
+            } finally {
+                await app.harness.commit(async (tx) => {
+                    const state = await tx.doc(DeskThreads);
+
+                    delete state.threads[added];
+                    state.sweepers = saved.sweepers ?? {};
+                    state.clerks = saved.clerks ?? {};
+
+                    for (const thread of Object.values(state.threads)) {
+                        thread.supervisor =
+                            saved.threads[thread.id]?.supervisor ?? thread.supervisor;
+                    }
+                }, context);
+            }
+        });
+
+        test("an agent's replayed call binds to the supervisor whose receipt holds its key, also after it retired", async () => {
+            await closeAll();
+
+            mkdirSync(join(root, "teg-replay-session"), { recursive: true });
+
+            const agentSession = Number(await newSession(app, join(root, "teg-replay-session")));
+
+            personas.set(agentSession, { id: "teg", name: "Teg", role: "agent" });
+
+            const saved = await deskState();
+            const call = () =>
+                desk.tool(
+                    agentSession,
+                    { action: "board_add", fields: { ...FIELDS, agent: undefined } },
+                    "call-replay-after-retire",
+                );
+
+            // Only 1745 is live, by its sweeper record: every thread is closed and no row is open.
+            await app.harness.commit(async (tx) => {
+                const state = await tx.doc(DeskThreads);
+
+                state.sweepers = { "1745": "task-test" };
+                state.clerks = {};
+            }, context);
+
+            try {
+                const first = await call();
+                const row = (await rowsOf(1745)).at(-1) ?? assert.fail("the agent's row on 1745");
+
+                assert.equal(row.by, "teg");
+
+                // 1745 retires (its row dropped, no sweeper) and 4242 is the 1 live supervisor.
+                await app.harness.commit(async (tx) => {
+                    const state = await tx.doc(DeskThreads);
+                    const stored = state.board?.rows.find((each) => each.id === row.id);
+
+                    assert(stored !== undefined);
+                    stored.state = "dropped";
+                    state.sweepers = { "4242": "task-test" };
+                }, context);
+
+                const rowsBefore = (await deskState()).board?.rows.length;
+                const rows4242 = (await rowsOf(4242)).length;
+
+                assert.equal(await call(), first, "the replay gives the first text");
+                assert.equal((await rowsOf(4242)).length, rows4242, "4242 gets no row");
+                assert.equal((await deskState()).board?.rows.length, rowsBefore, "no new row");
+            } finally {
+                await app.harness.commit(async (tx) => {
+                    const state = await tx.doc(DeskThreads);
+
+                    state.sweepers = saved.sweepers ?? {};
+                    state.clerks = saved.clerks ?? {};
+                }, context);
+            }
+        });
+
+        test("an agent's call whose key has receipts on 2 boards is refused, and no board changes", async () => {
+            await closeAll();
+
+            mkdirSync(join(root, "teg-ambiguous-session"), { recursive: true });
+
+            const agentSession = Number(await newSession(app, join(root, "teg-ambiguous-session")));
+
+            personas.set(agentSession, { id: "teg", name: "Teg", role: "agent" });
+
+            const saved = await deskState();
+            const callId = "call-ambiguous-receipts";
+            const key = `x.desk.board:task-board:${callId}`;
+            const receipt = { key, at: Date.now(), result: "Added: the first try" };
+            const savedReceipts = structuredClone(
+                (await app.harness.snapshot(BoardReceipts, context))?.supervisors ?? {},
+            );
+
+            // Retired 1745 and 1746 both hold the call's receipt; 4242 is the 1 live supervisor.
+            await app.harness.commit(async (tx) => {
+                const state = await tx.doc(DeskThreads);
+                const receipts = await tx.doc(BoardReceipts);
+
+                state.sweepers = { "4242": "task-test" };
+                state.clerks = {};
+
+                for (const id of ["1745", "1746"]) {
+                    receipts.supervisors[id] = {
+                        receipts: [...(receipts.supervisors[id]?.receipts ?? []), receipt],
+                    };
+                }
+            }, context);
+
+            try {
+                const rowsBefore = (await deskState()).board?.rows.length ?? 0;
+                const rows4242 = (await rowsOf(4242)).length;
+
+                await assert.rejects(
+                    desk.tool(
+                        agentSession,
+                        { action: "board_add", fields: { ...FIELDS, agent: undefined } },
+                        callId,
+                    ),
+                    /This call's key has receipts on 2 boards \(1745, 1746\), so it is not replayed and changes nothing/,
+                );
+                assert.equal((await deskState()).board?.rows.length ?? 0, rowsBefore, "no new row");
+                assert.equal((await rowsOf(4242)).length, rows4242, "4242 gets no row");
+            } finally {
+                await app.harness.commit(async (tx) => {
+                    const state = await tx.doc(DeskThreads);
+                    const receipts = await tx.doc(BoardReceipts);
+
+                    state.sweepers = saved.sweepers ?? {};
+                    state.clerks = saved.clerks ?? {};
+
+                    for (const id of ["1745", "1746"]) {
+                        const before = savedReceipts[id];
+
+                        if (before === undefined) {
+                            delete receipts.supervisors[id];
+                        } else {
+                            receipts.supervisors[id] = before;
+                        }
                     }
                 }, context);
             }
