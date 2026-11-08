@@ -1510,8 +1510,21 @@
 
 /* ─── The Board (the goal board) ────────────────────────────────────────── */
 
+/*
+ * The board's status tones, from the theme only (Pocket's web/style.css): blue runs, green finished, red failed, amber
+ * unknown, magenta picked, gray dropped. Light themes darken --hl-*, --ok, --err and --warn, so each border and bar
+ * reads at 3:1 on --card with the bundled palettes. No row has a tint: a tint lowers the --muted lines under 4.5:1. State
+ * text stays in --muted or --text (4.5:1); the state word on each row says the status too, so color is never the only
+ * sign.
+ */
 .board-page {
     overflow-wrap: anywhere;
+    --board-run: var(--hl-fn);
+    --board-pick: var(--hl-kw);
+    --board-done: var(--ok);
+    --board-fail: var(--err);
+    --board-unknown: var(--warn);
+    --board-dropped: var(--muted);
 }
 
 /* The header wraps on a phone: the title keeps its word, the limits and Launch picks go below it. */
@@ -1557,17 +1570,49 @@
     background: var(--card);
 }
 
-.board-row.board-picked {
-    border-color: var(--accent);
+/* A row's status (`rowStatus` in board.js): the border and a left bar of its tone, no tint. Proposed stays neutral. */
+.board-row.board-status-proposed {
+    border-color: var(--line);
 }
 
-.board-row.board-failed,
-.board-row.board-unknown {
-    border-color: var(--err);
+.board-row.board-status-picked {
+    border-color: var(--board-pick);
+    box-shadow: inset 3px 0 0 var(--board-pick);
 }
 
-.board-row.board-launched {
-    border-color: var(--ok);
+/* Queued, not running: a dashed blue border, no bar and no fill. */
+.board-row.board-status-waiting {
+    border-color: var(--board-run);
+    border-style: dashed;
+}
+
+.board-row.board-status-running {
+    border-color: var(--board-run);
+    box-shadow: inset 4px 0 0 var(--board-run);
+}
+
+.board-row.board-status-finished {
+    border-color: var(--board-done);
+    box-shadow: inset 4px 0 0 var(--board-done);
+}
+
+.board-row.board-status-failed {
+    border-color: var(--board-fail);
+    box-shadow: inset 4px 0 0 var(--board-fail);
+}
+
+.board-row.board-status-unknown {
+    border-color: var(--board-unknown);
+    box-shadow: inset 4px 0 0 var(--board-unknown);
+}
+
+.board-row.board-status-dropped {
+    border-color: var(--board-dropped);
+}
+
+.board-status-dropped .board-title {
+    color: var(--muted);
+    font-weight: 400;
 }
 
 .board-row-head {
@@ -1603,9 +1648,11 @@
     color: var(--muted);
 }
 
-.board-failed .board-state,
-.board-unknown .board-state {
-    color: var(--err);
+/* A row that needs the owner: its state line in the text color, bold (a red or amber text is under 4.5:1 in some light themes). */
+.board-status-failed .board-state,
+.board-status-unknown .board-state {
+    color: var(--text);
+    font-weight: 600;
 }
 
 .board-detail {
