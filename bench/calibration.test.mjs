@@ -1,8 +1,10 @@
-// The judge calibration sets: from fixture findings files and a fake gh, 8 blind held-out diffs per owner (4 at a
-// Not-ready head, 4 at the merged head), a separate key, 20 development pairs from other PRs, private files, and
-// the same output for the same seed. No network.
+// The judge calibration's instrument: the plan (4 models per task by price group, seeded), the replacements, the
+// driver (budget, peak hours, a stuck action), and an end-to-end run with the fake `pi` and the fake `bwrap`: the
+// attempts in stage `calibration`, their checks with no judge, a pilot task from pilot results, the blind packs and
+// the keys. No network, no model.
 import assert from "node:assert/strict";
 import {
+    existsSync,
     mkdirSync,
     mkdtempSync,
     readFileSync,
@@ -10,254 +12,704 @@ import {
     statSync,
     writeFileSync,
 } from "node:fs";
-import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import { rm } from "node:fs/promises";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
-import { calibrationMain, loadPoints } from "./lib/calibration.mjs";
-import { DIFF_LIMIT } from "./lib/judge.mjs";
-import { BENCH_REPOS, OWNERS, reposOf } from "./lib/owners.mjs";
-import { fakeGh } from "./fixtures/harvest.mjs";
+import {
+    ITEM_FIELDS,
+    MAX_REPLACEMENTS,
+    PRICE_GROUPS,
+    buildPlan,
+    drive,
+    nextModel,
+    outcomeOf,
+    rankPilot,
+    resolveTask,
+} from "./lib/calibration.mjs";
+import { calibrationMain } from "./lib/calibration-cli.mjs";
+import { seededShuffle } from "./lib/owners.mjs";
+import {
+    FAKE_BWRAP,
+    fixtureTask,
+    makeFixture,
+    runScript,
+    setBudget,
+    testEnv,
+} from "./fixtures/helpers.mjs";
 
-let root;
-const sha = (seed) => seed.repeat(40).slice(0, 40);
-const prs = {};
-const diffs = {};
-const findings = [];
+const FAKE_LEASE = join(import.meta.dirname, "fixtures", "fake-lease.sh");
 
-/** 1 PR with blocking points: `notReady` heads, a final head, a base; a diff for each head. */
-function addPr(repo, number, { notReady = [`${number}a`], merged = true, big = false } = {}) {
-    const ref = `${repo}#${number}`;
-    const base = sha(`b${number}`);
-    const head = sha(`f${number}`);
+// A decoy data dir for this process: a child that does not get the CLI's environment writes here, never to a real one.
+const LEAK = mkdtempSync(join(tmpdir(), "bench-calibration-leak-"));
 
-    prs[ref] = {
-        state: merged ? "MERGED" : "OPEN",
-        headRefOid: head,
-        baseRefOid: base,
-        mergeCommit: { oid: sha(`m${number}`) },
-        title: `PR ${number}`,
-        body: `Body of ${ref}.`,
-    };
+process.env.BENCH_DATA = LEAK;
+const POOL = JSON.parse(readFileSync(join(import.meta.dirname, "pool-v1.json"), "utf8"));
+const ALL = [...PRICE_GROUPS.cheap, ...PRICE_GROUPS.middle, ...PRICE_GROUPS.dear];
+const groupOf = (model) => Object.keys(PRICE_GROUPS).find((g) => PRICE_GROUPS[g].includes(model));
 
-    for (const h of [...notReady.map(sha), head]) {
-        diffs[`${repo}@${base}...${h}`] = big
-            ? `diff --git a/x b/x\n${"+y\n".repeat(DIFF_LIMIT)}`
-            : `diff --git a/f b/f\n+${ref} at ${h}\n`;
+test("the plan: 4 models per task (2 cheap, 1 middle, 1 dear), seeded, balanced, and the pilot for Sheeana", () => {
+    const pilot = ["pilot-small", "pilot-medium", "pilot-large"];
+    const plan = buildPlan(POOL, pilot, (id) => `~/agents/x/bench/${id.split("-")[0]}.json`);
+    const pool = plan.tasks.filter((t) => t.source === "pool");
+    const fromPilot = plan.tasks.filter((t) => t.source === "pilot");
+
+    assert.equal(plan.seed, 1064);
+    assert.equal(plan.maxReplacements, MAX_REPLACEMENTS);
+    assert.deepEqual(
+        pool.map((t) => t.id),
+        POOL.calibration.ids,
+    );
+    assert.equal(pool.length, 12);
+    assert.deepEqual(
+        fromPilot.map((t) => [t.id, t.owner, t.set, t.manifest]),
+        rankPilot(pilot).map((id, i) => [
+            id,
+            "sheeana",
+            i < 2 ? "heldOut" : "dev",
+            "bench/pilot.json",
+        ]),
+    );
+
+    for (const task of plan.tasks) {
+        assert.deepEqual(task.models.map(groupOf), ["cheap", "cheap", "middle", "dear"]);
+        assert.equal(new Set(task.models).size, 4, `${task.id}: 4 different models`);
     }
 
-    return notReady.map((n) => ({ ref, head: sha(n), state: "merged", item: "1" }));
-}
+    // Each owner: 1 dev task and 2 held-out tasks, as the pool says.
+    for (const [owner, sets] of Object.entries(POOL.calibration.owners)) {
+        const mine = plan.tasks.filter((t) => t.owner === owner);
 
-before(() => {
-    root = mkdtempSync(join(tmpdir(), "bench-calibration-"));
-
-    const day1 = [];
-    const day2 = [];
-    let n = 100;
-
-    // Each owner: 10 PRs in its bench repositories; the first has 2 Not-ready heads and a big diff.
-    for (const owner of OWNERS) {
-        const repos = reposOf(owner);
-
-        for (let i = 0; i < 10; i += 1) {
-            n += 1;
-
-            const points = addPr(repos[i % repos.length], n, {
-                notReady: i === 0 ? [`${n}a`, `${n}c`] : [`${n}a`],
-                big: i === 0,
-            });
-
-            (i % 2 ? day1 : day2).push(...points);
-        }
-    }
-
-    // Other repositories: 25 PRs for the development set, and PRs that give no pair.
-    for (let i = 0; i < 25; i += 1) {
-        n += 1;
-        day1.push(...addPr("frostyard/snosi", n));
-    }
-
-    n += 1;
-    addPr("frostyard/snosi", n);
-    // A point at the final head gives no Not-ready head; a PR open on GitHub gives none; an open point is skipped.
-    day2.push({ ref: `frostyard/snosi#${n}`, head: sha(`f${n}`), state: "merged" });
-    n += 1;
-    day2.push(...addPr("frostyard/snosi", n, { merged: false }));
-    day2.push({ ref: "frostyard/snosi#999", head: sha("z"), state: "open" });
-    // The same point in 2 files counts once.
-    day2.push(day1[0]);
-
-    const write = (name, points) => {
-        const dir = join(root, "reports", `${name}-daily-audit`);
-
-        mkdirSync(dir, { recursive: true });
-        writeFileSync(
-            join(dir, "findings.json"),
-            JSON.stringify({ metrics: { Q1: { blockers: { points } } } }),
+        assert.deepEqual(
+            mine.filter((t) => t.set === "dev").map((t) => t.id),
+            sets.dev,
         );
-        findings.push(join(dir, "findings.json"));
+        assert.deepEqual(
+            mine
+                .filter((t) => t.set === "heldOut")
+                .map((t) => t.id)
+                .sort(),
+            [...sets.heldOut].sort(),
+        );
+    }
+
+    // The 48 attempts: every model has 4 to 6 of them; in a group, the counts differ by 1 at most.
+    const count = (tasks) => {
+        const out = Object.fromEntries(ALL.map((m) => [m, 0]));
+
+        for (const task of tasks) {
+            for (const model of task.models) {
+                out[model] += 1;
+            }
+        }
+
+        return out;
     };
 
-    write("2026-11-01", day1);
-    write("2026-11-02", day2);
+    const attempts = count(pool);
+
+    assert.equal(
+        Object.values(attempts).reduce((a, b) => a + b),
+        48,
+    );
+
+    for (const [group, models] of Object.entries(PRICE_GROUPS)) {
+        const counts = models.map((m) => attempts[m]);
+
+        assert.ok(Math.max(...counts) - Math.min(...counts) <= 1, `${group}: ${counts}`);
+        assert.ok(
+            counts.every((n) => n >= 4 && n <= 6),
+            `${group}: ${counts}`,
+        );
+    }
+
+    // The same inputs give the same plan.
+    assert.deepEqual(
+        buildPlan(POOL, pilot, (id) => `~/agents/x/bench/${id.split("-")[0]}.json`),
+        plan,
+    );
 });
 
-after(() => rm(root, { recursive: true, force: true }));
+test("the next model of a group: after the failed one, in the group's order, not used on the task", () => {
+    const order = ["a", "b", "c", "d"];
 
-/** Build into `out`; returns the exit code and the files as JSON. */
-async function build(out, gh = fakeGh({ prs, diffs })) {
-    const logs = [];
-    const code = await calibrationMain(
-        [...findings.flatMap((f) => ["--findings", f]), "--out", out],
-        process.env,
-        { gh, log: (line) => logs.push(line), print: () => {} },
+    assert.equal(nextModel(order, "b", new Set(["a", "b"])), "c");
+    assert.equal(nextModel(order, "d", new Set(["d", "a"])), "b");
+    assert.equal(nextModel(order, "a", new Set(order)), null);
+});
+
+const GROUPS = { cheap: ["c1", "c2", "c3", "c4"], middle: ["m1", "m2"], dear: ["d1", "d2", "d3"] };
+const TASK = {
+    id: "t",
+    slots: ["cheap", "cheap", "middle", "dear"],
+    models: ["c1", "c2", "m1", "d1"],
+};
+
+test("replacements: the next model of the group; at most 2 per task; never while a slot waits", () => {
+    const states = (outcomes) => resolveTask(TASK, GROUPS, (m) => outcomes[m] ?? "run");
+
+    // All checked: 4 items, no replacement.
+    const ok = states({ c1: "ok", c2: "ok", m1: "ok", d1: "ok" });
+
+    assert.deepEqual(
+        ok.slots.map((s) => s.state),
+        ["ok", "ok", "ok", "ok"],
     );
-    const read = (path) => JSON.parse(readFileSync(join(out, path), "utf8"));
+    assert.equal(ok.replacements, 0);
+
+    // A slot waits (d1 not run): the excluded c1 gets no replacement yet.
+    const early = states({ c1: "excluded", c2: "ok", m1: "ok" });
+
+    assert.deepEqual(early.waiting, [{ model: "d1", need: "run" }]);
+    assert.deepEqual(early.slots[0].chain, ["c1"]);
+
+    // c1 excluded: c3 replaces it (c2 is used); then c3 waits for its run.
+    const one = states({ c1: "excluded", c2: "ok", m1: "ok", d1: "ok" });
+
+    assert.deepEqual(one.slots[0].chain, ["c1", "c3"]);
+    assert.deepEqual(one.waiting, [{ model: "c3", need: "run" }]);
+    assert.equal(one.replacements, 1);
+
+    // c1, m1 and d1 excluded: 2 replacements in slot order (c3, m2), then d1's item is missing.
+    const capped = states({
+        c1: "excluded",
+        c2: "ok",
+        m1: "excluded",
+        d1: "excluded",
+        c3: "ok",
+        m2: "ok",
+    });
+
+    assert.deepEqual(
+        capped.slots.map((s) => [s.chain, s.state]),
+        [
+            [["c1", "c3"], "ok"],
+            [["c2"], "ok"],
+            [["m1", "m2"], "ok"],
+            [["d1"], "missing"],
+        ],
+    );
+    assert.equal(capped.replacements, 2);
+    assert.deepEqual(capped.waiting, []);
+
+    // A replacement that fails too takes the 2nd replacement; then the slot is missing.
+    const chain = states({
+        c1: "excluded",
+        c2: "ok",
+        m1: "ok",
+        d1: "ok",
+        c3: "excluded",
+        c4: "excluded",
+    });
+
+    assert.deepEqual(chain.slots[0].chain, ["c1", "c3", "c4"]);
+    assert.equal(chain.slots[0].state, "missing");
+
+    // The middle group has 2 models: with both used, a failed middle slot is missing.
+    const none = states({ c1: "ok", c2: "ok", m1: "excluded", d1: "ok", m2: "excluded" });
+
+    assert.deepEqual(none.slots[2].chain, ["m1", "m2"]);
+    assert.equal(none.slots[2].state, "missing");
+});
+
+test("outcomes: no result runs, failures are excluded, unchecked results wait for the check", () => {
+    const task = { hiddenCommand: null };
+
+    assert.equal(outcomeOf(null, task), "run");
+    assert.equal(outcomeOf({ harness: true }, task), "excluded");
+
+    for (const failure of ["limit", "provider", "protocol"]) {
+        assert.equal(outcomeOf({ failure, s0: { protocol: false } }, task), "excluded");
+    }
+
+    assert.equal(outcomeOf({ failure: null, s0: null }, task), "check");
+    assert.equal(outcomeOf({ failure: null, s0: {}, s1: true, diffFile: "x" }, task), "ok");
+    assert.equal(
+        outcomeOf({ failure: null, s0: {}, s1: true, diffFile: "x", scoreError: "e" }, task),
+        "check",
+    );
+    assert.equal(
+        outcomeOf({ failure: null, s0: {}, s1: true, diffFile: "x" }, { hiddenCommand: "x" }),
+        "check",
+    );
+});
+
+/** A driver on a plan of 1 task, with outcomes in a map and fake actions. */
+function fakeDrive({
+    models = {},
+    onRun = () => 0,
+    onCheck = () => 0,
+    now = Date.UTC(2026, 10, 7, 12),
+} = {}) {
+    const outcomes = new Map();
+    const calls = [];
+    const plan = { groups: GROUPS, tasks: [{ ...TASK, source: "pool" }] };
 
     return {
-        code,
-        logs,
-        gh,
-        heldOut: Object.fromEntries(OWNERS.map((o) => [o, read(join("held-out", `${o}.json`))])),
-        key: read("held-out-key.json").key,
-        dev: read("dev.json").items,
+        calls,
+        outcomes,
+        run: () =>
+            drive(plan, {
+                parallel: 2,
+                waitPeak: false,
+                now: () => now,
+                wait: async () => {},
+                log: () => {},
+                peakEnds: () => new Date(now + 3_600_000),
+                model: (id) => ({ id, priced: true, ...models[id] }),
+                lease: async () => true,
+                outcome: (task, model) => outcomes.get(model) ?? "run",
+                run: async (task, model) => {
+                    calls.push(["run", model]);
+
+                    const code = onRun(model);
+
+                    if (code === 0) {
+                        outcomes.set(model, model === "c1" ? "excluded" : "check");
+                    }
+
+                    return code;
+                },
+                check: async (task, model) => {
+                    calls.push(["check", model]);
+
+                    const code = onCheck(model);
+
+                    if (code === 0) {
+                        outcomes.set(model, "ok");
+                    }
+
+                    return code;
+                },
+            }),
     };
 }
 
-test("points: the union of the files, 1 per ref@head, merged only", async () => {
-    const points = await loadPoints(findings);
+test("the driver: runs, checks, a replacement after a failure, and the end state", async () => {
+    const fake = fakeDrive();
+    const result = await fake.run();
 
-    assert.equal(points.get(`${reposOf("sheeana")[0]}#101`).length, 2);
-    assert.equal(points.has("frostyard/snosi#999"), false);
+    assert.deepEqual(
+        result.tasks[0].slots.map((s) => [s.chain, s.state]),
+        [
+            [["c1", "c3"], "ok"],
+            [["c2"], "ok"],
+            [["m1"], "ok"],
+            [["d1"], "ok"],
+        ],
+    );
+    assert.equal(fake.calls.filter(([what]) => what === "run").length, 5);
+    assert.deepEqual(
+        fake.calls
+            .filter(([what]) => what === "check")
+            .map(([, m]) => m)
+            .sort(),
+        ["c2", "c3", "d1", "m1"],
+    );
+    assert.equal(result.stuck.size, 0);
+    assert.equal(result.budgetRefused, false);
 });
 
-test("8 blind held-out diffs per owner, 4 Not-ready and 4 merged; 20 development pairs from other PRs", async () => {
-    const out = join(root, "out");
-    const { code, heldOut, key, dev, gh, logs } = await build(out);
+test("the driver: a budget refusal stops priced runs; peak hours defer; a usage error is stuck", async () => {
+    const refused = await fakeDrive({ onRun: (m) => (m === "c2" ? 2 : 0) }).run();
 
-    assert.equal(code, 0, logs.join("\n"));
+    assert.equal(refused.budgetRefused, true);
+    assert.ok(refused.tasks[0].waiting.some((w) => w.model === "c2" && w.need === "run"));
 
-    const heldPrs = new Set();
+    const peak = fakeDrive({ models: { d1: { peakUtc: [[0, 24]] } } });
+    const deferred = await peak.run();
 
-    for (const owner of OWNERS) {
-        const { items } = heldOut[owner];
-        const repos = new Set(reposOf(owner));
+    assert.deepEqual(deferred.deferred, ["t\nd1"]);
+    assert.ok(!peak.calls.some(([what, m]) => what === "run" && m === "d1"));
 
-        assert.equal(items.length, 8, owner);
-        assert.equal(new Set(items.map((i) => i.pr)).size, 8, `${owner}: 8 different PRs`);
+    const usage = await fakeDrive({ onCheck: (m) => (m === "m1" ? 1 : 0) }).run();
 
-        for (const item of items) {
-            assert.deepEqual(Object.keys(item).sort(), [
-                "brief",
-                "diff",
-                "diffCut",
-                "id",
-                "label",
-                "pr",
-                "repo",
-            ]);
-            assert.equal(item.label, null);
-            assert.ok(repos.has(item.repo), `${item.repo} is ${owner}'s`);
-            assert.match(item.brief, /^PR \d+\n\nBody of /);
-            heldPrs.add(item.pr);
-        }
+    assert.deepEqual([...usage.stuck.keys()], ["t\nm1"]);
 
-        const labels = items.map((i) => key[i.id].label);
+    // A scoring error gets 1 more check; a second one is stuck.
+    const flaky = fakeDrive({ onCheck: (m) => (m === "d1" ? 3 : 0) });
+    const twice = await flaky.run();
 
-        assert.equal(labels.filter((l) => l === "notReady").length, 4, owner);
-        assert.equal(labels.filter((l) => l === "merged").length, 4, owner);
+    assert.equal(flaky.calls.filter(([what, m]) => what === "check" && m === "d1").length, 2);
+    assert.deepEqual([...twice.stuck.keys()], ["t\nd1"]);
+});
 
-        for (const item of items) {
-            const { label, head } = key[item.id];
-            const pr = prs[item.pr];
+// ---------------------------------------------------------------------------------------------------------------
+// End to end: the CLI with the fake pi and the fake bwrap.
+// ---------------------------------------------------------------------------------------------------------------
 
-            assert.equal(label === "merged", head === pr.headRefOid);
-            assert.ok(item.diff.includes(`at ${head}`) || item.diffCut);
-        }
-    }
+let fixture;
+let dir;
+const E2E_GROUPS = {
+    cheap: [
+        "github-copilot/gpt-6-luna",
+        "github-copilot/mai-code-2-flash",
+        "halogen/halogen-qwen3.8-flash-next",
+    ],
+    middle: ["github-copilot/gemini-3.8-flash", "github-copilot/grok-4.7"],
+    dear: ["github-copilot/claude-sonnet-5.5", "github-copilot/gpt-6.1-sol"],
+};
+const FAILS = "github-copilot/mai-code-2-flash";
 
-    assert.equal(Object.keys(key).length, 40);
-    assert.equal(dev.length, 20);
+before(async () => {
+    fixture = makeFixture();
+    dir = join(fixture.root, "calibration");
+    await setBudget(fixture, 100);
 
-    for (const pair of dev) {
-        assert.equal(heldPrs.has(pair.pr), false, `${pair.pr} is also held out`);
-        assert.equal(pair.base, prs[pair.pr].baseRefOid, "1 base for both diffs");
-        assert.equal(pair.mergedHead, prs[pair.pr].headRefOid);
-        assert.notEqual(pair.notReadyHead, pair.mergedHead);
-        assert.match(pair.notReadyDiff, new RegExp(`at ${pair.notReadyHead}`));
-        assert.match(pair.mergedDiff, new RegExp(`at ${pair.mergedHead}`));
-    }
+    const scenario = { name: "ok", byModel: { [FAILS]: "always-error" } };
+    const manifest = join(fixture.root, "owner.json");
+    const pilotManifest = join(fixture.root, "pilot.json");
 
-    assert.ok(
-        gh.calls.every(
-            (args) =>
-                (args[0] === "pr" && args[1] === "view") ||
-                (args[0] === "api" && args[2] === "Accept: application/vnd.github.diff"),
-        ),
-        "gh only reads",
+    writeFileSync(
+        manifest,
+        JSON.stringify({
+            schema: 1,
+            checkout: fixture.repo,
+            tasks: ["a", "b", "c"].map((id) => fixtureTask(fixture, id, scenario)),
+        }),
+    );
+    writeFileSync(
+        pilotManifest,
+        JSON.stringify({
+            schema: 1,
+            stage: "pilot",
+            checkout: fixture.repo,
+            tasks: [fixtureTask(fixture, "p", { name: "ok" })],
+        }),
     );
 
-    // Private files and folders.
-    assert.equal(statSync(out).mode & 0o777, 0o700);
-    assert.equal(statSync(join(out, "held-out")).mode & 0o777, 0o700);
-
-    for (const file of [
-        "dev.json",
-        "held-out-key.json",
-        ...readdirSync(join(out, "held-out")).map((f) => join("held-out", f)),
+    // The pilot ran 2 models on task p; Claude Sonnet ended at a limit there.
+    for (const [model, name] of [
+        ["github-copilot/gpt-6-luna", "ok"],
+        ["github-copilot/claude-sonnet-5.5", "always-error"],
     ]) {
-        assert.equal(statSync(join(out, file)).mode & 0o777, 0o600, file);
-    }
-});
+        const pilotTask = fixtureTask(fixture, "p", { name });
 
-test("a diff over 60,000 characters is cut with a stat", async () => {
-    const { heldOut, dev } = await build(join(root, "cut"));
-    const cut = [
-        ...Object.values(heldOut).flatMap((h) => h.items.map((i) => [i.diffCut, i.diff])),
-        ...dev.map((d) => [d.mergedCut, d.mergedDiff]),
-    ].filter(([c]) => c);
-
-    assert.ok(cut.length > 0, "a big diff is in the sets");
-
-    for (const [, diff] of cut) {
-        assert.match(diff, /^ x \| \+\d+ -0\n 1 files changed/);
-        assert.ok(diff.length <= DIFF_LIMIT + 200);
-    }
-});
-
-test("the same seed gives the same files", async () => {
-    await build(join(root, "a"));
-    await build(join(root, "b"));
-
-    for (const file of [
-        "dev.json",
-        "held-out-key.json",
-        ...OWNERS.map((o) => join("held-out", `${o}.json`)),
-    ]) {
-        assert.equal(
-            readFileSync(join(root, "a", file), "utf8"),
-            readFileSync(join(root, "b", file), "utf8"),
-            file,
+        writeFileSync(
+            join(fixture.root, `pilot-${name}.json`),
+            JSON.stringify({ schema: 1, checkout: fixture.repo, tasks: [pilotTask] }),
         );
+
+        const ran = await runScript(
+            "run.mjs",
+            [
+                "--manifest",
+                join(fixture.root, `pilot-${name}.json`),
+                "--task",
+                "p",
+                "--model",
+                model,
+                "--stage",
+                "pilot",
+                "--results",
+                join(fixture.root, "pilot-results"),
+                "--checkout",
+                fixture.repo,
+                "--pocket",
+                fixture.pocket,
+                "--agent-src",
+                fixture.agent,
+                "--no-auth-preflight",
+                "--bwrap",
+                FAKE_BWRAP,
+            ],
+            testEnv(fixture),
+        );
+
+        assert.equal(ran.code, 0, ran.stderr);
     }
+
+    // Luna's pilot result was scored before, with an S1 that the current manifest does not give: it must not count.
+    const lunaPilot = join(
+        fixture.root,
+        "pilot-results",
+        "pilot",
+        "p",
+        "github-copilot__gpt-6-luna.json",
+    );
+
+    writeFileSync(
+        lunaPilot,
+        JSON.stringify({
+            ...JSON.parse(readFileSync(lunaPilot, "utf8")),
+            s0: { protocol: false, leakTry: false },
+            s1: false,
+            s2: null,
+            diffFile: "/nowhere.diff",
+            checksOnly: true,
+            judgePending: true,
+            grades: [null, null],
+        }),
+    );
+
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+        join(dir, "plan.json"),
+        JSON.stringify({
+            schema: 1,
+            seed: 1064,
+            groups: E2E_GROUPS,
+            maxReplacements: 2,
+            tasks: [
+                ...[
+                    ["a", "heldOut", "github-copilot/gpt-6-luna", FAILS],
+                    ["b", "heldOut", FAILS, "halogen/halogen-qwen3.8-flash-next"],
+                    ["c", "dev", "github-copilot/gpt-6-luna", "halogen/halogen-qwen3.8-flash-next"],
+                ].map(([id, set, c1, c2]) => ({
+                    id,
+                    owner: "irulan",
+                    set,
+                    source: "pool",
+                    manifest,
+                    slots: ["cheap", "cheap", "middle", "dear"],
+                    models: [
+                        c1,
+                        c2,
+                        "github-copilot/gemini-3.8-flash",
+                        "github-copilot/gpt-6.1-sol",
+                    ],
+                })),
+                {
+                    id: "p",
+                    owner: "sheeana",
+                    set: "dev",
+                    source: "pilot",
+                    manifest: pilotManifest,
+                    slots: ["cheap", "cheap", "middle", "dear"],
+                    models: [
+                        "github-copilot/gpt-6-luna",
+                        FAILS,
+                        "github-copilot/gemini-3.8-flash",
+                        "github-copilot/claude-sonnet-5.5",
+                    ],
+                },
+            ],
+        }),
+    );
 });
 
-test("an owner with fewer PRs gets fewer items and a warning", async () => {
-    const teg = new Set(reposOf("teg").map((r) => `${r}#`));
-    const few = Object.fromEntries(
-        Object.entries(prs).map(([ref, pr]) =>
-            // Only 3 of Teg's PRs stay merged.
-            [...teg].some((p) => ref.startsWith(p)) && Number(ref.split("#")[1]) >= 144
-                ? [ref, { ...pr, state: "CLOSED" }]
-                : [ref, pr],
-        ),
-    );
-    const { heldOut, key, logs } = await build(join(root, "few"), fakeGh({ prs: few, diffs }));
-    const items = heldOut.teg.items;
+after(async () => {
+    await rm(fixture.root, { recursive: true, force: true });
+    await rm(LEAK, { recursive: true, force: true });
+});
 
-    assert.equal(items.length, 3);
-    assert.deepEqual(items.map((i) => key[i.id].label).sort(), ["merged", "notReady", "notReady"]);
-    assert.ok(logs.some((line) => /warning: teg: 3 held-out diffs, not 8/.test(line)));
-    assert.ok(BENCH_REPOS.length > 0);
+/** Run the CLI on the fixture. */
+const cli = (args) => {
+    const out = [];
+    const err = [];
+
+    return calibrationMain(
+        [...args, "--dir", dir, "--pilot-results", join(fixture.root, "pilot-results")],
+        testEnv(fixture),
+        { log: (line) => err.push(line), print: (text) => out.push(text) },
+    ).then((code) => ({ code, out: out.join("\n"), err: err.join("\n") }));
+};
+
+// A timeout: a driver that never ends (a lease that is never taken, say) fails here at once, never hangs the suite.
+test(
+    "end to end: attempts in stage calibration, checks with no judge, replacements, pilot items, packs and keys",
+    { timeout: 120_000 },
+    async () => {
+        // In this process, with the fixture's environment: every child (run.mjs, score.mjs, the lease tool) must get it.
+        const run = await cli([
+            "run",
+            "--parallel",
+            "3",
+            "--lease-bin",
+            FAKE_LEASE,
+            "--checkout",
+            fixture.repo,
+            "--pocket",
+            fixture.pocket,
+            "--agent-src",
+            fixture.agent,
+            "--no-auth-preflight",
+            "--bwrap",
+            FAKE_BWRAP,
+            "--kill-grace",
+            "2000",
+        ]);
+
+        assert.equal(run.code, 0, `${run.out}\n${run.err}`);
+        assert.ok(
+            existsSync(join(fixture.data, "runs", "calibration", "a")),
+            "the runs are in the fixture's data dir",
+        );
+        assert.deepEqual(
+            readdirSync(LEAK),
+            [],
+            "no child wrote to the data dir of this process's environment",
+        );
+        assert.match(
+            readFileSync(join(fixture.leases, "calls.log"), "utf8"),
+            /^take halogen T1064 bench calibration$/m,
+        );
+
+        const results = join(dir, "results");
+        const calibration = join(results, "calibration");
+        const read = (...parts) => JSON.parse(readFileSync(join(...parts), "utf8"));
+
+        // Every attempt of a pool task is in stage calibration; MAI-Code's provider failures stay in the record.
+        for (const task of ["a", "b", "c"]) {
+            for (const name of readdirSync(join(calibration, task))) {
+                assert.equal(read(calibration, task, name).stage, "calibration");
+            }
+        }
+
+        const failed = read(calibration, "a", "github-copilot__mai-code-2-flash.json");
+
+        assert.equal(failed.failure, "provider");
+        assert.equal(failed.checksOnly, undefined, "a failed attempt is not checked");
+
+        // a: MAI-Code failed, halogen (next cheap after it, not used on a) replaced it.
+        const a = read(calibration, "a", "halogen__halogen-qwen3.8-flash-next.json");
+
+        assert.equal(a.checksOnly, true);
+        assert.equal(a.s1, true);
+        assert.deepEqual(a.grades, [null, null]);
+        assert.equal(a.judgePending, true);
+        assert.equal(existsSync(join(fixture.data, "judges")), false, "no judge ran");
+
+        // b: MAI-Code failed, Luna replaced it (halogen is used on b).
+        assert.equal(read(calibration, "b", "github-copilot__gpt-6-luna.json").checksOnly, true);
+
+        // p (pilot): Luna's pilot result is copied and checked. MAI-Code and Gemini have no pilot attempt, and Sonnet's
+        // ended in a provider failure: halogen replaces MAI-Code and Grok replaces Gemini (the 2 replacements), both
+        // with no pilot attempt either, so those slots and Sonnet's are missing.
+        const pilotCopy = read(results, "pilot", "p", "github-copilot__gpt-6-luna.json");
+
+        assert.equal(pilotCopy.stage, "pilot");
+        assert.equal(pilotCopy.checksOnly, true);
+        assert.equal(pilotCopy.s1, true, "checked again by the current manifest");
+        assert.equal(
+            read(fixture.root, "pilot-results", "pilot", "p", "github-copilot__gpt-6-luna.json").s1,
+            false,
+            "the pilot's own result never changes",
+        );
+
+        const status = await cli(["status"]);
+
+        assert.equal(status.code, 0);
+        assert.match(
+            status.out,
+            /\| a \| irulan \| heldOut \| cheap: github-copilot\/gpt-6-luna -> ok; cheap: github-copilot\/mai-code-2-flash > halogen\/halogen-qwen3\.8-flash-next -> ok;/,
+        );
+        assert.match(status.out, /\| irulan \| 4 \| 8 \| 0 \|/);
+
+        // The packs: 1 per owner, items in a seeded order, exactly the judge's input; the keys hold the models.
+        const packs = await cli(["packs"]);
+
+        assert.equal(packs.code, 0, packs.err);
+        assert.match(packs.out, /irulan: 12 items \(4 dev, 8 held-out\): written/);
+
+        const pack = join(dir, "packs", "irulan");
+        const items = read(pack, "items.json").items;
+        const labels = read(pack, "labels.json");
+        const key = read(dir, "keys", "irulan.json");
+
+        assert.equal(items.length, 12);
+        assert.deepEqual(
+            items.map((i) => i.id),
+            items.map((_, i) => `irulan-${String(i + 1).padStart(2, "0")}`),
+        );
+
+        for (const item of items) {
+            assert.deepEqual(Object.keys(item), ITEM_FIELDS);
+            assert.deepEqual(Object.keys(item.submitted), ["text", "cut"]);
+        }
+
+        // The fixture's brief names a model (its fake-pi scenario): every other field must not.
+        const shown = JSON.stringify([items.map(({ brief, ...rest }) => rest), labels]);
+
+        for (const model of ALL) {
+            assert.ok(!shown.includes(model), `no model id in the pack: ${model}`);
+            assert.ok(!shown.includes(model.split("/")[1]), `no model name in the pack: ${model}`);
+        }
+
+        assert.doesNotMatch(shown, /cost|wallMs|tries|startedAt/);
+        assert.match(
+            readFileSync(join(pack, "items", "irulan-01.md"), "utf8"),
+            /## The submitted change[\s\S]*pi-ran\.txt[\s\S]*## The merged change[\s\S]*future\.txt/,
+        );
+        assert.deepEqual(labels.labels[0], {
+            id: "irulan-01",
+            set: items[0].set,
+            label: null,
+            note: "",
+            blind: true,
+            reason: "",
+        });
+        assert.deepEqual(Object.keys(key.items).sort(), items.map((i) => i.id).sort());
+
+        // The order: the items in plan order (task, then slot) shuffled 1 time with seed 1064; not the plan order.
+        const planOrder = ["a", "b", "c"].flatMap((task) =>
+            [0, 1, 2, 3].map((slot) => `${task}/${slot}`),
+        );
+        const expected = seededShuffle(planOrder, 1064);
+        const actual = items.map((i) => `${key.items[i.id].task}/${key.items[i.id].slot}`);
+
+        assert.deepEqual(actual, expected);
+        assert.notDeepEqual(actual, planOrder);
+        assert.equal(Object.values(key.items).filter((k) => k.set === "dev").length, 4);
+        assert.ok(Object.values(key.items).every((k) => ALL.includes(k.model)));
+        assert.equal(statSync(join(dir, "keys", "irulan.json")).mode & 0o777, 0o600);
+
+        // Split by task: no task gives both dev and held-out items.
+        const sets = new Map();
+
+        for (const entry of Object.values(key.items)) {
+            sets.set(entry.task, new Set([...(sets.get(entry.task) ?? []), entry.set]));
+        }
+
+        assert.ok([...sets.values()].every((s) => s.size === 1));
+
+        // Sheeana's pack: only Luna's pilot item (MAI-Code and Sonnet had no finished pilot attempt; Gemini none).
+        const sheeana = read(dir, "packs", "sheeana", "items.json").items;
+
+        assert.equal(sheeana.length, 1);
+        assert.equal(sheeana[0].s1, true, "the item's S1 is the copy's, not the stale original's");
+
+        // The same packs again: unchanged. Labels, then other items: refused, nothing written.
+        assert.equal((await cli(["packs"])).code, 0);
+
+        labels.labels[0].label = "pass";
+        writeFileSync(join(pack, "labels.json"), JSON.stringify(labels));
+
+        const same = await cli(["packs"]);
+
+        assert.equal(same.code, 0);
+        assert.match(same.out, /irulan: .*kept \(labelled\)/);
+
+        const plan = read(dir, "plan.json");
+
+        plan.tasks[0].set = "dev";
+        writeFileSync(join(dir, "plan.json"), JSON.stringify(plan));
+
+        const changed = await cli(["packs"]);
+
+        assert.equal(changed.code, 1);
+        assert.equal(read(pack, "labels.json").labels[0].label, "pass", "the labels stay");
+    },
+);
+
+test("usage: no command, an unknown command, no plan, --results", { timeout: 60_000 }, async () => {
+    assert.equal(
+        await calibrationMain(
+            ["run", "--results", join(fixture.root, "elsewhere"), "--dir", dir],
+            testEnv(fixture),
+            {
+                print: () => {},
+            },
+        ),
+        1,
+        "--results would put the attempts where the driver never looks",
+    );
+    assert.equal(await calibrationMain([], testEnv(fixture), { print: () => {} }), 1);
+    assert.equal(await calibrationMain(["nope"], testEnv(fixture), { print: () => {} }), 1);
+    assert.equal(
+        await calibrationMain(["status", "--dir", join(fixture.root, "none")], testEnv(fixture), {
+            print: () => {},
+        }),
+        1,
+    );
 });

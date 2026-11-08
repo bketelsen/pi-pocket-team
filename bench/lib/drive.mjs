@@ -42,8 +42,8 @@ export function passArgs(values) {
     return args;
 }
 
-/** Run the lease tool; resolves true on exit 0. Its output goes to stderr. */
-export function lease(bin, action, note) {
+/** Run the lease tool; resolves true on exit 0. Its output goes to stderr. `env`: its environment. */
+export function lease(bin, action, note, env = process.env) {
     const args = [action, LEASE_RESOURCE, LEASE_THREAD];
 
     if (note !== undefined) {
@@ -51,7 +51,7 @@ export function lease(bin, action, note) {
     }
 
     return new Promise((done) => {
-        execFile(bin, args, (error, stdout, stderr) => {
+        execFile(bin, args, { env }, (error, stdout, stderr) => {
             process.stderr.write(stdout + stderr);
             done(!error);
         });
@@ -60,14 +60,15 @@ export function lease(bin, action, note) {
 
 /**
  * Hold the halogen lease for a driver: take it, renew it every 30 minutes with `progress()`, and release it at the
- * end and on SIGINT or SIGTERM (`onSignal` runs first, to end the children). Returns `{ ok, release }`.
+ * end and on SIGINT or SIGTERM (`onSignal` runs first, to end the children). `env`: the lease tool's environment.
+ * Returns `{ ok, release }`.
  */
-export async function holdLease(bin, note, progress, onSignal = () => {}) {
-    if (!(await lease(bin, "take", note))) {
+export async function holdLease(bin, note, progress, onSignal = () => {}, env = process.env) {
+    if (!(await lease(bin, "take", note, env))) {
         return { ok: false, release: async () => {} };
     }
 
-    const timer = setInterval(() => lease(bin, "renew", progress()), 30 * 60_000);
+    const timer = setInterval(() => lease(bin, "renew", progress(), env), 30 * 60_000);
     let released = false;
 
     const release = async () => {
@@ -79,7 +80,7 @@ export async function holdLease(bin, note, progress, onSignal = () => {}) {
         clearInterval(timer);
         process.off("SIGINT", stop);
         process.off("SIGTERM", stop);
-        await lease(bin, "release");
+        await lease(bin, "release", undefined, env);
     };
 
     const stop = async (signal) => {
@@ -95,9 +96,16 @@ export async function holdLease(bin, note, progress, onSignal = () => {}) {
 }
 
 /** Start a run.mjs child; resolves its exit code. `children` tracks the live ones. */
-export function runChild(args, children) {
+export const runChild = (args, children) => benchChild("run.mjs", args, children);
+
+/**
+ * Start a child `node bench/<script>`; resolves its exit code. `children` tracks the live ones. `env`: the child's
+ * environment (the caller's, so `BENCH_DATA` and the lease folder follow it).
+ */
+export function benchChild(script, args, children, env = process.env) {
     return new Promise((done) => {
-        const child = spawn(process.execPath, [join(BENCH_DIR, "run.mjs"), ...args], {
+        const child = spawn(process.execPath, [join(BENCH_DIR, script), ...args], {
+            env,
             stdio: ["ignore", "inherit", "inherit"],
         });
 

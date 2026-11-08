@@ -6,7 +6,7 @@ The bench's pre-registration fixes every rule, number and seed before any paid r
 and records what each step settled. The scripts and their data are in [bench/README.md](../../bench/README.md). After
 router v3, the daily audit's R2 check measures the routed threads end to end ([daily-audit.md](../modules/daily-audit.md)).
 
-Status: phase 1 in review (2026-11-08).
+Status: phase 1 done (pi-pocket-team#164); phase 2, the instrument, in review (2026-11-07).
 
 ## Phase 1 — Pool gate (this change)
 
@@ -105,12 +105,29 @@ Where that text leaves a choice open, the script makes these choices:
 - The judges calibrate on real bench attempts: 4 models per calibration task of the pool (`calibration.owners`: 1
   dev and 2 held-out tasks per owner), 48 attempts in all; Sheeana's 12 items come from the pilot attempts on her 3
   pilot tasks. The split into dev and held-out is by task, so no task is in both.
-- The owner of each repository labels its items blind (pass or fail by the label rules), with the judge's input
-  only. The judge prompt may change on the dev items only, then it is frozen by SHA-256 before the held-out test.
+- The owner of each repository labels its items blind (pass or fail by
+  [bench/calibration-labels.md](../../bench/calibration-labels.md)), with the judge's input only. The judge prompt may
+  change on the dev items only, then it is frozen by SHA-256 before the held-out test.
 - The held-out test runs once: each judge must agree with the owners on 80% or more of the counted items with a
   kappa of 0.6 or more, and the 2-judge rule must have a false-pass rate of 20% or less.
 - **Done when:** the held-out result (agreement, kappa and both error rates with their bounds) is recorded here, before
   the first stage 1 score counts.
+
+### The instrument
+
+- `bench/calibration.mjs` (logic in `bench/lib/calibration.mjs` and `bench/lib/calibration-cli.mjs`): the plan of
+  the attempts (4 models per task: 2 cheap, 1 middle, 1 dear, each group in a seeded order taken in turn), the runs in
+  the runner stage `calibration` with their checks (`bench/score.mjs --checks-only`: S0 to S2, no judge call), the
+  replacements of failed attempts, and the blind label packs with their keys. The rules are in
+  [bench/README.md](../../bench/README.md), section "Calibration".
+- `bench/judge-calibration.mjs` (logic in `bench/lib/judge-calibration.mjs`, statistics in `bench/lib/agreement.mjs`):
+  the judges on the labelled packs, with agreement, Cohen's kappa, both error rates with 80% Wilson bounds, and the
+  class minimums. The held-out set runs only with the frozen prompt (`JUDGE_PROMPT_SHA256`) and only when it is
+  valid.
+- The first instrument (pairs of a Not-ready head and its merged head, from the daily audit's blocking review points)
+  is retired: it could not test the rubric, as a head with 1 or 2 small blocking points is "acceptable with minor
+  fixes", and many of its held-out items were not blind. Its files stay in `calibration/` of the data dir.
+- The packs go to the owners only after `bench/calibration-labels.md` is on `main`.
 
 ## Phase 3 — Stage 1 (explore)
 
@@ -159,4 +176,5 @@ Where that text leaves a choice open, the script makes these choices:
 
 - Implements: [bench/README.md](../../bench/README.md) (the scripts), [modules/model-router.md](../modules/model-router.md)
   (the router that takes the result)
-- Reads: [modules/daily-audit.md](../modules/daily-audit.md) (the blocking review points of the judge calibration)
+- Reads: [modules/daily-audit.md](../modules/daily-audit.md) (R2, which measures the routed threads after router v3)
+- Label rules: [bench/calibration-labels.md](../../bench/calibration-labels.md)

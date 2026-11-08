@@ -193,8 +193,8 @@ export async function findTask(taskId, { manifest, data }) {
 // Scoring
 // ---------------------------------------------------------------------------------------------------------------
 
-/** True when a result needs no more scoring. */
-export function fullyScored(result) {
+/** True when a result needs no more scoring (`task`: its manifest task, for a task with no check). */
+export function fullyScored(result, task) {
     if (!result.s0 || result.judgePending) {
         return false;
     }
@@ -204,11 +204,39 @@ export function fullyScored(result) {
     }
 
     return (
-        typeof result.s1 === "boolean" &&
+        s1Done(result, task) &&
         (result.s2 === null || typeof result.s2 === "boolean") &&
         Array.isArray(result.grades) &&
         result.grades.length === 2 &&
         result.grades.every((g) => typeof g === "number")
+    );
+}
+
+/**
+ * S1 is done: null for a task with no check (`check: null`), else a boolean. A boolean S1 of a task that has no check
+ * (now) is stale: the check runs again, and gives null.
+ */
+const s1Done = (result, task) =>
+    task?.check === null ? result.s1 === null : typeof result.s1 === "boolean";
+
+/**
+ * True when a result needs no more checks-only scoring: S0 is done, and the attempt failed, or S1 (and S2 when the task
+ * has one) and the submitted diff are done.
+ */
+export function checksDone(result, task) {
+    if (!result.s0) {
+        return false;
+    }
+
+    if (result.failure) {
+        return true;
+    }
+
+    return (
+        s1Done(result, task) &&
+        (!task?.hiddenCommand || typeof result.s2 === "boolean") &&
+        typeof result.diffFile === "string" &&
+        result.scoreError === undefined
     );
 }
 
@@ -449,7 +477,7 @@ export async function scoreResult(ctx, file, result, { task, manifest }) {
         !ctx.force &&
         result.judgePending === true &&
         Boolean(result.s0) &&
-        typeof result.s1 === "boolean" &&
+        s1Done(result, task) &&
         (!task.hiddenCommand || typeof result.s2 === "boolean");
     const save = () => writeJsonAtomic(file, result);
 
@@ -545,28 +573,37 @@ async function scoreAfterS0(ctx, { file, result, task, checkout, git, attempt, j
             const logFile = ctx.logFile;
             const s1Tree = join(scratch, "s1");
 
+            // A task with no check (`check: null`, the manifest says why in `checkNote`): S1 is not run.
+            if (!task.check) {
+                result.s1 = null;
+                result.s1Detail = `no check: ${task.checkNote ?? "the task has none"}`;
+            }
+
             await copyTree(result.workDir, s1Tree);
 
             // New files of the worker are untracked: stage them, so a check that lists files with `git ls-files`
             // sees them as a commit holds them. A failure is logged, and the check runs anyway.
-            const s1Staged = await stageAll(ctx.sandbox, {
-                work: s1Tree,
-                cache,
-                timeoutMs: ctx.timeouts.check,
-                logFile,
-                step: "S1, the staging of new files",
-            });
-            const s1 = await runInSandbox(ctx.sandbox, {
-                work: s1Tree,
-                cache,
-                command: task.check,
-                timeoutMs: ctx.timeouts.check,
-                logFile,
-                step: "S1, the check",
-            });
+            if (task.check) {
+                const s1Staged = await stageAll(ctx.sandbox, {
+                    work: s1Tree,
+                    cache,
+                    timeoutMs: ctx.timeouts.check,
+                    logFile,
+                    step: "S1, the staging of new files",
+                });
+                const s1 = await runInSandbox(ctx.sandbox, {
+                    work: s1Tree,
+                    cache,
+                    command: task.check,
+                    timeoutMs: ctx.timeouts.check,
+                    logFile,
+                    step: "S1, the check",
+                });
 
-            result.s1 = s1.ok;
-            result.s1Detail = s1.ok ? "pass" : `${failText(s1)}${stageNote(s1Staged)}`;
+                result.s1 = s1.ok;
+                result.s1Detail = s1.ok ? "pass" : `${failText(s1)}${stageNote(s1Staged)}`;
+            }
+
             await cleanupTree(s1Tree, ctx.log);
 
             if (task.hiddenCommand) {
@@ -704,6 +741,23 @@ async function scoreAfterS0(ctx, { file, result, task, checkout, git, attempt, j
     result.diffCut = own.cut;
     result.referenceCut = ref.cut;
 
+    // Checks only (the judge calibration's attempts): S0 to S2 and the diffs, and no judge call. The judges stay
+    // pending, so a later run without `--checks-only` judges only.
+    if (ctx.checksOnly) {
+        result.checksOnly = true;
+        result.grades = Array.isArray(result.grades) ? result.grades : [null, null];
+        result.judges = Array.isArray(result.judges) ? result.judges : [];
+        result.judgePending = true;
+        result.scoredAt = new Date(ctx.now()).toISOString();
+        delete result.scoreError;
+        await save();
+        ctx.log(
+            `${attempt}: s0 ${JSON.stringify(result.s0)}, s1 ${result.s1}, s2 ${result.s2} (checks only: no judge)`,
+        );
+
+        return 0;
+    }
+
     const judges = ctx.judges ?? JUDGES;
     const grades = Array.isArray(result.grades) ? [...result.grades] : [null, null];
     const entries = Array.isArray(result.judges) ? [...result.judges] : [];
@@ -762,6 +816,7 @@ async function scoreAfterS0(ctx, { file, result, task, checkout, git, attempt, j
     result.judgePending = grades.some((g) => typeof g !== "number");
     result.scoredAt = new Date(ctx.now()).toISOString();
     delete result.scoreError;
+    delete result.checksOnly;
     await save();
     ctx.log(
         `${attempt}: s0 ${JSON.stringify(result.s0)}, s1 ${result.s1}, s2 ${result.s2}, grades ${JSON.stringify(grades)}${result.judgePending ? " (judge pending)" : ""}`,
@@ -775,7 +830,9 @@ async function scoreAfterS0(ctx, { file, result, task, checkout, git, attempt, j
 // ---------------------------------------------------------------------------------------------------------------
 
 export const SCORE_USAGE = `usage: node bench/score.mjs --result <file> [--manifest <file>] [--checkout <dir>] [--bwrap <path>]
-         [--pocket <dir>] [--agent-src <dir>] [--mise-installs <dir>] [--force] [--no-auth-preflight]
+         [--pocket <dir>] [--agent-src <dir>] [--mise-installs <dir>] [--force] [--checks-only]
+         [--no-auth-preflight]
+--checks-only: S0 to S2 and the diffs, no judge call (the judges stay pending)
 exit codes: 0 scored (a judge may be pending), 1 usage error, 2 budget refused,
             3 scoring error (the result is saved with the scores so far and scoreError; run again)`;
 
@@ -788,6 +845,7 @@ const SCORE_OPTIONS = {
     "agent-src": { type: "string" },
     "mise-installs": { type: "string" },
     force: { type: "boolean" },
+    "checks-only": { type: "boolean" },
     "no-auth-preflight": { type: "boolean" },
 };
 
@@ -831,14 +889,21 @@ export async function scoreMain(argv, env = process.env, deps = {}) {
             return 0;
         }
 
-        if (fullyScored(result) && !values.force) {
+        const data = dataDir(env);
+        const found = await findTask(result.task, { manifest: values.manifest, data });
+
+        if (fullyScored(result, found.task) && !values.force) {
             console.log(`scored already: ${file} (--force scores it again)`);
 
             return 0;
         }
 
-        const data = dataDir(env);
-        const found = await findTask(result.task, { manifest: values.manifest, data });
+        if (values["checks-only"] && !values.force && checksDone(result, found.task)) {
+            console.log(`checked already: ${file} (--force checks it again)`);
+
+            return 0;
+        }
+
         const bwrap = findProgram(values.bwrap ?? "bwrap", env);
 
         if (!bwrap) {
@@ -859,6 +924,7 @@ export async function scoreMain(argv, env = process.env, deps = {}) {
             data,
             sandbox,
             force: Boolean(values.force),
+            checksOnly: Boolean(values["checks-only"]),
             checkout: values.checkout,
             now: deps.now ?? Date.now,
             log,
