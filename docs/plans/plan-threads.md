@@ -777,8 +777,8 @@ Each line below differs from the design above, or settles what it left open, and
 - **Approve is refused while a task of the old approved graph is delegated** ("t3 is delegated (T575): wait for its
   end, or stop it with Stop and revise"). Decision 5 lets unnamed tasks go on; this keeps 2 workers from ever doing 1
   task. Once the task is done, the next graph can carry it. The scope change's news, the planning session's message
-  and the `plan revise` answer name each task that still runs ("The approval waits for these running tasks to end, or
-  for Brian's Stop and revise of them: t2 (T5).", #178 P6).
+  and the `plan revise` answer name each task that still runs ("The approval waits for these running tasks to end; no
+  second scope change can stop them while this one is in force: t2 (T5).", #178 P6).
 - **A watch's pass on a task thread with no PR is refused** while its attempt is open and it has no merged PR, no PR
   that is open or not read yet, and no `plan nochange`: the close would make the task ready again, and a second
   delivery would do it again (#178 P4). A fail is never refused.

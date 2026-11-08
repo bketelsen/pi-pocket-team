@@ -4874,7 +4874,7 @@ describe("a scope change", () => {
             {
                 supervisor: 7,
                 to: "session-31",
-                text: '[desk] Plan T1 is under revision ("The key moves."), by Brian. Stopped tasks: t1 (T2); the other tasks go on. The approval waits for these running tasks to end, or for Brian\'s Stop and revise of them: t3 (T3). Read the plan, and write the sections that change. Then draft a new graph with plan tasks: a task that is done and stays the same is carried (carried: { why }). Then call plan ready: Brian approves the new revision.',
+                text: '[desk] Plan T1 is under revision ("The key moves."), by Brian. Stopped tasks: t1 (T2); the other tasks go on. The approval waits for these running tasks to end; no second scope change can stop them while this one is in force: t3 (T3). Read the plan, and write the sections that change. Then draft a new graph with plan tasks: a task that is done and stays the same is carried (carried: { why }). Then call plan ready: Brian approves the new revision.',
                 requestId: planSendId("T1", "revise:1", "planning"),
             },
         ]);
@@ -4884,7 +4884,7 @@ describe("a scope change", () => {
         // The approval waits for t3, which still runs: the news says so (#178 P6).
         assert.equal(
             done.item.line,
-            '[desk] T1 plan under revision by Brian: "The key moves.". Stopped: t1 (T2). The other tasks go on. The approval waits for these running tasks to end, or for Brian\'s Stop and revise of them: t3 (T3). No new task is delegated until Brian approves a new revision.',
+            '[desk] T1 plan under revision by Brian: "The key moves.". Stopped: t1 (T2). The other tasks go on. The approval waits for these running tasks to end; no second scope change can stop them while this one is in force: t3 (T3). No new task is delegated until Brian approves a new revision.',
         );
         assert(state.threads.T2?.events.some((event) => event.key === "plan-stopped:revise:1"));
     });
@@ -4909,6 +4909,9 @@ describe("a scope change", () => {
 
         assert.deepEqual(runningTasks(plan), ["t1 (T2)", "t3 (T3)"]);
         assert.equal(approvalWaitText([]), "");
+        // While a scope change is in force, a second one (Stop and revise, plan revise) is refused: the words never
+        // offer it (#181 review).
+        assert.doesNotMatch(approvalWaitText(["t3 (T3)"]), /Stop and revise/);
 
         merged(graph, "t1", tick(6));
         assert.deepEqual(runningTasks(plan), ["t3 (T3)"]);

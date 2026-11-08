@@ -15839,7 +15839,7 @@ export function runningTasks(plan: Plan): string[] {
 export function approvalWaitText(running: readonly string[]): string {
     return running.length === 0
         ? ""
-        : ` The approval waits for these running tasks to end, or for Brian's Stop and revise of them: ${running.join(", ")}.`;
+        : ` The approval waits for these running tasks to end; no second scope change can stop them while this one is in force: ${running.join(", ")}.`;
 }
 
 /** The plan-revise news for the supervisor: at once, by `DIGEST_NOW`. */
