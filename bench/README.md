@@ -19,7 +19,9 @@ router v3, is in [docs/plans/router-bench.md](../docs/plans/router-bench.md).
 | `bench/calibration.mjs`       | The judge calibration's instrument: `plan` (4 models per calibration task), `run` (the attempts in stage `calibration` and their checks, with replacements), `status`, `packs` (blind label packs). |
 | `bench/judge-calibration.mjs` | The judges on the owners' labelled packs: agreement, Cohen's kappa, both error rates with 80% Wilson bounds, and the class minimums (`--set dev` or `--set held-out`).                              |
 | `bench/calibration-labels.md` | The owners' label rules (pass or fail), blind rules, and how to record a label.                                                                                                                     |
-| `bench/judge-v1.md`           | The judge prompt: the rubric, the brief, S1, S2, the submitted diff and the reference diff ("1 accepted solution, not the only one").                                                               |
+| `bench/judge-v3.md`           | The frozen judge prompt (`JUDGE_PROMPT_SHA256`): the rubric with the label rules' line between grade 2 and 3, the brief, S1, S2, the submitted diff and the reference diff.                         |
+| `bench/judge-v1.md`, `-v2.md` | The earlier judge prompts of the development rounds, kept as the record ([judge-calibration.md](judge-calibration.md)).                                                                             |
+| `bench/judge-calibration.md`  | The judge calibration's record: the development rounds, the freeze, the held-out result and the spend.                                                                                              |
 | `bench/pool.mjs`              | The pool gate: writes `bench/pool-v1.json`, the 3 disjoint sets of kept tasks (calibration, stage 1, stage 2 = R). Frozen once written; `--grow` appends new kept tasks to R, `--check` compares.   |
 | `bench/pool-v1.json`          | The frozen pool (written by `bench/pool.mjs`; deterministic, so Prettier leaves it alone).                                                                                                          |
 | `bench/analyze.mjs`           | The pre-registered statistics: `--stage 1`, `--stage 2`, `--simulate`, and `--branch` (the stage 2 branch of R before any stage 2 run). Runs no model.                                              |
@@ -44,6 +46,7 @@ node bench/calibration.mjs run --parallel 4 --wait-peak
 node bench/calibration.mjs status
 node bench/calibration.mjs packs
 node bench/judge-calibration.mjs --set dev [--prompt bench/judge-v2.md]
+node bench/judge-calibration.mjs --set held-out
 node bench/pool.mjs
 node bench/pool.mjs --check
 node bench/pool.mjs --grow
@@ -223,14 +226,14 @@ A pack whose `labels.json` holds an owner's work is never written over: with the
 other items the command exits 1 and writes nothing. Every task must have an outcome first.
 
 `node bench/judge-calibration.mjs --set dev|held-out [--prompt <file>] [--stats-only]` runs both judges on the
-counted items of a set, from the pack's fields (`renderPrompt` with the prompt file, default `bench/judge-v1.md`), and
+counted items of a set, from the pack's fields (`renderPrompt` with the prompt file, default the frozen `bench/judge-v3.md`), and
 compares each judge's verdict (grade 3 or more), and the S3 rule (both 3 or more), with the owners' labels:
 
 - An item marked `blind: false` leaves every count and is not judged. An unlabelled counted item, a changed
   `items.json`, a label other than `pass` or `fail`, or `blind: false` without a reason stops the run before any call.
-- `--set held-out` needs the frozen prompt (its SHA-256 is `JUDGE_PROMPT_SHA256` in `bench/lib/judge.mjs`, null until
-  the freeze) and 36 or more counted items with 10 or more owner fails and 10 or more owner passes; both are checked
-  before any judge call.
+- `--set held-out` needs the frozen prompt (its SHA-256 is `JUDGE_PROMPT_SHA256` in `bench/lib/judge.mjs`, set at the
+  freeze to the hash of `bench/judge-v3.md`) and 36 or more counted items with 10 or more owner fails and 10 or more
+  owner passes; both are checked before any judge call.
 - Each verdict is saved in `judged/<prompt sha256, 12>/<judge>/<item>.json` with the hashes of the prompt and of the
   rendered input: a run resumes, and a changed item or prompt is judged again. The judges' tries reserve under the
   budget guard in stage `calibration`.

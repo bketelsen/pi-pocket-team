@@ -308,9 +308,9 @@ test("the held-out gates: an unlabelled item, a prompt not frozen, a short set: 
     writePack("irulan", heldOut(4, 0), (i) => (i.id === "h2" ? null : "pass"));
     assert.equal((await run(["--set", "held-out"], { frozenSha256: "x" })).code, 1);
 
-    // Not frozen.
+    // Not frozen (the state before the freeze: JUDGE_PROMPT_SHA256 was null).
     writePack("irulan", heldOut(40, 12), (i) => (Number(i.id.slice(1)) < 12 ? "fail" : "pass"));
-    assert.equal((await run(["--set", "held-out"])).code, 1);
+    assert.equal((await run(["--set", "held-out"], { frozenSha256: null })).code, 1);
 
     // Another prompt than the frozen one.
     assert.equal((await run(["--set", "held-out"], { frozenSha256: "0".repeat(64) })).code, 1);

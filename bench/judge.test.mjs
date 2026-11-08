@@ -3,10 +3,12 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
+import { basename, join } from "node:path";
 import { test } from "node:test";
 import {
     DIFF_LIMIT,
     JUDGE_PROMPT,
+    JUDGE_PROMPT_SHA256,
     cutDiff,
     diffStat,
     isTestPath,
@@ -17,7 +19,8 @@ import {
 } from "./lib/judge.mjs";
 
 const sha256 = (text) => createHash("sha256").update(text).digest("hex");
-const template = readFileSync(JUDGE_PROMPT, "utf8");
+// The render hashes below were taken with prompt version 1; the frozen prompt has its own test.
+const template = readFileSync(join(import.meta.dirname, "judge-v1.md"), "utf8");
 
 /** A file section of a diff with `lines` added lines. */
 const section = (path, lines, mark = "x") =>
@@ -149,4 +152,28 @@ test("a S3 prompt renders byte for byte as before the cut order changed", () => 
             "4a9b17765b9af4242735c031f7f5ab9a0701456cae6e87454498049e7186eb25",
         ],
     );
+});
+
+test("the judge prompt is frozen: the default prompt file has the SHA-256 of JUDGE_PROMPT_SHA256", () => {
+    // The freeze of the judge calibration (bench/judge-calibration.md): an edit of the prompt is a new calibration.
+    assert.equal(basename(JUDGE_PROMPT), "judge-v3.md");
+    assert.match(JUDGE_PROMPT_SHA256, /^[0-9a-f]{64}$/);
+    assert.equal(sha256(readFileSync(JUDGE_PROMPT, "utf8")), JUDGE_PROMPT_SHA256);
+});
+
+test("the frozen prompt keeps the rubric: grades 1 to 4 in the plan's words, grade 0 with the minor-fix rule", () => {
+    // bench/judge-calibration.md ("Change 1"): only grade 0 gained "and needs more than a minor fix", to follow the
+    // owners' label rule (bench/calibration-labels.md); the other 4 lines are those of judge-v1.md.
+    const frozen = readFileSync(JUDGE_PROMPT, "utf8");
+    const rubric = (text) => text.split("\n").filter((line) => /^- [0-4]: /.test(line));
+
+    assert.deepEqual(rubric(frozen), [
+        "- 0: no change, or the build breaks and needs more than a minor fix.",
+        "- 1: wrong approach.",
+        "- 2: right approach, needs major fixes.",
+        "- 3: acceptable with minor fixes.",
+        "- 4: mergeable as it is.",
+    ]);
+    assert.deepEqual(rubric(frozen).slice(1), rubric(template).slice(1));
+    assert.equal(rubric(template)[0], "- 0: no change, or the build breaks.");
 });
