@@ -23085,6 +23085,11 @@ export default function createDesk(host: Host, web: Web) {
         /** The goal board's clock math. An older shift module has none: the board refuses a pick. */
         nextClockTime?: (hour: number, minute: number, now: number, zone: string) => number;
         localMidnight?: (now: number, zone: string) => number;
+        /**
+         * The shift's text limit (objective plus stop condition). An older shift module has none: the board then leaves
+         * the check to the start.
+         */
+        textLimit?: number;
     };
 
     const nightShiftApi = (): NightShiftApi | undefined =>
@@ -31073,6 +31078,11 @@ export default function createDesk(host: Host, web: Web) {
             }
         })();
         const clock = boardClock();
+        const textLimit = nightShiftApi()?.textLimit;
+        const shiftTextLimit =
+            typeof textLimit === "number" && Number.isInteger(textLimit) && textLimit > 0
+                ? textLimit
+                : undefined;
         const { board: settings } = await deskConfig();
 
         return access.commit(async (state, tx) => {
@@ -31107,6 +31117,7 @@ export default function createDesk(host: Host, web: Web) {
                     roster,
                     models,
                     ...(clock === undefined ? {} : { clock }),
+                    ...(shiftTextLimit === undefined ? {} : { shiftTextLimit }),
                     threadSupervisor: (id) => threadById(state, id)?.supervisor,
                 },
                 now,
@@ -31708,7 +31719,7 @@ export default function createDesk(host: Host, web: Web) {
                     {
                         additionalProperties: true,
                         description:
-                            "board_add, board_edit: row fields: agent (roster id), repo (owner/name), title (1 to 120), task (1 to 6000), objective (up to 3000), stopWhen (1 to 3000), max (1 to 100 rounds), until (HH:MM), start (HH:MM), worker (provider/model), prCheck ({ pr, repo, checks, label }), kind (goal, hygiene, grooming, sweep, feature or quality), note (up to 500), order (a number); null clears an optional field in an edit",
+                            "board_add, board_edit: row fields: agent (roster id), repo (owner/name), title (1 to 120), task (1 to 6000), objective (up to 3000), stopWhen (1 to 3000; the objective, else the task, and stopWhen together up to 3000, the shift's limit), max (1 to 100 rounds), until (HH:MM), start (HH:MM), worker (provider/model), prCheck ({ pr, repo, checks, label }), kind (goal, hygiene, grooming, sweep, feature or quality), note (up to 500), order (a number); null clears an optional field in an edit",
                     },
                 ),
             ),
