@@ -1545,7 +1545,7 @@ export function makeDashboard(pocket, { refreshMs = REFRESH_MS } = {}) {
         const range = snapshot?.range;
         const notStarted = snapshot?.coverage.status === "not started";
 
-        return html`<div class="desk dash">
+        return html`<div class="dash">
             <header class="desk-head dash-head">
                 <h1>Dashboard</h1>
                 <p class="small muted">
