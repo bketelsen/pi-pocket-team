@@ -17326,6 +17326,67 @@ describe("the desk in a Pi Pocket", () => {
         );
     });
 
+    test("attribute stores the found PR event on the found thread", async () => {
+        const source = await supervisor("found-event-pr");
+        const ref = "frostyard/found-event#1";
+        const repo = "frostyard/found-event";
+        let id = "";
+
+        try {
+            await app.harness.commit(async (tx) => {
+                const state = await tx.doc(DeskThreads);
+
+                const now = Date.now();
+
+                // As the sweep does before it reads PRs: the desk gets its epoch, and the PR is not older than it.
+                repairEpoch(state, now);
+
+                const epoch = deskEpoch(state)!;
+
+                const pr = prFact({
+                    ref,
+                    repo,
+                    number: 1,
+                    title: "Found event PR",
+                    createdAt: epoch,
+                });
+
+                attribute(
+                    state,
+                    {
+                        viewer: "github-viewer",
+                        repos: { [repo]: { archived: false, open: [pr] } },
+                        prs: {},
+                    },
+                    gitOf({ supervisor: Number(source) }),
+                    now,
+                );
+
+                const found = Object.values(state.threads).find(
+                    (thread) => thread.key === `found:pr:${ref}`,
+                );
+
+                id = found?.id ?? "";
+            }, context);
+
+            const found = (await deskState())?.threads[id];
+
+            assert(found !== undefined, "the PR sweep made a found thread");
+            assert(
+                found.events.some((event) => event.text === "found: a PR with no thread"),
+                "the found PR event is stored",
+            );
+        } finally {
+            if (id !== "") {
+                await app.harness.commit(async (tx) => {
+                    const state = await tx.doc(DeskThreads);
+
+                    delete state.threads[id];
+                }, context);
+            }
+        }
+    });
+
     test("desk own closes a found PR thread, and keeps its PR on it", async () => {
         const source = await supervisor("own-pr");
         let id = "";
@@ -20504,6 +20565,12 @@ describe("the desk in a Pi Pocket", () => {
             assert.equal(found[0]?.run.folder, fresh);
             assert.match(found[0]?.id ?? "", /^F[1-9][0-9]*$/);
             assert.equal(found[0]?.run.next, "odrade");
+            assert(
+                found[0]?.events.some(
+                    (event) => event.key === "found" && event.text === "found: a dirty folder",
+                ),
+                "the found folder event is stored",
+            );
             assert.equal(
                 (await deskState())?.baseline?.[String(Number(source))]?.pending?.[fresh],
                 undefined,
@@ -27034,6 +27101,37 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
                     true,
                 );
                 assert.equal(odradeReason(woken!), "run failed: the provider refused");
+            } finally {
+                stub.restore();
+            }
+        });
+
+        test("a sync stores the found event on a session with no thread", async () => {
+            const stub = archiveDesk();
+
+            try {
+                const source = await supervisor("found-event-session");
+
+                await stub.sync(source);
+                made += 1;
+
+                const address = `session-found-event-${String(made)}`;
+
+                stub.listed.set(address, { address, busy: false, archived: false });
+
+                await stub.sync(source);
+
+                const found = Object.values((await deskState())?.threads ?? {}).find(
+                    (each) => each.key === `found:session:${address}`,
+                );
+
+                assert(found !== undefined, "the sweep found the session");
+                assert(
+                    found.events.some(
+                        (event) => event.text === "found: a linked session with no thread",
+                    ),
+                    "the found session event is stored",
+                );
             } finally {
                 stub.restore();
             }

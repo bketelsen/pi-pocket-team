@@ -770,7 +770,7 @@ describe("Team startShift", () => {
 describe("the board in Pi Pocket", () => {
     test("2 picked rows launched with board_launch give 2 threads whose goals hold the rows' task, stop, max and for", async () => {
         const source = await supervisor();
-        const until = untilSoon();
+        const untilTime = untilSoon();
 
         for (const [agent, task] of [
             ["teg", "BOARD-ONE fix the flaky test"],
@@ -784,7 +784,7 @@ describe("the board in Pi Pocket", () => {
                     task,
                     stopWhen: `${agent} is done`,
                     max: 2,
-                    until,
+                    until: untilTime,
                 },
             });
         }
@@ -797,6 +797,16 @@ describe("the board in Pi Pocket", () => {
             rows: rows.map((row) => ({ row: row.id, rev: row.rev })),
         });
         await runTool(source, "desk", { action: "board_launch" });
+
+        await until(
+            async () => {
+                const rows = boardRows((await deskState()).board, Number(source));
+
+                return rows.length === 2 && rows.every((row) => row.state === "launched");
+            },
+            "both board rows launched",
+            20_000,
+        );
 
         const launched = boardRows((await deskState()).board, Number(source));
 
