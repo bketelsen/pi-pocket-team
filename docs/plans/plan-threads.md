@@ -481,7 +481,8 @@ Waiting: T560b, T560c open · c3 open · k2 running
   correction); a write over 64 KB; and text with a known secret form (`ghp_`, `github_pat_`, `sk-`, `xox`,
   `-----BEGIN`).
 - `amend` refuses: a plan that is not `approved`, `building` or `verifying`; a change to `decisions` or `tasks`; a
-  change of the sections or a `heading`; `asks`, `comments`, or a text that changes nothing; and, from the supervisor,
+  change of the sections or of a heading (the `heading` argument, or a heading line in a whole-file text or edit); a
+  change of the text above the first section; `asks`, `comments`, or a text that changes nothing; and, from the supervisor,
   `edits` and `rev` (its `amend` is a request, and the planning session writes it in its own words).
 - `drop` refuses: a plan that is `done`, or `dropped` already; a `why` that is not 1 line of 1 to 200 characters; an
   `ask` that is not on the plan thread or on 1 of its task or verification threads; an answer that is not Brian's or

@@ -14879,11 +14879,12 @@ function amendWriteProblem(plan: Plan, write: PlanWrite): string | undefined {
         return "The amend changes nothing: give edits that change the text.";
     }
 
-    const before = plan.sections.map((section) => section.id).join(",");
-    const after = write.sections.map((section) => section.id).join(",");
+    // The ids, their order and their headings: a whole-file text or edit can rename a heading too.
+    const shape = (sections: readonly { id: string; heading: string }[]): string =>
+        JSON.stringify(sections.map((section) => [section.id, section.heading]));
 
-    if (before !== after) {
-        return "An amend keeps the sections: it adds, removes or moves none. A change of the plan's shape needs plan revise.";
+    if (shape(plan.sections) !== shape(write.sections)) {
+        return "An amend keeps the sections and their headings: it adds, removes, moves or renames none. A change of the plan's shape needs plan revise.";
     }
 
     if ((write.asks ?? []).length > 0 || (write.comments ?? []).length > 0) {
@@ -16028,6 +16029,21 @@ export function planReviseItem(
         line: `[desk] ${plan.thread} plan under revision by ${request.by}: ${quote(request.why)}. Stopped: ${stopped.length === 0 ? "none" : stopped.join(", ")}. The other tasks go on.${approvalWaitText(running)} No new task is delegated until Brian approves a new revision.`,
         at: request.at,
     };
+}
+
+/** `plan read`'s lines for the amends of the approval in force, oldest first: an older approval's amends are left out. */
+export function planAmendLines(
+    plan: Plan,
+    quote: (text: string, limit?: number) => string = defaultQuote,
+): string[] {
+    const approval = plan.approvals.at(-1);
+
+    return (plan.amends ?? [])
+        .filter((amend) => approval !== undefined && amend.approval === approval.key)
+        .map(
+            (amend) =>
+                `Amended (by ${amend.by}): rev ${amend.from.slice(0, 7)} → ${amend.rev.slice(0, 7)} (${amend.sections.join(", ") || "none"}): ${quote(amend.why, 300)}`,
+        );
 }
 
 /** The plan-amend news for the supervisor: 1 digest item, not urgent, with the 2 revisions and the sections. */
@@ -18933,6 +18949,16 @@ export async function planWriteFlow(
 
     if ("error" in built) {
         return built;
+    }
+
+    // An amend keeps the text above the first section: the amend's record and its diff name sections only.
+    if (
+        request.amend !== undefined &&
+        parsePlanText(built.text).preamble !== parsePlanText(current).preamble
+    ) {
+        return {
+            error: "An amend keeps the title and the text above the first section: change a section's body only.",
+        };
     }
 
     const rev = await io.writeStore(built.text);
@@ -34142,12 +34168,9 @@ export default function createDesk(host: Host, web: Web) {
                                   `Under revision (by ${plan.revising.by}): ${host.text.quoted(plan.revising.why, 300)}. Stopped: ${plan.revising.tasks.join(", ") || "none"}. Carry each done task that stays the same.`,
                               ]),
                         // The text-only corrections of the approval in force: the state and the graph did not change.
-                        ...(plan.amends ?? [])
-                            .filter((amend) => amend.approval === plan.approvals.at(-1)?.key)
-                            .map(
-                                (amend) =>
-                                    `Amended (by ${amend.by}): rev ${amend.from.slice(0, 7)} → ${amend.rev.slice(0, 7)} (${amend.sections.join(", ") || "none"}): ${host.text.quoted(amend.why, 300)}`,
-                            ),
+                        ...planAmendLines(plan, (value, limit) =>
+                            host.text.quoted(value, limit ?? 300),
+                        ),
                         `Sections: ${plan.sections
                             .map((section) =>
                                 PLAN_DESK_SECTIONS.some((each) => each.id === section.id)

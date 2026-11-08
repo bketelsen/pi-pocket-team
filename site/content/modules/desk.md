@@ -28,6 +28,13 @@ A session with a supervisor identity uses `desk`; another session is refused.
 - `archive`: the one-time sweep of the idle sessions of closed threads.
 - `board`, `board_add`, `board_edit`, `board_drop`, `board_pick`, `board_unpick`, `board_launch`, `board_reopen`, `board_resolve`: the goal board (below).
 
+Plans have a tool of their own, `plan`. After Brian approves a plan, 2 of its actions close gaps without a new approval:
+
+- `plan amend`: a text-only correction of an approved plan. The planning session writes it, with a why; the plan keeps its state, its approved graph and its tasks, and the change shows on the Desk page under the changes since the approval. It never changes Decisions, Tasks, the sections, a heading or the title. A supervisor's `plan amend` is only a request: the desk sends it to the planning session, which writes it in its own words.
+- `plan drop`: the supervisor closes a plan that Brian stopped. It names Brian's answered ask that says stop or drop, on the plan thread or on one of its task threads. An open ask on the plan thread still refuses the drop. The open tasks stop, and their sessions get the stop.
+
+A pass on a plan task thread with no PR and no `plan nochange` is refused (see Watches below).
+
 An agent session can use `read`, `watch` and `result` on its own thread only. On the goal board, an agent reads its supervisor's board with `board`, adds its own proposals with `board_add`, and edits or drops only its own proposed rows with `board_edit` and `board_drop`. A Clerk has its own smaller list, and escalates to its supervisor with `desk escalate`: the desk drops an escalation of news the supervisor already acted on or got, and puts the rest in her next digest, or sends it at once with `urgent: true`.
 
 ## Asks, watches and the cap

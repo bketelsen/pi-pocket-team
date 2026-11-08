@@ -114,6 +114,7 @@ import {
     requestPlanAmend,
     supervisorDropPlan,
     amendedRev,
+    planAmendLines,
     DIGEST_KINDS,
     DIGEST_NOW,
     planReadyItem,
@@ -9313,7 +9314,7 @@ describe("a text-only amend of an approved plan", () => {
 
         assert.equal(
             (drop as { error: string }).error,
-            "An amend keeps the sections: it adds, removes or moves none. A change of the plan's shape needs plan revise.",
+            "An amend keeps the sections and their headings: it adds, removes, moves or renames none. A change of the plan's shape needs plan revise.",
         );
 
         // An amend settles no ask and no comment.
@@ -9473,6 +9474,93 @@ describe("a text-only amend of an approved plan", () => {
         assert.deepEqual(DIGEST_KINDS.slice(-2), ["escalation-urgent", "plan-amend"]);
         assert.equal(DIGEST_KINDS.at(-1), "plan-amend");
         assert.equal(DIGEST_NOW.includes("plan-amend"), false, "an amend is not urgent");
+    });
+
+    test("an amend renames no heading, by a whole-file text or by a whole-file edit (#183 review)", async () => {
+        for (const how of ["text", "edits"] as const) {
+            const harness = await amendHarness();
+            const current = harness.current() ?? "";
+            const heading = parsePlanText(current).sections.find((each) => each.id === "idea");
+
+            assert(heading !== undefined, "the plan has the idea section");
+
+            const oldLine = `## ${heading.heading} <!-- s:idea -->`;
+            const newLine = "## The real idea <!-- s:idea -->";
+
+            assert(current.includes(oldLine), "the heading line is in the file");
+
+            const snapshot = JSON.stringify(harness.state);
+            const done = await amendWrite(
+                harness,
+                how === "text"
+                    ? { text: current.replace(oldLine, newLine) }
+                    : { edits: [{ oldText: oldLine, newText: newLine }] },
+            );
+
+            assert.equal(
+                (done as { error: string }).error,
+                "An amend keeps the sections and their headings: it adds, removes, moves or renames none. A change of the plan's shape needs plan revise.",
+                how,
+            );
+            assert.equal(JSON.stringify(harness.state), snapshot, `${how}: nothing changes`);
+            assert.equal(harness.current(), current, `${how}: the file stays`);
+        }
+    });
+
+    test("an amend keeps the text above the first section, alone or with a section's change (#183 review)", async () => {
+        for (const withSection of [false, true]) {
+            const harness = await amendHarness();
+            const current = harness.current() ?? "";
+            const preamble = parsePlanText(current).preamble;
+
+            assert.notEqual(preamble, "", "the plan has a title");
+
+            let edited = current.replace(preamble, `${preamble}\n\nA new line above the sections.`);
+
+            if (withSection) {
+                const idea = parsePlanText(current).sections.find((each) => each.id === "idea");
+
+                assert(idea !== undefined && idea.body !== "");
+                edited = edited.replace(idea.body, `${idea.body} With the HSM key.`);
+            }
+
+            const snapshot = JSON.stringify(harness.state);
+            const done = await amendWrite(harness, { text: edited });
+
+            assert.equal(
+                (done as { error: string }).error,
+                "An amend keeps the title and the text above the first section: change a section's body only.",
+                `with a section: ${String(withSection)}`,
+            );
+            assert.equal(JSON.stringify(harness.state), snapshot);
+            assert.equal(harness.current(), current);
+        }
+    });
+
+    test("plan read's lines name each amend of the approval in force, and no older one (#183 review)", async () => {
+        const harness = await amendHarness();
+        const before = harness.plan.rev;
+
+        assert.deepEqual(planAmendLines(harness.plan), []);
+        assert(
+            !("error" in (await amendWrite(harness, { section: "idea", text: "> The HSM key." }))),
+        );
+
+        const after = harness.plan.rev;
+
+        assert.deepEqual(planAmendLines(harness.plan, quoted), [
+            `Amended (by lucilla): rev ${before.slice(0, 7)} → ${after.slice(0, 7)} (idea): "The key rotates each year."`,
+        ]);
+
+        // A newer approval: the older approval's amends are not its own.
+        harness.plan.approvals.push({
+            rev: after,
+            graph: 1,
+            at: tick(9),
+            by: "brian",
+            key: "approve:2",
+        });
+        assert.deepEqual(planAmendLines(harness.plan, quoted), []);
     });
 
     test("the plan read names each amend of the approval in force", async () => {
