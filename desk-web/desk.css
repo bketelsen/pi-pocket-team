@@ -1563,6 +1563,17 @@
     list-style: none;
 }
 
+/* The Done fold: the finished and dropped rows, closed until a tap. */
+.board-done {
+    margin-top: 12px;
+}
+
+.board-done-summary {
+    padding: 4px 0;
+    color: var(--muted);
+    cursor: pointer;
+}
+
 .board-row {
     margin: 0 0 10px;
     padding: 10px 12px;

@@ -12697,7 +12697,8 @@ export type BoardLimits = {
 
 /**
  * 1 board row as the Desk page's Board view reads it: the stored fields, and from the row's thread (when the desk holds it)
- * the next actor, the thread's state, and `shiftEnded` when its shift ended. The page colors a launched row from these.
+ * the next actor, the thread's state, and `shiftEnded` when its shift ended. The page colors a launched row from these, and
+ * sorts its Done fold by `changedAt`.
  */
 export type BoardRowView = Pick<
     BoardModule.BoardRow,
@@ -12722,6 +12723,7 @@ export type BoardRowView = Pick<
     | "untilAt"
     | "thread"
     | "launchedAt"
+    | "changedAt"
     | "error"
     | "attempts"
 > & { next?: NextActor; threadState?: Thread["state"]; shiftEnded?: true };
@@ -12752,6 +12754,7 @@ export function boardRowViews(
             ...(row.note === undefined ? {} : { note: row.note }),
             order: row.order,
             by: row.by,
+            changedAt: row.changedAt,
             ...(row.startAt === undefined ? {} : { startAt: row.startAt }),
             ...(row.untilAt === undefined ? {} : { untilAt: row.untilAt }),
             ...(row.thread === undefined ? {} : { thread: row.thread }),

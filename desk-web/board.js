@@ -134,6 +134,31 @@ export const rowStatus = (row) => {
     return SAME_STATUS.has(state) ? state : "proposed";
 };
 
+/** A row's time of its last change; a row with no number there counts as 0. */
+const rowChangedAt = (row) => (Number.isFinite(row?.changedAt) ? row.changedAt : 0);
+
+/**
+ * The board's rows in 2 lists. `active` holds the rows that wait for an act or run, in the input order (launch order):
+ * proposed, picked, waiting, starting, failed, unknown, and launched while it runs. `done` holds the dropped rows and the
+ * launched rows whose thread closed or whose shift ended, newest `changedAt` first: a row with none counts as 0, and a tie
+ * keeps the input order.
+ */
+export const boardSplit = (rows) => {
+    const active = [];
+    const done = [];
+
+    for (const row of rows ?? []) {
+        const finished = row?.state === "launched" && rowStatus(row) === "finished";
+
+        (row?.state === "dropped" || finished ? done : active).push(row);
+    }
+
+    // `sort` is stable, so 2 rows of the same time stay in the order they came in.
+    done.sort((a, b) => rowChangedAt(b) - rowChangedAt(a));
+
+    return { active, done };
+};
+
 /** A row's state on 1 line: its state and rev (a launched row says running or finished), then its thread and the next actor, or its error. */
 export const rowStateText = (row) =>
     [
@@ -369,6 +394,7 @@ export function boardMarkup(html, view, ctl) {
     const rows = board?.rows ?? [];
     const supervisors = board?.supervisors ?? [];
     const picked = pickedRows(rows);
+    const { active, done } = boardSplit(rows);
 
     const rowButtons = (row) =>
         rowActs(row).map(({ op, label }) =>
@@ -542,9 +568,23 @@ export function boardMarkup(html, view, ctl) {
         ${
             board !== null && board.supervisor !== null && rows.length === 0
                 ? html`<p class="small muted">The board has no rows.</p>`
-                : html`<ol class="board-rows">
-                      ${rows.map(rowItem)}
-                  </ol>`
+                : html`${
+                      active.length === 0 && done.length > 0
+                          ? html`<p class="small muted">No row waits or runs.</p>`
+                          : html`<ol class="board-rows">
+                                ${active.map(rowItem)}
+                            </ol>`
+                  }
+                  ${
+                      done.length === 0
+                          ? null
+                          : html`<details class="board-done">
+                                <summary class="board-done-summary">Done (${String(done.length)})</summary>
+                                <ol class="board-rows">
+                                    ${done.map(rowItem)}
+                                </ol>
+                            </details>`
+                  }`
         }
     </section>`;
 }
