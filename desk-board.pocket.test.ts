@@ -1436,6 +1436,29 @@ describe("the Desk page's board routes", () => {
         );
     });
 
+    test("POST board: an edit over the shift's text limit gets 400 with the counted length; nothing changes", async () => {
+        const call = await routes();
+        const source = await knownSupervisor();
+        const row = await addRow(source);
+        const over = await call(`board/${String(source)}`, {
+            op: "edit",
+            row,
+            rev: 1,
+            key: key(),
+            fields: { task: "t".repeat(2990), stopWhen: "s".repeat(11) },
+        });
+
+        assert.equal(over.status, 400, JSON.stringify(over.data));
+        assert.match(
+            JSON.stringify(over.data),
+            /Row \d+: the shift's text is 3001 characters \(the task 2990, as the objective, and stopWhen 11\): a shift takes at most 3000\./,
+        );
+        assert.deepEqual(
+            { rev: (await stored(row)).rev, task: (await stored(row)).task },
+            { rev: 1, task: "BOARD-PAGE tend the tests" },
+        );
+    });
+
     test("POST board: 403 for a conversation that is no supervisor's, and for another supervisor's row", async () => {
         const call = await routes();
         const source = await knownSupervisor();
