@@ -110,6 +110,7 @@ import {
     newBoardKey,
     rowActs,
     rowStateText,
+    rowStatus,
 } from "./desk-web/board.js";
 
 const NOW = Date.now();
@@ -3090,7 +3091,7 @@ test("Board: the rows in launch order, with the limits line, each with its facts
     assert.ok(out.includes("teg frostyard/teg · sweep · max 20 · until 06:45"));
     assert.ok(out.includes("Note: first"));
     assert.ok(out.includes("proposed · rev 2"));
-    assert.ok(out.includes("launched · rev 1 · T12 (next: agent)"));
+    assert.ok(out.includes("launched (running) · rev 1 · T12 (next: agent)"));
     assert.ok(out.includes("failed · rev 1 · error: over the day's round budget"));
     assert.ok(out.includes("unknown · rev 4 · error: it threw"));
     assert.doesNotMatch(out, /Task<\/dt>/, "the task is closed until a tap");
@@ -3412,6 +3413,120 @@ test("Board keys and texts: 1 key per act, another rev is another act; the state
         max: "x",
         until: "6",
     });
+});
+
+test("Board status: rowStatus gives 1 status for each state; a launched row runs until its thread closes or its shift ends", () => {
+    for (const [state, status] of [
+        ["proposed", "proposed"],
+        ["picked", "picked"],
+        ["waiting", "waiting"],
+        ["starting", "running"],
+        ["launched", "running"],
+        ["failed", "failed"],
+        ["unknown", "unknown"],
+        ["dropped", "dropped"],
+        ["something-new", "proposed"],
+    ]) {
+        assert.equal(rowStatus(boardRow({ state })), status, state);
+    }
+
+    assert.equal(rowStatus(boardRow({ state: "launched", threadState: "open" })), "running");
+    assert.equal(rowStatus(boardRow({ state: "launched", threadState: "parked" })), "running");
+    assert.equal(rowStatus(boardRow({ state: "launched", threadState: "closed" })), "finished");
+    assert.equal(
+        rowStatus(boardRow({ state: "launched", threadState: "open", shiftEnded: true })),
+        "finished",
+    );
+    assert.equal(rowStatus(boardRow({ state: "launched", thread: "T12" })), "running");
+    // Thread facts never change another state's status.
+    assert.equal(rowStatus(boardRow({ state: "failed", threadState: "closed" })), "failed");
+    assert.equal(rowStatus(undefined), "proposed");
+});
+
+test("Board status: the state line says running or finished for a launched row, and keeps every other state's text", () => {
+    assert.equal(
+        rowStateText(
+            boardRow({
+                state: "launched",
+                rev: 3,
+                thread: "T12",
+                next: "agent",
+                threadState: "open",
+            }),
+        ),
+        "launched (running) · rev 3 · T12 (next: agent)",
+    );
+    assert.equal(
+        rowStateText(boardRow({ state: "launched", rev: 3, thread: "T12", threadState: "closed" })),
+        "launched (finished) · rev 3 · T12",
+    );
+    assert.equal(
+        rowStateText(boardRow({ state: "launched", rev: 2, thread: "T9", shiftEnded: true })),
+        "launched (finished) · rev 2 · T9",
+    );
+    assert.equal(rowStateText(boardRow({ state: "starting", rev: 5 })), "starting · rev 5");
+    assert.equal(rowStateText(boardRow({ state: "dropped", rev: 6 })), "dropped · rev 6");
+});
+
+test("Board status: each row carries its state class and its status class, and desk.css colors each status", async () => {
+    const rows = [
+        boardRow({ id: 1, state: "proposed" }),
+        boardRow({ id: 2, state: "picked" }),
+        boardRow({ id: 3, state: "waiting" }),
+        boardRow({ id: 4, state: "starting" }),
+        boardRow({ id: 5, state: "launched", thread: "T1", threadState: "open" }),
+        boardRow({ id: 6, state: "launched", thread: "T2", threadState: "closed" }),
+        boardRow({ id: 7, state: "launched", thread: "T3", threadState: "open", shiftEnded: true }),
+        boardRow({ id: 8, state: "failed", error: "no" }),
+        boardRow({ id: 9, state: "unknown", error: "it threw" }),
+        boardRow({ id: 10, state: "dropped" }),
+    ];
+    const ctl = await loadedBoard(boardApi({ board: boardAnswer(rows) }));
+    const { out } = boardScreen(ctl);
+    const classes = [...out.matchAll(/<li class=(board-row [^>]*?) ?>/g)].map((found) => found[1]);
+
+    assert.deepEqual(classes, [
+        "board-row board-proposed board-status-proposed",
+        "board-row board-picked board-status-picked",
+        "board-row board-waiting board-status-waiting",
+        "board-row board-starting board-status-running",
+        "board-row board-launched board-status-running",
+        "board-row board-launched board-status-finished",
+        "board-row board-launched board-status-finished",
+        "board-row board-failed board-status-failed",
+        "board-row board-unknown board-status-unknown",
+        "board-row board-dropped board-status-dropped",
+    ]);
+    // The state word stays on each row: color is never the only sign.
+    assert.ok(out.includes("launched (finished) · rev 1 · T2"));
+    assert.ok(out.includes("launched (running) · rev 1 · T1"));
+
+    const css = readFileSync(new URL("./desk-web/desk.css", import.meta.url), "utf8");
+
+    for (const status of [
+        "proposed",
+        "picked",
+        "waiting",
+        "running",
+        "finished",
+        "failed",
+        "unknown",
+        "dropped",
+    ]) {
+        assert.match(
+            css,
+            new RegExp(`\\.board-row\\.board-status-${status} \\{[^}]*border-color:`),
+            `desk.css colors board-status-${status}`,
+        );
+    }
+
+    // No status rule sets a background: a tint lowers the --muted lines (facts, state) under 4.5:1.
+    for (const rule of css.matchAll(/([^{}]*\.board-status-[^{}]*)\{([^}]*)\}/g)) {
+        assert.doesNotMatch(rule[2], /background/, `no background in ${rule[1].trim()}`);
+    }
+
+    // A running launched row is not green: the old always-green launched rule is gone.
+    assert.doesNotMatch(css, /\.board-row\.board-launched \{/);
 });
 
 test("makeBoard: the view reads at once, reads again on changed, and stops listening when it unmounts", async () => {
