@@ -83,17 +83,52 @@ pass.
 JUDGE_PROMPT_SHA256 = 23c5c31c42ef09ca72dc4365d50779951c86c4339c6639caae2f4203d7872fb9
 ```
 
-`bench/judge.test.mjs` fails when the file and the hash differ. The freeze was committed before any held-out call.
+`bench/judge.test.mjs` fails when the file and the hash differ. The freeze was committed (`2745e58`) and pushed before any held-out call.
 `judge-v1.md` and `judge-v2.md` stay as the record; no stage scores with them.
 
 ## The held-out test
 
-Not run yet.
+Run once on 2026-11-08 with the frozen prompt (`node bench/judge-calibration.mjs --set held-out`, exit 0), 78 judge
+calls, no verdict pending. Result: **PASS** (the set is valid, both judges pass, and S3 passes).
+
+| Rater | Counted | Agree (need 32) | Kappa | False pass (of 13), 80% bounds | False fail (of 26), 80% bounds | Pass |
+| ----- | ------- | --------------- | ----- | ------------------------------ | ------------------------------ | ---- |
+| Sol   | 39      | 34              | 0.737 | 0.0% (0), 0.0% to 11.2%        | 19.2% (5), 11.3% to 30.8%      | yes  |
+| Opus  | 39      | 37              | 0.889 | 0.0% (0), 0.0% to 11.2%        | 7.7% (2), 3.2% to 17.2%        | yes  |
+| S3    | 39      | 34              | 0.737 | 0.0% (0), 0.0% to 11.2%        | 19.2% (5), 11.3% to 30.8%      | yes  |
+
+Every miss is a false fail: the judges are stricter than the owners, never more lenient. 2 items are a fail for both
+judges (an owner pass with a missing test, and an owner pass with a short text gap that the judges called a missing
+requirement); 3 more are a fail for Sol only. S3 takes Sol's misses, so on these items about 1 in 5 owner passes is an
+S3 fail (80% bounds 11% to 31%). For the bench this means S3 undercounts passes, the same for every model, and it does
+not pass work that an owner would fail on this sample.
+
+The result file is `<data>/calibration-v2/judge-results/held-out-23c5c31c42ef.json`.
+
+## The label check
+
+Each owner labelled 12 items in about 2 minutes, so the notes were read for signs of a careless pass before the
+held-out run (no label was changed):
+
+- No label contradicts its own note: each fail note names a defect that is not minor or a missing requirement, and
+  each pass note names only fixes that it calls minor.
+- The notes are specific to their item (versions, file names, line lengths, the exact defect); median length 181 to
+  382 characters per owner, none empty.
+- 3 Irulan items have the same note, and 2 pairs of Duncan items share 1 sentence: each is an item with no code change
+  (no diff, or only a report file), where the same words are correct.
+- 1 Duncan note refers to "the other attempts" of its task; the label rules ask for each item on its own. The note
+  gives its own reason as well, and the label agrees with it.
+- Sheeana's 8 held-out items are all owner passes; the class minimums hold over the whole set.
 
 ## Spend (list price, stage `calibration`)
 
-| What                                        | List cost |
-| ------------------------------------------- | --------- |
-| Dev round 1 (`judge-v1.md`, 40 judge calls) | $2.05     |
-| Dev round 2 (`judge-v2.md`, 40 judge calls) | $2.17     |
-| Dev round 3 (`judge-v3.md`, 40 judge calls) | $2.20     |
+| What                                        | List cost  |
+| ------------------------------------------- | ---------- |
+| Dev round 1 (`judge-v1.md`, 40 judge calls) | $2.05      |
+| Dev round 2 (`judge-v2.md`, 40 judge calls) | $2.17      |
+| Dev round 3 (`judge-v3.md`, 40 judge calls) | $2.20      |
+| Held-out (`judge-v3.md`, 78 judge calls)    | $6.10      |
+| **This task (t25)**                         | **$12.52** |
+
+The stage `calibration` in the budget ledger: $42.79 before these rounds (the first instrument's run, the 48 attempts
+and their checks), $55.31 after. The whole bench: $83.45 settled of $3,000.

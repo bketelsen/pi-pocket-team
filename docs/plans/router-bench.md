@@ -6,7 +6,7 @@ The bench's pre-registration fixes every rule, number and seed before any paid r
 and records what each step settled. The scripts and their data are in [bench/README.md](../../bench/README.md). After
 router v3, the daily audit's R2 check measures the routed threads end to end ([daily-audit.md](../modules/daily-audit.md)).
 
-Status: phase 1 done (pi-pocket-team#164); phase 2, the instrument, in review (2026-11-07).
+Status: phase 1 done (pi-pocket-team#164); phase 2 done: the judges passed the held-out test (2026-11-08).
 
 ## Phase 1 — Pool gate (this change)
 
@@ -113,6 +113,27 @@ Where that text leaves a choice open, the script makes these choices:
 - **Done when:** the held-out result (agreement, kappa and both error rates with their bounds) is recorded here, before
   the first stage 1 score counts.
 
+### Result (2026-11-08)
+
+The record is [bench/judge-calibration.md](../../bench/judge-calibration.md).
+
+- **Dev:** 20 items (12 owner passes, 8 owner fails), 3 rounds. 2 prompt changes: `judge-v2.md` takes the owners'
+  label rule (grade a defect by the size of its fix); `judge-v3.md` adds that a minor fix never adds what the author
+  missed, and that all the fixes count together. Only version 3 passes for both judges and for S3 on the dev items.
+- **Freeze:** `bench/judge-v3.md`, `JUDGE_PROMPT_SHA256` =
+  `23c5c31c42ef09ca72dc4365d50779951c86c4339c6639caae2f4203d7872fb9`, committed before any held-out call.
+- **Held-out:** run once; 39 counted items (26 owner passes, 13 owner fails), no top-up, no item left out. **PASS.**
+
+| Rater                            | Agree (need 32) | Kappa | False pass, 80% bounds  | False fail, 80% bounds   | Pass |
+| -------------------------------- | --------------- | ----- | ----------------------- | ------------------------ | ---- |
+| `openai/gpt-6.1-sol`             | 34 of 39        | 0.737 | 0 of 13 (0.0% to 11.2%) | 5 of 26 (11.3% to 30.8%) | yes  |
+| `github-copilot/claude-opus-5.5` | 37 of 39        | 0.889 | 0 of 13 (0.0% to 11.2%) | 2 of 26 (3.2% to 17.2%)  | yes  |
+| S3 (both 3 or more)              | 34 of 39        | 0.737 | 0 of 13 (0.0% to 11.2%) | 5 of 26 (11.3% to 30.8%) | yes  |
+
+- **Reading:** every miss is a false fail, so S3 is stricter than the owners: it undercounts passes for every model
+  alike, and on this sample it passes no work that an owner fails.
+- **Spend:** $12.52 of judge calls (dev $6.42, held-out $6.10); the bench's ledger is at $83.45 of $3,000.
+
 ### The instrument
 
 - `bench/calibration.mjs` (logic in `bench/lib/calibration.mjs` and `bench/lib/calibration-cli.mjs`): the plan of
@@ -178,3 +199,4 @@ Where that text leaves a choice open, the script makes these choices:
   (the router that takes the result)
 - Reads: [modules/daily-audit.md](../modules/daily-audit.md) (R2, which measures the routed threads after router v3)
 - Label rules: [bench/calibration-labels.md](../../bench/calibration-labels.md)
+- Judge calibration record: [bench/judge-calibration.md](../../bench/judge-calibration.md)
