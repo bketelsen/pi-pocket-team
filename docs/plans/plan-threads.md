@@ -467,17 +467,26 @@ Waiting: T560b, T560c open · c3 open · k2 running
 | `finding`  | a consult session, once                          | its answer: stance and summary                                                        |
 | `nochange` | a task thread's agent                            | its task is done with no PR: the reason and the evidence                              |
 | `revise`   | a task agent, the supervisor                     | a scope change: why, and the tasks it touches                                         |
+| `amend`    | the planning session; the supervisor asks        | a text-only correction of an approved plan: `why`, `rev`, and `edits` or a section    |
 | `verify`   | the verification thread's agent                  | the whole-plan result, per task                                                       |
 | `list`     | the supervisor, Clerk                            | the open plans, 1 line each                                                           |
-| `drop`     | the supervisor                                   | drop the plan: refused while it has open asks                                         |
+| `drop`     | the supervisor                                   | drop a plan Brian stopped: `why`, and his answered ask that stops or drops it         |
 
 - "The planning session" is the session that the plan thread's `session` names; the desk checks the conversation id,
   not a name in the arguments. A planning session is a linked session: Pocket refuses its `team` starts and `team_work`,
   so it cannot start repository work.
 - `write` refuses: a stale `rev` (it gives the current one: read again, merge, write again); a write to `decisions` or
   `tasks`; a write in `approved`, `building` or `verifying` (a scope change first: the refusal says that the planning
-  session cannot call `revise`, and asks the supervisor or Brian for it); a write over 64 KB; and text with a
-  known secret form (`ghp_`, `github_pat_`, `sk-`, `xox`, `-----BEGIN`).
+  session cannot call `revise`, asks the supervisor or Brian for it, and names `plan amend` for a text-only
+  correction); a write over 64 KB; and text with a known secret form (`ghp_`, `github_pat_`, `sk-`, `xox`,
+  `-----BEGIN`).
+- `amend` refuses: a plan that is not `approved`, `building` or `verifying`; a change to `decisions` or `tasks`; a
+  change of the sections or of a heading (the `heading` argument, or a heading line in a whole-file text or edit); a
+  change of the text above the first section; `asks`, `comments`, or a text that changes nothing; and, from the supervisor,
+  `edits` and `rev` (its `amend` is a request, and the planning session writes it in its own words).
+- `drop` refuses: a plan that is `done`, or `dropped` already; a `why` that is not 1 line of 1 to 200 characters; an
+  `ask` that is not on the plan thread or on 1 of its task or verification threads; an answer that is not Brian's or
+  that does not say stop or drop; and an open ask on the plan thread, as the page's drop refuses it.
 - `write` naming an ask sets its `written` only when the ask is answered and the write touched the ask's section.
 - Every action takes the call's key (`plan:<task>:<call>`): a replayed call adds nothing.
 - No action approves, merges, labels, closes an issue, or delegates. Approve is a page route with `access: "owner"`

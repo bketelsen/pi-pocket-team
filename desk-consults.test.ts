@@ -2013,7 +2013,7 @@ describe("with the Pi Pocket app", () => {
 
             assert.match(
                 properties.rev?.description ?? "",
-                /^write, tasks: the full rev you read .*; a write that changes the file makes a new rev, so call tasks again after it$/,
+                /^write, tasks, amend: the full rev you read .*; a write that changes the file makes a new rev, so call tasks again after it; an amend names the revision the file has now; the supervisor's amend gives none$/,
             );
             assert.match(
                 task.repo?.description ?? "",

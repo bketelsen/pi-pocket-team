@@ -110,6 +110,13 @@ import {
     openThread,
     parsePlanText,
     planDecidedItem,
+    planAmendItem,
+    requestPlanAmend,
+    supervisorDropPlan,
+    amendedRev,
+    planAmendLines,
+    DIGEST_KINDS,
+    DIGEST_NOW,
     planReadyItem,
     planRosterText,
     planSlug,
@@ -148,6 +155,8 @@ import {
     writeStore,
     type PlanWakeMessage,
     type PlanWriteIo,
+    type PlanWriteResult,
+    type PlanAmendAsk,
     type DeskState,
     type Plan,
     type PlanRoster,
@@ -795,7 +804,7 @@ describe("a plan write", () => {
         assert.ok("error" in refused);
         assert.equal(
             refused.error,
-            `Plan T1 is approved: a write needs a scope change first (plan revise, or Brian's Stop and revise). The planning session cannot call plan revise: ask the supervisor for a plan revise, or Brian for Stop and revise.`,
+            `Plan T1 is approved: a write needs a scope change first (plan revise, or Brian's Stop and revise). The planning session cannot call plan revise: ask the supervisor for a plan revise, or Brian for Stop and revise. For a text-only correction, call plan amend: it keeps the state and the approved graph.`,
         );
         assert.equal(plan.revs.length, 1);
     });
@@ -811,7 +820,7 @@ describe("a plan write", () => {
             assert.ok("error" in refused);
             assert.equal(
                 refused.error,
-                `Plan T1 is ${planState}: a write needs a scope change first (plan revise, or Brian's Stop and revise). The planning session cannot call plan revise: ask the supervisor for a plan revise, or Brian for Stop and revise.`,
+                `Plan T1 is ${planState}: a write needs a scope change first (plan revise, or Brian's Stop and revise). The planning session cannot call plan revise: ask the supervisor for a plan revise, or Brian for Stop and revise. For a text-only correction, call plan amend: it keeps the state and the approved graph.`,
             );
         }
     });
@@ -8256,6 +8265,26 @@ const model = scriptedModel((request) => {
         });
     }
 
+    if (text.endsWith("plan amend other test")) {
+        return call("plan", {
+            action: "amend",
+            plan: planId,
+            rev: writeRev,
+            why: "A correction.",
+            section: "idea",
+            text: "A correction from a session that does not plan it.",
+        });
+    }
+
+    if (text.endsWith("plan drop other test")) {
+        return call("plan", {
+            action: "drop",
+            plan: planId,
+            why: "Brian stopped it.",
+            ask: "T1082a",
+        });
+    }
+
     if (text.endsWith("plan edit both test")) {
         return call("plan", {
             action: "write",
@@ -9020,6 +9049,913 @@ async function stopTasks(kind: string): Promise<void> {
     }
 }
 
+// ─── #178 P3 and P5: a text-only amend, and a drop after Brian's stop ───────
+
+/**
+ * A plan Brian approved (or 1 that builds), with its own revision store and its file on disk: the io the flow writes
+ * through, and the text the file has now.
+ */
+async function amendHarness(
+    build: () => { state: DeskState; plan: Plan; graph: TaskGraph } = approvedPlan,
+): Promise<{
+    state: DeskState;
+    plan: Plan;
+    graph: TaskGraph;
+    folder: string;
+    io: PlanWriteIo;
+    current: () => string | undefined;
+}> {
+    const made = build();
+    const folder = mkdtempSync(join(root, "desk-plan-amend-"));
+    const locks = new Map<string, Promise<void>>();
+    const text = file;
+    const publish = () => publishPending(locks, "T1", publishIo(made.state, "T1", folder));
+
+    const current = (): string | undefined => {
+        try {
+            return readFileSync(made.plan.file, "utf8");
+        } catch {
+            return undefined;
+        }
+    };
+
+    made.plan.file = join(folder, "T1-snow-iso-signing.md");
+    delete made.plan.pending;
+    assert.equal(
+        await writeStore(folder, text),
+        made.plan.rev,
+        "the plan's revision is its text's",
+    );
+    writeFileSync(made.plan.file, text, "utf8");
+
+    return {
+        ...made,
+        folder,
+        current,
+        io: {
+            read: async () => made.state,
+            commit: async (change) => change(made.state, undefined as never),
+            readStore: (rev) => readStore(folder, rev),
+            writeStore: (written) => writeStore(folder, written),
+            publish,
+        },
+    };
+}
+
+/** 1 amend of plan T1 through the flow, as the planning session makes it. */
+function amendWrite(
+    harness: Awaited<ReturnType<typeof amendHarness>>,
+    request: {
+        section?: string;
+        heading?: string;
+        text?: string;
+        edits?: unknown;
+        why?: string;
+        key?: string;
+        from?: string;
+    } = {},
+): Promise<PlanWriteResult | { error: string }> {
+    return planWriteFlow(harness.io, "T1", {
+        ...(request.section === undefined ? {} : { section: request.section }),
+        ...(request.heading === undefined ? {} : { heading: request.heading }),
+        ...(request.edits === undefined ? { text: request.text ?? "" } : { edits: request.edits }),
+        key: request.key ?? "amend:1",
+        by: "lucilla",
+        at: tick(8),
+        from: request.from ?? harness.plan.rev,
+        amend: { why: request.why ?? "The key rotates each year." },
+    });
+}
+
+describe("a text-only amend of an approved plan", () => {
+    test("an amend in building keeps the state, the approved graph and the tasks, and moves the revision", async () => {
+        const harness = await amendHarness(buildingPlan);
+        const { plan, graph } = harness;
+        const before = plan.rev;
+        const graphThen = JSON.stringify(graph);
+        const done = await amendWrite(harness, {
+            section: "idea",
+            text: "> Sign the ISO with the HSM key.",
+        });
+
+        assert(!("error" in done), "the amend is written");
+        assert.notEqual(plan.rev, before, "the revision moved");
+        assert.equal(plan.state, "building", "the state stays");
+        assert.equal(
+            JSON.stringify(plan.graphs),
+            JSON.stringify([graph]),
+            "the graph is the only 1",
+        );
+        assert.equal(JSON.stringify(graph), graphThen, "the approved graph stays as it was");
+        assert.deepEqual(
+            graph.tasks.map((task) => task.state),
+            ["delegated", "waiting", "delegated"],
+            "the task states stay",
+        );
+        assert.deepEqual(plan.amends, [
+            {
+                key: "amend:1",
+                at: tick(8),
+                by: "lucilla",
+                why: "The key rotates each year.",
+                from: before,
+                rev: plan.rev,
+                approval: "approve:1",
+                sections: ["idea"],
+            },
+        ]);
+
+        // The bytes are in the store and in the file, and the write is published.
+        assert.equal(harness.current(), await readStore(harness.folder, plan.rev));
+        assert.match(harness.current() ?? "", /HSM key/);
+        assert.equal(plan.pending, undefined);
+
+        // 1 event on the plan thread, with the 2 revisions and the why; the write's own event is not added.
+        const events = harness.state.threads.T1?.events ?? [];
+
+        assert.equal(
+            events.find((event) => event.key === "plan-amended:amend:1")?.text,
+            `plan amended by lucilla: rev ${before.slice(0, 7)} → ${plan.rev.slice(0, 7)} (idea): The key rotates each year.`,
+        );
+        assert.equal(
+            events.some((event) => event.key === "plan-written:amend:1"),
+            false,
+            "no plan-written event",
+        );
+    });
+
+    test("an amend keeps the approval, so a ready task still starts; the briefs name the amended rev", async () => {
+        const harness = await amendHarness();
+        const { plan, graph } = harness;
+        const ready = { agent: "lucilla", repo: "frostyard/snow" };
+        const before = plan.rev;
+        const t2 = graph.tasks.find((each) => each.id === "t2") ?? assert.fail("t2");
+
+        assert.equal(deliverCheck(harness.state, "T1", "t1", ready), undefined, "t1 starts");
+        assert.match(
+            planTaskBrief(plan, "Snow ISO signing", graph, t2),
+            new RegExp(`^Approved rev ${before.slice(0, 7)}, graph v1\\.$`, "m"),
+        );
+        assert.doesNotMatch(planVerifyBrief(plan, "Snow ISO signing", graph), /amended/);
+
+        const done = await amendWrite(harness, {
+            section: "idea",
+            text: "> The HSM key signs it.",
+        });
+
+        assert(!("error" in done));
+        assert.notEqual(plan.rev, before);
+        assert.equal(amendedRev(plan), plan.rev, "the newest amend covers the revision now");
+        assert.equal(
+            deliverCheck(harness.state, "T1", "t1", ready),
+            undefined,
+            "a ready task still starts",
+        );
+        assert.equal(
+            planTaskBrief(plan, "Snow ISO signing", graph, t2).split("\n")[1],
+            `Approved rev ${before.slice(0, 7)}, amended to rev ${plan.rev.slice(0, 7)} (text only), graph v1.`,
+        );
+        assert.equal(
+            planVerifyBrief(plan, "Snow ISO signing", graph).split("\n")[1],
+            `Approved rev ${before}, amended to rev ${plan.rev} (text only), graph v1. Its text is in the store: ${storePath(harness.folder, plan.rev)}. Read it with read.`,
+        );
+    });
+
+    test("an amend works in approved and in verifying; drafting, review, done and dropped are refused", async () => {
+        for (const state of ["approved", "verifying"] as const) {
+            const harness = await amendHarness();
+
+            harness.plan.state = state;
+
+            const done = await amendWrite(harness, {
+                section: "idea",
+                text: "> The HSM key signs it.",
+            });
+
+            assert(!("error" in done), `${state} takes an amend`);
+            assert.equal(harness.plan.state, state, "the state stays");
+            assert.equal(harness.plan.amends?.length, 1);
+        }
+
+        for (const [state, text] of [
+            [
+                "drafting",
+                "Plan T1 is drafting: use plan write; plan amend is for an approved plan.",
+            ],
+            ["review", "Plan T1 is review: use plan write; plan amend is for an approved plan."],
+            ["done", "Plan T1 is done."],
+            ["dropped", "Plan T1 is dropped."],
+        ] as const) {
+            const harness = await amendHarness();
+
+            harness.plan.state = state;
+
+            const before = JSON.stringify(harness.state);
+            const done = await amendWrite(harness, {
+                section: "idea",
+                text: "> The HSM key signs it.",
+            });
+
+            assert.equal((done as { error: string }).error, text);
+            assert.equal(
+                JSON.stringify(harness.state),
+                before,
+                `a refused amend in ${state} changes nothing`,
+            );
+            assert.equal(harness.plan.rev, JSON.parse(before).plans.T1.rev);
+        }
+    });
+
+    test("an amend never changes Decisions or Tasks, by section or by a whole-file write", async () => {
+        const bySection = await amendHarness();
+        const one = await amendWrite(bySection, { section: "decisions", text: "None yet." });
+        const two = await amendWrite(bySection, { section: "tasks", text: "No task graph yet." });
+
+        assert.equal(
+            (one as { error: string }).error,
+            "Decisions and Tasks belong to the desk: it writes them. Write another section.",
+        );
+        assert.equal((two as { error: string }).error, (one as { error: string }).error);
+
+        const whole = await amendHarness();
+        const text = (whole.current() ?? "").replace("None yet.", "T1a: the keys live in the TPM.");
+        const three = await amendWrite(whole, { text });
+
+        assert.equal(
+            (three as { error: string }).error,
+            "Decisions and Tasks belong to the desk: leave them out of a whole-file write, or copy them unchanged from plan read.",
+        );
+        assert.equal(whole.plan.amends, undefined, "nothing is recorded");
+    });
+
+    test("an amend keeps the sections and the headings, settles nothing, and changes something", async () => {
+        // A new section needs a heading, and an amend takes none.
+        const added = await amendWrite(await amendHarness(), {
+            section: "storage",
+            heading: "Storage",
+            text: "A disk.",
+        });
+
+        assert.equal(
+            (added as { error: string }).error,
+            "An amend keeps the headings: leave out heading.",
+        );
+
+        // A whole file with a section the plan does not have is a change of the plan's shape.
+        const removed = await amendHarness();
+        const without =
+            parsePlanText(removed.current() ?? "")
+                .sections.map(
+                    (section) =>
+                        `## ${section.heading} <!-- s:${section.id} -->\n\n${section.body}`,
+                )
+                .join("\n\n") + "\n\n## Storage <!-- s:storage -->\n\nA disk.\n";
+        const drop = await amendWrite(removed, { text: without });
+
+        assert.equal(
+            (drop as { error: string }).error,
+            "An amend keeps the sections and their headings: it adds, removes, moves or renames none. A change of the plan's shape needs plan revise.",
+        );
+
+        // An amend settles no ask and no comment.
+        const plain = approvedPlan();
+        const settled = commitPlanWrite(plain.state, "T1", {
+            key: "amend:comment",
+            by: "lucilla",
+            at: tick(8),
+            from: plain.plan.rev,
+            rev: plain.plan.rev,
+            sections: plain.plan.sections,
+            asks: [],
+            comments: ["c1"],
+            touched: ["idea"],
+            amend: { why: "A correction." },
+        });
+
+        assert.equal(
+            (settled as { error: string }).error,
+            "An amend settles no ask or comment: leave out asks and comments.",
+        );
+
+        // A text that changes nothing is no amend.
+        const same = await amendHarness();
+        const body =
+            parsePlanText(same.current() ?? "").sections.find((section) => section.id === "idea")
+                ?.body ?? "";
+        const nothing = await amendWrite(same, { section: "idea", text: body });
+
+        assert.equal(
+            (nothing as { error: string }).error,
+            "The amend changes nothing: give edits that change the text.",
+        );
+        assert.equal(same.plan.amends, undefined);
+    });
+
+    test("an amend by edits works, and its Decisions and Tasks bodies stay byte for byte as they were", async () => {
+        const harness = await amendHarness();
+        const before = harness.plan.rev;
+        const done = await amendWrite(harness, {
+            section: "idea",
+            edits: [{ oldText: "TPM", newText: "HSM" }],
+        });
+
+        assert(!("error" in done), "the amend is written");
+
+        const then = await readStore(harness.folder, before);
+        const now = harness.current() ?? assert.fail("the file is there");
+
+        assert.match(now, /HSM key/);
+        assert.notEqual(now, then);
+        // Everything from the desk's first section on is the same text.
+        assert.equal(
+            now.slice(now.indexOf("## Decisions")),
+            then.slice(then.indexOf("## Decisions")),
+        );
+        assert.deepEqual(harness.plan.amends?.at(-1)?.sections, ["idea"]);
+    });
+
+    test("a replay of an amend's key changes nothing", async () => {
+        const harness = await amendHarness();
+
+        assert(
+            !("error" in (await amendWrite(harness, { section: "idea", text: "> The HSM key." }))),
+        );
+
+        const snapshot = JSON.stringify(harness.state);
+        const again = await amendWrite(harness, { section: "idea", text: "> Another text." });
+
+        assert(!("error" in again));
+        assert.equal(again.replay, true);
+        assert.equal(JSON.stringify(harness.state), snapshot);
+        assert.equal(harness.plan.amends?.length, 1);
+        assert.equal(planReplay(harness.state, "T1", "amend", "amend:1")?.rev, harness.plan.rev);
+    });
+
+    test("a scope change and Stop and revise still work after an amend", async () => {
+        const harness = await amendHarness(buildingPlan);
+
+        assert(
+            !("error" in (await amendWrite(harness, { section: "idea", text: "> The HSM key." }))),
+        );
+
+        const done = revisePlan(
+            harness.state,
+            "T1",
+            {
+                key: "revise:1",
+                by: "Brian",
+                at: tick(9),
+                why: "A new task.",
+                tasks: ["t1"],
+            },
+            quoted,
+        );
+
+        assert(!("error" in done) && !done.replay);
+        assert.equal(harness.plan.state, "drafting");
+        assert.equal(harness.plan.revising?.key, "revise:1");
+        // The amend stays recorded: the scope change does not erase it.
+        assert.equal(harness.plan.amends?.length, 1);
+    });
+
+    test("a revision that no amend made still needs Brian's approval", () => {
+        const { state, plan } = approvedPlan();
+        const approved = plan.approvals.at(-1) ?? assert.fail("an approval");
+
+        plan.rev = "1".repeat(40);
+
+        assert.equal(amendedRev(plan), undefined);
+        assert.equal(
+            deliverCheck(state, "T1", "t1", { agent: "lucilla", repo: "frostyard/snow" }),
+            `Plan T1 is at rev 1111111, and its approval is rev ${approved.rev.slice(0, 7)}: Brian approves the revision first.`,
+        );
+
+        // An amend of an older approval does not cover the revision now.
+        plan.amends = [
+            {
+                key: "amend:old",
+                at: tick(8),
+                by: "lucilla",
+                why: "Old.",
+                from: approved.rev,
+                rev: "2".repeat(40),
+                approval: approved.key,
+                sections: ["idea"],
+            },
+        ];
+        assert.equal(amendedRev(plan), undefined);
+    });
+
+    test("the amend's news is 1 digest item, with a kind of its own at the end", () => {
+        const { plan } = approvedPlan();
+        const item = planAmendItem(
+            plan,
+            {
+                key: "amend:1",
+                at: tick(8),
+                by: "lucilla",
+                why: "The key rotates.",
+                from: "a".repeat(40),
+                rev: "b".repeat(40),
+                approval: "approve:1",
+                sections: ["idea", "risks"],
+            },
+            quoted,
+        );
+
+        assert.equal(item.kind, "plan-amend");
+        assert.equal(item.key, "plan-amend:T1:amend:1");
+        assert.equal(item.thread, "T1");
+        assert.equal(item.at, tick(8));
+        assert.equal(
+            item.line,
+            '[desk] T1 plan amended by lucilla (text only; the state and the approved graph stay): "The key rotates.". Rev aaaaaaa → bbbbbbb, sections: idea, risks. The Desk page shows the changes since the approval.',
+        );
+        assert.deepEqual(DIGEST_KINDS.slice(-2), ["escalation-urgent", "plan-amend"]);
+        assert.equal(DIGEST_KINDS.at(-1), "plan-amend");
+        assert.equal(DIGEST_NOW.includes("plan-amend"), false, "an amend is not urgent");
+    });
+
+    test("an amend renames no heading, by a whole-file text or by a whole-file edit (#183 review)", async () => {
+        for (const how of ["text", "edits"] as const) {
+            const harness = await amendHarness();
+            const current = harness.current() ?? "";
+            const heading = parsePlanText(current).sections.find((each) => each.id === "idea");
+
+            assert(heading !== undefined, "the plan has the idea section");
+
+            const oldLine = `## ${heading.heading} <!-- s:idea -->`;
+            const newLine = "## The real idea <!-- s:idea -->";
+
+            assert(current.includes(oldLine), "the heading line is in the file");
+
+            const snapshot = JSON.stringify(harness.state);
+            const done = await amendWrite(
+                harness,
+                how === "text"
+                    ? { text: current.replace(oldLine, newLine) }
+                    : { edits: [{ oldText: oldLine, newText: newLine }] },
+            );
+
+            assert.equal(
+                (done as { error: string }).error,
+                "An amend keeps the sections and their headings: it adds, removes, moves or renames none. A change of the plan's shape needs plan revise.",
+                how,
+            );
+            assert.equal(JSON.stringify(harness.state), snapshot, `${how}: nothing changes`);
+            assert.equal(harness.current(), current, `${how}: the file stays`);
+        }
+    });
+
+    test("an amend keeps the text above the first section, alone or with a section's change (#183 review)", async () => {
+        for (const withSection of [false, true]) {
+            const harness = await amendHarness();
+            const current = harness.current() ?? "";
+            const preamble = parsePlanText(current).preamble;
+
+            assert.notEqual(preamble, "", "the plan has a title");
+
+            let edited = current.replace(preamble, `${preamble}\n\nA new line above the sections.`);
+
+            if (withSection) {
+                const idea = parsePlanText(current).sections.find((each) => each.id === "idea");
+
+                assert(idea !== undefined && idea.body !== "");
+                edited = edited.replace(idea.body, `${idea.body} With the HSM key.`);
+            }
+
+            const snapshot = JSON.stringify(harness.state);
+            const done = await amendWrite(harness, { text: edited });
+
+            assert.equal(
+                (done as { error: string }).error,
+                "An amend keeps the title and the text above the first section: change a section's body only.",
+                `with a section: ${String(withSection)}`,
+            );
+            assert.equal(JSON.stringify(harness.state), snapshot);
+            assert.equal(harness.current(), current);
+        }
+    });
+
+    test("plan read's lines name each amend of the approval in force, and no older one (#183 review)", async () => {
+        const harness = await amendHarness();
+        const before = harness.plan.rev;
+
+        assert.deepEqual(planAmendLines(harness.plan), []);
+        assert(
+            !("error" in (await amendWrite(harness, { section: "idea", text: "> The HSM key." }))),
+        );
+
+        const after = harness.plan.rev;
+
+        assert.deepEqual(planAmendLines(harness.plan, quoted), [
+            `Amended (by lucilla): rev ${before.slice(0, 7)} → ${after.slice(0, 7)} (idea): "The key rotates each year."`,
+        ]);
+
+        // A newer approval: the older approval's amends are not its own.
+        harness.plan.approvals.push({
+            rev: after,
+            graph: 1,
+            at: tick(9),
+            by: "brian",
+            key: "approve:2",
+        });
+        assert.deepEqual(planAmendLines(harness.plan, quoted), []);
+    });
+
+    test("the plan read names each amend of the approval in force", async () => {
+        const harness = await amendHarness();
+        const before = harness.plan.rev;
+
+        assert(
+            !("error" in (await amendWrite(harness, { section: "idea", text: "> The HSM key." }))),
+        );
+
+        const state = harness.state;
+        const read = planView(state, "T1", harness.current() ?? "", now);
+
+        assert(!("error" in read));
+        // The view's own fields are unchanged by the amend: the graph and the approval in force.
+        assert.equal(read.graph?.version, 1);
+        assert.equal(read.approval?.rev, before);
+        assert.equal(state.plans?.T1?.amends?.length, 1);
+    });
+});
+
+describe("the supervisor's amend request", () => {
+    const ask = (state: DeskState, request: Partial<PlanAmendAsk> = {}) =>
+        requestPlanAmend(
+            state,
+            "T1",
+            {
+                key: request.key ?? "ask-amend:1",
+                by: request.by ?? "odrade",
+                at: request.at ?? tick(8),
+                why: request.why ?? "The key rotates.",
+                text: request.text ?? "Say the HSM key, not the TPM key.",
+                ...(request.section === undefined ? {} : { section: request.section }),
+                ...(request.edits === undefined ? {} : { edits: request.edits }),
+                ...(request.rev === undefined ? {} : { rev: request.rev }),
+            },
+            quoted,
+        );
+
+    test("it sends the correction to the planning session, and records the request", () => {
+        const { state, plan } = buildingPlan();
+        const done = ask(state, { section: "idea" });
+
+        assert(!("error" in done));
+        assert.equal(done.replay, false);
+        assert.deepEqual(done.sends, [
+            {
+                supervisor: 7,
+                to: "session-31",
+                text: '[desk] odrade asks for a text-only correction of plan T1 (section idea): "The key rotates.". The correction: "Say the HSM key, not the TPM key.". Write it in your words with plan { action: "amend", rev, why, section, edits }: it keeps the state and the approved graph. A change of Decisions, Tasks or the graph needs plan revise.',
+                requestId: planSendId("T1", "ask-amend:1", "amend"),
+            },
+        ]);
+        assert.deepEqual(plan.amendRequests, [
+            {
+                key: "ask-amend:1",
+                at: tick(8),
+                by: "odrade",
+                why: "The key rotates.",
+                text: "Say the HSM key, not the TPM key.",
+                section: "idea",
+            },
+        ]);
+        assert.equal(
+            state.threads.T1?.events.find((event) => event.key === "plan-amend-asked:ask-amend:1")
+                ?.text,
+            "amend asked by odrade: The key rotates.",
+        );
+        // The plan itself does not change: the planning session writes it.
+        assert.equal(plan.state, "building");
+        assert.equal(plan.amends, undefined);
+    });
+
+    test("a replay sends nothing and changes nothing", () => {
+        const { state } = buildingPlan();
+
+        assert(!("error" in ask(state)));
+
+        const snapshot = JSON.stringify(state);
+
+        assert.deepEqual(ask(state), { replay: true, sends: [] });
+        assert.equal(JSON.stringify(state), snapshot);
+    });
+
+    test("drafting, review, a finished plan, edits and a rev are refused", () => {
+        const { state, plan } = buildingPlan();
+        const snapshot = JSON.stringify(state);
+
+        for (const extra of [
+            { edits: [{ oldText: "TPM", newText: "HSM" }] },
+            { rev: "0".repeat(40) },
+        ]) {
+            assert.equal(
+                (ask(state, { ...extra, key: "ask-amend:x" }) as { error: string }).error,
+                "The supervisor's amend is a request: give why and text (the correction you ask for), and the planning session writes it in its words. Leave out edits and rev.",
+            );
+        }
+
+        for (const [state2, pattern] of [
+            [
+                "drafting",
+                /^Plan T1 is drafting: use plan write; plan amend is for an approved plan\.$/,
+            ],
+            ["review", /^Plan T1 is review: use plan write; plan amend is for an approved plan\.$/],
+            ["done", /^Plan T1 is done\.$/],
+            ["dropped", /^Plan T1 is dropped\.$/],
+        ] as const) {
+            plan.state = state2;
+            assert.match(
+                (ask(state, { key: "ask-amend:state" }) as { error: string }).error,
+                pattern,
+            );
+        }
+
+        plan.state = "building";
+        assert.equal(JSON.stringify(state), snapshot, "a refused request changes nothing");
+        assert.equal(plan.amendRequests, undefined);
+    });
+
+    test("a why and a text are checked, and a planning session with no address is refused", () => {
+        const { state } = buildingPlan();
+
+        for (const why of ["", "one\ntwo", "x".repeat(301), 7] as unknown[]) {
+            assert.match(
+                (ask(state, { why, key: "ask-amend:why" }) as { error: string }).error,
+                /^The supervisor's amend needs why: 1 to 300 characters, on 1 line\.$/,
+            );
+        }
+
+        for (const text of ["", "   ", "x".repeat(2001)] as unknown[]) {
+            assert.equal(
+                (ask(state, { text, key: "ask-amend:text" }) as { error: string }).error,
+                "The correction is text: 1 to 2000 characters.",
+            );
+        }
+
+        assert.equal(state.plans?.T1?.amendRequests, undefined);
+
+        for (const section of ["tasks", "decisions", "nothere"]) {
+            assert.equal(
+                (ask(state, { section, key: `ask-amend:${section}` }) as { error: string }).error,
+                `Section ${section} is not a planning section of T1: name 1 that plan read lists, or none. Decisions and Tasks belong to the desk.`,
+            );
+        }
+
+        assert.equal(state.plans?.T1?.amendRequests, undefined);
+
+        delete (state.threads.T1 ?? assert.fail("T1")).address;
+
+        assert.equal(
+            (ask(state, { key: "ask-amend:address" }) as { error: string }).error,
+            "The planning session of T1 has no address: send the correction with desk send.",
+        );
+    });
+});
+
+describe("a drop by the supervisor", () => {
+    /** Brian's answer on an ask of a thread, as the page gives it. */
+    function answered(thread: Thread, id: string, words: string, by = "brian"): void {
+        thread.asks.push({
+            id,
+            text: "Did Brian stop it?",
+            at: tick(5),
+            answer: { at: tick(6), by, words },
+        });
+    }
+
+    const drop = (state: DeskState, request: { key?: string; why?: unknown; ask?: unknown } = {}) =>
+        supervisorDropPlan(
+            state,
+            "T1",
+            {
+                key: request.key ?? "drop:1",
+                by: "odrade",
+                at: tick(9),
+                why: request.why ?? "Brian stopped it.",
+                ask: request.ask ?? "T1a",
+            },
+            quoted,
+        );
+
+    test("it drops the plan as the desk, ends every open attempt stopped, and sends the stop", () => {
+        const { state, plan, graph } = buildingPlan();
+
+        answered(state.threads.T1 ?? assert.fail("T1"), "T1a", "Drop the plan: we stop here.");
+
+        const done = drop(state);
+
+        assert(!("error" in done));
+        assert.equal(done.replay, false);
+        assert.equal(plan.state, "dropped");
+        assert.deepEqual(plan.dropped, {
+            key: "drop:1",
+            at: tick(9),
+            by: "odrade",
+            why: "Brian stopped it.",
+            ask: "T1a",
+        });
+        assert.equal(state.threads.T1?.state, "closed");
+        assert.deepEqual(state.threads.T1?.closed, { at: tick(9), why: "dropped", by: "desk" });
+        // The plan thread's own event names Brian's answer.
+        assert.match(
+            state.threads.T1?.events.at(-1)?.text ?? "",
+            /^plan dropped by odrade: Brian stopped it\. \(Brian's answer T1a\)$/,
+        );
+
+        for (const id of ["t1", "t3"]) {
+            assert.equal(taskOf(graph, id).state, "stopped");
+            assert.deepEqual(taskOf(graph, id).attempts.at(-1)?.end, {
+                at: tick(9),
+                how: "stopped",
+            });
+        }
+
+        // t2 has no attempt: nothing to stop there.
+        assert.deepEqual(taskOf(graph, "t2").attempts, []);
+
+        assert.deepEqual(
+            done.sends.map((send) => [send.to, send.supervisor, send.requestId]),
+            [
+                ["session-T2", 7, planSendId("T1", "drop:1", "task:t1:T2")],
+                ["session-T3", 7, planSendId("T1", "drop:1", "task:t3:T3")],
+            ],
+        );
+        assert.equal(
+            done.sends[0]?.text,
+            '[desk] Stop: plan T1 is dropped ("Brian stopped it."). Push nothing more on this task. Report what you have.',
+        );
+        assert.equal(
+            state.threads.T2?.events.find((event) => event.key === "plan-dropped:drop:1")?.text,
+            "stopped: plan T1 is dropped",
+        );
+    });
+
+    test("an ask on a task thread is Brian's answer too, and the open verification thread is stopped", () => {
+        const { state, plan, graph } = buildingPlan();
+
+        answered(state.threads.T2 ?? assert.fail("T2"), "T2a", "Stop t1, and drop it.");
+        merged(graph, "t1", tick(6));
+        merged(graph, "t3", tick(6));
+        plan.state = "verifying";
+        taskThread(state, "T5");
+        plan.verification = { threads: ["T5"], rounds: [] };
+
+        const done = drop(state, { ask: "t2a" });
+
+        assert(!("error" in done));
+        assert.equal(plan.dropped?.ask, "T2a");
+        // Every task of the graph is done: no attempt stops, and the open check gets the stop.
+        assert.deepEqual(
+            done.sends.map((send) => [send.to, send.requestId]),
+            [["session-T5", planSendId("T1", "drop:1", "verify:T5")]],
+        );
+    });
+
+    test("a drop with an open ask on the plan thread is refused, and changes nothing", () => {
+        const { state } = buildingPlan();
+
+        answered(state.threads.T1 ?? assert.fail("T1"), "T1a", "Stop it.");
+        (state.threads.T1 ?? assert.fail("T1")).asks.push({
+            id: "T1b",
+            text: "And then?",
+            at: tick(7),
+        });
+
+        const before = JSON.stringify(state);
+
+        assert.equal(
+            (drop(state) as { error: string }).error,
+            "the drop refused: T1 has an open ask: T1b. A closed thread hides it. Answer it first, then the drop again.",
+        );
+        assert.equal(JSON.stringify(state), before);
+    });
+
+    test("no ask, an unanswered ask, the desk's answer and an answer that does not stop are refused", () => {
+        const empty = buildingPlan();
+
+        assert.equal(
+            (drop(empty.state) as { error: string }).error,
+            "T1a is not an ask of plan T1 or of its task threads.",
+        );
+
+        const open = buildingPlan();
+
+        (open.state.threads.T1 ?? assert.fail("T1")).asks.push({
+            id: "T1a",
+            text: "Did Brian stop it?",
+            at: tick(5),
+        });
+        assert.equal(
+            (drop(open.state) as { error: string }).error,
+            "T1a is not answered: Brian answers it first.",
+        );
+
+        const desk = buildingPlan();
+
+        answered(desk.state.threads.T1 ?? assert.fail("T1"), "T1a", "Stop it.", "desk");
+        assert.equal(
+            (drop(desk.state) as { error: string }).error,
+            "T1a was answered by the desk, not by Brian.",
+        );
+
+        const other = buildingPlan();
+
+        answered(other.state.threads.T1 ?? assert.fail("T1"), "T1a", "Yes, go on.");
+        assert.equal(
+            (drop(other.state) as { error: string }).error,
+            "T1a's answer does not stop or drop the plan: a drop needs Brian's answer that stops or drops it.",
+        );
+
+        for (const each of [empty, open, desk, other]) {
+            assert.equal(each.plan.state, "building", "a refused drop changes nothing");
+            assert.equal(each.plan.dropped, undefined);
+        }
+    });
+
+    test("a bad why, a plan that is done, and an ask of another plan are refused", () => {
+        const { state, plan } = buildingPlan();
+
+        answered(state.threads.T1 ?? assert.fail("T1"), "T1a", "Stop it.");
+
+        for (const why of ["", "one\ntwo", "x".repeat(201), 7] as unknown[]) {
+            assert.match(
+                (drop(state, { why }) as { error: string }).error,
+                /^A drop needs why: 1 to 200 characters, on 1 line\.$/,
+            );
+        }
+
+        other(state, "T9");
+        (state.threads.T9 ?? assert.fail("T9")).asks.push({
+            id: "T9a",
+            text: "Another plan?",
+            at: tick(5),
+            answer: { at: tick(6), by: "brian", words: "Stop it." },
+        });
+        assert.equal(
+            (drop(state, { ask: "T9a" }) as { error: string }).error,
+            "T9a is not an ask of plan T1 or of its task threads.",
+        );
+
+        plan.state = "done";
+        assert.equal((drop(state) as { error: string }).error, "Plan T1 is done.");
+        assert.equal(plan.dropped, undefined);
+    });
+
+    test("a replay changes nothing; another key on a dropped plan is refused", () => {
+        const { state } = buildingPlan();
+
+        answered(state.threads.T1 ?? assert.fail("T1"), "T1a", "Stop it.");
+        assert(!("error" in drop(state)));
+
+        const snapshot = JSON.stringify(state);
+
+        assert.deepEqual(drop(state), { replay: true, sends: [], stopped: [] });
+        assert.equal(JSON.stringify(state), snapshot);
+        assert.equal(
+            (drop(state, { key: "drop:2" }) as { error: string }).error,
+            "Plan T1 is dropped already.",
+        );
+        assert.equal(JSON.stringify(state), snapshot);
+    });
+
+    test("a plan that Brian dropped on the page is not dropped again", () => {
+        const { state, graph } = buildingPlan();
+
+        answered(state.threads.T1 ?? assert.fail("T1"), "T1a", "Stop it.");
+        assert(!("error" in dropPlan(state, "T1", { by: "brian", why: "No.", at: tick(8) })));
+
+        const snapshot = JSON.stringify(state);
+
+        assert.equal((drop(state) as { error: string }).error, "Plan T1 is dropped already.");
+        assert.equal(JSON.stringify(state), snapshot);
+        assert.equal(taskOf(graph, "t1").state, "delegated");
+    });
+
+    test("the drop names each task it stopped", () => {
+        const { state } = buildingPlan();
+
+        answered(state.threads.T1 ?? assert.fail("T1"), "T1a", "Stop it.");
+
+        const done = drop(state);
+
+        assert(!("error" in done));
+        assert.deepEqual(done.stopped, ["t1 (T2)", "t3 (T3)"]);
+    });
+
+    test("the page's drop, with no closedBy, still closes as Brian's", () => {
+        const { state } = buildingPlan();
+        const done = dropPlan(state, "T1", { by: "brian", why: "No.", at: tick(9) });
+
+        assert(!("error" in done));
+        assert.deepEqual(state.threads.T1?.closed, { at: tick(9), why: "dropped", by: "brian" });
+    });
+});
+
 describe("with the Pi Pocket app", () => {
     test("a plan start opens a plan thread with its file, and a planning session", async () => {
         const source = await supervisor("plan-start");
@@ -9298,6 +10234,43 @@ describe("with the Pi Pocket app", () => {
         assert.equal(
             (await modelTexts(app, nobody)).some((each) => each.includes("<plan-file rev=")),
             false,
+        );
+    });
+
+    test("a task session amends no plan, and no session but the supervisor drops 1", async () => {
+        const teg = await personaSession("plan-amend-teg", "teg");
+        const before = JSON.stringify(await planSnapshot());
+
+        await say(app, teg, "plan amend other test");
+        await until(
+            async () =>
+                (await modelTexts(app, teg)).some((each) =>
+                    each.includes(
+                        `Only the planning session of ${planId} amends its plan, or the supervisor asks it to: this session is neither.`,
+                    ),
+                ),
+            "the amend refusal",
+            20_000,
+        );
+        assert.equal(
+            JSON.stringify(await planSnapshot()),
+            before,
+            "a refused amend changes nothing",
+        );
+
+        await say(app, teg, "plan drop other test");
+        await until(
+            async () =>
+                (await modelTexts(app, teg)).some((each) =>
+                    each.includes("Only the supervisor drops a plan: ask your supervisor."),
+                ),
+            "the drop refusal",
+            20_000,
+        );
+        assert.equal(
+            JSON.stringify(await planSnapshot()),
+            before,
+            "a refused drop changes nothing",
         );
     });
 
