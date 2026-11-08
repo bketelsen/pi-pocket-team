@@ -359,3 +359,56 @@ test("a budget refusal stops the run with exit 2 and keeps the verdicts so far",
 
     assert.equal(done.code, 0, done.out);
 });
+
+test("a labels file that lists an item twice is refused before any judge call", async () => {
+    const log = judgeLog();
+    const before = calls();
+
+    await rm(join(dir, "packs"), { recursive: true, force: true });
+    writePack(
+        "lucilla",
+        [item("x1", "dev", [4, 4], log), item("x2", "dev", [4, 4], log)],
+        () => "pass",
+        ["x1"],
+    );
+
+    const file = join(dir, "packs", "lucilla", "labels.json");
+    const labels = JSON.parse(readFileSync(file, "utf8"));
+
+    // A 2nd entry for x1 that says blind: true would count an item the owner saw before.
+    labels.labels.push({ ...labels.labels[0], blind: true, reason: "" });
+    writeFileSync(file, JSON.stringify(labels));
+
+    assert.equal((await run(["--set", "dev"])).code, 1);
+    assert.equal(calls(), before);
+});
+
+test("the spend counts each verdict's whole cost: pending tries, a resumed try, and a stats-only run", async () => {
+    const log = judgeLog();
+    const bad = "no json";
+
+    await rm(join(dir, "packs"), { recursive: true, force: true });
+
+    const pending = {
+        ...item("s1", "dev", [4, 4], log),
+        brief: `Task s1.\nSCENARIO ${JSON.stringify({ name: "judge", answers: { [JUDGES[0]]: [bad, bad, bad, GOOD(4)], [JUDGES[1]]: [GOOD(4)] }, log })}`,
+    };
+
+    writePack("duncan", [pending], () => "pass");
+
+    // Judge 1: 3 unparsable tries ($0.06), pending; judge 2: 1 try ($0.02).
+    const first = await run(["--set", "dev"]);
+
+    assert.equal(first.code, 3, "a verdict is pending");
+    assert.match(first.out, /Judge spend of this set: \$0\.0800/);
+
+    // The resumed judge 1 parses at its 4th try: $0.08 in all for it, $0.10 for the set.
+    const second = await run(["--set", "dev"]);
+
+    assert.equal(second.code, 0);
+    assert.match(second.out, /Judge spend of this set: \$0\.1000/);
+
+    const stats = await run(["--set", "dev", "--stats-only"]);
+
+    assert.match(stats.out, /Judge spend of this set: \$0\.1000/);
+});

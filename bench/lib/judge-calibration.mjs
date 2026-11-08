@@ -76,8 +76,13 @@ export function readPacks(dir) {
 
         const byId = new Map(labels.labels.map((entry) => [entry.id, entry]));
 
-        if (byId.size !== items.length || items.some((item) => !byId.has(item.id))) {
-            throw new UsageError(`${owner}: labels.json does not list each item once`);
+        // Each item exactly once: a repeated id would let its last entry silently win (a label, or a blind mark).
+        if (
+            labels.labels.length !== items.length ||
+            byId.size !== items.length ||
+            items.some((item) => !byId.has(item.id))
+        ) {
+            throw new UsageError(`${owner}: labels.json does not list each item exactly once`);
         }
 
         for (const entry of labels.labels) {
@@ -321,7 +326,6 @@ export async function judgeCalibrationMain(argv, env = process.env, deps = {}) {
 
                 if (verdictHolds(saved, call)) {
                     grades.set(`${model}\n${item.id}`, saved.grade);
-                    spend += saved.cost ?? 0;
                     continue;
                 }
 
@@ -369,7 +373,6 @@ export async function judgeCalibrationMain(argv, env = process.env, deps = {}) {
                 };
 
                 await writeJsonAtomic(file, next);
-                spend += verdict.cost;
                 refused = verdict.refused;
 
                 if (Number.isInteger(next.grade)) {
@@ -379,6 +382,24 @@ export async function judgeCalibrationMain(argv, env = process.env, deps = {}) {
                 log(
                     `${model} ${item.id}: ${verdict.pending ? (refused ? "budget refused" : "pending") : `grade ${verdict.grade}`}`,
                 );
+            }
+        }
+
+        // The spend of the set: every saved verdict of this prompt and input, pending ones too, with its cumulative
+        // cost; the same with or without new calls.
+        for (const model of judges) {
+            for (const { item } of counted) {
+                const saved = await readJson(verdictPath(dir, promptSha256, model, item.id), null);
+
+                if (
+                    saved &&
+                    saved.judge === model &&
+                    saved.item === item.id &&
+                    saved.promptSha256 === promptSha256 &&
+                    saved.inputSha256 === sha256(itemPrompt(template, item))
+                ) {
+                    spend += saved.cost ?? 0;
+                }
             }
         }
 

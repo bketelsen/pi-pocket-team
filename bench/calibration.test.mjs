@@ -28,6 +28,7 @@ import {
     resolveTask,
 } from "./lib/calibration.mjs";
 import { calibrationMain } from "./lib/calibration-cli.mjs";
+import { seededShuffle } from "./lib/owners.mjs";
 import {
     FAKE_BWRAP,
     fixtureTask,
@@ -418,6 +419,29 @@ before(async () => {
         assert.equal(ran.code, 0, ran.stderr);
     }
 
+    // Luna's pilot result was scored before, with an S1 that the current manifest does not give: it must not count.
+    const lunaPilot = join(
+        fixture.root,
+        "pilot-results",
+        "pilot",
+        "p",
+        "github-copilot__gpt-6-luna.json",
+    );
+
+    writeFileSync(
+        lunaPilot,
+        JSON.stringify({
+            ...JSON.parse(readFileSync(lunaPilot, "utf8")),
+            s0: { protocol: false, leakTry: false },
+            s1: false,
+            s2: null,
+            diffFile: "/nowhere.diff",
+            checksOnly: true,
+            judgePending: true,
+            grades: [null, null],
+        }),
+    );
+
     mkdirSync(dir, { recursive: true });
     writeFileSync(
         join(dir, "plan.json"),
@@ -552,9 +576,10 @@ test("end to end: attempts in stage calibration, checks with no judge, replaceme
 
     assert.equal(pilotCopy.stage, "pilot");
     assert.equal(pilotCopy.checksOnly, true);
+    assert.equal(pilotCopy.s1, true, "checked again by the current manifest");
     assert.equal(
-        read(fixture.root, "pilot-results", "pilot", "p", "github-copilot__gpt-6-luna.json").s0,
-        null,
+        read(fixture.root, "pilot-results", "pilot", "p", "github-copilot__gpt-6-luna.json").s1,
+        false,
         "the pilot's own result never changes",
     );
 
@@ -611,6 +636,16 @@ test("end to end: attempts in stage calibration, checks with no judge, replaceme
         reason: "",
     });
     assert.deepEqual(Object.keys(key.items).sort(), items.map((i) => i.id).sort());
+
+    // The order: the items in plan order (task, then slot) shuffled 1 time with seed 1064; not the plan order.
+    const planOrder = ["a", "b", "c"].flatMap((task) =>
+        [0, 1, 2, 3].map((slot) => `${task}/${slot}`),
+    );
+    const expected = seededShuffle(planOrder, 1064);
+    const actual = items.map((i) => `${key.items[i.id].task}/${key.items[i.id].slot}`);
+
+    assert.deepEqual(actual, expected);
+    assert.notDeepEqual(actual, planOrder);
     assert.equal(Object.values(key.items).filter((k) => k.set === "dev").length, 4);
     assert.ok(Object.values(key.items).every((k) => ALL.includes(k.model)));
     assert.equal(statSync(join(dir, "keys", "irulan.json")).mode & 0o777, 0o600);
@@ -625,7 +660,10 @@ test("end to end: attempts in stage calibration, checks with no judge, replaceme
     assert.ok([...sets.values()].every((s) => s.size === 1));
 
     // Sheeana's pack: only Luna's pilot item (MAI-Code and Sonnet had no finished pilot attempt; Gemini none).
-    assert.equal(read(dir, "packs", "sheeana", "items.json").items.length, 1);
+    const sheeana = read(dir, "packs", "sheeana", "items.json").items;
+
+    assert.equal(sheeana.length, 1);
+    assert.equal(sheeana[0].s1, true, "the item's S1 is the copy's, not the stale original's");
 
     // The same packs again: unchanged. Labels, then other items: refused, nothing written.
     assert.equal((await cli(["packs"])).code, 0);
@@ -649,7 +687,18 @@ test("end to end: attempts in stage calibration, checks with no judge, replaceme
     assert.equal(read(pack, "labels.json").labels[0].label, "pass", "the labels stay");
 });
 
-test("usage: no command, an unknown command, no plan", async () => {
+test("usage: no command, an unknown command, no plan, --results", async () => {
+    assert.equal(
+        await calibrationMain(
+            ["run", "--results", join(fixture.root, "elsewhere"), "--dir", dir],
+            testEnv(fixture),
+            {
+                print: () => {},
+            },
+        ),
+        1,
+        "--results would put the attempts where the driver never looks",
+    );
     assert.equal(await calibrationMain([], testEnv(fixture), { print: () => {} }), 1);
     assert.equal(await calibrationMain(["nope"], testEnv(fixture), { print: () => {} }), 1);
     assert.equal(

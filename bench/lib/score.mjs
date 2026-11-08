@@ -193,8 +193,8 @@ export async function findTask(taskId, { manifest, data }) {
 // Scoring
 // ---------------------------------------------------------------------------------------------------------------
 
-/** True when a result needs no more scoring. */
-export function fullyScored(result) {
+/** True when a result needs no more scoring (`task`: its manifest task, for a task with no check). */
+export function fullyScored(result, task) {
     if (!result.s0 || result.judgePending) {
         return false;
     }
@@ -204,7 +204,7 @@ export function fullyScored(result) {
     }
 
     return (
-        typeof result.s1 === "boolean" &&
+        s1Done(result, task) &&
         (result.s2 === null || typeof result.s2 === "boolean") &&
         Array.isArray(result.grades) &&
         result.grades.length === 2 &&
@@ -212,9 +212,12 @@ export function fullyScored(result) {
     );
 }
 
-/** S1 is done: a boolean, or null for a task with no check (`check: null`). */
+/**
+ * S1 is done: null for a task with no check (`check: null`), else a boolean. A boolean S1 of a task that has no check
+ * (now) is stale: the check runs again, and gives null.
+ */
 const s1Done = (result, task) =>
-    typeof result.s1 === "boolean" || (task?.check === null && result.s1 === null);
+    task?.check === null ? result.s1 === null : typeof result.s1 === "boolean";
 
 /**
  * True when a result needs no more checks-only scoring: S0 is done, and the attempt failed, or S1 (and S2 when the task
@@ -886,14 +889,14 @@ export async function scoreMain(argv, env = process.env, deps = {}) {
             return 0;
         }
 
-        if (fullyScored(result) && !values.force) {
+        const data = dataDir(env);
+        const found = await findTask(result.task, { manifest: values.manifest, data });
+
+        if (fullyScored(result, found.task) && !values.force) {
             console.log(`scored already: ${file} (--force scores it again)`);
 
             return 0;
         }
-
-        const data = dataDir(env);
-        const found = await findTask(result.task, { manifest: values.manifest, data });
 
         if (values["checks-only"] && !values.force && checksDone(result, found.task)) {
             console.log(`checked already: ${file} (--force checks it again)`);

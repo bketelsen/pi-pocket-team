@@ -15,7 +15,7 @@
 //   (item -> task, model, result file) is a separate file that no operator or owner opens.
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { copyFile, readFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import {
     REPO_ROOT,
@@ -444,40 +444,74 @@ export const pilotResultPath = (pilotResults, task, model) =>
     resultPath(pilotResults, { stage: "pilot", task: task.id, model });
 
 /**
- * The result of a model on a task: the instrument's copy; for a pilot task with no copy yet, the original pilot
- * result (copied before its check).
- */
-export async function readItemResult(dir, pilotResults, task, model) {
-    const own = await readJson(itemResultPath(dir, task, model), null);
-
-    if (own || task.source !== "pilot") {
-        return own;
-    }
-
-    return readJson(pilotResultPath(pilotResults, task, model), null);
-}
-
-/**
  * The outcome of a model on a task. A pilot task has no runs: a model with no pilot result is `excluded` (it did not
- * run in the pilot: the pilot ran Claude Haiku on the route `anthropic/claude-haiku-5-5`).
+ * run in the pilot: the pilot ran Claude Haiku on the route `anthropic/claude-haiku-5-5`). A pilot result counts only
+ * through its copy in the instrument's folder: an original with no failure waits for its check (the copy, then the
+ * check), whatever scores the original holds, so an item's S1 and S2 are always those of the current manifest.
  */
 export async function outcomeOnDisk(dir, pilotResults, task, manifestTask, model) {
-    const result = await readItemResult(dir, pilotResults, task, model);
+    if (task.source !== "pilot") {
+        return outcomeOf(await readJson(itemResultPath(dir, task, model), null), manifestTask);
+    }
 
-    if (!result && task.source === "pilot") {
+    const copy = await readJson(itemResultPath(dir, task, model), null);
+
+    if (copy) {
+        return outcomeOf(copy, manifestTask);
+    }
+
+    const original = await readJson(pilotResultPath(pilotResults, task, model), null);
+
+    if (!original) {
         return "excluded";
     }
 
-    return outcomeOf(result, manifestTask);
+    const outcome = outcomeOf({ ...original, s0: null }, manifestTask);
+
+    return outcome === "excluded" ? "excluded" : "check";
 }
 
-/** Copy a pilot result into the instrument's folder once (its scores go there; the pilot's file never changes). */
+/** The fields that scoring adds to a result: a pilot copy starts without them. */
+export const SCORE_FIELDS = [
+    "s0",
+    "s1",
+    "s1Detail",
+    "s2",
+    "s2Detail",
+    "grades",
+    "judges",
+    "diffCut",
+    "referenceCut",
+    "judgePending",
+    "checksOnly",
+    "diffFile",
+    "scoredAt",
+    "scoreError",
+];
+
+/**
+ * Copy a pilot result into the instrument's folder once, without any score of the original (S0 to S3 are those of the
+ * current manifest, from the copy's own check). The pilot's file never changes.
+ */
 export async function copyPilotResult(dir, pilotResults, task, model) {
     const to = itemResultPath(dir, task, model);
 
     if (!existsSync(to)) {
+        const original = await readJson(pilotResultPath(pilotResults, task, model), null);
+
+        for (const field of SCORE_FIELDS) {
+            delete original[field];
+        }
+
         await privateDir(dirname(to));
-        await copyFile(pilotResultPath(pilotResults, task, model), to);
+        await writeJsonAtomic(to, {
+            ...original,
+            s0: null,
+            s1: null,
+            s2: null,
+            grades: null,
+            judgePending: null,
+        });
     }
 
     return to;

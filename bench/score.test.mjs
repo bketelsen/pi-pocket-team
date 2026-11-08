@@ -396,10 +396,12 @@ test("--checks-only: S0 to S2 and the diffs with no judge call; a later run with
     assert.deepEqual((await readSpend(paths.data)).entries, [], "no judge spend");
     assert.ok(lines.some((line) => /checks only: no judge/.test(line)));
 
-    // Checked already: a second checks-only run does nothing.
-    const again = await score(paths, ["--checks-only"]);
+    // Checked already: a second checks-only run does nothing (no sandbox run).
+    const steps = [];
+    const again = await score(paths, ["--checks-only"], { onRun: ({ step }) => steps.push(step) });
 
     assert.equal(again.code, 0);
+    assert.deepEqual(steps, []);
     assert.equal(existsSync(judgeLog), false);
 
     // A later full run judges only: S1 and S2 stay, both judges grade.
@@ -416,44 +418,64 @@ test("--checks-only: S0 to S2 and the diffs with no judge call; a later run with
     );
 });
 
-test("a task with no check (check: null): S1 is not run, and the checks are done", async () => {
+test("a task with no check (check: null): S1 is not run; checked and scored results are not run again", async () => {
     const task = taskOf(
         "no-check",
         { default: [GOOD(4)] },
         { check: null, checkNote: "fails at the merge" },
     );
     const paths = await attempt(task, { change: FIX });
-    const { code, result } = await score(paths, ["--checks-only"]);
+    const steps = [];
+    const onRun = ({ step }) => steps.push(step);
+    const judgeLog = join(fixture.root, "no-check.judges.log");
+    const { code, result } = await score(paths, ["--checks-only"], { onRun });
 
     assert.equal(code, 0);
     assert.equal(result.s1, null);
     assert.equal(result.s1Detail, "no check: fails at the merge");
     assert.equal(result.s2, true, "S2 still runs");
     assert.equal(result.checksOnly, true);
-    assert.equal(
-        existsSync(
-            join(paths.data, "score", "stage1", "no-check", "github-copilot__gpt-6-luna.score.log"),
-        ) &&
-            /S1, the check/.test(
-                readFileSync(
-                    join(
-                        paths.data,
-                        "score",
-                        "stage1",
-                        "no-check",
-                        "github-copilot__gpt-6-luna.score.log",
-                    ),
-                    "utf8",
-                ),
-            ),
-        false,
-        "no S1 command ran",
-    );
+    assert.ok(steps.length > 0);
+    assert.ok(!steps.some((step) => step.startsWith("S1")), "no S1 step ran");
 
-    const again = await score(paths, ["--checks-only"]);
+    // Checked already: no sandbox run.
+    steps.length = 0;
+    assert.equal((await score(paths, ["--checks-only"], { onRun })).code, 0);
+    assert.deepEqual(steps, []);
+
+    // The full score judges only; a second full score runs nothing and calls no judge.
+    const full = await score(paths, [], { onRun });
+
+    assert.deepEqual(full.result.grades, [4, 4]);
+    assert.ok(!steps.some((step) => step.startsWith("S1") || step.startsWith("S2")));
+    steps.length = 0;
+
+    const again = await score(paths, [], { onRun });
 
     assert.equal(again.code, 0);
-    assert.equal(again.result.scoredAt, result.scoredAt, "checked already");
+    assert.deepEqual(steps, []);
+    assert.equal(readFileSync(judgeLog, "utf8").split("\n").filter(Boolean).length, 2);
+});
+
+test("a stale S1 of a task that has no check now is checked again and becomes null", async () => {
+    const task = taskOf("stale-s1", { default: [GOOD(4)] }, { check: null });
+    const paths = await attempt(task, {
+        change: FIX,
+        result: {
+            s0: { protocol: false, leakTry: false },
+            s1: false,
+            s2: true,
+            diffFile: "/nowhere.diff",
+            checksOnly: true,
+            judgePending: true,
+            grades: [null, null],
+        },
+    });
+    const { code, result } = await score(paths, ["--checks-only"]);
+
+    assert.equal(code, 0);
+    assert.equal(result.s1, null);
+    assert.match(readFileSync(result.diffFile, "utf8"), /\+export const add/);
 });
 
 test("a wrong change fails S1 or S2; the tree with no fix fails S2", async () => {
