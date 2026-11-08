@@ -160,3 +160,20 @@ test("the judge prompt is frozen: the default prompt file has the SHA-256 of JUD
     assert.match(JUDGE_PROMPT_SHA256, /^[0-9a-f]{64}$/);
     assert.equal(sha256(readFileSync(JUDGE_PROMPT, "utf8")), JUDGE_PROMPT_SHA256);
 });
+
+test("the frozen prompt keeps the rubric: grades 1 to 4 in the plan's words, grade 0 with the minor-fix rule", () => {
+    // bench/judge-calibration.md ("Change 1"): only grade 0 gained "and needs more than a minor fix", to follow the
+    // owners' label rule (bench/calibration-labels.md); the other 4 lines are those of judge-v1.md.
+    const frozen = readFileSync(JUDGE_PROMPT, "utf8");
+    const rubric = (text) => text.split("\n").filter((line) => /^- [0-4]: /.test(line));
+
+    assert.deepEqual(rubric(frozen), [
+        "- 0: no change, or the build breaks and needs more than a minor fix.",
+        "- 1: wrong approach.",
+        "- 2: right approach, needs major fixes.",
+        "- 3: acceptable with minor fixes.",
+        "- 4: mergeable as it is.",
+    ]);
+    assert.deepEqual(rubric(frozen).slice(1), rubric(template).slice(1));
+    assert.equal(rubric(template)[0], "- 0: no change, or the build breaks.");
+});

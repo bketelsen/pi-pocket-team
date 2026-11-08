@@ -130,8 +130,10 @@ The record is [bench/judge-calibration.md](../../bench/judge-calibration.md).
 | `github-copilot/claude-opus-5.5` | 37 of 39        | 0.889 | 0 of 13 (0.0% to 11.2%) | 2 of 26 (3.2% to 17.2%)  | yes  |
 | S3 (both 3 or more)              | 34 of 39        | 0.737 | 0 of 13 (0.0% to 11.2%) | 5 of 26 (11.3% to 30.8%) | yes  |
 
-- **Reading:** every miss is a false fail, so S3 is stricter than the owners: it undercounts passes for every model
-  alike, and on this sample it passes no work that an owner fails.
+- **Reading:** every miss is a false fail: on this sample S3 rejected 5 of 26 owner passes and accepted 0 of 13 owner
+  fails. The rates are pooled; an error rate per candidate model is not established.
+- **Rubric:** `judge-v3.md` keeps the words of grades 1 to 4; grade 0 reads "the build breaks and needs more than a
+  minor fix", which follows the owners' label rule for a minor fix (the record gives the reason).
 - **Spend:** $12.52 of judge calls (dev $6.42, held-out $6.10); the bench's ledger is at $83.45 of $3,000.
 
 ### The instrument

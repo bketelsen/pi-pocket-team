@@ -56,7 +56,15 @@ The prompt took the owners' label rule ([calibration-labels.md](calibration-labe
 lines, 30 minutes or less, no correctness, security or data-loss defect and no requirement of the brief left out). New
 rules: grade a defect by its fix, not its symptom (grade 0 only when the build breaks beyond a minor fix); the author's
 design choices count, and an edge case that the brief does not ask for does not lower the grade; the steps of the
-brief that need a PR, CI or a host are not requirements in the sandbox. The rubric's 5 grades keep their meaning.
+brief that need a PR, CI or a host are not requirements in the sandbox.
+
+The rubric's lines for grades 1 to 4 keep their exact words. The line for grade 0 changes from "no change, or the
+build breaks" to "no change, or the build breaks and needs more than a minor fix". This is a change of the rubric's
+text, made to remove a conflict inside the plan's own rules: version 1's grade 0 and grade 3 ("acceptable with minor
+fixes") overlap for a build that breaks with a minor fix, and the owners' label rule decides that case as pass ("a
+maintainer would merge the change ... after minor fixes ... that is grade 3 or 4"; [calibration-labels.md](calibration-labels.md),
+step 4: "the item is a pass only when its fix is minor"). The judges calibrate against that rule, so the prompt takes
+its side. `bench/judge.test.mjs` pins the 5 rubric lines of the frozen prompt.
 
 Result: the false fails fell (Sol 5 to 1, Opus 3 to 0), but Sol now passed 5 of the 8 owner fails. In its reasons, a
 change that fixed another cause than the one the brief names, a pinned version other than the one the brief names, and
@@ -100,8 +108,9 @@ calls, no verdict pending. Result: **PASS** (the set is valid, both judges pass,
 Every miss is a false fail: the judges are stricter than the owners, never more lenient. 2 items are a fail for both
 judges (an owner pass with a missing test, and an owner pass with a short text gap that the judges called a missing
 requirement); 3 more are a fail for Sol only. S3 takes Sol's misses, so on these items about 1 in 5 owner passes is an
-S3 fail (80% bounds 11% to 31%). For the bench this means S3 undercounts passes, the same for every model, and it does
-not pass work that an owner would fail on this sample.
+S3 fail (80% bounds 11% to 31%). On this sample, S3 rejected 5 of 26 owner passes and accepted 0 of 13 owner fails.
+These are pooled rates: the sample is too small for an error rate per candidate model, so a model-specific bias of the
+judges is not established either way.
 
 The result file is `<data>/calibration-v2/judge-results/held-out-23c5c31c42ef.json`.
 
