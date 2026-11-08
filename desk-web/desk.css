@@ -7,6 +7,19 @@
     color: var(--text);
 }
 
+/*
+ * The 3 views (Desk, Dashboard, Board) share 1 box: the Dashboard's width, and the view switch as its first child. So
+ * the switch stays in 1 place when the view changes. A thread or a plan opened from a view keeps the narrow `.desk`.
+ */
+.desk.desk-view {
+    max-width: 1200px;
+}
+
+/* A scrollbar that comes and goes with the view must not move the centered box sideways. */
+.ext-page-body:has(> .desk-view) {
+    scrollbar-gutter: stable;
+}
+
 .desk-head h1 {
     margin: 0 0 4px;
     font-size: 22px;
@@ -550,19 +563,7 @@
 
 /* ─── The Dashboard ─────────────────────────────────────────────────────── */
 
-.dash-page {
-    padding-top: 16px;
-}
-
-.dash-tabs-wrap {
-    max-width: 1200px;
-    margin: 0 auto;
-    padding: 0 16px;
-}
-
-.desk.dash {
-    max-width: 1200px;
-    padding-top: 0;
+.dash {
     overflow-wrap: anywhere;
 }
 

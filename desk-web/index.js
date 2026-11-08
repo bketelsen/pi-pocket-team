@@ -2172,6 +2172,8 @@ export default function setup(pocket) {
     /**
      * The 3 views of the page: the operational desk (the default each time the page opens), the Dashboard and the
      * Board. Each view draws its own copy of the switch, so the pressed button gets the focus back after a switch.
+     * Each view is 1 `.desk.desk-view` box with the switch as its first child: 1 width and 1 padding for the 3, so the
+     * switch stays in 1 place when the view changes.
      */
     const switchTo = (setTab, next) => {
         setTab(next);
@@ -2565,14 +2567,14 @@ export default function setup(pocket) {
                 />`;
             }
 
-            return html`<div class="dash-page">
-                <div class="dash-tabs-wrap">${viewTabs(tab, setTab)}</div>
+            return html`<div class="desk desk-view dash-page">
+                ${viewTabs(tab, setTab)}
                 <${Dashboard} onOpenThread=${(thread) => setOpenId(thread)} />
             </div>`;
         }
 
         if (tab === "board") {
-            return html`<div class="desk board-page">
+            return html`<div class="desk desk-view board-page">
                 ${viewTabs(tab, setTab)}
                 <${Board} />
             </div>`;
@@ -3310,7 +3312,7 @@ export default function setup(pocket) {
                         </div>
                     </div>`;
 
-        return html`<div class="desk">
+        return html`<div class="desk desk-view">
             ${viewTabs(tab, setTab)}
             <header class="desk-head">
                 <h1>Desk</h1>

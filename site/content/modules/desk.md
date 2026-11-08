@@ -13,7 +13,7 @@ Files: `desk.ts` and `desk-web/`. The tools are `desk`, `team_delegate` and `tea
 - **Found, Stale, Watching, Working, Waiting on review, Parked:** attach or drop, keep, park, wake, and a dated check with Pass and Fail.
 - **Other PRs** and **Closed in the last 7 days**, both collapsed.
 
-The header counts what needs you, what is ready to merge, what is open, stale and parked, and how many threads count. A second view of the page is the **Dashboard**: the numbers of Desk-tracked work for 1 range and 1 scope. Its definitions are in [docs/desk-dashboard.md](https://github.com/bketelsen/pi-pocket-team/blob/main/docs/desk-dashboard.md).
+The header counts what needs you, what is ready to merge, what is open, stale and parked, and how many threads count. A second view of the page is the **Dashboard**: the numbers of Desk-tracked work for 1 range and 1 scope. The 3 views (Desk, Dashboard, Board) have the same width, so the switch between them stays in 1 place. Its definitions are in [docs/desk-dashboard.md](https://github.com/bketelsen/pi-pocket-team/blob/main/docs/desk-dashboard.md).
 
 ## The tools
 

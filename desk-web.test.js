@@ -1,5 +1,6 @@
 // The Desk page's queue section: rendered with stand-ins for Pocket's page tools, no browser.
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { test } from "node:test";
 import setup, {
     answerBody,
@@ -158,13 +159,17 @@ const html = (strings, ...values) => {
     );
 };
 
-/** Render the page with this view. `onBadge` takes each rail update. */
-const render = async (view, onBadge = () => {}) => {
+/** Render the page with this view. `onBadge` takes each rail update; `tab` is the view the switch shows. */
+const render = async (view, onBadge = () => {}, tab = "desk") => {
     let page;
 
     setup({
         html,
-        useState: (value) => [typeof value === "function" ? value() : value, () => {}],
+        // The page's only `useState("desk")` is the view switch.
+        useState: (value) => [
+            value === "desk" ? tab : typeof value === "function" ? value() : value,
+            () => {},
+        ],
         useEffect: () => {},
         useRef: () => ({ current: null }),
         Loader: () => "",
@@ -1552,6 +1557,46 @@ test("the operational view is the default: the page opens on Desk, with the Dash
     );
     assert.match(out, /<h1>Desk<\/h1>/);
     assert.doesNotMatch(out, /dash-controls/);
+});
+
+test("the 3 views share 1 box: the same classes for the width, and the switch as its first child", async () => {
+    const boxes = {};
+
+    for (const tab of ["desk", "dashboard", "board"]) {
+        const out = await render(viewWith(null), () => {}, tab);
+        const box = /<div class="([^"]*)"> <div class="desk-tabs"/.exec(out);
+
+        assert.ok(box, `${tab}: the view switch is the first child of the view's box`);
+        assert.match(
+            out,
+            new RegExp(`data-tab="${tab}" aria-pressed=true`),
+            `${tab}: its tab is pressed`,
+        );
+        boxes[tab] = box[1].split(" ").filter((name) => name === "desk" || name === "desk-view");
+    }
+
+    assert.deepEqual(boxes, {
+        desk: ["desk", "desk-view"],
+        dashboard: ["desk", "desk-view"],
+        board: ["desk", "desk-view"],
+    });
+
+    // The box's width is the Dashboard's, in 1 rule, and no view sets a width of its own.
+    const css = readFileSync(new URL("./desk-web/desk.css", import.meta.url), "utf8");
+    const rule = /\.desk\.desk-view \{([^}]*)\}/.exec(css);
+
+    assert.ok(rule, "desk.css has the .desk.desk-view rule");
+    assert.match(rule[1], /max-width: 1200px;/);
+
+    for (const own of [".dash-page", ".dash-tabs-wrap", ".board-page", ".dash", ".desk.dash"]) {
+        const block = new RegExp(`(^|\\n)${own.replaceAll(".", "\\.")} \\{([^}]*)\\}`).exec(css);
+
+        assert.doesNotMatch(
+            block?.[2] ?? "",
+            /width|padding|margin/,
+            `${own} sets no width, padding or margin`,
+        );
+    }
 });
 
 test("unknown is never 0: each format gives null for unknown, and a real 0 for 0", () => {
