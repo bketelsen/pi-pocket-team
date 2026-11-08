@@ -20,6 +20,12 @@ export const JUDGES = ["openai/gpt-6.1-sol", "github-copilot/claude-opus-5.5"];
 /** The judge prompt, version 1. */
 export const JUDGE_PROMPT = join(BENCH_DIR, "judge-v1.md");
 
+/**
+ * The SHA-256 of the frozen judge prompt: null until the freeze, which follows the development rounds of the judge
+ * calibration (`bench/judge-calibration.mjs --set dev`). The held-out set runs only with the frozen prompt.
+ */
+export const JUDGE_PROMPT_SHA256 = null;
+
 /** The most characters of a diff in the judge's input. */
 export const DIFF_LIMIT = 60_000;
 
@@ -48,9 +54,124 @@ export const JUDGE_MIN_EXPIRY = "30m";
 export const JUDGE_MESSAGE =
     "Grade the submitted change in the attached file by its rubric. Answer with 1 JSON object only, and nothing before or after it.";
 
+/** The folders whose files are test files. */
+const TEST_FOLDERS = new Set(["test", "tests", "__tests__", "testdata", "fixtures"]);
+
+/**
+ * True for a test file: a path with a folder `test`, `tests`, `__tests__`, `testdata` or `fixtures`, or a base name
+ * `*_test.go`, `*_test.py`, `test_*.py`, `*.test.<ext>` or `*.spec.<ext>` (ext: js, mjs, cjs, ts, mts, cts, jsx, tsx).
+ */
+export function isTestPath(path) {
+    const parts = String(path ?? "").split("/");
+    const base = parts.pop();
+
+    return (
+        parts.some((part) => TEST_FOLDERS.has(part)) ||
+        /_test\.(?:go|py)$/.test(base) ||
+        /^test_.*\.py$/.test(base) ||
+        /\.(?:test|spec)\.(?:js|mjs|cjs|ts|mts|cts|jsx|tsx)$/.test(base)
+    );
+}
+
+/** The C-style escapes of a quoted path that git writes, as bytes. */
+const ESCAPES = { a: 7, b: 8, t: 9, n: 10, v: 11, f: 12, r: 13, '"': 34, "\\": 92 };
+
+/**
+ * A path as git writes it in a `diff --git` line: as it is, or, for a path with special characters, in double quotes
+ * with C-style escapes (`\\`, `\"`, `\t`, `\n`, and octal `\NNN` bytes of UTF-8), decoded to its text.
+ */
+export function unquotePath(token) {
+    const value = String(token ?? "");
+
+    if (!(value.length >= 2 && value.startsWith('"') && value.endsWith('"'))) {
+        return value;
+    }
+
+    const body = value.slice(1, -1);
+    const bytes = [];
+
+    for (let i = 0; i < body.length; i += 1) {
+        const c = body[i];
+
+        if (c !== "\\") {
+            bytes.push(...Buffer.from(c, "utf8"));
+            continue;
+        }
+
+        const octal = /^[0-7]{1,3}/.exec(body.slice(i + 1))?.[0];
+        const next = body[i + 1] ?? "";
+
+        if (octal) {
+            bytes.push(parseInt(octal, 8) & 0xff);
+            i += octal.length;
+        } else if (Object.hasOwn(ESCAPES, next)) {
+            bytes.push(ESCAPES[next]);
+            i += 1;
+        } else {
+            bytes.push(92);
+        }
+    }
+
+    return Buffer.from(bytes).toString("utf8");
+}
+
+/** A `diff --git` line: 2 path tokens, each a C-style quoted string or plain text. */
+const QUOTED = String.raw`"(?:[^"\\]|\\.)*"`;
+const GIT_HEADER = new RegExp(`^diff --git (${QUOTED}|a/.+?) (${QUOTED}|b/.+)$`);
+
+/**
+ * The path of a file section of a diff: the `b/` path of its `diff --git` line, quoted or not, decoded (the rest of
+ * the line when none parses). The section's text is not changed.
+ */
+export function sectionPath(section) {
+    const end = section.indexOf("\n");
+    const line = end < 0 ? section : section.slice(0, end);
+    const match = GIT_HEADER.exec(line);
+
+    if (!match) {
+        return line.slice("diff --git ".length);
+    }
+
+    const path = unquotePath(match[2]);
+
+    return path.startsWith("b/") ? path.slice(2) : path;
+}
+
+/**
+ * A diff with its test files last: the text before the first `diff --git ` line stays first, then the non-test file
+ * sections, then the test file sections, each group in its original order. Git sorts files by path, so test files
+ * (`desk-x.test.ts` before `desk.ts`) can fill a cut and hide the code they test. It keeps each section's text; it
+ * can add 1 newline between sections (after a section with no final newline that is no longer last).
+ */
+export function testsLast(diff) {
+    const text = String(diff ?? "");
+    const starts = [...text.matchAll(/^diff --git /gm)].map((m) => m.index);
+
+    if (starts.length < 2) {
+        return text;
+    }
+
+    const head = text.slice(0, starts[0]);
+    const sections = starts.map((start, i) => text.slice(start, starts[i + 1] ?? text.length));
+    const ordered = [
+        ...sections.filter((section) => !isTestPath(sectionPath(section))),
+        ...sections.filter((section) => isTestPath(sectionPath(section))),
+    ];
+
+    // Only the original last section can lack its final newline; elsewhere it would join 2 lines.
+    return (
+        head +
+        ordered
+            .map((section, i) =>
+                i < ordered.length - 1 && !section.endsWith("\n") ? `${section}\n` : section,
+            )
+            .join("")
+    );
+}
+
 /**
  * A diff for the judge: as it is up to `DIFF_LIMIT` characters; a longer one becomes its `--stat`, a blank line, and
- * its first `DIFF_LIMIT` characters, with `cut: true`.
+ * the first `DIFF_LIMIT` characters of the diff with its test files last (`testsLast`), with `cut: true`.
  */
 export function cutDiff(diff, stat) {
     const text = String(diff ?? "");
@@ -59,7 +180,10 @@ export function cutDiff(diff, stat) {
         return { text, cut: false };
     }
 
-    return { text: `${String(stat ?? "").trimEnd()}\n\n${text.slice(0, DIFF_LIMIT)}`, cut: true };
+    return {
+        text: `${String(stat ?? "").trimEnd()}\n\n${testsLast(text).slice(0, DIFF_LIMIT)}`,
+        cut: true,
+    };
 }
 
 /** A stat of a unified diff (files, lines added and removed), for a diff that has no `git diff --stat`. */
@@ -90,13 +214,14 @@ export function diffStat(diff) {
 }
 
 /** The note of a diff in the prompt. */
-const cutNote = (cut, what) =>
+export const cutNote = (cut, what) =>
     cut
         ? `The ${what} diff is longer than ${DIFF_LIMIT} characters: below are its stat and its first ${DIFF_LIMIT} characters.`
         : `The ${what} diff is complete.`;
 
 /** An S1 or S2 result in words. */
-const checkWords = (value, none) => (value === true ? "passed" : value === false ? "failed" : none);
+export const checkWords = (value, none) =>
+    value === true ? "passed" : value === false ? "failed" : none;
 
 /**
  * The judge's input: the template with the brief, S1, S2, the 2 diffs and their cut notes. No model name goes in.

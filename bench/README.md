@@ -7,24 +7,26 @@ router v3, is in [docs/plans/router-bench.md](../docs/plans/router-bench.md).
 
 ## Scripts
 
-| Script                  | What it does                                                                                                                                                                                      |
-| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `bench/run.mjs`         | 1 attempt of 1 model on 1 manifest task: budget reserve, slots, auth pre-flight, scratch clone, setup, then Pi in the sandbox. Writes 1 result file. Idempotent.                                  |
-| `bench/batch.mjs`       | Every (task, model) pair of a manifest as `run.mjs` children, `--parallel` at a time. Holds the halogen lease when halogen is in the batch. Prints a table per model.                             |
-| `bench/load-test.mjs`   | Halogen only, under the lease: levels 1 to 4 of parallel attempts, then the halogen concurrency (highest level with no error and each attempt at 70% of level 1).                                 |
-| `bench/report.mjs`      | A stage's summary per model: attempts, failures by kind, list cost, tokens, median and max wall time, and the total cost.                                                                         |
-| `bench/budget.mjs`      | The budget guard: `set --budget <usd>`, `show`, `reap` (settles reservations of dead runners at their full cap).                                                                                  |
-| `bench/harvest.mjs`     | Candidate tasks from the desk: 1 manifest per bench repository, validated in the sandbox. `--revalidate <file>` runs a file's commands again.                                                     |
-| `bench/score.mjs`       | S0 to S3 of 1 result file: protocol, the repository check, the hidden tests, and the 2 judges. Adds the scores to the result file.                                                                |
-| `bench/calibration.mjs` | The judge calibration sets: 20 development pairs and 8 blind held-out diffs per owner, from the daily audit's blocking review points.                                                             |
-| `bench/judge-v1.md`     | The judge prompt: the rubric, the brief, S1, S2, the submitted diff and the reference diff ("1 accepted solution, not the only one").                                                             |
-| `bench/pool.mjs`        | The pool gate: writes `bench/pool-v1.json`, the 3 disjoint sets of kept tasks (calibration, stage 1, stage 2 = R). Frozen once written; `--grow` appends new kept tasks to R, `--check` compares. |
-| `bench/pool-v1.json`    | The frozen pool (written by `bench/pool.mjs`; deterministic, so Prettier leaves it alone).                                                                                                        |
-| `bench/analyze.mjs`     | The pre-registered statistics: `--stage 1`, `--stage 2`, `--simulate`, and `--branch` (the stage 2 branch of R before any stage 2 run). Runs no model.                                            |
-| `bench/pilot.json`      | The pilot manifest: 3 pi-pocket-team tasks (small, medium, large), picked by hand.                                                                                                                |
-| `bench/models.json`     | The 10 candidate models; `priced: false` for a model with no list price; `peakUtc` for DeepSeek's peak hours.                                                                                     |
-| `bench/header-v1.md`    | The bench header: the first part of every prompt, and `/agent/AGENTS.md` in the sandbox.                                                                                                          |
-| `bench/hosts`           | The sandbox's `/etc/hosts`: GitHub's hosts go to 127.0.0.1.                                                                                                                                       |
+| Script                        | What it does                                                                                                                                                                                        |
+| ----------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `bench/run.mjs`               | 1 attempt of 1 model on 1 manifest task: budget reserve, slots, auth pre-flight, scratch clone, setup, then Pi in the sandbox. Writes 1 result file. Idempotent.                                    |
+| `bench/batch.mjs`             | Every (task, model) pair of a manifest as `run.mjs` children, `--parallel` at a time. Holds the halogen lease when halogen is in the batch. Prints a table per model.                               |
+| `bench/load-test.mjs`         | Halogen only, under the lease: levels 1 to 4 of parallel attempts, then the halogen concurrency (highest level with no error and each attempt at 70% of level 1).                                   |
+| `bench/report.mjs`            | A stage's summary per model: attempts, failures by kind, list cost, tokens, median and max wall time, and the total cost.                                                                           |
+| `bench/budget.mjs`            | The budget guard: `set --budget <usd>`, `show`, `reap` (settles reservations of dead runners at their full cap).                                                                                    |
+| `bench/harvest.mjs`           | Candidate tasks from the desk: 1 manifest per bench repository, validated in the sandbox. `--revalidate <file>` runs a file's commands again.                                                       |
+| `bench/score.mjs`             | S0 to S3 of 1 result file: protocol, the repository check, the hidden tests, and the 2 judges. Adds the scores to the result file. `--checks-only`: S0 to S2 and the diffs, no judge call.          |
+| `bench/calibration.mjs`       | The judge calibration's instrument: `plan` (4 models per calibration task), `run` (the attempts in stage `calibration` and their checks, with replacements), `status`, `packs` (blind label packs). |
+| `bench/judge-calibration.mjs` | The judges on the owners' labelled packs: agreement, Cohen's kappa, both error rates with 80% Wilson bounds, and the class minimums (`--set dev` or `--set held-out`).                              |
+| `bench/calibration-labels.md` | The owners' label rules (pass or fail), blind rules, and how to record a label.                                                                                                                     |
+| `bench/judge-v1.md`           | The judge prompt: the rubric, the brief, S1, S2, the submitted diff and the reference diff ("1 accepted solution, not the only one").                                                               |
+| `bench/pool.mjs`              | The pool gate: writes `bench/pool-v1.json`, the 3 disjoint sets of kept tasks (calibration, stage 1, stage 2 = R). Frozen once written; `--grow` appends new kept tasks to R, `--check` compares.   |
+| `bench/pool-v1.json`          | The frozen pool (written by `bench/pool.mjs`; deterministic, so Prettier leaves it alone).                                                                                                          |
+| `bench/analyze.mjs`           | The pre-registered statistics: `--stage 1`, `--stage 2`, `--simulate`, and `--branch` (the stage 2 branch of R before any stage 2 run). Runs no model.                                              |
+| `bench/pilot.json`            | The pilot manifest: 3 pi-pocket-team tasks (small, medium, large), picked by hand.                                                                                                                  |
+| `bench/models.json`           | The 10 candidate models; `priced: false` for a model with no list price; `peakUtc` for DeepSeek's peak hours.                                                                                       |
+| `bench/header-v1.md`          | The bench header: the first part of every prompt, and `/agent/AGENTS.md` in the sandbox.                                                                                                            |
+| `bench/hosts`                 | The sandbox's `/etc/hosts`: GitHub's hosts go to 127.0.0.1.                                                                                                                                         |
 
 Examples:
 
@@ -37,7 +39,11 @@ node bench/report.mjs --stage pilot
 node bench/harvest.mjs --since 2026-09-01 --parallel 2
 node bench/harvest.mjs --revalidate ~/agents/sheeana/bench/pi-pocket-team.json
 node bench/score.mjs --result bench/results/stage1/<task>/<model-slug>.json
-node bench/calibration.mjs
+node bench/calibration.mjs plan
+node bench/calibration.mjs run --parallel 4 --wait-peak
+node bench/calibration.mjs status
+node bench/calibration.mjs packs
+node bench/judge-calibration.mjs --set dev [--prompt bench/judge-v2.md]
 node bench/pool.mjs
 node bench/pool.mjs --check
 node bench/pool.mjs --grow
@@ -115,7 +121,8 @@ Before each try of an OAuth provider, the runner refreshes the token on the host
 
 ## Data
 
-The data dir is `$BENCH_DATA`, else `~/.local/share/pi-pocket-team/bench` (folders 0700, files 0600). It holds `spend.json` (the budget), `slots/`, `halogen.json`, `agent/`, `agent-files/` (`settings.json`, and the sandbox's `passwd` and `group`, written when missing or different) and `runs/<stage>/<task>/<model-slug>[--<run-id>]/try-<n>/` with `work/`, `session/`, `cache/`, `events.jsonl` and `stderr.log`. The harvester adds `manifests/`, `harvest-cache/` (validations, `gh` facts, command logs `<pr>.log`, and `revalidate/<task>.log`) and `harvest-work/` (scratch clones, removed after each validation); the scorer adds `diffs/`, `judges/<stage>/<task>/<attempt>/<judge>/try-<n>/` and `score/` (copies, removed after scoring; the log `score/<stage>/<task>/<attempt>.score.log` stays); the calibration builder writes `calibration/`. Every cleanup of a scratch tree or cache first adds the owner's write permission when `rm` meets a read-only folder (Go writes its module cache read-only); a cleanup that still fails is logged with its path and does not stop the work. A candidate whose validation throws is dropped with the reason, and the harvest goes on. Run folders are kept; a new run of the same attempt continues the try numbers. Result files go to `bench/results/` (ignored by git) or `--results`.
+The data dir is `$BENCH_DATA`, else `~/.local/share/pi-pocket-team/bench` (folders 0700, files 0600). It holds `spend.json` (the budget), `slots/`, `halogen.json`, `agent/`, `agent-files/` (`settings.json`, and the sandbox's `passwd` and `group`, written when missing or different) and `runs/<stage>/<task>/<model-slug>[--<run-id>]/try-<n>/` with `work/`, `session/`, `cache/`, `events.jsonl` and `stderr.log`. The harvester adds `manifests/`, `harvest-cache/` (validations, `gh` facts, command logs `<pr>.log`, and `revalidate/<task>.log`) and `harvest-work/` (scratch clones, removed after each validation); the scorer adds `diffs/`, `judges/<stage>/<task>/<attempt>/<judge>/try-<n>/` and `score/` (copies, removed after scoring; the log `score/<stage>/<task>/<attempt>.score.log` stays); the judge calibration writes `calibration-v2/` (the first instrument's files stay in `calibration/` and
+`calibration-v0-pr-body/`). Every cleanup of a scratch tree or cache first adds the owner's write permission when `rm` meets a read-only folder (Go writes its module cache read-only); a cleanup that still fails is logged with its path and does not stop the work. A candidate whose validation throws is dropped with the reason, and the harvest goes on. Run folders are kept; a new run of the same attempt continues the try numbers. Result files go to `bench/results/` (ignored by git) or `--results`.
 
 Attempt lock: `runs/<stage>/<task>/<model-slug>[--<run-id>].lock` (with the pid) is held from before the result-exists check until the result is written; a second runner of the same attempt exits 1. A lock of a dead pid is free. The take and the release both hold the short lock `runs/.locks.lock`.
 
@@ -139,7 +146,10 @@ Concurrency: at most 4 tries on the host and 2 per provider; halogen at most the
 
 ## Scoring
 
-`node bench/score.mjs --result <file> [--manifest <file>] [--checkout <dir>] [--force]` scores 1 attempt. Without `--manifest`, the task is looked up in `bench/pilot.json` and `<data>/manifests/**`; it must be in exactly 1. The checkout is `--checkout`, else the manifest's `checkout`, else `~/projects/<name>` (the runner uses the same rule). The submitted tree (`workDir`) must be a folder; it needs no `.git` of its own. It adds these fields and keeps every other:
+`node bench/score.mjs --result <file> [--manifest <file>] [--checkout <dir>] [--force] [--checks-only]` scores 1
+attempt. With `--checks-only` it runs S0, S1, S2 and the diffs, calls no judge, and sets `checksOnly: true`,
+`grades: [null, null]` and `judgePending: true`; a result whose checks are done is not checked again without
+`--force`, and a later run without `--checks-only` judges only (S1 and S2 stay). Without `--manifest`, the task is looked up in `bench/pilot.json` and `<data>/manifests/**`; it must be in exactly 1. The checkout is `--checkout`, else the manifest's `checkout`, else `~/projects/<name>` (the runner uses the same rule). The submitted tree (`workDir`) must be a folder; it needs no `.git` of its own. It adds these fields and keeps every other:
 
 | Field                     | Meaning                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -155,14 +165,80 @@ A result with `harness: true` is not scored. A result with `failure` (limit, pro
 
 ## Calibration
 
-`node bench/calibration.mjs [--findings <file>]... [--out <dir>]` reads the blocking review points (`metrics.Q1.blockers.points`) of every `~/agents/odrade/reports/*-daily-audit/findings.json` (1 per `ref@head`, merged PRs only), reads each PR (`gh pr view --json headRefOid,baseRefOid,mergeCommit,title,body,state`) and its diffs from GitHub's compare API (`base...head`, the same base for both diffs of a PR), all read only, and writes to `<data>/calibration`:
+The judges calibrate on real bench attempts that the owners label blind (the plan's section Scoring, "Judge
+calibration"). The instrument's folder is `<data>/calibration-v2/` (`--dir`); its folders and files are private (0700,
+0600).
 
-- `held-out/<owner>.json`: 8 diffs of the owner's bench repositories from 8 PRs, 4 at a Not-ready head and 4 at the final merged head, in a blind order; items `{ id, repo, pr, brief, diff, diffCut, label: null }`.
-- `held-out-key.json`: `id` -> `{ label: "notReady" | "merged", head, repo, pr }`.
-- `dev.json`: 20 pairs from the other PRs: `{ id, repo, pr, brief, base, notReadyHead, mergedHead, notReadyDiff, mergedDiff, notReadyCut, mergedCut }`.
+`node bench/calibration.mjs plan [--pool bench/pool-v1.json] [--pilot bench/pilot.json]` writes `plan.json`, frozen
+once written (a run whose plan differs exits 1). The tasks: the pool's calibration tasks (`calibration.ids`, in rank
+order; each owner's 1 dev and 2 held-out tasks), then the 3 pilot tasks for Sheeana, ranked as the pool ranks (ids
+sorted, 1 shuffle by mulberry32(1064)): the first 2 held-out, the 3rd dev. Each task gets 4 models, 2 cheap, 1
+middle and 1 dear:
 
-Every choice is seeded (mulberry32, seed 1064). With fewer PRs it writes fewer items and prints a warning.
+| Group  | Models                                                                                                                                                             |
+| ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| cheap  | `github-copilot/gpt-6-luna`, `github-copilot/claude-haiku-5.5`, `deepseek/deepseek-flash`, `halogen/halogen-qwen3.8-flash-next`, `github-copilot/mai-code-2-flash` |
+| middle | `github-copilot/gemini-3.8-flash`, `github-copilot/grok-4.7`                                                                                                       |
+| dear   | `github-copilot/claude-sonnet-5.5`, `github-copilot/gpt-6.1-sol`, `github-copilot/claude-opus-5.5`                                                                 |
+
+Each group is shuffled 1 time (mulberry32(1064)) and taken in turn over the tasks, so in a group the counts differ
+by 1 at most: over the 48 attempts, 4 or 5 per cheap model, 6 per middle model, 4 per dear model. With Sheeana's 12
+pilot items, the 2 middle models have 7 and 8 items (15 middle slots for 2 models).
+
+`node bench/calibration.mjs run [--parallel 4] [--wait-peak] [--lease-bin <path>] [run.mjs options]` drives the plan:
+
+- A pool task's model runs as `node bench/run.mjs --stage calibration --results <dir>/results`, then
+  `node bench/score.mjs --checks-only`. A pilot task never runs: its model's pilot result
+  (`<data>/results-t1/pilot/`, `--pilot-results`) is copied to `<dir>/results/pilot/` once and checked there; the
+  pilot's own file never changes. A model with no pilot result (the pilot ran Claude Haiku on the route
+  `anthropic/claude-haiku-5-5`) counts as a failed attempt.
+- An attempt with a `limit`, `provider`, `harness` or `protocol` failure stays in the record, with its cost, and gets
+  no item. The next model of its group, in the group's order (cyclic), that the task has not used replaces it, at
+  most 2 times per task; then the item is missing. Replacements wait until each slot of the task has an outcome, and
+  go in slot order, so the result depends only on the outcomes.
+- At most `--parallel` children at a time (runs and checks); the runner's slots keep their caps. The halogen lease is
+  taken before the first halogen run and released at the end. DeepSeek waits outside its peak hours (`--wait-peak`;
+  without it, the run ends with exit 4 and the pairs that wait). After a budget refusal no priced run starts (exit 2).
+  An action that exits 1, or a check that fails 2 times, or an action that ran 3 times and still waits, cannot go on
+  (exit 1). Every child gets the CLI's environment (`BENCH_DATA`, the lease folder).
+- It prints the state of each slot (its chain of models and `ok`, `missing` or `waiting`), the items per owner and
+  per model, and the list cost of the stage `calibration` attempts. `status` prints the same and runs nothing. No
+  output shows a diff.
+
+`node bench/calibration.mjs packs` writes, for each owner with items:
+
+- `packs/<owner>/items.json`: the items in a seeded order (mulberry32(1064)), ids `<owner>-01` and on, each with
+  exactly the judge's input: `{ id, set, brief, s1, s2, submitted: { text, cut }, reference: { text, cut } }` (the diffs
+  as `cutDiff` gives them to the judges). No model, cost, wall time or try count.
+- `packs/<owner>/items/<id>.md`: each item as Markdown (the task, the checks, the submitted change, the merged
+  change), and `packs/<owner>/README.md`: what to do.
+- `packs/<owner>/labels.json`: `{ schema, owner, rules, itemsSha256, labels: [{ id, set, label: null, note: "",
+blind: true, reason: "" }] }`, the file the owner fills by [calibration-labels.md](calibration-labels.md).
+- `keys/<owner>.json`: item id -> `{ task, set, slot, group, model, stage, result }`. No operator or owner opens it;
+  the judge calibration does not read it.
+
+A pack whose `labels.json` holds an owner's work is never written over: with the same items it stays (`kept`); with
+other items the command exits 1 and writes nothing. Every task must have an outcome first.
+
+`node bench/judge-calibration.mjs --set dev|held-out [--prompt <file>] [--stats-only]` runs both judges on the
+counted items of a set, from the pack's fields (`renderPrompt` with the prompt file, default `bench/judge-v1.md`), and
+compares each judge's verdict (grade 3 or more), and the S3 rule (both 3 or more), with the owners' labels:
+
+- An item marked `blind: false` leaves every count and is not judged. An unlabelled counted item, a changed
+  `items.json`, a label other than `pass` or `fail`, or `blind: false` without a reason stops the run before any call.
+- `--set held-out` needs the frozen prompt (its SHA-256 is `JUDGE_PROMPT_SHA256` in `bench/lib/judge.mjs`, null until
+  the freeze) and 36 or more counted items with 10 or more owner fails and 10 or more owner passes; both are checked
+  before any judge call.
+- Each verdict is saved in `judged/<prompt sha256, 12>/<judge>/<item>.json` with the hashes of the prompt and of the
+  rendered input: a run resumes, and a changed item or prompt is judged again. The judges' tries reserve under the
+  budget guard in stage `calibration`.
+- The result (`judge-results/<set>-<prompt sha256, 12>.json` and Markdown on stdout): per judge and for S3, the counted
+  items, the agreement and its threshold ceil(0.8 x counted), Cohen's kappa, the false-pass rate (a pass on an owner
+  fail) and the false-fail rate (a fail on an owner pass) with 80% Wilson bounds, and the pending verdicts. A judge
+  passes with the threshold and kappa 0.6 or more; S3 passes with a false-pass rate of 20% or less; the held-out set
+  passes when it is valid and all 3 pass. The development numbers decide nothing.
+- Exit codes: 0 complete, 1 usage error, 2 budget refused (the verdicts so far stay), 3 verdicts pending.
 
 ## Tests
 
-`bench/*.test.mjs` use a fake `pi` (`bench/fixtures/fake-pi.cjs`; a judge reads its scenario from its `@file`), temp data and lease dirs, and a fixture git repository. The harvester, scorer and calibration tests add a Node-only fixture repository with a merged PR, a fixture Pocket database and a fake `gh` (`bench/fixtures/harvest.mjs`); Go and pytest output is canned. Most run behind a fake `bwrap` (`bench/fixtures/fake-bwrap.mjs`, no isolation); `bench/sandbox.test.mjs` uses the real `bwrap` and skips where it cannot run. No test calls a model.
+`bench/*.test.mjs` use a fake `pi` (`bench/fixtures/fake-pi.cjs`; a judge reads its scenario from its `@file`; `byModel` in a scenario gives 1 model another one), temp data and lease dirs, and a fixture git repository. The harvester, scorer and calibration tests add a Node-only fixture repository with a merged PR, a fixture Pocket database and a fake `gh` (`bench/fixtures/harvest.mjs`); Go and pytest output is canned. Most run behind a fake `bwrap` (`bench/fixtures/fake-bwrap.mjs`, no isolation); `bench/sandbox.test.mjs` uses the real `bwrap` and skips where it cannot run. No test calls a model.

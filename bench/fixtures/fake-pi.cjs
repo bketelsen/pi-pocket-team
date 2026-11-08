@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 // A fake `pi` for the bench tests: it prints JSON events like Pi's `--mode json` stream. The scenario is a line
 // `SCENARIO {json}` in the prompt (the last argument, or the file of an `@file` argument and the message after it, as
-// a judge gets them); `BENCH_TRY` is the try number. It never calls a model.
+// a judge gets them); `byModel` in it names another scenario for a model; `BENCH_TRY` is the try number. It never calls
+// a model.
 "use strict";
 
 const { spawn, spawnSync } = require("node:child_process");
@@ -13,7 +14,13 @@ const prompt = fileArg
     ? `${readFileSync(fileArg.slice(1), "utf8")}\n${lastArg.startsWith("@") ? "" : lastArg}`
     : lastArg;
 const line = prompt.split("\n").find((l) => l.startsWith("SCENARIO "));
-const scenario = line ? JSON.parse(line.slice("SCENARIO ".length)) : { name: "ok" };
+const parsed = line ? JSON.parse(line.slice("SCENARIO ".length)) : { name: "ok" };
+// `byModel`: a scenario name per model (the `--model` argument without its thinking level).
+const modelArg = process.argv[process.argv.indexOf("--model") + 1] ?? "";
+const scenario = {
+    ...parsed,
+    name: parsed.byModel?.[modelArg.replace(/:[a-z]+$/, "")] ?? parsed.name,
+};
 const tryNo = Number(process.env.BENCH_TRY);
 
 const emit = (event) => process.stdout.write(`${JSON.stringify(event)}\n`);

@@ -374,6 +374,48 @@ test("a full score: S1 and S2 in copies (the submitted tree never changes), both
     );
 });
 
+test("--checks-only: S0 to S2 and the diffs with no judge call; a later run without it judges only", async () => {
+    const answers = { [JUDGES[0]]: [GOOD(4)], [JUDGES[1]]: [GOOD(2)] };
+    const task = taskOf("checks-only", answers);
+    const paths = await attempt(task, { change: FIX });
+    const judgeLog = join(fixture.root, "checks-only.judges.log");
+    const { code, result, lines } = await score(paths, ["--checks-only"]);
+
+    assert.equal(code, 0);
+    assert.deepEqual(result.s0, { protocol: false, leakTry: false });
+    assert.equal(result.s1, true);
+    assert.equal(result.s2, true);
+    assert.equal(result.checksOnly, true);
+    assert.deepEqual(result.grades, [null, null]);
+    assert.deepEqual(result.judges, []);
+    assert.equal(result.judgePending, true);
+    assert.equal(result.diffCut, false);
+    assert.match(readFileSync(result.diffFile, "utf8"), /\+export const add/);
+    assert.equal(existsSync(judgeLog), false, "no judge ran");
+    assert.equal(existsSync(join(paths.data, "judges")), false, "no judge folder");
+    assert.deepEqual((await readSpend(paths.data)).entries, [], "no judge spend");
+    assert.ok(lines.some((line) => /checks only: no judge/.test(line)));
+
+    // Checked already: a second checks-only run does nothing.
+    const again = await score(paths, ["--checks-only"]);
+
+    assert.equal(again.code, 0);
+    assert.equal(existsSync(judgeLog), false);
+
+    // A later full run judges only: S1 and S2 stay, both judges grade.
+    const full = await score(paths);
+
+    assert.equal(full.code, 0);
+    assert.deepEqual(full.result.grades, [4, 2]);
+    assert.equal(full.result.judgePending, false);
+    assert.equal(full.result.checksOnly, undefined);
+    assert.equal(
+        readFileSync(judgeLog, "utf8").split("\n").filter(Boolean).length,
+        2,
+        "each judge ran once",
+    );
+});
+
 test("a wrong change fails S1 or S2; the tree with no fix fails S2", async () => {
     const task = taskOf("nofix", { default: [GOOD(1)] });
     const paths = await attempt(task, { change: { "notes.txt": "only notes\n" } });

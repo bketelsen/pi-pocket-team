@@ -23,8 +23,8 @@ export const REPO_ROOT = resolve(import.meta.dirname, "..", "..");
 /** The bench folder of the repository. */
 export const BENCH_DIR = join(REPO_ROOT, "bench");
 
-/** The stages a result can belong to. */
-export const STAGES = ["pilot", "stage1", "stage2", "loadtest"];
+/** The stages a result can belong to. `calibration`: the judge calibration's attempts, never in stage 1 or 2. */
+export const STAGES = ["pilot", "stage1", "stage2", "loadtest", "calibration"];
 
 /** The data dir: env `BENCH_DATA`, else `~/.local/share/pi-pocket-team/bench`. */
 export const dataDir = (env = process.env) =>

@@ -212,6 +212,27 @@ export function fullyScored(result) {
     );
 }
 
+/**
+ * True when a result needs no more checks-only scoring: S0 is done, and the attempt failed, or S1 (and S2 when the task
+ * has one) and the submitted diff are done.
+ */
+export function checksDone(result, task) {
+    if (!result.s0) {
+        return false;
+    }
+
+    if (result.failure) {
+        return true;
+    }
+
+    return (
+        typeof result.s1 === "boolean" &&
+        (!task?.hiddenCommand || typeof result.s2 === "boolean") &&
+        typeof result.diffFile === "string" &&
+        result.scoreError === undefined
+    );
+}
+
 /** Copy a tree (`cp -a --reflink=auto`): the copy has the tree's files, `.git` included. */
 async function copyTree(from, to) {
     await removeTree(to);
@@ -704,6 +725,23 @@ async function scoreAfterS0(ctx, { file, result, task, checkout, git, attempt, j
     result.diffCut = own.cut;
     result.referenceCut = ref.cut;
 
+    // Checks only (the judge calibration's attempts): S0 to S2 and the diffs, and no judge call. The judges stay
+    // pending, so a later run without `--checks-only` judges only.
+    if (ctx.checksOnly) {
+        result.checksOnly = true;
+        result.grades = Array.isArray(result.grades) ? result.grades : [null, null];
+        result.judges = Array.isArray(result.judges) ? result.judges : [];
+        result.judgePending = true;
+        result.scoredAt = new Date(ctx.now()).toISOString();
+        delete result.scoreError;
+        await save();
+        ctx.log(
+            `${attempt}: s0 ${JSON.stringify(result.s0)}, s1 ${result.s1}, s2 ${result.s2} (checks only: no judge)`,
+        );
+
+        return 0;
+    }
+
     const judges = ctx.judges ?? JUDGES;
     const grades = Array.isArray(result.grades) ? [...result.grades] : [null, null];
     const entries = Array.isArray(result.judges) ? [...result.judges] : [];
@@ -762,6 +800,7 @@ async function scoreAfterS0(ctx, { file, result, task, checkout, git, attempt, j
     result.judgePending = grades.some((g) => typeof g !== "number");
     result.scoredAt = new Date(ctx.now()).toISOString();
     delete result.scoreError;
+    delete result.checksOnly;
     await save();
     ctx.log(
         `${attempt}: s0 ${JSON.stringify(result.s0)}, s1 ${result.s1}, s2 ${result.s2}, grades ${JSON.stringify(grades)}${result.judgePending ? " (judge pending)" : ""}`,
@@ -775,7 +814,9 @@ async function scoreAfterS0(ctx, { file, result, task, checkout, git, attempt, j
 // ---------------------------------------------------------------------------------------------------------------
 
 export const SCORE_USAGE = `usage: node bench/score.mjs --result <file> [--manifest <file>] [--checkout <dir>] [--bwrap <path>]
-         [--pocket <dir>] [--agent-src <dir>] [--mise-installs <dir>] [--force] [--no-auth-preflight]
+         [--pocket <dir>] [--agent-src <dir>] [--mise-installs <dir>] [--force] [--checks-only]
+         [--no-auth-preflight]
+--checks-only: S0 to S2 and the diffs, no judge call (the judges stay pending)
 exit codes: 0 scored (a judge may be pending), 1 usage error, 2 budget refused,
             3 scoring error (the result is saved with the scores so far and scoreError; run again)`;
 
@@ -788,6 +829,7 @@ const SCORE_OPTIONS = {
     "agent-src": { type: "string" },
     "mise-installs": { type: "string" },
     force: { type: "boolean" },
+    "checks-only": { type: "boolean" },
     "no-auth-preflight": { type: "boolean" },
 };
 
@@ -839,6 +881,13 @@ export async function scoreMain(argv, env = process.env, deps = {}) {
 
         const data = dataDir(env);
         const found = await findTask(result.task, { manifest: values.manifest, data });
+
+        if (values["checks-only"] && !values.force && checksDone(result, found.task)) {
+            console.log(`checked already: ${file} (--force checks it again)`);
+
+            return 0;
+        }
+
         const bwrap = findProgram(values.bwrap ?? "bwrap", env);
 
         if (!bwrap) {
@@ -859,6 +908,7 @@ export async function scoreMain(argv, env = process.env, deps = {}) {
             data,
             sandbox,
             force: Boolean(values.force),
+            checksOnly: Boolean(values["checks-only"]),
             checkout: values.checkout,
             now: deps.now ?? Date.now,
             log,
