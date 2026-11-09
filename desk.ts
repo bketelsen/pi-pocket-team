@@ -441,7 +441,8 @@ export type Thread = {
      * repair wake-ups that went to the agent: never pruned), `worktreeGone` (when a sweep removed the thread's
      * delegation worktree), `worktreeKeptAt` (when git refused to remove it: the next try waits a day), and `unready`
      * (the `ready-for-human` removals the sweep decided, by key `unready:<ref>:<label time>`:
-     * `{ at, why, to, removed, sent }`, at most 30), and `reportBlocked` (true when the newest report says BLOCKED or
+     * `{ at, why, to, removed, sent, by? }`, at most 30; `by: "workflow"` when the label was already gone on GitHub),
+     * and `reportBlocked` (true when the newest report says BLOCKED or
      * asks for a decision, false when it does not, absent when the desk did not derive it yet: an older thread gets it
      * at its next sweep, from its newest stored report, and it stays open until then because an absent flag is not
      * `false`), `reportAsks` (true when the newest report asks Brian for a decision by itself: a refused ask, or a
@@ -5546,6 +5547,12 @@ export type UnreadyEntry = {
     /** The label is gone from the PR: a retry sends the wake-up only, never the removal again. */
     removed: boolean;
     sent: boolean;
+    /**
+     * Absent: the desk removes the label. `workflow`: the label was already gone on GitHub after a new commit (core's
+     * pr-triage workflow removes it when the head moves), so the desk removes nothing and its wake-up says so. An entry
+     * stored before this field has none.
+     */
+    by?: "workflow";
 };
 
 const KEPT_UNREADY = 30;
@@ -5596,7 +5603,8 @@ const isUnreadyEntry = (value: unknown): value is UnreadyEntry => {
         typeof entry.why === "string" &&
         (entry.to === "agent" || entry.to === "odrade") &&
         typeof entry.removed === "boolean" &&
-        typeof entry.sent === "boolean"
+        typeof entry.sent === "boolean" &&
+        (entry.by === undefined || entry.by === "workflow")
     );
 };
 
@@ -5632,15 +5640,8 @@ export function unreadyReason(link: PrLink, fact: PrFact): string | undefined {
         return undefined;
     }
 
-    // A new commit needs proof from GitHub: a head oid now that differs from the one the desk recorded with the label, or
-    // a head commit that GitHub dates after a known label time. A read with no head (a partial answer: GitHub gave the
-    // PR with a null commit node) proves nothing, and neither does a label recorded with no head.
-    if (
-        fact.head !== "" &&
-        ((ready.head !== "" && ready.head !== fact.head) ||
-            (ready.at > 0 && fact.headAt > ready.at))
-    ) {
-        return "a new commit came after the label";
+    if (headMovedSince(ready, fact)) {
+        return NEW_COMMIT;
     }
 
     if (fact.checks === "FAILURE" || fact.checks === "ERROR") {
@@ -5660,25 +5661,62 @@ export function unreadyReason(link: PrLink, fact: PrFact): string | undefined {
     return undefined;
 }
 
+/** The reason when a commit came after the label. */
+const NEW_COMMIT = "a new commit came after the label";
+
+/**
+ * Whether GitHub proves a new commit after the label: a head oid now that differs from the one the desk recorded with
+ * the label, or a head commit that GitHub dates after a known label time. A read with no head (a partial answer: GitHub
+ * gave the PR with a null commit node) proves nothing, and neither does a label recorded with no head.
+ */
+function headMovedSince(ready: { at: number; head: string }, fact: PrFact): boolean {
+    return (
+        fact.head !== "" &&
+        ((ready.head !== "" && ready.head !== fact.head) ||
+            (ready.at > 0 && fact.headAt > ready.at))
+    );
+}
+
+/** Who hears of a removal: the agent when the thread has a session and an address and is not archived; else Odrade. */
+const unreadyRoute = (thread: Thread): UnreadyEntry["to"] =>
+    thread.session !== undefined && thread.address !== undefined && thread.run.archived !== true
+        ? "agent"
+        : "odrade";
+
+/** Who removed the label, as the messages say it. */
+const remover = (by: UnreadyEntry["by"]): string =>
+    by === "workflow" ? "the pr-triage workflow" : "the desk";
+
 /** The message to the agent whose PR lost the label. */
-export const unreadyMessage = (ref: string, why: string): string =>
-    `${ref}: the desk removed the label \`${READY_LABEL}\`: ${why}. Fix it, run the checks, push, and add the label again only when the PR is ready (CI green, every blocking review point resolved, nothing pending). Then report.`;
+export const unreadyMessage = (ref: string, why: string, by?: UnreadyEntry["by"]): string =>
+    by === "workflow"
+        ? `${ref}: ${remover(by)} removed the label \`${READY_LABEL}\` on GitHub: ${why}. Run the checks and the review again at the new head, fix what they find, and add the label again only when the PR is ready (CI green, every blocking review point resolved, nothing pending). Then report.`
+        : `${ref}: ${remover(by)} removed the label \`${READY_LABEL}\`: ${why}. Fix it, run the checks, push, and add the label again only when the PR is ready (CI green, every blocking review point resolved, nothing pending). Then report.`;
 
 /** The notice when the thread has no agent session to wake. */
-export const unreadyNotice = (ref: string, id: string, why: string): string =>
-    `${ref} on ${id}: the desk removed the label \`${READY_LABEL}\`: ${why}. The thread has no agent session to wake: it waits on Odrade.`;
+export const unreadyNotice = (
+    ref: string,
+    id: string,
+    why: string,
+    by?: UnreadyEntry["by"],
+): string =>
+    `${ref} on ${id}: ${remover(by)} removed the label \`${READY_LABEL}\`${by === "workflow" ? " on GitHub" : ""}: ${why}. The thread has no agent session to wake: it waits on Odrade.`;
 
 /** Record 1 decided removal and its event, and keep at most 30 entries: the oldest sent ones go first. */
 function recordUnready(
     thread: Thread,
     key: string,
-    entry: { why: string; to: UnreadyEntry["to"] },
+    entry: { why: string; to: UnreadyEntry["to"]; by?: UnreadyEntry["by"] },
     ref: string,
     now: number,
 ): boolean {
     const unready = unreadyOf(thread);
 
-    unready[key] = { at: now, why: entry.why, to: entry.to, removed: false, sent: false };
+    // A removal by the workflow is done on GitHub already: the sweeper sends the wake-up only.
+    unready[key] =
+        entry.by === "workflow"
+            ? { at: now, why: entry.why, to: entry.to, removed: true, sent: false, by: entry.by }
+            : { at: now, why: entry.why, to: entry.to, removed: false, sent: false };
 
     const order = (sent: boolean) =>
         Object.entries(unready)
@@ -5698,7 +5736,9 @@ function recordUnready(
     return addEvent(
         thread,
         `unready:${key}`,
-        `${ref}: ${READY_LABEL} comes off: ${entry.why}`,
+        entry.by === "workflow"
+            ? `${ref}: ${READY_LABEL} came off on GitHub (${remover(entry.by)}): ${entry.why}`
+            : `${ref}: ${READY_LABEL} comes off: ${entry.why}`,
         now,
     );
 }
@@ -5714,10 +5754,7 @@ export function planUnready(thread: Thread, github: GitHubFacts, now: number): n
         return 0;
     }
 
-    const to: UnreadyEntry["to"] =
-        thread.session !== undefined && thread.address !== undefined && thread.run.archived !== true
-            ? "agent"
-            : "odrade";
+    const to = unreadyRoute(thread);
     let events = 0;
 
     for (const ref of Object.keys(thread.prs).sort()) {
@@ -8727,6 +8764,30 @@ export function updatePrs(thread: Thread, github: GitHubFacts, now: number): num
                 known.head = fact.head;
             }
         } else if (link.ready !== undefined) {
+            // The label came off on GitHub, and the desk did not decide it: core's pr-triage workflow removes it when a
+            // commit lands after it (frostyard/core#220). The desk decides here, before the label time goes, from the heads
+            // alone: it reads no comment. A new head since the label wakes the agent once, by the key of the desk's
+            // own removal: a sweep that saw the push first already has the entry, and a replay finds it. A removal with
+            // no new head (a person's choice), a parked or closed thread, and a PR that is not open wake nobody.
+            const ready = link.ready;
+            const key = `unready:${ref}:${String(ready.at)}`;
+
+            if (
+                thread.state === "open" &&
+                state === "OPEN" &&
+                headMovedSince(ready, fact) &&
+                unreadyOf(thread)[key] === undefined &&
+                recordUnready(
+                    thread,
+                    key,
+                    { why: NEW_COMMIT, to: unreadyRoute(thread), by: "workflow" },
+                    ref,
+                    now,
+                )
+            ) {
+                events += 1;
+            }
+
             delete link.ready;
 
             if (
@@ -27735,6 +27796,8 @@ export default function createDesk(host: Host, web: Web) {
         to: UnreadyEntry["to"];
         /** The label is already gone from the PR: send the wake-up only. */
         removed: boolean;
+        /** `workflow`: the label came off on GitHub, not by the desk; the messages say so. */
+        by?: UnreadyEntry["by"];
         /** The supervisor's address for the agent. */
         address?: string;
     };
@@ -27813,16 +27876,26 @@ export default function createDesk(host: Host, web: Web) {
                         supervisor,
                         {
                             to: work.address,
-                            message: unreadyMessage(work.ref, work.why),
+                            message: unreadyMessage(work.ref, work.why, work.by),
                         },
                         `x.desk.unready:${work.key}`,
                     );
                     sent = true;
-                    done = `ready-for-human removed, wake-up sent to the agent`;
+                    done =
+                        work.by === "workflow"
+                            ? "ready-for-human removed on GitHub, wake-up sent to the agent"
+                            : `ready-for-human removed, wake-up sent to the agent`;
                 } else {
-                    host.notice("warning", unreadyNotice(work.ref, work.id, work.why), supervisor);
+                    host.notice(
+                        "warning",
+                        unreadyNotice(work.ref, work.id, work.why, work.by),
+                        supervisor,
+                    );
                     sent = true;
-                    done = "ready-for-human removed, notice sent to Odrade";
+                    done =
+                        work.by === "workflow"
+                            ? "ready-for-human removed on GitHub, notice sent to Odrade"
+                            : "ready-for-human removed, notice sent to Odrade";
                 }
             } catch (error) {
                 failure = (error as Error).message;
@@ -28079,6 +28152,7 @@ export default function createDesk(host: Host, web: Web) {
                                         why: entry.why,
                                         to: entry.to,
                                         removed: entry.removed,
+                                        ...(entry.by === undefined ? {} : { by: entry.by }),
                                         ...(thread.address === undefined
                                             ? {}
                                             : { address: thread.address }),

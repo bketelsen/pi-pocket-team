@@ -8015,6 +8015,184 @@ describe("planUnready", () => {
     });
 });
 
+describe("the label ready-for-human: the workflow removed it", () => {
+    const ref = "frostyard/test#7";
+    const key = `unready:${ref}:1000`;
+    const labeled = (patch: Partial<Thread> = {}): Thread =>
+        thread({
+            prs: {
+                [ref]: { via: "seen", state: "OPEN", head: "h1", ready: { at: 1000, head: "h1" } },
+            },
+            ...patch,
+        });
+    /** The read after core's pr-triage workflow removed the label on a push: a new head, and no label. */
+    const removedOnPush = () => githubOf([prFact({ head: "h2", headAt: 2000 })]);
+
+    test("a push, then the label gone: 1 wake for the agent, already removed, and the label time goes", () => {
+        const one = labeled();
+
+        assert.equal(updatePrs(one, removedOnPush(), 3000) >= 1, true);
+        assert.deepEqual(unreadyOf(one)[key], {
+            at: 3000,
+            why: "a new commit came after the label",
+            to: "agent",
+            removed: true,
+            sent: false,
+            by: "workflow",
+        });
+        assert.equal(one.prs[ref]?.ready, undefined, "the link's label goes after the decision");
+        assert(
+            one.events.some(
+                (event) =>
+                    event.text ===
+                    `${ref}: ready-for-human came off on GitHub (the pr-triage workflow): a new commit came after the label`,
+            ),
+            "the wake is an event",
+        );
+        assert(
+            one.events.some((event) => event.text === `${ref}: label ready-for-human gone`),
+            "the label's removal is still an event",
+        );
+        // The label time is gone: the desk's own rule finds nothing more to remove.
+        assert.equal(planUnready(one, removedOnPush(), 3000), 0);
+
+        // A thread with no session: the same entry goes to Odrade.
+        const quiet = labeled({ session: undefined, address: undefined });
+
+        updatePrs(quiet, removedOnPush(), 3000);
+        assert.equal(unreadyOf(quiet)[key]?.to, "odrade");
+        assert.equal(unreadyOf(quiet)[key]?.by, "workflow");
+    });
+
+    test("the desk's own entry first, then the workflow removes the label: no second wake", () => {
+        const one = labeled();
+        const pushedLabeled = githubOf([
+            prFact({ head: "h2", headAt: 2000, ready: true, readyAt: 1000 }),
+        ]);
+
+        // The sweep sees the push while the label is still on: the desk decides its own removal.
+        updatePrs(one, pushedLabeled, 2500);
+        assert.equal(planUnready(one, pushedLabeled, 2500), 1);
+
+        const decided = unreadyOf(one)[key];
+
+        assert.equal(decided?.by, undefined);
+        assert.equal(decided?.removed, false);
+
+        // The next read: the workflow (or the desk) removed the label. The key is there: no second entry, no event.
+        const events = one.events.length;
+
+        updatePrs(one, removedOnPush(), 3000);
+        assert.deepEqual(unreadyOf(one), { [key]: decided });
+        assert.equal(
+            one.events.filter((event) => event.text.includes("came off on GitHub")).length,
+            0,
+        );
+        assert.equal(
+            one.events.slice(events).filter((event) => event.key.startsWith("unready:")).length,
+            0,
+            "no wake event",
+        );
+        assert.equal(one.prs[ref]?.ready, undefined);
+    });
+
+    test("the label gone with no head change, on a parked thread, or on a closed PR: no wake", () => {
+        // The same head and no newer commit: a person removed the label, and the desk wakes nobody.
+        const same = labeled();
+
+        updatePrs(same, githubOf([prFact({ head: "h1", headAt: 500 })]), 3000);
+        assert.deepEqual(unreadyOf(same), {});
+        assert.equal(same.prs[ref]?.ready, undefined);
+
+        // A read with no head proves no commit.
+        const partial = labeled();
+
+        updatePrs(partial, githubOf([prFact({ head: "", headAt: 0 })]), 3000);
+        assert.deepEqual(unreadyOf(partial), {});
+
+        const parked = labeled({ state: "parked" });
+
+        updatePrs(parked, removedOnPush(), 3000);
+        assert.deepEqual(unreadyOf(parked), {});
+
+        const closedThread = labeled({ state: "closed" });
+
+        updatePrs(closedThread, removedOnPush(), 3000);
+        assert.deepEqual(unreadyOf(closedThread), {});
+
+        const closedPr = labeled();
+
+        updatePrs(
+            closedPr,
+            githubOf([prFact({ head: "h2", headAt: 2000, state: "CLOSED" })]),
+            3000,
+        );
+        assert.deepEqual(unreadyOf(closedPr), {});
+
+        const frozen = labeled();
+
+        updatePrs(
+            frozen,
+            githubOf([prFact({ head: "h2", headAt: 2000 })], { archived: true }),
+            3000,
+        );
+        assert.deepEqual(unreadyOf(frozen), {});
+    });
+
+    test("a replay of the same read, or of the read on the stored link, wakes once", () => {
+        const one = labeled();
+        const before = structuredClone(one);
+
+        updatePrs(one, removedOnPush(), 3000);
+
+        const entry = unreadyOf(one)[key];
+        const events = one.events.length;
+
+        // The same read again: the label time is gone, so nothing is decided.
+        assert.equal(updatePrs(one, removedOnPush(), 3100), 0);
+        assert.deepEqual(unreadyOf(one), { [key]: entry });
+        assert.equal(one.events.length, events);
+
+        // A replayed commit that runs the read again on a link that still has the label time: the key is stored.
+        one.prs[ref] = structuredClone(before.prs[ref]!);
+        updatePrs(one, removedOnPush(), 3200);
+        assert.deepEqual(unreadyOf(one), { [key]: entry });
+        assert.equal(
+            one.events.filter((event) => event.key === `unready:${key}`).length,
+            1,
+            "1 wake event",
+        );
+    });
+
+    test("an entry stored before the field reads as the desk's own; the workflow's messages say who removed it", () => {
+        const one = thread({
+            run: {
+                unready: {
+                    [key]: { at: 1, why: "w", to: "agent", removed: true, sent: true },
+                    "unready:x/y#1:1": {
+                        at: 1,
+                        why: "w",
+                        to: "agent",
+                        removed: true,
+                        sent: true,
+                        by: "person",
+                    },
+                },
+            },
+        });
+
+        assert.deepEqual(Object.keys(unreadyOf(one)), [key], "an unknown remover is left out");
+        assert.equal(
+            unreadyMessage(ref, "a new commit came after the label", "workflow"),
+            "frostyard/test#7: the pr-triage workflow removed the label `ready-for-human` on GitHub: a new commit came after the label. Run the checks and the review again at the new head, fix what they find, and add the label again only when the PR is ready (CI green, every blocking review point resolved, nothing pending). Then report.",
+        );
+        assert.equal(
+            unreadyNotice(ref, "T9", "a new commit came after the label", "workflow"),
+            "frostyard/test#7 on T9: the pr-triage workflow removed the label `ready-for-human` on GitHub: a new commit came after the label. The thread has no agent session to wake: it waits on Odrade.",
+        );
+    });
+});
+
 /** A thread with 1 open PR that GitHub said needs a repair, unless the patch says otherwise. */
 const REPAIR_REF = "frostyard/test#7";
 const repairing = (link: PrLink = {}, patch: Partial<Thread> = {}): Thread =>
@@ -22659,15 +22837,11 @@ describe("the desk in a Pi Pocket", () => {
         },
     });
 
-    test("a labeled PR that gets a new commit loses the label, and its agent hears why once", async () => {
-        const { linked, thread, first, texts } = await withOpenPr("ready-label");
-        const ref = "frostyard/test#7";
-        const log = join(root, "ready-label.log");
-        const labelAt = "2026-10-20T10:00:00Z";
-        const key = `unready:${ref}:${String(Date.parse(labelAt))}`;
-        const why = "a new commit came after the label";
-        const message = unreadyMessage(ref, why);
-
+    /**
+     * A `gh` that keeps its arguments in a log file, and prints the fixture for a GraphQL read: `deletes` gives the label
+     * removals it ran, `restartWithLog` opens the app again at a later clock with that `gh`.
+     */
+    const ghWithLog = (log: string) => {
         const deletes = () => {
             try {
                 return readFileSync(log, "utf8")
@@ -22678,7 +22852,6 @@ describe("the desk in a Pi Pocket", () => {
             }
         };
 
-        // A `gh` that keeps its arguments in a log file, and prints the fixture for a GraphQL read.
         const restartWithLog = async (by: number, github: unknown) => {
             await app.close();
             shift = by;
@@ -22692,6 +22865,19 @@ describe("the desk in a Pi Pocket", () => {
             process.env.PI_POCKET_DESK_CONFIG = configPath;
             app = await openApp(model, dataDir, () => Date.now() + shift);
         };
+
+        return { deletes, restartWithLog };
+    };
+
+    test("a labeled PR that gets a new commit loses the label, and its agent hears why once", async () => {
+        const { linked, thread, first, texts } = await withOpenPr("ready-label");
+        const ref = "frostyard/test#7";
+        const log = join(root, "ready-label.log");
+        const labelAt = "2026-10-20T10:00:00Z";
+        const key = `unready:${ref}:${String(Date.parse(labelAt))}`;
+        const why = "a new commit came after the label";
+        const message = unreadyMessage(ref, why);
+        const { deletes, restartWithLog } = ghWithLog(log);
 
         try {
             rmSync(log, { force: true });
@@ -22778,6 +22964,98 @@ describe("the desk in a Pi Pocket", () => {
             );
             assert.equal(deletes().length, 1, "the label is removed once");
             assert.equal(await texts(linked, message), 1, "the agent hears it once");
+        } finally {
+            await quiet([]);
+            shift = 0;
+        }
+    });
+
+    test("the workflow removes the label after a push: the agent hears it once, and the desk removes nothing", async () => {
+        const { linked, thread, first, texts } = await withOpenPr("ready-workflow");
+        const ref = "frostyard/test#7";
+        const log = join(root, "ready-workflow.log");
+        const labelAt = "2026-10-20T10:00:00Z";
+        const key = `unready:${ref}:${String(Date.parse(labelAt))}`;
+        const why = "a new commit came after the label";
+        const message = unreadyMessage(ref, why, "workflow");
+        const { deletes, restartWithLog } = ghWithLog(log);
+
+        try {
+            rmSync(log, { force: true });
+            await quiet([thread.id]);
+
+            // The label goes on the head the desk has.
+            await restartWithLog(
+                SWEEP_SLEEP_MS + 60_000,
+                readyFixture({
+                    head: "aaa111",
+                    committed: "2026-10-19T10:00:00Z",
+                    labels: [READY_LABEL],
+                    readyAt: labelAt,
+                }),
+            );
+            await sweptAfter(thread, first);
+
+            const labeled = (await deskState())?.threads[thread.id];
+
+            assert.deepEqual(labeled?.prs[ref]?.ready, {
+                at: Date.parse(labelAt),
+                head: "aaa111",
+            });
+
+            // A push, and the workflow removed the label before the next sweep: the desk sees a new head and no label.
+            await restartWithLog(
+                SWEEP_SLEEP_MS * 2 + 120_000,
+                readyFixture({
+                    head: "bbb222",
+                    committed: "2026-10-21T10:00:00Z",
+                    labels: [],
+                    readyAt: labelAt,
+                }),
+            );
+            await sweptAfter(thread, labeled?.run.sweptAt);
+            await until(async () => (await texts(linked, message)) === 1, "the wake-up", 20_000);
+            await until(
+                async () => unreadyOf((await deskState())!.threads[thread.id]!)[key]?.sent === true,
+                "the wake-up marked sent",
+                20_000,
+            );
+
+            const after = (await deskState())?.threads[thread.id];
+
+            assert.deepEqual(deletes(), [], "the desk removes no label");
+            assert.deepEqual(unreadyOf(after!)[key], {
+                at: unreadyOf(after!)[key]?.at,
+                why,
+                to: "agent",
+                removed: true,
+                sent: true,
+                by: "workflow",
+            });
+            assert.equal(after?.prs[ref]?.ready, undefined);
+            assert(
+                after?.events.some(
+                    (event) =>
+                        event.text ===
+                        "ready-for-human removed on GitHub, wake-up sent to the agent",
+                ),
+                "the wake-up is an event",
+            );
+            await until(() => !app.isBusy(linked), "the wake-up's turn", 20_000);
+
+            // The next sweep reads the same: nothing more.
+            await quiet([thread.id]);
+
+            const sent = (await deskState())?.threads[thread.id];
+
+            await restartWithLog(
+                SWEEP_SLEEP_MS * 3 + 180_000,
+                readyFixture({ head: "bbb222", committed: "2026-10-21T10:00:00Z", labels: [] }),
+            );
+            await sweptAfter(thread, sent?.run.sweptAt);
+            assert.deepEqual(deletes(), []);
+            assert.equal(await texts(linked, message), 1, "the agent hears it once");
+            assert.equal(await texts(linked, "the desk removed the label"), 0);
         } finally {
             await quiet([]);
             shift = 0;
