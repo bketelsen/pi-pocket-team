@@ -67,6 +67,7 @@ import {
     repairEpoch,
     reopenable,
     reopenReason,
+    userEntryBefore,
     wakeParked,
     reparkRepairWoken,
     closeCheck,
@@ -2627,6 +2628,72 @@ describe("reopening", () => {
         assert.equal(reopenReason(done, { busy: false, userBefore: 5 }, now), undefined);
     });
 
+    test("an entry from before a pass's close is no new work, also when no sweep scanned it", () => {
+        const now = 10 * DAY;
+        // The sweep last saw entry 5; entry 9 (a message, then the agent's report) came before the pass.
+        const passed = thread({
+            state: "closed",
+            closed: { at: now - DAY, why: "done", by: "desk", userEntry: 9 },
+            run: { lastUserEntry: 5 },
+        });
+
+        const before = userEntryBefore(passed);
+
+        assert.equal(before, 9, "the close's own entry is newer than the sweep's");
+
+        // The next sweep scans entry 9 for the first time: it is no reason to reopen. The sweep's old mark alone would be.
+        passed.run.lastUserEntry = 9;
+        passed.run.otherUserEntry = 9;
+        assert.equal(reopenReason(passed, { busy: false, userBefore: before }, now), undefined);
+        assert.equal(
+            reopenReason(passed, { busy: false, userBefore: 5 }, now),
+            "new work in its session",
+        );
+
+        // An entry after the close is new work.
+        passed.run.lastUserEntry = 10;
+        assert.equal(
+            reopenReason(passed, { busy: false, userBefore: 9 }, now),
+            "new work in its session",
+        );
+
+        // The sweep's own mark wins when it is newer, and each one alone counts.
+        assert.equal(
+            userEntryBefore(
+                thread({
+                    state: "closed",
+                    closed: { at: 1, why: "done", by: "desk", userEntry: 3 },
+                    run: { lastUserEntry: 7 },
+                }),
+            ),
+            7,
+        );
+        assert.equal(
+            userEntryBefore(
+                thread({
+                    state: "closed",
+                    closed: { at: 1, why: "done", by: "desk", userEntry: 3 },
+                    run: { lastUserEntry: null },
+                }),
+            ),
+            3,
+        );
+        assert.equal(userEntryBefore(thread({ run: { lastUserEntry: 7 } })), 7);
+        assert.equal(userEntryBefore(thread({ run: { lastUserEntry: null } })), undefined);
+
+        // Only a closed thread's mark counts: a reopen deletes `closed`, and this guards a stored leftover.
+        assert.equal(
+            userEntryBefore(
+                thread({
+                    state: "open",
+                    closed: { at: 1, why: "done", by: "desk", userEntry: 9 },
+                    run: { lastUserEntry: 7 },
+                }),
+            ),
+            7,
+        );
+    });
+
     test("a PR seen in the closed thread reopens it", () => {
         const state = deskOf();
 
@@ -4623,10 +4690,29 @@ describe("the watch's rules", () => {
             key: "f-1",
             at: on("2026-11-01"),
             closedBy: "desk",
+            userEntry: 41,
         });
         assert.equal(failing.state, "open");
-        assert.equal(failing.closed, undefined);
+        assert.equal(failing.closed, undefined, "a fail stores no user entry");
         assert.equal(isCounted(failing, on("2026-11-01")), true);
+
+        // A pass keeps the session's newest user entry on its close.
+        recordResult(failing, {
+            pass: true,
+            text: "the blobs are gone",
+            by: "duncan",
+            key: "p-1",
+            at: on("2026-11-02"),
+            closedBy: "brian",
+            userEntry: 42,
+        });
+        assert.deepEqual(failing.closed, {
+            at: on("2026-11-02"),
+            why: "done",
+            by: "brian",
+            outcome: "verified",
+            userEntry: 42,
+        });
     });
 
     test("setWatch on a closed thread: a bad request leaves it closed, and only a done one of the last 7 days opens", () => {
@@ -20992,6 +21078,59 @@ describe("the desk in a Pi Pocket", () => {
             // A second result on a passed watch is refused.
             await say(app, source, "desk result fail test");
             assert.match((await modelTexts(app, source)).join("\n"), /passed already/);
+        });
+
+        test("a pass right after a report stays closed: the next sweep takes the unscanned entries for old work", async () => {
+            await stopSweepers();
+            const { source, linked, thread } = await delegated("watch-pass-race");
+
+            await until(
+                async () =>
+                    typeof (await deskState())?.threads[thread.id]?.run.sweptAt === "number",
+                "the first sweep",
+                20_000,
+            );
+            await until(sweepersAsleep, "the sweepers to sleep", 20_000);
+
+            watchThreadId = thread.id;
+            resultThreadId = thread.id;
+            await say(app, source, "desk watch test");
+
+            const scanned = (await deskState())?.threads[thread.id]?.run.lastUserEntry;
+
+            // A message in the agent's session, and the agent's report, between 2 sweeps.
+            await say(app, linked, "report to supervisor test");
+            await until(() => !app.isBusy(linked), "the report's turn", 20_000);
+
+            const reported = (await deskState())?.threads[thread.id];
+
+            assert.equal(reported?.run.lastUserEntry, scanned, "no sweep scanned the new message");
+            assert.equal(typeof reported?.run.reportedAt, "number", "the report is in");
+
+            // The supervisor's pass closes it, and keeps the session's newest user entry.
+            await say(app, source, "desk result test");
+
+            const passed = (await deskState())?.threads[thread.id];
+
+            assert.equal(passed?.state, "closed");
+            assert.equal(typeof passed?.closed?.userEntry, "number");
+            assert(
+                Number(passed?.closed?.userEntry) > Number(scanned),
+                "the close knows the message the sweep did not scan",
+            );
+
+            // The next sweep scans the message for the first time: it came before the close, so it is no new work.
+            await say(app, source, "desk sync test");
+
+            const after = (await deskState())?.threads[thread.id];
+
+            assert.equal(after?.state, "closed", "the pass holds");
+            assert.equal(after?.run.lastUserEntry, passed?.closed?.userEntry);
+            assert.equal(
+                after?.events.some((event) => event.key.startsWith("reopened:")),
+                false,
+                after?.events.map((event) => event.text).join("; "),
+            );
         });
 
         test("a replayed desk watch keeps the date it first resolved", async () => {
