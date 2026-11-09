@@ -424,6 +424,12 @@ export type Thread = {
         by: "sweep" | "brian" | "desk";
         /** How it ended, when `why` is "done"; an older record has none. Stored data: never rename a field. */
         outcome?: CloseOutcome;
+        /**
+         * The session's newest `pi.user` entry when a watch's pass closed it, read in the closing commit; absent for
+         * another close, and on an older record. An entry at or before it came before the close: the reopen rule
+         * (`userEntryBefore`) never takes it for new work, also when no sweep scanned it before the close.
+         */
+        userEntry?: number;
     };
     /** Key "owner/name#n". */
     prs: Record<string, PrLink>;
@@ -2891,6 +2897,11 @@ export type ResultRequest = {
     at: number;
     /** Who closed the thread on a pass: the tool is the desk, the page is Brian. */
     closedBy: "desk" | "brian";
+    /**
+     * The session's newest `pi.user` entry, read in the same commit (`newestUserEntry`). A pass stores it as
+     * `closed.userEntry`.
+     */
+    userEntry?: number;
 };
 
 /**
@@ -2964,6 +2975,7 @@ export function recordResult(
             why: "done",
             by: request.closedBy,
             outcome: closeOutcome(thread),
+            ...(request.userEntry === undefined ? {} : { userEntry: request.userEntry }),
         };
         thread.run.next = "none";
         addEvent(
@@ -7068,6 +7080,23 @@ export function reopenable(thread: Thread, now: number): boolean {
         thread.closed?.why === "done" &&
         now - thread.closed.at <= REOPEN_MS
     );
+}
+
+/**
+ * The newest user entry of a closed thread's session that came before its close, as far as the desk knows: the sweep's
+ * `run.lastUserEntry`, or the close's own `closed.userEntry` when it is newer. A pass can close a thread before any
+ * sweep scanned its session's newest entries (2026-11-06: a message, then the agent's report, then the pass, all
+ * between 2 sweeps); those entries are not new work.
+ */
+export function userEntryBefore(thread: Thread): number | undefined {
+    const scanned = numberOr(thread.run.lastUserEntry);
+    const atClose = thread.state === "closed" ? numberOr(thread.closed?.userEntry) : undefined;
+
+    if (scanned === undefined || atClose === undefined) {
+        return scanned ?? atClose;
+    }
+
+    return Math.max(scanned, atClose);
 }
 
 /** Why a closed done thread reopens from its session: busy, or a person wrote in it again. */
@@ -26897,8 +26926,9 @@ export default function createDesk(host: Host, web: Web) {
         const planTaskOnly = planTaskClosedThreads(state, supervisor).filter(
             (thread) => !closedDoneIds.has(thread.id),
         );
+        // An entry from before the close is no new work, also when this sweep is the first to scan it.
         const usersBefore = new Map(
-            closedDone.map((thread) => [thread.id, thread.run.lastUserEntry]),
+            closedDone.map((thread) => [thread.id, userEntryBefore(thread)]),
         );
         // The event keys of each thread before this sweep: a parked thread wakes on a key that is new, never on the list's
         // length, which stays at 50 when a new event pushes the oldest out.
@@ -30722,6 +30752,11 @@ export default function createDesk(host: Host, web: Web) {
                     return;
                 }
 
+                // A pass keeps the session's newest user entry: an entry from before the close is no new work.
+                const userEntry =
+                    pass && thread.session !== undefined
+                        ? await newestUserEntry(tx, thread.session as ConversationId)
+                        : undefined;
                 const recorded = recordResult(
                     thread,
                     {
@@ -30731,6 +30766,7 @@ export default function createDesk(host: Host, web: Web) {
                         key: `page:result:${String(now)}`,
                         at: now,
                         closedBy: "brian",
+                        ...(userEntry === undefined ? {} : { userEntry }),
                     },
                     state,
                 );
@@ -33483,6 +33519,11 @@ export default function createDesk(host: Host, web: Web) {
 
                     const flat = flatLine(args.text ?? "");
                     const clipped = flat.length > MAX_LINE;
+                    // A pass keeps the session's newest user entry: an entry from before the close is no new work.
+                    const userEntry =
+                        args.pass === true && thread.session !== undefined
+                            ? await newestUserEntry(tx, thread.session as ConversationId)
+                            : undefined;
                     const recorded = recordResult(
                         thread,
                         {
@@ -33492,6 +33533,7 @@ export default function createDesk(host: Host, web: Web) {
                             key,
                             at,
                             closedBy: "desk",
+                            ...(userEntry === undefined ? {} : { userEntry }),
                         },
                         state,
                     );
