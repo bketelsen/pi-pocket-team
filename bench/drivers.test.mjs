@@ -166,8 +166,9 @@ test("batch: a child's disk-low exit (4) stops every new launch; the pairs left 
             "pilot",
             "--tasks",
             "a,b",
+            // The unpriced pair (a, UNPRICED) waits after the first pair.
             "--models",
-            PRICED,
+            `${PRICED},${UNPRICED}`,
             "--parallel",
             "1",
             "--run-id",
@@ -186,10 +187,13 @@ test("batch: a child's disk-low exit (4) stops every new launch; the pairs left 
         1,
         "only the first child ran: " + result.stderr,
     );
-    assert.match(result.stdout, /0 of 2 pair\(s\) recorded/);
+    assert.match(result.stdout, /0 of 4 pair\(s\) recorded/);
     assert.match(
         result.stdout,
-        new RegExp(`^Not run \\(disk low\\): a ${PRICED}; b ${PRICED}$`, "m"),
+        new RegExp(
+            `^Not run \\(disk low\\): a ${PRICED}; a ${UNPRICED}; b ${PRICED}; b ${UNPRICED}$`,
+            "m",
+        ),
     );
 });
 

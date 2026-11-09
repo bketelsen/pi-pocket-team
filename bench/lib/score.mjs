@@ -149,19 +149,20 @@ export function cacheDirs(result) {
 }
 
 /**
- * Remove the cache folder of each try of a scored attempt (`--drop-caches`), and save `cachesDropped: true`. A failed
- * removal is logged with its path (`cleanupTree`) and changes no exit code; `cachesDropped` is set anyway, so no later
- * run trusts a cache that is partly gone, and a later run with `--drop-caches` tries the removal again. `work/`,
- * `session/`, `events.jsonl` and `stderr.log` stay.
+ * Save `cachesDropped: true`, then remove the cache folder of each try of a scored attempt (`--drop-caches`). The save
+ * comes first: a crash during the removal leaves the flag, so no later `--force` scores on a cache that is partly
+ * gone. A failed save removes nothing and throws. A failed removal is logged with its path (`cleanupTree`) and changes
+ * no exit code; a later run with `--drop-caches` tries the removal again. `work/`, `session/`, `events.jsonl` and
+ * `stderr.log` stay.
  */
 export async function dropCaches(file, result, log) {
-    for (const dir of cacheDirs(result)) {
-        await cleanupTree(dir, log);
+    if (result.cachesDropped !== true) {
+        await writeJsonAtomic(file, { ...result, cachesDropped: true });
+        result.cachesDropped = true;
     }
 
-    if (result.cachesDropped !== true) {
-        result.cachesDropped = true;
-        await writeJsonAtomic(file, result);
+    for (const dir of cacheDirs(result)) {
+        await cleanupTree(dir, log);
     }
 
     log(`${basename(file, ".json")}: the try caches are dropped`);
@@ -946,7 +947,8 @@ export async function scoreMain(argv, env = process.env, deps = {}) {
         if (fullyScored(result, found.task) && !values.force) {
             console.log(`scored already: ${file} (--force scores it again)`);
 
-            if (values["drop-caches"]) {
+            // As after a scoring run: a result with `scoreError` keeps its caches (a later run needs them).
+            if (values["drop-caches"] && result.scoreError === undefined) {
                 await dropCaches(file, result, log);
             }
 

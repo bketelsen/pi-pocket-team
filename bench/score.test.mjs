@@ -32,7 +32,7 @@ import {
     runJudge,
 } from "./lib/judge.mjs";
 import { authPreflight, authPreflightArgs } from "./lib/runner.mjs";
-import { hostGit, s0Of, scoreMain, toolCalls } from "./lib/score.mjs";
+import { dropCaches, hostGit, s0Of, scoreMain, toolCalls } from "./lib/score.mjs";
 import { FAKE_BWRAP, bwrapWorks, git, makeFixture } from "./fixtures/helpers.mjs";
 import { makeExtraRepo, makeNodeRepo, makeSubmoduleRepo } from "./fixtures/harvest.mjs";
 
@@ -1240,4 +1240,51 @@ test("--drop-caches with --checks-only is a usage error", async () => {
     assert.equal(code, 1);
     assert.deepEqual(readFileSync(paths.file), before);
     assert.ok(existsSync(join(paths.work, "..", "cache")));
+});
+
+test("dropCaches saves cachesDropped before the first removal: a failed save removes nothing", async () => {
+    const task = taskOf("drop-caches-save-fails", { default: [GOOD(4)] });
+    const paths = await attempt(task, { change: FIX, events2: [] });
+    const caches = ["try-1", "try-2"].map((name) => join(paths.work, "..", "..", name, "cache"));
+    const result = JSON.parse(readFileSync(paths.file, "utf8"));
+    const folder = join(paths.root, "results");
+
+    mkdirSync(caches[1], { recursive: true });
+    // A read-only folder: the atomic write of the result file cannot make its temporary file.
+    chmodSync(folder, 0o555);
+
+    try {
+        await assert.rejects(dropCaches(paths.file, result, () => {}));
+    } finally {
+        chmodSync(folder, 0o755);
+    }
+
+    for (const cache of caches) {
+        assert.ok(existsSync(cache), `${cache} stays`);
+    }
+
+    assert.equal(JSON.parse(readFileSync(paths.file, "utf8")).cachesDropped, undefined);
+});
+
+test("--drop-caches on a scored result that has scoreError: the caches stay, and the file does not change", async () => {
+    const task = taskOf("drop-caches-score-error", { default: [GOOD(4)] });
+    const paths = await attempt(task, {
+        change: FIX,
+        result: {
+            s0: { protocol: false, leakTry: false },
+            s1: true,
+            s2: true,
+            grades: [4, 3],
+            judges: [],
+            judgePending: false,
+            diffCut: false,
+            scoreError: "an earlier error",
+        },
+    });
+    const before = readFileSync(paths.file);
+    const { code } = await score(paths, ["--drop-caches"]);
+
+    assert.equal(code, 0);
+    assert.deepEqual(readFileSync(paths.file), before);
+    assert.ok(existsSync(join(paths.work, "..", "cache")), "the cache stays");
 });
