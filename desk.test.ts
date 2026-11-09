@@ -16514,19 +16514,21 @@ describe("the desk in a Pi Pocket", () => {
             30_000,
         );
 
-        const texts = (await modelTexts(app, source)).join("\n");
-
         if (runEndAnswersStayOn()) {
             // A Pocket that sends run-end answers and has no switch to turn them off (upstream 0.28.0): the linked
             // session's final answer brings the full report to the chat by itself. The desk files it all the same.
-            assert.match(
-                texts,
-                /finished its run\.[^\n]*NIGHT-REPORT-END/,
+            // The run-end answer comes by its own path, so the short line above proves nothing about it: wait for it.
+            await until(
+                async () =>
+                    /finished its run\.[^\n]*NIGHT-REPORT-END/.test(
+                        (await modelTexts(app, source)).join("\n"),
+                    ),
                 "the run-end answer carries the full report",
+                30_000,
             );
         } else {
             assert.doesNotMatch(
-                texts,
+                (await modelTexts(app, source)).join("\n"),
                 /NIGHT-REPORT-END/,
                 "the full report does not go to the chat",
             );
