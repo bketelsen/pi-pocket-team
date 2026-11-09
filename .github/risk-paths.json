@@ -1,72 +1,90 @@
 {
-    "schema_version": 1,
+    "schema_version": 2,
+    "default_level": "L3",
     "paths": [
         {
             "glob": ".github/risk-paths.json",
+            "level": "L2",
             "why": "governance: the high-risk path list"
         },
         {
             "glob": ".github/workflows/**",
-            "why": "governance: CI, the risk-paths caller and token permissions"
+            "level": "L2",
+            "why": "governance: CI, the PR triage caller and token permissions"
         },
         {
             "glob": "Makefile",
+            "level": "L2",
             "why": "governance: the verify gate"
         },
         {
             "glob": "scripts/check-template.mjs",
+            "level": "L2",
             "why": "governance: the template verification gate"
         },
         {
             "glob": "scripts/check-corrections.mjs",
+            "level": "L2",
             "why": "governance: the corrections validation gate"
         },
         {
             "glob": "scripts/lib/**",
+            "level": "L2",
             "why": "governance: the vendored risk-path validator and matcher"
         },
         {
             "glob": "mise.toml",
+            "level": "L2",
             "why": "governance: the Node pin of the gate"
         },
         {
             "glob": "mise.lock",
+            "level": "L2",
             "why": "governance: the checksums of the Node pin"
         },
         {
             "glob": "package.json",
+            "level": "L2",
             "why": "governance: the lint, test and type-check scripts that the gate runs"
         },
         {
             "glob": ".prettierignore",
+            "level": "L2",
             "why": "governance: the files that the lint gate skips"
         },
         {
             "glob": "eslint.config.js",
+            "level": "L2",
             "why": "governance: the lint rules and the files that the lint gate skips"
         },
         {
             "glob": "install.mjs",
+            "level": "L1",
             "why": "publication: writes the drop-ins into the running server's extensions folder, and each write reloads a module live"
         },
         {
             "glob": "terminal.ts",
+            "level": "L1",
             "why": "auth: the owner-only routes to an interactive login shell as the server's user"
         },
         {
             "glob": "desk.ts",
+            "level": "L1",
             "why": "auth: the owner-only Desk routes, and the desk file route that must keep each read inside its root"
         },
         {
             "glob": "model-router.ts",
+            "level": "L1",
             "why": "secrets and credentials: reads the TypeSafe API key setting, sends it as a bearer token, and redacts it from errors"
         },
         {
             "glob": "night-shift.ts",
+            "level": "L1",
             "why": "auth: only the owner may set a night shift's check command, which runs with the owner's rights and no Lancet Guard"
         },
         {
             "glob": "github-hooks.ts",
+            "level": "L1",
             "why": "auth: the webhook listener on a LAN port, HMAC verification, and the webhook secret file"
         }
     ]

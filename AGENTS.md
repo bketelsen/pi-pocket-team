@@ -29,11 +29,11 @@ Repeatable procedures live in [.agents/skills/](.agents/skills/) (start from `.a
 
 **Blocker to guard.** When a review (agent cross-review, owner review, or a human) finds a blocking point, the PR that fixes it also adds a guard: a targeted test that fails without the fix (preferred), or an `AGENTS.md` rule when no test can catch it. The same PR appends 1 line to `.memory/corrections.jsonl` (`evidence`: the PR and the review; `promoted_to`: the test or the rule). See `.memory/README.md`.
 
-**Risk paths.** `.github/risk-paths.json` lists the high-risk paths; a PR that touches one gets `risk:high` from `.github/workflows/risk-paths.yml` and declares tier 3. Add a path when you add a file of that kind (signing, auth, publication, secrets, destructive operations, CI).
+**Risk paths.** `.github/risk-paths.json` lists the high-risk paths. The list is version 2: each glob carries a level `L1` to `L4`, and `default_level` is `L3`. The caller `.github/workflows/risk-paths.yml` runs core's `pr-triage.yml`, which adds 1 `level:L1` to `level:L4` label (when those labels exist) and `risk:high` at L1 and L2, and removes `ready-for-human` when the head moves after the label or when CI was not green when the label came (frostyard/core ADR-0077, ADR-0078). A `risk:high` PR still declares tier 3. Add a path when you add a file of that kind (signing, auth, publication, secrets, destructive operations, CI).
 
 **Vendored files.** `scripts/lib/risk-paths.mjs` and `scripts/check-corrections.mjs` are copies from frostyard/core; never edit them by hand (`make verify` checks their hashes). `scripts/check-template.mjs` and `test/check-template.test.mjs` are copies from bketelsen/agentic-template. Prettier and ESLint skip these copies (`.prettierignore`, `eslint.config.js`).
 
-**Labels.** Issues are in GitHub Issues. The labels the team uses: `ready-for-human`, `risk:high`, `sweep`, `agent-queue`, `agent-urgent` and `needs-plan`.
+**Labels.** Issues are in GitHub Issues. The labels the team uses: `ready-for-human`, `risk:high`, `level:L1`, `level:L2`, `level:L3`, `level:L4`, `sweep`, `agent-queue`, `agent-urgent` and `needs-plan`.
 
 ## Releases and dependencies
 
