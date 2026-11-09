@@ -278,6 +278,23 @@ import createTeam, { Identity, taskTitle } from "./team.ts";
 import { createHandler } from "./_pocket/src/server/http.ts";
 import type { Host } from "./_pocket.d.ts";
 
+/**
+ * Whether the linked Pi Pocket sends run-end answers and has no switch to turn them off (`linkedSessions.reports`,
+ * since 0.28.0-bk.1): upstream 0.28.0 is such a release. There, a lead gets each linked session's final answer, and
+ * the desk can only warn. Read from the checkout: its version, and its types.
+ */
+function runEndAnswersStayOn(): boolean {
+    const pocket = join(import.meta.dirname, "_pocket");
+    const version = (
+        JSON.parse(readFileSync(join(pocket, "package.json"), "utf8")) as { version?: string }
+    ).version;
+    const hasSwitch = /^\s*reports\(/m.test(
+        readFileSync(join(pocket, "types", "pocket.d.ts"), "utf8"),
+    );
+
+    return sendsRunEndAnswers(version) && !hasSwitch;
+}
+
 // ─── The rules ───────────────────────────────────────────────────────────────
 
 test("the scripted model reads each user message of the turn, without run-end answers", () => {
@@ -16497,9 +16514,26 @@ describe("the desk in a Pi Pocket", () => {
             30_000,
         );
 
-        const texts = (await modelTexts(app, source)).join("\n");
+        if (runEndAnswersStayOn()) {
+            // A Pocket that sends run-end answers and has no switch to turn them off (upstream 0.28.0): the linked
+            // session's final answer brings the full report to the chat by itself. The desk files it all the same.
+            // The run-end answer comes by its own path, so the short line above proves nothing about it: wait for it.
+            await until(
+                async () =>
+                    /finished its run\.[^\n]*NIGHT-REPORT-END/.test(
+                        (await modelTexts(app, source)).join("\n"),
+                    ),
+                "the run-end answer carries the full report",
+                30_000,
+            );
+        } else {
+            assert.doesNotMatch(
+                (await modelTexts(app, source)).join("\n"),
+                /NIGHT-REPORT-END/,
+                "the full report does not go to the chat",
+            );
+        }
 
-        assert.doesNotMatch(texts, /NIGHT-REPORT-END/, "the full report does not go to the chat");
         assert.equal(typeof (await deskState())?.threads[thread.id]?.run.reportedAt, "number");
 
         await say(app, source, `desk read ${thread.id} test`);
