@@ -9,7 +9,7 @@ Files: `desk.ts` and `desk-web/`. The tools are `desk`, `team_delegate` and `tea
 **Desk** is the owner's inbox, phone first. Its sections:
 
 - **Needs you:** each ask with an **Answered** button and an optional field for the words, and the PRs ready to merge. An ask's text shows as Markdown: lists, bold, `https:` links, and code. A long command (41 characters or more in backticks, also in bold) gets a box of its own with a **Copy** button; code in a link's text stays in the line. A tap on `artifact:<id>` opens the supervisor's session, and a tap on a desk path such as `reports/…/x.md` opens that file, read only.
-- **Ready to merge:** each PR with the label `ready-for-human`: its ref, title, head, thread, agents and CI state. Brian merges them there; Odrade files no ask for a merge.
+- **Ready to merge:** each PR with the label `ready-for-human`: its ref, level, title, head, thread, agents and CI state. The level comes from the `level:L1` to `level:L4` labels, and is `L1/L2` when the PR has `risk:high` and no level label. The order is L4, L3, L2, L1/L2, L1, then no level; inside a level, the oldest label first, then by ref (see [ADR-0078](https://github.com/frostyard/core/blob/main/docs/adr/0078-sort-pull-requests-by-levels-l1-to-l4.md)). A cut label list keeps the last level. Brian merges them there; Odrade files no ask for a merge.
 - **Found, Stale, Watching, Working, Waiting on review, Parked:** attach or drop, keep, park, wake, and a dated check with Pass and Fail.
 - **Other PRs** and **Closed in the last 7 days**, both collapsed.
 

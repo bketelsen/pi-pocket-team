@@ -2700,6 +2700,7 @@ export default function setup(pocket) {
                                               pr.ref,
                                               pr.state,
                                               pr.ready ? "ready-for-human" : "",
+                                              pr.level,
                                               pr.next,
                                               pr.via === "window" ? "guessed" : "",
                                           ]
@@ -2714,7 +2715,7 @@ export default function setup(pocket) {
                 ${actions}
             </li>`;
 
-        /** One PR that Brian can merge now: its link, its head, the thread it belongs to, and its CI state. */
+        /** One PR that Brian can merge now: its link, its level, its head, the thread it belongs to, and its CI state. */
         const readyRow = (pr) =>
             html`<li class="desk-row">
                 <span class="desk-line">
@@ -2724,6 +2725,13 @@ export default function setup(pocket) {
                                   >${pr.ref}</a
                               >`
                             : html`<span class="desk-title">${pr.ref}</span>`
+                    }
+                    ${
+                        pr.level
+                            ? html`<span class=${`desk-level desk-level-${String(pr.level).replace("/", "")}`}
+                                  >${pr.level}</span
+                              >`
+                            : null
                     }
                     ${pr.title ? html`<span class="desk-title">${pr.title}</span>` : null}
                     ${pr.head ? html`<code class="desk-pr-head">${pr.head}</code>` : null}
@@ -3454,7 +3462,7 @@ export default function setup(pocket) {
                 "Ready to merge",
                 ready,
                 readyRow,
-                "PRs with the label ready-for-human. A PR leaves the list when it merges, closes, or loses the label.",
+                "PRs with the label ready-for-human, by level: L4 first, L1 last, then no level. A PR leaves the list when it merges, closes, or loses the label.",
             )}
             ${section(
                 "Found",

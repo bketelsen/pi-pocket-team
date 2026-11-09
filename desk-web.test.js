@@ -792,6 +792,44 @@ test("Ready to merge sits after Needs you, with the link, the head, the thread, 
     assert.match(out, /2 ready to merge/);
 });
 
+test("a ready row shows its level, and a row with no level shows no level mark", async () => {
+    const out = await render({
+        ...viewWith(null),
+        ready: [
+            {
+                ref: "frostyard/test#12",
+                title: "A risky fix",
+                thread: "T1",
+                agents: ["duncan"],
+                level: "L1/L2",
+                at: NOW,
+            },
+            {
+                ref: "frostyard/test#13",
+                title: "No level yet",
+                thread: "T2",
+                agents: ["irulan"],
+                at: NOW,
+            },
+        ],
+    });
+
+    const start = out.indexOf("<h2>Ready to merge");
+    const part = out.slice(start, out.indexOf("</section>", start));
+
+    assert.match(
+        part,
+        /class="?desk-level desk-level-L1L2"?\s*>L1\/L2</,
+        "the level shows beside the ref",
+    );
+
+    const rows = part.split('<li class="desk-row">').slice(1);
+
+    assert.equal(rows.length, 2);
+    assert.match(rows[0], /desk-level-L1L2/);
+    assert.doesNotMatch(rows[1], /desk-level/, "a row with no level shows no level mark");
+});
+
 test("no PR is ready: no section and no count", async () => {
     const out = await render(viewWith(null));
 

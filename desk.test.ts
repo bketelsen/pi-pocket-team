@@ -199,6 +199,8 @@ import {
     unreadyNotice,
     READY_LABEL,
     type PrLink,
+    type PrLevel,
+    prLevelOf,
     type GitFacts,
     type GitHubFacts,
     type PrFact,
@@ -9268,6 +9270,89 @@ describe("attribute", () => {
     });
 });
 
+describe("the PR level from its labels", () => {
+    const ref = "frostyard/test#7";
+
+    /** A thread with the PR linked, with these stored facts. */
+    const linked = (patch: Partial<PrLink> = {}): Thread =>
+        thread({ prs: { [ref]: { via: "seen", state: "OPEN", ...patch } } });
+
+    test("the strictest level label wins, whatever its place in the list", () => {
+        const one = linked();
+
+        updatePrs(one, githubOf([prFact({ labels: ["level:L3", "level:L1"] })]), 1000);
+
+        assert.equal(one.prs[ref]?.level, "L1");
+
+        // The names compare without case, as GitHub gives them.
+        const upper = linked();
+
+        updatePrs(upper, githubOf([prFact({ labels: ["LEVEL:l2"] })]), 1000);
+
+        assert.equal(upper.prs[ref]?.level, "L2");
+    });
+
+    test("risk:high alone is L1/L2, and a level label beside it wins", () => {
+        const alone = linked();
+
+        updatePrs(alone, githubOf([prFact({ labels: ["risk:high"] })]), 1000);
+
+        assert.equal(alone.prs[ref]?.level, "L1/L2");
+
+        const both = linked();
+
+        updatePrs(both, githubOf([prFact({ labels: ["risk:high", "level:L3"] })]), 1000);
+
+        assert.equal(both.prs[ref]?.level, "L3");
+    });
+
+    test("a cut label list keeps the last level; a full read with no level label deletes it", () => {
+        const one = linked({ level: "L2" });
+
+        updatePrs(one, githubOf([prFact({ labels: ["dependencies"], labelsCut: true })]), 1000);
+
+        assert.equal(one.prs[ref]?.level, "L2", "a cut list knows nothing of a missing level");
+
+        updatePrs(one, githubOf([prFact({ labels: ["dependencies"] })]), 2000);
+
+        assert.equal("level" in one.prs[ref]!, false, "a full read with no level label deletes it");
+    });
+
+    test("a link from before the field takes the level of the first read that has labels", () => {
+        const one = linked();
+
+        updatePrs(one, githubOf([prFact()]), 1000);
+
+        assert.equal("level" in one.prs[ref]!, false, "a read with no labels gives no level");
+
+        updatePrs(one, githubOf([prFact({ labels: ["level:L4"] })]), 2000);
+
+        assert.equal(one.prs[ref]?.level, "L4", "the first read with labels fills it in");
+
+        updatePrs(one, githubOf([prFact()]), 3000);
+
+        assert.equal(one.prs[ref]?.level, "L4", "a read with no labels keeps it");
+    });
+
+    test("threadsView carries the level on the thread's PR", () => {
+        const state = deskOf();
+        const one = placed(state, 100);
+
+        one.prs[ref] = { via: "seen", state: "OPEN", level: "L3", readAt: 900 };
+
+        assert.equal(threadsView(state, 100 * DAY).threads[0]?.prs[0]?.level, "L3");
+    });
+
+    test("the level of a read's labels: a new link takes it, and a cut list gives none", () => {
+        assert.equal(prLevelOf(["level:L3"], undefined, undefined), "L3");
+        assert.equal(prLevelOf(["risk:high"], undefined, undefined), "L1/L2");
+        assert.equal(prLevelOf(["dependencies"], undefined, undefined), undefined);
+        assert.equal(prLevelOf(undefined, undefined, undefined), undefined, "no labels read");
+        assert.equal(prLevelOf(["level:L3"], true, undefined), undefined, "a cut list gives none");
+        assert.equal(prLevelOf(undefined, true, "L2"), "L2", "a cut list keeps the known level");
+    });
+});
+
 describe("readyPrs", () => {
     const now = 100 * DAY;
 
@@ -9377,6 +9462,73 @@ describe("readyPrs", () => {
             readyPrs(state, now).map((pr) => pr.ref),
             ["frostyard/test#2", "frostyard/test#1", "frostyard/test#9"],
         );
+    });
+
+    test("by level: L4, L3, L2, L1/L2, L1, then no level; inside a level the oldest label first", () => {
+        const state = deskOf();
+        const row = (level: PrLevel | undefined, readyAt: number): PrLink =>
+            readyLink({
+                ...(level === undefined ? {} : { level }),
+                ready: { at: readyAt, head: "a" },
+            });
+
+        withPr(state, 100, {}, row("L1", 100), "frostyard/test#1");
+        withPr(state, 200, {}, row("L1/L2", 100), "frostyard/test#2");
+        withPr(state, 300, {}, row("L2", 100), "frostyard/test#3");
+        withPr(state, 400, {}, row("L3", 200), "frostyard/test#5");
+        withPr(state, 500, {}, row("L3", 100), "frostyard/test#9");
+        withPr(state, 600, {}, row("L4", 900), "frostyard/test#6");
+        withPr(state, 700, {}, row(undefined, 100), "frostyard/test#8");
+        withPr(state, 800, {}, row(undefined, 100), "frostyard/test#7");
+
+        assert.deepEqual(
+            readyPrs(state, now).map((pr) => pr.ref),
+            [
+                "frostyard/test#6",
+                "frostyard/test#9",
+                "frostyard/test#5",
+                "frostyard/test#3",
+                "frostyard/test#2",
+                "frostyard/test#1",
+                "frostyard/test#7",
+                "frostyard/test#8",
+            ],
+        );
+    });
+
+    test("a link stored before the level field: no level key, and it sorts after the levelled ones", () => {
+        const state = deskOf();
+        const old = withPr(
+            state,
+            100,
+            {},
+            readyLink({ ready: { at: 100, head: "a" } }),
+            "frostyard/test#1",
+        );
+
+        withPr(
+            state,
+            200,
+            {},
+            readyLink({ level: "L4", ready: { at: 900, head: "b" } }),
+            "frostyard/test#2",
+        );
+
+        const list = readyPrs(state, now);
+
+        assert.deepEqual(
+            list.map((pr) => pr.ref),
+            ["frostyard/test#2", "frostyard/test#1"],
+            "the stored link with no level is last, whatever its label time",
+        );
+        assert.equal(list[0]?.level, "L4");
+        assert.equal("level" in list[1]!, false, "no level key on the row at all");
+
+        const shown = threadsView(state, now).threads.find((each) => each.id === old.id);
+        const pr = shown?.prs.find((each) => each.ref === "frostyard/test#1");
+
+        assert.notEqual(pr, undefined);
+        assert.equal("level" in pr!, false, "the thread's PR has no level key either");
     });
 
     test("threadsView carries the list and its count", () => {
