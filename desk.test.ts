@@ -16531,6 +16531,7 @@ describe("the desk in a Pi Pocket", () => {
                 "the full report does not go to the chat",
             );
         }
+
         assert.equal(typeof (await deskState())?.threads[thread.id]?.run.reportedAt, "number");
 
         await say(app, source, `desk read ${thread.id} test`);
