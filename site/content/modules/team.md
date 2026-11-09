@@ -52,7 +52,7 @@ Pi Pocket's memory has 2 scopes: a project, and everywhere. Team adds a third la
 
 - The owner must enable the drop-in: Pi Pocket's extension policy reserves that action for the owner. Installing the files does not enable it or restart the server.
 - Automatic delegation runs the specialist on the model in its profile when Pi Pocket allows that model under **Providers → Models for subagents**; otherwise it runs on the supervisor's model, and the tool result says so. There is no automatic fallback: if the model cannot be used now, the tool fails and tells Pi to stop.
-- A specialist reports back through `team_message`. That report is model-driven, not an automatic completion hook.
+- A specialist reports back through `team_message`. That report is model-driven, not an automatic completion hook. A report also lists its PRs in `prs`, as `{ repo, number }`: the desk puts each one on the thread.
 - There is no automatic review workflow, no scheduled duties, no imported MCP setup, and no shared notebook. This is a test of whether named people and task delegation are enough.
 - All memory routes (`/api/x/team/memory…`) are owner-only. The durable documents `x.team.identity` and `x.team.memory` hold stored data: never rename a kind or change what a field means.
 - Disable **Team** in Extensions to remove the UI, tools and prompt section. Stored identities remain available if it is re-enabled.

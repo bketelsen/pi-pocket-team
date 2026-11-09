@@ -659,6 +659,7 @@ test("teamMessageProblems: each limit, with the count, the limit and the fix; th
         question: 500,
         options: { min: 2, max: 6 },
         option: 40,
+        prs: 100,
     });
     const ok = {
         to: "s",
@@ -740,4 +741,77 @@ test("teamMessageProblems: each limit, with the count, the limit and the fix; th
     // A wrong type is the schema's to report.
     assert.deepEqual(teamMessageProblems({ message: 5, asks: "x", status: undefined }), []);
     assert.deepEqual(teamMessageProblems(null), []);
+});
+
+test("teamMessageProblems: prs takes a list of { repo, number }, and each bad item says the fix", () => {
+    const done = { to: "s", message: "m", status: "done", asks: [] as unknown[] };
+
+    // A list of PRs, an empty list, and no list at all: no problem.
+    assert.deepEqual(
+        teamMessageProblems({
+            ...done,
+            prs: [
+                { repo: "frostyard/test", number: 7 },
+                { repo: "bketelsen/pi-pocket-team", number: 1 },
+            ],
+        }),
+        [],
+    );
+    assert.deepEqual(teamMessageProblems({ ...done, prs: [] }), []);
+    assert.deepEqual(teamMessageProblems(done), []);
+    // A null optional is the validator's to drop, as for status.
+    assert.deepEqual(teamMessageProblems({ ...done, prs: null }), []);
+    // The limit exactly: no problem.
+    assert.deepEqual(
+        teamMessageProblems({
+            ...done,
+            prs: Array.from({ length: 100 }, (_one, index) => ({
+                repo: "frostyard/test",
+                number: index + 1,
+            })),
+        }),
+        [],
+    );
+
+    // A string in the list: the whole list is refused with the shape, as the likely mistake.
+    assert.deepEqual(teamMessageProblems({ ...done, prs: ["frostyard/test#7"] }), [
+        'prs[0] is "frostyard/test#7": use { repo: "owner/name", number: 12 }.',
+    ]);
+    assert.deepEqual(teamMessageProblems({ ...done, prs: [{ repo: "frostyard", number: 7 }] }), [
+        'prs[0].repo is "frostyard": use owner/name, such as bketelsen/pi-pocket.',
+    ]);
+    assert.deepEqual(teamMessageProblems({ ...done, prs: [{ repo: 5, number: 7 }] }), [
+        "prs[0].repo is 5: use owner/name, such as bketelsen/pi-pocket.",
+    ]);
+    assert.deepEqual(teamMessageProblems({ ...done, prs: [{ repo: "a/b", number: 0 }] }), [
+        "prs[0].number is 0: use the PR number as a whole number, such as 12.",
+    ]);
+    assert.deepEqual(teamMessageProblems({ ...done, prs: [{ repo: "a/b", number: "12" }] }), [
+        'prs[0].number is "12": use the PR number as a whole number, such as 12.',
+    ]);
+    assert.deepEqual(teamMessageProblems({ ...done, prs: [{ repo: "a/b", number: 1.5 }] }), [
+        "prs[0].number is 1.5: use the PR number as a whole number, such as 12.",
+    ]);
+    // Both fields wrong: 1 line each.
+    assert.deepEqual(teamMessageProblems({ ...done, prs: [{ repo: "", number: -1 }] }), [
+        'prs[0].repo is "": use owner/name, such as bketelsen/pi-pocket.',
+        "prs[0].number is -1: use the PR number as a whole number, such as 12.",
+    ]);
+    assert.deepEqual(
+        teamMessageProblems({
+            ...done,
+            prs: Array.from({ length: 101 }, (_one, index) => ({
+                repo: "frostyard/test",
+                number: index + 1,
+            })),
+        }),
+        ["prs has 101 PRs; the limit is 100. Send the others in a second team_message."],
+    );
+    // Not a list at all: the fix is the shape.
+    assert.deepEqual(teamMessageProblems({ ...done, prs: "frostyard/test#7" }), [
+        'prs is "frostyard/test#7": use a list of { repo: "owner/name", number: 12 }, or [].',
+    ]);
+    assert.deepEqual(teamMessageProblems({ ...done, prs: { repo: "a/b", number: 1 } }), [
+        'prs is {"repo":"a/b","number":1}: use a list of { repo: "owner/name", number: 12 }, or [].',
+    ]);
 });

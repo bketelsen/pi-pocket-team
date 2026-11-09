@@ -1383,6 +1383,7 @@ export function summaryMessage(goal: Goal): string {
             : [
                   `Write it in ASD-STE100 (Simplified Technical English): it goes to ${goal.delegated.supervisor}.`,
                   `This summary is your shift report. It goes to ${goal.delegated.supervisor} by itself: do not send a separate team_message report. Answer a later message from ${goal.delegated.supervisor} as usual.`,
+                  'Before that, write 1 line "PRS:" with each PR you created, changed, reviewed or labelled in this shift, as owner/name#N separated by commas, or "PRS: none", then 1 blank line. The desk puts each PR on your thread.',
                   'End the summary with a line "ASKS FOR BRIAN:" and 1 line under it for each decision Brian must make, with its options in [a | b] when it is a pick-one. Write "ASKS FOR BRIAN: none" when there is none. A merge or install request is no decision.',
               ]),
         "Do not end with a STATUS line.",
@@ -1730,6 +1731,12 @@ export default function createNightShift(host: Host, web: Web) {
                 reason?: string;
                 /** The decisions for Brian that the summary names, 1 to 4: the desk files each as an ask. */
                 asks?: { question: string; options?: string[] }[];
+                /** The PRs the summary names, as `owner/name#N`: the desk puts each on the thread. */
+                prs?: string[];
+                /** A PR the desk must not attach, and why: it is an event on the thread. */
+                prsRefused?: { ref: string; why: string }[];
+                /** The summary has no `PRS:` line: the desk records it, and never fails the report for it. */
+                prsMissing?: true;
             },
         ) => Promise<{ line: string; held?: boolean } | undefined>;
         /**
@@ -1737,6 +1744,18 @@ export default function createNightShift(host: Host, web: Web) {
          * Absent in an older desk: the text alone holds the thread then.
          */
         asks?: (text: string) => { question: string; options?: string[] }[] | undefined;
+        /**
+         * The PRs of a summary's last `PRS:` line, by the desk's own parser: `bad` holds the tokens that are no ref.
+         * Absent in an older desk: the PRs stay in the report's text only.
+         */
+        prs?: (text: string) => { refs: string[]; bad: string[] } | undefined;
+        /**
+         * Whether GitHub has each reported PR, and its owner is one the team works in: no write, and it never throws.
+         * Absent in an older desk: the PRs stay in the report's text only.
+         */
+        checkPrs?: (
+            refs: string[],
+        ) => Promise<{ ok: string[]; refused: { ref: string; why: string }[] }>;
         /**
          * Tell the desk page that the desk changed: call it after the commit that used `file` returned, never inside
          * it. Absent in an older desk: skip the call.
@@ -2449,12 +2468,56 @@ export default function createNightShift(host: Host, web: Web) {
                 const text = task.state.checkpoint.text;
                 const goal = (await runtime.snapshot(GoalDoc, id, context))?.goal;
                 const report = goal === undefined ? undefined : reportMessage(goal, text);
-                const found: { address?: string; filed?: { line: string; held?: boolean } } = {};
+                const found: {
+                    address?: string;
+                    filed?: { line: string; held?: boolean };
+                } = {};
+                const desk = deskApi();
+                // The summary's PRs are read before the commit: the check reads GitHub, and no network runs inside a
+                // commit. A restart reruns this phase, which is safe: the check only reads, and `file` is replay-safe
+                // by its key, so the thread gets each PR and each event once.
+                const line = desk?.prs?.(text);
+                const missing = line === undefined && desk?.prs !== undefined;
+
+                if (missing) {
+                    host.notice(
+                        "warning",
+                        "The shift summary has no PRS line: its PRs are not attached to the desk thread.",
+                        id,
+                    );
+                }
+
+                const check =
+                    line === undefined || line.refs.length === 0 ? undefined : desk?.checkPrs;
+                let checked: { ok: string[]; refused: { ref: string; why: string }[] } | undefined;
+
+                if (check !== undefined && line !== undefined) {
+                    try {
+                        checked = await check(line.refs);
+                    } catch (error) {
+                        checked = {
+                            ok: [],
+                            refused: line.refs.map((ref) => ({
+                                ref,
+                                why: `the desk could not check it: ${(error as Error).message}`,
+                            })),
+                        };
+                    }
+                }
+
+                // A token that is no PR ref is refused as one, so nothing the summary named is dropped in silence.
+                const refusedPrs = [
+                    ...(line?.bad ?? []).map((ref) => ({
+                        ref,
+                        why: "it is not a PR ref like owner/name#12",
+                    })),
+                    ...(checked?.refused ?? []),
+                ];
+                const okPrs = checked?.ok ?? [];
 
                 await runtime.commit(async (tx) => {
                     found.address = await returnAddress(tx, id);
 
-                    const desk = deskApi();
                     // The summary's own `ASKS FOR BRIAN:` block becomes the desk's asks, by the desk's parser: 1 to 4
                     // of them. More than 4 leaves the decisions in the text alone.
                     const asks = desk?.asks?.(text);
@@ -2469,6 +2532,9 @@ export default function createNightShift(host: Host, web: Web) {
                             digest: true,
                             ...(goal?.reason === undefined ? {} : { reason: goal.reason }),
                             ...(asks === undefined || asks.length === 0 ? {} : { asks }),
+                            ...(okPrs.length === 0 ? {} : { prs: okPrs }),
+                            ...(refusedPrs.length === 0 ? {} : { prsRefused: refusedPrs }),
+                            ...(missing ? { prsMissing: true as const } : {}),
                         });
                     }
 

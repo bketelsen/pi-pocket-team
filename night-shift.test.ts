@@ -503,10 +503,20 @@ describe("parsing", () => {
             /End the summary with a line "ASKS FOR BRIAN:" and 1 line under it for each decision Brian must make, with its options in \[a \| b\] when it is a pick-one\. Write "ASKS FOR BRIAN: none" when there is none\. A merge or install request is no decision\./,
         );
 
+        // A delegated shift's summary says its PRs, 1 line each, so the desk puts them on the thread.
+        assert.match(
+            summaryMessage(delegated),
+            /Before that, write 1 line "PRS:" with each PR you created, changed, reviewed or labelled in this shift, as owner\/name#N separated by commas, or "PRS: none", then 1 blank line\. The desk puts each PR on your thread\./,
+        );
+
         const plain = goal();
 
         assert.ok(!roundMessage(plain, 1, now).includes("team_message report"));
         assert.ok(!summaryMessage(plain).includes("team_message report"));
+        assert.ok(
+            !summaryMessage(plain).includes("PRS:"),
+            "a shift of a session's own reports no PRs",
+        );
         assert.ok(!summaryMessage(plain).includes("ASKS FOR BRIAN"), "a shift of a session's own");
     });
 

@@ -3899,6 +3899,13 @@ const BRIAN_LABEL =
 /** The words of an "ASKS FOR BRIAN:" line: its items are the label of the block. */
 const ASKS_BRIAN_LINE = /^asks\s+for\s+brian\s*:\s*(.*)$/i;
 
+/** The words of a "PRS:" line: the PRs a shift summary or a report names, on 1 line of its own. */
+const PRS_LINE = /^prs\s*:\s*(.*)$/i;
+
+/** A GitHub PR URL that a `PRS:` line may hold instead of a ref: `https://github.com/o/n/pull/12`. */
+const PRS_URL =
+    /^https?:\/\/github\.com\/([A-Za-z0-9][A-Za-z0-9_.-]*)\/([A-Za-z0-9][A-Za-z0-9_.-]*)\/pull\/([1-9][0-9]*)\/?$/i;
+
 /** An item that names nothing for Brian: "none", "nothing left", "no". */
 const NO_ITEM = /^(?:no|none|nothing)\b/i;
 
@@ -3914,9 +3921,63 @@ export function asksForBrian(text: string): string[] | undefined {
 }
 
 /**
+ * The PRs a report's last `PRS:` line names: each `owner/name#N` ref, also written as a GitHub URL, and the tokens that
+ * are neither a ref nor "none" (`bad`). The line is found in the code-free text, so a line inside a code block does not
+ * count, and it is read from the report as written, with its inline backticks removed. Only that 1 line counts.
+ * Undefined when the report has no such line.
+ */
+export function prsLineOf(text: string): { refs: string[]; bad: string[] } | undefined {
+    const lines = withoutCode(text).split("\n");
+    const raws = text.split(/\r\n?|\n/);
+    const bareOf = (line: string) =>
+        line
+            .replace(/^[\s>#*-]+/, "")
+            .replace(/\*+/g, "")
+            .trim();
+    let at: number | undefined;
+
+    for (const [index, line] of lines.entries()) {
+        if (PRS_LINE.test(bareOf(line))) {
+            at = index;
+        }
+    }
+
+    if (at === undefined) {
+        return undefined;
+    }
+
+    const written = (raws[at] ?? lines[at] ?? "").replace(/`/g, "");
+    const rest = PRS_LINE.exec(bareOf(written))?.[1]?.trim() ?? "";
+    const refs: string[] = [];
+    const bad: string[] = [];
+    const seen = new Set<string>();
+
+    for (const token of rest.split(/[,\s]+/).filter((one) => one !== "")) {
+        const word = token.replace(/[.;]+$/, "");
+
+        if (word === "" || word.toLowerCase() === "none") {
+            continue;
+        }
+
+        const url = PRS_URL.exec(word);
+        const ref =
+            url !== null ? `${url[1]!}/${url[2]!}#${url[3]!}` : REF.test(word) ? word : undefined;
+
+        if (ref === undefined || !REF.test(ref)) {
+            bad.push(word);
+        } else if (!seen.has(ref.toLowerCase())) {
+            seen.add(ref.toLowerCase());
+            refs.push(ref);
+        }
+    }
+
+    return { refs, bad };
+}
+
+/**
  * The items of the last `ASKS FOR BRIAN:` block, each code-free (`plain`) and as written (`raw`, with its inline code).
  * The block is found in the code-free text; `withoutCode` keeps each line in its place, so the same lines of the text
- * give the written items.
+ * give the written items. A `PRS:` line ends the block: it is no item.
  */
 function lastAsksBlock(text: string): { plain: string; raw: string }[] | undefined {
     const lines = withoutCode(text).split("\n");
@@ -3946,7 +4007,7 @@ function lastAsksBlock(text: string): { plain: string; raw: string }[] | undefin
     for (let index = start + 1; index < lines.length; index += 1) {
         const line = lines[index]!;
 
-        if (line.trim() === "") {
+        if (line.trim() === "" || PRS_LINE.test(bareOf(line))) {
             break;
         }
 
@@ -9434,6 +9495,79 @@ export function attachTo(
     );
 
     return { text: `${source.id} is merged into ${target.id}.` };
+}
+
+/**
+ * Put each PR that a report names on the thread that reported it, where the desk may: a PR the thread holds already
+ * is `already`; one another open thread holds stays there, with a note; a thread that closed as done hands it over; one
+ * a `desk detach` took off stays off; and a refusal is a note. Pure over the state: the caller commits it. A second
+ * call with the same refs adds nothing.
+ */
+export function attachReported(
+    state: DeskState,
+    threadId: string,
+    refs: readonly string[],
+    now: number,
+    by: string,
+): { attached: string[]; already: string[]; notes: string[] } {
+    const attached: string[] = [];
+    const already: string[] = [];
+    const notes: string[] = [];
+    const same = (one: string, other: string) => one.toLowerCase() === other.toLowerCase();
+
+    for (const ref of refs) {
+        // The key as the desk spells it, when a thread holds the PR: `attachTo` moves and repeats by that key.
+        const holder = Object.values(state.threads).find((thread) =>
+            Object.keys(thread.prs).some((key) => same(key, ref)),
+        );
+        const key =
+            holder === undefined
+                ? undefined
+                : Object.keys(holder.prs).find((each) => same(each, ref));
+        let source = ref;
+
+        if (holder !== undefined && key !== undefined) {
+            if (same(holder.id, threadId)) {
+                already.push(ref);
+                continue;
+            }
+
+            if (holder.state !== "closed") {
+                notes.push(
+                    `${key} stays on ${holder.id}: that open thread holds it. Your supervisor can move it with desk attach.`,
+                );
+                continue;
+            }
+
+            if (holder.closed?.why !== "done") {
+                notes.push(
+                    `${key} stays on ${holder.id}: that thread closed as ${holder.closed?.why ?? "closed"}.`,
+                );
+                continue;
+            }
+
+            // Closed as done: its work goes on, so the PR moves, as `desk attach` moves it.
+            source = key;
+        } else if (
+            state.dropped !== undefined &&
+            Object.keys(state.dropped).some((each) => same(each, ref))
+        ) {
+            notes.push(
+                `${ref} was taken off the desk with desk detach: not attached. Only your supervisor's desk attach brings it back.`,
+            );
+            continue;
+        }
+
+        const moved = attachTo(state, source, threadId, now, by);
+
+        if ("error" in moved) {
+            notes.push(`${ref} is not attached: ${moved.error}`);
+        } else {
+            attached.push(ref);
+        }
+    }
+
+    return { attached, already, notes };
 }
 
 /**
@@ -21174,6 +21308,15 @@ export type FileRequest = {
     asksNone?: true;
     /** The agent's name: the asks are filed by it. */
     by?: string;
+    /**
+     * The PRs the report names, as `owner/name#N` refs that the caller checked: each goes on the thread with the report
+     * (`attachReported`).
+     */
+    prs?: string[];
+    /** A PR the desk must not attach, and why: each is an event on the thread, so no refusal is lost. */
+    prsRefused?: { ref: string; why: string }[];
+    /** A shift summary with no `PRS:` line: its PRs are not attached, and the thread says so, once. */
+    prsMissing?: true;
 };
 
 /** A Clerk's registration, as `team.ts` hands it over: the Clerk, and its supervisor. */
@@ -21220,7 +21363,27 @@ export type DeskApi = {
         tx: Tx,
         session: ConversationId,
         request: FileRequest,
-    ) => Promise<{ thread: Thread; line: string; held?: boolean; asked?: string[] } | undefined>;
+    ) => Promise<
+        | {
+              thread: Thread;
+              line: string;
+              held?: boolean;
+              asked?: string[];
+              /** What the report's PRs did: attached here, already here, or kept elsewhere with the reason. */
+              prs?: { attached: string[]; already: string[]; notes: string[] };
+          }
+        | undefined
+    >;
+    /**
+     * Whether GitHub has each reported PR, and whether its owner is one the team works in: no write, and it never
+     * throws. `ok` holds the refs as GitHub spells them. An older desk has none: a caller then keeps the PRs in the
+     * report's text only.
+     */
+    checkPrs?: (
+        refs: string[],
+    ) => Promise<{ ok: string[]; refused: { ref: string; why: string }[] }>;
+    /** The PRs a report's last `PRS:` line names (`prsLineOf`): Night shift reads its summary's line with it. */
+    prs?: (text: string) => { refs: string[]; bad: string[] } | undefined;
     /** Register a supervisor's Clerk. The same values twice change nothing, and nothing else is added. */
     clerk: (tx: Tx, request: ClerkRequest) => Promise<void>;
     /** The supervisor's Clerk, for the check before a Clerk starts: no write. */
@@ -23185,6 +23348,124 @@ export default function createDesk(host: Host, web: Web) {
         }
     };
 
+    /**
+     * The owners of the roster's repositories, as the sweep reads them: each member's `repositories` keys that are
+     * exactly "owner/name", then their owners. Undefined when there is no Team module, or its roster cannot be read,
+     * and the owner check is skipped then.
+     */
+    const rosterOwnersList = async (): Promise<string[] | undefined> => {
+        const team = teamApi();
+
+        if (team === undefined) {
+            return undefined;
+        }
+
+        try {
+            const members = await team.roster();
+
+            return ownersOfRepos(
+                members
+                    .filter((member) => member.role !== "supervisor")
+                    .flatMap((member) => Object.keys(member.repositories ?? {}))
+                    .filter((repo) => isRepoName(repo)),
+            );
+        } catch {
+            return undefined;
+        }
+    };
+
+    /** The PRs 1 GraphQL call asks for: GitHub's own limit on aliases in 1 query is far above this. */
+    const PRS_CHUNK = 20;
+
+    /**
+     * Whether GitHub has each PR that an agent reported, and whether its owner is one the team works in: 1 GraphQL call
+     * per 20 refs, read from GitHub with `graphqlJson`, which keeps a partial answer. It never throws: a ref it cannot
+     * check is refused with the reason, so a caller never drops one in silence.
+     */
+    const checkPrs = async (
+        refs: string[],
+    ): Promise<{ ok: string[]; refused: { ref: string; why: string }[] }> => {
+        const ok: string[] = [];
+        const refused: { ref: string; why: string }[] = [];
+        const owners = await rosterOwnersList();
+        const asked: { ref: string; repo: string; number: number }[] = [];
+
+        for (const ref of refs) {
+            const match = REF.exec(ref);
+
+            if (match === null) {
+                refused.push({ ref, why: "it is not a PR ref like owner/name#12" });
+                continue;
+            }
+
+            const repo = match[1]!;
+            const owner = repo.split("/")[0]!;
+
+            if (
+                owners !== undefined &&
+                !owners.some((one) => one.toLowerCase() === owner.toLowerCase())
+            ) {
+                refused.push({
+                    ref,
+                    why: `the owner ${owner} is not one the team works in (${owners.join(", ")}): not attached`,
+                });
+                continue;
+            }
+
+            asked.push({ ref, repo, number: Number(match[2]) });
+        }
+
+        for (let at = 0; at < asked.length; at += PRS_CHUNK) {
+            const chunk = asked.slice(at, at + PRS_CHUNK);
+            const parts = chunk.map((one, index) => {
+                const [owner, name] = one.repo.split("/");
+
+                return `p${String(index)}: repository(owner: ${JSON.stringify(owner)}, name: ${JSON.stringify(name)}) { nameWithOwner pullRequest(number: ${String(one.number)}) { number } }`;
+            });
+
+            try {
+                const answer = (await graphqlJson(`query { ${parts.join(" ")} }`)) as {
+                    data?: Record<
+                        string,
+                        {
+                            nameWithOwner?: unknown;
+                            pullRequest?: { number?: unknown } | null;
+                        } | null
+                    >;
+                };
+                const data = answer.data ?? {};
+
+                chunk.forEach((one, index) => {
+                    const entry = data[`p${String(index)}`];
+                    const found = entry?.pullRequest?.number;
+
+                    if (found === undefined || found === null) {
+                        refused.push({
+                            ref: one.ref,
+                            why: "GitHub has no such PR (an issue, a wrong number, or a repository the machine account cannot read): not attached",
+                        });
+
+                        return;
+                    }
+
+                    const spelled =
+                        typeof entry?.nameWithOwner === "string" ? entry.nameWithOwner : one.repo;
+
+                    ok.push(`${spelled}#${String(one.number)}`);
+                });
+            } catch (error) {
+                for (const one of chunk) {
+                    refused.push({
+                        ref: one.ref,
+                        why: `GitHub could not be read now (${githubError(error)}): not attached. Your supervisor can attach it later with desk attach`,
+                    });
+                }
+            }
+        }
+
+        return { ok, refused };
+    };
+
     const published: DeskApi = {
         version: 1,
         open: async (tx, request) => {
@@ -23457,19 +23738,32 @@ export default function createDesk(host: Host, web: Web) {
             const reports = await tx.doc(DeskReports, session);
             const same = reports.reports.find((report) => report.key === request.key);
 
-            // A replay: the stored report says whether the digest held it, so the caller sends nothing again.
+            // A replay: the stored report says whether the digest held it, so the caller sends nothing again. Its PRs
+            // are attached again where they are not already: `attachReported` is idempotent, and a replay adds no
+            // event.
             if (same !== undefined) {
                 const asked = Object.values(state.threads).flatMap((each) =>
                     each.asks
                         .filter((ask) => ask.key?.startsWith(`${request.key}:ask:`) === true)
                         .map((ask) => ask.id),
                 );
+                const replayed =
+                    (request.prs?.length ?? 0) === 0 && (request.prsRefused?.length ?? 0) === 0
+                        ? undefined
+                        : attachReported(
+                              state,
+                              thread.id,
+                              request.prs ?? [],
+                              request.at,
+                              request.by ?? "the agent",
+                          );
 
                 return {
                     thread: copyThread(thread),
                     line: same.line,
                     held: same.held === true,
                     ...(asked.length === 0 ? {} : { asked }),
+                    ...(replayed === undefined ? {} : { prs: replayed }),
                 };
             }
 
@@ -23510,6 +23804,54 @@ export default function createDesk(host: Host, web: Web) {
             // The page and the list show Brian as next at once, not at the next sweep.
             if (filedAsks.length > 0) {
                 thread.run.next = nextActor(thread);
+            }
+
+            // The PRs the agent reported go on its thread in the report's commit: a PR the desk may not attach, and a
+            // shift summary with no PRS line, are events, so no refusal is lost.
+            const wasClosed = thread.state === "closed";
+            let reportedPrs: { attached: string[]; already: string[]; notes: string[] } | undefined;
+
+            if ((request.prs?.length ?? 0) > 0 || (request.prsRefused?.length ?? 0) > 0) {
+                reportedPrs = attachReported(
+                    state,
+                    thread.id,
+                    request.prs ?? [],
+                    request.at,
+                    request.by ?? "the agent",
+                );
+
+                reportedPrs.notes.forEach((note, index) => {
+                    addEvent(
+                        thread,
+                        `report-pr:${request.key}:${String(index)}`,
+                        `report PR: ${note}`,
+                        request.at,
+                    );
+                });
+
+                (request.prsRefused ?? []).forEach((refusedPr, index) => {
+                    addEvent(
+                        thread,
+                        `report-pr-refused:${request.key}:${String(index)}`,
+                        `report PR refused: ${refusedPr.ref}: ${refusedPr.why}`,
+                        request.at,
+                    );
+                });
+            }
+
+            if (request.prsMissing === true) {
+                addEvent(
+                    thread,
+                    `report-prs-missing:${request.key}`,
+                    "the shift summary has no PRS line: its PRs are not attached",
+                    request.at,
+                );
+            }
+
+            // A PR put on a thread that closed as done opens it again, as an ask does: its supervisor's sweeper may
+            // have ended with the last open thread.
+            if (wasClosed && thread.state === "open") {
+                reopened = true;
             }
 
             const reported = shortLine(thread, {
@@ -23618,6 +23960,7 @@ export default function createDesk(host: Host, web: Web) {
                 line,
                 ...(held ? { held: true } : {}),
                 ...(filedAsks.length === 0 ? {} : { asked: filedAsks }),
+                ...(reportedPrs === undefined ? {} : { prs: reportedPrs }),
             };
         },
         clerk: async (tx, request) => {
@@ -23646,6 +23989,8 @@ export default function createDesk(host: Host, web: Web) {
             };
         },
         asks: reportAsksOf,
+        prs: prsLineOf,
+        checkPrs,
         supervisors: async (read, context) =>
             boundSupervisors(await read.snapshot(DeskThreads, context)),
         clerkOf: async (tx, supervisor) => {
