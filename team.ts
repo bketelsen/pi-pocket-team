@@ -2128,7 +2128,12 @@ export default function createTeam(host: Host, web: Web) {
                   held?: boolean;
                   asked?: string[];
                   /** What the desk did with the report's PRs. An older desk has none. */
-                  prs?: { attached: string[]; already: string[]; notes: string[] };
+                  prs?: {
+                      attached: string[];
+                      already: string[];
+                      notes: string[];
+                      refused: { ref: string; why: string }[];
+                  };
               }
             | undefined
         >;
@@ -4269,7 +4274,11 @@ export default function createTeam(host: Host, web: Web) {
                         ? " This desk cannot attach PRs: they are in the report's text only."
                         : [
                               onDesk === "" ? "" : ` PRs on ${filed.thread.id}: ${onDesk}.`,
-                              ...checked.refused.map((one) => ` Error: ${one.ref}: ${one.why}.`),
+                              // The refusals of the first filing when the desk has them: a replayed call made its
+                              // check again, and a filed report never changes.
+                              ...(filed.prs?.refused ?? checked.refused).map(
+                                  (one) => ` Error: ${one.ref}: ${one.why}.`,
+                              ),
                               ...(filed.prs?.notes ?? []).map((note) => ` ${note}`),
                           ].join("");
 

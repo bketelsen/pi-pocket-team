@@ -1144,6 +1144,17 @@ export type StoredReport = {
     line: string;
     /** The report went into the digest: the caller sent nothing, and a replay of its call sends nothing again. */
     held?: boolean;
+    /**
+     * What the report's PRs did in the report's own commit: attached here, already here, kept elsewhere with the reason
+     * (the notes), and each refusal. A replay reads this and attaches nothing: the caller's second check of GitHub may
+     * differ from the first, and a filed report never changes. An old report has no field.
+     */
+    prs?: {
+        attached: string[];
+        already: string[];
+        notes: string[];
+        refused: { ref: string; why: string }[];
+    };
 };
 
 /** One thread session's reports, newest first, the last 10 kept. Stored data: never rename a field. */
@@ -9771,6 +9782,55 @@ export function queueConfig(raw: unknown, rosterOwners: readonly string[] = []):
 /** The owners (the part before the slash) of repository names, once each: the default search. */
 export function ownersOfRepos(repos: readonly string[]): string[] {
     return [...new Set(repos.filter(isRepoName).map((repo) => repo.split("/")[0]!))].sort();
+}
+
+/**
+ * Split the PR refs an agent reported into the ones to ask GitHub about, and the ones refused before any call: a ref
+ * that is no `owner/name#N`, and a ref whose owner is not one the team works in. With no owner list, every ref is
+ * refused: an owner must be a roster owner, so a roster that cannot be read proves nothing about the ref. The rule is
+ * pure, so a caller checks it without a commit.
+ */
+export function ownerRefusals(
+    refs: readonly string[],
+    owners: readonly string[] | undefined,
+): {
+    asked: { ref: string; repo: string; number: number }[];
+    refused: { ref: string; why: string }[];
+} {
+    const asked: { ref: string; repo: string; number: number }[] = [];
+    const refused: { ref: string; why: string }[] = [];
+
+    for (const ref of refs) {
+        const match = REF.exec(ref);
+
+        if (match === null) {
+            refused.push({ ref, why: "it is not a PR ref like owner/name#12" });
+            continue;
+        }
+
+        const repo = match[1]!;
+        const owner = repo.split("/")[0]!;
+
+        if (owners === undefined) {
+            refused.push({
+                ref,
+                why: "the team roster cannot be read now, so its owner cannot be checked: not attached. Your supervisor can attach it later with desk attach",
+            });
+            continue;
+        }
+
+        if (!owners.some((one) => one.toLowerCase() === owner.toLowerCase())) {
+            refused.push({
+                ref,
+                why: `the owner ${owner} is not one the team works in (${owners.join(", ")}): not attached`,
+            });
+            continue;
+        }
+
+        asked.push({ ref, repo, number: Number(match[2]) });
+    }
+
+    return { asked, refused };
 }
 
 /** Roster repository (lower case) → the ids of the agents that own it, sorted. */
@@ -21369,8 +21429,13 @@ export type DeskApi = {
               line: string;
               held?: boolean;
               asked?: string[];
-              /** What the report's PRs did: attached here, already here, or kept elsewhere with the reason. */
-              prs?: { attached: string[]; already: string[]; notes: string[] };
+              /** What the report's PRs did: attached here, already here, or kept or refused with the reason. */
+              prs?: {
+                  attached: string[];
+                  already: string[];
+                  notes: string[];
+                  refused: { ref: string; why: string }[];
+              };
           }
         | undefined
     >;
@@ -23350,8 +23415,8 @@ export default function createDesk(host: Host, web: Web) {
 
     /**
      * The owners of the roster's repositories, as the sweep reads them: each member's `repositories` keys that are
-     * exactly "owner/name", then their owners. Undefined when there is no Team module, or its roster cannot be read,
-     * and the owner check is skipped then.
+     * exactly "owner/name", then their owners. Undefined when there is no Team module, or its roster cannot be read:
+     * `ownerRefusals` then refuses every ref, because an owner must be a roster owner.
      */
     const rosterOwnersList = async (): Promise<string[] | undefined> => {
         const team = teamApi();
@@ -23380,40 +23445,16 @@ export default function createDesk(host: Host, web: Web) {
     /**
      * Whether GitHub has each PR that an agent reported, and whether its owner is one the team works in: 1 GraphQL call
      * per 20 refs, read from GitHub with `graphqlJson`, which keeps a partial answer. It never throws: a ref it cannot
-     * check is refused with the reason, so a caller never drops one in silence.
+     * check is refused with the reason, so a caller never drops one in silence. The ref and owner checks are
+     * `ownerRefusals`; a roster that cannot be read refuses every ref, and no GitHub call is made for them.
      */
     const checkPrs = async (
         refs: string[],
     ): Promise<{ ok: string[]; refused: { ref: string; why: string }[] }> => {
         const ok: string[] = [];
-        const refused: { ref: string; why: string }[] = [];
-        const owners = await rosterOwnersList();
-        const asked: { ref: string; repo: string; number: number }[] = [];
-
-        for (const ref of refs) {
-            const match = REF.exec(ref);
-
-            if (match === null) {
-                refused.push({ ref, why: "it is not a PR ref like owner/name#12" });
-                continue;
-            }
-
-            const repo = match[1]!;
-            const owner = repo.split("/")[0]!;
-
-            if (
-                owners !== undefined &&
-                !owners.some((one) => one.toLowerCase() === owner.toLowerCase())
-            ) {
-                refused.push({
-                    ref,
-                    why: `the owner ${owner} is not one the team works in (${owners.join(", ")}): not attached`,
-                });
-                continue;
-            }
-
-            asked.push({ ref, repo, number: Number(match[2]) });
-        }
+        const split = ownerRefusals(refs, await rosterOwnersList());
+        const refused = split.refused;
+        const asked = split.asked;
 
         for (let at = 0; at < asked.length; at += PRS_CHUNK) {
             const chunk = asked.slice(at, at + PRS_CHUNK);
@@ -23738,32 +23779,30 @@ export default function createDesk(host: Host, web: Web) {
             const reports = await tx.doc(DeskReports, session);
             const same = reports.reports.find((report) => report.key === request.key);
 
-            // A replay: the stored report says whether the digest held it, so the caller sends nothing again. Its PRs
-            // are attached again where they are not already: `attachReported` is idempotent, and a replay adds no
-            // event.
+            // A replay: the stored report says whether the digest held it, so the caller sends nothing again. It also
+            // says what its PRs did: a replay writes nothing and attaches nothing, because the caller's second check of
+            // GitHub can differ from the first (the shift's report phase checks again after a restart) and a filed
+            // report never changes.
             if (same !== undefined) {
                 const asked = Object.values(state.threads).flatMap((each) =>
                     each.asks
                         .filter((ask) => ask.key?.startsWith(`${request.key}:ask:`) === true)
                         .map((ask) => ask.id),
                 );
-                const replayed =
-                    (request.prs?.length ?? 0) === 0 && (request.prsRefused?.length ?? 0) === 0
-                        ? undefined
-                        : attachReported(
-                              state,
-                              thread.id,
-                              request.prs ?? [],
-                              request.at,
-                              request.by ?? "the agent",
-                          );
 
                 return {
                     thread: copyThread(thread),
                     line: same.line,
                     held: same.held === true,
                     ...(asked.length === 0 ? {} : { asked }),
-                    ...(replayed === undefined ? {} : { prs: replayed }),
+                    // A plain copy, as the thread is: a commit's draft is not usable after its commit.
+                    ...(same.prs === undefined
+                        ? {}
+                        : {
+                              prs: JSON.parse(JSON.stringify(same.prs)) as NonNullable<
+                                  StoredReport["prs"]
+                              >,
+                          }),
                 };
             }
 
@@ -23809,10 +23848,10 @@ export default function createDesk(host: Host, web: Web) {
             // The PRs the agent reported go on its thread in the report's commit: a PR the desk may not attach, and a
             // shift summary with no PRS line, are events, so no refusal is lost.
             const wasClosed = thread.state === "closed";
-            let reportedPrs: { attached: string[]; already: string[]; notes: string[] } | undefined;
+            let prsOutcome: NonNullable<StoredReport["prs"]> | undefined;
 
             if ((request.prs?.length ?? 0) > 0 || (request.prsRefused?.length ?? 0) > 0) {
-                reportedPrs = attachReported(
+                const reportedPrs = attachReported(
                     state,
                     thread.id,
                     request.prs ?? [],
@@ -23837,6 +23876,9 @@ export default function createDesk(host: Host, web: Web) {
                         request.at,
                     );
                 });
+
+                // The refused refs are part of the outcome: the tool's answer names them, and a replay repeats them.
+                prsOutcome = { ...reportedPrs, refused: request.prsRefused ?? [] };
             }
 
             if (request.prsMissing === true) {
@@ -23928,6 +23970,8 @@ export default function createDesk(host: Host, web: Web) {
                 text: request.text,
                 line,
                 ...(held ? { held: true } : {}),
+                // What its PRs did is part of the report: a replay reads it and attaches nothing.
+                ...(prsOutcome === undefined ? {} : { prs: prsOutcome }),
             });
 
             if (reports.reports.length > KEPT_REPORTS) {
@@ -23960,7 +24004,7 @@ export default function createDesk(host: Host, web: Web) {
                 line,
                 ...(held ? { held: true } : {}),
                 ...(filedAsks.length === 0 ? {} : { asked: filedAsks }),
-                ...(reportedPrs === undefined ? {} : { prs: reportedPrs }),
+                ...(prsOutcome === undefined ? {} : { prs: { ...prsOutcome } }),
             };
         },
         clerk: async (tx, request) => {

@@ -119,6 +119,7 @@ import {
     askById,
     attachTo,
     attachReported,
+    ownerRefusals,
     prsLineOf,
     boundSupervisors,
     attribute,
@@ -9669,6 +9670,43 @@ describe("attachTo", () => {
             assert.equal(target.state, "closed");
             assert.equal(target.prs["frostyard/test#7"], undefined);
         }
+    });
+});
+
+describe("ownerRefusals: the ref and owner checks before any GitHub call", () => {
+    test("a roster that cannot be read refuses every ref, and asks GitHub nothing", () => {
+        const roster =
+            "the team roster cannot be read now, so its owner cannot be checked: not attached. Your supervisor can attach it later with desk attach";
+
+        assert.deepEqual(ownerRefusals(["frostyard/test#7", "evil/x#1"], undefined), {
+            asked: [],
+            refused: [
+                { ref: "frostyard/test#7", why: roster },
+                { ref: "evil/x#1", why: roster },
+            ],
+        });
+    });
+
+    test("only a roster owner is asked about, and case does not count", () => {
+        assert.deepEqual(
+            ownerRefusals(
+                ["frostyard/test#7", "Frostyard/test#8", "evil/x#1", "nonsense"],
+                ["frostyard"],
+            ),
+            {
+                asked: [
+                    { ref: "frostyard/test#7", repo: "frostyard/test", number: 7 },
+                    { ref: "Frostyard/test#8", repo: "Frostyard/test", number: 8 },
+                ],
+                refused: [
+                    {
+                        ref: "evil/x#1",
+                        why: "the owner evil is not one the team works in (frostyard): not attached",
+                    },
+                    { ref: "nonsense", why: "it is not a PR ref like owner/name#12" },
+                ],
+            },
+        );
     });
 });
 
@@ -23756,6 +23794,98 @@ describe("the desk in a Pi Pocket", () => {
                 await stopDigests();
                 digestOff();
             }
+        });
+
+        test("a replay of a report attaches no PR, and repeats the first refusals", async () => {
+            digestOff();
+
+            const { linked, thread } = await delegated("prs-replay");
+
+            await until(
+                async () =>
+                    typeof (await deskState())?.threads[thread.id]?.run.sweptAt === "number",
+                "the first sweep",
+                20_000,
+            );
+            // No sweep after this: the thread must be the same before and after the replay.
+            await stopSweepers();
+
+            const address = String((await deskState())?.threads[thread.id]?.run.returnAddress);
+            const api = (
+                globalThis as unknown as Record<
+                    symbol,
+                    {
+                        file: (
+                            tx: unknown,
+                            session: ConversationId,
+                            request: object,
+                        ) => Promise<
+                            | {
+                                  line: string;
+                                  prs?: {
+                                      attached: string[];
+                                      already: string[];
+                                      notes: string[];
+                                      refused: { ref: string; why: string }[];
+                                  };
+                              }
+                            | undefined
+                        >;
+                    }
+                >
+            )[Symbol.for("pi-pocket-team.desk")]!;
+            const key = "x.team.message:replay-prs:1";
+            const text = "Done.\n\nPRs: frostyard/test#4702";
+            // The first filing: GitHub could not be read, so the PR is refused and not attached.
+            const first = await app.harness.commit(
+                (tx) =>
+                    api.file(tx, linked, {
+                        to: address,
+                        key,
+                        from: "team_message",
+                        text,
+                        at: Date.now(),
+                        prsRefused: [
+                            {
+                                ref: "frostyard/test#4702",
+                                why: "GitHub could not be read now (x): not attached. Your supervisor can attach it later with desk attach",
+                            },
+                        ],
+                    }),
+                context,
+            );
+
+            assert.deepEqual(
+                first?.prs?.refused.map((one) => one.ref),
+                ["frostyard/test#4702"],
+            );
+            assert.equal(first?.prs?.attached.length, 0);
+
+            const before = JSON.stringify((await deskState())?.threads[thread.id]);
+            // The same call again, as a restart makes: its second GitHub check finds the PR. A filed report never
+            // changes, so the replay attaches nothing and adds no event.
+            const replay = await app.harness.commit(
+                (tx) =>
+                    api.file(tx, linked, {
+                        to: address,
+                        key,
+                        from: "team_message",
+                        text,
+                        at: Date.now(),
+                        prs: ["frostyard/test#4702"],
+                    }),
+                context,
+            );
+
+            const after = (await deskState())?.threads[thread.id];
+
+            assert.equal(
+                after?.prs["frostyard/test#4702"],
+                undefined,
+                "the replay attaches nothing",
+            );
+            assert.equal(JSON.stringify(after), before, "the thread is unchanged");
+            assert.deepEqual(replay?.prs?.refused, first?.prs?.refused, "the first refusal stands");
         });
 
         test("a night shift report waits for the digest too, and sends nothing itself", async () => {

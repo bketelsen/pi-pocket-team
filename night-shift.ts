@@ -1738,7 +1738,20 @@ export default function createNightShift(host: Host, web: Web) {
                 /** The summary has no `PRS:` line: the desk records it, and never fails the report for it. */
                 prsMissing?: true;
             },
-        ) => Promise<{ line: string; held?: boolean } | undefined>;
+        ) => Promise<
+            | {
+                  line: string;
+                  held?: boolean;
+                  /** What the desk did with the report's PRs, when its desk has them. */
+                  prs?: {
+                      attached: string[];
+                      already: string[];
+                      notes: string[];
+                      refused: { ref: string; why: string }[];
+                  };
+              }
+            | undefined
+        >;
         /**
          * The asks of a summary's `ASKS FOR BRIAN:` block, by the desk's own parser, so the 2 modules cannot drift.
          * Absent in an older desk: the text alone holds the thread then.
