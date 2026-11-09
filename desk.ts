@@ -232,6 +232,12 @@ export function openAskRefusal(
     return `${head} A closed thread hides ${them} from Brian. Brian ${one ? "answers it" : "answers them"}, or the supervisor ends ${one ? "it" : "each"} with \`desk withdraw\`: give words, or give \`into\` with another open ask to merge it there. Then run ${action} again.`;
 }
 
+/**
+ * How closely Brian reads a PR: the `level:` label core's pr-triage workflow puts on it. L1 is the strictest (read every
+ * line), L4 the loosest (title and CI). "L1/L2" is a PR with `risk:high` and no level label.
+ */
+export type PrLevel = "L1" | "L2" | "L3" | "L4" | "L1/L2";
+
 /** One attached PR: how it was attached, and what GitHub said about it. */
 export type PrLink = {
     via: "seen" | "branch" | "window" | "attached";
@@ -255,6 +261,12 @@ export type PrLink = {
      * next read with a head fills it in. Absent: no label.
      */
     ready?: { at: number; head: string };
+    /**
+     * The strictest `level:` label from the last read: "L1/L2" when the PR has `risk:high` and no level label. Absent
+     * when it has neither, or when no read gave labels yet (a link from before the field). A read whose label list is cut
+     * (`labelsCut`) keeps the old value: a level label that is not in the list is not known to be absent.
+     */
+    level?: PrLevel;
     /**
      * When a GitHub read last gave this link's facts: the sweep's `now`. Absent on a link from before the field, or on one
      * no read has covered yet (a seed, or an attach by hand). A link whose read is older than its thread's last read
@@ -5539,6 +5551,9 @@ export function repairReopen(thread: Thread, github: GitHubFacts, now: number): 
 /** The GitHub label that says a PR is ready for Brian. Only the agent adds it, and only when the PR is ready. */
 export const READY_LABEL = "ready-for-human";
 
+/** The GitHub label of a risk path: its PR takes a stricter level, and L1/L2 when it has no `level:` label. */
+export const RISK_HIGH_LABEL = "risk:high";
+
 /** Where 1 removal of the label goes, and what it says. Stored data: never rename a value. */
 export type UnreadyEntry = {
     at: number;
@@ -8621,7 +8636,35 @@ function answerByDesk(thread: Thread, ask: Ask, words: string, now: number): boo
     );
 }
 
-const linkFor = (pr: PrFact, via: PrLink["via"]): PrLink => ({
+/** The level labels of a read, strictest first. */
+const LEVEL_LABELS: readonly PrLevel[] = ["L1", "L2", "L3", "L4"];
+
+/**
+ * A PR's level from the labels of a read: the strictest `level:` label it has, else "L1/L2" when it has `risk:high`, else
+ * none. A read that gave no labels, or whose label list is cut (`cut`), knows nothing of a missing level: it keeps the
+ * level the last read gave (`known`).
+ */
+export function prLevelOf(
+    labels: readonly string[] | undefined,
+    cut: boolean | undefined,
+    known: PrLevel | undefined,
+): PrLevel | undefined {
+    if (labels === undefined || cut === true) {
+        return known;
+    }
+
+    const names = labels.map((label) => label.toLowerCase());
+
+    for (const level of LEVEL_LABELS) {
+        if (names.includes(`level:${level.toLowerCase()}`)) {
+            return level;
+        }
+    }
+
+    return names.includes(RISK_HIGH_LABEL) ? "L1/L2" : undefined;
+}
+
+const linkFor = (pr: PrFact, via: PrLink["via"], known?: PrLevel): PrLink => ({
     via,
     state: pr.state,
     next: prNext(pr),
@@ -8635,7 +8678,13 @@ const linkFor = (pr: PrFact, via: PrLink["via"]): PrLink => ({
     draft: pr.isDraft,
     // A list read says the label is there but not when: 0 is "unknown", and the next pinned read fills the time in.
     ...(pr.ready ? { ready: { at: pr.readyAt > 0 ? pr.readyAt : 0, head: pr.head } } : {}),
+    ...levelOrNothing(prLevelOf(pr.labels, pr.labelsCut, known)),
 });
+
+/** The `level` field of a link, or nothing when the level is unknown: a stored link keeps no `level: undefined` key. */
+function levelOrNothing(level: PrLevel | undefined): { level?: PrLevel } {
+    return level === undefined ? {} : { level };
+}
 
 /**
  * A link copied to another thread. The read that gave it its facts was of the source thread (`readAt`), so the copy
@@ -8724,6 +8773,16 @@ export function updatePrs(thread: Thread, github: GitHubFacts, now: number): num
         link.review = fact.review;
         link.mergeable = fact.mergeable;
         link.draft = fact.isDraft;
+
+        // The level core's pr-triage workflow gave it: the strictest `level:` label, or L1/L2 for `risk:high` alone. A
+        // read with no labels, or with a cut list, keeps the level the last read gave.
+        const level = prLevelOf(fact.labels, fact.labelsCut, link.level);
+
+        if (level === undefined) {
+            delete link.level;
+        } else {
+            link.level = level;
+        }
 
         if (commitRead) {
             link.checks = fact.checks;
@@ -9003,8 +9062,14 @@ export function attribute(
                 .sort((a, b) => b.startedAt - a.startedAt)[0];
 
             if (newer !== undefined) {
+                // The level is a fact of the PR the holder's last read gave: the copy keeps it.
+                const level = holder.prs[pr.ref]?.level;
+
                 delete holder.prs[pr.ref];
-                newer.prs[pr.ref] = { ...linkFor(pr, "seen"), readAt: now };
+                newer.prs[pr.ref] = {
+                    ...linkFor(pr, "seen", level),
+                    readAt: now,
+                };
 
                 if (
                     addEvent(
@@ -13282,6 +13347,11 @@ export type ReadyPr = {
     /** The head oid, at 7 characters. */
     head?: string;
     checks?: string;
+    /**
+     * How closely Brian reads it: the strictest `level:` label of the PR (`L1/L2` for `risk:high` alone). Absent: no read
+     * gave a level yet.
+     */
+    level?: PrLevel;
     /** The id of the thread the PR is attached to. */
     thread: string;
     agents: string[];
@@ -13328,7 +13398,7 @@ export function staleReady(
 /**
  * The PRs that are ready for Brian to merge: each open PR with the label seen on it, on a thread that is not closed, or
  * on a thread that closed as done in the last 7 days (`reopenable`) and may come back. The stored links only: no GitHub
- * read. Oldest label first, then by ref.
+ * read. Loosest first: L4, L3, L2, L1/L2, L1, then a PR with no level. Inside a level, the oldest label first, then by ref.
  *
  * A link shows only when the last GitHub read of its thread gave its facts (`readCovered`): a link with no read, or one
  * that read did not cover, is hidden, so a merged PR on a thread no sweep reads cannot stay in the list. The page sweeps
@@ -13370,6 +13440,7 @@ export function readyPrs(state: Readonly<DeskState> | undefined, now: number): R
                     ...(link.url === undefined ? {} : { url: link.url }),
                     ...(link.head === undefined ? {} : { head: link.head.slice(0, 7) }),
                     ...(link.checks === undefined ? {} : { checks: link.checks }),
+                    ...(link.level === undefined ? {} : { level: link.level }),
                     thread: thread.id,
                     agents: [...thread.agents],
                     at: link.ready.at,
@@ -13380,7 +13451,26 @@ export function readyPrs(state: Readonly<DeskState> | undefined, now: number): R
 
     return [...ready.values()]
         .map((each) => each.pr)
-        .sort((a, b) => a.at - b.at || a.ref.localeCompare(b.ref));
+        .sort(
+            (a, b) =>
+                levelRank(a.level) - levelRank(b.level) ||
+                a.at - b.at ||
+                a.ref.localeCompare(b.ref),
+        );
+}
+
+/** The place of a level in `readyPrs`'s order: L4 first, L1 last, and a PR with no level after them all. */
+const LEVEL_RANK: Readonly<Record<PrLevel, number>> = {
+    L4: 0,
+    L3: 1,
+    L2: 2,
+    "L1/L2": 3,
+    L1: 4,
+};
+
+/** The sort key of a level: the loosest level first, and an unknown level last. */
+function levelRank(level: PrLevel | undefined): number {
+    return level === undefined ? 5 : LEVEL_RANK[level];
 }
 
 /** Whether the row of a thread beats the row a PR has: a thread that is not closed first, then the lowest thread id. */
@@ -13415,6 +13505,8 @@ export type ThreadView = {
         guessed: boolean;
         /** The label `ready-for-human` is on the PR. */
         ready?: boolean;
+        /** How closely Brian reads the PR: the level from its labels. Absent: no read gave one. */
+        level?: PrLevel;
     }[];
     /** Open asks; `from` is the agent that filed one in a report. */
     asks: {
@@ -13507,6 +13599,7 @@ export function threadView(
             via: pr.via,
             guessed: pr.via === "window",
             ...(pr.ready === undefined ? {} : { ready: true }),
+            ...(pr.level === undefined ? {} : { level: pr.level }),
         })),
         asks: thread.asks
             .filter((ask) => askIsOpen(ask))

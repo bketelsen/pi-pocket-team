@@ -101,6 +101,36 @@
     color: var(--muted);
 }
 
+/* How closely Brian reads a ready PR: the `level:` label core's pr-triage workflow put on it. */
+.desk-level {
+    font-size: 11px;
+    padding: 1px 7px;
+    border-radius: 999px;
+    font-weight: 600;
+}
+
+.desk-level-L1 {
+    background: #b60205;
+    color: #fff;
+}
+
+/* A `risk:high` PR with no level label: read as L1 or L2. */
+.desk-level-L1L2,
+.desk-level-L2 {
+    background: #d93f0b;
+    color: #fff;
+}
+
+.desk-level-L3 {
+    background: #fbca04;
+    color: #000;
+}
+
+.desk-level-L4 {
+    background: #0e8a16;
+    color: #fff;
+}
+
 .desk-title {
     font-weight: 600;
 }
