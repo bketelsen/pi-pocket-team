@@ -241,6 +241,47 @@ test("risk-path list with no caller glob exits 1", (t) => {
   assertFailure(run(root), "risk-paths");
 });
 
+test("version 1 risk-path list exits 0", (t) => {
+  const root = fixture();
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  writeFileSync(join(root, ".github", "risk-paths.json"), JSON.stringify({
+    schema_version: 1,
+    paths: [
+      { glob: ".github/risk-paths.json", why: "governance: the high-risk path list" },
+      { glob: ".github/workflows/**", why: "governance: CI and the caller workflow" },
+    ],
+  }, null, 2) + "\n", "utf8");
+  assertClean(run(root));
+});
+
+test("version 2 risk-path list with levels exits 0", (t) => {
+  const root = fixture();
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  writeFileSync(join(root, ".github", "risk-paths.json"), JSON.stringify({
+    schema_version: 2,
+    default_level: "L3",
+    paths: [
+      { glob: ".github/risk-paths.json", level: "L2", why: "governance: the high-risk path list" },
+      { glob: ".github/workflows/**", level: "L1", why: "governance: CI and the caller workflow" },
+    ],
+  }, null, 2) + "\n", "utf8");
+  assertClean(run(root));
+});
+
+test("version 2 risk-path list at L3 for a required path exits 1", (t) => {
+  const root = fixture();
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  writeFileSync(join(root, ".github", "risk-paths.json"), JSON.stringify({
+    schema_version: 2,
+    default_level: "L3",
+    paths: [
+      { glob: ".github/risk-paths.json", level: "L3", why: "governance: the high-risk path list" },
+      { glob: ".github/workflows/**", level: "L2", why: "governance: CI and the caller workflow" },
+    ],
+  }, null, 2) + "\n", "utf8");
+  assertFailure(run(root), "matches the required path \\.github/risk-paths\\.json at level L3; it must be L1 or L2");
+});
+
 test("correction with a sixth field exits 1", (t) => {
   const root = fixture();
   t.after(() => rmSync(root, { recursive: true, force: true }));

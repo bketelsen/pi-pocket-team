@@ -768,7 +768,12 @@ export type Features = {
     reposNamed: number;
     /** The first repository folder's language, from its marker files; `unknown` with no folder. */
     language: "go" | "ts" | "js" | "python" | "other" | "unknown";
-    /** A named path matches a folder's `.github/risk-paths.json`; null when no folder has a readable list. */
+    /**
+     * A named path is a risk path: it matches a glob of a folder's `.github/risk-paths.json` that gets the label
+     * `risk:high`, so any glob of a version 1 list, and an L1 or L2 glob of a version 2 list (frostyard/core ADR-0078).
+     * Null when no folder has a readable list. The meaning stays "a named path is a risk path": the L3 and L4 globs of a
+     * version 2 list are not risk paths.
+     */
     riskPathNamed: boolean | null;
     /** A named path's folder holds a test file; null when no path is named or no folder exists. */
     testsBeside: boolean | null;
@@ -893,8 +898,9 @@ function realInside(realRoot: string, target: string): string | undefined {
 }
 
 /**
- * The globs of a folder's `.github/risk-paths.json`, or undefined when it is absent, unreadable, not a list, or a link
- * to a file outside the folder.
+ * The globs of a folder's `.github/risk-paths.json` that name a risk path, or undefined when it is absent, unreadable,
+ * not a list, or a link to a file outside the folder. In a version 2 list only the L1 and L2 globs are risk paths
+ * (frostyard/core ADR-0078); an entry with no `level`, in a version 1 list, is one.
  */
 function riskGlobs(dir: string, realRoot: string): string[] | undefined {
     const file = realInside(realRoot, join(dir, ".github", "risk-paths.json"));
@@ -911,9 +917,13 @@ function riskGlobs(dir: string, realRoot: string): string[] | undefined {
         }
 
         return parsed.paths.flatMap((entry: unknown) => {
-            const glob = (entry as { glob?: unknown } | null)?.glob;
+            const { glob, level } = (entry ?? {}) as { glob?: unknown; level?: unknown };
 
-            return typeof glob === "string" && glob !== "" ? [glob] : [];
+            if (typeof glob !== "string" || glob === "") {
+                return [];
+            }
+
+            return level === undefined || level === "L1" || level === "L2" ? [glob] : [];
         });
     } catch {
         return undefined;

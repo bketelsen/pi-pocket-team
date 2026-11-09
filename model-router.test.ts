@@ -1205,6 +1205,39 @@ test("features: riskPathNamed matches named paths against the folder's risk path
     }
 });
 
+test("features: riskPathNamed reads only the L1 and L2 globs of a version 2 risk paths list", async () => {
+    const v2 = (level: string) =>
+        JSON.stringify({
+            schema_version: 2,
+            default_level: "L3",
+            paths: [{ glob: "model-router.ts", level, why: "the router" }],
+        });
+    const loose = await repoWith({
+        ".github/risk-paths.json": v2("L4"),
+        "model-router.ts": "",
+    });
+    const strict = await repoWith({
+        ".github/risk-paths.json": v2("L2"),
+        "model-router.ts": "",
+    });
+
+    try {
+        assert.equal(
+            features("Change model-router.ts", [loose.dir]).riskPathNamed,
+            false,
+            "an L4 glob is not a risk path",
+        );
+        assert.equal(
+            features("Change model-router.ts", [strict.dir]).riskPathNamed,
+            true,
+            "an L2 glob is a risk path",
+        );
+    } finally {
+        await loose.done();
+        await strict.done();
+    }
+});
+
 test("features: testsBeside looks for a test file in each named path's folder", async () => {
     const repo = await repoWith({
         "team.ts": "",
