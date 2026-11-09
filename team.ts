@@ -849,10 +849,27 @@ ${
         ? "You own the team, not this conversation's repository. Do work directly when helpful. Use team_delegate for a specialist; select their repository by its roster name and give a self-contained task. Their task starts in that repository regardless of your folder. A greeting needs no audit of old work."
         : persona.role === "clerk"
           ? "You are the desk clerk of your supervisor. Desk digests arrive as messages whose lines start with [desk]. Escalate to your supervisor with desk escalate: thread (the thread it is about), text, and urgent: true only for what must go at once. The desk drops an escalation when the supervisor acted on the thread, or got its news directly, after the news that caused it, and records the drop on the thread. Use team_message to your supervisor only to answer a task that it sent you. A thread that desk read shows as Handled needs no escalation for its reports, because the supervisor acted after them."
-          : "Do your assigned work directly. For a linked task, report the result once with team_message to the return address in its initial message. Set its status. Put each decision you need from Brian in its asks, 1 question each, with options when it is a pick-one: a decision written only in the text can be missed. A done or blocked report with no decision sends asks: []. A plain merge or install request is no ask: the PR's label brings it to Brian. In a linked task, never call the built-in `ask` tool: its card waits only in this session, and the desk does not see it. Put the decision in the asks of team_message."
+          : "Do your assigned work directly. For a linked task, report the result once with team_message to the return address in its initial message. Set its status. Put each decision you need from Brian in its asks, 1 question each, with options when it is a pick-one: a decision written only in the text can be missed. A done or blocked report with no decision sends asks: []. A plain merge or install request is no ask: the PR's label brings it to Brian. In a linked task, never call the built-in `ask` tool: its card waits only in this session, and the desk does not see it. Put the decision in the asks of team_message. List in its prs each PR you created, changed, reviewed or labelled in the task, as { repo, number }, or send prs: [] when there is none."
 }`;
 
 const reply = (text: string) => ({ output: [{ type: "text" as const, text }] });
+
+/** The PRs a report names, as `owner/name#N` refs, once each: a repeat that differs only in case is the same PR. */
+const prsRefs = (prs: readonly { repo: string; number: number }[] | undefined): string[] => {
+    const seen = new Set<string>();
+    const refs: string[] = [];
+
+    for (const one of prs ?? []) {
+        const ref = `${one.repo}#${String(one.number)}`;
+
+        if (!seen.has(ref.toLowerCase())) {
+            seen.add(ref.toLowerCase());
+            refs.push(ref);
+        }
+    }
+
+    return refs;
+};
 
 /** What the supervisor rail button needs: the session it opens, or why there is none. */
 export type FrontDoor =
@@ -1421,6 +1438,7 @@ export const MESSAGE_LIMITS = {
     question: 500,
     options: { min: 2, max: 6 },
     option: 40,
+    prs: 100,
 } as const;
 
 const STATUSES = ["done", "working", "blocked"] as const;
@@ -1450,16 +1468,71 @@ function lengthProblem(name: string, text: unknown, max: number, fix: string): s
         : [];
 }
 
+/** A repository as `prs` takes it: exactly "owner/name". */
+const PR_REPO = /^[A-Za-z0-9][A-Za-z0-9_.-]*\/[A-Za-z0-9][A-Za-z0-9_.-]*$/;
+
+/**
+ * What is wrong with `prs`, 1 line each with the fix. This is the one place `teamMessageProblems` reads a type: a
+ * string such as "owner/name#12" is the likely mistake, and the schema's own error names only the path.
+ */
+function prsProblems(prs: unknown): string[] {
+    if (prs === undefined || prs === null) {
+        return [];
+    }
+
+    if (!Array.isArray(prs)) {
+        return [
+            `prs is ${JSON.stringify(prs)}: use a list of { repo: "owner/name", number: 12 }, or [].`,
+        ];
+    }
+
+    const problems: string[] =
+        prs.length > MESSAGE_LIMITS.prs
+            ? [
+                  `prs has ${String(prs.length)} PRs; the limit is ${String(MESSAGE_LIMITS.prs)}. Send the others in a second team_message.`,
+              ]
+            : [];
+
+    prs.forEach((item: unknown, index) => {
+        const at = `prs[${String(index)}]`;
+
+        if (typeof item !== "object" || item === null || Array.isArray(item)) {
+            problems.push(
+                `${at} is ${JSON.stringify(item)}: use { repo: "owner/name", number: 12 }.`,
+            );
+
+            return;
+        }
+
+        const { repo, number } = item as Record<string, unknown>;
+
+        if (typeof repo !== "string" || !PR_REPO.test(repo)) {
+            problems.push(
+                `${at}.repo is ${JSON.stringify(repo)}: use owner/name, such as bketelsen/pi-pocket.`,
+            );
+        }
+
+        if (typeof number !== "number" || !Number.isSafeInteger(number) || number < 1) {
+            problems.push(
+                `${at}.number is ${JSON.stringify(number)}: use the PR number as a whole number, such as 12.`,
+            );
+        }
+    });
+
+    return problems;
+}
+
 /**
  * What is wrong with team_message's arguments, 1 line each, with the limit and the fix: the schema's own error names
- * only the path. It checks the limits only; a wrong type is left to the schema. The limits stay as they are.
+ * only the path. It checks the limits, and each of `prs`'s items (a bad one is refused with the fix); another wrong
+ * type is left to the schema. The limits stay as they are.
  */
 export function teamMessageProblems(args: unknown): string[] {
     if (typeof args !== "object" || args === null) {
         return [];
     }
 
-    const { message, status, asks } = args as Record<string, unknown>;
+    const { message, status, asks, prs } = args as Record<string, unknown>;
     const problems = lengthProblem(
         "message",
         message,
@@ -1475,6 +1548,8 @@ export function teamMessageProblems(args: unknown): string[] {
     ) {
         problems.push(`status is ${JSON.stringify(status)}: use done, working or blocked.`);
     }
+
+    problems.push(...prsProblems(prs));
 
     // A done or blocked report says its decisions for Brian, or that there are none: the desk then reads no prose for
     // them. A null is the validator's absent value, so it is missing too.
@@ -2041,10 +2116,34 @@ export default function createTeam(host: Host, web: Web) {
                 asksNone?: true;
                 /** The agent's name, as the asks' author. */
                 by?: string;
+                /** The PRs the agent reported, as `owner/name#N`: the desk attaches each to the thread. */
+                prs?: string[];
+                /** The PRs the desk refused, with the reason: each is an event on the thread. */
+                prsRefused?: { ref: string; why: string }[];
             },
         ) => Promise<
-            { thread: DeskThread; line: string; held?: boolean; asked?: string[] } | undefined
+            | {
+                  thread: DeskThread;
+                  line: string;
+                  held?: boolean;
+                  asked?: string[];
+                  /** What the desk did with the report's PRs. An older desk has none. */
+                  prs?: {
+                      attached: string[];
+                      already: string[];
+                      notes: string[];
+                      refused: { ref: string; why: string }[];
+                  };
+              }
+            | undefined
         >;
+        /**
+         * Whether GitHub has each reported PR, and its owner is one the team works in, as `owner/name#N` refs: no
+         * write, and it never throws. An older desk has none: the caller then keeps the PRs in the report's text only.
+         */
+        checkPrs?: (
+            refs: string[],
+        ) => Promise<{ ok: string[]; refused: { ref: string; why: string }[] }>;
         /** Register a supervisor's Clerk. The same values twice change nothing. */
         clerk: (
             tx: Tx,
@@ -4002,7 +4101,7 @@ export default function createTeam(host: Host, web: Web) {
     const message = defineTool({
         name: "team_message",
         description:
-            "Send a task follow-up or final report to a linked-session address. It returns when admitted, without waiting for an answer. In a report to your supervisor, set status, and put each decision you need from Brian in asks: each becomes an ask on the desk thread, which Brian sees at once and your supervisor may rewrite, merge or withdraw. A done or blocked report must send asks: [] when there is no decision. A plain merge or install request is no ask.",
+            "Send a task follow-up or final report to a linked-session address. It returns when admitted, without waiting for an answer. In a report to your supervisor, set status, and put each decision you need from Brian in asks: each becomes an ask on the desk thread, which Brian sees at once and your supervisor may rewrite, merge or withdraw. A done or blocked report must send asks: [] when there is no decision. A plain merge or install request is no ask. List in prs each PR you created, changed, reviewed or labelled in the task, as { repo, number }: the desk puts each on your thread, so Brian finds it in Ready to merge.",
         parameters: Type.Object({
             to: Type.String(),
             message: Type.String({ minLength: 1, maxLength: MESSAGE_LIMITS.message }),
@@ -4038,6 +4137,23 @@ export default function createTeam(host: Host, web: Web) {
                     { maxItems: MESSAGE_LIMITS.asks },
                 ),
             ),
+            prs: Type.Optional(
+                Type.Array(
+                    Type.Object({
+                        repo: Type.String({
+                            minLength: 1,
+                            pattern: "^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$",
+                            description: "owner/name, such as bketelsen/pi-pocket",
+                        }),
+                        number: Type.Integer({ minimum: 1, description: "the PR number" }),
+                    }),
+                    {
+                        maxItems: MESSAGE_LIMITS.prs,
+                        description:
+                            "The PRs you created, changed, reviewed or labelled in this task, each as { repo, number }. [] or none is valid. The desk puts each on your thread.",
+                    },
+                ),
+            ),
         }),
         // Before the schema: an argument over a limit gets an error that says the limit, by how much, and what to do.
         // Pure, and it changes nothing; arguments within the limits go on to the schema as they are. The first line
@@ -4058,15 +4174,37 @@ export default function createTeam(host: Host, web: Web) {
             const key = `x.team.message:${api.taskId}:${api.callId}`;
             const desk = deskApi();
             const asks = args.asks ?? [];
+            const refs = prsRefs(args.prs);
+            // The check reads GitHub, so it runs before the commit: no network inside one. A throw refuses each ref,
+            // because a refused ref must never be dropped in silence.
+            const check = refs.length === 0 ? undefined : desk?.checkPrs;
+            let checked: { ok: string[]; refused: { ref: string; why: string }[] } | undefined;
+
+            if (check !== undefined) {
+                try {
+                    checked = await check(refs);
+                } catch (error) {
+                    checked = {
+                        ok: [],
+                        refused: refs.map((ref) => ({
+                            ref,
+                            why: `the desk could not check it: ${(error as Error).message}`,
+                        })),
+                    };
+                }
+            }
+
             const sender =
                 desk === undefined || asks.length === 0
                     ? undefined
                     : await published.persona(api, api.conversationId, context);
-            // The asks are in the text too: a reader of the report, or of a message that is no report, sees them.
-            const text =
+            // The asks are in the text too: a reader of the report, or of a message that is no report, sees them. The
+            // PRs are there as the agent gave them, so a reader finds them without the desk.
+            const asksText =
                 asks.length === 0
                     ? args.message
                     : `${args.message}\n\nDecisions for Brian:\n${asks.map((ask) => `- ${ask.question}${ask.options === undefined ? "" : ` [${ask.options.join(" | ")}]`}`).join("\n")}`;
+            const text = refs.length === 0 ? asksText : `${asksText}\n\nPRs: ${refs.join(", ")}`;
 
             // A report to the thread's supervisor is filed on the thread in one commit with the send's key, so a replay
             // finds it and sends the same line once. A message to anyone else goes as before. With the desk's digest on,
@@ -4090,6 +4228,12 @@ export default function createTeam(host: Host, web: Web) {
                                       ? { asksNone: true as const }
                                       : {}),
                                   ...(sender === undefined ? {} : { by: sender.name }),
+                                  ...(checked === undefined || checked.ok.length === 0
+                                      ? {}
+                                      : { prs: checked.ok }),
+                                  ...(checked === undefined || checked.refused.length === 0
+                                      ? {}
+                                      : { prsRefused: checked.refused }),
                               }),
                           context,
                       );
@@ -4116,6 +4260,27 @@ export default function createTeam(host: Host, web: Web) {
                     : filedAsks.length === asks.length
                       ? ` Filed for Brian: ${filedAsks.join(", ")}.`
                       : ` ${String(asks.length - filedAsks.length)} of your asks were refused, and are in the report's text only: your supervisor sees them there.${filedAsks.length === 0 ? "" : ` Filed for Brian: ${filedAsks.join(", ")}.`}`;
+            // Every PR the agent named gets an answer: attached, refused, or kept elsewhere. None is dropped silently.
+            const onDesk =
+                filed?.prs === undefined
+                    ? ""
+                    : [...filed.prs.attached, ...filed.prs.already].join(", ");
+            const prsText =
+                refs.length === 0
+                    ? ""
+                    : filed === undefined
+                      ? " Your prs were not attached: this message is no report on a desk thread."
+                      : checked === undefined
+                        ? " This desk cannot attach PRs: they are in the report's text only."
+                        : [
+                              onDesk === "" ? "" : ` PRs on ${filed.thread.id}: ${onDesk}.`,
+                              // The refusals of the first filing when the desk has them: a replayed call made its
+                              // check again, and a filed report never changes.
+                              ...(filed.prs?.refused ?? checked.refused).map(
+                                  (one) => ` Error: ${one.ref}: ${one.why}.`,
+                              ),
+                              ...(filed.prs?.notes ?? []).map((note) => ` ${note}`),
+                          ].join("");
 
             return reply(
                 (filed === undefined
@@ -4123,7 +4288,8 @@ export default function createTeam(host: Host, web: Web) {
                     : filed.held === true
                       ? `Filed on ${filed.thread.id}. Your supervisor gets it in the next desk digest. Do not send an acknowledgement or wait for a reply.`
                       : `Filed on ${filed.thread.id}. Your supervisor got 1 line. Do not send an acknowledgement or wait for a reply.`) +
-                    asked,
+                    asked +
+                    prsText,
             );
         },
     });

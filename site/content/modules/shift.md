@@ -58,7 +58,7 @@ State is one document per conversation, `x.night-shift.goal`. It is stored data.
 
 ## Delegated shifts
 
-A supervisor identity can start a shift in the linked session that `team_delegate` makes, with its `shift` argument: `{ objective?, stop_when, start?, until?, for?, max?, worker?, pr_check? }`. The report comes back to the supervisor's session by itself when the goal stops. `night_shift` is the old name of `shift`, with the same fields; a call that gives both is refused.
+A supervisor identity can start a shift in the linked session that `team_delegate` makes, with its `shift` argument: `{ objective?, stop_when, start?, until?, for?, max?, worker?, pr_check? }`. The report comes back to the supervisor's session by itself when the goal stops. Its summary also writes 1 line `PRS:` with each PR the shift touched, as `owner/name#N`, or `PRS: none`: the desk puts each PR on the thread. `night_shift` is the old name of `shift`, with the same fields; a call that gives both is refused.
 
 A shift from the tool takes no free check command. `pr_check` is the only check it takes: a structured PR check, and the module builds the `gh` command itself from `pr`, `repo`, `checks` and `label`. Both modules must be on in **Menu → Extensions**.
 

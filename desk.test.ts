@@ -118,6 +118,9 @@ import {
     statusLineClears,
     askById,
     attachTo,
+    attachReported,
+    ownerRefusals,
+    prsLineOf,
     boundSupervisors,
     attribute,
     asleep,
@@ -9670,6 +9673,150 @@ describe("attachTo", () => {
     });
 });
 
+describe("ownerRefusals: the ref and owner checks before any GitHub call", () => {
+    test("a roster that cannot be read refuses every ref, and asks GitHub nothing", () => {
+        const roster =
+            "the team roster cannot be read now, so its owner cannot be checked: not attached. Your supervisor can attach it later with desk attach";
+
+        assert.deepEqual(ownerRefusals(["frostyard/test#7", "evil/x#1"], undefined), {
+            asked: [],
+            refused: [
+                { ref: "frostyard/test#7", why: roster },
+                { ref: "evil/x#1", why: roster },
+            ],
+        });
+    });
+
+    test("only a roster owner is asked about, and case does not count", () => {
+        assert.deepEqual(
+            ownerRefusals(
+                ["frostyard/test#7", "Frostyard/test#8", "evil/x#1", "nonsense"],
+                ["frostyard"],
+            ),
+            {
+                asked: [
+                    { ref: "frostyard/test#7", repo: "frostyard/test", number: 7 },
+                    { ref: "Frostyard/test#8", repo: "Frostyard/test", number: 8 },
+                ],
+                refused: [
+                    {
+                        ref: "evil/x#1",
+                        why: "the owner evil is not one the team works in (frostyard): not attached",
+                    },
+                    { ref: "nonsense", why: "it is not a PR ref like owner/name#12" },
+                ],
+            },
+        );
+    });
+});
+
+describe("attachReported: the PRs a report names go on its thread", () => {
+    test("a ref with no holder is attached, and a second call adds nothing", () => {
+        const state = deskOf();
+        const thread = placed(state, 100);
+
+        assert.deepEqual(attachReported(state, thread.id, ["frostyard/test#7"], 200, "duncan"), {
+            attached: ["frostyard/test#7"],
+            already: [],
+            notes: [],
+        });
+        assert.equal(thread.prs["frostyard/test#7"]?.via, "attached");
+        assert.deepEqual(
+            thread.events.map((event) => event.text).filter((text) => text.includes("attached")),
+            ["frostyard/test#7 attached"],
+            "1 event",
+        );
+
+        // The same ref again, in another case: already here, with no second event.
+        assert.deepEqual(attachReported(state, thread.id, ["Frostyard/Test#7"], 300, "duncan"), {
+            attached: [],
+            already: ["Frostyard/Test#7"],
+            notes: [],
+        });
+        assert.equal(
+            thread.events.filter((event) => event.text.includes("attached")).length,
+            1,
+            "no second event",
+        );
+        assert.deepEqual(Object.keys(thread.prs), ["frostyard/test#7"]);
+    });
+
+    test("another open thread keeps it, and a thread closed as done hands it over", () => {
+        const state = deskOf();
+        const older = placed(state, 100);
+        const mine = placed(state, 200);
+
+        older.prs["frostyard/test#7"] = { via: "seen", state: "OPEN" };
+        const kept = attachReported(state, mine.id, ["frostyard/test#7"], 300, "duncan");
+
+        assert.deepEqual(kept, {
+            attached: [],
+            already: [],
+            notes: [
+                `frostyard/test#7 stays on ${older.id}: that open thread holds it. Your supervisor can move it with desk attach.`,
+            ],
+        });
+        assert.equal(older.prs["frostyard/test#7"]?.via, "seen", "nothing moved");
+        assert.equal(mine.prs["frostyard/test#7"], undefined);
+
+        // Closed as done: its work goes on, so the PR moves, as desk attach moves it.
+        older.state = "closed";
+        older.closed = { at: 250, why: "done", by: "sweep" };
+
+        const moved = attachReported(state, mine.id, ["frostyard/test#7"], 400, "duncan");
+
+        assert.deepEqual(moved, { attached: ["frostyard/test#7"], already: [], notes: [] });
+        assert.equal(older.prs["frostyard/test#7"], undefined);
+        assert.equal(mine.prs["frostyard/test#7"]?.via, "attached");
+        assert.match(older.events.map((event) => event.text).join("; "), /moved to /);
+    });
+
+    test("a thread closed as dropped keeps it, and a detached ref stays off", () => {
+        const state = deskOf();
+        const closed = placed(state, 100);
+        const mine = placed(state, 200);
+
+        closed.prs["frostyard/test#8"] = { via: "seen", state: "OPEN" };
+        closed.state = "closed";
+        closed.closed = { at: 150, why: "dropped", by: "brian" };
+
+        assert.deepEqual(
+            attachReported(state, mine.id, ["frostyard/test#8"], 300, "duncan").notes,
+            [`frostyard/test#8 stays on ${closed.id}: that thread closed as dropped.`],
+        );
+        assert.equal(closed.prs["frostyard/test#8"]?.via, "seen");
+        assert.equal(mine.prs["frostyard/test#8"], undefined);
+
+        // A ref taken off with desk detach stays off: only the supervisor brings it back.
+        state.dropped = { "frostyard/test#9": { at: 100, from: "F1" } };
+
+        assert.deepEqual(attachReported(state, mine.id, ["frostyard/test#9"], 400, "duncan"), {
+            attached: [],
+            already: [],
+            notes: [
+                "frostyard/test#9 was taken off the desk with desk detach: not attached. Only your supervisor's desk attach brings it back.",
+            ],
+        });
+        assert.equal(mine.prs["frostyard/test#9"], undefined);
+    });
+
+    test("a plan thread is refused with the reason, in a note", () => {
+        const state = deskOf();
+        const plan = placed(state, 100);
+
+        plan.origin = "plan";
+
+        assert.deepEqual(attachReported(state, plan.id, ["frostyard/test#7"], 200, "duncan"), {
+            attached: [],
+            already: [],
+            notes: [
+                `frostyard/test#7 is not attached: ${plan.id} is a plan thread: it holds no PR and takes no merge. Attach the work to the task thread.`,
+            ],
+        });
+        assert.equal(plan.prs["frostyard/test#7"], undefined);
+    });
+});
+
 describe("exportFiles", () => {
     test("sections, PR and ask lines, and escaped agent text", () => {
         const state = deskOf();
@@ -10854,6 +11001,49 @@ describe("a report that asks Brian for a decision", () => {
         );
         assert.equal(namesDecision("ASKS FOR BRIAN:\n- Rotate the key."), true);
     });
+
+    test("a PRS: line, its refs, its URLs, and its bad tokens", () => {
+        // No line at all: nothing.
+        assert.equal(prsLineOf("Done. Nothing for Brian."), undefined);
+        assert.equal(prsLineOf("Done.\n\nnone"), undefined);
+        // The words, and a "none", give no ref and no bad token.
+        assert.deepEqual(prsLineOf("Done.\n\nPRS: none"), { refs: [], bad: [] });
+        assert.deepEqual(prsLineOf("Done.\n\nPRS: none."), { refs: [], bad: [] });
+        assert.deepEqual(prsLineOf("PRS:"), { refs: [], bad: [] });
+        // A list, a URL, and the marks and spacing an agent writes.
+        assert.deepEqual(
+            prsLineOf(
+                "Done.\n\n**PRS:** `frostyard/test#7`, https://github.com/bketelsen/x/pull/12",
+            ),
+            { refs: ["frostyard/test#7", "bketelsen/x#12"], bad: [] },
+        );
+        assert.deepEqual(
+            prsLineOf("PRS: a/b#1\nb/c#2"),
+            { refs: ["a/b#1"], bad: [] },
+            "1 line only",
+        );
+        // The last line wins.
+        assert.deepEqual(prsLineOf("PRS: a/b#1\n\nPRS: c/d#3"), { refs: ["c/d#3"], bad: [] });
+        // A line inside a code block is quoted, not said.
+        assert.equal(prsLineOf("Done.\n\n```\nPRS: a/b#1\n```\n\nAll set."), undefined);
+        // A token that is no ref, and the same ref twice in another case.
+        assert.deepEqual(prsLineOf("PRS: a/b#1, a/B#1, owner/name, #12, see below"), {
+            refs: ["a/b#1"],
+            bad: ["owner/name", "#12", "see", "below"],
+        });
+        // The line is read as written: a ref in inline code keeps its text.
+        assert.deepEqual(prsLineOf("PRS: `a/b#1`"), { refs: ["a/b#1"], bad: [] });
+    });
+
+    test("a PRS: line ends the ASKS FOR BRIAN block, so it is no ask", () => {
+        assert.deepEqual(asksForBrian("ASKS FOR BRIAN: none\nPRS: a/b#1"), []);
+        assert.deepEqual(reportAsksOf("ASKS FOR BRIAN: none\nPRS: a/b#1"), []);
+        assert.deepEqual(
+            asksForBrian("ASKS FOR BRIAN:\n- Rotate the key?\nPRS: a/b#1"),
+            ["Rotate the key?"],
+            "the items above the line still count",
+        );
+    });
 });
 
 describe("asks from agents, rewritten and withdrawn", () => {
@@ -11993,6 +12183,21 @@ function scriptStep(text: string, request: unknown): ReturnType<typeof script> |
         });
     }
 
+    // The PRs of the task: 2 in a repository the team works in, and 1 whose owner it does not.
+    if (text.endsWith("report with prs test")) {
+        return call("team_message", {
+            to: linkedAddressOf(request),
+            message: "Done. I triaged the Dependabot PRs and labelled 1.",
+            status: "done",
+            asks: [],
+            prs: [
+                { repo: "frostyard/test", number: 7 },
+                { repo: "frostyard/test", number: 8 },
+                { repo: "evil/x", number: 1 },
+            ],
+        });
+    }
+
     if (text.endsWith("desk rewrite test")) {
         return call("desk", {
             action: "rewrite",
@@ -12200,6 +12405,9 @@ const failGh = join(root, "fail-gh.sh");
 const partialPath = join(root, "partial-github.json");
 const partialGh = join(root, "partial-gh.sh");
 const okGh = join(root, "ok-gh.sh");
+/** A `gh` for a report's PR check: 1 alias with a PR, 1 without, then a non-zero exit, as `gh` answers a wrong number. */
+const prsGh = join(root, "prs-gh.sh");
+const prsAnswerPath = join(root, "prs-answer.json");
 
 /** A `gh api graphql` answer for frostyard/pilothouse. */
 const githubFixture = (
@@ -12471,6 +12679,22 @@ before(async () => {
         `#!/bin/sh\nprintf '%s' '{"data":{"repository":{"pullRequest":{"number":1}}}}'\n`,
     );
     chmodSync(okGh, 0o755);
+    // The PR check: p0 is a PR that exists, p1 is not one (a null), and `gh` exits 1 over it. Any other read gets the
+    // desk's ordinary fixture, so a sweep in the same window still reads what it expects.
+    writeFileSync(
+        prsAnswerPath,
+        JSON.stringify({
+            data: {
+                p0: { nameWithOwner: "frostyard/test", pullRequest: { number: 7 } },
+                p1: { nameWithOwner: "frostyard/test", pullRequest: null },
+            },
+        }),
+    );
+    writeFileSync(
+        prsGh,
+        `#!/bin/sh\ncase "$*" in\n*"pullRequest(number: "*|*"pullRequest(number:"*) cat ${JSON.stringify(prsAnswerPath)}; exit 1 ;;\nesac\ncat ${JSON.stringify(fixturePath)}\n`,
+    );
+    chmodSync(prsGh, 0o755);
     process.env.PI_POCKET_DESK_GH = fakeGh;
     process.env.PI_POCKET_DESK_CONFIG = configPath;
     // The tests make many threads: a high cap, so only the cap tests meet the cap. Each of them restores this.
@@ -15739,6 +15963,50 @@ describe("the desk in a Pi Pocket", () => {
         assert.equal(blocked?.run.reportBlocked, true);
     });
 
+    test("a report's PRs go on its thread: checked, attached, and refused with the reason", async () => {
+        const { linked, thread } = await delegated("prs-reporter");
+
+        // A `gh` that answers the PR check with 1 alias that has a PR and 1 that has none, then exits 1.
+        process.env.PI_POCKET_DESK_GH = prsGh;
+
+        try {
+            await say(app, linked, "report with prs test");
+        } finally {
+            process.env.PI_POCKET_DESK_GH = fakeGh;
+        }
+
+        const filed = (await deskState())?.threads[thread.id];
+
+        assert.equal(filed?.prs["frostyard/test#7"]?.via, "attached");
+        assert.equal(filed?.prs["frostyard/test#8"], undefined, "GitHub has no such PR");
+        assert.equal(filed?.prs["evil/x#1"], undefined, "that owner is not one the team works in");
+
+        // Each refusal is an event, so the thread keeps the reason.
+        const events = (filed?.events ?? []).map((event) => event.text).join("\n");
+
+        assert.match(events, /frostyard\/test#7 attached/);
+        assert.match(
+            events,
+            /report PR refused: frostyard\/test#8: GitHub has no such PR \(an issue, a wrong number, or a repository the machine account cannot read\): not attached/,
+        );
+        assert.match(
+            events,
+            /report PR refused: evil\/x#1: the owner evil is not one the team works in \(frostyard\): not attached/,
+        );
+
+        // The report's text names them, as the agent gave them: a reader finds them without the desk.
+        const report = (await app.harness.snapshot(DeskReports, linked, context))?.reports[0];
+
+        assert.match(String(report?.text), /PRs: frostyard\/test#7, frostyard\/test#8, evil\/x#1/);
+
+        // The tool's answer says what the desk did with each one.
+        const reply = (await modelTexts(app, linked)).join("\n");
+
+        assert.match(reply, new RegExp(`PRs on ${rx(thread.id)}: frostyard/test#7\\.`));
+        assert.match(reply, /Error: frostyard\/test#8: GitHub has no such PR/);
+        assert.match(reply, /Error: evil\/x#1: the owner evil is not one the team works in/);
+    });
+
     test("a message to another address sends the full text unchanged", async () => {
         const { source, linked, thread } = await delegated("messenger");
 
@@ -16031,6 +16299,98 @@ describe("the desk in a Pi Pocket", () => {
             assert.equal(ask?.text, "Rotate the console cloud key?");
             assert.deepEqual(ask?.options, ["rotate", "keep"]);
             assert.equal(filed?.run.reportAsks, false, "the asks hold the thread, not the text");
+        } finally {
+            nightSummary = "";
+        }
+    });
+
+    test("a night shift summary's PRS line puts its PRs on the thread", async () => {
+        // A PR no other test names, so no other thread holds it.
+        nightSummary = [
+            "NIGHT-REPORT-START the shift is done.",
+            "",
+            "PRS: frostyard/test#4701",
+            "",
+            "ASKS FOR BRIAN: none",
+            "",
+            "NIGHT-REPORT-END",
+        ].join("\n");
+        // The same `gh` answer as a report's check: p0 is a PR that exists.
+        process.env.PI_POCKET_DESK_GH = prsGh;
+
+        try {
+            const source = await supervisor("night-prs");
+
+            await say(app, source, "desk night shift test");
+            const linked = app
+                .sessions()
+                .find((session) => session.linkedFrom?.id === Number(source));
+
+            assert(linked, "the night shift started a linked session");
+            const thread = threadOfSession(await deskState(), Number(linked.id));
+
+            assert(thread);
+            await until(
+                async () =>
+                    (await deskState())?.threads[thread.id]?.prs["frostyard/test#4701"] !==
+                    undefined,
+                "the report's PR on the thread",
+                30_000,
+            );
+
+            const filed = (await deskState())?.threads[thread.id];
+
+            assert.equal(filed?.prs["frostyard/test#4701"]?.via, "attached");
+            assert.match(
+                (filed?.events ?? []).map((event) => event.text).join("\n"),
+                /frostyard\/test#4701 attached/,
+            );
+            assert.equal(
+                (filed?.events ?? []).some((event) => event.key.startsWith("report-prs-missing")),
+                false,
+                "the summary has its line",
+            );
+        } finally {
+            process.env.PI_POCKET_DESK_GH = fakeGh;
+            nightSummary = "";
+        }
+    });
+
+    test("a night shift summary with no PRS line files its report, and the thread says its PRs are not attached", async () => {
+        nightSummary = ["NIGHT-REPORT-START the shift is done.", "", "NIGHT-REPORT-END"].join("\n");
+
+        try {
+            const source = await supervisor("night-no-prs");
+
+            await say(app, source, "desk night shift test");
+            const linked = app
+                .sessions()
+                .find((session) => session.linkedFrom?.id === Number(source));
+
+            assert(linked, "the night shift started a linked session");
+            const thread = threadOfSession(await deskState(), Number(linked.id));
+
+            assert(thread);
+            await until(
+                async () =>
+                    typeof (await deskState())?.threads[thread.id]?.run.reportedAt === "number",
+                "the summary's report",
+                30_000,
+            );
+
+            const filed = (await deskState())?.threads[thread.id];
+
+            // The report is filed as usual: the missing line is a warning and an event, never a failure.
+            assert.equal(filed?.state, "open");
+            assert(
+                (filed?.events ?? []).some(
+                    (event) =>
+                        event.key.startsWith("report-prs-missing") &&
+                        event.text ===
+                            "the shift summary has no PRS line: its PRs are not attached",
+                ),
+                "the thread records the missing line",
+            );
         } finally {
             nightSummary = "";
         }
@@ -23434,6 +23794,98 @@ describe("the desk in a Pi Pocket", () => {
                 await stopDigests();
                 digestOff();
             }
+        });
+
+        test("a replay of a report attaches no PR, and repeats the first refusals", async () => {
+            digestOff();
+
+            const { linked, thread } = await delegated("prs-replay");
+
+            await until(
+                async () =>
+                    typeof (await deskState())?.threads[thread.id]?.run.sweptAt === "number",
+                "the first sweep",
+                20_000,
+            );
+            // No sweep after this: the thread must be the same before and after the replay.
+            await stopSweepers();
+
+            const address = String((await deskState())?.threads[thread.id]?.run.returnAddress);
+            const api = (
+                globalThis as unknown as Record<
+                    symbol,
+                    {
+                        file: (
+                            tx: unknown,
+                            session: ConversationId,
+                            request: object,
+                        ) => Promise<
+                            | {
+                                  line: string;
+                                  prs?: {
+                                      attached: string[];
+                                      already: string[];
+                                      notes: string[];
+                                      refused: { ref: string; why: string }[];
+                                  };
+                              }
+                            | undefined
+                        >;
+                    }
+                >
+            )[Symbol.for("pi-pocket-team.desk")]!;
+            const key = "x.team.message:replay-prs:1";
+            const text = "Done.\n\nPRs: frostyard/test#4702";
+            // The first filing: GitHub could not be read, so the PR is refused and not attached.
+            const first = await app.harness.commit(
+                (tx) =>
+                    api.file(tx, linked, {
+                        to: address,
+                        key,
+                        from: "team_message",
+                        text,
+                        at: Date.now(),
+                        prsRefused: [
+                            {
+                                ref: "frostyard/test#4702",
+                                why: "GitHub could not be read now (x): not attached. Your supervisor can attach it later with desk attach",
+                            },
+                        ],
+                    }),
+                context,
+            );
+
+            assert.deepEqual(
+                first?.prs?.refused.map((one) => one.ref),
+                ["frostyard/test#4702"],
+            );
+            assert.equal(first?.prs?.attached.length, 0);
+
+            const before = JSON.stringify((await deskState())?.threads[thread.id]);
+            // The same call again, as a restart makes: its second GitHub check finds the PR. A filed report never
+            // changes, so the replay attaches nothing and adds no event.
+            const replay = await app.harness.commit(
+                (tx) =>
+                    api.file(tx, linked, {
+                        to: address,
+                        key,
+                        from: "team_message",
+                        text,
+                        at: Date.now(),
+                        prs: ["frostyard/test#4702"],
+                    }),
+                context,
+            );
+
+            const after = (await deskState())?.threads[thread.id];
+
+            assert.equal(
+                after?.prs["frostyard/test#4702"],
+                undefined,
+                "the replay attaches nothing",
+            );
+            assert.equal(JSON.stringify(after), before, "the thread is unchanged");
+            assert.deepEqual(replay?.prs?.refused, first?.prs?.refused, "the first refusal stands");
         });
 
         test("a night shift report waits for the digest too, and sends nothing itself", async () => {
