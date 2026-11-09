@@ -60,7 +60,7 @@ Every sync of a supervisor (the sweeper, `desk sync`, the page's view sweep, and
 
 A hooks module can hand the desk facts of GitHub webhook deliveries with `nudge` on the desk's API. The desk takes each delivery id once (a redelivery changes nothing). A fact about a PR or an issue on a thread (a CI suite fact names every PR of the suite), a PR a watch waits for, a PR head, or the issue queue makes that supervisor's next sync come early: 20 seconds after the first fact, and at most 1 such sync in 60 seconds, by the durable task `x.desk.nudge`. So 50 deliveries in 20 seconds are 1 sync. The fact only decides when to read: the sync's own GitHub read is the truth. Each sweep also records the changes it saw on PRs and queued issues (state, labels, review, head, CI), for a later alarm that compares them with the deliveries.
 
-The sweep also wakes an agent when every PR on its thread is merged or closed, tells a session once when its PR conflicts or its checks fail, removes the label `ready-for-human` when the PR changes after it, and archives the idle sessions of closed threads.
+The sweep also wakes an agent when every PR on its thread is merged or closed, tells a session once when its PR conflicts or its checks fail, removes the label `ready-for-human` when the PR changes after it (or wakes the agent once when core's `pr-triage` workflow already removed it after a push), and archives the idle sessions of closed threads.
 
 ## The goal board
 
