@@ -768,7 +768,12 @@ export type Features = {
     reposNamed: number;
     /** The first repository folder's language, from its marker files; `unknown` with no folder. */
     language: "go" | "ts" | "js" | "python" | "other" | "unknown";
-    /** A named path matches an L1 or L2 glob of a folder's `.github/risk-paths.json`; null when no folder has a readable list. */
+    /**
+     * A named path is a risk path: it matches a glob of a folder's `.github/risk-paths.json` that gets the label
+     * `risk:high`, so any glob of a version 1 list, and an L1 or L2 glob of a version 2 list (frostyard/core ADR-0078).
+     * Null when no folder has a readable list. The meaning stays "a named path is a risk path": the L3 and L4 globs of a
+     * version 2 list are not risk paths.
+     */
     riskPathNamed: boolean | null;
     /** A named path's folder holds a test file; null when no path is named or no folder exists. */
     testsBeside: boolean | null;
