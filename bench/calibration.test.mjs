@@ -334,6 +334,19 @@ test("the driver: a budget refusal stops priced runs; peak hours defer; a usage 
     assert.deepEqual([...twice.stuck.keys()], ["t\nd1"]);
 });
 
+test("the driver: a disk-low run (exit 4) stops every new run, priced or not", async () => {
+    const fake = fakeDrive({ onRun: (m) => (m === "c1" ? 4 : 0) });
+    const result = await fake.run();
+    const runs = fake.calls.filter(([what]) => what === "run").map(([, m]) => m);
+
+    assert.equal(result.diskLow, true);
+    assert.equal(result.budgetRefused, false);
+    assert.equal(result.stuck.size, 0, "a low disk is no stuck action");
+    assert.ok(!runs.includes("c3"), "no replacement run starts");
+    assert.ok(runs.length <= 2, `only the runs already live end: ${runs}`);
+    assert.ok(result.tasks[0].waiting.some((w) => w.model === "c1" && w.need === "run"));
+});
+
 // ---------------------------------------------------------------------------------------------------------------
 // End to end: the CLI with the fake pi and the fake bwrap.
 // ---------------------------------------------------------------------------------------------------------------

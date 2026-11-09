@@ -14,11 +14,13 @@ import { spawnSync } from "node:child_process";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
-import { allowanceSpent, checkoutOf } from "./lib/runner.mjs";
+import { allowanceSpent, checkoutOf, prepare, runAttempt } from "./lib/runner.mjs";
+import { acquireSlots } from "./lib/slots.mjs";
 import { limitReached } from "./lib/proc.mjs";
 import { rm } from "node:fs/promises";
 import {
     BENCH,
+    FAKE_BWRAP,
     PRICED,
     UNPRICED,
     fixtureArgs,
@@ -61,6 +63,9 @@ before(async () => {
         fixtureTask(fixture, "retry-tight", { name: "error-then-ok" }),
         fixtureTask(fixture, "exact-cost", { name: "ok" }),
         fixtureTask(fixture, "exact-tokens", { name: "ok" }),
+        fixtureTask(fixture, "disk-low", { name: "ok" }),
+        fixtureTask(fixture, "disk-zero", { name: "ok" }),
+        fixtureTask(fixture, "disk-drops", { name: "ok" }),
     ]);
     await setBudget(fixture, 100);
 });
@@ -515,4 +520,109 @@ test("the limit checks stop at the boundary, and no retry starts on a used-up al
         "tokens",
     );
     assert.equal(allowanceSpent(limits, { wallMs: 0, cost: 9, tokens: 3_999_999 }, false), null);
+});
+
+test("a disk below the minimum: exit 4 before the budget reserve; nothing is spent or made", async () => {
+    const before = spend();
+    // 10^9 GB: more than any disk has.
+    const env = testEnv(fixture, { BENCH_MIN_FREE_GB: "1000000000" });
+    const result = await runScript(
+        "run.mjs",
+        [...fixtureArgs(fixture, manifest), "--task", "disk-low", "--model", PRICED],
+        env,
+    );
+
+    assert.equal(result.code, 4, result.stderr);
+    assert.match(
+        result.stderr,
+        /disk low: \d+\.\d GB free in .+, the minimum is 1000000000\.0 GB \(BENCH_MIN_FREE_GB\)\. Nothing was spent\./,
+    );
+    assert.deepEqual(spend(), before, "no reservation and no entry");
+    assert.equal(existsSync(join(fixture.data, "runs", "pilot", "disk-low", SLUG)), false);
+    assert.equal(
+        existsSync(join(fixture.data, "runs", "pilot", "disk-low", `${SLUG}.lock`)),
+        false,
+    );
+    assert.equal(existsSync(join(fixture.results, "pilot", "disk-low")), false);
+
+    // A dry run reports the free space and the minimum, and does not fail on it.
+    const dry = await runScript(
+        "run.mjs",
+        [...fixtureArgs(fixture, manifest), "--task", "disk-low", "--model", PRICED, "--dry-run"],
+        env,
+    );
+
+    assert.equal(dry.code, 0, dry.stderr);
+    assert.match(
+        dry.stdout,
+        /^disk: \d+\.\d GB free in .+, minimum 1000000000\.0 GB \(low: a real run exits 4\)$/m,
+    );
+});
+
+test("BENCH_MIN_FREE_GB: 0 runs; a value that is not a number >= 0 is a usage error", async (t) => {
+    const args = [...fixtureArgs(fixture, manifest), "--task", "disk-zero", "--model", PRICED];
+    const zero = await runScript("run.mjs", args, testEnv(fixture, { BENCH_MIN_FREE_GB: "0" }));
+
+    assert.equal(zero.code, 0, zero.stderr);
+    assert.equal(readResult(fixture, "pilot", "disk-zero", PRICED).harness, false);
+
+    for (const value of ["abc", "-1", "", "Infinity"]) {
+        await t.test(JSON.stringify(value), async () => {
+            const result = await runScript(
+                "run.mjs",
+                [...args, "--dry-run"],
+                testEnv(fixture, { BENCH_MIN_FREE_GB: value }),
+            );
+
+            assert.equal(result.code, 1, result.stdout + result.stderr);
+            assert.match(result.stderr, /BENCH_MIN_FREE_GB must be a number >= 0/);
+        });
+    }
+});
+
+test("a disk that gets low during the slot wait: a harness failure with no repeat, exit 3", async () => {
+    const ctx = await prepare(
+        [...fixtureArgs(fixture, manifest), "--task", "disk-drops", "--model", PRICED],
+        testEnv(fixture, { BENCH_MIN_FREE_GB: "12" }),
+    );
+    let waited = false;
+    const lines = [];
+
+    ctx.bwrap = FAKE_BWRAP;
+    ctx.hooks = {
+        acquireSlots: async (...args) => {
+            const slots = await acquireSlots(...args);
+
+            waited = true;
+
+            return slots;
+        },
+        // 100 GB before the slot wait, 2 GB after it.
+        freeBytes: () => (waited ? 2e9 : 100e9),
+    };
+
+    assert.equal(await runAttempt(ctx, (line) => lines.push(line)), 3);
+
+    const record = readResult(fixture, "pilot", "disk-drops", PRICED);
+
+    assert.equal(record.harness, true);
+    assert.equal(record.tries, 1, "no second try for a low disk");
+    assert.deepEqual(
+        record.tryLog.map((entry) => entry.outcome),
+        ["harness"],
+    );
+    assert.ok(lines.includes("try 1: harness failure: disk low (2.0 GB free)"), lines.join("\n"));
+    assert.ok(
+        lines.some((line) => /no retry: the disk is below the minimum of 12\.0 GB/.test(line)),
+    );
+    assert.equal(
+        existsSync(join(fixture.data, "runs", "pilot", "disk-drops", SLUG, "try-1", "work")),
+        false,
+        "no scratch clone",
+    );
+    assert.deepEqual(
+        entriesOf("disk-drops").map((e) => [e.tries, e.cost]),
+        [[1, 0]],
+    );
+    assert.equal(spend().reservations.length, 0, "the attempt settled");
 });

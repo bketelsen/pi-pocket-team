@@ -1,6 +1,6 @@
 // The bench runner: 1 attempt of 1 model on 1 task, in the bwrap sandbox, under the budget guard and the slots.
 // Exit codes: 0 attempt recorded (or the result exists), 1 usage error, 2 budget refused (or DeepSeek peak hours),
-// 3 harness failure after retries.
+// 3 harness failure after retries (or a disk that got low before a try), 4 disk low (nothing was spent).
 import { spawn } from "node:child_process";
 import { existsSync, readdirSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
@@ -8,9 +8,13 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import {
+    GB,
+    MIN_FREE_BYTES,
     STAGES,
     dataDir,
     delay,
+    formatGb,
+    freeBytes,
     privateDir,
     providerOf,
     readJson,
@@ -56,6 +60,9 @@ export const LIMITS = {
 /** Tries in all after harness failures (1 + 2 repeats), and after provider errors (1 + 1 retry). */
 export const HARNESS_TRIES = 3;
 export const PROVIDER_TRIES = 2;
+
+/** The exit code of a run that does not start because the disk is low: nothing was spent. */
+export const DISK_LOW_EXIT = 4;
 
 /** The bench header version and its prompt text. */
 export const HEADER_VERSION = 1;
@@ -103,6 +110,33 @@ function numberOption(values, name, fallback, { integer = false } = {}) {
     }
 
     return value;
+}
+
+/** The free-space minimum in bytes: env `BENCH_MIN_FREE_GB` (a number >= 0), else `MIN_FREE_BYTES`. */
+export function minFreeBytes(env = process.env) {
+    const raw = env.BENCH_MIN_FREE_GB;
+
+    if (raw === undefined) {
+        return MIN_FREE_BYTES;
+    }
+
+    const value = Number(raw);
+
+    if (String(raw).trim() === "" || !Number.isFinite(value) || value < 0) {
+        throw new UsageError(`BENCH_MIN_FREE_GB must be a number >= 0, not ${JSON.stringify(raw)}`);
+    }
+
+    return value * GB;
+}
+
+/**
+ * The free space of the data dir's file system, and whether it is below the minimum. `ctx.hooks.freeBytes` replaces
+ * the real read in tests.
+ */
+export function diskSpace(ctx) {
+    const free = (ctx.hooks?.freeBytes ?? freeBytes)(ctx.data);
+
+    return { free, low: free < ctx.minFreeBytes };
 }
 
 /**
@@ -208,6 +242,7 @@ export async function prepare(argv, env = process.env) {
         slotPollMs:
             Number(env.BENCH_SLOT_POLL_MS) > 0 ? Number(env.BENCH_SLOT_POLL_MS) : SLOT_POLL_MS,
         limits,
+        minFreeBytes: minFreeBytes(env),
         env,
     };
 }
@@ -338,7 +373,9 @@ export function allowanceSpent(limits, used, priced) {
  * 1 try: take the slots, pre-flight, clone, setup, then Pi. The slots are released whatever happens.
  * Returns the try's log line, its usage and its stream. The try's usage goes into `tally` (the attempt's settlement)
  * as soon as Pi's run ends, before any cleanup that can throw; while Pi runs, `tally.unknown` is true.
- * `ctx.hooks.acquireSlots` and `ctx.hooks.runStreamed` replace the real ones in fault-injection tests.
+ * `ctx.hooks.acquireSlots`, `ctx.hooks.runStreamed` and `ctx.hooks.freeBytes` replace the real ones in tests.
+ * A disk below the minimum before the clone (a long slot wait can end on a full disk) is a harness failure with
+ * `final: true`: the next try would meet the same disk, so it gets no repeat.
  */
 async function runTry(ctx, tryNo, used, prompt, log, tally) {
     const acquire = ctx.hooks?.acquireSlots ?? acquireSlots;
@@ -384,6 +421,12 @@ async function runTry(ctx, tryNo, used, prompt, log, tally) {
             !(await authPreflight(ctx))
         ) {
             return harness("auth pre-flight failed");
+        }
+
+        const disk = diskSpace(ctx);
+
+        if (disk.low) {
+            return { ...harness(`disk low (${formatGb(disk.free)} GB free)`), final: true };
         }
 
         try {
@@ -536,7 +579,9 @@ async function runTries(ctx, tally, log) {
         if (outcome === "harness") {
             harnessFails += 1;
 
-            if (harnessFails < HARNESS_TRIES) {
+            if (result.final) {
+                log(`no retry: the disk is below the minimum of ${formatGb(ctx.minFreeBytes)} GB`);
+            } else if (harnessFails < HARNESS_TRIES) {
                 tryNo += 1;
                 continue;
             }
@@ -604,6 +649,12 @@ async function dryRun(ctx) {
     console.log(`run dir: ${paths.dir}`);
     console.log(`checkout: ${ctx.checkout} at ${ctx.task.parent}`);
     console.log(`budget: ${describeSpend(spend)}`);
+
+    const disk = diskSpace(ctx);
+
+    console.log(
+        `disk: ${formatGb(disk.free)} GB free in ${ctx.data}, minimum ${formatGb(ctx.minFreeBytes)} GB${disk.low ? " (low: a real run exits 4)" : ""}`,
+    );
     console.log(`cap per try: $${capOf(ctx)}${ctx.model.priced ? "" : " (unpriced)"}`);
     console.log(
         `limits: wall ${ctx.limits.wallMs} ms, ${ctx.model.priced ? `cost $${ctx.limits.costUsd}` : `tokens ${ctx.limits.tokens}`}`,
@@ -645,12 +696,13 @@ async function checkLease(ctx, env) {
     }
 }
 
-/** The runner's main: returns the exit code. */
-export async function main(argv = process.argv.slice(2), env = process.env) {
+/** The runner's main: returns the exit code. `hooks`: as `ctx.hooks` (`freeBytes`, `acquireSlots`, ...), for tests. */
+export async function main(argv = process.argv.slice(2), env = process.env, hooks = {}) {
     let ctx;
 
     try {
         ctx = await prepare(argv, env);
+        ctx.hooks = hooks;
 
         if (ctx.dryRun) {
             await checkLease(ctx, env);
@@ -721,6 +773,17 @@ async function runLocked(ctx, env) {
         );
 
         return 2;
+    }
+
+    // Before the budget reserve: a run on a nearly full disk can fill it, and the host's services fail with it.
+    const disk = diskSpace(ctx);
+
+    if (disk.low) {
+        console.error(
+            `disk low: ${formatGb(disk.free)} GB free in ${ctx.data}, the minimum is ${formatGb(ctx.minFreeBytes)} GB (BENCH_MIN_FREE_GB). Nothing was spent.`,
+        );
+
+        return DISK_LOW_EXIT;
     }
 
     const onSignal = (signal) => {

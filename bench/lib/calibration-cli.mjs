@@ -40,7 +40,8 @@ export const CALIBRATION_USAGE = `usage: node bench/calibration.mjs <plan|run|st
            --cost-limit, --token-limit, --wall-limit, --agent-src, --mise-installs, --bwrap, --no-auth-preflight
   status   the outcome of each slot, the items per owner and model, the spend (no diff is shown)
   packs    write 1 pack per owner (packs/<owner>/) and 1 key per owner (keys/<owner>.json)
-exit codes: 0 done, 1 usage error or an attempt that cannot go on, 2 budget refused, 4 attempts wait (peak hours)`;
+exit codes: 0 done, 1 usage error or an attempt that cannot go on, 2 budget refused,
+            4 attempts wait (peak hours, or the disk is low)`;
 
 const OPTIONS = {
     dir: { type: "string" },
@@ -348,7 +349,17 @@ export async function calibrationMain(argv, env = process.env, deps = {}) {
             );
         }
 
-        return result.stuck.size ? 1 : result.budgetRefused ? 2 : result.deferred.length ? 4 : 0;
+        if (result.diskLow) {
+            print("disk low: no more runs started; free disk space, then run again");
+        }
+
+        return result.stuck.size
+            ? 1
+            : result.budgetRefused
+              ? 2
+              : result.deferred.length || result.diskLow
+                ? 4
+                : 0;
     } catch (error) {
         if (error instanceof UsageError) {
             console.error(`${error.message}\n${CALIBRATION_USAGE}`);

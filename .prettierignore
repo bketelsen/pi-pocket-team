@@ -16,3 +16,7 @@ site/content/stylesheets/
 
 # Written by bench/pool.mjs, byte for byte (its --check compares the bytes).
 bench/pool-v1.json
+
+# Written by bench/analyze.mjs: the stage 1 record and the frozen rule.
+bench/rule-v1.json
+bench/results/

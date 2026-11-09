@@ -6,7 +6,8 @@ The bench's pre-registration fixes every rule, number and seed before any paid r
 and records what each step settled. The scripts and their data are in [bench/README.md](../../bench/README.md). After
 router v3, the daily audit's R2 check measures the routed threads end to end ([daily-audit.md](../modules/daily-audit.md)).
 
-Status: phase 1 done (pi-pocket-team#164); phase 2 done: the judges passed the held-out test (2026-11-08).
+Status: phase 1 done (pi-pocket-team#164); phase 2 done: the judges passed the held-out test (2026-11-08); phase 3
+done: stage 1 ran and the rule is frozen (2026-11-09). Stage 2 waits for the pool (R = 22).
 
 ## Phase 1 — Pool gate (this change)
 
@@ -158,6 +159,51 @@ The record is [bench/judge-calibration.md](../../bench/judge-calibration.md).
 - `node bench/analyze.mjs --stage 1` gives the bands, B1, the shortlists, C1, the 2 merge groups (easy+medium,
   medium+hard, each on the union of its 2 bands) and the rule; the rule is frozen as `bench/rule-v1.json`.
 - **Done when:** `bench/results/stage1/summary.json` holds every stage 1 task, and `bench/rule-v1.json` is on `main`.
+
+### Result (2026-11-09)
+
+The record is [bench/results/stage1/summary.md](../../bench/results/stage1/summary.md) (and `summary.json`); the
+frozen rule is [bench/rule-v1.json](../../bench/rule-v1.json). How it ran: [bench/README.md](../../bench/README.md),
+"Stage 1".
+
+- **Runs:** 360 of 360 recorded and scored (36 tasks x 10 models), from 2026-11-08 16:18Z to 2026-11-09 23:14Z. No
+  harness failure, no provider failure, no task dropped. Failures that count against the model: `limit` 32
+  (halogen 13, Gemini 10, Grok 3, MAI-Code 3, DeepSeek 2, Haiku 1) and `protocol` 12 (the attempt read
+  `/agent/auth.json`: Grok 6, DeepSeek 4, halogen 2).
+- **Bands:** easy 15, medium 14, hard 5, unsolved 2 (pi-pocket-team-72, fleet-109). The majority band is easy
+  (15 of 36).
+- **B1:** `github-copilot/claude-opus-5.5` in every band and in both merge groups; it passes 31 of 36 tasks (31 of the
+  34 solved ones). **Shortlists:** easy: `github-copilot/gpt-6-luna`, `deepseek/deepseek-flash`; medium, hard,
+  easy+medium and medium+hard: none (no model reaches P(gap <= margin) >= 0.5 against B1). **C1:** Opus itself (best
+  overall). The $0 pricing of halogen and MAI-Code changes no pick.
+- **Rule:** features `pathsNamed`, `briefChars`, `reposNamed`, `riskPathNamed`; nested leave-one-repository-out
+  accuracy 0.288 over 9 folds, below the majority band's 0.417 on the same tasks. With these features, stage 1 shows
+  no sign that the difficulty is predictable at delegation time; H1 is tested only in stage 2.
+- **H2:** inconclusive by rule: only 10 of the 36 tasks (28%) have Jev numbers.
+- **Self-preference** (mean grade of its own family's attempts against the other family's): `openai/gpt-6.1-sol` 3.00
+  against 2.85 (72 own attempts); `github-copilot/claude-opus-5.5` 3.18 against 3.05 (107). Recorded only; it changes
+  no score.
+- **For stage 2's simulation:** against Opus over the 34 solved tasks, the discordant pairs are 9 of 34 (Sol) to 20
+  of 34 (Gemini); about 13 of 34 for the cheap models.
+- **Spend:** $398.02 in stage 1: attempts $274.95, judges $41.78, the attempts set aside $1.29, and $80.00 for 12
+  runs that 2 restarts killed (settled at their full cap by `budget.mjs reap`). The ledger is at $481.47 of
+  $3,000.
+
+Incidents of the run, and what changed:
+
+- **Pi Pocket version.** The Pi Pocket checkout moved to v0.28.0-bk.1 on 2026-11-07, after the pool's revalidation on
+  v0.27.0. A pi-pocket-team check fails at its own merge on v0.28 (pi-pocket-team-84: 22 failing tests; on v0.27.0 it
+  passes). The 10 attempts of pi-pocket-team-84 that ran on v0.28 (S1 false for every model) are set aside, and every
+  pi-pocket-team task ran and scored on a v0.27.0 copy.
+- **Disk full.** Each attempt kept its try caches (Go module caches: nsl-89 alone took 22 GB). On 2026-11-09 at about
+  06:38Z they filled `/var` (123 GB in `runs/`), and the Pocket server crashed until the VM restarted. 1 attempt
+  that met the full disk (nsl-76, MAI-Code) is set aside and ran again. The caches of every scored attempt are
+  removed (about 105 GB), `bench/score.mjs --drop-caches` removes them after each score, and `bench/run.mjs`
+  refuses to start below 12 GB free (exit 4, nothing spent).
+- **Restarts.** The VM restart and a later server restart (2026-11-09 12:01Z) ended 12 attempts that were running or waiting for a slot; they ran again from the start.
+  After the first one, the run used 1 queue of at most 4 attempts at a time.
+- **A brief outside the sandbox.** nsl-76's brief asks the worker to read a plan file in an agent home, which the
+  sandbox does not show. 7 or more models still passed it (easy); GPT-6 Luna stopped and asked for the file.
 
 ## Phase 4 — Stage 2 by the branch
 

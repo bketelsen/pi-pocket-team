@@ -156,6 +156,43 @@ test("batch: unknown model is a usage error", async () => {
     assert.equal(result.code, 1);
 });
 
+test("batch: a child's disk-low exit (4) stops every new launch; the pairs left are listed; exit 4", async () => {
+    const result = await runScript(
+        "batch.mjs",
+        [
+            "--manifest",
+            manifest,
+            "--stage",
+            "pilot",
+            "--tasks",
+            "a,b",
+            "--models",
+            PRICED,
+            "--parallel",
+            "1",
+            "--run-id",
+            "disk-low",
+            "--lease-bin",
+            FAKE_LEASE,
+            ...driverArgs(),
+        ],
+        // 10^9 GB: more than any disk has, so every child exits 4.
+        testEnv(fixture, { BENCH_MIN_FREE_GB: "1000000000" }),
+    );
+
+    assert.equal(result.code, 4, result.stderr);
+    assert.equal(
+        result.stderr.match(/^disk low: /gm)?.length,
+        1,
+        "only the first child ran: " + result.stderr,
+    );
+    assert.match(result.stdout, /0 of 2 pair\(s\) recorded/);
+    assert.match(
+        result.stdout,
+        new RegExp(`^Not run \\(disk low\\): a ${PRICED}; b ${PRICED}$`, "m"),
+    );
+});
+
 test("load test: levels and rounds under the lease, then halogen.json", async () => {
     const result = await runScript(
         "load-test.mjs",
