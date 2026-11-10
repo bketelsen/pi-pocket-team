@@ -5681,6 +5681,44 @@ describe("task grace and post-merge close-out (#178 P1 and P2)", () => {
     const newest = (graph: TaskGraph) =>
         taskOf(graph, "t1").attempts.at(-1) ?? assert.fail("attempt");
     const events = (state: DeskState) => state.threads.T1?.events.map((event) => event.text) ?? [];
+    const blockedCloseout =
+        "t1: T2 closed before its close-out: the task stays delegated. Reopen the thread with desk watch and record a pass after the host steps, or recover with plan revise.";
+
+    const closeoutPass = (state: DeskState, watchAt: number, passAt: number): void => {
+        const thread = state.threads.T2 ?? assert.fail("T2");
+
+        assert(
+            !(
+                "error" in
+                setWatch(thread, {
+                    checkOn: "7d",
+                    check: "Host steps are complete.",
+                    by: "odrade",
+                    key: `host-watch:${String(watchAt)}`,
+                    at: watchAt,
+                })
+            ),
+        );
+        assert.equal(thread.state, "open");
+        assert.equal(thread.closed, undefined);
+        assert(
+            !(
+                "error" in
+                recordResult(
+                    thread,
+                    {
+                        key: `host-pass:${String(passAt)}`,
+                        pass: true,
+                        text: "Host steps are complete.",
+                        by: "odrade",
+                        closedBy: "desk",
+                        at: passAt,
+                    },
+                    state,
+                )
+            ),
+        );
+    };
 
     test("a no-PR close gets 1 grace sweep, then a late open PR keeps its attempt until merge", () => {
         const { state, graph } = buildingPlan();
@@ -5738,6 +5776,45 @@ describe("task grace and post-merge close-out (#178 P1 and P2)", () => {
         assert.equal(JSON.stringify(state), ended);
     });
 
+    test("no GitHub read preserves no-PR grace until a later sweep reads GitHub", () => {
+        const { state, graph } = buildingPlan();
+
+        close(state);
+        assert.deepEqual(planFacts(state, "T1", tick(10), false).items, []);
+        assert.equal(newest(graph).grace, tick(10));
+        const snapshot = JSON.stringify(state);
+
+        assert.deepEqual(planFacts(state, "T1", tick(11), false), { events: 0, items: [] });
+        assert.equal(JSON.stringify(state), snapshot);
+        assert.equal(taskOf(graph, "t1").state, "delegated");
+        const stopped = planFacts(state, "T1", tick(12), true);
+
+        assert.equal(taskOf(graph, "t1").state, "ready");
+        assert.deepEqual(newest(graph).end, { at: tick(12), how: "stopped" });
+        assert.equal(stopped.items[0]?.kind, "plan-approved");
+    });
+
+    test("a close during the read bounds grace by its close time and keeps replay stable", () => {
+        const { state, graph } = buildingPlan();
+        const thread = close(state, tick(11));
+
+        planFacts(state, "T1", tick(10));
+        assert.equal(newest(graph).grace, tick(11));
+        assert(
+            (newest(graph).grace ?? 0) >= (thread.closed?.at ?? 0),
+            "the window candidate's grace covers the close",
+        );
+        const snapshot = JSON.stringify(state);
+
+        for (const at of [tick(10), tick(11)]) {
+            assert.deepEqual(planFacts(state, "T1", at), { events: 0, items: [] });
+            assert.equal(JSON.stringify(state), snapshot);
+        }
+
+        planFacts(state, "T1", tick(12));
+        assert.equal(taskOf(graph, "t1").state, "ready");
+    });
+
     test("a reopened task thread gets grace for its next no-PR close, but dropped threads get none", () => {
         const { state, graph } = buildingPlan();
         const thread = close(state);
@@ -5773,7 +5850,7 @@ describe("task grace and post-merge close-out (#178 P1 and P2)", () => {
         assert.equal(state.threads.T2?.state, "open");
         assert(
             events(state).includes(
-                "t1: frostyard/snow#1 attached to T2 after its attempt stopped: the task is done when the PR merges",
+                "t1: frostyard/snow#1 attached to T2 after its attempt stopped: the task is done when the PR merges. Do not deliver the task again while the PR is open.",
             ),
         );
         const attached = JSON.stringify(state);
@@ -5829,7 +5906,7 @@ describe("task grace and post-merge close-out (#178 P1 and P2)", () => {
         assert.equal(JSON.stringify(state), settled);
     });
 
-    test("the last close-out starts verification; a thread done before merge completes at once", () => {
+    test("the last close-out verifies only after a post-merge done close, also when it closed before merge", () => {
         for (const alreadyClosed of [false, true]) {
             const { state, plan, graph } = buildingPlan();
 
@@ -5843,18 +5920,96 @@ describe("task grace and post-merge close-out (#178 P1 and P2)", () => {
                 close(state);
             }
 
-            const first = planFacts(state, "T1", tick(10));
+            assert.deepEqual(planFacts(state, "T1", tick(10)).items, []);
+            assert.equal(plan.state, "building");
+            assert.equal(taskOf(graph, "t1").state, "delegated");
 
-            if (!alreadyClosed) {
-                assert.equal(plan.state, "building");
-                close(state, tick(11));
-                assert.equal(planFacts(state, "T1", tick(12)).items[0]?.kind, "plan-verify");
+            if (alreadyClosed) {
+                assert(events(state).includes(blockedCloseout));
+                assert.deepEqual(planFacts(state, "T1", tick(11)), { events: 0, items: [] });
+                closeoutPass(state, tick(12), tick(13));
             } else {
-                assert.equal(first.items[0]?.kind, "plan-verify");
+                close(state, tick(13));
             }
 
+            assert.equal(planFacts(state, "T1", tick(14)).items[0]?.kind, "plan-verify");
             assert.equal(taskOf(graph, "t1").state, "done");
             assert.equal(plan.state, "verifying");
+        }
+    });
+
+    test("merge and done close in the same sweep wait for a reopen and a later done close", () => {
+        const { state, plan, graph } = buildingPlan();
+
+        taskOf(graph, "t1").after = "closeout";
+        close(state, tick(10));
+        prOn(state, "T2", "frostyard/snow#1", "MERGED");
+        assert.deepEqual(planFacts(state, "T1", tick(10)).items, []);
+        assert.equal(newest(graph).end?.at, tick(10));
+        assert.equal(taskOf(graph, "t1").state, "delegated");
+        assert.equal(plan.state, "building");
+        assert.equal(taskOf(graph, "t2").state, "waiting");
+        assert(events(state).includes(blockedCloseout));
+        assert(
+            state.threads.T1?.events.some(
+                (event) => event.key === `plan-task-closeout-blocked:T2:${String(tick(10))}`,
+            ),
+        );
+        const snapshot = JSON.stringify(state);
+
+        for (const at of [tick(10), tick(11)]) {
+            assert.deepEqual(planFacts(state, "T1", at), { events: 0, items: [] });
+            assert.equal(JSON.stringify(state), snapshot);
+        }
+
+        closeoutPass(state, tick(12), tick(13));
+        planFacts(state, "T1", tick(14));
+        assert.equal(taskOf(graph, "t1").state, "done");
+        assert.equal(taskOf(graph, "t2").state, "ready");
+    });
+
+    test("a close during the merge read cannot complete close-out on a same-time replay", () => {
+        const { state, graph } = buildingPlan();
+
+        taskOf(graph, "t1").after = "closeout";
+        close(state, tick(11));
+        prOn(state, "T2", "frostyard/snow#1", "MERGED");
+        planFacts(state, "T1", tick(10));
+        assert.equal(taskOf(graph, "t1").state, "delegated");
+        assert(events(state).includes(blockedCloseout));
+        const snapshot = JSON.stringify(state);
+
+        assert.deepEqual(planFacts(state, "T1", tick(10)), { events: 0, items: [] });
+        assert.equal(JSON.stringify(state), snapshot);
+        closeoutPass(state, tick(12), tick(13));
+        planFacts(state, "T1", tick(14));
+        assert.equal(taskOf(graph, "t1").state, "done");
+    });
+
+    test("repairStopped holds a close-out on a closed thread until a post-merge done close", () => {
+        for (const why of ["done", "dropped"] as const) {
+            const { state, graph } = buildingPlan();
+            const task = taskOf(graph, "t1");
+
+            task.after = "closeout";
+            task.state = "ready";
+            newest(graph).end = { at: tick(9), how: "stopped" };
+            close(state, tick(9), why);
+            prOn(state, "T2", "frostyard/snow#1", "MERGED");
+            assert.deepEqual(planFacts(state, "T1", tick(10)).items, []);
+            assert.equal(task.state, "delegated");
+            assert.deepEqual(newest(graph).end, { at: tick(10), how: "merged" });
+            assert(events(state).includes(blockedCloseout));
+            const snapshot = JSON.stringify(state);
+
+            assert.deepEqual(planFacts(state, "T1", tick(11)), { events: 0, items: [] });
+            assert.equal(JSON.stringify(state), snapshot);
+
+            if (why === "done") {
+                closeoutPass(state, tick(12), tick(13));
+                planFacts(state, "T1", tick(14));
+                assert.equal(task.state, "done");
+            }
         }
     });
 
@@ -5867,11 +6022,7 @@ describe("task grace and post-merge close-out (#178 P1 and P2)", () => {
         close(state, tick(11), "dropped");
         planFacts(state, "T1", tick(12));
         assert.equal(taskOf(graph, "t1").state, "delegated");
-        assert(
-            events(state).includes(
-                "t1: T2 closed as dropped before its close-out: the task stays delegated. Recover it with plan revise.",
-            ),
-        );
+        assert(events(state).includes(blockedCloseout));
         const snapshot = JSON.stringify(state);
 
         assert.deepEqual(planFacts(state, "T1", tick(13)), { events: 0, items: [] });
@@ -5989,8 +6140,9 @@ describe("task grace and post-merge close-out (#178 P1 and P2)", () => {
         const task = taskOf(graph, "t1");
 
         task.after = "closeout";
-        close(state);
         prOn(state, "T2", "frostyard/snow#1", "MERGED");
+        planFacts(state, "T1", tick(8));
+        close(state, tick(9));
         planFacts(state, "T1", tick(10));
         merged(graph, "t3", tick(10));
         const carried = { ...task, carried: { graph: 1, why: "The host steps are complete." } };

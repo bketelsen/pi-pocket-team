@@ -9018,7 +9018,7 @@ describe("attribute", () => {
                                     acceptance: ["Works."],
                                     deps: [],
                                     state: "delegated",
-                                    attempts: [{ thread: thread.id, at: 100, prs: [], grace: 350 }],
+                                    attempts: [{ thread: thread.id, at: 100, prs: [], grace: 300 }],
                                 },
                             ],
                         },
@@ -9069,16 +9069,34 @@ describe("attribute", () => {
 
         const pinned = fixture();
 
-        attribute(
-            pinned.state,
-            { ...githubOf([]), prs: { "frostyard/test#7": prFact({ createdAt: 250 }) } },
-            pinned.git,
-            400,
-        );
+        const pinnedPr = prFact({ createdAt: 250 });
+        const pinnedFacts = {
+            ...githubOf([]),
+            prs: { [pinnedPr.ref]: pinnedPr },
+            seenPins: [pinnedPr.ref],
+        };
+
+        attribute(pinned.state, pinnedFacts, pinned.git, 400);
         assert.equal(
             pinned.thread.prs["frostyard/test#7"],
             undefined,
             "no window for evidence-only reads",
+        );
+        assert.equal(
+            foundIn(pinned.state),
+            undefined,
+            "an evidence-only PR also makes no found thread",
+        );
+        attribute(
+            pinned.state,
+            { ...pinnedFacts, repos: githubOf([pinnedPr]).repos },
+            pinned.git,
+            401,
+        );
+        assert.equal(
+            pinned.thread.prs[pinnedPr.ref]?.via,
+            "window",
+            "the same PR in the open list can attach by window",
         );
 
         const ended = fixture();
