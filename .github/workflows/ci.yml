@@ -2,8 +2,8 @@
 # checkout at PI_POCKET_CHECKOUT. The job "pocket" clones each pinned Pi Pocket release of the matrix into the
 # runner's temporary folder, installs its dependencies, points the links at it, and runs the gate, make ci:
 #   - upstream TannerMidd/pi-pocket at v0.27.0, the release to roll back to;
-#   - the fork bketelsen/pi-pocket at v0.28.0-bk.1, the server's release: upstream v0.28.0 plus the patches listed
-#     in BK-PATCHES.md on its branch bk/v0.28.0.
+#   - the fork bketelsen/pi-pocket at v0.28.1-bk.1, the server's release: upstream v0.28.1 plus the patches listed
+#     in BK-PATCHES.md on its branch bk/v0.28.1.
 # Each entry also names the tag's commit, and the job fails when the clone is another one. Actions are pinned by
 # commit SHA, and the token can only read (frostyard/core ADR-0021).
 # The ruleset requires the check "Test". A matrix job gets 1 check for each entry, named with the entry, so the job
@@ -36,8 +36,8 @@ jobs:
                       ref: v0.27.0
                       commit: 50194aa38eb368ef2cb8599d44fba81b05ed5263
                     - repository: bketelsen/pi-pocket
-                      ref: v0.28.0-bk.1
-                      commit: ad3d00df43b544b8c8903f8a0ef5d422c5f4da07
+                      ref: v0.28.1-bk.1
+                      commit: 7891d67bb0179f1c13aad6a15014fba7d8f4ddf5
         steps:
             - name: Check out this repository
               uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
