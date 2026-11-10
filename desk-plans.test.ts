@@ -11913,16 +11913,16 @@ describe("with the Pi Pocket app", () => {
     });
 
     /**
-     * A plan of 1 task, of a new supervisor session, whose task thread closed `closedAgo` ms ago with 1 PR link. The
-     * fake `gh` gives `pr` for that ref; `run` runs the sweep and the checks. After it, the fake `gh` gives the
-     * viewer only again, and the plan is dropped, so no later test counts it as open. The `gh` calls' arguments
-     * are kept for `run`.
+     * A plan of 1 task, of a new supervisor session, whose task thread closed `closedAgo` ms ago. It has 1 PR link
+     * when `link` is given. The fake `gh` gives `pr` for that ref when given; `run` runs the sweep and the checks.
+     * After it, the fake `gh` gives the viewer only again, and the plan is dropped, so no later test counts it as
+     * open. The `gh` calls' arguments are kept for `run`.
      */
     async function closedTaskPlan(
         name: string,
         closedAgo: number,
-        link: { state?: "OPEN" },
-        pr: Record<string, unknown>,
+        link: { state?: "OPEN" } | undefined,
+        pr: Record<string, unknown> | undefined,
         run: (ids: {
             source: ConversationId;
             plan: string;
@@ -12012,31 +12012,37 @@ describe("with the Pi Pocket app", () => {
 
             thread.state = "closed";
             thread.closed = { at: at - closedAgo, why: "done", by: "sweep" };
-            thread.prs[ref] = { via: "attached", ...link };
+
+            if (link !== undefined) {
+                thread.prs[ref] = { via: "attached", ...link };
+            }
         }, context);
 
         try {
-            // GitHub gives the PR read by number; the fake `gh` keeps its arguments.
+            // GitHub gives the PR read by number when given; the fake `gh` keeps its arguments.
             writeFileSync(
                 fixturePath,
                 JSON.stringify({
                     data: {
                         viewer: { login: "github-viewer" },
-                        p0: {
-                            nameWithOwner: "frostyard/snow",
-                            isArchived: false,
-                            pullRequest: {
-                                number: 41,
-                                title: "Sign the old ISO",
-                                url: "https://github.com/frostyard/snow/pull/41",
-                                isDraft: false,
-                                createdAt: new Date(at).toISOString(),
-                                headRefName: "old-iso",
-                                reviewDecision: "REVIEW_REQUIRED",
-                                author: { login: "github-viewer" },
-                                ...pr,
-                            },
-                        },
+                        p0:
+                            pr === undefined
+                                ? undefined
+                                : {
+                                      nameWithOwner: "frostyard/snow",
+                                      isArchived: false,
+                                      pullRequest: {
+                                          number: 41,
+                                          title: "Sign the old ISO",
+                                          url: "https://github.com/frostyard/snow/pull/41",
+                                          isDraft: false,
+                                          createdAt: new Date(at).toISOString(),
+                                          headRefName: "old-iso",
+                                          reviewDecision: "REVIEW_REQUIRED",
+                                          author: { login: "github-viewer" },
+                                          ...pr,
+                                      },
+                                  },
                     },
                 }),
             );
@@ -12197,6 +12203,95 @@ describe("with the Pi Pocket app", () => {
                 );
                 assert.equal(done?.state, "done");
                 assert.deepEqual(done?.attempts[0]?.prs, [{ ref: "frostyard/snow#41", head }]);
+            },
+        );
+    });
+
+    test("the sweep preserves no-PR grace when the task repository read is incomplete", async () => {
+        await closedTaskPlan(
+            "plan-grace-cut",
+            24 * 3600_000,
+            undefined,
+            undefined,
+            async ({ source, plan, task, ghArgs }) => {
+                const shiftBefore = shift;
+                const realNow = Date.now;
+                let clock = realNow();
+                const repo = (nameWithOwner: string) => ({
+                    nameWithOwner,
+                    isArchived: false,
+                    pullRequests: {
+                        nodes: [],
+                        totalCount: 0,
+                        pageInfo: { hasNextPage: false },
+                    },
+                });
+                const complete = {
+                    data: {
+                        viewer: { login: "github-viewer" },
+                        r0: repo("frostyard/snow"),
+                        r1: repo("frostyard/nsl"),
+                    },
+                };
+
+                const incomplete = {
+                    data: { ...complete.data, r0: null },
+                    errors: [{ path: ["r0"], message: "timeout" }],
+                };
+
+                try {
+                    // Sync uses Date.now; the automatic sweeper uses the harness clock plus shift. Inject both.
+                    shift = 0;
+                    Date.now = () => clock;
+                    // Keep the first read cut too: a sweeper started by sync must not spend grace between checks.
+                    writeFileSync(fixturePath, JSON.stringify(incomplete));
+                    await say(app, source, "desk sync test");
+
+                    const grace = await closedTaskOf(plan);
+                    const graceAt = grace?.attempts[0]?.grace ?? assert.fail("grace was set");
+
+                    assert.equal(grace?.state, "delegated");
+                    assert(
+                        (await deskSnapshot())?.threads[plan]?.events.some((event) =>
+                            event.text.includes(
+                                "closed with no PR: the desk looks for its PR in the next sweep",
+                            ),
+                        ),
+                        "the sweep recorded the grace event",
+                    );
+                    assert.match(ghArgs(), /r0: repository\(owner: "frostyard", name: "snow"\)/);
+
+                    clock += 1000;
+                    await say(app, source, "desk sync test");
+
+                    const state = await deskSnapshot();
+                    const held = await closedTaskOf(plan);
+
+                    assert.equal(state?.github?.ok, true);
+                    assert(
+                        state?.github?.incomplete?.includes("frostyard/snow: not read (timeout)"),
+                        "the sweep recorded the incomplete repository read",
+                    );
+                    assert((state?.threads[plan]?.run.sweptAt ?? 0) > graceAt);
+                    assert.equal(state?.threads[task]?.state, "closed");
+                    assert.deepEqual(state?.threads[task]?.prs, {});
+                    assert.equal(held?.state, "delegated");
+                    assert.equal(held?.attempts[0]?.grace, graceAt);
+                    assert.equal(held?.attempts[0]?.end, undefined);
+
+                    writeFileSync(fixturePath, JSON.stringify(complete));
+                    clock += 1000;
+                    await say(app, source, "desk sync test");
+
+                    const ready = await closedTaskOf(plan);
+
+                    assert.equal((await deskSnapshot())?.github?.incomplete, undefined);
+                    assert.equal(ready?.state, "ready");
+                    assert.equal(ready?.attempts[0]?.end?.how, "stopped");
+                } finally {
+                    Date.now = realNow;
+                    shift = shiftBefore;
+                }
             },
         );
     });

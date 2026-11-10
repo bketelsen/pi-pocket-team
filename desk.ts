@@ -882,6 +882,7 @@ export type PlanTask = {
         prs: { ref: string; head?: string }[];
         /** Later of sweep and close time when a done thread with no PR gets 1 grace sweep; a later close renews it. */
         grace?: number;
+        /** For `merged`, `at` is the merge observation: the later of sweep time and a closed thread's close time. */
         end?: {
             at: number;
             how: "merged" | "no-change" | "stopped";
