@@ -3865,11 +3865,47 @@ const BLOCKED_SAID =
     /\b(?:[Ii]s|[Aa]re|[Aa]m|[Ww]as|[Ww]ere|[Bb]een|[Ss]tays?|[Rr]emains?|[Ss]till|[Nn]ow|[Ss]tatus|[Ss]tate|[Rr]esult)\s*:?\s+(?:(?:\w+ly|still|now|again|also)\s+){0,2}\**BLOCKED\b|\bBLOCKED\**\s*(?::|\b(?:by|on|until)\b)/;
 
 /**
+ * GitHub's merge state value `BLOCKED` after its name, with optional backticks or bold marks and an optional `is`,
+ * `was`, `:` or `=` between: "`mergeStateStatus` is BLOCKED", "merge state: BLOCKED". The name is in any case; the
+ * value must be `BLOCKED` in capitals (`withoutMergeState` checks it).
+ */
+const MERGE_STATE_BLOCKED =
+    /(\b(?:mergeStateStatus|merge_state_status|merge\s+state(?:\s+status)?)\b[`*\s]*(?:(?:is|was)\b|[:=])?[`*\s]*)(BLOCKED)\b/gi;
+
+/** "the state BLOCKED" in lower case: GitHub's merge state only in a sentence that names it (`MERGE_STATE_NAMED`). */
+const THE_STATE_BLOCKED = /(\bthe state\b[`*\s]*(?:(?:is|was)\b|[:=])?[`*\s]*)BLOCKED\b/g;
+
+/** A sentence that names GitHub's merge state: `MERGEABLE`, `mergeable`, `mergeStateStatus` or `merge state`. */
+const MERGE_STATE_NAMED = /\b(?:mergeable|mergeStateStatus|merge[\s_]state)\b/i;
+
+/**
+ * The text without each `BLOCKED` that is GitHub's merge state value, not the work's state: after the name
+ * `mergeStateStatus`, `merge state`, `merge state status` or `merge_state_status` (`MERGE_STATE_BLOCKED`), or after a
+ * lower-case "the state" in a sentence that names the merge state (`THE_STATE_BLOCKED`). It reads the text with its
+ * inline code, so a name in backticks counts; every other character stays in its place.
+ */
+function withoutMergeState(text: string): string {
+    return text
+        .split(/((?<=[.!?])\s+)/)
+        .map((sentence) => {
+            const named = sentence.replace(
+                MERGE_STATE_BLOCKED,
+                (match: string, before: string, value: string) =>
+                    value === "BLOCKED" ? `${before} ` : match,
+            );
+
+            return MERGE_STATE_NAMED.test(named) ? named.replace(THE_STATE_BLOCKED, "$1 ") : named;
+        })
+        .join("");
+}
+
+/**
  * Whether a report says the work is blocked, or asks for a decision: the reason `blocked` or `failed`, the word `BLOCKED`
  * in capitals, a line that starts with `blocked` (any case, after a bullet or bold mark), or a decision for Brian
  * (`reportAsksBrian`). Code blocks and inline code never count: a report that quotes
  * the word `BLOCKED` is not blocked. `BLOCKED` counts only when it is said of the work (`BLOCKED_SAID`): "a BLOCKED
- * report" names a kind of report, and is not blocked. A request to merge or install, with no choice in it, is no
+ * report" names a kind of report, and is not blocked. GitHub's merge state is not the work's state: "`mergeStateStatus`
+ * is BLOCKED" is not blocked (`withoutMergeState`). A request to merge or install, with no choice in it, is no
  * decision: the PR's label `ready-for-human` already brings it to Brian.
  */
 export function reportBlocks(text: string, reason?: string): boolean {
@@ -3877,7 +3913,7 @@ export function reportBlocks(text: string, reason?: string): boolean {
         return true;
     }
 
-    const plain = withoutCode(text);
+    const plain = withoutCode(withoutMergeState(withoutFences(text)));
 
     if (BLOCKED_SAID.test(plain)) {
         return true;
@@ -3937,10 +3973,19 @@ export function reportAsksBrian(text: string): boolean {
 
 /**
  * A sentence that gives Brian a decision: "Brian must decide", "a decision from Brian", "needs Brian's choice",
- * "is Brian's decision", "stays up to Brian", "needs Brian to confirm", "until Brian decides".
+ * "is Brian's decision", "stays up to Brian", "needs Brian to confirm". The wait form "until Brian decides" is
+ * `DECISION_WAIT`.
  */
 const DECISION_SAID =
-    /\bBrian\s+(?:must|should|needs to|has to|may want to|can)\s+(?:decide|choose|pick|confirm|answer|accept|allow|authori[sz]e|grant|rotate|treat|say)\b|\b(?:decisions?|choices?)\s+(?:for|from)\s+Brian\b|\bneeds?\s+Brian's\s+(?:decision|choice|answer|yes|ok|approval)\b|\b(?:is|are|stays?|remains?|awaits?)\s+(?:an?\s+)?Brian's\s+(?:decision|call|choice)\b|\b(?:is|are|stays?|remains?)\s+up\s+to\s+Brian\b|\bneeds?\s+Brian\s+to\s+(?:decide|choose|pick|confirm|answer|accept|allow|approve|authori[sz]e|grant)\b|\b(?:until|once|when|after)\s+Brian\s+(?:decides|chooses|picks|confirms|answers|approves|allows)\b/i;
+    /\bBrian\s+(?:must|should|needs to|has to|may want to|can)\s+(?:decide|choose|pick|confirm|answer|accept|allow|authori[sz]e|grant|rotate|treat|say)\b|\b(?:decisions?|choices?)\s+(?:for|from)\s+Brian\b|\bneeds?\s+Brian's\s+(?:decision|choice|answer|yes|ok|approval)\b|\b(?:is|are|stays?|remains?|awaits?)\s+(?:an?\s+)?Brian's\s+(?:decision|call|choice)\b|\b(?:is|are|stays?|remains?)\s+up\s+to\s+Brian\b|\bneeds?\s+Brian\s+to\s+(?:decide|choose|pick|confirm|answer|accept|allow|approve|authori[sz]e|grant)\b/i;
+
+/**
+ * A sentence that waits for Brian: "until Brian decides", "once Brian answers". It is a decision, except in
+ * `namesDecision` when the same sentence or the sentence before it names an ask id: then the decision is already an
+ * ask on the desk.
+ */
+const DECISION_WAIT =
+    /\b(?:until|once|when|after)\s+Brian\s+(?:decides|chooses|picks|confirms|answers|approves|allows)\b/i;
 
 /** A negation before a label for Brian: "No action for Brian: …". */
 const NEEDS_BRIAN_NOT = /(?:\bnot|\bnever|\bnothing|\bno|\bnone|n't)\b/i;
@@ -4225,7 +4270,10 @@ function decisionItem(item: string): boolean {
 
             return index === 0
                 ? !routineOnly(clause)
-                : VERB_FIRST.test(clause) || DECISION_SAID.test(clause) || hasChoice(clause);
+                : VERB_FIRST.test(clause) ||
+                      DECISION_SAID.test(clause) ||
+                      DECISION_WAIT.test(clause) ||
+                      hasChoice(clause);
         });
 }
 
@@ -4253,13 +4301,24 @@ export function namesDecision(plain: string): boolean {
         return true;
     }
 
-    for (const sentence of plain.split(/(?<=[.!?])\s+|\n/)) {
-        if (NO_DECISION.test(sentence) || NEGATED.test(sentence)) {
-            continue;
-        }
+    // A wait for Brian (`DECISION_WAIT`) waits on an ask when the same sentence or the sentence before it names an ask
+    // id: it names no new decision. A line break ends a sentence, and a blank line ends the paragraph, so an ask id
+    // further away does not count.
+    for (const paragraph of plain.split(/\n\s*\n/)) {
+        const sentences = paragraph.split(/(?<=[.!?])\s+|\n/);
 
-        if (DECISION_SAID.test(sentence)) {
-            return true;
+        for (const [index, sentence] of sentences.entries()) {
+            if (NO_DECISION.test(sentence) || NEGATED.test(sentence)) {
+                continue;
+            }
+
+            const asked = [sentence, sentences[index - 1] ?? ""].some(
+                (near) => near.match(ASK_IDS) !== null,
+            );
+
+            if (DECISION_SAID.test(sentence) || (!asked && DECISION_WAIT.test(sentence))) {
+                return true;
+            }
         }
     }
 
@@ -12686,18 +12745,22 @@ function withoutFences(text: string): string {
  * Whether the last paragraph asks Brian something. Code blocks and inline code never count, a sentence that says
  * there is no ask never counts, and a "?" counts in every other sentence. In a report (`report`), "please merge" is no
  * ask word (`REPORT_ASK_WORDS`) unless the sentence holds a choice (`CHOICE`): a statement that only asks for the merge
- * is no decision. A sentence that only asks for a merge of a named PR never counts, in either mode (`plainMergeAsk`): the
+ * is no decision, and a double-quoted span on 1 line (`"…"`, `“…”`) is a quote, so its `?` and words do not count. A
+ * sentence that only asks for a merge of a named PR never counts, in either mode (`plainMergeAsk`): the
  * Desk page lists that PR under Ready to merge. An inline code run that holds only a PR name counts as the name itself,
  * so "Please merge `owner/name#12`" is a plain merge ask.
  */
 export function asksBrian(text: string, options: { report?: boolean } = {}): boolean {
     const plain = withoutCode(unwrapPrCode(text));
-    const last =
+    const paragraph =
         plain
             .trim()
             .split(/\n\s*\n/)
             .at(-1)
             ?.trim() ?? "";
+    // In a report, a double-quoted span on 1 line is a quote (an ask's new text, an option), not a question to Brian.
+    const last =
+        options.report === true ? paragraph.replace(/"[^"\n]*"|“[^”\n]*”/g, " ") : paragraph;
     const sentences = last
         .split(/(?<=[.!?])\s+|;\s*/)
         .map((sentence) => sentence.trim())

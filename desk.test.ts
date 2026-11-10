@@ -2279,6 +2279,101 @@ describe("reportBlocks", () => {
     });
 });
 
+describe("reportBlocks: words that only look blocked", () => {
+    test("GitHub's mergeStateStatus BLOCKED in a report is not the work's state", () => {
+        // 2 real reports, word for word: each names GitHub's merge state, and the work is not blocked.
+        const inlineName =
+            "#219: no check fails now. The failure you saw was the first head `c013a4d` (Biome: 3 errors). Head `e941592` fixes it. At `e941592`, 10 of 11 checks pass (App UI, App shell, Verify, Race detector, Windows, Windows app e2e, deb, vulncheck, Flatpak sources, pr-triage). The Flatpak build is still running. `mergeStateStatus` is BLOCKED only for the required human review. The PR has no conflict with `main` (MERGEABLE).\n\n#219 is not ready yet. The cross-review (batch 1) found 5 blocking points in the find logic and the bar's keys. A subagent fixes them now, with tests. Then I merge `main` (no force-push), run `make ui-check`, push, and do the re-review. #218 is merged.\n\nPRs: frostyard/frostmail#219, frostyard/frostmail#218";
+        const theState =
+            "#141 is not conflicting now. I merged `origin/main` (eb5080d, with #142) into the branch with no force-push. Head is a77786a. GitHub shows MERGEABLE; the state BLOCKED only waits for review and CI. `make verify` passes (2229 tests), and `check-corrections --base origin/main` passes (43 lines). The head also has the fix of re-review 2 (a fact that renews expired 30-day coverage starts it again, with a guard test). Re-review 3 of 3 runs now. #142 is merged.";
+
+        assert.equal(reportBlocks(inlineName), false);
+        assert.equal(reportAsksBrian(inlineName), false);
+        assert.equal(reportBlocks(theState), false);
+        assert.equal(reportAsksBrian(theState), false);
+        assert.equal(reportBlocks("Head e941592: merge state: BLOCKED for the review."), false);
+        assert.equal(reportBlocks("The PR has mergeStateStatus=**BLOCKED** now."), false);
+        // BLOCKED said of the work still counts, also beside the merge state.
+        assert.equal(reportBlocks("Status: BLOCKED"), true);
+        assert.equal(reportBlocks("State: BLOCKED on the key"), true);
+        assert.equal(reportBlocks("I am BLOCKED: the PR is not mergeable."), true);
+        assert.equal(
+            reportBlocks("BLOCKED: GitHub merge state is BLOCKED and I cannot push."),
+            true,
+        );
+        // "the state" is the merge state only in a sentence that names it.
+        assert.equal(reportBlocks("The deploy waits: the state BLOCKED on the key."), true);
+    });
+
+    test("a question inside double quotes in a report is a quote, not a question to Brian", () => {
+        // A real report, word for word: it gives an ask's new text in quotes, for the supervisor.
+        const quoted =
+            'Plan T1013 is drafted. The crusty pass is done and its 10 findings are in the plan. The Teg consult k1 runs. Asks T1013a, T1013b and T1013c are open.\n\n1 request: please rewrite ask T1013c. The crusty pass found that 1 private GitHub App cannot install on 2 accounts. The plan now recommends 2 private Apps, 1 for each owner, with the same URL and the same secret. New text: "Where do the hooks come from: 2 private GitHub Apps with the same webhook URL and secret, 1 owned by frostyard (all repositories) and 1 by bketelsen (8 selected), so no stranger can install them (recommended), or 1 org webhook on frostyard plus 1 repository hook on each of the 8 bketelsen repositories (9 hooks)?" New options: "2 private Apps, 1 per owner" and "Org hook plus 8 repository hooks". The planning session cannot rewrite an ask.';
+
+        assert.equal(reportBlocks(quoted), false);
+        assert.equal(reportAsksBrian(quoted), false);
+        assert.equal(asksBrian('New text: "Which repository?"', { report: true }), false);
+        assert.equal(asksBrian("New text: \u201cWhich repository?\u201d", { report: true }), false);
+        // A question around a quote still asks him.
+        assert.equal(asksBrian('Do you approve "Install now"?', { report: true }), true);
+        assert.equal(asksBrian('Should I keep the "legacy" flag?', { report: true }), true);
+        assert.equal(reportBlocks('Done.\n\nDo you approve "Install now"?'), true);
+        // Odrade's reply mode does not change: a quoted question still counts there.
+        assert.equal(asksBrian('New text: "Which repository?"'), true);
+    });
+
+    test("a wait for Brian's answer beside a filed ask id names no new decision", () => {
+        // 2 real reports, word for word: each waits on asks that are already on the desk.
+        const openAsks =
+            'T1072 status: the draft is complete. `plan ready` is refused because 3 asks are open (T1072a, T1072b, T1072c). I continue when Brian answers.\n\nDone:\n- I wrote all the sections. Graph v3 has 5 tasks, all mine: t1 sandbox proof, t2 core ADR, t3 engine and shadow, t4 live in std and clix, t5 review on 2027-01-15.\n- I ran 1 crusty pass and 2 Goldfish passes on rev `4f8f35e` (`openai/gpt-6.1-sol`). Findings: 1 Blocker and 7 Major from crusty, 4 Major from comprehension, and 4 Blocker, 13 Major and 1 Nit from readiness. The plan accepts all of them. The `Review trial` section records them. Goldfish count: 10 distinct accepted Blocker or Major gaps that no crusty finding overlaps.\n\nChanges to your starting design:\n- Dependabot leaves the plan. The Go proxy `.info` `Time` is the commit time, not the publication time, so the 7-day aging rule fails. Also, a narrow `go.sum` diff does not prove an unchanged build graph. std and clix had 0 such PRs in 7.5 weeks.\n- The App approval cannot be atomic with the enqueue. A reconcile step now runs at the start of each live run, and the plan states the exposure that stays.\n- A stop issue (`merge-lane: stop` in core) stops a running job at its next write. The emergency stop suspends the App first.\n- The value is small: about 8 owner minutes a week at full rollout. T1072a now asks Brian for the goal. For fewer owner minutes, the owner batch command is cheaper. For unattended merging, only the App lane works.\n\nWording problem: the T1072b text says "Dependabot Go patch updates in shadow only". The plan now removes Dependabot from scope, also from shadow. Its first option still fits. You can rewrite T1072b if you want the text to match.\n\nNo owner consult is due: std and clix are my repositories.';
+        const openAsk =
+            "T1072: I wrote T1072d and T1072a back into the plan. The desk marks both as settled. The plan is at rev 6faa2cb, graph v7.\n\nChanges for scope (c):\n- `rollout`: all 26 public repositories with risk paths go live when they meet C2. A table gives each repository its owner, its publish status and its live categories.\n- `rollout`: the publish trade is now explicit. `publishes_on_merge: true` is a code rule (J1), so a publishing repository never gets `scored`. It does get `skills-sync` and `docs-only`. snosi: its build ignores Markdown and skills, so a lane merge builds no image. problem-intake: Markdown and skills are outside its deploy paths. nsl: a `docs-only` merge under `site/` goes live on the site at once. lab, intuneme, chairlift, pilothouse, updex, frostyard-org and the other unconfirmed repositories get mechanical categories only.\n- `rollout`: these owner limits are now overridden, and the plan says so: Duncan's nsl \"skills-sync only\", Irulan's lodge \"scored after 1 clean week\", and the rejection of (c) by all 3 owners.\n- `never`: all named owner paths are now in the floor. Basename globs match at any depth. Cargo, tauri and the flatpak JSON, polkit, sudoers, PAM, trust and keys are in the floor groups. There is a new F-repo-paths table for snosi, lab, problem-intake (privacy), testsuite, firn (erase, LUKS, secure boot), intuneme, nsl and frostread, plus tauri and `kit/` for Irulan's repositories. C3 reads `.github/risk-paths.json` at the base SHA.\n- Merge queues: new tasks t9 to t11 (Irulan) add `merge_group` to frostmail, frostnotes and frostread. t12 (Lucilla) does the same for repogen. H9b is Brian's step that applies the queue to these repositories and to lodge and porter.\n\nOpen: T1072e only. After Brian answers it, I reshape the graph if he picks the batch merge. Then I record the second review round and call `plan ready`.";
+
+        assert.equal(reportBlocks(openAsks), false);
+        assert.equal(reportAsksBrian(openAsks), false);
+        assert.equal(reportBlocks(openAsk), false);
+        assert.equal(reportAsksBrian(openAsk), false);
+        assert.equal(namesDecision("Open: T5a. I continue when Brian answers."), false);
+        // Without an ask id in its sentence or the sentence before it, the wait is still a decision.
+        assert.equal(namesDecision("I wait until Brian decides which repository."), true);
+        assert.equal(reportBlocks("I wait until Brian decides which repository."), true);
+        assert.equal(
+            namesDecision("Asks T5a and T5b are open.\n\nI continue once Brian picks the key."),
+            true,
+        );
+        // Every other decision form counts, also beside an ask id.
+        assert.equal(namesDecision("Brian must choose the key (T5a)."), true);
+        assert.equal(reportBlocks("Brian must choose the key (T5a)."), true);
+    });
+
+    test("a wait for Brian far from an ask id is still a decision", () => {
+        // A real report, word for word: its paragraph names an ask, but the wait 2 lines later is a new decision.
+        const farWait =
+            "PR #45 is not in conflict now. GitHub shows MERGEABLE at head `7ed040a`. That head merges main as of `48673d2` and includes the test-build fix. Brian then merged #58 (`757a247`), which has the same test fix as my PR #57. So #45, #38, #48, #49, #50 and #52 all show MERGEABLE against the new main. Their host checks pass. The re-reviews for #38, #45, #48, #50 and #52 run now. I add `ready-for-human` again after each review is Ready and CI is green. #49 waits for the review-budget ask T597e.\nI closed #57, because #58 superseded it (identical change). I deleted its remote branch by mistake: the rule allows this only for a merged PR. I pushed the branch back at once (`irulan/fix-main-build` at `b146f36`). It stays until Brian decides. I removed its local worktree.\n#56 is in conflict. It stays last: I merge main into it and run Prettier again after #48 and #49 merge.";
+
+        assert.equal(reportAsksBrian(farWait), true);
+        assert.equal(reportBlocks(farWait), true);
+        assert.equal(
+            namesDecision(
+                "Ask T5a is open.\nI pushed the branch back. It stays until Brian decides.",
+            ),
+            true,
+        );
+        // The same sentence or the sentence before it still waits on the ask.
+        assert.equal(namesDecision("Ask T5a is open. It stays until Brian decides."), false);
+        assert.equal(namesDecision("It stays until Brian answers T5a."), false);
+    });
+
+    test("a real decision for Brian in a report still holds the thread", () => {
+        // A real report, word for word: its "Decisions for Brian:" block asks for a tag.
+        const decision =
+            'frostyard/snowkit is done. PR #9 merged. pkg.go.dev shows MIT. The default pkg.go.dev page still hides the documentation, because the latest tag `v0.1.0` has no LICENSE.\n\nPR:\n- https://github.com/frostyard/snowkit/pull/9 "Add MIT LICENSE". It merged on 2026-11-06 at 02:51 UTC as merge commit `4f8bd38a2d316b7f48fc3dec3376208d9a3bb31f`.\n- CI: 5 of 5 checks passed (Lint, Race Detection, Unit Tests, Verify, Vulnerability Check).\n- Cross-review: `openai/gpt-6.1-sol` reviewed head `4ec2b18`. The result was Ready, with no findings. The revert test is exempt because the PR only adds a license file.\n- The PR had no `risk:high` label.\n\npkg.go.dev check:\n- `proxy.golang.org` serves the merge commit as `v0.1.1-0.20261106025136-4f8bd38a2d31`. I sent a fetch request to pkg.go.dev for this version.\n- `pkg.go.dev/github.com/frostyard/snowkit/gtk@v0.1.1-0.20261106025136-4f8bd38a2d31` shows the license MIT and the full documentation, for example `func RunOnMainThread`.\n- `pkg.go.dev/github.com/frostyard/snowkit/gtk` shows the latest tag, `v0.1.0`, by default. That tag has no LICENSE, so the page still says "Documentation not displayed due to license restrictions."\n- A new tag, for example `v0.1.1`, makes the default page show the documentation. The machine account must not make tags, so this is a release task for Brian.\n\nCleanup:\n- I deleted the remote branch `chore/mit-license` after I checked that the PR is merged.\n- I removed the worktree `/var/home/team/projects/frostyard/snowkit--duncan-01243b33` with `git worktree remove`, without `--force`. Before that, its status was clean.\n- I stopped the PR watch and cancelled the 4-hour check.\n\nWhat remains:\n- The local branch `chore/mit-license` stays in the main checkout `/var/home/team/projects/frostyard/snowkit`. It is merged: `git merge-base --is-ancestor chore/mit-license origin/main` succeeds. `git branch -d` refused it because the local `main` in the main checkout is behind `origin/main`. The removal of the worktree also removed this session\'s folder, so this session cannot run commands now. To remove the branch, run `git -C /var/home/team/projects/frostyard/snowkit branch -D chore/mit-license`.\n- I did not touch another worktree, `/var/home/team/projects/frostyard/snowkit--duncan-e7490045` (branch `chore/repo-baseline`), because it is not part of this task.\n\nDecisions for Brian:\n- frostyard/snowkit: pkg.go.dev hides the documentation on its default page, because the latest tag v0.1.0 has no LICENSE. The LICENSE is now on main (4f8bd38), CI is green. The machine account cannot tag. Do you want to tag v0.1.1 on main (`make bump` or `git tag v0.1.1 4f8bd38 && git push origin v0.1.1`)? [Tag v0.1.1 now | Wait for the next release]';
+
+        assert.equal(reportBlocks(decision), true);
+        assert.equal(reportAsksBrian(decision), true);
+    });
+});
+
 /** Attached PRs with the state GitHub gave them. */
 const prs = (...states: ("MERGED" | "CLOSED" | "FROZEN" | "OPEN" | "MISSING")[]) =>
     Object.fromEntries(
@@ -13244,6 +13339,14 @@ async function openWorktreeThread(
     branch: string,
 ): Promise<string> {
     let id = "";
+    // The thread starts at the folder's first commit, not at the wall clock: `threadAhead` counts only the commits at or
+    // after the start second, and the test's commits are the thread's own work (#197).
+    const started =
+        Number(
+            execFileSync("git", ["log", "--reverse", "--format=%ct"], { cwd: folder, env: gitEnv })
+                .toString()
+                .split("\n")[0],
+        ) * 1000;
 
     await app.harness.commit(async (tx) => {
         const state = await tx.doc(DeskThreads);
@@ -13255,7 +13358,7 @@ async function openWorktreeThread(
             cwd: folder,
             worktree: { path: folder, branch, checkout: folder },
             title: "A delegation in a worktree",
-            at: Date.now(),
+            at: started,
         }).thread;
         const stored = state.threads[opened.id]!;
 
