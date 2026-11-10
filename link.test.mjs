@@ -16,7 +16,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
 import { promisify } from "node:util";
-import { checkoutFor } from "./link.mjs";
 
 const run = promisify(execFile);
 const made = [];
@@ -57,7 +56,16 @@ async function link(repository) {
     return run(process.execPath, [join(repository, "link.mjs")], { cwd: repository, env });
 }
 
-test("checkoutFor: PI_POCKET_CHECKOUT, else pi-pocket-live when it is a checkout, else pi-pocket", () => {
+test("checkoutFor: PI_POCKET_CHECKOUT, else pi-pocket-live when it is a checkout, else pi-pocket", async () => {
+    // Imported from a copy beside a fake checkout: a link.mjs that runs its links on import touches only that copy.
+    const { root, repository: copy } = await projects();
+
+    await fakeCheckout(join(root, "pi-pocket"));
+
+    const { checkoutFor } = await import(join(copy, "link.mjs"));
+
+    assert.equal(typeof checkoutFor, "function", "link.mjs exports checkoutFor");
+
     const repository = "/p/pi-pocket-team";
 
     assert.equal(
