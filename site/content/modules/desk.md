@@ -35,6 +35,8 @@ Plans have a tool of their own, `plan`. After Brian approves a plan, 2 of its ac
 
 A pass on a plan task thread with no PR and no `plan nochange` is refused (see Watches below).
 
+A task thread that closes as done with no PR gets 1 grace sweep to find it; `desk attach` to its recent stopped attempt's thread lets a later merge repair the task. Tasks with `after: "closeout"` stay delegated after the merge until the thread closes as done, so host steps finish before deps or verification start.
+
 An agent session can use `read`, `watch` and `result` on its own thread only. On the goal board, an agent reads its supervisor's board with `board`, adds its own proposals with `board_add`, and edits or drops only its own proposed rows with `board_edit` and `board_drop`. A Clerk has its own smaller list, and escalates to its supervisor with `desk escalate`: the desk drops an escalation of news the supervisor already acted on or got, and puts the rest in her next digest, or sends it at once with `urgent: true`.
 
 ## Asks, watches and the cap

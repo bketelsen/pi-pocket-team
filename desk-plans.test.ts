@@ -5668,6 +5668,413 @@ describe("the approval of a new graph", () => {
     });
 });
 
+describe("task grace and post-merge close-out (#178 P1 and P2)", () => {
+    const close = (state: DeskState, at = tick(9), why: "done" | "dropped" = "done") => {
+        const thread = state.threads.T2 ?? assert.fail("T2");
+
+        thread.state = "closed";
+        thread.closed = { at, why, by: "sweep" };
+
+        return thread;
+    };
+
+    const newest = (graph: TaskGraph) =>
+        taskOf(graph, "t1").attempts.at(-1) ?? assert.fail("attempt");
+    const events = (state: DeskState) => state.threads.T1?.events.map((event) => event.text) ?? [];
+
+    test("a no-PR close gets 1 grace sweep, then a late open PR keeps its attempt until merge", () => {
+        const { state, graph } = buildingPlan();
+
+        close(state);
+        const grace = planFacts(state, "T1", tick(10));
+
+        assert.deepEqual(grace.items, []);
+        assert.equal(taskOf(graph, "t1").state, "delegated");
+        assert.equal(newest(graph).grace, tick(10));
+        assert.equal(newest(graph).end, undefined);
+        assert(
+            events(state).includes(
+                "t1: T2 closed with no PR: the desk looks for its PR in the next sweep",
+            ),
+        );
+        assert.match(
+            deliverCheck(state, "T1", "t1", { agent: "lucilla", repo: "frostyard/snow" }) ?? "",
+            /delegated/,
+        );
+        prOn(state, "T2", "frostyard/snow#1", "OPEN");
+        assert.deepEqual(planFacts(state, "T1", tick(11)).items, []);
+        assert.equal(taskOf(graph, "t1").state, "delegated");
+        assert.equal(newest(graph).end, undefined);
+        prOn(state, "T2", "frostyard/snow#1", "MERGED");
+        planFacts(state, "T1", tick(12));
+        assert.equal(taskOf(graph, "t1").state, "done");
+    });
+
+    test("no PR after grace resets the task with recovery text; a same-time replay spends no grace", () => {
+        const { state, graph } = buildingPlan();
+
+        close(state);
+        planFacts(state, "T1", tick(10));
+        const snapshot = JSON.stringify(state);
+
+        assert.deepEqual(planFacts(state, "T1", tick(10)), { events: 0, items: [] });
+        assert.equal(JSON.stringify(state), snapshot);
+        const stopped = planFacts(state, "T1", tick(11));
+
+        assert.equal(taskOf(graph, "t1").state, "ready");
+        assert.deepEqual(newest(graph).end, { at: tick(11), how: "stopped" });
+        assert.deepEqual(
+            stopped.items.map((item) => item.key),
+            ["plan-tasks:T1:v1:t1:2"],
+        );
+        assert(
+            events(state).includes(
+                "t1: T2 closed with no merged PR: the task is ready again. Attach its PR with desk attach, or deliver the task again.",
+            ),
+        );
+        const ended = JSON.stringify(state);
+
+        assert.deepEqual(planFacts(state, "T1", tick(12)), { events: 0, items: [] });
+        assert.equal(JSON.stringify(state), ended);
+    });
+
+    test("a reopened task thread gets grace for its next no-PR close, but dropped threads get none", () => {
+        const { state, graph } = buildingPlan();
+        const thread = close(state);
+
+        planFacts(state, "T1", tick(10));
+        thread.state = "open";
+        delete thread.closed;
+        planFacts(state, "T1", tick(11));
+        close(state, tick(12));
+        planFacts(state, "T1", tick(13));
+        assert.equal(newest(graph).grace, tick(13));
+        assert.equal(newest(graph).end, undefined);
+        assert.equal(
+            events(state).filter((text) => text.includes("the desk looks for its PR")).length,
+            2,
+        );
+        const other = buildingPlan();
+
+        close(other.state, tick(9), "dropped");
+        planFacts(other.state, "T1", tick(10));
+        assert.equal(newest(other.graph).grace, undefined);
+        assert.equal(taskOf(other.graph, "t1").state, "ready");
+    });
+
+    test("attach after a stopped no-PR attempt reopens its recent thread and merge repairs the task", () => {
+        const { state, graph } = buildingPlan();
+
+        close(state);
+        planFacts(state, "T1", tick(10));
+        planFacts(state, "T1", tick(11));
+        assert.equal(taskOf(graph, "t1").state, "ready");
+        assert(!("error" in attachTo(state, "frostyard/snow#1", "T2", tick(12))));
+        assert.equal(state.threads.T2?.state, "open");
+        assert(
+            events(state).includes(
+                "t1: frostyard/snow#1 attached to T2 after its attempt stopped: the task is done when the PR merges",
+            ),
+        );
+        const attached = JSON.stringify(state);
+
+        attachTo(state, "frostyard/snow#1", "T2", tick(12));
+        assert.equal(JSON.stringify(state), attached);
+        prOn(state, "T2", "frostyard/snow#1", "MERGED");
+        planFacts(state, "T1", tick(13));
+        assert.equal(taskOf(graph, "t1").state, "done");
+        assert.equal(newest(graph).end?.how, "merged");
+        const old = buildingPlan();
+
+        close(old.state);
+        assert("error" in attachTo(old.state, "frostyard/snow#1", "T2", tick(9) + 8 * 86400000));
+        assert.equal(old.state.threads.T2?.state, "closed");
+    });
+
+    test("a close-out merge ends its attempt but keeps the task delegated and the plan building until done", () => {
+        const { state, plan, graph } = buildingPlan();
+        const task = taskOf(graph, "t1");
+
+        task.after = "closeout";
+        prOn(state, "T2", "frostyard/snow#1", "MERGED");
+        const merged = planFacts(state, "T1", tick(10));
+
+        assert.equal(task.state, "delegated");
+        assert.deepEqual(newest(graph).end, { at: tick(10), how: "merged" });
+        assert.equal(plan.state, "building");
+        assert.equal(taskOf(graph, "t2").state, "waiting");
+        assert.deepEqual(merged.items, []);
+        assert(events(state).includes("t1 merged: waits for its close-out (T2)"));
+        assert.deepEqual(runningTasks(plan), ["t1 (T2)", "t3 (T3)"]);
+        const snapshot = JSON.stringify(state);
+
+        assert.deepEqual(planFacts(state, "T1", tick(11)), { events: 0, items: [] });
+        assert.equal(JSON.stringify(state), snapshot);
+        const end = JSON.stringify(newest(graph).end);
+
+        close(state, tick(12));
+        const done = planFacts(state, "T1", tick(13));
+
+        assert.equal(task.state, "done");
+        assert.equal(JSON.stringify(newest(graph).end), end);
+        assert.equal(taskOf(graph, "t2").state, "ready");
+        assert.deepEqual(
+            done.items.map((item) => item.key),
+            ["plan-tasks:T1:v1:t2:2"],
+        );
+        assert(events(state).includes("t1 closed out: T2"));
+        const settled = JSON.stringify(state);
+
+        assert.deepEqual(planFacts(state, "T1", tick(14)), { events: 0, items: [] });
+        assert.equal(JSON.stringify(state), settled);
+    });
+
+    test("the last close-out starts verification; a thread done before merge completes at once", () => {
+        for (const alreadyClosed of [false, true]) {
+            const { state, plan, graph } = buildingPlan();
+
+            taskOf(graph, "t1").after = "closeout";
+            taskOf(graph, "t2").attempts.push({ thread: "T4", at: tick(4), prs: [] });
+            merged(graph, "t2", tick(8));
+            merged(graph, "t3", tick(8));
+            prOn(state, "T2", "frostyard/snow#1", "MERGED");
+
+            if (alreadyClosed) {
+                close(state);
+            }
+
+            const first = planFacts(state, "T1", tick(10));
+
+            if (!alreadyClosed) {
+                assert.equal(plan.state, "building");
+                close(state, tick(11));
+                assert.equal(planFacts(state, "T1", tick(12)).items[0]?.kind, "plan-verify");
+            } else {
+                assert.equal(first.items[0]?.kind, "plan-verify");
+            }
+
+            assert.equal(taskOf(graph, "t1").state, "done");
+            assert.equal(plan.state, "verifying");
+        }
+    });
+
+    test("a non-done close-out stays delegated with 1 recovery event, and revise can stop it", () => {
+        const { state, graph } = buildingPlan();
+
+        taskOf(graph, "t1").after = "closeout";
+        prOn(state, "T2", "frostyard/snow#1", "MERGED");
+        planFacts(state, "T1", tick(10));
+        close(state, tick(11), "dropped");
+        planFacts(state, "T1", tick(12));
+        assert.equal(taskOf(graph, "t1").state, "delegated");
+        assert(
+            events(state).includes(
+                "t1: T2 closed as dropped before its close-out: the task stays delegated. Recover it with plan revise.",
+            ),
+        );
+        const snapshot = JSON.stringify(state);
+
+        assert.deepEqual(planFacts(state, "T1", tick(13)), { events: 0, items: [] });
+        assert.equal(JSON.stringify(state), snapshot);
+        const end = JSON.stringify(newest(graph).end);
+        const revised = revisePlan(state, "T1", {
+            key: "closeout-stop",
+            by: "brian",
+            at: tick(14),
+            why: "The host steps change.",
+            tasks: ["t1"],
+        });
+
+        assert(!("error" in revised));
+        assert.equal(taskOf(graph, "t1").state, "stopped");
+        assert.equal(JSON.stringify(newest(graph).end), end);
+    });
+
+    test("a merged close-out cannot be delivered or recorded no-change, but its thread can pass its result", () => {
+        const { state, graph } = buildingPlan();
+
+        taskOf(graph, "t1").after = "closeout";
+        prOn(state, "T2", "frostyard/snow#1", "MERGED");
+        planFacts(state, "T1", tick(10));
+        assert.match(
+            deliverCheck(state, "T1", "t1", { agent: "lucilla", repo: "frostyard/snow" }) ?? "",
+            /delegated/,
+        );
+        const noChange = planNoChange(state, "T1", {
+            thread: "T2",
+            at: tick(11),
+            reason: "Already merged.",
+            evidence: "The PR merged.",
+        });
+
+        assert("error" in noChange);
+        assert.match(noChange.error, /ended \(merged\)/);
+        const thread = state.threads.T2 ?? assert.fail("T2");
+
+        assert(
+            !(
+                "error" in
+                setWatch(thread, {
+                    checkOn: "7d",
+                    check: "Host steps are done.",
+                    by: "odrade",
+                    key: "closeout-watch",
+                    at: tick(11),
+                })
+            ),
+        );
+        const passed = recordResult(
+            thread,
+            {
+                key: "closeout-pass",
+                pass: true,
+                text: "Host steps done.",
+                by: "odrade",
+                closedBy: "desk",
+                at: tick(12),
+            },
+            state,
+        );
+
+        assert(!("error" in passed));
+        planFacts(state, "T1", tick(13));
+        assert.equal(taskOf(graph, "t1").state, "done");
+    });
+
+    test("revise stops an open merged close-out thread and preserves its merged attempt", () => {
+        const { state, graph } = buildingPlan();
+
+        taskOf(graph, "t1").after = "closeout";
+        prOn(state, "T2", "frostyard/snow#1", "MERGED");
+        planFacts(state, "T1", tick(10));
+        assert.equal(taskOf(graph, "t1").state, "delegated");
+        const end = JSON.stringify(taskOf(graph, "t1").attempts.at(-1)?.end);
+        const revised = revisePlan(state, "T1", {
+            key: "host-revise",
+            by: "brian",
+            at: tick(11),
+            why: "The host steps change.",
+            tasks: ["t1"],
+        });
+
+        assert(!("error" in revised));
+        assert.equal(taskOf(graph, "t1").state, "stopped");
+        assert.equal(JSON.stringify(taskOf(graph, "t1").attempts.at(-1)?.end), end);
+        assert(
+            revised.sends.some((send) => send.to === "session-T2" && send.text.includes("Stop:")),
+        );
+    });
+
+    test("the page drop leaves delegated close-out tasks unchanged", () => {
+        const { state, graph } = buildingPlan();
+
+        taskOf(graph, "t1").after = "closeout";
+        prOn(state, "T2", "frostyard/snow#1", "MERGED");
+        planFacts(state, "T1", tick(10));
+        const tasks = JSON.stringify(graph.tasks);
+        const dropped = dropPlan(state, "T1", {
+            by: "brian",
+            why: "Drop the plan.",
+            at: tick(11),
+        });
+
+        assert(!("error" in dropped));
+        assert.equal(taskOf(graph, "t1").state, "delegated");
+        assert.equal(JSON.stringify(graph.tasks), tasks);
+        assert.deepEqual(Object.keys(dropped), ["thread"]);
+    });
+
+    test("a carried close-out keeps its field and attempts, and changing after is new work", () => {
+        const { state, plan, graph } = buildingPlan();
+        const task = taskOf(graph, "t1");
+
+        task.after = "closeout";
+        close(state);
+        prOn(state, "T2", "frostyard/snow#1", "MERGED");
+        planFacts(state, "T1", tick(10));
+        merged(graph, "t3", tick(10));
+        const carried = { ...task, carried: { graph: 1, why: "The host steps are complete." } };
+
+        assert.equal(carryProblem(plan, [carried]), undefined);
+        assert.match(carryProblem(plan, [{ ...carried, after: undefined }]) ?? "", /after changed/);
+        assert(
+            !(
+                "error" in
+                revisePlan(state, "T1", {
+                    key: "carry-closeout",
+                    by: "brian",
+                    at: tick(11),
+                    why: "Only completed work remains.",
+                    tasks: [],
+                })
+            ),
+        );
+        draftGraph(state, "T1", {
+            key: "carried-closeout",
+            at: tick(12),
+            rev: plan.rev,
+            tasks: [carried],
+        });
+        const draft = plan.graphs.at(-1) ?? assert.fail("graph");
+
+        assert.equal(draft.tasks[0]?.after, "closeout");
+        assert.deepEqual(draft.tasks[0]?.attempts, task.attempts);
+        assert(!("error" in readyPlan(state, "T1", { key: "ready-carried", at: tick(13) })));
+        assert(
+            !(
+                "error" in
+                approvePlan(state, "T1", {
+                    key: "approve-carried",
+                    by: "brian",
+                    rev: plan.rev,
+                    graph: draft.version,
+                    at: tick(14),
+                })
+            ),
+        );
+        assert.equal(draft.tasks[0]?.after, "closeout");
+        assert.deepEqual(draft.tasks[0]?.attempts, task.attempts);
+    });
+
+    test("close-out validates, survives draft and approval, and appears only in its task brief", () => {
+        const { state, plan } = startPlan();
+        const wanted = tasks();
+        const first = wanted[0] ?? assert.fail("task");
+
+        first.after = "closeout";
+        assert.equal(validateGraph(wanted, ROSTER), undefined);
+        assert.equal(
+            validateGraph([{ ...first, after: "deploy" as "closeout" }], ROSTER),
+            'Task t1\'s after must be "closeout", or absent.',
+        );
+        draftGraph(state, "T1", { key: "closeout", at: tick(1), rev: plan.rev, tasks: wanted });
+        const graph = plan.graphs[0] ?? assert.fail("graph");
+
+        assert.equal(taskOf(graph, "t1").after, "closeout");
+        assert.match(renderTasks(graph), /after: closeout/);
+        readyPlan(state, "T1", { key: "ready", at: tick(2) });
+        const approved = approvePlan(state, "T1", {
+            key: "approved",
+            by: "brian",
+            rev: plan.rev,
+            graph: graph.version,
+            at: tick(3),
+        });
+
+        assert(!("error" in approved));
+        assert.equal(taskOf(graph, "t1").after, "closeout");
+        assert.match(
+            planTaskBrief(plan, "Plan", graph, taskOf(graph, "t1")),
+            /This task is done only when its thread closes as done after the merge: do the host steps, then report done\./,
+        );
+        assert.doesNotMatch(
+            planTaskBrief(plan, "Plan", graph, taskOf(graph, "t2")),
+            /do the host steps/,
+        );
+        assert.match(planningBrief("T1", "Plan.md"), /after: "closeout"/);
+    });
+});
+
 describe("the plan view's scope change", () => {
     test("the view says the scope change, and whether Brian can Stop and revise", () => {
         const { state } = buildingPlan();
@@ -8441,6 +8848,25 @@ const model = scriptedModel((request) => {
         });
     }
 
+    if (
+        text.endsWith("plan tasks closeout test") ||
+        text.endsWith("plan tasks invalid after test")
+    ) {
+        return call("plan", {
+            action: "tasks",
+            rev: writeRev,
+            tasks: [
+                {
+                    id: "t1",
+                    title: "Install on the host",
+                    agent: "paul",
+                    acceptance: ["The host runs the merged code."],
+                    after: text.endsWith("plan tasks invalid after test") ? "deploy" : "closeout",
+                },
+            ],
+        });
+    }
+
     if (text.endsWith("plan tasks test")) {
         return call("plan", {
             action: "tasks",
@@ -9795,6 +10221,30 @@ describe("a drop by the supervisor", () => {
         );
     });
 
+    test("the supervisor drop stops delegated close-out work without rewriting its merged attempt", () => {
+        const { state, graph } = buildingPlan();
+        const task = taskOf(graph, "t1");
+
+        task.after = "closeout";
+        prOn(state, "T2", "frostyard/snow#1", "MERGED");
+        planFacts(state, "T1", tick(6));
+        assert.equal(task.state, "delegated");
+        const end = JSON.stringify(task.attempts.at(-1)?.end);
+
+        answered(state.threads.T1 ?? assert.fail("T1"), "T1a", "Drop the plan.");
+        const dropped = drop(state);
+
+        assert(!("error" in dropped));
+        assert.equal(task.state, "stopped");
+        assert.equal(JSON.stringify(task.attempts.at(-1)?.end), end);
+        assert(dropped.stopped.includes("t1 (T2)"));
+        assert(dropped.sends.some((send) => send.to === "session-T2"));
+        assert.equal(
+            state.threads.T2?.events.find((event) => event.key === "plan-dropped:drop:1")?.text,
+            "stopped: plan T1 is dropped",
+        );
+    });
+
     test("an ask on a task thread is Brian's answer too, and the open verification thread is stopped", () => {
         const { state, plan, graph } = buildingPlan();
 
@@ -10022,6 +10472,37 @@ describe("with the Pi Pocket app", () => {
             Object.values(state?.plans ?? {}).some((each) => each.lead === "paul"),
             true,
         );
+    });
+
+    test("plan tasks accepts and stores closeout, and refuses another after value", async () => {
+        const state = await deskSnapshot();
+        const thread =
+            Object.values(state?.threads ?? {}).find(
+                (each) => each.origin === "plan" && each.agents.includes("paul"),
+            ) ?? assert.fail("paul's plan");
+        const plan = planOf(state, thread.id) ?? assert.fail("plan");
+        const session = thread.session as ConversationId;
+        const priorRev = writeRev;
+
+        writeRev = plan.rev;
+
+        try {
+            await say(app, session, "plan tasks invalid after test");
+            const refused = JSON.stringify(await modelTexts(app, session));
+
+            assert.match(refused, /closeout/, "the schema names the only allowed value");
+            assert.equal(planOf(await deskSnapshot(), thread.id)?.graphs.length, 0);
+            await say(app, session, "plan tasks closeout test");
+            const graph = planOf(await deskSnapshot(), thread.id)?.graphs.at(-1);
+
+            assert.equal(graph?.tasks[0]?.after, "closeout");
+            assert.match(
+                await readStore(plansFolder, planOf(await deskSnapshot(), thread.id)?.rev ?? ""),
+                /after: closeout/,
+            );
+        } finally {
+            writeRev = priorRev;
+        }
     });
 
     test("a sweep does not close a quiet plan thread", async () => {

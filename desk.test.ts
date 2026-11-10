@@ -8978,6 +8978,122 @@ describe("attribute", () => {
         assert.equal(thread.prs["frostyard/test#7"]?.via, "branch");
     });
 
+    test("the window rule includes a no-PR plan task in grace, bounded by its close and the shared ambiguity count", () => {
+        const fixture = () => {
+            const state = deskOf();
+            const thread = placed(state, 100);
+
+            thread.state = "closed";
+            thread.closed = { at: 300, why: "done", by: "sweep" };
+            thread.planTask = { plan: "T99", task: "t1" };
+            state.plans = {
+                T99: {
+                    thread: "T99",
+                    slug: "test",
+                    file: "/fixture/test.md",
+                    lead: "duncan",
+                    idea: "Test grace.",
+                    source: "chat",
+                    state: "building",
+                    rev: "a".repeat(40),
+                    revs: [],
+                    sections: [],
+                    comments: [],
+                    approvals: [],
+                    consults: [],
+                    findings: [],
+                    graphs: [
+                        {
+                            version: 1,
+                            rev: "a".repeat(40),
+                            state: "approved",
+                            at: 1,
+                            key: "g",
+                            tasks: [
+                                {
+                                    id: "t1",
+                                    title: "Test",
+                                    agent: "duncan",
+                                    repo: "frostyard/test",
+                                    acceptance: ["Works."],
+                                    deps: [],
+                                    state: "delegated",
+                                    attempts: [{ thread: thread.id, at: 100, prs: [], grace: 350 }],
+                                },
+                            ],
+                        },
+                    ],
+                },
+            };
+
+            return { state, thread, git: gitOf({ recentlyClosed: [thread.id] }) };
+        };
+
+        const { state, thread, git } = fixture();
+        const result = attribute(state, githubOf([prFact({ createdAt: 250 })]), git, 400);
+
+        assert.equal(thread.prs["frostyard/test#7"]?.via, "window");
+        assert.deepEqual(
+            result.reopened,
+            [thread.id],
+            "the sweep reopens it as for seen and branch",
+        );
+
+        for (const createdAt of [99, 301]) {
+            const other = fixture();
+
+            attribute(other.state, githubOf([prFact({ createdAt })]), other.git, 400);
+            assert.equal(
+                other.thread.prs["frostyard/test#7"],
+                undefined,
+                "no guess before start or after close",
+            );
+        }
+
+        const ambiguous = fixture();
+        const second = placed(ambiguous.state, 200);
+
+        attribute(ambiguous.state, githubOf([prFact({ createdAt: 250 })]), ambiguous.git, 400);
+        assert.equal(ambiguous.thread.prs["frostyard/test#7"], undefined);
+        assert.equal(
+            second.prs["frostyard/test#7"],
+            undefined,
+            "count the open thread and grace candidate together",
+        );
+
+        const own = fixture();
+
+        own.git.ownAuthors = [prFact().author];
+        attribute(own.state, githubOf([prFact({ createdAt: 250 })]), own.git, 400);
+        assert.equal(own.thread.prs["frostyard/test#7"], undefined, "no window for the owner's PR");
+
+        const pinned = fixture();
+
+        attribute(
+            pinned.state,
+            { ...githubOf([]), prs: { "frostyard/test#7": prFact({ createdAt: 250 }) } },
+            pinned.git,
+            400,
+        );
+        assert.equal(
+            pinned.thread.prs["frostyard/test#7"],
+            undefined,
+            "no window for evidence-only reads",
+        );
+
+        const ended = fixture();
+        const attempt =
+            ended.state.plans?.T99?.graphs[0]?.tasks[0]?.attempts[0] ?? assert.fail("attempt");
+
+        attempt.end = { at: 375, how: "stopped" };
+        attribute(ended.state, githubOf([prFact({ createdAt: 250 })]), ended.git, 400);
+        assert.equal(
+            ended.thread.prs["frostyard/test#7"],
+            undefined,
+            "a stopped attempt has no grace",
+        );
+    });
+
     test("the window rule: exactly one thread in that repository was open", () => {
         const state = deskOf();
         const thread = placed(state, 100);

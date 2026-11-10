@@ -208,6 +208,8 @@ type PlanTask = {
     acceptance: string[];
     deps: string[];
     state: "waiting" | "ready" | "delegated" | "done" | "stopped";
+    /** Host or owner steps after the merge; done only when the thread closes as done. */
+    after?: "closeout";
     /**
      * Every delivery of the task, oldest first: the first one, and 1 more for each repair after a failed verification.
      * An attempt is never removed or changed after it ends; a repair adds a new one. A failed verification does not
@@ -218,6 +220,8 @@ type PlanTask = {
         at: number;
         /** Every PR of the thread, with its merged head oid when it merged. */
         prs: { ref: string; head?: string }[];
+        /** Sweep time when a done thread with no PR refs first gets 1 grace sweep; a later close gets new grace. */
+        grace?: number;
         end?: {
             at: number;
             how: "merged" | "no-change" | "stopped";
@@ -360,7 +364,10 @@ is set. Approval and verification read the bytes from the store by revision, nev
 ### 5.3 A task
 
 `waiting` (a dep is not done) → `ready` → `delegated` (the thread opened) → `done` (its PR merged, or `plan nochange`
-recorded evidence), or `stopped` (a scope change named it). One PR per task is the rule: a task thread with a second PR
+recorded evidence), or `stopped` (a scope change named it). Optional `after: "closeout"` keeps a task delegated
+when its PR merges: it becomes done only when its thread closes as done, after the host or owner steps. Another close
+reason keeps it delegated and names `plan revise` as the recovery. A task without the field keeps the done-at-merge
+rule. One PR per task is the rule: a task thread with a second PR
 gets a thread event and a line for Odrade ("T575 has 2 PRs for 1 task"), not a block. A task that needs 2 repositories
 is 2 tasks. Each delegation adds an attempt. The task is `done` when its newest attempt ended as `merged` or
 `no-change`, and no failed verification round that names the task came after that attempt started. A failed round
@@ -377,7 +384,7 @@ leaves every attempt as it was, and sets the named tasks back to `ready`, so the
 
 **Carry.** A new graph (after a scope change) can mark a task as carried from the approved graph only when the task
 is `done` there (by the rule in section 5.3, so a task that is waiting, delegated, stopped or named by a failed round is
-not), and all of these are the same: the id, the agent, the repository, the acceptance lines, and the deps, and every
+not), and all of these are the same: the id, the agent, the repository, optional `after`, the acceptance lines, and the deps, and every
 dep is itself carried. The desk checks this; the planning session's reason does not replace it.
 The planning session gives a reason for each carried task (`carried.why`), and the page shows the carried tasks at
 Approve. A carried task keeps its attempts and stays `done`. Every other task is new work. A graph whose tasks are all
@@ -801,8 +808,20 @@ Each line below differs from the design above, or settles what it left open, and
 - **An attempt ends `merged` when at least 1 PR of its thread merged and no PR of it is open.** A PR whose state is not
   read yet counts as open.
 - **A task thread that closes with no merged PR and no no-change** ends its attempt `stopped`, and the task is ready
-  again (waiting when a dep is not done), with 1 event. A thread that closed as `failed` keeps its task `delegated`,
-  as PR 1 decided (a failed start is an unknown outcome).
+  again (waiting when a dep is not done), with 1 event. A done thread with no PR refs gets 1 grace sweep first,
+  recorded in optional `attempt.grace`; a same-time replay changes nothing. A PR found then keeps the attempt open
+  while it is open or unread. Window attribution includes these grace candidates only for PRs made between start and
+  close, and counts them together with open threads; the owner-PR and evidence-only exclusions remain. With no PR
+  after grace the stop event says to attach the PR with `desk attach`, or deliver again. An attempt with a closed
+  unmerged ref gets no grace. A thread that closed as `failed` keeps its task `delegated` (an unknown outcome).
+- **An attached PR repairs the newest stopped attempt** of a ready or waiting task when the PR merges and none is
+  open. `desk attach` still only reopens a thread closed as done within 7 days, and records 1 plan-thread event about
+  the repair. Older closed threads remain refused.
+- **`after: "closeout"` holds a merged task delegated**, with 1 event `t1 merged: waits for its close-out (T2)`.
+  The attempt ends `merged` and keeps the heads; only a later done close completes the task and releases deps or
+  verification. A thread already closed as done completes at merge. Another close reason gets 1 recovery event
+  naming `plan revise`. The supervisor's `plan drop` also stops delegated close-out tasks and sends the stop to their open threads, without
+  rewriting merged attempts. Scope changes can stop them too, and approval still waits while they are delegated.
 - **Tasks that become ready reuse the kind `plan-approved`** (its meaning is "delegate the ready tasks now"), with the
   key `plan-tasks:<plan>:v<graph>:<ids>:<attempt count>`. No new kind is needed. While `revising` is set, the line says to wait
   for the new approval. A task that goes back to `waiting` gets only its event.
