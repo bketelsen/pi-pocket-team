@@ -281,8 +281,9 @@ While the branch is `wait`, the pool grows on the 1st of each month. The steps o
 1. **Harvest** (Sheeana), into a new folder per round: `node bench/harvest.mjs` with `--since` the day after the last
    window, `--until` the day before the round, `--out <data>/manifests-<yyyy-mm>` and `--fetch`. The check of a
    bketelsen/pi-pocket-team task passes only on the Pi Pocket release that its merge was tested on ("Phase 3",
-   incidents): harvest those tasks with `--pocket` at that release (v0.28.0-bk.1 for merges since 2026-11-07), and
-   use the same `--pocket` for each task in stage 2.
+   incidents): harvest those tasks with `--pocket` at that release, the CI pin at their merge (v0.28.0-bk.1 for merges from
+   2026-11-07 until bketelsen/pi-pocket-team#200, v0.28.1-bk.1 for merges after it), and use the same `--pocket`
+   for each task in stage 2.
 2. **Owner review**, as in round 1 (scope, commands, keep or drop with a reason), on a copy of the round's new
    manifest, not on the owner's file: `--revalidate` checks every task of the file it gets with 1 `--pocket`, and
    the owner's file holds the pool's older pi-pocket-team tasks, which pass only on v0.27.0. So the owner runs
