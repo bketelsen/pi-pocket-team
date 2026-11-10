@@ -144,6 +144,7 @@ import {
     quietWakeOf,
     quietWake,
     quietTrigger,
+    threadAhead,
     quietWatched,
     readyWatched,
     quietReopens,
@@ -1314,6 +1315,37 @@ const thread = (patch: Partial<Thread> = {}): Thread => ({
 });
 
 const facts = (now = 1000, folders: string[] = []) => ({ now, folders: new Set(folders) });
+
+describe("threadAhead", () => {
+    test("a delegated thread counts only the unpushed commits from its start second on", () => {
+        // Started at 5000.9 seconds: a commit at second 5000 is its own, one at 4999 is not.
+        const delegated = thread({ startedAt: 5_000_900 });
+
+        assert.equal(threadAhead(delegated, { dirty: 0, ahead: 2, times: [4000, 4999] }), 0);
+        assert.equal(threadAhead(delegated, { dirty: 0, ahead: 3, times: [5000, 4999, 4000] }), 1);
+        assert.equal(
+            threadAhead(delegated, { dirty: 0, ahead: 1, times: [5001, 5000] }),
+            1,
+            "the smaller count",
+        );
+        assert.equal(threadAhead(delegated, { dirty: 0, ahead: 2 }), 2, "no times: the count");
+        assert.equal(threadAhead(delegated, { dirty: 0, times: [5001] }), undefined, "no count");
+    });
+
+    test("a found, seed, ask or plan thread keeps the folder's count", () => {
+        for (const origin of ["found", "seed", "ask", "plan"] as const) {
+            assert.equal(
+                threadAhead(thread({ origin, startedAt: 5_000_000 }), {
+                    dirty: 0,
+                    ahead: 2,
+                    times: [4000, 4999],
+                }),
+                2,
+                origin,
+            );
+        }
+    });
+});
 
 describe("closeCheck", () => {
     test("a thread with every part closed closes", () => {
@@ -2643,6 +2675,34 @@ describe("reopening", () => {
             "new work in its session",
         );
         assert.equal(reopenReason(done, { busy: false, userBefore: 5 }, now), undefined);
+    });
+
+    test("a busy session read before the close does not reopen the thread", () => {
+        const now = 10 * DAY;
+        // The sweep read its facts at `now`; a pass closed the thread after that, before the sweep's commit.
+        const later = thread({
+            state: "closed",
+            closed: { at: now + 1, why: "done", by: "desk" },
+            run: { lastUserEntry: 5 },
+        });
+
+        assert.equal(reopenReason(later, { busy: true }, now), undefined);
+        // New user entries still count: the commit reads them, so a real new message reopens it.
+        assert.equal(
+            reopenReason(later, { busy: true, userBefore: 4 }, now),
+            "new work in its session",
+        );
+
+        // A close at or before the read: the busy session is new work.
+        for (const at of [now, now - 1]) {
+            const closed = thread({
+                state: "closed",
+                closed: { at, why: "done", by: "desk" },
+                run: { lastUserEntry: 5 },
+            });
+
+            assert.equal(reopenReason(closed, { busy: true }, now), "its session is busy");
+        }
     });
 
     test("an entry from before a pass's close is no new work, also when no sweep scanned it", () => {
@@ -4301,6 +4361,34 @@ describe("a handled report and a quiet wake", () => {
             quietTrigger(done({ ...wake, ahead: undefined }), { dirty: 1 }, new Set()),
             undefined,
             "an unknown unpushed count is no work by itself",
+        );
+    });
+
+    test("commits from before a delegated thread started are no folder work after a quiet wake", () => {
+        const wake = { quietWake: { at: 1200, entry: 5 } };
+        const work = "work in its folder after a supervisor message";
+        // Started at second 5000; its close had 1 changed file and 2 unpushed commits.
+        const started = { startedAt: 5_000_000 };
+        const old = { dirty: 1, ahead: 4, times: [4999, 4200, 4100, 4000] };
+
+        assert.equal(
+            quietTrigger(done(wake, started), old, new Set()),
+            undefined,
+            "4 commits on no remote, all from before the start",
+        );
+        assert.equal(
+            quietTrigger(
+                done(wake, started),
+                { dirty: 1, ahead: 4, times: [5002, 5001, 5000, 4000] },
+                new Set(),
+            ),
+            work,
+            "3 own commits are above the 2 at the close",
+        );
+        assert.equal(
+            quietTrigger(done(wake, { ...started, origin: "found" }), old, new Set()),
+            work,
+            "a found thread keeps the folder's count",
         );
     });
 
@@ -22602,6 +22690,267 @@ describe("the desk in a Pi Pocket", () => {
                 false,
                 "the missing worktree does not hold the thread",
             );
+        } finally {
+            await quiet([]);
+            shift = 0;
+        }
+    });
+
+    /**
+     * An open delegated thread on `folder`, after its first sweep. Its session stays busy, so it stays open across the
+     * later sweeps.
+     */
+    const busyFolderThread = async (name: string, folder: string): Promise<Thread> => {
+        const source = await supervisor(name);
+        let id = "";
+
+        await app.harness.commit(async (tx) => {
+            const state = await tx.doc(DeskThreads);
+            const opened = openThread(state, {
+                key: `x.test.${name}`,
+                supervisor: Number(source),
+                agents: ["duncan"],
+                repo: `frostyard/${name}`,
+                cwd: folder,
+                title: "A folder that changes between sweeps",
+                at: Date.now(),
+            }).thread;
+
+            id = opened.id;
+            state.threads[id]!.state = "open";
+            state.threads[id]!.address = `session-${name}`;
+            state.threads[id]!.run.busy = true;
+        }, context);
+
+        await say(app, source, "desk list test");
+        await until(
+            async () => typeof (await deskState())?.threads[id]?.run.sweptAt === "number",
+            "the first sweep",
+            20_000,
+        );
+
+        const first = (await deskState())?.threads[id];
+
+        assert(first, "the thread is stored");
+
+        return first;
+    };
+
+    /** Sweep number `round` (2 or more) of a thread: the app's clock moves past the sweeper's sleep each time. */
+    const sweepAgain = async (before: Thread, round: number): Promise<Thread> => {
+        await quiet([before.id]);
+        await restartApp((round - 1) * (SWEEP_SLEEP_MS + 60_000));
+        await sweptAfter(before, before.run.sweptAt);
+
+        const after = (await deskState())?.threads[before.id];
+
+        assert(after, "the thread is still stored");
+
+        return after;
+    };
+
+    /** The parts of a thread's close check that name `folder`. */
+    const folderParts = (thread: Thread, folder: string): string[] =>
+        closeCheck(thread, facts()).open.filter((part) => part.includes(folder));
+
+    test("a gone folder clears an unknown unpushed count from a failed read during its removal", async () => {
+        await stopSweepers();
+        const folder = join(root, "gone-after-failed-read");
+
+        rmSync(folder, { recursive: true, force: true });
+        repository(folder);
+
+        try {
+            const first = await busyFolderThread("gone-unknown", folder);
+
+            assert.equal(first.run.ahead, 0);
+
+            // A sweep reads the folder in the middle of the removal: `git status` fails.
+            writeFileSync(join(folder, ".git", "index"), "not an index");
+            const second = await sweepAgain(first, 2);
+
+            assert.equal(second.run.aheadUnknown, "git status failed");
+            assert.deepEqual(folderParts(second, folder), [
+                `unpushed commits in ${folder} are unknown (git status failed)`,
+            ]);
+
+            // Then the folder is gone: it counts as clean, and the event keeps what it held.
+            rmSync(folder, { recursive: true, force: true });
+            const third = await sweepAgain(second, 3);
+
+            assert.equal(third.run.aheadUnknown, undefined);
+            assert.equal(third.run.dirty, 0);
+            assert.equal(third.run.ahead, 0);
+            assert.equal(
+                third.events.some(
+                    (event) =>
+                        event.key.startsWith("gone:") &&
+                        event.text ===
+                            "the folder is gone: it counts as clean (it had unknown unpushed commits: git status failed)",
+                ),
+                true,
+            );
+            assert.deepEqual(folderParts(third, folder), []);
+        } finally {
+            await quiet([]);
+            shift = 0;
+        }
+    });
+
+    test("a gone folder clears a changed file that a sweep saw before the removal", async () => {
+        await stopSweepers();
+        const folder = join(root, "gone-after-changed-file");
+
+        rmSync(folder, { recursive: true, force: true });
+        repository(folder);
+        writeFileSync(join(folder, "untracked.txt"), "work\n");
+
+        try {
+            const first = await busyFolderThread("gone-dirty", folder);
+
+            assert.equal(first.run.dirty, 1);
+            assert.deepEqual(folderParts(first, folder), [`1 changed file in ${folder}`]);
+
+            rmSync(folder, { recursive: true, force: true });
+            const second = await sweepAgain(first, 2);
+
+            assert.equal(second.run.dirty, 0);
+            assert.equal(
+                second.events.some(
+                    (event) =>
+                        event.text ===
+                        "the folder is gone: it counts as clean (it had 1 changed file)",
+                ),
+                true,
+            );
+            assert.deepEqual(folderParts(second, folder), []);
+        } finally {
+            await quiet([]);
+            shift = 0;
+        }
+    });
+
+    test("an empty folder that a worktree removal left behind counts as gone", async () => {
+        await stopSweepers();
+        const folder = join(root, "gone-empty-folder");
+
+        rmSync(folder, { recursive: true, force: true });
+        repository(folder);
+        writeFileSync(join(folder, "untracked.txt"), "work\n");
+
+        try {
+            const first = await busyFolderThread("gone-empty", folder);
+
+            assert.equal(first.run.dirty, 1);
+
+            // `git worktree remove` left the directory, with nothing in it: no `.git`, no file.
+            rmSync(folder, { recursive: true, force: true });
+            mkdirSync(folder);
+            const second = await sweepAgain(first, 2);
+
+            assert.equal(second.run.aheadUnknown, undefined);
+            assert.equal(second.run.dirty, 0);
+            assert.equal(
+                second.events.some((event) => event.text.includes("git status failed")),
+                false,
+            );
+            assert.equal(
+                second.events.some(
+                    (event) =>
+                        event.text ===
+                        "the folder is gone: it counts as clean (it had 1 changed file)",
+                ),
+                true,
+            );
+            assert.deepEqual(folderParts(second, folder), []);
+        } finally {
+            await quiet([]);
+            shift = 0;
+        }
+    });
+
+    test(
+        "a folder that lstat cannot read is a failed read, not a gone folder",
+        // Root reads the folder anyway.
+        { skip: process.getuid?.() === 0 },
+        async () => {
+            await stopSweepers();
+            const parent = join(root, "locked-parent");
+            const folder = join(parent, "repo");
+
+            rmSync(parent, { recursive: true, force: true });
+            repository(folder);
+
+            try {
+                const first = await busyFolderThread("locked-parent", folder);
+
+                assert.equal(first.run.ahead, 0);
+
+                // No permission on the parent: `lstat` of the folder fails with EACCES, and so does `git status`.
+                chmodSync(parent, 0o000);
+                const second = await sweepAgain(first, 2);
+
+                assert.equal(second.run.aheadUnknown, "git status failed");
+                assert.equal(
+                    second.events.some((event) => event.key.startsWith("gone:")),
+                    false,
+                );
+                assert.deepEqual(folderParts(second, folder), [
+                    `unpushed commits in ${folder} are unknown (git status failed)`,
+                ]);
+            } finally {
+                chmodSync(parent, 0o755);
+                await quiet([]);
+                shift = 0;
+            }
+        },
+    );
+
+    test("commits from before a delegated thread started are not its unpushed work", async () => {
+        await stopSweepers();
+        const folder = join(root, "agent-home");
+        // An agent's home: a branch with no remote, and 2 commits from long before the thread.
+        const oldDates = {
+            ...gitEnv,
+            GIT_AUTHOR_DATE: "2020-01-01T00:00:00Z",
+            GIT_COMMITTER_DATE: "2020-01-01T00:00:00Z",
+        };
+
+        rmSync(folder, { recursive: true, force: true });
+        mkdirSync(folder, { recursive: true });
+        git(folder, "init", "-q");
+
+        for (const words of ["one", "two"]) {
+            writeFileSync(join(folder, "file.txt"), `${words}\n`);
+            git(folder, "add", ".");
+            execFileSync(
+                "git",
+                [
+                    "-c",
+                    "user.email=test@example.com",
+                    "-c",
+                    "user.name=Test",
+                    "commit",
+                    "-qm",
+                    words,
+                ],
+                { cwd: folder, env: oldDates, stdio: "ignore" },
+            );
+        }
+
+        try {
+            const first = await busyFolderThread("agent-home", folder);
+
+            assert.equal(first.run.ahead, 0, "the 2 older commits are not the thread's");
+            assert.equal(first.run.aheadUnknown, undefined);
+            assert.deepEqual(folderParts(first, folder), []);
+
+            // A commit after the thread started is its own work: it holds the thread.
+            commitFile(folder, "after the start");
+            const second = await sweepAgain(first, 2);
+
+            assert.equal(second.run.ahead, 1);
+            assert.deepEqual(folderParts(second, folder), [`1 unpushed commit in ${folder}`]);
         } finally {
             await quiet([]);
             shift = 0;
