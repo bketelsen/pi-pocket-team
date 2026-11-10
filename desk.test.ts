@@ -13348,6 +13348,21 @@ function commitFile(folder: string, words: string): void {
 }
 
 /**
+ * The committer time of a folder's first commit, in milliseconds. A delegated thread that starts at this time counts
+ * every commit of the test as its own: `threadAhead` counts only the commits at or after the start second, and a thread
+ * opened at the wall clock after its commits counts 0 when the clock moves to a new second in between (#186, #197).
+ */
+function firstCommitAt(folder: string): number {
+    return (
+        Number(
+            execFileSync("git", ["log", "--reverse", "--format=%ct"], { cwd: folder, env: gitEnv })
+                .toString()
+                .split("\n")[0],
+        ) * 1000
+    );
+}
+
+/**
  * Open a thread for a sweep on a folder that is its own delegation worktree, with no session and no address: the session
  * part is closed and idle, so only the folder's counts decide whether it closes.
  */
@@ -13357,14 +13372,8 @@ async function openWorktreeThread(
     branch: string,
 ): Promise<string> {
     let id = "";
-    // The thread starts at the folder's first commit, not at the wall clock: `threadAhead` counts only the commits at or
-    // after the start second, and the test's commits are the thread's own work (#197).
-    const started =
-        Number(
-            execFileSync("git", ["log", "--reverse", "--format=%ct"], { cwd: folder, env: gitEnv })
-                .toString()
-                .split("\n")[0],
-        ) * 1000;
+    // The thread starts at the folder's first commit, not at the wall clock: the test's commits are its own work.
+    const started = firstCommitAt(folder);
 
     await app.harness.commit(async (tx) => {
         const state = await tx.doc(DeskThreads);
@@ -22056,6 +22065,33 @@ describe("the desk in a Pi Pocket", () => {
         repository(folder);
         // No upstream at all: the case this test is about.
         git(folder, "remote", "remove", "origin");
+        // The commit is 1 hour old. A thread opened at the wall clock does not count it as its own work, and its first
+        // sweep writes "nothing is unpushed": the same as a thread opened in the second after the commit (#186). The
+        // thread starts at the commit, so the clock never decides the count.
+        const hourAgo = `${String(Math.floor(Date.now() / 1000) - 3600)} +0000`;
+
+        execFileSync(
+            "git",
+            [
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "--amend",
+                "--no-edit",
+                "-q",
+            ],
+            {
+                cwd: folder,
+                env: {
+                    ...gitEnv,
+                    GIT_AUTHOR_DATE: hourAgo,
+                    GIT_COMMITTER_DATE: hourAgo,
+                },
+                stdio: "ignore",
+            },
+        );
 
         const source = await supervisor("ahead");
         let id = "";
@@ -22069,7 +22105,7 @@ describe("the desk in a Pi Pocket", () => {
                 repo: "frostyard/no-upstream",
                 cwd: folder,
                 title: "A branch with no upstream",
-                at: Date.now(),
+                at: firstCommitAt(folder),
             }).thread;
 
             // The doc's copy is not the returned object: set the state on the stored thread.
