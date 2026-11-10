@@ -242,7 +242,8 @@ What the branch can give, with stage 1's model sets (a reading of the fixed rule
 group runs B1, its shortlist and C1. Stage 1 has a shortlist only for easy (`github-copilot/gpt-6-luna`,
 `deepseek/deepseek-flash`); medium, hard, easy+medium and medium+hard have none, and C1 is B1
 (`github-copilot/claude-opus-5.5`). So only an easy tier of 30 or more predicted tasks, confirmed alone, compares a
-cheaper model with Opus. A merged group, or the constant branch, runs Opus alone, and its pick is Opus. At the mix of
+cheaper model with Opus. A merged group, or the constant branch, runs Opus alone: when it decides, its only possible pick is Opus
+(it can still be `inconclusive`, or keep today's policy when Opus fails a guard). At the mix of
 R now (half easy, no hard), easy+medium reaches 30 when R reaches 30 (branch `merge`), and easy alone needs R of about 60.
 
 ### The decision now
@@ -277,26 +278,38 @@ else 1 extension of 28 days, then undo.
 
 While the branch is `wait`, the pool grows on the 1st of each month. The steps of a round:
 
-1. **Harvest** (Sheeana): `node bench/harvest.mjs --since <the day after the last window> --until <the day before>
---out <data>/manifests-<yyyy-mm> --fetch`. The check of a bketelsen/pi-pocket-team task passes only on the Pi
-   Pocket release that its merge was tested on ("Phase 3", incidents): harvest those tasks with `--pocket` at that
-   release (v0.28.0-bk.1 for merges since 2026-11-07), and use the same `--pocket` in stage 2.
-2. **Owner review**, as in round 1 (scope, commands, keep or drop with a reason): each owner adds its new
-   candidates to `~/agents/<owner>/bench/<repository name>.json` (a task id appears once; an earlier decision
-   stands), and runs `node bench/harvest.mjs --revalidate <file>` on it.
+1. **Harvest** (Sheeana), into a new folder per round: `node bench/harvest.mjs` with `--since` the day after the last
+   window, `--until` the day before the round, `--out <data>/manifests-<yyyy-mm>` and `--fetch`. The check of a
+   bketelsen/pi-pocket-team task passes only on the Pi Pocket release that its merge was tested on ("Phase 3",
+   incidents): harvest those tasks with `--pocket` at that release (v0.28.0-bk.1 for merges since 2026-11-07), and
+   use the same `--pocket` for each task in stage 2.
+2. **Owner review**, as in round 1 (scope, commands, keep or drop with a reason), on a copy of the round's new
+   manifest, not on the owner's file: `--revalidate` checks every task of the file it gets with 1 `--pocket`, and
+   the owner's file holds the pool's older pi-pocket-team tasks, which pass only on v0.27.0. So the owner runs
+   `node bench/harvest.mjs --revalidate <copy>` (with the round's `--pocket` for pi-pocket-team), then adds the
+   reviewed new tasks to `~/agents/<owner>/bench/<repository name>.json` (a task id appears once; an earlier
+   decision stands).
 3. **Grow:** `node bench/pool.mjs --grow`. Calibration and stage 1 stay; the new kept tasks join the end of R as 1
    entry of `stage2.rounds`.
 4. **Branch:** `node bench/analyze.mjs --branch` with every input manifest, as above. Commit `branch.json`,
    `branch.md` and 1 row in the table below.
-5. **Branch not `wait`:** run the simulation (`node bench/analyze.mjs --simulate --out bench/results/simulation.json`:
-   tier sizes 30 and 60, the smallest and the largest n of a group) for the threshold, then stage 2 by the branch (B1, the shortlist and C1 of each group), then `--stage 2`. Record H1 to H3,
-   B, the picks, the constant policy and the live experiment's pre-registration in this phase.
+5. **Branch not `wait`:** run the simulation for the threshold: `node bench/analyze.mjs --simulate` with
+   `--discordance <d>` and `--out bench/results/simulation.json` (tier sizes 30 and 60, the smallest and the largest
+   n of a group); then stage 2 by the branch (B1, the shortlist and C1 of each group), then `--stage 2`. Record H1 to
+   H3, B, the picks, the constant policy and the live experiment's pre-registration in this phase.
+    - The discordance `d` (a reading of `bench/analyze.mjs`, which says to run the simulation again with stage 1's
+      discordance): the highest share of discordant pairs against B1, over the confirmed groups' other models, on
+      each group's stage 1 tasks (the `vsB1` cells of `bench/results/stage1/summary.json`), but never below the
+      default 0.2. The simulated true gap is 15 points, and the discordance can never be below the gap. The only
+      group with another model is easy alone: there, Luna has 1 discordant pair of 15 and DeepSeek 0 of 15, so `d`
+      is 0.2. A merged group or the constant branch runs Opus alone and compares no model with it. `pB` stays at
+      its default 0.7. The round's row records `d`.
 
-| Round       | Run on         | Harvest window           | New kept | R   | easy | medium | hard | Branch |
-| ----------- | -------------- | ------------------------ | -------- | --- | ---- | ------ | ---- | ------ |
-| 0 (pool v1) | 2026-11-10     | 2026-09-01 to 2026-11-06 | 70       | 22  | 11   | 11     | 0    | `wait` |
-| 1           | due 2026-12-01 | 2026-11-07 to 2026-11-30 |          |     |      |        |      |        |
-| 2           | due 2027-01-01 | 2026-12-01 to 2026-12-31 |          |     |      |        |      |        |
+| Round       | Run on         | Harvest window           | New kept | R   | easy | medium | hard | Branch | d       |
+| ----------- | -------------- | ------------------------ | -------- | --- | ---- | ------ | ---- | ------ | ------- |
+| 0 (pool v1) | 2026-11-10     | 2026-09-01 to 2026-11-06 | 70       | 22  | 11   | 11     | 0    | `wait` | not run |
+| 1           | due 2026-12-01 | 2026-11-07 to 2026-11-30 |          |     |      |        |      |        |         |
+| 2           | due 2027-01-01 | 2026-12-01 to 2026-12-31 |          |     |      |        |      |        |         |
 
 Round 0's "New kept" is the whole pool (70 kept tasks, 22 of them in R). Round 2 is the last: if R is still under 30
 after it, stage 1 is reported as exploratory on 2027-01-31 at the latest, and no live change follows.
