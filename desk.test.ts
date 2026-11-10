@@ -22869,6 +22869,47 @@ describe("the desk in a Pi Pocket", () => {
         }
     });
 
+    test("an empty folder inside a parent repository counts as gone, not as the parent's changes", async () => {
+        await stopSweepers();
+        const parent = join(root, "parent-of-empty");
+        // A worktree folder under the parent's checkout, as `.worktrees/<name>`.
+        const folder = join(parent, ".worktrees", "task");
+
+        rmSync(parent, { recursive: true, force: true });
+        repository(parent);
+        // The parent has its own changed file: it is not the thread's work.
+        appendFileSync(join(parent, "file.txt"), "the parent's change\n");
+        mkdirSync(folder, { recursive: true });
+        writeFileSync(join(folder, "work.txt"), "work\n");
+
+        try {
+            const first = await busyFolderThread("parent-of-empty", folder);
+            const held = first.run.dirty as number;
+
+            assert.ok(held > 0, "the first sweep sees changed files");
+
+            // The removal left the folder empty: `git status` in it would read the parent's changed file.
+            rmSync(join(folder, "work.txt"));
+            const second = await sweepAgain(first, 2);
+
+            assert.equal(second.run.dirty, 0);
+            assert.equal(second.run.aheadUnknown, undefined);
+            assert.equal(
+                second.events.some(
+                    (event) =>
+                        event.key.startsWith("gone:") &&
+                        event.text ===
+                            `the folder is gone: it counts as clean (it had ${String(held)} changed file${held === 1 ? "" : "s"})`,
+                ),
+                true,
+            );
+            assert.deepEqual(folderParts(second, folder), []);
+        } finally {
+            await quiet([]);
+            shift = 0;
+        }
+    });
+
     test(
         "a folder that lstat cannot read is a failed read, not a gone folder",
         // Root reads the folder anyway.

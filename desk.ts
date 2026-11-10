@@ -36,8 +36,8 @@ import {
     lstat,
     mkdir,
     open,
+    opendir,
     readFile,
-    readdir,
     readlink,
     realpath,
     rename,
@@ -24809,6 +24809,8 @@ export default function createDesk(host: Host, web: Web) {
 
         const fact = await statusOf(folder, options);
 
+        // A "gone" fact here is a folder that went between the reads, or an empty directory inside a parent repository
+        // (`rev-parse` above read the parent): both stay unknown, so the archive keeps the session (`folder-unknown`).
         return fact === null || fact.gone === true ? undefined : fact;
     };
 
@@ -25417,10 +25419,12 @@ export default function createDesk(host: Host, web: Web) {
     }
 
     /**
-     * Whether a folder whose `git status` failed is on disk: "gone" when `lstat` fails with ENOENT or ENOTDIR, as
+     * Whether a folder is on disk, read before its `git status`: "gone" when `lstat` fails with ENOENT or ENOTDIR, as
      * `archiveFolder` reads it, and "unread" for any other error (EACCES, for example): a failed read, not a gone folder.
      * An empty directory is "gone" too: `git worktree remove` can leave the directory behind with nothing in it, and an
-     * empty directory holds no changed file and no commit. A `readdir` that fails keeps it "there".
+     * empty directory holds no changed file and no commit. It is read first because `git status` in an empty directory
+     * inside a parent repository (an empty `.worktrees/<name>`) gives the parent's status. The check reads at most 1
+     * entry, since it runs on every folder at each sweep; a directory read that fails keeps it "there".
      */
     const folderOnDisk = async (folder: string): Promise<"there" | "gone" | "unread"> => {
         let isDirectory: boolean;
@@ -25438,7 +25442,13 @@ export default function createDesk(host: Host, web: Web) {
         }
 
         try {
-            return (await readdir(folder)).length === 0 ? "gone" : "there";
+            const dir = await opendir(folder);
+
+            try {
+                return (await dir.read()) === null ? "gone" : "there";
+            } finally {
+                await dir.close();
+            }
         } catch {
             return "there";
         }
@@ -25496,16 +25506,17 @@ export default function createDesk(host: Host, web: Web) {
         folder: string,
         options: { heads?: ReadonlySet<string>; branch?: string } = {},
     ): Promise<FolderFact | null> {
+        const onDisk = await folderOnDisk(folder);
+
+        // A folder that is gone (an agent removed its worktree after a merge, or left it empty) is no failure: it counts
+        // as clean. This comes before `git status`, which in an empty folder inside a parent repository reads the parent.
+        if (onDisk === "gone") {
+            return { dirty: 0, ahead: undefined, gone: true };
+        }
+
         const text = await gitText(folder, ["status", "--porcelain=v2", "--branch"]);
 
         if (text === undefined) {
-            const onDisk = await folderOnDisk(folder);
-
-            // A folder that is gone (an agent removed its worktree after a merge) is no failure: it counts as clean.
-            if (onDisk === "gone") {
-                return { dirty: 0, ahead: undefined, gone: true };
-            }
-
             return onDisk === "there" &&
                 (await gitText(folder, ["rev-parse", "--git-dir"])) === undefined
                 ? null

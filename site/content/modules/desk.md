@@ -54,6 +54,9 @@ A `x.desk.sweeper` task sweeps each supervisor's threads every 10 minutes. Its r
 - it attributes a PR to a thread by 3 rules in order (the PR was seen in the session, or exactly 1 thread made its branch, or exactly 1 thread was open when it was made);
 - it reads by number the PRs a session named when their repository's open list was not read whole, and only the seen and branch rules attach them;
 - it copies a linked session's failed run (Pi Pocket 0.28.0 and later) to the thread, with the event `run failed: <line>`; while its session is idle and not archived, such a thread waits on Odrade with the reason `run failed: <line>`, and it does not close;
+- it counts a folder that is gone, or empty after a worktree removal, as clean, with 1 event that says what the folder held; a folder it cannot read holds the thread, as a failed `git status` does;
+- for a delegated thread, it does not count unpushed commits from before the thread started: they are not its work;
+- it does not open a closed thread again for a busy session that it read before the close (for example, a watch pass between its read and its commit);
 - it computes the next actor (`brian`, `agent`, `odrade`, a `reviewer`, or `none`) and checks whether every part is closed. A thread is not done while the read left out a PR its session named, or, for a thread with no PR of its own, the open PRs of its repository: GitHub being down keeps such a thread open until a read works.
 
 `desk list`, `desk sync` and the prompt section say `Unread: T12 (frostyard/x#5, 6 h)` for a PR link that no read gave facts for in more than 30 minutes, `GitHub: last read at 01:47, 6 h ago` when the read is that old, and `Sweep failed at 01:47: <why>` until the next good sweep. The page header shows only the `Unread: …` line.
