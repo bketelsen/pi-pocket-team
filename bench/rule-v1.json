@@ -1,0 +1,38 @@
+{
+    "version": 1,
+    "features": [
+        "pathsNamed",
+        "briefChars",
+        "reposNamed",
+        "riskPathNamed"
+    ],
+    "center": {
+        "pathsNamed": 4.25,
+        "briefChars": 1413.9722222222222,
+        "reposNamed": 0.3611111111111111,
+        "riskPathNamed": 0.05555555555555555
+    },
+    "scale": {
+        "pathsNamed": 2.3258809561588105,
+        "briefChars": 635.0676904477327,
+        "reposNamed": 0.5846545883291442,
+        "riskPathNamed": 0.2290614236454256
+    },
+    "levels": {},
+    "weights": {
+        "pathsNamed": -1.1411993994430039,
+        "briefChars": 1.1539642295104615,
+        "reposNamed": 0.25411729719765563,
+        "riskPathNamed": -0.5544501927713672
+    },
+    "thresholds": [
+        -0.31323889176032077,
+        1.8867564431398014
+    ],
+    "medians": {
+        "pathsNamed": 4.5,
+        "briefChars": 1388.5,
+        "reposNamed": 0,
+        "riskPathNamed": 0
+    }
+}

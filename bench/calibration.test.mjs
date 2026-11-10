@@ -240,6 +240,7 @@ function fakeDrive({
     onRun = () => 0,
     onCheck = () => 0,
     now = Date.UTC(2026, 10, 7, 12),
+    parallel = 2,
 } = {}) {
     const outcomes = new Map();
     const calls = [];
@@ -250,7 +251,7 @@ function fakeDrive({
         outcomes,
         run: () =>
             drive(plan, {
-                parallel: 2,
+                parallel,
                 waitPeak: false,
                 now: () => now,
                 wait: async () => {},
@@ -332,6 +333,27 @@ test("the driver: a budget refusal stops priced runs; peak hours defer; a usage 
 
     assert.equal(flaky.calls.filter(([what, m]) => what === "check" && m === "d1").length, 2);
     assert.deepEqual([...twice.stuck.keys()], ["t\nd1"]);
+});
+
+test("the driver: a disk-low run (exit 4) stops every new run, priced or not; a ready check still runs", async () => {
+    // 1 action at a time: c1 runs first and exits 4; the unpriced c2 waits after it, and m1's check is ready.
+    const fake = fakeDrive({
+        models: { c2: { priced: false } },
+        onRun: (m) => (m === "c1" ? 4 : 0),
+        parallel: 1,
+    });
+
+    fake.outcomes.set("m1", "check");
+
+    const result = await fake.run();
+    const of = (kind) => fake.calls.filter(([what]) => what === kind).map(([, m]) => m);
+
+    assert.equal(result.diskLow, true);
+    assert.equal(result.budgetRefused, false);
+    assert.equal(result.stuck.size, 0, "a low disk is no stuck action");
+    assert.deepEqual(of("run"), ["c1"], "no run starts after the exit 4, the unpriced c2 too");
+    assert.deepEqual(of("check"), ["m1"], "the ready check runs");
+    assert.ok(result.tasks[0].waiting.some((w) => w.model === "c2" && w.need === "run"));
 });
 
 // ---------------------------------------------------------------------------------------------------------------

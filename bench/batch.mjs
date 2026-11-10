@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // The batch driver: every (task, model) pair of a manifest as a child `node bench/run.mjs`, at most `--parallel` at
-// a time (the slots enforce the provider caps). It stops starting priced pairs after a budget refusal (exit 2), holds
-// the halogen lease when a halogen model is in the batch, and keeps DeepSeek pairs out of DeepSeek's peak hours.
+// a time (the slots enforce the provider caps). It stops starting priced pairs after a budget refusal (exit 2), stops
+// starting every pair after a disk-low exit of a child (exit 4: the disk is nearly full), holds the halogen lease when a halogen model is in the batch, and keeps DeepSeek pairs out of DeepSeek's peak hours.
 // At the end it prints a Markdown table per model.
 import { parseArgs } from "node:util";
 import { delay, providerOf, resultPath, resultsDir, readJson } from "./lib/common.mjs";
@@ -15,6 +15,7 @@ import {
     stopChildren,
 } from "./lib/drive.mjs";
 import { markdownTable, summarize } from "./lib/report.mjs";
+import { DISK_LOW_EXIT } from "./lib/runner.mjs";
 
 const USAGE = `usage: node bench/batch.mjs --manifest <file> --stage <s> [--models a,b|all] [--tasks a,b|all]
          [--parallel 4] [--run-id <s>] [--wall-limit <ms>] [--wait-peak] [--lease-bin <path>]
@@ -91,6 +92,7 @@ async function main() {
     const finished = [];
     const deferred = [];
     const budgetSkipped = [];
+    const diskSkipped = [];
     let lease = null;
 
     if (pairs.some(({ model }) => providerOf(model.id) === "halogen")) {
@@ -120,6 +122,7 @@ async function main() {
     const queue = [...pairs];
     const live = new Set();
     let stopPriced = false;
+    let diskLow = false;
 
     /** Start 1 pair; on its end, record its exit code. */
     const launch = (pair) => {
@@ -128,6 +131,14 @@ async function main() {
             children,
         ).then((code) => {
             live.delete(promise);
+
+            // The disk is nearly full: nothing was spent, and no new pair starts (priced or unpriced).
+            if (code === DISK_LOW_EXIT) {
+                diskLow = true;
+                diskSkipped.push(pair);
+
+                return;
+            }
 
             if (code === 2 && pair.model.peakUtc && inPeak(pair.model, new Date())) {
                 queue.push(pair);
@@ -151,6 +162,11 @@ async function main() {
     try {
         while (queue.length || live.size) {
             while (live.size < values.parallel) {
+                if (diskLow) {
+                    diskSkipped.push(...queue.splice(0));
+                    break;
+                }
+
                 for (let i = queue.length - 1; i >= 0; i -= 1) {
                     if (stopPriced && queue[i].model.priced) {
                         budgetSkipped.push(...queue.splice(i, 1));
@@ -216,6 +232,7 @@ async function main() {
     for (const [what, list] of [
         ["Deferred (DeepSeek peak hours)", deferred],
         ["Not run (budget refused)", budgetSkipped],
+        ["Not run (disk low)", diskSkipped],
     ]) {
         if (list.length) {
             console.log(
@@ -224,7 +241,7 @@ async function main() {
         }
     }
 
-    return budgetSkipped.length ? 2 : 0;
+    return diskSkipped.length ? DISK_LOW_EXIT : budgetSkipped.length ? 2 : 0;
 }
 
 process.exitCode = await main();

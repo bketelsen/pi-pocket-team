@@ -1,7 +1,7 @@
 // Shared helpers of the replay bench: the data and results paths, atomic writes, a mkdir lock, and pid checks.
 // The bench keeps its private files (spend, slots, run dirs, transcripts) in the data dir, mode 0700 for folders and
 // 0600 for files; only the result files go to the repository's ignored `bench/results/`.
-import { mkdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, statfsSync } from "node:fs";
 import {
     chmod,
     lstat,
@@ -31,6 +31,31 @@ export const dataDir = (env = process.env) =>
     env.BENCH_DATA
         ? resolve(env.BENCH_DATA)
         : join(homedir(), ".local", "share", "pi-pocket-team", "bench");
+
+/** 1 GB (10^9 bytes), the unit of the free-space minimum. */
+export const GB = 1e9;
+
+/** The free space that a run needs on the file system of the data dir, by default (`BENCH_MIN_FREE_GB` changes it). */
+export const MIN_FREE_BYTES = 12 * GB;
+
+/**
+ * The free bytes for an unprivileged user (`bavail * bsize` of `statfs`) on the file system of `path`, or of its
+ * nearest folder that exists (the data dir may not exist yet).
+ */
+export function freeBytes(path) {
+    let dir = resolve(path);
+
+    while (!existsSync(dir) && dirname(dir) !== dir) {
+        dir = dirname(dir);
+    }
+
+    const { bavail, bsize } = statfsSync(dir);
+
+    return bavail * bsize;
+}
+
+/** Bytes as GB, with 1 decimal. */
+export const formatGb = (bytes) => (bytes / GB).toFixed(1);
 
 /** The results dir: `--results`, else `<repo>/bench/results`. */
 export const resultsDir = (option) => (option ? resolve(option) : join(BENCH_DIR, "results"));

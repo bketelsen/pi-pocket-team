@@ -279,14 +279,14 @@ export function resolveTask(task, groups, outcome, max = MAX_REPLACEMENTS) {
  * Run the plan until every task has an outcome, at most `parallel` actions at a time. `deps`:
  * - `outcome(task, model)`: as `outcomeOf`, read fresh each time;
  * - `run(task, model)`: 1 attempt (exit code of `run.mjs`: 0 recorded, 1 usage error, 2 budget refused or peak hours,
- *   3 harness failure, recorded);
+ *   3 harness failure, recorded, 4 disk low: nothing was spent, and no more runs start);
  * - `check(task, model)`: S0 to S2 with no judge (exit code of `score.mjs --checks-only`);
  * - `model(id)`: the entry of `bench/models.json` (`priced`, `peakUtc`);
  * - `lease()`: resolves true when the halogen lease is held (called before the first halogen run);
  * - `refresh()` (optional): runs before each step, so a synchronous `outcome` can read a fresh cache;
  * - `peakEnds(model, date)`, `now()`, `wait(ms)`, `waitPeak`, `parallel`, `log`.
  * A pilot task never runs: a model with no finished pilot attempt is `excluded` by its `outcome`. Returns `{ tasks,
- * stuck, deferred, budgetRefused }`, the tasks as `resolveTask` gives them.
+ * stuck, deferred, budgetRefused, diskLow }`, the tasks as `resolveTask` gives them.
  */
 export async function drive(plan, deps) {
     const live = new Map();
@@ -295,6 +295,7 @@ export async function drive(plan, deps) {
     const failures = new Map();
     const deferred = new Set();
     let budgetRefused = false;
+    let diskLow = false;
     let leaseTaken = null;
 
     const keyOf = (task, model) => `${task.id}\n${model}`;
@@ -332,7 +333,7 @@ export async function drive(plan, deps) {
                         continue;
                     }
 
-                    if (budgetRefused && entry?.priced) {
+                    if ((budgetRefused && entry?.priced) || diskLow) {
                         continue;
                     }
 
@@ -366,6 +367,13 @@ export async function drive(plan, deps) {
 
             const code =
                 need === "run" ? await deps.run(task, model) : await deps.check(task, model);
+
+            if (need === "run" && code === 4) {
+                diskLow = true;
+                deps.log(`${task.id} ${model}: disk low; no more runs start`);
+
+                return;
+            }
 
             if (need === "run" && code === 2) {
                 if (inPeak(deps.model(model) ?? {}, new Date(deps.now()))) {
@@ -424,7 +432,7 @@ export async function drive(plan, deps) {
 
     await deps.refresh?.();
 
-    return { tasks: states(), stuck, deferred: [...deferred], budgetRefused };
+    return { tasks: states(), stuck, deferred: [...deferred], budgetRefused, diskLow };
 }
 
 // ---------------------------------------------------------------------------------------------------------------

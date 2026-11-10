@@ -122,6 +122,8 @@ export const testEnv = (fixture, extra = {}) => {
         BENCH_DATA: fixture.data,
         LEASE_DIR: fixture.leases,
         BENCH_SLOT_POLL_MS: "50",
+        // The tests do not depend on the host's free disk space; a test that checks the minimum sets its own.
+        BENCH_MIN_FREE_GB: "0",
         ...extra,
     };
 

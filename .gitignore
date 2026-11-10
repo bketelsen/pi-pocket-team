@@ -3,4 +3,9 @@ _pocket.d.ts
 _pocket
 site/dist/
 build/
-bench/results/
+bench/results/*
+# The stage summaries are the bench's record (no diff, transcript or path): they are committed.
+!bench/results/stage1/
+bench/results/stage1/*
+!bench/results/stage1/summary.json
+!bench/results/stage1/summary.md

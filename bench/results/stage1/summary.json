@@ -1,0 +1,1423 @@
+{
+    "stage": 1,
+    "settings": {
+        "margin": 0.1,
+        "draws": 100000,
+        "seed": 1064
+    },
+    "models": [
+        "deepseek/deepseek-flash",
+        "github-copilot/claude-haiku-5.5",
+        "github-copilot/claude-opus-5.5",
+        "github-copilot/claude-sonnet-5.5",
+        "github-copilot/gemini-3.8-flash",
+        "github-copilot/gpt-6-luna",
+        "github-copilot/gpt-6.1-sol",
+        "github-copilot/grok-4.7",
+        "github-copilot/mai-code-2-flash",
+        "halogen/halogen-qwen3.8-flash-next"
+    ],
+    "tasks": {
+        "total": 36,
+        "ids": [
+            "pi-pocket-team-84",
+            "pi-pocket-team-79",
+            "pi-pocket-team-53",
+            "pi-pocket-team-72",
+            "pi-pocket-team-100",
+            "pi-pocket-team-104",
+            "pi-pocket-team-70",
+            "pi-pocket-team-116",
+            "pi-pocket-team-81",
+            "frostmail-135",
+            "lodge-40",
+            "porter-25",
+            "updex-480",
+            "updex-481",
+            "updex-457",
+            "core-170",
+            "core-214",
+            "core-197",
+            "core-212",
+            "core-193",
+            "nsl-77",
+            "nsl-70",
+            "nsl-74",
+            "nsl-89",
+            "nsl-75",
+            "nsl-68",
+            "nsl-76",
+            "chairlift-276",
+            "fleet-104",
+            "fleet-100",
+            "fleet-89",
+            "fleet-103",
+            "fleet-108",
+            "fleet-109",
+            "fleet-118",
+            "fleet-120"
+        ],
+        "usable": 36,
+        "dropped": [],
+        "incomplete": []
+    },
+    "bands": {
+        "pi-pocket-team-84": "easy",
+        "pi-pocket-team-79": "easy",
+        "pi-pocket-team-53": "easy",
+        "pi-pocket-team-72": "unsolved",
+        "pi-pocket-team-100": "easy",
+        "pi-pocket-team-104": "medium",
+        "pi-pocket-team-70": "easy",
+        "pi-pocket-team-116": "medium",
+        "pi-pocket-team-81": "medium",
+        "frostmail-135": "hard",
+        "lodge-40": "easy",
+        "porter-25": "easy",
+        "updex-480": "hard",
+        "updex-481": "medium",
+        "updex-457": "medium",
+        "core-170": "easy",
+        "core-214": "easy",
+        "core-197": "medium",
+        "core-212": "easy",
+        "core-193": "easy",
+        "nsl-77": "easy",
+        "nsl-70": "medium",
+        "nsl-74": "medium",
+        "nsl-89": "easy",
+        "nsl-75": "medium",
+        "nsl-68": "hard",
+        "nsl-76": "easy",
+        "chairlift-276": "medium",
+        "fleet-104": "medium",
+        "fleet-100": "easy",
+        "fleet-89": "medium",
+        "fleet-103": "medium",
+        "fleet-108": "medium",
+        "fleet-109": "unsolved",
+        "fleet-118": "hard",
+        "fleet-120": "hard"
+    },
+    "bandCounts": {
+        "easy": 15,
+        "medium": 14,
+        "hard": 5,
+        "unsolved": 2
+    },
+    "majorityBand": "easy",
+    "tiers": {
+        "easy": {
+            "n": 15,
+            "b1": "github-copilot/claude-opus-5.5",
+            "shortlist": [
+                "github-copilot/gpt-6-luna",
+                "deepseek/deepseek-flash"
+            ],
+            "stats": [
+                {
+                    "model": "deepseek/deepseek-flash",
+                    "n": 15,
+                    "passes": 15,
+                    "passRate": 1,
+                    "meanGrade": 3.533333333333333,
+                    "cost": 0.6840447000000001,
+                    "costPerPass": 0.04560298,
+                    "availability": 1,
+                    "medianWallMs": 386434
+                },
+                {
+                    "model": "github-copilot/claude-haiku-5.5",
+                    "n": 15,
+                    "passes": 13,
+                    "passRate": 0.8666666666666667,
+                    "meanGrade": 3.3666666666666667,
+                    "cost": 0.9804871549999999,
+                    "costPerPass": 0.07542208884615384,
+                    "availability": 1,
+                    "medianWallMs": 246097
+                },
+                {
+                    "model": "github-copilot/claude-opus-5.5",
+                    "n": 15,
+                    "passes": 15,
+                    "passRate": 1,
+                    "meanGrade": 3.7333333333333334,
+                    "cost": 8.1156598,
+                    "costPerPass": 0.5410439866666666,
+                    "availability": 1,
+                    "medianWallMs": 265474
+                },
+                {
+                    "model": "github-copilot/claude-sonnet-5.5",
+                    "n": 15,
+                    "passes": 15,
+                    "passRate": 1,
+                    "meanGrade": 3.6,
+                    "cost": 2.456134800000001,
+                    "costPerPass": 0.16374232000000005,
+                    "availability": 1,
+                    "medianWallMs": 106360
+                },
+                {
+                    "model": "github-copilot/gemini-3.8-flash",
+                    "n": 15,
+                    "passes": 8,
+                    "passRate": 0.5333333333333333,
+                    "meanGrade": 2.2666666666666666,
+                    "cost": 47.617443675,
+                    "costPerPass": 5.952180459375,
+                    "availability": 1,
+                    "medianWallMs": 1020267
+                },
+                {
+                    "model": "github-copilot/gpt-6-luna",
+                    "n": 15,
+                    "passes": 14,
+                    "passRate": 0.9333333333333333,
+                    "meanGrade": 3.2333333333333334,
+                    "cost": 0.29598745500000007,
+                    "costPerPass": 0.021141961071428576,
+                    "availability": 1,
+                    "medianWallMs": 188287
+                },
+                {
+                    "model": "github-copilot/gpt-6.1-sol",
+                    "n": 15,
+                    "passes": 13,
+                    "passRate": 0.8666666666666667,
+                    "meanGrade": 3.433333333333333,
+                    "cost": 2.6259698,
+                    "costPerPass": 0.20199767692307694,
+                    "availability": 1,
+                    "medianWallMs": 216228
+                },
+                {
+                    "model": "github-copilot/grok-4.7",
+                    "n": 15,
+                    "passes": 14,
+                    "passRate": 0.9333333333333333,
+                    "meanGrade": 3.433333333333333,
+                    "cost": 34.339742,
+                    "costPerPass": 2.4528387142857144,
+                    "availability": 1,
+                    "medianWallMs": 810703
+                },
+                {
+                    "model": "github-copilot/mai-code-2-flash",
+                    "n": 15,
+                    "passes": 10,
+                    "passRate": 0.6666666666666666,
+                    "meanGrade": 3,
+                    "cost": 4.3798242,
+                    "costPerPass": 0.43798242,
+                    "availability": 1,
+                    "medianWallMs": 245922
+                },
+                {
+                    "model": "halogen/halogen-qwen3.8-flash-next",
+                    "n": 15,
+                    "passes": 11,
+                    "passRate": 0.7333333333333333,
+                    "meanGrade": 2.8333333333333335,
+                    "cost": 9.636349199999998,
+                    "costPerPass": 0.8760317454545453,
+                    "availability": 1,
+                    "medianWallMs": 569419
+                }
+            ],
+            "vsB1": {
+                "deepseek/deepseek-flash": {
+                    "n11": 15,
+                    "n10": 0,
+                    "n01": 0,
+                    "n00": 0,
+                    "p": 0.92476
+                },
+                "github-copilot/claude-haiku-5.5": {
+                    "n11": 13,
+                    "n10": 2,
+                    "n01": 0,
+                    "n00": 0,
+                    "p": 0.50304
+                },
+                "github-copilot/claude-opus-5.5": {
+                    "n11": 15,
+                    "n10": 0,
+                    "n01": 0,
+                    "n00": 0,
+                    "p": 0.92476
+                },
+                "github-copilot/claude-sonnet-5.5": {
+                    "n11": 15,
+                    "n10": 0,
+                    "n01": 0,
+                    "n00": 0,
+                    "p": 0.92476
+                },
+                "github-copilot/gemini-3.8-flash": {
+                    "n11": 8,
+                    "n10": 7,
+                    "n01": 0,
+                    "n00": 0,
+                    "p": 0.02208
+                },
+                "github-copilot/gpt-6-luna": {
+                    "n11": 14,
+                    "n10": 1,
+                    "n01": 0,
+                    "n00": 0,
+                    "p": 0.73702
+                },
+                "github-copilot/gpt-6.1-sol": {
+                    "n11": 13,
+                    "n10": 2,
+                    "n01": 0,
+                    "n00": 0,
+                    "p": 0.50304
+                },
+                "github-copilot/grok-4.7": {
+                    "n11": 14,
+                    "n10": 1,
+                    "n01": 0,
+                    "n00": 0,
+                    "p": 0.73702
+                },
+                "github-copilot/mai-code-2-flash": {
+                    "n11": 10,
+                    "n10": 5,
+                    "n01": 0,
+                    "n00": 0,
+                    "p": 0.08563
+                },
+                "halogen/halogen-qwen3.8-flash-next": {
+                    "n11": 11,
+                    "n10": 4,
+                    "n01": 0,
+                    "n00": 0,
+                    "p": 0.16263
+                }
+            }
+        },
+        "medium": {
+            "n": 14,
+            "b1": "github-copilot/claude-opus-5.5",
+            "shortlist": [],
+            "stats": [
+                {
+                    "model": "deepseek/deepseek-flash",
+                    "n": 14,
+                    "passes": 5,
+                    "passRate": 0.35714285714285715,
+                    "meanGrade": 2.107142857142857,
+                    "cost": 1.2566687039999997,
+                    "costPerPass": 0.2513337407999999,
+                    "availability": 1,
+                    "medianWallMs": 841861.5
+                },
+                {
+                    "model": "github-copilot/claude-haiku-5.5",
+                    "n": 14,
+                    "passes": 5,
+                    "passRate": 0.35714285714285715,
+                    "meanGrade": 2.5,
+                    "cost": 1.4974644700000002,
+                    "costPerPass": 0.299492894,
+                    "availability": 1,
+                    "medianWallMs": 345213.5
+                },
+                {
+                    "model": "github-copilot/claude-opus-5.5",
+                    "n": 14,
+                    "passes": 13,
+                    "passRate": 0.9285714285714286,
+                    "meanGrade": 3.5357142857142856,
+                    "cost": 17.8753768,
+                    "costPerPass": 1.3750289846153847,
+                    "availability": 1,
+                    "medianWallMs": 612146
+                },
+                {
+                    "model": "github-copilot/claude-sonnet-5.5",
+                    "n": 14,
+                    "passes": 4,
+                    "passRate": 0.2857142857142857,
+                    "meanGrade": 2.4285714285714284,
+                    "cost": 4.574029599999999,
+                    "costPerPass": 1.1435073999999998,
+                    "availability": 1,
+                    "medianWallMs": 154439.5
+                },
+                {
+                    "model": "github-copilot/gemini-3.8-flash",
+                    "n": 14,
+                    "passes": 3,
+                    "passRate": 0.21428571428571427,
+                    "meanGrade": 1.5357142857142858,
+                    "cost": 33.19300904999999,
+                    "costPerPass": 11.064336349999998,
+                    "availability": 1,
+                    "medianWallMs": 1426625.5
+                },
+                {
+                    "model": "github-copilot/gpt-6-luna",
+                    "n": 14,
+                    "passes": 5,
+                    "passRate": 0.35714285714285715,
+                    "meanGrade": 2.392857142857143,
+                    "cost": 0.6245598950000002,
+                    "costPerPass": 0.12491197900000003,
+                    "availability": 1,
+                    "medianWallMs": 290472
+                },
+                {
+                    "model": "github-copilot/gpt-6.1-sol",
+                    "n": 14,
+                    "passes": 11,
+                    "passRate": 0.7857142857142857,
+                    "meanGrade": 3.392857142857143,
+                    "cost": 7.386418449999999,
+                    "costPerPass": 0.6714925863636363,
+                    "availability": 1,
+                    "medianWallMs": 448768
+                },
+                {
+                    "model": "github-copilot/grok-4.7",
+                    "n": 14,
+                    "passes": 7,
+                    "passRate": 0.5,
+                    "meanGrade": 2.4285714285714284,
+                    "cost": 42.791692,
+                    "costPerPass": 6.113098857142857,
+                    "availability": 1,
+                    "medianWallMs": 1143933
+                },
+                {
+                    "model": "github-copilot/mai-code-2-flash",
+                    "n": 14,
+                    "passes": 5,
+                    "passRate": 0.35714285714285715,
+                    "meanGrade": 1.7857142857142858,
+                    "cost": 6.5878956,
+                    "costPerPass": 1.31757912,
+                    "availability": 1,
+                    "medianWallMs": 272852
+                },
+                {
+                    "model": "halogen/halogen-qwen3.8-flash-next",
+                    "n": 14,
+                    "passes": 2,
+                    "passRate": 0.14285714285714285,
+                    "meanGrade": 1.25,
+                    "cost": 14.2272525,
+                    "costPerPass": 7.11362625,
+                    "availability": 1,
+                    "medianWallMs": 943854
+                }
+            ],
+            "vsB1": {
+                "deepseek/deepseek-flash": {
+                    "n11": 4,
+                    "n10": 9,
+                    "n01": 1,
+                    "n00": 0,
+                    "p": 0.02249
+                },
+                "github-copilot/claude-haiku-5.5": {
+                    "n11": 5,
+                    "n10": 8,
+                    "n01": 0,
+                    "n00": 1,
+                    "p": 0.00986
+                },
+                "github-copilot/claude-opus-5.5": {
+                    "n11": 13,
+                    "n10": 0,
+                    "n01": 0,
+                    "n00": 1,
+                    "p": 0.9174
+                },
+                "github-copilot/claude-sonnet-5.5": {
+                    "n11": 4,
+                    "n10": 9,
+                    "n01": 0,
+                    "n00": 1,
+                    "p": 0.00515
+                },
+                "github-copilot/gemini-3.8-flash": {
+                    "n11": 3,
+                    "n10": 10,
+                    "n01": 0,
+                    "n00": 1,
+                    "p": 0.00243
+                },
+                "github-copilot/gpt-6-luna": {
+                    "n11": 4,
+                    "n10": 9,
+                    "n01": 1,
+                    "n00": 0,
+                    "p": 0.02249
+                },
+                "github-copilot/gpt-6.1-sol": {
+                    "n11": 11,
+                    "n10": 2,
+                    "n01": 0,
+                    "n00": 1,
+                    "p": 0.47689
+                },
+                "github-copilot/grok-4.7": {
+                    "n11": 7,
+                    "n10": 6,
+                    "n01": 0,
+                    "n00": 1,
+                    "p": 0.04012
+                },
+                "github-copilot/mai-code-2-flash": {
+                    "n11": 4,
+                    "n10": 9,
+                    "n01": 1,
+                    "n00": 0,
+                    "p": 0.02249
+                },
+                "halogen/halogen-qwen3.8-flash-next": {
+                    "n11": 2,
+                    "n10": 11,
+                    "n01": 0,
+                    "n00": 1,
+                    "p": 0.00133
+                }
+            }
+        },
+        "hard": {
+            "n": 5,
+            "b1": "github-copilot/claude-opus-5.5",
+            "shortlist": [],
+            "stats": [
+                {
+                    "model": "deepseek/deepseek-flash",
+                    "n": 5,
+                    "passes": 0,
+                    "passRate": 0,
+                    "meanGrade": 1.4,
+                    "cost": 0.5761694879999999,
+                    "costPerPass": null,
+                    "availability": 1,
+                    "medianWallMs": 724011
+                },
+                {
+                    "model": "github-copilot/claude-haiku-5.5",
+                    "n": 5,
+                    "passes": 0,
+                    "passRate": 0,
+                    "meanGrade": 1.7,
+                    "cost": 0.548245475,
+                    "costPerPass": null,
+                    "availability": 1,
+                    "medianWallMs": 658640
+                },
+                {
+                    "model": "github-copilot/claude-opus-5.5",
+                    "n": 5,
+                    "passes": 3,
+                    "passRate": 0.6,
+                    "meanGrade": 3.2,
+                    "cost": 12.5744476,
+                    "costPerPass": 4.191482533333333,
+                    "availability": 1,
+                    "medianWallMs": 1036706
+                },
+                {
+                    "model": "github-copilot/claude-sonnet-5.5",
+                    "n": 5,
+                    "passes": 2,
+                    "passRate": 0.4,
+                    "meanGrade": 2.7,
+                    "cost": 3.7329029000000005,
+                    "costPerPass": 1.8664514500000002,
+                    "availability": 1,
+                    "medianWallMs": 395247
+                },
+                {
+                    "model": "github-copilot/gemini-3.8-flash",
+                    "n": 5,
+                    "passes": 0,
+                    "passRate": 0,
+                    "meanGrade": 1.2,
+                    "cost": 6.165582225,
+                    "costPerPass": null,
+                    "availability": 1,
+                    "medianWallMs": 1254479
+                },
+                {
+                    "model": "github-copilot/gpt-6-luna",
+                    "n": 5,
+                    "passes": 1,
+                    "passRate": 0.2,
+                    "meanGrade": 1.7,
+                    "cost": 0.33330128000000003,
+                    "costPerPass": 0.33330128000000003,
+                    "availability": 1,
+                    "medianWallMs": 207062
+                },
+                {
+                    "model": "github-copilot/gpt-6.1-sol",
+                    "n": 5,
+                    "passes": 2,
+                    "passRate": 0.4,
+                    "meanGrade": 2.2,
+                    "cost": 1.9446424500000001,
+                    "costPerPass": 0.9723212250000001,
+                    "availability": 1,
+                    "medianWallMs": 322348
+                },
+                {
+                    "model": "github-copilot/grok-4.7",
+                    "n": 5,
+                    "passes": 0,
+                    "passRate": 0,
+                    "meanGrade": 0,
+                    "cost": 20.774046000000002,
+                    "costPerPass": null,
+                    "availability": 1,
+                    "medianWallMs": 1576502
+                },
+                {
+                    "model": "github-copilot/mai-code-2-flash",
+                    "n": 5,
+                    "passes": 0,
+                    "passRate": 0,
+                    "meanGrade": 1.6,
+                    "cost": 3.6634473,
+                    "costPerPass": null,
+                    "availability": 1,
+                    "medianWallMs": 329513
+                },
+                {
+                    "model": "halogen/halogen-qwen3.8-flash-next",
+                    "n": 5,
+                    "passes": 0,
+                    "passRate": 0,
+                    "meanGrade": 0.4,
+                    "cost": 5.939391,
+                    "costPerPass": null,
+                    "availability": 1,
+                    "medianWallMs": 1172877
+                }
+            ],
+            "vsB1": {
+                "deepseek/deepseek-flash": {
+                    "n11": 0,
+                    "n10": 3,
+                    "n01": 0,
+                    "n00": 2,
+                    "p": 0.13332
+                },
+                "github-copilot/claude-haiku-5.5": {
+                    "n11": 0,
+                    "n10": 3,
+                    "n01": 0,
+                    "n00": 2,
+                    "p": 0.13332
+                },
+                "github-copilot/claude-opus-5.5": {
+                    "n11": 3,
+                    "n10": 0,
+                    "n01": 0,
+                    "n00": 2,
+                    "p": 0.78565
+                },
+                "github-copilot/claude-sonnet-5.5": {
+                    "n11": 1,
+                    "n10": 2,
+                    "n01": 1,
+                    "n00": 1,
+                    "p": 0.47612
+                },
+                "github-copilot/gemini-3.8-flash": {
+                    "n11": 0,
+                    "n10": 3,
+                    "n01": 0,
+                    "n00": 2,
+                    "p": 0.13332
+                },
+                "github-copilot/gpt-6-luna": {
+                    "n11": 1,
+                    "n10": 2,
+                    "n01": 0,
+                    "n00": 2,
+                    "p": 0.26095
+                },
+                "github-copilot/gpt-6.1-sol": {
+                    "n11": 0,
+                    "n10": 3,
+                    "n01": 2,
+                    "n00": 0,
+                    "p": 0.47607
+                },
+                "github-copilot/grok-4.7": {
+                    "n11": 0,
+                    "n10": 3,
+                    "n01": 0,
+                    "n00": 2,
+                    "p": 0.13332
+                },
+                "github-copilot/mai-code-2-flash": {
+                    "n11": 0,
+                    "n10": 3,
+                    "n01": 0,
+                    "n00": 2,
+                    "p": 0.13332
+                },
+                "halogen/halogen-qwen3.8-flash-next": {
+                    "n11": 0,
+                    "n10": 3,
+                    "n01": 0,
+                    "n00": 2,
+                    "p": 0.13332
+                }
+            }
+        }
+    },
+    "groups": {
+        "easy+medium": {
+            "n": 29,
+            "b1": "github-copilot/claude-opus-5.5",
+            "shortlist": [],
+            "stats": [
+                {
+                    "model": "deepseek/deepseek-flash",
+                    "n": 29,
+                    "passes": 20,
+                    "passRate": 0.6896551724137931,
+                    "meanGrade": 2.8448275862068964,
+                    "cost": 1.9407134040000005,
+                    "costPerPass": 0.09703567020000002,
+                    "availability": 1,
+                    "medianWallMs": 414774
+                },
+                {
+                    "model": "github-copilot/claude-haiku-5.5",
+                    "n": 29,
+                    "passes": 18,
+                    "passRate": 0.6206896551724138,
+                    "meanGrade": 2.9482758620689653,
+                    "cost": 2.4779516249999993,
+                    "costPerPass": 0.13766397916666662,
+                    "availability": 1,
+                    "medianWallMs": 274426
+                },
+                {
+                    "model": "github-copilot/claude-opus-5.5",
+                    "n": 29,
+                    "passes": 28,
+                    "passRate": 0.9655172413793104,
+                    "meanGrade": 3.6379310344827585,
+                    "cost": 25.991036599999997,
+                    "costPerPass": 0.9282513071428571,
+                    "availability": 1,
+                    "medianWallMs": 318320
+                },
+                {
+                    "model": "github-copilot/claude-sonnet-5.5",
+                    "n": 29,
+                    "passes": 19,
+                    "passRate": 0.6551724137931034,
+                    "meanGrade": 3.0344827586206895,
+                    "cost": 7.030164399999998,
+                    "costPerPass": 0.37000865263157884,
+                    "availability": 1,
+                    "medianWallMs": 119796
+                },
+                {
+                    "model": "github-copilot/gemini-3.8-flash",
+                    "n": 29,
+                    "passes": 11,
+                    "passRate": 0.3793103448275862,
+                    "meanGrade": 1.9137931034482758,
+                    "cost": 80.810452725,
+                    "costPerPass": 7.346404793181819,
+                    "availability": 1,
+                    "medianWallMs": 1236618
+                },
+                {
+                    "model": "github-copilot/gpt-6-luna",
+                    "n": 29,
+                    "passes": 19,
+                    "passRate": 0.6551724137931034,
+                    "meanGrade": 2.8275862068965516,
+                    "cost": 0.9205473500000002,
+                    "costPerPass": 0.0484498605263158,
+                    "availability": 1,
+                    "medianWallMs": 199481
+                },
+                {
+                    "model": "github-copilot/gpt-6.1-sol",
+                    "n": 29,
+                    "passes": 24,
+                    "passRate": 0.8275862068965517,
+                    "meanGrade": 3.413793103448276,
+                    "cost": 10.012388249999999,
+                    "costPerPass": 0.41718284375,
+                    "availability": 1,
+                    "medianWallMs": 285667
+                },
+                {
+                    "model": "github-copilot/grok-4.7",
+                    "n": 29,
+                    "passes": 21,
+                    "passRate": 0.7241379310344828,
+                    "meanGrade": 2.9482758620689653,
+                    "cost": 77.131434,
+                    "costPerPass": 3.6729254285714283,
+                    "availability": 1,
+                    "medianWallMs": 1012181
+                },
+                {
+                    "model": "github-copilot/mai-code-2-flash",
+                    "n": 29,
+                    "passes": 15,
+                    "passRate": 0.5172413793103449,
+                    "meanGrade": 2.413793103448276,
+                    "cost": 10.967719800000001,
+                    "costPerPass": 0.73118132,
+                    "availability": 1,
+                    "medianWallMs": 245922
+                },
+                {
+                    "model": "halogen/halogen-qwen3.8-flash-next",
+                    "n": 29,
+                    "passes": 13,
+                    "passRate": 0.4482758620689655,
+                    "meanGrade": 2.0689655172413794,
+                    "cost": 23.8636017,
+                    "costPerPass": 1.8356616692307692,
+                    "availability": 1,
+                    "medianWallMs": 719041
+                }
+            ],
+            "vsB1": {
+                "deepseek/deepseek-flash": {
+                    "n11": 19,
+                    "n10": 9,
+                    "n01": 1,
+                    "n00": 0,
+                    "p": 0.06407
+                },
+                "github-copilot/claude-haiku-5.5": {
+                    "n11": 18,
+                    "n10": 10,
+                    "n01": 0,
+                    "n00": 1,
+                    "p": 0.01047
+                },
+                "github-copilot/claude-opus-5.5": {
+                    "n11": 28,
+                    "n10": 0,
+                    "n01": 0,
+                    "n00": 1,
+                    "p": 0.98332
+                },
+                "github-copilot/claude-sonnet-5.5": {
+                    "n11": 19,
+                    "n10": 9,
+                    "n01": 0,
+                    "n00": 1,
+                    "p": 0.02069
+                },
+                "github-copilot/gemini-3.8-flash": {
+                    "n11": 11,
+                    "n10": 17,
+                    "n01": 0,
+                    "n00": 1,
+                    "p": 0.00014
+                },
+                "github-copilot/gpt-6-luna": {
+                    "n11": 18,
+                    "n10": 10,
+                    "n01": 1,
+                    "n00": 0,
+                    "p": 0.03718
+                },
+                "github-copilot/gpt-6.1-sol": {
+                    "n11": 24,
+                    "n10": 4,
+                    "n01": 0,
+                    "n00": 1,
+                    "p": 0.3991
+                },
+                "github-copilot/grok-4.7": {
+                    "n11": 21,
+                    "n10": 7,
+                    "n01": 0,
+                    "n00": 1,
+                    "p": 0.07684
+                },
+                "github-copilot/mai-code-2-flash": {
+                    "n11": 14,
+                    "n10": 14,
+                    "n01": 1,
+                    "n00": 0,
+                    "p": 0.0035
+                },
+                "halogen/halogen-qwen3.8-flash-next": {
+                    "n11": 13,
+                    "n10": 15,
+                    "n01": 0,
+                    "n00": 1,
+                    "p": 0.00033
+                }
+            }
+        },
+        "medium+hard": {
+            "n": 19,
+            "b1": "github-copilot/claude-opus-5.5",
+            "shortlist": [],
+            "stats": [
+                {
+                    "model": "deepseek/deepseek-flash",
+                    "n": 19,
+                    "passes": 5,
+                    "passRate": 0.2631578947368421,
+                    "meanGrade": 1.9210526315789473,
+                    "cost": 1.8328381919999999,
+                    "costPerPass": 0.36656763839999995,
+                    "availability": 1,
+                    "medianWallMs": 819570
+                },
+                {
+                    "model": "github-copilot/claude-haiku-5.5",
+                    "n": 19,
+                    "passes": 5,
+                    "passRate": 0.2631578947368421,
+                    "meanGrade": 2.289473684210526,
+                    "cost": 2.045709945,
+                    "costPerPass": 0.409141989,
+                    "availability": 1,
+                    "medianWallMs": 367183
+                },
+                {
+                    "model": "github-copilot/claude-opus-5.5",
+                    "n": 19,
+                    "passes": 16,
+                    "passRate": 0.8421052631578947,
+                    "meanGrade": 3.4473684210526314,
+                    "cost": 30.449824400000004,
+                    "costPerPass": 1.9031140250000003,
+                    "availability": 1,
+                    "medianWallMs": 668131
+                },
+                {
+                    "model": "github-copilot/claude-sonnet-5.5",
+                    "n": 19,
+                    "passes": 6,
+                    "passRate": 0.3157894736842105,
+                    "meanGrade": 2.5,
+                    "cost": 8.306932499999998,
+                    "costPerPass": 1.3844887499999998,
+                    "availability": 1,
+                    "medianWallMs": 170072
+                },
+                {
+                    "model": "github-copilot/gemini-3.8-flash",
+                    "n": 19,
+                    "passes": 3,
+                    "passRate": 0.15789473684210525,
+                    "meanGrade": 1.4473684210526316,
+                    "cost": 39.358591274999995,
+                    "costPerPass": 13.119530424999999,
+                    "availability": 1,
+                    "medianWallMs": 1315862
+                },
+                {
+                    "model": "github-copilot/gpt-6-luna",
+                    "n": 19,
+                    "passes": 6,
+                    "passRate": 0.3157894736842105,
+                    "meanGrade": 2.210526315789474,
+                    "cost": 0.9578611750000002,
+                    "costPerPass": 0.15964352916666671,
+                    "availability": 1,
+                    "medianWallMs": 283875
+                },
+                {
+                    "model": "github-copilot/gpt-6.1-sol",
+                    "n": 19,
+                    "passes": 13,
+                    "passRate": 0.6842105263157895,
+                    "meanGrade": 3.0789473684210527,
+                    "cost": 9.3310609,
+                    "costPerPass": 0.7177739153846154,
+                    "availability": 1,
+                    "medianWallMs": 384290
+                },
+                {
+                    "model": "github-copilot/grok-4.7",
+                    "n": 19,
+                    "passes": 7,
+                    "passRate": 0.3684210526315789,
+                    "meanGrade": 1.7894736842105263,
+                    "cost": 63.565737999999996,
+                    "costPerPass": 9.080819714285713,
+                    "availability": 1,
+                    "medianWallMs": 1179899
+                },
+                {
+                    "model": "github-copilot/mai-code-2-flash",
+                    "n": 19,
+                    "passes": 5,
+                    "passRate": 0.2631578947368421,
+                    "meanGrade": 1.736842105263158,
+                    "cost": 10.251342900000001,
+                    "costPerPass": 2.05026858,
+                    "availability": 1,
+                    "medianWallMs": 311153
+                },
+                {
+                    "model": "halogen/halogen-qwen3.8-flash-next",
+                    "n": 19,
+                    "passes": 2,
+                    "passRate": 0.10526315789473684,
+                    "meanGrade": 1.0263157894736843,
+                    "cost": 20.1666435,
+                    "costPerPass": 10.08332175,
+                    "availability": 1,
+                    "medianWallMs": 1035064
+                }
+            ],
+            "vsB1": {
+                "deepseek/deepseek-flash": {
+                    "n11": 4,
+                    "n10": 12,
+                    "n01": 1,
+                    "n00": 2,
+                    "p": 0.00562
+                },
+                "github-copilot/claude-haiku-5.5": {
+                    "n11": 5,
+                    "n10": 11,
+                    "n01": 0,
+                    "n00": 3,
+                    "p": 0.00205
+                },
+                "github-copilot/claude-opus-5.5": {
+                    "n11": 16,
+                    "n10": 0,
+                    "n01": 0,
+                    "n00": 3,
+                    "p": 0.95105
+                },
+                "github-copilot/claude-sonnet-5.5": {
+                    "n11": 5,
+                    "n10": 11,
+                    "n01": 1,
+                    "n00": 2,
+                    "p": 0.01001
+                },
+                "github-copilot/gemini-3.8-flash": {
+                    "n11": 3,
+                    "n10": 13,
+                    "n01": 0,
+                    "n00": 3,
+                    "p": 0.00044
+                },
+                "github-copilot/gpt-6-luna": {
+                    "n11": 5,
+                    "n10": 11,
+                    "n01": 1,
+                    "n00": 2,
+                    "p": 0.01001
+                },
+                "github-copilot/gpt-6.1-sol": {
+                    "n11": 11,
+                    "n10": 5,
+                    "n01": 2,
+                    "n00": 1,
+                    "p": 0.40033
+                },
+                "github-copilot/grok-4.7": {
+                    "n11": 7,
+                    "n10": 9,
+                    "n01": 0,
+                    "n00": 3,
+                    "p": 0.00802
+                },
+                "github-copilot/mai-code-2-flash": {
+                    "n11": 4,
+                    "n10": 12,
+                    "n01": 1,
+                    "n00": 2,
+                    "p": 0.00562
+                },
+                "halogen/halogen-qwen3.8-flash-next": {
+                    "n11": 2,
+                    "n10": 14,
+                    "n01": 0,
+                    "n00": 3,
+                    "p": 0.00024
+                }
+            }
+        }
+    },
+    "overall": {
+        "n": 34,
+        "best": "github-copilot/claude-opus-5.5",
+        "c1": "github-copilot/claude-opus-5.5",
+        "stats": [
+            {
+                "model": "deepseek/deepseek-flash",
+                "n": 34,
+                "passes": 20,
+                "passRate": 0.5882352941176471,
+                "meanGrade": 2.6323529411764706,
+                "cost": 2.5168828920000013,
+                "costPerPass": 0.12584414460000007,
+                "availability": 1,
+                "medianWallMs": 434342
+            },
+            {
+                "model": "github-copilot/claude-haiku-5.5",
+                "n": 34,
+                "passes": 18,
+                "passRate": 0.5294117647058824,
+                "meanGrade": 2.764705882352941,
+                "cost": 3.0261970999999996,
+                "costPerPass": 0.16812206111111108,
+                "availability": 1,
+                "medianWallMs": 301797
+            },
+            {
+                "model": "github-copilot/claude-opus-5.5",
+                "n": 34,
+                "passes": 31,
+                "passRate": 0.9117647058823529,
+                "meanGrade": 3.573529411764706,
+                "cost": 38.56548419999999,
+                "costPerPass": 1.2440478774193546,
+                "availability": 1,
+                "medianWallMs": 337349
+            },
+            {
+                "model": "github-copilot/claude-sonnet-5.5",
+                "n": 34,
+                "passes": 21,
+                "passRate": 0.6176470588235294,
+                "meanGrade": 2.985294117647059,
+                "cost": 10.7630673,
+                "costPerPass": 0.5125270142857142,
+                "availability": 1,
+                "medianWallMs": 126994.5
+            },
+            {
+                "model": "github-copilot/gemini-3.8-flash",
+                "n": 34,
+                "passes": 11,
+                "passRate": 0.3235294117647059,
+                "meanGrade": 1.8088235294117647,
+                "cost": 86.97603495,
+                "costPerPass": 7.906912268181818,
+                "availability": 1,
+                "medianWallMs": 1245548.5
+            },
+            {
+                "model": "github-copilot/gpt-6-luna",
+                "n": 34,
+                "passes": 20,
+                "passRate": 0.5882352941176471,
+                "meanGrade": 2.661764705882353,
+                "cost": 1.2538486300000005,
+                "costPerPass": 0.06269243150000002,
+                "availability": 1,
+                "medianWallMs": 203271.5
+            },
+            {
+                "model": "github-copilot/gpt-6.1-sol",
+                "n": 34,
+                "passes": 26,
+                "passRate": 0.7647058823529411,
+                "meanGrade": 3.235294117647059,
+                "cost": 11.9570307,
+                "costPerPass": 0.45988579615384617,
+                "availability": 1,
+                "medianWallMs": 289409
+            },
+            {
+                "model": "github-copilot/grok-4.7",
+                "n": 34,
+                "passes": 21,
+                "passRate": 0.6176470588235294,
+                "meanGrade": 2.514705882352941,
+                "cost": 97.90548000000001,
+                "costPerPass": 4.662165714285715,
+                "availability": 1,
+                "medianWallMs": 1071293
+            },
+            {
+                "model": "github-copilot/mai-code-2-flash",
+                "n": 34,
+                "passes": 15,
+                "passRate": 0.4411764705882353,
+                "meanGrade": 2.2941176470588234,
+                "cost": 14.6311671,
+                "costPerPass": 0.9754111400000001,
+                "availability": 1,
+                "medianWallMs": 289787
+            },
+            {
+                "model": "halogen/halogen-qwen3.8-flash-next",
+                "n": 34,
+                "passes": 13,
+                "passRate": 0.38235294117647056,
+                "meanGrade": 1.8235294117647058,
+                "cost": 29.802992700000004,
+                "costPerPass": 2.2925379,
+                "availability": 1,
+                "medianWallMs": 762933
+            }
+        ],
+        "vsBest": {
+            "deepseek/deepseek-flash": {
+                "n11": 19,
+                "n10": 12,
+                "n01": 1,
+                "n00": 2,
+                "p": 0.01733
+            },
+            "github-copilot/claude-haiku-5.5": {
+                "n11": 18,
+                "n10": 13,
+                "n01": 0,
+                "n00": 3,
+                "p": 0.002
+            },
+            "github-copilot/claude-opus-5.5": {
+                "n11": 31,
+                "n10": 0,
+                "n01": 0,
+                "n00": 3,
+                "p": 0.98959
+            },
+            "github-copilot/claude-sonnet-5.5": {
+                "n11": 20,
+                "n10": 11,
+                "n01": 1,
+                "n00": 2,
+                "p": 0.03086
+            },
+            "github-copilot/gemini-3.8-flash": {
+                "n11": 11,
+                "n10": 20,
+                "n01": 0,
+                "n00": 3,
+                "p": 0.00002
+            },
+            "github-copilot/gpt-6-luna": {
+                "n11": 19,
+                "n10": 12,
+                "n01": 1,
+                "n00": 2,
+                "p": 0.01733
+            },
+            "github-copilot/gpt-6.1-sol": {
+                "n11": 24,
+                "n10": 7,
+                "n01": 2,
+                "n00": 1,
+                "p": 0.35429
+            },
+            "github-copilot/grok-4.7": {
+                "n11": 21,
+                "n10": 10,
+                "n01": 0,
+                "n00": 3,
+                "p": 0.01601
+            },
+            "github-copilot/mai-code-2-flash": {
+                "n11": 14,
+                "n10": 17,
+                "n01": 1,
+                "n00": 2,
+                "p": 0.00089
+            },
+            "halogen/halogen-qwen3.8-flash-next": {
+                "n11": 13,
+                "n10": 18,
+                "n01": 0,
+                "n00": 3,
+                "p": 0.0001
+            }
+        }
+    },
+    "zeroPricing": {
+        "tiers": {
+            "easy": {
+                "b1": "github-copilot/claude-opus-5.5",
+                "shortlist": [
+                    "github-copilot/gpt-6-luna",
+                    "deepseek/deepseek-flash"
+                ]
+            },
+            "medium": {
+                "b1": "github-copilot/claude-opus-5.5",
+                "shortlist": []
+            },
+            "hard": {
+                "b1": "github-copilot/claude-opus-5.5",
+                "shortlist": []
+            }
+        },
+        "groups": {
+            "easy+medium": {
+                "b1": "github-copilot/claude-opus-5.5",
+                "shortlist": []
+            },
+            "medium+hard": {
+                "b1": "github-copilot/claude-opus-5.5",
+                "shortlist": []
+            }
+        },
+        "c1": "github-copilot/claude-opus-5.5"
+    },
+    "pricingDiffers": [],
+    "rule": {
+        "version": 1,
+        "features": [
+            "pathsNamed",
+            "briefChars",
+            "reposNamed",
+            "riskPathNamed"
+        ],
+        "center": {
+            "pathsNamed": 4.25,
+            "briefChars": 1413.9722222222222,
+            "reposNamed": 0.3611111111111111,
+            "riskPathNamed": 0.05555555555555555
+        },
+        "scale": {
+            "pathsNamed": 2.3258809561588105,
+            "briefChars": 635.0676904477327,
+            "reposNamed": 0.5846545883291442,
+            "riskPathNamed": 0.2290614236454256
+        },
+        "levels": {},
+        "weights": {
+            "pathsNamed": -1.1411993994430039,
+            "briefChars": 1.1539642295104615,
+            "reposNamed": 0.25411729719765563,
+            "riskPathNamed": -0.5544501927713672
+        },
+        "thresholds": [
+            -0.31323889176032077,
+            1.8867564431398014
+        ],
+        "medians": {
+            "pathsNamed": 4.5,
+            "briefChars": 1388.5,
+            "reposNamed": 0,
+            "riskPathNamed": 0
+        }
+    },
+    "nested": {
+        "accuracy": 0.28831569664903,
+        "folds": [
+            {
+                "repo": "bketelsen/fleet",
+                "n": 8,
+                "features": [
+                    "riskPathNamed",
+                    "complexity"
+                ],
+                "accuracy": 0.125
+            },
+            {
+                "repo": "bketelsen/pi-pocket-team",
+                "n": 9,
+                "features": [
+                    "riskPathNamed",
+                    "testsBeside"
+                ],
+                "accuracy": 0.5555555555555556
+            },
+            {
+                "repo": "frostyard/chairlift",
+                "n": 1,
+                "features": [
+                    "briefChars",
+                    "pathsNamed"
+                ],
+                "accuracy": 1
+            },
+            {
+                "repo": "frostyard/core",
+                "n": 5,
+                "features": [
+                    "testsBeside",
+                    "briefChars",
+                    "pathsNamed",
+                    "reposNamed"
+                ],
+                "accuracy": 0.2
+            },
+            {
+                "repo": "frostyard/frostmail",
+                "n": 1,
+                "features": [
+                    "pathsNamed",
+                    "briefChars",
+                    "reposNamed",
+                    "complexity"
+                ],
+                "accuracy": 0
+            },
+            {
+                "repo": "frostyard/lodge",
+                "n": 1,
+                "features": [
+                    "testsBeside"
+                ],
+                "accuracy": 0
+            },
+            {
+                "repo": "frostyard/nsl",
+                "n": 7,
+                "features": [
+                    "pathsNamed",
+                    "briefChars"
+                ],
+                "accuracy": 0.7142857142857143
+            },
+            {
+                "repo": "frostyard/porter",
+                "n": 1,
+                "features": [
+                    "testsBeside"
+                ],
+                "accuracy": 0
+            },
+            {
+                "repo": "frostyard/updex",
+                "n": 3,
+                "features": [
+                    "riskPathNamed"
+                ],
+                "accuracy": 0
+            }
+        ]
+    },
+    "h2": {
+        "result": "inconclusive",
+        "jevShare": 0.2777777777777778,
+        "reason": "fewer than half the tasks have Jev numbers"
+    },
+    "selfPreference": {
+        "openai": {
+            "n": 72,
+            "own": 3,
+            "other": 2.8472222222222223
+        },
+        "anthropic": {
+            "n": 107,
+            "own": 3.177570093457944,
+            "other": 3.046728971962617
+        }
+    }
+}

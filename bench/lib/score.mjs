@@ -132,6 +132,42 @@ export function eventFiles(result) {
     return tries.map((n) => join(base, `try-${n}`, "events.jsonl"));
 }
 
+/**
+ * The cache folders of an attempt: `try-<n>/cache` of every try folder in the attempt's run folder, not only the tries
+ * of the result's `tryLog` (`eventFiles`): a runner that a host restart killed leaves try folders that no result
+ * names, and the next run of the same attempt continues the try numbers.
+ */
+export function cacheDirs(result) {
+    const base = dirname(dirname(result.workDir));
+    const tries = existsSync(base)
+        ? readdirSync(base, { withFileTypes: true })
+              .filter((e) => e.isDirectory() && /^try-\d+$/.test(e.name))
+              .map((e) => e.name)
+        : [];
+
+    return tries.map((name) => join(base, name, "cache"));
+}
+
+/**
+ * Save `cachesDropped: true`, then remove the cache folder of each try of a scored attempt (`--drop-caches`). The save
+ * comes first: a crash during the removal leaves the flag, so no later `--force` scores on a cache that is partly
+ * gone. A failed save removes nothing and throws. A failed removal is logged with its path (`cleanupTree`) and changes
+ * no exit code; a later run with `--drop-caches` tries the removal again. `work/`, `session/`, `events.jsonl` and
+ * `stderr.log` stay.
+ */
+export async function dropCaches(file, result, log) {
+    if (result.cachesDropped !== true) {
+        await writeJsonAtomic(file, { ...result, cachesDropped: true });
+        result.cachesDropped = true;
+    }
+
+    for (const dir of cacheDirs(result)) {
+        await cleanupTree(dir, log);
+    }
+
+    log(`${basename(file, ".json")}: the try caches are dropped`);
+}
+
 // ---------------------------------------------------------------------------------------------------------------
 // Finding the task
 // ---------------------------------------------------------------------------------------------------------------
@@ -831,8 +867,10 @@ async function scoreAfterS0(ctx, { file, result, task, checkout, git, attempt, j
 
 export const SCORE_USAGE = `usage: node bench/score.mjs --result <file> [--manifest <file>] [--checkout <dir>] [--bwrap <path>]
          [--pocket <dir>] [--agent-src <dir>] [--mise-installs <dir>] [--force] [--checks-only]
-         [--no-auth-preflight]
+         [--no-auth-preflight] [--drop-caches]
 --checks-only: S0 to S2 and the diffs, no judge call (the judges stay pending)
+--drop-caches: when the result is fully scored (no judge pending, no scoreError) or a failure, remove each try's
+               cache/ and set cachesDropped: true; then --force is refused (S1 and S2 need the caches)
 exit codes: 0 scored (a judge may be pending), 1 usage error, 2 budget refused,
             3 scoring error (the result is saved with the scores so far and scoreError; run again)`;
 
@@ -847,6 +885,7 @@ const SCORE_OPTIONS = {
     force: { type: "boolean" },
     "checks-only": { type: "boolean" },
     "no-auth-preflight": { type: "boolean" },
+    "drop-caches": { type: "boolean" },
 };
 
 /**
@@ -874,6 +913,12 @@ export async function scoreMain(argv, env = process.env, deps = {}) {
             throw new UsageError("--result is required");
         }
 
+        if (values["drop-caches"] && values["checks-only"]) {
+            throw new UsageError(
+                "--drop-caches cannot go with --checks-only: a checks-only result waits for its judges",
+            );
+        }
+
         const file = resolve(values.result);
         let result;
 
@@ -889,11 +934,23 @@ export async function scoreMain(argv, env = process.env, deps = {}) {
             return 0;
         }
 
+        // S1 and S2 run in the try's cache (Go modules, npm and pip caches, the Python venv in `/cache/venv`).
+        if (values.force && result.cachesDropped === true) {
+            throw new UsageError(
+                `cannot score ${file} again: S1 and S2 need the try caches (for example the Python venv in /cache/venv), and they were dropped (cachesDropped: true)`,
+            );
+        }
+
         const data = dataDir(env);
         const found = await findTask(result.task, { manifest: values.manifest, data });
 
         if (fullyScored(result, found.task) && !values.force) {
             console.log(`scored already: ${file} (--force scores it again)`);
+
+            // As after a scoring run: a result with `scoreError` keeps its caches (a later run needs them).
+            if (values["drop-caches"] && result.scoreError === undefined) {
+                await dropCaches(file, result, log);
+            }
 
             return 0;
         }
@@ -946,7 +1003,18 @@ export async function scoreMain(argv, env = process.env, deps = {}) {
             },
         };
 
-        return await scoreResult(ctx, file, result, found);
+        const code = await scoreResult(ctx, file, result, found);
+
+        // Only a result that needs nothing more: S1 and S2 of a later run would need the caches.
+        if (
+            values["drop-caches"] &&
+            fullyScored(result, found.task) &&
+            result.scoreError === undefined
+        ) {
+            await dropCaches(file, result, log);
+        }
+
+        return code;
     } catch (error) {
         if (error instanceof UsageError) {
             console.error(`${error.message}\n${SCORE_USAGE}`);
