@@ -9,3 +9,8 @@ bench/results/*
 bench/results/stage1/*
 !bench/results/stage1/summary.json
 !bench/results/stage1/summary.md
+# The stage 2 branch of each pool round is the record too.
+!bench/results/stage2/
+bench/results/stage2/*
+!bench/results/stage2/branch.json
+!bench/results/stage2/branch.md
