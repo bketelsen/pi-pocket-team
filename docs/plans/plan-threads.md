@@ -222,6 +222,7 @@ type PlanTask = {
         prs: { ref: string; head?: string }[];
         /** Later of sweep and close time when a done thread with no PR refs gets grace; a later close renews it. */
         grace?: number;
+        /** For `merged`, `at` is the merge observation: the later of sweep time and a closed thread's close time. */
         end?: {
             at: number;
             how: "merged" | "no-change" | "stopped";
@@ -812,8 +813,9 @@ Each line below differs from the design above, or settles what it left open, and
 - **A task thread that closes with no merged PR and no no-change** ends its attempt `stopped`, and the task is ready
   again (waiting when a dep is not done), with 1 event. A done thread with no PR refs gets 1 grace sweep first,
   recorded in optional `attempt.grace` as the later of the sweep and close times; a same-time replay changes nothing.
-  A sweep without a GitHub read can set grace but cannot spend it. The next sweep with a read looks for the PR before
-  it resets the task. A PR found then keeps the attempt open
+  A sweep without a GitHub read can set grace but cannot spend it. A read cut short for any repository of the task
+  thread cannot spend grace either. The next sweep with a complete read for the thread looks for the PR before it
+  resets the task. A PR found then keeps the attempt open
   while it is open or unread. Window attribution includes these grace candidates only for PRs made between start and
   close, and counts them together with open threads; the owner-PR and evidence-only exclusions remain. With no PR
   after grace the stop event says to attach the PR with `desk attach`, or deliver again. An attempt with a closed
@@ -821,11 +823,13 @@ Each line below differs from the design above, or settles what it left open, and
 - **An attached PR repairs the newest stopped attempt** of a ready or waiting task when the PR merges and none is
   open. `desk attach` still only reopens a thread closed as done within 7 days, and records 1 plan-thread event about
   the repair. That event says not to deliver the task again while the PR is open. A repaired close-out task stays
-  delegated until a done close strictly after the repair's merge observation. Older closed threads remain refused.
+  delegated until a done close strictly after the repair's merge observation. That observation is the later of the
+  sweep time and the close time of a thread already closed. Older closed threads remain refused.
 - **`after: "closeout"` holds a merged task delegated**, with 1 event `t1 merged: waits for its close-out (T2)`.
   The attempt ends `merged` and keeps the heads; only a done close with `closed.at > attempt.end.at` completes the
-  task and releases deps or verification. A thread already closed at merge, also as done or in the same sweep, stays
-  delegated. An earlier or simultaneous done close, or a non-done close, gets 1 recovery event keyed by thread id and
+  task and releases deps or verification. The merge observation is the later of the sweep time and the close time of
+  a thread already closed. A thread already closed at merge, also as done or in the same sweep, stays delegated.
+  An earlier or simultaneous done close, or a non-done close, gets 1 recovery event keyed by thread id and
   close time: reopen with `desk watch` and record a pass after the host steps, or recover with `plan revise`. A later
   close gets a new event. The supervisor's `plan drop` also stops delegated close-out tasks and sends the stop to their open threads, without
   rewriting merged attempts. Scope changes can stop them too, and approval still waits while they are delegated.
