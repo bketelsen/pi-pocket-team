@@ -2305,6 +2305,24 @@ describe("reportBlocks: words that only look blocked", () => {
         assert.equal(reportBlocks("The deploy waits: the state BLOCKED on the key."), true);
     });
 
+    test("GitHub's merge state on another line or paragraph does not hide a real BLOCKED", () => {
+        // A line break and a blank line end a sentence: a merge state name there does not reach the BLOCKED here.
+        assert.equal(
+            reportBlocks("GitHub: MERGEABLE\n\nDeployment: the state BLOCKED on credentials."),
+            true,
+        );
+        assert.equal(reportBlocks("GitHub shows MERGEABLE\nthe state BLOCKED on the key."), true);
+        assert.equal(reportBlocks("GitHub shows MERGEABLE.\nThe state BLOCKED on the key."), true);
+        assert.equal(reportBlocks("merge state\nBLOCKED: the token is missing."), true);
+        assert.equal(reportBlocks("The mergeStateStatus is\nBLOCKED on the token."), true);
+        // On 1 line, the merge state still is not the work's state.
+        assert.equal(
+            reportBlocks("GitHub shows MERGEABLE; the state BLOCKED waits for review."),
+            false,
+        );
+        assert.equal(reportBlocks("Line 1.\n`mergeStateStatus` is BLOCKED for the review."), false);
+    });
+
     test("a question inside double quotes in a report is a quote, not a question to Brian", () => {
         // A real report, word for word: it gives an ask's new text in quotes, for the supervisor.
         const quoted =

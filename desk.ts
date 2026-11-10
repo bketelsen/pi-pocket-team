@@ -3867,26 +3867,28 @@ const BLOCKED_SAID =
 /**
  * GitHub's merge state value `BLOCKED` after its name, with optional backticks or bold marks and an optional `is`,
  * `was`, `:` or `=` between: "`mergeStateStatus` is BLOCKED", "merge state: BLOCKED". The name is in any case; the
- * value must be `BLOCKED` in capitals (`withoutMergeState` checks it).
+ * value must be `BLOCKED` in capitals (`withoutMergeState` checks it). Only spaces and tabs separate them: a line break
+ * ends the match, so a "BLOCKED:" line after a line that ends with the name still counts.
  */
 const MERGE_STATE_BLOCKED =
-    /(\b(?:mergeStateStatus|merge_state_status|merge\s+state(?:\s+status)?)\b[`*\s]*(?:(?:is|was)\b|[:=])?[`*\s]*)(BLOCKED)\b/gi;
+    /(\b(?:mergeStateStatus|merge_state_status|merge[ \t]+state(?:[ \t]+status)?)\b[`* \t]*(?:(?:is|was)\b|[:=])?[`* \t]*)(BLOCKED)\b/gi;
 
 /** "the state BLOCKED" in lower case: GitHub's merge state only in a sentence that names it (`MERGE_STATE_NAMED`). */
-const THE_STATE_BLOCKED = /(\bthe state\b[`*\s]*(?:(?:is|was)\b|[:=])?[`*\s]*)BLOCKED\b/g;
+const THE_STATE_BLOCKED = /(\bthe state\b[`* \t]*(?:(?:is|was)\b|[:=])?[`* \t]*)BLOCKED\b/g;
 
 /** A sentence that names GitHub's merge state: `MERGEABLE`, `mergeable`, `mergeStateStatus` or `merge state`. */
-const MERGE_STATE_NAMED = /\b(?:mergeable|mergeStateStatus|merge[\s_]state)\b/i;
+const MERGE_STATE_NAMED = /\b(?:mergeable|mergeStateStatus|merge[ \t_]state)\b/i;
 
 /**
  * The text without each `BLOCKED` that is GitHub's merge state value, not the work's state: after the name
  * `mergeStateStatus`, `merge state`, `merge state status` or `merge_state_status` (`MERGE_STATE_BLOCKED`), or after a
  * lower-case "the state" in a sentence that names the merge state (`THE_STATE_BLOCKED`). It reads the text with its
- * inline code, so a name in backticks counts; every other character stays in its place.
+ * inline code, so a name in backticks counts; every other character stays in its place. A sentence ends at `.`, `!` or
+ * `?` with white space after it, and at every line break: a name on another line or in another paragraph hides nothing.
  */
 function withoutMergeState(text: string): string {
     return text
-        .split(/((?<=[.!?])\s+)/)
+        .split(/((?<=[.!?])\s+|\n)/)
         .map((sentence) => {
             const named = sentence.replace(
                 MERGE_STATE_BLOCKED,
