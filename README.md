@@ -31,7 +31,7 @@ of a server who works with a team of named agents. It is written for Brian Ketel
 ## Requirements
 
 Pi Pocket v0.21.0 or later (extension API 2), on Node.js 24, and a Pi Pocket checkout beside this repository
-(`../pi-pocket` by default) for the links and the tests. CI tests upstream v0.27.0 and the fork tag v0.28.1-bk.1 of
+(`../pi-pocket-live` by default when it is a checkout, else `../pi-pocket`) for the links and the tests. CI tests upstream v0.27.0 and the fork tag v0.28.1-bk.1 of
 [bketelsen/pi-pocket](https://github.com/bketelsen/pi-pocket), the release the owner's server runs. On a Pi Pocket
 that has the run-end switch (the fork's `bk` tags), the desk turns off automatic run-end answers on supervisor
 sessions.
@@ -41,7 +41,7 @@ sessions.
 ```sh
 git clone https://github.com/bketelsen/pi-pocket-team.git
 cd pi-pocket-team
-npm run link               # link node_modules, _pocket.d.ts and _pocket to ../pi-pocket
+npm run link               # link node_modules, _pocket.d.ts and _pocket to ../pi-pocket-live or ../pi-pocket
 npm run install-check      # list what an install would write; it writes nothing
 npm run install-extension  # copy the changed files into ~/.pi-pocket/extensions/
 ```

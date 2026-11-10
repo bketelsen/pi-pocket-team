@@ -7,7 +7,7 @@ The modules are source files in this repository. They run inside your own Pi Poc
 - Pi Pocket v0.21.0 or later (Pi Durable 1.4: `runtime.sleepUntil` and `checkpointWhen`). It includes the linked-session working directory that Team delegation needs.
 - The modules declare `pocketApi = 2`, Pi Pocket's extension API version. A Pocket with another API version may refuse them or break them.
 - Node.js 24, the one Pocket runs on.
-- A Pi Pocket checkout for the tests, `../pi-pocket` by default. Set `PI_POCKET_CHECKOUT` to another path.
+- A Pi Pocket checkout for the tests: `../pi-pocket-live` by default when it is a checkout (the link to the release folder the server runs), else `../pi-pocket`. Set `PI_POCKET_CHECKOUT` to another path.
 
 The same list, with the reasons, is in [Requirements](https://github.com/bketelsen/pi-pocket-team/blob/main/docs/setup.md#requirements).
 
@@ -37,7 +37,7 @@ Run `npm run install-check` first, and make sure every file it lists is one you 
 
 !!! note "The server needs `node_modules`"
 
-    The extensions folder must already have `node_modules` in it. Pocket's drop-in setup does this; see Pocket's `docs/extensions.md`.
+    The extensions folder must already have `node_modules` in it. Pocket's drop-in setup does this; see Pocket's `docs/extensions.md`. On a server that runs through `pi-pocket-live`, point `node_modules` and `_pocket.d.ts` there through that link, so they follow each switch.
 
 ## Turn a module on
 
