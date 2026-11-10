@@ -75,7 +75,9 @@ outside R. `node bench/analyze.mjs --branch --manifest <file>... [--pool bench/p
 predicts the tier of each R task with the frozen rule and writes `bench/results/stage2/branch.json` and `branch.md`:
 the counts, the branch (`confirm`, `merge`, `constant` or `wait`), each group's bands, n, deciding tasks (its first n
 in R's order) and models. Stage 2 decides by the same branch, and a result for a task or a model outside it is an
-error.
+error. `branch.json` and `branch.md` are committed (`.gitignore` names them): while the branch is `wait`, each
+monthly round of the pool writes them again, and the steps of a round are in
+[docs/plans/router-bench.md](../docs/plans/router-bench.md), "Monthly rounds".
 
 ## Exit codes of `run.mjs`
 
