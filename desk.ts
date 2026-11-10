@@ -855,6 +855,8 @@ export type PlanTask = {
     agent: string;
     /** A roster repository of that agent; absent: the agent's home. */
     repo?: string;
+    /** Host or owner steps remain after the merge: done only for a done close after the recorded merge time. */
+    after?: "closeout";
     /** 1 to 8 lines, each at most 300 characters: what the verification checks. */
     acceptance: string[];
     deps: string[];
@@ -878,6 +880,8 @@ export type PlanTask = {
         repo?: string;
         /** Every PR of the thread, with its merged head oid when it merged. */
         prs: { ref: string; head?: string }[];
+        /** Later of sweep and close time when a done thread with no PR gets 1 grace sweep; a later close renews it. */
+        grace?: number;
         end?: {
             at: number;
             how: "merged" | "no-change" | "stopped";
@@ -8988,6 +8992,34 @@ export function attribute(
                 thread.origin !== "plan",
         );
     const recent = new Set(gitFacts.recentlyClosed ?? []);
+    // Only the newest open attempt in the approved graph gets the no-PR window grace.
+    const graceThreads = new Set<string>();
+
+    for (const plan of Object.values(state.plans ?? {})) {
+        if (plan.state === "done" || plan.state === "dropped") {
+            continue;
+        }
+
+        for (const task of approvedGraphOf(plan)?.tasks ?? []) {
+            const attempt = openAttempt(task);
+            const thread = attempt === undefined ? undefined : threadById(state, attempt.thread);
+
+            if (
+                task.state === "delegated" &&
+                attempt !== undefined &&
+                attempt.prs.length === 0 &&
+                thread?.state === "closed" &&
+                thread.closed?.why === "done" &&
+                recent.has(thread.id) &&
+                attempt.grace !== undefined &&
+                attempt.grace >= thread.closed.at &&
+                Object.keys(thread.prs).length === 0
+            ) {
+                graceThreads.add(thread.id);
+            }
+        }
+    }
+
     const targetsFor = () =>
         Object.values(state.threads).filter(
             (thread) =>
@@ -9158,12 +9190,16 @@ export function attribute(
             }
         }
 
-        // 3. window: exactly one open thread in that repository was open when the PR was made. Never a closed one.
-        // A window is a guess, so it never claims Brian's own PR, nor a PR from a read by number.
+        // 3. window: exactly one thread was open when the PR was made. A task in its no-PR grace also counts,
+        // but only through its close time. Count both sets together: grace must not make an ambiguous guess unique.
+        // A window never claims the owner's own PR, nor a PR from a read by number.
         if (target === undefined && !ownPr && !evidenceOnly) {
-            const matches = mine().filter(
+            const matches = threads.filter(
                 (thread) =>
-                    threadRepos(thread).includes(pr.repo) && thread.startedAt <= pr.createdAt,
+                    (thread.state !== "closed" || graceThreads.has(thread.id)) &&
+                    threadRepos(thread).includes(pr.repo) &&
+                    thread.startedAt <= pr.createdAt &&
+                    (thread.state !== "closed" || pr.createdAt <= (thread.closed?.at ?? 0)),
             );
 
             if (matches.length === 1) {
@@ -9563,6 +9599,32 @@ export function attachTo(
         // A PR put on by hand comes back: the dropped list no longer holds it.
         delete state.dropped?.[ref];
         addEvent(target, `attached:${ref}:${String(now)}`, `${ref} attached`, now);
+
+        const plan =
+            target.planTask === undefined ? undefined : planOf(state, target.planTask.plan);
+        const task =
+            plan === undefined
+                ? undefined
+                : approvedGraphOf(plan)?.tasks.find((each) => each.id === target.planTask?.task);
+        const newest = task?.attempts.at(-1);
+        const planThread = plan === undefined ? undefined : threadById(state, plan.thread);
+
+        if (
+            plan?.state !== "done" &&
+            plan?.state !== "dropped" &&
+            task !== undefined &&
+            (task.state === "ready" || task.state === "waiting") &&
+            newest?.thread === target.id &&
+            newest.end?.how === "stopped" &&
+            planThread !== undefined
+        ) {
+            addEvent(
+                planThread,
+                `plan-task-attached:${target.id}:${ref}`,
+                `${task.id}: ${ref} attached to ${target.id} after its attempt stopped: ${task.after === "closeout" ? "the task waits for its close-out when the PR merges" : "the task is done when the PR merges"}. Do not deliver the task again while the PR is open.`,
+                now,
+            );
+        }
 
         return { text: `${ref} is on ${target.id}.` };
     }
@@ -14455,9 +14517,10 @@ export function renderTasks(graph?: TaskGraph): string {
 
         const carried =
             task.carried === undefined ? "" : ` · carried as done: ${flatLine(task.carried.why)}`;
+        const after = task.after === "closeout" ? " · after: closeout" : "";
 
         lines.push(
-            `- **${task.id}** ${task.title} · ${task.agent}${repo} · deps: ${deps}${carried}`,
+            `- **${task.id}** ${task.title} · ${task.agent}${repo} · deps: ${deps}${after}${carried}`,
         );
 
         for (const line of task.acceptance) {
@@ -15129,6 +15192,10 @@ export function validateGraph(
 
         if (title === "" || title.length > MAX_TITLE) {
             return `Task ${task.id}'s title is 1 to ${String(MAX_TITLE)} characters, on 1 line.`;
+        }
+
+        if (task.after !== undefined && task.after !== "closeout") {
+            return `Task ${task.id}'s after must be "closeout", or absent.`;
         }
 
         const agent = roster.find((each) => each.id === task.agent);
@@ -16380,7 +16447,9 @@ export function runningTasks(plan: Plan): string[] {
             return [];
         }
 
-        return [attempt === undefined ? task.id : `${task.id} (${attempt.thread})`];
+        const thread = (attempt ?? task.attempts.at(-1))?.thread;
+
+        return [thread === undefined ? task.id : `${task.id} (${thread})`];
     });
 }
 
@@ -16766,7 +16835,7 @@ export function taskDone(plan: Plan, task: PlanTask): boolean {
 
 /**
  * Why the carried tasks of a new graph are refused, or undefined when they are right (section 5.4): a carried task is
- * done in the approved graph, with the same id, agent, repository, acceptance lines and deps, and each of its deps is
+ * done in the approved graph, with the same id, agent, repository, after, acceptance lines and deps, and each dep is
  * carried too. Its reason is 1 line of 1 to 300 characters.
  */
 export function carryProblem(plan: Plan, tasks: readonly PlanTask[]): string | undefined {
@@ -16806,6 +16875,10 @@ export function carryProblem(plan: Plan, tasks: readonly PlanTask[]): string | u
 
         if (old.repo !== task.repo) {
             return `${task.id} is carried, but its repository changed (${old.repo ?? "home"} → ${task.repo ?? "home"}): a changed task is new work.`;
+        }
+
+        if (old.after !== task.after) {
+            return `${task.id} is carried, but its after changed: a changed task is new work.`;
         }
 
         if (
@@ -17494,7 +17567,8 @@ export type PlanDropAsk = {
  * The supervisor's drop of a plan: Brian stopped it, and the supervisor closes it. It needs Brian's own answer on an ask
  * of the plan (or of its task or verification threads), and that answer says stop or drop. The plan is dropped as
  * `dropPlan` does, with `closedBy: "desk"`, and the open work stops in the same commit: each task with an open attempt
- * ends `stopped` and gets the stop message, as does the open verification thread. A plan dropped already is a replay of
+ * ends `stopped`; delegated close-out tasks stop too, keeping their merged attempt. Their open threads get the stop
+ * message, as does the open verification thread. A plan dropped already is a replay of
  * its own key, and changes nothing.
  */
 export function supervisorDropPlan(
@@ -17612,15 +17686,20 @@ export function supervisorDropPlan(
     for (const task of graph?.tasks ?? []) {
         const attempt = openAttempt(task);
 
-        if (attempt === undefined) {
+        if (attempt === undefined && task.state !== "delegated") {
             continue;
         }
 
-        attempt.end = { at: request.at, how: "stopped" };
-        task.state = "stopped";
-        stopped.push(`${task.id} (${attempt.thread})`);
+        const newest = attempt ?? task.attempts.at(-1);
 
-        const thread = threadById(state, attempt.thread);
+        if (attempt !== undefined) {
+            attempt.end = { at: request.at, how: "stopped" };
+        }
+
+        task.state = "stopped";
+        stopped.push(newest === undefined ? task.id : `${task.id} (${newest.thread})`);
+
+        const thread = newest === undefined ? undefined : threadById(state, newest.thread);
 
         if (thread !== undefined) {
             addEvent(
@@ -17631,7 +17710,9 @@ export function supervisorDropPlan(
             );
         }
 
-        sendTo(thread, `task:${task.id}:${attempt.thread}`);
+        if (newest !== undefined) {
+            sendTo(thread, `task:${task.id}:${newest.thread}`);
+        }
     }
 
     const verifying = [...(plan.verification?.threads ?? [])]
@@ -17777,11 +17858,13 @@ const pinnableRef = (ref: string): boolean => REF.test(ref) && isRepoName(repoOf
 /**
  * The closed task threads of a supervisor whose PRs the sweep still reads: each is the thread of an open attempt in the
  * approved graph of a plan that is not done or dropped, and did not close `failed`. A thread that closed while its PR
- * was open keeps its attempt open (`planFacts`), so its PR's merge or close must be read at any close age. The sweep
+ * was open keeps its attempt open (`planFacts`), so its PR's merge or close must be read at any close age. A done
+ * thread with no PR also keeps its attempt open for 1 grace sweep; it has no link to pin yet. The sweep
  * pins their PRs that are open or not read yet, also for a thread that `reopenable` gives (the 7-day set pins only
  * `OPEN` links). It runs `updatePrs` on the ones that are not in the 7-day set, 1 time. The desk's standing repair rule
  * (`repairReopen`, for any closed thread that is not dropped) still opens such a thread again for Odrade when its open
- * PR conflicts or fails. No other rule reopens them, and they get no attribution, no labels and no issues.
+ * PR conflicts or fails. Outside the 7-day set they get no attribution, no labels and no issues. In that set, a
+ * no-PR grace candidate can get window attribution for a PR made between its start and its close.
  */
 export function planTaskClosedThreads(state: DeskState | undefined, supervisor: number): Thread[] {
     const found = new Map<string, Thread>();
@@ -17881,7 +17964,8 @@ export function sweepPinnedLinks(
 /**
  * The repair of a task that an older sweep set back to `ready` while its PR was still open (F9): the task is `ready` or
  * `waiting`, its newest attempt ended `stopped`, and that attempt's thread now has a merged PR and no open PR. The
- * attempt takes the thread's PRs (a merged one with its head) and ends `merged`, and the task is done. A task in any
+ * attempt takes the thread's PRs (a merged one with its head) and ends `merged`, and the task is done (or delegated
+ * until a done close after this repair's merge observation when `after: "closeout"` applies). A task in any
  * other state (`stopped` by a scope change, `delegated`, `done`) and an older attempt are never touched. True when it
  * repaired the task.
  */
@@ -17922,7 +18006,7 @@ function repairStopped(state: DeskState, task: PlanTask, now: number): boolean {
     }
 
     newest.end = { at: now, how: "merged" };
-    task.state = "done";
+    task.state = task.after === "closeout" ? "delegated" : "done";
 
     return true;
 }
@@ -17931,8 +18015,13 @@ function repairStopped(state: DeskState, task: PlanTask, now: number): boolean {
  * The PR facts of a plan's task threads, in the sweep's commit (decisions 11 to 14). For each task with an open
  * attempt: the attempt's `prs` take every PR of its thread (a merged one with its head); a second PR gets 1 warning
  * event on both threads, once for each ref; the attempt ends `merged` when a PR merged and none is open, and the task
- * is done; a thread that closed with no merged PR and no open PR (or none not read yet) ends its attempt `stopped`,
- * and the task is ready again. A closed thread with an open PR keeps its attempt open until the PR merges or closes.
+ * is done, except `after: "closeout"` keeps it delegated until a done close strictly after the merge observation
+ * (`closed.at > end.at`). An earlier, simultaneous or non-done close gets a recovery event: watch and pass after
+ * host steps, or `plan revise`. A thread that closed with no merged PR and no open PR
+ * (or none not read yet) ends its attempt `stopped`, and the task is ready again. A done thread with no PR refs gets
+ * 1 grace sweep first, recorded in `attempt.grace` as the later of now and the close time; a replay never spends it,
+ * and a later close gets new grace. Without a GitHub read (`github: false`), the sweep cannot spend grace either.
+ * A closed thread with an open PR keeps its attempt open until the PR merges or closes.
  * A `ready` or `waiting` task whose newest attempt ended `stopped` (an older sweep ended it while its PR was open)
  * becomes done when that thread now has a merged PR and no open PR: a repair of stored data, with 1 event. A closed
  * thread whose open ref the sweep cannot pin (not `owner/name#N`) is never read: it gets 1 event on the plan thread for
@@ -17944,6 +18033,7 @@ export function planFacts(
     state: DeskState,
     planId: string,
     now: number,
+    github = true,
 ): { events: number; items: DigestItem[] } {
     const plan = planOf(state, planId);
     const graph = plan === undefined ? undefined : approvedGraphOf(plan);
@@ -17966,6 +18056,41 @@ export function planFacts(
     const event = (thread: Thread, key: string, text: string): void => {
         if (addEvent(thread, key, text, now)) {
             events += 1;
+        }
+    };
+
+    // Seeing a merge starts the hold, even when the thread is already closed. Only a later sweep can complete it.
+    const closeoutFacts = (task: PlanTask): void => {
+        const newest = task.attempts.at(-1);
+        const thread = newest === undefined ? undefined : threadById(state, newest.thread);
+
+        if (
+            task.state !== "delegated" ||
+            task.after !== "closeout" ||
+            newest?.end?.how !== "merged" ||
+            thread?.state !== "closed"
+        ) {
+            return;
+        }
+
+        if (
+            now > newest.end.at &&
+            thread.closed?.why === "done" &&
+            thread.closed.at > newest.end.at
+        ) {
+            task.state = "done";
+            changed = true;
+            event(
+                planThread,
+                `plan-task-closeout:${thread.id}`,
+                `${task.id} closed out: ${thread.id}`,
+            );
+        } else {
+            event(
+                planThread,
+                `plan-task-closeout-blocked:${thread.id}:${String(thread.closed?.at)}`,
+                `${task.id}: ${thread.id} closed before its close-out: the task stays delegated. Reopen the thread with desk watch and record a pass after the host steps, or recover with plan revise.`,
+            );
         }
     };
 
@@ -18002,14 +18127,18 @@ export function planFacts(
                 event(
                     planThread,
                     `plan-task-merged:${newest?.thread ?? ""}`,
-                    `${task.id} merged after ${newest?.thread ?? ""} closed: the task is done (${(
-                        newest?.prs ?? []
-                    )
-                        .filter((pr) => pr.head !== undefined)
-                        .map((pr) => pr.ref)
-                        .join(", ")})`,
+                    task.state === "delegated"
+                        ? `${task.id} merged: waits for its close-out (${newest?.thread ?? ""})`
+                        : `${task.id} merged after ${newest?.thread ?? ""} closed: the task is done (${(
+                              newest?.prs ?? []
+                          )
+                              .filter((pr) => pr.head !== undefined)
+                              .map((pr) => pr.ref)
+                              .join(", ")})`,
                 );
             }
+
+            closeoutFacts(task);
 
             continue;
         }
@@ -18066,16 +18195,19 @@ export function planFacts(
         // check then names the ref only, never an older head.
         if (merged && !open) {
             attempt.end = { at: now, how: "merged" };
-            task.state = "done";
+            task.state = task.after === "closeout" ? "delegated" : "done";
             changed = true;
             event(
                 planThread,
                 `plan-task-end:${thread.id}`,
-                `${task.id} merged: ${thread.id} (${attempt.prs
-                    .filter((pr) => pr.head !== undefined)
-                    .map((pr) => pr.ref)
-                    .join(", ")})`,
+                task.state === "delegated"
+                    ? `${task.id} merged: waits for its close-out (${thread.id})`
+                    : `${task.id} merged: ${thread.id} (${attempt.prs
+                          .filter((pr) => pr.head !== undefined)
+                          .map((pr) => pr.ref)
+                          .join(", ")})`,
             );
+            closeoutFacts(task);
             continue;
         }
 
@@ -18083,6 +18215,24 @@ export function planFacts(
         // session: it stays delegated (PR 1). A PR that is open, or not read yet, keeps the attempt open: its merge or
         // its close ends it in a later sweep.
         if (thread.state === "closed" && thread.closed?.why !== "failed" && !merged && !open) {
+            const noPrGrace = attempt.prs.length === 0 && thread.closed?.why === "done";
+
+            if (noPrGrace) {
+                if (attempt.grace === undefined || attempt.grace < (thread.closed?.at ?? 0)) {
+                    attempt.grace = Math.max(now, thread.closed?.at ?? now);
+                    event(
+                        planThread,
+                        `plan-task-grace:${thread.id}:${String(thread.closed?.at)}`,
+                        `${task.id}: ${thread.id} closed with no PR: the desk looks for its PR in the next sweep`,
+                    );
+                }
+
+                // A replay, or a sweep with no GitHub read, must not spend the grace it just recorded.
+                if (!github || now <= (attempt.grace ?? now)) {
+                    continue;
+                }
+            }
+
             attempt.end = { at: now, how: "stopped" };
 
             const depsDone = task.deps.every(
@@ -18099,7 +18249,7 @@ export function planFacts(
             event(
                 planThread,
                 `plan-task-end:${thread.id}`,
-                `${task.id}: ${thread.id} closed with no merged PR: the task is ${task.state} again`,
+                `${task.id}: ${thread.id} closed with no merged PR: the task is ${task.state} again${noPrGrace ? ". Attach its PR with desk attach, or deliver the task again." : ""}`,
             );
         }
     }
@@ -19405,6 +19555,7 @@ export function planningBrief(id: string, file: string): string {
         `Write an answer back with asks: [{ ask, gen }] in your write, and change that ask's section: the desk then marks it settled.`,
         `Brian comments on sections from the Desk page (c1, c2, ...): settle a comment with comments: ["c1"] in a write that changes its section. An open comment holds the plan, as an open ask does.`,
         `Draft the task graph with plan { action: "tasks", rev, tasks: [...] } after the decisions are written, and then call plan { action: "ready" }. tasks needs the rev you read. A write after plan tasks that changes the file makes a new rev: call plan tasks again with it before plan ready.`,
+        'Set after: "closeout" in plan tasks when a task has host or owner steps after the merge (deploy, install, or a host runbook). The task stays delegated until its thread closes as done.',
         "After a scope change, a task that is done in the approved graph and stays the same (id, agent, repository, acceptance lines and deps, and each dep carried too) is carried: give it carried: { why } in plan tasks. It keeps its work and stays done. Every other task is new work.",
         `After the approval, plan write is refused. For a text-only correction (no change of Decisions, Tasks, the graph, or the sections), call plan { action: "amend", rev, why, section, edits }: it keeps the state and the approved graph, and the desk records it with its why.`,
         `To hear an expert while the plan drafts, call plan { action: "consult", agents: ["teg"], question, ask: "<ask id>" }: 1 to 3 other agents, each in a read-only session of its own. Each answers once with a finding (supports, objects or neutral); the desk wakes you with it, and a queued, starting or running consult holds the plan. Agents over the running limit queue: each starts by itself when a running consult ends, so do not call again for them.`,
@@ -19442,6 +19593,11 @@ export function planTaskBrief(plan: Plan, title: string, graph: TaskGraph, task:
         task.deps.length === 0 ? "Deps: none." : `Deps: ${deps.join(", ")}.`,
         `The plan file is ${plan.file}: read it with plan { action: "read", plan: "${plan.thread}" }.`,
         `1 PR for this task. When the code already meets the criteria, open no PR: call plan { action: "nochange", reason, evidence } with the reason and the evidence.`,
+        ...(task.after === "closeout"
+            ? [
+                  "This task is done only when its thread closes as done after the merge: do the host steps, then report done.",
+              ]
+            : []),
         `When this repository takes commits straight to main and you open no PR, end with plan { action: "nochange", reason, evidence }: the reason says so, and the evidence names the commit SHA. A task thread that closes with no PR and no nochange makes the task ready again.`,
     ].join("\n");
 }
@@ -27526,7 +27682,7 @@ export default function createDesk(host: Host, web: Web) {
                 continue;
             }
 
-            const result = planFacts(state, plan.thread, now);
+            const result = planFacts(state, plan.thread, now, facts.github !== undefined);
 
             events += result.events;
 
@@ -34298,6 +34454,12 @@ export default function createDesk(host: Host, web: Web) {
                                 description:
                                     "1 to 8 lines, each 1 to 300 characters: what the verification checks",
                             }),
+                            after: Type.Optional(
+                                Type.Literal("closeout", {
+                                    description:
+                                        "host or owner steps after the merge (deploy, install, or a host runbook); done when the task thread closes as done",
+                                }),
+                            ),
                             deps: Type.Optional(
                                 Type.Array(Type.String(), {
                                     description: "the ids of the tasks this one waits for",
@@ -35118,6 +35280,7 @@ export default function createDesk(host: Host, web: Web) {
                     title: each.title,
                     agent: each.agent,
                     ...(each.repo === undefined ? {} : { repo: each.repo }),
+                    ...(each.after === undefined ? {} : { after: each.after }),
                     acceptance: [...each.acceptance],
                     deps: [...(each.deps ?? [])],
                     state: (each.deps ?? []).length === 0 ? "ready" : "waiting",
