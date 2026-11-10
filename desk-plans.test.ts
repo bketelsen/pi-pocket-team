@@ -158,6 +158,7 @@ import {
     type PlanWriteResult,
     type PlanAmendAsk,
     type DeskState,
+    type GitHubFacts,
     type Plan,
     type PlanRoster,
     type PlanTask,
@@ -5794,6 +5795,61 @@ describe("task grace and post-merge close-out (#178 P1 and P2)", () => {
         assert.equal(stopped.items[0]?.kind, "plan-approved");
     });
 
+    test("an incomplete repository open list preserves no-PR grace until a complete read", () => {
+        const facts = (incomplete: string[]): GitHubFacts => ({
+            viewer: "frostyard-machines",
+            repos: {},
+            prs: {},
+            incomplete,
+        });
+
+        for (const line of [
+            "frostyard/snow: not read (timeout)",
+            "Frostyard/Snow: open PR page limit reached",
+        ]) {
+            const { state, graph } = buildingPlan();
+
+            close(state).repo = "frostyard/snow";
+            planFacts(state, "T1", tick(10));
+            const snapshot = JSON.stringify(state);
+
+            for (const at of [tick(11), tick(12)]) {
+                assert.deepEqual(planFacts(state, "T1", at, facts([line])), {
+                    events: 0,
+                    items: [],
+                });
+                assert.equal(taskOf(graph, "t1").state, "delegated");
+                assert.equal(JSON.stringify(state), snapshot);
+            }
+
+            const stopped = planFacts(state, "T1", tick(13), facts([]));
+
+            assert.equal(taskOf(graph, "t1").state, "ready");
+            assert.deepEqual(newest(graph).end, { at: tick(13), how: "stopped" });
+            assert.equal(stopped.items[0]?.kind, "plan-approved");
+            const ended = JSON.stringify(state);
+
+            assert.deepEqual(planFacts(state, "T1", tick(13), facts([])), {
+                events: 0,
+                items: [],
+            });
+            assert.equal(JSON.stringify(state), ended);
+        }
+
+        for (const line of [
+            "frostyard/nsl: not read (timeout)",
+            "frostyard/snow#5: not read (timeout)",
+        ]) {
+            const { state, graph } = buildingPlan();
+
+            close(state).repo = "frostyard/snow";
+            planFacts(state, "T1", tick(10));
+            planFacts(state, "T1", tick(11), facts([line]));
+            assert.equal(taskOf(graph, "t1").state, "ready");
+            assert.deepEqual(newest(graph).end, { at: tick(11), how: "stopped" });
+        }
+    });
+
     test("a close during the read bounds grace by its close time and keeps replay stable", () => {
         const { state, graph } = buildingPlan();
         const thread = close(state, tick(11));
@@ -5981,6 +6037,13 @@ describe("task grace and post-merge close-out (#178 P1 and P2)", () => {
 
         assert.deepEqual(planFacts(state, "T1", tick(10)), { events: 0, items: [] });
         assert.equal(JSON.stringify(state), snapshot);
+
+        for (const at of [tick(11), tick(12)]) {
+            assert.deepEqual(planFacts(state, "T1", at), { events: 0, items: [] });
+            assert.equal(taskOf(graph, "t1").state, "delegated");
+            assert.equal(JSON.stringify(state), snapshot);
+        }
+
         closeoutPass(state, tick(12), tick(13));
         planFacts(state, "T1", tick(14));
         assert.equal(taskOf(graph, "t1").state, "done");
@@ -6011,6 +6074,31 @@ describe("task grace and post-merge close-out (#178 P1 and P2)", () => {
                 assert.equal(task.state, "done");
             }
         }
+    });
+
+    test("repairStopped holds a close during the merge read through later sweeps", () => {
+        const { state, graph } = buildingPlan();
+        const task = taskOf(graph, "t1");
+
+        task.after = "closeout";
+        task.state = "ready";
+        newest(graph).end = { at: tick(9), how: "stopped" };
+        close(state, tick(11));
+        prOn(state, "T2", "frostyard/snow#1", "MERGED");
+        assert.deepEqual(planFacts(state, "T1", tick(10)).items, []);
+        assert.equal(task.state, "delegated");
+        assert(events(state).includes(blockedCloseout));
+        const snapshot = JSON.stringify(state);
+
+        for (const at of [tick(10), tick(11), tick(12)]) {
+            assert.deepEqual(planFacts(state, "T1", at), { events: 0, items: [] });
+            assert.equal(task.state, "delegated");
+            assert.equal(JSON.stringify(state), snapshot);
+        }
+
+        closeoutPass(state, tick(12), tick(13));
+        planFacts(state, "T1", tick(14));
+        assert.equal(task.state, "done");
     });
 
     test("a non-done close-out stays delegated with 1 recovery event, and revise can stop it", () => {

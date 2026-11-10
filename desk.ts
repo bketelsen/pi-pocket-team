@@ -18005,10 +18005,33 @@ function repairStopped(state: DeskState, task: PlanTask, now: number): boolean {
         }
     }
 
-    newest.end = { at: now, how: "merged" };
+    newest.end = { at: mergeSeenAt(thread, now), how: "merged" };
     task.state = task.after === "closeout" ? "delegated" : "done";
 
     return true;
+}
+
+/**
+ * When a sweep records a task's merge: its own time, or the close time of a thread already closed when that is later. A
+ * pass can close the thread after the sweep took its time and before its commit; the close-out rule
+ * (`closed.at > attempt.end.at`) must not count that close as one after the merge.
+ */
+function mergeSeenAt(thread: Thread, now: number): number {
+    return thread.state === "closed" ? Math.max(now, thread.closed?.at ?? now) : now;
+}
+
+/**
+ * Whether a GitHub read can spend a thread's no-PR grace: a read exists, and no incomplete line speaks of an open
+ * list of any repository of the thread. A line about 1 PR does not hold grace.
+ */
+function canSpendPlanGrace(thread: Thread, github: boolean | GitHubFacts): boolean {
+    if (typeof github === "boolean") {
+        return github;
+    }
+
+    return !threadRepos(thread).some((repo) =>
+        (github.incomplete ?? []).some((line) => openLineOf(line, repo)),
+    );
 }
 
 /**
@@ -18020,7 +18043,8 @@ function repairStopped(state: DeskState, task: PlanTask, now: number): boolean {
  * host steps, or `plan revise`. A thread that closed with no merged PR and no open PR
  * (or none not read yet) ends its attempt `stopped`, and the task is ready again. A done thread with no PR refs gets
  * 1 grace sweep first, recorded in `attempt.grace` as the later of now and the close time; a replay never spends it,
- * and a later close gets new grace. Without a GitHub read (`github: false`), the sweep cannot spend grace either.
+ * and a later close gets new grace. Without a GitHub read (`github: false`), or with a read (`GitHubFacts`) cut short
+ * for a repository of the thread, the sweep cannot spend grace either. `true` is a complete read.
  * A closed thread with an open PR keeps its attempt open until the PR merges or closes.
  * A `ready` or `waiting` task whose newest attempt ended `stopped` (an older sweep ended it while its PR was open)
  * becomes done when that thread now has a merged PR and no open PR: a repair of stored data, with 1 event. A closed
@@ -18033,7 +18057,7 @@ export function planFacts(
     state: DeskState,
     planId: string,
     now: number,
-    github = true,
+    github: boolean | GitHubFacts = true,
 ): { events: number; items: DigestItem[] } {
     const plan = planOf(state, planId);
     const graph = plan === undefined ? undefined : approvedGraphOf(plan);
@@ -18194,7 +18218,7 @@ export function planFacts(
         // A merged PR with no known head (a partial GitHub answer) ends the attempt with its ref and no head: the whole-plan
         // check then names the ref only, never an older head.
         if (merged && !open) {
-            attempt.end = { at: now, how: "merged" };
+            attempt.end = { at: mergeSeenAt(thread, now), how: "merged" };
             task.state = task.after === "closeout" ? "delegated" : "done";
             changed = true;
             event(
@@ -18227,8 +18251,8 @@ export function planFacts(
                     );
                 }
 
-                // A replay, or a sweep with no GitHub read, must not spend the grace it just recorded.
-                if (!github || now <= (attempt.grace ?? now)) {
+                // A replay, or a sweep with no complete read for this thread, must not spend the recorded grace.
+                if (!canSpendPlanGrace(thread, github) || now <= (attempt.grace ?? now)) {
                     continue;
                 }
             }
@@ -27682,7 +27706,7 @@ export default function createDesk(host: Host, web: Web) {
                 continue;
             }
 
-            const result = planFacts(state, plan.thread, now, facts.github !== undefined);
+            const result = planFacts(state, plan.thread, now, facts.github ?? false);
 
             events += result.events;
 
