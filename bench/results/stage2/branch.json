@@ -1,0 +1,34 @@
+{
+    "branch": "wait",
+    "counts": {
+        "easy": 11,
+        "medium": 11,
+        "hard": 0
+    },
+    "R": 22,
+    "groups": [],
+    "predictedTiers": {
+        "pi-pocket-team-117": "medium",
+        "pi-pocket-team-113": "medium",
+        "pi-pocket-team-126": "medium",
+        "pi-pocket-team-66": "medium",
+        "pi-pocket-team-67": "easy",
+        "pi-pocket-team-77": "easy",
+        "nsl-73": "easy",
+        "chairlift-254": "medium",
+        "pi-pocket-team-78": "easy",
+        "chairlift-253": "medium",
+        "chairlift-257": "easy",
+        "pi-pocket-team-45": "easy",
+        "pi-pocket-team-73": "medium",
+        "pi-pocket-team-99": "easy",
+        "pi-pocket-team-107": "medium",
+        "core-205": "easy",
+        "pi-pocket-team-56": "easy",
+        "core-189": "medium",
+        "pi-pocket-team-118": "easy",
+        "core-194": "medium",
+        "core-191": "medium",
+        "updex-469": "easy"
+    }
+}

@@ -7,7 +7,8 @@ and records what each step settled. The scripts and their data are in [bench/REA
 router v3, the daily audit's R2 check measures the routed threads end to end ([daily-audit.md](../modules/daily-audit.md)).
 
 Status: phase 1 done (pi-pocket-team#164); phase 2 done: the judges passed the held-out test (2026-11-08); phase 3
-done: stage 1 ran and the rule is frozen (2026-11-09). Stage 2 waits for the pool (R = 22).
+done: stage 1 ran and the rule is frozen (2026-11-09). Phase 4: the branch is `wait` (2026-11-10, R = 22, under 30);
+stage 2 waits for the monthly rounds (next: 2026-12-01), and no band has a pick yet.
 
 ## Phase 1 — Pool gate (this change)
 
@@ -225,6 +226,81 @@ Incidents of the run, and what changed:
 - **Done when:** `branch.json` is recorded before the first stage 2 run, and `node bench/analyze.mjs --stage 2` gives
   a decision for each tier, or the branch is `wait`.
 
+### Branch record (2026-11-10)
+
+`node bench/pool.mjs --check` exits 0 (pool v1 is unchanged: R = 22). Then `node bench/analyze.mjs --branch`, with 1
+`--manifest` for each of the 9 input manifests of the pool, wrote
+[bench/results/stage2/branch.json](../../bench/results/stage2/branch.json) and
+[branch.md](../../bench/results/stage2/branch.md). Both are committed: each round's branch is part of the record.
+
+- **Predicted tiers of R** (frozen `bench/rule-v1.json`): easy 11, medium 11, hard 0.
+- **Branch: 4, `wait`.** R = 22 is under 30, so the tier counts do not matter yet. No stage 2 attempt ran, and none
+  may run while the branch is `wait`.
+- **Spend:** unchanged, $481.47 of $3,000 (`node bench/budget.mjs show`: settled $481.47, nothing reserved).
+
+What the branch can give, with stage 1's model sets (a reading of the fixed rules, not a new rule): each confirmed
+group runs B1, its shortlist and C1. Stage 1 has a shortlist only for easy (`github-copilot/gpt-6-luna`,
+`deepseek/deepseek-flash`); medium, hard, easy+medium and medium+hard have none, and C1 is B1
+(`github-copilot/claude-opus-5.5`). So only an easy tier of 30 or more predicted tasks, confirmed alone, compares a
+cheaper model with Opus. A merged group, or the constant branch, runs Opus alone, and its pick is Opus. At the mix of
+R now (half easy, no hard), easy+medium reaches 30 when R reaches 30 (branch `merge`), and easy alone needs R of about 60.
+
+### The decision now
+
+The branch is `wait`, so stage 2 has decided nothing. Until a later round changes this table, it is the bench's
+decision:
+
+| Item                                  | Now                                                                                                          |
+| ------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| H1 (difficulty is predictable)        | Not tested: stage 2 waits. Stage 1 (exploratory): nested accuracy 0.288, below the majority band's 0.417.    |
+| H2 (Jev adds little)                  | Inconclusive by rule (stage 1: Jev numbers on 10 of 36 tasks).                                               |
+| H3 (tiers pay)                        | Not tested: stage 2 waits.                                                                                   |
+| B per band                            | None confirmed. Stage 1 (exploratory): `github-copilot/claude-opus-5.5` in every band.                       |
+| Pick per band (easy, medium, hard)    | None.                                                                                                        |
+| Constant policy                       | None confirmed. Stage 1 (exploratory): C1 is `github-copilot/claude-opus-5.5`.                               |
+| Picks at the stand-in price and at $0 | None at either price. In stage 1, the $0 price of halogen and MAI-Code changes no shortlist or C1.           |
+| Router                                | No band has a pick, so router v3 assigns no worker: every delegation keeps today's policy (Odrade names it). |
+
+### Live experiment
+
+Not pre-registered yet. Its pre-registration needs a pick per band, and the control of each band is counted over the
+eligible night-shift lines of the 30 days before stage 2 decides. It is written here when stage 2 decides, and before
+the router's mode `assign` is on. If stage 2 decides nothing by 2027-01-31, no live experiment follows. These parts
+are fixed already (plan T1064, section Rollout): the `easy` tier first, and not before 2026-11-18; the gate (R2
+installed, with 14 days of baseline for the tier's eligible lines); 30 decided threads per arm; the review at the
+start + 28 days or the sample, whichever comes first; keep when arm A's accepted rate is within the margin of arm B
+(P >= 0.8) and its cost per accepted thread is lower; undo when arm A is below arm B by more than the margin with
+P >= 0.8, at the interim look (15 decided per arm) or at the end; a revert of an arm A PR triggers a review at once;
+else 1 extension of 28 days, then undo.
+
+### Monthly rounds
+
+While the branch is `wait`, the pool grows on the 1st of each month. The steps of a round:
+
+1. **Harvest** (Sheeana): `node bench/harvest.mjs --since <the day after the last window> --until <the day before>
+--out <data>/manifests-<yyyy-mm> --fetch`. The check of a bketelsen/pi-pocket-team task passes only on the Pi
+   Pocket release that its merge was tested on ("Phase 3", incidents): harvest those tasks with `--pocket` at that
+   release (v0.28.0-bk.1 for merges since 2026-11-07), and use the same `--pocket` in stage 2.
+2. **Owner review**, as in round 1 (scope, commands, keep or drop with a reason): each owner adds its new
+   candidates to `~/agents/<owner>/bench/<repository name>.json` (a task id appears once; an earlier decision
+   stands), and runs `node bench/harvest.mjs --revalidate <file>` on it.
+3. **Grow:** `node bench/pool.mjs --grow`. Calibration and stage 1 stay; the new kept tasks join the end of R as 1
+   entry of `stage2.rounds`.
+4. **Branch:** `node bench/analyze.mjs --branch` with every input manifest, as above. Commit `branch.json`,
+   `branch.md` and 1 row in the table below.
+5. **Branch not `wait`:** run the simulation (`node bench/analyze.mjs --simulate --out bench/results/simulation.json`:
+   tier sizes 30 and 60, the smallest and the largest n of a group) for the threshold, then stage 2 by the branch (B1, the shortlist and C1 of each group), then `--stage 2`. Record H1 to H3,
+   B, the picks, the constant policy and the live experiment's pre-registration in this phase.
+
+| Round       | Run on         | Harvest window           | New kept | R   | easy | medium | hard | Branch |
+| ----------- | -------------- | ------------------------ | -------- | --- | ---- | ------ | ---- | ------ |
+| 0 (pool v1) | 2026-11-10     | 2026-09-01 to 2026-11-06 | 70       | 22  | 11   | 11     | 0    | `wait` |
+| 1           | due 2026-12-01 | 2026-11-07 to 2026-11-30 |          |     |      |        |      |        |
+| 2           | due 2027-01-01 | 2026-12-01 to 2026-12-31 |          |     |      |        |      |        |
+
+Round 0's "New kept" is the whole pool (70 kept tasks, 22 of them in R). Round 2 is the last: if R is still under 30
+after it, stage 1 is reported as exploratory on 2027-01-31 at the latest, and no live change follows.
+
 ## Phase 5 — Router v3
 
 - The model router takes the stage 2 decisions: each confirmed tier's pick, or the constant policy, or today's policy
@@ -238,8 +314,8 @@ Incidents of the run, and what changed:
 
 ## Open questions
 
-- **R under 30:** stage 2 waits until `--grow` brings R to 30 or more. What decides it: how often the owners review
-  new harvests; by phase 4.
+- **R under 30** (settled 2026-11-10): the monthly rounds of phase 4, on 2026-12-01 and 2027-01-01, and the
+  deadline of 2027-01-31.
 
 ## References
 
