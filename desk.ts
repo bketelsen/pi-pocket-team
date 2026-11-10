@@ -36,6 +36,7 @@ import {
     lstat,
     mkdir,
     open,
+    opendir,
     readFile,
     readlink,
     realpath,
@@ -3521,7 +3522,28 @@ export type FolderCounts = {
     ahead?: number;
     statusFailed?: true;
     gone?: true;
+    /** The committer times (seconds) of the commits on HEAD that no remote has, when `ahead` is above 0 and git read them. */
+    times?: number[];
 };
+
+/**
+ * The unpushed commits of a folder that are the thread's own work. For a delegated thread, a commit whose committer time
+ * is before the thread started is not its work: a delegation that runs in an agent's home finds older local commits
+ * there. Each count is an upper bound of the thread's own unpushed commits, so the smaller one is safe: a 0 from either
+ * one proves there are none. A found, seed, ask or plan thread keeps the folder's count: a found folder thread exists
+ * because of the work that was there before it.
+ */
+export function threadAhead(thread: Thread, counts: FolderCounts): number | undefined {
+    const times = counts.times;
+
+    if (thread.origin !== "delegate" || times === undefined || typeof counts.ahead !== "number") {
+        return counts.ahead;
+    }
+
+    const start = Math.floor(thread.startedAt / 1000);
+
+    return Math.min(counts.ahead, times.filter((time) => time >= start).length);
+}
 
 /**
  * Why a closed done thread with a quiet-wake mark opens again, in words: a report after it closed, or folder work above
@@ -3558,7 +3580,8 @@ export function quietTrigger(
     const dirty = numberOr(thread.run.dirty) ?? 0;
     const ahead = numberOr(thread.run.ahead) ?? 0;
 
-    return counts.dirty > dirty || (counts.ahead ?? 0) > ahead
+    // The thread's own count, as the sweep stores it: older commits in a delegated thread's folder are not new work.
+    return counts.dirty > dirty || (threadAhead(thread, counts) ?? 0) > ahead
         ? "work in its folder after a supervisor message"
         : undefined;
 }
@@ -7114,7 +7137,11 @@ export function reopenReason(
         return undefined;
     }
 
-    if (facts.busy === true) {
+    // A busy fact read before the close is not new work: the sweep reads its facts, and a pass can close the thread
+    // before the sweep commits them.
+    const closedAt = numberOr(thread.closed?.at);
+
+    if (facts.busy === true && (closedAt === undefined || closedAt <= now)) {
         return "its session is busy";
     }
 
@@ -24494,8 +24521,13 @@ export default function createDesk(host: Host, web: Web) {
         aheadUnknown?: AheadUnknown;
         /** `git status` failed in a repository: its counts are unknown, not clean. */
         statusFailed?: true;
-        /** The folder is not on disk, as after an agent removes its worktree: keep the last counts, and no failure. */
+        /**
+         * The folder is not on disk (`lstat` fails with ENOENT or ENOTDIR), or is an empty directory, as after an agent
+         * removes its worktree: it counts as clean, and it is no failure.
+         */
         gone?: true;
+        /** The committer times (seconds) of the commits on HEAD that no remote has: only when `ahead` is above 0. */
+        times?: number[];
     };
 
     /** What one sweep read, before its commit. A missing key means the read failed: the thread keeps its old value. */
@@ -24777,6 +24809,8 @@ export default function createDesk(host: Host, web: Web) {
 
         const fact = await statusOf(folder, options);
 
+        // A "gone" fact here is a folder that went between the reads, or an empty directory inside a parent repository
+        // (`rev-parse` above read the parent): both stay unknown, so the archive keeps the session (`folder-unknown`).
         return fact === null || fact.gone === true ? undefined : fact;
     };
 
@@ -25384,12 +25418,81 @@ export default function createDesk(host: Host, web: Web) {
         }
     }
 
-    /** Whether a folder is on disk. */
-    const exists = (folder: string): Promise<boolean> =>
-        access(folder).then(
-            () => true,
-            () => false,
-        );
+    /**
+     * Whether a folder is on disk, read before its `git status`: "gone" when `lstat` fails with ENOENT or ENOTDIR, as
+     * `archiveFolder` reads it, and "unread" for any other error (EACCES, for example): a failed read, not a gone folder.
+     * An empty directory is "gone" too: `git worktree remove` can leave the directory behind with nothing in it, and an
+     * empty directory holds no changed file and no commit. It is read first because `git status` in an empty directory
+     * inside a parent repository (an empty `.worktrees/<name>`) gives the parent's status. The check reads at most 1
+     * entry, since it runs on every folder at each sweep; a directory read that fails keeps it "there".
+     */
+    const folderOnDisk = async (folder: string): Promise<"there" | "gone" | "unread"> => {
+        let isDirectory: boolean;
+
+        try {
+            isDirectory = (await lstat(folder)).isDirectory();
+        } catch (error) {
+            const code = (error as NodeJS.ErrnoException).code;
+
+            return code === "ENOENT" || code === "ENOTDIR" ? "gone" : "unread";
+        }
+
+        if (!isDirectory) {
+            return "there";
+        }
+
+        try {
+            const dir = await opendir(folder);
+
+            try {
+                return (await dir.read()) === null ? "gone" : "there";
+            } finally {
+                await dir.close();
+            }
+        } catch {
+            return "there";
+        }
+    };
+
+    /** The committer times (seconds) of the commits on HEAD that no remote has; undefined when git cannot read them. */
+    async function unpushedTimes(folder: string): Promise<number[] | undefined> {
+        const text = await gitText(folder, ["log", "--format=%ct", "HEAD", "--not", "--remotes"]);
+
+        if (text === undefined) {
+            return undefined;
+        }
+
+        const times: number[] = [];
+
+        for (const line of text.split("\n")) {
+            const word = line.trim();
+
+            if (word === "") {
+                continue;
+            }
+
+            const time = Number(word);
+
+            if (!Number.isInteger(time)) {
+                return undefined;
+            }
+
+            times.push(time);
+        }
+
+        return times;
+    }
+
+    /** A folder fact with the committer times of its unpushed commits, when its own count is above 0. */
+    async function withTimes(folder: string, fact: FolderFact): Promise<FolderFact> {
+        if (fact.ahead === undefined || fact.ahead <= 0) {
+            return fact;
+        }
+
+        const times = await unpushedTimes(folder);
+
+        return times === undefined ? fact : { ...fact, times };
+    }
 
     /**
      * `git status` of one folder: null when it is not a git repository, as before. A repository whose status git cannot
@@ -25403,15 +25506,19 @@ export default function createDesk(host: Host, web: Web) {
         folder: string,
         options: { heads?: ReadonlySet<string>; branch?: string } = {},
     ): Promise<FolderFact | null> {
+        const onDisk = await folderOnDisk(folder);
+
+        // A folder that is gone (an agent removed its worktree after a merge, or left it empty) is no failure: it counts
+        // as clean. This comes before `git status`, which in an empty folder inside a parent repository reads the parent.
+        if (onDisk === "gone") {
+            return { dirty: 0, ahead: undefined, gone: true };
+        }
+
         const text = await gitText(folder, ["status", "--porcelain=v2", "--branch"]);
 
         if (text === undefined) {
-            // A folder that is gone (an agent removed its worktree after a merge) is no failure: its counts stay.
-            if (!(await exists(folder))) {
-                return { dirty: 0, ahead: undefined, gone: true };
-            }
-
-            return (await gitText(folder, ["rev-parse", "--git-dir"])) === undefined
+            return onDisk === "there" &&
+                (await gitText(folder, ["rev-parse", "--git-dir"])) === undefined
                 ? null
                 : {
                       dirty: 0,
@@ -25429,10 +25536,10 @@ export default function createDesk(host: Host, web: Web) {
         };
 
         if (status.ahead !== undefined) {
-            return {
+            return await withTimes(folder, {
                 dirty: status.dirty,
                 ahead: await ownAhead(folder, status.ahead, own),
-            };
+            });
         }
 
         // No `# branch.ab` line: this works for a branch with no upstream and for a detached HEAD. It fails when there is
@@ -25447,7 +25554,10 @@ export default function createDesk(host: Host, web: Web) {
         const ahead = counted === undefined ? Number.NaN : Number(counted.trim());
 
         return Number.isInteger(ahead) && ahead >= 0
-            ? { dirty: status.dirty, ahead: await ownAhead(folder, ahead, own) }
+            ? await withTimes(folder, {
+                  dirty: status.dirty,
+                  ahead: await ownAhead(folder, ahead, own),
+              })
             : {
                   dirty: status.dirty,
                   ahead: undefined,
@@ -27246,7 +27356,51 @@ export default function createDesk(host: Host, web: Web) {
                       ? knownBefore
                       : counts.statusFailed === true;
 
-            if (failed) {
+            if (gone) {
+                // A folder that is gone counts as clean: an agent removed its worktree, and a read in the middle of the
+                // removal (a failed status, or a changed file) must not hold the thread. The event says what it held.
+                const dirtyBefore = numberOr(thread.run.dirty) ?? 0;
+                const aheadBefore = numberOr(thread.run.ahead) ?? 0;
+                const unknownBefore =
+                    typeof thread.run.aheadUnknown === "string"
+                        ? thread.run.aheadUnknown
+                        : undefined;
+                const held =
+                    dirtyBefore > 0 || aheadBefore > 0 || thread.run.aheadUnknown !== undefined;
+
+                thread.run.dirty = 0;
+                thread.run.ahead = 0;
+                delete thread.run.aheadUnknown;
+
+                if (held) {
+                    const parts: string[] = [];
+
+                    if (dirtyBefore > 0) {
+                        parts.push(
+                            `${String(dirtyBefore)} changed file${dirtyBefore === 1 ? "" : "s"}`,
+                        );
+                    }
+
+                    if (unknownBefore !== undefined) {
+                        parts.push(`unknown unpushed commits: ${unknownBefore}`);
+                    } else if (aheadBefore > 0) {
+                        parts.push(
+                            `${String(aheadBefore)} unpushed commit${aheadBefore === 1 ? "" : "s"}`,
+                        );
+                    }
+
+                    if (
+                        addEvent(
+                            thread,
+                            `gone:${String(now)}`,
+                            `the folder is gone: it counts as clean${parts.length === 0 ? "" : ` (it had ${parts.join(", ")})`}`,
+                            now,
+                        )
+                    ) {
+                        events += 1;
+                    }
+                }
+            } else if (failed) {
                 // A failed read is not a clean folder: keep the last counts, and say the unpushed count is unknown.
                 if (thread.run.aheadUnknown !== "git status failed") {
                     thread.run.aheadUnknown = "git status failed";
@@ -27281,20 +27435,22 @@ export default function createDesk(host: Host, web: Web) {
                 }
 
                 const wasUnknown = thread.run.aheadUnknown !== undefined;
+                // Only the thread's own commits: a delegated thread's folder may hold commits from before it started.
+                const ahead = threadAhead(thread, counts);
 
-                if (counts.ahead !== undefined) {
+                if (ahead !== undefined) {
                     delete thread.run.aheadUnknown;
 
-                    if (thread.run.ahead !== counts.ahead || wasUnknown) {
-                        thread.run.ahead = counts.ahead;
+                    if (thread.run.ahead !== ahead || wasUnknown) {
+                        thread.run.ahead = ahead;
 
                         if (
                             addEvent(
                                 thread,
-                                `ahead:${String(counts.ahead)}:${String(now)}`,
-                                counts.ahead === 0
+                                `ahead:${String(ahead)}:${String(now)}`,
+                                ahead === 0
                                     ? "nothing is unpushed"
-                                    : `${String(counts.ahead)} unpushed commit${counts.ahead === 1 ? "" : "s"}`,
+                                    : `${String(ahead)} unpushed commit${ahead === 1 ? "" : "s"}`,
                                 now,
                             )
                         ) {
