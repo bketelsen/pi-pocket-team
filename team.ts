@@ -22,7 +22,6 @@ import {
     ToolTask,
     type ConversationId,
     type DocumentReader,
-    type ToolExecutionApi,
     type Tx,
 } from "@earendil-works/pi-durable";
 import type { Host, Web } from "./_pocket.d.ts";
@@ -76,6 +75,23 @@ function within(folder: string, parent: string): boolean {
     const root = resolve(parent);
 
     return path === root || path.startsWith(root.endsWith(sep) ? root : `${root}${sep}`);
+}
+
+/**
+ * The desk's reads and commits, in the shape its API takes: the caller's reader, bound to its own document, and the
+ * caller's commit. The desk gives the context of its own call; this commit already holds it.
+ */
+function deskIoOf(io: {
+    read: Pick<DocumentReader, "snapshot">;
+    commit: <T>(change: (tx: Tx) => T | Promise<T>) => Promise<T>;
+}): {
+    snapshot: DocumentReader["snapshot"];
+    commit: <T>(change: (tx: Tx) => T | Promise<T>, _at?: Context) => Promise<T>;
+} {
+    return {
+        snapshot: io.read.snapshot.bind(io.read),
+        commit: <T>(change: (tx: Tx) => T | Promise<T>, _at?: Context) => io.commit(change),
+    };
 }
 
 /**
@@ -629,6 +645,25 @@ export const Identity = defineDoc<{ persona?: Persona; cleared?: true }>({
     initial: () => ({}),
 });
 
+/** Set a session's identity in a commit's document, or clear it. */
+function applyIdentity(
+    doc: { persona?: Persona; cleared?: true },
+    persona: Persona | undefined,
+): void {
+    if (persona) {
+        doc.persona = persona;
+        delete doc.cleared;
+    } else {
+        delete doc.persona;
+        // An explicit none: the agent whose home holds this folder must not come back by itself.
+        doc.cleared = true;
+    }
+}
+
+/** The profile files of a reader's names, in their order: 1 agent is 1 `<id>.md` file. */
+const profileFiles = (names: string[]): string[] =>
+    names.sort().filter((file) => /^[a-z0-9][a-z0-9_-]*\.md$/.test(file));
+
 export async function roster(directory: string): Promise<Persona[]> {
     const names = await readdir(directory).catch((error: NodeJS.ErrnoException) => {
         if (error.code === "ENOENT") {
@@ -639,11 +674,7 @@ export async function roster(directory: string): Promise<Persona[]> {
     });
     const agents: Persona[] = [];
 
-    for (const file of names.sort()) {
-        if (!/^[a-z0-9][a-z0-9_-]*\.md$/.test(file)) {
-            continue;
-        }
-
+    for (const file of profileFiles(names)) {
         const { frontmatter, body } = parseFrontmatter(
             await readFile(join(directory, file), "utf8"),
         );
@@ -689,11 +720,7 @@ async function rosterKey(directory: string): Promise<string> {
     const names = await readdir(directory).catch((): string[] => []);
     const parts: string[] = [];
 
-    for (const file of names.sort()) {
-        if (!/^[a-z0-9][a-z0-9_-]*\.md$/.test(file)) {
-            continue;
-        }
-
+    for (const file of profileFiles(names)) {
         const info = await stat(join(directory, file)).catch(() => undefined);
 
         parts.push(`${file}:${info?.mtimeMs ?? 0}`);
@@ -1738,14 +1765,7 @@ export default function createTeam(host: Host, web: Web) {
         }
 
         // The supervisor takes no run-end answers of the sessions it starts: the desk sets it before the start.
-        await desk?.reportsOff?.(
-            {
-                snapshot: deps.read.snapshot.bind(deps.read),
-                commit: (change) => deps.commit(change),
-            },
-            context,
-            supervisor,
-        );
+        await desk?.reportsOff?.(deskIoOf(deps), context, supervisor);
 
         const started = await host.linkedSessions.start(
             deps.source,
@@ -2462,14 +2482,7 @@ export default function createTeam(host: Host, web: Web) {
             const model = allowedModel(persona);
 
             // The supervisor takes no run-end answers of the sessions it starts: the desk sets it before the start.
-            await deskApi()?.reportsOff?.(
-                {
-                    snapshot: request.read.snapshot.bind(request.read),
-                    commit: (change) => request.commit(change),
-                },
-                request.context,
-                request.supervisor,
-            );
+            await deskApi()?.reportsOff?.(deskIoOf(request), request.context, request.supervisor);
 
             const started = await host.linkedSessions.start(
                 supervisor,
@@ -2640,16 +2653,7 @@ export default function createTeam(host: Host, web: Web) {
             const persona = req.body.agent === null ? undefined : await find(req.body.agent);
 
             await req.commit(async (tx) => {
-                const doc = await tx.doc(Identity, req.conversation.id);
-
-                if (persona) {
-                    doc.persona = persona;
-                    delete doc.cleared;
-                } else {
-                    delete doc.persona;
-                    // An explicit none: the agent whose home holds this folder must not come back by itself.
-                    doc.cleared = true;
-                }
+                applyIdentity(await tx.doc(Identity, req.conversation.id), persona);
             });
 
             identityChanged(req.conversation.id);
@@ -2883,15 +2887,7 @@ export default function createTeam(host: Host, web: Web) {
             const persona = args.trim() === "clear" ? undefined : await find(args.trim());
 
             await ctx.commit(async (tx) => {
-                const doc = await tx.doc(Identity, ctx.conversationId);
-
-                if (persona) {
-                    doc.persona = persona;
-                    delete doc.cleared;
-                } else {
-                    delete doc.persona;
-                    doc.cleared = true;
-                }
+                applyIdentity(await tx.doc(Identity, ctx.conversationId), persona);
             });
 
             identityChanged(ctx.conversationId);
@@ -3056,14 +3052,7 @@ export default function createTeam(host: Host, web: Web) {
 
         // The supervisor takes no run-end answers of the sessions it starts: the desk sets it before the start, for the
         // tool's start and the page's alike.
-        await desk.reportsOff?.(
-            {
-                snapshot: deps.read.snapshot.bind(deps.read),
-                commit: (change) => deps.commit(change),
-            },
-            deps.context,
-            Number(deps.supervisor),
-        );
+        await desk.reportsOff?.(deskIoOf(deps), deps.context, Number(deps.supervisor));
 
         try {
             started = await deps.start(request, key);
@@ -3259,10 +3248,7 @@ export default function createTeam(host: Host, web: Web) {
         /** The whole-plan check: the lead, in its home, with no repository and no worktree. */
         const verifying = delivering && plan.task?.trim() === "verify";
         /** The desk's reads and commits, in the shape its API takes. */
-        const deskIo = {
-            snapshot: deps.read.snapshot.bind(deps.read),
-            commit: <T>(change: (tx: Tx) => T | Promise<T>, _at: Context) => deps.commit(change),
-        };
+        const deskIo = deskIoOf(deps);
 
         // The check runs unasked, with the owner's rights, and Lancet Guard does not see it: only the owner sets one,
         // with /team-shift in the session itself. `pr_check` is the exception: a fixed, read-only `gh` command
