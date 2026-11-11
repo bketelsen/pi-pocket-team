@@ -229,7 +229,7 @@ export const DeskUsage = defineDoc<UsageState>({
 // ─── Small rules ─────────────────────────────────────────────────────────────
 
 /** A deep compare of JSON values. An absent key and an undefined value are the same. */
-function same(a: unknown, b: unknown): boolean {
+export function same(a: unknown, b: unknown): boolean {
     if (a === b) {
         return true;
     }
@@ -254,10 +254,10 @@ function same(a: unknown, b: unknown): boolean {
     return keys.length === others.length && keys.every((key) => same(left[key], right[key]));
 }
 
-const copy = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
+export const copy = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
 
 /** Set 1 field only when its value changes; undefined deletes it. */
-function put<T extends object, K extends keyof T>(
+export function put<T extends object, K extends keyof T>(
     target: T,
     key: K,
     value: T[K] | undefined,
@@ -295,7 +295,7 @@ const validId = (value: unknown): value is number =>
 const counter = (value: unknown): value is number =>
     typeof value === "number" && Number.isFinite(value) && value >= 0;
 
-const record = (value: unknown): Record<string, unknown> | undefined =>
+export const record = (value: unknown): Record<string, unknown> | undefined =>
     value !== null && typeof value === "object" && !Array.isArray(value)
         ? (value as Record<string, unknown>)
         : undefined;
