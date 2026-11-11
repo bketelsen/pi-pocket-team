@@ -34,6 +34,13 @@ const usage = (await import(
     new URL(`./_desk-usage.ts${new URL(import.meta.url).search}`, import.meta.url).href
 )) as typeof UsageModule;
 
+/**
+ * The JSON rules this module shares with the usage helper: 1 copy, in `_desk-usage.ts`. `same` keeps the export it
+ * had here.
+ */
+export const same = usage.same;
+const { copy, put, record } = usage;
+
 // ─── Limits ──────────────────────────────────────────────────────────────────
 
 /** How long the collector sleeps between passes. A new collector waits this long before its first pass. */
@@ -338,59 +345,6 @@ export function parseTime(value: unknown): number | undefined {
 /** Thread ids in a stable order: T2 before T10. */
 const byId = (a: string, b: string): number =>
     a.localeCompare(b, "en", { numeric: true, sensitivity: "variant" });
-
-/** A deep compare of JSON values. An absent key and an undefined value are the same. */
-export function same(a: unknown, b: unknown): boolean {
-    if (a === b) {
-        return true;
-    }
-
-    if (typeof a !== "object" || typeof b !== "object" || a === null || b === null) {
-        return false;
-    }
-
-    if (Array.isArray(a) || Array.isArray(b)) {
-        if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) {
-            return false;
-        }
-
-        return a.every((value, index) => same(value, b[index]));
-    }
-
-    const left = a as Record<string, unknown>;
-    const right = b as Record<string, unknown>;
-    const keys = Object.keys(left).filter((key) => left[key] !== undefined);
-    const others = Object.keys(right).filter((key) => right[key] !== undefined);
-
-    return keys.length === others.length && keys.every((key) => same(left[key], right[key]));
-}
-
-const copy = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
-
-/** Set 1 field only when its value changes; undefined deletes it. True when it wrote. */
-function put<T extends object, K extends keyof T>(
-    target: T,
-    key: K,
-    value: T[K] | undefined,
-): boolean {
-    if (value === undefined) {
-        if (target[key] === undefined) {
-            return false;
-        }
-
-        delete target[key];
-
-        return true;
-    }
-
-    if (same(target[key], value)) {
-        return false;
-    }
-
-    target[key] = copy(value);
-
-    return true;
-}
 
 // ─── Threads ─────────────────────────────────────────────────────────────────
 
@@ -954,11 +908,6 @@ export type Answer = {
     errors: string[];
 };
 
-const record = (value: unknown): Record<string, unknown> | undefined =>
-    value !== null && typeof value === "object" && !Array.isArray(value)
-        ? (value as Record<string, unknown>)
-        : undefined;
-
 /** A PR node of a closing list or a closer as a lowercased ref, or undefined. */
 function prRefOf(node: Record<string, unknown> | undefined): string | undefined {
     const repo = record(node?.repository)?.nameWithOwner;
@@ -1243,16 +1192,15 @@ export function parseAnswer(json: unknown, reads: readonly Read[]): Answer {
     return parsed;
 }
 
+/** The text of a `gh` output value: a string, a Buffer, or nothing. */
+function outputText(value: unknown): string {
+    return typeof value === "string" ? value : Buffer.isBuffer(value) ? value.toString("utf8") : "";
+}
+
 /** The text a `gh` failure printed: its stderr and its message. */
 function failureText(error: unknown): string {
     const failure = record(error);
-    const stderr = failure?.stderr;
-    const err =
-        typeof stderr === "string"
-            ? stderr
-            : Buffer.isBuffer(stderr)
-              ? stderr.toString("utf8")
-              : "";
+    const err = outputText(failure?.stderr);
     const message = typeof failure?.message === "string" ? failure.message : String(error);
 
     return `${err}\n${message}`;
@@ -1303,13 +1251,7 @@ export function failureLine(error: unknown): string {
 
 /** The JSON a failed `gh` call still printed, when it holds data: a partial answer. */
 export function partialJson(error: unknown): unknown {
-    const stdout = record(error)?.stdout;
-    const raw =
-        typeof stdout === "string"
-            ? stdout
-            : Buffer.isBuffer(stdout)
-              ? stdout.toString("utf8")
-              : "";
+    const raw = outputText(record(error)?.stdout);
 
     try {
         const answer = raw.trim() === "" ? undefined : (JSON.parse(raw) as unknown);
@@ -1766,6 +1708,11 @@ function applyGitHubSource(draft: DashboardState, input: PassInput): void {
 
     if (input.reads.length > 0) {
         const rate = answer?.rate;
+        /** When a backoff from the rate limit ends: its own reset time when that is ahead, else the standard wait. */
+        const backoffEnd = (): number =>
+            rate?.resetAt !== undefined && rate.resetAt > now
+                ? rate.resetAt
+                : now + RATE_BACKOFF_MS;
 
         if (failure !== undefined) {
             source.at = now;
@@ -1781,10 +1728,7 @@ function applyGitHubSource(draft: DashboardState, input: PassInput): void {
             source.ok = false;
             source.error = "GitHub's rate limit";
             source.kind = "rate";
-            source.backoffUntil =
-                rate?.resetAt !== undefined && rate.resetAt > now
-                    ? rate.resetAt
-                    : now + RATE_BACKOFF_MS;
+            source.backoffUntil = backoffEnd();
         } else if (answer?.results.some((result) => result.ok) !== true) {
             // No requested read worked: no success, and `lastGoodAt` stays.
             const failed = answer?.results.find((result) => !result.ok);
@@ -1816,10 +1760,7 @@ function applyGitHubSource(draft: DashboardState, input: PassInput): void {
 
         if (failure === undefined && source.backoffUntil === undefined) {
             if (rate !== undefined && rate.remaining < RATE_FLOOR) {
-                source.backoffUntil =
-                    rate.resetAt !== undefined && rate.resetAt > now
-                        ? rate.resetAt
-                        : now + RATE_BACKOFF_MS;
+                source.backoffUntil = backoffEnd();
             }
         }
 
