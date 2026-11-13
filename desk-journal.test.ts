@@ -22,7 +22,6 @@ import { createServer, type Server, type ServerResponse } from "node:http";
 import { join } from "node:path";
 import { after, afterEach, before, describe, test } from "node:test";
 import { fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
-import type { JsonValue } from "@earendil-works/chord";
 import type { ConversationId, TaskId } from "@earendil-works/pi-durable";
 import { createHandler } from "./_pocket/src/server/http.ts";
 import { McpHttpError } from "@earendil-works/pi-mcp";
@@ -53,6 +52,7 @@ import {
     openThread,
     type DeskState,
     type JournalItem,
+    type JsonValue,
     type PrFact,
     type Thread,
 } from "./desk.ts";

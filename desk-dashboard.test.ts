@@ -19,7 +19,6 @@ import { chmodSync, cpSync, mkdirSync, readFileSync, writeFileSync } from "node:
 import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
 import { fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
-import type { JsonValue } from "@earendil-works/chord";
 import { defineDoc, type ConversationId, type Tx } from "@earendil-works/pi-durable";
 import {
     applyPass,
@@ -49,7 +48,14 @@ import {
     type Read,
 } from "./_desk-dashboard.ts";
 import { DeskUsage } from "./_desk-usage.ts";
-import { DeskThreads, SWEEP_SLEEP_MS, type DeskState, type PrLink, type Thread } from "./desk.ts";
+import {
+    DeskThreads,
+    SWEEP_SLEEP_MS,
+    type DeskState,
+    type JsonValue,
+    type PrLink,
+    type Thread,
+} from "./desk.ts";
 
 // ─── Fixtures ────────────────────────────────────────────────────────────────
 

@@ -29,7 +29,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { isIP, type Socket } from "node:net";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import type { Context } from "@earendil-works/chord";
+import type { Context } from "@earendil-works/chord/context";
 import {
     defineDoc,
     defineExtension,
