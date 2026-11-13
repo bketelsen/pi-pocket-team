@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-07",
+  "scope": "bench-overlay-modes",
+  "correction": "A staged or overlaid hidden file keeps its mode from the reference tree (100755, 100644, 120000 as a link), and the sandbox's copy keeps modes",
+  "evidence": "bketelsen/pi-pocket-team#151 cross-review re-review 1 (openai/gpt-6.1-sol) finding R2",
+  "promoted_to": "bench/score.test.mjs: S2 keeps the reference's file modes: an executable support script runs"
+}

@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-05",
+  "scope": "desk-archive-shared-session",
+  "correction": "The archive restore must go by session: a done, unrestored entry on any thread is restored when any thread bound to that session (threadsOfSession, consults included) is not closed, with the event on the reopened threads and the recording thread",
+  "evidence": "pi-pocket-team#126, cross-review (openai/gpt-6.1-sol) of head 9d6505c, finding 6",
+  "promoted_to": "desk.test.ts"
+}

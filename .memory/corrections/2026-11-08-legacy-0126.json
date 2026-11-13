@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-08",
+  "scope": "bench-calibration-pilot-copy",
+  "correction": "A pilot item counts only through its copy in the calibration folder, made without the original's scores and checked by the current manifest: an original scored earlier could pass its stale S1 into a pack",
+  "evidence": "bketelsen/pi-pocket-team#157 cross-review (openai/gpt-6.1-sol) of 91a8b06, finding 2",
+  "promoted_to": "bench/calibration.test.mjs: end to end: a pilot result scored before with S1 false is copied, checked again (S1 true), and the pack shows the copy's S1; bench/score.test.mjs: a stale S1 of a task that has no check now becomes null"
+}

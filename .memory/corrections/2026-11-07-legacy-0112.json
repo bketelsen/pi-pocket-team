@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-07",
+  "scope": "desk-board-page-draft-rev",
+  "correction": "The Board view's Edit and Resolve forms keep the rev they opened on, and Save posts that rev, so a row that a reload showed changed is refused with 409 and never overwritten with the form's old values",
+  "evidence": "bketelsen/pi-pocket-team#161: cross-review (openai/gpt-6.1-sol) of de63da8, batch 1",
+  "promoted_to": "desk-web.test.js: Board: Edit and Resolve post the rev their form opened on, also after a reload gave a newer rev"
+}

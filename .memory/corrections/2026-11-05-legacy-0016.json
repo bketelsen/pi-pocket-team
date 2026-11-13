@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-05",
+  "scope": "desk-archive-reopen",
+  "correction": "Every place that copies the list's archived fact into run.archived must use archivedFact (the deskArchived mask), also the closedDone loop, or a thread that reopens inside applySweep keeps run.archived true and planRepairs routes its new repair to Odrade as archived",
+  "evidence": "pi-pocket-team#126, cross-review (openai/gpt-6.1-sol) re-review 1 of head 20b5c6a, finding 2",
+  "promoted_to": "desk.test.ts"
+}

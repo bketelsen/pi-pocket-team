@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-08",
+  "scope": "bench-judge-calibration-spend",
+  "correction": "The judge spend of a set sums the cumulative cost of every saved verdict of the prompt and input, pending ones too, so a resumed run and a stats-only run give the same total",
+  "evidence": "bketelsen/pi-pocket-team#157 cross-review (openai/gpt-6.1-sol) of 91a8b06, finding 5",
+  "promoted_to": "bench/judge-calibration.test.mjs: the spend counts each verdict's whole cost: pending tries, a resumed try, and a stats-only run"
+}

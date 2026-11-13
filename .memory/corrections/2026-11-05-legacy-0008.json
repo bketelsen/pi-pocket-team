@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-05",
+  "scope": "audit-blocker-guards",
+  "correction": "A failed guard read must be named: loadBlockerGuards returns errors (each kind once, no GitHub text) and q1Blockers puts guards { available, reason, errors, calls, pending } in metrics.Q1.blockers, or a failed PR or blob query looks like no work to do",
+  "evidence": "pi-pocket-team#125, cross-review (openai/gpt-6.1-sol) of head fdc7abf, batch 1 finding 3",
+  "promoted_to": "audit/daily.test.ts"
+}

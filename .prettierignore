@@ -14,6 +14,9 @@ docs/*/TEMPLATE.md
 site/properdocs.yml
 site/content/stylesheets/
 
+# Correction records: core's validator requires their exact 2-space JSON form (frostyard/core ADR-0081).
+.memory/corrections/
+
 # Written by bench/pool.mjs, byte for byte (its --check compares the bytes).
 bench/pool-v1.json
 

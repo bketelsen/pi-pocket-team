@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-06",
+  "scope": "bench-settle-before-cleanup",
+  "correction": "A paid try's usage must reach the attempt's settlement tally as soon as Pi's run ends, before any cleanup that can throw (slot release); a failure while a Pi run's usage is unknown settles at the full cap",
+  "evidence": "bketelsen/pi-pocket-team#146 cross-review re-review 1 (openai/gpt-6.1-sol) finding 2",
+  "promoted_to": "bench/settle.test.mjs: slot release throws after a paid try: the settled entry keeps its cost and tokens; a failure while Pi's usage is unknown settles at the full cap"
+}

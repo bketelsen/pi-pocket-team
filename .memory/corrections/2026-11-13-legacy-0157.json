@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-13",
+  "scope": "test-waits",
+  "correction": "A wait that replaces a fixed sleep must observe a state after the decision under test (the shift driver's in-phase sleep timer, not its wait memo, which comes before the decide commit), and a settle check reads the busy lanes before and after the live sweepers, because a lane commit can start a sweeper between the reads",
+  "evidence": "bketelsen/pi-pocket-team#217 cross-review of 0b426c3c, findings 1 and 2",
+  "promoted_to": "AGENTS.md: Test reliability"
+}

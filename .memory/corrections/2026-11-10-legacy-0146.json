@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-10",
+  "scope": "plan-grace-sweep-wiring",
+  "correction": "A fix that changes what the sweep passes to a pure function also gets a sweep-level test, because unit tests of the pure function cannot see the wiring",
+  "evidence": "bketelsen/pi-pocket-team#195 cross-review (anthropic/claude-opus-5-5) of 4a5afba, finding 1",
+  "promoted_to": "desk-plans.test.ts: the sweep preserves no-PR grace when the task repository read is incomplete"
+}

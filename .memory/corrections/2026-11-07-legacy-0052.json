@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-07",
+  "scope": "bench-analysis-inputs",
+  "correction": "The bench analysis must check its inputs, not trust them: the expected model set of each stage, unique task ids, owner-kept manifests, scored results, the frozen rule, the stage 1 summary and the simulation threshold for stage 2; and the simulation must decide through the stage 2 code (unsolved drop, minimum of tasks), else a missing model, a repeated manifest or an unfinished score changes a pick silently",
+  "evidence": "bketelsen/pi-pocket-team#145 cross-review (openai/gpt-6.1-sol) findings 1-8",
+  "promoted_to": "bench/analyze.test.mjs (Guards from the cross-review of the first version; the command line tests; manifests; the simulation threshold)"
+}

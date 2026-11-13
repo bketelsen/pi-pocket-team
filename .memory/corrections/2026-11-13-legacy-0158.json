@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-13",
+  "scope": "q1-guards",
+  "correction": "The unchanged-head branch of loadBlockerGuards passed no skipped paths to guardOf, so a record file under .memory/corrections/ that the read-only gh refuses was dropped from the lookup and not named in the guard's correctionsSkipped; every branch that builds a guard carries the skipped paths",
+  "evidence": "bketelsen/pi-pocket-team#218 cross-review of 5359452, finding 1",
+  "promoted_to": "audit/sources.test.ts: a PR with no commit after the reviewed head still names a skipped record file (#218)"
+}

@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-06",
+  "scope": "desk-nudge-claim",
+  "correction": "A nudged sync's claim must take a pending entry only when it is due (now >= due); it always takes a running entry that a restart left, and sets last only with a pending entry, or a restart before the task's last commit claims a follow-up at once and skips the 60 s gap",
+  "evidence": "bketelsen/pi-pocket-team#137 cross-review (openai/gpt-6.1-sol) finding 1",
+  "promoted_to": "desk-nudge.test.ts: claimNudges (a pending entry that is not due, and no running entry: nothing taken, nothing changes; a running entry a restart left, and a pending entry not due: only running is taken, pending stays)"
+}

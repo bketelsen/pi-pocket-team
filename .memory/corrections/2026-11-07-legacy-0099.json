@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-07",
+  "scope": "bench-discovery-timeout",
+  "correction": "A validation records every sandbox step that timed out (timedOutSteps: the hidden-test discovery of each language at the merge and the parent, the staging at the parent, and the setup, check and hidden-command steps), and an outcome with one is never cached or reused: a discovery that timed out finds no valid name and would cache a task with no S2",
+  "evidence": "bketelsen/pi-pocket-team#156 cross-review re-review 1 (openai/gpt-6.1-sol) finding 2",
+  "promoted_to": "bench/harvest.test.mjs: a discovery that times out (at the merge, at the parent) is recorded, not cached, and validated again"
+}

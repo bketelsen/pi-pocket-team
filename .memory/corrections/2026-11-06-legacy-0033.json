@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-06",
+  "scope": "desk-escalate-line-cap",
+  "correction": "A digest must never cut an escalation line with the 30-line cap (no Desk page lists it), and told must record only the items a message shows, or a hidden line counts as sent and a later escalation drops for news the supervisor never saw",
+  "evidence": "bketelsen/pi-pocket-team#139 cross-review (openai/gpt-6.1-sol) finding 1",
+  "promoted_to": "desk.test.ts: an escalation line is never cut by the 30-line cap, and shows first; a direct item cut by the cap sets no told"
+}

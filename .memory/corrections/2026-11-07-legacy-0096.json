@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-07",
+  "scope": "bench-nested-go-module",
+  "correction": "A Go hidden test file belongs to the module of the nearest go.mod at or above its folder: discovery and the hidden command run a nested module's package as go -C <module folder> test ./<folder in the module>, the outcome maps it to that module's import path, and --revalidate accepts go -C <dir> test",
+  "evidence": "owner review of the bench manifests: frostyard/lodge task lodge-40 had no S2, because kit/jsonrpc/client_test.go of the nested module kit/ was mapped to the root module",
+  "promoted_to": "bench/hidden.test.mjs: go: a hidden file of a nested module runs with go -C and maps to its own module's package; revalidation reporters: go -C <dir> test and go -C=<dir> test get -json after test"
+}

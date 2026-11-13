@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-07",
+  "scope": "audit-r2-report-reopen-work",
+  "correction": "A report reopening ('reopened: a report after a supervisor message') hides folder work, because quietTrigger names the report first: R2 counts it as rework (kind work) when the session made an edit or write call, or a worker spawn, between the last closed: event before it and the reopen",
+  "evidence": "bketelsen/pi-pocket-team#148 cross-review (openai/gpt-6.1-sol) finding F1",
+  "promoted_to": "audit/checks.test.ts: R2: a report reopening after work in the session since the close is rework; a report alone is bookkeeping"
+}

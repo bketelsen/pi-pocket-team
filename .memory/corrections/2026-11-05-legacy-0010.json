@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-05",
+  "scope": "desk-archive-pending",
+  "correction": "A pending archive entry must pass the rules again (its mode, keepPending, fresh facts) before its call: a rule that forbids it ends it as done when the list shows the session archived, else removes it with the event archive withdrawn: <reason> and no call",
+  "evidence": "pi-pocket-team#126, cross-review (openai/gpt-6.1-sol) of head 9d6505c, finding 2",
+  "promoted_to": "desk.test.ts"
+}

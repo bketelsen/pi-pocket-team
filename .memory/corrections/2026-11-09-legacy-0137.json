@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-09",
+  "scope": "module-site-page",
+  "correction": "A change to a module's behavior that its reference page records also changes its site page in site/content/modules/ in the same PR, even when the site summary still reads true",
+  "evidence": "bketelsen/pi-pocket-team#188 cross-review (openai/gpt-6.1-sol) of d159c89, finding 2",
+  "promoted_to": "AGENTS.md: Documentation rules, README and site lines (a change to a module's behavior changes that page and the site page in the same PR)"
+}

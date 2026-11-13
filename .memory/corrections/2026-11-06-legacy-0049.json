@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-06",
+  "scope": "desk-nudge-claim-before-read",
+  "correction": "A nudged sync must claim its nudges before its batch's shared read begins (the runner's prepare step); a claim after another work's read began takes deliveries that came during that read, records them as synced, and leaves no pending entry for them",
+  "evidence": "bketelsen/pi-pocket-team#143 cross-review (openai/gpt-6.1-sol) finding 2",
+  "promoted_to": "desk-nudge.test.ts: SyncRunner: every prepare of a batch runs before its first read / nudge in Pocket: a nudge in a batch after desk sync claims before the shared read: a delivery during the read waits for the next sync"
+}

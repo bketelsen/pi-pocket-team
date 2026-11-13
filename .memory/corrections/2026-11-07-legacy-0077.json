@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-07",
+  "scope": "bench-score-overlay-symlinks",
+  "correction": "S2 copies the reference's hidden-test files over the worker's tree inside the sandbox, from a trusted staging folder bound read-only, never on the host: host writes follow the tree's symbolic links; the host overlay of the harvester's own trees refuses a path through a symbolic link",
+  "evidence": "bketelsen/pi-pocket-team#151 cross-review (openai/gpt-6.1-sol) finding F2",
+  "promoted_to": "bench/score.test.mjs: real bwrap: S2's copy of the hidden tests follows no symbolic link out of the copy; the host overlay (the harvester's own trees) refuses a path through a symbolic link"
+}

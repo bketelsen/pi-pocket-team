@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-06",
+  "scope": "desk-sweep-error-test",
+  "correction": "A test of the sweep failure record must make the sweep really throw (a broken stored record that gather reads) and go through recordSweepError in the sweeper and desk sync paths, not write state.sweepErrors itself",
+  "evidence": "pi-pocket-team#136, cross-review (openai/gpt-6.1-sol) of head 5bfa1f0, finding 2",
+  "promoted_to": "desk.test.ts: a sweeper sweep or a desk sync that throws records the failure on the desk, and the next good sync clears it"
+}

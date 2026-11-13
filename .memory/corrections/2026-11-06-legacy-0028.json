@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-06",
+  "scope": "desk-pr-labels-cut",
+  "correction": "The normal PR read must ask labels(first: 20) with totalCount and set labelsCut when GitHub has more labels than it read, or a PR with more than 20 labels read in full by a watched pin and then cut by a normal read gives a false label change",
+  "evidence": "bketelsen/pi-pocket-team#137 cross-review (openai/gpt-6.1-sol) finding 2",
+  "promoted_to": "desk-nudge.test.ts: labels from the parser to the observer (a full watched read of 21 labels, then a normal read of 20 of 21: no labels change, the 21 stay)"
+}

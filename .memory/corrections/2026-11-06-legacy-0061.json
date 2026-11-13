@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-06",
+  "scope": "bench-priced-flag",
+  "correction": "A budget reservation must carry the priced flag: a priced model settles its real cost even with a cap of 0, and a limit of 0 for the limit that counts is a usage error",
+  "evidence": "bketelsen/pi-pocket-team#146 cross-review round 1 finding 5",
+  "promoted_to": "bench/budget.test.mjs: a priced reservation with cap 0 settles its real cost; bench/run.test.mjs: a zero limit for the limit that counts is a usage error"
+}

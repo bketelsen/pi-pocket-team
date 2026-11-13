@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-10",
+  "scope": "desk-sweep-false-holds",
+  "correction": "A folder that is gone (lstat ENOENT or ENOTDIR, or an empty directory) counts as clean, and its stale counts go; a delegated thread's unpushed count leaves out commits from before it started; a busy fact read before a close does not reopen the thread",
+  "evidence": "desk sweep left finished threads open: gone worktree folders with stale counts, pre-start commits in an agent home, a stale busy fact after a close",
+  "promoted_to": "desk.test.ts: a gone folder clears an unknown unpushed count from a failed read during its removal; a gone folder clears a changed file that a sweep saw before the removal; an empty folder that a worktree removal left behind counts as gone; a folder that lstat cannot read is a failed read, not a gone folder; commits from before a delegated thread started are not its unpushed work; threadAhead; commits from before a delegated thread started are no folder work after a quiet wake; a busy session read before the close does not reopen the thread"
+}

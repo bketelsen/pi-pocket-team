@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-07",
+  "scope": "team-start-shift-thrown-value",
+  "correction": "startShift reads the marks of a thrown value only from an object, so a dependency that rejects with null or undefined gives an error result, never a throw",
+  "evidence": "bketelsen/pi-pocket-team#160: cross-review (openai/gpt-6.1-sol) of 7e9de66, batch 1",
+  "promoted_to": "desk-board.pocket.test.ts: a dependency that rejects with null or undefined gives an error result, never a throw"
+}
