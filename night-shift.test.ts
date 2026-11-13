@@ -42,6 +42,7 @@ import {
     SHIFT_TEXT_LIMIT,
     standing,
     statusCard,
+    SUBAGENT_POLL_MS,
     SUBAGENT_WAIT_MS,
     summaryMessage,
     waiting,
@@ -893,6 +894,36 @@ async function waitingForSubagents(id: ConversationId, round: number): Promise<b
     );
 }
 
+/**
+ * Count the timers armed with a delay that `match` accepts, until `stop()`. The driver's in-phase sleeps arm their
+ * timer through Pi Durable's default timer, which calls the global `setTimeout`: a matching timer shows that the driver
+ * reached its sleep. Every call goes through unchanged.
+ */
+function spyTimers(match: (delayMs: number) => boolean): { count: () => number; stop: () => void } {
+    const real = globalThis.setTimeout;
+    let armed = 0;
+    const spy = ((callback: (...args: unknown[]) => void, delayMs?: number, ...args: unknown[]) => {
+        if (match(Number(delayMs))) {
+            armed += 1;
+        }
+
+        return real(callback, delayMs, ...args);
+    }) as unknown as typeof globalThis.setTimeout;
+
+    // `util.promisify(setTimeout)` and the other properties of the real function still work.
+    Object.assign(spy, real);
+    globalThis.setTimeout = spy;
+
+    return {
+        count: () => armed,
+        stop: () => {
+            if (globalThis.setTimeout === spy) {
+                globalThis.setTimeout = real;
+            }
+        },
+    };
+}
+
 /** The server's clock in ZONE, 3 hours from now, as "HH:MM"; and that time as epoch ms. */
 function soon(): { hhmm: string; start: number } {
     const at = Date.now() + 3 * 3600_000;
@@ -1471,10 +1502,25 @@ describe("Pi's own subagents", () => {
         await setWorking(child, true);
 
         try {
-            await command(id, "max 5: scenario-subagent; stop when never");
-            await until(async () => (await goalOf(id))?.round === 1, "round 1 to start");
-            // Long enough for a round 2 that nothing holds back.
-            await new Promise((resolve) => setTimeout(resolve, 1500));
+            const timers = spyTimers(
+                (delay) =>
+                    delay > 0 && delay <= SUBAGENT_POLL_MS && delay > SUBAGENT_POLL_MS - 5_000,
+            );
+
+            try {
+                await command(id, "max 5: scenario-subagent; stop when never");
+                await until(async () => (await goalOf(id))?.round === 1, "round 1 to start");
+                // In `decide`, the driver writes the memo of its wait, then its commit holds the round, and only then
+                // does it arm the poll timer: the timer proves that the decision is made, not only that the memo is there.
+                await until(
+                    () => timers.count() > 0,
+                    "the driver to sleep before its next look",
+                    20_000,
+                );
+            } finally {
+                timers.stop();
+            }
+
             const held = (await goalOf(id))!;
 
             assert.equal(held.round, 1, "no round 2 while the subagent works");
@@ -1635,11 +1681,30 @@ describe("Pi's own subagents", () => {
         try {
             await command(id, "max 5: scenario-subagent; stop when never");
             await until(() => waitingForSubagents(id, 1), "the wait to start", 20_000);
-            // The server stops during the wait, before the cap.
+            // The server stops during the wait, before the cap. The memo survives the restart, so it proves nothing
+            // here: the sleep before the driver's next look shows that the restarted driver waits again.
             await app.close();
-            app = await openApp(model, dataDir, () => Date.now() + shift);
-            await until(async () => (await drivers(id)) === 1, "the driver to come back", 20_000);
-            await new Promise((resolve) => setTimeout(resolve, 1500));
+            const timers = spyTimers(
+                (delay) =>
+                    delay > 0 && delay <= SUBAGENT_POLL_MS && delay > SUBAGENT_POLL_MS - 5_000,
+            );
+
+            try {
+                app = await openApp(model, dataDir, () => Date.now() + shift);
+                await until(
+                    async () => (await drivers(id)) === 1,
+                    "the driver to come back",
+                    20_000,
+                );
+                await until(
+                    () => timers.count() > 0,
+                    "the driver to sleep before its next look",
+                    20_000,
+                );
+            } finally {
+                timers.stop();
+            }
+
             const held = (await goalOf(id))!;
 
             assert.equal(held.round, 1, "the restart counted no round");
@@ -1738,11 +1803,25 @@ describe("start", () => {
             assert.equal(goal.status, "running");
             assert.equal(goal.round, 0);
 
-            // A restart before start sleeps again: no round.
+            // A restart before start sleeps again: no round. The sleep runs to goal.start, so its timer says that the
+            // restarted driver waits for the start.
             await app.close();
-            app = await openApp(model, dataDir, () => Date.now() + shift);
-            await until(async () => (await drivers(id)) === 1, "the driver to come back", 20_000);
-            await new Promise((resolve) => setTimeout(resolve, 1500));
+            const timers = spyTimers(
+                (delay) => Math.abs(delay - (start - (Date.now() + shift))) < 60_000,
+            );
+
+            try {
+                app = await openApp(model, dataDir, () => Date.now() + shift);
+                await until(
+                    async () => (await drivers(id)) === 1,
+                    "the driver to come back",
+                    20_000,
+                );
+                await until(() => timers.count() > 0, "the driver to sleep until start", 20_000);
+            } finally {
+                timers.stop();
+            }
+
             assert.deepEqual(await sent(id), []);
             assert.equal(await drivers(id), 1);
             assert.equal((await goalOf(id))!.round, 0);
@@ -1763,11 +1842,19 @@ describe("start", () => {
 
     test("/team-shift stop cancels a waiting goal", async () => {
         const id = await session("cancel-wait");
-        const { hhmm } = soon();
+        const { hhmm, start } = soon();
+        // The driver starts its watch and then sleeps until start: the timer of that sleep proves both.
+        const timers = spyTimers(
+            (delay) => Math.abs(delay - (start - (Date.now() + shift))) < 60_000,
+        );
 
-        await command(id, `start ${hhmm} max 2: scenario-wait; stop when never`);
-        // Let the driver reach its sleep and its watch.
-        await new Promise((resolve) => setTimeout(resolve, 500));
+        try {
+            await command(id, `start ${hhmm} max 2: scenario-wait; stop when never`);
+            await until(() => timers.count() > 0, "the driver to sleep until start", 20_000);
+        } finally {
+            timers.stop();
+        }
+
         const card = await command(id, "stop");
 
         assert.match(JSON.stringify(card), /cancelled/);
