@@ -93,10 +93,11 @@ What exists today:
 - **R1** compares the router's shadow suggestion with what ran, and how each thread ended. A rate shows only at 10
   threads or more.
 - **Q1** (T801): decided acceptance, `(merged − reverted) / decided`, per repository and per agent, over 30 days. A
-  finding needs 8 or more decided PRs and 25 or more covered days. T801 t12 added review rounds per thread (median and
-  P90), 3-failure stops (2 in 7 days per repository), and CI reruns from the flaky-test scan.
+  finding needs 8 or more decided PRs and 25 or more covered days. T801 t12 added review rounds per PR (reviewed heads,
+  median and P90), 3-failure stops (2 in 7 days per repository), and CI reruns from the flaky-test scan.
 - **Q1 `prRounds` and `blockers`** (measurement only, no finding): cross-review rounds per PR from the session
-  records (`rounds`, `heads`, mean, median, P90, PRs with 3 or more rounds, rounds with no PR), and every blocking
+  records (`rounds`: the reviewed heads, `heads`, `calls`, mean, median, P90, PRs with 3 or more rounds, round calls
+  with no PR), and every blocking
   point of a reviewer answer with its PR, its reviewed head, the PR's state and its guard: a test or an `AGENTS.md`
   file of the PR's own diff that is new or changed at the final head against the reviewed head, and the lines added to
   `.memory/corrections.jsonl` between them plus the new record files under `.memory/corrections/` (a record moved out

@@ -47,6 +47,7 @@ import {
     runChecks,
 } from "./checks.mjs";
 import { NOW, ago, ctx, emptyData, event, pr, thread, threadMap } from "./fixtures/builders.mjs";
+import { headIn } from "./reviews.mjs";
 
 const ids = (result: { findings: { id: string }[] }) => result.findings.map((f) => f.id);
 
@@ -2478,6 +2479,18 @@ type ReviewCall = {
     tools?: string[] | null;
     review?: boolean;
     brief?: string;
+    refs?: string[];
+    bare?: number[];
+    head?: string | null;
+};
+
+type ReviewAnswer = {
+    id: number;
+    c: number;
+    at: number;
+    name: string;
+    ready: boolean | null;
+    items: string[];
 };
 
 /** A cross-review spawn: the tools `read` and `bash`, and "review" in the brief. */
@@ -2514,136 +2527,234 @@ const sendTo = (c: number, at: number, name: string): ReviewCall => ({
     name,
 });
 
-/** `n` rounds in session `c`, the last one at `at`: 1 reviewer spawn, then `n - 1` sends to it, 1 minute apart. */
-const roundsOf = (c: number, n: number, at: number) =>
-    Array.from({ length: n }, (_, k) =>
-        k === 0
-            ? reviewerSpawn(c, at - (n - 1) * MINUTE)
-            : sendTo(c, at - (n - 1 - k) * MINUTE, "reviewer"),
+const HEAD_A = "a".repeat(40);
+const HEAD_B = "b".repeat(40);
+const HEAD_C = "c".repeat(40);
+
+/** An invented full SHA for the number `n`. */
+const sha = (n: number) => n.toString(16).padStart(40, "0");
+
+/** A review call with the PRs and the head its message names. */
+const named = (
+    call: ReviewCall,
+    refs: string[] = [],
+    bare: number[] = [],
+    head: string | null = null,
+) => ({ ...call, refs, bare, head });
+
+/** A reviewer's answer in session `c`. */
+const answerOf = (c: number, at: number, name = "reviewer"): ReviewAnswer => ({
+    id: (reviewCallId += 1),
+    c,
+    at,
+    name,
+    ready: false,
+    items: [],
+});
+
+/**
+ * `n` reviewed heads of PR `ref` in session `c`, the last one at `at`: 1 reviewer spawn, then `n - 1` sends to it, 1
+ * minute apart, each at a new head, with the reviewer's answer 30 seconds after each call.
+ */
+const roundsOf = (c: number, n: number, at: number, ref: string, base = 0) => {
+    const times = Array.from({ length: n }, (_, k) => at - (n - 1 - k) * MINUTE);
+
+    return {
+        calls: times.map((time, k) =>
+            named(
+                k === 0 ? reviewerSpawn(c, time) : sendTo(c, time, "reviewer"),
+                k === 0 ? [ref] : [],
+                [],
+                sha(base + k + 1),
+            ),
+        ),
+        answers: times.map((time) => answerOf(c, time + 30_000)),
+    };
+};
+
+/**
+ * Desk threads T1 to Tn of acme/widgets and irulan; thread i holds PR acme/widgets#i and reviews it `rounds[i]` times;
+ * `times[i]` is its last round.
+ */
+const roundThreads = (rounds: number[], times: number[], over: object = {}) => {
+    const threads = rounds.map((_, i) =>
+        thread(`T${i + 1}`, { prs: { [`acme/widgets#${i + 1}`]: {} }, ...over }),
+    );
+    const made = rounds.map((n, i) =>
+        roundsOf(threads[i]!.session, n, times[i]!, `acme/widgets#${i + 1}`, 1000 * (i + 1)),
     );
 
-/** Desk threads T1 to Tn of acme/widgets and irulan, each with its rounds; `times[i]` is thread i's last round. */
-const roundThreads = (rounds: number[], times: number[], over: object = {}) => {
-    const threads = rounds.map((_, i) => thread(`T${i + 1}`, over));
-    const calls = rounds.flatMap((n, i) => roundsOf(threads[i]!.session, n, times[i]!));
-
-    return { threads: threadMap(...threads), reviewCalls: calls };
+    return {
+        threads: threadMap(...threads),
+        reviewCalls: made.flatMap((item) => item.calls),
+        reviewAnswers: made.flatMap((item) => item.answers),
+    };
 };
+
+/** The `[ref, rounds]` pairs of Q1's per-PR review rounds. */
+const prRoundsOf = (data: object) =>
+    checkQ1(emptyData({ decided: todayEmpty, ...data }), q1Ctx([])).metrics.rounds.prs.map(
+        (item: { ref: string; rounds: number }) => [item.ref, item.rounds],
+    );
 
 /** `count` merged PRs of acme/widgets by irulan, 1 a day: Q1's acceptance rows for the gate of 8 decided PRs. */
 const decidedDays = (count: number) => q1Ctx(earlierDays(count, (i) => [q1Pr(i)]));
 
-test("Q1 rounds: a reviewer spawn and 2 sends are 3 rounds; coder calls, old calls and calls with no thread do not count", () => {
-    const t1 = thread("T1");
+test("Q1 rounds: a spawn and 2 sends at 3 heads are 3 rounds of 1 PR; coder calls, a name with no spawn, calls before the window and calls with no PR do not count", () => {
+    const t1 = thread("T1", { prs: { "acme/widgets#1": {} } });
     const t2 = thread("T2");
+    const at = ago(2 * DAY);
     const reviewCalls = [
-        reviewerSpawn(t1.session, ago(2 * DAY)),
-        coderSpawn(t1.session, ago(2 * DAY) + MINUTE),
-        sendTo(t1.session, ago(2 * DAY) + HOUR, "reviewer"),
-        sendTo(t1.session, ago(2 * DAY) + 2 * HOUR, "coder"),
-        sendTo(t1.session, ago(2 * DAY) + 3 * HOUR, "reviewer"),
+        named(reviewerSpawn(t1.session, at), ["acme/widgets#1"], [], HEAD_A),
+        named(coderSpawn(t1.session, at + MINUTE), ["acme/widgets#1"], [], HEAD_C),
+        named(sendTo(t1.session, at + HOUR, "reviewer"), [], [], HEAD_B),
+        named(sendTo(t1.session, at + 2 * HOUR, "coder"), [], [], HEAD_A),
+        named(sendTo(t1.session, at + 3 * HOUR, "reviewer"), [], [], HEAD_C),
         // A send to a name with no spawn does not count.
-        sendTo(t1.session, ago(2 * DAY) + 4 * HOUR, "nobody"),
-        // T2: the reviewer spawn is 31 days old; the spawn and the send to it do not count.
-        reviewerSpawn(t2.session, ago(31 * DAY)),
-        sendTo(t2.session, ago(DAY), "reviewer"),
-        // A session with no desk thread.
-        reviewerSpawn(999, ago(DAY)),
-        sendTo(999, ago(DAY) + MINUTE, "reviewer"),
+        named(sendTo(t1.session, at + 4 * HOUR, "nobody"), ["acme/widgets#1"], [], sha(9)),
+        // T2: the spawn is 31 days old and does not count; it still makes the send in the window a round of #2.
+        named(reviewerSpawn(t2.session, ago(31 * DAY)), ["acme/widgets#2"], [], sha(1)),
+        named(sendTo(t2.session, ago(DAY), "reviewer"), [], [], sha(2)),
+        // A session with no desk thread: its PR counts, with no agent.
+        named(reviewerSpawn(999, ago(DAY)), ["acme/gadgets#3"], [], sha(3)),
+        // A round with no PR does not count here.
+        named(reviewerSpawn(999, ago(DAY), "rv0"), [], [], sha(4)),
+    ];
+    const reviewAnswers = [
+        answerOf(t1.session, at + 30 * MINUTE),
+        answerOf(t1.session, at + 90 * MINUTE),
+        answerOf(t1.session, at + 200 * MINUTE),
+        answerOf(t2.session, ago(31 * DAY) + MINUTE),
     ];
     const result = checkQ1(
-        emptyData({ decided: todayEmpty, threads: threadMap(t1, t2), reviewCalls }),
+        emptyData({ decided: todayEmpty, threads: threadMap(t1, t2), reviewCalls, reviewAnswers }),
         q1Ctx([]),
     );
     const rounds = result.metrics.rounds;
+    const isoOf = (time: number) => new Date(time).toISOString().slice(0, 16) + "Z";
 
     assert.equal(rounds.available, true);
     assert.deepEqual(rounds.thresholds, Q1_ROUND_THRESHOLDS);
-    assert.deepEqual(rounds.threads, [
+    assert.deepEqual(rounds.prs, [
         {
-            id: "T1",
+            ref: "acme/gadgets#3",
+            repo: "acme/gadgets",
+            agent: "unattributed",
+            threads: [],
+            rounds: 1,
+            at: isoOf(ago(DAY)),
+        },
+        {
+            ref: "acme/widgets#1",
             repo: "acme/widgets",
             agent: "irulan",
+            threads: ["T1"],
             rounds: 3,
-            at: new Date(ago(2 * DAY) + 3 * HOUR).toISOString().slice(0, 16) + "Z",
+            at: isoOf(at + 3 * HOUR),
+        },
+        {
+            ref: "acme/widgets#2",
+            repo: "acme/widgets",
+            agent: "irulan",
+            threads: ["T2"],
+            rounds: 1,
+            at: isoOf(ago(DAY)),
         },
     ]);
     assert.deepEqual(rounds.totals, {
-        threads: 1,
-        median: 3,
+        prs: 3,
+        median: 1,
         p90: 3,
-        recent: { threads: 1, median: 3 },
-        before: { threads: 0, median: null },
+        recent: { prs: 3, median: 1 },
+        before: { prs: 0, median: null },
     });
-    assert.deepEqual(Object.keys(rounds.repos), ["acme/widgets"]);
-    assert.deepEqual(Object.keys(rounds.agents), ["irulan"]);
+    assert.deepEqual(Object.keys(rounds.repos), ["acme/gadgets", "acme/widgets"]);
+    assert.deepEqual(Object.keys(rounds.agents), ["irulan", "unattributed"]);
 });
 
 test("Q1 rounds: a send goes by the latest spawn of its name; a non-review spawn that reuses the name stops the count", () => {
     const t1 = thread("T1");
+    const s = t1.session;
     const rounds = (reviewCalls: ReviewCall[]) =>
-        checkQ1(
-            emptyData({ decided: todayEmpty, threads: threadMap(t1), reviewCalls }),
-            q1Ctx([]),
-        ).metrics.rounds.threads.map((item: { rounds: number }) => item.rounds);
+        prRoundsOf({
+            threads: threadMap(t1),
+            reviewCalls,
+            reviewAnswers: [answerOf(s, ago(DAY) + 30_000), answerOf(s, ago(DAY) + 90_000)],
+        }).map(([, n]: [string, number]) => n);
 
     // A cross-review spawn (1 round), then a coder spawn with the same name: the send goes to the coder.
     assert.deepEqual(
         rounds([
-            reviewerSpawn(t1.session, ago(DAY)),
-            coderSpawn(t1.session, ago(DAY) + MINUTE, "reviewer"),
-            sendTo(t1.session, ago(DAY) + 2 * MINUTE, "reviewer"),
+            named(reviewerSpawn(s, ago(DAY)), ["acme/widgets#1"], [], HEAD_A),
+            named(coderSpawn(s, ago(DAY) + MINUTE, "reviewer"), [], [], HEAD_B),
+            named(sendTo(s, ago(DAY) + 2 * MINUTE, "reviewer"), [], [], HEAD_C),
         ]),
         [1],
     );
-    // The reverse order: the latest spawn is the cross-review, so its spawn and the send are 2 rounds.
+    // The reverse order: the latest spawn is the cross-review, so its spawn and the send are 2 reviewed heads.
     assert.deepEqual(
         rounds([
-            coderSpawn(t1.session, ago(DAY), "reviewer"),
-            reviewerSpawn(t1.session, ago(DAY) + MINUTE),
-            sendTo(t1.session, ago(DAY) + 2 * MINUTE, "reviewer"),
+            named(coderSpawn(s, ago(DAY) - MINUTE, "reviewer"), ["acme/widgets#1"], [], HEAD_C),
+            named(reviewerSpawn(s, ago(DAY)), ["acme/widgets#1"], [], HEAD_A),
+            named(sendTo(s, ago(DAY) + MINUTE, "reviewer"), [], [], HEAD_B),
         ]),
         [2],
     );
 });
 
-test("Q1 rounds: a session with 2 threads gives each call to the thread with the latest start at or before it", () => {
+test("Q1 rounds: the agent of a PR is that of a thread that holds it, else that of the thread of its latest round", () => {
     const old = thread("T1", { session: 500, startedAt: ago(20 * DAY), repo: "acme/old" });
-    const now = thread("T2", { session: 500, startedAt: ago(5 * DAY), repo: "acme/new" });
+    const now = thread("T2", {
+        session: 500,
+        startedAt: ago(5 * DAY),
+        repo: "acme/new",
+        agents: ["duncan"],
+    });
     const reviewCalls = [
-        reviewerSpawn(500, ago(10 * DAY)),
-        sendTo(500, ago(4 * DAY), "reviewer"),
-        sendTo(500, ago(3 * DAY), "reviewer"),
+        named(reviewerSpawn(500, ago(10 * DAY)), ["acme/widgets#4"], [], HEAD_A),
+        named(sendTo(500, ago(4 * DAY), "reviewer"), [], [], HEAD_B),
+        named(sendTo(500, ago(3 * DAY), "reviewer"), [], [], HEAD_C),
     ];
-    const result = checkQ1(
-        emptyData({ decided: todayEmpty, threads: threadMap(old, now), reviewCalls }),
-        q1Ctx([]),
-    );
+    const reviewAnswers = [
+        answerOf(500, ago(10 * DAY) + MINUTE),
+        answerOf(500, ago(4 * DAY) + MINUTE),
+        answerOf(500, ago(3 * DAY) + MINUTE),
+    ];
+    const rows = (threads: object) =>
+        checkQ1(
+            emptyData({ decided: todayEmpty, threads, reviewCalls, reviewAnswers }),
+            q1Ctx([]),
+        ).metrics.rounds.prs.map(
+            (item: { repo: string; agent: string; threads: string[]; rounds: number }) => [
+                item.repo,
+                item.agent,
+                item.threads,
+                item.rounds,
+            ],
+        );
 
-    assert.deepEqual(
-        result.metrics.rounds.threads.map((item: { id: string; rounds: number }) => [
-            item.id,
-            item.rounds,
-        ]),
-        [
-            ["T1", 1],
-            ["T2", 2],
-        ],
-    );
+    // The repository is the PR's own; the agent is that of T2, the thread of the latest round.
+    assert.deepEqual(rows(threadMap(old, now)), [["acme/widgets", "duncan", ["T1", "T2"], 3]]);
+    // A thread that holds the PR gives its agent, and is 1 of the PR's threads.
+    const holder = thread("T9", { prs: { "acme/widgets#4": {} }, agents: ["alia"] });
+
+    assert.deepEqual(rows(threadMap(old, now, holder)), [
+        ["acme/widgets", "alia", ["T1", "T2", "T9"], 3],
+    ]);
 });
 
-test("Q1 rounds: rounds [1, 2, 3, 4, 10] give median 3 and P90 10; a row with no thread has median null", () => {
+test("Q1 rounds: reviewed heads [1, 2, 3, 4, 10] give median 3 and P90 10; a row with no PR has median null", () => {
     const times = [1, 2, 3, 4, 5].map((n) => ago(n * DAY));
     const result = checkQ1(
         emptyData({ decided: todayEmpty, ...roundThreads([1, 2, 3, 4, 10], times) }),
         q1Ctx([]),
     );
     const row = {
-        threads: 5,
+        prs: 5,
         median: 3,
         p90: 10,
-        recent: { threads: 5, median: 3 },
-        before: { threads: 0, median: null },
+        recent: { prs: 5, median: 3 },
+        before: { prs: 0, median: null },
     };
 
     assert.deepEqual(result.metrics.rounds.totals, row);
@@ -2651,6 +2762,17 @@ test("Q1 rounds: rounds [1, 2, 3, 4, 10] give median 3 and P90 10; a row with no
     assert.deepEqual(result.metrics.rounds.agents, { irulan: row });
     // No decided PRs: no finding.
     assert.deepEqual(result.findings, []);
+
+    const none = checkQ1(emptyData({ decided: todayEmpty }), q1Ctx([])).metrics.rounds;
+
+    assert.deepEqual(none.totals, {
+        prs: 0,
+        median: null,
+        p90: null,
+        recent: { prs: 0, median: null },
+        before: { prs: 0, median: null },
+    });
+    assert.deepEqual(none.prs, []);
 });
 
 test("Q1 rounds finding: a median of 3 or more with 8 decided PRs; none with 7; none for unattributed", () => {
@@ -2666,15 +2788,15 @@ test("Q1 rounds finding: a median of 3 or more with 8 decided PRs; none with 7; 
     assert.equal(repo.severity, "medium");
     assert.equal(
         repo.text,
-        "Review rounds of acme/widgets have a median of 3 and a P90 of 10 over 5 desk threads in 30 days",
+        "Review rounds of acme/widgets have a median of 3 and a P90 of 10 over 5 PRs in 30 days (reviewed heads per PR)",
     );
     assert.equal(repo.cases, 5);
     assert.deepEqual(repo.evidence, [
-        "desk/T1.md 1 rounds",
-        "desk/T2.md 2 rounds",
-        "desk/T3.md 3 rounds",
-        "desk/T4.md 4 rounds",
-        "desk/T5.md 10 rounds",
+        "https://github.com/acme/widgets/pull/1 1 reviewed head (desk/T1.md)",
+        "https://github.com/acme/widgets/pull/2 2 reviewed heads (desk/T2.md)",
+        "https://github.com/acme/widgets/pull/3 3 reviewed heads (desk/T3.md)",
+        "https://github.com/acme/widgets/pull/4 4 reviewed heads (desk/T4.md)",
+        "https://github.com/acme/widgets/pull/5 10 reviewed heads (desk/T5.md)",
     ]);
     assert.equal(repo.lastSeen, new Date(ago(DAY)).toISOString().slice(0, 16) + "Z");
     assert.match(
@@ -2685,18 +2807,18 @@ test("Q1 rounds finding: a median of 3 or more with 8 decided PRs; none with 7; 
     // 7 decided PRs: under the gate.
     assert.deepEqual(ids(checkQ1(data(), decidedDays(7))), []);
 
-    // The same rounds with no repository and no agent are unattributed: no finding, though the acceptance rows have
-    // 8 decided PRs of `unattributed`.
+    // The same rounds with no agent are unattributed: no agent finding, though the acceptance rows have 8 decided
+    // PRs of `unattributed`. The repository is the PR's own, so its finding stays.
     const unattributed = checkQ1(
-        data({ repo: undefined, agents: [] }),
+        data({ agents: [] }),
         q1Ctx(
             earlierDays(8, (i) => [q1Pr(i, { ref: `acme/widgets#${i}`, agent: "unattributed" })]),
         ),
     );
 
-    assert.deepEqual(Object.keys(unattributed.metrics.rounds.repos), ["unattributed"]);
+    assert.deepEqual(Object.keys(unattributed.metrics.rounds.repos), ["acme/widgets"]);
     assert.deepEqual(Object.keys(unattributed.metrics.rounds.agents), ["unattributed"]);
-    assert.deepEqual(ids(unattributed), []);
+    assert.deepEqual(ids(unattributed), ["Q1:rounds:repo:acme/widgets"]);
 });
 
 test("Q1 rise finding: recent [3, 3] against [1, 2, 2] before gives only the rise findings; a rise of 0.5 gives none", () => {
@@ -2707,8 +2829,8 @@ test("Q1 rise finding: recent [3, 3] against [1, 2, 2] before gives only the ris
     );
 
     assert.equal(result.metrics.rounds.totals.median, 2);
-    assert.deepEqual(result.metrics.rounds.totals.recent, { threads: 2, median: 3 });
-    assert.deepEqual(result.metrics.rounds.totals.before, { threads: 3, median: 2 });
+    assert.deepEqual(result.metrics.rounds.totals.recent, { prs: 2, median: 3 });
+    assert.deepEqual(result.metrics.rounds.totals.before, { prs: 3, median: 2 });
     assert.deepEqual(ids(result).sort(), [
         "Q1:rounds-rise:agent:irulan",
         "Q1:rounds-rise:repo:acme/widgets",
@@ -2719,9 +2841,12 @@ test("Q1 rise finding: recent [3, 3] against [1, 2, 2] before gives only the ris
     assert.equal(rise.severity, "medium");
     assert.equal(
         rise.text,
-        "Review rounds of acme/widgets rose: a median of 3 over 2 desk threads in the last 7 days, against 2 over 3 in the 23 days before",
+        "Review rounds of acme/widgets rose: a median of 3 over 2 PRs in the last 7 days, against 2 over 3 in the 23 days before (reviewed heads per PR)",
     );
-    assert.deepEqual(rise.evidence, ["desk/T1.md 3 rounds", "desk/T2.md 3 rounds"]);
+    assert.deepEqual(rise.evidence, [
+        "https://github.com/acme/widgets/pull/1 3 reviewed heads (desk/T1.md)",
+        "https://github.com/acme/widgets/pull/2 3 reviewed heads (desk/T2.md)",
+    ]);
     assert.equal(rise.cases, 2);
 
     // Recent [2, 3]: a median of 2.5, 0.5 above 2.
@@ -2732,6 +2857,273 @@ test("Q1 rise finding: recent [3, 3] against [1, 2, 2] before gives only the ris
 
     assert.equal(small.metrics.rounds.totals.recent.median, 2.5);
     assert.deepEqual(ids(small), []);
+});
+
+// Case 1: a thread with 2 or more PRs gives 1 row per PR, not 1 summed row.
+test("Q1 rounds case 1: a thread that reviews 2 PRs gives 1 row for each PR", () => {
+    const t1 = thread("T1", { prs: { "acme/widgets#1": {}, "acme/widgets#2": {} } });
+    const s = t1.session;
+    const at = ago(DAY);
+
+    assert.deepEqual(
+        prRoundsOf({
+            threads: threadMap(t1),
+            reviewCalls: [
+                named(reviewerSpawn(s, at, "rv1"), ["acme/widgets#1"], [], HEAD_A),
+                named(sendTo(s, at + 2 * MINUTE, "rv1"), [], [], HEAD_B),
+                named(reviewerSpawn(s, at + 4 * MINUTE, "rv2"), ["acme/widgets#2"], [], HEAD_C),
+            ],
+            reviewAnswers: [
+                answerOf(s, at + MINUTE, "rv1"),
+                answerOf(s, at + 3 * MINUTE, "rv1"),
+                answerOf(s, at + 5 * MINUTE, "rv2"),
+            ],
+        }),
+        [
+            ["acme/widgets#1", 2],
+            ["acme/widgets#2", 1],
+        ],
+    );
+});
+
+// Case 2: a thread of repository A that reviews a PR of repository B: the round counts for B only.
+test("Q1 rounds case 2: a thread of acme/widgets that reviews a PR of acme/gadgets counts for acme/gadgets only", () => {
+    const t1 = thread("T1");
+    const at = ago(DAY);
+    const rounds = checkQ1(
+        emptyData({
+            decided: todayEmpty,
+            threads: threadMap(t1),
+            reviewCalls: [named(reviewerSpawn(t1.session, at), ["acme/gadgets#7"], [], HEAD_A)],
+            reviewAnswers: [answerOf(t1.session, at + MINUTE)],
+        }),
+        q1Ctx([]),
+    ).metrics.rounds;
+
+    assert.deepEqual(Object.keys(rounds.repos), ["acme/gadgets"]);
+    assert.deepEqual(
+        rounds.prs.map((item: { repo: string; threads: string[] }) => [item.repo, item.threads]),
+        [["acme/gadgets", ["T1"]]],
+    );
+});
+
+// Case 3: batches. A spawn at head H, then 3 batch sends with no SHA ("Batch 2", "Same SHAs"), with answers between.
+test("Q1 rounds case 3: a spawn at 1 head and 3 batch sends with no SHA are 1 reviewed head of 4 calls", () => {
+    const t1 = thread("T1");
+    const s = t1.session;
+    const at = ago(DAY);
+    const data = emptyData({
+        decided: todayEmpty,
+        threads: threadMap(t1),
+        reviewCalls: [
+            named(reviewerSpawn(s, at), ["acme/widgets#1"], [], headIn(`Head: ${HEAD_A}`)),
+            ...[1, 2, 3].map((k) =>
+                named(
+                    sendTo(s, at + 2 * k * MINUTE, "reviewer"),
+                    [],
+                    [],
+                    headIn(`Batch ${k + 1} of 4. Same SHAs.`),
+                ),
+            ),
+        ],
+        reviewAnswers: [0, 1, 2, 3].map((k) => answerOf(s, at + (2 * k + 1) * MINUTE)),
+    });
+    const result = checkQ1(data, q1Ctx([]));
+
+    assert.deepEqual(
+        result.metrics.rounds.prs.map((item: { rounds: number }) => item.rounds),
+        [1],
+    );
+    assert.deepEqual(
+        result.metrics.prRounds.prs.map(
+            (item: { rounds: number; heads: number; calls: number }) => [
+                item.rounds,
+                item.heads,
+                item.calls,
+            ],
+        ),
+        [[1, 1, 4]],
+    );
+});
+
+// Case 4: a SHA correction. `New head: B`, then before any answer `Correction: the new head SHA is C`.
+test("Q1 rounds case 4: a SHA correction before the answer supersedes the head it corrects; with an answer between, both count", () => {
+    const t1 = thread("T1");
+    const s = t1.session;
+    const at = ago(DAY);
+    const reviewCalls = [
+        named(reviewerSpawn(s, at), ["acme/widgets#1"], [], HEAD_A),
+        named(sendTo(s, at + 2 * MINUTE, "reviewer"), [], [], headIn(`New head: ${HEAD_B}.`)),
+        named(
+            sendTo(s, at + 3 * MINUTE, "reviewer"),
+            [],
+            [],
+            headIn(
+                `Correction: the new head SHA is ${HEAD_C}. My last message gave a wrong short SHA.`,
+            ),
+        ),
+    ];
+    const first = answerOf(s, at + MINUTE);
+
+    // A, then B superseded by C: 2 reviewed heads (A and C), 3 calls.
+    assert.deepEqual(
+        prRoundsOf({
+            threads: threadMap(t1),
+            reviewCalls,
+            reviewAnswers: [first, answerOf(s, at + 4 * MINUTE)],
+        }),
+        [["acme/widgets#1", 2]],
+    );
+    // An answer between B and C: B was reviewed too, so 3 reviewed heads.
+    assert.deepEqual(
+        prRoundsOf({
+            threads: threadMap(t1),
+            reviewCalls,
+            reviewAnswers: [first, answerOf(s, at + 150_000), answerOf(s, at + 4 * MINUTE)],
+        }),
+        [["acme/widgets#1", 3]],
+    );
+});
+
+// Case 5: a mid-review head move. A re-review at B, then `the head moved again, to C` before the answer.
+test("Q1 rounds case 5: a head move sent before the answer is 1 reviewed head with the re-review it follows", () => {
+    const t1 = thread("T1");
+    const s = t1.session;
+    const at = ago(DAY);
+
+    assert.deepEqual(
+        prRoundsOf({
+            threads: threadMap(t1),
+            reviewCalls: [
+                named(reviewerSpawn(s, at), ["acme/widgets#1"], [], HEAD_A),
+                named(
+                    sendTo(s, at + 2 * MINUTE, "reviewer"),
+                    [],
+                    [],
+                    headIn(`Re-review 2. Last reviewed head: ${HEAD_A}. New head: ${HEAD_B}.`),
+                ),
+                named(
+                    sendTo(s, at + 3 * MINUTE, "reviewer"),
+                    [],
+                    [],
+                    headIn(`Note for re-review 2: the head moved again, to \`${HEAD_C}\`.`),
+                ),
+            ],
+            reviewAnswers: [answerOf(s, at + MINUTE), answerOf(s, at + 4 * MINUTE)],
+        }),
+        // A, and C (B is superseded): 2 reviewed heads; the re-review and the head move are 1 of them.
+        [["acme/widgets#1", 2]],
+    );
+});
+
+// Case 6: without the answers source, nothing is superseded: the distinct heads count.
+test("Q1 rounds case 6: with the answers source failed, no call is superseded and each distinct head counts", () => {
+    const t1 = thread("T1");
+    const s = t1.session;
+    const at = ago(DAY);
+    const reviewCalls = [
+        named(reviewerSpawn(s, at), ["acme/widgets#1"], [], HEAD_A),
+        named(sendTo(s, at + MINUTE, "reviewer"), [], [], HEAD_B),
+        named(sendTo(s, at + 2 * MINUTE, "reviewer"), [], [], HEAD_C),
+        // A batch send with no SHA: it takes C, which is not a new head.
+        named(sendTo(s, at + 3 * MINUTE, "reviewer")),
+    ];
+    const data = { threads: threadMap(t1), reviewCalls };
+
+    // No answer at all, from a usable source: only the last call is a reviewed head.
+    assert.deepEqual(prRoundsOf({ ...data, reviewAnswers: [] }), [["acme/widgets#1", 1]]);
+    // The source failed: every distinct head counts.
+    assert.deepEqual(
+        prRoundsOf({ ...data, reviewAnswers: [], sourceErrors: { reviewAnswers: "boom" } }),
+        [["acme/widgets#1", 3]],
+    );
+});
+
+// Case 7: 2 reviewers (2 names) that review the same head of 1 PR.
+test("Q1 rounds case 7: 2 reviewers of the same head of 1 PR are 1 reviewed head", () => {
+    const t1 = thread("T1");
+    const s = t1.session;
+    const at = ago(DAY);
+
+    assert.deepEqual(
+        prRoundsOf({
+            threads: threadMap(t1),
+            reviewCalls: [
+                named(reviewerSpawn(s, at, "rv-a"), ["acme/widgets#1"], [], HEAD_A),
+                named(reviewerSpawn(s, at + MINUTE, "rv-b"), ["acme/widgets#1"], [], HEAD_A),
+            ],
+            reviewAnswers: [
+                answerOf(s, at + 2 * MINUTE, "rv-a"),
+                answerOf(s, at + 3 * MINUTE, "rv-b"),
+            ],
+        }),
+        [["acme/widgets#1", 1]],
+    );
+});
+
+// Case 8: a reviewer chain with no head at all: a spawn and 2 sends, with answers between.
+test("Q1 rounds case 8: a reviewer chain with no head is 1 round", () => {
+    const t1 = thread("T1");
+    const s = t1.session;
+    const at = ago(DAY);
+    const result = checkQ1(
+        emptyData({
+            decided: todayEmpty,
+            threads: threadMap(t1),
+            reviewCalls: [
+                named(reviewerSpawn(s, at), ["acme/widgets#1"]),
+                named(sendTo(s, at + 2 * MINUTE, "reviewer")),
+                named(sendTo(s, at + 4 * MINUTE, "reviewer")),
+            ],
+            reviewAnswers: [0, 1, 2].map((k) => answerOf(s, at + (2 * k + 1) * MINUTE)),
+        }),
+        q1Ctx([]),
+    );
+
+    assert.deepEqual(
+        result.metrics.rounds.prs.map((item: { rounds: number }) => item.rounds),
+        [1],
+    );
+    assert.deepEqual(
+        result.metrics.prRounds.prs.map(
+            (item: { rounds: number; heads: number; calls: number }) => [
+                item.rounds,
+                item.heads,
+                item.calls,
+            ],
+        ),
+        [[1, 0, 3]],
+    );
+});
+
+// Case 9: a real re-review message names the old head first; the new head counts.
+test("Q1 rounds case 9: a spawn at A and re-reviews at B and C, by their real message forms, are 3 reviewed heads", () => {
+    const t1 = thread("T1");
+    const s = t1.session;
+    const at = ago(DAY);
+
+    assert.deepEqual(
+        prRoundsOf({
+            threads: threadMap(t1),
+            reviewCalls: [
+                named(reviewerSpawn(s, at), ["acme/widgets#1"], [], headIn(`Head: ${HEAD_A}`)),
+                named(
+                    sendTo(s, at + 2 * MINUTE, "reviewer"),
+                    [],
+                    [],
+                    headIn(`Re-review 1. Last reviewed head: ${HEAD_A}. New head: ${HEAD_B}.`),
+                ),
+                named(
+                    sendTo(s, at + 4 * MINUTE, "reviewer"),
+                    [],
+                    [],
+                    headIn(`Re-review 2. The head moved from \`${HEAD_B}\` to \`${HEAD_C}\`.`),
+                ),
+            ],
+            reviewAnswers: [0, 1, 2].map((k) => answerOf(s, at + (2 * k + 1) * MINUTE)),
+        }),
+        [["acme/widgets#1", 3]],
+    );
 });
 
 test("Q1 stops: 2 stops of 1 repository in 7 days are a finding; with 1 older than 7 days, none", () => {
@@ -3322,18 +3714,7 @@ test("P1: a missing planning-session source skips P1 by name", () => {
 
 // ---------- Q1: cross-review rounds per PR and blocking points ----------
 
-const HEAD_A = "a".repeat(40);
-const HEAD_B = "b".repeat(40);
-
-/** A review call with the PRs and the head its message names. */
-const named = (
-    call: ReviewCall,
-    refs: string[] = [],
-    bare: number[] = [],
-    head: string | null = null,
-) => ({ ...call, refs, bare, head });
-
-test("Q1 prRounds: rounds per PR from the session records; a send takes the PR of the call before it", () => {
+test("Q1 prRounds: reviewed heads per PR from the session records; a send takes the PR of the call before it", () => {
     const t1 = thread("T1");
     const s = t1.session;
     const at = ago(2 * DAY);
@@ -3341,7 +3722,9 @@ test("Q1 prRounds: rounds per PR from the session records; a send takes the PR o
         named(reviewerSpawn(s, at), ["acme/widgets#4", "stranger/x#1"], [], HEAD_A),
         // A send with no PR of its own takes acme/widgets#4; its head is its own.
         named(sendTo(s, at + MINUTE, "reviewer"), [], [], HEAD_B),
-        named(sendTo(s, at + 2 * MINUTE, "reviewer")),
+        named(sendTo(s, at + 2 * MINUTE, "reviewer"), [], [], HEAD_C),
+        // A send with no head takes C: no new reviewed head, but 1 more call.
+        named(sendTo(s, at + 150_000, "reviewer")),
         // A bare number goes to the repository of the session's desk thread.
         named(reviewerSpawn(s, at + 3 * MINUTE, "rv5"), [], [5]),
         // A coder call names a PR and is no round.
@@ -3351,8 +3734,10 @@ test("Q1 prRounds: rounds per PR from the session records; a send takes the PR o
         // Older than 30 days.
         named(reviewerSpawn(s, ago(31 * DAY), "old"), ["acme/widgets#7"]),
     ];
+    // The reviewer answers A and B; C and the send after it come before the next answer.
+    const reviewAnswers = [30_000, 90_000, 170_000].map((ms) => answerOf(s, at + ms));
     const result = checkQ1(
-        emptyData({ decided: todayEmpty, threads: threadMap(t1), reviewCalls }),
+        emptyData({ decided: todayEmpty, threads: threadMap(t1), reviewCalls, reviewAnswers }),
         q1Ctx([]),
     );
 
@@ -3363,6 +3748,7 @@ test("Q1 prRounds: rounds per PR from the session records; a send takes the PR o
         totals: {
             prs: 2,
             rounds: 4,
+            calls: 5,
             mean: 2,
             median: 2,
             p90: 3,
@@ -3373,7 +3759,8 @@ test("Q1 prRounds: rounds per PR from the session records; a send takes the PR o
             {
                 ref: "acme/widgets#4",
                 rounds: 3,
-                heads: 2,
+                heads: 3,
+                calls: 4,
                 first: "2026-10-21T14:00Z",
                 last: "2026-10-21T14:02Z",
             },
@@ -3381,6 +3768,7 @@ test("Q1 prRounds: rounds per PR from the session records; a send takes the PR o
                 ref: "acme/widgets#5",
                 rounds: 1,
                 heads: 0,
+                calls: 1,
                 first: "2026-10-21T14:03Z",
                 last: "2026-10-21T14:03Z",
             },
