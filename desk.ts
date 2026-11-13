@@ -79,8 +79,8 @@ import type * as UsageModule from "./_desk-usage.ts";
 import type * as BoardModule from "./_desk-board.ts";
 
 /**
- * A JSON value, the same shape as chord's `JsonValue`. Kept here: chord 1.5.2 (Pi Pocket 0.28.2 and later) exports it
- * only from `@earendil-works/chord/json`, and chord 1.4.0 (Pi Pocket 0.27) has no such subpath.
+ * A JSON value, the same shape as chord's `JsonValue`. Kept here: chord 1.5.2 (Pi Pocket 0.28.2 and later) no longer
+ * exports it from the package root, and chord 1.4.0 (Pi Pocket 0.27) has no `@earendil-works/chord/json` subpath.
  */
 export type JsonValue =
     null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
