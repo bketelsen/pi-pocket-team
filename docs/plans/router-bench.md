@@ -260,7 +260,7 @@ decision:
 | Pick per band (easy, medium, hard)    | None.                                                                                                        |
 | Constant policy                       | None confirmed. Stage 1 (exploratory): C1 is `github-copilot/claude-opus-5.5`.                               |
 | Picks at the stand-in price and at $0 | None at either price. In stage 1, the $0 price of halogen and MAI-Code changes no shortlist or C1.           |
-| Router                                | No band has a pick, so router v3 assigns no worker: every delegation keeps today's policy (Odrade names it). |
+| Router                                | Router v3 is built (t14) with `RULE_PICKS` empty: it assigns no worker, and Odrade still names every worker. |
 
 ### Live experiment
 
@@ -319,6 +319,14 @@ after it, stage 1 is reported as exploratory on 2027-01-31 at the latest, and no
 
 - The model router takes the stage 2 decisions: each confirmed tier's pick, or the constant policy, or today's policy
   where the bench decided nothing.
+- **Built (plan T1064, task t14; the module's API version 4):** an eligible shift records `tierRule: "v1"` and its band
+  from `router-rule-v1.json` (a copy of `bench/rule-v1.json`); mode `assign` beside `off` and `shadow` (the default stays
+  `shadow`); the setting `liveTiers` (empty by default); arm A or B by the first byte of SHA-256(desk thread id); and
+  the goal field `workerThinking`. `RULE_PICKS` ships empty, because the branch is `wait`: no band has a pick or a
+  control, so no route gets an assignment. A round that decides a band fills `RULE_PICKS` (or `router.json`'s
+  `ruleV1.picks`), with the control counted as section Rollout of the plan says, and writes the live experiment's
+  pre-registration above, before Brian sets `assign`. See
+  [model-router.md](../modules/model-router.md#rule-v1-and-assign-mode).
 - **Done when:** [model-router.md](../modules/model-router.md) documents the v3 tiers with the bench's evidence, and
   the router routes by them.
 

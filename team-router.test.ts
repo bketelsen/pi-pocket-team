@@ -89,6 +89,9 @@ type RouterCall = {
     worker?: string;
     repoDirs?: string[];
     roster?: string[];
+    shift?: boolean;
+    repo?: string;
+    threadId?: string;
 };
 type ExplicitCall = { worker: string; profileModel?: string };
 
@@ -97,7 +100,11 @@ type ExplicitCall = { worker: string; profileModel?: string };
  * records Jev's failure (as the real router does: features with no Jev fields, and the brief's hash). Version 1 is the
  * old API; version 3 also publishes `features`.
  */
-function fakeRouter(behaviour: "ok" | "throw" | "hang" | "off" | "jev-failed" = "ok", version = 3) {
+function fakeRouter(
+    behaviour: "ok" | "throw" | "hang" | "off" | "jev-failed" | "assign" = "ok",
+    version = 3,
+    assigned = "faux/faux-1",
+) {
     const calls: RouterCall[] = [];
     const explicitCalls: ExplicitCall[] = [];
     const featureCalls: {
@@ -146,6 +153,25 @@ function fakeRouter(behaviour: "ok" | "throw" | "hang" | "off" | "jev-failed" = 
                 };
             }
 
+            if (behaviour === "assign") {
+                // A router in mode assign on a live band: it assigns even beside a named worker here, so the test
+                // sees that team.ts lets a named worker win.
+                return {
+                    ...shadowRoute(request.worker),
+                    mode: "assign",
+                    status: "assigned",
+                    tier: "easy",
+                    tierRule: "v1",
+                    model: assigned,
+                    thinking: "high",
+                    arm: "A",
+                    assigned,
+                    assignedThinking: "high",
+                    reason: "assign: arm A",
+                    line: `Route: v1 easy: arm A assigned ${assigned}, thinking high (implement 1.9); assign`,
+                };
+            }
+
             return shadowRoute(request.worker);
         },
         ...(version >= 3
@@ -190,9 +216,19 @@ const answer = (text: string) => fauxAssistantMessage([fauxText(text)]);
 const teamCall = (args: object) =>
     fauxAssistantMessage([fauxToolCall("team_delegate", args)], { stopReason: "toolUse" });
 
+/** The stop line of the assigned shift's goal: its round requests, and no other, hold it. */
+const ASSIGN_MARK = "the assigned shift is done (assign-round-mark)";
+
+/** Each round request a linked session sent, as JSON: the prompt section is in it. */
+const roundRequests: string[] = [];
+
 /** Pi, scripted: the supervisor session asks for a delegation, and the linked session's own turns say little. */
 const model = scriptedModel((request) => {
     const { role, text } = lastText(request as never);
+
+    if (role !== "toolResult" && text.startsWith("[shift] Round")) {
+        roundRequests.push(JSON.stringify(request));
+    }
 
     if (role === "toolResult") {
         return answer("ok");
@@ -208,6 +244,16 @@ const model = scriptedModel((request) => {
 
     if (text.includes("This task runs as a shift")) {
         return answer("Shift noted. I start in round 1.");
+    }
+
+    // The assigned shift's own stop line marks its rounds: a test finds that round, not a round of another session.
+    if (text.endsWith("assign marked route night shift test")) {
+        return teamCall({
+            agent: "duncan",
+            repository: "frostyard/test",
+            task: TASK,
+            night_shift: { stop_when: ASSIGN_MARK },
+        });
     }
 
     if (text.endsWith("worker route night shift test")) {
@@ -836,6 +882,178 @@ describe("a delegated night shift and the model router", () => {
             assert.equal(routed.worker, plain.worker, `${words}: the worker`);
             assert.equal(routed.result, plain.result, `${words}: the result`);
         }
+    });
+});
+
+describe("the router's assignment (router v4, mode assign)", () => {
+    test("an assigned worker and its thinking go in the goal and the rounds; the profile model stays", async () => {
+        await app.setSubagentModels(owner(app), ["faux/faux-2", "faux/faux-1"]);
+        const router = fakeRouter("assign", 4);
+
+        try {
+            const { linked } = await delegate(
+                "route-assign",
+                "assign marked route night shift test",
+            );
+
+            await until(async () => (await goalOf(linked)) !== undefined, "the goal", 20_000);
+
+            const thread = await threadOf(linked);
+
+            assert.equal(router.calls.length, 1);
+            assert.equal(router.calls[0].shift, true, "the router hears it is a shift");
+            assert.equal(router.calls[0].repo, "frostyard/test");
+            assert.equal(router.calls[0].threadId, thread?.id, "the desk thread sets the arm");
+
+            const goal = (await goalOf(linked))!;
+
+            assert.equal(goal.worker, "faux/faux-1", "the assigned worker");
+            assert.equal(goal.workerThinking, "high", "its thinking level");
+            assert.equal(thread?.route?.status, "assigned");
+            assert.equal(thread?.route?.arm, "A");
+            assert.equal(thread?.route?.assigned, "faux/faux-1");
+            assert.equal(
+                app.sessions().find((session) => session.id === Number(linked))?.model,
+                "faux-2",
+                "the linked session stays on the profile model",
+            );
+
+            const ownRound = () => roundRequests.find((request) => request.includes(ASSIGN_MARK));
+
+            await until(() => ownRound() !== undefined, "round 1 of this shift", 20_000);
+            assert.match(
+                ownRound()!,
+                /give execution to subagents on `faux\/faux-1` and thinking `high`/,
+            );
+        } finally {
+            router.remove();
+            await app.setSubagentModels(owner(app), ["faux/faux-2"]);
+        }
+    });
+
+    test("a named worker wins over an assignment, and an assigned model off the allowed list is not used", async () => {
+        await app.setSubagentModels(owner(app), ["faux/faux-2", "faux/faux-1"]);
+
+        try {
+            const named = fakeRouter("assign", 4);
+
+            try {
+                const { linked } = await delegate(
+                    "route-assign-named",
+                    "worker route night shift test",
+                );
+
+                await until(async () => (await goalOf(linked)) !== undefined, "the goal", 20_000);
+
+                const goal = (await goalOf(linked))!;
+
+                assert.equal(goal.worker, "faux/faux-2", "the named worker runs");
+                assert.equal(goal.workerThinking, undefined);
+                assert.equal("workerThinking" in goal, false);
+            } finally {
+                named.remove();
+            }
+
+            const offList = fakeRouter("assign", 4, "acme/not-allowed");
+
+            try {
+                const { linked } = await delegate(
+                    "route-assign-off-list",
+                    "route night shift test",
+                );
+
+                await until(async () => (await goalOf(linked)) !== undefined, "the goal", 20_000);
+
+                const goal = (await goalOf(linked))!;
+
+                assert.equal(goal.worker, undefined, "a model off the allowed list is not set");
+                assert.equal(goal.workerThinking, undefined);
+            } finally {
+                offList.remove();
+            }
+        } finally {
+            await app.setSubagentModels(owner(app), ["faux/faux-2"]);
+        }
+    });
+
+    test("an assigned route from a memo is not applied when the shift module is older than version 4", async () => {
+        await app.setSubagentModels(owner(app), ["faux/faux-2", "faux/faux-1"]);
+        // The fake answers `assigned` with no thread id: as a memo written before a reload to an older shift module.
+        const router = fakeRouter("assign", 4);
+        const shiftApi = (globalThis as unknown as Record<symbol, { version: number }>)[
+            Symbol.for("pi-pocket-team.night-shift")
+        ]!;
+        const version = shiftApi.version;
+
+        shiftApi.version = 3;
+
+        try {
+            const { linked } = await delegate("route-assign-old-shift", "route night shift test");
+
+            await until(async () => (await goalOf(linked)) !== undefined, "the goal", 20_000);
+
+            assert.equal(router.calls[0].threadId, undefined, "no thread for an arm");
+            assert.equal((await threadOf(linked))?.route?.status, "assigned", "the memo's route");
+
+            const goal = (await goalOf(linked))!;
+
+            assert.equal(goal.worker, undefined, "an older shift module gets no assigned worker");
+            assert.equal("workerThinking" in goal, false);
+        } finally {
+            shiftApi.version = version;
+            router.remove();
+            await app.setSubagentModels(owner(app), ["faux/faux-2"]);
+        }
+    });
+
+    test("a delegation with no shift tells the router so, and gives it no thread for an arm", async () => {
+        const router = fakeRouter("assign", 4);
+
+        try {
+            const { linked } = await delegate("route-assign-plain", "plain route test");
+
+            await until(
+                async () => (await threadOf(linked))?.route !== undefined,
+                "the route",
+                20_000,
+            );
+
+            assert.equal(router.calls[0].shift, false);
+            assert.equal(router.calls[0].threadId, undefined);
+            assert.equal(await goalOf(linked), undefined, "no goal, so no worker");
+        } finally {
+            router.remove();
+        }
+    });
+
+    test("a replay reads the assigned route from the memo: the same arm and worker, and no second ask", async () => {
+        const stored = {
+            status: "assigned",
+            tierRule: "v1",
+            tier: "easy",
+            arm: "B",
+            assigned: "deepseek/deepseek-flash",
+        };
+        const memo: RouteMemo<typeof stored> = {
+            stored: async () => stored,
+            keep: async (value) => value,
+            started: async () => true,
+            start: async () => undefined,
+        };
+        let asked = 0;
+        const route = await routeOnce(
+            memo,
+            async () => {
+                asked += 1;
+
+                return { ...stored, arm: "A", assigned: "github-copilot/gpt-6-luna" };
+            },
+            () => ({ ...stored, status: "failed" }),
+        );
+
+        assert.equal(asked, 0);
+        assert.equal(route.arm, "B");
+        assert.equal(route.assigned, "deepseek/deepseek-flash");
     });
 });
 

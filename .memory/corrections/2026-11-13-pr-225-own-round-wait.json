@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-13",
+  "scope": "team-router-tests",
+  "correction": "The assigned-worker test waited for any new round request, so a late round of another session could satisfy the wait before its own round came; the test now marks its shift with its own stop line and waits for the round that holds it",
+  "evidence": "bketelsen/pi-pocket-team#225 cross-review of 9c9d0dc, finding 2",
+  "promoted_to": "AGENTS.md: a test that asserts on a message that comes by its own path waits for that message itself (team-router.test.ts: an assigned worker and its thinking go in the goal and the rounds)"
+}
