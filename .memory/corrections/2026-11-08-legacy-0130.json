@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-08",
+  "scope": "bench-calibration-guard-strength",
+  "correction": "The checks-only resume and the pack order have tests that fail without them: a second check counts the sandbox steps (0), and the pack order equals the seeded shuffle of the plan order",
+  "evidence": "bketelsen/pi-pocket-team#157 cross-review (openai/gpt-6.1-sol) of 91a8b06, finding 6",
+  "promoted_to": "bench/score.test.mjs: --checks-only (no sandbox run on the second run); bench/calibration.test.mjs: end to end (the pack order is seededShuffle(plan order, 1064))"
+}

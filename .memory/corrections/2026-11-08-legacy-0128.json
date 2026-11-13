@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-08",
+  "scope": "bench-judge-calibration-duplicate-labels",
+  "correction": "labels.json must list each item exactly once: a repeated id let its last entry silently win, so an item marked blind: false could be counted",
+  "evidence": "bketelsen/pi-pocket-team#157 cross-review (openai/gpt-6.1-sol) of 91a8b06, finding 4",
+  "promoted_to": "bench/judge-calibration.test.mjs: a labels file that lists an item twice is refused before any judge call"
+}

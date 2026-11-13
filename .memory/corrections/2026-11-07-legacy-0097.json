@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-07",
+  "scope": "bench-repo-command-limit",
+  "correction": "A bench repository whose suite needs more than 10 minutes gets its own limit (commandMinutes in bench/lib/owners.mjs, 30 for bketelsen/fleet) for the check and the hidden-test commands in the harvest, --revalidate and the scorer's S1 and S2; an explicit deps.timeouts wins; a validation with a timed-out step is never cached or reused",
+  "evidence": "owner review of the fleet manifest: the harvest dropped 19 bketelsen/fleet candidates because the check at the merge timed out at 10 minutes under host load (fleet-93 took 9 min 45 s at low load)",
+  "promoted_to": "bench/harvest.test.mjs: a repository's own command limit: fleet's check and hidden tests get 30 minutes, setup and others 10; bench/score.test.mjs: S1 and S2 run with the repository's own command limit; an explicit limit wins"
+}

@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-09",
+  "scope": "bench-disk",
+  "correction": "A bench attempt keeps its per-try caches (Go modules, npm, pip, a venv) until they are dropped, and a run never starts on a nearly full disk: stage 1 caches filled /var and the Pocket server crashed",
+  "evidence": "T1064 t11 stage 1 incident of 2026-11-09 (123 GB of try caches in runs/, /var full from about 06:38Z, Pocket down until the VM restart)",
+  "promoted_to": "bench/score.test.mjs (--drop-caches removes the try caches of a scored result; --force refused after) and bench/run.test.mjs, bench/drivers.test.mjs (exit 4 below 12 GB free, nothing reserved; batch stops launching)"
+}

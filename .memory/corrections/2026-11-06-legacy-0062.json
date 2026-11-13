@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-06",
+  "scope": "bench-provider-override",
+  "correction": "--max-provider and BENCH_MAX_PROVIDER may raise only halogen's slot cap; every other provider stays at 2",
+  "evidence": "bketelsen/pi-pocket-team#146 cross-review round 1 finding 6",
+  "promoted_to": "bench/slots.test.mjs: --max-provider raises only halogen's cap: other providers stay at 2"
+}

@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-08",
+  "scope": "plan-amend-preamble",
+  "correction": "plan amend keeps the text above the first section, because its record and the approval diff name sections only",
+  "evidence": "bketelsen/pi-pocket-team#183 cross-review (openai/gpt-6.1-sol) of d09afce, finding 2",
+  "promoted_to": "desk-plans.test.ts: an amend keeps the text above the first section, alone or with a section's change (#183 review)"
+}

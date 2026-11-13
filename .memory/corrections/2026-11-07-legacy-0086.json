@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-07",
+  "scope": "bench-revalidate-shell-parse",
+  "correction": "Revalidation finds the runner of a hidden command with a quote-aware shell tokenizer, accepts only && between segments, and refuses other shell syntax with a stated reason",
+  "evidence": "bketelsen/pi-pocket-team#151 cross-review re-review 2 (openai/gpt-6.1-sol) finding RR3",
+  "promoted_to": "bench/hidden.test.mjs: revalidation reporters: words found by a quote-aware tokenizer; only && joins segments"
+}

@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-10",
+  "scope": "bench-round-revalidate",
+  "correction": "A pool round revalidates only its new candidates, on a copy of the round's manifest, with the Pi Pocket release of their merges; the owner's whole file mixes tasks that pass only on different releases",
+  "evidence": "bketelsen/pi-pocket-team#194 cross-review (openai/gpt-6.1-sol) of faf816a, finding 1",
+  "promoted_to": "AGENTS.md rule 'Bench pool rounds' and docs/plans/router-bench.md 'Monthly rounds' step 2"
+}

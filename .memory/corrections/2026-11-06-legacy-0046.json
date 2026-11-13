@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-06",
+  "scope": "desk-sync-runner-one-follow-up",
+  "correction": "Requests of any source during a running sync must join 1 follow-up batch with 1 shared GitHub read, and each caller must keep its own result; a follow-up per source lets 1 running sync queue up to 3 more reads",
+  "evidence": "whole-plan verification (openai/gpt-6.1-sol) of the GitHub webhooks plan at main 86bbbe6, finding t1 sync runner follow-ups; fixed in bketelsen/pi-pocket-team#143",
+  "promoted_to": "desk-nudge.test.ts (SyncRunner): requests of 3 sources during a sync mark 1 follow-up: 1 read, each caller gets its own result / a failed shared read reaches each work of the batch that reads; the lane goes on"
+}

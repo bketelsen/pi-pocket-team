@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-07",
+  "scope": "team-start-linked-thrown-value",
+  "correction": "startLinked turns any rejected value of Pocket's start, null and undefined too, into words before it fails the desk thread, so every rejected start keeps the startThrew mark and startShift gives unknown: true; an Error keeps its own words",
+  "evidence": "bketelsen/pi-pocket-team#160: cross-review (openai/gpt-6.1-sol) of 8bb4dd7, re-review 1, batch 1",
+  "promoted_to": "desk-board.pocket.test.ts: a start that admits a session and then throws null or undefined is unknown, with its thread failed"
+}

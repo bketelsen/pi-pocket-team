@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-07",
+  "scope": "bench-diff-nested-git",
+  "correction": "The scoring copy loses every .git below its root (folder or file) inside the sandbox before git add, so a nested repository or submodule folder is diffed as its source, never as a gitlink",
+  "evidence": "bketelsen/pi-pocket-team#151 cross-review re-review 2 (openai/gpt-6.1-sol) finding RR1",
+  "promoted_to": "bench/score.test.mjs: a nested repository in the submitted tree is judged as its source, not as a gitlink"
+}

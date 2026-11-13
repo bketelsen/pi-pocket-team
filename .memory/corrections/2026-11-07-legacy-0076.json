@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-07",
+  "scope": "bench-score-host-git",
+  "correction": "The scorer never runs host git in a tree the worker could change (its .git/config and .gitattributes can name commands): the submitted diff is made inside the credential-free sandbox, on a copy, with --no-ext-diff --no-textconv; host git runs only in the local checkout",
+  "evidence": "bketelsen/pi-pocket-team#151 cross-review (openai/gpt-6.1-sol) finding F1",
+  "promoted_to": "bench/score.test.mjs: the submitted diff runs git only in the sandbox: host git never runs in a worker's tree; real bwrap: a worker's clean filter and fsmonitor reach no host file"
+}

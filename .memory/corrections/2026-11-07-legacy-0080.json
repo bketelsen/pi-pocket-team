@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-07",
+  "scope": "bench-score-trusted-diff",
+  "correction": "The submitted diff uses trusted git metadata only: a disposable clone of the local checkout at the parent as --git-dir, no system or global config, attributes from the parent tree (GIT_ATTR_SOURCE), --text; the worker's .git and .gitattributes choose nothing, so the judges see the tree that S1 and S2 checked",
+  "evidence": "bketelsen/pi-pocket-team#151 cross-review re-review 1 (openai/gpt-6.1-sol) finding R1",
+  "promoted_to": "bench/score.test.mjs: the submitted diff uses trusted git metadata: the worker's clean filter and `-diff` change nothing"
+}

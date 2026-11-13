@@ -1,6 +1,8 @@
 # The Clerk: routine desk traffic off the supervisor
 
-Status: design, decided by Brian on 2026-10-23 (Odrade's cost brief, desk thread T121). It builds on the
+Status: done (checked 2026-11-13 at `d05d04e`): built and running. The Clerk role is in `team.ts` and `desk.ts` (#40,
+merged on 2026-10-23); the live profile `~/.config/pi-pocket-team/agents/clerk.md` has `role: clerk` (section 7 copies
+it), and a 7-day measure of the Clerk's wake-ups was recorded on 2026-11-13. Design decided by Brian on 2026-10-23 (Odrade's cost brief, desk thread T121). It builds on the
 desk digest (`docs/plans/desk-digest.md`). The Clerk's model is `github-copilot/gpt-6-luna` (Brian added
 it to the allowed list for subagents on 2026-10-23, T120a).
 

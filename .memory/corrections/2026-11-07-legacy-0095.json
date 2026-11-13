@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-07",
+  "scope": "bench-rebase-merge-parent",
+  "correction": "The parent of a merged PR is the first parent of a merge commit, the commit before the PR's rebased commits for a rebase merge (the last N first-parent commits match the PR's N commits by subject and author date: <merge>~N), and <merge>^1 for a squash merge; <merge>^1 of a rebase merge is a commit of the PR itself",
+  "evidence": "owner review of the bench manifests: frostyard/nsl#68 was rebase-merged with 2 commits, and the harvest took the PR's own first commit as the parent",
+  "promoted_to": "bench/harvest.test.mjs: the parent of a rebase merge is the commit before the PR's rebased commits; the parent of a squash merge of 3 commits and of a merge commit stays the first parent"
+}

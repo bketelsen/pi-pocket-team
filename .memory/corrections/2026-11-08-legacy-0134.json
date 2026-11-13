@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-08",
+  "scope": "site-plan-actions",
+  "correction": "A new plan tool action gets its summary on the user site page of the Desk in the same PR, as AGENTS.md asks for each module behavior change",
+  "evidence": "bketelsen/pi-pocket-team#183 cross-review (openai/gpt-6.1-sol) of d09afce, finding 3",
+  "promoted_to": "AGENTS.md rule (Documentation rules: a module behavior change changes the module page and the site page in the same PR); site/content/modules/desk.md names plan amend and plan drop"
+}

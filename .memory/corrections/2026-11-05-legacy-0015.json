@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-05",
+  "scope": "desk-archive-reopen",
+  "correction": "deskArchived must count a pending archive entry too (its call may have acted before a stop), not only a done entry with no restored, or a reopened thread whose early list read failed reads its session as archived in gather and closes, and the restore skips it",
+  "evidence": "pi-pocket-team#126, cross-review (openai/gpt-6.1-sol) re-review 1 of head 20b5c6a, finding 1",
+  "promoted_to": "desk.test.ts"
+}

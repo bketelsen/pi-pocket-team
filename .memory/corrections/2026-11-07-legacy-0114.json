@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-07",
+  "scope": "desk-board-page-resolve-thread",
+  "correction": "The route test of POST board resolve also names a thread of the same supervisor, and checks that the answer and the stored row are launched with that thread, so a route that drops body.thread fails a test",
+  "evidence": "bketelsen/pi-pocket-team#161: cross-review (openai/gpt-6.1-sol) of de63da8, batch 2",
+  "promoted_to": "desk-board.pocket.test.ts: POST board: resolve with a thread of the same supervisor launches the unknown row with that thread"
+}

@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-06",
+  "scope": "bench-attempt-lock",
+  "correction": "2 runners of the same bench attempt (stage, task, model, run id) must never run at once: take the attempt lock before the result-exists check and the try selection, and hold it until the result is written",
+  "evidence": "bketelsen/pi-pocket-team#146 cross-review round 1 finding 2",
+  "promoted_to": "bench/run.test.mjs: 2 runs of the same attempt at once: only 1 runs Pi, the other exits 1"
+}

@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-07",
+  "scope": "desk-board-liveness-failed-row",
+  "correction": "The goal board's liveness rule keeps a supervisor live with a retained row in proposed, picked, waiting, starting, failed or unknown; liveSupervisors treated failed as ended, so a supervisor whose only row was failed left GET board and its POST Reopen got 403",
+  "evidence": "bketelsen/pi-pocket-team#168 (liveSupervisors): whole-plan verification of the goal board, round 2, against the plan's Supervisor liveness rule",
+  "promoted_to": "desk.test.ts: the liveness rule, 1 fact at a time; desk-board.pocket.test.ts: GET board, Reopen and Resolve: a supervisor whose only row is failed or unknown stays live; desk-board.test.ts: an agent's row binds to a supervisor live only by a failed or unknown row"
+}

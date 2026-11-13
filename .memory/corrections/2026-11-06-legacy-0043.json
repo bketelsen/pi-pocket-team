@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-06",
+  "scope": "github-hooks-coverage-since-review-3",
+  "correction": "A repository fact must sync the coverage starts before it renews coverage.repos, and again after; else a 30-day coverage that expired between 2 evaluations keeps its old start, and changes in the uncovered interval raise false alarms",
+  "evidence": "bketelsen/pi-pocket-team#141 cross-review re-review 2 (openai/gpt-6.1-sol) finding 1",
+  "promoted_to": "github-hooks.test.ts (The coverage alarm): rule D2: a fact that renews 30-day coverage after it expired between 2 evaluations starts it again"
+}

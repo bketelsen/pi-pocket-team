@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-07",
+  "scope": "bench-score-error-saved",
+  "correction": "An error after S0 saves the result with every score so far, judgePending true and scoreError, and exits 3; a later run that succeeds removes scoreError",
+  "evidence": "bketelsen/pi-pocket-team#151 cross-review re-review 1 (openai/gpt-6.1-sol) finding R3",
+  "promoted_to": "bench/score.test.mjs: a scoring error after S0 saves S0 to S2 with scoreError and exits 3; a later run finishes and clears it; a broken worker index (a lock and a corrupt index) does not stop the diff or the grades"
+}

@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-06",
+  "scope": "desk-escalate-take-tests",
+  "correction": "A change to the digest take needs app tests of a take that drops every item (no message, records kept) and of a restart in deliver (sent once, nothing recorded twice), not only helper tests",
+  "evidence": "bketelsen/pi-pocket-team#139 cross-review (openai/gpt-6.1-sol) finding 5",
+  "promoted_to": "desk.test.ts: a take that drops every item sends no message to anybody, ends, and keeps its records; a restart in deliver sends the escalation digest once"
+}

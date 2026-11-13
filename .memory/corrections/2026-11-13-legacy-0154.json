@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-13",
+  "scope": "desk-wake-up-sends",
+  "correction": "A pairing of 2 wake-ups into 1 message is stored on both entries (pair: the other key, or \"\" for alone) in a commit before any send, so a retry never changes a repair's request id; the sweeper and the nudged sync send inside the supervisor's lane, so 2 syncs never send the same entry at once; a repeat close-out mark keeps the first closeoutEntry",
+  "evidence": "bketelsen/pi-pocket-team#214 cross-review of 3033d141, findings 1 and 2",
+  "promoted_to": "desk.test.ts: pairWakes keeps a stored decision (#214); markCloseoutSent keeps the first boundary (#214); a failed label removal decides alone (#214); the sweeper's and a nudged sync's sends run in the supervisor's lane (#214)"
+}

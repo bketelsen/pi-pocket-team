@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-07",
+  "scope": "audit-r2-rework-reopenings",
+  "correction": "Only rework reopenings (checks, work, busy) make a routed thread not accepted in R2; a Clerk attach, a watch, a sweep attach, a report after a supervisor message and a plan ask reopening are bookkeeping",
+  "evidence": "bketelsen/pi-pocket-team#147 live dry run: 8 of 17 reopenings of not-accepted routed threads were a PR attach",
+  "promoted_to": "audit/checks.test.ts: R2: a thread reopened only by a PR attach is accepted"
+}

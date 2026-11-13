@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-06",
+  "scope": "github-hooks-receiver",
+  "correction": "The github-hooks receiver must bound its inbox to 16 jobs (the active one included; over it, receiver-busy, 503) and drop a job the listener gave up on while its commit has not started; every hand-over of pending markers must obey the 30-second nudge back-off; and the maintenance (desk-change check, refusal flush, coverage alarm) must run after each job, not only when the inbox is empty",
+  "evidence": "PR #138 cross-review (openai/gpt-6.1-sol), batch 1",
+  "promoted_to": "github-hooks.test.ts: The receiver loop: the inbox holds at most 16 jobs; a job that timed out at the listener leaves it and never commits / the nudge back-off holds for every caller: deliveries before the retry time call no nudge / a busy inbox does not starve the maintenance: refusals, the coverage alarm and the desk change run"
+}

@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-08",
+  "scope": "report-prs-replay",
+  "correction": "A replay of desk file attaches no PR and writes nothing: the stored report holds what its PRs did, because the caller's GitHub check can differ after a restart",
+  "evidence": "bketelsen/pi-pocket-team#184 cross-review (openai/gpt-6.1-sol) of 5bf410b, finding 1",
+  "promoted_to": "desk.test.ts: a replay of a report attaches no PR, and repeats the first refusals (#184 review)"
+}

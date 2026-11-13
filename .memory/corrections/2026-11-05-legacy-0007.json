@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-05",
+  "scope": "audit-review-window",
+  "correction": "The review joins must read all earlier calls, with no lower time limit, and build the latest spawn and PR over all loaded calls before the 30-day window filter, or a send or an answer in the window to a spawn before the window is lost",
+  "evidence": "pi-pocket-team#125, cross-review (openai/gpt-6.1-sol) of head fdc7abf, batch 1 finding 2",
+  "promoted_to": "audit/reviews.test.ts"
+}
