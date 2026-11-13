@@ -14,6 +14,7 @@ import {
     prRefsIn,
     reviewPoints,
     reviewRounds,
+    reviewedHeads,
     threadAt,
     verdictIn,
 } from "./reviews.mjs";
@@ -84,6 +85,42 @@ test("headIn: the SHA after the word head; else the second SHA of a range or a p
     assert.equal(headIn(`The head commit of the branch that we reviewed is ${SHA_A}`), null);
     assert.equal(headIn("head abc1234"), null);
     assert.equal(headIn(undefined), null);
+});
+
+test("headIn: a re-review message gives its new head, not the old one", () => {
+    // The old head first, then the new one.
+    assert.equal(headIn(`Last reviewed head: ${SHA_A}. New head: ${SHA_B}.`), SHA_B);
+    assert.equal(
+        headIn(
+            `- Previous reviewed head: ${SHA_A}.\n- New head: ${SHA_B} (local ref refs/heads/x)`,
+        ),
+        SHA_B,
+    );
+    assert.equal(headIn(`PR #103: old head \`${SHA_A}\`, new head \`${SHA_B}\``), SHA_B);
+    assert.equal(headIn(`New HEAD: \`${SHA_B}\`. Last reviewed HEAD: \`${SHA_A}\`.`), SHA_B);
+    // The new head first, then the old one.
+    assert.equal(headIn(`New head: ${SHA_B}. Last reviewed head: ${SHA_A}.`), SHA_B);
+    // `from A to B`, with or without backticks.
+    assert.equal(headIn(`The head moved from \`${SHA_A}\` to \`${SHA_B}\`.`), SHA_B);
+    assert.equal(headIn(`Head moved from \`${SHA_A}\` to \`${SHA_C}\`.`), SHA_C);
+    assert.equal(
+        headIn(
+            `Run a re-review of acme/widgets PR #282 from ${SHA_A} to ${SHA_B}, in the working directory.`,
+        ),
+        SHA_B,
+    );
+    // A mid-review head move, and a SHA correction.
+    assert.equal(headIn(`Note for re-review 2: the head moved again, to \`${SHA_C}\`.`), SHA_C);
+    assert.equal(headIn(`New head (equal to the PR head now): ${SHA_B}`), SHA_B);
+    assert.equal(
+        headIn(`Correction: the new head SHA is ${SHA_C}. My last message gave a wrong short SHA.`),
+        SHA_C,
+    );
+    // An old head alone is no reviewed head; a later `head` on the same line still counts.
+    assert.equal(headIn(`Last reviewed head: ${SHA_A}.`), null);
+    assert.equal(headIn(`Base head ${SHA_A}, and the head is ${SHA_B}.`), SHA_B);
+    // A short SHA after `new head` is no head.
+    assert.equal(headIn("New head: abc1234."), null);
 });
 
 // ---------- blockingItems and verdictIn ----------
@@ -381,4 +418,113 @@ test("reviewRounds and reviewPoints: a spawn 60 days ago still sets the round an
         ),
         [["acme/widgets#4", SHA_C, "1"]],
     );
+});
+
+// ---------- reviewedHeads ----------
+
+const answerTo = (id: number, at: number, name = "rv") => ({
+    id,
+    c: t1.session,
+    at,
+    name,
+    ready: false,
+    items: [],
+});
+
+test("reviewedHeads: a call with no head takes the reviewed head of the call before it, for the same PR only", () => {
+    const at = ago(2 * DAY);
+    const data = emptyData({
+        threads: threadMap(t1),
+        reviewCalls: [
+            spawn(1, at, { refs: ["acme/widgets#4"], head: SHA_A }),
+            // A batch send: no PR and no head of its own.
+            send(2, at + 2 * MINUTE, {}),
+            // Another PR, with no head: it does not take the head of acme/widgets#4.
+            send(3, at + 4 * MINUTE, { refs: ["acme/widgets#5"] }),
+        ],
+        reviewAnswers: [answerTo(10, at + MINUTE), answerTo(11, at + 3 * MINUTE)],
+    });
+
+    assert.deepEqual(reviewedHeads(data, { now: NOW }), [
+        {
+            ref: "acme/widgets#4",
+            head: SHA_A,
+            chain: `${t1.session}\u0000rv`,
+            at,
+            session: t1.session,
+            reviewer: "rv",
+            superseded: false,
+        },
+        {
+            ref: "acme/widgets#4",
+            head: SHA_A,
+            chain: `${t1.session}\u0000rv`,
+            at: at + 2 * MINUTE,
+            session: t1.session,
+            reviewer: "rv",
+            superseded: false,
+        },
+        {
+            ref: "acme/widgets#5",
+            head: null,
+            chain: `${t1.session}\u0000rv`,
+            at: at + 4 * MINUTE,
+            session: t1.session,
+            reviewer: "rv",
+            superseded: false,
+        },
+    ]);
+});
+
+test("reviewedHeads: a call is superseded when the next call of its chain, for the same PR, comes before any answer", () => {
+    const at = ago(2 * DAY);
+    const calls = [
+        spawn(1, at, { refs: ["acme/widgets#4"], head: SHA_A }),
+        send(2, at + 2 * MINUTE, { head: SHA_B }),
+        send(3, at + 3 * MINUTE, { head: SHA_C }),
+        // The next call names another PR: the call before it is not superseded.
+        send(4, at + 5 * MINUTE, { refs: ["acme/widgets#5"], head: SHA_A }),
+        send(5, at + 6 * MINUTE, { refs: ["acme/widgets#6"], head: SHA_B }),
+    ];
+    const superseded = (over: object) =>
+        reviewedHeads(emptyData({ threads: threadMap(t1), reviewCalls: calls, ...over }), {
+            now: NOW,
+        }).map((item: { head: string; superseded: boolean }) => [item.head, item.superseded]);
+
+    // An answer after the spawn and after C; none between B and C, so B is superseded.
+    assert.deepEqual(
+        superseded({ reviewAnswers: [answerTo(10, at + MINUTE), answerTo(11, at + 4 * MINUTE)] }),
+        [
+            [SHA_A, false],
+            [SHA_B, true],
+            [SHA_C, false],
+            [SHA_A, false],
+            [SHA_B, false],
+        ],
+    );
+    // An answer at the time of the next call still counts as between: B is not superseded.
+    assert.deepEqual(
+        superseded({
+            reviewAnswers: [answerTo(10, at + MINUTE), answerTo(11, at + 3 * MINUTE)],
+        })[1],
+        [SHA_B, false],
+    );
+    // An answer of another name does not count.
+    assert.deepEqual(
+        superseded({
+            reviewAnswers: [answerTo(10, at + MINUTE), answerTo(11, at + 150_000, "x")],
+        })[1],
+        [SHA_B, true],
+    );
+
+    // Without a usable answers source, no call is superseded.
+    for (const over of [
+        { reviewAnswers: undefined },
+        { reviewAnswers: [], sourceErrors: { reviewAnswers: "boom" } },
+    ]) {
+        assert.ok(
+            superseded(over).every(([, flag]: [string, boolean]) => flag === false),
+            JSON.stringify(over),
+        );
+    }
 });

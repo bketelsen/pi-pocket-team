@@ -77,19 +77,61 @@ export function prRefsIn(text) {
     return { refs, bare: [...new Set(bare)] };
 }
 
-const HEAD_WORD = /\bhead\b[^\n]{0,30}?\b([0-9a-f]{40})\b/i;
-const SHA_PAIR = /\b([0-9a-f]{40})(?:\.\.\.?|\s+)([0-9a-f]{40})\b/;
+// Rule 1: `new head`, `current PR head`, `latest HEAD`, then a full SHA within 30 characters on the same line.
+const NEW_HEAD =
+    /\b(?:new|current|updated|latest)\s+(?:PR\s+)?head\b[^\n]{0,30}?\b([0-9a-f]{40})\b/i;
+// Rule 2: `from A to B` (backticks allowed), and the ranges `A..B` and `A...B`.
+const FROM_TO = /\bfrom\s+`?([0-9a-f]{40})`?\s+to\s+`?([0-9a-f]{40})\b/i;
+const SHA_RANGE = /\b([0-9a-f]{40})\.\.\.?([0-9a-f]{40})\b/i;
+// Rule 3: the word `head`, then a full SHA within 30 characters on the same line (a sticky match at its end).
+const HEAD = /\bhead\b/gi;
+const SHA_AFTER = /[^\n]{0,30}?\b([0-9a-f]{40})\b/iy;
+// The word just before `head` on its line.
+const WORD_BEFORE = /([a-z]+)[^a-z0-9\n]*$/i;
+// A `head` after one of these words names an old head, not the reviewed one.
+const OLD_HEAD_WORDS = new Set([
+    "previous",
+    "prior",
+    "old",
+    "last",
+    "earlier",
+    "former",
+    "reviewed",
+    "base",
+]);
+// Rule 4: the bare pair `A B`.
+const SHA_PAIR = /\b([0-9a-f]{40})\s+([0-9a-f]{40})\b/i;
 
 /**
- * The reviewed head of a call: the full SHA within 30 characters after the word `head` on the same line; else the
- * second SHA of `A..B`, `A...B` or `A B`; else null.
+ * The reviewed head of a call, a full 40-hex SHA, by the first rule that finds one: (1) a SHA within 30 characters
+ * after `new`, `current`, `updated` or `latest`, an optional `PR`, and `head`, on the same line; (2) B of
+ * `from A to B` (backticks allowed), `A..B` or `A...B`; (3) a SHA within 30 characters after a word `head` on the same
+ * line, where the word before `head` is not `previous`, `prior`, `old`, `last`, `earlier`, `former`, `reviewed` or
+ * `base` (each `head` in text order); (4) B of the bare pair `A B`. Else null.
  */
 export function headIn(text) {
     const source = String(text ?? "");
-    const named = HEAD_WORD.exec(source);
+    const named = NEW_HEAD.exec(source) ?? FROM_TO.exec(source) ?? SHA_RANGE.exec(source);
 
     if (named) {
-        return named[1];
+        return named[2] ?? named[1];
+    }
+
+    for (const match of source.matchAll(HEAD)) {
+        const lineStart = source.lastIndexOf("\n", match.index) + 1;
+        const before = WORD_BEFORE.exec(source.slice(lineStart, match.index))?.[1];
+
+        if (before !== undefined && OLD_HEAD_WORDS.has(before.toLowerCase())) {
+            continue;
+        }
+
+        SHA_AFTER.lastIndex = match.index + match[0].length;
+
+        const after = SHA_AFTER.exec(source);
+
+        if (after) {
+            return after[1];
+        }
     }
 
     return SHA_PAIR.exec(source)?.[2] ?? null;
@@ -190,8 +232,10 @@ export function callPr(call, data, owners = ownersOf(data)) {
 /**
  * Every loaded review call (all history: the audit loads them with no lower time limit), oldest first, each with `round` (a cross-review spawn, or a
  * send whose name's latest spawn in that session was one), `pr` (`callPr`; a send with no PR of its own takes the PR
- * of the latest earlier call to the same name in the same session) and `head` (the call's own). No window filter
- * here: a spawn before the window still sets the round and the PR of a later send.
+ * of the latest earlier call to the same name in the same session), `head` (the call's own) and `reviewedHead` (the
+ * call's own head; else the `reviewedHead` of the latest earlier call to the same name in the same session, when that
+ * call has the same `pr.ref`; else null). No window filter here: a spawn before the window still sets the round, the
+ * PR and the reviewed head of a later send.
  */
 function reviewCalls(data) {
     const owners = ownersOf(data);
@@ -202,6 +246,7 @@ function reviewCalls(data) {
         .map((item) => item.call);
     const latestSpawn = new Map();
     const latestPr = new Map();
+    const latestHead = new Map();
 
     return calls.map((call) => {
         const key = `${call.c}\u0000${call.name}`;
@@ -219,10 +264,73 @@ function reviewCalls(data) {
             }
         }
 
-        latestPr.set(key, pr);
+        const head = typeof call.head === "string" ? call.head : null;
+        const earlier = latestHead.get(key);
+        const reviewedHead = head ?? (earlier?.ref === pr.ref ? earlier.head : null);
 
-        return { call, key, round, pr, head: typeof call.head === "string" ? call.head : null };
+        latestPr.set(key, pr);
+        latestHead.set(key, { ref: pr.ref, head: reviewedHead });
+
+        return { call, key, round, pr, head, reviewedHead };
     });
+}
+
+/**
+ * The reviewed heads of the window, oldest first: each round call (a call `at` or after `now` minus
+ * `REVIEW_WINDOW_DAYS`) as `{ ref, head, chain, at, session, reviewer, superseded }`. `head` is the call's
+ * `reviewedHead`; `chain` is the key of its session and name. A round call is `superseded` when the answers source is
+ * usable (`data.reviewAnswers` is an array, and `data.sourceErrors.reviewAnswers` is not set), the next call of its
+ * chain is a round with the same PR, and no answer of the chain has a time from the call's to the next call's (both
+ * included): the reviewer got the next message in the same run, so the call is no reviewed head of its own. Without a
+ * usable answers source, no call is superseded.
+ */
+export function reviewedHeads(data, ctx) {
+    const from = ctx.now - REVIEW_WINDOW_DAYS * DAY;
+    const usable = Array.isArray(data.reviewAnswers) && !data.sourceErrors?.reviewAnswers;
+    const answersOf = new Map();
+
+    if (usable) {
+        for (const answer of data.reviewAnswers) {
+            if (typeof answer?.at === "number") {
+                const key = `${answer.c}\u0000${answer.name}`;
+
+                answersOf.set(key, [...(answersOf.get(key) ?? []), answer.at]);
+            }
+        }
+    }
+
+    const calls = reviewCalls(data);
+    const next = new Map();
+
+    // `calls` is oldest first: walk it from the end to know the next call of each chain.
+    for (let index = calls.length - 1, later = new Map(); index >= 0; index -= 1) {
+        next.set(calls[index], later.get(calls[index].key));
+        later.set(calls[index].key, calls[index]);
+    }
+
+    const superseded = (item) => {
+        const after = next.get(item);
+
+        return (
+            usable &&
+            after !== undefined &&
+            after.round &&
+            after.pr.ref === item.pr.ref &&
+            !(answersOf.get(item.key) ?? []).some((at) => at >= item.call.at && at <= after.call.at)
+        );
+    };
+
+    return calls
+        .filter((item) => item.round && item.call.at >= from)
+        .map((item) => ({
+            ref: item.pr.ref,
+            head: item.reviewedHead,
+            chain: item.key,
+            at: item.call.at,
+            session: item.call.c,
+            reviewer: item.call.name,
+            superseded: superseded(item),
+        }));
 }
 
 /**

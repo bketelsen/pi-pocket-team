@@ -809,12 +809,12 @@ test("Q1: the model never gets the day record, and its numbers are not allowed; 
     assert.equal(summary("PR 9137 was merged.").summary, "");
 });
 
-test("Q1: the model never gets the review-round thread list or the stop list; their totals stay", () => {
+test("Q1: the model never gets the review-round PR list or the stop list; their totals stay", () => {
     const q1 = makeFinding({
         check: "Q1",
         subject: "rounds:repo:acme/widgets",
         severity: "medium",
-        text: "Review rounds of acme/widgets have a median of 3 and a P90 of 10 over 5 desk threads in 30 days",
+        text: "Review rounds of acme/widgets have a median of 3 and a P90 of 10 over 5 PRs in 30 days (reviewed heads per PR)",
         cases: 5,
     });
     const q1Metrics = {
@@ -822,8 +822,16 @@ test("Q1: the model never gets the review-round thread list or the stop list; th
             day: { complete: true, calls: 1, prs: [] },
             rounds: {
                 available: true,
-                totals: { threads: 5, median: 3, p90: 10 },
-                threads: [{ id: "T7741", repo: "acme/widgets", agent: "irulan", rounds: 10 }],
+                totals: { prs: 5, median: 3, p90: 10 },
+                prs: [
+                    {
+                        ref: "acme/widgets#5530",
+                        repo: "acme/widgets",
+                        agent: "irulan",
+                        threads: ["T7741"],
+                        rounds: 10,
+                    },
+                ],
             },
             stops: {
                 available: true,
@@ -845,6 +853,7 @@ test("Q1: the model never gets the review-round thread list or the stop list; th
     const fit = fitInput([q1], q1Metrics, []);
 
     assert.ok(!fit.content.includes("T7741"));
+    assert.ok(!fit.content.includes("5530"));
     assert.ok(!fit.content.includes("goal-8812"));
     assert.ok(fit.content.includes('"p90":10'));
     assert.ok(fit.content.includes('"last7":2'));
@@ -854,7 +863,7 @@ test("Q1: the model never gets the review-round thread list or the stop list; th
     assert.ok(fit.content.includes('"atLeast3":1'));
     assert.ok(fit.content.includes('"evaluated":0'));
     // The metrics passed in are not changed.
-    assert.equal(q1Metrics.Q1.rounds.threads.length, 1);
+    assert.equal(q1Metrics.Q1.rounds.prs.length, 1);
     assert.equal(q1Metrics.Q1.stops.goals.length, 1);
     assert.equal(q1Metrics.Q1.prRounds.prs.length, 1);
     assert.equal(q1Metrics.Q1.blockers.points.length, 1);
