@@ -7,6 +7,7 @@ import { createServer } from "node:http";
 import { join } from "node:path";
 import { after, test } from "node:test";
 import { createHandler } from "./_pocket/src/server/http.ts";
+import { linkTarget } from "./homewiki-web/index.js";
 
 after(cleanUp);
 const wiki = join(root, "homewiki");
@@ -163,4 +164,23 @@ test("homewiki lists pages in order, strips frontmatter, and serves only listed 
         server?.close();
         await app.close();
     }
+});
+
+test("a wiki link's file and fragment decode apart, and a malformed escape never throws (#220)", () => {
+    assert.deepEqual(linkTarget("guides/backups.md"), {
+        file: "guides/backups.md",
+        fragment: null,
+    });
+    assert.deepEqual(linkTarget("network%20map.md#vlan-ids"), {
+        file: "network map.md",
+        fragment: "vlan-ids",
+    });
+    assert.deepEqual(linkTarget("#history"), { file: "", fragment: "history" });
+
+    // A malformed escape stays as it is written, in the file and in the fragment.
+    assert.deepEqual(linkTarget("50%.md"), { file: "50%.md", fragment: null });
+    assert.deepEqual(linkTarget("ok.md#cut-%E2%8"), { file: "ok.md", fragment: "cut-%E2%8" });
+
+    // An encoded # belongs to the file name: the split comes before the decode.
+    assert.deepEqual(linkTarget("c%23-notes.md#setup"), { file: "c#-notes.md", fragment: "setup" });
 });
