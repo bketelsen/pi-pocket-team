@@ -33640,18 +33640,25 @@ export default function createDesk(host: Host, web: Web) {
                     // Read only for a refusal: the same words for another thread and a missing one.
                     const hint = async () =>
                         `Ask ${await supervisorName()} with team_message ${await askAt()}.`;
+                    // The id as the agent asked for it, in the form `threadById` reads it (no "#", upper case): a
+                    // refusal that showed the stored id for one and the raw id for the other would tell them apart.
+                    const asked = (id ?? "").replace(/^#/, "").toUpperCase();
+                    const notYours = async () =>
+                        `${asked} is not this session's thread: an agent can read only its own thread. ${await hint()}`;
 
                     if (thread === undefined) {
                         throw new Error(
                             id === undefined || id === ""
                                 ? `This session has no thread on the desk. ${await hint()}`
-                                : `${id.toUpperCase()} is not this session's thread: an agent can read only its own thread. ${await hint()}`,
+                                : await notYours(),
                         );
                     }
 
                     if (thread.session !== session) {
                         throw new Error(
-                            `${thread.id} is not this session's thread: an agent can read only its own thread. ${await hint()}`,
+                            id === undefined || id === ""
+                                ? `${thread.id} is not this session's thread: an agent can read only its own thread. ${await hint()}`
+                                : await notYours(),
                         );
                     }
 

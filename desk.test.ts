@@ -28377,6 +28377,20 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
                     "the same error for another thread and a missing one",
                 );
 
+                // With the "#" and the lower case that a read accepts: still the same words for both.
+                const anotherHash = await messageOf(`#${other.id.toLowerCase()}`);
+                const missingHash = await messageOf("#t99");
+
+                assert.ok(
+                    anotherHash.startsWith(`${other.id} is not this session's thread`),
+                    anotherHash,
+                );
+                assert.equal(
+                    anotherHash.replace(other.id, "X"),
+                    missingHash.replace("T99", "X"),
+                    "the same error for another thread and a missing one, with a #",
+                );
+
                 // An agent with no thread of its own: the error says so, with the same hint. A session that a person
                 // started has no return address: the hint keeps the general words.
                 const looseFolder = join(root, "agent-read-loose");
