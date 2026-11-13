@@ -16,6 +16,27 @@ const slug = (text) =>
         .replace(/[^\p{L}\p{N}\s_-]/gu, "")
         .replace(/\s/g, "-");
 
+/** `text` with its percent escapes decoded; a malformed escape (`50%.md`) leaves the text as it is written. */
+function decoded(text) {
+    try {
+        return decodeURIComponent(text);
+    } catch {
+        return text;
+    }
+}
+
+/**
+ * A link's `href` as the file and the fragment it names, each decoded. The split comes first, so an encoded `#` (`%23`)
+ * stays in the file name; a malformed escape never throws (issue #220).
+ */
+export function linkTarget(href) {
+    const at = href.indexOf("#");
+
+    return at === -1
+        ? { file: decoded(href), fragment: null }
+        : { file: decoded(href.slice(0, at)), fragment: decoded(href.slice(at + 1)) };
+}
+
 /** `file`, written in the page at `from`, as a path from the checkout's top. */
 function resolve(from, file) {
     const parts = from.split("/").slice(0, -1);
@@ -166,7 +187,7 @@ export default function setup(pocket) {
             event.preventDefault();
             event.stopPropagation();
 
-            const [file, fragment = null] = decodeURIComponent(raw).split("#");
+            const { file, fragment } = linkTarget(raw);
 
             if (file === "") {
                 setAnchor(fragment);
