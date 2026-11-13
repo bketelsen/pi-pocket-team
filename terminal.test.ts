@@ -222,21 +222,12 @@ async function keys(id: string, data: string, tab: string, seq: number) {
     });
 }
 
-/** Poll until the shell writes nothing for a moment: its prompt is out, and only a keystroke is news. */
-async function quiet(id: string) {
-    const state = collected(id);
-
-    for (let tries = 0; tries < 40; tries++) {
-        const answer = await pollList([{ id, from: state.offset }], 300);
-        const entry = answer.data.terminals?.[id];
-
-        if (!entry || entry.gone || entry.data === "") {
-            return;
-        }
-
-        state.offset = entry.to;
-        state.text += entry.data;
-    }
+/**
+ * How many times a command's output `word` is in the text. The test types `printf '<word-stem>-%s\n' <n>`, so the
+ * terminal's echo of the keys shows `%s` and never the word: only a run of the command writes it.
+ */
+function runs(text: string, word: string): number {
+    return text.split(word).length - 1;
 }
 
 /** Poll until the shell's output so far satisfies `match`. */
@@ -542,25 +533,24 @@ test("a poll refuses a bad list of terminals", async () => {
 test("keys are written once: a repeated seq and an older one write nothing", async () => {
     const id = await start();
 
-    assert.equal((await keys(id, "echo once-42\n", "tab-retry", 1)).status, 200);
-    await expectOutput(id, (text) => /once-42/.test(text), "the chunk to run");
-    await quiet(id);
-
-    const after = collected(id).offset;
+    assert.equal((await keys(id, "printf 'once-%s\\n' 42\n", "tab-retry", 1)).status, 200);
+    await expectOutput(id, (text) => runs(text, "once-42") > 0, "the chunk to run");
 
     // The same chunk with the same seq, the way a POST that failed on the way goes again: an answer, no keys.
-    assert.equal((await keys(id, "echo once-42\n", "tab-retry", 1)).status, 200);
-    await quiet(id);
-    assert.equal(collected(id).offset, after, "a repeated seq writes nothing");
+    assert.equal((await keys(id, "printf 'once-%s\\n' 42\n", "tab-retry", 1)).status, 200);
 
     // An older seq: nothing either.
-    assert.equal((await keys(id, "echo older-5\n", "tab-retry", 1)).status, 200);
-    await quiet(id);
-    assert.equal(collected(id).offset, after, "an older seq writes nothing");
+    assert.equal((await keys(id, "printf 'older-%s\\n' 5\n", "tab-retry", 1)).status, 200);
 
-    // A newer seq is written, and the shell runs it.
-    assert.equal((await keys(id, "echo later-7\n", "tab-retry", 2)).status, 200);
-    await expectOutput(id, (text) => /later-7/.test(text), "the newer chunk");
+    // A newer seq is written, and the shell runs it. The shell runs its keys in order, so a chunk that went in before
+    // this one would have written its word before `later-7`: when `later-7` is out, the count is final. No pause in
+    // the output stands in for "nothing more comes" (#222).
+    assert.equal((await keys(id, "printf 'later-%s\\n' 7\n", "tab-retry", 2)).status, 200);
+
+    const text = await expectOutput(id, (each) => runs(each, "later-7") > 0, "the newer chunk");
+
+    assert.equal(runs(text, "once-42"), 1, "a repeated seq writes nothing");
+    assert.equal(runs(text, "older-5"), 0, "an older seq writes nothing");
 
     // Another tab numbers its own chunks: its seq 1 is not this tab's seq 1.
     assert.equal((await keys(id, "echo other-tab-9\n", "tab-other", 1)).status, 200);
@@ -665,27 +655,36 @@ test("16 tabs type into a terminal; a 17th is refused", async () => {
     await end(id);
 });
 
-test("a receipt expires after its own span, and then another tab may type", async () => {
+test("a receipt expires after its own span, and then another tab may type", async (t) => {
     // A short span, as for the detach timer: the receipt lives its RECEIPT_MS, and not 30 s.
     await reloadWith({ PI_POCKET_TERMINAL_RECEIPT_MS: "300" });
 
     const id = await start();
 
     try {
+        // The module reads the clock from `Date`: a mock of it alone (timers stay real) holds the time still while the
+        // 17 POSTs go, however slow the machine is, and then moves it past the span. On the real clock, 17 POSTs on a
+        // loaded machine took more than the 300 ms and the 17th tab got in early (#222).
+        t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+
         for (let each = 0; each < 16; each++) {
             assert.equal((await keys(id, "", `tab-${each}`, 1)).status, 200);
         }
 
         assert.equal((await keys(id, "", "tab-16", 1)).status, 429);
 
-        await pastSpan(300, "the receipt's span to pass");
+        // 1 ms before the span ends, every receipt still holds its place.
+        t.mock.timers.setTime(Date.now() + 299);
+        assert.equal((await keys(id, "", "tab-16", 1)).status, 429, "the receipts still hold");
 
+        t.mock.timers.setTime(Date.now() + 1);
         assert.equal(
             (await keys(id, "", "tab-16", 1)).status,
             200,
             "the expired receipts let it in",
         );
     } finally {
+        t.mock.timers.reset();
         await end(id);
         await reloadWith({ PI_POCKET_TERMINAL_RECEIPT_MS: undefined });
     }
@@ -698,19 +697,25 @@ test("a receipt older than the tab span still blocks a repeated seq", async () =
     const id = await start();
 
     try {
-        assert.equal((await keys(id, "echo receipt-1\n", "tab-receipt", 1)).status, 200);
-        await expectOutput(id, (text) => /receipt-1/.test(text), "the first chunk");
-        await quiet(id);
-
-        const after = collected(id).offset;
+        assert.equal((await keys(id, "printf 'receipt-%s\\n' 1\n", "tab-receipt", 1)).status, 200);
+        await expectOutput(id, (text) => runs(text, "receipt-1") > 0, "the first chunk");
 
         // Past the tab span, the poll that follows drops the tab entry the terminal keeps for back pressure, and the
         // receipt is still there: the same seq writes nothing, also with no tab entry.
         await pastSpan(200, "the tab span to pass");
 
-        assert.equal((await keys(id, "echo receipt-1\n", "tab-receipt", 1)).status, 200);
-        await quiet(id);
-        assert.equal(collected(id).offset, after, "the repeated seq still writes nothing");
+        assert.equal((await keys(id, "printf 'receipt-%s\\n' 1\n", "tab-receipt", 1)).status, 200);
+
+        // A newer seq after it: when its word is out, every chunk before it has run (#222).
+        assert.equal((await keys(id, "printf 'receipt-%s\\n' 2\n", "tab-receipt", 2)).status, 200);
+
+        const text = await expectOutput(
+            id,
+            (each) => runs(each, "receipt-2") > 0,
+            "the newer chunk",
+        );
+
+        assert.equal(runs(text, "receipt-1"), 1, "the repeated seq still writes nothing");
     } finally {
         await end(id);
         await reloadWith({ PI_POCKET_TERMINAL_TAB_MS: undefined });
