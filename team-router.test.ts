@@ -959,6 +959,36 @@ describe("the router's assignment (router v4, mode assign)", () => {
         }
     });
 
+    test("an assigned route from a memo is not applied when the shift module is older than version 4", async () => {
+        await app.setSubagentModels(owner(app), ["faux/faux-2", "faux/faux-1"]);
+        // The fake answers `assigned` with no thread id: as a memo written before a reload to an older shift module.
+        const router = fakeRouter("assign", 4);
+        const shiftApi = (globalThis as unknown as Record<symbol, { version: number }>)[
+            Symbol.for("pi-pocket-team.night-shift")
+        ]!;
+        const version = shiftApi.version;
+
+        shiftApi.version = 3;
+
+        try {
+            const { linked } = await delegate("route-assign-old-shift", "route night shift test");
+
+            await until(async () => (await goalOf(linked)) !== undefined, "the goal", 20_000);
+
+            assert.equal(router.calls[0].threadId, undefined, "no thread for an arm");
+            assert.equal((await threadOf(linked))?.route?.status, "assigned", "the memo's route");
+
+            const goal = (await goalOf(linked))!;
+
+            assert.equal(goal.worker, undefined, "an older shift module gets no assigned worker");
+            assert.equal("workerThinking" in goal, false);
+        } finally {
+            shiftApi.version = version;
+            router.remove();
+            await app.setSubagentModels(owner(app), ["faux/faux-2"]);
+        }
+    });
+
     test("a delegation with no shift tells the router so, and gives it no thread for an arm", async () => {
         const router = fakeRouter("assign", 4);
 

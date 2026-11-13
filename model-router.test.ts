@@ -1767,7 +1767,7 @@ test("readLiveTiers reads a comma list of bands, once each, and notes an unknown
     assert.deepEqual(readLiveTiers(" Easy, hard ,easy"), { bands: ["easy", "hard"], notes: [] });
     assert.deepEqual(readLiveTiers("easy,premium"), {
         bands: ["easy"],
-        notes: ["liveTiers: premium is not a band, ignored"],
+        notes: ["liveTiers: a name that is not a band is ignored"],
     });
 });
 
@@ -1815,7 +1815,7 @@ test("readRulePicks: the code's picks, router.json's valid entries over them, an
             notes: [
                 "router.json: ruleV1.picks.medium is not valid, ignored",
                 "router.json: ruleV1.picks.hard is not valid, ignored",
-                "router.json: ruleV1.picks.premium is not a band, ignored",
+                "router.json: a ruleV1.picks entry that is not a band is ignored",
             ],
         });
 
@@ -2169,7 +2169,7 @@ test("assign: only a live band, only with a thread, and an unknown live tier is 
             const route = await notLive.api.route(setup.request);
 
             assert.equal(route.arm, undefined, "another band is live, not this one");
-            assert.ok(route.notes?.includes("liveTiers: premium is not a band, ignored"));
+            assert.ok(route.notes?.includes("liveTiers: a name that is not a band is ignored"));
         } finally {
             notLive.dispose();
         }
@@ -2233,6 +2233,49 @@ test("assign: an unusable pick falls back to the control, then to no assignment"
         assert.equal(peak.assigned, undefined);
         assert.equal(peak.reason, "assign: no usable model");
         assert.match(peak.line, /arm A, no usable model/);
+    } finally {
+        await setup.done();
+    }
+});
+
+test("no field, note or line of a route holds the TypeSafe key, from the settings or router.json, in any case", async () => {
+    // The key pasted by mistake: in liveTiers (lowercase too), as a pick's band, model and control, and as the experiment.
+    const setup = await ruleRouter(
+        { mode: "assign", liveTiers: `easy,medium,hard,${KEY.toUpperCase()},${KEY.toLowerCase()}` },
+        {
+            routerJson: {
+                ruleV1: {
+                    experiment: KEY,
+                    picks: {
+                        easy: { model: `acme/${KEY}`, thinking: "high", control: `acme/c-${KEY}` },
+                        medium: {
+                            model: `acme/${KEY}`,
+                            thinking: "high",
+                            control: `acme/c-${KEY}`,
+                        },
+                        hard: { model: `acme/${KEY}`, thinking: "high", control: `acme/c-${KEY}` },
+                        [KEY]: PICK,
+                    },
+                },
+            },
+            allowed: [`acme/${KEY}`, `acme/c-${KEY}`],
+        },
+    );
+
+    try {
+        for (const threadId of [ARM_A, ARM_B]) {
+            const route = await setup.router.api.route({ ...setup.request, threadId });
+            const raw = JSON.stringify(route).toLowerCase();
+
+            assert.equal(route.status, "assigned", "the assignment still happens");
+            assert.equal(
+                raw.includes(KEY.toLowerCase()),
+                false,
+                `the raw route of arm ${route.arm}`,
+            );
+            assert.match(route.assigned!, /^acme\/(c-)?\[TYPESAFE_API_KEY\]$/);
+            assert.equal(route.experiment, "[TYPESAFE_API_KEY]");
+        }
     } finally {
         await setup.done();
     }

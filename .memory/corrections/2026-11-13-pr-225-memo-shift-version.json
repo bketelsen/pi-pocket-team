@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-13",
+  "scope": "team-router",
+  "correction": "The shift-module version check guarded only the router request (the thread id), so a memoized assigned route could apply a worker and workerThinking to a shift module below version 4, which drops the thinking level; team.ts checks the shift module version where it applies an assignment too",
+  "evidence": "bketelsen/pi-pocket-team#225 cross-review of 2afc109, batch 1 finding 2",
+  "promoted_to": "team-router.test.ts: an assigned route from a memo is not applied when the shift module is older than version 4"
+}

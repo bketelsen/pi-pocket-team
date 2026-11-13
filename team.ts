@@ -3677,9 +3677,12 @@ export default function createTeam(host: Host, web: Web) {
         // The router's assignment (mode `assign`, a live band of rule v1): its worker and thinking level go in the
         // shift's goal, and the rounds name both. A worker the supervisor named always wins, and the owner's allowed
         // list is checked again here, before the start: the goal's own check after it must not fail. The session's own
-        // model, the profile model, never changes. A replay reads the same route from the memo, so the same arm.
+        // model, the profile model, never changes. A replay reads the same route from the memo, so the same arm; the
+        // shift module is checked here too, not only when the router was asked: a memo from before a reload to an
+        // older shift module (below version 4, which drops the thinking level) applies nothing.
         if (
             shift !== undefined &&
+            shift.ns.version >= 4 &&
             shift.request.worker === undefined &&
             route?.status === "assigned" &&
             route.assigned !== undefined &&

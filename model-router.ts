@@ -1519,8 +1519,9 @@ export function readLiveTiers(value: unknown): { bands: Band[]; notes: string[] 
             continue;
         }
 
+        // The note never repeats the value: a setting can hold any text, a secret pasted by mistake too.
         if (!(BANDS as readonly string[]).includes(name)) {
-            notes.push(`liveTiers: ${name.slice(0, 40)} is not a band, ignored`);
+            notes.push("liveTiers: a name that is not a band is ignored");
             continue;
         }
 
@@ -1529,7 +1530,7 @@ export function readLiveTiers(value: unknown): { bands: Band[]; notes: string[] 
         }
     }
 
-    return { bands, notes };
+    return { bands, notes: [...new Set(notes)] };
 }
 
 /** A pick as `router.json` gives it, or undefined when it is not valid. */
@@ -1615,8 +1616,9 @@ export async function readRulePicks(
         notes.push("router.json: ruleV1.picks is not an object, ignored");
     } else {
         for (const [band, entry] of Object.entries(held.picks ?? {})) {
+            // The note never repeats the key: the file can hold any text.
             if (!(BANDS as readonly string[]).includes(band)) {
-                notes.push(`router.json: ruleV1.picks.${band.slice(0, 40)} is not a band, ignored`);
+                notes.push("router.json: a ruleV1.picks entry that is not a band is ignored");
                 continue;
             }
 
@@ -1863,6 +1865,28 @@ async function usableModels(host: Host): Promise<{ allowed: string[]; unusable: 
 /** The longest reason a route keeps: it goes to the supervisor and to the desk. */
 const MAX_REASON = 200;
 
+/**
+ * `value` with every string in it (keys too) redacted by `redact`: a route's fields come from Jev, from `router.json`
+ * and from the settings, and none of them may carry the TypeSafe key into the memo or the desk.
+ */
+export function redactDeep<T>(value: T, redact: (text: string) => string): T {
+    if (typeof value === "string") {
+        return redact(value) as T;
+    }
+
+    if (Array.isArray(value)) {
+        return value.map((each: unknown) => redactDeep(each, redact)) as T;
+    }
+
+    if (typeof value === "object" && value !== null) {
+        return Object.fromEntries(
+            Object.entries(value).map(([name, each]) => [redact(name), redactDeep(each, redact)]),
+        ) as T;
+    }
+
+    return value;
+}
+
 export default function createModelRouter(host: Host, web: Web) {
     web.settings([
         {
@@ -1994,7 +2018,24 @@ export default function createModelRouter(host: Host, web: Web) {
             .trim()
             .slice(0, MAX_REASON);
 
+    /**
+     * The route, with the key taken out of every string in it, in any case: a field or a note that the settings or
+     * `router.json` fed (a key pasted in `liveTiers` by mistake) never stores it.
+     */
     const route = async (request: RouteRequest): Promise<Route> => {
+        const answer = await routeOf(request);
+        const key = apiKey();
+
+        if (key === undefined) {
+            return answer;
+        }
+
+        const pattern = new RegExp(key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi");
+
+        return redactDeep(answer, (text) => text.replace(pattern, "[TYPESAFE_API_KEY]"));
+    };
+
+    const routeOf = async (request: RouteRequest): Promise<Route> => {
         const now = Date.now();
         const held = mode();
         const hostNames = await sshNames();
