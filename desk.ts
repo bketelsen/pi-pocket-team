@@ -33365,6 +33365,21 @@ export default function createDesk(host: Host, web: Web) {
             const supervisorName = async (): Promise<string> =>
                 (await team.roster().catch(() => [])).find((member) => member.role === "supervisor")
                     ?.name ?? "your supervisor";
+
+            /**
+             * Where an agent's refusal sends it: the return address of this session's first message, by name, or the
+             * old words in a session that a person started. A commit that only reads writes nothing.
+             */
+            const askAt = async (): Promise<string> => {
+                const address = await api
+                    .commit((tx) => returnAddress(tx, api.conversationId), context)
+                    .catch(() => undefined);
+
+                return address === undefined
+                    ? "to the return address in your first message"
+                    : `to ${address} (the return address of your first message)`;
+            };
+
             const watching = args.action === "watch" || args.action === "result";
             /** A session with no supervisor and no Clerk role: it reads, watches, and records results on its own thread. */
             const agent =
@@ -33432,7 +33447,7 @@ export default function createDesk(host: Host, web: Web) {
                 !args.action.startsWith("board")
             ) {
                 throw new Error(
-                    `Only a session assigned a supervisor identity can use the desk. An agent can use only read, watch, and result, on its own thread. For ${args.action}, ask ${await supervisorName()} with team_message to the return address in your first message; your task is in that message.`,
+                    `Only a session assigned a supervisor identity can use the desk. An agent can use only read, watch, and result, on its own thread. For ${args.action}, ask ${await supervisorName()} with team_message ${await askAt()}; your task is in that message.`,
                 );
             }
 
@@ -33618,23 +33633,25 @@ export default function createDesk(host: Host, web: Web) {
                 // An agent reads its own thread, and only that one. It writes nothing: no look, no sweeper.
                 if (agent) {
                     const state = await api.snapshot(DeskThreads, context);
-                    const hint = `Ask ${await supervisorName()} with team_message to the return address in your first message.`;
                     const thread =
                         id === undefined || id === ""
                             ? ownThreadOf(state, session)
                             : threadById(state, id);
+                    // Read only for a refusal: the same words for another thread and a missing one.
+                    const hint = async () =>
+                        `Ask ${await supervisorName()} with team_message ${await askAt()}.`;
 
                     if (thread === undefined) {
                         throw new Error(
                             id === undefined || id === ""
-                                ? `This session has no thread on the desk. ${hint}`
-                                : `${id.toUpperCase()} is not this session's thread: an agent can read only its own thread. ${hint}`,
+                                ? `This session has no thread on the desk. ${await hint()}`
+                                : `${id.toUpperCase()} is not this session's thread: an agent can read only its own thread. ${await hint()}`,
                         );
                     }
 
                     if (thread.session !== session) {
                         throw new Error(
-                            `${thread.id} is not this session's thread: an agent can read only its own thread. ${hint}`,
+                            `${thread.id} is not this session's thread: an agent can read only its own thread. ${await hint()}`,
                         );
                     }
 

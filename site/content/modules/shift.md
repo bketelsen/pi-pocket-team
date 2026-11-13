@@ -32,6 +32,7 @@ Examples:
 1. The module sends a message, `[shift] Round N of M…`, with the objective, the stop condition, the deadline, and what happened last round.
 2. A prompt section tells Pi to end every answer with `STATUS: DONE|CONTINUE|BLOCKED: <reason>`, to say DONE only when the condition holds, and never to work around Lancet Guard or plan mode.
 3. Pi's answer decides: DONE ends the goal (after the check passes, when there is one); BLOCKED ends it; CONTINUE, or no status line, goes on. Pi judges the condition itself: no other model is asked.
+4. After round 1, a round waits while Pi works, while its subagents work, or while a background command that will tell Pi it ended still runs: at most 60 minutes, then it goes anyway. A PR watch does not hold it. A person's message, plan mode and the other stops still apply during the wait.
 
 ## When it stops
 
@@ -58,7 +59,7 @@ State is one document per conversation, `x.night-shift.goal`. It is stored data.
 
 ## Delegated shifts
 
-A supervisor identity can start a shift in the linked session that `team_delegate` makes, with its `shift` argument: `{ objective?, stop_when, start?, until?, for?, max?, worker?, pr_check? }`. The report comes back to the supervisor's session by itself when the goal stops. Its summary also writes 1 line `PRS:` with each PR the shift touched, as `owner/name#N`, or `PRS: none`: the desk puts each PR on the thread. `night_shift` is the old name of `shift`, with the same fields; a call that gives both is refused.
+A supervisor identity can start a shift in the linked session that `team_delegate` makes, with its `shift` argument: `{ objective?, stop_when, start?, until?, for?, max?, worker?, pr_check? }`. The report comes back to the supervisor's session by itself when the goal stops. Each round also gives the supervisor's address, from the linked session's first message, so Pi can ask a question before then with `team_message`. Its summary also writes 1 line `PRS:` with each PR the shift touched, as `owner/name#N`, or `PRS: none`: the desk puts each PR on the thread. `night_shift` is the old name of `shift`, with the same fields; a call that gives both is refused.
 
 A shift from the tool takes no free check command. `pr_check` is the only check it takes: a structured PR check, and the module builds the `gh` command itself from `pr`, `repo`, `checks` and `label`. Both modules must be on in **Menu → Extensions**.
 

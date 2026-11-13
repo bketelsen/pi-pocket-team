@@ -13545,6 +13545,24 @@ async function delegated(
     return { source, linked: linked.id as ConversationId, thread };
 }
 
+/** The return address in a linked session's first message: where an agent's refusal tells it to ask. */
+async function firstAddress(id: ConversationId): Promise<string> {
+    const page = await (await app.harness.conversation(id, context))!.entries(
+        { order: "ascending" },
+        50,
+        undefined,
+        context,
+    );
+    const first = page.items.find((entry) => entry.kind === "pi.user");
+    const address = /Message from linked session (session-[0-9a-f-]+)/.exec(
+        JSON.stringify(first?.model),
+    )?.[1];
+
+    assert(address, "the linked session's first message names its return address");
+
+    return address;
+}
+
 /**
  * Stop one sweeper, and wait for it to be terminal. An abort that is only marked resumes after a restart, which is not
  * what a test that closes the app wants.
@@ -28243,7 +28261,10 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
                     /For new work, use team_delegate; to put a question on it, use desk ask/,
                 );
 
-                // An agent may read its own thread. `list` and the other actions stay refused.
+                // An agent may read its own thread. `list` and the other actions stay refused, and the refusal names
+                // the return address of the agent's first message.
+                const address = await firstAddress(linked);
+
                 for (const action of ["list", "sync", "attach", "ask"]) {
                     await assert.rejects(
                         () =>
@@ -28254,7 +28275,7 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
                                 `call-agent-${action}`,
                             ),
                         new RegExp(
-                            `Only a session assigned a supervisor identity can use the desk\\. An agent can use only read, watch, and result.*For ${action}, ask Odrade with team_message`,
+                            `Only a session assigned a supervisor identity can use the desk\\. An agent can use only read, watch, and result.*For ${action}, ask Odrade with team_message to ${address} \\(the return address of your first message\\); your task is in that message\\.`,
                         ),
                     );
                 }
@@ -28341,9 +28362,14 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
                 const another = await messageOf(other.id);
                 const missing = await messageOf("T99");
 
-                assert.match(
+                // The hint names the exact address to ask: the return address of the agent's first message.
+                const address = await firstAddress(linked);
+
+                assert.ok(
+                    another.endsWith(
+                        `is not this session's thread: an agent can read only its own thread. Ask Odrade with team_message to ${address} (the return address of your first message).`,
+                    ),
                     another,
-                    /is not this session's thread: an agent can read only its own thread\. Ask Odrade with team_message to the return address in your first message\./,
                 );
                 assert.equal(
                     another.replace(other.id, "X"),
@@ -28351,7 +28377,8 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
                     "the same error for another thread and a missing one",
                 );
 
-                // An agent with no thread of its own: the error says so, with the same hint.
+                // An agent with no thread of its own: the error says so, with the same hint. A session that a person
+                // started has no return address: the hint keeps the general words.
                 const looseFolder = join(root, "agent-read-loose");
 
                 mkdirSync(looseFolder, { recursive: true });
@@ -28377,6 +28404,17 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
                     JSON.stringify((await deskState())?.seen ?? {}),
                     before,
                     "the supervisor's look is written",
+                );
+
+                // A linked agent whose thread lost its session: no thread, and the hint names its return address.
+                await app.harness.commit(async (tx) => {
+                    delete (await tx.doc(DeskThreads)).threads[thread.id]!.session;
+                }, context);
+                await assert.rejects(
+                    () => read({ action: "read" }, Number(linked), "call-unbound"),
+                    (error: Error) =>
+                        error.message ===
+                        `This session has no thread on the desk. Ask Odrade with team_message to ${address} (the return address of your first message).`,
                 );
             } finally {
                 stub.restore();
