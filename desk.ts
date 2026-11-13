@@ -1357,6 +1357,24 @@ export function threadById(state: Readonly<DeskState> | undefined, id: string): 
     return Object.hasOwn(threads, key) ? threads[key] : undefined;
 }
 
+/**
+ * The end of an agent's `read` refusal for a named thread: where the export keeps a read-only copy of it. It reads only
+ * the asked id and the export folder, never the state, so it is the same for another thread and a missing one. An id
+ * in a thread id's form names its file; any other text names only the folder, so no path holds the agent's own text.
+ * Empty when the desk has no export folder.
+ */
+export function copyHint(asked: string, exportFolder: string | undefined): string {
+    if (exportFolder === undefined || !isAbsolute(exportFolder)) {
+        return "";
+    }
+
+    const folder = exportFolder.replace(/\/+$/, "") || "/";
+
+    return /^[TF][1-9][0-9]*$/.test(asked)
+        ? ` Or read its read-only synced copy, \`${join(folder, `${asked}.md`)}\`, if it is there: the desk writes it again after each change.`
+        : ` Or read a thread's read-only synced copy in \`${join(folder, "/")}\`, as \`<id>.md\` (for example \`T13.md\`), if it is there.`;
+}
+
 /** The folders a desk path starts with: each is beside the export folder. `desk-web/ask-text.js` has the same list. */
 export const DESK_PATH_ROOTS = ["reports", "desk", "plans", "decisions"] as const;
 /** The longest desk path, in characters. */
@@ -33644,7 +33662,7 @@ export default function createDesk(host: Host, web: Web) {
                     // refusal that showed the stored id for one and the raw id for the other would tell them apart.
                     const asked = (id ?? "").replace(/^#/, "").toUpperCase();
                     const notYours = async () =>
-                        `${asked} is not this session's thread: an agent can read only its own thread. ${await hint()}`;
+                        `${asked} is not this session's thread: an agent can read only its own thread. ${await hint()}${copyHint(asked, (await deskConfig()).export)}`;
 
                     if (thread === undefined) {
                         throw new Error(
