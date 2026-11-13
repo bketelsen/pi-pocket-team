@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-07",
+  "scope": "bench-diff-gitlinks",
+  "correction": "Before git add, the submitted diff removes every gitlink (mode 160000) from the trusted index only, so a submodule folder that the parent tracks is staged and judged as its submitted source",
+  "evidence": "bketelsen/pi-pocket-team#151 cross-review re-review 3 (openai/gpt-6.1-sol) finding RR1",
+  "promoted_to": "bench/score.test.mjs: a submodule that the parent tracks (a gitlink) is judged as its submitted source"
+}

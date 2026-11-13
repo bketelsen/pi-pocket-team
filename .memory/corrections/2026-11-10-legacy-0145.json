@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-10",
+  "scope": "bench-simulation-discordance",
+  "correction": "The stage 2 simulation runs with the discordance that stage 1 measured for the confirmed groups (never below the plan's 0.2), not only the default, and the round records it",
+  "evidence": "bketelsen/pi-pocket-team#194 cross-review (openai/gpt-6.1-sol) of faf816a, finding 2",
+  "promoted_to": "AGENTS.md rule 'Bench pool rounds' and docs/plans/router-bench.md 'Monthly rounds' step 5"
+}

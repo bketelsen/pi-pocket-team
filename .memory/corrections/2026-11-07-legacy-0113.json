@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-07",
+  "scope": "desk-board-page-selection",
+  "correction": "Each Board answer, GET or POST, is bound to the supervisor and the selection it was for, and an answer of an earlier selection is dropped; the supervisor select is off while an act runs, and the acts are off while a new board loads",
+  "evidence": "bketelsen/pi-pocket-team#161: cross-review (openai/gpt-6.1-sol) of de63da8, batch 1",
+  "promoted_to": "desk-web.test.js: Board: a POST answer for supervisor A that comes after the choice of B changes nothing on B's board"
+}

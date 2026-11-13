@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-08",
+  "scope": "bench-calibration-results-option",
+  "correction": "bench/calibration.mjs refuses --results: the runner would write the attempts there, and the driver, which reads <dir>/results, would start them again until stuck",
+  "evidence": "bketelsen/pi-pocket-team#157 cross-review (openai/gpt-6.1-sol) of 91a8b06, finding 3",
+  "promoted_to": "bench/calibration.test.mjs: usage: --results is refused"
+}

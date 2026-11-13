@@ -25,7 +25,7 @@ npm run typecheck  # the types of the modules
 npm run lint       # Prettier and ESLint, Pi Pocket's config (npm run format fixes)
 ```
 
-`make ci` runs the same gate, and with `BASE` set it also checks that `.memory/corrections.jsonl` is append-only against the PR base. CI job `Test` runs `make ci`, and its name is the required check.
+`make ci` runs the same gate, and with `BASE` set it also checks the correction records under `.memory/corrections/` against the PR base: no record removed or renamed, only an empty `promoted_to` filled, and the old single corrections file does not come back. CI job `Test` runs `make ci`, and its name is the required check.
 
 Node is pinned in `mise.toml` and `mise.lock`; `make verify` needs Node.js 22 or later.
 

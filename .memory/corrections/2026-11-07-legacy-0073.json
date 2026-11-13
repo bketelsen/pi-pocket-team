@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-07",
+  "scope": "audit-r2-report-reopen-watch-close",
+  "correction": "The interval of R2's evidence of work for a report reopening starts at the latest close of the done thread before the reopen: an event key closed: (the sweep) or watch:pass: (a passed watch), not closed: only",
+  "evidence": "bketelsen/pi-pocket-team#148 cross-review re-review 1 (openai/gpt-6.1-sol) finding RR1",
+  "promoted_to": "audit/checks.test.ts: R2: a report reopening counts work after the latest close of the done thread, closed: or watch:pass:"
+}

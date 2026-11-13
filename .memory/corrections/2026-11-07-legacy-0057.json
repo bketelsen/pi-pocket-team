@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-07",
+  "scope": "model-router-features-linked-root",
+  "correction": "features() must resolve each repository folder with realpath before it checks reads against it: comparing a resolved target with the unresolved folder drops a folder that is a link, or sits below one, and its risk and test flags become null",
+  "evidence": "bketelsen/pi-pocket-team#144 cross-review re-review 1 (openai/gpt-6.1-sol) finding 1",
+  "promoted_to": "model-router.test.ts: features: a folder reached through a symbolic link has the features of its real path"
+}

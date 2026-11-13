@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-07",
+  "scope": "audit-r2-revert-unknown-state",
+  "correction": "R2's revert check applies only to the PRs whose resolved state is MERGED: a PR of unknown state (no state, OPEN, MISSING, FROZEN, and no Q1 record) that a stored revert names stays unknown, while a known merged PR reverted inside the window still makes the thread not accepted",
+  "evidence": "bketelsen/pi-pocket-team#147 cross-review re-review 1 (openai/gpt-6.1-sol) finding RR1",
+  "promoted_to": "audit/checks.test.ts: R2: a stored revert of a PR whose state is unknown leaves the thread unknown; a known merged PR reverted is not accepted"
+}

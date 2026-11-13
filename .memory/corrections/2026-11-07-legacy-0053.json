@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-07",
+  "scope": "bench-analysis-input-contents",
+  "correction": "The bench analysis must check the contents of its inputs, not only that they exist: a frozen rule (version, features, transform, finite weights, ordered thresholds), a stage 1 summary (task ids, majority band, tier model sets, C1) and a simulation report (seed, counts, rates from 0 to 1); and stage 1 with no usable task must stop before it writes or freezes a rule",
+  "evidence": "bketelsen/pi-pocket-team#145 cross-review re-review 1 (openai/gpt-6.1-sol) findings 1-3",
+  "promoted_to": "bench/analyze.test.mjs (re-review 1: stage 1 with no usable task freezes no rule; stage 2 refuses a rule or a stage 1 summary that is not whole; --simulate refuses counts and shares out of range; the simulation threshold)"
+}

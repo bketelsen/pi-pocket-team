@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-06",
+  "scope": "github-hooks-began-ended-coverage",
+  "correction": "The began migration must also cover keys whose coverage ended before the upgrade (a suspended installation, a removed repository): take the repositories of the stored misses and alarms, with log evidence or 0; else a later start becomes the first and clears a real alarm",
+  "evidence": "bketelsen/pi-pocket-team#143 cross-review re-review 1 (openai/gpt-6.1-sol) finding 1",
+  "promoted_to": "github-hooks.test.ts (The coverage alarm): rule G3: an upgrade while the coverage is ended (suspended, or a repository removed): a later start keeps the real alarm"
+}

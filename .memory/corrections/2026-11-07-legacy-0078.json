@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-07",
+  "scope": "bench-s0-per-try",
+  "correction": "S0 parses each try's events on its own before it joins the tool calls: call ids of different Pi runs can repeat, and a merge by id hides a call",
+  "evidence": "bketelsen/pi-pocket-team#151 cross-review (openai/gpt-6.1-sol) finding F3",
+  "promoted_to": "bench/score.test.mjs: S0 reads each try on its own: an auth read in try 2 with the call id of an ordinary call in try 1 counts"
+}

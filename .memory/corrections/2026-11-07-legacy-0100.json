@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-07",
+  "scope": "desk-reports-off-stale-task",
+  "correction": "A reportsOffTasks record older than REPORTS_OFF_TASK_STALE_MS (10 minutes) is stale, so the next load pass starts the supervisor again: a task that the scheduler ends as faulted runs neither its last commit nor its abort, and its record must not block the sweep retry for ever",
+  "evidence": "bketelsen/pi-pocket-team#158: cross-review (openai/gpt-6.1-sol) of 60e0d91",
+  "promoted_to": "desk.test.ts: the load pass: a fresh task record skips the supervisor; a stale one starts it again"
+}

@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-07",
+  "scope": "bench-judge-calibration-held-out-size",
+  "correction": "The held-out set is valid only with 36 or more counted items, 10 or more owner fails and 10 or more owner passes, checked before any judge call: with fewer items a tiny set passed at a tiny threshold, and with 1 class a judge that always says pass agreed by base rate",
+  "evidence": "bketelsen/pi-pocket-team#157 cross-review (openai/gpt-6.1-sol) finding 2; the first calibration's held-out labels were 38 of 40 pass",
+  "promoted_to": "bench/judge-calibration.test.mjs: the held-out gates (an unlabelled item, a prompt not frozen, a short set: no judge call); bench/judge-calibration.test.mjs: a judge that always says pass fails on kappa"
+}

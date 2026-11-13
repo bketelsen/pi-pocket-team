@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-07",
+  "scope": "bench-revalidate-named-tests",
+  "correction": "--revalidate checks each named hidden test with the harvest's reporter classification (fails by an assertion at the parent, passes at the merge), not only a non-zero exit of the hidden command at the parent",
+  "evidence": "bketelsen/pi-pocket-team#151 cross-review (openai/gpt-6.1-sol) finding F4",
+  "promoted_to": "bench/harvest.test.mjs: --revalidate runs a file's commands again, writes validation, and keeps the tasks as they are"
+}

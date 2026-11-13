@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-05",
+  "scope": "desk-file-route",
+  "correction": "A size-limited file read must read at most the limit plus 1 byte from the descriptor and answer 413 when the extra byte comes, not readFile after a size check, or a file that grows after the check is read and held whole; its test counts the bytes the handle gives back, because a status check alone passes with the unbounded read too",
+  "evidence": "pi-pocket-team#128, cross-review (openai/gpt-6.1-sol) of head 874d381 finding 2, and re-review 1 of head 1498e43 finding 2",
+  "promoted_to": "desk-file.test.ts (a file that grows past the limit after the size check is a 413, and at most the limit + 1 byte is read)"
+}

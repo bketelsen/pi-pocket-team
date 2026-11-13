@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-05",
+  "scope": "site-front-matter",
+  "correction": "A site page's front matter must parse as YAML: a value that holds ': ' must be quoted, or ProperDocs renders the front matter as page text with no error in a strict build, and the page loses its title, description and hide",
+  "evidence": "pi-pocket-team#132, cross-review (openai/gpt-6.1-sol) of head 96e3a0f, finding 1",
+  "promoted_to": "test/site-pages.test.mjs"
+}

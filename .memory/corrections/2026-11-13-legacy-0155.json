@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-13",
+  "scope": "desk-wake-up-pairing",
+  "correction": "The pairing of a repair and a label wake-up is decided by decidePairs in the commit that records the entries (applySweep), never at send time: an entry sent alone never pairs later, a pair partner keeps the pair's request id when its other half is gone, and the pruning keeps unsent pair partners",
+  "evidence": "bketelsen/pi-pocket-team#214 re-review 1 of 77e29f63, findings 1 and 2",
+  "promoted_to": "desk.test.ts: decidePairs decides each new entry once (#214); pairWakes follows the stored decisions only (#214); the pruning keeps an unsent pair partner beyond 30 entries (#214); the sweeper's and a nudged sync's sends run in the supervisor's lane (#214)"
+}

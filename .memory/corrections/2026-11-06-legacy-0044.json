@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-06",
+  "scope": "github-hooks-coverage-began",
+  "correction": "The cleanup of stored misses and raised coverage alarms must compare with the first coverage of a key (began), never with its current start: a suspend and unsuspend, or a removal and a new add, makes a new start, and an alarm must clear only on a matching delivery",
+  "evidence": "whole-plan verification (openai/gpt-6.1-sol) of the GitHub webhooks plan at main 86bbbe6, finding t2 coverage clear; fixed in bketelsen/pi-pocket-team#143",
+  "promoted_to": "github-hooks.test.ts (The coverage alarm): rule G: a suspend and unsuspend keeps a real alarm and its misses; only a matching delivery clears it / rule G: a selected repository removed and added again keeps its real alarm and misses"
+}

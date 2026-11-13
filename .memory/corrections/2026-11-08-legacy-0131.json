@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-08",
+  "scope": "plan-revise-approval-wait",
+  "correction": "The revise news names the running tasks that hold the approval, and never offers Stop and revise for them: while a scope change is in force, a second one is refused",
+  "evidence": "bketelsen/pi-pocket-team#181 cross-review (openai/gpt-6.1-sol) of d5eef4e, finding 1",
+  "promoted_to": "desk-plans.test.ts: the running tasks are the tasks that hold the approval (the wait text names no Stop and revise), and the exact revise texts"
+}

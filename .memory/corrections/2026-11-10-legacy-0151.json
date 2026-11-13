@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-10",
+  "scope": "desk-merge-state-lines",
+  "correction": "The merge-state rule of the desk report reader ends a sentence at every line break and blank line, and separates the name from BLOCKED only by spaces and tabs, so a merge state named on another line or in another paragraph never hides a real BLOCKED; a change to the rules a report is read by changes the site page in the same PR",
+  "evidence": "bketelsen/pi-pocket-team#198 cross-review of 33174d7, findings 1 and 2",
+  "promoted_to": "desk.test.ts: GitHub's merge state on another line or paragraph does not hide a real BLOCKED; AGENTS.md rule 'The user site (site/content/, built by make site) summarizes the module reference'"
+}

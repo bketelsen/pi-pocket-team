@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-07",
+  "scope": "bench-judge-cut-quoted-path",
+  "correction": "The cut order decodes a path that git quotes (C-style escapes, octal UTF-8 bytes) before it tests for a test file: an unparsed quoted path left a test file first",
+  "evidence": "bketelsen/pi-pocket-team#157 cross-review (openai/gpt-6.1-sol) finding 3",
+  "promoted_to": "bench/judge.test.mjs: a quoted git path is decoded: a cut diff with a quoted test file first shows the production file first"
+}

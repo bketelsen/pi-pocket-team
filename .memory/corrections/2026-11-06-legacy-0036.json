@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-06",
+  "scope": "desk-escalate-replay-outcome",
+  "correction": "The outcome of a dropped desk escalate call must be stored beside its replay key, not read from the thread's last 50 events, or a replay after the events roll says queued when nothing was",
+  "evidence": "bketelsen/pi-pocket-team#139 cross-review (openai/gpt-6.1-sol) finding 4",
+  "promoted_to": "desk.test.ts: a Clerk's escalation after the supervisor's desk send is dropped, recorded, and counted once (replay after 50 other events)"
+}

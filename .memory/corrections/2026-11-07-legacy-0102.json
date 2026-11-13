@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-07",
+  "scope": "shift-rename-docs",
+  "correction": "Docs and site prose that names the current feature say shift, also when the 2 old words wrap over a line break; only the old-name notes and old paths keep night shift",
+  "evidence": "bketelsen/pi-pocket-team#159: cross-review (openai/gpt-6.1-sol) of 75258fc, batch 2 (docs/beacon.md, docs/modules/team.md)",
+  "promoted_to": "shift-names.test.ts: no doc names the current feature night shift, except the old names it explains"
+}

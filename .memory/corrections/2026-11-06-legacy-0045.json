@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-06",
+  "scope": "github-hooks-nudge-numbers",
+  "correction": "The desk's fact of a check_suite delivery must carry every PR number of the suite (numbers), and the desk must match a thread or a watch on any of them; the first number alone gives no early sync for the other PRs",
+  "evidence": "whole-plan verification (openai/gpt-6.1-sol) of the GitHub webhooks plan at main 86bbbe6, finding t1 check_suite numbers; fixed in bketelsen/pi-pocket-team#143",
+  "promoted_to": "github-hooks.test.ts: toNudgeFact: a check_suite fact hands the desk every PR number, not only the first / desk-nudge.test.ts: check_suite numbers: a thread or a watch on any of them matches, not only the first"
+}

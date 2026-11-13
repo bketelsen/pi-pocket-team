@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-07",
+  "scope": "desk-wake-parked-full-events",
+  "correction": "A parked thread wakes on the events that the sweep added, found by event key, not by list length: the event list keeps 50, so a new event at the cap pushes the oldest out and leaves the length unchanged",
+  "evidence": "bketelsen/pi-pocket-team#154: cross-review (openai/gpt-6.1-sol) of ffb826c",
+  "promoted_to": "desk.test.ts: wakeParked: with a key set, a new event at the 50-event cap wakes a parked thread; a sync wakes a parked thread with 50 events on its failed run"
+}

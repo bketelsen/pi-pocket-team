@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-07",
+  "scope": "bench-judge-calibration-resume",
+  "correction": "A saved calibration verdict is used again only when its judge, item id, prompt hash and the SHA-256 of the rendered input all match: a rebuilt pack can give another item an old id, and a match by path alone reuses the old grade",
+  "evidence": "bketelsen/pi-pocket-team#157 cross-review (openai/gpt-6.1-sol) finding 1",
+  "promoted_to": "bench/judge-calibration.test.mjs: a rebuilt pack gives the id d1 another diff: d1 is judged again; a changed prompt judges each item again"
+}

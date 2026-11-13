@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-07",
+  "scope": "audit-r2-revert-window-last-merge",
+  "correction": "R2's revert window ends 14 days after the thread's last merge, not each PR's own merge: a revert of any PR of the thread at or before that end, or at an unknown time, makes it not accepted",
+  "evidence": "bketelsen/pi-pocket-team#147 cross-review (openai/gpt-6.1-sol) finding R2",
+  "promoted_to": "audit/checks.test.ts: R2: the revert window ends 14 days after the thread's last merge, for a revert of any of its PRs"
+}

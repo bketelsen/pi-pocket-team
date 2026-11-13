@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-05",
+  "scope": "desk-archive-reopen",
+  "correction": "A session the desk archived must count as not archived for a thread that is not closed (deskArchived masks run.archived in applySweep), and the sweeper and desk sync must run the archive pass's pending and restore steps before gather, or a thread reopened by a tool or the page closes again in the next sweep and loses its close-out wake-up",
+  "evidence": "pi-pocket-team#126, cross-review (openai/gpt-6.1-sol) of head 9d6505c, finding 1",
+  "promoted_to": "desk.test.ts"
+}

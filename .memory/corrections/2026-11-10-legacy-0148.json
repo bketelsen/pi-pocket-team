@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-10",
+  "scope": "desk-empty-folder-order",
+  "correction": "The sweep checks for an empty folder before git status: in an empty directory inside a parent repository, git status succeeds with the parent's status, so a check after a failed status never runs",
+  "evidence": "bketelsen/pi-pocket-team#196 cross-review of a12d197, finding 1",
+  "promoted_to": "desk.test.ts: an empty folder inside a parent repository counts as gone, not as the parent's changes"
+}

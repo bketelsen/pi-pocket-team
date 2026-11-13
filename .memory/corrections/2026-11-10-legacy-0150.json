@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-10",
+  "scope": "desk-report-false-blocked",
+  "correction": "The desk report reader does not hold a thread for GitHub's merge state value BLOCKED after its name (mergeStateStatus, merge state, or the state beside MERGEABLE), for a question inside double quotes in a report's last paragraph, or for a wait until Brian answers next to an ask id, because none of them says the work is blocked or names a new decision",
+  "evidence": "replay of the stored desk reports of 2026-11-03 to 2026-11-10: 5 false reads",
+  "promoted_to": "desk.test.ts: GitHub's mergeStateStatus BLOCKED in a report is not the work's state; a question inside double quotes in a report is a quote, not a question to Brian; a wait for Brian's answer beside a filed ask id names no new decision; a wait for Brian far from an ask id is still a decision; a real decision for Brian in a report still holds the thread"
+}

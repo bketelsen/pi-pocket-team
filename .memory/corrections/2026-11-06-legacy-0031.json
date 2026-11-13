@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-06",
+  "scope": "github-hooks-delivery-coverage",
+  "correction": "applyDelivery must clear seen-full after the prune whenever the set is under SEEN_MAX, also on a duplicate (a duplicate while the set is full stays a duplicate); and the coverage alarm may match a CI change by the observed head sha only with a status fact (RecentFact.event \"status\"), while a check_suite fact matches by number or numbers only",
+  "evidence": "PR #138 cross-review (openai/gpt-6.1-sol), batch 2",
+  "promoted_to": "github-hooks.test.ts: The delivery commit: a duplicate clears seen-full once the set is under its cap; a duplicate while it is full stays a duplicate / The coverage alarm: by the observed head sha, a check_suite fact of another number does not match: it matches by number only / by the observed head sha, a status fact matches a CI change / the delivery commit stores event status for a status fact, and none for a check_suite fact"
+}
