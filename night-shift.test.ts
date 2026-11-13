@@ -20,9 +20,10 @@ import { after, before, describe, test } from "node:test";
 import type { FauxResponseStep } from "@earendil-works/pi-ai";
 import { fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import { type ConversationId, LiveDoc, type TaskId } from "@earendil-works/pi-durable";
-import { SubagentsDoc } from "./_pocket/src/server/docs.ts";
+import { BackgroundDoc, SubagentsDoc } from "./_pocket/src/server/docs.ts";
 import type { Host } from "./_pocket.d.ts";
 import {
+    backgroundWakes,
     checkFingerprint,
     deepseekStart,
     DEFAULT_ROUNDS,
@@ -509,6 +510,18 @@ describe("parsing", () => {
             /Before that, write 1 line "PRS:" with each PR you created, changed, reviewed or labelled in this shift, as owner\/name#N separated by commas, or "PRS: none", then 1 blank line\. The desk puts each PR on your thread\./,
         );
 
+        // With the supervisor's address (set when the goal was made), the round says where to ask before the report.
+        // A goal made before the field keeps the old words.
+        const addressed = goal({
+            delegated: { supervisor: "Sheeana", address: "session-1234-abcd" },
+        });
+
+        assert.match(
+            roundMessage(addressed, 2, now),
+            /Do not send a separate team_message report\.\nTo ask Sheeana something before then \(a decision, or the facts of another desk thread\), send team_message to session-1234-abcd\.\n/,
+        );
+        assert.ok(!roundMessage(delegated, 1, now).includes("To ask"), "no address: the old words");
+
         const plain = goal();
 
         assert.ok(!roundMessage(plain, 1, now).includes("team_message report"));
@@ -606,6 +619,16 @@ const route: FauxResponseStep = async (request, options) => {
         return say("Summary for the morning: I did the rounds. Nothing is left.");
     }
 
+    // An automated input that starts a run of its own after round 1: it holds until the test opens it.
+    if (text.startsWith("[background] Task own-run")) {
+        await new Promise<void>((resolve) => {
+            gates.set("own-run", resolve);
+            options?.signal?.addEventListener("abort", () => resolve());
+        });
+
+        return say("I started a re-review. Its report wakes me.");
+    }
+
     const round = /^\[shift\] Round (\d+) of/.exec(text);
     const scenario = /Objective: (scenario-[a-z-]+)/.exec(text)?.[1];
 
@@ -652,6 +675,7 @@ const route: FauxResponseStep = async (request, options) => {
 
             return say("STATUS: CONTINUE: more to do");
         case "scenario-person":
+        case "scenario-own-run":
         case "scenario-background":
         case "scenario-stop":
         case "scenario-command":
@@ -824,6 +848,33 @@ async function setWorking(child: ConversationId, working: boolean): Promise<void
         } else {
             delete live.run;
         }
+    }, context);
+}
+
+/** Pocket's record of a background command in session `id`, as `background.ts` writes it; `null` removes it. */
+async function setBackground(
+    id: ConversationId,
+    task: { status: "running" | "exited"; notify: boolean; untold?: true } | null,
+): Promise<void> {
+    await app.harness.commit(async (tx) => {
+        const doc = await tx.doc(BackgroundDoc, id);
+
+        if (task === null) {
+            delete doc.items.bg1;
+
+            return;
+        }
+
+        doc.items.bg1 = {
+            id: "bg1",
+            command: "npm test",
+            cwd: root,
+            pid: 0,
+            startedAt: Date.now(),
+            read: 0,
+            taskId: "background-test-task" as TaskId,
+            ...task,
+        };
     }, context);
 }
 
@@ -1441,6 +1492,109 @@ describe("Pi's own subagents", () => {
         const goal = await settled(id);
 
         assert.equal(goal.reason, "done");
+        assert.deepEqual(await sent(id), ["Round 1", "Round 2", "The shift has stopped"]);
+    });
+
+    test("a background command holds the next round only while it will tell Pi that it ended", () => {
+        assert.equal(backgroundWakes({ status: "running", notify: true }), true);
+        assert.equal(backgroundWakes({ status: "starting", notify: true }), true);
+        assert.equal(backgroundWakes({ status: "running", notify: false }), false, "Pi stopped it");
+        assert.equal(backgroundWakes({ status: "exited", notify: true }), false, "told already");
+        assert.equal(backgroundWakes({ status: "stopped", notify: true }), false);
+        assert.equal(backgroundWakes({ status: "lost", notify: true }), false);
+        assert.equal(
+            backgroundWakes({ status: "exited", notify: true, untold: true }),
+            true,
+            "it ended, and its message is still to go",
+        );
+    });
+
+    test("a background command that tells Pi it ended holds the next round until it exits; one with notify false does not", async () => {
+        // notify false: nothing wakes Pi, so round 2 goes at once (well before one poll).
+        const quiet = await session("background-quiet");
+
+        await setBackground(quiet, { status: "running", notify: false });
+
+        try {
+            await command(quiet, "max 5: scenario-subagent; stop when never");
+            await until(
+                async () => (await sent(quiet)).includes("Round 2"),
+                "round 2 with a quiet background command",
+                10_000,
+            );
+            assert.equal((await settled(quiet)).reason, "done");
+        } finally {
+            await setBackground(quiet, null);
+        }
+
+        // notify true: Pi hears when it ends, so the driver waits for it.
+        const id = await session("background-wait");
+
+        await setBackground(id, { status: "running", notify: true });
+
+        try {
+            await command(id, "max 5: scenario-subagent; stop when never");
+            await until(() => waitingForSubagents(id, 1), "the wait to start", 20_000);
+            const held = (await goalOf(id))!;
+
+            assert.equal(held.round, 1, "no round 2 while the command runs");
+            assert.deepEqual(await sent(id), ["Round 1"]);
+        } finally {
+            await setBackground(id, { status: "exited", notify: true });
+        }
+
+        await until(
+            async () => (await sent(id)).includes("Round 2"),
+            "round 2 after the command exits",
+            30_000,
+        );
+        const goal = await settled(id);
+
+        assert.equal(goal.reason, "done");
+        assert.deepEqual(await sent(id), ["Round 1", "Round 2", "The shift has stopped"]);
+        await setBackground(id, null);
+    });
+
+    test("Pi's own run holds the next round, and the round goes as soon as the run ends", async () => {
+        const id = await session("own-run");
+
+        await command(id, "max 2: scenario-own-run; stop when never");
+        await until(() => gates.has("scenario-own-run"), "round 1 to start");
+        // An automated input queues behind round 1, as a subagent's report or a background end does. Round 1's end
+        // starts a run with it, and that run is still on when the driver decides.
+        await (await app.harness.conversation(id, context))!.submit(
+            {
+                type: "input",
+                content:
+                    "[background] Task own-run exited with code 0 after 2m.\nIt printed nothing.",
+                whenBusy: "followUp",
+                requestId: "background:own-run",
+            },
+            context,
+        );
+        open("scenario-own-run");
+
+        try {
+            await until(() => gates.has("own-run"), "the automated input's run to start");
+            await until(() => waitingForSubagents(id, 1), "the wait to start", 20_000);
+            const held = (await goalOf(id))!;
+
+            assert.equal(held.round, 1, "no round 2 while Pi runs");
+            assert.deepEqual(await sent(id), ["Round 1"]);
+        } finally {
+            open("own-run");
+        }
+
+        // The end of the run ends the wait: round 2 comes well before the next poll (15 s).
+        await until(
+            async () => (await sent(id)).includes("Round 2"),
+            "round 2 when the run ends",
+            10_000,
+        );
+        const goal = await settled(id);
+
+        assert.equal(goal.reason, "max-rounds");
+        assert.equal(goal.status, "ended", "an automated input is no person");
         assert.deepEqual(await sent(id), ["Round 1", "Round 2", "The shift has stopped"]);
     });
 

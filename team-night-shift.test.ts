@@ -948,6 +948,33 @@ describe("delegated goals", () => {
         assert.equal(goal.stop, "the work is done");
         assert.equal(goal.maxRounds, 20);
 
+        // The supervisor's address, from the linked session's first message: the goal keeps it, and the round names it.
+        const users = (await entries(linked)).items.filter((entry) => entry.kind === "pi.user");
+        const address = /Message from linked session (session-[0-9a-f-]+)/.exec(
+            JSON.stringify(users.at(-1)?.model),
+        )?.[1];
+
+        assert.ok(address !== undefined, "the first message names the return address");
+        assert.equal(goal.delegated?.address, address);
+        await until(
+            async () =>
+                (await entries(linked)).items.some((entry) =>
+                    JSON.stringify(entry.model).includes("[shift] Round 1"),
+                ),
+            "round 1",
+            20_000,
+        );
+        const round = (await entries(linked)).items.find((entry) =>
+            JSON.stringify(entry.model).includes("[shift] Round 1"),
+        );
+
+        assert.match(
+            JSON.stringify(round?.model),
+            new RegExp(
+                `To ask Odrade something before then \\(a decision, or the facts of another desk thread\\), send team_message to ${address}\\.`,
+            ),
+        );
+
         const card = await command(linked, "team-shift", "status");
 
         assert.match(JSON.stringify(card), /Shift: /);

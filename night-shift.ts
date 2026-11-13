@@ -15,9 +15,12 @@
  *   first without the second does not run it again; the round says it was cut off.
  * - A `start` time is a restart-safe wait in the task's `wait` phase, before round 1: a restart sleeps again until the
  *   stored start, and a server that was down past it starts round 1 at once. Round 1 starts only in `decide`.
- * - After round 1, `decide` waits while Pi's own subagents still work (`pocket.subagents`): a round sent then would only
- *   hear "still waiting". One poll is a restart-safe wait, and a memo keyed by the round holds the wait's start, so a
- *   restart waits for the rest of the same hour and no round is counted meanwhile.
+ * - After round 1, `decide` waits while Pi waits for work that will wake it: while Pi runs in the session (a subagent's
+ *   report or a background command's end started a run), while its own subagents still work (`pocket.subagents`), and
+ *   while a background command that will tell Pi it ended still runs, or is still to tell it (`pocket.background`). A
+ *   round sent then would only hear "still waiting". A PR watch does not hold a round: it can last for weeks. One poll
+ *   is a restart-safe wait (it ends early when Pi's run ends), and a memo keyed by the round holds the wait's start, so
+ *   a restart waits for the rest of the same hour and no round is counted meanwhile.
  *
  * State is one document per conversation, `x.night-shift.goal`. It is stored data: never rename it or change what a
  * field means.
@@ -125,9 +128,9 @@ const SHOW_ENDED_MS = 12 * 3600_000;
 /** How long the report to a delegated goal's supervisor session may be. */
 const MAX_REPORT = 8000;
 
-/** How often `decide` looks again while Pi's own subagents work. */
+/** How often `decide` looks again while Pi waits for work: its run, its subagents, a background command. */
 export const SUBAGENT_POLL_MS = 15_000;
-/** The longest `decide` waits for them before one round: after it, the round goes anyway. */
+/** The longest `decide` waits for that work before one round: after it, the round goes anyway. */
 export const SUBAGENT_WAIT_MS = 60 * 60_000;
 
 const PREFIX = "[shift]";
@@ -376,9 +379,10 @@ export type Goal = {
     endedAt?: number;
     /**
      * Set by `team_delegate`: the goal belongs to a linked session, and when it stops the driver reports to the
-     * source session of that linked session.
+     * source session of that linked session. `address` (added later; absent in older goals) is that source session's
+     * address, from the linked session's first message, when the goal was set: the round names it for questions.
      */
-    delegated?: { supervisor: string };
+    delegated?: { supervisor: string; address?: string };
 };
 
 export const GoalDoc = defineDoc<{ goal?: Goal }>({
@@ -430,6 +434,39 @@ const SubagentsDoc = defineDoc<{
     checkpointWhen: (_value, _ops, info) => info.deltasSinceBase >= 64,
     initial: () => ({ agents: {}, reporters: {} }),
 });
+
+/** The fields of one of Pocket's background commands that say whether Pi still hears of it. */
+export type BackgroundItem = {
+    status: "starting" | "running" | "exited" | "stopped" | "lost";
+    notify: boolean;
+    untold?: true;
+};
+
+/**
+ * Pocket's background commands of this conversation (`background.ts`), read only. It is Pocket's own document, not
+ * public API: when its shape changes, reading it fails, and the driver then does not wait for them. Never write it.
+ */
+const BackgroundDoc = defineDoc<{ items: Record<string, BackgroundItem> }>({
+    kind: "pocket.background",
+    version: 1,
+    scope: "conversation",
+    history: "latest",
+    fork: "initial",
+    // The same as Pocket's own base, `rebased` in src/server/docs.ts: not part of the stored meaning.
+    checkpointWhen: (_value, _ops, info) => info.deltasSinceBase >= 64,
+    initial: () => ({ items: {} }),
+});
+
+/**
+ * Whether a background command will still wake Pi: it runs (or starts) and tells Pi when it ends (`notify`), or it
+ * ended and Pi is still to be told (`untold`). One that Pi stopped itself (`notify: false`) wakes nobody.
+ */
+export function backgroundWakes(item: BackgroundItem): boolean {
+    return (
+        item.untold === true ||
+        (item.notify === true && (item.status === "starting" || item.status === "running"))
+    );
+}
 
 // ─── Parsing what people type ────────────────────────────────────────────────
 
@@ -1364,6 +1401,11 @@ export function roundMessage(goal: Goal, n: number, now: number): string {
             ? []
             : [
                   `Your shift report goes to ${goal.delegated.supervisor} by itself when the shift stops. Do not send a separate team_message report.`,
+                  ...(goal.delegated.address === undefined
+                      ? []
+                      : [
+                            `To ask ${goal.delegated.supervisor} something before then (a decision, or the facts of another desk thread), send team_message to ${goal.delegated.address}.`,
+                        ]),
               ]),
         "Work toward the objective now. End your answer with one status line: STATUS: DONE, STATUS: CONTINUE, or STATUS: BLOCKED, then the reason.",
     ].join("\n");
@@ -1868,19 +1910,73 @@ export default function createNightShift(host: Host, web: Web) {
         }
     }
 
+    /** Whether a background command of this session will still tell Pi that it ended. A failure to read means no. */
+    async function backgroundBusy(runtime: Runtime, context: Context): Promise<boolean> {
+        try {
+            const doc = await runtime.snapshot(BackgroundDoc, runtime.conversationId, context);
+
+            return Object.values(doc?.items ?? {}).some((item) => backgroundWakes(item));
+        } catch {
+            return false;
+        }
+    }
+
     /**
-     * Sleep until the next look at the subagents, or until the end of this round's wait. A goal that stops or another
-     * driver that takes over ends the sleep, as in `wait`.
+     * Whether Pi runs in this session now: a subagent's report, a background command's end, or another automated input
+     * started a run, and a round sent now would only wait behind it. A failure to read means no.
+     *
+     * Its queue needs no look of its own: Pi Durable queues an input only while a run is on, and places the queue at
+     * that run's end in the same commit that starts the next run. Inputs that stay queued with no run belong to a
+     * failed run, and nothing wakes Pi for them: the next round places them.
+     */
+    async function ownRunBusy(runtime: Runtime, context: Context): Promise<boolean> {
+        try {
+            return (
+                (await runtime.snapshot(LiveDoc, runtime.conversationId, context))?.run !==
+                undefined
+            );
+        } catch {
+            return false;
+        }
+    }
+
+    /**
+     * Whether Pi waits for work that will wake it, so a round sent now would only hear "still waiting": Pi runs now
+     * (`run`), or its subagents work, or a background command will tell it that it ended (`work`). Undefined when
+     * nothing will wake it. A PR watch does not count: it can last for weeks.
+     */
+    async function waitsForWork(
+        runtime: Runtime,
+        context: Context,
+    ): Promise<"run" | "work" | undefined> {
+        if (await ownRunBusy(runtime, context)) {
+            return "run";
+        }
+
+        if ((await subagentsBusy(runtime, context)) || (await backgroundBusy(runtime, context))) {
+            return "work";
+        }
+
+        return undefined;
+    }
+
+    /**
+     * Sleep until the next look, or until the end of this round's wait. A goal that stops or another driver that takes
+     * over ends the sleep, as in `wait`. So does the end of Pi's own run (`running`: it ran at the look, or starts
+     * during the sleep): the round then goes at once, not one poll later.
      */
     async function sleepBeforeLook(
         runtime: Runtime,
         startedAt: number,
+        running: boolean,
         context: Context,
     ): Promise<void> {
         const id = runtime.conversationId;
         const until = Math.min(runtime.now() + SUBAGENT_POLL_MS, startedAt + SUBAGENT_WAIT_MS);
         const controller = new AbortController();
         const watch = await runtime.watchDoc(GoalDoc, id, context);
+        const live = await runtime.watchDoc(LiveDoc, id, context);
+        let ran = running;
 
         try {
             if (watch !== undefined) {
@@ -1903,37 +1999,64 @@ export default function createNightShift(host: Host, web: Web) {
                 watch.start(look);
             }
 
+            if (live !== undefined) {
+                const ended = async (argument: unknown) => {
+                    const value = watchDocumentValue<NonNullable<typeof live>["value"]>(argument);
+
+                    if (value === undefined) {
+                        return;
+                    }
+
+                    if (value?.run !== undefined) {
+                        ran = true;
+                    } else if (ran) {
+                        controller.abort();
+                    }
+                };
+
+                await ended(live.value);
+                live.start(ended);
+            }
+
             await sleepInPhase(runtime, until, withAbortSignal(controller.signal, context));
         } catch (failure) {
-            // The goal stopped, or another driver took over. Any other rejection is not ours to swallow.
+            // The goal stopped, another driver took over, or Pi's run ended. Any other rejection is not ours to swallow.
             if (!controller.signal.aborted) {
                 throw failure;
             }
         } finally {
+            await live?.stop();
             await watch?.stop();
         }
     }
 
     /**
-     * While Pi's own subagents work after round 1: the start of this round's wait, from a memo keyed by the round, or
-     * undefined when they are done (or before round 2). The memo makes the wait restart-safe: a restart goes on with the
-     * same hour, and no round is counted meanwhile. `decide` gives up the wait after `SUBAGENT_WAIT_MS`.
+     * While Pi waits for work after round 1 (`waitsForWork`): the start of this round's wait, from a memo keyed by the
+     * round, and whether Pi runs now; or undefined when nothing will wake Pi (or before round 2). The memo keeps its
+     * stored name `subagents-<round>`, from when only subagents held a round. It makes the wait restart-safe: a restart
+     * goes on with the same hour, and no round is counted meanwhile. `decide` gives up the wait after
+     * `SUBAGENT_WAIT_MS`.
      */
     async function subagentWaitStart(
         runtime: Runtime,
         context: Context,
-    ): Promise<number | undefined> {
+    ): Promise<{ start: number; running: boolean } | undefined> {
         const goal = await mine(runtime, context);
 
         if (goal === undefined || goal.status !== "running" || goal.round === 0) {
             return undefined;
         }
 
-        if (!(await subagentsBusy(runtime, context))) {
+        const busy = await waitsForWork(runtime, context);
+
+        if (busy === undefined) {
             return undefined;
         }
 
-        return runtime.memo<number>(`subagents-${goal.round}`, runtime.now(), context);
+        return {
+            start: await runtime.memo<number>(`subagents-${goal.round}`, runtime.now(), context),
+            running: busy === "run",
+        };
     }
 
     /** A person's message waiting in the session's queue. */
@@ -2144,7 +2267,8 @@ export default function createNightShift(host: Host, web: Web) {
 
             /**
              * Before each round: a person's message, plan mode, a spend limit, the rounds, the deadline, and, after round
-             * 1, Pi's own subagents. While they work, a poll sleeps and looks again; every poll runs the stop checks.
+             * 1, work that will wake Pi (`waitsForWork`). While Pi waits for it, a poll sleeps and looks again; every poll
+             * runs the stop checks.
              */
             decide: async (_task, runtime, context) => {
                 const id = runtime.conversationId;
@@ -2155,7 +2279,8 @@ export default function createNightShift(host: Host, web: Web) {
                     const plan = await planOn(runtime, context);
                     const held = host.heldBack(id);
                     // Read before the commit, which reads documents only through `tx`.
-                    const startedAt = await subagentWaitStart(runtime, context);
+                    const busy = await subagentWaitStart(runtime, context);
+                    const startedAt = busy?.start;
                     const waiting: { start?: number } = {};
 
                     await runtime.commit(async (tx) => {
@@ -2199,7 +2324,8 @@ export default function createNightShift(host: Host, web: Web) {
                             return stopped("deadline");
                         }
 
-                        // Pi's own subagents still work: no round is counted or sent until they stop, or the cap.
+                        // Pi still waits for work (its run, its subagents, a background command): no round is counted
+                        // or sent until it ends, or the cap.
                         if (startedAt !== undefined && now - startedAt < SUBAGENT_WAIT_MS) {
                             waiting.start = startedAt;
 
@@ -2215,7 +2341,7 @@ export default function createNightShift(host: Host, web: Web) {
                         break;
                     }
 
-                    await sleepBeforeLook(runtime, waiting.start, context);
+                    await sleepBeforeLook(runtime, waiting.start, busy?.running === true, context);
                 }
 
                 announce(id, seen.goal);
@@ -2693,6 +2819,9 @@ export default function createNightShift(host: Host, web: Web) {
             throw new Error(`Pi cannot start: ${held}.`);
         }
 
+        // The supervisor's address, for the rounds: the linked session's first message names it. None: the old words.
+        const address = await returnAddress(tx, id).catch(() => undefined);
+
         const goal: Goal = {
             id: goalId,
             ...request,
@@ -2703,7 +2832,10 @@ export default function createNightShift(host: Host, web: Web) {
             round: 0,
             seen: 0,
             rounds: [],
-            delegated: { supervisor: who.supervisor },
+            delegated: {
+                supervisor: who.supervisor,
+                ...(address === undefined ? {} : { address }),
+            },
         };
 
         await drive(tx, id, goal);
