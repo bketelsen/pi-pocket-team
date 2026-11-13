@@ -66,6 +66,8 @@ import {
     ToolTask,
     type ConversationId,
     type Cursor,
+    type HookApi,
+    type ToolHooks,
     type DocumentReader,
     type EntryId,
     LiveDoc,
@@ -6974,6 +6976,143 @@ export function markHandled(
     thread.run.handled = { at: action.at, by: action.by, act: action.act };
 
     return true;
+}
+
+/**
+ * The address of a supervisor's message to an agent: the `to` of a `team_message` call, or of a built-in `team` call
+ * with `action: "send"`. Undefined for any other call, and for an empty or missing `to`.
+ */
+export function messageTo(call: { name: string; arguments: unknown }): string | undefined {
+    const args = (call.arguments ?? {}) as { action?: unknown; to?: unknown };
+
+    if (call.name !== "team_message" && (call.name !== "team" || args.action !== "send")) {
+        return undefined;
+    }
+
+    return typeof args.to === "string" && args.to !== "" ? args.to : undefined;
+}
+
+/**
+ * Record the supervisor's message to the agent at the address `to`: each thread of `supervisor` with that address gets
+ * 1 event under `key` and the handled mark `message` at `at`. A key the thread has already changes nothing, so a re-run
+ * of the same call marks once, and 2 calls with their own keys mark twice. The ids of the threads it changed.
+ */
+export function markMessaged(
+    state: DeskState,
+    message: { supervisor: number; to: string; key: string; at: number; by: string; tool: string },
+): string[] {
+    const changed: string[] = [];
+
+    for (const thread of Object.values(state.threads)) {
+        if (
+            thread.supervisor === message.supervisor &&
+            thread.address === message.to &&
+            addEvent(
+                thread,
+                message.key,
+                `message from ${message.by} sent with ${message.tool}`,
+                message.at,
+            )
+        ) {
+            markHandled(thread, { at: message.at, by: message.by, act: "message" });
+            changed.push(thread.id);
+        }
+    }
+
+    return changed;
+}
+
+/** The memo of a message call's time before it ran: a re-run of the task reads the first value. */
+const messageAtMemo = (callId: string) => `desk.messageAt:${callId}`;
+
+/**
+ * The hooks that mark a thread handled when the supervisor's `team_message` or built-in `team` send goes to its agent:
+ * a decision about the thread's news, so a Clerk escalation of older news is dropped. `beforeTool` keeps the time
+ * before the send in a memo of the call; `afterTool` marks with that time, so a report that comes during the send, or
+ * a recovery after a restart, stays newer than the mark. The event key is the task and the call, so 2 sends in 1
+ * codemode script mark twice, and a re-run of 1 call marks once. Any other call returns at once, with no read. They
+ * never block a call or change its result, and an error never fails the call.
+ */
+export function supervisorMessageHooks(deps: {
+    now: () => number;
+    persona: (api: HookApi, context: Context) => Promise<{ name: string } | undefined>;
+    commitOf: (
+        api: object,
+    ) => ((change: (tx: Tx) => Promise<undefined>, context: Context) => Promise<void>) | undefined;
+    announce: () => void;
+}): Pick<ToolHooks, "beforeTool" | "afterTool"> {
+    return {
+        beforeTool: async (call, api, context) => {
+            try {
+                if (messageTo(call) !== undefined) {
+                    await api.memo(messageAtMemo(call.id), deps.now(), context);
+                }
+            } catch {
+                // No time: the call runs, and marks nothing.
+            }
+
+            return undefined;
+        },
+        afterTool: async (call, result, api, context) => {
+            try {
+                const to = messageTo(call);
+
+                if (to === undefined || result.isError === true) {
+                    return undefined;
+                }
+
+                const at = await api.memo<number>(messageAtMemo(call.id), context);
+
+                if (typeof at !== "number") {
+                    return undefined;
+                }
+
+                const supervisor = Number(api.conversationId);
+                const state = await api.snapshot(DeskThreads, context);
+                const known = Object.values(state?.threads ?? {}).some(
+                    (thread) => thread.supervisor === supervisor && thread.address === to,
+                );
+
+                if (!known) {
+                    return undefined;
+                }
+
+                const commit = deps.commitOf(api);
+
+                if (commit === undefined) {
+                    return undefined;
+                }
+
+                const by = (await deps.persona(api, context))?.name ?? "supervisor";
+                let changed: string[] = [];
+
+                await commit.call(
+                    api,
+                    async (tx) => {
+                        changed = markMessaged(await tx.doc(DeskThreads), {
+                            supervisor,
+                            to,
+                            key: `message:${api.taskId}:${call.id}`,
+                            at,
+                            by,
+                            tool: call.name,
+                        });
+
+                        return undefined;
+                    },
+                    context,
+                );
+
+                if (changed.length > 0) {
+                    deps.announce();
+                }
+            } catch {
+                // The message went: a missing mark only lets an escalation through.
+            }
+
+            return undefined;
+        },
+    };
 }
 
 /**
@@ -17886,7 +18025,8 @@ export function deliverCheck(
  * thread of each earlier attempt of the same task (`earlier`) and the thread of the newest attempt of each of its deps;
  * for `verify`, the thread of the newest attempt of every task of the approved graph and every other verification
  * thread. The new thread itself, a thread the desk does not know, and a thread of another supervisor than the plan
- * thread's (or every thread, when the plan thread is gone) get no mark.
+ * thread's (or every thread, when the plan thread is gone) get no mark. A new thread of another supervisor than the
+ * plan thread's marks nothing.
  */
 function markTaskRelated(
     state: DeskState,
@@ -17898,7 +18038,11 @@ function markTaskRelated(
 ): void {
     const planThread = threadById(state, plan.thread);
 
-    if (planThread === undefined) {
+    // Only the plan's own supervisor acts on its threads: another supervisor's delegation marks none.
+    if (
+        planThread === undefined ||
+        threadById(state, threadId)?.supervisor !== planThread.supervisor
+    ) {
         return;
     }
 
@@ -32775,88 +32919,17 @@ export default function createDesk(host: Host, web: Web) {
         },
     });
 
-    /**
-     * The supervisor's message to a thread's agent, with `team_message` or the built-in `team` send: a decision about
-     * the thread's news, so the thread gets the handled mark `message`, and a Clerk escalation of older news is dropped.
-     * The event key of the tool task makes a re-run change nothing. It runs on every tool call: any other call returns
-     * at once, with no read. It never changes the result, and an error never fails the call.
-     */
-    const supervisorMessage = hook(ToolTask, {
-        afterTool: async (call, result, api, context) => {
-            try {
-                const args = call.arguments as { action?: unknown; to?: unknown };
-                const to = args.to;
-
-                if (
-                    (call.name !== "team_message" &&
-                        (call.name !== "team" || args.action !== "send")) ||
-                    typeof to !== "string" ||
-                    to === "" ||
-                    result.isError === true
-                ) {
-                    return undefined;
-                }
-
-                const supervisor = Number(api.conversationId);
-                const state = await api.snapshot(DeskThreads, context);
-                const ids = Object.values(state?.threads ?? {})
-                    .filter((thread) => thread.supervisor === supervisor && thread.address === to)
-                    .map((thread) => thread.id);
-
-                if (ids.length === 0) {
-                    return undefined;
-                }
-
-                const commit = entryCommit(api);
-
-                if (commit === undefined) {
-                    return undefined;
-                }
-
-                const persona = await teamApi()?.persona(api, api.conversationId, context);
-                const by = persona?.name ?? "supervisor";
-                const at = Date.now();
-                let changed = false;
-
-                await commit.call(
-                    api,
-                    async (tx) => {
-                        const draft = await tx.doc(DeskThreads);
-
-                        for (const id of ids) {
-                            const thread = threadById(draft, id);
-
-                            if (
-                                thread !== undefined &&
-                                thread.supervisor === supervisor &&
-                                thread.address === to &&
-                                addEvent(
-                                    thread,
-                                    `message:${api.taskId}`,
-                                    `message from ${by} sent with ${call.name}`,
-                                    at,
-                                )
-                            ) {
-                                markHandled(thread, { at, by, act: "message" });
-                                changed = true;
-                            }
-                        }
-
-                        return undefined;
-                    },
-                    context,
-                );
-
-                if (changed) {
-                    announced(undefined);
-                }
-            } catch {
-                // The message went: a missing mark only lets an escalation through.
-            }
-
-            return undefined;
-        },
-    });
+    /** The supervisor's message to a thread's agent marks the thread handled: see `supervisorMessageHooks`. */
+    const supervisorMessage = hook(
+        ToolTask,
+        supervisorMessageHooks({
+            now: () => Date.now(),
+            persona: async (api, context) =>
+                await teamApi()?.persona(api, api.conversationId, context),
+            commitOf: (api) => entryCommit(api),
+            announce: () => announced(undefined),
+        }),
+    );
 
     /**
      * conversation id → the consult nonces of its first `pi.user` entry (none: no consult). The first entry never

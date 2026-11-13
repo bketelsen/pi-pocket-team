@@ -1841,6 +1841,28 @@ describe("the delivery of a task", () => {
         }
     });
 
+    test("a delegation thread of another supervisor marks no related thread of the plan", () => {
+        const { state } = approvedPlan();
+
+        for (const id of ["T4", "T5", "T6", "T7"]) {
+            other(state, id);
+        }
+
+        assert(!("error" in startTask(state, "T1", "t1", "T4", tick(4), "Odrade")));
+        assert(!("error" in startTask(state, "T1", "t2", "T5", tick(5), "Odrade")));
+        assert.equal((state.threads.T4?.run.handled as { at?: number }).at, tick(5));
+
+        // A new attempt of t1 and a verify, each on a thread of another supervisor: the plan's threads keep their marks.
+        state.threads.T6!.supervisor = 9;
+        state.threads.T7!.supervisor = 9;
+        assert(!("error" in startTask(state, "T1", "t1", "T6", tick(6), "Other")));
+        assert(!("error" in startTask(state, "T1", "verify", "T7", tick(7), "Other")));
+        assert.equal((state.threads.T4?.run.handled as { at?: number }).at, tick(5));
+        assert.equal(state.threads.T5?.run.handled, undefined);
+        assert.equal(state.threads.T6?.run.handled, undefined);
+        assert.equal(state.threads.T7?.run.handled, undefined);
+    });
+
     test("a started task marks no related thread of another supervisor, and a replay changes no mark", () => {
         const { state } = approvedPlan();
 

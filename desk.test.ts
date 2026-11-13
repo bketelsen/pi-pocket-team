@@ -33,7 +33,14 @@ import { createServer } from "node:http";
 import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
 import { fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
-import { defineDoc, type ConversationId, LiveDoc, type TaskId } from "@earendil-works/pi-durable";
+import {
+    defineDoc,
+    type ConversationId,
+    type HookApi,
+    LiveDoc,
+    type TaskId,
+    type ToolHookCall,
+} from "@earendil-works/pi-durable";
 import { ScheduleDoc, SubagentsDoc } from "./_pocket/src/server/docs.ts";
 import { RUN_END, turnTexts } from "./scripted-turn-fixture.ts";
 import {
@@ -155,6 +162,9 @@ import {
     QUIET_WATCH_MS,
     markHandled,
     markNamedAsks,
+    markMessaged,
+    messageTo,
+    supervisorMessageHooks,
     handledActWords,
     handledAfter,
     dropHandled,
@@ -4389,6 +4399,132 @@ describe("a handled report and a quiet wake", () => {
         assert.deepEqual(markNamedAsks(state, "T1b only", 7, "T4", 200), []);
         assert.deepEqual(markNamedAsks(state, "T1a again", 7, "T4", 200), ["T1"]);
         assert.equal((state.threads.T1?.run.handled as { by?: string }).by, "supervisor");
+    });
+
+    test("messageTo reads the address of a team_message or a team send, and nothing else", () => {
+        assert.equal(
+            messageTo({ name: "team_message", arguments: { to: "session-a" } }),
+            "session-a",
+        );
+        assert.equal(
+            messageTo({ name: "team", arguments: { action: "send", to: "session-a" } }),
+            "session-a",
+        );
+        assert.equal(
+            messageTo({ name: "team", arguments: { action: "list", to: "session-a" } }),
+            undefined,
+        );
+        assert.equal(messageTo({ name: "team_message", arguments: { to: "" } }), undefined);
+        assert.equal(messageTo({ name: "desk", arguments: { to: "session-a" } }), undefined);
+    });
+
+    test("markMessaged marks once for each call key, and the mark moves to a second call", () => {
+        const state: DeskState = {
+            ...empty(),
+            threads: {
+                T1: thread({ id: "T1", supervisor: 7, address: "session-a" }),
+                T2: thread({ id: "T2", supervisor: 9, address: "session-a" }),
+                T3: thread({ id: "T3", supervisor: 7, address: "session-b" }),
+            },
+        };
+        const message = { supervisor: 7, to: "session-a", by: "Odrade", tool: "team" };
+
+        // 2 sends in 1 codemode script: 1 task, 2 call ids.
+        assert.deepEqual(markMessaged(state, { ...message, key: "message:task:call-1", at: 100 }), [
+            "T1",
+        ]);
+        assert.deepEqual(markMessaged(state, { ...message, key: "message:task:call-2", at: 200 }), [
+            "T1",
+        ]);
+        assert.deepEqual(state.threads.T1?.run.handled, { at: 200, by: "Odrade", act: "message" });
+        assert.equal(
+            state.threads.T1?.events.filter((event) => event.key.startsWith("message:")).length,
+            2,
+        );
+        // The same call again adds nothing.
+        assert.deepEqual(
+            markMessaged(state, { ...message, key: "message:task:call-2", at: 300 }),
+            [],
+        );
+        assert.equal((state.threads.T1?.run.handled as { at?: number }).at, 200);
+        assert.equal(state.threads.T1?.events.length, 2);
+        assert.equal(state.threads.T2?.run.handled, undefined, "another supervisor's thread");
+        assert.equal(state.threads.T3?.run.handled, undefined, "another address");
+    });
+
+    test("the message hooks mark with the time before the send, and 2 calls of 1 task mark twice", async () => {
+        const state: DeskState = {
+            ...empty(),
+            threads: { T1: thread({ id: "T1", supervisor: 7, address: "session-a" }) },
+        };
+        const memos = new Map<string, JsonValue>();
+        const api = {
+            taskId: "task-1",
+            conversationId: "7",
+            memo: async (name: string, ...rest: unknown[]) => {
+                if (rest.length === 2 && !memos.has(name)) {
+                    memos.set(name, rest[0] as JsonValue);
+                }
+
+                return memos.get(name);
+            },
+            snapshot: async () => state,
+            commit: async (change: (tx: unknown) => Promise<undefined>) => {
+                await change({ doc: async () => state });
+            },
+        } as unknown as HookApi;
+        let clock = 1000;
+        let announced = 0;
+        const hooks = supervisorMessageHooks({
+            now: () => clock,
+            persona: async () => ({ name: "Odrade" }),
+            commitOf: (each) => (each as { commit: never }).commit,
+            announce: () => {
+                announced += 1;
+            },
+        });
+
+        const send = async (id: string, sendTakes: number) => {
+            const call = {
+                id,
+                name: "team",
+                arguments: { action: "send", to: "session-a", message: "Merge it." },
+            } as unknown as ToolHookCall;
+
+            assert.equal(await hooks.beforeTool!(call, api, context), undefined);
+            // The send runs: a report can come in this time.
+            clock += sendTakes;
+            assert.equal(await hooks.afterTool!(call, { output: [] }, api, context), undefined);
+            // A re-run of the same call's hook (a recovery) keeps the first time and adds nothing.
+            clock += 5000;
+            await hooks.afterTool!(call, { output: [] }, api, context);
+        };
+
+        await send("call-1", 300);
+        assert.deepEqual(state.threads.T1?.run.handled, { at: 1000, by: "Odrade", act: "message" });
+
+        await send("call-2", 300);
+        assert.deepEqual(state.threads.T1?.run.handled, { at: 6300, by: "Odrade", act: "message" });
+        assert.deepEqual(
+            state.threads.T1?.events.map((event) => [event.key, event.at]),
+            [
+                ["message:task-1:call-1", 1000],
+                ["message:task-1:call-2", 6300],
+            ],
+        );
+        assert.equal(announced, 2);
+
+        // An error result, and a call with no time from before it, mark nothing.
+        const failed = {
+            id: "call-3",
+            name: "team_message",
+            arguments: { to: "session-a" },
+        } as unknown as ToolHookCall;
+
+        await hooks.beforeTool!(failed, api, context);
+        await hooks.afterTool!(failed, { output: [], isError: true }, api, context);
+        await hooks.afterTool!({ ...failed, id: "call-4" }, { output: [] }, api, context);
+        assert.equal(state.threads.T1?.events.length, 2);
     });
 
     test("handledAfter is true at and after the mark, and false before it, with a safe read", () => {
