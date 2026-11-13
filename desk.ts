@@ -7006,7 +7006,8 @@ export function messageTo(call: { name: string; arguments: unknown }): string | 
 /**
  * Record the supervisor's message to the agent at the address `to`: each thread of `supervisor` with that address gets
  * 1 event under `key` and the handled mark `message` at `at`. A key the thread has already changes nothing, so a re-run
- * of the same call marks once, and 2 calls with their own keys mark twice. The ids of the threads it changed.
+ * of the same call marks once, and 2 calls with their own keys mark twice. `at` is the time before the send, so
+ * `lastEventAt` never moves back: it keeps the newer of its value and `at`. The ids of the threads it changed.
  */
 export function markMessaged(
     state: DeskState,
@@ -7015,6 +7016,9 @@ export function markMessaged(
     const changed: string[] = [];
 
     for (const thread of Object.values(state.threads)) {
+        // The time is from before the send: an event that came during the send keeps the thread's newest event time.
+        const lastEventAt = thread.lastEventAt;
+
         if (
             thread.supervisor === message.supervisor &&
             thread.address === message.to &&
@@ -7025,6 +7029,7 @@ export function markMessaged(
                 message.at,
             )
         ) {
+            thread.lastEventAt = Math.max(lastEventAt, message.at);
             markHandled(thread, { at: message.at, by: message.by, act: "message" });
             changed.push(thread.id);
         }

@@ -4418,6 +4418,33 @@ describe("a handled report and a quiet wake", () => {
         assert.equal(messageTo({ name: "desk", arguments: { to: "session-a" } }), undefined);
     });
 
+    test("markMessaged never moves lastEventAt back to the time before the send", () => {
+        const state: DeskState = {
+            ...empty(),
+            threads: {
+                T1: thread({ id: "T1", supervisor: 7, address: "session-a", lastEventAt: 200 }),
+                T2: thread({ id: "T2", supervisor: 7, address: "session-a", lastEventAt: 50 }),
+            },
+        };
+
+        // A report at 200 came during the send, which started at 100.
+        assert.deepEqual(
+            markMessaged(state, {
+                supervisor: 7,
+                to: "session-a",
+                key: "message:task:call-1",
+                at: 100,
+                by: "Odrade",
+                tool: "team_message",
+            }),
+            ["T1", "T2"],
+        );
+        assert.equal((state.threads.T1?.run.handled as { at?: number }).at, 100);
+        assert.equal(state.threads.T1?.lastEventAt, 200);
+        // An older event time moves forward to the message.
+        assert.equal(state.threads.T2?.lastEventAt, 100);
+    });
+
     test("markMessaged marks once for each call key, and the mark moves to a second call", () => {
         const state: DeskState = {
             ...empty(),

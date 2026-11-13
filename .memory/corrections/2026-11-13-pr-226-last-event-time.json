@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-13",
+  "scope": "desk.ts",
+  "correction": "markMessaged passed the time before the send to addEvent, which set lastEventAt to it, so an event that came during the send had its lastEventAt moved back and isStale could see an active thread as stale; markMessaged keeps lastEventAt at the newer of its value and the message time",
+  "evidence": "bketelsen/pi-pocket-team#226, cross-review (openai/gpt-6.1-sol) of head 055ac7c",
+  "promoted_to": "desk.test.ts: markMessaged never moves lastEventAt back to the time before the send"
+}
