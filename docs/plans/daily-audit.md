@@ -1,7 +1,10 @@
 # Daily audit of pi-pocket-team operations: design
 
-Status: design, decided by Brian on 2026-10-23 (desk thread T108, asks T108a and T108b; Section 11).
-Nothing here is installed or turned on.
+Status: done (checked 2026-11-13 at `d05d04e`): built and running. Design decided by Brian on 2026-10-23 (desk thread
+T108, asks T108a and T108b; Section 11). `audit/daily.mjs` came in #31 (merged on 2026-10-23; reference
+[docs/modules/daily-audit.md](../modules/daily-audit.md)), and a Pocket schedule runs it each day at 06:30: Odrade's
+reports folder has 1 report for each day from 2026-10-24 to 2026-11-13. Roll-out steps 1 to 3 (Section 10) are done;
+the keep decision after the first week is not recorded here.
 
 The daily audit reads one day of the team's work and gives Brian at most 5 small proposals, each
 backed by facts. It reads, counts and compares. It never changes anything. Mechanical checks do the
