@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-13",
+  "scope": "desk.ts",
+  "correction": "markTaskRelated marked a plan's task threads when another supervisor delegated a task of that plan; it marks only when the new thread's supervisor is the plan thread's supervisor",
+  "evidence": "bketelsen/pi-pocket-team#226, cross-review (openai/gpt-6.1-sol) of head 49c604f",
+  "promoted_to": "desk-plans.test.ts: a delegation thread of another supervisor marks no related thread of the plan"
+}

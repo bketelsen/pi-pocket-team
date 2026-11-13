@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-13",
+  "scope": "desk.ts",
+  "correction": "The message mark's event key was message:<taskId>, so 2 sends in 1 codemode script shared it and the second marked nothing; the key is message:<taskId>:<callId>",
+  "evidence": "bketelsen/pi-pocket-team#226, cross-review (openai/gpt-6.1-sol) of head 49c604f",
+  "promoted_to": "desk.test.ts: markMessaged marks once for each call key, and the mark moves to a second call"
+}

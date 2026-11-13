@@ -98,7 +98,9 @@ caused it: when the Clerk got the thread's news in a digest taken at most 60 min
 newest item time of that news (`clerkNews`); else the call's time. The desk drops the escalation when:
 
 - the supervisor acted on the thread with a `desk` action at or after the cause (`handled`: send, watch,
-  result, ask, answer, rewrite, withdraw, attach, detach, or a plan task's delegation); or
+  result, ask, answer, rewrite, withdraw, attach, detach, or a plan task's delegation), or with a message
+  to the agent (`team_message` or `team` send), a delegation whose text names an answered ask of the
+  thread, or the delegation of a plan task that waits for the thread's task, or that repeats it; or
 - the supervisor got news of the thread directly in her own digest at or after the cause (`told`); an
   acknowledgement (`answer`), the issue kinds and the escalation kinds never count.
 

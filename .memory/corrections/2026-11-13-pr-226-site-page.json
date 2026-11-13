@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-13",
+  "scope": "site/content",
+  "correction": "The site page of the desk did not say that a message to the thread's agent and a delegation that acts on the thread count as the supervisor's acts that drop a Clerk escalation; a change to a module's behavior changes its site page in the same PR",
+  "evidence": "bketelsen/pi-pocket-team#226, cross-review (openai/gpt-6.1-sol) of head 49c604f",
+  "promoted_to": "AGENTS.md"
+}

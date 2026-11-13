@@ -66,6 +66,8 @@ import {
     ToolTask,
     type ConversationId,
     type Cursor,
+    type HookApi,
+    type ToolHooks,
     type DocumentReader,
     type EntryId,
     LiveDoc,
@@ -493,7 +495,10 @@ export type Thread = {
      * thread that stays quiet, with no report after it, may close again, see `quietSilence`; a thread stored with it
      * keeps that meaning, and a quiet wake now keeps the thread closed, see `quietWake`), `handled` (`{ at, by, act
      * }`: the newest `desk` action of the supervisor on the thread, `at` its time, `by` its name, and `act` the action's
-     * name; a report filed at or before `at` needs no escalation, see `handledAfter`), `told` (`{ at, kind }`: the newest item time
+     * name; also the supervisor's message to the thread's agent with `team_message` or the `team` send (`message`), and
+     * a delegation (`delegate`) of a plan task that repeats the thread's task or waits for it (`markTaskRelated`), or
+     * whose text names an answered ask of the thread (`markNamedAsks`); a report filed at or before `at` needs no
+     * escalation, see `handledAfter`), `told` (`{ at, kind }`: the newest item time
      * of news of the thread that went to the supervisor itself in a digest message, and that item's kind; the kinds
      * `answer`, the issue kinds and the escalation kinds never set it; a Clerk escalation whose cause is at or before
      * `at` is dropped, see `escalationDrop`), `clerkNews` (`{ at, sent }`: the newest item time of the thread's news
@@ -6985,6 +6990,148 @@ export function markHandled(
 }
 
 /**
+ * The address of a supervisor's message to an agent: the `to` of a `team_message` call, or of a built-in `team` call
+ * with `action: "send"`. Undefined for any other call, and for an empty or missing `to`.
+ */
+export function messageTo(call: { name: string; arguments: unknown }): string | undefined {
+    const args = (call.arguments ?? {}) as { action?: unknown; to?: unknown };
+
+    if (call.name !== "team_message" && (call.name !== "team" || args.action !== "send")) {
+        return undefined;
+    }
+
+    return typeof args.to === "string" && args.to !== "" ? args.to : undefined;
+}
+
+/**
+ * Record the supervisor's message to the agent at the address `to`: each thread of `supervisor` with that address gets
+ * 1 event under `key` and the handled mark `message` at `at`. A key the thread has already changes nothing, so a re-run
+ * of the same call marks once, and 2 calls with their own keys mark twice. `at` is the time before the send, so
+ * `lastEventAt` never moves back: it keeps the newer of its value and `at`. The ids of the threads it changed.
+ */
+export function markMessaged(
+    state: DeskState,
+    message: { supervisor: number; to: string; key: string; at: number; by: string; tool: string },
+): string[] {
+    const changed: string[] = [];
+
+    for (const thread of Object.values(state.threads)) {
+        // The time is from before the send: an event that came during the send keeps the thread's newest event time.
+        const lastEventAt = thread.lastEventAt;
+
+        if (
+            thread.supervisor === message.supervisor &&
+            thread.address === message.to &&
+            addEvent(
+                thread,
+                message.key,
+                `message from ${message.by} sent with ${message.tool}`,
+                message.at,
+            )
+        ) {
+            thread.lastEventAt = Math.max(lastEventAt, message.at);
+            markHandled(thread, { at: message.at, by: message.by, act: "message" });
+            changed.push(thread.id);
+        }
+    }
+
+    return changed;
+}
+
+/** The memo of a message call's time before it ran: a re-run of the task reads the first value. */
+const messageAtMemo = (callId: string) => `desk.messageAt:${callId}`;
+
+/**
+ * The hooks that mark a thread handled when the supervisor's `team_message` or built-in `team` send goes to its agent:
+ * a decision about the thread's news, so a Clerk escalation of older news is dropped. `beforeTool` keeps the time
+ * before the send in a memo of the call; `afterTool` marks with that time, so a report that comes during the send, or
+ * a recovery after a restart, stays newer than the mark. The event key is the task and the call, so 2 sends in 1
+ * codemode script mark twice, and a re-run of 1 call marks once. Any other call returns at once, with no read. They
+ * never block a call or change its result, and an error never fails the call.
+ */
+export function supervisorMessageHooks(deps: {
+    now: () => number;
+    persona: (api: HookApi, context: Context) => Promise<{ name: string } | undefined>;
+    commitOf: (
+        api: object,
+    ) => ((change: (tx: Tx) => Promise<undefined>, context: Context) => Promise<void>) | undefined;
+    announce: () => void;
+}): Pick<ToolHooks, "beforeTool" | "afterTool"> {
+    return {
+        beforeTool: async (call, api, context) => {
+            try {
+                if (messageTo(call) !== undefined) {
+                    await api.memo(messageAtMemo(call.id), deps.now(), context);
+                }
+            } catch {
+                // No time: the call runs, and marks nothing.
+            }
+
+            return undefined;
+        },
+        afterTool: async (call, result, api, context) => {
+            try {
+                const to = messageTo(call);
+
+                if (to === undefined || result.isError === true) {
+                    return undefined;
+                }
+
+                const at = await api.memo<number>(messageAtMemo(call.id), context);
+
+                if (typeof at !== "number") {
+                    return undefined;
+                }
+
+                const supervisor = Number(api.conversationId);
+                const state = await api.snapshot(DeskThreads, context);
+                const known = Object.values(state?.threads ?? {}).some(
+                    (thread) => thread.supervisor === supervisor && thread.address === to,
+                );
+
+                if (!known) {
+                    return undefined;
+                }
+
+                const commit = deps.commitOf(api);
+
+                if (commit === undefined) {
+                    return undefined;
+                }
+
+                const by = (await deps.persona(api, context))?.name ?? "supervisor";
+                let changed: string[] = [];
+
+                await commit.call(
+                    api,
+                    async (tx) => {
+                        changed = markMessaged(await tx.doc(DeskThreads), {
+                            supervisor,
+                            to,
+                            key: `message:${api.taskId}:${call.id}`,
+                            at,
+                            by,
+                            tool: call.name,
+                        });
+
+                        return undefined;
+                    },
+                    context,
+                );
+
+                if (changed.length > 0) {
+                    deps.announce();
+                }
+            } catch {
+                // The message went: a missing mark only lets an escalation through.
+            }
+
+            return undefined;
+        },
+    };
+}
+
+/**
  * Whether the supervisor acted on a thread at or after `at`: a report filed at `at` needs no escalation then. False
  * when the thread has no mark, or the stored one has another shape.
  */
@@ -7054,6 +7201,11 @@ export function escalationCause(thread: Thread | undefined, at: number): number 
         : at;
 }
 
+/** A handled mark's act in words: `message` is the supervisor's message to the agent, any other act is `desk <act>`. */
+export function handledActWords(act: string): string {
+    return act === "message" ? "a message to its agent" : `desk ${act}`;
+}
+
 /**
  * Why a Clerk escalation with this cause repeats known news, in words; undefined to keep it. It is dropped when the
  * supervisor acted on the thread at or after the cause (`handledAfter`), or got news of the thread directly at or after
@@ -7067,7 +7219,7 @@ export function escalationDrop(thread: Thread | undefined, cause: number): strin
     const handled = handledMark(thread);
 
     if (handled !== undefined && handled.at >= cause) {
-        return `the supervisor acted after its news: desk ${handled.act} at ${new Date(handled.at).toISOString()}`;
+        return `the supervisor acted after its news: ${handledActWords(handled.act)} at ${new Date(handled.at).toISOString()}`;
     }
 
     const told = toldMark(thread);
@@ -13149,6 +13301,42 @@ export function asksBrian(text: string, options: { report?: boolean } = {}): boo
 const ASK_IDS = /\b[TF][1-9][0-9]*[a-z]+\b/g;
 
 /**
+ * Mark the thread of each answered ask that a delegation's text names with the handled mark `delegate`: the
+ * supervisor acted on Brian's answer, so a Clerk escalation of it is dropped. An open ask, an id the desk does not know,
+ * an ask of another supervisor, and an ask on the new thread `threadId` itself mark nothing. The ids of the threads it
+ * marked, each once.
+ */
+export function markNamedAsks(
+    state: DeskState,
+    text: string,
+    supervisor: number,
+    threadId: string,
+    at: number,
+    by = "supervisor",
+): string[] {
+    const marked: string[] = [];
+
+    for (const id of new Set([...text.matchAll(ASK_IDS)].map((match) => match[0]))) {
+        const found = askById(state, id);
+
+        if (
+            found === undefined ||
+            found.ask.answer === undefined ||
+            found.thread.id === threadId ||
+            found.thread.supervisor !== supervisor ||
+            marked.includes(found.thread.id)
+        ) {
+            continue;
+        }
+
+        markHandled(found.thread, { at, by, act: "delegate" });
+        marked.push(found.thread.id);
+    }
+
+    return marked;
+}
+
+/**
  * Whether the last paragraph, as `asksBrian` reads it, names at least 1 ask that is open on the desk now (`askIsOpen`),
  * whatever turn or session filed it. Such a reply points Brian at an ask he already has ("T382g: rotate the key?"), so
  * the reminder does not fire. An id in a fenced code block does not count; an id in inline code does, because it still
@@ -14519,7 +14707,7 @@ export function readText(state: Readonly<DeskState> | undefined, id: string): st
     const handledLine =
         handled === undefined || reportedAt === undefined || !handledAfter(thread, reportedAt)
             ? undefined
-            : `Handled: ${iso(handled.at)} · by ${handled.by} · desk ${handled.act} · after the newest report: no escalation for it`;
+            : `Handled: ${iso(handled.at)} · by ${handled.by} · ${handledActWords(handled.act)} · after the newest report: no escalation for it`;
 
     return [
         `${thread.id} · ${thread.state} · ${thread.title}`,
@@ -17849,10 +18037,65 @@ export function deliverCheck(
 }
 
 /**
+ * Mark the threads that a new plan task delegation acts on, with the handled mark `delegate`: for a graph task, the
+ * thread of each earlier attempt of the same task (`earlier`) and the thread of the newest attempt of each of its deps;
+ * for `verify`, the thread of the newest attempt of every task of the approved graph and every other verification
+ * thread. The new thread itself, a thread the desk does not know, and a thread of another supervisor than the plan
+ * thread's (or every thread, when the plan thread is gone) get no mark. A new thread of another supervisor than the
+ * plan thread's marks nothing.
+ */
+function markTaskRelated(
+    state: DeskState,
+    plan: Plan,
+    taskId: string,
+    threadId: string,
+    earlier: readonly string[],
+    action: { at: number; by: string; act: string },
+): void {
+    const planThread = threadById(state, plan.thread);
+
+    // Only the plan's own supervisor acts on its threads: another supervisor's delegation marks none.
+    if (
+        planThread === undefined ||
+        threadById(state, threadId)?.supervisor !== planThread.supervisor
+    ) {
+        return;
+    }
+
+    const graph = approvedGraphOf(plan);
+    const newest = (id: string) =>
+        graph?.tasks.find((each) => each.id === id)?.attempts.at(-1)?.thread;
+    const ids =
+        taskId === "verify"
+            ? [
+                  ...(graph?.tasks ?? []).map((each) => each.attempts.at(-1)?.thread),
+                  ...(plan.verification?.threads ?? []),
+              ]
+            : [
+                  ...earlier,
+                  ...(graph?.tasks.find((each) => each.id === taskId)?.deps ?? []).map(newest),
+              ];
+
+    for (const id of new Set(ids)) {
+        const related = id === undefined ? undefined : threadById(state, id);
+
+        if (
+            related !== undefined &&
+            related.id !== threadId &&
+            related.supervisor === planThread.supervisor
+        ) {
+            markHandled(related, action);
+        }
+    }
+}
+
+/**
  * Record that a plan task's thread opened: the task is delegated, the attempt is stored, and the plan moves from
  * `approved` to `building`. The task `verify` is the whole-plan check: its thread goes in `verification.threads`. The
  * plan thread gets the handled mark `delegate` by `by` (the supervisor's name, else "supervisor") when a thread binds,
- * and never on a replay that changes nothing.
+ * and never on a replay that changes nothing. A new binding also marks the related threads (`markTaskRelated`): the
+ * earlier attempts of the same task and the newest attempt of each dep, or for `verify` the newest attempt of every
+ * task and the other verification threads, so a Clerk escalation of their older news is dropped.
  */
 export function startTask(
     state: DeskState,
@@ -17907,6 +18150,10 @@ export function startTask(
             }
         }
 
+        if (bound) {
+            markTaskRelated(state, plan, "verify", thread.id, [], { at, by, act: "delegate" });
+        }
+
         return {};
     }
 
@@ -17933,6 +18180,7 @@ export function startTask(
     // The graph named the home, and the delivery a repository of the agent (`deliverCheck`): the attempt keeps it, and
     // the approved graph stays as Brian approved it.
     const repo = task.repo === undefined ? thread.repo : undefined;
+    const earlier = task.attempts.map((each) => each.thread);
 
     task.state = "delegated";
     task.attempts.push({ thread: threadId, at, ...(repo === undefined ? {} : { repo }), prs: [] });
@@ -17964,6 +18212,7 @@ export function startTask(
     }
 
     thread.planTask = { plan: plan.thread, task: taskId };
+    markTaskRelated(state, plan, taskId, thread.id, earlier, { at, by, act: "delegate" });
 
     return { task };
 }
@@ -24443,6 +24692,15 @@ export default function createDesk(host: Host, web: Web) {
                 });
                 const thread = state.threads[opened.thread.id] ?? opened.thread;
 
+                // A plan for an answered ask is the supervisor's act on that ask's thread.
+                markNamedAsks(
+                    state,
+                    request.task === undefined ? start.idea : `${start.idea}\n${request.task}`,
+                    request.supervisor,
+                    thread.id,
+                    request.at,
+                );
+
                 await startSweeper(tx, request.supervisor);
 
                 return {
@@ -24540,6 +24798,9 @@ export default function createDesk(host: Host, web: Web) {
                     throw new Error(started.error);
                 }
             }
+
+            // A delegation that names an answered ask is the supervisor's act on that ask's thread.
+            markNamedAsks(state, request.task ?? "", request.supervisor, thread.id, request.at);
 
             // A task text that names an open plan gets 1 warning: the desk can check a delegation that names its plan.
             const warning =
@@ -32674,6 +32935,18 @@ export default function createDesk(host: Host, web: Web) {
         },
     });
 
+    /** The supervisor's message to a thread's agent marks the thread handled: see `supervisorMessageHooks`. */
+    const supervisorMessage = hook(
+        ToolTask,
+        supervisorMessageHooks({
+            now: () => Date.now(),
+            persona: async (api, context) =>
+                await teamApi()?.persona(api, api.conversationId, context),
+            commitOf: (api) => entryCommit(api),
+            announce: () => announced(undefined),
+        }),
+    );
+
     /**
      * conversation id → the consult nonces of its first `pi.user` entry (none: no consult). The first entry never
      * changes, so 1 read for each session is enough; a restart or a reload of the module reads it again.
@@ -36303,7 +36576,7 @@ export default function createDesk(host: Host, web: Web) {
     return defineExtension({
         name: "desk",
         tools: [tool, planTool],
-        hooks: [consultGuard, noTeamReport, noClerkMerge, reminder],
+        hooks: [consultGuard, noTeamReport, supervisorMessage, noClerkMerge, reminder],
         tasks: [
             Sweeper,
             NudgeTask,

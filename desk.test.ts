@@ -33,7 +33,14 @@ import { createServer } from "node:http";
 import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
 import { fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
-import { defineDoc, type ConversationId, LiveDoc, type TaskId } from "@earendil-works/pi-durable";
+import {
+    defineDoc,
+    type ConversationId,
+    type HookApi,
+    LiveDoc,
+    type TaskId,
+    type ToolHookCall,
+} from "@earendil-works/pi-durable";
 import { ScheduleDoc, SubagentsDoc } from "./_pocket/src/server/docs.ts";
 import { RUN_END, turnTexts } from "./scripted-turn-fixture.ts";
 import {
@@ -154,6 +161,11 @@ import {
     workedFolders,
     QUIET_WATCH_MS,
     markHandled,
+    markNamedAsks,
+    markMessaged,
+    messageTo,
+    supervisorMessageHooks,
+    handledActWords,
     handledAfter,
     dropHandled,
     countEscalations,
@@ -4039,6 +4051,26 @@ describe("the Clerk's escalations", () => {
         assert.equal(escalationDrop(told, 701), undefined);
     });
 
+    test("a message to the agent reads as such in a drop; every other act keeps its desk words", () => {
+        assert.equal(handledActWords("message"), "a message to its agent");
+        assert.equal(handledActWords("send"), "desk send");
+        assert.equal(handledActWords("delegate"), "desk delegate");
+        assert.equal(
+            escalationDrop(
+                thread({ run: { handled: { at: 500, by: "Odrade", act: "message" } } }),
+                400,
+            ),
+            `the supervisor acted after its news: a message to its agent at ${new Date(500).toISOString()}`,
+        );
+        assert.equal(
+            escalationDrop(
+                thread({ run: { handled: { at: 500, by: "Odrade", act: "send" } } }),
+                400,
+            ),
+            `the supervisor acted after its news: desk send at ${new Date(500).toISOString()}`,
+        );
+    });
+
     test("an escalation stays when the supervisor did nothing, and one with no thread is never dropped", () => {
         assert.equal(escalationDrop(thread(), 100), undefined);
         assert.equal(escalationDrop(undefined, 100), undefined);
@@ -4311,6 +4343,216 @@ describe("a handled report and a quiet wake", () => {
             run: { lastUserEntry: 6, otherUserEntry: 5, dirty: 1, ahead: 2, ...run },
             ...patch,
         });
+
+    test("markNamedAsks marks the thread of an answered ask that the text names, once", () => {
+        const answer = { at: 50, by: "brian", words: "Yes." };
+        const state: DeskState = {
+            ...empty(),
+            threads: {
+                T1: thread({
+                    id: "T1",
+                    supervisor: 7,
+                    asks: [
+                        { id: "T1a", text: "Rotate?", at: 10, answer },
+                        { id: "T1b", text: "Keep?", at: 11 },
+                    ],
+                }),
+                T2: thread({
+                    id: "T2",
+                    supervisor: 7,
+                    asks: [{ id: "T2a", text: "Open?", at: 10 }],
+                }),
+                T3: thread({
+                    id: "T3",
+                    supervisor: 9,
+                    asks: [{ id: "T3a", text: "Theirs?", at: 10, answer }],
+                }),
+                T4: thread({
+                    id: "T4",
+                    supervisor: 7,
+                    asks: [{ id: "T4a", text: "Mine?", at: 10, answer }],
+                }),
+            },
+        };
+
+        assert.deepEqual(
+            markNamedAsks(
+                state,
+                "Do T1a now (see T1a), then T2a, T3a, T4a and T99z.",
+                7,
+                "T4",
+                100,
+                "Odrade",
+            ),
+            ["T1"],
+        );
+        assert.deepEqual(state.threads.T1?.run.handled, {
+            at: 100,
+            by: "Odrade",
+            act: "delegate",
+        });
+        assert.equal(state.threads.T2?.run.handled, undefined, "an open ask");
+        assert.equal(state.threads.T3?.run.handled, undefined, "another supervisor's ask");
+        assert.equal(state.threads.T4?.run.handled, undefined, "the new thread itself");
+
+        // An open ask alone marks nothing; the name defaults to "supervisor".
+        assert.deepEqual(markNamedAsks(state, "T1b only", 7, "T4", 200), []);
+        assert.deepEqual(markNamedAsks(state, "T1a again", 7, "T4", 200), ["T1"]);
+        assert.equal((state.threads.T1?.run.handled as { by?: string }).by, "supervisor");
+    });
+
+    test("messageTo reads the address of a team_message or a team send, and nothing else", () => {
+        assert.equal(
+            messageTo({ name: "team_message", arguments: { to: "session-a" } }),
+            "session-a",
+        );
+        assert.equal(
+            messageTo({ name: "team", arguments: { action: "send", to: "session-a" } }),
+            "session-a",
+        );
+        assert.equal(
+            messageTo({ name: "team", arguments: { action: "list", to: "session-a" } }),
+            undefined,
+        );
+        assert.equal(messageTo({ name: "team_message", arguments: { to: "" } }), undefined);
+        assert.equal(messageTo({ name: "desk", arguments: { to: "session-a" } }), undefined);
+    });
+
+    test("markMessaged never moves lastEventAt back to the time before the send", () => {
+        const state: DeskState = {
+            ...empty(),
+            threads: {
+                T1: thread({ id: "T1", supervisor: 7, address: "session-a", lastEventAt: 200 }),
+                T2: thread({ id: "T2", supervisor: 7, address: "session-a", lastEventAt: 50 }),
+            },
+        };
+
+        // A report at 200 came during the send, which started at 100.
+        assert.deepEqual(
+            markMessaged(state, {
+                supervisor: 7,
+                to: "session-a",
+                key: "message:task:call-1",
+                at: 100,
+                by: "Odrade",
+                tool: "team_message",
+            }),
+            ["T1", "T2"],
+        );
+        assert.equal((state.threads.T1?.run.handled as { at?: number }).at, 100);
+        assert.equal(state.threads.T1?.lastEventAt, 200);
+        // An older event time moves forward to the message.
+        assert.equal(state.threads.T2?.lastEventAt, 100);
+    });
+
+    test("markMessaged marks once for each call key, and the mark moves to a second call", () => {
+        const state: DeskState = {
+            ...empty(),
+            threads: {
+                T1: thread({ id: "T1", supervisor: 7, address: "session-a" }),
+                T2: thread({ id: "T2", supervisor: 9, address: "session-a" }),
+                T3: thread({ id: "T3", supervisor: 7, address: "session-b" }),
+            },
+        };
+        const message = { supervisor: 7, to: "session-a", by: "Odrade", tool: "team" };
+
+        // 2 sends in 1 codemode script: 1 task, 2 call ids.
+        assert.deepEqual(markMessaged(state, { ...message, key: "message:task:call-1", at: 100 }), [
+            "T1",
+        ]);
+        assert.deepEqual(markMessaged(state, { ...message, key: "message:task:call-2", at: 200 }), [
+            "T1",
+        ]);
+        assert.deepEqual(state.threads.T1?.run.handled, { at: 200, by: "Odrade", act: "message" });
+        assert.equal(
+            state.threads.T1?.events.filter((event) => event.key.startsWith("message:")).length,
+            2,
+        );
+        // The same call again adds nothing.
+        assert.deepEqual(
+            markMessaged(state, { ...message, key: "message:task:call-2", at: 300 }),
+            [],
+        );
+        assert.equal((state.threads.T1?.run.handled as { at?: number }).at, 200);
+        assert.equal(state.threads.T1?.events.length, 2);
+        assert.equal(state.threads.T2?.run.handled, undefined, "another supervisor's thread");
+        assert.equal(state.threads.T3?.run.handled, undefined, "another address");
+    });
+
+    test("the message hooks mark with the time before the send, and 2 calls of 1 task mark twice", async () => {
+        const state: DeskState = {
+            ...empty(),
+            threads: { T1: thread({ id: "T1", supervisor: 7, address: "session-a" }) },
+        };
+        const memos = new Map<string, JsonValue>();
+        const api = {
+            taskId: "task-1",
+            conversationId: "7",
+            memo: async (name: string, ...rest: unknown[]) => {
+                if (rest.length === 2 && !memos.has(name)) {
+                    memos.set(name, rest[0] as JsonValue);
+                }
+
+                return memos.get(name);
+            },
+            snapshot: async () => state,
+            commit: async (change: (tx: unknown) => Promise<undefined>) => {
+                await change({ doc: async () => state });
+            },
+        } as unknown as HookApi;
+        let clock = 1000;
+        let announced = 0;
+        const hooks = supervisorMessageHooks({
+            now: () => clock,
+            persona: async () => ({ name: "Odrade" }),
+            commitOf: (each) => (each as { commit: never }).commit,
+            announce: () => {
+                announced += 1;
+            },
+        });
+
+        const send = async (id: string, sendTakes: number) => {
+            const call = {
+                id,
+                name: "team",
+                arguments: { action: "send", to: "session-a", message: "Merge it." },
+            } as unknown as ToolHookCall;
+
+            assert.equal(await hooks.beforeTool!(call, api, context), undefined);
+            // The send runs: a report can come in this time.
+            clock += sendTakes;
+            assert.equal(await hooks.afterTool!(call, { output: [] }, api, context), undefined);
+            // A re-run of the same call's hook (a recovery) keeps the first time and adds nothing.
+            clock += 5000;
+            await hooks.afterTool!(call, { output: [] }, api, context);
+        };
+
+        await send("call-1", 300);
+        assert.deepEqual(state.threads.T1?.run.handled, { at: 1000, by: "Odrade", act: "message" });
+
+        await send("call-2", 300);
+        assert.deepEqual(state.threads.T1?.run.handled, { at: 6300, by: "Odrade", act: "message" });
+        assert.deepEqual(
+            state.threads.T1?.events.map((event) => [event.key, event.at]),
+            [
+                ["message:task-1:call-1", 1000],
+                ["message:task-1:call-2", 6300],
+            ],
+        );
+        assert.equal(announced, 2);
+
+        // An error result, and a call with no time from before it, mark nothing.
+        const failed = {
+            id: "call-3",
+            name: "team_message",
+            arguments: { to: "session-a" },
+        } as unknown as ToolHookCall;
+
+        await hooks.beforeTool!(failed, api, context);
+        await hooks.afterTool!(failed, { output: [], isError: true }, api, context);
+        await hooks.afterTool!({ ...failed, id: "call-4" }, { output: [] }, api, context);
+        assert.equal(state.threads.T1?.events.length, 2);
+    });
 
     test("handledAfter is true at and after the mark, and false before it, with a safe read", () => {
         const marked = thread({ run: { handled: { at: 500, by: "Odrade", act: "send" } } });
@@ -13027,6 +13269,10 @@ const PlanDoc = defineDoc<{ on: boolean }>({
 let otherAddress = "";
 /** The address of a thread's agent: the supervisor's `team_message` goes there. */
 let quietAddress = "";
+/** The address of a thread's agent, for the supervisor's `team_message` and `team` send that mark it handled. */
+let messageAddress = "";
+/** An answered ask that a delegation's task text names. */
+let namedAskId = "";
 /** The supervisor's address for the linked session, for the built-in team tool's guard. */
 let guardAddress = "";
 /** The summary a night shift's model answers with: the long one when it is empty. */
@@ -13416,6 +13662,18 @@ function scriptStep(text: string, request: unknown): ReturnType<typeof script> |
         return call("team_message", { to: linkedAddressOf(request), message: LONG_REPORT });
     }
 
+    if (text.endsWith("team message handled test")) {
+        return call("team_message", { to: messageAddress, message: "Merge it when CI is green." });
+    }
+
+    if (text.endsWith("team send handled test")) {
+        return call("team", {
+            action: "send",
+            to: messageAddress,
+            message: "Merge it when CI is green.",
+        });
+    }
+
     if (text.endsWith("message elsewhere test")) {
         return call("team_message", { to: otherAddress, message: OTHER_REPORT });
     }
@@ -13532,6 +13790,14 @@ function scriptStep(text: string, request: unknown): ReturnType<typeof script> |
             agent: "gurney",
             repository: "frostyard/old",
             task: TASK,
+        });
+    }
+
+    if (text.endsWith("desk delegate named ask test")) {
+        return call("team_delegate", {
+            agent: "duncan",
+            repository: "frostyard/test",
+            task: `Brian answered ${namedAskId}. ${TASK}`,
         });
     }
 
@@ -19558,6 +19824,120 @@ describe("the desk in a Pi Pocket", () => {
             );
         } finally {
             sendThreadId = "";
+        }
+    });
+
+    test("a supervisor's team_message to a thread's agent marks the thread handled, and desk read shows it", async () => {
+        const { source, linked, thread } = await delegated("handled-message");
+
+        try {
+            await say(app, linked, "report to supervisor test");
+            await until(() => !app.isBusy(linked), "the report's turn", 20_000);
+
+            const filed = (await deskState())?.threads[thread.id];
+
+            assert.equal(filed?.run.handled, undefined, "no mark before the message");
+
+            messageAddress = thread.address ?? "";
+            assert.notEqual(messageAddress, "");
+            await say(app, source, "team message handled test");
+            await until(
+                async () => (await deskState())?.threads[thread.id]?.run.handled !== undefined,
+                "the handled mark",
+                20_000,
+            );
+
+            const marked = (await deskState())?.threads[thread.id];
+            const handled = marked?.run.handled as { at?: number; by?: string; act?: string };
+
+            assert.equal(handled.act, "message");
+            assert.equal(handled.by, "Odrade");
+            assert.equal(handledAfter(marked as Thread, filed?.run.reportedAt as number), true);
+            assert.match(
+                readText(await deskState(), thread.id) ?? "",
+                /^Handled: .* · by Odrade · a message to its agent · after the newest report: no escalation for it$/m,
+            );
+            assert.equal(
+                (marked?.events ?? []).filter((event) => event.key.startsWith("message:")).length,
+                1,
+            );
+        } finally {
+            messageAddress = "";
+            await until(() => !app.isBusy(linked), "the agent's turn", 20_000);
+        }
+    });
+
+    test("a supervisor's built-in team send to a thread's agent marks the thread handled", async () => {
+        const { source, linked, thread } = await delegated("handled-team-send");
+
+        try {
+            await say(app, linked, "report to supervisor test");
+            await until(() => !app.isBusy(linked), "the report's turn", 20_000);
+            assert.equal((await deskState())?.threads[thread.id]?.run.handled, undefined);
+
+            messageAddress = thread.address ?? "";
+            assert.notEqual(messageAddress, "");
+            await say(app, source, "team send handled test");
+            await until(
+                async () => (await deskState())?.threads[thread.id]?.run.handled !== undefined,
+                "the handled mark",
+                20_000,
+            );
+
+            const marked = (await deskState())?.threads[thread.id];
+            const handled = marked?.run.handled as { at?: number; by?: string; act?: string };
+
+            assert.equal(handled.act, "message");
+            assert.equal(handled.by, "Odrade");
+            assert.match(
+                marked?.events.map((event) => event.text).join("; ") ?? "",
+                /message from Odrade sent with team/,
+            );
+            assert.match(
+                readText(await deskState(), thread.id) ?? "",
+                /· a message to its agent ·/,
+            );
+        } finally {
+            messageAddress = "";
+            await until(() => !app.isBusy(linked), "the agent's turn", 20_000);
+        }
+    });
+
+    test("a delegation whose task names an answered ask marks that ask's thread handled", async () => {
+        const { source, thread } = await delegated("handled-named-ask");
+        const askId = `${thread.id}a`;
+
+        try {
+            await app.harness.commit(async (tx) => {
+                (await tx.doc(DeskThreads)).threads[thread.id]!.asks.push({
+                    id: askId,
+                    text: "Route the next task?",
+                    at: Date.now(),
+                    answer: { at: Date.now(), by: "brian", words: "Yes." },
+                });
+            }, context);
+            assert.equal((await deskState())?.threads[thread.id]?.run.handled, undefined);
+
+            namedAskId = askId;
+            await say(app, source, "desk delegate named ask test");
+
+            const state = await deskState();
+            const opened = Object.values(state?.threads ?? {}).find(
+                (each) =>
+                    each.supervisor === Number(source) &&
+                    each.id !== thread.id &&
+                    each.origin === "delegate",
+            );
+
+            assert(opened, "the second delegation opened a thread");
+            assert.deepEqual(state?.threads[thread.id]?.run.handled, {
+                at: opened.startedAt,
+                by: "supervisor",
+                act: "delegate",
+            });
+            assert.equal(opened.run.handled, undefined, "the new thread has no mark");
+        } finally {
+            namedAskId = "";
         }
     });
 

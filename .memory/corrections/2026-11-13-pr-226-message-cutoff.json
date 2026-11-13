@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-13",
+  "scope": "desk.ts",
+  "correction": "The supervisor's team_message or team send marked its thread handled with Date.now() after the send, so a report that came during the send or a recovery after a restart got a later mark and its news was dropped; the hook keeps the time before the send in a memo of the call and marks with it",
+  "evidence": "bketelsen/pi-pocket-team#226, cross-review (openai/gpt-6.1-sol) of head 49c604f",
+  "promoted_to": "desk.test.ts: the message hooks mark with the time before the send, and 2 calls of 1 task mark twice"
+}
