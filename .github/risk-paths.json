@@ -86,6 +86,21 @@
             "glob": "github-hooks.ts",
             "level": "L1",
             "why": "auth: the webhook listener on a LAN port, HMAC verification, and the webhook secret file"
+        },
+        {
+            "glob": "team.ts",
+            "level": "L1",
+            "why": "auth: the owner-only Team routes, and the memory routes where only the owner approves an agent's lesson"
+        },
+        {
+            "glob": "homewiki.ts",
+            "level": "L1",
+            "why": "auth: the owner-only Wiki routes that read files from disk, and the path check that keeps each read to a listed page"
+        },
+        {
+            "glob": "bench/lib/sandbox.mjs",
+            "level": "L1",
+            "why": "secrets and credentials: binds the real auth.json into the bench sandbox with write access"
         }
     ]
 }
