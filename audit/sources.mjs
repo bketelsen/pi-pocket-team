@@ -1248,6 +1248,8 @@ export const BLOCKER_MAX_QUERIES = 4;
 /** At most this many files of a PR are read; a PR with more is "too many files". */
 const BLOCKER_PR_FILES = 100;
 const CORRECTIONS_FILE = ".memory/corrections.jsonl";
+/** 1 record file of the new form: 1 JSON object with `date`, `scope`, `correction`, `evidence` and `promoted_to`. */
+const RECORD_FILE = /^\.memory\/corrections\/[^/]+\.json$/;
 
 /** The words that `checkGhArgs` refuses in a `gh` argument. */
 const READ_ONLY_REFUSED = /\b(mutation|subscription)\b/i;
@@ -1263,20 +1265,27 @@ const TEST_PATHS = [
 ];
 
 /**
- * The files of a PR's own diff that can guard a blocking point: test files, `AGENTS.md` files (any folder) and
- * `.memory/corrections.jsonl`. Each is `{ path, test, agents, corrections }`.
+ * The files of a PR's own diff that can guard a blocking point: test files, `AGENTS.md` files (any folder),
+ * `.memory/corrections.jsonl` (the old form of a correction record) and `.memory/corrections/<name>.json` files (the
+ * new form). Each is `{ path, test, agents, corrections, record }`. A record file is never a test file, even when its
+ * name matches a test pattern.
  */
 export function guardCandidates(prFiles) {
     return [
         ...new Set(prFiles.map((file) => file?.path).filter((path) => typeof path === "string")),
     ]
-        .map((path) => ({
-            path,
-            test: TEST_PATHS.some((pattern) => pattern.test(path)),
-            agents: /(^|\/)AGENTS\.md$/.test(path),
-            corrections: path === CORRECTIONS_FILE,
-        }))
-        .filter((file) => file.test || file.agents || file.corrections);
+        .map((path) => {
+            const record = RECORD_FILE.test(path);
+
+            return {
+                path,
+                test: !record && TEST_PATHS.some((pattern) => pattern.test(path)),
+                agents: /(^|\/)AGENTS\.md$/.test(path),
+                corrections: path === CORRECTIONS_FILE,
+                record,
+            };
+        })
+        .filter((file) => file.test || file.agents || file.corrections || file.record);
 }
 
 const escapeRegExp = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -1313,14 +1322,57 @@ const blobText = (blob) =>
           ? blob.text
           : null;
 
+/** A plain JSON object: not null, not an array. */
+const isPlainObject = (value) =>
+    typeof value === "object" && value !== null && !Array.isArray(value);
+
+/** The key of a correction record: every field but `promoted_to`, which a filled record may change. */
+const recordKey = (record) =>
+    JSON.stringify([record.date, record.scope, record.correction, record.evidence]);
+
+/** The regex that finds a mention of `ref` (`owner/name#N`, also without the owner) in a text, or null. */
+function mentionOf(ref) {
+    const [, owner, name, number] = /^([^/]+)\/([^#]+)#(\d+)$/.exec(ref) ?? [];
+
+    if (name === undefined) {
+        return null;
+    }
+
+    return new RegExp(
+        `(?<![\\w./-])(?:${escapeRegExp(owner)}\\/)?${escapeRegExp(name)}#${number}(?!\\d)`,
+        "i",
+    );
+}
+
+/** The result of a guard whose correction records cannot be read (a missing or truncated text, invalid JSON). */
+const textMissing = (test, agentsRule, skipped) => ({
+    final: true,
+    state: "merged",
+    guarded: null,
+    test,
+    agentsRule,
+    corrections: null,
+    correctionsLegacy: null,
+    correctionsFiles: null,
+    correctionsSkipped: skipped,
+    namesPr: null,
+    reason: "corrections text missing",
+});
+
 /**
  * The guard of 1 blocking point, from blob lookups at the reviewed head H and the PR's final head F. `lookup` is
- * `{ head, files }`: `head` is GitHub's object of H (null when GitHub does not have it); each file is a candidate of
- * `guardCandidates` with `atHead` and `atFinal`, the blob at H and at F (`{ oid, text?, isTruncated? }`, or null with
- * no blob). A file changed when it has a blob at F with another oid than at H (no blob at H: a new file); a deleted
- * file did not change. `corrections` counts the non-empty lines at F that are not at H.
+ * `{ head, files, skipped }`: `head` is GitHub's object of H (null when GitHub does not have it); each file is a
+ * candidate of `guardCandidates` with `atHead` and `atFinal`, the blob at H and at F (`{ oid, text?, isTruncated? }`,
+ * or null with no blob); `skipped` lists record files that the read-only `gh` refuses (default none). A file changed
+ * when it has a blob at F with another oid than at H (no blob at H: a new file); a deleted file did not change.
+ *
+ * `correctionsLegacy` counts the non-empty lines of `.memory/corrections.jsonl` at F that are not at H.
+ * `correctionsFiles` counts the new record files under `.memory/corrections/` whose record is not moved from the old
+ * file: a record whose `date`, `scope`, `correction` and `evidence` match a line of the old file at H is a moved
+ * record and counts for nothing. `corrections` is their sum; `namesPr` is true when an added old line or a counted
+ * record file names the PR.
  */
-export function guardOf(ref, { head, files }) {
+export function guardOf(ref, { head, files, skipped = [] }) {
     if (!head) {
         return { final: true, state: "merged", guarded: null, reason: "head not found" };
     }
@@ -1330,7 +1382,8 @@ export function guardOf(ref, { head, files }) {
     const test = files.some((file) => file.test && changed(file));
     const agentsRule = files.some((file) => file.agents && changed(file));
     const log = files.find((file) => file.corrections && changed(file));
-    let corrections = 0;
+    const mention = mentionOf(ref);
+    let correctionsLegacy = 0;
     let namesPr = false;
 
     if (log) {
@@ -1338,32 +1391,82 @@ export function guardOf(ref, { head, files }) {
         const after = blobText(log.atFinal);
 
         if (before === null || after === null) {
-            return {
-                final: true,
-                state: "merged",
-                guarded: null,
-                test,
-                agentsRule,
-                corrections: null,
-                namesPr: null,
-                reason: "corrections text missing",
-            };
+            return textMissing(test, agentsRule, skipped);
         }
 
         const lines = addedLines(before, after);
-        const [, owner, name, number] = /^([^/]+)\/([^#]+)#(\d+)$/.exec(ref) ?? [];
 
-        corrections = lines.length;
+        correctionsLegacy = lines.length;
+        namesPr = mention !== null && lines.some((line) => mention.test(line));
+    }
 
-        if (name !== undefined) {
-            const mention = new RegExp(
-                `(?<![\\w./-])(?:${escapeRegExp(owner)}\\/)?${escapeRegExp(name)}#${number}(?!\\d)`,
-                "i",
-            );
+    // A record file that is new at the final head: no blob at the reviewed head. Sorted, so the reads are stable.
+    const added = files
+        .filter((file) => file.record && file.atFinal && !file.atHead)
+        .sort((a, b) => a.path.localeCompare(b.path));
+    let correctionsFiles = 0;
 
-            namesPr = lines.some((line) => mention.test(line));
+    if (added.length > 0) {
+        // The old file's text at the reviewed head finds the records moved into the new form.
+        const old = files.find((file) => file.path === CORRECTIONS_FILE);
+        const before = old ? blobText(old.atHead) : null;
+
+        if (before === null) {
+            return textMissing(test, agentsRule, skipped);
+        }
+
+        // The keys of the old file's records, as a multiset: a record may be in it more than once.
+        const keys = new Map();
+
+        for (const line of linesOf(before)) {
+            let record;
+
+            try {
+                record = JSON.parse(line);
+            } catch {
+                continue;
+            }
+
+            if (!isPlainObject(record)) {
+                continue;
+            }
+
+            const key = recordKey(record);
+
+            keys.set(key, (keys.get(key) ?? 0) + 1);
+        }
+
+        for (const file of added) {
+            const text = blobText(file.atFinal);
+            let record;
+
+            try {
+                record = text === null ? null : JSON.parse(text);
+            } catch {
+                record = null;
+            }
+
+            if (!isPlainObject(record)) {
+                return textMissing(test, agentsRule, skipped);
+            }
+
+            const key = recordKey(record);
+            const left = keys.get(key) ?? 0;
+
+            if (left > 0) {
+                // Moved from the old file after the reviewed head: not a new record.
+                keys.set(key, left - 1);
+            } else {
+                correctionsFiles += 1;
+
+                if (mention !== null && mention.test(text)) {
+                    namesPr = true;
+                }
+            }
         }
     }
+
+    const corrections = correctionsLegacy + correctionsFiles;
 
     return {
         final: true,
@@ -1372,6 +1475,9 @@ export function guardOf(ref, { head, files }) {
         test,
         agentsRule,
         corrections,
+        correctionsLegacy,
+        correctionsFiles,
+        correctionsSkipped: skipped,
         namesPr,
     };
 }
@@ -1449,6 +1555,9 @@ function isWholePr(node) {
 /** The object lookups of 1 key in 1 blob query: H, and each candidate at H and at F. */
 const lookupCount = (key) => 1 + 2 * key.files.length;
 
+/** The files whose text the guard needs: the old corrections file, a record file, and the reference copy of the old file. */
+const needsText = (file) => Boolean(file.corrections || file.record || file.reference);
+
 /** 1 blob query: 1 `repository` alias per repository, and in it the lookups of each key. */
 function blobQuery(batch) {
     const repos = new Map();
@@ -1457,7 +1566,7 @@ function blobQuery(batch) {
         const lines = [`k${index}: object(oid: ${JSON.stringify(key.head)}) { oid }`];
 
         key.files.forEach((file, j) => {
-            const blob = file.corrections ? " ... on Blob { text isTruncated }" : "";
+            const blob = needsText(file) ? " ... on Blob { text isTruncated }" : "";
 
             for (const [mark, sha] of [
                 ["h", key.head],
@@ -1540,6 +1649,7 @@ function guardsOfAnswer(batch, aliases, answer, kinds) {
                     atHead: repo[`k${index}h${j}`],
                     atFinal: repo[`k${index}f${j}`],
                 })),
+                skipped: key.skipped ?? [],
             }),
         );
     });
@@ -1553,7 +1663,10 @@ function guardsOfAnswer(batch, aliases, answer, kinds) {
  * 40 to a GraphQL query, at most `BLOCKER_MAX_PR_QUERIES` queries: their state and their files. Step 2: for each
  * merged `(ref, head)`, the candidate files of the PR's own diff (`guardCandidates`) are looked up at the reviewed
  * head and at the final head, with no compare call: at most `BLOCKER_LOOKUPS` object lookups a query, at most
- * `BLOCKER_MAX_QUERIES` queries a run, newest keys first. Keys that do not fit, or whose answer is missing, stay
+ * `BLOCKER_MAX_QUERIES` queries a run, newest keys first. A record file under `.memory/corrections/` whose path holds
+ * a word the read-only `gh` refuses is not looked up: it is dropped and listed in the guard's `correctionsSkipped`.
+ * When a PR has a record file, the text of `.memory/corrections.jsonl` at the reviewed head is looked up too, as a
+ * reference, to find the records moved from that file. Keys that do not fit, or whose answer is missing, stay
  * pending: the next run tries again. A closed PR is final with no lookup. A PR node is used only when no error names
  * its alias and its file list is whole (`isWholePr`); else its keys stay pending, never final. Returns
  * `{ prs, guards, calls, pending, errors }`: `pending` counts every distinct `ref@head` with no final result yet
@@ -1668,18 +1781,46 @@ export function loadBlockerGuards(data, { gh, now, cache = {} }) {
         }
 
         const files = guardCandidates(node.files.nodes);
+        // A record file whose path holds a refused word is dropped from the lookup, not counted, and listed.
+        const skipped = files
+            .filter((file) => file.record && READ_ONLY_REFUSED.test(file.path))
+            .map((file) => file.path);
+        const looked = files.filter((file) => !(file.record && READ_ONLY_REFUSED.test(file.path)));
 
         if (node.files.totalCount > BLOCKER_PR_FILES) {
             guards[key] = tooMany;
-        } else if (point.head === node.headRefOid || files.length === 0) {
-            // No commit after the reviewed head, or no file that can guard: nothing to look up.
-            guards[key] = guardOf(point.ref, { head: { oid: point.head }, files: [] });
+        } else if (point.head === node.headRefOid || looked.length === 0) {
+            // No commit after the reviewed head, or no file that can guard: nothing to look up. A record file that the
+            // read-only gh refuses is skipped, so the result still names it.
+            guards[key] = guardOf(point.ref, { head: { oid: point.head }, files: [], skipped });
         } else {
-            const item = { key, ref: point.ref, head: point.head, final: node.headRefOid, files };
+            // A record file must be compared with the old file at H: its text is needed to find moved records.
+            if (
+                looked.some((file) => file.record) &&
+                !looked.some((file) => file.path === CORRECTIONS_FILE)
+            ) {
+                looked.push({
+                    path: CORRECTIONS_FILE,
+                    test: false,
+                    agents: false,
+                    corrections: false,
+                    record: false,
+                    reference: true,
+                });
+            }
+
+            const item = {
+                key,
+                ref: point.ref,
+                head: point.head,
+                final: node.headRefOid,
+                files: looked,
+                skipped,
+            };
 
             if (lookupCount(item) > BLOCKER_LOOKUPS) {
                 guards[key] = tooMany;
-            } else if (files.some((file) => READ_ONLY_REFUSED.test(file.path))) {
+            } else if (looked.some((file) => READ_ONLY_REFUSED.test(file.path))) {
                 // `checkGhArgs` refuses a query with these words: such a path cannot be looked up.
                 guards[key] = {
                     final: true,
