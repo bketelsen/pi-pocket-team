@@ -71,6 +71,7 @@ import {
     wakeParked,
     reparkRepairWoken,
     closeCheck,
+    copyHint,
     closeOutcome,
     closeoutHold,
     closeoutKey,
@@ -428,6 +429,24 @@ const errorOf = (result: { error: string } | object): string => {
 
 /** A thread id as a literal in a RegExp: the id depends on the tests that ran before. */
 const rx = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+describe("copyHint", () => {
+    test("names the thread's file in the export folder, and nothing without one", () => {
+        assert.equal(copyHint("T5", undefined), "");
+        assert.equal(copyHint("T5", "relative/desk"), "");
+        assert.match(copyHint("T5", "/home/x/desk/"), /`\/home\/x\/desk\/T5\.md`/);
+        assert.match(copyHint("F12", "/home/x/desk"), /`\/home\/x\/desk\/F12\.md`/);
+    });
+
+    test("an id in another form names only the folder, never the agent's text", () => {
+        for (const asked of ["../SECRET", "T0", "T5/../X", "X1", ""]) {
+            const hint = copyHint(asked, "/home/x/desk");
+
+            assert.match(hint, /`\/home\/x\/desk\/`, as `<id>\.md`/);
+            assert.ok(asked === "" || !hint.includes(asked), hint);
+        }
+    });
+});
 
 describe("threads", () => {
     test("the same key opens one thread, and a second open reuses it", () => {
@@ -28390,6 +28409,35 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
                     missingHash.replace("T99", "X"),
                     "the same error for another thread and a missing one, with a #",
                 );
+
+                // With an export folder: the refusal also names the thread's read-only copy there, in the same words for
+                // another thread and a missing one, so the hint never says that a thread exists.
+                const exportFolder = join(root, "agent-read-export");
+
+                writeFileSync(
+                    configPath,
+                    JSON.stringify({ digest: { minutes: 0 }, cap: 100, export: exportFolder }),
+                );
+
+                try {
+                    const anotherCopy = await messageOf(other.id);
+                    const missingCopy = await messageOf("#t99");
+
+                    assert.ok(
+                        anotherCopy.includes(
+                            `(the return address of your first message). Or read its read-only synced copy, \`${join(exportFolder, `${other.id}.md`)}\``,
+                        ),
+                        anotherCopy,
+                    );
+                    assert.ok(missingCopy.includes(join(exportFolder, "T99.md")), missingCopy);
+                    assert.equal(
+                        anotherCopy.replaceAll(other.id, "X"),
+                        missingCopy.replaceAll("T99", "X"),
+                        "the same error and copy hint for another thread and a missing one",
+                    );
+                } finally {
+                    writeFileSync(configPath, JSON.stringify({ digest: { minutes: 0 }, cap: 100 }));
+                }
 
                 // An agent with no thread of its own: the error says so, with the same hint. A session that a person
                 // started has no return address: the hint keeps the general words.
