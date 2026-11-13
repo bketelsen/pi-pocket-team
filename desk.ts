@@ -13709,6 +13709,8 @@ export type ThreadView = {
     lastEventAt: number;
     events: { at: number; text: string }[];
     supervisor?: number;
+    /** Bound session, when present; owner-only views need not infer it from a title. */
+    session?: number;
     hasSession: boolean;
     /** Whether it has an address: the page resolves the session id for it. */
     hasAddress: boolean;
@@ -13819,6 +13821,7 @@ export function threadView(
             text: event.text,
         })),
         ...(thread.supervisor === undefined ? {} : { supervisor: thread.supervisor }),
+        ...(thread.session === undefined ? {} : { session: thread.session }),
         hasSession: thread.session !== undefined,
         hasAddress: thread.address !== undefined,
         ...(thread.watch === undefined
