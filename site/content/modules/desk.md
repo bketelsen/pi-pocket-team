@@ -15,6 +15,8 @@ Files: `desk.ts` and `desk-web/`. The tools are `desk`, `team_delegate` and `tea
 
 The header counts what needs you, what is ready to merge, what is open, stale and parked, and how many threads count. A second view of the page is the **Dashboard**: the numbers of Desk-tracked work for 1 range and 1 scope. The 3 views (Desk, Dashboard, Board) have the same width, so the switch between them stays in 1 place. Its definitions are in [docs/desk-dashboard.md](https://github.com/bketelsen/pi-pocket-team/blob/main/docs/desk-dashboard.md).
 
+Native clients receive the bound session id in the owner-only thread views, when one exists, so opening a thread need not depend on its session title.
+
 ## The tools
 
 A session with a supervisor identity uses `desk`; another session is refused.

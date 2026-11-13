@@ -30392,3 +30392,26 @@ describe("the export queue across a module reload", () => {
         assert.equal(ran, true, "the step after a failed one runs");
     });
 });
+
+test("owner thread views expose the bound session without inferring one", () => {
+    const state = deskOf();
+
+    addAsk(state, {
+        thread: "new",
+        title: "CI fixes",
+        text: "Keep it?",
+        key: "view-session",
+        by: "Odrade",
+        supervisor: 1,
+        at: 100,
+    });
+    const thread = state.threads.T1!;
+
+    assert.equal(Object.hasOwn(threadView(state.threads, thread, 200), "session"), false);
+    thread.session = 42;
+    const view = threadView(state.threads, thread, 200);
+
+    assert.equal(view.session, 42);
+    assert.equal(view.hasSession, true);
+    assert.equal(view.title, "CI fixes");
+});
