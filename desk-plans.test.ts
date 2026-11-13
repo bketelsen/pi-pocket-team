@@ -1767,6 +1767,100 @@ describe("the delivery of a task", () => {
         assert.equal((plain.threads.T1?.run.handled as { by?: string }).by, "supervisor");
     });
 
+    test("a started task marks the thread of the newest attempt of each dep, and not its own thread", () => {
+        const { state } = approvedPlan();
+
+        other(state, "T4");
+        other(state, "T5");
+        other(state, "T6");
+        assert(!("error" in startTask(state, "T1", "t1", "T4", tick(4), "Odrade")));
+        assert(!("error" in startTask(state, "T1", "t1", "T5", tick(5), "Odrade")));
+        assert(!("error" in startTask(state, "T1", "t2", "T6", tick(6), "Odrade")));
+        // t2 waits for t1: the newest attempt of t1 (T5) gets the mark of the t2 delegation.
+        assert.deepEqual(state.threads.T5?.run.handled, {
+            at: tick(6),
+            by: "Odrade",
+            act: "delegate",
+        });
+        // An older attempt of the dep is not the dep's news: it keeps the mark of t1's second delegation.
+        assert.equal((state.threads.T4?.run.handled as { at?: number }).at, tick(5));
+        // The new thread itself has no mark.
+        assert.equal(state.threads.T6?.run.handled, undefined);
+    });
+
+    test("a started task marks the thread of each earlier attempt of the same task", () => {
+        const { state } = approvedPlan();
+
+        other(state, "T5");
+        other(state, "T6");
+        assert(!("error" in startTask(state, "T1", "t1", "T5", tick(4), "Odrade")));
+        // The first attempt has no earlier attempt and no dep: no task thread gets a mark.
+        assert.equal(state.threads.T5?.run.handled, undefined);
+        assert(!("error" in startTask(state, "T1", "t1", "T6", tick(5), "Odrade")));
+        assert.deepEqual(state.threads.T5?.run.handled, {
+            at: tick(5),
+            by: "Odrade",
+            act: "delegate",
+        });
+        assert.equal(state.threads.T6?.run.handled, undefined);
+    });
+
+    test("verify marks the newest thread of every task and the other verification threads", () => {
+        const { state } = approvedPlan();
+
+        for (const id of ["T4", "T5", "T6", "T7", "T8"]) {
+            other(state, id);
+        }
+
+        assert(!("error" in startTask(state, "T1", "t1", "T4", tick(4), "Odrade")));
+        assert(!("error" in startTask(state, "T1", "t2", "T5", tick(5), "Odrade")));
+        assert(!("error" in startTask(state, "T1", "verify", "T6", tick(6), "Odrade")));
+        assert.equal((state.threads.T4?.run.handled as { at?: number }).at, tick(6));
+        assert.equal((state.threads.T5?.run.handled as { at?: number }).at, tick(6));
+        assert.equal(state.threads.T6?.run.handled, undefined);
+
+        assert(!("error" in startTask(state, "T1", "verify", "T7", tick(7), "Odrade")));
+
+        for (const id of ["T4", "T5", "T6"]) {
+            assert.deepEqual(state.threads[id]?.run.handled, {
+                at: tick(7),
+                by: "Odrade",
+                act: "delegate",
+            });
+        }
+
+        assert.equal(state.threads.T7?.run.handled, undefined);
+        // A thread outside the plan gets no mark.
+        assert.equal(state.threads.T8?.run.handled, undefined);
+
+        // A replay of a verify binds nothing new: no mark moves.
+        assert(!("error" in startTask(state, "T1", "verify", "T7", tick(8), "Odrade")));
+
+        for (const id of ["T4", "T5", "T6"]) {
+            assert.equal((state.threads[id]?.run.handled as { at?: number }).at, tick(7));
+        }
+    });
+
+    test("a started task marks no related thread of another supervisor, and a replay changes no mark", () => {
+        const { state } = approvedPlan();
+
+        other(state, "T4").supervisor = 9;
+        other(state, "T5");
+        other(state, "T6");
+        assert(!("error" in startTask(state, "T1", "t1", "T4", tick(4), "Odrade")));
+        assert(!("error" in startTask(state, "T1", "t1", "T5", tick(5), "Odrade")));
+        // T4 is an earlier attempt, but of another supervisor.
+        assert.equal(state.threads.T4?.run.handled, undefined);
+        assert(!("error" in startTask(state, "T1", "t1", "T6", tick(6), "Odrade")));
+        assert.equal(state.threads.T4?.run.handled, undefined);
+        assert.equal((state.threads.T5?.run.handled as { at?: number }).at, tick(6));
+
+        // A replay for the same thread binds nothing new: no mark moves.
+        assert(!("error" in startTask(state, "T1", "t1", "T6", tick(9), "Odrade")));
+        assert.equal((state.threads.T5?.run.handled as { at?: number }).at, tick(6));
+        assert.equal(state.threads.T6?.run.handled, undefined);
+    });
+
     /** The roster now: lucilla owns a repository made after the approval. */
     const NOW: PlanRoster[] = [
         {
