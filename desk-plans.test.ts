@@ -12994,7 +12994,32 @@ describe("with the Pi Pocket app", () => {
             shift += 600_000;
             app = await openLogged(log);
             await startServer();
-            await new Promise((resolve) => setTimeout(resolve, 1500));
+
+            // The tasks the restart recovered are the only work that could send a 4th time, and no
+            // `x.desk.plan-send` is among them: this one ended before the restart. Wait until each recovered task has
+            // started and come to rest (it ended, it waits, or it sleeps until a time still ahead of the app's clock: a
+            // sleep that is due after the clock moved still has to run), so no try of one is still on its way.
+            const recovered = (await app.harness.inspect(context)).tasks.map(
+                (task) => task.record.id,
+            );
+
+            await until(
+                async () => {
+                    const ids = new Set(recovered);
+
+                    return (await app.harness.inspect(context)).tasks
+                        .filter((task) => ids.has(task.record.id))
+                        .every(
+                            (task) =>
+                                task.state.kind === "waiting" ||
+                                (task.state.kind === "sleeping" &&
+                                    task.state.until > Date.now() + shift),
+                        );
+                },
+                "the restart's recovered tasks to come to rest",
+                20_000,
+            );
+
             assert.equal(held.matched.length, 3, "no 4th try");
             assert.equal((await live()).length, 0);
             assert.equal(log.filter(notice).length, 1);

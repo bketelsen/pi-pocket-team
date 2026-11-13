@@ -27,7 +27,7 @@ Every route is the owner's, and each handler checks it too: guests, viewers and 
 - **Memory:** the last 256 K characters of each shell are kept in memory, and one poll carries up to 16 terminals.
 - **Input:** at most 32 K characters a POST (413 above).
 - **Keys are written once.** Each chunk carries the tab and that tab's sequence number, and the server writes only a number newer than the last one it took. A POST that failed on the way is sent again with the same chunk and the same number, after 0.5, 1, 2 and 4 s. After 60 s the tab gives up and says how many characters may not have reached the shell.
-- **Back pressure is for each tab:** a shell pauses its output when the oldest tab still watching it is more than 128 K characters behind. A tab that has not polled for 30 s stops counting, and one shell keeps 16 tabs at most.
+- **Back pressure is for each tab:** a shell pauses its output when the oldest tab still watching it is more than 128 K characters behind. A tab that has not polled for 30 s stops counting, and one shell keeps 16 tabs at most. `PI_POCKET_TERMINAL_TAB_MS` lowers that span.
 - **When a shell ends:** Close, when the shell exits (its code shows for 60 s), 60 s after the last output poll, 60 minutes after the last keystroke, or when the module goes. `PI_POCKET_TERMINAL_DETACH_MS` and `PI_POCKET_TERMINAL_IDLE_MS` lower those 2 spans.
 - **Nothing is logged.** Keystrokes and output live in memory only; the server log gets a start failure, and nothing else.
 

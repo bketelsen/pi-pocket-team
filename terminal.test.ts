@@ -378,6 +378,17 @@ async function reloadWith(environment: Record<string, string | undefined>) {
     await app.setExtensionEnabled(owner(app), "terminal.ts", true);
 }
 
+/**
+ * Wait until the clock has passed `span` plus a margin, counted from this call. The condition is the clock, so the wait
+ * is as long as the span the module holds and never a guess at how long the work that reads it takes.
+ */
+async function pastSpan(span: number, what: string) {
+    const from = Date.now();
+
+    // 100 ms of margin: a receipt or a tab that the module sees as old by 1 ms is old enough.
+    await until(() => Date.now() >= from + span + 100, what, span + 10_000);
+}
+
 test("a terminal starts in a folder, takes input, and follows its size", async () => {
     const id = await start();
     const listed = await call("owner", "terminals");
@@ -593,6 +604,48 @@ test("back pressure follows the ack: a tab that received the output but drew lit
     await end(id);
 });
 
+test("a tab that has not polled for the tab span stops holding the shell", async () => {
+    // A short tab span, so the test does not wait the 30 s of the default.
+    await reloadWith({ PI_POCKET_TERMINAL_TAB_MS: "300" });
+
+    const id = await start();
+
+    try {
+        await type(id, "seq 1 400000\n");
+
+        // The slow tab receives the output and draws nothing: the shell pauses for it.
+        let received = 0;
+
+        for (let round = 0; round < 20; round++) {
+            const answer = await pollList([{ id, from: received, ack: 0 }], 600, "owner", "slow");
+            const entry = answer.data.terminals?.[id];
+
+            if (!entry || entry.data === "") {
+                break;
+            }
+
+            received = entry.to;
+        }
+
+        assert.ok(received > 128 * 1024, `the shell wrote ${received} characters before the pause`);
+        assert.ok(received < 512 * 1024, "far less than the 2 MB of output");
+
+        // The slow tab polls no more. Past the tab span, it stops counting: another tab that drew everything it got
+        // lets the shell go on. With the 30 s default, the slow tab would still hold it for this whole poll.
+        await pastSpan(300, "the tab span to pass");
+
+        const more = await pollList([{ id, from: received, ack: received }], 5000, "owner", "fast");
+
+        assert.ok(
+            (more.data.terminals?.[id]?.data ?? "").length > 0,
+            "the slow tab no longer holds the shell",
+        );
+    } finally {
+        await end(id);
+        await reloadWith({ PI_POCKET_TERMINAL_TAB_MS: undefined });
+    }
+});
+
 test("16 tabs type into a terminal; a 17th is refused", async () => {
     const id = await start();
 
@@ -625,7 +678,7 @@ test("a receipt expires after its own span, and then another tab may type", asyn
 
         assert.equal((await keys(id, "", "tab-16", 1)).status, 429);
 
-        await new Promise((resolve) => setTimeout(resolve, 400));
+        await pastSpan(300, "the receipt's span to pass");
 
         assert.equal(
             (await keys(id, "", "tab-16", 1)).status,
@@ -638,23 +691,30 @@ test("a receipt expires after its own span, and then another tab may type", asyn
     }
 });
 
-test("a receipt older than 30 s still blocks a repeated seq", async () => {
+test("a receipt older than the tab span still blocks a repeated seq", async () => {
+    // A short tab span: the tab stops counting for back pressure after TAB_MS, and its receipt lives far longer.
+    await reloadWith({ PI_POCKET_TERMINAL_TAB_MS: "200" });
+
     const id = await start();
 
-    assert.equal((await keys(id, "echo receipt-1\n", "tab-receipt", 1)).status, 200);
-    await expectOutput(id, (text) => /receipt-1/.test(text), "the first chunk");
-    await quiet(id);
+    try {
+        assert.equal((await keys(id, "echo receipt-1\n", "tab-receipt", 1)).status, 200);
+        await expectOutput(id, (text) => /receipt-1/.test(text), "the first chunk");
+        await quiet(id);
 
-    const after = collected(id).offset;
+        const after = collected(id).offset;
 
-    // Past the 30 s that a poll's tab is kept for: the receipt is still there, so the same seq writes nothing.
-    await new Promise((resolve) => setTimeout(resolve, 31_000));
+        // Past the tab span, the poll that follows drops the tab entry the terminal keeps for back pressure, and the
+        // receipt is still there: the same seq writes nothing, also with no tab entry.
+        await pastSpan(200, "the tab span to pass");
 
-    assert.equal((await keys(id, "echo receipt-1\n", "tab-receipt", 1)).status, 200);
-    await quiet(id);
-    assert.equal(collected(id).offset, after, "the repeated seq still writes nothing");
-
-    await end(id);
+        assert.equal((await keys(id, "echo receipt-1\n", "tab-receipt", 1)).status, 200);
+        await quiet(id);
+        assert.equal(collected(id).offset, after, "the repeated seq still writes nothing");
+    } finally {
+        await end(id);
+        await reloadWith({ PI_POCKET_TERMINAL_TAB_MS: undefined });
+    }
 });
 
 test("an input POST needs its tab and a positive seq", async () => {
