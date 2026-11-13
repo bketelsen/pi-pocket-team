@@ -3406,6 +3406,198 @@ test("loadBlockerGuards: a record file that the read-only gh refuses is skipped,
     });
 });
 
+test("loadBlockerGuards: a PR with no commit after the reviewed head still names a skipped record file", () => {
+    const refused = ".memory/corrections/2026-11-13-mutation-fix.json";
+    const { queries, gh } = guardGh(() => ({
+        state: "MERGED",
+        headRefOid: SHA_A,
+        files: prFiles("src/a.test.ts", refused),
+    }));
+    const result = loadBlockerGuards(blockerData([{ n: 4 }]), { gh, now: NOW });
+
+    // Nothing changed after the reviewed head: no lookup. The skipped record file is still named.
+    assert.deepEqual(queries, []);
+    assert.deepEqual(result.guards[`acme/w#4@${SHA_A}`], {
+        final: true,
+        state: "merged",
+        guarded: false,
+        test: false,
+        agentsRule: false,
+        corrections: 0,
+        correctionsLegacy: 0,
+        correctionsFiles: 0,
+        correctionsSkipped: [refused],
+        namesPr: false,
+    });
+});
+
+test("loadBlockerGuards: a moved record counts as often as the old file has its key at the reviewed head", () => {
+    const old = ".memory/corrections.jsonl";
+    const record = (slug: string) => `.memory/corrections/2026-11-13-${slug}.json`;
+    // 1 test file in every case, so `guarded` follows the corrections alone.
+    const testFile: Record<string, Blob> = { [`${SHA_B}:src/a.test.ts`]: { oid: "t2" } };
+    const cases: {
+        name: string;
+        files: string[];
+        blobs: Record<string, Blob>;
+        expected: object;
+    }[] = [
+        {
+            name: "2 lines with the key at H and 3 record files: 1 is new",
+            files: ["src/a.test.ts", old, record("a"), record("b"), record("c")],
+            blobs: {
+                [`${SHA_A}:${old}`]: {
+                    oid: "c1",
+                    text: `${recordText("PR #4")}\n${recordText("PR #4")}\n`,
+                },
+                [`${SHA_B}:${record("a")}`]: { oid: "r1", text: recordText("PR #4") },
+                [`${SHA_B}:${record("b")}`]: { oid: "r2", text: recordText("a test") },
+                [`${SHA_B}:${record("c")}`]: { oid: "r3", text: recordText() },
+            },
+            expected: {
+                final: true,
+                state: "merged",
+                guarded: true,
+                test: true,
+                agentsRule: false,
+                corrections: 1,
+                correctionsLegacy: 0,
+                correctionsFiles: 1,
+                correctionsSkipped: [],
+                namesPr: true,
+            },
+        },
+        {
+            name: "2 lines with the key at H and 2 record files: none is new",
+            files: ["src/a.test.ts", old, record("a"), record("b")],
+            blobs: {
+                [`${SHA_A}:${old}`]: {
+                    oid: "c1",
+                    text: `${recordText("PR #4")}\n${recordText("PR #4")}\n`,
+                },
+                [`${SHA_B}:${record("a")}`]: { oid: "r1", text: recordText("PR #4") },
+                [`${SHA_B}:${record("b")}`]: { oid: "r2", text: recordText("a test") },
+            },
+            expected: {
+                final: true,
+                state: "merged",
+                guarded: false,
+                test: true,
+                agentsRule: false,
+                corrections: 0,
+                correctionsLegacy: 0,
+                correctionsFiles: 0,
+                correctionsSkipped: [],
+                namesPr: false,
+            },
+        },
+        {
+            name: "the old file is in the PR's diff and adds a line: the moved record is not new",
+            files: ["src/a.test.ts", old, record("guard")],
+            blobs: {
+                [`${SHA_A}:${old}`]: { oid: "c1", text: `${recordText("PR #4")}\n` },
+                [`${SHA_B}:${old}`]: {
+                    oid: "c2",
+                    text: `${recordText("PR #4")}\n${secondRecordText()}\n`,
+                },
+                [`${SHA_B}:${record("guard")}`]: { oid: "r1", text: recordText("a test") },
+            },
+            expected: {
+                final: true,
+                state: "merged",
+                guarded: true,
+                test: true,
+                agentsRule: false,
+                corrections: 1,
+                correctionsLegacy: 1,
+                correctionsFiles: 0,
+                correctionsSkipped: [],
+                namesPr: true,
+            },
+        },
+        {
+            name: "the old file is absent at H: the record file is new",
+            files: ["src/a.test.ts", record("new")],
+            blobs: {
+                [`${SHA_B}:${old}`]: { oid: "c2", text: `${recordText()}\n` },
+                [`${SHA_B}:${record("new")}`]: { oid: "r1", text: recordText("a test") },
+            },
+            expected: {
+                final: true,
+                state: "merged",
+                guarded: true,
+                test: true,
+                agentsRule: false,
+                corrections: 1,
+                correctionsLegacy: 0,
+                correctionsFiles: 1,
+                correctionsSkipped: [],
+                namesPr: true,
+            },
+        },
+        {
+            name: "the old file at H is truncated: corrections text missing",
+            files: ["src/a.test.ts", record("cut")],
+            blobs: {
+                [`${SHA_A}:${old}`]: { oid: "c1", text: recordText(), isTruncated: true },
+                [`${SHA_B}:${record("cut")}`]: { oid: "r1", text: recordText("a test") },
+            },
+            expected: {
+                final: true,
+                state: "merged",
+                guarded: null,
+                test: true,
+                agentsRule: false,
+                corrections: null,
+                correctionsLegacy: null,
+                correctionsFiles: null,
+                correctionsSkipped: [],
+                namesPr: null,
+                reason: "corrections text missing",
+            },
+        },
+        {
+            name: "a reference old file that main appended to adds no legacy line",
+            files: ["src/a.test.ts", record("e")],
+            blobs: {
+                [`${SHA_A}:${old}`]: { oid: "c1", text: `${recordText("PR #4")}\n` },
+                [`${SHA_B}:${old}`]: {
+                    oid: "c2",
+                    text: `${recordText("PR #4")}\n${secondRecordText()}\n`,
+                },
+                [`${SHA_B}:${record("e")}`]: { oid: "r1", text: secondRecordText("a test") },
+            },
+            expected: {
+                final: true,
+                state: "merged",
+                guarded: true,
+                test: true,
+                agentsRule: false,
+                corrections: 1,
+                correctionsLegacy: 0,
+                correctionsFiles: 1,
+                correctionsSkipped: [],
+                namesPr: true,
+            },
+        },
+    ];
+
+    for (const one of cases) {
+        const { queries, gh } = guardGh(() => ({ state: "MERGED", files: prFiles(...one.files) }), {
+            blobs: { ...testFile, ...one.blobs },
+        });
+        const result = loadBlockerGuards(blockerData([{ n: 4 }]), { gh, now: NOW });
+
+        assert.deepEqual(result.guards[`acme/w#4@${SHA_A}`], one.expected, one.name);
+        // The old file is looked up at H once: a record file in the diff adds no second copy as a reference.
+        assert.equal(
+            queries[0]!.split(`${SHA_A}:${old}`).length - 1,
+            1,
+            `${one.name}: the old file once at H`,
+        );
+    }
+});
+
 test("guardOf: a truncated or invalid record file has no verdict: corrections text missing", () => {
     const head = { oid: SHA_A };
     const record = (atFinal: Blob | null) =>

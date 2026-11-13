@@ -1789,11 +1789,9 @@ export function loadBlockerGuards(data, { gh, now, cache = {} }) {
 
         if (node.files.totalCount > BLOCKER_PR_FILES) {
             guards[key] = tooMany;
-        } else if (point.head === node.headRefOid) {
-            // No commit after the reviewed head: nothing to look up, and no new record file.
-            guards[key] = guardOf(point.ref, { head: { oid: point.head }, files: [] });
-        } else if (looked.length === 0) {
-            // No file that can guard: nothing to look up.
+        } else if (point.head === node.headRefOid || looked.length === 0) {
+            // No commit after the reviewed head, or no file that can guard: nothing to look up. A record file that the
+            // read-only gh refuses is skipped, so the result still names it.
             guards[key] = guardOf(point.ref, { head: { oid: point.head }, files: [], skipped });
         } else {
             // A record file must be compared with the old file at H: its text is needed to find moved records.
