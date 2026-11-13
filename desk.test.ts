@@ -24587,6 +24587,74 @@ describe("the desk in a Pi Pocket", () => {
         }
     });
 
+    test("an entry from before the pairing field never pairs with a new repair: each goes alone (#214)", async () => {
+        const { linked, thread, first, texts } = await withOpenPr("ready-conflict-legacy");
+        const ref = "frostyard/test#7";
+        const log = join(root, "ready-conflict-legacy.log");
+        const labelAt = "2026-10-20T10:00:00Z";
+        const unreadyKey = `unready:${ref}:${String(Date.parse(labelAt))}`;
+        const repairKey = `repair:${ref}:aaa111:CONFLICTING`;
+        const why = "the PR conflicts with its base";
+        const { restartWithLog } = ghWithLog(log);
+        const fixture = (mergeable: string) =>
+            readyFixture({
+                head: "aaa111",
+                committed: "2026-10-19T10:00:00Z",
+                labels: [READY_LABEL],
+                readyAt: labelAt,
+                mergeable,
+            });
+        const now = async () => (await deskState())!.threads[thread.id]!;
+
+        try {
+            rmSync(log, { force: true });
+            await quiet([thread.id]);
+            await restartWithLog(SWEEP_SLEEP_MS + 60_000, fixture("MERGEABLE"));
+            await sweptAfter(thread, first);
+
+            const labeled = await now();
+
+            // An older version sent this label wake-up under its own id, and its mark did not land: unsent, no `pair`.
+            await app.harness.commit(async (tx) => {
+                const stored = (await tx.doc(DeskThreads)).threads[thread.id]!;
+
+                stored.run.unready = {
+                    [unreadyKey]: { at: 1, why, to: "agent", removed: true, sent: false },
+                };
+            }, context);
+
+            // The same head conflicts: the new repair must not pair with the legacy entry.
+            await restartWithLog(SWEEP_SLEEP_MS * 2 + 120_000, fixture("CONFLICTING"));
+            await sweptAfter(thread, labeled.run.sweptAt);
+            await until(
+                async () =>
+                    unreadyOf(await now())[unreadyKey]?.sent === true &&
+                    repairsOf(await now())[repairKey]?.sent === true,
+                "both entries sent",
+                20_000,
+            );
+
+            const after = await now();
+
+            assert.equal(unreadyOf(after)[unreadyKey]?.pair, "", "the legacy entry goes alone");
+            assert.equal(repairsOf(after)[repairKey]?.pair, "", "the new repair goes alone");
+            assert.equal(
+                await texts(linked, repairUnreadyMessage(ref, "CONFLICTING", [], why)),
+                0,
+                "no message under the pair's id",
+            );
+            await until(
+                async () => (await texts(linked, repairMessage(ref, "CONFLICTING", []))) === 1,
+                "the repair alone",
+                20_000,
+            );
+            await until(() => !app.isBusy(linked), "the wake-ups' turn", 20_000);
+        } finally {
+            await quiet([]);
+            shift = 0;
+        }
+    });
+
     test("a failed label removal decides alone: the repair goes alone once, and the label wake-up later (#214)", async () => {
         const { linked, thread, first, texts } = await withOpenPr("ready-conflict-fail");
         const ref = "frostyard/test#7";

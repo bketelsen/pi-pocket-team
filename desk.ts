@@ -6081,6 +6081,39 @@ export const pairRequestId = (repairKey: string, unreadyKey: string): string =>
     `x.desk.repair:${repairKey}|${unreadyKey}`;
 
 /**
+ * Mark every entry of `run.repairs` and `run.unready` that has no pairing decision as alone (`pair: ""`): an entry from
+ * before the field. `applySweep` runs it first, before any step that records an entry, so `decidePairs` later pairs only
+ * entries of the same commit. A legacy entry may have gone already under its own request id (its send went, and the
+ * commit that marks it sent failed): pairing it would send it again under the pair's id. True when it changed an entry.
+ */
+export function settleLegacyPairs(thread: Thread): boolean {
+    const repairs = repairsOf(thread);
+    const unready = unreadyOf(thread);
+    const legacyRepairs = Object.keys(repairs).filter((key) => repairs[key]!.pair === undefined);
+    const legacyUnready = Object.keys(unready).filter((key) => unready[key]!.pair === undefined);
+
+    if (legacyRepairs.length > 0) {
+        thread.run.repairs = Object.fromEntries(
+            Object.entries(repairs).map(([key, entry]) => [
+                key,
+                entry.pair === undefined ? { ...entry, pair: "" } : entry,
+            ]),
+        );
+    }
+
+    if (legacyUnready.length > 0) {
+        thread.run.unready = Object.fromEntries(
+            Object.entries(unready).map(([key, entry]) => [
+                key,
+                entry.pair === undefined ? { ...entry, pair: "" } : entry,
+            ]),
+        );
+    }
+
+    return legacyRepairs.length > 0 || legacyUnready.length > 0;
+}
+
+/**
  * Decide the pairing of every entry of `run.repairs` and `run.unready` that has none yet (`pair` absent), in the commit
  * that records it, before any send: the decision never changes. A repair and a label removal that are both undecided
  * and unsent, on the same PR, both to the agent, on a thread with an address, where the repair key's head is the PR
@@ -27542,6 +27575,15 @@ export default function createDesk(host: Host, web: Web) {
         }
 
         repairEpoch(state, now);
+
+        // Entries from before the pairing field go alone, before this sweep records any: `decidePairs` below pairs only
+        // the entries of this commit.
+        for (const thread of Object.values(state.threads)) {
+            if (thread.supervisor === supervisor) {
+                settleLegacyPairs(thread);
+            }
+        }
+
         // The digest's setting, read at each sweep: a change works without a reload.
         const { cap, digest, plans: planSettings } = await deskConfig();
         const digestOn = digest.minutes > 0;
