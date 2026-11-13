@@ -1502,11 +1502,25 @@ describe("Pi's own subagents", () => {
         await setWorking(child, true);
 
         try {
-            await command(id, "max 5: scenario-subagent; stop when never");
-            await until(async () => (await goalOf(id))?.round === 1, "round 1 to start");
-            // In `decide`, the driver writes the memo of its wait before its commit, and that commit counts no round
-            // while the memo is younger than the cap: once the memo is there, round 2 is held.
-            await until(() => waitingForSubagents(id, 1), "the wait to start", 20_000);
+            const timers = spyTimers(
+                (delay) =>
+                    delay > 0 && delay <= SUBAGENT_POLL_MS && delay > SUBAGENT_POLL_MS - 5_000,
+            );
+
+            try {
+                await command(id, "max 5: scenario-subagent; stop when never");
+                await until(async () => (await goalOf(id))?.round === 1, "round 1 to start");
+                // In `decide`, the driver writes the memo of its wait, then its commit holds the round, and only then
+                // does it arm the poll timer: the timer proves that the decision is made, not only that the memo is there.
+                await until(
+                    () => timers.count() > 0,
+                    "the driver to sleep before its next look",
+                    20_000,
+                );
+            } finally {
+                timers.stop();
+            }
+
             const held = (await goalOf(id))!;
 
             assert.equal(held.round, 1, "no round 2 while the subagent works");

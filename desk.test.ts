@@ -13995,7 +13995,8 @@ async function stopSweepers(): Promise<void> {
 /**
  * Stop every live sweeper and wait until it stays so: an aborted sweeper may still finish its commit in its lane, and
  * that commit can start a sweeper again. Done when no sweeper is live and no lane of a known supervisor works, so no
- * other supervisor sees this test's fixture.
+ * other supervisor sees this test's fixture. The lanes are read before and after the look at the sweepers: a lane commit
+ * can start a sweeper.
  */
 async function stopSweepersSettled(): Promise<void> {
     // Read at each check: an app restart makes a new runner for the same data folder.
@@ -14007,9 +14008,30 @@ async function stopSweepersSettled(): Promise<void> {
             >
         )[Symbol.for("pi-pocket-team.desk.runner")]?.get(dataDir)?.runner;
 
+    /** The known supervisors: each thread's, and each `sweepers` key's. */
+    const supervisors = async (): Promise<Set<number>> => {
+        const state = await deskState();
+
+        return new Set<number>([
+            ...Object.values(state?.threads ?? {}).map((thread) => thread.supervisor),
+            ...Object.keys(state?.sweepers ?? {}).map(Number),
+        ]);
+    };
+
+    /** Whether a lane of a known supervisor works or waits. No runner for this data folder means that no lane works. */
+    const lanesBusy = async (): Promise<boolean> => {
+        const lane = runner();
+
+        return [...(await supervisors())].some((each) => lane?.busy(each) === true);
+    };
+
     await until(
         async () => {
             await stopSweepers();
+
+            if (await lanesBusy()) {
+                return false;
+            }
 
             const live = await app.harness.inspect(context);
 
@@ -14017,15 +14039,7 @@ async function stopSweepersSettled(): Promise<void> {
                 return false;
             }
 
-            const state = await deskState();
-            const lane = runner();
-            const supervisors = new Set<number>([
-                ...Object.values(state?.threads ?? {}).map((thread) => thread.supervisor),
-                ...Object.keys(state?.sweepers ?? {}).map(Number),
-            ]);
-
-            // No runner for this data folder means that no lane works.
-            return [...supervisors].every((each) => lane?.busy(each) !== true);
+            return !(await lanesBusy());
         },
         "the sweepers to settle",
         20_000,
