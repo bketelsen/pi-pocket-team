@@ -47,7 +47,7 @@ import {
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, sep } from "node:path";
 import { promisify } from "node:util";
-import type { Context, JsonValue } from "@earendil-works/chord";
+import type { Context } from "@earendil-works/chord/context";
 import { Type } from "typebox";
 import {
     McpClient,
@@ -77,6 +77,13 @@ import type * as DashboardModule from "./_desk-dashboard.ts";
 import type * as MetricsModule from "./_desk-metrics.ts";
 import type * as UsageModule from "./_desk-usage.ts";
 import type * as BoardModule from "./_desk-board.ts";
+
+/**
+ * A JSON value, the same shape as chord's `JsonValue`. Kept here: chord 1.5.2 (Pi Pocket 0.28.2 and later) no longer
+ * exports it from the package root, and chord 1.4.0 (Pi Pocket 0.27) has no `@earendil-works/chord/json` subpath.
+ */
+export type JsonValue =
+    null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 
 /** Keep linked-session sends as follow-up work on Pi Pocket 0.28, as they were on 0.27. */
 export async function linkedSend(

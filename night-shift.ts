@@ -38,7 +38,7 @@
  * aliases, and the readers of the round prefix accept the old `[night-shift]` too, because old entries hold it.
  */
 import { createHash, randomUUID } from "node:crypto";
-import type { Context } from "@earendil-works/chord";
+import type { Context } from "@earendil-works/chord/context";
 import { withAbortSignal } from "@earendil-works/chord/context";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import {
