@@ -204,6 +204,7 @@ import {
     unreadyNotice,
     queuedWakes,
     pairWakes,
+    decidePairs,
     repairUnreadyMessage,
     type RepairWork,
     type UnreadyWork,
@@ -9039,10 +9040,13 @@ describe("queued wake-ups (#212)", () => {
         assert.equal("queued" in threadView(state.threads, one, t2), false);
     });
 
-    test("pairWakes keeps a stored decision: alone stays alone, a pair pairs only with its partner (#214)", () => {
+    test("pairWakes follows the stored decisions only: a pair keeps its id, also when its partner is not pending (#214)", () => {
+        const repairKey = `repair:${REPAIR_REF}:h1:CONFLICTING`;
+        const unreadyKey = `unready:${REPAIR_REF}:1000`;
+        const pairId = `x.desk.repair:${repairKey}|${unreadyKey}`;
         const repair = (patch: Partial<RepairWork> = {}): RepairWork => ({
             id: "T1",
-            key: `repair:${REPAIR_REF}:h1:CONFLICTING`,
+            key: repairKey,
             ref: REPAIR_REF,
             state: "CONFLICTING",
             failing: [],
@@ -9053,62 +9057,201 @@ describe("queued wake-ups (#212)", () => {
         });
         const removal = (patch: Partial<UnreadyWork> = {}): UnreadyWork => ({
             id: "T1",
-            key: `unready:${REPAIR_REF}:1000`,
+            key: unreadyKey,
             ref: REPAIR_REF,
             why: "the PR conflicts with its base",
             to: "agent",
             removed: false,
             address: "session-abc",
-            head: "h1",
             ...patch,
         });
-        const repairKey = `repair:${REPAIR_REF}:h1:CONFLICTING`;
-        const unreadyKey = `unready:${REPAIR_REF}:1000`;
 
-        // Decided alone: the rule would pair them, the decision does not.
+        // A stored pair goes as 1 message.
+        const stored = pairWakes(
+            [
+                repair({ key: `repair:${REPAIR_REF}:h0:CONFLICTING`, pair: "" }),
+                repair({ pair: unreadyKey }),
+            ],
+            [removal({ pair: repairKey })],
+        );
+
+        assert.equal(stored.pairs.length, 1);
+        assert.equal(stored.pairs[0]!.repair.key, repairKey);
+        assert.deepEqual(stored.repairs, [
+            repair({ key: `repair:${REPAIR_REF}:h0:CONFLICTING`, pair: "" }),
+        ]);
+        assert.deepEqual(stored.unready, []);
+
+        // Alone, under its own id: "", and an entry from before the field (no decision), even where they match.
         for (const [what, one, other] of [
             ["both alone", repair({ pair: "" }), removal({ pair: "" })],
             ["the repair alone", repair({ pair: "" }), removal()],
-            ["the removal alone", repair(), removal({ pair: "" })],
+            ["no decision", repair(), removal()],
         ] as const) {
             const out = pairWakes([one], [other]);
 
             assert.equal(out.pairs.length, 0, what);
             assert.deepEqual(out.repairs, [one], what);
             assert.deepEqual(out.unready, [other], what);
+            assert.equal(out.repairs[0]!.requestId, undefined, what);
+            assert.equal(out.unready[0]!.requestId, undefined, what);
         }
 
-        // A stored pair pairs with its partner, also when the PR's head moved since.
-        const stored = pairWakes(
-            [
-                repair({ key: `repair:${REPAIR_REF}:h0:CONFLICTING`, pair: "x" }),
-                repair({ pair: unreadyKey }),
-            ],
-            [removal({ pair: repairKey, removed: true, head: "h2" })],
-        );
-
-        assert.equal(stored.pairs.length, 1);
-        assert.equal(stored.pairs[0]!.repair.key, repairKey);
-        assert.deepEqual(
-            stored.repairs.map((each) => each.key),
-            [`repair:${REPAIR_REF}:h0:CONFLICTING`],
-        );
-
-        // A stored pair whose partner is not pending (sent, or pruned) goes alone, under its own id.
+        // A pair partner whose other half is not pending (sent, or pruned): the pair's id, never its own.
         const lonely = pairWakes([repair({ pair: unreadyKey })], []);
 
         assert.equal(lonely.pairs.length, 0);
-        assert.equal(lonely.repairs.length, 1);
+        assert.equal(lonely.repairs[0]!.requestId, pairId);
 
         const orphan = pairWakes([], [removal({ pair: repairKey, removed: true })]);
 
         assert.equal(orphan.pairs.length, 0);
-        assert.equal(orphan.unready.length, 1);
+        assert.equal(orphan.unready[0]!.requestId, pairId);
 
-        // An undecided work never pairs with a decided one.
-        const mixed = pairWakes([repair({ pair: "other" })], [removal()]);
+        // A pair with no address now: each half alone, under the pair's id (only a notice can go).
+        const unaddressed = pairWakes(
+            [repair({ pair: unreadyKey, address: undefined })],
+            [removal({ pair: repairKey, address: undefined })],
+        );
 
-        assert.equal(mixed.pairs.length, 0);
+        assert.equal(unaddressed.pairs.length, 0);
+        assert.equal(unaddressed.repairs[0]!.requestId, pairId);
+        assert.equal(unaddressed.unready[0]!.requestId, pairId);
+    });
+
+    test("decidePairs decides each new entry once: a pair on the same PR and head, else alone (#214)", () => {
+        const repairKey = `repair:${REPAIR_REF}:h1:CONFLICTING`;
+        const unreadyKey = `unready:${REPAIR_REF}:1000`;
+        const conflicting = () => githubOf([prFact({ head: "h1", mergeable: "CONFLICTING" })]);
+
+        const planned = (patch: Partial<Thread> = {}): Thread => {
+            const one = repairing({ ready: { at: 1000, head: "h1" } }, patch);
+
+            planRepairs(one, 100);
+            planUnready(one, conflicting(), 200);
+
+            return one;
+        };
+
+        // The same PR and head, both to the agent: a pair, each with the other's key.
+        const pair = planned();
+
+        assert.equal(decidePairs(pair), true);
+        assert.equal(repairsOf(pair)[repairKey]?.pair, unreadyKey);
+        assert.equal(unreadyOf(pair)[unreadyKey]?.pair, repairKey);
+        // A stored decision never changes.
+        assert.equal(decidePairs(pair), false);
+        assert.equal(repairsOf(pair)[repairKey]?.pair, unreadyKey);
+
+        // Another head now, the Odrade route, and no address: alone.
+        const moved = planned();
+
+        moved.prs[REPAIR_REF]!.head = "h2";
+
+        const odrade = planned({ session: undefined, address: undefined });
+        const unaddressed = planned();
+
+        delete unaddressed.address;
+
+        for (const [what, one] of [
+            ["another head", moved],
+            ["the Odrade route", odrade],
+            ["no address", unaddressed],
+        ] as const) {
+            assert.equal(decidePairs(one), true, what);
+            assert.equal(repairsOf(one)[repairKey]?.pair, "", what);
+            assert.equal(unreadyOf(one)[unreadyKey]?.pair, "", what);
+        }
+
+        // A stored "" stays, and its undecided match does not pair with it.
+        const half = planned();
+
+        half.run.repairs = { [repairKey]: { ...repairsOf(half)[repairKey]!, pair: "" } };
+        decidePairs(half);
+        assert.equal(repairsOf(half)[repairKey]?.pair, "");
+        assert.equal(unreadyOf(half)[unreadyKey]?.pair, "");
+
+        // Review finding 1: the label wake-up went alone (decided "", or sent before the field), then a repair comes.
+        for (const sentBefore of [false, true]) {
+            const one = repairing({ ready: { at: 1000, head: "h1" } });
+
+            planUnready(one, conflicting(), 100);
+
+            if (sentBefore) {
+                // Sent alone by a version with no decision: the mark landed, the decision did not.
+                one.run.unready = { [unreadyKey]: { ...unreadyOf(one)[unreadyKey]!, sent: true } };
+            } else {
+                decidePairs(one);
+            }
+
+            planRepairs(one, 200);
+            decidePairs(one);
+            assert.equal(repairsOf(one)[repairKey]?.pair, "", `sent before: ${String(sentBefore)}`);
+            assert.equal(
+                unreadyOf(one)[unreadyKey]?.pair,
+                "",
+                `sent before: ${String(sentBefore)}`,
+            );
+        }
+
+        assert.equal(
+            repairUnreadyMessage(REPAIR_REF, "CONFLICTING", [], "the PR conflicts with its base"),
+            "frostyard/test#7 is now conflicting, and the desk removed the label `ready-for-human`: the PR conflicts with its base. Merge `main` in (no force-push) or fix the check, run the checks, push, and add the label again only when the PR is ready (CI green, every blocking review point resolved, nothing pending). Then report.",
+        );
+    });
+
+    test("the pruning keeps an unsent pair partner beyond 30 entries (#214)", () => {
+        const unreadyStored: Record<string, object> = {};
+        const repairStored: Record<string, object> = {};
+
+        for (let index = 0; index < 30; index += 1) {
+            unreadyStored[`unready:old/r#${String(index)}:${String(index)}`] = {
+                at: index,
+                why: "a new commit came after the label",
+                to: "agent",
+                removed: false,
+                sent: false,
+                ...(index === 0 ? { pair: "repair:old/r#0:h0:CONFLICTING" } : { pair: "" }),
+            };
+            repairStored[`repair:old/r#${String(index)}:h${String(index)}:CONFLICTING`] = {
+                at: index,
+                to: "agent",
+                why: "change",
+                sent: false,
+                ...(index === 0 ? { pair: "unready:old/r#0:0" } : { pair: "" }),
+            };
+        }
+
+        const one = repairing(
+            { ready: { at: 1000, head: "h1" } },
+            {
+                run: { busy: false, unready: unreadyStored, repairs: repairStored },
+            },
+        );
+
+        assert.equal(
+            planUnready(one, githubOf([prFact({ head: "h1", mergeable: "CONFLICTING" })]), 100),
+            1,
+        );
+        assert.equal(planRepairs(one, 100), 1);
+
+        const unready = unreadyOf(one);
+        const repairs = repairsOf(one);
+
+        assert.equal(Object.keys(unready).length, 30);
+        assert.notEqual(unready["unready:old/r#0:0"], undefined, "the unsent pair partner stays");
+        assert.equal(unready["unready:old/r#1:1"], undefined, "the oldest other unsent entry went");
+        assert.equal(Object.keys(repairs).length, 30);
+        assert.notEqual(
+            repairs["repair:old/r#0:h0:CONFLICTING"],
+            undefined,
+            "the unsent pair partner stays",
+        );
+        assert.equal(
+            repairs["repair:old/r#1:h1:CONFLICTING"],
+            undefined,
+            "the oldest other unsent entry went",
+        );
     });
 
     test("markCloseoutSent: a repeat mark of the same key keeps the first boundary; a new key takes its own (#214)", () => {
@@ -9129,60 +9272,6 @@ describe("queued wake-ups (#212)", () => {
         markCloseoutSent(one, "closeout:b", 30, 300);
         assert.equal(one.run.closeout, "closeout:b");
         assert.equal(one.run.closeoutEntry, 30);
-    });
-
-    test("pairWakes pairs a repair and a removal of the same thread, PR and head, to the agent only", () => {
-        const repair = (patch: Partial<RepairWork> = {}): RepairWork => ({
-            id: "T1",
-            key: `repair:${REPAIR_REF}:h1:CONFLICTING`,
-            ref: REPAIR_REF,
-            state: "CONFLICTING",
-            failing: [],
-            to: "agent",
-            why: "change",
-            address: "session-abc",
-            ...patch,
-        });
-        const removal = (patch: Partial<UnreadyWork> = {}): UnreadyWork => ({
-            id: "T1",
-            key: `unready:${REPAIR_REF}:1000`,
-            ref: REPAIR_REF,
-            why: "the PR conflicts with its base",
-            to: "agent",
-            removed: false,
-            address: "session-abc",
-            head: "h1",
-            ...patch,
-        });
-        const same = pairWakes([repair()], [removal()]);
-
-        assert.equal(same.pairs.length, 1);
-        assert.deepEqual(same.repairs, []);
-        assert.deepEqual(same.unready, []);
-
-        const cases: [string, RepairWork, UnreadyWork][] = [
-            ["another PR", repair(), removal({ ref: "frostyard/test#8" })],
-            ["another thread", repair({ id: "T2" }), removal()],
-            ["another head", repair(), removal({ head: "h2" })],
-            ["no head", repair(), removal({ head: undefined })],
-            ["a repair to Odrade", repair({ to: "odrade", why: "cap" }), removal()],
-            ["a removal to Odrade", repair(), removal({ to: "odrade" })],
-            ["no address on the repair", repair({ address: undefined }), removal()],
-            ["no address on the removal", repair(), removal({ address: undefined })],
-        ];
-
-        for (const [what, one, other] of cases) {
-            const out = pairWakes([one], [other]);
-
-            assert.equal(out.pairs.length, 0, what);
-            assert.deepEqual(out.repairs, [one], what);
-            assert.deepEqual(out.unready, [other], what);
-        }
-
-        assert.equal(
-            repairUnreadyMessage(REPAIR_REF, "CONFLICTING", [], "the PR conflicts with its base"),
-            "frostyard/test#7 is now conflicting, and the desk removed the label `ready-for-human`: the PR conflicts with its base. Merge `main` in (no force-push) or fix the check, run the checks, push, and add the label again only when the PR is ready (CI green, every blocking review point resolved, nothing pending). Then report.",
-        );
     });
 });
 
@@ -23940,6 +24029,7 @@ describe("the desk in a Pi Pocket", () => {
                 to: "odrade",
                 why: "archived",
                 sent: true,
+                pair: "", // decided alone in the commit that recorded it (decidePairs)
             });
             assert.equal(after?.run.repairCounts, undefined, "an Odrade route counts nothing");
             assert.equal(after?.run.next, "odrade");
@@ -24374,6 +24464,7 @@ describe("the desk in a Pi Pocket", () => {
                 to: "agent",
                 removed: true,
                 sent: true,
+                pair: "", // decided alone in the commit that recorded it (decidePairs)
             });
             assert(
                 after?.events.some(
@@ -24650,6 +24741,15 @@ describe("the desk in a Pi Pocket", () => {
 
             await until(async () => deletes().length === 1, "the label removal", 20_000);
             assert.equal(lane().busy(Number(source)), true, `the ${by} sends in its lane`);
+
+            // The pair was stored in the commit that recorded both entries, before any send.
+            const held = (await deskState())!.threads[thread.id]!;
+            const repairKey = `repair:${ref}:aaa111:CONFLICTING`;
+            const unreadyKey = `unready:${ref}:${String(Date.parse("2026-10-20T10:00:00Z"))}`;
+
+            assert.equal(repairsOf(held)[repairKey]?.pair, unreadyKey);
+            assert.equal(unreadyOf(held)[unreadyKey]?.pair, repairKey);
+            assert.equal(unreadyOf(held)[unreadyKey]?.removed, false, "the removal still waits");
             assert.equal(
                 await lane().tryRun(Number(source), "view", async () => "ran"),
                 undefined,
@@ -24659,8 +24759,10 @@ describe("the desk in a Pi Pocket", () => {
             await until(async () => (await texts(linked, message)) === 1, "the wake-up", 20_000);
             await until(() => !app.isBusy(linked), "the wake-up's turn", 20_000);
         } finally {
-            rmSync(go, { force: true });
+            // A removal still held ends now, so a failed check does not leave it waiting.
+            writeFileSync(go, "");
             await quiet([]);
+            rmSync(go, { force: true });
             shift = 0;
         }
     };
@@ -24733,6 +24835,7 @@ describe("the desk in a Pi Pocket", () => {
                 to: "agent",
                 removed: true,
                 sent: true,
+                pair: "", // decided alone in the commit that recorded it (decidePairs)
                 by: "workflow",
             });
             assert.equal(after?.prs[ref]?.ready, undefined);

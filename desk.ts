@@ -5379,9 +5379,10 @@ export type RepairEntry = {
     why: "change" | "archived" | "closed" | "cap" | "no-session";
     sent: boolean;
     /**
-     * The send's pairing decision with a label removal (`pairWakes`), stored before the first send so it never changes:
-     * the key of the `run.unready` entry it goes with as 1 message, or "" when it goes alone. Absent: not decided yet
-     * (also an entry stored before this field).
+     * The send's pairing decision with a label removal (`decidePairs`), made in the commit that records the entry and
+     * never changed after, except to "" when a pair's label removal fails before its message went: the key of the
+     * `run.unready` entry it goes with as 1 message (`x.desk.repair:<key>|<unready key>`), or "" when it goes alone.
+     * Absent: an entry stored before this field, not decided yet; it goes alone. The pruning keeps an unsent partner.
      */
     pair?: string;
 };
@@ -5566,9 +5567,16 @@ function recordRepair(
 
     // A key that is still current stays: dropping it would make the same change a new one.
     const current = new Set(Object.entries(thread.prs).map(([ref, each]) => repairKey(ref, each)));
+    // An unsent pair partner stays too: its pair must keep its request id.
     const order = (sent: boolean) =>
         Object.entries(repairs)
-            .filter(([each, value]) => value.sent === sent && each !== key && !current.has(each))
+            .filter(
+                ([each, value]) =>
+                    value.sent === sent &&
+                    each !== key &&
+                    !current.has(each) &&
+                    (sent || value.pair === undefined || value.pair === ""),
+            )
             .sort((a, b) => a[1].at - b[1].at);
 
     for (const [old] of [...order(true), ...order(false)]) {
@@ -5717,9 +5725,10 @@ export type UnreadyEntry = {
      */
     by?: "workflow";
     /**
-     * The send's pairing decision with a repair wake-up (`pairWakes`), stored before the first send so it never changes:
-     * the key of the `run.repairs` entry it goes with as 1 message, or "" when it goes alone. Absent: not decided yet
-     * (also an entry stored before this field).
+     * The send's pairing decision with a repair wake-up (`decidePairs`), made in the commit that records the entry and
+     * never changed after, except to "" when the pair's label removal fails before its message went: the key of the
+     * `run.repairs` entry it goes with as 1 message (`x.desk.repair:<repair key>|<key>`), or "" when it goes alone.
+     * Absent: an entry stored before this field, not decided yet; it goes alone. The pruning keeps an unsent partner.
      */
     pair?: string;
 };
@@ -5896,9 +5905,15 @@ function recordUnready(
             ? { at: now, why: entry.why, to: entry.to, removed: true, sent: false, by: entry.by }
             : { at: now, why: entry.why, to: entry.to, removed: false, sent: false };
 
+    // An unsent pair partner stays: its pair must keep its request id.
     const order = (sent: boolean) =>
         Object.entries(unready)
-            .filter(([each, value]) => value.sent === sent && each !== key)
+            .filter(
+                ([each, value]) =>
+                    value.sent === sent &&
+                    each !== key &&
+                    (sent || value.pair === undefined || value.pair === ""),
+            )
             .sort((a, b) => a[1].at - b[1].at);
 
     for (const [old] of [...order(true), ...order(false)]) {
@@ -6038,6 +6053,8 @@ export type RepairWork = {
     back?: string;
     /** The entry's stored pairing decision (`RepairEntry.pair`). */
     pair?: string;
+    /** The send's request id when it is not `x.desk.repair:<key>`: a pair's id, set by `pairWakes`. */
+    requestId?: string;
 };
 
 /** One `ready-for-human` removal to do: the label, the wake-up, and what the commit needs. */
@@ -6053,19 +6070,90 @@ export type UnreadyWork = {
     by?: UnreadyEntry["by"];
     /** The supervisor's address for the agent. */
     address?: string;
-    /** The head oid of the PR's link when the work was collected: a repair at this head goes with it. */
-    head?: string;
     /** The entry's stored pairing decision (`UnreadyEntry.pair`). */
     pair?: string;
+    /** The send's request id when it is not `x.desk.unready:<key>`: a pair's id, set by `pairWakes`. */
+    requestId?: string;
 };
 
+/** The request id of a pair's 1 message: its repair key, then its unready key. */
+export const pairRequestId = (repairKey: string, unreadyKey: string): string =>
+    `x.desk.repair:${repairKey}|${unreadyKey}`;
+
 /**
- * Pair the repair wake-ups and the label removals that go to the agent as 1 message. A stored decision (`pair`) comes
- * first and never changes: "" goes alone, and a key pairs only with the work of that key. Only works with no decision
- * pair by the rule: both to the agent with an address, on the same thread and the same PR, and the repair key's head is
- * the PR's head when the work was collected. Each removal takes at most 1 repair, the first in order. The rest go alone,
- * in their order. So each repair goes under 1 request id for its whole life: `x.desk.repair:<key>` alone, or
- * `x.desk.repair:<key>|<unready key>` paired.
+ * Decide the pairing of every entry of `run.repairs` and `run.unready` that has none yet (`pair` absent), in the commit
+ * that records it, before any send: the decision never changes. A repair and a label removal that are both undecided
+ * and unsent, on the same PR, both to the agent, on a thread with an address, where the repair key's head is the PR
+ * link's head now, become a pair: each holds the other's key, and they go as 1 message. Every other undecided entry gets
+ * "" (alone). So an entry sent alone never pairs later, and a pair keeps its request id. True when it changed an entry.
+ */
+export function decidePairs(thread: Thread): boolean {
+    const repairs = repairsOf(thread);
+    const unready = unreadyOf(thread);
+    const repairsNext: Record<string, RepairEntry> = { ...repairs };
+    const unreadyNext: Record<string, UnreadyEntry> = { ...unready };
+    let changed = false;
+
+    for (const [key, entry] of Object.entries(unready).sort((a, b) => a[1].at - b[1].at)) {
+        if (entry.pair !== undefined) {
+            continue;
+        }
+
+        const ref = unreadyKeyRef(key);
+        const head = ref === undefined ? undefined : thread.prs[ref]?.head;
+        const partner =
+            entry.sent ||
+            entry.to !== "agent" ||
+            thread.address === undefined ||
+            head === undefined ||
+            head === ""
+                ? undefined
+                : Object.keys(repairsNext)
+                      .sort()
+                      .find((repairKey) => {
+                          const repair = repairsNext[repairKey]!;
+                          const parsed = parseRepairKey(repairKey);
+
+                          return (
+                              repair.pair === undefined &&
+                              !repair.sent &&
+                              repair.to === "agent" &&
+                              parsed?.ref === ref &&
+                              repairKey.split(":")[2] === head
+                          );
+                      });
+
+        if (partner === undefined) {
+            unreadyNext[key] = { ...entry, pair: "" };
+        } else {
+            unreadyNext[key] = { ...entry, pair: partner };
+            repairsNext[partner] = { ...repairsNext[partner]!, pair: key };
+        }
+
+        changed = true;
+    }
+
+    for (const [key, entry] of Object.entries(repairsNext)) {
+        if (entry.pair === undefined) {
+            repairsNext[key] = { ...entry, pair: "" };
+            changed = true;
+        }
+    }
+
+    if (changed) {
+        thread.run.repairs = repairsNext;
+        thread.run.unready = unreadyNext;
+    }
+
+    return changed;
+}
+
+/**
+ * Follow the stored pairing decisions (`decidePairs`) at send time; it decides nothing itself. A pair whose 2 works are
+ * both pending, both to the agent with an address, goes as 1 message. Every other work goes alone: "" and an absent
+ * `pair` (an entry from before the field, not decided yet) under its own id; a pair partner whose other half is not
+ * pending (sent, or no address now) under the pair's id (`requestId`), so a message that already went as the pair's is
+ * not sent again in another form.
  */
 export function pairWakes(
     repairs: readonly RepairWork[],
@@ -6082,43 +6170,39 @@ export function pairWakes(
         work.to === "agent" && work.address !== undefined;
 
     for (const removal of unready) {
-        let repair: RepairWork | undefined;
-
-        if (removal.pair !== undefined) {
-            // A stored pair goes together; its partner not pending (sent, or pruned) means it goes alone under its own
-            // id. With no address it goes alone too: then no message goes to the agent, only a notice to Odrade.
-            repair =
-                removal.pair === "" || !addressed(removal)
-                    ? undefined
-                    : repairs.find(
-                          (each) =>
-                              !paired.has(each) &&
-                              addressed(each) &&
-                              each.id === removal.id &&
-                              each.key === removal.pair &&
-                              each.pair === removal.key,
-                      );
-        } else if (addressed(removal) && removal.head !== undefined) {
-            repair = repairs.find(
-                (each) =>
-                    !paired.has(each) &&
-                    each.pair === undefined &&
-                    addressed(each) &&
-                    each.id === removal.id &&
-                    each.ref === removal.ref &&
-                    each.key.split(":")[2] === removal.head,
-            );
+        if (removal.pair === undefined || removal.pair === "") {
+            alone.push(removal);
+            continue;
         }
 
-        if (repair === undefined) {
-            alone.push(removal);
-        } else {
+        const repair = repairs.find(
+            (each) =>
+                !paired.has(each) &&
+                each.id === removal.id &&
+                each.key === removal.pair &&
+                each.pair === removal.key,
+        );
+
+        if (repair !== undefined && addressed(repair) && addressed(removal)) {
             paired.add(repair);
             pairs.push({ repair, unready: removal });
+        } else {
+            // The pair's id: its other half may have gone already, as the pair's message.
+            alone.push({ ...removal, requestId: pairRequestId(removal.pair, removal.key) });
         }
     }
 
-    return { pairs, repairs: repairs.filter((each) => !paired.has(each)), unready: alone };
+    return {
+        pairs,
+        repairs: repairs
+            .filter((each) => !paired.has(each))
+            .map((each) =>
+                each.pair === undefined || each.pair === ""
+                    ? each
+                    : { ...each, requestId: pairRequestId(each.key, each.pair) },
+            ),
+        unready: alone,
+    };
 }
 
 /** The 1 message for a repair wake-up and a label removal of the same PR and head. */
@@ -28040,6 +28124,12 @@ export default function createDesk(host: Host, web: Web) {
             events += planRepairs(thread, now);
         }
 
+        // The pairing of each new repair and label entry, in the commit that records it, before any send can happen:
+        // after every step above that records one (the label, the label gone on GitHub, the reopen, the repairs).
+        for (const thread of mine) {
+            decidePairs(thread);
+        }
+
         // A parked thread that got an event from this sweep goes back to open: something changed on it.
         for (const thread of open) {
             if (reparked.has(thread.id)) {
@@ -28473,7 +28563,7 @@ export default function createDesk(host: Host, web: Web) {
                         to: work.address,
                         message: repairMessage(work.ref, work.state, work.failing),
                     },
-                    `x.desk.repair:${work.key}`,
+                    work.requestId ?? `x.desk.repair:${work.key}`,
                 );
                 done = "repair wake-up sent to the agent";
             } else if (
@@ -28495,7 +28585,7 @@ export default function createDesk(host: Host, web: Web) {
                             work.why,
                         ),
                     },
-                    `x.desk.repair:${work.key}`,
+                    work.requestId ?? `x.desk.repair:${work.key}`,
                 );
                 done = "repair wake-up sent to Odrade";
             } else {
@@ -28675,7 +28765,7 @@ export default function createDesk(host: Host, web: Web) {
                             to: work.address,
                             message: unreadyMessage(work.ref, work.why, work.by),
                         },
-                        `x.desk.unready:${work.key}`,
+                        work.requestId ?? `x.desk.unready:${work.key}`,
                     );
                     sent = true;
                     done =
@@ -28703,15 +28793,16 @@ export default function createDesk(host: Host, web: Web) {
     };
 
     /**
-     * Send a repair wake-up and a label removal of the same PR and head as 1 message (`pairWakes`), under the key
-     * `x.desk.repair:<repair key>|<unready key>`. The decision is stored before any send, so a retry never changes the
-     * envelope: a repair goes under 1 request id for its whole life.
-     * 1. Remove the label, unless it is already gone.
-     * 2. A failed removal: 1 commit stores `pair: ""` on both entries (each goes alone from now on) and the removal's
-     *    failure; only after it, the repair goes alone (`sendRepair`). The label wake-up goes alone at a later sync.
-     * 3. Else 1 commit stores `removed: true` and the pair (each entry holds the other's key), before the send.
+     * Send a repair wake-up and a label removal that `decidePairs` paired as 1 message (`pairWakes`), under the pair's
+     * id `x.desk.repair:<repair key>|<unready key>`. The pair was stored in the commit that recorded the entries, so a
+     * retry never changes the envelope.
+     * 1. Remove the label, unless it is already gone (`removed: true`).
+     * 2. A failed removal: the pair's message never went (it goes only after `removed: true` is stored), so 1 commit
+     *    stores `pair: ""` on both entries (each goes alone from now on) and the removal's failure; only after it, the
+     *    repair goes alone under `x.desk.repair:<key>` (`sendRepair`). The label wake-up goes alone at a later sync.
+     * 3. Else, when the label was on, 1 commit stores `removed: true` before the send.
      * 4. The 1 message, then 1 commit that marks both sent. A failed send adds both failure events and keeps both unsent.
-     * A commit that fails, or finds an entry gone, sent, or decided otherwise, sends nothing: the next sync tries again.
+     * A commit that fails, or finds an entry gone, sent, or with another `pair`, sends nothing: the next sync tries again.
      */
     const sendPair = async (
         supervisor: ConversationId,
@@ -28720,9 +28811,7 @@ export default function createDesk(host: Host, web: Web) {
         runtime: SendRuntime,
         context: Context,
     ): Promise<void> => {
-        const stored = repair.pair === unready.key && unready.pair === repair.key;
-
-        /** Both entries are still there, unsent, and not decided otherwise. */
+        /** Both entries are still there, unsent, and still paired with each other. */
         const open = (thread: Thread) => {
             const repairEntry = repairsOf(thread)[repair.key];
             const unreadyEntry = unreadyOf(thread)[unready.key];
@@ -28731,15 +28820,15 @@ export default function createDesk(host: Host, web: Web) {
                 unreadyEntry === undefined ||
                 repairEntry.sent ||
                 unreadyEntry.sent ||
-                (repairEntry.pair !== undefined && repairEntry.pair !== unready.key) ||
-                (unreadyEntry.pair !== undefined && unreadyEntry.pair !== repair.key)
+                repairEntry.pair !== unready.key ||
+                unreadyEntry.pair !== repair.key
                 ? undefined
                 : { repairEntry, unreadyEntry };
         };
 
-        if (!stored) {
-            const removal = unready.removed ? { removed: true } : await removeLabel(unready.ref);
-            let decided = false;
+        if (!unready.removed) {
+            const removal = await removeLabel(unready.ref);
+            let stored = false;
 
             try {
                 await runtime.commit(async (tx) => {
@@ -28764,39 +28853,32 @@ export default function createDesk(host: Host, web: Web) {
                             thread,
                             `unready-failed:${unready.key}`,
                             `${unready.ref}: the label ${READY_LABEL} removal failed: ${
-                                (removal as { error?: string }).error ?? "the label removal failed"
+                                removal.error ?? "the label removal failed"
                             }`,
                             runtime.now(),
                         );
                     } else {
-                        thread.run.repairs = {
-                            ...repairsOf(thread),
-                            [repair.key]: { ...entries.repairEntry, pair: unready.key },
-                        };
                         thread.run.unready = {
                             ...unreadyOf(thread),
-                            [unready.key]: {
-                                ...entries.unreadyEntry,
-                                removed: true,
-                                pair: repair.key,
-                            },
+                            [unready.key]: { ...entries.unreadyEntry, removed: true },
                         };
                     }
 
-                    decided = true;
+                    stored = true;
 
                     return undefined;
                 }, context);
             } catch {
-                // Not stored: nothing goes now, and the next sync decides again.
+                // Not stored: nothing goes now, and the next sync tries again.
                 return;
             }
 
-            if (!decided) {
+            if (!stored) {
                 return;
             }
 
             if (!removal.removed) {
+                // Under its own id: a paired work from `pairWakes` carries no other.
                 await sendRepair(supervisor, { ...repair, pair: "" }, runtime, context);
 
                 return;
@@ -28819,7 +28901,7 @@ export default function createDesk(host: Host, web: Web) {
                         unready.by,
                     ),
                 },
-                `x.desk.repair:${repair.key}|${unready.key}`,
+                pairRequestId(repair.key, unready.key),
             );
         } catch (error) {
             failure = (error as Error).message;
@@ -28990,8 +29072,6 @@ export default function createDesk(host: Host, web: Web) {
                     continue;
                 }
 
-                const head = thread.prs[ref]?.head;
-
                 unready.push({
                     id: thread.id,
                     key,
@@ -29002,8 +29082,6 @@ export default function createDesk(host: Host, web: Web) {
                     ...(entry.by === undefined ? {} : { by: entry.by }),
                     ...(entry.pair === undefined ? {} : { pair: entry.pair }),
                     ...(thread.address === undefined ? {} : { address: thread.address }),
-                    // The PR's head now: a repair at this head goes with the removal as 1 message.
-                    ...(head === undefined || head === "" ? {} : { head }),
                 });
             }
         }
@@ -29013,11 +29091,12 @@ export default function createDesk(host: Host, web: Web) {
 
     /**
      * After the commit that collected them (`collectSends`): the close-out wake-ups, then the repair wake-ups, then the
-     * label removals; a repair and a removal of the same PR and head go as 1 message (`pairWakes`). Each send has its
-     * request id (`x.desk.closeout:<key>`, `x.desk.repair:<key>`, `x.desk.unready:<key>`), and Pocket acts once for a
-     * key: a replay, or the sweeper and a nudge sync that both find the same unsent entry, sends the message once. A
-     * chat notice to Odrade (`host.notice`) has no key: in that race it can show twice, which is accepted. A label
-     * removal that GitHub already did counts as done. Each send is marked in its own later commit.
+     * label removals; a pair that `decidePairs` stored goes as 1 message (`pairWakes`). Each send has its request id
+     * (`x.desk.closeout:<key>`, `x.desk.repair:<key>`, `x.desk.unready:<key>`, or a pair's
+     * `x.desk.repair:<repair key>|<unready key>`), and Pocket acts once for a key, so a replay sends the message once. It
+     * runs in the supervisor's lane, so 2 syncs never send at once. A chat notice to Odrade (`host.notice`) has no key: a
+     * replay after a lost mark can show it twice, which is accepted. A label removal that GitHub already did counts as
+     * done. Each send is marked in its own later commit.
      */
     const sendPending = async (
         supervisor: ConversationId,
