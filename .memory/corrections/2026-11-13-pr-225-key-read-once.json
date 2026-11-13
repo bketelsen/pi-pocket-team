@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-13",
+  "scope": "model-router",
+  "correction": "The route redacted the key it read after Jev answered, so a key cleared or rotated during classification left the old key in a route field; the router reads the key once before the route, uses it for Jev and for the redaction, and also takes out the key the settings hold when the route ends",
+  "evidence": "bketelsen/pi-pocket-team#225 cross-review of 9c9d0dc, finding 1",
+  "promoted_to": "model-router.test.ts: a key changed or cleared while Jev answers is still taken out of the route"
+}

@@ -216,6 +216,9 @@ const answer = (text: string) => fauxAssistantMessage([fauxText(text)]);
 const teamCall = (args: object) =>
     fauxAssistantMessage([fauxToolCall("team_delegate", args)], { stopReason: "toolUse" });
 
+/** The stop line of the assigned shift's goal: its round requests, and no other, hold it. */
+const ASSIGN_MARK = "the assigned shift is done (assign-round-mark)";
+
 /** Each round request a linked session sent, as JSON: the prompt section is in it. */
 const roundRequests: string[] = [];
 
@@ -241,6 +244,16 @@ const model = scriptedModel((request) => {
 
     if (text.includes("This task runs as a shift")) {
         return answer("Shift noted. I start in round 1.");
+    }
+
+    // The assigned shift's own stop line marks its rounds: a test finds that round, not a round of another session.
+    if (text.endsWith("assign marked route night shift test")) {
+        return teamCall({
+            agent: "duncan",
+            repository: "frostyard/test",
+            task: TASK,
+            night_shift: { stop_when: ASSIGN_MARK },
+        });
     }
 
     if (text.endsWith("worker route night shift test")) {
@@ -876,10 +889,12 @@ describe("the router's assignment (router v4, mode assign)", () => {
     test("an assigned worker and its thinking go in the goal and the rounds; the profile model stays", async () => {
         await app.setSubagentModels(owner(app), ["faux/faux-2", "faux/faux-1"]);
         const router = fakeRouter("assign", 4);
-        const before = roundRequests.length;
 
         try {
-            const { linked } = await delegate("route-assign", "route night shift test");
+            const { linked } = await delegate(
+                "route-assign",
+                "assign marked route night shift test",
+            );
 
             await until(async () => (await goalOf(linked)) !== undefined, "the goal", 20_000);
 
@@ -903,9 +918,11 @@ describe("the router's assignment (router v4, mode assign)", () => {
                 "the linked session stays on the profile model",
             );
 
-            await until(() => roundRequests.length > before, "round 1", 20_000);
+            const ownRound = () => roundRequests.find((request) => request.includes(ASSIGN_MARK));
+
+            await until(() => ownRound() !== undefined, "round 1 of this shift", 20_000);
             assert.match(
-                roundRequests.slice(before).join("\n"),
+                ownRound()!,
                 /give execution to subagents on `faux\/faux-1` and thinking `high`/,
             );
         } finally {

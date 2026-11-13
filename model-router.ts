@@ -2020,22 +2020,31 @@ export default function createModelRouter(host: Host, web: Web) {
 
     /**
      * The route, with the key taken out of every string in it, in any case: a field or a note that the settings or
-     * `router.json` fed (a key pasted in `liveTiers` by mistake) never stores it.
+     * `router.json` fed (a key pasted in `liveTiers` by mistake) never stores it. The key is read once, before the
+     * route starts: the same key goes to Jev and is taken out, and the key of the settings when the route ends is taken
+     * out too, so a key changed or cleared while Jev answers is never stored either.
      */
     const route = async (request: RouteRequest): Promise<Route> => {
-        const answer = await routeOf(request);
         const key = apiKey();
+        const answer = await routeOf(request, key);
+        const keys = [...new Set([key, apiKey()])].filter(
+            (each): each is string => each !== undefined,
+        );
 
-        if (key === undefined) {
+        if (keys.length === 0) {
             return answer;
         }
 
-        const pattern = new RegExp(key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi");
+        const patterns = keys.map(
+            (each) => new RegExp(each.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi"),
+        );
 
-        return redactDeep(answer, (text) => text.replace(pattern, "[TYPESAFE_API_KEY]"));
+        return redactDeep(answer, (text) =>
+            patterns.reduce((out, pattern) => out.replace(pattern, "[TYPESAFE_API_KEY]"), text),
+        );
     };
 
-    const routeOf = async (request: RouteRequest): Promise<Route> => {
+    const routeOf = async (request: RouteRequest, key: string | undefined): Promise<Route> => {
         const now = Date.now();
         const held = mode();
         const hostNames = await sshNames();
@@ -2052,8 +2061,6 @@ export default function createModelRouter(host: Host, web: Web) {
                 at: now,
             });
         }
-
-        const key = apiKey();
 
         if (key === undefined) {
             return failed("no TypeSafe key set", now, factsOf(request, hostNames), request.worker);

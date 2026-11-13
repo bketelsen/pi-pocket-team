@@ -682,6 +682,7 @@ function loadRouter(settings: Record<string, unknown>, allowed: string[], broken
     const hidden: string[] = [];
     const disposers: (() => void)[] = [];
     const listeners: (() => void)[] = [];
+    const declared: { name: string; default?: unknown }[] = [];
     const host = {
         subagentModels: () => allowed,
         resolveModel: (spec: string) => {
@@ -701,7 +702,9 @@ function loadRouter(settings: Record<string, unknown>, allowed: string[], broken
         },
     } as unknown as Host;
     const web = {
-        settings: () => undefined,
+        settings: (fields: { name: string; default?: unknown }[]) => {
+            declared.push(...fields);
+        },
         setting: (name: string) => settings[name],
         onSettings: (listener: () => void) => {
             listeners.push(listener);
@@ -720,6 +723,7 @@ function loadRouter(settings: Record<string, unknown>, allowed: string[], broken
     return {
         api,
         hidden,
+        declared,
         changed: () => listeners.forEach((listener) => listener()),
         dispose: () => disposers.forEach((dispose) => dispose()),
     };
@@ -1956,8 +1960,9 @@ async function ruleRouter(
     }
 
     const fetchStub = stubFetch(async () => new Response(JSON.stringify(ANSWER)));
+    const held: Record<string, unknown> = { typesafeApiKey: KEY, ...settings };
     const router = loadRouter(
-        { typesafeApiKey: KEY, ...settings },
+        held,
         options.allowed ?? [PICK.model, PICK.control, "github-copilot/claude-sonnet-5.5"],
     );
     const request = {
@@ -1976,6 +1981,7 @@ async function ruleRouter(
         router,
         request,
         fetchStub,
+        settings: held,
         done: async () => {
             fetchStub.restore();
             router.dispose();
@@ -2276,6 +2282,86 @@ test("no field, note or line of a route holds the TypeSafe key, from the setting
             assert.match(route.assigned!, /^acme\/(c-)?\[TYPESAFE_API_KEY\]$/);
             assert.equal(route.experiment, "[TYPESAFE_API_KEY]");
         }
+    } finally {
+        await setup.done();
+    }
+});
+
+test("a key changed or cleared while Jev answers is still taken out of the route", async () => {
+    const OTHER = "tsk-rotated-key-9876543210";
+
+    for (const change of ["cleared", "rotated"] as const) {
+        const setup = await ruleRouter(
+            { mode: "shadow" },
+            {
+                routerJson: {
+                    ruleV1: {
+                        picks: {
+                            easy: { ...PICK, model: `acme/${KEY}-${OTHER}` },
+                            medium: { ...PICK, model: `acme/${KEY}-${OTHER}` },
+                            hard: { ...PICK, model: `acme/${KEY}-${OTHER}` },
+                        },
+                    },
+                },
+            },
+        );
+
+        setup.fetchStub.restore();
+        let release: () => void = () => undefined;
+        const answered = new Promise<void>((resolve) => {
+            release = resolve;
+        });
+        let asked: () => void = () => undefined;
+        const called = new Promise<void>((resolve) => {
+            asked = resolve;
+        });
+        const deferred = stubFetch(async () => {
+            asked();
+            await answered;
+
+            return new Response(JSON.stringify(ANSWER));
+        });
+
+        try {
+            const pending = setup.router.api.route(setup.request);
+
+            await called;
+            setup.settings.typesafeApiKey = change === "cleared" ? undefined : OTHER;
+            release();
+
+            const route = await pending;
+            const raw = JSON.stringify(route).toLowerCase();
+
+            assert.equal(route.tierRule, "v1", change);
+            assert.equal(raw.includes(KEY.toLowerCase()), false, `${change}: the key Jev got`);
+
+            if (change === "rotated") {
+                assert.equal(raw.includes(OTHER.toLowerCase()), false, "rotated: the new key");
+            }
+        } finally {
+            deferred.restore();
+            await setup.done();
+        }
+    }
+});
+
+test("the settings declare mode shadow and empty live tiers by default, and no mode set routes in shadow", async () => {
+    const setup = await ruleRouter({ liveTiers: undefined }, { routerJson: ALL_PICKS });
+
+    try {
+        const declared = Object.fromEntries(
+            setup.router.declared.map((field) => [field.name, field.default]),
+        );
+
+        assert.equal(declared.mode, "shadow");
+        assert.equal(declared.liveTiers, "");
+
+        const route = await setup.router.api.route(setup.request);
+
+        assert.equal(route.mode, "shadow", "no mode set: shadow");
+        assert.equal(route.tierRule, "v1");
+        assert.equal(route.arm, undefined);
+        assert.equal(route.assigned, undefined);
     } finally {
         await setup.done();
     }
