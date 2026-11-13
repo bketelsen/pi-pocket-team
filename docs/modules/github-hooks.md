@@ -1,6 +1,6 @@
 # GitHub hooks
 
-GitHub webhook deliveries wake the desk early. The module `github-hooks.ts` owns a small `node:http` listener on `0.0.0.0:8790`. It verifies each delivery, keeps only pattern-checked facts, records them in its own documents, and hands them to the desk's `nudge`. No GitHub text reaches a prompt: a fact holds no title, body, comment, branch name (other than `main` and `master`), URL or HTML. The desk then reads GitHub itself in an early sync; the fact only decides when to read. The 10-minute sweep stays the truth and the fallback.
+GitHub webhook deliveries wake the desk early. The module `github-hooks.ts` owns a small `node:http` listener on `0.0.0.0:8790`. It verifies each delivery, keeps only pattern-checked facts, records them in its own documents, and hands them to the desk's `nudge`. No GitHub text reaches a prompt: a fact holds no title, body, comment, branch name (other than `main` and `master`), URL or HTML. The desk then reads GitHub itself in an early sync; the fact only decides when to read. The early sync sends the repair, label and close-out wake-ups it decides right after its commit, as the sweep does. The 10-minute sweep stays the truth and the fallback.
 
 The design is the plan T1013 ("GitHub webhooks into Pi Pocket"); the desk's side is the `nudge` API in [desk.md](desk.md) ("Nudges from GitHub webhooks", "Observed changes"). The public path (`https://hooks.ketelsen.cloud/github` through caddy on `10.0.1.234`) and the nftables rule on the team VM belong to fleet.
 

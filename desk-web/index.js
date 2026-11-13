@@ -2095,6 +2095,14 @@ export default function setup(pocket) {
                                         )}
                                     </ul>`
                           }
+                          ${
+                              (thread.queued ?? []).length === 0
+                                  ? null
+                                  : html`<p class="small">Queued wake-ups (not sent yet):</p>
+                                        <ul class="desk-list small">
+                                            ${thread.queued.map((line) => html`<li>${line}</li>`)}
+                                        </ul>`
+                          }
                           <h3>Asks</h3>
                           ${
                               thread.asks.length === 0

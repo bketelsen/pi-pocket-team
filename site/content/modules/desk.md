@@ -21,7 +21,7 @@ Native clients receive the bound session id in the owner-only thread views, when
 
 A session with a supervisor identity uses `desk`; another session is refused.
 
-- `list` and `read`: one line for each open thread, or one thread in full with its agents, repository, sessions, PRs, asks, the last 10 events and the reports.
+- `list` and `read`: one line for each open thread, or one thread in full with its agents, repository, sessions, PRs, the wake-ups not sent yet, asks, the last 10 events and the reports.
 - `sync`: sweep the threads now.
 - `seed`: import a `seed.json` file once.
 - `attach`, `detach`, `own`: put a PR or another thread's work on a thread, take a PR off it, or mark a found PR thread as Brian's own.
@@ -67,7 +67,7 @@ Every sync of a supervisor (the sweeper, `desk sync`, the page's view sweep, and
 
 A hooks module can hand the desk facts of GitHub webhook deliveries with `nudge` on the desk's API. The desk takes each delivery id once (a redelivery changes nothing). A fact about a PR or an issue on a thread (a CI suite fact names every PR of the suite), a PR a watch waits for, a PR head, or the issue queue makes that supervisor's next sync come early: 20 seconds after the first fact, and at most 1 such sync in 60 seconds, by the durable task `x.desk.nudge`. So 50 deliveries in 20 seconds are 1 sync. The fact only decides when to read: the sync's own GitHub read is the truth. Each sweep also records the changes it saw on PRs and queued issues (state, labels, review, head, CI), for a later alarm that compares them with the deliveries.
 
-The sweep also wakes an agent when every PR on its thread is merged or closed, tells a session once when its PR conflicts or its checks fail, removes the label `ready-for-human` when the PR changes after it (or wakes the agent once when core's `pr-triage` workflow already removed it after a push), and archives the idle sessions of closed threads.
+The sweep also wakes an agent when every PR on its thread is merged or closed, tells a session once when its PR conflicts or its checks fail, removes the label `ready-for-human` when the PR gets a new commit, conflicts with its base, fails a check, or gets a review or a comment that blocks it after the label (or wakes the agent once when core's `pr-triage` workflow already removed it after a push), and archives the idle sessions of closed threads. When the same PR at the same head needs a repair and loses the label, the agent gets 1 message for both. The sweeper and a nudged sync send these wake-ups right after their commit; `desk sync` and the page's view sweep only decide them, and the next sweeper or nudged sync sends them. Until a wake-up goes, its event says `(queued)`, and `desk read` and the thread on the page list it under "Queued wake-ups (not sent yet)".
 
 ## The goal board
 
