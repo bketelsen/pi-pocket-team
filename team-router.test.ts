@@ -89,6 +89,9 @@ type RouterCall = {
     worker?: string;
     repoDirs?: string[];
     roster?: string[];
+    shift?: boolean;
+    repo?: string;
+    threadId?: string;
 };
 type ExplicitCall = { worker: string; profileModel?: string };
 
@@ -97,7 +100,11 @@ type ExplicitCall = { worker: string; profileModel?: string };
  * records Jev's failure (as the real router does: features with no Jev fields, and the brief's hash). Version 1 is the
  * old API; version 3 also publishes `features`.
  */
-function fakeRouter(behaviour: "ok" | "throw" | "hang" | "off" | "jev-failed" = "ok", version = 3) {
+function fakeRouter(
+    behaviour: "ok" | "throw" | "hang" | "off" | "jev-failed" | "assign" = "ok",
+    version = 3,
+    assigned = "faux/faux-1",
+) {
     const calls: RouterCall[] = [];
     const explicitCalls: ExplicitCall[] = [];
     const featureCalls: {
@@ -146,6 +153,25 @@ function fakeRouter(behaviour: "ok" | "throw" | "hang" | "off" | "jev-failed" = 
                 };
             }
 
+            if (behaviour === "assign") {
+                // A router in mode assign on a live band: it assigns even beside a named worker here, so the test
+                // sees that team.ts lets a named worker win.
+                return {
+                    ...shadowRoute(request.worker),
+                    mode: "assign",
+                    status: "assigned",
+                    tier: "easy",
+                    tierRule: "v1",
+                    model: assigned,
+                    thinking: "high",
+                    arm: "A",
+                    assigned,
+                    assignedThinking: "high",
+                    reason: "assign: arm A",
+                    line: `Route: v1 easy: arm A assigned ${assigned}, thinking high (implement 1.9); assign`,
+                };
+            }
+
             return shadowRoute(request.worker);
         },
         ...(version >= 3
@@ -190,9 +216,16 @@ const answer = (text: string) => fauxAssistantMessage([fauxText(text)]);
 const teamCall = (args: object) =>
     fauxAssistantMessage([fauxToolCall("team_delegate", args)], { stopReason: "toolUse" });
 
+/** Each round request a linked session sent, as JSON: the prompt section is in it. */
+const roundRequests: string[] = [];
+
 /** Pi, scripted: the supervisor session asks for a delegation, and the linked session's own turns say little. */
 const model = scriptedModel((request) => {
     const { role, text } = lastText(request as never);
+
+    if (role !== "toolResult" && text.startsWith("[shift] Round")) {
+        roundRequests.push(JSON.stringify(request));
+    }
 
     if (role === "toolResult") {
         return answer("ok");
@@ -836,6 +869,144 @@ describe("a delegated night shift and the model router", () => {
             assert.equal(routed.worker, plain.worker, `${words}: the worker`);
             assert.equal(routed.result, plain.result, `${words}: the result`);
         }
+    });
+});
+
+describe("the router's assignment (router v4, mode assign)", () => {
+    test("an assigned worker and its thinking go in the goal and the rounds; the profile model stays", async () => {
+        await app.setSubagentModels(owner(app), ["faux/faux-2", "faux/faux-1"]);
+        const router = fakeRouter("assign", 4);
+        const before = roundRequests.length;
+
+        try {
+            const { linked } = await delegate("route-assign", "route night shift test");
+
+            await until(async () => (await goalOf(linked)) !== undefined, "the goal", 20_000);
+
+            const thread = await threadOf(linked);
+
+            assert.equal(router.calls.length, 1);
+            assert.equal(router.calls[0].shift, true, "the router hears it is a shift");
+            assert.equal(router.calls[0].repo, "frostyard/test");
+            assert.equal(router.calls[0].threadId, thread?.id, "the desk thread sets the arm");
+
+            const goal = (await goalOf(linked))!;
+
+            assert.equal(goal.worker, "faux/faux-1", "the assigned worker");
+            assert.equal(goal.workerThinking, "high", "its thinking level");
+            assert.equal(thread?.route?.status, "assigned");
+            assert.equal(thread?.route?.arm, "A");
+            assert.equal(thread?.route?.assigned, "faux/faux-1");
+            assert.equal(
+                app.sessions().find((session) => session.id === Number(linked))?.model,
+                "faux-2",
+                "the linked session stays on the profile model",
+            );
+
+            await until(() => roundRequests.length > before, "round 1", 20_000);
+            assert.match(
+                roundRequests.slice(before).join("\n"),
+                /give execution to subagents on `faux\/faux-1` and thinking `high`/,
+            );
+        } finally {
+            router.remove();
+            await app.setSubagentModels(owner(app), ["faux/faux-2"]);
+        }
+    });
+
+    test("a named worker wins over an assignment, and an assigned model off the allowed list is not used", async () => {
+        await app.setSubagentModels(owner(app), ["faux/faux-2", "faux/faux-1"]);
+
+        try {
+            const named = fakeRouter("assign", 4);
+
+            try {
+                const { linked } = await delegate(
+                    "route-assign-named",
+                    "worker route night shift test",
+                );
+
+                await until(async () => (await goalOf(linked)) !== undefined, "the goal", 20_000);
+
+                const goal = (await goalOf(linked))!;
+
+                assert.equal(goal.worker, "faux/faux-2", "the named worker runs");
+                assert.equal(goal.workerThinking, undefined);
+                assert.equal("workerThinking" in goal, false);
+            } finally {
+                named.remove();
+            }
+
+            const offList = fakeRouter("assign", 4, "acme/not-allowed");
+
+            try {
+                const { linked } = await delegate(
+                    "route-assign-off-list",
+                    "route night shift test",
+                );
+
+                await until(async () => (await goalOf(linked)) !== undefined, "the goal", 20_000);
+
+                const goal = (await goalOf(linked))!;
+
+                assert.equal(goal.worker, undefined, "a model off the allowed list is not set");
+                assert.equal(goal.workerThinking, undefined);
+            } finally {
+                offList.remove();
+            }
+        } finally {
+            await app.setSubagentModels(owner(app), ["faux/faux-2"]);
+        }
+    });
+
+    test("a delegation with no shift tells the router so, and gives it no thread for an arm", async () => {
+        const router = fakeRouter("assign", 4);
+
+        try {
+            const { linked } = await delegate("route-assign-plain", "plain route test");
+
+            await until(
+                async () => (await threadOf(linked))?.route !== undefined,
+                "the route",
+                20_000,
+            );
+
+            assert.equal(router.calls[0].shift, false);
+            assert.equal(router.calls[0].threadId, undefined);
+            assert.equal(await goalOf(linked), undefined, "no goal, so no worker");
+        } finally {
+            router.remove();
+        }
+    });
+
+    test("a replay reads the assigned route from the memo: the same arm and worker, and no second ask", async () => {
+        const stored = {
+            status: "assigned",
+            tierRule: "v1",
+            tier: "easy",
+            arm: "B",
+            assigned: "deepseek/deepseek-flash",
+        };
+        const memo: RouteMemo<typeof stored> = {
+            stored: async () => stored,
+            keep: async (value) => value,
+            started: async () => true,
+            start: async () => undefined,
+        };
+        let asked = 0;
+        const route = await routeOnce(
+            memo,
+            async () => {
+                asked += 1;
+
+                return { ...stored, arm: "A", assigned: "github-copilot/gpt-6-luna" };
+            },
+            () => ({ ...stored, status: "failed" }),
+        );
+
+        assert.equal(asked, 0);
+        assert.equal(route.arm, "B");
+        assert.equal(route.assigned, "deepseek/deepseek-flash");
     });
 });
 

@@ -30,6 +30,26 @@ import {
 import createModelRouter from "./model-router.ts";
 import type { Host, Web } from "./_pocket.d.ts";
 import { matchGlob } from "./scripts/lib/risk-paths.mjs";
+import {
+    BANDS,
+    BENCH_REPOS,
+    RULE_EXPERIMENT,
+    RULE_PICKS,
+    armOf,
+    assignArm,
+    briefNames,
+    checkRule,
+    ineligible,
+    predictBand,
+    readLiveTiers,
+    readRule,
+    readRulePicks,
+} from "./model-router.ts";
+import { readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { install } from "./install.mjs";
+import { predictTier, validateRule } from "./bench/analyze.mjs";
+import { R2_BENCH_REPOS } from "./audit/checks.mjs";
 
 // 12:00 UTC: outside DeepSeek's peak hours.
 const NOON = Date.UTC(2026, 9, 23, 12, 0);
@@ -853,11 +873,11 @@ test("the module skips a model it cannot resolve, and a named worker needs no ca
     }
 });
 
-test("the module publishes version 3, and keeps `explicit` for an older team.ts", () => {
+test("the module publishes version 4, and keeps `explicit` for an older team.ts", () => {
     const router = loadRouter({ mode: "shadow", typesafeApiKey: KEY }, []);
 
     try {
-        assert.equal(router.api.version, 3);
+        assert.equal(router.api.version, 4);
         assert.equal(typeof router.api.explicit, "function");
         assert.equal(typeof router.api.features, "function");
     } finally {
@@ -1549,5 +1569,671 @@ test("features: a folder reached through a symbolic link has the features of its
     } finally {
         await rm(parent, { recursive: true, force: true });
         await repo.done();
+    }
+});
+
+// ─── Rule v1: the bands, the picks, assign mode and the arm (router v4) ─────
+
+test("router-rule-v1.json is the bench's frozen rule, valid, and install.mjs copies it", async () => {
+    const here = import.meta.dirname;
+    const parsed = JSON.parse(readFileSync(join(here, "router-rule-v1.json"), "utf8"));
+
+    // The same rule, value for value (Prettier formats the copy; the bench's file is skipped).
+    assert.deepEqual(
+        parsed,
+        JSON.parse(readFileSync(join(here, "bench", "rule-v1.json"), "utf8")),
+        "a copy of the frozen rule",
+    );
+
+    assert.doesNotThrow(() => validateRule(parsed), "the bench accepts it");
+    assert.ok("rule" in checkRule(parsed), "the router accepts it");
+
+    const target = await mkdtemp(join(tmpdir(), "router-install-"));
+
+    try {
+        const { changed } = await install({ source: here, target, check: true });
+
+        assert.ok(changed.includes("new  router-rule-v1.json"), "the install writes it");
+    } finally {
+        await rm(target, { recursive: true, force: true });
+    }
+});
+
+test("checkRule refuses a rule that is not whole, as the bench's validateRule does", () => {
+    const rule = JSON.parse(
+        readFileSync(join(import.meta.dirname, "bench", "rule-v1.json"), "utf8"),
+    );
+    const broken: [string, unknown][] = [
+        ["not an object", null],
+        ["version", { ...rule, version: 2 }],
+        ["features", { ...rule, features: ["nope"] }],
+        ["scale", { ...rule, scale: { ...rule.scale, briefChars: 0 } }],
+        ["median", { ...rule, medians: {} }],
+        ["weight", { ...rule, weights: { ...rule.weights, briefChars: "x" } }],
+        ["thresholds", { ...rule, thresholds: [2, 1] }],
+        ["levels", { ...rule, features: ["kind"], levels: { kind: ["implement"] } }],
+    ];
+
+    for (const [name, value] of broken) {
+        const checked = checkRule(value);
+
+        assert.ok("why" in checked, name);
+        assert.throws(() => validateRule(value), undefined, `the bench refuses it too: ${name}`);
+    }
+});
+
+test("predictBand gives the band that the bench's predictTier gives", () => {
+    const rule = JSON.parse(readFileSync(join(import.meta.dirname, "router-rule-v1.json"), "utf8"));
+    // A rule with a categorical feature too: the 1-hot columns and the `unknown` level.
+    const kinded = {
+        ...rule,
+        features: [...rule.features, "kind", "language"],
+        levels: { kind: ["implement", "unknown"], language: ["go", "ts", "unknown"] },
+        weights: {
+            ...rule.weights,
+            "kind=implement": 0.7,
+            "kind=unknown": -0.4,
+            "language=go": 0.3,
+            "language=ts": -0.2,
+            "language=unknown": 0.1,
+        },
+    };
+    let seed = 1064;
+
+    const next = () => {
+        seed = (seed * 1103515245 + 12345) % 2 ** 31;
+
+        return seed / 2 ** 31;
+    };
+
+    const seen = new Set<string>();
+
+    for (let i = 0; i < 400; i++) {
+        const facts = {
+            v: 1 as const,
+            briefChars: Math.floor(next() * 4000),
+            pathsNamed: Math.floor(next() * 12),
+            reposNamed: Math.floor(next() * 3),
+            language: (["go", "ts", "python", "unknown"] as const)[Math.floor(next() * 4)]!,
+            riskPathNamed: next() < 0.3 ? null : next() < 0.5,
+            testsBeside: null,
+            ...(next() < 0.5 ? { kind: next() < 0.5 ? "implement" : "write" } : {}),
+        };
+
+        for (const each of [rule, kinded]) {
+            const band = predictBand(each, facts);
+
+            assert.equal(band, predictTier(each, facts), JSON.stringify(facts));
+            seen.add(band);
+        }
+    }
+
+    assert.deepEqual([...seen].sort(), [...BANDS].sort(), "the sample reaches every band");
+});
+
+test("readRule: an absent, a broken and an invalid rule file each say why; a valid one is read", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "router-rule-"));
+
+    try {
+        const absent = await readRule(join(dir, "none.json"));
+
+        assert.ok("why" in absent && /absent/.test(absent.why));
+
+        await writeFile(join(dir, "broken.json"), "{ not json");
+        const broken = await readRule(join(dir, "broken.json"));
+
+        assert.ok("why" in broken && /not a valid rule/.test(broken.why));
+
+        await writeFile(join(dir, "invalid.json"), JSON.stringify({ version: 1, features: [] }));
+        const invalid = await readRule(join(dir, "invalid.json"));
+
+        assert.ok("why" in invalid && /not a valid rule/.test(invalid.why));
+
+        const valid = await readRule(join(import.meta.dirname, "router-rule-v1.json"));
+
+        assert.ok("rule" in valid);
+    } finally {
+        await rm(dir, { recursive: true, force: true });
+    }
+});
+
+test("armOf is A when the first byte of SHA-256(thread id) is even, else B", () => {
+    const parity = (id: string) =>
+        createHash("sha256").update(id, "utf8").digest()[0]! % 2 === 0 ? "A" : "B";
+    const arms = new Set<string>();
+
+    for (let n = 1; n <= 40; n++) {
+        const id = `T${String(n)}`;
+
+        assert.equal(armOf(id), parity(id), id);
+        assert.equal(armOf(id), armOf(id), "the same thread, the same arm");
+        arms.add(armOf(id));
+    }
+
+    assert.deepEqual([...arms].sort(), ["A", "B"]);
+});
+
+test("ineligible: each condition of the bench's population", () => {
+    const eligible = {
+        shift: true,
+        kind: "implement",
+        repo: "bketelsen/pi-pocket-team",
+        reposNamed: ["bketelsen/pi-pocket-team", "frostyard/core"],
+        riskPathNamed: false,
+    };
+
+    assert.equal(ineligible(eligible), undefined);
+
+    for (const kind of ["implement", "debug", "refactor", "write"]) {
+        assert.equal(ineligible({ ...eligible, kind }), undefined, kind);
+    }
+
+    assert.equal(ineligible({ ...eligible, repo: "Frostyard/NSL" }), undefined, "any case");
+    assert.equal(ineligible({ ...eligible, shift: false }), "not a shift");
+    assert.equal(ineligible({ ...eligible, shift: undefined }), "not a shift");
+    assert.equal(ineligible({ ...eligible, worker: "acme/named" }), "a named worker");
+    assert.equal(ineligible({ ...eligible, kind: "review" }), "kind review");
+    assert.equal(ineligible({ ...eligible, kind: undefined }), "kind unknown");
+    assert.equal(ineligible({ ...eligible, repo: "frostyard/snosi" }), "not a bench repository");
+    assert.equal(ineligible({ ...eligible, repo: undefined }), "not a bench repository");
+    assert.equal(
+        ineligible({ ...eligible, reposNamed: ["bketelsen/pi-pocket"] }),
+        "the brief names a repository outside the bench",
+    );
+    assert.equal(ineligible({ ...eligible, riskPathNamed: true }), "the brief names a risk path");
+    assert.equal(ineligible({ ...eligible, riskPathNamed: null }), "no risk paths list to read");
+    assert.equal(
+        ineligible({ ...eligible, riskPathNamed: undefined }),
+        "no risk paths list to read",
+    );
+});
+
+test("BENCH_REPOS is the audit's R2 list", () => {
+    assert.deepEqual([...BENCH_REPOS].sort(), [...R2_BENCH_REPOS].sort());
+});
+
+test("briefNames gives the roster repositories that a brief names, lowercase", () => {
+    const { repos, paths } = briefNames("Fix Frostyard/Core#12 and store.go, not acme/x", {
+        roster: ["frostyard/core", "bketelsen/fleet"],
+    });
+
+    assert.deepEqual([...repos], ["frostyard/core"]);
+    assert.ok(paths.has("store.go"));
+});
+
+test("readLiveTiers reads a comma list of bands, once each, and notes an unknown name", () => {
+    assert.deepEqual(readLiveTiers(""), { bands: [], notes: [] });
+    assert.deepEqual(readLiveTiers(undefined), { bands: [], notes: [] });
+    assert.deepEqual(readLiveTiers(" Easy, hard ,easy"), { bands: ["easy", "hard"], notes: [] });
+    assert.deepEqual(readLiveTiers("easy,premium"), {
+        bands: ["easy"],
+        notes: ["liveTiers: premium is not a band, ignored"],
+    });
+});
+
+const PICK = {
+    model: "github-copilot/gpt-6-luna",
+    thinking: "high",
+    control: "deepseek/deepseek-flash",
+};
+
+test("RULE_PICKS ships empty: stage 2 decided no band (branch wait)", () => {
+    assert.deepEqual(RULE_PICKS, {});
+    assert.equal(RULE_EXPERIMENT, undefined);
+});
+
+test("readRulePicks: the code's picks, router.json's valid entries over them, and a note for each invalid one", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "router-picks-"));
+    const path = join(dir, "router.json");
+
+    try {
+        assert.deepEqual(await readRulePicks(join(dir, "none.json")), { picks: {}, notes: [] });
+
+        await writeFile(path, "{ not json");
+        assert.deepEqual(await readRulePicks(path), { picks: {}, notes: [] });
+
+        await writeFile(path, JSON.stringify({ tiers: {} }));
+        assert.deepEqual(await readRulePicks(path), { picks: {}, notes: [] }, "no ruleV1");
+
+        await writeFile(
+            path,
+            JSON.stringify({
+                ruleV1: {
+                    experiment: "T1064-easy-1",
+                    picks: {
+                        easy: PICK,
+                        medium: { ...PICK, thinking: "very" },
+                        hard: { model: "acme/x", thinking: "high" },
+                        premium: PICK,
+                    },
+                },
+            }),
+        );
+        assert.deepEqual(await readRulePicks(path), {
+            picks: { easy: PICK },
+            experiment: "T1064-easy-1",
+            notes: [
+                "router.json: ruleV1.picks.medium is not valid, ignored",
+                "router.json: ruleV1.picks.hard is not valid, ignored",
+                "router.json: ruleV1.picks.premium is not a band, ignored",
+            ],
+        });
+
+        await writeFile(path, JSON.stringify({ ruleV1: { picks: [], experiment: "a b" } }));
+        assert.deepEqual(await readRulePicks(path), {
+            picks: {},
+            notes: [
+                "router.json: ruleV1.experiment is not valid, ignored",
+                "router.json: ruleV1.picks is not an object, ignored",
+            ],
+        });
+
+        await writeFile(path, JSON.stringify({ ruleV1: "on" }));
+        assert.deepEqual(await readRulePicks(path), {
+            picks: {},
+            notes: ["router.json: ruleV1 is not an object, ignored"],
+        });
+
+        // A file with only ruleV1 keeps the default tiers, with no note.
+        await writeFile(path, JSON.stringify({ ruleV1: { picks: { easy: PICK } } }));
+        assert.deepEqual(await readTiers(path), { tiers: DEFAULT_TIERS, notes: [] });
+    } finally {
+        await rm(dir, { recursive: true, force: true });
+    }
+});
+
+test("assignArm: arm A gets the pick and its thinking, arm B the control; an unusable model falls back", () => {
+    const all = () => true;
+
+    assert.deepEqual(assignArm(PICK, "A", all), {
+        assigned: PICK.model,
+        assignedThinking: "high",
+        notes: [],
+    });
+    assert.deepEqual(assignArm(PICK, "B", all), { assigned: PICK.control, notes: [] });
+    assert.deepEqual(
+        assignArm(PICK, "A", (model) => model === PICK.control),
+        {
+            assigned: PICK.control,
+            notes: [`${PICK.model} cannot be used now: the control instead`],
+        },
+        "an unusable pick: the control, with no thinking",
+    );
+    assert.deepEqual(
+        assignArm(PICK, "A", () => false),
+        {
+            notes: [
+                `${PICK.model} cannot be used now: the control instead`,
+                `${PICK.control} cannot be used now: no assignment`,
+            ],
+        },
+    );
+    assert.deepEqual(
+        assignArm(PICK, "B", () => false),
+        {
+            notes: [`${PICK.control} cannot be used now: no assignment`],
+        },
+    );
+});
+
+test("routeLine says the band, the pick, the arm and the assignment of a v1 route", () => {
+    const base = {
+        mode: "assign" as const,
+        status: "shadow" as const,
+        kind: "implement",
+        demand: 2,
+        tier: "easy" as const,
+        tierRule: "v1" as const,
+        reason: "",
+        at: 0,
+    };
+
+    assert.equal(
+        routeLine(base),
+        "Route: v1 easy: no pick (implement 2.0); today's policy; shadow",
+    );
+    assert.equal(
+        routeLine({ ...base, model: PICK.model, thinking: "high" }),
+        "Route: v1 easy: github-copilot/gpt-6-luna, thinking high (implement 2.0); shadow, not applied",
+    );
+    assert.equal(
+        routeLine({ ...base, arm: "B" }),
+        "Route: v1 easy: arm B, no usable model (implement 2.0); today's policy",
+    );
+
+    const long = routeLine({
+        ...base,
+        status: "assigned",
+        tier: "medium",
+        arm: "A",
+        assigned: "github-copilot/claude-sonnet-5.5-preview-xx",
+        assignedThinking: "xhigh",
+    });
+
+    assert.equal(
+        long,
+        "Route: v1 medium: arm A assigned github-copilot/claude-sonnet-5.5-preview-xx, thinking xhigh (implement 2.0); assign",
+    );
+    assert.ok(long.length <= 120, "the desk event holds it whole");
+    assert.equal(
+        routeLine({ ...base, status: "assigned", arm: "B", assigned: PICK.control }),
+        "Route: v1 easy: arm B assigned deepseek/deepseek-flash (implement 2.0); assign",
+    );
+});
+
+/** The thread ids of each arm, by the arm rule itself. */
+const ARM_A = Array.from({ length: 40 }, (_, n) => `T${String(n + 1)}`).find(
+    (id) => armOf(id) === "A",
+)!;
+const ARM_B = Array.from({ length: 40 }, (_, n) => `T${String(n + 1)}`).find(
+    (id) => armOf(id) === "B",
+)!;
+
+/**
+ * An eligible shift of a bench repository (a risk paths list that the brief does not match), the router's files in a
+ * temporary folder, and the router module in `settings`. `routerJson` is `router.json`; `rule` names another rule file.
+ */
+async function ruleRouter(
+    settings: Record<string, unknown>,
+    options: { routerJson?: unknown; rule?: string; allowed?: string[] } = {},
+) {
+    const dir = await mkdtemp(join(tmpdir(), "router-v1-"));
+    const repo = await repoWith({
+        "go.mod": "module x",
+        ".github/risk-paths.json": RISK_LIST,
+        "store.go": "",
+    });
+
+    process.env.PI_POCKET_TEAM_SSH_CONFIG = join(dir, "no-ssh-config");
+    process.env.PI_POCKET_TEAM_ROUTER_CONFIG = join(dir, "router.json");
+
+    if (options.rule !== undefined) {
+        process.env.PI_POCKET_TEAM_ROUTER_RULE = options.rule;
+    }
+
+    if (options.routerJson !== undefined) {
+        await writeFile(join(dir, "router.json"), JSON.stringify(options.routerJson));
+    }
+
+    const fetchStub = stubFetch(async () => new Response(JSON.stringify(ANSWER)));
+    const router = loadRouter(
+        { typesafeApiKey: KEY, ...settings },
+        options.allowed ?? [PICK.model, PICK.control, "github-copilot/claude-sonnet-5.5"],
+    );
+    const request = {
+        brief: "Change store.go in bketelsen/pi-pocket-team\n\nStop when: the tests pass",
+        startAt: NOON,
+        profileModel: "github-copilot/claude-opus-5.5",
+        repoDirs: [repo.dir],
+        roster: ["bketelsen/pi-pocket-team", "frostyard/test"],
+        shift: true,
+        repo: "bketelsen/pi-pocket-team",
+        threadId: ARM_A,
+    };
+
+    return {
+        dir,
+        router,
+        request,
+        fetchStub,
+        done: async () => {
+            fetchStub.restore();
+            router.dispose();
+            delete process.env.PI_POCKET_TEAM_SSH_CONFIG;
+            delete process.env.PI_POCKET_TEAM_ROUTER_CONFIG;
+            delete process.env.PI_POCKET_TEAM_ROUTER_RULE;
+            await repo.done();
+            await rm(dir, { recursive: true, force: true });
+        },
+    };
+}
+
+const RULE = JSON.parse(readFileSync(join(import.meta.dirname, "router-rule-v1.json"), "utf8"));
+const ALL_PICKS = { ruleV1: { picks: { easy: PICK, medium: PICK, hard: PICK } } };
+
+test("an eligible shift records tierRule v1 and its band; with no pick it assigns nothing and suggests nothing", async () => {
+    const setup = await ruleRouter({ mode: "assign", liveTiers: "easy,medium,hard" });
+
+    try {
+        const route = await setup.router.api.route(setup.request);
+
+        assert.equal(route.tierRule, "v1");
+        assert.equal(route.tier, predictBand(RULE, route.features!));
+        assert.ok((BANDS as readonly string[]).includes(route.tier!));
+        assert.equal(route.features?.riskPathNamed, false);
+        assert.equal(route.status, "shadow", "no pick: no assignment");
+        assert.equal(route.model, undefined, "no pick: no suggestion");
+        assert.equal(route.arm, undefined);
+        assert.equal(route.assigned, undefined);
+        assert.deepEqual(route.notes, [`no pick for ${route.tier}: no assignment`]);
+        assert.equal(route.profileModel, "github-copilot/claude-opus-5.5");
+        assert.match(route.line, /^Route: v1 (easy|medium|hard): no pick/);
+        assert.equal(setup.fetchStub.calls.length, 1, "1 Jev call");
+    } finally {
+        await setup.done();
+    }
+});
+
+test("a delegation outside the bench's population keeps today's route: no tierRule", async () => {
+    const setup = await ruleRouter(
+        { mode: "assign", liveTiers: "easy,medium,hard" },
+        { routerJson: ALL_PICKS },
+    );
+
+    try {
+        const cases: [string, Record<string, unknown>][] = [
+            ["no shift", { shift: false }],
+            ["a named worker", { worker: PICK.control }],
+            ["not a bench repository", { repo: "frostyard/test" }],
+            ["no repository", { repo: undefined }],
+            [
+                "a repository outside the bench in the brief",
+                { brief: "Change store.go in frostyard/test\n\nStop when: done" },
+            ],
+            ["a risk path", { brief: "Change model-router.ts\n\nStop when: done" }],
+            ["no risk paths list", { repoDirs: [] }],
+        ];
+
+        for (const [name, change] of cases) {
+            const route = await setup.router.api.route({ ...setup.request, ...change });
+
+            assert.equal(route.tierRule, undefined, name);
+            assert.equal(route.arm, undefined, name);
+            assert.equal(route.assigned, undefined, name);
+            assert.equal(route.status, "shadow", name);
+            assert.ok(
+                (TIERS as readonly string[]).includes(route.tier!),
+                `${name}: the 4 tiers as before`,
+            );
+        }
+
+        // A kind outside the bench's: Jev says review.
+        setup.fetchStub.restore();
+        const review = stubFetch(
+            async () =>
+                new Response(
+                    JSON.stringify({
+                        answers: { ...ANSWER.answers, task_kind: { choice: "review" } },
+                    }),
+                ),
+        );
+
+        try {
+            const route = await setup.router.api.route(setup.request);
+
+            assert.equal(route.tierRule, undefined, "kind review");
+            assert.equal(route.assigned, undefined);
+        } finally {
+            review.restore();
+        }
+    } finally {
+        await setup.done();
+    }
+});
+
+test("an absent or invalid rule file: no band, no assignment, and the route says why", async () => {
+    for (const [name, contents, why] of [
+        ["absent", undefined, /router-rule-v1\.json is absent: no band, no assignment/],
+        ["invalid", "{}", /router-rule-v1\.json is not a valid rule: .*: no band, no assignment/],
+    ] as const) {
+        const folder = await mkdtemp(join(tmpdir(), "router-rule-file-"));
+        const rule = join(folder, "router-rule-v1.json");
+
+        if (contents !== undefined) {
+            await writeFile(rule, contents);
+        }
+
+        const setup = await ruleRouter(
+            { mode: "assign", liveTiers: "easy,medium,hard" },
+            { routerJson: ALL_PICKS, rule },
+        );
+
+        try {
+            const route = await setup.router.api.route(setup.request);
+
+            assert.equal(route.tierRule, undefined, name);
+            assert.equal(route.arm, undefined, name);
+            assert.equal(route.assigned, undefined, name);
+            assert.equal(route.status, "shadow", name);
+            assert.ok(
+                route.notes?.some((note) => why.test(note)),
+                `${name}: ${JSON.stringify(route.notes)}`,
+            );
+        } finally {
+            await setup.done();
+            await rm(folder, { recursive: true, force: true });
+        }
+    }
+});
+
+test("assign: a router.json pick on a live band gives arm A the pick at its thinking, and arm B the control", async () => {
+    const setup = await ruleRouter(
+        { mode: "assign", liveTiers: "easy,medium,hard" },
+        { routerJson: { ruleV1: { ...ALL_PICKS.ruleV1, experiment: "T1064-live-1" } } },
+    );
+
+    try {
+        const a = await setup.router.api.route(setup.request);
+
+        assert.equal(a.mode, "assign");
+        assert.equal(a.status, "assigned");
+        assert.equal(a.tierRule, "v1");
+        assert.equal(a.arm, "A");
+        assert.equal(a.assigned, PICK.model);
+        assert.equal(a.assignedThinking, "high");
+        assert.equal(a.model, PICK.model, "the band's pick");
+        assert.equal(a.thinking, "high");
+        assert.equal(a.experiment, "T1064-live-1");
+        assert.equal(a.reason, "assign: arm A");
+        assert.equal(a.profileModel, "github-copilot/claude-opus-5.5", "the profile model stays");
+        assert.match(a.line, /arm A assigned github-copilot\/gpt-6-luna, thinking high/);
+
+        const b = await setup.router.api.route({ ...setup.request, threadId: ARM_B });
+
+        assert.equal(b.status, "assigned");
+        assert.equal(b.arm, "B");
+        assert.equal(b.assigned, PICK.control);
+        assert.equal(b.assignedThinking, undefined, "the control runs with no thinking level");
+        assert.equal("assignedThinking" in b, false);
+
+        // A replay of the same thread asks the router again only without a memo: the arm is the same.
+        const again = await setup.router.api.route(setup.request);
+
+        assert.equal(again.arm, a.arm);
+        assert.equal(again.assigned, a.assigned);
+    } finally {
+        await setup.done();
+    }
+});
+
+test("assign: only a live band, only with a thread, and an unknown live tier is noted", async () => {
+    const setup = await ruleRouter({ mode: "assign" }, { routerJson: ALL_PICKS });
+
+    try {
+        const first = await setup.router.api.route(setup.request);
+        const band = first.tier!;
+
+        assert.equal(first.arm, undefined, "liveTiers empty: no band is live");
+        assert.equal(first.status, "shadow");
+        assert.equal(first.model, PICK.model, "the pick is a suggestion");
+        assert.match(first.line, /shadow, not applied$/);
+        setup.router.dispose();
+
+        const others = BANDS.filter((each) => each !== band).join(",");
+        const notLive = loadRouter(
+            { mode: "assign", typesafeApiKey: KEY, liveTiers: `${others},premium` },
+            [PICK.model, PICK.control],
+        );
+
+        try {
+            const route = await notLive.api.route(setup.request);
+
+            assert.equal(route.arm, undefined, "another band is live, not this one");
+            assert.ok(route.notes?.includes("liveTiers: premium is not a band, ignored"));
+        } finally {
+            notLive.dispose();
+        }
+
+        const live = loadRouter({ mode: "assign", typesafeApiKey: KEY, liveTiers: band }, [
+            PICK.model,
+            PICK.control,
+        ]);
+
+        try {
+            const { threadId: _drop, ...noThread } = setup.request;
+            const route = await live.api.route(noThread);
+
+            assert.equal(route.arm, undefined);
+            assert.equal(route.assigned, undefined);
+            assert.ok(route.notes?.includes("no desk thread: no arm, no assignment"));
+        } finally {
+            live.dispose();
+        }
+
+        const shadow = loadRouter({ mode: "shadow", typesafeApiKey: KEY, liveTiers: band }, [
+            PICK.model,
+            PICK.control,
+        ]);
+
+        try {
+            const route = await shadow.api.route(setup.request);
+
+            assert.equal(route.mode, "shadow");
+            assert.equal(route.tierRule, "v1");
+            assert.equal(route.arm, undefined, "shadow assigns nothing");
+            assert.equal(route.assigned, undefined);
+        } finally {
+            shadow.dispose();
+        }
+    } finally {
+        await setup.done();
+    }
+});
+
+test("assign: an unusable pick falls back to the control, then to no assignment", async () => {
+    const setup = await ruleRouter(
+        { mode: "assign", liveTiers: "easy,medium,hard" },
+        { routerJson: ALL_PICKS, allowed: [PICK.control] },
+    );
+
+    try {
+        const route = await setup.router.api.route(setup.request);
+
+        assert.equal(route.status, "assigned");
+        assert.equal(route.arm, "A");
+        assert.equal(route.assigned, PICK.control, "the pick is not allowed: the control");
+        assert.equal(route.assignedThinking, undefined);
+        assert.ok(route.notes?.includes(`${PICK.model} cannot be used now: the control instead`));
+
+        // DeepSeek in its peak hours cannot be used either: nothing is left.
+        const peak = await setup.router.api.route({ ...setup.request, startAt: PEAK });
+
+        assert.equal(peak.status, "shadow");
+        assert.equal(peak.arm, "A", "the arm stays on the record");
+        assert.equal(peak.assigned, undefined);
+        assert.equal(peak.reason, "assign: no usable model");
+        assert.match(peak.line, /arm A, no usable model/);
+    } finally {
+        await setup.done();
     }
 });

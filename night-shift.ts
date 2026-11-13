@@ -169,6 +169,17 @@ export type RoundRecord = {
     worker?: string;
 };
 
+/** The thinking levels a goal's `workerThinking` may hold. */
+export const WORKER_THINKING: readonly string[] = [
+    "off",
+    "minimal",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+];
+
 /** A short, stable summary of a failed check. Times and transient output do not make separate failures. */
 export function checkFingerprint(check: CheckResult | undefined): string | undefined {
     if (check === undefined || check.passed || check.cutOff) {
@@ -351,6 +362,11 @@ export type Goal = {
     startWhy?: "deepseek-peak";
     /** The provider/model that executes the work in subagents. */
     worker?: string;
+    /**
+     * The thinking level of the worker's subagents, set only with `worker`, and only by `team_delegate` when the model
+     * router assigned the worker (its tested configuration). Added later; stored data. Absent: the spawn names none.
+     */
+    workerThinking?: string;
     by: string;
     byName: string;
     setAt: number;
@@ -485,6 +501,8 @@ export type GoalRequest = {
     startWhy?: "deepseek-peak";
     /** The provider/model that executes the work in subagents. */
     worker?: string;
+    /** The thinking level of the worker's subagents: only with `worker`, only from `team_delegate` (router v4). */
+    workerThinking?: string;
 };
 
 export type Parsed =
@@ -1383,6 +1401,27 @@ function lastRoundWords(goal: Goal): string {
     return `Last round you said ${last.verdict.toUpperCase()}${last.reason === "" ? "" : `: ${last.reason}`}`;
 }
 
+/**
+ * The prompt section's lines about the worker: none without one. With `workerThinking` (a worker the model router
+ * assigned), the line names the thinking level next to the model, so each spawn gets the tested configuration.
+ */
+export function workerLines(goal: Pick<Goal, "worker" | "workerThinking">): string[] {
+    if (goal.worker === undefined) {
+        return [];
+    }
+
+    const thinking =
+        goal.workerThinking === undefined ? "" : ` and thinking \`${goal.workerThinking}\``;
+    const spawn =
+        goal.workerThinking === undefined
+            ? ""
+            : ` Spawn each worker with model \`${goal.worker}\` and thinking \`${goal.workerThinking}\`.`;
+
+    return [
+        `For this goal, give execution to subagents on \`${goal.worker}\`${thinking}. This replaces the DeepSeek Flash rule for this goal.${spawn} If \`${goal.worker}\` cannot be used, end with STATUS: BLOCKED. Do not pick another model.`,
+    ];
+}
+
 export function roundMessage(goal: Goal, n: number, now: number): string {
     const limit =
         goal.deadline === undefined
@@ -1521,7 +1560,11 @@ export function statusCard(goal: Goal | undefined, now: number): string {
         `Objective: ${goal.objective}`,
         `Stop when: ${goal.stop}`,
         ...(goal.check === undefined ? [] : [`Check: ${goal.check}`]),
-        ...(goal.worker === undefined ? [] : [`Worker: ${goal.worker}`]),
+        ...(goal.worker === undefined
+            ? []
+            : [
+                  `Worker: ${goal.worker}${goal.workerThinking === undefined ? "" : `, thinking ${goal.workerThinking}`}`,
+              ]),
         `Set by ${goal.byName}.`,
     ];
 
@@ -1713,8 +1756,11 @@ const SUMMARIZED = new Set<StopReason>(["done", "max-rounds", "deadline", "block
 
 /** What `team.ts` uses: on `globalThis[Symbol.for("pi-pocket-team.night-shift")]`, so it finds the live version. */
 export type NightShiftApi = {
-    /** Version 3: `delegatedRequest` takes `until_at` (an absolute stop, from the desk's goal board). */
-    version: 3;
+    /**
+     * Version 3: `delegatedRequest` takes `until_at` (an absolute stop, from the desk's goal board). Version 4:
+     * `setDelegated` keeps the request's `workerThinking`, and the prompt names it next to the worker.
+     */
+    version: 4;
     delegatedRequest: typeof delegatedRequest;
     setDelegated: (
         tx: Tx,
@@ -2822,9 +2868,20 @@ export default function createNightShift(host: Host, web: Web) {
         // The supervisor's address, for the rounds: the linked session's first message names it. None: the old words.
         const address = await returnAddress(tx, id).catch(() => undefined);
 
+        // A thinking level goes only with a worker, and only a level Pi knows: anything else is left out, never refused
+        // (the linked session runs already).
+        const { workerThinking, ...rest } = request;
+        const thinking =
+            request.worker !== undefined &&
+            typeof workerThinking === "string" &&
+            WORKER_THINKING.includes(workerThinking)
+                ? { workerThinking }
+                : {};
+
         const goal: Goal = {
             id: goalId,
-            ...request,
+            ...rest,
+            ...thinking,
             by: who.by,
             byName: who.byName,
             setAt: Date.now(),
@@ -3157,8 +3214,8 @@ export default function createNightShift(host: Host, web: Web) {
 
     // Another module finds this version here. A new version sets its own before the old one's cleanup runs.
     const api: NightShiftApi = {
-        // Version 3 takes `until_at` in `delegatedRequest`.
-        version: 3,
+        // Version 3 takes `until_at` in `delegatedRequest`; version 4 keeps `workerThinking`.
+        version: 4,
         delegatedRequest,
         setDelegated,
         notifyChanged,
@@ -3212,11 +3269,7 @@ export default function createNightShift(host: Host, web: Web) {
                     `<objective>\n${host.text.defang(goal.objective)}\n</objective>`,
                     `<stop-condition>\n${host.text.defang(goal.stop)}\n</stop-condition>`,
                     `Limits: ${limits}.`,
-                    ...(goal.worker === undefined
-                        ? []
-                        : [
-                              `For this goal, give execution to subagents on \`${goal.worker}\`. This replaces the DeepSeek Flash rule for this goal. If \`${goal.worker}\` cannot be used, end with STATUS: BLOCKED. Do not pick another model.`,
-                          ]),
+                    ...workerLines(goal),
                     "End every answer in a round with one status line, the last line of the answer:",
                     "STATUS: DONE: <why the stop condition holds>",
                     "STATUS: CONTINUE: <what is left>",

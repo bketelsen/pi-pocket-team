@@ -1,6 +1,6 @@
 ---
 title: pi-pocket-team
-description: "Drop-in extensions for Pi Pocket: named agents, a desk of background work, shifts, a wiki page, a terminal page and a shadow model router."
+description: "Drop-in extensions for Pi Pocket: named agents, a desk of background work, shifts, a wiki page, a terminal page and a model router."
 hide:
     - navigation
     - toc
@@ -12,7 +12,7 @@ hide:
 
 # pi-pocket-team
 
-<p class="fy-hero__lede">Drop-in extensions for Pi Pocket, written for Brian Ketelsen's own server and shared as they are. Seven modules extend one server: named agents that delegate work, a desk that keeps the work in the background, GitHub webhooks that wake the desk, shifts that work in rounds at any hour, a wiki page, a terminal page, and a shadow router that only records.</p>
+<p class="fy-hero__lede">Drop-in extensions for Pi Pocket, written for Brian Ketelsen's own server and shared as they are. Seven modules extend one server: named agents that delegate work, a desk that keeps the work in the background, GitHub webhooks that wake the desk, shifts that work in rounds at any hour, a wiki page, a terminal page, and a model router that records, and assigns a worker only on a tier Brian makes live.</p>
 
 [Install into Pi Pocket →](getting-started/install.md){ .md-button .md-button--primary }
 [Build and test](contributing/build.md){ .md-button }
@@ -49,7 +49,7 @@ pi-pocket-team is a set of drop-in extensions for [Pi Pocket](https://github.com
 
     ***
 
-    Shadow only: records the model tier and model it would pick for each delegation, and the brief's features, on the desk thread.
+    Records the model tier and model it would pick for each delegation, and the brief's features, on the desk thread. Shadow by default: it assigns a worker only in mode `assign`, on a tier Brian makes live.
 
 - **[Desk](modules/desk.md)**
 
