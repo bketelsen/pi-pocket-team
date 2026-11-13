@@ -75,6 +75,8 @@ import {
     closeOutcome,
     closeoutHold,
     closeoutKey,
+    markCloseoutSent,
+    type SyncRunner,
     knownHeads,
     reportBlocks,
     reportAsksBrian,
@@ -9035,6 +9037,98 @@ describe("queued wake-ups (#212)", () => {
         assert.deepEqual(queuedWakes(one), []);
         assert.equal((readText(state, one.id) ?? "").includes("Queued wake-ups"), false);
         assert.equal("queued" in threadView(state.threads, one, t2), false);
+    });
+
+    test("pairWakes keeps a stored decision: alone stays alone, a pair pairs only with its partner (#214)", () => {
+        const repair = (patch: Partial<RepairWork> = {}): RepairWork => ({
+            id: "T1",
+            key: `repair:${REPAIR_REF}:h1:CONFLICTING`,
+            ref: REPAIR_REF,
+            state: "CONFLICTING",
+            failing: [],
+            to: "agent",
+            why: "change",
+            address: "session-abc",
+            ...patch,
+        });
+        const removal = (patch: Partial<UnreadyWork> = {}): UnreadyWork => ({
+            id: "T1",
+            key: `unready:${REPAIR_REF}:1000`,
+            ref: REPAIR_REF,
+            why: "the PR conflicts with its base",
+            to: "agent",
+            removed: false,
+            address: "session-abc",
+            head: "h1",
+            ...patch,
+        });
+        const repairKey = `repair:${REPAIR_REF}:h1:CONFLICTING`;
+        const unreadyKey = `unready:${REPAIR_REF}:1000`;
+
+        // Decided alone: the rule would pair them, the decision does not.
+        for (const [what, one, other] of [
+            ["both alone", repair({ pair: "" }), removal({ pair: "" })],
+            ["the repair alone", repair({ pair: "" }), removal()],
+            ["the removal alone", repair(), removal({ pair: "" })],
+        ] as const) {
+            const out = pairWakes([one], [other]);
+
+            assert.equal(out.pairs.length, 0, what);
+            assert.deepEqual(out.repairs, [one], what);
+            assert.deepEqual(out.unready, [other], what);
+        }
+
+        // A stored pair pairs with its partner, also when the PR's head moved since.
+        const stored = pairWakes(
+            [
+                repair({ key: `repair:${REPAIR_REF}:h0:CONFLICTING`, pair: "x" }),
+                repair({ pair: unreadyKey }),
+            ],
+            [removal({ pair: repairKey, removed: true, head: "h2" })],
+        );
+
+        assert.equal(stored.pairs.length, 1);
+        assert.equal(stored.pairs[0]!.repair.key, repairKey);
+        assert.deepEqual(
+            stored.repairs.map((each) => each.key),
+            [`repair:${REPAIR_REF}:h0:CONFLICTING`],
+        );
+
+        // A stored pair whose partner is not pending (sent, or pruned) goes alone, under its own id.
+        const lonely = pairWakes([repair({ pair: unreadyKey })], []);
+
+        assert.equal(lonely.pairs.length, 0);
+        assert.equal(lonely.repairs.length, 1);
+
+        const orphan = pairWakes([], [removal({ pair: repairKey, removed: true })]);
+
+        assert.equal(orphan.pairs.length, 0);
+        assert.equal(orphan.unready.length, 1);
+
+        // An undecided work never pairs with a decided one.
+        const mixed = pairWakes([repair({ pair: "other" })], [removal()]);
+
+        assert.equal(mixed.pairs.length, 0);
+    });
+
+    test("markCloseoutSent: a repeat mark of the same key keeps the first boundary; a new key takes its own (#214)", () => {
+        const one = thread({
+            prs: { "frostyard/test#1": { via: "seen", state: "MERGED" } },
+        });
+
+        assert.equal(markCloseoutSent(one, "closeout:a", 10, 100), true);
+        assert.equal(one.run.closeout, "closeout:a");
+        assert.equal(one.run.closeoutEntry, 10);
+
+        // A second sender collected the same key later, with a newer entry: the boundary stays.
+        markCloseoutSent(one, "closeout:a", 20, 200);
+        assert.equal(one.run.closeoutEntry, 10);
+        assert.equal(one.events.filter((event) => event.key === "closeout:closeout:a").length, 1);
+
+        // A new key is a new wake-up: its own boundary.
+        markCloseoutSent(one, "closeout:b", 30, 300);
+        assert.equal(one.run.closeout, "closeout:b");
+        assert.equal(one.run.closeoutEntry, 30);
     });
 
     test("pairWakes pairs a repair and a removal of the same thread, PR and head, to the agent only", () => {
@@ -24182,13 +24276,28 @@ describe("the desk in a Pi Pocket", () => {
             }
         };
 
-        const restartWithLog = async (by: number, github: unknown) => {
+        /**
+         * `remove`: `fail` makes each label DELETE fail as GitHub's 502; `hold` makes it wait until the file `go` (next to
+         * the log) exists, so a test can look at the lane while the send runs.
+         */
+        const restartWithLog = async (
+            by: number,
+            github: unknown,
+            remove: "ok" | "fail" | "hold" = "ok",
+        ) => {
             await app.close();
             shift = by;
             writeFileSync(fixturePath, JSON.stringify(github));
+            const removal =
+                remove === "fail"
+                    ? `echo "HTTP 502: Bad Gateway" >&2; exit 1`
+                    : remove === "hold"
+                      ? `while [ ! -f ${JSON.stringify(`${log}.go`)} ]; do sleep 0.05; done; printf '{}'`
+                      : `printf '{}'`;
+
             writeFileSync(
                 fakeGh,
-                `#!/bin/sh\nprintf '%s\\n' "$*" >> ${JSON.stringify(log)}\nif [ "$2" = "graphql" ]; then cat ${JSON.stringify(fixturePath)}; else printf '{}'; fi\n`,
+                `#!/bin/sh\nprintf '%s\\n' "$*" >> ${JSON.stringify(log)}\nif [ "$2" = "graphql" ]; then cat ${JSON.stringify(fixturePath)}; elif [ "$3" = "DELETE" ]; then ${removal}; else printf '{}'; fi\n`,
             );
             chmodSync(fakeGh, 0o755);
             process.env.PI_POCKET_DESK_GH = fakeGh;
@@ -24360,7 +24469,9 @@ describe("the desk in a Pi Pocket", () => {
                 to: "agent",
                 removed: true,
                 sent: true,
+                pair: repairKey,
             });
+            assert.equal(repairsOf(after)[repairKey]?.pair, unreadyKey, "the pair is stored");
             assert.equal(await texts(linked, repairMessage(ref, "CONFLICTING", [])), 0);
             assert.equal(await texts(linked, unreadyMessage(ref, why)), 0);
             assert(
@@ -24383,6 +24494,183 @@ describe("the desk in a Pi Pocket", () => {
             await quiet([]);
             shift = 0;
         }
+    });
+
+    test("a failed label removal decides alone: the repair goes alone once, and the label wake-up later (#214)", async () => {
+        const { linked, thread, first, texts } = await withOpenPr("ready-conflict-fail");
+        const ref = "frostyard/test#7";
+        const log = join(root, "ready-conflict-fail.log");
+        const labelAt = "2026-10-20T10:00:00Z";
+        const unreadyKey = `unready:${ref}:${String(Date.parse(labelAt))}`;
+        const repairKey = `repair:${ref}:aaa111:CONFLICTING`;
+        const why = "the PR conflicts with its base";
+        const repairText = repairMessage(ref, "CONFLICTING", []);
+        const { deletes, restartWithLog } = ghWithLog(log);
+        const fixture = (mergeable: string) =>
+            readyFixture({
+                head: "aaa111",
+                committed: "2026-10-19T10:00:00Z",
+                labels: [READY_LABEL],
+                readyAt: labelAt,
+                mergeable,
+            });
+        const now = async () => (await deskState())!.threads[thread.id]!;
+
+        try {
+            rmSync(log, { force: true });
+            await quiet([thread.id]);
+            await restartWithLog(SWEEP_SLEEP_MS + 60_000, fixture("MERGEABLE"));
+            await sweptAfter(thread, first);
+
+            const labeled = await now();
+
+            // The removal fails: each goes alone from now on, and the repair goes at once.
+            await restartWithLog(SWEEP_SLEEP_MS * 2 + 120_000, fixture("CONFLICTING"), "fail");
+            await sweptAfter(thread, labeled.run.sweptAt);
+            await until(async () => (await texts(linked, repairText)) === 1, "the repair", 20_000);
+            await until(
+                async () => repairsOf(await now())[repairKey]?.sent === true,
+                "the repair marked sent",
+                20_000,
+            );
+
+            const failed = await now();
+
+            assert.equal(repairsOf(failed)[repairKey]?.pair, "");
+            assert.deepEqual(unreadyOf(failed)[unreadyKey], {
+                at: unreadyOf(failed)[unreadyKey]?.at,
+                why,
+                to: "agent",
+                removed: false,
+                sent: false,
+                pair: "",
+            });
+            assert(failed.events.some((event) => event.key === `unready-failed:${unreadyKey}`));
+            assert.equal(deletes().length, 1);
+            await until(() => !app.isBusy(linked), "the repair's turn", 20_000);
+
+            // The removal works now: the label wake-up goes alone, and the repair is not sent again.
+            await restartWithLog(SWEEP_SLEEP_MS * 3 + 180_000, fixture("CONFLICTING"));
+            await sweptAfter(thread, failed.run.sweptAt);
+            await until(
+                async () => (await texts(linked, unreadyMessage(ref, why))) === 1,
+                "the label wake-up",
+                20_000,
+            );
+            await until(
+                async () => unreadyOf(await now())[unreadyKey]?.sent === true,
+                "the label wake-up marked sent",
+                20_000,
+            );
+            assert.equal(await texts(linked, repairText), 1, "the repair went once");
+            assert.equal(
+                await texts(linked, repairUnreadyMessage(ref, "CONFLICTING", [], why)),
+                0,
+                "never as a pair",
+            );
+            assert.equal(deletes().length, 2);
+            await until(() => !app.isBusy(linked), "the wake-up's turn", 20_000);
+        } finally {
+            await quiet([]);
+            shift = 0;
+        }
+    });
+
+    /**
+     * A labelled PR that conflicts, read by the sweeper or by a nudged sync whose label removal waits on a file: while it
+     * waits, the supervisor's lane is still taken, so no other sync collects the same entries.
+     */
+    const sendsInLane = async (name: string, by: "sweeper" | "nudge") => {
+        const { source, linked, thread, first, texts } = await withOpenPr(name);
+        const ref = "frostyard/test#7";
+        const log = join(root, `${name}.log`);
+        const go = `${log}.go`;
+        const why = "the PR conflicts with its base";
+        const message = repairUnreadyMessage(ref, "CONFLICTING", [], why);
+        const { deletes, restartWithLog } = ghWithLog(log);
+        const fixture = (mergeable: string) =>
+            readyFixture({
+                head: "aaa111",
+                committed: "2026-10-19T10:00:00Z",
+                labels: [READY_LABEL],
+                readyAt: "2026-10-20T10:00:00Z",
+                mergeable,
+            });
+
+        const lane = () => {
+            const slot = (
+                globalThis as unknown as Record<
+                    symbol,
+                    Map<string, { runner: SyncRunner }> | undefined
+                >
+            )[Symbol.for("pi-pocket-team.desk.runner")]?.get(dataDir);
+
+            assert(slot !== undefined, "desk.ts keeps a runner for the data folder");
+
+            return slot.runner;
+        };
+
+        try {
+            rmSync(log, { force: true });
+            rmSync(go, { force: true });
+            await quiet([thread.id]);
+            await restartWithLog(SWEEP_SLEEP_MS + 60_000, fixture("MERGEABLE"));
+            await sweptAfter(thread, first);
+
+            if (by === "sweeper") {
+                await restartWithLog(SWEEP_SLEEP_MS * 2 + 120_000, fixture("CONFLICTING"), "hold");
+            } else {
+                const api = (globalThis as unknown as Record<symbol, DeskApi | undefined>)[
+                    Symbol.for("pi-pocket-team.desk")
+                ];
+
+                assert(api?.nudge !== undefined, "the desk publishes nudge");
+                await app.harness.commit(async (tx) => {
+                    await api.nudge!(
+                        tx,
+                        [
+                            {
+                                delivery: crypto.randomUUID(),
+                                event: "pull_request",
+                                action: "synchronize",
+                                repo: "frostyard/test",
+                                number: 7,
+                            },
+                        ],
+                        Date.now() + shift,
+                    );
+                }, context);
+                // Past the nudge window, far before the sweeper's next sweep.
+                await restartWithLog(
+                    SWEEP_SLEEP_MS + 60_000 + NUDGE_WINDOW_MS + 10_000,
+                    fixture("CONFLICTING"),
+                    "hold",
+                );
+            }
+
+            await until(async () => deletes().length === 1, "the label removal", 20_000);
+            assert.equal(lane().busy(Number(source)), true, `the ${by} sends in its lane`);
+            assert.equal(
+                await lane().tryRun(Number(source), "view", async () => "ran"),
+                undefined,
+                "a view sweep skips the taken lane",
+            );
+            writeFileSync(go, "");
+            await until(async () => (await texts(linked, message)) === 1, "the wake-up", 20_000);
+            await until(() => !app.isBusy(linked), "the wake-up's turn", 20_000);
+        } finally {
+            rmSync(go, { force: true });
+            await quiet([]);
+            shift = 0;
+        }
+    };
+
+    test("the sweeper's sends run in the supervisor's lane (#214)", async () => {
+        await sendsInLane("lane-sweeper", "sweeper");
+    });
+
+    test("a nudged sync's sends run in the supervisor's lane (#214)", async () => {
+        await sendsInLane("lane-nudge", "nudge");
     });
 
     test("the workflow removes the label after a push: the agent hears it once, and the desk removes nothing", async () => {

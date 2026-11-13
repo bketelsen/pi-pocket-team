@@ -5344,6 +5344,25 @@ export function closeoutHold(thread: Thread): string | undefined {
         : "it has not reported after the close-out wake-up";
 }
 
+/**
+ * Mark a close-out wake-up sent: `run.closeout`, `closeoutRefs`, and 1 event. `closeoutEntry` is the boundary a report
+ * must come after; a repeat mark of the same key (a second sender whose send Pocket dropped as a repeat) keeps the first
+ * boundary, so a report that already came still counts. A new key takes the new entry.
+ */
+export function markCloseoutSent(thread: Thread, key: string, entry: number, now: number): boolean {
+    const kept = thread.run.closeout === key && typeof thread.run.closeoutEntry === "number";
+
+    thread.run.closeout = key;
+
+    if (!kept) {
+        thread.run.closeoutEntry = entry;
+    }
+
+    thread.run.closeoutRefs = closeoutRefsAfter(thread, key);
+
+    return addEvent(thread, `closeout:${key}`, "close-out wake-up sent", now);
+}
+
 /** The close-out wake-up's 1 message to a thread's agent: the after-merge steps, and a report back. */
 const closeoutMessage = (id: string): string =>
     `All PRs on ${id} are merged or closed. Do the after-merge steps from your task (verify releases, deploys or publishes; delete local branches of merged PRs; leave the folder clean). Then report: done, or what remains.`;
@@ -5359,6 +5378,12 @@ export type RepairEntry = {
     to: "agent" | "odrade";
     why: "change" | "archived" | "closed" | "cap" | "no-session";
     sent: boolean;
+    /**
+     * The send's pairing decision with a label removal (`pairWakes`), stored before the first send so it never changes:
+     * the key of the `run.unready` entry it goes with as 1 message, or "" when it goes alone. Absent: not decided yet
+     * (also an entry stored before this field).
+     */
+    pair?: string;
 };
 
 /** The wake-ups 1 PR gets for its agent, at most. The next change waits on Odrade. */
@@ -5420,7 +5445,8 @@ const isRepairEntry = (value: unknown): value is RepairEntry => {
         typeof entry.at === "number" &&
         (entry.to === "agent" || entry.to === "odrade") &&
         typeof entry.why === "string" &&
-        typeof entry.sent === "boolean"
+        typeof entry.sent === "boolean" &&
+        (entry.pair === undefined || typeof entry.pair === "string")
     );
 };
 
@@ -5690,6 +5716,12 @@ export type UnreadyEntry = {
      * stored before this field has none.
      */
     by?: "workflow";
+    /**
+     * The send's pairing decision with a repair wake-up (`pairWakes`), stored before the first send so it never changes:
+     * the key of the `run.repairs` entry it goes with as 1 message, or "" when it goes alone. Absent: not decided yet
+     * (also an entry stored before this field).
+     */
+    pair?: string;
 };
 
 const KEPT_UNREADY = 30;
@@ -5741,7 +5773,8 @@ const isUnreadyEntry = (value: unknown): value is UnreadyEntry => {
         (entry.to === "agent" || entry.to === "odrade") &&
         typeof entry.removed === "boolean" &&
         typeof entry.sent === "boolean" &&
-        (entry.by === undefined || entry.by === "workflow")
+        (entry.by === undefined || entry.by === "workflow") &&
+        (entry.pair === undefined || typeof entry.pair === "string")
     );
 };
 
@@ -6003,6 +6036,8 @@ export type RepairWork = {
     session?: ConversationId;
     /** The agent session's address for the supervisor. */
     back?: string;
+    /** The entry's stored pairing decision (`RepairEntry.pair`). */
+    pair?: string;
 };
 
 /** One `ready-for-human` removal to do: the label, the wake-up, and what the commit needs. */
@@ -6020,12 +6055,17 @@ export type UnreadyWork = {
     address?: string;
     /** The head oid of the PR's link when the work was collected: a repair at this head goes with it. */
     head?: string;
+    /** The entry's stored pairing decision (`UnreadyEntry.pair`). */
+    pair?: string;
 };
 
 /**
- * Pair the repair wake-ups and the label removals that go to the agent as 1 message: both to the agent with an address,
- * on the same thread and the same PR, and the repair key's head is the PR's head when the work was collected. Each
- * removal takes at most 1 repair, the first in order. The rest go alone, in their order.
+ * Pair the repair wake-ups and the label removals that go to the agent as 1 message. A stored decision (`pair`) comes
+ * first and never changes: "" goes alone, and a key pairs only with the work of that key. Only works with no decision
+ * pair by the rule: both to the agent with an address, on the same thread and the same PR, and the repair key's head is
+ * the PR's head when the work was collected. Each removal takes at most 1 repair, the first in order. The rest go alone,
+ * in their order. So each repair goes under 1 request id for its whole life: `x.desk.repair:<key>` alone, or
+ * `x.desk.repair:<key>|<unready key>` paired.
  */
 export function pairWakes(
     repairs: readonly RepairWork[],
@@ -6038,20 +6078,37 @@ export function pairWakes(
     const pairs: { repair: RepairWork; unready: UnreadyWork }[] = [];
     const paired = new Set<RepairWork>();
     const alone: UnreadyWork[] = [];
+    const addressed = (work: { to: string; address?: string }) =>
+        work.to === "agent" && work.address !== undefined;
 
     for (const removal of unready) {
-        const repair =
-            removal.to === "agent" && removal.address !== undefined && removal.head !== undefined
-                ? repairs.find(
-                      (each) =>
-                          !paired.has(each) &&
-                          each.to === "agent" &&
-                          each.address !== undefined &&
-                          each.id === removal.id &&
-                          each.ref === removal.ref &&
-                          each.key.split(":")[2] === removal.head,
-                  )
-                : undefined;
+        let repair: RepairWork | undefined;
+
+        if (removal.pair !== undefined) {
+            // A stored pair goes together; its partner not pending (sent, or pruned) means it goes alone under its own
+            // id. With no address it goes alone too: then no message goes to the agent, only a notice to Odrade.
+            repair =
+                removal.pair === "" || !addressed(removal)
+                    ? undefined
+                    : repairs.find(
+                          (each) =>
+                              !paired.has(each) &&
+                              addressed(each) &&
+                              each.id === removal.id &&
+                              each.key === removal.pair &&
+                              each.pair === removal.key,
+                      );
+        } else if (addressed(removal) && removal.head !== undefined) {
+            repair = repairs.find(
+                (each) =>
+                    !paired.has(each) &&
+                    each.pair === undefined &&
+                    addressed(each) &&
+                    each.id === removal.id &&
+                    each.ref === removal.ref &&
+                    each.key.split(":")[2] === removal.head,
+            );
+        }
 
         if (repair === undefined) {
             alone.push(removal);
@@ -28646,10 +28703,15 @@ export default function createDesk(host: Host, web: Web) {
     };
 
     /**
-     * Send a repair wake-up and a label removal of the same PR and head as 1 message (`pairWakes`): remove the label
-     * first, then send `repairUnreadyMessage` under the key `x.desk.repair:<repair key>|<unready key>`, then mark both
-     * sent in 1 commit. A failed removal sends the repair alone, as `sendRepair` does, and records the removal's failure
-     * as `sendUnready` does. A failed send adds both failure events and keeps both unsent: the next sweep tries again.
+     * Send a repair wake-up and a label removal of the same PR and head as 1 message (`pairWakes`), under the key
+     * `x.desk.repair:<repair key>|<unready key>`. The decision is stored before any send, so a retry never changes the
+     * envelope: a repair goes under 1 request id for its whole life.
+     * 1. Remove the label, unless it is already gone.
+     * 2. A failed removal: 1 commit stores `pair: ""` on both entries (each goes alone from now on) and the removal's
+     *    failure; only after it, the repair goes alone (`sendRepair`). The label wake-up goes alone at a later sync.
+     * 3. Else 1 commit stores `removed: true` and the pair (each entry holds the other's key), before the send.
+     * 4. The 1 message, then 1 commit that marks both sent. A failed send adds both failure events and keeps both unsent.
+     * A commit that fails, or finds an entry gone, sent, or decided otherwise, sends nothing: the next sync tries again.
      */
     const sendPair = async (
         supervisor: ConversationId,
@@ -28658,19 +28720,84 @@ export default function createDesk(host: Host, web: Web) {
         runtime: SendRuntime,
         context: Context,
     ): Promise<void> => {
-        if (!unready.removed) {
-            const removal = await removeLabel(unready.ref);
+        const stored = repair.pair === unready.key && unready.pair === repair.key;
+
+        /** Both entries are still there, unsent, and not decided otherwise. */
+        const open = (thread: Thread) => {
+            const repairEntry = repairsOf(thread)[repair.key];
+            const unreadyEntry = unreadyOf(thread)[unready.key];
+
+            return repairEntry === undefined ||
+                unreadyEntry === undefined ||
+                repairEntry.sent ||
+                unreadyEntry.sent ||
+                (repairEntry.pair !== undefined && repairEntry.pair !== unready.key) ||
+                (unreadyEntry.pair !== undefined && unreadyEntry.pair !== repair.key)
+                ? undefined
+                : { repairEntry, unreadyEntry };
+        };
+
+        if (!stored) {
+            const removal = unready.removed ? { removed: true } : await removeLabel(unready.ref);
+            let decided = false;
+
+            try {
+                await runtime.commit(async (tx) => {
+                    const thread = threadById(await tx.doc(DeskThreads), repair.id);
+                    const entries = thread === undefined ? undefined : open(thread);
+
+                    if (thread === undefined || entries === undefined) {
+                        return undefined;
+                    }
+
+                    if (!removal.removed) {
+                        // Each goes alone from now on; the removal's failure as `sendUnready` records it.
+                        thread.run.repairs = {
+                            ...repairsOf(thread),
+                            [repair.key]: { ...entries.repairEntry, pair: "" },
+                        };
+                        thread.run.unready = {
+                            ...unreadyOf(thread),
+                            [unready.key]: { ...entries.unreadyEntry, pair: "" },
+                        };
+                        addEvent(
+                            thread,
+                            `unready-failed:${unready.key}`,
+                            `${unready.ref}: the label ${READY_LABEL} removal failed: ${
+                                (removal as { error?: string }).error ?? "the label removal failed"
+                            }`,
+                            runtime.now(),
+                        );
+                    } else {
+                        thread.run.repairs = {
+                            ...repairsOf(thread),
+                            [repair.key]: { ...entries.repairEntry, pair: unready.key },
+                        };
+                        thread.run.unready = {
+                            ...unreadyOf(thread),
+                            [unready.key]: {
+                                ...entries.unreadyEntry,
+                                removed: true,
+                                pair: repair.key,
+                            },
+                        };
+                    }
+
+                    decided = true;
+
+                    return undefined;
+                }, context);
+            } catch {
+                // Not stored: nothing goes now, and the next sync decides again.
+                return;
+            }
+
+            if (!decided) {
+                return;
+            }
 
             if (!removal.removed) {
-                await sendRepair(supervisor, repair, runtime, context);
-                await markUnready(
-                    unready,
-                    false,
-                    removal.error ?? "the label removal failed",
-                    "",
-                    runtime,
-                    context,
-                );
+                await sendRepair(supervisor, { ...repair, pair: "" }, runtime, context);
 
                 return;
             }
@@ -28710,7 +28837,7 @@ export default function createDesk(host: Host, web: Web) {
                 const unreadyEntry = unreadyOf(thread)[unready.key];
 
                 if (failure !== undefined) {
-                    // The same events as each send alone; both stay unsent, and the label stays removed.
+                    // The same events as each send alone; both stay unsent, with the pair and the removal stored.
                     addEvent(
                         thread,
                         `repair-failed:${repair.key}`,
@@ -28719,10 +28846,6 @@ export default function createDesk(host: Host, web: Web) {
                     );
 
                     if (unreadyEntry !== undefined) {
-                        thread.run.unready = {
-                            ...unreadyOf(thread),
-                            [unready.key]: { ...unreadyEntry, removed: true },
-                        };
                         addEvent(
                             thread,
                             `unready-failed:${unready.key}`,
@@ -28765,7 +28888,7 @@ export default function createDesk(host: Host, web: Web) {
                 return undefined;
             }, context);
         } catch {
-            // The removal and the send went: the next sweep does them again with the same key, which acts once.
+            // The send went: the next sync sends again with the same key, which acts once.
         }
     };
 
@@ -28834,6 +28957,7 @@ export default function createDesk(host: Host, web: Web) {
                     failing: [...(thread.prs[parsed.ref]?.failing ?? [])],
                     to: entry.to,
                     why: entry.why,
+                    ...(entry.pair === undefined ? {} : { pair: entry.pair }),
                     ...(thread.address === undefined ? {} : { address: thread.address }),
                     ...(thread.session === undefined
                         ? {}
@@ -28876,6 +29000,7 @@ export default function createDesk(host: Host, web: Web) {
                     to: entry.to,
                     removed: entry.removed,
                     ...(entry.by === undefined ? {} : { by: entry.by }),
+                    ...(entry.pair === undefined ? {} : { pair: entry.pair }),
                     ...(thread.address === undefined ? {} : { address: thread.address }),
                     // The PR's head now: a repair at this head goes with the removal as 1 message.
                     ...(head === undefined || head === "" ? {} : { head }),
@@ -28944,15 +29069,7 @@ export default function createDesk(host: Host, web: Web) {
                     const thread = threadById(await tx.doc(DeskThreads), wake.id);
 
                     if (thread !== undefined) {
-                        thread.run.closeout = wake.key;
-                        thread.run.closeoutEntry = wake.entry;
-                        thread.run.closeoutRefs = closeoutRefsAfter(thread, wake.key);
-                        addEvent(
-                            thread,
-                            `closeout:${wake.key}`,
-                            "close-out wake-up sent",
-                            runtime.now(),
-                        );
+                        markCloseoutSent(thread, wake.key, wake.entry, runtime.now());
                     }
 
                     return undefined;
@@ -29023,9 +29140,9 @@ export default function createDesk(host: Host, web: Web) {
     /**
      * One sweeper per supervisor: sweep, sleep 10 minutes, sweep again. It ends when that supervisor has no thread that
      * is not closed. The sleep is a durable sleep (`runtime.sleepUntil`): the task has status `sleeping` until the time, and
-     * a restart keeps it. The `sweep` phase commits `{ phase: "sleep", until }` and does its sends and `sweepWorktrees`
-     * afterwards, which needs the running invocation; the `sleep` phase then starts the durable sleep. `sweepers` keeps
-     * it to one task.
+     * a restart keeps it. The `sweep` phase commits `{ phase: "sleep", until }`, does its sends after that commit and
+     * still in the supervisor's lane, then `sweepWorktrees` and the rest outside it, which needs the running invocation;
+     * the `sleep` phase then starts the durable sleep. `sweepers` keeps it to one task.
      */
     const Sweeper = defineTask<SweeperInput, SweeperState, null>({
         name: "x.desk.sweeper",
@@ -29040,9 +29157,9 @@ export default function createDesk(host: Host, web: Web) {
                     runtime.commit(change, context),
                 );
 
-                // The wake-ups to send after the commit below (`collectSends`): the close-outs, repairs and label removals
-                // decided in it, and any an earlier sweep could not send. A restart before the send loses nothing: the
-                // next sweep finds them again, and each key acts once.
+                // The wake-ups to send after the commit below (`collectSends`), in the lane: the close-outs, repairs and
+                // label removals decided in it, and any an earlier sync could not send. A restart before the send loses
+                // nothing: the next sync finds them again, and each key acts once.
                 let pending: PendingSends = { closedOut: [], repairs: [], unready: [] };
                 // Whether this task's own work ran in the lane: a request that joined another sweeper's queued work
                 // (never 2 sweepers of 1 supervisor, but a lost record can make one) commits only its own next phase.
@@ -29129,6 +29246,14 @@ export default function createDesk(host: Host, web: Web) {
 
                             throw error;
                         }
+
+                        // The sends, still in the lane: the next sync's `collectSends` sees their marks, so 2 syncs
+                        // never send the same entry at once. A send failure is no sweep error: the next sync tries again.
+                        try {
+                            await sendPending(supervisor, pending, runtime, context);
+                        } catch {
+                            // The entries stay unsent.
+                        }
                     });
                 } catch (error) {
                     if (ran) {
@@ -29150,8 +29275,6 @@ export default function createDesk(host: Host, web: Web) {
 
                     return;
                 }
-
-                await sendPending(supervisor, pending, runtime, context);
 
                 // After the commit, so a thread that closed in it has its worktree handled at once: the sweeper ends
                 // when its last thread closes, and the next sweep may never come.
@@ -29487,8 +29610,6 @@ export default function createDesk(host: Host, web: Web) {
                 const key = String(supervisor);
                 // A sync ran in this invocation: the steps after it follow.
                 let synced = false;
-                // The wake-ups its commit decided or found unsent (`collectSends`): set only when that commit succeeded.
-                let pending: PendingSends | undefined;
 
                 try {
                     let claimed = false;
@@ -29541,6 +29662,10 @@ export default function createDesk(host: Host, web: Web) {
 
                                 delete nudges.running[key];
                             };
+
+                            // The wake-ups its commit decided or found unsent (`collectSends`): set only when that
+                            // commit succeeded.
+                            let pending: PendingSends | undefined;
 
                             try {
                                 // Before the reads: a session the desk archived comes back for a thread that opened again.
@@ -29596,6 +29721,22 @@ export default function createDesk(host: Host, web: Web) {
                                     return undefined;
                                 }, context);
                             }
+
+                            // The wake-ups the sync decided go now, not at the next sweep (bketelsen/pi-pocket-team#212),
+                            // as the sweeper sends them: after the commit that recorded them, in the lane, so the next
+                            // sync's `collectSends` sees their marks. Its own try: a send failure is no failed sync.
+                            if (pending !== undefined) {
+                                try {
+                                    await sendPending(
+                                        supervisor as ConversationId,
+                                        pending,
+                                        runtime,
+                                        context,
+                                    );
+                                } catch {
+                                    // The next sync sends what is still unsent.
+                                }
+                            }
                         },
                         { prepare: claim },
                     );
@@ -29605,21 +29746,6 @@ export default function createDesk(host: Host, web: Web) {
                 }
 
                 if (synced) {
-                    // The wake-ups the sync decided go now, not at the next sweep (bketelsen/pi-pocket-team#212): after
-                    // the commit that recorded them, by the same keys as the sweeper's, so a send acts once.
-                    if (pending !== undefined) {
-                        try {
-                            await sendPending(
-                                supervisor as ConversationId,
-                                pending,
-                                runtime,
-                                context,
-                            );
-                        } catch {
-                            // The next sweep sends what is still unsent.
-                        }
-                    }
-
                     // The same steps as after `desk sync`, each in its own try: none fails the task.
                     try {
                         await sweepWorktrees(
