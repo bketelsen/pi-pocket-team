@@ -13992,6 +13992,46 @@ async function stopSweepers(): Promise<void> {
     }
 }
 
+/**
+ * Stop every live sweeper and wait until it stays so: an aborted sweeper may still finish its commit in its lane, and
+ * that commit can start a sweeper again. Done when no sweeper is live and no lane of a known supervisor works, so no
+ * other supervisor sees this test's fixture.
+ */
+async function stopSweepersSettled(): Promise<void> {
+    // Read at each check: an app restart makes a new runner for the same data folder.
+    const runner = () =>
+        (
+            globalThis as unknown as Record<
+                symbol,
+                Map<string, { version: number; runner: SyncRunner }> | undefined
+            >
+        )[Symbol.for("pi-pocket-team.desk.runner")]?.get(dataDir)?.runner;
+
+    await until(
+        async () => {
+            await stopSweepers();
+
+            const live = await app.harness.inspect(context);
+
+            if (live.tasks.some((task) => task.record.kind === "x.desk.sweeper")) {
+                return false;
+            }
+
+            const state = await deskState();
+            const lane = runner();
+            const supervisors = new Set<number>([
+                ...Object.values(state?.threads ?? {}).map((thread) => thread.supervisor),
+                ...Object.keys(state?.sweepers ?? {}).map(Number),
+            ]);
+
+            // No runner for this data folder means that no lane works.
+            return [...supervisors].every((each) => lane?.busy(each) !== true);
+        },
+        "the sweepers to settle",
+        20_000,
+    );
+}
+
 /** Stop every live digest task: a test that moves the clock must not wake the digests of earlier tests. */
 async function stopDigests(): Promise<void> {
     const live = await app.harness.inspect(context);
@@ -17716,9 +17756,7 @@ describe("the desk in a Pi Pocket", () => {
     });
 
     test("a PR URL in the session's answer is attached by seen; merged, it closes the thread", async () => {
-        await stopSweepers();
-        // An aborted sweeper may still finish its commit: let it, so no other supervisor sees this fixture.
-        await new Promise((resolve) => setTimeout(resolve, 250));
+        await stopSweepersSettled();
 
         const { source, linked, thread } = await delegated(
             "github",
@@ -18626,8 +18664,7 @@ describe("the desk in a Pi Pocket", () => {
     });
 
     test("a partial GitHub answer keeps its PRs and marks a missing ref", async () => {
-        await stopSweepers();
-        await new Promise((resolve) => setTimeout(resolve, 250));
+        await stopSweepersSettled();
 
         const { source, thread } = await delegated("partial");
 
@@ -19263,8 +19300,7 @@ describe("the desk in a Pi Pocket", () => {
     });
 
     test("a failed GitHub read holds a thread open; a thread closed before its PR showed reopens when it is open", async () => {
-        await stopSweepers();
-        await new Promise((resolve) => setTimeout(resolve, 250));
+        await stopSweepersSettled();
 
         const { source, linked, thread } = await delegated("reopen");
 
@@ -19326,8 +19362,7 @@ describe("the desk in a Pi Pocket", () => {
 
     /** Delegate, let the agent report, and sweep until the thread closes as done. */
     const closedDone = async (name: string) => {
-        await stopSweepers();
-        await new Promise((resolve) => setTimeout(resolve, 250));
+        await stopSweepersSettled();
 
         const made = await delegated(name);
 
