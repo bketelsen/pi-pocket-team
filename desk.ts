@@ -5344,6 +5344,25 @@ export function closeoutHold(thread: Thread): string | undefined {
         : "it has not reported after the close-out wake-up";
 }
 
+/**
+ * Mark a close-out wake-up sent: `run.closeout`, `closeoutRefs`, and 1 event. `closeoutEntry` is the boundary a report
+ * must come after; a repeat mark of the same key (a second sender whose send Pocket dropped as a repeat) keeps the first
+ * boundary, so a report that already came still counts. A new key takes the new entry.
+ */
+export function markCloseoutSent(thread: Thread, key: string, entry: number, now: number): boolean {
+    const kept = thread.run.closeout === key && typeof thread.run.closeoutEntry === "number";
+
+    thread.run.closeout = key;
+
+    if (!kept) {
+        thread.run.closeoutEntry = entry;
+    }
+
+    thread.run.closeoutRefs = closeoutRefsAfter(thread, key);
+
+    return addEvent(thread, `closeout:${key}`, "close-out wake-up sent", now);
+}
+
 /** The close-out wake-up's 1 message to a thread's agent: the after-merge steps, and a report back. */
 const closeoutMessage = (id: string): string =>
     `All PRs on ${id} are merged or closed. Do the after-merge steps from your task (verify releases, deploys or publishes; delete local branches of merged PRs; leave the folder clean). Then report: done, or what remains.`;
@@ -5359,6 +5378,13 @@ export type RepairEntry = {
     to: "agent" | "odrade";
     why: "change" | "archived" | "closed" | "cap" | "no-session";
     sent: boolean;
+    /**
+     * The send's pairing decision with a label removal (`decidePairs`), made in the commit that records the entry and
+     * never changed after, except to "" when a pair's label removal fails before its message went: the key of the
+     * `run.unready` entry it goes with as 1 message (`x.desk.repair:<key>|<unready key>`), or "" when it goes alone.
+     * Absent: an entry stored before this field, not decided yet; it goes alone. The pruning keeps an unsent partner.
+     */
+    pair?: string;
 };
 
 /** The wake-ups 1 PR gets for its agent, at most. The next change waits on Odrade. */
@@ -5420,7 +5446,8 @@ const isRepairEntry = (value: unknown): value is RepairEntry => {
         typeof entry.at === "number" &&
         (entry.to === "agent" || entry.to === "odrade") &&
         typeof entry.why === "string" &&
-        typeof entry.sent === "boolean"
+        typeof entry.sent === "boolean" &&
+        (entry.pair === undefined || typeof entry.pair === "string")
     );
 };
 
@@ -5512,7 +5539,10 @@ export const repairNotice = (
             : "The thread has no agent session"
     }: it waits on Odrade.`;
 
-/** Record 1 decided wake-up and its event, and keep at most 30 entries: the oldest sent ones go first. */
+/**
+ * Record 1 decided wake-up and its event, and keep at most 30 entries: the oldest sent ones go first. The event says
+ * `queued`: the send comes after the commit, and adds its own `repair-sent:<key>` event.
+ */
 function recordRepair(
     thread: Thread,
     key: string,
@@ -5537,9 +5567,16 @@ function recordRepair(
 
     // A key that is still current stays: dropping it would make the same change a new one.
     const current = new Set(Object.entries(thread.prs).map(([ref, each]) => repairKey(ref, each)));
+    // An unsent pair partner stays too: its pair must keep its request id.
     const order = (sent: boolean) =>
         Object.entries(repairs)
-            .filter(([each, value]) => value.sent === sent && each !== key && !current.has(each))
+            .filter(
+                ([each, value]) =>
+                    value.sent === sent &&
+                    each !== key &&
+                    !current.has(each) &&
+                    (sent || value.pair === undefined || value.pair === ""),
+            )
             .sort((a, b) => a[1].at - b[1].at);
 
     for (const [old] of [...order(true), ...order(false)]) {
@@ -5562,7 +5599,7 @@ function recordRepair(
     return addEvent(
         thread,
         `repair:${key}`,
-        `${parsed?.ref ?? "a PR"} ${what}: repair ${where}${entry.to === "odrade" ? ` (${entry.why})` : ""}`,
+        `${parsed?.ref ?? "a PR"} ${what}: repair ${where}${entry.to === "odrade" ? ` (${entry.why}; queued)` : " (queued)"}`,
         now,
     );
 }
@@ -5687,6 +5724,13 @@ export type UnreadyEntry = {
      * stored before this field has none.
      */
     by?: "workflow";
+    /**
+     * The send's pairing decision with a repair wake-up (`decidePairs`), made in the commit that records the entry and
+     * never changed after, except to "" when the pair's label removal fails before its message went: the key of the
+     * `run.repairs` entry it goes with as 1 message (`x.desk.repair:<repair key>|<key>`), or "" when it goes alone.
+     * Absent: an entry stored before this field, not decided yet; it goes alone. The pruning keeps an unsent partner.
+     */
+    pair?: string;
 };
 
 const KEPT_UNREADY = 30;
@@ -5738,7 +5782,8 @@ const isUnreadyEntry = (value: unknown): value is UnreadyEntry => {
         (entry.to === "agent" || entry.to === "odrade") &&
         typeof entry.removed === "boolean" &&
         typeof entry.sent === "boolean" &&
-        (entry.by === undefined || entry.by === "workflow")
+        (entry.by === undefined || entry.by === "workflow") &&
+        (entry.pair === undefined || typeof entry.pair === "string")
     );
 };
 
@@ -5762,10 +5807,11 @@ export function unreadyOf(thread: Thread): Record<string, UnreadyEntry> {
 }
 
 /**
- * Why the label `ready-for-human` must come off 1 PR, in the order the desk checks: a new commit after the label, a
- * failing check, a review that requests changes after the label, a comment marked blocking after the label. Undefined
- * when the label is not on the PR, when the PR is not open, when it is a draft, and when nothing came after the label.
- * A read with no head commit never says that a commit came: an unknown head is not a new one.
+ * Why the label `ready-for-human` must come off 1 PR, in the order the desk checks (5 cases): a new commit after the
+ * label, a conflict with the base (`mergeable: CONFLICTING`), a failing check, a review that requests changes after the
+ * label, a comment marked blocking after the label. Undefined when the label is not on the PR, when the PR is not open,
+ * when it is a draft, and when nothing came after the label. A read with no head commit never says that a commit came:
+ * an unknown head is not a new one.
  */
 export function unreadyReason(link: PrLink, fact: PrFact): string | undefined {
     const ready = link.ready;
@@ -5776,6 +5822,10 @@ export function unreadyReason(link: PrLink, fact: PrFact): string | undefined {
 
     if (headMovedSince(ready, fact)) {
         return NEW_COMMIT;
+    }
+
+    if (fact.mergeable === "CONFLICTING") {
+        return CONFLICT;
     }
 
     if (fact.checks === "FAILURE" || fact.checks === "ERROR") {
@@ -5797,6 +5847,9 @@ export function unreadyReason(link: PrLink, fact: PrFact): string | undefined {
 
 /** The reason when a commit came after the label. */
 const NEW_COMMIT = "a new commit came after the label";
+
+/** The reason when the PR conflicts with its base. */
+const CONFLICT = "the PR conflicts with its base";
 
 /**
  * Whether GitHub proves a new commit after the label: a head oid now that differs from the one the desk recorded with
@@ -5852,9 +5905,15 @@ function recordUnready(
             ? { at: now, why: entry.why, to: entry.to, removed: true, sent: false, by: entry.by }
             : { at: now, why: entry.why, to: entry.to, removed: false, sent: false };
 
+    // An unsent pair partner stays: its pair must keep its request id.
     const order = (sent: boolean) =>
         Object.entries(unready)
-            .filter(([each, value]) => value.sent === sent && each !== key)
+            .filter(
+                ([each, value]) =>
+                    value.sent === sent &&
+                    each !== key &&
+                    (sent || value.pair === undefined || value.pair === ""),
+            )
             .sort((a, b) => a[1].at - b[1].at);
 
     for (const [old] of [...order(true), ...order(false)]) {
@@ -5871,8 +5930,8 @@ function recordUnready(
         thread,
         `unready:${key}`,
         entry.by === "workflow"
-            ? `${ref}: ${READY_LABEL} came off on GitHub (${remover(entry.by)}): ${entry.why}`
-            : `${ref}: ${READY_LABEL} comes off: ${entry.why}`,
+            ? `${ref}: ${READY_LABEL} came off on GitHub (${remover(entry.by)}): ${entry.why}; wake-up queued`
+            : `${ref}: ${READY_LABEL} comes off: ${entry.why} (queued)`,
         now,
     );
 }
@@ -5920,6 +5979,274 @@ export function planUnready(thread: Thread, github: GitHubFacts, now: number): n
 
     return events;
 }
+
+/** The ref inside an unready key `unready:<ref>:<label time>`. Undefined for another shape. */
+const unreadyKeyRef = (key: string): string | undefined => {
+    const parts = key.split(":");
+
+    return parts.length < 3 || parts[0] !== "unready" ? undefined : parts.slice(1, -1).join(":");
+};
+
+/**
+ * The wake-ups a thread decided and did not send yet, 1 line each, oldest first: the repair wake-ups and the label
+ * removals of `run.repairs` and `run.unready` with `sent: false`. A parked thread sends none until it is woken: its lines
+ * say so. `desk read` and the page show them, so a supervisor does not take a queued wake-up for an ignored one.
+ */
+export function queuedWakes(thread: Thread): string[] {
+    const lines: { at: number; text: string }[] = [];
+    const since = (at: number) =>
+        `, queued since ${new Date(at).toISOString().replace(/\.\d{3}Z$/, "Z")}`;
+    const parked = thread.state === "parked" ? " · waits: the thread is parked" : "";
+
+    for (const [key, entry] of Object.entries(repairsOf(thread))) {
+        const parsed = parseRepairKey(key);
+
+        if (entry.sent || parsed === undefined) {
+            continue;
+        }
+
+        const where =
+            entry.to === "agent"
+                ? "wake-up to the agent"
+                : entry.why === "archived" || entry.why === "closed"
+                  ? "message to Odrade"
+                  : "notice to Odrade";
+        const what = repairWhat(parsed.state, thread.prs[parsed.ref]?.failing ?? []);
+
+        lines.push({
+            at: entry.at,
+            text: `${parsed.ref}: repair ${where} (${what})${since(entry.at)}${parked}`,
+        });
+    }
+
+    for (const [key, entry] of Object.entries(unreadyOf(thread))) {
+        const ref = unreadyKeyRef(key);
+
+        if (entry.sent || ref === undefined) {
+            continue;
+        }
+
+        const wake = entry.to === "agent" ? "wake-up to the agent" : "notice to Odrade";
+
+        lines.push({
+            at: entry.at,
+            text: `${ref}: ${entry.removed ? wake : `${READY_LABEL} removal and ${wake}`} (${entry.why})${since(entry.at)}${parked}`,
+        });
+    }
+
+    return lines.sort((a, b) => a.at - b.at).map((line) => line.text);
+}
+
+/** One repair wake-up to send: what the message and the commit after it need, copied out of the commit. */
+export type RepairWork = {
+    id: string;
+    key: string;
+    ref: string;
+    state: RepairState;
+    failing: string[];
+    to: RepairEntry["to"];
+    why: RepairEntry["why"];
+    /** The supervisor's address for the agent. */
+    address?: string;
+    session?: ConversationId;
+    /** The agent session's address for the supervisor. */
+    back?: string;
+    /** The entry's stored pairing decision (`RepairEntry.pair`). */
+    pair?: string;
+    /** The send's request id when it is not `x.desk.repair:<key>`: a pair's id, set by `pairWakes`. */
+    requestId?: string;
+};
+
+/** One `ready-for-human` removal to do: the label, the wake-up, and what the commit needs. */
+export type UnreadyWork = {
+    id: string;
+    key: string;
+    ref: string;
+    why: string;
+    to: UnreadyEntry["to"];
+    /** The label is already gone from the PR: send the wake-up only. */
+    removed: boolean;
+    /** `workflow`: the label came off on GitHub, not by the desk; the messages say so. */
+    by?: UnreadyEntry["by"];
+    /** The supervisor's address for the agent. */
+    address?: string;
+    /** The entry's stored pairing decision (`UnreadyEntry.pair`). */
+    pair?: string;
+    /** The send's request id when it is not `x.desk.unready:<key>`: a pair's id, set by `pairWakes`. */
+    requestId?: string;
+};
+
+/** The request id of a pair's 1 message: its repair key, then its unready key. */
+export const pairRequestId = (repairKey: string, unreadyKey: string): string =>
+    `x.desk.repair:${repairKey}|${unreadyKey}`;
+
+/**
+ * Mark every entry of `run.repairs` and `run.unready` that has no pairing decision as alone (`pair: ""`): an entry from
+ * before the field. `applySweep` runs it first, before any step that records an entry, so `decidePairs` later pairs only
+ * entries of the same commit. A legacy entry may have gone already under its own request id (its send went, and the
+ * commit that marks it sent failed): pairing it would send it again under the pair's id. True when it changed an entry.
+ */
+export function settleLegacyPairs(thread: Thread): boolean {
+    const repairs = repairsOf(thread);
+    const unready = unreadyOf(thread);
+    const legacyRepairs = Object.keys(repairs).filter((key) => repairs[key]!.pair === undefined);
+    const legacyUnready = Object.keys(unready).filter((key) => unready[key]!.pair === undefined);
+
+    if (legacyRepairs.length > 0) {
+        thread.run.repairs = Object.fromEntries(
+            Object.entries(repairs).map(([key, entry]) => [
+                key,
+                entry.pair === undefined ? { ...entry, pair: "" } : entry,
+            ]),
+        );
+    }
+
+    if (legacyUnready.length > 0) {
+        thread.run.unready = Object.fromEntries(
+            Object.entries(unready).map(([key, entry]) => [
+                key,
+                entry.pair === undefined ? { ...entry, pair: "" } : entry,
+            ]),
+        );
+    }
+
+    return legacyRepairs.length > 0 || legacyUnready.length > 0;
+}
+
+/**
+ * Decide the pairing of every entry of `run.repairs` and `run.unready` that has none yet (`pair` absent), in the commit
+ * that records it, before any send: the decision never changes. A repair and a label removal that are both undecided
+ * and unsent, on the same PR, both to the agent, on a thread with an address, where the repair key's head is the PR
+ * link's head now, become a pair: each holds the other's key, and they go as 1 message. Every other undecided entry gets
+ * "" (alone). So an entry sent alone never pairs later, and a pair keeps its request id. True when it changed an entry.
+ */
+export function decidePairs(thread: Thread): boolean {
+    const repairs = repairsOf(thread);
+    const unready = unreadyOf(thread);
+    const repairsNext: Record<string, RepairEntry> = { ...repairs };
+    const unreadyNext: Record<string, UnreadyEntry> = { ...unready };
+    let changed = false;
+
+    for (const [key, entry] of Object.entries(unready).sort((a, b) => a[1].at - b[1].at)) {
+        if (entry.pair !== undefined) {
+            continue;
+        }
+
+        const ref = unreadyKeyRef(key);
+        const head = ref === undefined ? undefined : thread.prs[ref]?.head;
+        const partner =
+            entry.sent ||
+            entry.to !== "agent" ||
+            thread.address === undefined ||
+            head === undefined ||
+            head === ""
+                ? undefined
+                : Object.keys(repairsNext)
+                      .sort()
+                      .find((repairKey) => {
+                          const repair = repairsNext[repairKey]!;
+                          const parsed = parseRepairKey(repairKey);
+
+                          return (
+                              repair.pair === undefined &&
+                              !repair.sent &&
+                              repair.to === "agent" &&
+                              parsed?.ref === ref &&
+                              repairKey.split(":")[2] === head
+                          );
+                      });
+
+        if (partner === undefined) {
+            unreadyNext[key] = { ...entry, pair: "" };
+        } else {
+            unreadyNext[key] = { ...entry, pair: partner };
+            repairsNext[partner] = { ...repairsNext[partner]!, pair: key };
+        }
+
+        changed = true;
+    }
+
+    for (const [key, entry] of Object.entries(repairsNext)) {
+        if (entry.pair === undefined) {
+            repairsNext[key] = { ...entry, pair: "" };
+            changed = true;
+        }
+    }
+
+    if (changed) {
+        thread.run.repairs = repairsNext;
+        thread.run.unready = unreadyNext;
+    }
+
+    return changed;
+}
+
+/**
+ * Follow the stored pairing decisions (`decidePairs`) at send time; it decides nothing itself. A pair whose 2 works are
+ * both pending, both to the agent with an address, goes as 1 message. Every other work goes alone: "" and an absent
+ * `pair` (an entry from before the field, not decided yet) under its own id; a pair partner whose other half is not
+ * pending (sent, or no address now) under the pair's id (`requestId`), so a message that already went as the pair's is
+ * not sent again in another form.
+ */
+export function pairWakes(
+    repairs: readonly RepairWork[],
+    unready: readonly UnreadyWork[],
+): {
+    pairs: { repair: RepairWork; unready: UnreadyWork }[];
+    repairs: RepairWork[];
+    unready: UnreadyWork[];
+} {
+    const pairs: { repair: RepairWork; unready: UnreadyWork }[] = [];
+    const paired = new Set<RepairWork>();
+    const alone: UnreadyWork[] = [];
+    const addressed = (work: { to: string; address?: string }) =>
+        work.to === "agent" && work.address !== undefined;
+
+    for (const removal of unready) {
+        if (removal.pair === undefined || removal.pair === "") {
+            alone.push(removal);
+            continue;
+        }
+
+        const repair = repairs.find(
+            (each) =>
+                !paired.has(each) &&
+                each.id === removal.id &&
+                each.key === removal.pair &&
+                each.pair === removal.key,
+        );
+
+        if (repair !== undefined && addressed(repair) && addressed(removal)) {
+            paired.add(repair);
+            pairs.push({ repair, unready: removal });
+        } else {
+            // The pair's id: its other half may have gone already, as the pair's message.
+            alone.push({ ...removal, requestId: pairRequestId(removal.pair, removal.key) });
+        }
+    }
+
+    return {
+        pairs,
+        repairs: repairs
+            .filter((each) => !paired.has(each))
+            .map((each) =>
+                each.pair === undefined || each.pair === ""
+                    ? each
+                    : { ...each, requestId: pairRequestId(each.key, each.pair) },
+            ),
+        unready: alone,
+    };
+}
+
+/** The 1 message for a repair wake-up and a label removal of the same PR and head. */
+export const repairUnreadyMessage = (
+    ref: string,
+    state: RepairState,
+    failing: string[],
+    why: string,
+    by?: UnreadyEntry["by"],
+): string =>
+    `${ref} is now ${repairWhat(state, failing)}, and ${remover(by)} removed the label \`${READY_LABEL}\`${by === "workflow" ? " on GitHub" : ""}: ${why}. Merge \`main\` in (no force-push) or fix the check, run the checks, push, and add the label again only when the PR is ready (CI green, every blocking review point resolved, nothing pending). Then report.`;
 
 export type NextActor = "brian" | "agent" | "odrade" | "reviewer" | "none";
 
@@ -13710,6 +14037,8 @@ export type ThreadView = {
         /** How closely Brian reads the PR: the level from its labels. Absent: no read gave one. */
         level?: PrLevel;
     }[];
+    /** The wake-ups decided and not sent yet (`queuedWakes`), 1 line each. Absent when there is none. */
+    queued?: string[];
     /** Open asks; `from` is the agent that filed one in a report. */
     asks: {
         id: string;
@@ -13781,6 +14110,7 @@ export function threadView(
 ): ThreadView {
     const next = nextActor(thread);
     const check = closeCheck(thread, { now, folders: otherFolders(threads, thread) });
+    const queued = queuedWakes(thread);
 
     return {
         id: thread.id,
@@ -13805,6 +14135,7 @@ export function threadView(
             ...(pr.ready === undefined ? {} : { ready: true }),
             ...(pr.level === undefined ? {} : { level: pr.level }),
         })),
+        ...(queued.length === 0 ? {} : { queued }),
         asks: thread.asks
             .filter((ask) => askIsOpen(ask))
             .map((ask) => ({
@@ -14163,6 +14494,7 @@ export function readText(state: Readonly<DeskState> | undefined, id: string): st
 
     const prs = Object.entries(thread.prs);
     const events = thread.events.slice(-SHOWN_EVENTS);
+    const queued = queuedWakes(thread);
     // A report that the supervisor handled needs no escalation: the mark came at or after the newest report.
     const reportedAt = numberOr(thread.run.reportedAt);
     const handled = handledMark(thread);
@@ -14195,6 +14527,9 @@ export function readText(state: Readonly<DeskState> | undefined, id: string): st
         prs.length === 0
             ? "PRs: none"
             : `PRs:\n${prs.map(([ref, pr]) => `  ${ref} · ${pr.via}${pr.state === undefined ? "" : ` · ${pr.state}`}${pr.ready === undefined ? "" : ` · ${READY_LABEL}`}${pr.next === undefined ? "" : ` · next: ${pr.next}`}${pr.title === undefined || pr.title === "" ? "" : ` · ${pr.title}`}`).join("\n")}`,
+        ...(queued.length === 0
+            ? []
+            : [`Queued wake-ups (not sent yet):\n${queued.map((line) => `  ${line}`).join("\n")}`]),
         `Branches: ${thread.branches.length === 0 ? "none" : thread.branches.join(", ")}`,
         thread.asks.length === 0
             ? "Asks: none"
@@ -27240,6 +27575,15 @@ export default function createDesk(host: Host, web: Web) {
         }
 
         repairEpoch(state, now);
+
+        // Entries from before the pairing field go alone, before this sweep records any: `decidePairs` below pairs only
+        // the entries of this commit.
+        for (const thread of Object.values(state.threads)) {
+            if (thread.supervisor === supervisor) {
+                settleLegacyPairs(thread);
+            }
+        }
+
         // The digest's setting, read at each sweep: a change works without a reload.
         const { cap, digest, plans: planSettings } = await deskConfig();
         const digestOn = digest.minutes > 0;
@@ -27822,6 +28166,12 @@ export default function createDesk(host: Host, web: Web) {
             events += planRepairs(thread, now);
         }
 
+        // The pairing of each new repair and label entry, in the commit that records it, before any send can happen:
+        // after every step above that records one (the label, the label gone on GitHub, the reopen, the repairs).
+        for (const thread of mine) {
+            decidePairs(thread);
+        }
+
         // A parked thread that got an event from this sweep goes back to open: something changed on it.
         for (const thread of open) {
             if (reparked.has(thread.id)) {
@@ -28212,20 +28562,13 @@ export default function createDesk(host: Host, web: Web) {
         return { events };
     };
 
-    /** One repair wake-up to send: where it goes, and what the message needs. */
-    type RepairWork = {
-        id: string;
-        key: string;
-        ref: string;
-        state: RepairState;
-        failing: string[];
-        to: RepairEntry["to"];
-        why: RepairEntry["why"];
-        /** The supervisor's address for the agent. */
-        address?: string;
-        session?: ConversationId;
-        /** The agent session's address for the supervisor. */
-        back?: string;
+    /**
+     * What a send needs of a task's runtime: its commit and its clock. The sweeper's and the nudge sync's runtimes both
+     * fit.
+     */
+    type SendRuntime = {
+        commit(change: (tx: Tx) => Promise<undefined>, context: Context): Promise<void>;
+        now(): number;
     };
 
     /**
@@ -28236,7 +28579,7 @@ export default function createDesk(host: Host, web: Web) {
     const sendRepair = async (
         supervisor: ConversationId,
         work: RepairWork,
-        runtime: TaskRuntime<SweeperInput, SweeperState, null, object>,
+        runtime: SendRuntime,
         context: Context,
     ): Promise<void> => {
         // A route with no address can only tell the chat: what it says follows the reason.
@@ -28262,7 +28605,7 @@ export default function createDesk(host: Host, web: Web) {
                         to: work.address,
                         message: repairMessage(work.ref, work.state, work.failing),
                     },
-                    `x.desk.repair:${work.key}`,
+                    work.requestId ?? `x.desk.repair:${work.key}`,
                 );
                 done = "repair wake-up sent to the agent";
             } else if (
@@ -28284,7 +28627,7 @@ export default function createDesk(host: Host, web: Web) {
                             work.why,
                         ),
                     },
-                    `x.desk.repair:${work.key}`,
+                    work.requestId ?? `x.desk.repair:${work.key}`,
                 );
                 done = "repair wake-up sent to Odrade";
             } else {
@@ -28333,21 +28676,6 @@ export default function createDesk(host: Host, web: Web) {
         }
     };
 
-    /** One `ready-for-human` removal to do: the label, the wake-up, and what the commit needs. */
-    type UnreadyWork = {
-        id: string;
-        key: string;
-        ref: string;
-        why: string;
-        to: UnreadyEntry["to"];
-        /** The label is already gone from the PR: send the wake-up only. */
-        removed: boolean;
-        /** `workflow`: the label came off on GitHub, not by the desk; the messages say so. */
-        by?: UnreadyEntry["by"];
-        /** The supervisor's address for the agent. */
-        address?: string;
-    };
-
     /**
      * Remove the label `ready-for-human` from 1 PR with `gh` (the bot account). A `gh` that says the label is not there
      * counts as done: the removal is the goal, not the call.
@@ -28389,65 +28717,17 @@ export default function createDesk(host: Host, web: Web) {
     }
 
     /**
-     * Remove 1 `ready-for-human` label, wake the agent (or tell Odrade), then mark what went in its own commit. A failure
-     * adds 1 event and keeps the entry unsent: the next sweep tries again, and does not remove the label again when it
-     * is already gone.
+     * The commit after 1 label removal and its wake-up: on a failure, 1 event, `removed` kept, and the entry unsent, so
+     * the next sweep tries again from where this one stopped; else the entry is marked sent, with the event `done`.
      */
-    const sendUnready = async (
-        supervisor: ConversationId,
+    const markUnready = async (
         work: UnreadyWork,
-        runtime: TaskRuntime<SweeperInput, SweeperState, null, object>,
+        removed: boolean,
+        failure: string | undefined,
+        done: string,
+        runtime: SendRuntime,
         context: Context,
     ): Promise<void> => {
-        let removed = work.removed;
-        let sent = false;
-        let done: string;
-        let failure: string | undefined;
-
-        if (!removed) {
-            const removal = await removeLabel(work.ref);
-
-            if (!removal.removed) {
-                failure = removal.error ?? "the label removal failed";
-            } else {
-                removed = true;
-            }
-        }
-
-        if (failure === undefined) {
-            try {
-                if (work.to === "agent" && work.address !== undefined) {
-                    await linkedSend(
-                        host,
-                        supervisor,
-                        {
-                            to: work.address,
-                            message: unreadyMessage(work.ref, work.why, work.by),
-                        },
-                        `x.desk.unready:${work.key}`,
-                    );
-                    sent = true;
-                    done =
-                        work.by === "workflow"
-                            ? "ready-for-human removed on GitHub, wake-up sent to the agent"
-                            : `ready-for-human removed, wake-up sent to the agent`;
-                } else {
-                    host.notice(
-                        "warning",
-                        unreadyNotice(work.ref, work.id, work.why, work.by),
-                        supervisor,
-                    );
-                    sent = true;
-                    done =
-                        work.by === "workflow"
-                            ? "ready-for-human removed on GitHub, notice sent to Odrade"
-                            : "ready-for-human removed, notice sent to Odrade";
-                }
-            } catch (error) {
-                failure = (error as Error).message;
-            }
-        }
-
         try {
             await runtime.commit(async (tx) => {
                 const thread = threadById(await tx.doc(DeskThreads), work.id);
@@ -28488,6 +28768,450 @@ export default function createDesk(host: Host, web: Web) {
             }, context);
         } catch {
             // The removal and the send went: the next sweep does them again with the same key, which acts once.
+        }
+    };
+
+    /**
+     * Remove 1 `ready-for-human` label, wake the agent (or tell Odrade), then mark what went in its own commit. A failure
+     * adds 1 event and keeps the entry unsent: the next sweep tries again, and does not remove the label again when it
+     * is already gone.
+     */
+    const sendUnready = async (
+        supervisor: ConversationId,
+        work: UnreadyWork,
+        runtime: SendRuntime,
+        context: Context,
+    ): Promise<void> => {
+        let removed = work.removed;
+        let sent = false;
+        let done = "";
+        let failure: string | undefined;
+
+        if (!removed) {
+            const removal = await removeLabel(work.ref);
+
+            if (!removal.removed) {
+                failure = removal.error ?? "the label removal failed";
+            } else {
+                removed = true;
+            }
+        }
+
+        if (failure === undefined) {
+            try {
+                if (work.to === "agent" && work.address !== undefined) {
+                    await linkedSend(
+                        host,
+                        supervisor,
+                        {
+                            to: work.address,
+                            message: unreadyMessage(work.ref, work.why, work.by),
+                        },
+                        work.requestId ?? `x.desk.unready:${work.key}`,
+                    );
+                    sent = true;
+                    done =
+                        work.by === "workflow"
+                            ? "ready-for-human removed on GitHub, wake-up sent to the agent"
+                            : `ready-for-human removed, wake-up sent to the agent`;
+                } else {
+                    host.notice(
+                        "warning",
+                        unreadyNotice(work.ref, work.id, work.why, work.by),
+                        supervisor,
+                    );
+                    sent = true;
+                    done =
+                        work.by === "workflow"
+                            ? "ready-for-human removed on GitHub, notice sent to Odrade"
+                            : "ready-for-human removed, notice sent to Odrade";
+                }
+            } catch (error) {
+                failure = (error as Error).message;
+            }
+        }
+
+        await markUnready(work, removed, failure, done, runtime, context);
+    };
+
+    /**
+     * Send a repair wake-up and a label removal that `decidePairs` paired as 1 message (`pairWakes`), under the pair's
+     * id `x.desk.repair:<repair key>|<unready key>`. The pair was stored in the commit that recorded the entries, so a
+     * retry never changes the envelope.
+     * 1. Remove the label, unless it is already gone (`removed: true`).
+     * 2. A failed removal: the pair's message never went (it goes only after `removed: true` is stored), so 1 commit
+     *    stores `pair: ""` on both entries (each goes alone from now on) and the removal's failure; only after it, the
+     *    repair goes alone under `x.desk.repair:<key>` (`sendRepair`). The label wake-up goes alone at a later sync.
+     * 3. Else, when the label was on, 1 commit stores `removed: true` before the send.
+     * 4. The 1 message, then 1 commit that marks both sent. A failed send adds both failure events and keeps both unsent.
+     * A commit that fails, or finds an entry gone, sent, or with another `pair`, sends nothing: the next sync tries again.
+     */
+    const sendPair = async (
+        supervisor: ConversationId,
+        repair: RepairWork,
+        unready: UnreadyWork,
+        runtime: SendRuntime,
+        context: Context,
+    ): Promise<void> => {
+        /** Both entries are still there, unsent, and still paired with each other. */
+        const open = (thread: Thread) => {
+            const repairEntry = repairsOf(thread)[repair.key];
+            const unreadyEntry = unreadyOf(thread)[unready.key];
+
+            return repairEntry === undefined ||
+                unreadyEntry === undefined ||
+                repairEntry.sent ||
+                unreadyEntry.sent ||
+                repairEntry.pair !== unready.key ||
+                unreadyEntry.pair !== repair.key
+                ? undefined
+                : { repairEntry, unreadyEntry };
+        };
+
+        if (!unready.removed) {
+            const removal = await removeLabel(unready.ref);
+            let stored = false;
+
+            try {
+                await runtime.commit(async (tx) => {
+                    const thread = threadById(await tx.doc(DeskThreads), repair.id);
+                    const entries = thread === undefined ? undefined : open(thread);
+
+                    if (thread === undefined || entries === undefined) {
+                        return undefined;
+                    }
+
+                    if (!removal.removed) {
+                        // Each goes alone from now on; the removal's failure as `sendUnready` records it.
+                        thread.run.repairs = {
+                            ...repairsOf(thread),
+                            [repair.key]: { ...entries.repairEntry, pair: "" },
+                        };
+                        thread.run.unready = {
+                            ...unreadyOf(thread),
+                            [unready.key]: { ...entries.unreadyEntry, pair: "" },
+                        };
+                        addEvent(
+                            thread,
+                            `unready-failed:${unready.key}`,
+                            `${unready.ref}: the label ${READY_LABEL} removal failed: ${
+                                removal.error ?? "the label removal failed"
+                            }`,
+                            runtime.now(),
+                        );
+                    } else {
+                        thread.run.unready = {
+                            ...unreadyOf(thread),
+                            [unready.key]: { ...entries.unreadyEntry, removed: true },
+                        };
+                    }
+
+                    stored = true;
+
+                    return undefined;
+                }, context);
+            } catch {
+                // Not stored: nothing goes now, and the next sync tries again.
+                return;
+            }
+
+            if (!stored) {
+                return;
+            }
+
+            if (!removal.removed) {
+                // Under its own id: a paired work from `pairWakes` carries no other.
+                await sendRepair(supervisor, { ...repair, pair: "" }, runtime, context);
+
+                return;
+            }
+        }
+
+        let failure: string | undefined;
+
+        try {
+            await linkedSend(
+                host,
+                supervisor,
+                {
+                    to: repair.address!,
+                    message: repairUnreadyMessage(
+                        repair.ref,
+                        repair.state,
+                        repair.failing,
+                        unready.why,
+                        unready.by,
+                    ),
+                },
+                pairRequestId(repair.key, unready.key),
+            );
+        } catch (error) {
+            failure = (error as Error).message;
+        }
+
+        try {
+            await runtime.commit(async (tx) => {
+                const thread = threadById(await tx.doc(DeskThreads), repair.id);
+
+                if (thread === undefined) {
+                    return undefined;
+                }
+
+                const repairEntry = repairsOf(thread)[repair.key];
+                const unreadyEntry = unreadyOf(thread)[unready.key];
+
+                if (failure !== undefined) {
+                    // The same events as each send alone; both stay unsent, with the pair and the removal stored.
+                    addEvent(
+                        thread,
+                        `repair-failed:${repair.key}`,
+                        `repair wake-up failed: ${failure}`,
+                        runtime.now(),
+                    );
+
+                    if (unreadyEntry !== undefined) {
+                        addEvent(
+                            thread,
+                            `unready-failed:${unready.key}`,
+                            `${unready.ref}: the label ${READY_LABEL} removal failed: ${failure}`,
+                            runtime.now(),
+                        );
+                    }
+
+                    return undefined;
+                }
+
+                if (repairEntry !== undefined) {
+                    thread.run.repairs = {
+                        ...repairsOf(thread),
+                        [repair.key]: { ...repairEntry, sent: true },
+                    };
+                    addEvent(
+                        thread,
+                        `repair-sent:${repair.key}`,
+                        "repair wake-up sent to the agent",
+                        runtime.now(),
+                    );
+                }
+
+                if (unreadyEntry !== undefined) {
+                    thread.run.unready = {
+                        ...unreadyOf(thread),
+                        [unready.key]: { ...unreadyEntry, removed: true, sent: true },
+                    };
+                    addEvent(
+                        thread,
+                        `unready-sent:${unready.key}`,
+                        unready.by === "workflow"
+                            ? "ready-for-human removed on GitHub, wake-up sent to the agent with the repair wake-up"
+                            : "ready-for-human removed, wake-up sent to the agent with the repair wake-up",
+                        runtime.now(),
+                    );
+                }
+
+                return undefined;
+            }, context);
+        } catch {
+            // The send went: the next sync sends again with the same key, which acts once.
+        }
+    };
+
+    /** One close-out wake-up to send after the commit that found it. */
+    type CloseoutWork = { id: string; address: string; key: string; entry: number };
+
+    /** The wake-ups a commit found to send, copied out of it: the documents are not readable after the commit. */
+    type PendingSends = {
+        closedOut: CloseoutWork[];
+        repairs: RepairWork[];
+        unready: UnreadyWork[];
+    };
+
+    /**
+     * Inside a commit, after `applySweep`: the close-out, repair and label wake-ups of 1 supervisor still to send, the ones
+     * decided in this commit and any an earlier sync could not send. A parked thread sends nothing: an entry from before
+     * the park waits until Brian wakes it. Each goes later by its recorded route and key, so a repeat acts once. The
+     * sweeper and the nudge sync both call it.
+     */
+    const collectSends = async (
+        tx: Tx,
+        state: DeskState,
+        supervisor: number,
+    ): Promise<PendingSends> => {
+        const closedOut: CloseoutWork[] = [];
+        const repairs: RepairWork[] = [];
+        const unready: UnreadyWork[] = [];
+
+        for (const thread of Object.values(state.threads)) {
+            if (thread.supervisor !== supervisor) {
+                continue;
+            }
+
+            const key = closeoutKey(thread);
+
+            if (key !== undefined && thread.address !== undefined) {
+                closedOut.push({
+                    id: thread.id,
+                    address: thread.address,
+                    key,
+                    // The sweep scanned the session in this commit: the wake-up comes after this entry.
+                    entry: numberOr(thread.run.lastUserEntry) ?? 0,
+                });
+            }
+        }
+
+        for (const thread of Object.values(state.threads)) {
+            // A parked thread sends nothing: an entry from before the park waits until Brian wakes it.
+            if (thread.supervisor !== supervisor || thread.state !== "open") {
+                continue;
+            }
+
+            for (const [key, entry] of Object.entries(repairsOf(thread))) {
+                const parsed = parseRepairKey(key);
+
+                if (entry.sent || parsed === undefined) {
+                    continue;
+                }
+
+                repairs.push({
+                    id: thread.id,
+                    key,
+                    ref: parsed.ref,
+                    state: parsed.state,
+                    // A copy: the document's own array is not readable after the commit.
+                    failing: [...(thread.prs[parsed.ref]?.failing ?? [])],
+                    to: entry.to,
+                    why: entry.why,
+                    ...(entry.pair === undefined ? {} : { pair: entry.pair }),
+                    ...(thread.address === undefined ? {} : { address: thread.address }),
+                    ...(thread.session === undefined
+                        ? {}
+                        : { session: thread.session as ConversationId }),
+                    ...(entry.to === "odrade" && thread.session !== undefined
+                        ? await (async () => {
+                              const back = await addressOf(
+                                  tx,
+                                  thread,
+                                  thread.session as ConversationId,
+                              );
+
+                              return back === undefined ? {} : { back };
+                          })()
+                        : {}),
+                });
+            }
+        }
+
+        for (const thread of Object.values(state.threads)) {
+            // A parked thread sends nothing: the same rule as the repair wake-up.
+            if (thread.supervisor !== supervisor || thread.state !== "open") {
+                continue;
+            }
+
+            for (const [key, entry] of Object.entries(unreadyOf(thread))) {
+                const ref = unreadyKeyRef(key);
+
+                if (entry.sent || ref === undefined) {
+                    continue;
+                }
+
+                unready.push({
+                    id: thread.id,
+                    key,
+                    ref,
+                    why: entry.why,
+                    to: entry.to,
+                    removed: entry.removed,
+                    ...(entry.by === undefined ? {} : { by: entry.by }),
+                    ...(entry.pair === undefined ? {} : { pair: entry.pair }),
+                    ...(thread.address === undefined ? {} : { address: thread.address }),
+                });
+            }
+        }
+
+        return { closedOut, repairs, unready };
+    };
+
+    /**
+     * After the commit that collected them (`collectSends`): the close-out wake-ups, then the repair wake-ups, then the
+     * label removals; a pair that `decidePairs` stored goes as 1 message (`pairWakes`). Each send has its request id
+     * (`x.desk.closeout:<key>`, `x.desk.repair:<key>`, `x.desk.unready:<key>`, or a pair's
+     * `x.desk.repair:<repair key>|<unready key>`), and Pocket acts once for a key, so a replay sends the message once. It
+     * runs in the supervisor's lane, so 2 syncs never send at once. A chat notice to Odrade (`host.notice`) has no key: a
+     * replay after a lost mark can show it twice, which is accepted. A label removal that GitHub already did counts as
+     * done. Each send is marked in its own later commit.
+     */
+    const sendPending = async (
+        supervisor: ConversationId,
+        pending: PendingSends,
+        runtime: SendRuntime,
+        context: Context,
+    ): Promise<void> => {
+        for (const wake of pending.closedOut) {
+            let failure: string | undefined;
+
+            try {
+                await linkedSend(
+                    host,
+                    supervisor,
+                    { to: wake.address, message: closeoutMessage(wake.id) },
+                    `x.desk.closeout:${wake.key}`,
+                );
+            } catch (error) {
+                failure = (error as Error).message;
+            }
+
+            if (failure !== undefined) {
+                // 1 event, and no `run.closeout`: the next sweep tries again with the same key.
+                try {
+                    await runtime.commit(async (tx) => {
+                        const thread = threadById(await tx.doc(DeskThreads), wake.id);
+
+                        if (thread !== undefined) {
+                            addEvent(
+                                thread,
+                                `closeout-failed:${wake.key}`,
+                                `close-out wake-up failed: ${failure}`,
+                                runtime.now(),
+                            );
+                        }
+
+                        return undefined;
+                    }, context);
+                } catch {
+                    // The sweep goes on: the next one finds the thread again.
+                }
+
+                continue;
+            }
+
+            try {
+                // A document change only: the send has its own record, and the mark needs its own commit.
+                await runtime.commit(async (tx) => {
+                    const thread = threadById(await tx.doc(DeskThreads), wake.id);
+
+                    if (thread !== undefined) {
+                        markCloseoutSent(thread, wake.key, wake.entry, runtime.now());
+                    }
+
+                    return undefined;
+                }, context);
+            } catch {
+                // The send went: the next sweep sends again with the same key, which acts once.
+            }
+        }
+
+        const { pairs, repairs, unready } = pairWakes(pending.repairs, pending.unready);
+
+        for (const pair of pairs) {
+            await sendPair(supervisor, pair.repair, pair.unready, runtime, context);
+        }
+
+        for (const work of repairs) {
+            await sendRepair(supervisor, work, runtime, context);
+        }
+
+        for (const work of unready) {
+            await sendUnready(supervisor, work, runtime, context);
         }
     };
 
@@ -28537,9 +29261,9 @@ export default function createDesk(host: Host, web: Web) {
     /**
      * One sweeper per supervisor: sweep, sleep 10 minutes, sweep again. It ends when that supervisor has no thread that
      * is not closed. The sleep is a durable sleep (`runtime.sleepUntil`): the task has status `sleeping` until the time, and
-     * a restart keeps it. The `sweep` phase commits `{ phase: "sleep", until }` and does its sends and `sweepWorktrees`
-     * afterwards, which needs the running invocation; the `sleep` phase then starts the durable sleep. `sweepers` keeps
-     * it to one task.
+     * a restart keeps it. The `sweep` phase commits `{ phase: "sleep", until }`, does its sends after that commit and
+     * still in the supervisor's lane, then `sweepWorktrees` and the rest outside it, which needs the running invocation;
+     * the `sleep` phase then starts the durable sleep. `sweepers` keeps it to one task.
      */
     const Sweeper = defineTask<SweeperInput, SweeperState, null>({
         name: "x.desk.sweeper",
@@ -28554,16 +29278,10 @@ export default function createDesk(host: Host, web: Web) {
                     runtime.commit(change, context),
                 );
 
-                // The threads that closed out in the commit below: their agents hear about it after the commit, so a
-                // restart before the send loses nothing (the next sweep finds them again, because `run.closeout` is
-                // unset). The key makes a repeated send act once.
-                const closedOut: { id: string; address: string; key: string; entry: number }[] = [];
-                // The repair wake-ups still to send: the ones decided in this commit, and any an earlier sweep could not
-                // send. Each goes by its recorded route and key, so a repeat acts once.
-                const repairs: RepairWork[] = [];
-                // The `ready-for-human` removals still to do: the ones decided in this commit, and any an earlier sweep
-                // could not finish. A removal and a send act once by their key.
-                const unready: UnreadyWork[] = [];
+                // The wake-ups to send after the commit below (`collectSends`), in the lane: the close-outs, repairs and
+                // label removals decided in it, and any an earlier sync could not send. A restart before the send loses
+                // nothing: the next sync finds them again, and each key acts once.
+                let pending: PendingSends = { closedOut: [], repairs: [], unready: [] };
                 // Whether this task's own work ran in the lane: a request that joined another sweeper's queued work
                 // (never 2 sweepers of 1 supervisor, but a lost record can make one) commits only its own next phase.
                 let ran = false;
@@ -28607,104 +29325,7 @@ export default function createDesk(host: Host, web: Web) {
                             // Entries that wait with no writer (the journal was off, then on again): a writer starts again.
                             await resumeJournal(tx, Number(supervisor));
 
-                            for (const thread of Object.values(state.threads)) {
-                                if (thread.supervisor !== Number(supervisor)) {
-                                    continue;
-                                }
-
-                                const key = closeoutKey(thread);
-
-                                if (key !== undefined && thread.address !== undefined) {
-                                    closedOut.push({
-                                        id: thread.id,
-                                        address: thread.address,
-                                        key,
-                                        // The sweep scanned the session in this commit: the wake-up comes after this entry.
-                                        entry: numberOr(thread.run.lastUserEntry) ?? 0,
-                                    });
-                                }
-                            }
-
-                            for (const thread of Object.values(state.threads)) {
-                                // A parked thread sends nothing: an entry from before the park waits until Brian wakes it.
-                                if (
-                                    thread.supervisor !== Number(supervisor) ||
-                                    thread.state !== "open"
-                                ) {
-                                    continue;
-                                }
-
-                                for (const [key, entry] of Object.entries(repairsOf(thread))) {
-                                    const parsed = parseRepairKey(key);
-
-                                    if (entry.sent || parsed === undefined) {
-                                        continue;
-                                    }
-
-                                    repairs.push({
-                                        id: thread.id,
-                                        key,
-                                        ref: parsed.ref,
-                                        state: parsed.state,
-                                        // A copy: the document's own array is not readable after the commit.
-                                        failing: [...(thread.prs[parsed.ref]?.failing ?? [])],
-                                        to: entry.to,
-                                        why: entry.why,
-                                        ...(thread.address === undefined
-                                            ? {}
-                                            : { address: thread.address }),
-                                        ...(thread.session === undefined
-                                            ? {}
-                                            : { session: thread.session as ConversationId }),
-                                        ...(entry.to === "odrade" && thread.session !== undefined
-                                            ? await (async () => {
-                                                  const back = await addressOf(
-                                                      tx,
-                                                      thread,
-                                                      thread.session as ConversationId,
-                                                  );
-
-                                                  return back === undefined ? {} : { back };
-                                              })()
-                                            : {}),
-                                    });
-                                }
-                            }
-
-                            for (const thread of Object.values(state.threads)) {
-                                // A parked thread sends nothing: the same rule as the repair wake-up.
-                                if (
-                                    thread.supervisor !== Number(supervisor) ||
-                                    thread.state !== "open"
-                                ) {
-                                    continue;
-                                }
-
-                                for (const [key, entry] of Object.entries(unreadyOf(thread))) {
-                                    if (entry.sent) {
-                                        continue;
-                                    }
-
-                                    const parts = key.split(":");
-
-                                    if (parts.length < 3 || parts[0] !== "unready") {
-                                        continue;
-                                    }
-
-                                    unready.push({
-                                        id: thread.id,
-                                        key,
-                                        ref: parts.slice(1, -1).join(":"),
-                                        why: entry.why,
-                                        to: entry.to,
-                                        removed: entry.removed,
-                                        ...(entry.by === undefined ? {} : { by: entry.by }),
-                                        ...(thread.address === undefined
-                                            ? {}
-                                            : { address: thread.address }),
-                                    });
-                                }
-                            }
+                            pending = await collectSends(tx, state, Number(supervisor));
 
                             // The dashboard's collector, after every table read of this commit (a task is a table write): it
                             // only reads the threads, and it starts no agent.
@@ -28746,6 +29367,14 @@ export default function createDesk(host: Host, web: Web) {
 
                             throw error;
                         }
+
+                        // The sends, still in the lane: the next sync's `collectSends` sees their marks, so 2 syncs
+                        // never send the same entry at once. A send failure is no sweep error: the next sync tries again.
+                        try {
+                            await sendPending(supervisor, pending, runtime, context);
+                        } catch {
+                            // The entries stay unsent.
+                        }
                     });
                 } catch (error) {
                     if (ran) {
@@ -28766,76 +29395,6 @@ export default function createDesk(host: Host, web: Web) {
                     );
 
                     return;
-                }
-
-                for (const wake of closedOut) {
-                    let failure: string | undefined;
-
-                    try {
-                        await linkedSend(
-                            host,
-                            supervisor,
-                            { to: wake.address, message: closeoutMessage(wake.id) },
-                            `x.desk.closeout:${wake.key}`,
-                        );
-                    } catch (error) {
-                        failure = (error as Error).message;
-                    }
-
-                    if (failure !== undefined) {
-                        // 1 event, and no `run.closeout`: the next sweep tries again with the same key.
-                        try {
-                            await runtime.commit(async (tx) => {
-                                const thread = threadById(await tx.doc(DeskThreads), wake.id);
-
-                                if (thread !== undefined) {
-                                    addEvent(
-                                        thread,
-                                        `closeout-failed:${wake.key}`,
-                                        `close-out wake-up failed: ${failure}`,
-                                        runtime.now(),
-                                    );
-                                }
-
-                                return undefined;
-                            }, context);
-                        } catch {
-                            // The sweep goes on: the next one finds the thread again.
-                        }
-
-                        continue;
-                    }
-
-                    try {
-                        // A document change only: the send has its own record, and the mark needs its own commit.
-                        await runtime.commit(async (tx) => {
-                            const thread = threadById(await tx.doc(DeskThreads), wake.id);
-
-                            if (thread !== undefined) {
-                                thread.run.closeout = wake.key;
-                                thread.run.closeoutEntry = wake.entry;
-                                thread.run.closeoutRefs = closeoutRefsAfter(thread, wake.key);
-                                addEvent(
-                                    thread,
-                                    `closeout:${wake.key}`,
-                                    "close-out wake-up sent",
-                                    runtime.now(),
-                                );
-                            }
-
-                            return undefined;
-                        }, context);
-                    } catch {
-                        // The send went: the next sweep sends again with the same key, which acts once.
-                    }
-                }
-
-                for (const work of repairs) {
-                    await sendRepair(supervisor, work, runtime, context);
-                }
-
-                for (const work of unready) {
-                    await sendUnready(supervisor, work, runtime, context);
                 }
 
                 // After the commit, so a thread that closed in it has its worktree handled at once: the sweeper ends
@@ -29225,6 +29784,10 @@ export default function createDesk(host: Host, web: Web) {
                                 delete nudges.running[key];
                             };
 
+                            // The wake-ups its commit decided or found unsent (`collectSends`): set only when that
+                            // commit succeeded.
+                            let pending: PendingSends | undefined;
+
                             try {
                                 // Before the reads: a session the desk archived comes back for a thread that opened again.
                                 // Inside the try: a failure here is a failed sync with its beacon record, not a `running`
@@ -29247,20 +29810,20 @@ export default function createDesk(host: Host, web: Web) {
                                     ),
                                 );
 
+                                let collected: PendingSends | undefined;
+
                                 await runtime.commit(async (tx) => {
                                     // As `desk sync`: read first, start last, and a dashboard failure is no failed sync.
                                     const live = await dashboard
                                         .collectorLive(tx)
                                         .catch(() => undefined);
+                                    const state = await tx.doc(DeskThreads);
 
-                                    await applySweep(
-                                        tx,
-                                        await tx.doc(DeskThreads),
-                                        supervisor,
-                                        facts,
-                                    );
+                                    await applySweep(tx, state, supervisor, facts);
                                     await startMissingSweepers(tx);
                                     await resumeJournal(tx, supervisor);
+                                    // As the sweeper: the wake-ups to send after this commit, before the collector starts.
+                                    collected = await collectSends(tx, state, supervisor);
                                     await dashboard
                                         .ensureCollector(tx, supervisor, Collector, live)
                                         .catch(() => undefined);
@@ -29268,6 +29831,7 @@ export default function createDesk(host: Host, web: Web) {
 
                                     return undefined;
                                 }, context);
+                                pending = collected;
                             } catch (error) {
                                 await recordSweepError(supervisor, error, runtime.now(), (change) =>
                                     runtime.commit(change, context),
@@ -29277,6 +29841,22 @@ export default function createDesk(host: Host, web: Web) {
 
                                     return undefined;
                                 }, context);
+                            }
+
+                            // The wake-ups the sync decided go now, not at the next sweep (bketelsen/pi-pocket-team#212),
+                            // as the sweeper sends them: after the commit that recorded them, in the lane, so the next
+                            // sync's `collectSends` sees their marks. Its own try: a send failure is no failed sync.
+                            if (pending !== undefined) {
+                                try {
+                                    await sendPending(
+                                        supervisor as ConversationId,
+                                        pending,
+                                        runtime,
+                                        context,
+                                    );
+                                } catch {
+                                    // The next sync sends what is still unsent.
+                                }
                             }
                         },
                         { prepare: claim },

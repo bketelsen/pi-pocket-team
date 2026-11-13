@@ -75,6 +75,8 @@ import {
     closeOutcome,
     closeoutHold,
     closeoutKey,
+    markCloseoutSent,
+    type SyncRunner,
     knownHeads,
     reportBlocks,
     reportAsksBrian,
@@ -200,6 +202,14 @@ import {
     unreadyOf,
     unreadyMessage,
     unreadyNotice,
+    queuedWakes,
+    pairWakes,
+    decidePairs,
+    repairUnreadyMessage,
+    type RepairWork,
+    type UnreadyWork,
+    type DeskApi,
+    NUDGE_WINDOW_MS,
     READY_LABEL,
     type PrLink,
     type PrLevel,
@@ -3446,8 +3456,11 @@ describe("reparkRepairWoken", () => {
 
     test("each repair route's text counts: the agent, a message to Odrade, and failing checks", () => {
         for (const text of [
+            "woke: frostyard/test#7 is conflicting: repair wake-up to the agent (queued)",
+            "woke: frostyard/test#7 is failing: lint, unit tests: repair message to Odrade (archived; queued)",
+            "woke: frostyard/test#7 needs a repair: repair notice to Odrade (cap; queued)",
+            // The texts stored before the decision said `queued`: old events still count.
             "woke: frostyard/test#7 is conflicting: repair wake-up to the agent",
-            "woke: frostyard/test#7 is failing: lint, unit tests: repair message to Odrade (archived)",
             "woke: frostyard/test#7 needs a repair: repair notice to Odrade (cap)",
         ]) {
             const thread = woken();
@@ -8094,6 +8107,26 @@ describe("unreadyReason", () => {
         );
     });
 
+    test("a conflict with the base, on an open, ready, labelled PR (#212)", () => {
+        const conflicting = (patch: Partial<PrFact> = {}) =>
+            factOf({ mergeable: "CONFLICTING", ...patch });
+
+        assert.equal(unreadyReason(labeled(), conflicting()), "the PR conflicts with its base");
+        // Before a failing check, after a new commit.
+        assert.equal(
+            unreadyReason(labeled(), conflicting({ checks: "FAILURE", failing: ["lint"] })),
+            "the PR conflicts with its base",
+        );
+        assert.equal(
+            unreadyReason(labeled(), conflicting({ head: "h2", headAt: 2000 })),
+            "a new commit came after the label",
+        );
+        // A draft, a closed PR, and a PR with no label give nothing.
+        assert.equal(unreadyReason(labeled(), conflicting({ isDraft: true })), undefined);
+        assert.equal(unreadyReason(labeled(), conflicting({ state: "CLOSED" })), undefined);
+        assert.equal(unreadyReason({ via: "attached", state: "OPEN" }, conflicting()), undefined);
+    });
+
     test("the order: a commit, then a check, then a review, then a comment", () => {
         assert.equal(
             unreadyReason(
@@ -8147,12 +8180,32 @@ describe("planUnready", () => {
         });
         assert.equal(
             one.events.at(-1)?.text,
-            `${ref}: ready-for-human comes off: a new commit came after the label`,
+            `${ref}: ready-for-human comes off: a new commit came after the label (queued)`,
         );
 
         // The same key again: nothing.
         assert.equal(planUnready(one, pushed(), 200), 0);
         assert.deepEqual(Object.keys(unreadyOf(one)), [key]);
+    });
+
+    test("a conflicting PR with the label gets 1 entry on an open thread (#212)", () => {
+        const one = labeled();
+
+        assert.equal(
+            planUnready(one, githubOf([prFact({ head: "h1", mergeable: "CONFLICTING" })]), 100),
+            1,
+        );
+        assert.deepEqual(unreadyOf(one)[key], {
+            at: 100,
+            why: "the PR conflicts with its base",
+            to: "agent",
+            removed: false,
+            sent: false,
+        });
+        assert.equal(
+            one.events.at(-1)?.text,
+            `${ref}: ready-for-human comes off: the PR conflicts with its base (queued)`,
+        );
     });
 
     test("a thread with no session, and an archived one, go to Odrade", () => {
@@ -8370,7 +8423,7 @@ describe("the label ready-for-human: the workflow removed it", () => {
             one.events.some(
                 (event) =>
                     event.text ===
-                    `${ref}: ready-for-human came off on GitHub (the pr-triage workflow): a new commit came after the label`,
+                    `${ref}: ready-for-human came off on GitHub (the pr-triage workflow): a new commit came after the label; wake-up queued`,
             ),
             "the wake is an event",
         );
@@ -8882,6 +8935,343 @@ describe("planRepairs", () => {
         assert(repairs[keyOf("h1")], "a current key stays, though it is the oldest");
         assert(repairs["repair:frostyard/test#8:n1:CONFLICTING"]);
         assert.equal(repairs["repair:o/r#0:x:CONFLICTING"], undefined, "the oldest other one went");
+    });
+});
+
+describe("queued wake-ups (#212)", () => {
+    const t1 = Date.UTC(2026, 10, 13, 11, 21, 18);
+    const t2 = t1 + 1000;
+    const conflicting = () => githubOf([prFact({ head: "h1", mergeable: "CONFLICTING" })]);
+
+    /** A conflicting PR with the label: 1 repair and 1 label removal decided, neither sent. */
+    const decided = (patch: Partial<Thread> = {}): Thread => {
+        const one = repairing({ ready: { at: 1000, head: "h1" } }, patch);
+
+        planRepairs(one, t1);
+        planUnready(one, conflicting(), t2);
+
+        return one;
+    };
+
+    /** Whether a sweep's `woke:` with this event text parks the thread again (`REPAIR_EVENT`). */
+    const reparks = (text: string): boolean => {
+        const one = thread({ state: "open" });
+
+        one.events = [
+            { at: 1, key: "parked:1", text: "parked by Brian" },
+            { at: 2, key: "woke:2", text: `woke: ${text}` },
+        ];
+
+        return reparkRepairWoken(one, 300);
+    };
+
+    test("the decision events say queued, and still count as repair events", () => {
+        const agent = repairing();
+        const nobody = repairing({}, { session: undefined, address: undefined });
+        const archived = repairing({}, { run: { busy: false, archived: true } });
+
+        planRepairs(agent, t1);
+        planRepairs(nobody, t1);
+        planRepairs(archived, t1);
+
+        const texts = [agent, nobody, archived].map((one) => one.events.at(-1)?.text ?? "");
+
+        assert.deepEqual(texts, [
+            "frostyard/test#7 is conflicting: repair wake-up to the agent (queued)",
+            "frostyard/test#7 is conflicting: repair notice to Odrade (no-session; queued)",
+            "frostyard/test#7 is conflicting: repair message to Odrade (archived; queued)",
+        ]);
+
+        for (const text of texts) {
+            assert.equal(reparks(text), true, text);
+        }
+
+        assert.equal(
+            decided().events.at(-1)?.text,
+            "frostyard/test#7: ready-for-human comes off: the PR conflicts with its base (queued)",
+        );
+    });
+
+    test("queuedWakes, readText and threadView show the unsent entries, and drop each once sent", () => {
+        const one = decided();
+        const state = deskOf();
+
+        state.threads[one.id] = one;
+
+        const lines = [
+            "frostyard/test#7: repair wake-up to the agent (conflicting), queued since 2026-11-13T11:21:18Z",
+            "frostyard/test#7: ready-for-human removal and wake-up to the agent (the PR conflicts with its base), queued since 2026-11-13T11:21:19Z",
+        ];
+
+        assert.deepEqual(queuedWakes(one), lines);
+        assert(
+            (readText(state, one.id) ?? "").includes(
+                `Queued wake-ups (not sent yet):\n  ${lines[0]!}\n  ${lines[1]!}\n`,
+            ),
+        );
+        assert.deepEqual(threadView(state.threads, one, t2).queued, lines);
+
+        // The label is gone, the wake-up is not sent yet.
+        const unready = one.run.unready as Record<string, { removed: boolean; sent: boolean }>;
+
+        unready[`unready:${REPAIR_REF}:1000`]!.removed = true;
+        assert.equal(
+            queuedWakes(one)[1],
+            "frostyard/test#7: wake-up to the agent (the PR conflicts with its base), queued since 2026-11-13T11:21:19Z",
+        );
+
+        // A parked thread sends nothing until it is woken: its lines say so.
+        one.state = "parked";
+        assert(queuedWakes(one).every((line) => line.endsWith(" · waits: the thread is parked")));
+        one.state = "open";
+
+        for (const entry of Object.values(one.run.repairs as Record<string, { sent: boolean }>)) {
+            entry.sent = true;
+        }
+
+        assert.equal(queuedWakes(one).length, 1, "the sent repair is gone");
+
+        for (const entry of Object.values(unready)) {
+            entry.sent = true;
+        }
+
+        assert.deepEqual(queuedWakes(one), []);
+        assert.equal((readText(state, one.id) ?? "").includes("Queued wake-ups"), false);
+        assert.equal("queued" in threadView(state.threads, one, t2), false);
+    });
+
+    test("pairWakes follows the stored decisions only: a pair keeps its id, also when its partner is not pending (#214)", () => {
+        const repairKey = `repair:${REPAIR_REF}:h1:CONFLICTING`;
+        const unreadyKey = `unready:${REPAIR_REF}:1000`;
+        const pairId = `x.desk.repair:${repairKey}|${unreadyKey}`;
+        const repair = (patch: Partial<RepairWork> = {}): RepairWork => ({
+            id: "T1",
+            key: repairKey,
+            ref: REPAIR_REF,
+            state: "CONFLICTING",
+            failing: [],
+            to: "agent",
+            why: "change",
+            address: "session-abc",
+            ...patch,
+        });
+        const removal = (patch: Partial<UnreadyWork> = {}): UnreadyWork => ({
+            id: "T1",
+            key: unreadyKey,
+            ref: REPAIR_REF,
+            why: "the PR conflicts with its base",
+            to: "agent",
+            removed: false,
+            address: "session-abc",
+            ...patch,
+        });
+
+        // A stored pair goes as 1 message.
+        const stored = pairWakes(
+            [
+                repair({ key: `repair:${REPAIR_REF}:h0:CONFLICTING`, pair: "" }),
+                repair({ pair: unreadyKey }),
+            ],
+            [removal({ pair: repairKey })],
+        );
+
+        assert.equal(stored.pairs.length, 1);
+        assert.equal(stored.pairs[0]!.repair.key, repairKey);
+        assert.deepEqual(stored.repairs, [
+            repair({ key: `repair:${REPAIR_REF}:h0:CONFLICTING`, pair: "" }),
+        ]);
+        assert.deepEqual(stored.unready, []);
+
+        // Alone, under its own id: "", and an entry from before the field (no decision), even where they match.
+        for (const [what, one, other] of [
+            ["both alone", repair({ pair: "" }), removal({ pair: "" })],
+            ["the repair alone", repair({ pair: "" }), removal()],
+            ["no decision", repair(), removal()],
+        ] as const) {
+            const out = pairWakes([one], [other]);
+
+            assert.equal(out.pairs.length, 0, what);
+            assert.deepEqual(out.repairs, [one], what);
+            assert.deepEqual(out.unready, [other], what);
+            assert.equal(out.repairs[0]!.requestId, undefined, what);
+            assert.equal(out.unready[0]!.requestId, undefined, what);
+        }
+
+        // A pair partner whose other half is not pending (sent, or pruned): the pair's id, never its own.
+        const lonely = pairWakes([repair({ pair: unreadyKey })], []);
+
+        assert.equal(lonely.pairs.length, 0);
+        assert.equal(lonely.repairs[0]!.requestId, pairId);
+
+        const orphan = pairWakes([], [removal({ pair: repairKey, removed: true })]);
+
+        assert.equal(orphan.pairs.length, 0);
+        assert.equal(orphan.unready[0]!.requestId, pairId);
+
+        // A pair with no address now: each half alone, under the pair's id (only a notice can go).
+        const unaddressed = pairWakes(
+            [repair({ pair: unreadyKey, address: undefined })],
+            [removal({ pair: repairKey, address: undefined })],
+        );
+
+        assert.equal(unaddressed.pairs.length, 0);
+        assert.equal(unaddressed.repairs[0]!.requestId, pairId);
+        assert.equal(unaddressed.unready[0]!.requestId, pairId);
+    });
+
+    test("decidePairs decides each new entry once: a pair on the same PR and head, else alone (#214)", () => {
+        const repairKey = `repair:${REPAIR_REF}:h1:CONFLICTING`;
+        const unreadyKey = `unready:${REPAIR_REF}:1000`;
+        const conflicting = () => githubOf([prFact({ head: "h1", mergeable: "CONFLICTING" })]);
+
+        const planned = (patch: Partial<Thread> = {}): Thread => {
+            const one = repairing({ ready: { at: 1000, head: "h1" } }, patch);
+
+            planRepairs(one, 100);
+            planUnready(one, conflicting(), 200);
+
+            return one;
+        };
+
+        // The same PR and head, both to the agent: a pair, each with the other's key.
+        const pair = planned();
+
+        assert.equal(decidePairs(pair), true);
+        assert.equal(repairsOf(pair)[repairKey]?.pair, unreadyKey);
+        assert.equal(unreadyOf(pair)[unreadyKey]?.pair, repairKey);
+        // A stored decision never changes.
+        assert.equal(decidePairs(pair), false);
+        assert.equal(repairsOf(pair)[repairKey]?.pair, unreadyKey);
+
+        // Another head now, the Odrade route, and no address: alone.
+        const moved = planned();
+
+        moved.prs[REPAIR_REF]!.head = "h2";
+
+        const odrade = planned({ session: undefined, address: undefined });
+        const unaddressed = planned();
+
+        delete unaddressed.address;
+
+        for (const [what, one] of [
+            ["another head", moved],
+            ["the Odrade route", odrade],
+            ["no address", unaddressed],
+        ] as const) {
+            assert.equal(decidePairs(one), true, what);
+            assert.equal(repairsOf(one)[repairKey]?.pair, "", what);
+            assert.equal(unreadyOf(one)[unreadyKey]?.pair, "", what);
+        }
+
+        // A stored "" stays, and its undecided match does not pair with it.
+        const half = planned();
+
+        half.run.repairs = { [repairKey]: { ...repairsOf(half)[repairKey]!, pair: "" } };
+        decidePairs(half);
+        assert.equal(repairsOf(half)[repairKey]?.pair, "");
+        assert.equal(unreadyOf(half)[unreadyKey]?.pair, "");
+
+        // Review finding 1: the label wake-up went alone (decided "", or sent before the field), then a repair comes.
+        for (const sentBefore of [false, true]) {
+            const one = repairing({ ready: { at: 1000, head: "h1" } });
+
+            planUnready(one, conflicting(), 100);
+
+            if (sentBefore) {
+                // Sent alone by a version with no decision: the mark landed, the decision did not.
+                one.run.unready = { [unreadyKey]: { ...unreadyOf(one)[unreadyKey]!, sent: true } };
+            } else {
+                decidePairs(one);
+            }
+
+            planRepairs(one, 200);
+            decidePairs(one);
+            assert.equal(repairsOf(one)[repairKey]?.pair, "", `sent before: ${String(sentBefore)}`);
+            assert.equal(
+                unreadyOf(one)[unreadyKey]?.pair,
+                "",
+                `sent before: ${String(sentBefore)}`,
+            );
+        }
+
+        assert.equal(
+            repairUnreadyMessage(REPAIR_REF, "CONFLICTING", [], "the PR conflicts with its base"),
+            "frostyard/test#7 is now conflicting, and the desk removed the label `ready-for-human`: the PR conflicts with its base. Merge `main` in (no force-push) or fix the check, run the checks, push, and add the label again only when the PR is ready (CI green, every blocking review point resolved, nothing pending). Then report.",
+        );
+    });
+
+    test("the pruning keeps an unsent pair partner beyond 30 entries (#214)", () => {
+        const unreadyStored: Record<string, object> = {};
+        const repairStored: Record<string, object> = {};
+
+        for (let index = 0; index < 30; index += 1) {
+            unreadyStored[`unready:old/r#${String(index)}:${String(index)}`] = {
+                at: index,
+                why: "a new commit came after the label",
+                to: "agent",
+                removed: false,
+                sent: false,
+                ...(index === 0 ? { pair: "repair:old/r#0:h0:CONFLICTING" } : { pair: "" }),
+            };
+            repairStored[`repair:old/r#${String(index)}:h${String(index)}:CONFLICTING`] = {
+                at: index,
+                to: "agent",
+                why: "change",
+                sent: false,
+                ...(index === 0 ? { pair: "unready:old/r#0:0" } : { pair: "" }),
+            };
+        }
+
+        const one = repairing(
+            { ready: { at: 1000, head: "h1" } },
+            {
+                run: { busy: false, unready: unreadyStored, repairs: repairStored },
+            },
+        );
+
+        assert.equal(
+            planUnready(one, githubOf([prFact({ head: "h1", mergeable: "CONFLICTING" })]), 100),
+            1,
+        );
+        assert.equal(planRepairs(one, 100), 1);
+
+        const unready = unreadyOf(one);
+        const repairs = repairsOf(one);
+
+        assert.equal(Object.keys(unready).length, 30);
+        assert.notEqual(unready["unready:old/r#0:0"], undefined, "the unsent pair partner stays");
+        assert.equal(unready["unready:old/r#1:1"], undefined, "the oldest other unsent entry went");
+        assert.equal(Object.keys(repairs).length, 30);
+        assert.notEqual(
+            repairs["repair:old/r#0:h0:CONFLICTING"],
+            undefined,
+            "the unsent pair partner stays",
+        );
+        assert.equal(
+            repairs["repair:old/r#1:h1:CONFLICTING"],
+            undefined,
+            "the oldest other unsent entry went",
+        );
+    });
+
+    test("markCloseoutSent: a repeat mark of the same key keeps the first boundary; a new key takes its own (#214)", () => {
+        const one = thread({
+            prs: { "frostyard/test#1": { via: "seen", state: "MERGED" } },
+        });
+
+        assert.equal(markCloseoutSent(one, "closeout:a", 10, 100), true);
+        assert.equal(one.run.closeout, "closeout:a");
+        assert.equal(one.run.closeoutEntry, 10);
+
+        // A second sender collected the same key later, with a newer entry: the boundary stays.
+        markCloseoutSent(one, "closeout:a", 20, 200);
+        assert.equal(one.run.closeoutEntry, 10);
+        assert.equal(one.events.filter((event) => event.key === "closeout:closeout:a").length, 1);
+
+        // A new key is a new wake-up: its own boundary.
+        markCloseoutSent(one, "closeout:b", 30, 300);
+        assert.equal(one.run.closeout, "closeout:b");
+        assert.equal(one.run.closeoutEntry, 30);
     });
 });
 
@@ -23639,6 +24029,7 @@ describe("the desk in a Pi Pocket", () => {
                 to: "odrade",
                 why: "archived",
                 sent: true,
+                pair: "", // decided alone in the commit that recorded it (decidePairs)
             });
             assert.equal(after?.run.repairCounts, undefined, "an Odrade route counts nothing");
             assert.equal(after?.run.next, "odrade");
@@ -23783,6 +24174,85 @@ describe("the desk in a Pi Pocket", () => {
         }
     });
 
+    test("a nudge sync that decides a repair sends it at once, with no sweep (#212)", async () => {
+        const { source, linked, thread, texts } = await withOpenPr("repair-nudge");
+        const ref = "frostyard/test#7";
+        const key = `repair:${ref}:aaa111:CONFLICTING`;
+        const message = repairMessage(ref, "CONFLICTING", []);
+        const entry = async () =>
+            repairsOf((await deskState())!.threads[thread.id]!)[key] as
+                { sent: boolean; to: string } | undefined;
+
+        /** The supervisor's sweeper in its durable sleep: the time it sweeps next. */
+        const sweeperUntil = async () => {
+            const task = (await app.harness.inspect(context)).tasks.find(
+                (each) =>
+                    each.record.kind === "x.desk.sweeper" &&
+                    Number(each.record.conversationId) === Number(source),
+            );
+            const state = task?.record.state as { status?: string; until?: number } | undefined;
+
+            return state?.status === "sleeping" ? state.until : undefined;
+        };
+
+        try {
+            await quiet([thread.id]);
+            await until(
+                async () => (await sweeperUntil()) !== undefined,
+                "the sweeper's sleep",
+                20_000,
+            );
+
+            const asleep = await sweeperUntil();
+            const api = (globalThis as unknown as Record<symbol, DeskApi | undefined>)[
+                Symbol.for("pi-pocket-team.desk")
+            ];
+
+            assert(api?.nudge !== undefined, "the desk publishes nudge");
+            await app.harness.commit(async (tx) => {
+                await api.nudge!(
+                    tx,
+                    [
+                        {
+                            delivery: crypto.randomUUID(),
+                            event: "pull_request",
+                            action: "synchronize",
+                            repo: "frostyard/test",
+                            number: 7,
+                        },
+                    ],
+                    Date.now() + shift,
+                );
+            }, context);
+            // Past the nudge window, far before the sweeper's next sweep: only the nudge sync reads GitHub.
+            await restartApp(
+                NUDGE_WINDOW_MS + 10_000,
+                repairFixture({ head: "aaa111", mergeable: "CONFLICTING" }),
+            );
+            assert(Date.now() + shift < asleep!, "the sweeper still sleeps");
+            await until(async () => (await texts(linked, message)) === 1, "the wake-up", 20_000);
+            await until(
+                async () => (await entry())?.sent === true,
+                "the wake-up marked sent",
+                20_000,
+            );
+            assert.equal((await entry())?.to, "agent");
+            assert.equal(await sweeperUntil(), asleep, "the sweeper did not sweep");
+            assert(
+                (await deskState())?.threads[thread.id]?.events.some(
+                    (event) =>
+                        event.text ===
+                        `${ref} is conflicting: repair wake-up to the agent (queued)`,
+                ),
+                "the decision said queued",
+            );
+            await until(() => !app.isBusy(linked), "the wake-up's turn", 20_000);
+        } finally {
+            await quiet([]);
+            shift = 0;
+        }
+    });
+
     test("a thread with no session gets a notice for Odrade, never a message, and marks it sent", async () => {
         const { linked, thread, first, texts } = await withOpenPr("repair-no-session");
         const ref = "frostyard/test#7";
@@ -23830,6 +24300,7 @@ describe("the desk in a Pi Pocket", () => {
         committed: string;
         labels: string[];
         readyAt?: string;
+        mergeable?: string;
     }) => ({
         data: {
             viewer: { login: "github-viewer" },
@@ -23844,7 +24315,7 @@ describe("the desk in a Pi Pocket", () => {
                     isDraft: false,
                     createdAt: "2026-10-01T00:00:00Z",
                     headRefName: "fix-7",
-                    mergeable: "MERGEABLE",
+                    mergeable: patch.mergeable ?? "MERGEABLE",
                     reviewDecision: "REVIEW_REQUIRED",
                     author: { login: "github-viewer" },
                     labels: { nodes: patch.labels.map((name) => ({ name })) },
@@ -23895,13 +24366,28 @@ describe("the desk in a Pi Pocket", () => {
             }
         };
 
-        const restartWithLog = async (by: number, github: unknown) => {
+        /**
+         * `remove`: `fail` makes each label DELETE fail as GitHub's 502; `hold` makes it wait until the file `go` (next to
+         * the log) exists, so a test can look at the lane while the send runs.
+         */
+        const restartWithLog = async (
+            by: number,
+            github: unknown,
+            remove: "ok" | "fail" | "hold" = "ok",
+        ) => {
             await app.close();
             shift = by;
             writeFileSync(fixturePath, JSON.stringify(github));
+            const removal =
+                remove === "fail"
+                    ? `echo "HTTP 502: Bad Gateway" >&2; exit 1`
+                    : remove === "hold"
+                      ? `while [ ! -f ${JSON.stringify(`${log}.go`)} ]; do sleep 0.05; done; printf '{}'`
+                      : `printf '{}'`;
+
             writeFileSync(
                 fakeGh,
-                `#!/bin/sh\nprintf '%s\\n' "$*" >> ${JSON.stringify(log)}\nif [ "$2" = "graphql" ]; then cat ${JSON.stringify(fixturePath)}; else printf '{}'; fi\n`,
+                `#!/bin/sh\nprintf '%s\\n' "$*" >> ${JSON.stringify(log)}\nif [ "$2" = "graphql" ]; then cat ${JSON.stringify(fixturePath)}; elif [ "$3" = "DELETE" ]; then ${removal}; else printf '{}'; fi\n`,
             );
             chmodSync(fakeGh, 0o755);
             process.env.PI_POCKET_DESK_GH = fakeGh;
@@ -23978,6 +24464,7 @@ describe("the desk in a Pi Pocket", () => {
                 to: "agent",
                 removed: true,
                 sent: true,
+                pair: "", // decided alone in the commit that recorded it (decidePairs)
             });
             assert(
                 after?.events.some(
@@ -24011,6 +24498,349 @@ describe("the desk in a Pi Pocket", () => {
             await quiet([]);
             shift = 0;
         }
+    });
+
+    test("a labeled PR that conflicts loses the label, and its agent gets 1 message for the repair and the label (#212)", async () => {
+        const { linked, thread, first, texts } = await withOpenPr("ready-conflict");
+        const ref = "frostyard/test#7";
+        const log = join(root, "ready-conflict.log");
+        const labelAt = "2026-10-20T10:00:00Z";
+        const unreadyKey = `unready:${ref}:${String(Date.parse(labelAt))}`;
+        const repairKey = `repair:${ref}:aaa111:CONFLICTING`;
+        const why = "the PR conflicts with its base";
+        const message = repairUnreadyMessage(ref, "CONFLICTING", [], why);
+        const { deletes, restartWithLog } = ghWithLog(log);
+        const fixture = (mergeable: string) =>
+            readyFixture({
+                head: "aaa111",
+                committed: "2026-10-19T10:00:00Z",
+                labels: [READY_LABEL],
+                readyAt: labelAt,
+                mergeable,
+            });
+
+        try {
+            rmSync(log, { force: true });
+            await quiet([thread.id]);
+
+            // The label goes on a clean PR: nothing comes off.
+            await restartWithLog(SWEEP_SLEEP_MS + 60_000, fixture("MERGEABLE"));
+            await sweptAfter(thread, first);
+
+            const labeled = (await deskState())?.threads[thread.id];
+
+            assert.deepEqual(labeled?.prs[ref]?.ready, { at: Date.parse(labelAt), head: "aaa111" });
+            assert.equal(deletes().length, 0);
+
+            // The same head conflicts: 1 removal, and 1 message that carries both.
+            await restartWithLog(SWEEP_SLEEP_MS * 2 + 120_000, fixture("CONFLICTING"));
+            await sweptAfter(thread, labeled?.run.sweptAt);
+            await until(async () => (await texts(linked, message)) === 1, "the wake-up", 20_000);
+            await until(
+                async () => {
+                    const now = (await deskState())!.threads[thread.id]!;
+
+                    return (
+                        unreadyOf(now)[unreadyKey]?.sent === true &&
+                        repairsOf(now)[repairKey]?.sent === true
+                    );
+                },
+                "both entries marked sent",
+                20_000,
+            );
+
+            const after = (await deskState())!.threads[thread.id]!;
+
+            assert.deepEqual(deletes(), [
+                "api -X DELETE repos/frostyard/test/issues/7/labels/ready-for-human",
+            ]);
+            assert.deepEqual(unreadyOf(after)[unreadyKey], {
+                at: unreadyOf(after)[unreadyKey]?.at,
+                why,
+                to: "agent",
+                removed: true,
+                sent: true,
+                pair: repairKey,
+            });
+            assert.equal(repairsOf(after)[repairKey]?.pair, unreadyKey, "the pair is stored");
+            assert.equal(await texts(linked, repairMessage(ref, "CONFLICTING", [])), 0);
+            assert.equal(await texts(linked, unreadyMessage(ref, why)), 0);
+            assert(
+                after.events.some(
+                    (event) =>
+                        event.key === `unready-sent:${unreadyKey}` &&
+                        event.text ===
+                            "ready-for-human removed, wake-up sent to the agent with the repair wake-up",
+                ),
+            );
+            assert(
+                after.events.some(
+                    (event) =>
+                        event.key === `repair-sent:${repairKey}` &&
+                        event.text === "repair wake-up sent to the agent",
+                ),
+            );
+            await until(() => !app.isBusy(linked), "the wake-up's turn", 20_000);
+        } finally {
+            await quiet([]);
+            shift = 0;
+        }
+    });
+
+    test("an entry from before the pairing field never pairs with a new repair: each goes alone (#214)", async () => {
+        const { linked, thread, first, texts } = await withOpenPr("ready-conflict-legacy");
+        const ref = "frostyard/test#7";
+        const log = join(root, "ready-conflict-legacy.log");
+        const labelAt = "2026-10-20T10:00:00Z";
+        const unreadyKey = `unready:${ref}:${String(Date.parse(labelAt))}`;
+        const repairKey = `repair:${ref}:aaa111:CONFLICTING`;
+        const why = "the PR conflicts with its base";
+        const { restartWithLog } = ghWithLog(log);
+        const fixture = (mergeable: string) =>
+            readyFixture({
+                head: "aaa111",
+                committed: "2026-10-19T10:00:00Z",
+                labels: [READY_LABEL],
+                readyAt: labelAt,
+                mergeable,
+            });
+        const now = async () => (await deskState())!.threads[thread.id]!;
+
+        try {
+            rmSync(log, { force: true });
+            await quiet([thread.id]);
+            await restartWithLog(SWEEP_SLEEP_MS + 60_000, fixture("MERGEABLE"));
+            await sweptAfter(thread, first);
+
+            const labeled = await now();
+
+            // An older version sent this label wake-up under its own id, and its mark did not land: unsent, no `pair`.
+            await app.harness.commit(async (tx) => {
+                const stored = (await tx.doc(DeskThreads)).threads[thread.id]!;
+
+                stored.run.unready = {
+                    [unreadyKey]: { at: 1, why, to: "agent", removed: true, sent: false },
+                };
+            }, context);
+
+            // The same head conflicts: the new repair must not pair with the legacy entry.
+            await restartWithLog(SWEEP_SLEEP_MS * 2 + 120_000, fixture("CONFLICTING"));
+            await sweptAfter(thread, labeled.run.sweptAt);
+            await until(
+                async () =>
+                    unreadyOf(await now())[unreadyKey]?.sent === true &&
+                    repairsOf(await now())[repairKey]?.sent === true,
+                "both entries sent",
+                20_000,
+            );
+
+            const after = await now();
+
+            assert.equal(unreadyOf(after)[unreadyKey]?.pair, "", "the legacy entry goes alone");
+            assert.equal(repairsOf(after)[repairKey]?.pair, "", "the new repair goes alone");
+            assert.equal(
+                await texts(linked, repairUnreadyMessage(ref, "CONFLICTING", [], why)),
+                0,
+                "no message under the pair's id",
+            );
+            await until(
+                async () => (await texts(linked, repairMessage(ref, "CONFLICTING", []))) === 1,
+                "the repair alone",
+                20_000,
+            );
+            await until(() => !app.isBusy(linked), "the wake-ups' turn", 20_000);
+        } finally {
+            await quiet([]);
+            shift = 0;
+        }
+    });
+
+    test("a failed label removal decides alone: the repair goes alone once, and the label wake-up later (#214)", async () => {
+        const { linked, thread, first, texts } = await withOpenPr("ready-conflict-fail");
+        const ref = "frostyard/test#7";
+        const log = join(root, "ready-conflict-fail.log");
+        const labelAt = "2026-10-20T10:00:00Z";
+        const unreadyKey = `unready:${ref}:${String(Date.parse(labelAt))}`;
+        const repairKey = `repair:${ref}:aaa111:CONFLICTING`;
+        const why = "the PR conflicts with its base";
+        const repairText = repairMessage(ref, "CONFLICTING", []);
+        const { deletes, restartWithLog } = ghWithLog(log);
+        const fixture = (mergeable: string) =>
+            readyFixture({
+                head: "aaa111",
+                committed: "2026-10-19T10:00:00Z",
+                labels: [READY_LABEL],
+                readyAt: labelAt,
+                mergeable,
+            });
+        const now = async () => (await deskState())!.threads[thread.id]!;
+
+        try {
+            rmSync(log, { force: true });
+            await quiet([thread.id]);
+            await restartWithLog(SWEEP_SLEEP_MS + 60_000, fixture("MERGEABLE"));
+            await sweptAfter(thread, first);
+
+            const labeled = await now();
+
+            // The removal fails: each goes alone from now on, and the repair goes at once.
+            await restartWithLog(SWEEP_SLEEP_MS * 2 + 120_000, fixture("CONFLICTING"), "fail");
+            await sweptAfter(thread, labeled.run.sweptAt);
+            await until(async () => (await texts(linked, repairText)) === 1, "the repair", 20_000);
+            await until(
+                async () => repairsOf(await now())[repairKey]?.sent === true,
+                "the repair marked sent",
+                20_000,
+            );
+
+            const failed = await now();
+
+            assert.equal(repairsOf(failed)[repairKey]?.pair, "");
+            assert.deepEqual(unreadyOf(failed)[unreadyKey], {
+                at: unreadyOf(failed)[unreadyKey]?.at,
+                why,
+                to: "agent",
+                removed: false,
+                sent: false,
+                pair: "",
+            });
+            assert(failed.events.some((event) => event.key === `unready-failed:${unreadyKey}`));
+            assert.equal(deletes().length, 1);
+            await until(() => !app.isBusy(linked), "the repair's turn", 20_000);
+
+            // The removal works now: the label wake-up goes alone, and the repair is not sent again.
+            await restartWithLog(SWEEP_SLEEP_MS * 3 + 180_000, fixture("CONFLICTING"));
+            await sweptAfter(thread, failed.run.sweptAt);
+            await until(
+                async () => (await texts(linked, unreadyMessage(ref, why))) === 1,
+                "the label wake-up",
+                20_000,
+            );
+            await until(
+                async () => unreadyOf(await now())[unreadyKey]?.sent === true,
+                "the label wake-up marked sent",
+                20_000,
+            );
+            assert.equal(await texts(linked, repairText), 1, "the repair went once");
+            assert.equal(
+                await texts(linked, repairUnreadyMessage(ref, "CONFLICTING", [], why)),
+                0,
+                "never as a pair",
+            );
+            assert.equal(deletes().length, 2);
+            await until(() => !app.isBusy(linked), "the wake-up's turn", 20_000);
+        } finally {
+            await quiet([]);
+            shift = 0;
+        }
+    });
+
+    /**
+     * A labelled PR that conflicts, read by the sweeper or by a nudged sync whose label removal waits on a file: while it
+     * waits, the supervisor's lane is still taken, so no other sync collects the same entries.
+     */
+    const sendsInLane = async (name: string, by: "sweeper" | "nudge") => {
+        const { source, linked, thread, first, texts } = await withOpenPr(name);
+        const ref = "frostyard/test#7";
+        const log = join(root, `${name}.log`);
+        const go = `${log}.go`;
+        const why = "the PR conflicts with its base";
+        const message = repairUnreadyMessage(ref, "CONFLICTING", [], why);
+        const { deletes, restartWithLog } = ghWithLog(log);
+        const fixture = (mergeable: string) =>
+            readyFixture({
+                head: "aaa111",
+                committed: "2026-10-19T10:00:00Z",
+                labels: [READY_LABEL],
+                readyAt: "2026-10-20T10:00:00Z",
+                mergeable,
+            });
+
+        const lane = () => {
+            const slot = (
+                globalThis as unknown as Record<
+                    symbol,
+                    Map<string, { runner: SyncRunner }> | undefined
+                >
+            )[Symbol.for("pi-pocket-team.desk.runner")]?.get(dataDir);
+
+            assert(slot !== undefined, "desk.ts keeps a runner for the data folder");
+
+            return slot.runner;
+        };
+
+        try {
+            rmSync(log, { force: true });
+            rmSync(go, { force: true });
+            await quiet([thread.id]);
+            await restartWithLog(SWEEP_SLEEP_MS + 60_000, fixture("MERGEABLE"));
+            await sweptAfter(thread, first);
+
+            if (by === "sweeper") {
+                await restartWithLog(SWEEP_SLEEP_MS * 2 + 120_000, fixture("CONFLICTING"), "hold");
+            } else {
+                const api = (globalThis as unknown as Record<symbol, DeskApi | undefined>)[
+                    Symbol.for("pi-pocket-team.desk")
+                ];
+
+                assert(api?.nudge !== undefined, "the desk publishes nudge");
+                await app.harness.commit(async (tx) => {
+                    await api.nudge!(
+                        tx,
+                        [
+                            {
+                                delivery: crypto.randomUUID(),
+                                event: "pull_request",
+                                action: "synchronize",
+                                repo: "frostyard/test",
+                                number: 7,
+                            },
+                        ],
+                        Date.now() + shift,
+                    );
+                }, context);
+                // Past the nudge window, far before the sweeper's next sweep.
+                await restartWithLog(
+                    SWEEP_SLEEP_MS + 60_000 + NUDGE_WINDOW_MS + 10_000,
+                    fixture("CONFLICTING"),
+                    "hold",
+                );
+            }
+
+            await until(async () => deletes().length === 1, "the label removal", 20_000);
+            assert.equal(lane().busy(Number(source)), true, `the ${by} sends in its lane`);
+
+            // The pair was stored in the commit that recorded both entries, before any send.
+            const held = (await deskState())!.threads[thread.id]!;
+            const repairKey = `repair:${ref}:aaa111:CONFLICTING`;
+            const unreadyKey = `unready:${ref}:${String(Date.parse("2026-10-20T10:00:00Z"))}`;
+
+            assert.equal(repairsOf(held)[repairKey]?.pair, unreadyKey);
+            assert.equal(unreadyOf(held)[unreadyKey]?.pair, repairKey);
+            assert.equal(unreadyOf(held)[unreadyKey]?.removed, false, "the removal still waits");
+            assert.equal(
+                await lane().tryRun(Number(source), "view", async () => "ran"),
+                undefined,
+                "a view sweep skips the taken lane",
+            );
+            writeFileSync(go, "");
+            await until(async () => (await texts(linked, message)) === 1, "the wake-up", 20_000);
+            await until(() => !app.isBusy(linked), "the wake-up's turn", 20_000);
+        } finally {
+            // A removal still held ends now, so a failed check does not leave it waiting.
+            writeFileSync(go, "");
+            await quiet([]);
+            rmSync(go, { force: true });
+            shift = 0;
+        }
+    };
+
+    test("the sweeper's sends run in the supervisor's lane (#214)", async () => {
+        await sendsInLane("lane-sweeper", "sweeper");
+    });
+
+    test("a nudged sync's sends run in the supervisor's lane (#214)", async () => {
+        await sendsInLane("lane-nudge", "nudge");
     });
 
     test("the workflow removes the label after a push: the agent hears it once, and the desk removes nothing", async () => {
@@ -24073,6 +24903,7 @@ describe("the desk in a Pi Pocket", () => {
                 to: "agent",
                 removed: true,
                 sent: true,
+                pair: "", // decided alone in the commit that recorded it (decidePairs)
                 by: "workflow",
             });
             assert.equal(after?.prs[ref]?.ready, undefined);
