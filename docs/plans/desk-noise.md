@@ -1,6 +1,8 @@
 # Desk noise: handled reports, and quiet wakes of done sessions
 
-Status: design for Odrade's night-shift goal of 2026-10-28 (Sheeana). It changes `desk.ts` and `team.ts`, and builds
+Status: done (checked 2026-11-13 at `d05d04e`): built in #73 (merged on 2026-10-28; commits `02800d6`, `2d8e24e`,
+`efb041a`). Part 1 (`markHandled`, `handledAfter`) and part 2 (`quietReopen`, `quietWakeOf`) are in `desk.ts`, with
+tests in `desk.test.ts`. It was the design for Odrade's night-shift goal of 2026-10-28 (Sheeana). It changes `desk.ts` and `team.ts`, and builds
 on the digest (`desk-digest.md`) and the Clerk (`clerk.md`).
 
 ## 1. Why

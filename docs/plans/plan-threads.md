@@ -1,7 +1,8 @@
 # Plan threads: an idea becomes a settled plan before work starts
 
-Status: PR 1, the plan and the gate, PR 2, decisions and delivery, and PR 3, consults, are built in this repository
-(sections 4 to 10, less the parts sections 15, 16 and 17 name).
+Status: done (checked 2026-11-13 at `d05d04e`). PR 1, the plan and the gate (#87), PR 2, decisions and delivery
+(#89), and PR 3, consults (#90), all merged on 2026-10-30, are built in this repository (sections 4 to 10, less the
+parts sections 15, 16 and 17 name). Only the "Later, by need" items of section 13 are not built.
 Brian asked for it on 2026-10-30 (T547a), after Odrade's report on
 githubnext/chopin (`~/agents/odrade/reports/2026-10-30-chopin/README.md`, Chopin commit `3548849`). Chopin is
 MIT; this design borrows its ideas (decision records, findings, a build gate, an approved revision, a task graph,
