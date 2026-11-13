@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-06",
+  "scope": "bench-attempt-lock-release",
+  "correction": "The attempt lock's release must hold the same short lock (runs/.locks.lock) as the take, during the owner check and the removal; else a take sees a lock folder half removed (no pid file), takes it, and the release fails with ENOTEMPTY or removes the new holder's lock",
+  "evidence": "bketelsen/pi-pocket-team#146 cross-review re-review 1 (openai/gpt-6.1-sol) finding 1",
+  "promoted_to": "bench/lock.test.mjs: a take during a release waits for it: no ENOENT or ENOTEMPTY, and 1 holder"
+}

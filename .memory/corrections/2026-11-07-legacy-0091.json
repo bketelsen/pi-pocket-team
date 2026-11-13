@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-07",
+  "scope": "bench-harvest-fetch",
+  "correction": "The harvester fetch runs in the trusted local checkout with the host git config (its credential helper) and no terminal prompt, and a failed fetch is logged while the harvest goes on without it",
+  "evidence": "bketelsen/pi-pocket-team#151: real harvest, bketelsen/fleet fetch",
+  "promoted_to": "bench/harvest.test.mjs: a failed fetch does not stop the harvest: the repository is harvested without it, and the next one too"
+}

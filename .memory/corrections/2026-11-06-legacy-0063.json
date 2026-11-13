@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-06",
+  "scope": "bench-limit-boundary",
+  "correction": "A bench limit is reached at its value (>=), and no retry starts when the attempt allowance (wall, cost or tokens) is used up",
+  "evidence": "bketelsen/pi-pocket-team#146 cross-review round 1 finding 7",
+  "promoted_to": "bench/run.test.mjs: a priced run that reaches the cost limit exactly is a limit; an unpriced run that reaches the token limit exactly is a limit; the limit checks stop at the boundary, and no retry starts on a used-up allowance"
+}

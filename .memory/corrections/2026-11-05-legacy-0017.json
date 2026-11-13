@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-05",
+  "scope": "desk-file-route",
+  "correction": "A route that reads a file under a root must bind its containment check to the open descriptor (O_NONBLOCK open, fstat is a regular file, the kernel's readlink text of /proc/self/fd/<fd>, not deleted, is in the real root), never resolve a name again (realpath of the name, or realpath of the /proc link, walks names a writer can swap), or a writer swaps the file or a parent folder for a symlink out of the root, or a FIFO, between the checks and the read",
+  "evidence": "pi-pocket-team#128, cross-review (openai/gpt-6.1-sol) of head 874d381 finding 1, re-review 1 of head 1498e43 finding 1, re-review 2 of head 8e4956b finding 1",
+  "promoted_to": "desk-file.test.ts"
+}

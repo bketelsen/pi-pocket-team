@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-07",
+  "scope": "audit-r2-eligible-risk-unknown",
+  "correction": "R2 eligibility needs features.riskPathNamed === false: null (no risk-path list read) and no features (an older route) are unknown, not 'no risk path', so such a night shift counts in nightShifts but not in eligible",
+  "evidence": "bketelsen/pi-pocket-team#147 cross-review (openai/gpt-6.1-sol) finding R3",
+  "promoted_to": "audit/checks.test.ts: R2: the eligible share of routed night shifts; an unknown risk path (null, or no features) is not eligible"
+}

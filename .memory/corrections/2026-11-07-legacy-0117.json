@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-07",
+  "scope": "desk-board-agent-replay-binding",
+  "correction": "A replayed agent board call binds to the supervisor whose receipt holds its key before the live-supervisor binding, so a replay after its supervisor retired gives the first text and adds no second row to another supervisor",
+  "evidence": "bketelsen/pi-pocket-team#168: cross-review (openai/gpt-6.1-sol) of 303629c",
+  "promoted_to": "desk-board.test.ts: an agent's replayed call binds to the supervisor whose receipt holds its key, also after it retired"
+}

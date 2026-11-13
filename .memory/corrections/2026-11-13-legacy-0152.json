@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-13",
+  "scope": "desk-agent-read-refusal",
+  "correction": "An agent's desk read refusal names the thread by the id as the agent asked for it, in the form threadById reads it (no leading #, upper case), for another thread and for a missing one alike, so a prefixed or lower-case id never tells an existing thread from a missing one",
+  "evidence": "bketelsen/pi-pocket-team#210 cross-review of cee6d13, finding 1",
+  "promoted_to": "desk.test.ts: an agent reads its own thread, by id and with no thread, and no other thread (the # and lower-case case)"
+}

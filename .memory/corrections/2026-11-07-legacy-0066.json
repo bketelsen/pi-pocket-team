@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-07",
+  "scope": "audit-r2-revert-without-record",
+  "correction": "R2 must keep each explicit Reverts target of a merged revert PR, also when the target has no Q1 record of its own: the desk link alone says the target merged, and dropping the revert counts a reverted thread as accepted. Q1's revertsOf stays as it is",
+  "evidence": "bketelsen/pi-pocket-team#147 cross-review (openai/gpt-6.1-sol) finding R1",
+  "promoted_to": "audit/checks.test.ts: R2: a stored revert of a PR with no Q1 record of its own makes the thread not accepted"
+}

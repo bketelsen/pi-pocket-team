@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-08",
+  "scope": "plan-amend-headings",
+  "correction": "plan amend compares each section's id, order and heading, so a whole-file text or edit that renames a heading is refused like a heading argument",
+  "evidence": "bketelsen/pi-pocket-team#183 cross-review (openai/gpt-6.1-sol) of d09afce, finding 1",
+  "promoted_to": "desk-plans.test.ts: an amend renames no heading, by a whole-file text or by a whole-file edit (#183 review)"
+}

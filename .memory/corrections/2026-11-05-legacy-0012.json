@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-05",
+  "scope": "desk-archive-folder",
+  "correction": "The archive must read a folder strictly (archiveFolder): gone only on lstat ENOENT or ENOTDIR, not git only on git's own not-a-repository message in the C locale, else unknown (folder-unknown); statusOf's gone or null after a failed read is no proof that a folder holds no work",
+  "evidence": "pi-pocket-team#126, cross-review (openai/gpt-6.1-sol) of head 9d6505c, finding 4",
+  "promoted_to": "desk.test.ts"
+}

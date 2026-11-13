@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-09",
+  "scope": "run-end-answer-wait",
+  "correction": "An integration test that asserts on a linked session's run-end answer waits for that answer with until: Pocket queues run-end delivery on its own path, so a desk line that arrived first does not show that the answer is there",
+  "evidence": "bketelsen/pi-pocket-team#190 cross-review (openai/gpt-6.1-sol) of fc11144, finding 1",
+  "promoted_to": "AGENTS.md: Test reliability (a test waits for a message that comes by its own path); desk.test.ts: a night shift's report is filed on the thread, and the chat gets one line"
+}

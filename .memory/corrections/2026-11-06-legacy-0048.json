@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-06",
+  "scope": "github-hooks-began-migration",
+  "correction": "A document with no began must migrate it from the accepted delivery log, never from since alone: a suspend and unsuspend under the older version left a later since, and a copy of it clears a real alarm; a log that dropped entries gives 0",
+  "evidence": "bketelsen/pi-pocket-team#143 cross-review (openai/gpt-6.1-sol) finding 1",
+  "promoted_to": "github-hooks.test.ts (The coverage alarm): rule G2: an upgrade after a suspend and unsuspend under the old version: began comes from the log, the real alarm stays"
+}

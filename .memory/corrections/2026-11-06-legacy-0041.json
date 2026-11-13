@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-06",
+  "scope": "github-hooks-coverage-since-review",
+  "correction": "A coverage start must never be later than the evidence proves: migrate stored data from the delivery log (0 when unknown) before any delivery writes a start, never delete a start in a delivery (only the evaluation ends one, by coveredRepos), let a repository inherit its account start, and compare a stored miss by its change's own time, not the sweep time",
+  "evidence": "bketelsen/pi-pocket-team#141 cross-review (openai/gpt-6.1-sol) findings 1-4",
+  "promoted_to": "github-hooks.test.ts (The coverage alarm): rule F: a stored miss of a change with at < T < seen is before the start: the cleanup drops it and clears its alarm / rule D: a removed selected repository with a fact in 30 days keeps its start, and a real miss after the start counts / rule D: all to selected: a kept repository keeps the account start / rule B: a legacy document migrates from the log before a delivery writes a start: an installation or a repository fact at T2 gets T0 / rule B: a legacy start comes from the installation's log entry, not the first repository fact: real misses stay / rule A: a legacy document with no log evidence, or a log that dropped entries, starts at 0: nothing is dropped or cleared"
+}

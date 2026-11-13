@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-06",
+  "scope": "desk-ask-command-blocks",
+  "correction": "The command-block split of ask text must look inside bold too (holdsCommand), not only at the top-level inline nodes, or a long command written in bold stays inline with no Copy button; code in a link label stays inline on purpose",
+  "evidence": "pi-pocket-team#135, cross-review (openai/gpt-6.1-sol) of head 400a83f, finding 1",
+  "promoted_to": "desk-web-ask-text.test.js (a long span inside bold is a command block too)"
+}

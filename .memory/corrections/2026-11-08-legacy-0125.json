@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-08",
+  "scope": "bench-score-no-check-done",
+  "correction": "A result of a task with check: null is fully scored with s1 null: the done tests read S1 by the task's manifest, so a second full score runs no check and calls no judge again",
+  "evidence": "bketelsen/pi-pocket-team#157 cross-review (openai/gpt-6.1-sol) of 91a8b06, finding 1",
+  "promoted_to": "bench/score.test.mjs: a task with no check: checked and scored results are not run again (no sandbox step, 2 judge calls in all)"
+}

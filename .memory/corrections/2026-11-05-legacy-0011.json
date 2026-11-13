@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-05",
+  "scope": "desk-archive-pass",
+  "correction": "The archive pass must read the desk state and the linked sessions list again after each step that committed, or step 2 and step 3 decide on a stale snapshot (a pending entry of a reopened thread is not restored in the same pass)",
+  "evidence": "pi-pocket-team#126, cross-review (openai/gpt-6.1-sol) of head 9d6505c, finding 3",
+  "promoted_to": "desk.test.ts"
+}

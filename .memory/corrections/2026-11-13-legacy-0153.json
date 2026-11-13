@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-13",
+  "scope": "desk-nudge-sends",
+  "correction": "A wake-up that a sync decides (repair, ready-for-human removal, close-out) is sent by every sync that is not decide-only, the sweeper and the nudged sync alike, right after the commit that records it, through the shared collectSends/sendPending path; a decision event says queued until the send, and a conflicting PR loses ready-for-human",
+  "evidence": "bketelsen/pi-pocket-team#212: on 2026-11-13 the nudged syncs decided 4 repair wake-ups for frostyard/pocket#74, #77, #78 and #80, and they waited 7 to 9 minutes for the sweeper",
+  "promoted_to": "desk.test.ts: a nudge sync that decides a repair sends it at once, with no sweep (#212)"
+}

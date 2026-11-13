@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-07",
+  "scope": "desk-reports-off-notice-durable",
+  "correction": "A failed run-end switch warns a supervisor at most once an hour, also across a reload or a restart: the warning is claimed in reportsOffNoticed on the desk document in 1 commit before the notice, and a claim commit that throws sends no notice",
+  "evidence": "bketelsen/pi-pocket-team#158: cross-review (openai/gpt-6.1-sol) of 60e0d91",
+  "promoted_to": "team-reports-off.test.ts: a reload of the desk keeps the 1-hour limit of the failure warning"
+}

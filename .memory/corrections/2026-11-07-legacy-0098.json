@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-07",
+  "scope": "bench-gh-commits-cap",
+  "correction": "gh pr view --json commits lists at most 100 commits, so a PR with 100 or more commits may have an incomplete list: the parent rule cannot tell a rebase merge, and the harvester drops the candidate as its parent is unknown, with no GitHub pagination",
+  "evidence": "bketelsen/pi-pocket-team#156 cross-review (openai/gpt-6.1-sol) finding 1",
+  "promoted_to": "bench/harvest.test.mjs: a PR with 100 or more commits is dropped: gh lists at most 100, so its parent is unknown"
+}

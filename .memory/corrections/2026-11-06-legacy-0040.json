@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-06",
+  "scope": "github-hooks-coverage-since",
+  "correction": "The coverage alarm counts only changes after a repository's coverage began; else an installation raises alarms for changes before it",
+  "evidence": "live edge check of the webhook path on 2026-11-06: 12 false coverage alarms after the 2 GitHub App installations (6 of them 76 seconds after the frostyard installation), each from changes before the installation",
+  "promoted_to": "github-hooks.test.ts (The coverage alarm): an all installation at T: changes before T are no miss and raise nothing; deleted ends the start / an all installation at T: 2 changes after T with no fact raise the alarm; only they are misses / stored data with no since: the evaluation writes it and clears an alarm whose misses are all before it / a selected installation: a repository added later starts at the added time; a removed one loses its start"
+}

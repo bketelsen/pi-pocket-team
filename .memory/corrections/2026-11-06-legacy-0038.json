@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-06",
+  "scope": "clerk-doc-sections",
+  "correction": "When the Clerk profile copy in docs/plans/clerk.md section 7 changes, section 4 must change with it, or the file gives a Clerk 2 contradictory steps (commit desk/, record merges in decided.md, close-outs with no message)",
+  "evidence": "bketelsen/pi-pocket-team#140 cross-review (openai/gpt-6.1-sol) findings 1 to 3",
+  "promoted_to": "AGENTS.md: Documentation rules, the clerk.md section 7 and section 4 rule"
+}

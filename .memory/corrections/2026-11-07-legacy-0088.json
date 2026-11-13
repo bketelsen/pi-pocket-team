@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-07",
+  "scope": "bench-validation-cache-errors",
+  "correction": "A cached validation outcome that is an unexpected error (validation error:) is never reused, and VALIDATION_VERSION moves when the validation's behavior changes (2: overlay modes)",
+  "evidence": "bketelsen/pi-pocket-team#151 cross-review re-review 2 (openai/gpt-6.1-sol) finding RR5",
+  "promoted_to": "bench/harvest.test.mjs: a cached validation error is never reused: the candidate is validated again"
+}

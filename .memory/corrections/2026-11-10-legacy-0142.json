@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-10",
+  "scope": "bench-drop-caches-score-error",
+  "correction": "Every path that drops the try caches checks the same conditions: a result with scoreError keeps its caches, also when it is scored already",
+  "evidence": "bketelsen/pi-pocket-team#191 cross-review (openai/gpt-6.1-sol) of bf85c53, finding 2",
+  "promoted_to": "bench/score.test.mjs: --drop-caches on a scored result that has scoreError: the caches stay, and the file does not change"
+}

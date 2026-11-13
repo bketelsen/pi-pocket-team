@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-07",
+  "scope": "desk-board-field-tests",
+  "correction": "The board's field tests check every supplied field at the largest and smallest values, each lower and upper bound refusal, and an unchanged board after each refusal of an add or an edit",
+  "evidence": "bketelsen/pi-pocket-team#160: cross-review (openai/gpt-6.1-sol) of 7e9de66, batch 4",
+  "promoted_to": "desk-board.test.ts: each field's bounds: a value outside them is refused with 400, and nothing changes; the largest values and every optional field are kept"
+}

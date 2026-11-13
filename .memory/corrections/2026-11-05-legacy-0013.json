@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-05",
+  "scope": "desk-archive-subagents",
+  "correction": "The archive must read subagents strictly (subagentsBusyOrUnknown): a registry or child read that throws is busy-unknown and keeps the session; subagentsBusy keeps its failure-means-idle rule only for its other callers",
+  "evidence": "pi-pocket-team#126, cross-review (openai/gpt-6.1-sol) of head 9d6505c, finding 5",
+  "promoted_to": "desk.test.ts"
+}
