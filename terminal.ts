@@ -144,8 +144,8 @@ const GRACE_MS = 60_000;
 const INPUT_MAX = 32 * 1024;
 /** The most terminals in one poll: the 4 live ones at most, plus exited ones that wait for their last output. */
 const POLL_MAX = 16;
-/** How long a tab counts for back pressure after its last poll: a poll waits 25 s, and 5 s is the margin. */
-const TAB_MS = 30_000;
+/** How long a tab counts for back pressure after its last poll: a poll waits 25 s, and 5 s is the margin. Tests set the environment variable lower. */
+const TAB_MS = span(process.env.PI_POCKET_TERMINAL_TAB_MS, 30_000);
 /** Tabs that one terminal keeps for back pressure: the oldest goes. */
 const TABS_MAX = 16;
 /** How long a tab's input receipt keeps its seq. A tab that gives up after 60 s retries, so it passes this by far. */

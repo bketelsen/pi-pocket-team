@@ -2159,6 +2159,20 @@ describe("with the Pi Pocket app", () => {
         assert.equal((await planSnapshot()).consults.length, 1);
     });
 
+    /** The plan's live wake-up tasks: a task that ended cannot send a message again. */
+    async function liveWakes(): Promise<number> {
+        const live = await app.harness.inspect(context);
+
+        return live.tasks.filter((task) => {
+            const record = task.record as unknown as {
+                kind: string;
+                input?: { plan?: string };
+            };
+
+            return record.kind === "x.desk.plan-wake" && record.input?.plan === planId;
+        }).length;
+    }
+
     test("the finding records, goes on the ask, and wakes the planning session once, also across a replay and a restart", async () => {
         const k1 = await consultNow("k1");
         const session = k1.session as unknown as ConversationId;
@@ -2233,8 +2247,16 @@ describe("with the Pi Pocket app", () => {
                 ),
             ).length;
 
+        // The restarted wake-up task takes the finding in `wake.sent` before it sends, and ends in the commit after the
+        // send: the mark, the 1 message, and no live task say that all its work is done, so no second message can come.
+        await until(
+            async () => (await planSnapshot()).wake?.sent?.includes("finding:f1") === true,
+            "the finding to be taken for its wake-up",
+            20_000,
+        );
         await until(async () => (await told()) >= 1, "the finding wake-up", 20_000);
-        await new Promise((resolve) => setTimeout(resolve, 300));
+        await until(async () => (await liveWakes()) === 0, "the wake-up's task to end", 20_000);
+
         assert.equal(await told(), 1);
         assert.deepEqual((await planSnapshot()).wake?.sent, ["finding:f1"]);
     });

@@ -1,11 +1,18 @@
-# Dependabot (frostyard/core ADR-0071, row B13): GitHub Actions, and npm for package.json.
+# Dependabot (frostyard/core ADR-0071, row B13): GitHub Actions, and npm for package.json. Each entry has 1 group
+# with the patterns ["*"], so a run makes at most 1 version-update pull request for each ecosystem (ADR-0075).
 version: 2
 updates:
     - package-ecosystem: github-actions
       directory: /
       schedule:
           interval: weekly
+      groups:
+          github-actions:
+              patterns: ["*"]
     - package-ecosystem: npm
       directory: /
       schedule:
           interval: weekly
+      groups:
+          npm:
+              patterns: ["*"]
