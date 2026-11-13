@@ -310,7 +310,7 @@ const q1Lines = (q1) => {
 
         lines.push(
             rounds.available
-                ? `- Review rounds (30 days): ${plural(t.threads, "thread")}, median ${t.median ?? "n/a"}, P90 ${t.p90 ?? "n/a"}.`
+                ? `- Review rounds (30 days, reviewed heads per PR): ${plural(t.prs, "PR")}, median ${t.median ?? "n/a"}, P90 ${t.p90 ?? "n/a"}.`
                 : `- Review rounds: not available (${rounds.reason}).`,
         );
     }

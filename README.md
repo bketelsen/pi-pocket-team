@@ -17,7 +17,7 @@ of a server who works with a team of named agents. It is written for Brian Ketel
   See [Desk](https://bketelsen.github.io/pi-pocket-team/modules/desk/).
 - **Shift.** `/team-shift` (old name `/night-shift`): Pi works on an objective in rounds, at any hour, until a stop
   condition, a round limit or a deadline, then writes a summary. See [Shift](https://bketelsen.github.io/pi-pocket-team/modules/shift/).
-- **Model router.** Shadow only: it records the model it would pick for each delegation, with the brief's features, and changes nothing.
+- **Model router.** Shadow by default: it records the model it would pick for each delegation, with the brief's features, and changes nothing. In mode `assign`, on a tier Brian makes live, it assigns a shift's worker.
   See [Model router](https://bketelsen.github.io/pi-pocket-team/modules/model-router/).
 - **Homewiki.** The "Wiki" rail page: a Markdown wiki checkout rendered from disk, read-only and owner-only. See
   [Homewiki](https://bketelsen.github.io/pi-pocket-team/modules/homewiki/).

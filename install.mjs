@@ -24,6 +24,8 @@ const MODULES = [
     "night-shift.ts",
     "night-shift-web",
     "model-router.ts",
+    // The frozen rule of the model router (a copy of `bench/rule-v1.json`): data, not a module; Pocket loads no `.json`.
+    "router-rule-v1.json",
     "_desk-usage.ts",
     "_desk-dashboard.ts",
     "_desk-metrics.ts",

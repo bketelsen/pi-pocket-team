@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-13",
+  "scope": "model-router",
+  "correction": "Route fields and notes that the settings or router.json feed (liveTiers, ruleV1 picks, experiment) could store the TypeSafe key in the memo and on the desk thread; the router redacts the key, in any case, from every string of a route before it gives it back, and a note never repeats a configuration value",
+  "evidence": "bketelsen/pi-pocket-team#225 cross-review of 2afc109, batch 1 finding 1",
+  "promoted_to": "model-router.test.ts: no field, note or line of a route holds the TypeSafe key, from the settings or router.json, in any case"
+}

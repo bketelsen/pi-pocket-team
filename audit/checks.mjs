@@ -24,7 +24,7 @@ import {
     REVIEW_WINDOW_DAYS,
     isCrossReviewSpawn,
     reviewPoints,
-    reviewRounds,
+    reviewedHeads,
     threadAt as q1ThreadAt,
 } from "./reviews.mjs";
 
@@ -2143,7 +2143,7 @@ const p90 = (values) => {
 
 const medianOrNull = (values) => (values.length === 0 ? null : median(values));
 
-/** 1 row of review rounds: `list` holds `{ rounds, at }` of each thread. */
+/** 1 row of review rounds: `list` holds `{ rounds, at }` of each PR (`rounds`: its reviewed heads). */
 function roundRow(list, now) {
     const recentFrom = now - Q1_ROUND_THRESHOLDS.recentDays * DAY;
     const from = now - Q1_ROUND_THRESHOLDS.windowDays * DAY;
@@ -2152,11 +2152,11 @@ function roundRow(list, now) {
     const rounds = (items) => items.map((item) => item.rounds);
 
     return {
-        threads: list.length,
+        prs: list.length,
         median: medianOrNull(rounds(list)),
         p90: p90(rounds(list)),
-        recent: { threads: recent.length, median: medianOrNull(rounds(recent)) },
-        before: { threads: before.length, median: medianOrNull(rounds(before)) },
+        recent: { prs: recent.length, median: medianOrNull(rounds(recent)) },
+        before: { prs: before.length, median: medianOrNull(rounds(before)) },
     };
 }
 
@@ -2164,9 +2164,63 @@ const sortedKeys = (rows) =>
     Object.fromEntries(Object.entries(rows).sort((a, b) => a[0].localeCompare(b[0])));
 
 /**
- * Q1's review rounds per desk thread, from 30 days of `subagent` spawn and send calls. A cross-review spawn is 1
- * round; a send is 1 round when the latest earlier spawn of that name in the same session is a cross-review spawn.
- * Each call goes to the desk thread of its session (`q1ThreadAt`); a call with no thread does not count.
+ * The reviewed heads of each PR in the window, from `reviewedHeads`: `{ rows, unattributed }`. A row is `{ ref, rounds,
+ * heads, calls, first, last, at, items }`: `rounds` counts the distinct reviewed-head keys of its calls that are not
+ * superseded (the head, or `unknown:<chain>` for a call with no head: all headless calls of 1 reviewer chain are 1
+ * round); `heads` counts the distinct known heads of those calls; `calls` counts all its round calls, the superseded
+ * ones too; `first` and `last` are the times of its first and last round call; `at` is the time of its last call that
+ * is not superseded; `items` are its round calls. `unattributed` counts the round calls with no PR.
+ */
+function q1PrHeads(data, ctx) {
+    const byRef = new Map();
+    let unattributed = 0;
+
+    for (const item of reviewedHeads(data, ctx)) {
+        if (item.ref === null) {
+            unattributed += 1;
+            continue;
+        }
+
+        const row = byRef.get(item.ref) ?? {
+            ref: item.ref,
+            keys: new Set(),
+            known: new Set(),
+            calls: 0,
+            first: item.at,
+            last: item.at,
+            at: item.at,
+            items: [],
+        };
+
+        row.calls += 1;
+        row.first = Math.min(row.first, item.at);
+        row.last = Math.max(row.last, item.at);
+        row.items.push(item);
+
+        if (!item.superseded) {
+            row.keys.add(item.head ?? `unknown:${item.chain}`);
+            row.at = Math.max(row.at, item.at);
+
+            if (item.head !== null) {
+                row.known.add(item.head);
+            }
+        }
+
+        byRef.set(item.ref, row);
+    }
+
+    const rows = [...byRef.values()]
+        .sort((a, b) => a.ref.localeCompare(b.ref))
+        .map(({ keys, known, ...row }) => ({ ...row, rounds: keys.size, heads: known.size }));
+
+    return { rows, unattributed };
+}
+
+/**
+ * Q1's review rounds per PR: the reviewed heads of each PR in 30 days (`q1PrHeads`), with the PR's own repository (never
+ * the thread's), its agent (`agents[0]` of a desk thread whose `prs` holds it; else the agent of the desk thread of the
+ * session of its latest round call, `q1ThreadAt`; else `unattributed`), and its desk threads (those that hold it, and
+ * those of the sessions that reviewed it). A round call with no PR does not count here.
  */
 function q1Rounds(data, ctx) {
     const unavailable = q1Unavailable(data, "reviews", "reviewCalls");
@@ -2175,50 +2229,37 @@ function q1Rounds(data, ctx) {
         return { metrics: unavailable, items: [] };
     }
 
-    const from = ctx.now - Q1_ROUND_THRESHOLDS.windowDays * DAY;
-    const calls = (Array.isArray(data.reviewCalls) ? data.reviewCalls : [])
-        .filter((call) => typeof call?.at === "number" && call.at >= from)
-        .map((call, index) => ({ call, index }))
-        .sort((a, b) => a.call.at - b.call.at || a.call.id - b.call.id || a.index - b.index)
-        .map((item) => item.call);
-    const latestSpawn = new Map();
-    const byThread = new Map();
+    const agentOfRef = prAgents(data.threads);
+    const desk = Object.values(data.threads ?? {});
+    const items = q1PrHeads(data, ctx).rows.map((row) => {
+        const threads = new Set(
+            desk
+                .filter((thread) => Object.hasOwn(thread.prs ?? {}, row.ref))
+                .map((thread) => thread.id),
+        );
 
-    for (const call of calls) {
-        const key = `${call.c}\u0000${call.name}`;
-        let round = false;
+        for (const item of row.items) {
+            const thread = q1ThreadAt(data, item.session, item.at);
 
-        if (call.action === "spawn") {
-            round = isCrossReviewSpawn(call);
-            latestSpawn.set(key, round);
-        } else if (call.action === "send") {
-            round = latestSpawn.get(key) === true;
+            if (thread) {
+                threads.add(thread.id);
+            }
         }
 
-        if (!round) {
-            continue;
-        }
+        const latest = row.items[row.items.length - 1];
 
-        const thread = q1ThreadAt(data, call.c, call.at);
-
-        if (!thread) {
-            continue;
-        }
-
-        const item = byThread.get(thread.id) ?? {
-            id: thread.id,
-            repo: q1RepoOf(thread),
-            agent: q1AgentOf(thread) ?? UNATTRIBUTED,
-            rounds: 0,
-            at: 0,
+        return {
+            ref: row.ref,
+            repo: repoOfRef(row.ref),
+            agent:
+                agentOfRef.get(row.ref) ??
+                q1AgentOf(q1ThreadAt(data, latest.session, latest.at)) ??
+                UNATTRIBUTED,
+            threads: [...threads].sort(byThreadId),
+            rounds: row.rounds,
+            at: row.at,
         };
-
-        item.rounds += 1;
-        item.at = Math.max(item.at, call.at);
-        byThread.set(thread.id, item);
-    }
-
-    const items = [...byThread.values()].sort((a, b) => byThreadId(a.id, b.id));
+    });
 
     const group = (field) => {
         const lists = {};
@@ -2241,17 +2282,13 @@ function q1Rounds(data, ctx) {
             totals: roundRow(items, ctx.now),
             repos: group("repo"),
             agents: group("agent"),
-            threads: items.map((item) => ({
-                id: item.id,
-                repo: item.repo,
-                agent: item.agent,
-                rounds: item.rounds,
-                at: iso(item.at),
-            })),
+            prs: items.map((item) => ({ ...item, threads: [...item.threads], at: iso(item.at) })),
         },
         items,
     };
 }
+
+const prCount = (count) => `${count} PR${count === 1 ? "" : "s"}`;
 
 /** Q1's review-round findings: a high median, and a rise of the last 7 days, gated by 8 decided PRs. */
 function roundFindings(rounds, acceptance, ctx) {
@@ -2261,7 +2298,15 @@ function roundFindings(rounds, acceptance, ctx) {
 
     const findings = [];
     const recentFrom = ctx.now - Q1_ROUND_THRESHOLDS.recentDays * DAY;
-    const evidence = (list) => list.map((item) => `desk/${item.id}.md ${item.rounds} rounds`);
+    const evidence = (list) =>
+        list.map(
+            (item) =>
+                `${prUrl(item.ref)} ${item.rounds} reviewed head${item.rounds === 1 ? "" : "s"}${
+                    item.threads.length > 0
+                        ? ` (${item.threads.map((id) => `desk/${id}.md`).join(", ")})`
+                        : ""
+                }`,
+        );
     const newest = (list) => Math.max(...list.map((item) => item.at));
     const t = Q1_ROUND_THRESHOLDS;
 
@@ -2283,17 +2328,17 @@ function roundFindings(rounds, acceptance, ctx) {
                         check: "Q1",
                         subject: `rounds:${kind}:${name}`,
                         severity: "medium",
-                        text: `Review rounds of ${label} have a median of ${row.median} and a P90 of ${row.p90} over ${row.threads} desk thread${row.threads === 1 ? "" : "s"} in ${t.windowDays} days`,
+                        text: `Review rounds of ${label} have a median of ${row.median} and a P90 of ${row.p90} over ${prCount(row.prs)} in ${t.windowDays} days (reviewed heads per PR)`,
                         evidence: evidence(list),
                         lastSeen: newest(list),
-                        cases: row.threads,
+                        cases: row.prs,
                     }),
                 );
             }
 
             if (
-                row.recent.threads >= 1 &&
-                row.before.threads >= 1 &&
+                row.recent.prs >= 1 &&
+                row.before.prs >= 1 &&
                 row.recent.median - row.before.median >= t.rise
             ) {
                 const recent = list.filter((item) => item.at >= recentFrom);
@@ -2303,10 +2348,10 @@ function roundFindings(rounds, acceptance, ctx) {
                         check: "Q1",
                         subject: `rounds-rise:${kind}:${name}`,
                         severity: "medium",
-                        text: `Review rounds of ${label} rose: a median of ${row.recent.median} over ${row.recent.threads} desk thread${row.recent.threads === 1 ? "" : "s"} in the last ${t.recentDays} days, against ${row.before.median} over ${row.before.threads} in the ${t.windowDays - t.recentDays} days before`,
+                        text: `Review rounds of ${label} rose: a median of ${row.recent.median} over ${prCount(row.recent.prs)} in the last ${t.recentDays} days, against ${row.before.median} over ${row.before.prs} in the ${t.windowDays - t.recentDays} days before (reviewed heads per PR)`,
                         evidence: evidence(recent),
                         lastSeen: newest(recent),
-                        cases: row.recent.threads,
+                        cases: row.recent.prs,
                     }),
                 );
             }
@@ -2563,11 +2608,13 @@ const round2 = (value) => Math.round(value * 100) / 100;
 
 /**
  * Q1's cross-review rounds per PR, from the session records (the session method; the PR-text method is elsewhere).
- * A round is a cross-review spawn, or a send to a name whose latest spawn in that session was one (as `rounds`). The
- * PR of a round is the first desk-owner ref its message names, else its bare PR number in its desk thread's
- * repository; a send with none takes the PR of the latest earlier call to that name. Per PR: `rounds`, `heads` (the
- * distinct reviewed heads), `first` and `last`. `totals.rounds` counts the rounds with a PR, `unattributed` those
- * without one. No findings.
+ * A round is 1 reviewed head of 1 PR (`q1PrHeads`, from `reviewedHeads`). A round call is a cross-review spawn, or a
+ * send to a name whose latest spawn in that session was one. The PR of a call is the first desk-owner ref its message
+ * names, else its bare PR number in its desk thread's repository; a send with none takes the PR of the latest earlier
+ * call to that name. Per PR: `rounds` (its reviewed heads), `heads` (the distinct known heads of them), `calls` (all
+ * its round calls, superseded ones too), `first` and `last` (its first and last round call). `totals.rounds` sums the
+ * reviewed heads, `totals.calls` the round calls with a PR, and `unattributed` counts the round calls with no PR;
+ * `mean`, `median`, `p90` and `atLeast3` are over the reviewed heads. No findings.
  */
 function q1PrRounds(data, ctx) {
     const unavailable = q1Unavailable(data, "reviews", "reviewCalls");
@@ -2576,35 +2623,7 @@ function q1PrRounds(data, ctx) {
         return unavailable;
     }
 
-    const byRef = new Map();
-    let unattributed = 0;
-
-    for (const round of reviewRounds(data, ctx)) {
-        if (round.ref === null) {
-            unattributed += 1;
-            continue;
-        }
-
-        const row = byRef.get(round.ref) ?? {
-            ref: round.ref,
-            rounds: 0,
-            heads: new Set(),
-            first: round.at,
-            last: round.at,
-        };
-
-        row.rounds += 1;
-        row.first = Math.min(row.first, round.at);
-        row.last = Math.max(row.last, round.at);
-
-        if (round.head !== null) {
-            row.heads.add(round.head);
-        }
-
-        byRef.set(round.ref, row);
-    }
-
-    const rows = [...byRef.values()].sort((a, b) => a.ref.localeCompare(b.ref));
+    const { rows, unattributed } = q1PrHeads(data, ctx);
     const counts = rows.map((row) => row.rounds);
     const sum = counts.reduce((total, count) => total + count, 0);
 
@@ -2615,6 +2634,7 @@ function q1PrRounds(data, ctx) {
         totals: {
             prs: rows.length,
             rounds: sum,
+            calls: rows.reduce((total, row) => total + row.calls, 0),
             mean: rows.length === 0 ? null : round2(sum / rows.length),
             median: medianOrNull(counts),
             p90: p90(counts),
@@ -2624,7 +2644,8 @@ function q1PrRounds(data, ctx) {
         prs: rows.map((row) => ({
             ref: row.ref,
             rounds: row.rounds,
-            heads: row.heads.size,
+            heads: row.heads,
+            calls: row.calls,
             first: iso(row.first),
             last: iso(row.last),
         })),
@@ -2778,8 +2799,8 @@ const q1Part = (fn, fallback) => {
  * A medium finding for a repository or an agent with 8 or more decided PRs, 25 or more covered days, and an
  * acceptance under 0.75. `unattributed` makes no finding.
  *
- * Beside it, in keys of their own: review rounds per desk thread (`rounds`), 3-failure stops of night-shift goals
- * (`stops`), CI reruns from the newest flaky-test scan (`ciReruns`), cross-review rounds per PR (`prRounds`) and the
+ * Beside it, in keys of their own: review rounds per PR, as reviewed heads (`rounds`), 3-failure stops of night-shift
+ * goals (`stops`), CI reruns from the newest flaky-test scan (`ciReruns`), cross-review rounds per PR (`prRounds`) and the
  * blocking points of cross-review answers with their guards (`blockers`). A new part whose source failed is
  * `{ available: false, reason }` and makes no finding; the acceptance part runs all the same.
  */

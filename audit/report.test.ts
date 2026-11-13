@@ -914,11 +914,11 @@ test("Q1's lines: review rounds, 3-failure stops and CI reruns follow decided ac
         rounds: {
             available: true,
             totals: {
-                threads: 5,
+                prs: 5,
                 median: 3,
                 p90: 10,
-                recent: { threads: 5, median: 3 },
-                before: { threads: 0, median: null },
+                recent: { prs: 5, median: 3 },
+                before: { prs: 0, median: null },
             },
         },
         stops: { available: true, totals: { stops: 3, last7: 2 } },
@@ -934,7 +934,7 @@ test("Q1's lines: review rounds, 3-failure stops and CI reruns follow decided ac
 
     assert.ok(at >= 0);
     assert.deepEqual(lines.slice(at + 1, at + 4), [
-        "- Review rounds (30 days): 5 threads, median 3, P90 10.",
+        "- Review rounds (30 days, reviewed heads per PR): 5 PRs, median 3, P90 10.",
         "- 3-failure stops: 3 in 30 days, 2 in the last 7 days.",
         "- CI reruns: 7 in 2 repositories (reports/2026-10-20-flaky-scan/scan.json).",
     ]);

@@ -1841,6 +1841,8 @@ export default function createTeam(host: Host, web: Web) {
         deadline?: number;
         deadlineLabel?: string;
         worker?: string;
+        /** The worker's thinking level: only a worker the router assigned has one (a shift module of version 4). */
+        workerThinking?: string;
     };
 
     /**
@@ -1876,17 +1878,28 @@ export default function createTeam(host: Host, web: Web) {
      * one: a copy of the shape, and nothing else. It is a suggestion only, never a model that ran.
      */
     type ThreadRoute = {
-        mode: "off" | "shadow";
-        status: "shadow" | "explicit" | "failed" | "off";
+        mode: "off" | "shadow" | "assign";
+        /** `assigned` (router v4): the route's `assigned` worker runs the shift's subagents. */
+        status: "shadow" | "explicit" | "failed" | "off" | "assigned";
         kind?: string;
         kindConfidence?: number;
         complexity?: number;
         capability?: number;
         deepReasoning?: number;
         demand?: number;
+        /** 1 of the router's 4 tiers; with `tierRule: "v1"`, the band of the rule (easy, medium, hard). */
         tier?: string;
+        /** `v1` (router v4): an eligible route, whose `tier` is rule v1's band. */
+        tierRule?: "v1";
         model?: string;
         thinking?: string;
+        /** The arm of a live band in mode `assign` (router v4). */
+        arm?: "A" | "B";
+        /** The worker the router assigned, and its thinking level (none for the control) (router v4). */
+        assigned?: string;
+        assignedThinking?: string;
+        /** The live experiment of the assignment, when one is named (router v4). */
+        experiment?: string;
         profileModel?: string;
         /**
          * The model the supervisor named. On an `explicit` route (an older router) the router did not run. On a
@@ -1936,6 +1949,10 @@ export default function createTeam(host: Host, web: Web) {
             worker?: string;
             repoDirs?: readonly string[];
             roster?: readonly string[];
+            /** Version 4: whether the delegation runs a shift, its repository, and its desk thread (the arm). */
+            shift?: boolean;
+            repo?: string;
+            threadId?: string;
         }) => Promise<ThreadRoute>;
         explicit: (request: { worker: string; profileModel?: string }) => ThreadRoute;
         /** Version 3: the brief's features with no Jev fields, for a route this module records itself. */
@@ -1958,6 +1975,10 @@ export default function createTeam(host: Host, web: Web) {
         worker?: string;
         repoDirs: string[];
         roster: string[];
+        /** The delegation runs a shift; its repository; its desk thread, when the router may assign a worker. */
+        shift: boolean;
+        repo?: string;
+        threadId?: string;
     };
 
     /**
@@ -1995,7 +2016,7 @@ export default function createTeam(host: Host, web: Web) {
     }
 
     /**
-     * The model router's shadow record for one delegation, a shift or not: a record only, never a model. A worker
+     * The model router's record for one delegation, a shift or not: never the session's model. A worker
      * the supervisor named still wins and still runs: the router is asked all the same, and the route carries the
      * `worker`, so the audit can compare the suggestion with the named worker. Only an older router (a version below 2)
      * does not take a worker: it records `explicit` and does not run. The answer is a memo keyed by the call
@@ -2029,6 +2050,9 @@ export default function createTeam(host: Host, web: Web) {
                         ...(input.worker === undefined ? {} : { worker: input.worker }),
                         repoDirs: input.repoDirs,
                         roster: input.roster,
+                        shift: input.shift,
+                        ...(input.repo === undefined ? {} : { repo: input.repo }),
+                        ...(input.threadId === undefined ? {} : { threadId: input.threadId }),
                     });
 
                     // An older router keeps no hash: the record ties the route to its brief all the same.
@@ -3620,11 +3644,11 @@ export default function createTeam(host: Host, web: Web) {
 
         // A plan's brief comes before the task: a delivery names the plan, its task and its acceptance lines.
         const firstTask = opened?.plan === undefined ? task : `${opened.plan.brief}\n\n${task}`;
-        // The model router's shadow record for this delegation: a record only, never a model. It runs for every
-        // delegation, a shift or not, also when the supervisor named the worker (the route then carries the
-        // `worker`, and the named worker still wins and still runs: nothing here changes the session's model,
-        // `goal.worker` or the result), and only when the router module is on. A shift's brief is its
-        // objective and stop condition; another delegation's is its task as the session gets it, the plan's brief
+        // The model router's record for this delegation. It runs for every delegation, a shift or not, also when the
+        // supervisor named the worker (the route then carries the `worker`, and the named worker still wins and still
+        // runs: nothing here changes the session's model, `goal.worker` or the result), and only when the router module
+        // is on. Only an `assigned` route (mode `assign`, a live band, below) sets a shift's worker. A shift's brief is
+        // its objective and stop condition; another delegation's is its task as the session gets it, the plan's brief
         // first. The features read the roster checkout of the delegation's repository: none for a home or a
         // workspace. Without a route, the delegation is exactly as it is without the router.
         const route = await delegationRoute(
@@ -3639,9 +3663,42 @@ export default function createTeam(host: Host, web: Web) {
                 repoDirs:
                     target.repo === undefined || target.folder === undefined ? [] : [target.folder],
                 roster: await rosterRepositories(),
+                shift: shift !== undefined,
+                ...(target.repo === undefined ? {} : { repo: target.repo }),
+                // The arm needs the desk thread, and the thinking level a shift module that keeps it (version 4):
+                // without both, the router assigns no worker.
+                ...(shift !== undefined && shift.ns.version >= 4 && opened !== undefined
+                    ? { threadId: opened.thread.id }
+                    : {}),
             },
             persona,
         );
+
+        // The router's assignment (mode `assign`, a live band of rule v1): its worker and thinking level go in the
+        // shift's goal, and the rounds name both. A worker the supervisor named always wins, and the owner's allowed
+        // list is checked again here, before the start: the goal's own check after it must not fail. The session's own
+        // model, the profile model, never changes. A replay reads the same route from the memo, so the same arm; the
+        // shift module is checked here too, not only when the router was asked: a memo from before a reload to an
+        // older shift module (below version 4, which drops the thinking level) applies nothing.
+        if (
+            shift !== undefined &&
+            shift.ns.version >= 4 &&
+            shift.request.worker === undefined &&
+            route?.status === "assigned" &&
+            route.assigned !== undefined &&
+            host.subagentModels().includes(route.assigned)
+        ) {
+            shift = {
+                ...shift,
+                request: {
+                    ...shift.request,
+                    worker: route.assigned,
+                    ...(route.assignedThinking === undefined
+                        ? {}
+                        : { workerThinking: route.assignedThinking }),
+                },
+            };
+        }
 
         // The owner's profile names the model, and the owner's allowed list permits it: neither is Pi's choice.
         // Not allowed: the source's model, as before, said in the result. Allowed but unusable now: core refuses

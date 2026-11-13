@@ -47,6 +47,7 @@ import {
     summaryMessage,
     waiting,
     watchDocumentValue,
+    workerLines,
 } from "./night-shift.ts";
 import { statusItem } from "./night-shift-web/index.js";
 
@@ -472,6 +473,46 @@ describe("parsing", () => {
             "waiting until 06:00 EDT (after DeepSeek's peak hours; 6h 30m left)",
         );
         assert.match(statusCard(goal, now), /Worker: deepseek\/deepseek-flash/);
+    });
+
+    test("a worker's thinking level goes next to the worker, in the prompt and the status", () => {
+        const goal: Goal = {
+            id: "thinking",
+            objective: "a",
+            stop: "b",
+            maxRounds: 40,
+            worker: "github-copilot/gpt-6-luna",
+            workerThinking: "high",
+            by: "u1",
+            byName: "Brian",
+            setAt: now,
+            status: "running",
+            round: 1,
+            seen: 0,
+            rounds: [],
+        };
+        const [line] = workerLines(goal);
+
+        assert.match(
+            line!,
+            /^For this goal, give execution to subagents on `github-copilot\/gpt-6-luna` and thinking `high`\./,
+        );
+        assert.match(
+            line!,
+            /Spawn each worker with model `github-copilot\/gpt-6-luna` and thinking `high`\./,
+        );
+        assert.match(line!, /end with STATUS: BLOCKED\. Do not pick another model\.$/);
+        assert.match(statusCard(goal, now), /Worker: github-copilot\/gpt-6-luna, thinking high/);
+
+        const { workerThinking: _drop, ...plain } = goal;
+        const [old] = workerLines(plain);
+
+        assert.equal(
+            old,
+            "For this goal, give execution to subagents on `github-copilot/gpt-6-luna`. This replaces the DeepSeek Flash rule for this goal. If `github-copilot/gpt-6-luna` cannot be used, end with STATUS: BLOCKED. Do not pick another model.",
+            "a worker with no thinking level: the words as before",
+        );
+        assert.deepEqual(workerLines({}), [], "no worker: no line");
     });
 
     test("a delegated goal is told its report goes to the supervisor by itself", () => {
@@ -1874,7 +1915,7 @@ describe("start", () => {
         ];
 
         assert.ok(api !== undefined, "the shift module's API");
-        assert.equal(api.version, 3);
+        assert.equal(api.version, 4);
         assert.equal(api.textLimit, SHIFT_TEXT_LIMIT, "the desk's goal board reads the limit");
 
         // A board row's end before its start: delegatedRequest keeps both, so the deadline does not move.
@@ -1923,6 +1964,58 @@ describe("start", () => {
             assert.deepEqual(await sent(id), ["The shift has stopped"]);
         } finally {
             shift = 0;
+        }
+    });
+});
+
+describe("a delegated worker's thinking level", () => {
+    test("setDelegated keeps workerThinking only with a worker, and only a known level", async () => {
+        await app.setSubagentModels(owner(app), ["faux/faux-2"]);
+        const api = (globalThis as unknown as Record<symbol, NightShiftApi | undefined>)[
+            Symbol.for("pi-pocket-team.night-shift")
+        ]!;
+        const { hhmm } = soon();
+        const cases = [
+            ["kept", { worker: "faux/faux-2", workerThinking: "high" }, "high"],
+            ["no worker", { workerThinking: "high" }, undefined],
+            ["unknown level", { worker: "faux/faux-2", workerThinking: "very" }, undefined],
+        ] as const;
+
+        for (const [name, fields, expected] of cases) {
+            const id = await session(`worker-thinking-${name.replaceAll(" ", "-")}`);
+            const request = api.delegatedRequest(
+                { objective: `scenario-thinking-${name}`, stop_when: "never", start: hhmm, max: 1 },
+                Date.now(),
+                ZONE,
+            );
+
+            assert(!("error" in request));
+
+            const goal = await app.harness.commit(
+                (tx) =>
+                    api.setDelegated(
+                        tx,
+                        id,
+                        { ...request, ...fields },
+                        { by: "owner", byName: "Owner", supervisor: "Odrade" },
+                        `x.test.thinking.${name}`,
+                    ),
+                context,
+            );
+
+            assert.equal(goal.workerThinking, expected, name);
+            assert.equal((await goalOf(id))?.workerThinking, expected, `${name}: stored`);
+            assert.equal(
+                "workerThinking" in (await goalOf(id))!,
+                expected !== undefined,
+                `${name}: no field when it is left out`,
+            );
+            await command(id, "stop");
+            await until(
+                async () => (await goalOf(id))?.status !== "running",
+                `${name}: the stop`,
+                10_000,
+            );
         }
     });
 });

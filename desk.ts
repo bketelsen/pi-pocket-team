@@ -340,18 +340,29 @@ export type CloseOutcome = "completed" | "abandoned" | "verified" | "frozen";
  * import that one: a copy of the shape, and nothing else. Stored data: never rename a field or change what one means.
  */
 export type ThreadRoute = {
-    mode: "off" | "shadow";
-    status: "shadow" | "explicit" | "failed" | "off";
+    mode: "off" | "shadow" | "assign";
+    /** `assigned` (router v4): the route's `assigned` worker runs the shift's subagents. */
+    status: "shadow" | "explicit" | "failed" | "off" | "assigned";
     kind?: string;
     kindConfidence?: number;
     complexity?: number;
     capability?: number;
     deepReasoning?: number;
     demand?: number;
+    /** 1 of the router's 4 tiers; with `tierRule: "v1"`, the band of the rule (easy, medium, hard). */
     tier?: string;
+    /** `v1` (router v4): an eligible route, whose `tier` is rule v1's band. */
+    tierRule?: "v1";
     /** The model the router would pick for the worker. */
     model?: string;
     thinking?: string;
+    /** The arm of a live band in mode `assign` (router v4). */
+    arm?: "A" | "B";
+    /** The worker the router assigned, and its thinking level (none for the control) (router v4). */
+    assigned?: string;
+    assignedThinking?: string;
+    /** The live experiment of the assignment, when one is named (router v4). */
+    experiment?: string;
     /** The agent's profile model: the model of the session itself, which the router never changes. */
     profileModel?: string;
     /**
