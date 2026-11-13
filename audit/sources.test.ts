@@ -8,6 +8,7 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { checkQ1, isCrossReviewSpawn } from "./checks.mjs";
+import { guardCacheOf } from "./reviews.mjs";
 import { DAY, HOUR } from "./common.mjs";
 import { NOW } from "./fixtures/builders.mjs";
 import { SESSION_T1, SESSION_T2, SUPERVISOR, createFixtureDb } from "./fixtures/pocket-db.mjs";
@@ -22,6 +23,7 @@ import {
     BLOCKER_LOOKUPS,
     BLOCKER_MAX_PR_QUERIES,
     BLOCKER_MAX_QUERIES,
+    guardCandidates,
     guardOf,
     loadBlockerGuards,
     loadGithub,
@@ -2536,6 +2538,9 @@ test("loadBlockerGuards: 1 PR query, then 1 blob query with the candidates at th
                 test: true,
                 agentsRule: false,
                 corrections: 1,
+                correctionsLegacy: 1,
+                correctionsFiles: 0,
+                correctionsSkipped: [],
                 namesPr: true,
             },
         },
@@ -2571,6 +2576,9 @@ test("loadBlockerGuards: an unchanged or deleted test file does not count; a cha
         test: false,
         agentsRule: true,
         corrections: 0,
+        correctionsLegacy: 0,
+        correctionsFiles: 0,
+        correctionsSkipped: [],
         namesPr: false,
     });
 });
@@ -2612,6 +2620,9 @@ test("guardOf: the added corrections lines are a multiset of non-empty lines; a 
             test: true,
             agentsRule: false,
             corrections: 2,
+            correctionsLegacy: 2,
+            correctionsFiles: 0,
+            correctionsSkipped: [],
             namesPr: true,
         },
     );
@@ -2625,6 +2636,9 @@ test("guardOf: the added corrections lines are a multiset of non-empty lines; a 
             test: false,
             agentsRule: false,
             corrections: 1,
+            correctionsLegacy: 1,
+            correctionsFiles: 0,
+            correctionsSkipped: [],
             namesPr: false,
         },
     );
@@ -2643,6 +2657,9 @@ test("guardOf: the added corrections lines are a multiset of non-empty lines; a 
                 test: true,
                 agentsRule: false,
                 corrections: null,
+                correctionsLegacy: null,
+                correctionsFiles: null,
+                correctionsSkipped: [],
                 namesPr: null,
                 reason: "corrections text missing",
             },
@@ -2696,6 +2713,9 @@ test("loadBlockerGuards: no candidate file, or no commit after the head, is fina
         test: false,
         agentsRule: false,
         corrections: 0,
+        correctionsLegacy: 0,
+        correctionsFiles: 0,
+        correctionsSkipped: [],
         namesPr: false,
     };
 
@@ -3065,6 +3085,391 @@ test("loadBlockerGuards: when the shared cap is reached before it starts, every 
     // PR 1's key is cached final: only PR 2 and PR 3 are pending.
     assert.equal(result.pending, 2);
     assert.deepEqual(result.errors, ["GitHub call cap reached"]);
+});
+
+// ---------- Q1: the new form of a correction record (`.memory/corrections/<date>-<slug>.json`) ----------
+
+/** The new form of a record: 1 JSON file, with `promoted_to` when it is filled. */
+const recordText = (promoted?: string) =>
+    JSON.stringify({
+        date: "2026-11-13",
+        scope: "acme/w",
+        correction: "Wait on the decision, not on a sleeper",
+        evidence: "acme/w#4 review",
+        ...(promoted === undefined ? {} : { promoted_to: promoted }),
+    });
+
+/** Another record, with another key: `date`, `scope`, `correction` and `evidence` all other. */
+const secondRecordText = (promoted?: string) =>
+    JSON.stringify({
+        date: "2026-11-14",
+        scope: "acme/w",
+        correction: "Read the busy lanes before and after the others",
+        evidence: "acme/w#4 review",
+        ...(promoted === undefined ? {} : { promoted_to: promoted }),
+    });
+
+/** 1 candidate file of `guardOf`, as `guardCandidates` gives it, with its blobs at H and at F. */
+function guardFile(path: string, atHead: Blob | null, atFinal: Blob | null) {
+    const record = /^\.memory\/corrections\/[^/]+\.json$/.test(path);
+
+    return {
+        path,
+        test: !record && /[._-](test|spec)\.[^/]+$/.test(path),
+        agents: /(^|\/)AGENTS\.md$/.test(path),
+        corrections: path === ".memory/corrections.jsonl",
+        record,
+        atHead,
+        atFinal,
+    };
+}
+
+/** The result of a guard whose correction records cannot be read. */
+const missingText = {
+    final: true,
+    state: "merged",
+    guarded: null,
+    test: false,
+    agentsRule: false,
+    corrections: null,
+    correctionsLegacy: null,
+    correctionsFiles: null,
+    correctionsSkipped: [],
+    namesPr: null,
+    reason: "corrections text missing",
+};
+
+test("guardCandidates: a record file under .memory/corrections/ is a record, never a test, and no other file there", () => {
+    assert.deepEqual(
+        guardCandidates([
+            { path: ".memory/corrections/2026-11-13-pr-4-test.json" },
+            { path: ".memory/corrections/.gitkeep" },
+            { path: ".memory/corrections/sub/x.json" },
+            { path: ".memory/corrections.jsonl" },
+            { path: "src/a.test.ts" },
+        ]),
+        [
+            {
+                path: ".memory/corrections/2026-11-13-pr-4-test.json",
+                test: false,
+                agents: false,
+                corrections: false,
+                record: true,
+            },
+            {
+                path: ".memory/corrections.jsonl",
+                test: false,
+                agents: false,
+                corrections: true,
+                record: false,
+            },
+            { path: "src/a.test.ts", test: true, agents: false, corrections: false, record: false },
+        ],
+    );
+});
+
+test("loadBlockerGuards: a new record file and a new test file guard a point; the old file is read as a reference", () => {
+    const record = ".memory/corrections/2026-11-13-pr-4-guard.json";
+    const { queries, gh } = guardGh(
+        () => ({ state: "MERGED", files: prFiles("src/a.test.ts", record) }),
+        {
+            blobs: {
+                [`${SHA_B}:src/a.test.ts`]: { oid: "t2" },
+                [`${SHA_B}:${record}`]: { oid: "r1", text: recordText() },
+                [`${SHA_A}:.memory/corrections.jsonl`]: { oid: "c1", text: "" },
+            },
+        },
+    );
+    const result = loadBlockerGuards(blockerData([{ n: 4 }]), { gh, now: NOW });
+
+    // The record file has text at H and at F, and the old file is a reference at H and at F: moved records need it.
+    assert.deepEqual(queries, [
+        `{ r0: repository(owner: "acme", name: "w") { k0: object(oid: "${SHA_A}") { oid } ` +
+            `k0h0: object(expression: "${SHA_A}:src/a.test.ts") { oid } ` +
+            `k0f0: object(expression: "${SHA_B}:src/a.test.ts") { oid } ` +
+            `k0h1: object(expression: "${SHA_A}:${record}") { oid ... on Blob { text isTruncated } } ` +
+            `k0f1: object(expression: "${SHA_B}:${record}") { oid ... on Blob { text isTruncated } } ` +
+            `k0h2: object(expression: "${SHA_A}:.memory/corrections.jsonl") { oid ... on Blob { text isTruncated } } ` +
+            `k0f2: object(expression: "${SHA_B}:.memory/corrections.jsonl") { oid ... on Blob { text isTruncated } } } }`,
+    ]);
+    assert.deepEqual(result, {
+        prs: { "acme/w#4": { state: "merged", mergedAt: null, closedAt: null, head: SHA_B } },
+        guards: {
+            [`acme/w#4@${SHA_A}`]: {
+                final: true,
+                state: "merged",
+                guarded: true,
+                test: true,
+                agentsRule: false,
+                corrections: 1,
+                correctionsLegacy: 0,
+                correctionsFiles: 1,
+                correctionsSkipped: [],
+                namesPr: true,
+            },
+        },
+        calls: 2,
+        pending: 0,
+        errors: [],
+    });
+});
+
+test("loadBlockerGuards: a new record file that does not name the PR is counted, and namesPr stays false", () => {
+    const record = ".memory/corrections/2026-11-13-other-guard.json";
+    const { gh } = guardGh(() => ({ state: "MERGED", files: prFiles("src/a.test.ts", record) }), {
+        blobs: {
+            [`${SHA_B}:src/a.test.ts`]: { oid: "t2" },
+            [`${SHA_B}:${record}`]: {
+                oid: "r1",
+                text: JSON.stringify({
+                    date: "2026-11-13",
+                    scope: "other/w",
+                    correction: "Read the lanes twice",
+                    evidence: "other/w#9 review",
+                }),
+            },
+            [`${SHA_A}:.memory/corrections.jsonl`]: { oid: "c1", text: "" },
+        },
+    });
+    const result = loadBlockerGuards(blockerData([{ n: 4 }]), { gh, now: NOW });
+
+    assert.deepEqual(result.guards[`acme/w#4@${SHA_A}`], {
+        final: true,
+        state: "merged",
+        guarded: true,
+        test: true,
+        agentsRule: false,
+        corrections: 1,
+        correctionsLegacy: 0,
+        correctionsFiles: 1,
+        correctionsSkipped: [],
+        namesPr: false,
+    });
+});
+
+test("loadBlockerGuards: a record moved from the old file after the reviewed head is not new; another key is", () => {
+    const record = ".memory/corrections/2026-11-13-pr-4-guard.json";
+    const second = ".memory/corrections/2026-11-14-pr-4-lanes.json";
+    // At H the old file has the record, with the key that the new file keeps; `promoted_to` differs.
+    const moved = (files: string[]) =>
+        guardGh(() => ({ state: "MERGED", files: prFiles(...files) }), {
+            blobs: {
+                [`${SHA_B}:src/a.test.ts`]: { oid: "t2" },
+                [`${SHA_A}:.memory/corrections.jsonl`]: {
+                    oid: "c1",
+                    text: `${recordText("PR #4")}\n`,
+                },
+                [`${SHA_B}:${record}`]: { oid: "r1", text: recordText("a test") },
+                [`${SHA_B}:${second}`]: { oid: "r2", text: secondRecordText() },
+            },
+        });
+    // The old file is gone at F: the record file is moved, and no line is added to the old file.
+    const one = moved(["src/a.test.ts", record]);
+    const result = loadBlockerGuards(blockerData([{ n: 4 }]), { gh: one.gh, now: NOW });
+
+    assert.deepEqual(result.guards[`acme/w#4@${SHA_A}`], {
+        final: true,
+        state: "merged",
+        guarded: false,
+        test: true,
+        agentsRule: false,
+        corrections: 0,
+        correctionsLegacy: 0,
+        correctionsFiles: 0,
+        correctionsSkipped: [],
+        namesPr: false,
+    });
+
+    // A second new record file, with another key: counted once.
+    const two = moved(["src/a.test.ts", record, second]);
+    const counted = loadBlockerGuards(blockerData([{ n: 4 }]), { gh: two.gh, now: NOW });
+
+    assert.deepEqual(counted.guards[`acme/w#4@${SHA_A}`], {
+        final: true,
+        state: "merged",
+        guarded: true,
+        test: true,
+        agentsRule: false,
+        corrections: 1,
+        correctionsLegacy: 0,
+        correctionsFiles: 1,
+        correctionsSkipped: [],
+        namesPr: true,
+    });
+});
+
+test("loadBlockerGuards: a PR that adds lines to .memory/corrections.jsonl counts them as legacy lines", () => {
+    const { queries, gh } = guardGh(
+        () => ({
+            state: "MERGED",
+            files: prFiles("src/a.test.ts", ".memory/corrections.jsonl"),
+        }),
+        {
+            blobs: {
+                [`${SHA_B}:src/a.test.ts`]: { oid: "t2" },
+                [`${SHA_A}:.memory/corrections.jsonl`]: {
+                    oid: "c1",
+                    text: `${recordText("PR #4")}\n`,
+                },
+                [`${SHA_B}:.memory/corrections.jsonl`]: {
+                    oid: "c2",
+                    text: `${recordText("PR #4")}\n${secondRecordText()}\n`,
+                },
+            },
+        },
+    );
+    const result = loadBlockerGuards(blockerData([{ n: 4 }]), { gh, now: NOW });
+
+    assert.equal(queries.length, 1);
+    assert.deepEqual(result.guards[`acme/w#4@${SHA_A}`], {
+        final: true,
+        state: "merged",
+        guarded: true,
+        test: true,
+        agentsRule: false,
+        corrections: 1,
+        correctionsLegacy: 1,
+        correctionsFiles: 0,
+        correctionsSkipped: [],
+        namesPr: true,
+    });
+});
+
+test("loadBlockerGuards: a record file that the read-only gh refuses is skipped, not looked up and not counted", () => {
+    const refused = ".memory/corrections/2026-11-13-pr-4-mutation-fix.json";
+    const { queries, gh } = guardGh(
+        (n) =>
+            n === 1
+                ? { state: "MERGED", files: prFiles("src/a.test.ts", refused) }
+                : { state: "MERGED", files: prFiles(refused) },
+        { blobs: { [`${SHA_B}:src/a.test.ts`]: { oid: "t2" } } },
+    );
+    const result = loadBlockerGuards(
+        blockerData([
+            { n: 1, minutes: 20 },
+            { n: 2, minutes: 10 },
+        ]),
+        { gh, now: NOW },
+    );
+
+    // PR 2's only candidate is the refused record file: no lookup at all. PR 1's query holds no such path.
+    assert.deepEqual(queries, [
+        `{ r0: repository(owner: "acme", name: "w") { k0: object(oid: "${SHA_A}") { oid } ` +
+            `k0h0: object(expression: "${SHA_A}:src/a.test.ts") { oid } ` +
+            `k0f0: object(expression: "${SHA_B}:src/a.test.ts") { oid } } }`,
+    ]);
+    assert.deepEqual(result.guards, {
+        [`acme/w#1@${SHA_A}`]: {
+            final: true,
+            state: "merged",
+            guarded: false,
+            test: true,
+            agentsRule: false,
+            corrections: 0,
+            correctionsLegacy: 0,
+            correctionsFiles: 0,
+            correctionsSkipped: [refused],
+            namesPr: false,
+        },
+        [`acme/w#2@${SHA_A}`]: {
+            final: true,
+            state: "merged",
+            guarded: false,
+            test: false,
+            agentsRule: false,
+            corrections: 0,
+            correctionsLegacy: 0,
+            correctionsFiles: 0,
+            correctionsSkipped: [refused],
+            namesPr: false,
+        },
+    });
+
+    // A PR whose only candidate is such a file: no lookup, so no blob query at all.
+    const alone = guardGh(() => ({ state: "MERGED", files: prFiles(refused) }));
+    const only = loadBlockerGuards(blockerData([{ n: 4 }]), { gh: alone.gh, now: NOW });
+
+    assert.deepEqual(alone.queries, []);
+    assert.deepEqual(only.guards, {
+        [`acme/w#4@${SHA_A}`]: {
+            final: true,
+            state: "merged",
+            guarded: false,
+            test: false,
+            agentsRule: false,
+            corrections: 0,
+            correctionsLegacy: 0,
+            correctionsFiles: 0,
+            correctionsSkipped: [refused],
+            namesPr: false,
+        },
+    });
+});
+
+test("guardOf: a truncated or invalid record file has no verdict: corrections text missing", () => {
+    const head = { oid: SHA_A };
+    const record = (atFinal: Blob | null) =>
+        guardFile(".memory/corrections/2026-11-13-pr-4-guard.json", null, atFinal);
+    const log = guardFile(".memory/corrections.jsonl", { oid: "c1", text: "" }, null);
+
+    const blobs: Blob[] = [
+        // A truncated text, no text at all, and JSON that is invalid, an array or null.
+        { oid: "r1", text: recordText(), isTruncated: true },
+        { oid: "r1" },
+        { oid: "r1", text: "not json {" },
+        { oid: "r1", text: "[1,2]" },
+        { oid: "r1", text: "null" },
+    ];
+
+    for (const atFinal of blobs) {
+        assert.deepEqual(guardOf("acme/w#4", { head, files: [log, record(atFinal)] }), missingText);
+    }
+});
+
+test("guardOf: a new record file with no .memory/corrections.jsonl candidate in the files has no text", () => {
+    assert.deepEqual(
+        guardOf("acme/w#4", {
+            head: { oid: SHA_A },
+            files: [
+                guardFile(".memory/corrections/2026-11-13-pr-4-guard.json", null, {
+                    oid: "r1",
+                    text: recordText(),
+                }),
+            ],
+        }),
+        missingText,
+    );
+});
+
+test("loadBlockerGuards: a cached final guard without the new fields stays as it is, with no call", () => {
+    const guard = {
+        final: true,
+        state: "merged",
+        guarded: true,
+        test: true,
+        agentsRule: false,
+        corrections: 1,
+        namesPr: true,
+    };
+    const earlier = [
+        {
+            date: "2026-10-23",
+            json: {
+                metrics: {
+                    Q1: { blockers: { points: [{ ref: "acme/w#4", head: SHA_A, guard }] } },
+                },
+            },
+        },
+    ];
+    const cache = guardCacheOf(earlier);
+
+    assert.deepEqual(cache, { [`acme/w#4@${SHA_A}`]: guard });
+
+    const { seen, gh } = guardGh(() => ({ state: "MERGED", files: prFiles("src/a.test.ts") }));
+    const result = loadBlockerGuards(blockerData([{ n: 4 }]), { gh, now: NOW, cache });
+
+    assert.equal(seen.length, 0);
+    assert.deepEqual(result, { prs: {}, guards: {}, calls: 0, pending: 0, errors: [] });
 });
 
 test("loadData and Q1: a spawn 60 days ago with a send and a blocking answer 29 days ago gives 1 round and the points", () => {

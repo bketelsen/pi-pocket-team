@@ -2680,9 +2680,9 @@ function pointState(ref, prs, guard) {
 /**
  * Q1's blocking points of cross-review answers ("Blocker to guard"): every blocking item of an answer, with the PR
  * and the reviewed head of the review call it answers, the PR's state, and its guard: whether, from the reviewed head
- * to the PR's final head, a test or an `AGENTS.md` file of the PR changed and `.memory/corrections.jsonl` got lines
- * (`loadBlockerGuards`, or a final result of an earlier day). `guards` says how this run's guard read went
- * (`guardsSource`). Without GitHub, or when the guard read fails, the points still show, with state `unknown` (a
+ * to the PR's final head, a test or an `AGENTS.md` file of the PR changed and `.memory/corrections.jsonl` got lines or
+ * `.memory/corrections/` got new record files (`loadBlockerGuards`, or a final result of an earlier day). `guards`
+ * says how this run's guard read went (`guardsSource`). Without GitHub, or when the guard read fails, the points still show, with state `unknown` (a
  * cached guard still applies). No findings.
  */
 function q1Blockers(data, ctx) {

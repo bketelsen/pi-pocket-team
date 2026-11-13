@@ -53,7 +53,7 @@ What exists today:
 | Tool calls of a planning session that name `desk.ts` or `pi-pocket/src` (source reads)          | Pocket's entries; `loadPlanSessions` keeps the tool name only, no argument text                   |
 | PR refs and reviewed head of each `subagent` spawn and send                                     | Pocket's entries; `loadReviewCalls` keeps the refs, the PR numbers and the head SHA, no text      |
 | Reviewer answers: the verdict (`Ready`, `Not ready`) and the labels of the blocking items       | Pocket's entries; `loadReviewAnswers` in `audit/sources.mjs` keeps no answer text                 |
-| Guard of each blocking point: test, `AGENTS.md` rule, corrections line after the reviewed head  | `metrics.Q1.blockers.points[].guard` in `findings.json`; a final result is not fetched again      |
+| Guard of each blocking point: test, `AGENTS.md` rule, correction record after the reviewed head | `metrics.Q1.blockers.points[].guard` in `findings.json`; a final result is not fetched again      |
 | GitHub webhook deliveries: each accepted fact and refusal, counts by outcome, the last delivery | `x.github-hooks.deliveries` (`github-hooks.ts`), the newest 2000; no free text                    |
 | Webhook alarms: system (`bind-failed`, `secret-missing`, …) and coverage, raised and cleared    | `x.github-hooks.alarms` (`github-hooks.ts`); the audit does not read it yet                       |
 
@@ -98,8 +98,9 @@ What exists today:
 - **Q1 `prRounds` and `blockers`** (measurement only, no finding): cross-review rounds per PR from the session
   records (`rounds`, `heads`, mean, median, P90, PRs with 3 or more rounds, rounds with no PR), and every blocking
   point of a reviewer answer with its PR, its reviewed head, the PR's state and its guard: a test or an `AGENTS.md`
-  file of the PR's own diff that is new or changed at the final head against the reviewed head, and the
-  `.memory/corrections.jsonl` lines added between them. `rate` is guarded points over evaluated points, null at 0.
+  file of the PR's own diff that is new or changed at the final head against the reviewed head, and the lines added to
+  `.memory/corrections.jsonl` between them plus the new record files under `.memory/corrections/` (a record moved out
+  of the old file after the reviewed head is not new). `rate` is guarded points over evaluated points, null at 0.
   GitHub calls, inside the cap of 40 and with no compare: at most 8 PR queries of 40 PRs, then at most 4 blob queries
   of at most 150 object lookups a run, newest first; the rest stay pending for the next run.
   A PR with an error on its alias, or with no whole file list, stays pending, never final. `blockers.guards` names
@@ -136,7 +137,8 @@ What exists today:
 - The audit writes at most 5 proposals. Each cites finding ids. Code, not the model, gives the owner and the size
   (`ownerOf` in `audit/report.mjs`).
 - Odrade reads the report for the 07:30 brief (README.md, "Daily audit").
-- A blocking review point gets a guard: a test or an `AGENTS.md` rule, and 1 line in `.memory/corrections.jsonl`.
+- A blocking review point gets a guard: a test or an `AGENTS.md` rule, and 1 record file in `.memory/corrections/`,
+  or 1 line in `.memory/corrections.jsonl` in a repository that still has it.
 
 The loop:
 
