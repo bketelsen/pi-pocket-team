@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-06",
+  "scope": "github-hooks-tests-docs",
+  "correction": "github-hooks tests must prove behavior in the module, not on copies or by time: a failed commit is a real rollback in the receiver (the test-fail hook), the turn-off and desk-off checks wait on the module's probe counters (parked, ticks, commits) and assert no commit, close() is tested with an idle and an active socket and the grace time, a secret change is tested in place with the same length and inode; and the site page says main and master stay as the branch, a duplicate adds only a log entry and a count, and 408 for slow headers or body",
+  "evidence": "PR #138 cross-review (openai/gpt-6.1-sol), batch 3",
+  "promoted_to": "github-hooks-pocket.test.ts: a real failed commit: 500, and no seen entry, accepted entry or marker persists; the same delivery then gets 202 / 1 real reload: an idle keep-alive socket closes at once, and the new listener accepts / turned off: the receiver waits in memory with no commit; turned on: the new code runs and accepts / a load that fails after it set its version id: a later turn-off still waits with no commit loop / the desk off: a delivery is accepted with no marker; a written marker waits; the desk on hands it over; github-hooks.test.ts: close: an idle keep-alive socket ends at once, an active request after the grace time and not before; a new listener accepts / a secret changed in place (same length, same inode, later mtime): the new one is accepted, the old one refused / The secret source"
+}

@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-06",
+  "scope": "desk-escalate-attach-holders",
+  "correction": "A supervisor attach must mark handled on every thread it changed, also the thread a PR moved off, or older Clerk news of that thread still escalates after the supervisor moved its work",
+  "evidence": "bketelsen/pi-pocket-team#139 cross-review (openai/gpt-6.1-sol) finding 3",
+  "promoted_to": "desk.test.ts: a supervisor's attach of a PR marks the thread it moved from and the thread it moved to"
+}

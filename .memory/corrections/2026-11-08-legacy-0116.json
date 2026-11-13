@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-08",
+  "scope": "bench-stage2-empty-r",
+  "correction": "Stage 2 planning permits an empty task list, so an empty R (every task left after calibration went to stage 1) gives the wait branch in analyzeStage2, --branch and --stage 2 instead of the error 'no tasks to analyze'",
+  "evidence": "bketelsen/pi-pocket-team#164: cross-review (openai/gpt-6.1-sol) of 902e00c",
+  "promoted_to": "bench/analyze.test.mjs: stage 2 with an empty R (every task left went to stage 1) is the wait branch, not an error; the command line: --branch with an empty R writes the wait branch; the command line: --stage 2 with no results writes the wait summary, for an empty R and for R under 30"
+}

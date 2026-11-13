@@ -7,6 +7,7 @@ Files: `homewiki.ts` and `homewiki-web/`. It is read-only and list-only: the mod
 ## What it shows
 
 - **Pages:** `README.md` and every `.md` file under `docs/`, skipping hidden files and folders. `README.md` comes first; the rest sort by their `order` frontmatter (none sorts last), then by path. The title is the frontmatter `title`, else the first `#` heading, else the path. A subfolder of `docs/` becomes a section.
+- **Links:** a relative link to a wiki page opens that page in the Wiki page. The link's file and `#` fragment are split before they are decoded, and a malformed percent escape (`50%.md`) stays as it is written. A link to a file that is not a page shows "No wiki page at" and the path.
 - **Live:** a watcher on the checkout tells open tabs when a Markdown file changes, at most once a second, so an edit shows without a reload.
 - **The checkout:** the page notes the commit the folder is at, and whether it has uncommitted edits.
 

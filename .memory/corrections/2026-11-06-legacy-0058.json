@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-06",
+  "scope": "bench-compaction-usage",
+  "correction": "The bench usage total and its limit checks must count compaction_end result.usage: automatic compaction calls the model, and its cost must reach the result file and the settled spend",
+  "evidence": "bketelsen/pi-pocket-team#146 cross-review round 1 finding 1",
+  "promoted_to": "bench/run.test.mjs: compaction usage reaches the result and the settled spend; bench/stream.test.mjs: compaction usage (compaction_end result.usage) counts in the total"
+}

@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-07",
+  "scope": "bench-score-no-root-git",
+  "correction": "The scorer requires only that the submitted tree is a folder; its own .git is not needed, because the diff uses trusted git metadata",
+  "evidence": "bketelsen/pi-pocket-team#151 cross-review re-review 2 (openai/gpt-6.1-sol) finding RR2",
+  "promoted_to": "bench/score.test.mjs: a submitted tree with no .git of its own is scored: S0, S1, S2, the diff and the grades"
+}

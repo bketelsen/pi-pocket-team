@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-07",
+  "scope": "desk-board-agent-replay-ambiguous",
+  "correction": "An agent board call whose key has receipts on more than 1 supervisor is refused and changes nothing, instead of falling back to the live-supervisor binding and adding a new row",
+  "evidence": "bketelsen/pi-pocket-team#168: cross-review (openai/gpt-6.1-sol) of 2c77072, re-review 1",
+  "promoted_to": "desk-board.test.ts: an agent's call whose key has receipts on 2 boards is refused, and no board changes"
+}

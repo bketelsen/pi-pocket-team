@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-04",
+  "scope": "desk-grant-refusals",
+  "correction": "A tap on Allow 1 can serve the refusal of a supervisor that has no counted thread: the grant route must also send the [desk] message to the supervisor of each refusal the tap served, or that delegation waits with no banner and no message",
+  "evidence": "pi-pocket-team#117, cross-review (openai/gpt-6.1-sol) of head fbc692e, finding 1",
+  "promoted_to": "desk.test.ts"
+}

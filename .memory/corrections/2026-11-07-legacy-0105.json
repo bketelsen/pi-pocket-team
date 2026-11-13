@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-07",
+  "scope": "team-start-shift-no-desk",
+  "correction": "startShift refuses before any setup when the desk API is absent: a board start never runs without its desk thread, the board's open limit and its cap",
+  "evidence": "bketelsen/pi-pocket-team#160: cross-review (openai/gpt-6.1-sol) of 7e9de66, batch 1",
+  "promoted_to": "desk-board.pocket.test.ts: with no desk API nothing starts, and the result is a refusal"
+}

@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-07",
+  "scope": "bench-judge-cut-order",
+  "correction": "A judge diff over the limit puts its non-test file sections before its test file sections before the cut: git sorts by path, so test files can fill the whole cut and hide the implementation",
+  "evidence": "Owner review of the first judge calibration's held-out set (bketelsen/pi-pocket-team#157): cut diffs showed only test files",
+  "promoted_to": "bench/judge.test.mjs: a cut diff shows the non-test files first, each group in its order; a diff under the limit is unchanged"
+}

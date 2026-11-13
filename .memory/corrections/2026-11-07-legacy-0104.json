@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-07",
+  "scope": "team-start-shift-admitted",
+  "correction": "An error in startShift after Pocket's linkedSessions.start gave a session (the bind commit, the goal, a notify) is unknown: true, so the board never marks the row failed and a reopen never starts a second session",
+  "evidence": "bketelsen/pi-pocket-team#160: cross-review (openai/gpt-6.1-sol) of 7e9de66, batch 1",
+  "promoted_to": "desk-board.pocket.test.ts: an error after Pocket admitted the session (the bind commit throws) is unknown"
+}

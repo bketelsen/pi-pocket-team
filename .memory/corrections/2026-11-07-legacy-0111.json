@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-07",
+  "scope": "team-start-shift-needs-desk",
+  "correction": "A board start passes needsDesk, and delegate refuses before any setup or start when the desk API it reads is absent, so a desk that unloads after startShift's own check never lets a start skip the open and its reserve",
+  "evidence": "bketelsen/pi-pocket-team#160: cross-review (openai/gpt-6.1-sol) of 8bb4dd7, re-review 1, batch 1",
+  "promoted_to": "desk-board.pocket.test.ts: a desk that unloads before delegate reads it: no session, no thread, a refusal"
+}

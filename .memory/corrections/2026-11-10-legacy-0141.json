@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-10",
+  "scope": "bench-drop-caches-order",
+  "correction": "A flag that tells later runs a resource is gone is saved before the resource is removed, and a failed save removes nothing",
+  "evidence": "bketelsen/pi-pocket-team#191 cross-review (openai/gpt-6.1-sol) of bf85c53, finding 1",
+  "promoted_to": "bench/score.test.mjs: dropCaches saves cachesDropped before the first removal: a failed save removes nothing"
+}

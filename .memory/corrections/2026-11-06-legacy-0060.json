@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-06",
+  "scope": "bench-reserve-per-attempt",
+  "correction": "A bench attempt reserves its cap once and keeps it across its retries, then settles all tries once; a reservation per try lets the budget refuse a retry after a paid try",
+  "evidence": "bketelsen/pi-pocket-team#146 cross-review round 1 finding 3",
+  "promoted_to": "bench/run.test.mjs: a retry is not refused by the budget after a paid try (1 reservation per attempt)"
+}

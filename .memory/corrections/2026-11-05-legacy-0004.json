@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-05",
+  "scope": "desk-plan-task-prs",
+  "correction": "The 7-day set pins only links with state OPEN, not links not read yet: planTaskClosedThreads must also give the reopenable task threads for pinning (their prOpen links), and run updatePrs 1 time for each thread, or a recently closed task thread's unread PR that merged ends its task only after 7 days",
+  "evidence": "pi-pocket-team#122, cross-review (openai/gpt-6.1-sol) of head 73ae3e1, finding 2",
+  "promoted_to": "desk-plans.test.ts"
+}

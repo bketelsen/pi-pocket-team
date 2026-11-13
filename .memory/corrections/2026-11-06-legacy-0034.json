@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-06",
+  "scope": "desk-escalate-box-cap",
+  "correction": "enqueueDigest above DIGEST_MAX_ITEMS must remove the oldest non-escalation items only, or an accepted escalation leaves the box with no event and no count",
+  "evidence": "bketelsen/pi-pocket-team#139 cross-review (openai/gpt-6.1-sol) finding 2",
+  "promoted_to": "desk.test.ts: the box drops its oldest items above the cap, but never an escalation"
+}

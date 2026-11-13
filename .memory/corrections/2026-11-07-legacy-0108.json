@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-07",
+  "scope": "desk-board-run-end-wait",
+  "correction": "A run-end count waits for the completed rounds (goal.rounds and status ended), the shift's report on the desk and both sessions at rest: goal.round moves before a round is sent",
+  "evidence": "bketelsen/pi-pocket-team#160: cross-review (openai/gpt-6.1-sol) of 7e9de66, batch 4",
+  "promoted_to": "desk-board.pocket.test.ts: with the run-end switch, the supervisor gets 0 run-end answers while the runs do 3 rounds"
+}

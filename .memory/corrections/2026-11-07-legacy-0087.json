@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-07",
+  "scope": "bench-overlay-replace-folder",
+  "correction": "Before S2's copy, each staged path's destination is removed inside the sandbox (rm -rf per path, as argv); the host overlay of the harvester's trees removes a folder at a reference file's path",
+  "evidence": "bketelsen/pi-pocket-team#151 cross-review re-review 2 (openai/gpt-6.1-sol) finding RR4",
+  "promoted_to": "bench/score.test.mjs: S2 puts a reference file where the submitted tree has a folder; the submitted tree does not change; the host overlay (the harvester's own trees) replaces a folder with the reference's file"
+}

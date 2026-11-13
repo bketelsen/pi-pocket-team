@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-10",
+  "scope": "desk-site-page",
+  "correction": "A change to a module's behavior changes its site page (site/content/modules/) in the same PR, not only docs/modules/",
+  "evidence": "bketelsen/pi-pocket-team#196 cross-review of a12d197, finding 2",
+  "promoted_to": "AGENTS.md rule 'The user site (site/content/, built by make site) summarizes the module reference'"
+}

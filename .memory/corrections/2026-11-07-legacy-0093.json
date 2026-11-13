@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-07",
+  "scope": "desk-found-session-failed",
+  "correction": "A found-session thread takes the list entry's failed in the sweep that finds it, so Odrade's queue gives run failed: <line> at once",
+  "evidence": "bketelsen/pi-pocket-team#154: cross-review (openai/gpt-6.1-sol) of ffb826c",
+  "promoted_to": "desk.test.ts: a sync that finds a session whose run failed gives the found thread run failed"
+}

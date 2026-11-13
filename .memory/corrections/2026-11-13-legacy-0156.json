@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-13",
+  "scope": "desk-pair-legacy",
+  "correction": "Every repair and ready-for-human entry stored before the pair field is marked alone at the start of applySweep (settleLegacyPairs), before the sweep records new entries, so decidePairs pairs only entries of the same commit and a legacy entry whose send went with a lost mark is never sent again under the pair request id",
+  "evidence": "bketelsen/pi-pocket-team#214 re-review 2 of f80fa821, finding 1",
+  "promoted_to": "desk.test.ts: an entry from before the pairing field never pairs with a new repair: each goes alone (#214)"
+}

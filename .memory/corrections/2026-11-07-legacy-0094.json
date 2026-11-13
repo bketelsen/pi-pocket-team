@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-07",
+  "scope": "bench-stage-new-files",
+  "correction": "The scorer's S1 and S2 copies, and the harvest and --revalidate parent trees after the copy of the hidden files, stage all changes (git add -A in the sandbox, no hook, no fsmonitor) before the check or the hidden command: a repository test that lists files with git ls-files must see a correct new file",
+  "evidence": "owner review of the bench manifests: frostyard/core task core-205, whose tests check that SECURITY.md is tracked",
+  "promoted_to": "bench/score.test.mjs: S1 and S2 stage new files: a check and a hidden command that need them in git ls-files pass; bench/harvest.test.mjs: the harvest stages the hidden files at the parent; --revalidate stages the hidden files at the parent"
+}

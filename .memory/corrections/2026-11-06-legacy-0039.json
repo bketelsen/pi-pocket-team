@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-06",
+  "scope": "github-hooks-report-miss-count",
+  "correction": "The hooks report must count coverage misses with their multiplicity: the changes of 1 sweep share 1 seen time, so [T, T] is 2 misses; merge misses and each coverage alarm's misses by the larger count of each repository, class and time, never by a set",
+  "evidence": "bketelsen/pi-pocket-team#142 cross-review (openai/gpt-6.1-sol) finding 1",
+  "promoted_to": "audit/github-hooks.test.ts: alarms: misses that share 1 time are each counted; the 2 lists merge by the larger count of each time"
+}

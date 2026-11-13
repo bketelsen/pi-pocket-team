@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-07",
+  "scope": "model-router-features-all-paths",
+  "correction": "riskPathNamed and testsBeside must look at every named path: a cut at the first 50 paths records false where a later path is a risk path or has a test beside it",
+  "evidence": "bketelsen/pi-pocket-team#144 cross-review (openai/gpt-6.1-sol) finding 2",
+  "promoted_to": "model-router.test.ts: features: every path counts for the risk and test flags, not only the first 50"
+}

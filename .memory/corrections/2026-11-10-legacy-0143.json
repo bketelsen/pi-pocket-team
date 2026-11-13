@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-10",
+  "scope": "bench-driver-stop-tests",
+  "correction": "A test that a driver stops every launch queues each kind of pair it must stop (priced and unpriced), and asserts on what did not start",
+  "evidence": "bketelsen/pi-pocket-team#191 cross-review (openai/gpt-6.1-sol) of bf85c53, finding 3",
+  "promoted_to": "bench/drivers.test.mjs (batch disk-low test with unpriced pairs) and bench/calibration.test.mjs (the driver's disk-low test: an unpriced run waits, a ready check runs)"
+}

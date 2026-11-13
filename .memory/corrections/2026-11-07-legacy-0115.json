@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-07",
+  "scope": "desk-board-page-failed-selection",
+  "correction": "A failed read of the chosen supervisor's board puts the selection back on the board still shown, and an act posts only when the select and the board name the same supervisor, so the page never launches rows of a supervisor it does not name",
+  "evidence": "bketelsen/pi-pocket-team#161: cross-review (openai/gpt-6.1-sol) of a6b3ea3, re-review 1",
+  "promoted_to": "desk-web.test.js: Board: a failed read of another supervisor's board puts the selection back on the board shown, and no act goes to it under another name"
+}

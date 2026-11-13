@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-07",
+  "scope": "shift-clock-fall-back",
+  "correction": "nextClockTime gives the smallest instant after now whose local time is hour:minute, and on a fall-back day the second instant of a repeated hour counts too; a spring-forward gap keeps its answer, and the shift's until and start and the goal board's untilAt and startAt use it",
+  "evidence": "bketelsen/pi-pocket-team#160: cross-review (openai/gpt-6.1-sol) of 7e9de66, batch 2",
+  "promoted_to": "night-shift.test.ts: a repeated hour on a fall-back day: the second instant counts, for the clock, until and start; desk-board.test.ts: a fall-back day: a pick between the 2 instants of 01:30, and a pick during the second hour"
+}

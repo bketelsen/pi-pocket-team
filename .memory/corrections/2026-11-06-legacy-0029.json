@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-06",
+  "scope": "desk-nudge-dedupe",
+  "correction": "takeNudges must prune seen only when the call takes a new delivery, and start tasks only for the supervisors the call matched, or a call of duplicates changes stored data (an expired id goes, a task starts)",
+  "evidence": "bketelsen/pi-pocket-team#137 cross-review (openai/gpt-6.1-sol) finding 3",
+  "promoted_to": "desk-nudge.test.ts: takeNudges changes nothing on a call with no new delivery (duplicates, an expired unrelated seen id and an overdue pending entry with a task: deep-equal, no start)"
+}

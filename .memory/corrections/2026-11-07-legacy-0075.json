@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-07",
+  "scope": "pocket-0.28-watch-call-and-steer",
+  "correction": "A watch listener must take both the Pi Durable 1.5 call object and the plain value, and a linked send must pass steer: false to keep follow-up delivery on Pi Pocket 0.28",
+  "evidence": "bketelsen/pi-pocket-team#150 cross-review (openai/gpt-6.1-sol) finding 1",
+  "promoted_to": "night-shift.test.ts: watchDocumentValue accepts Pi Durable 1.5 calls and plain 1.4 values; desk.test.ts: linkedSend keeps follow-up delivery arguments; team.test.ts: linkedSend keeps follow-up delivery arguments; night-shift.test.ts: linkedSend keeps follow-up delivery arguments"
+}

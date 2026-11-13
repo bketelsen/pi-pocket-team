@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-07",
+  "scope": "audit-r2-ask-reopen",
+  "correction": "addAsk also reopens a closed thread, with an event key ask:<id>:<time> and the text 'ask <id>[ from <name>] reopened the thread: ...': R2 counts it as an ask reopening (not rework), and an ordinary ask event is no reopening",
+  "evidence": "bketelsen/pi-pocket-team#148 cross-review (openai/gpt-6.1-sol) finding F2",
+  "promoted_to": "audit/checks.test.ts: R2: an ask that reopened the thread is an ask reopening, in both event forms; an ordinary ask is no reopening"
+}

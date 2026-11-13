@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-06",
+  "scope": "github-hooks-report-miss-window",
+  "correction": "The hooks report must not print a window count of coverage misses from lists that keep 24 hours: count from a miss log that keeps 30 days (missLog, missLogFrom), and say 'at least' for any part of the window before the log began",
+  "evidence": "whole-plan verification (openai/gpt-6.1-sol) of the GitHub webhooks plan at main 86bbbe6, finding t4 report miss count; fixed in bketelsen/pi-pocket-team#143",
+  "promoted_to": "audit/github-hooks.test.ts: alarms: the miss log counts every miss of a 7-day window, also those the 24-hour list dropped / github-hooks.test.ts: the miss log keeps every miss past 24 hours, for the report"
+}

@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-09",
+  "scope": "desk-pass-reopen",
+  "correction": "A watch's pass records the session's newest user entry in the closing commit, and the sweep's reopen rule counts only user entries after it: a message and a report between 2 sweeps, before the pass, are no new work",
+  "evidence": "A desk thread on 2026-11-06: a pass at 14:57:04.798Z was reopened 91 ms later as 'new work in its session' by entry 583360, a message the agent had answered in its report before the pass",
+  "promoted_to": "desk.test.ts: a pass right after a report stays closed: the next sweep takes the unscanned entries for old work; reopening: an entry from before a pass's close is no new work"
+}

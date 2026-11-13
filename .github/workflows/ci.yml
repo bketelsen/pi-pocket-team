@@ -43,7 +43,7 @@ jobs:
               uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
               with:
                   persist-credentials: false
-                  # The corrections check compares .memory/corrections.jsonl with the PR base, so the base
+                  # The corrections check compares .memory/corrections/ with the PR base, so the base
                   # commit must be in the clone.
                   fetch-depth: 0
 

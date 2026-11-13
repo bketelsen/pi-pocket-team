@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-07",
+  "scope": "bench-revalidate-reviewed-command",
+  "correction": "--revalidate builds its discovery from the reviewed hiddenCommand (a reporter added at each runner, every other word kept), not from the proposed commands, so the owner's settings stay",
+  "evidence": "bketelsen/pi-pocket-team#151 cross-review re-review 1 (openai/gpt-6.1-sol) finding R4",
+  "promoted_to": "bench/harvest.test.mjs: --revalidate keeps the reviewed hidden command's settings: a test that needs FEATURE=1 is accepted"
+}
