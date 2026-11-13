@@ -5,7 +5,7 @@ The modules are source files in this repository. They run inside your own Pi Poc
 ## Requirements
 
 - Pi Pocket v0.21.0 or later (Pi Durable 1.4: `runtime.sleepUntil` and `checkpointWhen`). It includes the linked-session working directory that Team delegation needs.
-- The modules declare `pocketApi = 2`, Pi Pocket's extension API version. A Pocket with another API version may refuse them or break them.
+- `team.ts`, `desk.ts` and `terminal.ts` declare `pocketApi = 2`, Pi Pocket's extension API version; the other modules declare none, and Pocket counts a module with none as version 1. Version 2 came with Pi Pocket v0.19.0, so the v0.21.0 floor above covers every module. A Pocket with a newer API version may refuse them or break them.
 - Node.js 24, the one Pocket runs on.
 - A Pi Pocket checkout for the tests: `../pi-pocket-live` by default when it is a checkout (the link to the release folder the server runs), else `../pi-pocket`. Set `PI_POCKET_CHECKOUT` to another path.
 

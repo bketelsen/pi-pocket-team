@@ -31,14 +31,16 @@ wakes Odrade only for judgement.
 The digest (`desk-digest.md`) decides **when** news goes. The Clerk changes **where** it goes. At each
 digest, the desk splits the items:
 
-| Kind                                       | With a Clerk            | Without a Clerk |
-| ------------------------------------------ | ----------------------- | --------------- |
-| `report`, `shift`, `closed`, `queue`       | the Clerk's digest      | the supervisor  |
-| `answer` (an acknowledgement from Brian)   | the supervisor's digest | the supervisor  |
-| `shift-blocked`, `answer-action`, `repair` | the supervisor, at once | the supervisor  |
+| Kind                                                                                                                                             | With a Clerk            | Without a Clerk |
+| ------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------- | --------------- |
+| `report`, `shift`, `closed`, `queue`, `plan-decided`                                                                                             | the Clerk's digest      | the supervisor  |
+| `answer` (an acknowledgement from Brian)                                                                                                         | the supervisor's digest | the supervisor  |
+| `shift-blocked`, `answer-action`, `repair`, `issue-urgent`, `report-blocked`, `plan-approved`, `plan-verify`, `plan-revise`, `escalation-urgent` | the supervisor, at once | the supervisor  |
 
 - The split is a setting: `digest.clerk` in `desk.json` lists the kinds the Clerk gets. Default
-  `["report", "shift", "closed", "queue"]`. A kind in `digest.now` always goes to the supervisor.
+  `["report", "shift", "closed", "queue", "plan-decided"]` (`DIGEST_CLERK` in `desk.ts`). A kind in
+  `digest.now` always goes to the supervisor. The default `digest.now` (`DIGEST_NOW` in `desk.ts`) is the
+  list of the last row of the table above.
 - When the Clerk's session cannot take a message (it is gone, or held back), its items go to the
   supervisor in the same digest, with 1 notice.
 - Escalations from the Clerk to Odrade go through `desk escalate` (since 2026-11-06; before, they were
