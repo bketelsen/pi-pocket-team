@@ -94,6 +94,8 @@ function setup() {
             ODRADE_DIR: odradeDir,
             // A temporary homes folder: a folder that does not exist gives no homes, and no real one is read.
             TEAM_HOMES_DIR: path.join(root, "agents"),
+            // A temporary roster folder: no test reads the real profiles in ~/.config.
+            PI_POCKET_TEAM_AGENTS: path.join(root, "roster"),
         },
     };
 }
@@ -446,6 +448,131 @@ test("main: with no ODRADE_DIR and no TEAM_HOMES_DIR, the home folder of the use
         JSON.parse(fs.readFileSync(path.join(dir, "findings.json"), "utf8")).metrics.I3,
         { homes: 0, dirty: 0 },
     );
+    // The roster folder is `HOME/.config/pi-pocket-team/agents`, under the temporary HOME: it is not there, and the
+    // real roster is never read.
+    assert.match(
+        fs.readFileSync(path.join(dir, "README.md"), "utf8"),
+        /- Roster: missing; owners come from the fixed table\./,
+    );
+});
+
+const profile = (role: string, name: string, repositories: string[] = []) =>
+    [
+        "---",
+        `role: ${role}`,
+        ...(repositories.length > 0
+            ? ["repositories:", ...repositories.map((repo) => `  ${repo}: ~/projects/x`)]
+            : []),
+        "---",
+        "",
+        `# ${name}`,
+        "",
+    ].join("\n");
+
+test("main: a finding of 7 days in a row is due with its owner from the roster, unless an action holds it", async () => {
+    const t = setup();
+    const roster = t.env.PI_POCKET_TEAM_AGENTS;
+
+    // 6 earlier days, 2026-10-17 to 2026-10-22, each with the 3 findings: with today, 7 days in a row.
+    for (let day = 17; day <= 22; day += 1) {
+        const dir = path.join(t.reports, `2026-10-${day}-daily-audit`);
+
+        fs.mkdirSync(dir, { recursive: true });
+        fs.writeFileSync(
+            path.join(dir, "findings.json"),
+            JSON.stringify({ findings: ["A1:T1", "F1:g1", "G1:late"].map((id) => ({ id })) }),
+        );
+    }
+
+    fs.mkdirSync(roster);
+    fs.writeFileSync(
+        path.join(roster, "sheeana.md"),
+        profile("agent", "Sheeana", ["bketelsen/pi-pocket-team"]),
+    );
+    fs.writeFileSync(path.join(roster, "odrade.md"), profile("supervisor", "Odrade"));
+    fs.mkdirSync(path.join(t.odradeDir, "decisions"));
+    fs.writeFileSync(
+        path.join(t.odradeDir, "decisions", "audit-actions.json"),
+        JSON.stringify({
+            version: 1,
+            entries: [
+                {
+                    id: "G1:late",
+                    action: "issue https://github.com/bketelsen/pi-pocket-team/issues/12",
+                    reason: "the schedule fix is open",
+                    until: "2026-11-01",
+                },
+                { id: "F1:g1", action: "accepted", reason: "known", until: "2026-10-20" },
+                { id: "A1:T1", action: "accepted", reason: "too long", until: "2026-12-31" },
+            ],
+        }),
+    );
+
+    await main(["--no-github", "--no-llm", "--out-dir", t.outDir], {
+        env: t.env,
+        now: NOW,
+        run: t.run,
+        log: () => undefined,
+    });
+
+    const readme = fs.readFileSync(path.join(t.outDir, "README.md"), "utf8");
+    const json = JSON.parse(fs.readFileSync(path.join(t.outDir, "findings.json"), "utf8"));
+    const section = readme.split("## Due: 7 days or more\n\n")[1]!.split("\n\n## Proposals")[0]!;
+    const lines = section.split("\n");
+
+    assert.ok(readme.indexOf("## Summary") < readme.indexOf("## Due: 7 days or more"));
+    assert.equal(lines.length, 4);
+    assert.match(
+        lines[0]!,
+        /^- `A1:T1` 7 days, medium: .+ Owner: Sheeana \(owns bketelsen\/pi-pocket-team \(desk\.ts\)\)\.$/,
+    );
+    assert.match(
+        lines[1]!,
+        /^- `F1:g1` 7 days, \w+: .+ Owner: Sheeana \(owns bketelsen\/pi-pocket-team \(night-shift\.ts\)\)\. Last action: accepted, expired 2026-10-20\.$/,
+    );
+    assert.equal(
+        lines[2],
+        "- Held by an action: `G1:late` (issue https://github.com/bketelsen/pi-pocket-team/issues/12, until 2026-11-01).",
+    );
+    assert.equal(
+        lines[3],
+        "- Actions file: 2 valid entries, 1 refused: `A1:T1` (until is more than 30 days after 2026-10-23).",
+    );
+
+    assert.equal(json.version, 1);
+    assert.deepEqual(
+        json.due.map((item: { id: string; days: number; owner: { id: string } }) => [
+            item.id,
+            item.days,
+            item.owner.id,
+        ]),
+        [
+            ["A1:T1", 7, "sheeana"],
+            ["F1:g1", 7, "sheeana"],
+        ],
+    );
+    assert.deepEqual(json.due[1].lastEntry, { action: "accepted", until: "2026-10-20" });
+    assert.deepEqual(json.dueActions, {
+        file: "decisions/audit-actions.json",
+        status: "ok",
+        entries: 2,
+        refused: [
+            {
+                index: 2,
+                id: "A1:T1",
+                reason: "until is more than 30 days after 2026-10-23",
+            },
+        ],
+        held: [
+            {
+                id: "G1:late",
+                days: 7,
+                action: "issue https://github.com/bketelsen/pi-pocket-team/issues/12",
+                reason: "the schedule fix is open",
+                until: "2026-11-01",
+            },
+        ],
+    });
 });
 
 test("main: the date is the run date in New York", async () => {
