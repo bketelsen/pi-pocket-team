@@ -29,6 +29,7 @@ Answer with 1 JSON object and nothing else (no Markdown, no code fence):
 Rules:
 - "pairs": 1 entry for each pair you get. Say "same" when both reports give the same facts, "partial" when some, "different" when none.
 - "proposals": at most 5. Each one is small and cites 1 or more finding ids from the list you got, exactly as written.
+- A pair id (P1, P2, ...) is not a finding id. Never cite a pair id: cite the id in the pair's "finding" field, when the findings list has it.
 - Each number must belong to the finding it comes from. A number of a proposal must be in a finding that the proposal cites (its text, its evidence, its cases or its waste). The metrics are totals of all threads: use them only in the summary, and never as a fact about one thread or one finding.
 - Never write a rank, a score or a number that you computed. Never invent a number, a name or a link.
 - A proposal is a suggestion for a person. It may state only facts that the cited findings state. It must not claim a cause or a fact that is not in them.
@@ -129,7 +130,7 @@ export function buildContent(findings, metrics, pairs) {
             text: finding.text,
         })),
         metrics: used,
-        pairs: pairs.map((pair) => ({ id: pair.id, a: pair.a, b: pair.b })),
+        pairs: pairs.map((pair) => ({ id: pair.id, finding: pair.finding, a: pair.a, b: pair.b })),
     });
 }
 
@@ -216,8 +217,31 @@ export function parseAnswer(text) {
     return JSON.parse(trimmed);
 }
 
-/** Why 1 proposal fails the checks, or undefined when it passes. `ids` are the top findings by id. */
-function proposalProblem(proposal, ids) {
+/**
+ * The finding id that 1 cite names: a top finding's id as it is, or, for a pair id (`P6`), the id of the pair's
+ * finding when that finding is a top finding. A finding id always wins over a pair id. Undefined for anything else.
+ */
+const citedFinding = (id, ids, pairs) => {
+    if (ids.has(id)) {
+        return id;
+    }
+
+    const finding = pairs.get(id)?.finding;
+
+    return finding !== undefined && ids.has(finding) ? finding : undefined;
+};
+
+/** Why a cite names no top finding: a pair id says whose pair it is. */
+const unknownCite = (id, pairs) =>
+    pairs.has(id)
+        ? `cites the pair ${id}, whose finding ${pairs.get(id).finding} is not one of the top findings`
+        : `cites ${id}, which is not one of the top findings`;
+
+/**
+ * Why 1 proposal fails the checks, or undefined when it passes. `ids` are the top findings by id, `pairs` the pairs
+ * by id. A proposal's cites must be resolved with `citedFinding` first: the checks read the findings they name.
+ */
+function proposalProblem(proposal, ids, pairs) {
     if (
         typeof proposal?.title !== "string" ||
         typeof proposal.text !== "string" ||
@@ -235,10 +259,10 @@ function proposalProblem(proposal, ids) {
         return "cites no finding";
     }
 
-    const unknown = proposal.cites.find((id) => !ids.has(id));
+    const unknown = proposal.cites.find((id) => citedFinding(id, ids, pairs) === undefined);
 
     if (unknown !== undefined) {
-        return `cites ${unknown}, which is not one of the top findings`;
+        return unknownCite(unknown, pairs);
     }
 
     const text = `${proposal.title}\n${proposal.text}`;
@@ -253,7 +277,7 @@ function proposalProblem(proposal, ids) {
 
     // A proposal may use the numbers of its cited findings only, not the totals in the metrics.
     const allowed = allowedNumbers(
-        proposal.cites.map((id) => ids.get(id)),
+        proposal.cites.map((id) => ids.get(citedFinding(id, ids, pairs))),
         null,
     );
     const stray = numbersIn(text).find((number) => !allowed.has(number));
@@ -287,7 +311,8 @@ function summaryProblem(summary, findings, metrics) {
 
 /**
  * Check the model's answer in code, each proposal alone and the summary alone. `findings` are the top findings the
- * model saw, `metrics` the metrics, `pairs` the pairs. A proposal or a summary that fails is dropped and listed in
+ * model saw, `metrics` the metrics, `pairs` the pairs. A proposal may cite a pair id: it counts as the pair's finding
+ * when that finding is a top finding, and its cites keep the finding id. A proposal or a summary that fails is dropped and listed in
  * `dropped` (`{ item, reason }`); the others stay. A pair verdict outside `same`, `different`, `partial` is dropped.
  *
  * Returns `{ ok: true, summary, proposals, verdicts, dropped }`. The whole answer fails (`ok: false`, with a
@@ -330,7 +355,7 @@ export function validateAnswer(answer, { findings, metrics, pairs }) {
     const clean = [];
 
     for (const [index, proposal] of proposals.entries()) {
-        const reason = proposalProblem(proposal, ids);
+        const reason = proposalProblem(proposal, ids, known);
 
         if (reason) {
             dropped.push({ item: `proposal ${index + 1}`, reason });
@@ -338,7 +363,7 @@ export function validateAnswer(answer, { findings, metrics, pairs }) {
             clean.push({
                 title: proposal.title.trim(),
                 text: proposal.text.trim(),
-                cites: [...new Set(proposal.cites)],
+                cites: [...new Set(proposal.cites.map((id) => citedFinding(id, ids, known)))],
             });
         }
     }
