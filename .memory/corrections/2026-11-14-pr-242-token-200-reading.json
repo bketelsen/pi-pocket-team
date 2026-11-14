@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-14",
+  "scope": "_desk-dashboard.ts",
+  "correction": "anthropicReader checked for the token only in error results, so a 200 answer whose severity, scoped name, kind or grant text held the token passed into the reading, desk usage, the board and the dashboard; a 200 reading whose copied strings hold the token is now refused with fixed words, and nothing of it is kept",
+  "evidence": "bketelsen/pi-pocket-team#242, whole-plan review of bketelsen/pi-pocket-team#237 by openai/gpt-6.1-sol at origin/main f188d66",
+  "promoted_to": "desk-dashboard.test.ts: a 200 answer that reflects the token in any string the reading copies is refused with fixed words, and the meter keeps nothing of it; and step (d) of: a fake token is in no desk usage answer, no GET dashboard answer, no console line and no notice"
+}
