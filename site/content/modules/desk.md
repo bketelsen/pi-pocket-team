@@ -15,6 +15,8 @@ Files: `desk.ts` and `desk-web/`. The tools are `desk`, `team_delegate` and `tea
 
 The header counts what needs you, what is ready to merge, what is open, stale and parked, and how many threads count. A second view of the page is the **Dashboard**: the numbers of Desk-tracked work for 1 range and 1 scope. The 3 views (Desk, Dashboard, Board) have the same width, so the switch between them stays in 1 place. Its definitions are in [docs/desk-dashboard.md](https://github.com/bketelsen/pi-pocket-team/blob/main/docs/desk-dashboard.md).
 
+The Pocket desktop app's **Approve + merge** posts a merge receipt to the thread (`POST threads/:id/merges`, owner-only): the thread gets 1 event that says what the app did, such as "Pocket reports: Brian approved and merged owner/name#12 at abc1234 (squash).", before the next GitHub read. A receipt is information only: the desk does not check it on GitHub, and it changes no PR, no thread state and no permission.
+
 Native clients receive the bound session id in the owner-only thread views, when one exists, so opening a thread need not depend on its session title.
 
 ## The tools
@@ -109,7 +111,7 @@ Install the files, then turn on **Desk** in **Menu → Extensions**. Team must b
 
 `PI_POCKET_DESK_CONFIG` names the config file, default `~/.config/pi-pocket-team/desk.json`, and every part reads it each time, so a change needs no restart. Its keys include `authors`, `ownAuthors`, `cap`, `export`, `exportCommit`, `digest` (`minutes` 15 by default; `now`, the kinds that go at once, by default `shift-blocked`, `answer-action`, `repair`, `issue-urgent`, `report-blocked`, `plan-approved`, `plan-verify`, `plan-revise` and `escalation-urgent`; `clerk`, the kinds that go to the Clerk, by default `report`, `shift`, `closed`, `queue` and `plan-decided`), `queue`, `journal`, `plans`, `archive`, `board` (the goal board's limits: `atOnce` 8, `rounds` 250, `reserve` 2 and `keep` 14 days by default; a value out of its bounds falls back to its default with 1 warning) and `meter` (the subscription meter: `providers` `["anthropic"]`, `pollMinutes` 5, `digestAt` 75 and `holdAt` null by default; off without the key; a bad value falls back to its default with 1 warning).
 
-These Pocket documents hold the desk: `x.desk.threads` (the app-wide desk, with the goal board), `x.desk.board-receipts` (the goal board's call receipts, 30 days), `x.desk.reports` (one thread session's full reports), `x.desk.nudges` (the delivery ids the desk took, the waiting nudges, and for each nudged sync its delivery times and its commit time) and `x.desk.observed` (the changes the sweeps saw, for the hooks' coverage alarm). They are stored data: never rename a kind or change what a field means. The page and its routes are owner-only.
+These Pocket documents hold the desk: `x.desk.threads` (the app-wide desk, with the goal board and `mergeReceipts`, the merge receipts of the last 48 hours), `x.desk.board-receipts` (the goal board's call receipts, 30 days), `x.desk.reports` (one thread session's full reports), `x.desk.nudges` (the delivery ids the desk took, the waiting nudges, and for each nudged sync its delivery times and its commit time) and `x.desk.observed` (the changes the sweeps saw, for the hooks' coverage alarm). They are stored data: never rename a kind or change what a field means. The page and its routes are owner-only.
 
 ## Read more
 

@@ -298,7 +298,10 @@ import {
     defaultBoardSupervisor,
     deskSupervisors,
     liveSupervisors,
+    mergeReceiptText,
+    MERGE_RECEIPT_KEEP_MS,
     receiptSupervisors,
+    recordMergeReceipt,
     REPORTS_OFF_TASK_STALE_MS,
     reportsOffActions,
     reportsOffKey,
@@ -613,6 +616,253 @@ describe("threads", () => {
         assert.match(text, /frostyard\/frostmail#106 · attached/);
         assert.match(text, /T1a · open · Keep the guard\?/);
         assert.match(text, /Events:/);
+    });
+});
+
+describe("merge receipts", () => {
+    const OP = "0b5c3f1e-2a4d-4c8e-9f10-123456789abc";
+    const OP2 = "1b5c3f1e-2a4d-4c8e-af10-123456789abc";
+    const HEAD = "abc1234def5678901234567890abcdef12345678";
+    const REF = "frostyard/test#12";
+    const NOW = 1_000_000_000_000;
+
+    /** A desk with T1 open and 1 PR link on it. */
+    const desk = () => {
+        const state = empty();
+
+        open(state, "k");
+        state.threads.T1!.state = "open";
+        state.threads.T1!.prs[REF] = { via: "attached" };
+
+        return state;
+    };
+
+    const merged = (extra: Record<string, unknown> = {}) => ({
+        op: OP,
+        ref: REF,
+        head: HEAD,
+        result: "merged",
+        method: "squash",
+        via: "pocket",
+        ...extra,
+    });
+
+    const without = (body: Record<string, unknown>, field: string) => {
+        const copy = { ...body };
+
+        delete copy[field];
+
+        return copy;
+    };
+
+    test("a new receipt is stored with 1 event and answers recorded true", () => {
+        const state = desk();
+        const before = structuredClone(state.threads.T1!);
+
+        assert.deepEqual(recordMergeReceipt(state, "T1", merged(), NOW), {
+            status: 200,
+            recorded: true,
+        });
+        assert.deepEqual(state.mergeReceipts, {
+            [`${OP}:merged`]: {
+                thread: "T1",
+                ref: REF,
+                head: HEAD,
+                result: "merged",
+                method: "squash",
+                at: NOW,
+                via: "pocket",
+            },
+        });
+
+        const event = state.threads.T1!.events.at(-1)!;
+
+        assert.equal(event.key, `merge:${OP}:merged`);
+        assert.equal(
+            event.text,
+            "Pocket reports: Brian approved and merged frostyard/test#12 at abc1234 (squash).",
+        );
+        assert.equal(event.at, NOW);
+        assert.deepEqual(state.threads.T1!.prs, before.prs, "no PR link changes");
+        assert.equal(state.threads.T1!.state, before.state, "no state change");
+    });
+
+    test("the event text of each result", () => {
+        const base = { thread: "T1", ref: "owner/name#12", head: HEAD, via: "pocket" as const };
+
+        assert.equal(
+            mergeReceiptText({ ...base, result: "merged", method: "rebase" }),
+            "Pocket reports: Brian approved and merged owner/name#12 at abc1234 (rebase).",
+        );
+        assert.equal(
+            mergeReceiptText({ ...base, result: "queued", method: "queue" }),
+            "Pocket reports: owner/name#12 at abc1234: queued.",
+        );
+        assert.equal(
+            mergeReceiptText({ ...base, result: "approved", reason: "checks pending" }),
+            "Pocket reports: owner/name#12 at abc1234: approved, not merged: checks pending.",
+        );
+        assert.equal(
+            mergeReceiptText({ ...base, result: "approved" }),
+            "Pocket reports: owner/name#12 at abc1234: approved, not merged.",
+        );
+        assert.equal(
+            mergeReceiptText({ ...base, result: "refused", reason: "Head moved." }),
+            "Pocket reports: owner/name#12 at abc1234: refused: Head moved.",
+            "no second period",
+        );
+        assert.equal(
+            mergeReceiptText({ ...base, result: "failed", reason: "GitHub said\n 502" }),
+            "Pocket reports: owner/name#12 at abc1234: failed: GitHub said 502.",
+        );
+        assert.equal(
+            mergeReceiptText({ ...base, result: "unknown", reason: "timeout" }),
+            "Pocket reports: owner/name#12 at abc1234: outcome unknown: timeout.",
+        );
+    });
+
+    test("a repeat answers recorded false and adds no second event", () => {
+        const state = desk();
+
+        recordMergeReceipt(state, "T1", merged(), NOW);
+        const events = state.threads.T1!.events.length;
+        const receipts = structuredClone(state.mergeReceipts);
+
+        assert.deepEqual(recordMergeReceipt(state, "t1", merged(), NOW + 5), {
+            status: 200,
+            recorded: false,
+        });
+        assert.equal(state.threads.T1!.events.length, events);
+        assert.deepEqual(state.mergeReceipts, receipts, "the first at stays");
+    });
+
+    test("the same key with other fields is a 409 that changes nothing", () => {
+        const state = desk();
+
+        open(state, "k2");
+        state.threads.T2!.prs[REF] = { via: "attached" };
+        recordMergeReceipt(state, "T1", merged(), NOW);
+        recordMergeReceipt(
+            state,
+            "T1",
+            { op: OP, ref: REF, head: HEAD, result: "failed", reason: "red", via: "pocket" },
+            NOW,
+        );
+        const before = structuredClone(state);
+
+        for (const [id, body] of [
+            ["T1", merged({ head: "f".repeat(40) })],
+            ["T1", merged({ method: "merge" })],
+            ["T1", merged({ reason: "extra" })],
+            ["T2", merged()],
+            [
+                "T1",
+                { op: OP, ref: REF, head: HEAD, result: "failed", reason: "other", via: "pocket" },
+            ],
+        ] as const) {
+            assert.deepEqual(recordMergeReceipt(state, id, body, NOW + 1), {
+                status: 409,
+                error: "receipt conflict",
+            });
+        }
+
+        assert.deepEqual(state, before);
+    });
+
+    test("each field rule is a 400 that names its reason and changes nothing", () => {
+        const cases: [Record<string, unknown>, RegExp][] = [
+            [merged({ op: "not-a-uuid" }), /op must be/],
+            [merged({ op: OP.toUpperCase() }), /op must be/],
+            [merged({ op: "0b5c3f1e-2a4d-3c8e-9f10-123456789abc" }), /op must be/],
+            [without(merged(), "op"), /op must be/],
+            [merged({ ref: "frostyard/test12" }), /ref must be/],
+            [merged({ ref: "frostyard/test#13" }), /frostyard\/test#13 is not a PR of thread T1/],
+            [merged({ head: "abc" }), /head must be/],
+            [merged({ head: HEAD.toUpperCase() }), /head must be/],
+            [merged({ result: "done" }), /result must be/],
+            [merged({ method: "fast" }), /method must be/],
+            [without(merged(), "method"), /merged needs method/],
+            [merged({ method: "queue" }), /merged must not have method queue/],
+            [merged({ result: "queued" }), /queued needs method queue/],
+            [without(merged({ result: "queued" }), "method"), /queued needs method queue/],
+            [merged({ result: "refused" }), /refused needs reason/],
+            [merged({ result: "failed" }), /failed needs reason/],
+            [merged({ result: "unknown" }), /unknown needs reason/],
+            [merged({ reason: "" }), /reason must be 1 to 300/],
+            [merged({ reason: "x".repeat(301) }), /reason must be 1 to 300/],
+            [without(merged(), "via"), /via must be "pocket"/],
+            [merged({ via: "web" }), /via must be "pocket"/],
+            [merged({ x: "1" }), /unknown field "x"/],
+            [merged({ head: 12 }), /head must be a string/],
+            [merged({ reason: null }), /reason must be a string/],
+            [{}, /op must be/],
+        ];
+
+        for (const [body, reason] of cases) {
+            const state = desk();
+            const before = structuredClone(state);
+            const result = recordMergeReceipt(state, "T1", body, NOW);
+
+            assert.equal(result.status, 400, JSON.stringify(body));
+            assert.match(errorOf(result), /^merges: /);
+            assert.match(errorOf(result), reason);
+            assert.deepEqual(state, before, "a 400 changes nothing");
+        }
+
+        // The limits that pass: 300 code points (600 UTF-16 units), and approved with or without a reason.
+        assert.equal(
+            recordMergeReceipt(desk(), "T1", merged({ reason: "\u{1F600}".repeat(300) }), NOW)
+                .status,
+            200,
+        );
+        assert.equal(
+            recordMergeReceipt(desk(), "T1", without(merged({ result: "approved" }), "method"), NOW)
+                .status,
+            200,
+        );
+    });
+
+    test("no thread is a 404 that changes nothing, whatever the thread's state", () => {
+        const state = desk();
+        const before = structuredClone(state);
+
+        assert.deepEqual(recordMergeReceipt(state, "T9", merged(), NOW), {
+            status: 404,
+            error: "There is no thread T9.",
+        });
+        assert.deepEqual(state, before);
+
+        state.threads.T1!.state = "closed";
+        assert.equal(
+            recordMergeReceipt(state, "T1", merged(), NOW).status,
+            200,
+            "a closed thread takes it",
+        );
+    });
+
+    test("a receipt is kept 48 hours: the next write drops an older one", () => {
+        const state = desk();
+
+        recordMergeReceipt(state, "T1", merged(), NOW - MERGE_RECEIPT_KEEP_MS - 1);
+        recordMergeReceipt(state, "T1", merged({ op: OP2 }), NOW - 47 * 3600_000);
+        assert.equal(Object.keys(state.mergeReceipts!).length, 2);
+
+        recordMergeReceipt(
+            state,
+            "T1",
+            merged({ op: "2b5c3f1e-2a4d-4c8e-bf10-123456789abc" }),
+            NOW,
+        );
+        assert.deepEqual(Object.keys(state.mergeReceipts!).sort(), [
+            `${OP2}:merged`,
+            "2b5c3f1e-2a4d-4c8e-bf10-123456789abc:merged",
+        ]);
+
+        // An old key past its time is no conflict: it goes, and the new fields are a new receipt.
+        assert.deepEqual(recordMergeReceipt(state, "T1", merged({ method: "merge" }), NOW), {
+            status: 200,
+            recorded: true,
+        });
     });
 });
 
@@ -20347,6 +20597,120 @@ describe("the desk in a Pi Pocket", () => {
             const guest = app.config.addUser("Front door guest", "guest");
 
             assert.equal((await get(guest.token)).status, 404, "only the owner may ask");
+
+            // The thread closes, so no later test sees it.
+            await app.harness.commit(async (tx) => {
+                const stored = (await tx.doc(DeskThreads)).threads[id]!;
+
+                stored.state = "closed";
+                stored.closed = { at: Date.now(), why: "dropped", by: "brian" };
+            }, context);
+        });
+
+        test("POST threads/:id/merges stores a receipt once, owner-only, and refuses bad bodies", async () => {
+            const ref = "frostyard/merges#4";
+            const id = await app.harness.commit(async (tx) => {
+                const state = await tx.doc(DeskThreads);
+                const { thread } = openThread(state, {
+                    key: "merges-route",
+                    supervisor: 5,
+                    agents: ["duncan"],
+                    title: "Merge receipts",
+                    at: Date.now(),
+                });
+                const stored = state.threads[thread.id]!;
+
+                stored.state = "open";
+                stored.prs[ref] = { via: "attached" };
+
+                return thread.id;
+            }, context);
+            const body = {
+                op: "7d1e2f30-4a5b-4c6d-8e7f-0123456789ab",
+                ref,
+                head: "0123456789abcdef0123456789abcdef01234567",
+                result: "merged",
+                method: "merge",
+                via: "pocket",
+            };
+
+            const first = await call(`threads/${id}/merges`, body);
+
+            assert.equal(first.status, 200);
+            assert.deepEqual(first.data, { recorded: true });
+
+            const state = await deskState();
+            const receipt = state.mergeReceipts?.[`${body.op}:merged`];
+
+            assert.equal(receipt?.thread, id);
+            assert.equal(receipt?.head, body.head);
+            assert.equal(
+                state.threads[id]!.events.filter((event) => event.key === `merge:${body.op}:merged`)
+                    .length,
+                1,
+            );
+
+            const repeat = await call(`threads/${id}/merges`, body);
+
+            assert.equal(repeat.status, 200);
+            assert.deepEqual(repeat.data, { recorded: false });
+
+            const conflict = await call(`threads/${id}/merges`, { ...body, method: "squash" });
+
+            assert.equal(conflict.status, 409);
+            assert.deepEqual(conflict.data, { error: "receipt conflict" });
+
+            const bad = await call(`threads/${id}/merges`, { ...body, extra: "1" });
+
+            assert.equal(bad.status, 400);
+            assert.match(bad.data.error, /merges: unknown field "extra"/);
+
+            const empty = await call(`threads/${id}/merges`, {});
+
+            assert.equal(empty.status, 400);
+            assert.match(empty.data.error, /^merges: /);
+
+            const missing = await call("threads/T99999/merges", body);
+
+            assert.equal(missing.status, 404);
+            assert.match(missing.data.error, /There is no thread T99999\./);
+
+            const port = (server!.address() as { port: number }).port;
+            const raw = await fetch(`http://127.0.0.1:${port}/api/x/desk/threads/${id}/merges`, {
+                method: "POST",
+                headers: {
+                    authorization: `Bearer ${app.config.ownerToken}`,
+                    "x-pocket": "1",
+                    "content-type": "application/json",
+                },
+                body: "{not json",
+            });
+
+            assert.equal(raw.status, 400);
+
+            const guest = app.config.addUser("A merges guest", "guest");
+
+            assert.equal(
+                (
+                    await call(
+                        `threads/${id}/merges`,
+                        { ...body, op: "8d1e2f30-4a5b-4c6d-8e7f-0123456789ab" },
+                        guest.token,
+                    )
+                ).status,
+                404,
+                "only the owner may post",
+            );
+
+            const after = await deskState();
+
+            assert.deepEqual(
+                after.mergeReceipts,
+                state.mergeReceipts,
+                "only the first POST stored",
+            );
+            assert.equal(after.threads[id]!.state, "open");
+            assert.deepEqual(after.threads[id]!.prs, { [ref]: { via: "attached" } });
 
             // The thread closes, so no later test sees it.
             await app.harness.commit(async (tx) => {
