@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-14",
+  "scope": "_desk-meter.ts",
+  "correction": "a stale provider reading still gave a burn, a projection and the unused-at-reset hint; a stale reading keeps only its percent and age and gets no estimate",
+  "evidence": "bketelsen/pi-pocket-team#235, cross-review by openai/gpt-6.1-sol at head 0203bd3",
+  "promoted_to": "desk-meter.test.ts: states: stale after 2 polls, awaiting after the reset (a stale reading with 3 samples has no burn or projection)"
+}

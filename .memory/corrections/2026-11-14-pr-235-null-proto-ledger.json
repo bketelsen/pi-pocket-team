@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-14",
+  "scope": "_desk-meter.ts",
+  "correction": "the meter's dictionaries keyed by outside names (provider, model, window id) were plain {} objects, so a model named __proto__ wrote ledger counters onto Object.prototype and lost the entry; every such dictionary now has no prototype",
+  "evidence": "bketelsen/pi-pocket-team#235, cross-review by openai/gpt-6.1-sol at head 0203bd3",
+  "promoted_to": "desk-meter.test.ts: ledger: names such as __proto__, constructor and toString are own keys and never touch Object.prototype"
+}

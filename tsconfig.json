@@ -18,6 +18,7 @@
         "_desk-dashboard.ts",
         "_desk-metrics.ts",
         "_desk-board.ts",
+        "_desk-meter.ts",
         "desk-dashboard-fixture.ts",
         "desk-plans-fixture.ts",
         "scripted-turn-fixture.ts",
