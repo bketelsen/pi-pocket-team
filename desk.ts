@@ -1418,24 +1418,6 @@ export function threadById(state: Readonly<DeskState> | undefined, id: string): 
     return Object.hasOwn(threads, key) ? threads[key] : undefined;
 }
 
-/**
- * The end of an agent's `read` refusal for a named thread: where the export keeps a read-only copy of it. It reads only
- * the asked id and the export folder, never the state, so it is the same for another thread and a missing one. An id
- * in a thread id's form names its file; any other text names only the folder, so no path holds the agent's own text.
- * Empty when the desk has no export folder.
- */
-export function copyHint(asked: string, exportFolder: string | undefined): string {
-    if (exportFolder === undefined || !isAbsolute(exportFolder)) {
-        return "";
-    }
-
-    const folder = exportFolder.replace(/\/+$/, "") || "/";
-
-    return /^[TF][1-9][0-9]*$/.test(asked)
-        ? ` Or read its read-only synced copy, \`${join(folder, `${asked}.md`)}\`, if it is there: the desk writes it again after each change.`
-        : ` Or read a thread's read-only synced copy in \`${join(folder, "/")}\`, as \`<id>.md\` (for example \`T13.md\`), if it is there.`;
-}
-
 /** The folders a desk path starts with: each is beside the export folder. `desk-web/ask-text.js` has the same list. */
 export const DESK_PATH_ROOTS = ["reports", "desk", "plans", "decisions"] as const;
 /** The longest desk path, in characters. */
@@ -34672,7 +34654,7 @@ export default function createDesk(host: Host, web: Web) {
     const tool = defineTool({
         name: "desk",
         description:
-            "The desk of threads for work the team runs in the background. A supervisor session can use every action; a Clerk can use list, read, sync, attach, detach, watch, result, send, issues, and escalate for its supervisor's threads; an agent session can use read, watch, and result on its own thread only. Actions: list (one line per open thread), read (one thread in full), sync (observe the threads now, with linked sessions, Shift, git, and GitHub), seed (import a seed.json file one time), attach (put a PR, a queued issue, or all of another thread's work, on one thread), detach (take a PR off a thread for good: the sweep does not attach or find it again; only attach brings it back), own (mark a found PR thread as Brian's own: it closes, and no sweep finds its PR again), ask (file a question for Brian on a thread, or on a new one; never for a plain merge: Ready to merge on the Desk page lists those), rewrite (give an open ask new words, and new options or none: an agent's ask is filed as it wrote it, so make it clear for Brian), withdraw (end an open ask that Brian need not answer, with words saying why, or with into to merge it into another open ask), answer (record Brian's words for an ask), watch (set a dated check on a thread: it sleeps until that date, or until its optional on event, and does not count toward the cap; a thread closed as done in the last 7 days opens again for it, and sleeps), result (record that check's pass, which closes the thread, or its fail, which opens it again: a pass is refused while the thread has an open ask, or while it delivers a plan task with no PR and no plan nochange), send (send 1 message from the supervisor's session to a thread's agent), issues (read the issues Brian queued on GitHub: read only), escalate (Clerk only: 1 escalation to the supervisor; the desk drops it when the supervisor already acted on the thread or got its news directly, and else puts it in her next digest, or sends it at once with urgent: true), archive (supervisor only: a dry run that lists the idle sessions of threads closed 2 days ago or more that the desk can archive, with the skips and their reasons; with apply: true, archive the sessions of a dry run of the last 60 minutes that still pass every rule; it archives, it never deletes), usage (anyone with the desk tool: subscription usage (provider percent, reset, burn, projection, grants) and the ledger at list price; read only). The goal board (shift rows of 1 supervisor, launched by the desk under the limits): board (anyone, the Clerk too: the rows in launch order with their rev, state, times and thread, and the limits now), board_add (fields: the supervisor adds any row; an agent adds only its own, as proposed, without note or order), board_edit (row, fields) and board_drop (row) (the supervisor on its rows; an agent only on its own proposed rows, not agent, note or order), and supervisor only: board_pick (rows), board_unpick (rows), board_launch (rows, or none for every picked row: they wait, and the desk starts them), board_reopen (row: a failed row back to proposed), board_resolve (row, and thread for an unknown row whose session started, or nothing to fail it). A rev that differs from the row's is refused: read the board again.",
+            "The desk of threads for work the team runs in the background. A supervisor session can use every action; a Clerk can use list, read, sync, attach, detach, watch, result, send, issues, and escalate for its supervisor's threads; an agent session can use watch and result on its own thread only, and read on any thread (its own in full, another as its read-only copy). Actions: list (one line per open thread), read (one thread in full), sync (observe the threads now, with linked sessions, Shift, git, and GitHub), seed (import a seed.json file one time), attach (put a PR, a queued issue, or all of another thread's work, on one thread), detach (take a PR off a thread for good: the sweep does not attach or find it again; only attach brings it back), own (mark a found PR thread as Brian's own: it closes, and no sweep finds its PR again), ask (file a question for Brian on a thread, or on a new one; never for a plain merge: Ready to merge on the Desk page lists those), rewrite (give an open ask new words, and new options or none: an agent's ask is filed as it wrote it, so make it clear for Brian), withdraw (end an open ask that Brian need not answer, with words saying why, or with into to merge it into another open ask), answer (record Brian's words for an ask), watch (set a dated check on a thread: it sleeps until that date, or until its optional on event, and does not count toward the cap; a thread closed as done in the last 7 days opens again for it, and sleeps), result (record that check's pass, which closes the thread, or its fail, which opens it again: a pass is refused while the thread has an open ask, or while it delivers a plan task with no PR and no plan nochange), send (send 1 message from the supervisor's session to a thread's agent), issues (read the issues Brian queued on GitHub: read only), escalate (Clerk only: 1 escalation to the supervisor; the desk drops it when the supervisor already acted on the thread or got its news directly, and else puts it in her next digest, or sends it at once with urgent: true), archive (supervisor only: a dry run that lists the idle sessions of threads closed 2 days ago or more that the desk can archive, with the skips and their reasons; with apply: true, archive the sessions of a dry run of the last 60 minutes that still pass every rule; it archives, it never deletes), usage (anyone with the desk tool: subscription usage (provider percent, reset, burn, projection, grants) and the ledger at list price; read only). The goal board (shift rows of 1 supervisor, launched by the desk under the limits): board (anyone, the Clerk too: the rows in launch order with their rev, state, times and thread, and the limits now), board_add (fields: the supervisor adds any row; an agent adds only its own, as proposed, without note or order), board_edit (row, fields) and board_drop (row) (the supervisor on its rows; an agent only on its own proposed rows, not agent, note or order), and supervisor only: board_pick (rows), board_unpick (rows), board_launch (rows, or none for every picked row: they wait, and the desk starts them), board_reopen (row: a failed row back to proposed), board_resolve (row, and thread for an unknown row whose session started, or nothing to fail it). A rev that differs from the row's is refused: read the board again.",
         parameters: Type.Object({
             action: Type.Union([
                 Type.Literal("list"),
@@ -34706,7 +34688,7 @@ export default function createDesk(host: Host, web: Web) {
             thread: Type.Optional(
                 Type.String({
                     description:
-                        "read: a thread id, such as T13; an agent may leave it out for its own thread; attach: the target thread; watch, result: the thread to change; send: the thread whose agent gets the message; own: the found thread; escalate: the thread the item is about (optional); board_resolve: the thread an unknown row started",
+                        "read: a thread id, such as T13; an agent may leave it out for its own thread, and gets another thread as its read-only copy; attach: the target thread; watch, result: the thread to change; send: the thread whose agent gets the message; own: the found thread; escalate: the thread the item is about (optional); board_resolve: the thread an unknown row started",
                 }),
             ),
             ref: Type.Optional(
@@ -34843,7 +34825,7 @@ export default function createDesk(host: Host, web: Web) {
             };
 
             const watching = args.action === "watch" || args.action === "result";
-            /** A session with no supervisor and no Clerk role: it reads, watches, and records results on its own thread. */
+            /** A session with no supervisor and no Clerk role: it watches and records results on its own thread, and reads any thread. */
             const agent =
                 persona !== undefined && persona.role !== "supervisor" && persona.role !== "clerk";
 
@@ -34910,7 +34892,7 @@ export default function createDesk(host: Host, web: Web) {
                 !args.action.startsWith("board")
             ) {
                 throw new Error(
-                    `Only a session assigned a supervisor identity can use the desk. An agent can use only read, watch, and result, on its own thread. For ${args.action}, ask ${await supervisorName()} with team_message ${await askAt()}; your task is in that message.`,
+                    `Only a session assigned a supervisor identity can use the desk. An agent can use only read (any thread, read only), and watch and result on its own thread. For ${args.action}, ask ${await supervisorName()} with team_message ${await askAt()}; your task is in that message.`,
                 );
             }
 
@@ -35098,35 +35080,53 @@ export default function createDesk(host: Host, web: Web) {
             if (args.action === "read") {
                 const id = args.thread?.trim();
 
-                // An agent reads its own thread, and only that one. It writes nothing: no look, no sweeper.
+                // An agent reads its own thread in full, and another thread as its synced copy (`threadFile`, the text
+                // the export writes), read only. It writes nothing: no look, no sweeper. Every write stays on its own
+                // thread (watch, result).
                 if (agent) {
                     const state = await api.snapshot(DeskThreads, context);
                     const thread =
                         id === undefined || id === ""
                             ? ownThreadOf(state, session)
                             : threadById(state, id);
-                    // Read only for a refusal: the same words for another thread and a missing one.
                     const hint = async () =>
                         `Ask ${await supervisorName()} with team_message ${await askAt()}.`;
-                    // The id as the agent asked for it, in the form `threadById` reads it (no "#", upper case): a
-                    // refusal that showed the stored id for one and the raw id for the other would tell them apart.
-                    const asked = (id ?? "").replace(/^#/, "").toUpperCase();
-                    const notYours = async () =>
-                        `${asked} is not this session's thread: an agent can read only its own thread. ${await hint()}${copyHint(asked, (await deskConfig()).export)}`;
 
                     if (thread === undefined) {
                         throw new Error(
                             id === undefined || id === ""
                                 ? `This session has no thread on the desk. ${await hint()}`
-                                : await notYours(),
+                                : `There is no thread ${(id ?? "").replace(/^#/, "").toUpperCase()} on the desk. ${await hint()}`,
                         );
                     }
 
                     if (thread.session !== session) {
-                        throw new Error(
-                            id === undefined || id === ""
-                                ? `${thread.id} is not this session's thread: an agent can read only its own thread. ${await hint()}`
-                                : await notYours(),
+                        // Another thread: the copy holds no session, address or queued wake-up, and the agent can
+                        // change nothing on it. The first line says so, and where to go for anything on it.
+                        const reports =
+                            thread.session === undefined
+                                ? undefined
+                                : await api.snapshot(
+                                      DeskReports,
+                                      thread.session as ConversationId,
+                                      context,
+                                  );
+
+                        return reply(
+                            [
+                                `${thread.id} is not this session's thread: this is its read-only copy. An agent can watch or record a result only on its own thread. For anything on ${thread.id}, ${(await hint()).replace(/^Ask/, "ask")}`,
+                                "",
+                                threadFile(
+                                    thread,
+                                    // Defanged as the reports of its own thread are: a report's text cannot pose as
+                                    // a message to this session.
+                                    reports?.reports.map((report) => ({
+                                        ...report,
+                                        text: host.text.defang(report.text),
+                                    })),
+                                    Date.now(),
+                                ),
+                            ].join("\n"),
                         );
                     }
 
