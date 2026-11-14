@@ -1641,6 +1641,21 @@ test("H3: a context list that GitHub cut, or a rollup that is not failing, keeps
     assert.equal(checkH3(pending, ctx).metrics.withAFailingCommit, 0);
 });
 
+test("H3: a failing rollup with an empty context list keeps the rollup's word, also for the merged head", () => {
+    for (const state of ["FAILURE", "ERROR"]) {
+        const result = checkH3(fivePrs(commitsPr([commitWith("a", state, [])])), ctx);
+
+        assert.equal(result.metrics.withAFailingCommit, 2, state);
+        assert.equal(result.metrics.cancelledOnly, 0, state);
+    }
+
+    const merged = fivePrs(
+        commitsPr([commitWith("head", "FAILURE", [])], { state: "MERGED", headRefOid: "head" }),
+    );
+
+    assert.equal(checkH3(merged, ctx).metrics.redAtMerge, 2);
+});
+
 test("H3: an open bot PR with no update for 48 h is idle; 47 h is not", () => {
     const idle = (hours: number) =>
         emptyData({

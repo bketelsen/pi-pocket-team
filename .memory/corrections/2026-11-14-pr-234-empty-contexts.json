@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-14",
+  "scope": "audit/checks.mjs",
+  "correction": "commitFailed treated a FAILURE or ERROR rollup with an empty context list (totalCount 0) as no failure; with no contexts read, the rollup must decide, so an empty list falls back to the rollup like a missing or cut list",
+  "evidence": "bketelsen/pi-pocket-team#234, cross-review by openai/gpt-6.1-sol at head de05fbb",
+  "promoted_to": "audit/checks.test.ts: H3: a failing rollup with an empty context list keeps the rollup's word, also for the merged head"
+}

@@ -1463,7 +1463,8 @@ const FAILED_STATUS = new Set(["FAILURE", "ERROR"]);
  * concludes FAILURE in a suite that concludes CANCELLED. So, when every context was read, a commit fails only when a
  * check run concluded FAILURE, TIMED_OUT, STARTUP_FAILURE or ACTION_REQUIRED in a check suite that did not conclude
  * CANCELLED, or a status context is FAILURE or ERROR. A rollup that is not FAILURE or ERROR never fails. With no
- * contexts, or a list that GitHub cut (`totalCount` above the nodes), the rollup decides, as before.
+ * contexts (none read, or an empty list), or a list that GitHub cut (`totalCount` above the nodes), the rollup decides,
+ * as before.
  */
 export function commitFailed(commit) {
     const rollup = commit?.statusCheckRollup;
@@ -1477,6 +1478,7 @@ export function commitFailed(commit) {
 
     if (
         nodes === null ||
+        nodes.length === 0 ||
         typeof contexts.totalCount !== "number" ||
         contexts.totalCount > nodes.length
     ) {
