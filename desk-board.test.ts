@@ -38,6 +38,8 @@ import {
     pruneBoard,
     recordStart,
     roundsToday,
+    rowLine,
+    rowProviders,
     shiftTextRefusal,
     staleText,
     type Board,
@@ -1056,6 +1058,203 @@ describe("the claim and the start's record", () => {
             assert.equal(boardKeepsSweeper(board, 7), true, state);
             assert.equal(boardKeepsSweeper(board, 8), false, "another supervisor's");
         }
+    });
+});
+
+describe("the meter's hold of a waiting row", () => {
+    const REASON = "Anthropic week 95% ≥ 90%, resets Fri 09:00";
+    const OTHER_REASON = "Anthropic week 97% ≥ 90%, resets Fri 09:00";
+
+    /** A board with `count` waiting rows of `max` rounds, each ending 6 hours after LATE. */
+    const waiting = (count: number, max = 20) => {
+        const board = emptyBoard();
+
+        for (let index = 0; index < count; index += 1) {
+            const row = added(board, { ...FIELDS, max });
+
+            row.state = "waiting";
+            row.untilAt = LATE + 6 * 3600_000;
+        }
+
+        return board;
+    };
+
+    const holds = (reason: string | undefined) => () => reason;
+    const limits = (patch: object = {}) => ({
+        settings: SETTINGS,
+        midnight: MIDNIGHT,
+        runs: ALWAYS,
+        ...patch,
+    });
+
+    test("held: the row stays waiting with held set, and its rev does not change", () => {
+        const board = waiting(1);
+        const row = board.rows[0]!;
+
+        assert.deepEqual(claimRow(board, 1, LATE, limits({ held: holds(REASON) })), {
+            claim: "held",
+            reason: REASON,
+        });
+        assert.equal(row.state, "waiting");
+        assert.deepEqual(row.held, { reason: REASON, at: LATE });
+        assert.equal(row.changedAt, LATE);
+        assert.equal(row.rev, 1);
+        assert.deepEqual(row.attempts, []);
+    });
+
+    test("held: the same reason again changes nothing; a new reason moves changedAt and the held time", () => {
+        const board = waiting(1);
+        const row = board.rows[0]!;
+
+        claimRow(board, 1, LATE, limits({ held: holds(REASON) }));
+        claimRow(board, 1, LATE + 60_000, limits({ held: holds(REASON) }));
+        assert.deepEqual(row.held, { reason: REASON, at: LATE });
+        assert.equal(row.changedAt, LATE);
+
+        claimRow(board, 1, LATE + 120_000, limits({ held: holds(OTHER_REASON) }));
+        assert.deepEqual(row.held, { reason: OTHER_REASON, at: LATE + 120_000 });
+        assert.equal(row.changedAt, LATE + 120_000);
+        assert.equal(row.rev, 1);
+    });
+
+    test("the claim order: a full desk wins over held, and the full pass removes held with no other change", () => {
+        const board = waiting(2);
+        const row = board.rows[1]!;
+        const full = limits({ settings: { ...SETTINGS, atOnce: 1 }, held: holds(REASON) });
+
+        row.held = { reason: REASON, at: LATE - 1 };
+        row.changedAt = LATE - 1;
+        assert.equal(claimRow(board, 1, LATE, limits()).claim, "claimed");
+        assert.deepEqual(claimRow(board, 2, LATE, full), { claim: "full" });
+        assert.equal(row.held, undefined);
+        assert.equal(row.changedAt, LATE - 1);
+        assert.equal(row.rev, 1);
+    });
+
+    test("the claim order: held wins over the day's round budget", () => {
+        const board = waiting(1, 100);
+        const row = board.rows[0]!;
+        const budget = { settings: { ...SETTINGS, rounds: 50 } };
+
+        assert.deepEqual(claimRow(board, 1, LATE, limits({ ...budget, held: holds(REASON) })), {
+            claim: "held",
+            reason: REASON,
+        });
+        assert.equal(row.state, "waiting");
+        assert.deepEqual(claimRow(board, 1, LATE, limits(budget)), {
+            claim: "failed",
+            error: "over the day's round budget",
+        });
+        assert.equal(row.held, undefined, "the fail removes held");
+    });
+
+    test("the claim order: a later row and a row past its until win over held; both remove held", () => {
+        const board = waiting(2);
+        const later = board.rows[0]!;
+        const late = board.rows[1]!;
+
+        later.startAt = LATE + 3600_000;
+        later.held = { reason: REASON, at: LATE - 1 };
+        later.changedAt = LATE - 1;
+        assert.deepEqual(claimRow(board, 1, LATE, limits({ held: holds(REASON) })), {
+            claim: "later",
+        });
+        assert.equal(later.held, undefined);
+        assert.equal(later.changedAt, LATE - 1, "a later pass changes nothing else");
+        assert.equal(later.rev, 1);
+
+        late.held = { reason: REASON, at: LATE - 1 };
+        assert.deepEqual(
+            claimRow(board, 2, (late.untilAt ?? 0) - 9 * 60_000, limits({ held: holds(REASON) })),
+            { claim: "failed", error: "past its until" },
+        );
+        assert.equal(late.state, "failed");
+        assert.equal(late.held, undefined);
+    });
+
+    test("held goes at the claim that starts the row (a pass where it is not held)", () => {
+        const board = waiting(1);
+        const row = board.rows[0]!;
+
+        claimRow(board, 1, LATE, limits({ held: holds(REASON) }));
+        assert.equal(
+            claimRow(board, 1, LATE + 1, limits({ held: holds(undefined) })).claim,
+            "claimed",
+        );
+        assert.equal(row.state, "starting");
+        assert.equal(row.held, undefined);
+    });
+
+    test("held goes at an edit, a drop and a reopen", () => {
+        const board = waiting(3);
+
+        for (const row of board.rows) {
+            claimRow(board, row.id, LATE, limits({ held: holds(REASON) }));
+            assert(row.held !== undefined);
+        }
+
+        const edited = boardOp(
+            board,
+            SUPERVISOR,
+            { op: "edit", row: 1, rev: 1, fields: { max: 10 } },
+            opContext(),
+            LATE + 1,
+        );
+
+        assert(!("status" in edited), JSON.stringify(edited));
+        assert.equal(board.rows[0]!.state, "proposed");
+        assert.equal(board.rows[0]!.held, undefined);
+
+        const dropped = boardOp(
+            board,
+            SUPERVISOR,
+            { op: "drop", row: 2, rev: 1 },
+            opContext(),
+            LATE,
+        );
+
+        assert(!("status" in dropped), JSON.stringify(dropped));
+        assert.equal(board.rows[1]!.state, "dropped");
+        assert.equal(board.rows[1]!.held, undefined);
+
+        // A failed row that still carries held (an older write): the reopen removes it.
+        const failed = board.rows[2]!;
+
+        failed.state = "failed";
+        failed.error = "past its until";
+        const reopened = boardOp(board, SUPERVISOR, { op: "reopen", row: 3 }, opContext(), LATE);
+
+        assert(!("status" in reopened), JSON.stringify(reopened));
+        assert.equal(failed.state, "proposed");
+        assert.equal(failed.held, undefined);
+    });
+
+    test("rowProviders: the provider of the agent's model, then the worker's, without duplicates", () => {
+        const row = (worker?: string) =>
+            ({ ...waiting(1).rows[0]!, ...(worker === undefined ? {} : { worker }) }) as BoardRow;
+
+        assert.deepEqual(rowProviders(row(), "anthropic/claude-opus-5-5"), ["anthropic"]);
+        assert.deepEqual(rowProviders(row("faux/faux-2"), undefined), ["faux"]);
+        assert.deepEqual(
+            rowProviders(row("anthropic/claude-sonnet-5"), "anthropic/claude-opus-5-5"),
+            ["anthropic"],
+        );
+        assert.deepEqual(rowProviders(row("faux/faux-2"), "anthropic/claude-opus-5-5"), [
+            "anthropic",
+            "faux",
+        ]);
+        assert.deepEqual(rowProviders(row("no-slash"), "claude"), []);
+        assert.deepEqual(rowProviders(row("/model"), "/x"), [], "an empty provider adds nothing");
+        assert.deepEqual(rowProviders(row(), undefined), []);
+    });
+
+    test("rowLine shows held and its reason before the order", () => {
+        const board = waiting(1);
+        const row = board.rows[0]!;
+
+        assert.doesNotMatch(rowLine(row, String), /held:/);
+        claimRow(board, 1, LATE, limits({ held: holds(REASON) }));
+        assert.match(rowLine(row, String), new RegExp(` · held: ${REASON} · order 10: `));
     });
 });
 

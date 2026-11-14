@@ -341,6 +341,7 @@ type Agent = {
     role: string;
     home?: string;
     repositories: Record<string, string>;
+    model?: string;
 };
 
 const persona = async (id: string) => {
@@ -407,6 +408,20 @@ test("the roster reads home, absolute or from ~/, and the Team API gives it", as
         "frostyard/nsl": repoA,
         "frostyard/igloo": repoB,
     });
+});
+
+test("the Team API's roster gives a profile's model, and no model key for a profile with none", async () => {
+    const team = (globalThis as unknown as Record<symbol, TeamApi | undefined>)[
+        Symbol.for("pi-pocket-team.team")
+    ];
+
+    assert(team, "the module publishes its API");
+    const listed = (await team.roster()) as Agent[];
+    const moneo = listed.find((each) => each.id === "moneo");
+
+    assert.equal(listed.find((each) => each.id === "duncan")?.model, "faux/faux-2");
+    assert(moneo !== undefined);
+    assert.equal("model" in moneo, false, "a profile with no model gives no model key");
 });
 
 test("a session in a home is its agent: explicit wins, a clear wins, and 2 agents with 1 home give none", async () => {

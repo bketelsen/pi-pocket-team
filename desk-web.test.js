@@ -3563,6 +3563,17 @@ test("Board status: the state line says running or finished for a launched row, 
     assert.equal(rowStateText(boardRow({ state: "dropped", rev: 6 })), "dropped · rev 6");
 });
 
+test("Board hold: the state line of a waiting row that the meter holds says held and its reason; another state does not", () => {
+    const held = { reason: "Anthropic week 95% ≥ 90%, resets Fri 09:00", at: 1 };
+
+    assert.equal(
+        rowStateText(boardRow({ state: "waiting", rev: 4, held })),
+        "waiting · rev 4 · held: Anthropic week 95% ≥ 90%, resets Fri 09:00",
+    );
+    assert.equal(rowStateText(boardRow({ state: "starting", rev: 5, held })), "starting · rev 5");
+    assert.equal(rowStateText(boardRow({ state: "waiting", rev: 4 })), "waiting · rev 4");
+});
+
 test("Board status: each row carries its state class and its status class, and desk.css colors each status", async () => {
     const rows = [
         boardRow({ id: 1, state: "proposed" }),

@@ -14085,9 +14085,9 @@ export type BoardLimits = {
 };
 
 /**
- * 1 board row as the Desk page's Board view reads it: the stored fields, and from the row's thread (when the desk holds it)
- * the next actor, the thread's state, and `shiftEnded` when its shift ended. The page colors a launched row from these, and
- * sorts its Done fold by `changedAt`.
+ * 1 board row as the Desk page's Board view reads it: the stored fields (`held` while the meter holds the row), and from
+ * the row's thread (when the desk holds it) the next actor, the thread's state, and `shiftEnded` when its shift ended. The
+ * page colors a launched row from these, and sorts its Done fold by `changedAt`.
  */
 export type BoardRowView = Pick<
     BoardModule.BoardRow,
@@ -14115,6 +14115,7 @@ export type BoardRowView = Pick<
     | "changedAt"
     | "error"
     | "attempts"
+    | "held"
 > & { next?: NextActor; threadState?: Thread["state"]; shiftEnded?: true };
 
 /** 1 supervisor's rows for the page, in launch order. */
@@ -14150,6 +14151,7 @@ export function boardRowViews(
             ...(row.launchedAt === undefined ? {} : { launchedAt: row.launchedAt }),
             ...(row.error === undefined ? {} : { error: row.error }),
             attempts: row.attempts,
+            ...(row.held === undefined ? {} : { held: row.held }),
             ...(thread === undefined ? {} : { next: nextActor(thread), threadState: thread.state }),
             ...(thread?.run.shift === "ended" ? { shiftEnded: true as const } : {}),
         };
@@ -23438,6 +23440,8 @@ type TeamMember = {
     repositories?: Record<string, string>;
     /** The agent's home: a plan's lead needs one. */
     home?: string;
+    /** The profile's model (`provider/model`): the board's hold reads its provider. An older Team gives none. */
+    model?: string;
 };
 
 type TeamApi = {
@@ -34188,12 +34192,63 @@ export default function createDesk(host: Host, web: Web) {
     };
 
     /**
+     * The board's hold for 1 pass (plan B2): a callback that gives why a row waits, when desk.json sets `meter.holdAt`
+     * and the meter is on; else undefined, and nothing holds. The row's providers come from its agent's profile model
+     * (read once per pass from Team's roster; a Team that fails or gives no model adds nothing) and its worker. The
+     * hold reads the meter's state only: it never reads a provider, and a failure holds nothing.
+     */
+    const boardHold = async (
+        config: Awaited<ReturnType<typeof deskConfig>>,
+        now: () => number,
+    ): Promise<BoardModule.RowHeld | undefined> => {
+        const holdAt = config.meter?.holdAt;
+
+        if (typeof holdAt !== "number") {
+            return undefined;
+        }
+
+        const on = await meterOn(config);
+
+        if (on === undefined) {
+            return undefined;
+        }
+
+        const models = new Map<string, string>();
+
+        try {
+            for (const member of (await teamApi()?.roster()) ?? []) {
+                if (typeof member.model === "string" && member.model !== "") {
+                    models.set(member.id, member.model);
+                }
+            }
+        } catch {
+            // No roster: an agent's provider is unknown and holds nothing; the worker still counts.
+        }
+
+        return (row) => {
+            try {
+                const at = now();
+
+                return meterRules.holdReason(
+                    meterViewOf(on, at),
+                    boardRules.rowProviders(row, models.get(row.agent)),
+                    holdAt,
+                    at,
+                    serverZone(),
+                );
+            } catch {
+                return undefined;
+            }
+        };
+    };
+
+    /**
      * 1 launch pass of 1 supervisor's board, from a launch request or a sweep. First each `starting` row (a restart
      * between its claim and its record) starts again under its attempt's key, before any limit. Then the `waiting` rows,
      * in launch order: each claim is 1 commit that reads the board again (`claimRow`), then Team's `startShift` under
-     * the attempt's key, then 1 commit records the result. A full desk or `atOnce` running stops the pass. Passes may
-     * overlap: a claim reads the row again, and a row whose start runs in this process is skipped. Gives 1 line per row
-     * it touched.
+     * the attempt's key, then 1 commit records the result. A full desk or `atOnce` running stops the pass; a row that the
+     * meter holds (`boardHold`) waits, and the pass goes on. Passes may overlap: a claim reads the row again, and a row
+     * whose start runs in this process is skipped. Gives 1 line per row it touched.
      */
     const boardPass = async (
         access: PlanPublish,
@@ -34215,9 +34270,11 @@ export default function createDesk(host: Host, web: Web) {
             ];
         }
 
-        const { board: settings } = await deskConfig();
+        const config = await deskConfig();
+        const settings = config.board;
         const running = boardStarts();
         const lines: string[] = [];
+        const heldBy = await boardHold(config, now);
 
         /** Start 1 claimed row's attempt `n`, and record what happened. Gives whether the pass goes on. */
         const startRow = async (id: number, n: number): Promise<boolean> => {
@@ -34288,7 +34345,7 @@ export default function createDesk(host: Host, web: Web) {
         };
 
         /** Run 1 row's work with its id held in this process; skip it when another pass holds it. */
-        const held = async (id: number, work: () => Promise<boolean>): Promise<boolean> => {
+        const inProcess = async (id: number, work: () => Promise<boolean>): Promise<boolean> => {
             if (running.has(id)) {
                 return true;
             }
@@ -34310,7 +34367,7 @@ export default function createDesk(host: Host, web: Web) {
                 continue;
             }
 
-            if (!(await held(row.id, () => startRow(row.id, n)))) {
+            if (!(await inProcess(row.id, () => startRow(row.id, n)))) {
                 return lines;
             }
         }
@@ -34322,7 +34379,7 @@ export default function createDesk(host: Host, web: Web) {
             .map((row) => row.id);
 
         for (const id of waiting) {
-            const go = await held(id, async () => {
+            const go = await inProcess(id, async () => {
                 let claim: BoardModule.BoardClaim | undefined;
 
                 await access.commit(async (state, tx) => {
@@ -34338,6 +34395,7 @@ export default function createDesk(host: Host, web: Web) {
                         settings,
                         midnight: boardMidnight(at),
                         runs: boardRowRuns(state),
+                        ...(heldBy === undefined ? {} : { held: heldBy }),
                     });
 
                     const row = state.board.rows.find((each) => each.id === id);
@@ -34367,6 +34425,13 @@ export default function createDesk(host: Host, web: Web) {
 
                 if (decided.claim === "failed") {
                     lines.push(`#${String(id)} failed: ${decided.error}`);
+
+                    return true;
+                }
+
+                // A held row waits; the next row may still start.
+                if (decided.claim === "held") {
+                    lines.push(`#${String(id)} held: ${decided.reason}`);
 
                     return true;
                 }

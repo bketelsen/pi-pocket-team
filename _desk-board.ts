@@ -81,6 +81,12 @@ export type BoardRow = {
     thread?: string;
     launchedAt?: number;
     error?: string;
+    /**
+     * Set by the launch pass while the meter holds a `waiting` row: the hold's reason, and when that reason was
+     * first seen. It never changes `rev`. It goes when the row starts, fails, goes back to `proposed`, is dropped, or
+     * when a pass finds the row not held.
+     */
+    held?: { reason: string; at: number };
 };
 
 /** A replayed call: its key, when, and the text it gave. */
@@ -722,6 +728,7 @@ function backToProposed(row: BoardRow, now: number): void {
     delete row.pickedRev;
     delete row.startAt;
     delete row.untilAt;
+    delete row.held;
     row.changedAt = now;
 }
 
@@ -877,6 +884,7 @@ export function boardOp(
             }
 
             row.state = "dropped";
+            delete row.held;
             row.changedAt = now;
 
             return { rows: [row] };
@@ -1155,6 +1163,7 @@ export type BoardClaim =
     | { claim: "claimed"; n: number; minutes: number }
     | { claim: "full" }
     | { claim: "later" }
+    | { claim: "held"; reason: string }
     | { claim: "failed"; error: string }
     | { claim: "gone" };
 
@@ -1165,16 +1174,21 @@ export function nextAttempt(row: BoardRow): number {
     return last === undefined ? 1 : last.outcome === "cap" ? last.n : last.n + 1;
 }
 
+/** The hold of the launch pass: the reason that holds a row, or undefined when nothing holds it. */
+export type RowHeld = (row: BoardRow) => string | undefined;
+
 /**
- * The claim of 1 waiting row, in the caller's commit that read the board again: a row with a future `startAt` waits;
- * a row with less than 10 minutes to its until fails; the supervisor at `atOnce` runs stops the pass; a row over the
- * day's round budget fails; else the row is `starting`, with its new attempt.
+ * The claim of 1 waiting row, in the caller's commit that read the board again, in this order: a row with a future
+ * `startAt` waits; a row with less than 10 minutes to its until fails; the supervisor at `atOnce` runs stops the pass;
+ * a row that `held` gives a reason for waits, with `held` set (its `changedAt` moves only when the reason is new, and
+ * its `rev` never); a row over the day's round budget fails; else the row is `starting`, with its new attempt. Every
+ * outcome but the hold removes `held`; a later or full row loses it with no other change.
  */
 export function claimRow(
     board: Board,
     rowIdValue: number,
     now: number,
-    limits: { settings: BoardSettings; midnight: number; runs: RowRuns },
+    limits: { settings: BoardSettings; midnight: number; runs: RowRuns; held?: RowHeld },
 ): BoardClaim {
     const row = board.rows.find((each) => each.id === rowIdValue);
 
@@ -1183,6 +1197,8 @@ export function claimRow(
     }
 
     if (row.startAt !== undefined && row.startAt > now) {
+        delete row.held;
+
         return { claim: "later" };
     }
 
@@ -1193,7 +1209,20 @@ export function claimRow(
     }
 
     if (runningCount(board, row.supervisor, limits.runs) >= limits.settings.atOnce) {
+        delete row.held;
+
         return { claim: "full" };
+    }
+
+    const reason = limits.held?.(row);
+
+    if (reason !== undefined) {
+        if (row.held?.reason !== reason) {
+            row.held = { reason, at: now };
+            row.changedAt = now;
+        }
+
+        return { claim: "held", reason };
     }
 
     if (roundsToday(board, row.supervisor, limits.midnight) + row.max > limits.settings.rounds) {
@@ -1209,15 +1238,36 @@ export function claimRow(
     row.attempts.push({ n, at: now, minutes });
     row.state = "starting";
     delete row.error;
+    delete row.held;
     row.changedAt = now;
 
     return { claim: "claimed", n, minutes };
+}
+
+/**
+ * The providers of a row: the part before the first `/` of the agent's profile model and of the row's worker, when
+ * the value has a `/` and that part is not empty; the agent's first, without duplicates. An unknown model adds nothing.
+ */
+export function rowProviders(row: BoardRow, agentModel: string | undefined): string[] {
+    const providers: string[] = [];
+
+    for (const model of [agentModel, row.worker]) {
+        const slash = model === undefined ? -1 : model.indexOf("/");
+        const provider = model !== undefined && slash > 0 ? model.slice(0, slash) : "";
+
+        if (provider !== "" && !providers.includes(provider)) {
+            providers.push(provider);
+        }
+    }
+
+    return providers;
 }
 
 /** A row that fails, with its error. */
 export function failRow(row: BoardRow, error: string, now: number): void {
     row.state = "failed";
     row.error = error;
+    delete row.held;
     row.changedAt = now;
 }
 
@@ -1340,6 +1390,7 @@ export function rowLine(
         ...(row.worker === undefined ? [] : [`worker ${row.worker}`]),
         ...(thread === undefined ? [] : [`${thread.id} (next: ${thread.next})`]),
         ...(row.error === undefined ? [] : [`error: ${row.error}`]),
+        ...(row.held === undefined ? [] : [`held: ${row.held.reason}`]),
         `order ${String(row.order)}`,
     ];
 
