@@ -6,6 +6,7 @@ import path from "node:path";
 import test from "node:test";
 import { HOUR, MINUTE, SECRET, iso, money, moneyFine, quote } from "./common.mjs";
 import { makeFinding } from "./checks.mjs";
+import { dueOf } from "./due.mjs";
 import {
     MAX_OTHER,
     annotate,
@@ -361,6 +362,11 @@ const baseReport = (over: object = {}) => ({
     totals: { spend: 391, threadsTouched: 23, botPrs: 41, botMerged: 38, failedShifts: 0 },
     github: { calls: 9, capReached: false },
     llm: emptyLlm,
+    due: dueOf([], {
+        date: "2026-10-23",
+        roster: { status: "ok", agents: [] },
+        actions: { status: "missing", entries: [], refused: [] },
+    }),
     ...over,
 });
 const sections = (markdown: string) => markdown.split("\n").filter((line) => line.startsWith("#"));
@@ -375,6 +381,7 @@ test("the report has the design's sections in order, and the first lines of Sect
     assert.deepEqual(sections(markdown), [
         "# Audit 2026-10-23 (24 h to 10:00)",
         "## Summary",
+        "## Due: 7 days or more",
         "## Proposals",
         "## Other findings",
         "## Maybe fixed",

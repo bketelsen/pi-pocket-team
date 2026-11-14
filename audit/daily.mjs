@@ -5,15 +5,17 @@
 //     node audit/daily.mjs [--hours 24] [--date YYYY-MM-DD] [--out-dir DIR] [--no-llm] [--no-github] [--json]
 //
 // Environment: PI_POCKET_DIR (default ~/.pi-pocket), ODRADE_DIR (default ~/agents/odrade when that folder exists,
-// else ~/projects/odrade), TEAM_HOMES_DIR (default ~/agents). The default out folder is
-// `$ODRADE_DIR/reports/<date>-daily-audit/`; earlier days are read from its sibling folders. See
-// docs/plans/daily-audit.md.
+// else ~/projects/odrade), TEAM_HOMES_DIR (default ~/agents), PI_POCKET_TEAM_AGENTS (the roster's profile folder,
+// default ~/.config/pi-pocket-team/agents). The default out folder is `$ODRADE_DIR/reports/<date>-daily-audit/`;
+// earlier days are read from its sibling folders. For the "Due" section it also reads the roster's profile files and
+// Odrade's `$ODRADE_DIR/decisions/audit-actions.json` (both only read). See docs/plans/daily-audit.md.
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL, fileURLToPath } from "node:url";
 import { HOUR, newYorkDate } from "./common.mjs";
 import { runChecks } from "./checks.mjs";
+import { ACTIONS_FILE, dueOf, readActions, readRoster } from "./due.mjs";
 import { runLlm } from "./llm.mjs";
 import {
     annotate,
@@ -91,6 +93,10 @@ export function defaultOdradeDir(env = process.env) {
 /** The folder of the agents' homes (`TEAM_HOMES_DIR`). */
 export const defaultHomesDir = (env) => env.TEAM_HOMES_DIR ?? path.join(userHome(env), "agents");
 
+/** The roster's profile folder (`PI_POCKET_TEAM_AGENTS`), as `team.ts` reads it. */
+export const defaultRosterDir = (env) =>
+    env.PI_POCKET_TEAM_AGENTS ?? path.join(userHome(env), ".config", "pi-pocket-team", "agents");
+
 /** The audit's own last commit and its date, or null. The repo root is the parent folder of `audit/`. */
 function codeVersion(run) {
     try {
@@ -138,6 +144,11 @@ export async function main(
     });
     const result = runChecks(data, { ...ctx, date, earlier });
     const findings = annotate(result.findings, earlier, data.installed, ctx.now);
+    const due = dueOf(findings, {
+        date,
+        roster: readRoster(defaultRosterDir(env)),
+        actions: readActions(path.join(odradeDir, ACTIONS_FILE), date),
+    });
     const llm = await runLlm({
         ranked: findings.filter((finding) => !finding.maybeFixed),
         metrics: result.metrics,
@@ -161,6 +172,7 @@ export async function main(
             totals,
             github,
             llm,
+            due,
         }),
     );
     const readme = scrubMarkdown(
@@ -175,6 +187,7 @@ export async function main(
             totals,
             github,
             llm,
+            due,
         }),
     );
 
