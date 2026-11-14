@@ -231,6 +231,16 @@ evidence links, the size, and the owner. The report fits on a phone screen:
 
 Spend $391 · 23 threads · 41 PRs (38 merged) · 0 failed shifts
 
+## Summary
+
+…
+
+## Due: 7 days or more
+
+- `F2` 10 days, medium: … Owner: Sheeana (owns bketelsen/pi-pocket-team (night-shift.ts)). Last action: accepted, expired 2026-11-10.
+- Held by an action: `G1:late` (issue https://github.com/bketelsen/pi-pocket-team/issues/12, until 2026-12-01).
+- Actions file: 2 valid entries.
+
 ## Proposals
 
 1. **Do not reopen a done thread for a supervisor's new message** (desk.ts, Sheeana, S)
@@ -247,6 +257,13 @@ Spend $391 · 23 threads · 41 PRs (38 merged) · 0 failed shifts
 ```
 
 The JSON keeps every finding, so the next day can say what is new, what repeats, and what is gone.
+
+The section "Due: 7 days or more" (added on 2026-11-13) lists each finding that repeats 7 days in a row and is not
+"maybe fixed". Each one has 1 owner from the roster: Brian for H1, the owner agent of the repository or the agent that
+an H or Q finding names, the agent of the home for I3, the owner of `bketelsen/pi-pocket-team` for a desk or shift
+check, and else the supervisor. An entry in Odrade's `decisions/audit-actions.json` (an issue, a board row, or
+`accepted`, with a reason and an `until` date at most 30 days ahead) holds the finding until that date. Odrade routes
+each due finding. `findings.json` keeps the list in `due`, and the file's state in `dueActions`.
 
 The report also names the audit's own code version, in the line `Audit code: <commit> (<date>).`
 (or `Audit code: unknown.`), so a finding can be traced to the code that made it.

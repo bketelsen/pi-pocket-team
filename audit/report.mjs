@@ -252,7 +252,10 @@ export function totalsOf(data, ctx, metrics) {
 
 // ---------- The JSON ----------
 
-/** The JSON of a run: every finding, the metrics, the skipped checks and the LLM use. It holds no report text. */
+/**
+ * The JSON of a run: every finding, the metrics, the skipped checks and the LLM use. It holds no report text. With
+ * `due` (from `dueOf`), it also holds the due findings and the state of the actions file, with the held findings.
+ */
 export function buildJson({
     date,
     ctx,
@@ -264,6 +267,7 @@ export function buildJson({
     totals,
     github,
     llm,
+    due,
 }) {
     return {
         version: 1,
@@ -279,6 +283,7 @@ export function buildJson({
         skipped,
         github,
         llm,
+        ...(due ? { due: due.due, dueActions: { ...due.actions, held: due.held } } : {}),
     };
 }
 
@@ -573,6 +578,64 @@ const metricLines = (metrics, github) => {
 const findingLine = (finding) =>
     `- \`${finding.id}\` ${finding.severity}, ${finding.cases} case${finding.cases === 1 ? "" : "s"}${finding.rank === undefined ? "" : `, rank ${finding.rank}`}: ${oneLine(finding.text)}${finding.installedRecently ? ` (installed recently: ${moduleOf(finding.check)} at ${finding.installedAt})` : ""}`;
 
+// ---------- The due section ----------
+
+const refusedName = (item) => (item.id === null ? `entries[${item.index}]` : `\`${item.id}\``);
+
+/** A text that ends as a sentence: a full stop is added unless it ends in `.`, `…`, `!` or `?`. */
+const sentence = (text) => (/[.…!?]$/.test(text) ? text : `${text}.`);
+
+/** The lines of the "Due: 7 days or more" section, with no heading. */
+export function dueLines(result) {
+    const lines =
+        result.due.length === 0
+            ? ["- None."]
+            : result.due.map(
+                  (item) =>
+                      `- \`${item.id}\` ${item.days} days, ${item.severity}: ${sentence(oneLine(item.text))} Owner: ${item.owner.name} (${item.owner.why}).${
+                          item.lastEntry
+                              ? ` Last action: ${item.lastEntry.action}, expired ${item.lastEntry.until}.`
+                              : ""
+                      }`,
+              );
+
+    if (result.held.length > 0) {
+        lines.push(
+            `- Held by an action: ${result.held
+                .map((item) => `\`${item.id}\` (${item.action}, until ${item.until})`)
+                .join("; ")}.`,
+        );
+    }
+
+    const file = result.actions;
+
+    if (file.status === "missing") {
+        lines.push(`- Actions file: ${file.file} not found: no entries.`);
+    } else if (file.status === "invalid") {
+        lines.push(`- Actions file: ${file.file} is not valid (${file.reason}): no entries.`);
+    } else {
+        const refused = file.refused.length;
+
+        lines.push(
+            `- Actions file: ${file.entries} valid ${file.entries === 1 ? "entry" : "entries"}${
+                refused > 0
+                    ? `, ${refused} refused: ${file.refused
+                          .map((item) => `${refusedName(item)} (${item.reason})`)
+                          .join("; ")}`
+                    : ""
+            }.`,
+        );
+    }
+
+    if (result.roster && result.roster.status !== "ok") {
+        lines.push(
+            `- Roster: ${result.roster.status}${result.roster.reason ? ` (${oneLine(result.roster.reason, 120)})` : ""}; owners come from the fixed table.`,
+        );
+    }
+
+    return lines;
+}
+
 /** The LLM line at the end of the report. */
 export function llmLine(llm) {
     if (!llm.used) {
@@ -608,7 +671,10 @@ export function summaryText(llm) {
     return llm.used ? "None. The LLM wrote no summary." : "None. LLM text not used.";
 }
 
-/** The Markdown report. `findings` are annotated (see `annotate`); `llm` holds a validated summary and proposals, or a reason. */
+/**
+ * The Markdown report. `findings` are annotated (see `annotate`); `due` is `dueOf`'s result; `llm` holds a validated
+ * summary and proposals, or a reason.
+ */
 export function renderReport({
     date,
     ctx,
@@ -620,7 +686,12 @@ export function renderReport({
     totals,
     github,
     llm,
+    due,
 }) {
+    if (!due) {
+        throw new Error("renderReport needs due (see dueOf in audit/due.mjs)");
+    }
+
     const ranked = findings.filter((finding) => !finding.maybeFixed);
     const fixed = findings.filter((finding) => finding.maybeFixed);
     const proposals = llm.proposals ?? [];
@@ -637,6 +708,10 @@ export function renderReport({
         "## Summary",
         "",
         summaryText(llm),
+        "",
+        "## Due: 7 days or more",
+        "",
+        ...dueLines(due),
         "",
         "## Proposals",
         "",
