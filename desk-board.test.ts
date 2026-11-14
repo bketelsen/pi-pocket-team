@@ -64,6 +64,7 @@ import createDesk, {
     capView,
     DeskThreads,
     meterHolder,
+    meterTokenFrom,
     type DeskState,
     openThread,
 } from "./desk.ts";
@@ -2917,6 +2918,59 @@ const launchSuite = (label: string, instant: number, untilAt: number) =>
             }
         });
     });
+
+test("meterTokenFrom: the token only for an OAuth sign-in, by checkAuth (not the empty snapshot of isUsingOAuth); the signal goes to both calls", async () => {
+    const TOKEN = "sk-ant-oat01-FAKE-TOKEN-DO-NOT-LEAK";
+    const signal = new AbortController().signal;
+
+    /** A fake model runtime: `isUsingOAuth` says false, as a runtime made with no refresh does. */
+    const runtime = (check: { type: "api_key" | "oauth" } | undefined, key?: string) => {
+        const calls: { name: string; provider: string; signal: unknown }[] = [];
+        const models = {
+            isUsingOAuth: () => false,
+            checkAuth: async (provider: string, options?: { signal?: AbortSignal }) => {
+                calls.push({ name: "checkAuth", provider, signal: options?.signal });
+
+                return check;
+            },
+            getAuth: async (provider: string, options?: { signal?: AbortSignal }) => {
+                calls.push({ name: "getAuth", provider, signal: options?.signal });
+
+                return key === undefined ? undefined : { auth: { apiKey: key } };
+            },
+        };
+
+        return { calls, models: models as never };
+    };
+
+    const oauth = runtime({ type: "oauth" }, TOKEN);
+
+    assert.equal(await meterTokenFrom(oauth.models, signal), TOKEN);
+    assert.deepEqual(oauth.calls, [
+        { name: "checkAuth", provider: "anthropic", signal },
+        { name: "getAuth", provider: "anthropic", signal },
+    ]);
+
+    const apiKey = runtime({ type: "api_key" }, "sk-ant-api03-KEY");
+
+    assert.deepEqual(await meterTokenFrom(apiKey.models, signal), {
+        error: "Pi's Anthropic sign-in is not a subscription (OAuth)",
+    });
+    assert.deepEqual(
+        apiKey.calls.map((call) => call.name),
+        ["checkAuth"],
+        "no token is read for an API key",
+    );
+    assert.deepEqual(await meterTokenFrom(runtime(undefined, TOKEN).models, signal), {
+        error: "Pi is not signed in to Anthropic",
+    });
+    assert.deepEqual(await meterTokenFrom(runtime({ type: "oauth" }).models, signal), {
+        error: "Pi is not signed in to Anthropic",
+    });
+    assert.deepEqual(await meterTokenFrom(runtime({ type: "oauth" }, "").models, signal), {
+        error: "Pi is not signed in to Anthropic",
+    });
+});
 
 // A plain afternoon, and the night of a fall-back change: at 2026-10-31 23:30 EDT, 3 hours on is 01:30 EST, and the
 // first 01:30 at or after the pick is 01:30 EDT (05:30Z), 2 hours away.

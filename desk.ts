@@ -19988,6 +19988,33 @@ export type MeterHolder = {
 };
 
 /**
+ * Pi's OAuth token for Anthropic from Pi's model runtime (plan D1), or why there is none. `checkAuth` reads the stored
+ * sign-in itself: `isUsingOAuth` reads only the runtime's snapshot, which `ModelRuntime.create({ refreshOnCreate:
+ * false })` leaves empty. Only a subscription sign-in (`oauth`) has a usage report; `getAuth` then gives the token, and
+ * renews it under Pi's lock. The signal goes to both calls.
+ */
+export async function meterTokenFrom(
+    models: Pick<import("@earendil-works/pi-coding-agent").ModelRuntime, "checkAuth" | "getAuth">,
+    signal: AbortSignal,
+): Promise<string | { error: string }> {
+    const check = await models.checkAuth("anthropic", { signal });
+
+    if (check === undefined) {
+        return { error: "Pi is not signed in to Anthropic" };
+    }
+
+    if (check.type !== "oauth") {
+        return { error: "Pi's Anthropic sign-in is not a subscription (OAuth)" };
+    }
+
+    const key = (await models.getAuth("anthropic", { signal }))?.auth.apiKey;
+
+    return typeof key === "string" && key !== ""
+        ? key
+        : { error: "Pi is not signed in to Anthropic" };
+}
+
+/**
  * The meter's memory, shared by every load of this module, so an install does not start the backfill again. A holder
  * of another version is replaced.
  */
@@ -26627,17 +26654,7 @@ export default function createDesk(host: Host, web: Web) {
 
             meterModels ??= ModelRuntime.create({ refreshOnCreate: false });
 
-            const models = await meterModels;
-
-            if (!models.isUsingOAuth("anthropic")) {
-                return { error: "Pi's Anthropic sign-in is not a subscription (OAuth)" };
-            }
-
-            const key = (await models.getAuth("anthropic", { signal }))?.auth.apiKey;
-
-            return typeof key === "string" && key !== ""
-                ? key
-                : { error: "Pi is not signed in to Anthropic" };
+            return await meterTokenFrom(await meterModels, signal);
         } catch (error) {
             meterModels = undefined;
 

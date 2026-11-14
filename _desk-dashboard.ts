@@ -1922,6 +1922,11 @@ export const METER_READ_MS = 15_000;
 export const ANTHROPIC_USAGE_URL =
     "https://api.anthropic.com/api/oauth/usage?cedar_ember=1&skip_spend=1";
 
+/** What an abort of the pass throws from a provider read: fixed words, never the reader's own exception. */
+export const METER_ABORTED = "the meter's read was aborted";
+
+const meterAborted = (): Error => new Error(METER_ABORTED);
+
 /** The table reads of the meter's ledger: only scans, in a commit that writes nothing. */
 export type MeterTx = Pick<Tx, "scanConversations" | "scanEntries">;
 
@@ -2370,6 +2375,7 @@ async function ledgerStep(deps: MeterDeps, now: number, signal: AbortSignal): Pr
             signal.throwIfAborted();
             apply(found);
         } catch (error) {
+            // A ledger read is a storage scan: the provider reader is not in it, so its error holds no token.
             if (signal.aborted) {
                 throw error;
             }
@@ -2389,16 +2395,23 @@ async function ledgerStep(deps: MeterDeps, now: number, signal: AbortSignal): Pr
                 continue;
             }
 
-            // The sweep skips the conversation whose read failed, and the step ends for this pass.
+            // The step ends for this pass. The backfill moves the conversation whose read failed to the end of its queue:
+            // it does not count as done, and the coverage is complete only when every listed conversation was read. A
+            // later sweep skips it: the backfill read every conversation it listed, so this one has its `high` (or a
+            // newer one has a backfill of 8 days ahead of it), and its next read (when it is active, or in the next
+            // sweep, about 1 hour later) goes on from its `high` or its backfill cursor, with no loss.
+            const sweep = ledger.sweep;
+
             if (
                 failed?.sweep === true &&
                 failed.id !== undefined &&
-                ledger.sweep?.queue[0] === failed.id
+                sweep !== undefined &&
+                sweep.queue[0] === failed.id
             ) {
-                ledger.sweep.queue.shift();
+                sweep.queue.shift();
 
-                if (ledger.sweep.backfill) {
-                    state.coverage.done += 1;
+                if (sweep.backfill) {
+                    sweep.queue.push(failed.id);
                 }
             }
 
@@ -2438,9 +2451,10 @@ export async function meterPass(deps: MeterDeps, now: number): Promise<void> {
 
         try {
             result = await deps.readProvider(provider, signal);
-        } catch (error) {
+        } catch {
+            // The reader's exception may hold the token: an abort throws fixed words, with no cause.
             if (signal.aborted) {
-                throw error;
+                throw meterAborted();
             }
 
             result = { error: "the read failed" };
@@ -2488,10 +2502,13 @@ export function anthropicReader(io: MeterIo): MeterDeps["readProvider"] {
         const limit = io.timeout?.() ?? AbortSignal.timeout(METER_READ_MS);
         const both = AbortSignal.any([signal, limit]);
 
-        /** A failure's words: an abort of the pass throws. */
-        const failure = (error: unknown, words: string): { error: string } => {
+        /**
+         * A failure's words. An abort of the pass throws fixed words with no cause: the token's, the fetch's or the JSON
+         * parser's exception may hold the token, so it never leaves here.
+         */
+        const failure = (_error: unknown, words: string): { error: string } => {
             if (signal.aborted) {
-                throw error;
+                throw meterAborted();
             }
 
             return { error: limit.aborted ? "timed out after 15 s" : words };

@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-14",
+  "scope": "_desk-dashboard.ts",
+  "correction": "an abort of the collector's pass during the meter's provider read rethrew the token, fetch or JSON exception, whose text can hold the token; anthropicReader and meterPass now throw the fixed error \"the meter's read was aborted\" with no cause",
+  "evidence": "bketelsen/pi-pocket-team#237, cross-review by openai/gpt-6.1-sol at head 936964b",
+  "promoted_to": "desk-dashboard.test.ts: an abort of the pass during the token, the fetch or the JSON read throws fixed words: the token is in no message, text, stack or cause"
+}

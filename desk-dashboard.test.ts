@@ -6,6 +6,7 @@ import {
     cleanUp,
     context,
     lastText,
+    modelTexts,
     newSession,
     openApp,
     owner,
@@ -16,6 +17,7 @@ import {
 } from "./_pocket/test/helpers.ts";
 import assert from "node:assert/strict";
 import { chmodSync, cpSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { createServer } from "node:http";
 import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
 import { fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
@@ -60,6 +62,7 @@ import {
     type Read,
 } from "./_desk-dashboard.ts";
 import { DeskUsage } from "./_desk-usage.ts";
+import { createHandler } from "./_pocket/src/server/http.ts";
 import {
     emptyMeterState,
     meterStatusLine,
@@ -2734,7 +2737,7 @@ describe("the subscription meter's step", () => {
         });
     });
 
-    test("a failed read: the sweep skips that conversation and ends for the pass; an active one waits for the next pass", async () => {
+    test("a failed read: the backfill retries that conversation at the end of its queue and is not complete before it is read; a later sweep skips it; an active one waits for the next pass", async () => {
         const w = meterWorld();
         const old = { at: METER_NOW - 2 * HOUR };
 
@@ -2752,14 +2755,51 @@ describe("the subscription meter's step", () => {
         assert.deepEqual(deps.state.coverage, {
             since: METER_NOW - 8 * DAY,
             complete: false,
+            done: 1,
+            total: 3,
+        });
+        assert.deepEqual(deps.ledger.sweep?.queue, [3, 2], "the failed conversation goes last");
+
+        // It fails again: the backfill stays not complete.
+        await meterPass(deps, METER_NOW + PASS_MS);
+        assert.equal(ledgerSums(deps.state).entries, 2);
+        assert.deepEqual(deps.state.coverage, {
+            since: METER_NOW - 8 * DAY,
+            complete: false,
             done: 2,
             total: 3,
         });
+        assert.deepEqual(deps.ledger.sweep?.queue, [2]);
 
-        await meterPass(deps, METER_NOW + PASS_MS);
-        assert.equal(ledgerSums(deps.state).entries, 2);
-        assert.equal(deps.state.coverage.complete, true);
-        assert.equal(deps.ledger.high["2"], undefined, "the skipped conversation is not read");
+        w.failing.clear();
+        await meterPass(deps, METER_NOW + 2 * PASS_MS);
+        assert.equal(ledgerSums(deps.state).entries, 3);
+        assert.deepEqual(deps.state.coverage, {
+            since: METER_NOW - 8 * DAY,
+            complete: true,
+            done: 3,
+            total: 3,
+        });
+
+        // A later sweep (the 12th pass after the backfill started) skips a conversation whose read fails, and ends.
+        meterConversation(w, 4);
+        answerIn(w, 4, old);
+        w.failing.add(4);
+
+        for (let pass = 4; pass <= 13; pass += 1) {
+            await meterPass(deps, METER_NOW + (pass - 1) * PASS_MS);
+        }
+
+        assert.equal(deps.ledger.sweeps, 2);
+        assert.equal(deps.ledger.sweep, undefined, "the later sweep ended");
+        assert.equal(deps.ledger.high["4"], undefined, "the skipped conversation is not read");
+        assert.equal(ledgerSums(deps.state).entries, 3);
+        assert.deepEqual(deps.state.coverage, {
+            since: METER_NOW - 8 * DAY,
+            complete: true,
+            done: 3,
+            total: 3,
+        });
 
         // 2 active conversations: 3 fails, 1 is read.
         w.failing.clear();
@@ -2767,14 +2807,70 @@ describe("the subscription meter's step", () => {
         deps.ledger.active.add(1);
         deps.ledger.active.add(3);
         answerIn(w, 1, old);
-        await meterPass(deps, METER_NOW + 2 * PASS_MS);
-        assert.equal(ledgerSums(deps.state).entries, 3);
+        await meterPass(deps, METER_NOW + 13 * PASS_MS);
+        assert.equal(ledgerSums(deps.state).entries, 4);
         assert.equal(deps.ledger.active.has(3), true);
 
         w.failing.clear();
         answerIn(w, 3, old);
-        await meterPass(deps, METER_NOW + 3 * PASS_MS);
-        assert.equal(ledgerSums(deps.state).entries, 4);
+        await meterPass(deps, METER_NOW + 14 * PASS_MS);
+        assert.equal(ledgerSums(deps.state).entries, 5);
+    });
+
+    test("a backfill read that fails once, within a conversation's backfill: the coverage stays not complete, then completes in the next pass, and each answer counts once", async () => {
+        const w = meterWorld();
+        const old = { at: METER_NOW - 2 * HOUR };
+
+        meterConversation(w, 1);
+        answerIn(w, 1, old);
+        meterConversation(w, 2);
+
+        for (let index = 0; index < 250; index += 1) {
+            answerIn(w, 2, old);
+        }
+
+        meterConversation(w, 3);
+        answerIn(w, 3, old);
+
+        let armed = false;
+
+        // After the first page of conversation 2, its next read fails.
+        w.onRead = (kind, id) => {
+            if (kind === "entries" && id === 2 && !armed) {
+                armed = true;
+                w.failing.add(2);
+            }
+        };
+
+        const deps = meterDeps(w);
+
+        await meterPass(deps, METER_NOW);
+        assert.equal(ledgerSums(deps.state).entries, 201, "conversation 1, and 2's first page");
+        assert.deepEqual(
+            { ...deps.ledger.downs },
+            { 2: 51 },
+            "the backfill keeps its entry cursor",
+        );
+        assert.deepEqual(deps.state.coverage, {
+            since: METER_NOW - 8 * DAY,
+            complete: false,
+            done: 1,
+            total: 3,
+        });
+
+        w.failing.clear();
+        await meterPass(deps, METER_NOW + PASS_MS);
+        assert.equal(ledgerSums(deps.state).entries, 252);
+        assert.deepEqual({ ...deps.ledger.downs }, {});
+        assert.deepEqual(deps.state.coverage, {
+            since: METER_NOW - 8 * DAY,
+            complete: true,
+            done: 3,
+            total: 3,
+        });
+
+        await meterPass(deps, METER_NOW + 2 * PASS_MS);
+        assert.equal(ledgerSums(deps.state).entries, 252);
     });
 
     test("an abort during a ledger read throws, counts nothing, and the pass's GitHub part does not run", async () => {
@@ -2979,6 +3075,92 @@ describe("the subscription meter's step", () => {
         assert.equal(aborted.state.providers.anthropic?.lastAttempt, undefined);
     });
 
+    test("an abort of the pass during the token, the fetch or the JSON read throws fixed words: the token is in no message, text, stack or cause", async () => {
+        const leaks = (error: unknown): boolean => {
+            const err = error as Error & { cause?: unknown };
+
+            return [err.message, String(err), err.stack ?? "", String(err.cause ?? "")].some(
+                (text) => text.includes(FAKE_TOKEN),
+            );
+        };
+
+        /** A reader whose `step` aborts the pass, then throws an error that holds the token. */
+        const aborting = (step: "token" | "fetch" | "json") => {
+            const controller = new AbortController();
+
+            const boom = (): never => {
+                controller.abort();
+
+                throw new Error(`request failed with Bearer ${FAKE_TOKEN}`);
+            };
+
+            const reader = anthropicReader({
+                token: async () => (step === "token" ? boom() : FAKE_TOKEN),
+                fetch: (async () => {
+                    if (step === "fetch") {
+                        return boom();
+                    }
+
+                    const response = respond(200, "{}");
+
+                    // The body read aborts the pass, and fails with the token in its text.
+                    Object.defineProperty(response, "json", { value: async () => boom() });
+
+                    return response;
+                }) as unknown as typeof fetch,
+            });
+
+            return { controller, reader };
+        };
+
+        for (const step of ["token", "fetch", "json"] as const) {
+            const direct = aborting(step);
+            const thrown = await direct.reader("anthropic", direct.controller.signal).then(
+                () => assert.fail(`${step}: the read must throw`),
+                (error: unknown) => error,
+            );
+
+            assert.equal((thrown as Error).message, "the meter's read was aborted", step);
+            assert.equal((thrown as Error & { cause?: unknown }).cause, undefined, step);
+            assert.equal(leaks(thrown), false, step);
+
+            // Through the pass, and through collectPass: the same fixed words.
+            const viaPass = aborting(step);
+            const deps = meterDeps(meterWorld(), {
+                settings: METER_ON,
+                signal: viaPass.controller.signal,
+                readProvider: viaPass.reader,
+            });
+            const passError = await meterPass(deps, METER_NOW).then(
+                () => assert.fail(`${step}: the pass must throw`),
+                (error: unknown) => error,
+            );
+
+            assert.equal((passError as Error).message, "the meter's read was aborted", step);
+            assert.equal(leaks(passError), false, step);
+            assert.equal(deps.state.providers.anthropic?.lastAttempt, undefined, step);
+
+            const viaCollect = aborting(step);
+            const collectError = await collectPass({
+                readDesk: async () => deskOf([]),
+                readDashboard: async () => fresh(),
+                now: () => T0,
+                graphql: async () => assert.fail("no GitHub call after an abort"),
+                commit: async () => undefined,
+                signal: viaCollect.controller.signal,
+                meter: meterDeps(meterWorld(), {
+                    settings: METER_ON,
+                    readProvider: viaCollect.reader,
+                }),
+            }).then(
+                () => assert.fail(`${step}: collectPass must throw`),
+                (error: unknown) => error,
+            );
+
+            assert.equal(leaks(collectError), false, step);
+        }
+    });
+
     test("collectPass runs the meter step after the usage step and before GitHub; a throwing meter step leaves GitHub to run", async () => {
         const doc = fresh();
         const desk = deskOf([thread("T1", { prs: { "a/b#1": link() } })]);
@@ -3064,6 +3246,10 @@ const model = scriptedModel((request) => {
 
     if (text.endsWith("desk sync test")) {
         return call("desk", { action: "sync" });
+    }
+
+    if (text.endsWith("desk usage test")) {
+        return call("desk", { action: "usage" });
     }
 
     return answer(`echo: ${text.slice(0, 40)}`);
@@ -3523,6 +3709,173 @@ describe("the collector in Pocket", () => {
             delete holder().state;
             delete holder().ledger;
         }
+    });
+
+    test("a fake token is in no desk usage answer, no GET dashboard answer, no console line and no notice: a 401 that holds it, a fetch error that holds it, and the R4 answer", async () => {
+        const shared = globalThis as unknown as Record<symbol, unknown>;
+        const holder = () =>
+            (shared[Symbol.for("pi-pocket-team.desk.meter")] as MeterHolder | undefined) ?? {
+                version: 0,
+            };
+        const logged: string[] = [];
+        const methods = ["log", "info", "warn", "error", "debug"] as const;
+        const saved = methods.map((name) => console[name]);
+        let server: ReturnType<typeof createServer> | undefined;
+        /** What the fake fetch does at the next provider read. */
+        let answerNow: () => Promise<Response> = async () => respond(200, "{}");
+
+        /** Each notice of the app: the desk's `host.notice` reaches `app.notice`, and owner notices `app.ownerNotice`. */
+        const watchNotices = () => {
+            const target = app as unknown as {
+                notice: (level: string, message: string, id?: unknown) => void;
+                ownerNotice: (level: string, message: string) => void;
+            };
+            const notice = target.notice.bind(app);
+            const ownerNotice = target.ownerNotice.bind(app);
+
+            target.notice = (level, message, id) => {
+                logged.push(message);
+                notice(level, message, id);
+            };
+
+            target.ownerNotice = (level, message) => {
+                logged.push(message);
+                ownerNotice(level, message);
+            };
+        };
+
+        /** `GET dashboard` on a local server of the app now, with the owner's token. */
+        const getDashboard = async (): Promise<string> => {
+            if (server !== undefined) {
+                await new Promise<void>((resolve) => server?.close(() => resolve()));
+            }
+
+            server = createServer(
+                createHandler({ app, listen: { host: "127.0.0.1", port: 0 }, restart: () => {} }),
+            );
+            await new Promise<void>((resolve) => server!.listen(0, "127.0.0.1", resolve));
+
+            const response = await fetch(
+                `http://127.0.0.1:${String((server.address() as { port: number }).port)}/api/x/desk/dashboard`,
+                { headers: { authorization: `Bearer ${app.config.ownerToken}`, "x-pocket": "1" } },
+            );
+
+            assert.equal(response.status, 200);
+
+            return response.text();
+        };
+
+        for (const name of methods) {
+            console[name] = (...args: unknown[]) => {
+                logged.push(args.map(String).join(" "));
+            };
+        }
+
+        shared[METER_IO] = {
+            token: async () => FAKE_TOKEN,
+            fetch: async () => answerNow(),
+        };
+        writeFileSync(configPath, JSON.stringify({ digest: { minutes: 0 }, cap: 100, meter: {} }));
+
+        try {
+            const folder = join(root, "dashboard-meter-surface");
+
+            mkdirSync(folder, { recursive: true });
+
+            const source = await newSession(app, folder);
+
+            await command(source, "team-agent", "odrade");
+            watchNotices();
+            await stopKind(COLLECTOR_TASK);
+            await app.harness.commit(async (tx) => {
+                await ensureCollector(tx, Number(source), Collector, await collectorLive(tx));
+            }, context);
+            await until(
+                async () =>
+                    (await liveTasks(COLLECTOR_TASK)).some(
+                        (task) => task.record.state.status === "sleeping",
+                    ),
+                "the collector's first wait",
+            );
+
+            /** 1 real collector pass after a restart `by` ms later; then both surfaces, which must not hold the token. */
+            const step = async (by: number, attempt: string | true, expected: RegExp) => {
+                await restartApp(shift + by);
+                watchNotices();
+                await until(
+                    async () => {
+                        const last = holder().state?.providers.anthropic?.lastAttempt;
+
+                        return attempt === true ? last?.ok === true : last?.error === attempt;
+                    },
+                    `the provider read (${String(attempt)})`,
+                    20_000,
+                );
+                await say(app, source, "desk usage test");
+
+                const usage = (await modelTexts(app, source)).findLast((text) =>
+                    text.includes("Meter: provider read"),
+                );
+
+                assert(usage !== undefined, "desk usage answered");
+                assert.match(usage, expected);
+                assert.ok(!usage.includes(FAKE_TOKEN), "desk usage holds no token");
+
+                const dashboard = await getDashboard();
+
+                assert.match(dashboard, /"meter":\{/);
+                assert.ok(!dashboard.includes(FAKE_TOKEN), "GET dashboard holds no token");
+            };
+
+            // (a) A 401 whose body holds the token.
+            answerNow = async () => respond(401, `invalid bearer ${FAKE_TOKEN}`);
+            await step(
+                PASS_MS + 60_000,
+                "sign-in refused, 401",
+                /Anthropic: no provider report \(sign-in refused, 401\)/,
+            );
+
+            // (b) A fetch that throws with the token in its message: the next read is 30 minutes after the 401.
+            answerNow = async () => {
+                throw new Error(`connect ECONNRESET with Bearer ${FAKE_TOKEN}`);
+            };
+
+            await step(
+                31 * 60_000,
+                "network error",
+                /Anthropic: no provider report \(network error\)/,
+            );
+            // (c) The R4 answer.
+            answerNow = async () => respond(200, JSON.stringify(R4_BODY));
+            await step(
+                PASS_MS + 60_000,
+                true,
+                /Anthropic: week 95% used \(critical\), resets \w{3} \d{2}:\d{2} \(in \d+d \d+h\) · week, Fable 19%/,
+            );
+            assert.ok(
+                !JSON.stringify(holder().state).includes(FAKE_TOKEN),
+                "the meter's memory holds no token",
+            );
+        } finally {
+            methods.forEach((name, index) => {
+                console[name] = saved[index] as never;
+            });
+
+            if (server !== undefined) {
+                await new Promise<void>((resolve) => server?.close(() => resolve()));
+            }
+
+            await stopKind(COLLECTOR_TASK);
+            writeFileSync(configPath, JSON.stringify({ digest: { minutes: 0 }, cap: 100 }));
+            delete shared[METER_IO];
+            delete holder().state;
+            delete holder().ledger;
+        }
+
+        assert.deepEqual(
+            logged.filter((line) => line.includes(FAKE_TOKEN)),
+            [],
+        );
     });
 
     test("a dashboard document that cannot be read does not fail the sweep", async () => {
