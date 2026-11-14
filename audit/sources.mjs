@@ -943,7 +943,9 @@ const json = (text, fallback) => {
 
 const PR_QUERY = `state createdAt updatedAt mergedAt closedAt headRefName headRefOid url author { login }
     headRef { name }
-    commits(first: 50) { totalCount nodes { commit { oid statusCheckRollup { state } } } }`;
+    commits(first: 50) { totalCount nodes { commit { oid statusCheckRollup { state
+        contexts(first: 100) { totalCount nodes { __typename
+            ... on CheckRun { conclusion checkSuite { conclusion } } ... on StatusContext { state } } } } } } }`;
 
 /** The PRs by ref, 40 to a GraphQL query. A PR that GitHub did not return is null. */
 function graphqlPrs(gh, refs) {

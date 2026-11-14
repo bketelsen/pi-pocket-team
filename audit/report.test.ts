@@ -763,6 +763,25 @@ test("the H3 metrics line includes the split and preserves the old form without 
 
     assert.match(split, /21 with a failing commit \(12 red then fixed, 3 red at merge, 6 other\)/);
 
+    const cancelled = renderReport(
+        baseReport({
+            metrics: {
+                H3: {
+                    botPrs: 70,
+                    withAFailingCommit: 4,
+                    redThenFixed: 2,
+                    redAtMerge: 1,
+                    redOther: 1,
+                    cancelledOnly: 17,
+                    idle: 0,
+                },
+            },
+        }),
+    );
+
+    assert.match(cancelled, /1 other\), 17 cancelled only \(not counted\), 0 idle\./);
+    assert.doesNotMatch(split, /cancelled only/);
+
     const old = renderReport(
         baseReport({
             metrics: {

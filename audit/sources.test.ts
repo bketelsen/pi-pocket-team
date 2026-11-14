@@ -1083,6 +1083,16 @@ test("loadGithub: 1 search, 1 query per 40 PRs, check runs of each repair, 1 set
                 (args.find((arg) => arg.startsWith("query=")) ?? "").includes("headRefOid"),
         ),
     );
+    // H3 reads each check run's suite conclusion: a cancelled suite is no failure.
+    assert.ok(
+        fake.seen.some(
+            (args) =>
+                args[1] === "graphql" &&
+                /CheckRun \{ conclusion checkSuite \{ conclusion \} \}/.test(
+                    args.find((arg) => arg.startsWith("query=")) ?? "",
+                ),
+        ),
+    );
     assert.deepEqual(result.checkRuns["acme/w0@abc123"], [
         { name: "Build", conclusion: "failure" },
     ]);

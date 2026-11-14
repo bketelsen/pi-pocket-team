@@ -1452,29 +1452,73 @@ function headCommit(pr) {
     return null;
 }
 
+/** The check run conclusions that are a real failure. CANCELLED is not one: a newer push cancels the older run. */
+const FAILED_RUN = new Set(["FAILURE", "TIMED_OUT", "STARTUP_FAILURE", "ACTION_REQUIRED"]);
+/** The status context states that are a failure, and the rollup states that can hide one. */
+const FAILED_STATUS = new Set(["FAILURE", "ERROR"]);
+
 /**
- * H3: more than 20% of the bot PRs had a commit whose check rollup is FAILURE or ERROR (with 5 PRs or more), and
+ * True when a commit's checks really failed. GitHub's rollup says FAILURE for a commit whose runs a newer push
+ * cancelled (`concurrency: cancel-in-progress`), and an aggregate gate job (`if: always()`) over cancelled needs
+ * concludes FAILURE in a suite that concludes CANCELLED. So, when every context was read, a commit fails only when a
+ * check run concluded FAILURE, TIMED_OUT, STARTUP_FAILURE or ACTION_REQUIRED in a check suite that did not conclude
+ * CANCELLED, or a status context is FAILURE or ERROR. A rollup that is not FAILURE or ERROR never fails. With no
+ * contexts, or a list that GitHub cut (`totalCount` above the nodes), the rollup decides, as before.
+ */
+export function commitFailed(commit) {
+    const rollup = commit?.statusCheckRollup;
+
+    if (!FAILED_STATUS.has(rollup?.state)) {
+        return false;
+    }
+
+    const contexts = rollup.contexts;
+    const nodes = Array.isArray(contexts?.nodes) ? contexts.nodes : null;
+
+    if (
+        nodes === null ||
+        typeof contexts.totalCount !== "number" ||
+        contexts.totalCount > nodes.length
+    ) {
+        return true;
+    }
+
+    return nodes.some((node) =>
+        node?.__typename === "CheckRun"
+            ? FAILED_RUN.has(node.conclusion) && node.checkSuite?.conclusion !== "CANCELLED"
+            : node?.__typename === "StatusContext" && FAILED_STATUS.has(node.state),
+    );
+}
+
+/**
+ * H3: more than 20% of the bot PRs had a commit whose checks really failed (`commitFailed`; with 5 PRs or more), and
  * open bot PRs with no update for 48 h. The metrics split the PRs with a failing commit (measurement only): red then
- * fixed (merged, green head), red at merge (merged, failing head), and other (not merged, or head unknown or pending).
+ * fixed (merged, green head), red at merge (merged, failing head), and other (not merged, or head unknown, pending or
+ * only cancelled). `cancelledOnly` counts the PRs whose rollup said FAILURE or ERROR on a commit with no real failure.
  */
 export function checkH3(data, ctx) {
     const prs = botList(data);
     const states = {};
     const red = prs.filter(({ pr }) =>
-        (pr.commits?.nodes ?? []).some((node) =>
-            ["FAILURE", "ERROR"].includes(node.commit?.statusCheckRollup?.state),
-        ),
+        (pr.commits?.nodes ?? []).some((node) => commitFailed(node.commit)),
     );
+    const cancelledOnly = prs.filter(
+        ({ pr }) =>
+            !red.some((one) => one.pr === pr) &&
+            (pr.commits?.nodes ?? []).some((node) =>
+                FAILED_STATUS.has(node.commit?.statusCheckRollup?.state),
+            ),
+    ).length;
     let redThenFixed = 0;
     let redAtMerge = 0;
     let redOther = 0;
     const redAtMergePrs = [];
 
     for (const { ref, pr } of red) {
-        const headState =
-            pr.state === "MERGED" ? headCommit(pr)?.commit?.statusCheckRollup?.state : undefined;
+        const head = pr.state === "MERGED" ? headCommit(pr)?.commit : undefined;
+        const headState = head?.statusCheckRollup?.state;
 
-        if (headState === "FAILURE" || headState === "ERROR") {
+        if (head && commitFailed(head)) {
             redAtMerge += 1;
             redAtMergePrs.push(ref);
         } else if (headState === "SUCCESS") {
@@ -1533,6 +1577,7 @@ export function checkH3(data, ctx) {
             redAtMerge,
             redOther,
             redAtMergePrs,
+            cancelledOnly,
             failingRate: Math.round(rate * 100) / 100,
             idle: idle.length,
         },
