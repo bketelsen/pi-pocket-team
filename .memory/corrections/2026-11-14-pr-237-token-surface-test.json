@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-14",
+  "scope": "desk-dashboard.test.ts",
+  "correction": "no test ran the real collector path with a fake token and then checked every place the meter shows: desk usage, GET dashboard, console output and notices; 1 Pocket test now runs a 401 and a fetch error that hold the token, and the R4 answer, and checks all 4",
+  "evidence": "bketelsen/pi-pocket-team#237, cross-review by openai/gpt-6.1-sol at head 936964b",
+  "promoted_to": "desk-dashboard.test.ts: a fake token is in no desk usage answer, no GET dashboard answer, no console line and no notice: a 401 that holds it, a fetch error that holds it, and the R4 answer"
+}

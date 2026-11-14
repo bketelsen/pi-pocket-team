@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-14",
+  "scope": "desk.ts",
+  "correction": "the meter's token read asked isUsingOAuth, which reads only the model runtime's snapshot, empty after ModelRuntime.create with refreshOnCreate false, so a real OAuth sign-in always read as not a subscription; meterTokenFrom asks checkAuth for the sign-in's type, then getAuth for the token, with the signal on both",
+  "evidence": "bketelsen/pi-pocket-team#237, cross-review by openai/gpt-6.1-sol at head 936964b",
+  "promoted_to": "desk-board.test.ts: meterTokenFrom: the token only for an OAuth sign-in, by checkAuth (not the empty snapshot of isUsingOAuth); the signal goes to both calls"
+}

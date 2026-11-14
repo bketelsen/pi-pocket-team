@@ -76,6 +76,10 @@ import {
     repoChoices,
     sortRows,
     MAX_RECORDS,
+    meterCard,
+    meterGrantsText,
+    meterLedgerText,
+    meterRows,
     PARTIAL_MARK,
     prEventsText,
     prUrl,
@@ -3908,4 +3912,172 @@ test("Board: a failed read of another supervisor's board puts the selection back
     // An act goes to the board that the select and the screen both name.
     void ctl.launch();
     assert.deepEqual(calls.at(-1).slice(0, 2), ["POST", "board/7"]);
+});
+
+// ─── The Subscriptions card (plan T1747, S4) ────────────────────────────────
+
+const METER_AT = Date.UTC(2026, 10, 14, 2, 56);
+const LEDGER = {
+    lastHour: 70,
+    today: 228,
+    days7: 2263,
+    partial: true,
+    top: [{ model: "claude-opus-5-5", cost: 2263 }],
+};
+const METER_LINE =
+    "Anthropic: week 95% used (critical), resets Wed 11:00 (in 4d 13h) · week, Fable 19%";
+
+/** 1 Anthropic row of the dashboard's `meter` field, with its main window in `state`. */
+const anthropicRow = (state, patch = {}) => ({
+    provider: "anthropic",
+    label: "Anthropic",
+    line: METER_LINE,
+    readAt: METER_AT,
+    lastAttempt: { at: METER_AT, ok: true },
+    mainWindowId: "weekly_all",
+    windows: [
+        {
+            id: "weekly_all",
+            label: "week",
+            scoped: false,
+            state,
+            ...(state === "awaiting" ? {} : { percent: 95 }),
+            active: true,
+        },
+        {
+            id: "weekly_scoped:Fable",
+            label: "week, Fable",
+            scoped: true,
+            state: "fresh",
+            percent: 19,
+            active: false,
+        },
+    ],
+    ledger: LEDGER,
+    ...patch,
+});
+const OPENAI_ROW = {
+    provider: "openai",
+    label: "OpenAI",
+    line: "OpenAI: no provider report (Pi's ChatGPT sign-in has no usage endpoint)",
+    windows: [],
+    ledger: { lastHour: 0, today: 0, days7: 0, partial: false, top: [] },
+};
+const meterOf = (...providers) => ({
+    at: METER_AT,
+    providers,
+    coverage: { complete: true, done: 3, total: 3 },
+});
+
+test("meterRows: fresh gets a gauge; stale, awaiting and none get their text in its place", () => {
+    const stale = anthropicRow("stale", {
+        readAt: METER_AT - 25 * 60_000,
+        line: "Anthropic: week 95% used (read 25 min ago; last attempt: HTTP 429), resets Wed 11:00 (in 4d 13h)",
+    });
+    const awaiting = anthropicRow("awaiting", {
+        line: "Anthropic: week: reset passed, awaiting provider report · reset seen 03:10",
+    });
+
+    assert.deepEqual(meterRows(undefined), []);
+    assert.deepEqual(meterRows({ at: 1 }), []);
+    assert.deepEqual(meterRows(meterOf(anthropicRow("fresh"), OPENAI_ROW)), [
+        {
+            provider: "anthropic",
+            label: "Anthropic",
+            line: METER_LINE,
+            grants: null,
+            ledger: "list price: $70 last hour, $228 today, $2,263 in 7 days (partial); top: claude-opus-5-5 $2,263",
+            state: "fresh",
+            gauge: { percent: 95, label: "95% of the week used" },
+            status: null,
+        },
+        {
+            provider: "openai",
+            label: "OpenAI",
+            line: null,
+            grants: null,
+            ledger: "list price: $0 last hour, $0 today, $0 in 7 days",
+            state: "none",
+            gauge: null,
+            status: "no provider report (Pi's ChatGPT sign-in has no usage endpoint)",
+        },
+    ]);
+
+    const [staleRow] = meterRows(meterOf(stale));
+
+    assert.equal(staleRow.state, "stale");
+    assert.equal(staleRow.gauge, null);
+    assert.equal(staleRow.status, "week 95% used, read 25 min ago");
+    assert.equal(staleRow.line, stale.line);
+
+    const [awaitingRow] = meterRows(meterOf(awaiting));
+
+    assert.equal(awaitingRow.state, "awaiting");
+    assert.equal(awaitingRow.gauge, null);
+    assert.equal(awaitingRow.status, "reset passed, awaiting provider report");
+});
+
+test("meterGrantsText and meterLedgerText: the grants by label with their first expiry, the note, and the ledger", () => {
+    assert.equal(
+        meterGrantsText(
+            {
+                grants: [
+                    {
+                        label: "Weekly",
+                        resetsLeft: 1,
+                        endsAt: METER_AT + 26 * 86400_000 + 5 * 3600_000,
+                    },
+                    { label: "Weekly", resetsLeft: 1, endsAt: METER_AT + 30 * 86400_000 },
+                    { label: "Fable", resetsLeft: 2, endsAt: METER_AT + 3 * 3600_000 },
+                    { label: "Session", resetsLeft: 1 },
+                ],
+            },
+            METER_AT,
+        ),
+        "resets granted: Weekly ×2 (first expires in 26d) · Fable ×2 (first expires in 3h) · Session ×1",
+    );
+    assert.equal(
+        meterGrantsText({ grantsNote: "not readable (surface)" }, METER_AT),
+        "grants: not readable (surface)",
+    );
+    assert.equal(meterGrantsText({}, METER_AT), null);
+    assert.equal(
+        meterLedgerText({ ...LEDGER, partial: false, unknownCost: 3 }),
+        "list price: $70 last hour, $228 today, $2,263 in 7 days; top: claude-opus-5-5 $2,263; 3 answers with no cost",
+    );
+    assert.equal(meterLedgerText(undefined), null);
+});
+
+test("the Subscriptions card: a gauge with its label for fresh, the state text for stale, awaiting and none", () => {
+    const out = meterCard(
+        html,
+        meterOf(
+            anthropicRow("fresh", { grantsNote: "not readable (surface)" }),
+            anthropicRow("stale", { provider: "stale", readAt: METER_AT - 25 * 60_000 }),
+            anthropicRow("awaiting", { provider: "awaiting" }),
+            OPENAI_ROW,
+        ),
+    ).replace(/\s+/g, " ");
+
+    assert.match(out, /<h3 id="dash-meter">Subscriptions<\/h3>/);
+    assert.match(
+        out,
+        /data-provider=anthropic data-state=fresh> <strong class="dash-meter-label">Anthropic<\/strong> <span class="dash-meter-gauge" ><meter min="0" max="100" value=95 aria-label=95% of the week used>95%<\/meter ><span>95% of the week used<\/span><\/span >/,
+    );
+    assert.ok(out.includes(`<span class="small dash-meter-line">${METER_LINE}</span>`));
+    assert.ok(out.includes('<span class="small">grants: not readable (surface)</span>'));
+    assert.match(
+        out,
+        /data-provider=stale data-state=stale> .*?<span class="dash-meter-state">week 95% used, read 25 min ago<\/span>/,
+    );
+    assert.match(
+        out,
+        /data-provider=awaiting data-state=awaiting> .*?<span class="dash-meter-state">reset passed, awaiting provider report<\/span>/,
+    );
+    assert.match(
+        out,
+        /data-provider=openai data-state=none> <strong class="dash-meter-label">OpenAI<\/strong> <span class="dash-meter-state">no provider report \(Pi's ChatGPT sign-in has no usage endpoint\)<\/span> <span class="small muted">list price: \$0 last hour, \$0 today, \$0 in 7 days<\/span>/,
+    );
+    assert.equal((out.match(/<meter /g) ?? []).length, 1, "only the fresh row has a gauge");
+    assert.match(out, /Account-wide: the filters do not apply\./);
 });

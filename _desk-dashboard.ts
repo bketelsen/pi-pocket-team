@@ -3,7 +3,9 @@
  * `x.desk.dashboard`. A collector task reads `x.desk.threads` (it never writes it), reads GitHub for the tracked refs
  * that are due, at most `MAX_REF_READS` in 1 query, and then writes what changed in 1 commit. It sleeps `PASS_MS`
  * between passes. Before the GitHub call, a pass runs the usage step of `_desk-usage.ts` (`x.desk.usage`): its own
- * small commits, which never write `x.desk.dashboard`.
+ * small commits, which never write `x.desk.dashboard`. Then, when the desk turns it on, it runs the subscription
+ * meter's step (`meterPass`, plan T1747): the provider read and the ledger reads, in commits that only read; the meter
+ * keeps what it learns in the desk's memory, not in a document.
  *
  * Pocket does not load this file as a module: the `_` prefix keeps it out. `desk.ts` imports it, and gives it what it
  * needs at run time (the threads' document token, the `gh` path), so this file never imports `desk.ts` at run time.
@@ -14,16 +16,21 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import {
+    AssistantEntry,
     defineDoc,
     defineTask,
     UsageDoc,
     type ConversationId,
+    type Cursor,
+    type EntryId,
+    type EntryRecord,
     type SessionDocToken,
     type TaskId,
     type Tx,
 } from "@earendil-works/pi-durable";
 import type { CloseOutcome, DeskState, PrLink, Thread } from "./desk.ts";
 import type * as UsageModule from "./_desk-usage.ts";
+import type * as MeterModule from "./_desk-meter.ts";
 
 /**
  * The usage helper, loaded fresh with each load of this module, as `desk.ts` loads this one: Pocket does not reload a
@@ -40,6 +47,10 @@ const usage = (await import(
  */
 export const same = usage.same;
 const { copy, put, record } = usage;
+/** The subscription meter's pure rules (`_desk-meter.ts`, plan T1747), loaded the same way. */
+const meterRules = (await import(
+    new URL(`./_desk-meter.ts${new URL(import.meta.url).search}`, import.meta.url).href
+)) as typeof MeterModule;
 
 // ─── Limits ──────────────────────────────────────────────────────────────────
 
@@ -1889,6 +1900,753 @@ export function applyReadFailure(draft: DashboardState, error: string, now: numb
     }
 }
 
+// ─── The subscription meter ──────────────────────────────────────────────────
+
+/** The most table reads in 1 meter read commit: the commit holds the session's line only briefly. */
+export const METER_READS = 25;
+/** The most time (by the pass's clock) that 1 pass spends on the meter's sweep of all conversations. */
+export const METER_SWEEP_MS = 20_000;
+/** A new sweep starts at this pass after the last sweep started (about 1 hour), once the last one ended. */
+export const METER_SWEEP_PASSES = 12;
+/** A gap of the backfill is retried until it failed this many times; a later sweep or an active read can still clear it. */
+export const METER_GAP_TRIES = 3;
+/** A conversation with an own answer this recent is active: each pass reads it. */
+export const METER_RECENT_MS = 60 * 60_000;
+/** How far back the backfill of a conversation reads: 8 days. */
+export const METER_BACKFILL_MS = 8 * 24 * 3600_000;
+/** Conversations in 1 page of the sweep. */
+export const METER_CONVERSATION_PAGE = 100;
+/** Entries in 1 page of a conversation. */
+export const METER_ENTRY_PAGE = 200;
+/** The provider read's own time limit. */
+export const METER_READ_MS = 15_000;
+/** Anthropic's usage endpoint, with the granted resets (`cedar_ember`) and no spend block (plan D1, R8). */
+export const ANTHROPIC_USAGE_URL =
+    "https://api.anthropic.com/api/oauth/usage?cedar_ember=1&skip_spend=1";
+
+/** What an abort of the pass throws from a provider read: fixed words, never the reader's own exception. */
+export const METER_ABORTED = "the meter's read was aborted";
+
+const meterAborted = (): Error => new Error(METER_ABORTED);
+
+/** The table reads of the meter's ledger: only scans, in a commit that writes nothing. */
+export type MeterTx = Pick<Tx, "scanConversations" | "scanEntries">;
+
+/** What 1 provider read gives: a reading, or why it failed (`status`: the HTTP status, when there was one). */
+export type MeterReadResult = MeterModule.ProviderReading | { error: string; status?: number };
+
+/** The sweep of all conversations that is in progress. */
+export type MeterSweep = {
+    /** The first sweep is the backfill: it fills `coverage` and makes it complete at its end. */
+    backfill: boolean;
+    /** The `scanConversations` cursor of the next page; absent before the first page. */
+    cursor?: Cursor;
+    /** True when the last listed page had no next page. */
+    listed: boolean;
+    /** The listed conversations that the sweep has not read yet, in order. */
+    queue: number[];
+};
+
+/**
+ * Where the ledger's reads are, in memory (plan D6). Its dictionaries have no prototype: their keys are conversation
+ * ids. Only `meterPass` and the desk's `run.started` and `run.ended` listeners change it.
+ */
+export type MeterLedger = {
+    /**
+     * By conversation: the newest entry id seen in it, its own or inherited, so a fork's inherited range is never read
+     * again. 0 for a conversation that had no entry. Absent: not read yet (the backfill rule).
+     */
+    high: Record<string, number>;
+    /**
+     * By conversation: the descending backfill in progress, as the highest entry id that its next page reads (the
+     * entry cursor). Absent when the conversation has no backfill in progress.
+     */
+    downs: Record<string, number>;
+    /** By conversation: the time of its newest own answer (`pi.assistant`) that a read counted. */
+    recentAt: Record<string, number>;
+    /** The sweep in progress; absent between sweeps. */
+    sweep?: MeterSweep;
+    /** The sweeps started. */
+    sweeps: number;
+    /** The ledger passes made. */
+    passes: number;
+    /** The pass number (`passes`) at which the last sweep started. */
+    sweepStartedPass?: number;
+    /** The conversations with a run (`run.started`). */
+    active: Set<number>;
+    /** By conversation: when its run ended (`run.ended`). It leaves `active` at its first read that starts later. */
+    ended: Map<number, number>;
+    /**
+     * By conversation: the failed reads of a conversation that the backfill sweep could not read (a gap in the
+     * coverage). Each pass retries the lowest one with fewer than `METER_GAP_TRIES` failures. Any read that finishes it
+     * with success removes it.
+     */
+    gaps: Record<string, number>;
+    /** True when the backfill sweep listed and visited every conversation. */
+    backfillDone: boolean;
+};
+
+export function emptyMeterLedger(): MeterLedger {
+    return {
+        high: Object.create(null) as Record<string, number>,
+        downs: Object.create(null) as Record<string, number>,
+        recentAt: Object.create(null) as Record<string, number>,
+        sweeps: 0,
+        passes: 0,
+        active: new Set(),
+        ended: new Map(),
+        gaps: Object.create(null) as Record<string, number>,
+        backfillDone: false,
+    };
+}
+
+/** What the meter step needs: its memory, its settings, the provider reader, and the read commits. */
+export type MeterDeps = {
+    state: MeterModule.MeterState;
+    ledger: MeterLedger;
+    settings: MeterModule.MeterSettings;
+    /** 1 provider read. It throws only when `signal` aborted it. */
+    readProvider: (provider: "anthropic", signal: AbortSignal) => Promise<MeterReadResult>;
+    /** 1 commit that only reads: no write. Each call makes at most `METER_READS` table reads. */
+    read: <T>(fn: (tx: MeterTx) => Promise<T>) => Promise<T>;
+    /** The clock of the sweep's budget; the pass's `now` when absent. */
+    now?: () => number;
+    signal?: AbortSignal;
+};
+
+/** 1 own answer of `id` as a ledger entry, or undefined: another conversation's entry, another kind, or not valid. */
+function ledgerUsage(
+    entry: Readonly<EntryRecord>,
+    id: number,
+): MeterModule.LedgerUsage | undefined {
+    if (entry.conversationId !== id || entry.kind !== AssistantEntry.kind) {
+        return undefined;
+    }
+
+    const reading = usage.entryUsage(entry);
+
+    if (reading === undefined) {
+        return undefined;
+    }
+
+    const split = reading.key.indexOf("/");
+    const found: MeterModule.LedgerUsage = {
+        provider: reading.key.slice(0, split),
+        model: reading.key.slice(split + 1),
+        input: reading.input,
+        output: reading.output,
+        cacheRead: reading.cacheRead,
+        cacheWrite: reading.cacheWrite,
+    };
+
+    if (reading.at !== undefined) {
+        found.timestamp = reading.at;
+    }
+
+    if (reading.cost !== undefined) {
+        found.cost = reading.cost;
+    }
+
+    return found;
+}
+
+/** The planning part of the ledger that 1 read commit moves: copied for each try of the commit. */
+type MeterPlan = {
+    high: Record<string, number>;
+    downs: Record<string, number>;
+    /** The active conversations still to read in this pass, head first. */
+    incremental: number[];
+    /** By conversation: when this pass started to read it (for the `ended` rule). */
+    started: Record<string, number>;
+    /** The gap that this pass retries, until it is finished. */
+    retry?: number;
+    sweep?: MeterSweep;
+};
+
+/** What 1 read commit found: applied to the meter's memory only after the commit. */
+type MeterFound = {
+    plan: MeterPlan;
+    usages: MeterModule.LedgerUsage[];
+    recent: Record<string, number>;
+    /** Conversations of `incremental` that this commit finished. */
+    finished: number[];
+    /** The gap that this commit retried and finished. */
+    retried?: number;
+    /** Conversations that the sweep finished in this commit. */
+    swept: number[];
+    /** Conversations that the sweep listed in this commit. */
+    listed: number;
+};
+
+const dictOf = (from: Record<string, number>): Record<string, number> =>
+    Object.assign(Object.create(null) as Record<string, number>, from);
+
+function planOf(
+    ledger: MeterLedger,
+    incremental: number[],
+    started: Record<string, number>,
+    retry: number | undefined,
+): MeterPlan {
+    const plan: MeterPlan = {
+        high: dictOf(ledger.high),
+        downs: dictOf(ledger.downs),
+        incremental: [...incremental],
+        started: dictOf(started),
+        ...(retry === undefined ? {} : { retry }),
+    };
+
+    if (ledger.sweep !== undefined) {
+        plan.sweep = { ...ledger.sweep, queue: [...ledger.sweep.queue] };
+    }
+
+    return plan;
+}
+
+/**
+ * Read 1 page of 1 conversation, and move the plan. A backfill in progress goes on downwards; a conversation with no
+ * `high` starts its backfill (descending, from its newest entry); else it reads upwards from `high + 1`. The backfill
+ * counts own answers until the first inherited entry or the first own answer older than 8 days. True when the
+ * conversation is finished for this visit.
+ */
+async function readPage(
+    tx: MeterTx,
+    plan: MeterPlan,
+    found: MeterFound,
+    id: number,
+    now: number,
+): Promise<boolean> {
+    const key = String(id);
+
+    const count = (own: MeterModule.LedgerUsage | undefined): void => {
+        if (own === undefined) {
+            return;
+        }
+
+        if (own.timestamp !== undefined) {
+            found.recent[key] = Math.max(found.recent[key] ?? 0, own.timestamp);
+        }
+
+        found.usages.push(own);
+    };
+
+    const down = plan.downs[key];
+
+    if (down !== undefined || plan.high[key] === undefined) {
+        const page = await tx.scanEntries(
+            {
+                conversationId: id as ConversationId,
+                order: "descending",
+                ...(down === undefined ? {} : { maxEntryId: down as EntryId }),
+            },
+            METER_ENTRY_PAGE,
+        );
+
+        if (down === undefined) {
+            plan.high[key] = page.items[0]?.id ?? 0;
+        }
+
+        let stop = false;
+
+        for (const entry of page.items) {
+            // An inherited entry: the parent counts it. Older entries are inherited too.
+            if (entry.conversationId !== id) {
+                stop = true;
+                break;
+            }
+
+            const own = ledgerUsage(entry, id);
+
+            if (own?.timestamp !== undefined && own.timestamp < now - METER_BACKFILL_MS) {
+                stop = true;
+                break;
+            }
+
+            count(own);
+        }
+
+        const last = page.items[page.items.length - 1];
+
+        if (!stop && page.next !== undefined && last !== undefined && last.id > 1) {
+            plan.downs[key] = last.id - 1;
+
+            return false;
+        }
+
+        delete plan.downs[key];
+
+        return true;
+    }
+
+    const page = await tx.scanEntries(
+        {
+            conversationId: id as ConversationId,
+            minEntryId: ((plan.high[key] ?? 0) + 1) as EntryId,
+            order: "ascending",
+        },
+        METER_ENTRY_PAGE,
+    );
+
+    for (const entry of page.items) {
+        count(ledgerUsage(entry, id));
+    }
+
+    const last = page.items[page.items.length - 1];
+
+    if (last !== undefined) {
+        plan.high[key] = Math.max(plan.high[key] ?? 0, last.id);
+    }
+
+    return page.next === undefined || last === undefined;
+}
+
+/**
+ * The ledger part of 1 meter pass (plan D6). First the active conversations (each `run.started` conversation, and
+ * each with an own answer in the last 60 minutes), each read to its end. Then at most 1 gap of the backfill (the lowest
+ * id with fewer than `METER_GAP_TRIES` failures), read to its end. Then the sweep of all conversations, at most
+ * `METER_SWEEP_MS` by the pass's clock, checked before each page; the next pass goes on from its cursor, and a
+ * conversation's backfill keeps its entry cursor in `downs`. A failed read of an active conversation or of the gap
+ * waits for the next pass, and the others go on. A failed read in the sweep ends the step for this pass, and the sweep
+ * goes on without that conversation: the backfill sweep keeps it as a gap; a later sweep skips it (it has its `high`
+ * or its cursor from the backfill, so its next read catches up with no loss). The coverage is complete only when the
+ * backfill sweep ended and no gap is left.
+ */
+async function ledgerStep(deps: MeterDeps, now: number, signal: AbortSignal): Promise<void> {
+    const { ledger, state } = deps;
+    const clock = deps.now ?? (() => now);
+
+    ledger.passes += 1;
+
+    for (const [key, at] of Object.entries(ledger.recentAt)) {
+        if (at < now - METER_RECENT_MS) {
+            delete ledger.recentAt[key];
+        }
+    }
+
+    for (const id of [...ledger.ended.keys()]) {
+        if (!ledger.active.has(id)) {
+            ledger.ended.delete(id);
+        }
+    }
+
+    const incremental = [
+        ...new Set([...ledger.active, ...Object.keys(ledger.recentAt).map(Number)]),
+    ].sort((a, b) => a - b);
+
+    if (
+        ledger.sweep === undefined &&
+        (ledger.sweepStartedPass === undefined ||
+            ledger.passes - ledger.sweepStartedPass >= METER_SWEEP_PASSES)
+    ) {
+        const backfill = ledger.sweeps === 0;
+
+        ledger.sweep = { backfill, listed: false, queue: [] };
+        ledger.sweeps += 1;
+        ledger.sweepStartedPass = ledger.passes;
+
+        if (backfill) {
+            state.coverage = { since: now - METER_BACKFILL_MS, complete: false, done: 0, total: 0 };
+        }
+    }
+
+    let started: Record<string, number> = Object.create(null) as Record<string, number>;
+    let deadline: number | undefined;
+    let left = incremental;
+    // The gap to retry in this pass: the lowest id with fewer than `METER_GAP_TRIES` failures, and not active (an
+    // active read clears it too).
+    let retry: number | undefined = Object.entries(ledger.gaps)
+        .filter(([key, tries]) => tries < METER_GAP_TRIES && !left.includes(Number(key)))
+        .map(([key]) => Number(key))
+        .sort((a, b) => a - b)[0];
+
+    /** A conversation that a read finished with success: a gap goes, and it counts in the coverage once. */
+    const succeeded = (id: number, backfillSweep: boolean): void => {
+        const key = String(id);
+
+        if (ledger.gaps[key] !== undefined) {
+            delete ledger.gaps[key];
+            state.coverage.done += 1;
+        } else if (backfillSweep) {
+            state.coverage.done += 1;
+        }
+    };
+
+    /** Apply what 1 read commit found: its reads are of committed states, also when a later read of it failed. */
+    const apply = (found: MeterFound): void => {
+        const plan = found.plan;
+        const backfillSweep = ledger.sweep?.backfill === true;
+
+        ledger.high = plan.high;
+        ledger.downs = plan.downs;
+        left = plan.incremental;
+        started = plan.started;
+        retry = plan.retry;
+
+        if (plan.sweep !== undefined) {
+            ledger.sweep = plan.sweep;
+        }
+
+        for (const own of found.usages) {
+            meterRules.addLedger(state, own);
+        }
+
+        for (const [key, at] of Object.entries(found.recent)) {
+            if (at >= now - METER_RECENT_MS) {
+                ledger.recentAt[key] = Math.max(ledger.recentAt[key] ?? 0, at);
+            }
+        }
+
+        for (const id of found.finished) {
+            const end = ledger.ended.get(id);
+            const begun = started[String(id)];
+
+            // A run that ended before this read started: its conversation leaves the active set.
+            if (end !== undefined && begun !== undefined && begun > end) {
+                ledger.active.delete(id);
+                ledger.ended.delete(id);
+            }
+
+            succeeded(id, false);
+        }
+
+        if (found.retried !== undefined) {
+            succeeded(found.retried, false);
+        }
+
+        for (const id of found.swept) {
+            succeeded(id, backfillSweep);
+        }
+
+        if (backfillSweep) {
+            state.coverage.total += found.listed;
+        }
+    };
+
+    /**
+     * A sweep that listed and visited every conversation ends. The coverage is complete only when the backfill sweep
+     * ended and no gap is left: it is set again here, so the last gap's success makes it complete.
+     */
+    const settle = (): void => {
+        const sweep = ledger.sweep;
+
+        if (sweep !== undefined && sweep.listed && sweep.queue.length === 0) {
+            if (sweep.backfill) {
+                ledger.backfillDone = true;
+            }
+
+            delete ledger.sweep;
+        }
+
+        state.coverage.complete = ledger.backfillDone && Object.keys(ledger.gaps).length === 0;
+    };
+
+    for (;;) {
+        signal.throwIfAborted();
+
+        /** What the commit found so far, and what it reads now: a failure keeps the first, and skips the second. */
+        let partial: MeterFound | undefined;
+        let reading: { kind: "active" | "retry" | "sweep"; id?: number } | undefined;
+
+        try {
+            const found = await deps.read(async (tx) => {
+                const result: MeterFound = {
+                    plan: planOf(ledger, left, started, retry),
+                    usages: [],
+                    recent: Object.create(null) as Record<string, number>,
+                    finished: [],
+                    swept: [],
+                    listed: 0,
+                };
+                const plan = result.plan;
+
+                partial = result;
+                reading = undefined;
+
+                for (let reads = 0; reads < METER_READS; reads += 1) {
+                    signal.throwIfAborted();
+
+                    const head = plan.incremental[0];
+
+                    if (head !== undefined) {
+                        reading = { kind: "active", id: head };
+                        plan.started[String(head)] ??= clock();
+
+                        if (await readPage(tx, plan, result, head, now)) {
+                            plan.incremental.shift();
+                            result.finished.push(head);
+                        }
+
+                        continue;
+                    }
+
+                    if (plan.retry !== undefined) {
+                        const gap = plan.retry;
+
+                        reading = { kind: "retry", id: gap };
+
+                        if (await readPage(tx, plan, result, gap, now)) {
+                            delete plan.retry;
+                            result.retried = gap;
+                        }
+
+                        continue;
+                    }
+
+                    const sweep = plan.sweep;
+
+                    if (sweep === undefined || (sweep.queue.length === 0 && sweep.listed)) {
+                        break;
+                    }
+
+                    deadline ??= clock() + METER_SWEEP_MS;
+
+                    if (clock() >= deadline) {
+                        break;
+                    }
+
+                    const id = sweep.queue[0];
+
+                    if (id === undefined) {
+                        reading = { kind: "sweep" };
+
+                        const page = await tx.scanConversations(
+                            { order: "ascending" },
+                            METER_CONVERSATION_PAGE,
+                            sweep.cursor,
+                        );
+
+                        sweep.queue.push(...page.items.map((item) => Number(item.id)));
+                        sweep.listed = page.next === undefined;
+
+                        if (page.next === undefined) {
+                            delete sweep.cursor;
+                        } else {
+                            sweep.cursor = page.next;
+                        }
+
+                        result.listed += page.items.length;
+                        continue;
+                    }
+
+                    reading = { kind: "sweep", id };
+
+                    if (await readPage(tx, plan, result, id, now)) {
+                        sweep.queue.shift();
+                        result.swept.push(id);
+                    }
+                }
+
+                reading = undefined;
+
+                return result;
+            });
+
+            // An abort of the pass ends the step at once.
+            signal.throwIfAborted();
+            apply(found);
+        } catch (error) {
+            // A ledger read is a storage scan: the provider reader is not in it, so its error holds no token.
+            if (signal.aborted) {
+                throw error;
+            }
+
+            const failed = reading as
+                { kind: "active" | "retry" | "sweep"; id?: number } | undefined;
+            const kept = partial as MeterFound | undefined;
+
+            if (kept !== undefined) {
+                apply(kept);
+            }
+
+            // An active conversation whose read fails waits for the next pass; the others go on.
+            if (failed?.kind === "active" && failed.id !== undefined) {
+                const id = failed.id;
+
+                left = left.filter((each) => each !== id);
+                continue;
+            }
+
+            // The retried gap fails once more: it waits for the next pass (until its tries are spent); the sweep goes on.
+            if (failed?.kind === "retry" && failed.id !== undefined) {
+                const key = String(failed.id);
+
+                ledger.gaps[key] = (ledger.gaps[key] ?? 0) + 1;
+                retry = undefined;
+                continue;
+            }
+
+            // A sweep read fails: the step ends for this pass, and the sweep goes on without that conversation, so every
+            // later page is still listed and the sweep can end. Its backfill cursor (`downs`) stays. The backfill sweep
+            // keeps it as a gap (not done, retried, and the coverage stays not complete). A later sweep skips it with no
+            // loss: it has its `high` or its cursor from the backfill, or it is a gap, or it is newer than the backfill
+            // and its next read (when it is active, or in the next sweep, about 1 hour later) reads its 8 days.
+            const sweep = ledger.sweep;
+
+            if (
+                failed?.kind === "sweep" &&
+                failed.id !== undefined &&
+                sweep !== undefined &&
+                sweep.queue[0] === failed.id
+            ) {
+                sweep.queue.shift();
+
+                if (sweep.backfill) {
+                    const key = String(failed.id);
+
+                    ledger.gaps[key] = (ledger.gaps[key] ?? 0) + 1;
+                }
+            }
+
+            settle();
+
+            return;
+        }
+
+        settle();
+
+        // Done: nothing left to read, or the sweep's time is over.
+        if (
+            left.length === 0 &&
+            retry === undefined &&
+            (ledger.sweep === undefined || (deadline !== undefined && clock() >= deadline))
+        ) {
+            return;
+        }
+    }
+}
+
+/**
+ * The meter step of 1 pass (plan D6, D8): each provider read that is due (1 at a time), then the ledger reads, then
+ * the pruning. The provider read's failure is recorded, never thrown; only an abort of the pass throws.
+ */
+export async function meterPass(deps: MeterDeps, now: number): Promise<void> {
+    const signal = deps.signal ?? new AbortController().signal;
+    const { state, settings } = deps;
+
+    for (const provider of settings.providers) {
+        if (now < meterRules.nextReadAt(state, provider, settings) - meterRules.READ_SLACK_MS) {
+            continue;
+        }
+
+        signal.throwIfAborted();
+
+        let result: MeterReadResult;
+
+        try {
+            result = await deps.readProvider(provider, signal);
+        } catch {
+            // The reader's exception may hold the token: an abort throws fixed words, with no cause.
+            if (signal.aborted) {
+                throw meterAborted();
+            }
+
+            result = { error: "the read failed" };
+        }
+
+        signal.throwIfAborted();
+        meterRules.recordAttempt(
+            state,
+            provider,
+            now,
+            "error" in result ? result : { ...result, at: now },
+        );
+    }
+
+    try {
+        await ledgerStep(deps, now, signal);
+    } finally {
+        meterRules.pruneMeter(state, now);
+    }
+}
+
+/** What the Anthropic reader needs: Pi's token, and `fetch`. Tests give fakes. */
+export type MeterIo = {
+    /** Pi's OAuth token for Anthropic, or why there is none. */
+    token: (signal: AbortSignal) => Promise<string | { error: string }>;
+    fetch: typeof fetch;
+    /** The read's own time limit; `AbortSignal.timeout(METER_READ_MS)` when absent. */
+    timeout?: () => AbortSignal;
+    /** The reading's time; the wall clock when absent (the pass records its own time). */
+    now?: () => number;
+};
+
+/**
+ * The provider reader for Anthropic (plan D1, D8): `GET /api/oauth/usage` with Pi's token and Claude Code's identity
+ * headers, no redirect, 15 seconds at most, aborted with the pass. Its error texts are fixed words: never the
+ * answer's body, never an exception's message, and never the token (a text that holds it becomes "request failed").
+ */
+export function anthropicReader(io: MeterIo): MeterDeps["readProvider"] {
+    return async (_provider, signal) => {
+        let token = "";
+        const safe = (result: { error: string; status?: number }) =>
+            token !== "" && result.error.includes(token)
+                ? { ...result, error: "request failed" }
+                : result;
+        const limit = io.timeout?.() ?? AbortSignal.timeout(METER_READ_MS);
+        const both = AbortSignal.any([signal, limit]);
+
+        /**
+         * A failure's words. An abort of the pass throws fixed words with no cause: the token's, the fetch's or the JSON
+         * parser's exception may hold the token, so it never leaves here.
+         */
+        const failure = (_error: unknown, words: string): { error: string } => {
+            if (signal.aborted) {
+                throw meterAborted();
+            }
+
+            return { error: limit.aborted ? "timed out after 15 s" : words };
+        };
+
+        try {
+            const got = await io.token(both);
+
+            if (typeof got !== "string") {
+                return safe({ error: got.error });
+            }
+
+            token = got;
+        } catch (error) {
+            return failure(error, "Pi's sign-in could not be read");
+        }
+
+        let response: Response;
+
+        try {
+            response = await io.fetch(ANTHROPIC_USAGE_URL, {
+                method: "GET",
+                headers: {
+                    authorization: `Bearer ${token}`,
+                    "anthropic-beta": "oauth-2025-04-20",
+                    "user-agent": `claude-cli/${meterRules.CLAUDE_CLI_VERSION}`,
+                    "x-app": "cli",
+                },
+                redirect: "error",
+                signal: both,
+            });
+        } catch (error) {
+            return failure(error, "network error");
+        }
+
+        if (!response.ok) {
+            // The body is not read: it is not shown anywhere.
+            await response.body?.cancel().catch(() => undefined);
+
+            return safe({ error: `HTTP ${String(response.status)}`, status: response.status });
+        }
+
+        let body: unknown;
+
+        try {
+            body = await response.json();
+        } catch (error) {
+            return failure(error, "usage answer is not JSON");
+        }
+
+        const reading = meterRules.parseAnthropicUsage(body, io.now?.() ?? Date.now());
+
+        return "error" in reading ? safe(reading) : reading;
+    };
+}
+
 // ─── The pass ────────────────────────────────────────────────────────────────
 
 /** What a pass needs from its task: injected, so a test can give fakes. */
@@ -1908,6 +2666,11 @@ export type PassDeps = {
      * call, once the boundary is fixed. Its failure never fails the GitHub part; an abort still throws.
      */
     usage?: UsageModule.UsageDeps;
+    /**
+     * The subscription meter's step (plan T1747): absent, no meter step (the meter is off). It runs after the usage
+     * step and before the GitHub call. Its failure never fails the GitHub part; an abort still throws.
+     */
+    meter?: MeterDeps;
 };
 
 /**
@@ -1968,6 +2731,18 @@ export async function collectPass(deps: PassDeps): Promise<number> {
         }
     }
 
+    if (deps.meter !== undefined) {
+        try {
+            await meterPass({ ...deps.meter, signal: deps.meter.signal ?? deps.signal }, now);
+        } catch (error) {
+            if (deps.signal?.aborted === true || deps.meter.signal?.aborted === true) {
+                throw error;
+            }
+
+            // The meter keeps what it read: anything it throws leaves the GitHub part to run.
+        }
+    }
+
     const reads = tracked === undefined ? [] : planReads(dashboard, tracked, now);
     let answer: Answer | undefined;
     let failure: PassFailure | undefined;
@@ -2014,6 +2789,11 @@ type CollectorState = { phase: "sleep" } | { phase: "pass" };
 export function defineCollector(options: {
     deskDoc: SessionDocToken<DeskState>;
     gh: () => string;
+    /**
+     * The meter's parts for 1 pass, read at the pass's start; undefined when the meter is off. The collector adds the
+     * read commits, the clock and the signal.
+     */
+    meter?: () => Promise<Omit<MeterDeps, "read" | "now" | "signal"> | undefined>;
 }) {
     const run = promisify(execFile);
 
@@ -2027,6 +2807,7 @@ export function defineCollector(options: {
                 runtime.sleepUntil(runtime.now() + PASS_MS, { phase: "pass" }, context),
             pass: async (_task, runtime, context) => {
                 const id = String(runtime.taskId);
+                const meterParts = await options.meter?.().catch(() => undefined);
 
                 await collectPass({
                     readDesk: () => runtime.snapshot(options.deskDoc, context),
@@ -2065,6 +2846,31 @@ export function defineCollector(options: {
                         },
                         signal: runtime.signal,
                     },
+                    ...(meterParts === undefined
+                        ? {}
+                        : {
+                              meter: {
+                                  ...meterParts,
+                                  // 1 commit that only reads: it writes nothing, and leaves the task's state as it is.
+                                  read: async <T>(fn: (tx: MeterTx) => Promise<T>): Promise<T> => {
+                                      let result: { value: T } | undefined;
+
+                                      await runtime.commit(async (tx) => {
+                                          result = { value: await fn(tx) };
+
+                                          return undefined;
+                                      }, context);
+
+                                      if (result === undefined) {
+                                          throw new Error("the meter's read commit gave nothing");
+                                      }
+
+                                      return result.value;
+                                  },
+                                  now: () => runtime.now(),
+                                  signal: runtime.signal,
+                              },
+                          }),
                     commit: (apply) =>
                         runtime.commit(async (tx) => {
                             const draft = await tx.doc(DeskDashboard);

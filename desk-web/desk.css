@@ -750,6 +750,40 @@
     background: var(--card);
 }
 
+/* The Subscriptions card (plan T1747): above the other cards, 1 row for each provider. */
+.dash-meter {
+    margin-bottom: 10px;
+}
+
+.dash-meter-rows {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+    gap: 10px;
+    margin: 8px 0 0;
+    padding: 0;
+    list-style: none;
+}
+
+.dash-meter-row {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    min-width: 0;
+    overflow-wrap: anywhere;
+}
+
+.dash-meter-gauge {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.dash-meter-gauge meter {
+    flex: 1;
+    min-width: 0;
+    height: 14px;
+}
+
 .dash-card h3 {
     margin: 0;
     font-size: 13px;
@@ -1103,6 +1137,10 @@
 
 /* Phones: stacked controls, and each table row as a small card. */
 @media (max-width: 700px) {
+    .dash-meter-rows {
+        grid-template-columns: 1fr;
+    }
+
     .dash-scope,
     .dash-scope label,
     .dash-scope select {

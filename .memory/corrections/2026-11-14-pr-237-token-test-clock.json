@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-14",
+  "scope": "desk-dashboard.test.ts",
+  "correction": "the full-surface token test runs on the real clock but answered the R4 fixture with its dated reset (2026-11-18T16:00:00Z) and expected a future reset, so it would fail after that date; the test now builds the answer's resets_at 4 days after the app's clock at the read, and only the fixed-clock tests keep the dated fixture",
+  "evidence": "bketelsen/pi-pocket-team#237, cross-review by openai/gpt-6.1-sol at head 3667483",
+  "promoted_to": "desk-dashboard.test.ts: a fake token is in no desk usage answer, no GET dashboard answer, no console line and no notice: a 401 that holds it, a fetch error that holds it, and the R4 answer"
+}

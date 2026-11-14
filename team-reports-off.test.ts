@@ -451,6 +451,7 @@ describe("run-end answers with the desk", { skip: SKIP }, () => {
             "_desk-dashboard.ts",
             "_desk-metrics.ts",
             "_desk-board.ts",
+            "_desk-meter.ts",
         ]) {
             cpSync(join(import.meta.dirname, file), join(dropIns, file));
         }

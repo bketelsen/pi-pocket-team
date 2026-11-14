@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-14",
+  "scope": "_desk-dashboard.ts",
+  "correction": "a failed read in the meter's backfill sweep counted the conversation as done and could end the sweep, so the ledger's coverage became complete with a conversation not read; the backfill now moves that conversation to the end of its queue, and coverage is complete only when every listed conversation was read",
+  "evidence": "bketelsen/pi-pocket-team#237, cross-review by openai/gpt-6.1-sol at head 936964b",
+  "promoted_to": "desk-dashboard.test.ts: a backfill read that fails once, within a conversation's backfill: the coverage stays not complete, then completes in the next pass, and each answer counts once"
+}

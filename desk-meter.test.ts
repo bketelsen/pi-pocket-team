@@ -15,8 +15,10 @@ import {
     mainWindow,
     type MeterSettings,
     type MeterState,
+    meterFooter,
     meterLine,
     meterSettings,
+    meterStatusLine,
     meterView,
     nextReadAt,
     parseAnthropicUsage,
@@ -686,6 +688,73 @@ test("no list price becomes a percent", () => {
         off.providers[0]?.line,
         "Anthropic: no provider report (provider reads off in meter.providers)",
     );
+});
+
+test("meterStatusLine: the provider read, the ledger's coverage and the hold, in the zone", () => {
+    const now = Date.parse("2026-11-14T02:56:29Z");
+    const state = emptyMeterState();
+    const line = (settings = SETTINGS) =>
+        meterStatusLine(meterView(state, settings, now, ZONE), now, ZONE);
+
+    assert.equal(
+        line(),
+        "Meter: provider read never; ledger filling 0 of 0 conversations; hold off",
+    );
+    assert.equal(
+        line({ ...SETTINGS, providers: [] }),
+        "Meter: provider reads off; ledger filling 0 of 0 conversations; hold off",
+    );
+
+    state.coverage = { since: now - 8 * DAY, complete: false, done: 120, total: 400 };
+    read(state, weekly(75, RESET_ISO), now - 25 * MINUTE);
+
+    assert.equal(
+        line(),
+        "Meter: provider read 25 min ago (last attempt ok); ledger filling 120 of 400 conversations; hold off",
+    );
+
+    state.coverage = { since: now - 8 * DAY, complete: true, done: 400, total: 400 };
+
+    assert.equal(
+        line({ ...SETTINGS, holdAt: 90 }),
+        "Meter: provider read 25 min ago (last attempt ok); ledger complete since Thu 5 Nov 21:56; hold at 90%",
+    );
+
+    recordAttempt(state, "anthropic", now - MINUTE, { error: "HTTP 429", status: 429 });
+
+    assert.equal(
+        line(),
+        "Meter: provider read 25 min ago (last attempt: HTTP 429 at 21:55); ledger complete since Thu 5 Nov 21:56; hold off",
+    );
+
+    const later = now + 2 * HOUR;
+
+    assert.equal(
+        meterStatusLine(meterView(state, SETTINGS, later, ZONE), later, ZONE),
+        "Meter: provider read 2h25m ago (last attempt: HTTP 429 at 21:55); ledger complete since Thu 5 Nov 21:56; hold off",
+    );
+});
+
+test("meterFooter: a fresh or stale main window at digestAt or more; none below, none awaiting, none unread", () => {
+    const now = Date.parse("2026-11-14T02:56:29Z");
+
+    const footer = (percent: number, at: number, when = now) => {
+        const state = emptyMeterState();
+
+        read(state, weekly(percent, RESET_ISO), at);
+
+        return meterFooter(meterView(state, SETTINGS, when, ZONE), 75);
+    };
+
+    assert.deepEqual(footer(75, now), [
+        "Meter: Anthropic: week 75% used, resets Wed 11:00 (in 4d 13h)",
+    ]);
+    assert.deepEqual(footer(74, now), []);
+    assert.deepEqual(footer(80, now - 25 * MINUTE), [
+        "Meter: Anthropic: week 80% used (read 25 min ago), resets Wed 11:00 (in 4d 13h)",
+    ]);
+    assert.deepEqual(footer(95, now, RESET + MINUTE), [], "an awaiting window has no percent");
+    assert.deepEqual(meterFooter(meterView(emptyMeterState(), SETTINGS, now, ZONE), 75), []);
 });
 
 test("the module has no run-time import and reads no clock", () => {

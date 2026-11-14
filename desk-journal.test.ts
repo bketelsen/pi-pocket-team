@@ -1044,6 +1044,7 @@ describe("the journal at the desk", () => {
         );
         cpSync(join(import.meta.dirname, "_desk-metrics.ts"), join(dropIns, "_desk-metrics.ts"));
         cpSync(join(import.meta.dirname, "_desk-board.ts"), join(dropIns, "_desk-board.ts"));
+        cpSync(join(import.meta.dirname, "_desk-meter.ts"), join(dropIns, "_desk-meter.ts"));
         cpSync(join(import.meta.dirname, "desk-web"), join(dropIns, "desk-web"), {
             recursive: true,
         });

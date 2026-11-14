@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-14",
+  "scope": "_desk-dashboard.ts",
+  "correction": "a backfill conversation whose read always failed went back into the current queue, and the sweep listed the next conversation page only when the queue was empty, so later pages were never listed and the hourly sweeps never started; a failed backfill read now leaves the queue as a gap (ledger.gaps), the sweep goes on and ends, each pass retries the lowest gap up to 3 failures, any successful read clears a gap, and coverage is complete only when the backfill sweep ended and no gap is left",
+  "evidence": "bketelsen/pi-pocket-team#237, cross-review by openai/gpt-6.1-sol at head 3667483",
+  "promoted_to": "desk-dashboard.test.ts: a backfill conversation that always fails, of 150: every page is listed and counted, the backfill ends, the coverage stays not complete, the retries stop after 3, and the hourly sweep starts at the 12th pass"
+}
