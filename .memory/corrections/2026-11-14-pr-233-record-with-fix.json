@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-14",
+  "scope": ".memory/corrections",
+  "correction": "bketelsen/pi-pocket-team#230 fixed a blocking review point but added no record file under .memory/corrections/; the PR that fixes a blocking point adds its record in the same PR, not in a later one",
+  "evidence": "bketelsen/pi-pocket-team#233, whole-plan verification review of the core ADR-0081 migration at main bdbaa8e",
+  "promoted_to": "AGENTS.md"
+}

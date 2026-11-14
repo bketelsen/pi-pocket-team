@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-14",
+  "scope": "team.ts, docs",
+  "correction": "After every repository moved its records to .memory/corrections/, the team_memory prompt guide (MEMORY_GUIDE), the team_memory refusal text and 2 docs still told agents to write a line to the old single corrections file; a text that tells agents where to write a record names only the folder",
+  "evidence": "bketelsen/pi-pocket-team#230, whole-plan verification review of the core ADR-0081 migration at main before #230",
+  "promoted_to": "team-memory.test.ts"
+}
