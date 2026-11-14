@@ -198,7 +198,8 @@ Q1's limits:
    metrics (Q1's day record, review-round thread list and stop list left out: they can be long), to the LLM. The LLM groups them into
    at most 5 proposals and writes each one. It never sees a transcript.
 3. **Code checks the LLM's text** before anyone sees it: at most 5 proposals; each cites 1 or more
-   finding ids that exist; each number in its text appears in a cited finding or metric; the owner
+   finding ids that exist (a cited pair id counts as its pair's finding when that finding is a
+   top finding); each number in its text appears in a cited finding or metric; the owner
    and the size come from the fixed table below, not from the model. A text that fails goes out as
    the plain ranked list, with no LLM text.
 
