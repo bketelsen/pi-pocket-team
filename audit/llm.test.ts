@@ -269,6 +269,74 @@ test("a proposal that cites an unknown id, or nothing, falls back", async () => 
     );
 });
 
+test("a proposal that cites a pair id counts as the pair's finding when it is a top finding (2026-11-13 audit)", () => {
+    // The 2026-11-13 audit lost every proposal: the model cited the E3 sample pairs P5, P6 and P7, and the
+    // check knew only finding ids. A pair id now stands for its pair's finding; a pair whose finding is not a
+    // top finding still fails, with a reason that names the pair.
+    const top = annotate(
+        [
+            ...ranked(),
+            finding("E3", undefined, "9 of 39 shift reports have a team_message within 30 min", {
+                severity: "medium",
+                cases: 9,
+                evidence: [],
+            }),
+        ],
+        [],
+        {},
+    );
+    const pairs = selectPairs(pairsFixture());
+
+    assert.equal(pairs[0].finding, "E1?:T65");
+    assert.equal(pairs[3].finding, "E3");
+
+    const result = validateAnswer(
+        {
+            proposals: [
+                { title: "One report", text: "9 of 39 shift reports came twice.", cites: ["P4"] },
+                { title: "Both", text: "9 reports came twice.", cites: ["P3", "E3", "P5"] },
+                { title: "Not top", text: "T65 reported twice.", cites: ["P1"] },
+                { title: "Unknown", text: "x", cites: ["P42"] },
+            ],
+        },
+        { findings: top, metrics, pairs },
+    );
+
+    assert.equal(result.ok, true);
+    assert.deepEqual(
+        result.proposals.map((p: { cites: string[] }) => p.cites),
+        [["E3"], ["E3"]],
+    );
+    assert.deepEqual(result.dropped, [
+        {
+            item: "proposal 3",
+            reason: "cites the pair P1, whose finding E1?:T65 is not one of the top findings",
+        },
+        { item: "proposal 4", reason: "cites P42, which is not one of the top findings" },
+    ]);
+});
+
+test("the model sees each pair's finding id and the rule that a pair id is not a finding id", async () => {
+    const model = fake(valid());
+
+    await run(model, { pairs: pairsFixture() });
+
+    const sent = JSON.parse(model.calls[0]!.content);
+
+    assert.deepEqual(
+        sent.pairs.map((pair: { id: string; finding: string }) => [pair.id, pair.finding]),
+        [
+            ["P1", "E1?:T65"],
+            ["P2", "E3"],
+            ["P3", "E3"],
+            ["P4", "E3"],
+            ["P5", "E3"],
+            ["P6", "E3"],
+        ],
+    );
+    assert.match(SYSTEM_PROMPT, /A pair id \(P1, P2, \.\.\.\) is not a finding id/);
+});
+
 test("a proposal with a number that is not in the cited finding falls back", async () => {
     await failsWith(
         {

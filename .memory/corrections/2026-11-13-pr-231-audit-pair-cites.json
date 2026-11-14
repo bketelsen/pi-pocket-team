@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-13",
+  "scope": "audit/llm.mjs",
+  "correction": "The daily audit check knew only finding ids, and the model got the report pairs (P1 to P10) with no finding id, so a proposal that cited a pair id was dropped and the 2026-11-13 audit had no proposals; the prompt now gives each pair its finding id and forbids a pair id, and the check resolves a cited pair id to its pair's finding when that finding is a top finding",
+  "evidence": "bketelsen/pi-pocket-team#231, daily audit 2026-11-13 (llm.reason: proposal 1 cites P6, which is not one of the top findings)",
+  "promoted_to": "audit/llm.test.ts: a proposal that cites a pair id counts as the pair's finding when it is a top finding (2026-11-13 audit)"
+}
