@@ -28706,7 +28706,11 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
             };
             const stubHost = {
                 requesterOf: () => owner(app).id,
-                text: { defang: (value: string) => value, quoted: () => "" },
+                text: {
+                    // A visible defang: a test can see that a text went through it.
+                    defang: (value: string) => value.replaceAll("<defang-me>", "[defanged]"),
+                    quoted: () => "",
+                },
                 notice() {},
                 linkedSessions: {
                     send: async (
@@ -30208,6 +30212,30 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
                 );
 
                 assert.ok(hashed.includes(`# ${other.id} · `), hashed);
+
+                // A report of the other thread's session is defanged, as the reports of its own thread are.
+                await app.harness.commit(async (tx) => {
+                    (
+                        await tx.doc(DeskReports, otherThread.session as ConversationId)
+                    ).reports.unshift({
+                        key: "report:defang",
+                        at: Date.now(),
+                        from: "team_message",
+                        text: "DONE: a report <defang-me> here.",
+                        line: "[desk] a report to defang",
+                    });
+                }, context);
+
+                const defanged = JSON.stringify(
+                    await read(
+                        { action: "read", thread: other.id },
+                        Number(linked),
+                        "call-other-defang",
+                    ),
+                );
+
+                assert.ok(defanged.includes("DONE: a report [defanged] here."), defanged);
+                assert.ok(!defanged.includes("<defang-me>"), defanged);
 
                 // An id that does not exist: an error that says so, with where to ask.
                 await assert.rejects(
