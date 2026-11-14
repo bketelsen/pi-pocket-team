@@ -46,6 +46,14 @@ import {
     type Window,
 } from "./_desk-metrics.ts";
 import { DeskThreads } from "./desk.ts";
+import {
+    emptyMeterState,
+    meterView,
+    parseAnthropicUsage,
+    recordAttempt,
+    type MeterSettings,
+    type MeterView,
+} from "./_desk-meter.ts";
 
 // ─── Fixtures ────────────────────────────────────────────────────────────────
 
@@ -2300,6 +2308,7 @@ describe("GET dashboard in Pocket", () => {
             "_desk-dashboard.ts",
             "_desk-metrics.ts",
             "_desk-board.ts",
+            "_desk-meter.ts",
         ]) {
             cpSync(join(import.meta.dirname, file), join(dropIns, file));
         }
@@ -2504,6 +2513,80 @@ describe("GET dashboard in Pocket", () => {
 
         // Pocket answers 404 to a person who may not use an owner route: it does not say the route exists.
         assert.equal(asViewer.status, 404);
+    });
+
+    test("GET dashboard: the meter field when meter is in desk.json, its view of the meter's memory; no field at all when it is off", async () => {
+        const shared = globalThis as unknown as Record<
+            symbol,
+            { version: number; state?: unknown } | undefined
+        >;
+        const holderKey = Symbol.for("pi-pocket-team.desk.meter");
+        const settings: MeterSettings = {
+            providers: ["anthropic"],
+            pollMinutes: 5,
+            digestAt: 75,
+            holdAt: 90,
+        };
+        const at = Date.now();
+        const state = emptyMeterState();
+        const reading = parseAnthropicUsage(
+            {
+                limits: [
+                    {
+                        kind: "weekly_all",
+                        percent: 80,
+                        severity: "normal",
+                        resets_at: new Date(at + 2 * DAY).toISOString(),
+                        is_active: true,
+                    },
+                ],
+            },
+            at,
+        );
+
+        assert(!("error" in reading));
+        recordAttempt(state, "anthropic", at, reading);
+
+        const off = await get("dashboard");
+
+        assert.equal(off.status, 200);
+        assert.equal("meter" in off.data, false, "no meter key: no field");
+
+        shared[holderKey] = { version: 1, state };
+        writeFileSync(
+            configPath,
+            JSON.stringify({ digest: { minutes: 0 }, cap: 100, meter: { holdAt: 90 } }),
+        );
+
+        try {
+            const on = await get("dashboard?owner=a");
+            const meter = (on.data as unknown as { meter: MeterView }).meter;
+
+            assert.equal(on.status, 200);
+            assert.deepEqual(
+                meter,
+                JSON.parse(
+                    JSON.stringify(
+                        meterView(
+                            state,
+                            settings,
+                            meter.at,
+                            Intl.DateTimeFormat().resolvedOptions().timeZone,
+                        ),
+                    ),
+                ),
+            );
+            assert.equal(meter.providers[0]?.windows[0]?.percent, 80);
+            assert.equal(meter.hold, 90);
+            assert.ok(!/authorization|bearer|token/i.test(JSON.stringify(meter)));
+        } finally {
+            writeFileSync(configPath, JSON.stringify({ digest: { minutes: 0 }, cap: 100 }));
+            delete shared[holderKey];
+        }
+
+        const again = await get("dashboard");
+
+        assert.equal("meter" in again.data, false);
     });
 
     test("a bad range or scope is a 400 with its reason", async () => {

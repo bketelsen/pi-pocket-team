@@ -19,8 +19,15 @@ import { chmodSync, cpSync, mkdirSync, readFileSync, writeFileSync } from "node:
 import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
 import { fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
-import { defineDoc, type ConversationId, type Tx } from "@earendil-works/pi-durable";
 import {
+    defineDoc,
+    type ConversationId,
+    type EntryRecord,
+    type Tx,
+} from "@earendil-works/pi-durable";
+import {
+    ANTHROPIC_USAGE_URL,
+    anthropicReader,
     applyPass,
     BOUNDARY_DAYS,
     CHECK_HEARTBEAT_MS,
@@ -32,10 +39,13 @@ import {
     COLLECTOR_TASK,
     defineCollector,
     DeskDashboard,
+    emptyMeterLedger,
     ensureCollector,
     ERROR_RETRY_MS,
     MAX_CLOSING_PAGES,
     MAX_REF_READS,
+    METER_READS,
+    meterPass,
     OPEN_REFRESH_MS,
     PASS_MS,
     parseAnswer,
@@ -45,12 +55,24 @@ import {
     threadFacts,
     trackedRefs,
     type DashboardState,
+    type MeterDeps,
+    type MeterTx,
     type Read,
 } from "./_desk-dashboard.ts";
 import { DeskUsage } from "./_desk-usage.ts";
 import {
+    emptyMeterState,
+    meterStatusLine,
+    meterView,
+    nextReadAt,
+    type MeterSettings,
+    type MeterState,
+} from "./_desk-meter.ts";
+import {
     DeskThreads,
+    METER_IO,
     SWEEP_SLEEP_MS,
+    type MeterHolder,
     type DeskState,
     type JsonValue,
     type PrLink,
@@ -2241,6 +2263,782 @@ describe("issue resolution", () => {
     });
 });
 
+// ─── The subscription meter's step ───────────────────────────────────────────
+
+/** The plan's R4 answer time (2026-11-14 02:56:29 UTC): the meter tests' clock. */
+const METER_NOW = Date.parse("2026-11-14T02:56:29Z");
+const MINUTE = 60_000;
+const METER_ZONE = "America/New_York";
+/** The ledger only: no provider read. */
+const LEDGER_ONLY: MeterSettings = { providers: [], pollMinutes: 5, digestAt: 75, holdAt: null };
+const METER_ON: MeterSettings = { ...LEDGER_ONLY, providers: ["anthropic"] };
+/** A fake token: no answer, view, error text or log line may hold it. */
+const FAKE_TOKEN = "sk-ant-oat01-FAKE-TOKEN-DO-NOT-LEAK";
+/** The plan's R4 answer, as `desk-meter.test.ts` has it (the parts the parser reads). */
+const R4_BODY = {
+    limits: [
+        {
+            kind: "weekly_all",
+            group: "weekly",
+            percent: 95,
+            severity: "critical",
+            resets_at: "2026-11-18T16:00:00Z",
+            scope: null,
+            is_active: true,
+        },
+        {
+            kind: "weekly_scoped",
+            group: "weekly",
+            percent: 19,
+            severity: "normal",
+            resets_at: "2026-11-18T16:00:00Z",
+            scope: { model: { display_name: "Fable" } },
+            is_active: false,
+        },
+    ],
+    five_hour: null,
+    seven_day: { utilization: 95, resets_at: "2026-11-18T16:00:00Z" },
+    tangelo: null,
+};
+
+/** A fake store: conversations (a fork has a parent), entries in id order. */
+type MeterWorld = {
+    conversations: { id: number; parent?: { conversationId: number; at: number } }[];
+    entries: EntryRecord[];
+    next: number;
+    /** The table reads of each read commit that ended. */
+    commits: number[];
+    /** A read of these throws. */
+    failing: Set<number>;
+    /** Runs after each table read (its page is made): a test adds entries or moves the clock here. */
+    onRead?: (kind: "conversations" | "entries", id?: number) => void;
+};
+
+const meterWorld = (): MeterWorld => ({
+    conversations: [],
+    entries: [],
+    next: 0,
+    commits: [],
+    failing: new Set(),
+});
+
+function meterConversation(w: MeterWorld, id: number, parentId?: number, at?: number): void {
+    w.conversations.push({
+        id,
+        ...(parentId === undefined ? {} : { parent: { conversationId: parentId, at: at ?? 0 } }),
+    });
+}
+
+/** 1 answer in conversation `id`, as generation writes it. `cost: null` leaves the cost out. */
+function answerIn(
+    w: MeterWorld,
+    id: number,
+    use: { at?: number; cost?: number | null; provider?: string; kind?: string } = {},
+): number {
+    w.next += 1;
+    w.entries.push({
+        id: w.next,
+        conversationId: id,
+        kind: use.kind ?? "pi.assistant",
+        model: [
+            {
+                role: "assistant",
+                content: [],
+                api: "fake",
+                provider: use.provider ?? "anthropic",
+                model: "claude-opus-5-5",
+                usage: {
+                    input: 10,
+                    output: 5,
+                    cacheRead: 0,
+                    cacheWrite: 0,
+                    totalTokens: 15,
+                    ...(use.cost === null
+                        ? {}
+                        : {
+                              cost: {
+                                  input: 0,
+                                  output: 0,
+                                  cacheRead: 0,
+                                  cacheWrite: 0,
+                                  total: use.cost ?? 1,
+                              },
+                          }),
+                },
+                stopReason: "stop",
+                timestamp: use.at ?? METER_NOW - MINUTE,
+            },
+        ],
+    } as unknown as EntryRecord);
+
+    return w.next;
+}
+
+/** A user entry: read, never counted. */
+function userIn(w: MeterWorld, id: number): void {
+    w.next += 1;
+    w.entries.push({
+        id: w.next,
+        conversationId: id,
+        kind: "pi.user",
+        model: [{ role: "user", content: "hi", timestamp: METER_NOW }],
+    } as unknown as EntryRecord);
+}
+
+/** The fork-aware history of a conversation, as Pi Durable's storage gives it, oldest first. */
+function visibleIn(w: MeterWorld, id: number, upper = Infinity): EntryRecord[] {
+    const conversation = w.conversations.find((each) => each.id === id);
+
+    assert(conversation, `conversation ${String(id)} exists`);
+
+    const own = w.entries.filter((entry) => entry.conversationId === id && entry.id <= upper);
+    const inherited =
+        conversation.parent === undefined
+            ? []
+            : visibleIn(
+                  w,
+                  conversation.parent.conversationId,
+                  Math.min(upper, conversation.parent.at),
+              );
+
+    return [...inherited, ...own].sort((a, b) => a.id - b.id);
+}
+
+/** 1 commit that only reads, over the fake store: it counts its table reads. */
+function meterRead(w: MeterWorld): MeterDeps["read"] {
+    return async <T>(fn: (tx: MeterTx) => Promise<T>): Promise<T> => {
+        let reads = 0;
+        const tx = {
+            scanEntries: async (
+                query: {
+                    conversationId: number;
+                    minEntryId?: number;
+                    maxEntryId?: number;
+                    order?: string;
+                },
+                limit: number,
+            ) => {
+                reads += 1;
+
+                if (w.failing.has(query.conversationId)) {
+                    throw new Error("the storage read failed");
+                }
+
+                const list = visibleIn(w, query.conversationId).filter(
+                    (entry) =>
+                        entry.id >= (query.minEntryId ?? 0) &&
+                        entry.id <= (query.maxEntryId ?? Infinity),
+                );
+
+                if ((query.order ?? "descending") === "descending") {
+                    list.reverse();
+                }
+
+                const items = copy(list.slice(0, limit));
+
+                w.onRead?.("entries", query.conversationId);
+
+                return list.length > limit ? { items, next: { more: true } } : { items };
+            },
+            scanConversations: async (
+                _query: unknown,
+                limit: number,
+                cursor?: { after?: number },
+            ) => {
+                reads += 1;
+
+                const list = [...w.conversations]
+                    .sort((a, b) => a.id - b.id)
+                    .filter((each) => each.id > (cursor?.after ?? 0));
+                const items = copy(list.slice(0, limit));
+
+                w.onRead?.("conversations");
+
+                return list.length > limit
+                    ? { items, next: { after: items[items.length - 1]?.id ?? 0 } }
+                    : { items };
+            },
+        } as unknown as MeterTx;
+        const value = await fn(tx);
+
+        w.commits.push(reads);
+
+        return value;
+    };
+}
+
+/** The meter's deps over the fake store: the ledger only, unless the test gives a reader. */
+function meterDeps(w: MeterWorld, patch: Partial<MeterDeps> = {}): MeterDeps {
+    return {
+        state: emptyMeterState(),
+        ledger: emptyMeterLedger(),
+        settings: LEDGER_ONLY,
+        readProvider: async () => assert.fail("no provider read"),
+        read: meterRead(w),
+        ...patch,
+    };
+}
+
+/** The ledger's sums over every bucket. */
+function ledgerSums(state: MeterState): { entries: number; cost: number; unknownCost: number } {
+    const sums = { entries: 0, cost: 0, unknownCost: 0 };
+
+    for (const byProvider of Object.values(state.buckets)) {
+        for (const byModel of Object.values(byProvider)) {
+            for (const bucket of Object.values(byModel)) {
+                sums.entries += bucket.entries;
+                sums.cost += bucket.cost;
+                sums.unknownCost += bucket.unknownCost;
+            }
+        }
+    }
+
+    return sums;
+}
+
+/** A Response for the fake fetch. */
+const respond = (status: number, body: string): Response => new Response(body, { status });
+
+/** A fake fetch that answers only when its signal aborts: then it throws the signal's reason, as fetch does. */
+const hangingFetch = (async (_url: string, init: RequestInit) =>
+    new Promise<Response>((_resolve, reject) => {
+        const signal = init.signal as AbortSignal;
+
+        if (signal.aborted) {
+            reject(signal.reason);
+        }
+
+        signal.addEventListener("abort", () => reject(signal.reason));
+    })) as unknown as typeof fetch;
+
+describe("the subscription meter's step", () => {
+    test("a parent and a fork: the fork's inherited answers count once, in the parent; a second pass adds none", async () => {
+        const w = meterWorld();
+
+        meterConversation(w, 1);
+        answerIn(w, 1, { cost: 1 });
+        const fork = answerIn(w, 1, { cost: 2 });
+
+        userIn(w, 1);
+        meterConversation(w, 2, 1, fork);
+        answerIn(w, 2, { cost: 4 });
+        meterConversation(w, 3);
+
+        const deps = meterDeps(w);
+
+        await meterPass(deps, METER_NOW);
+        assert.deepEqual(ledgerSums(deps.state), { entries: 3, cost: 7, unknownCost: 0 });
+        assert.deepEqual(deps.state.coverage, {
+            since: METER_NOW - 8 * DAY,
+            complete: true,
+            done: 3,
+            total: 3,
+        });
+        assert.deepEqual({ ...deps.ledger.high }, { 1: 3, 2: 4, 3: 0 });
+        assert.equal(deps.ledger.sweep, undefined, "the backfill ended");
+
+        await meterPass(deps, METER_NOW + PASS_MS);
+        assert.deepEqual(ledgerSums(deps.state), { entries: 3, cost: 7, unknownCost: 0 });
+        assert.ok(
+            w.commits.every((reads) => reads <= METER_READS),
+            "no commit reads more than 25 times",
+        );
+    });
+
+    test("the backfill stops at the first answer older than 8 days; no cost is unknown; other kinds and bad answers count nothing", async () => {
+        const w = meterWorld();
+
+        meterConversation(w, 1);
+        answerIn(w, 1, { at: METER_NOW - 9 * DAY, cost: 50 });
+        answerIn(w, 1, { at: METER_NOW - 2 * DAY, cost: null });
+        answerIn(w, 1, { kind: "pi.other", cost: 20 });
+        answerIn(w, 1, { provider: "", cost: 30 });
+        answerIn(w, 1, { at: METER_NOW - HOUR, cost: 3 });
+
+        const deps = meterDeps(w);
+
+        await meterPass(deps, METER_NOW);
+        assert.deepEqual(ledgerSums(deps.state), { entries: 2, cost: 3, unknownCost: 1 });
+    });
+
+    test("answers that arrive during the backfill count once: between its pages, and between passes", async () => {
+        const w = meterWorld();
+
+        meterConversation(w, 1);
+
+        for (let index = 0; index < 450; index += 1) {
+            answerIn(w, 1, { at: METER_NOW - 30 * MINUTE, cost: 1 });
+        }
+
+        let added = false;
+
+        w.onRead = (kind, id) => {
+            // After the backfill's first page: 2 new answers, above its first entry.
+            if (kind === "entries" && id === 1 && !added) {
+                added = true;
+                answerIn(w, 1, { cost: 10 });
+                answerIn(w, 1, { cost: 10 });
+            }
+        };
+
+        const deps = meterDeps(w);
+
+        await meterPass(deps, METER_NOW);
+        assert.deepEqual(ledgerSums(deps.state), { entries: 450, cost: 450, unknownCost: 0 });
+        assert.equal(deps.ledger.high["1"], 450, "the backfill's first entry");
+
+        // The conversation has recent answers: the next pass reads it up from its first entry.
+        await meterPass(deps, METER_NOW + PASS_MS);
+        assert.deepEqual(ledgerSums(deps.state), { entries: 452, cost: 470, unknownCost: 0 });
+
+        answerIn(w, 1, { cost: 100 });
+        await meterPass(deps, METER_NOW + 2 * PASS_MS);
+        assert.deepEqual(ledgerSums(deps.state), { entries: 453, cost: 570, unknownCost: 0 });
+
+        await meterPass(deps, METER_NOW + 3 * PASS_MS);
+        assert.deepEqual(ledgerSums(deps.state), { entries: 453, cost: 570, unknownCost: 0 });
+    });
+
+    test("the sweep spends at most 20 s by the pass's clock; the next pass goes on from its cursors, also within a backfill", async () => {
+        const w = meterWorld();
+        let clock = METER_NOW;
+
+        meterConversation(w, 1);
+
+        for (let index = 0; index < 650; index += 1) {
+            answerIn(w, 1, { at: METER_NOW - 2 * HOUR });
+        }
+
+        meterConversation(w, 2);
+        answerIn(w, 2, { at: METER_NOW - 2 * HOUR });
+        meterConversation(w, 3);
+        answerIn(w, 3, { at: METER_NOW - 2 * HOUR });
+
+        // Each table read takes 6 s: the list and 3 pages, then the 4th check is at 24 s.
+        w.onRead = () => {
+            clock += 6_000;
+        };
+
+        const deps = meterDeps(w, { now: () => clock });
+
+        await meterPass(deps, clock);
+        assert.deepEqual(ledgerSums(deps.state).entries, 600);
+        assert.deepEqual({ ...deps.ledger.downs }, { 1: 50 }, "the backfill's entry cursor");
+        assert.deepEqual(deps.state.coverage, {
+            since: METER_NOW - 8 * DAY,
+            complete: false,
+            done: 0,
+            total: 3,
+        });
+        assert.equal(
+            meterView(deps.state, LEDGER_ONLY, clock, METER_ZONE).providers[0]?.ledger.partial,
+            true,
+        );
+
+        await meterPass(deps, clock);
+        assert.deepEqual(ledgerSums(deps.state).entries, 652);
+        assert.deepEqual({ ...deps.ledger.downs }, {});
+        assert.deepEqual(deps.state.coverage, {
+            since: METER_NOW - 8 * DAY,
+            complete: true,
+            done: 3,
+            total: 3,
+        });
+        assert.equal(
+            meterView(deps.state, LEDGER_ONLY, clock, METER_ZONE).providers[0]?.ledger.partial,
+            false,
+        );
+        assert.equal(
+            meterStatusLine(
+                meterView(deps.state, LEDGER_ONLY, clock, METER_ZONE),
+                clock,
+                METER_ZONE,
+            ),
+            "Meter: provider reads off; ledger complete since Thu 5 Nov 21:56; hold off",
+        );
+    });
+
+    test("a run that lasts 3 passes: its answers count in each pass, each once; it goes after a read that starts after its end", async () => {
+        const w = meterWorld();
+        let clock = METER_NOW;
+        const old = { at: METER_NOW - 2 * HOUR };
+
+        meterConversation(w, 5);
+        answerIn(w, 5, old);
+
+        const deps = meterDeps(w, { now: () => clock });
+
+        await meterPass(deps, clock);
+        assert.equal(ledgerSums(deps.state).entries, 1);
+
+        // `run.started`: the desk's listener adds it.
+        deps.ledger.active.add(5);
+        answerIn(w, 5, old);
+        answerIn(w, 5, old);
+        clock += PASS_MS;
+        await meterPass(deps, clock);
+        assert.equal(ledgerSums(deps.state).entries, 3);
+
+        // `run.ended`, after this pass's read starts: it stays active.
+        deps.ledger.ended.set(5, clock + PASS_MS + 500);
+        answerIn(w, 5, old);
+        answerIn(w, 5, old);
+        clock += PASS_MS;
+        await meterPass(deps, clock);
+        assert.equal(ledgerSums(deps.state).entries, 5);
+        assert.equal(deps.ledger.active.has(5), true);
+
+        // The next read starts after the end: it counts the last answer, and the conversation goes.
+        answerIn(w, 5, old);
+        clock += PASS_MS;
+        await meterPass(deps, clock);
+        assert.equal(ledgerSums(deps.state).entries, 6);
+        assert.equal(deps.ledger.active.has(5), false);
+        assert.equal(deps.ledger.ended.has(5), false);
+
+        // Not active, and no answer in the last hour: the next sweep reads it.
+        answerIn(w, 5, old);
+        clock += PASS_MS;
+        await meterPass(deps, clock);
+        assert.equal(ledgerSums(deps.state).entries, 6);
+    });
+
+    test("a new sweep starts at the 12th pass after the last one started, and leaves the coverage as it is", async () => {
+        const w = meterWorld();
+        const old = { at: METER_NOW - 2 * HOUR };
+
+        meterConversation(w, 1);
+        answerIn(w, 1, old);
+
+        const deps = meterDeps(w);
+
+        await meterPass(deps, METER_NOW);
+        meterConversation(w, 9);
+        answerIn(w, 9, old);
+
+        for (let pass = 2; pass <= 12; pass += 1) {
+            await meterPass(deps, METER_NOW + (pass - 1) * PASS_MS);
+            assert.equal(ledgerSums(deps.state).entries, 1, `pass ${String(pass)}`);
+        }
+
+        await meterPass(deps, METER_NOW + 12 * PASS_MS);
+        assert.equal(ledgerSums(deps.state).entries, 2);
+        assert.equal(deps.ledger.passes, 13);
+        assert.equal(deps.ledger.sweeps, 2);
+        assert.equal(deps.ledger.sweepStartedPass, 13);
+        assert.deepEqual(deps.state.coverage, {
+            since: METER_NOW - 8 * DAY,
+            complete: true,
+            done: 1,
+            total: 1,
+        });
+    });
+
+    test("a failed read: the sweep skips that conversation and ends for the pass; an active one waits for the next pass", async () => {
+        const w = meterWorld();
+        const old = { at: METER_NOW - 2 * HOUR };
+
+        for (const id of [1, 2, 3]) {
+            meterConversation(w, id);
+            answerIn(w, id, old);
+        }
+
+        w.failing.add(2);
+
+        const deps = meterDeps(w);
+
+        await meterPass(deps, METER_NOW);
+        assert.equal(ledgerSums(deps.state).entries, 1, "the reads before the failure count");
+        assert.deepEqual(deps.state.coverage, {
+            since: METER_NOW - 8 * DAY,
+            complete: false,
+            done: 2,
+            total: 3,
+        });
+
+        await meterPass(deps, METER_NOW + PASS_MS);
+        assert.equal(ledgerSums(deps.state).entries, 2);
+        assert.equal(deps.state.coverage.complete, true);
+        assert.equal(deps.ledger.high["2"], undefined, "the skipped conversation is not read");
+
+        // 2 active conversations: 3 fails, 1 is read.
+        w.failing.clear();
+        w.failing.add(3);
+        deps.ledger.active.add(1);
+        deps.ledger.active.add(3);
+        answerIn(w, 1, old);
+        await meterPass(deps, METER_NOW + 2 * PASS_MS);
+        assert.equal(ledgerSums(deps.state).entries, 3);
+        assert.equal(deps.ledger.active.has(3), true);
+
+        w.failing.clear();
+        answerIn(w, 3, old);
+        await meterPass(deps, METER_NOW + 3 * PASS_MS);
+        assert.equal(ledgerSums(deps.state).entries, 4);
+    });
+
+    test("an abort during a ledger read throws, counts nothing, and the pass's GitHub part does not run", async () => {
+        const w = meterWorld();
+        const controller = new AbortController();
+        const deps = meterDeps(w);
+        let commits = 0;
+
+        meterConversation(w, 1);
+        answerIn(w, 1);
+        w.onRead = () => controller.abort();
+
+        await assert.rejects(
+            collectPass({
+                readDesk: async () => deskOf([thread("T1", { prs: { "a/b#1": link() } })]),
+                readDashboard: async () => fresh(),
+                now: () => T0,
+                graphql: async () => assert.fail("no GitHub call after an abort"),
+                commit: async () => {
+                    commits += 1;
+                },
+                signal: controller.signal,
+                meter: deps,
+            }),
+        );
+        assert.equal(commits, 0);
+        assert.equal(ledgerSums(deps.state).entries, 0);
+    });
+
+    test("the provider read: 200 with the R4 answer, its request, and its timing", async () => {
+        const calls: { url: string; init: RequestInit }[] = [];
+        const reader = anthropicReader({
+            token: async () => FAKE_TOKEN,
+            fetch: (async (url: string, init: RequestInit) => {
+                calls.push({ url, init });
+
+                return respond(200, JSON.stringify(R4_BODY));
+            }) as unknown as typeof fetch,
+            now: () => METER_NOW,
+        });
+        const deps = meterDeps(meterWorld(), { settings: METER_ON, readProvider: reader });
+
+        await meterPass(deps, METER_NOW);
+        assert.equal(calls.length, 1);
+        assert.equal(calls[0]?.url, ANTHROPIC_USAGE_URL);
+        assert.equal(
+            ANTHROPIC_USAGE_URL,
+            "https://api.anthropic.com/api/oauth/usage?cedar_ember=1&skip_spend=1",
+        );
+        assert.equal(calls[0]?.init.method, "GET");
+        assert.equal(calls[0]?.init.redirect, "error");
+        assert.deepEqual(calls[0]?.init.headers, {
+            authorization: `Bearer ${FAKE_TOKEN}`,
+            "anthropic-beta": "oauth-2025-04-20",
+            "user-agent": "claude-cli/2.1.280",
+            "x-app": "cli",
+        });
+        assert.ok(calls[0]?.init.signal instanceof AbortSignal);
+        assert.equal(
+            meterView(deps.state, METER_ON, METER_NOW, METER_ZONE).providers[0]?.line,
+            "Anthropic: week 95% used (critical), resets Wed 11:00 (in 4d 13h) · week, Fable 19%",
+        );
+
+        // The next read is due 5 minutes later, with 30 s of slack.
+        await meterPass(deps, METER_NOW + 4.5 * MINUTE - 1);
+        assert.equal(calls.length, 1);
+        await meterPass(deps, METER_NOW + 4.5 * MINUTE);
+        assert.equal(calls.length, 2);
+        assert.equal(nextReadAt(deps.state, "anthropic", METER_ON), METER_NOW + 9.5 * MINUTE);
+    });
+
+    test("failures give fixed words: HTTP status, no JSON, network, timeout, no sign-in; the token is in no answer, view, state or log", async () => {
+        const logged: string[] = [];
+        const methods = ["log", "info", "warn", "error", "debug"] as const;
+        const saved = methods.map((name) => console[name]);
+
+        for (const name of methods) {
+            console[name] = (...args: unknown[]) => {
+                logged.push(args.map(String).join(" "));
+            };
+        }
+
+        try {
+            const signal = new AbortController().signal;
+            const read = (io: Partial<Parameters<typeof anthropicReader>[0]>) =>
+                anthropicReader({
+                    token: async () => FAKE_TOKEN,
+                    fetch: hangingFetch,
+                    ...io,
+                })("anthropic", signal);
+            const answering = (status: number, body: string) =>
+                (async () => respond(status, body)) as unknown as typeof fetch;
+
+            assert.deepEqual(await read({ fetch: answering(401, `bad token ${FAKE_TOKEN}`) }), {
+                error: "HTTP 401",
+                status: 401,
+            });
+            assert.deepEqual(await read({ fetch: answering(429, `slow down ${FAKE_TOKEN}`) }), {
+                error: "HTTP 429",
+                status: 429,
+            });
+            assert.deepEqual(await read({ fetch: answering(200, `not json ${FAKE_TOKEN}`) }), {
+                error: "usage answer is not JSON",
+            });
+            assert.deepEqual(await read({ fetch: answering(200, "[1, 2]") }), {
+                error: "usage answer is not an object",
+            });
+            assert.deepEqual(
+                await read({
+                    fetch: (async () => {
+                        throw new Error(`connect failed with Bearer ${FAKE_TOKEN}`);
+                    }) as unknown as typeof fetch,
+                }),
+                { error: "network error" },
+            );
+            // The read's own limit is over: the hanging fetch ends with it.
+            assert.deepEqual(
+                await read({
+                    timeout: () => AbortSignal.abort(new DOMException("over", "TimeoutError")),
+                }),
+                { error: "timed out after 15 s" },
+            );
+            assert.deepEqual(
+                await read({
+                    token: async () => ({ error: "Pi is not signed in to Anthropic" }),
+                    fetch: async () => assert.fail("no request without a token"),
+                }),
+                { error: "Pi is not signed in to Anthropic" },
+            );
+            assert.deepEqual(
+                await read({
+                    token: async () => {
+                        throw new Error(`the auth file holds ${FAKE_TOKEN}`);
+                    },
+                }),
+                { error: "Pi's sign-in could not be read" },
+            );
+            // Defence in depth: an error text that holds the token is replaced.
+            assert.deepEqual(
+                await read({ token: async () => "HTTP 4", fetch: answering(403, "") }),
+                { error: "request failed", status: 403 },
+            );
+
+            // Through the pass: a 401 is a refused sign-in; nothing the meter keeps or shows holds the token.
+            const deps = meterDeps(meterWorld(), {
+                settings: METER_ON,
+                readProvider: anthropicReader({
+                    token: async () => FAKE_TOKEN,
+                    fetch: answering(401, `bad token ${FAKE_TOKEN}`),
+                }),
+            });
+
+            await meterPass(deps, METER_NOW);
+
+            const view = meterView(deps.state, METER_ON, METER_NOW, METER_ZONE);
+
+            assert.equal(
+                view.providers[0]?.line,
+                "Anthropic: no provider report (sign-in refused, 401)",
+            );
+            assert.equal(nextReadAt(deps.state, "anthropic", METER_ON), METER_NOW + 30 * MINUTE);
+            assert.equal(
+                meterStatusLine(view, METER_NOW, METER_ZONE),
+                "Meter: provider read never (last attempt: sign-in refused, 401 at 21:56); ledger complete since Thu 5 Nov 21:56; hold off",
+            );
+            assert.ok(!JSON.stringify(deps.state).includes(FAKE_TOKEN));
+            assert.ok(!JSON.stringify(view).includes(FAKE_TOKEN));
+        } finally {
+            methods.forEach((name, index) => {
+                console[name] = saved[index] as never;
+            });
+        }
+
+        assert.deepEqual(
+            logged.filter((line) => line.includes(FAKE_TOKEN)),
+            [],
+        );
+    });
+
+    test("a 429 backs off; an abort of the pass during the read throws, and records no attempt", async () => {
+        const deps = meterDeps(meterWorld(), {
+            settings: METER_ON,
+            readProvider: anthropicReader({
+                token: async () => FAKE_TOKEN,
+                fetch: (async () => respond(429, "")) as unknown as typeof fetch,
+            }),
+        });
+
+        await meterPass(deps, METER_NOW);
+        assert.equal(nextReadAt(deps.state, "anthropic", METER_ON), METER_NOW + 15 * MINUTE);
+
+        const controller = new AbortController();
+        const aborted = meterDeps(meterWorld(), {
+            settings: METER_ON,
+            signal: controller.signal,
+            readProvider: anthropicReader({ token: async () => FAKE_TOKEN, fetch: hangingFetch }),
+        });
+        const running = meterPass(aborted, METER_NOW);
+
+        controller.abort();
+        await assert.rejects(running);
+        assert.equal(aborted.state.providers.anthropic?.lastAttempt, undefined);
+    });
+
+    test("collectPass runs the meter step after the usage step and before GitHub; a throwing meter step leaves GitHub to run", async () => {
+        const doc = fresh();
+        const desk = deskOf([thread("T1", { prs: { "a/b#1": link() } })]);
+        const github = fakeGitHub({ prs: { "a/b#1": { state: "OPEN", createdAt: T0 - DAY } } });
+
+        // The first pass fixes the boundary, so the usage step runs.
+        await pass(doc, desk, T0, github.graphql);
+
+        const order: string[] = [];
+        const run = (meter: MeterDeps, at: number) =>
+            collectPass({
+                readDesk: async () => copy(desk),
+                readDashboard: async () => copy(doc),
+                now: () => at,
+                graphql: async (query) => {
+                    order.push("github");
+
+                    return github.graphql(query);
+                },
+                commit: async (apply) => apply(doc),
+                usage: {
+                    readUsage: async () => {
+                        order.push("usage");
+
+                        throw new Error("the usage document cannot be read");
+                    },
+                    readLedger: async () => undefined,
+                    commit: async () => false,
+                },
+                meter,
+            });
+        const w = meterWorld();
+
+        await run(
+            meterDeps(w, {
+                settings: METER_ON,
+                readProvider: async () => {
+                    order.push("meter");
+
+                    return { error: "network error" };
+                },
+            }),
+            T0 + OPEN_REFRESH_MS,
+        );
+        assert.deepEqual(order, ["usage", "meter", "github"]);
+
+        order.length = 0;
+        // A meter whose state is broken throws a TypeError: the GitHub part still runs.
+        await run(
+            meterDeps(w, {
+                settings: METER_ON,
+                state: undefined as unknown as MeterState,
+            }),
+            T0 + 2 * OPEN_REFRESH_MS,
+        );
+        assert.deepEqual(order, ["usage", "github"]);
+        assert.equal(github.calls.length, 3);
+    });
+});
+
 // ─── The collector in Pocket ─────────────────────────────────────────────────
 
 const dataDir = join(root, "dashboard-data");
@@ -2335,6 +3133,7 @@ describe("the collector in Pocket", () => {
         );
         cpSync(join(import.meta.dirname, "_desk-metrics.ts"), join(dropIns, "_desk-metrics.ts"));
         cpSync(join(import.meta.dirname, "_desk-board.ts"), join(dropIns, "_desk-board.ts"));
+        cpSync(join(import.meta.dirname, "_desk-meter.ts"), join(dropIns, "_desk-meter.ts"));
         cpSync(join(import.meta.dirname, "desk-web"), join(dropIns, "desk-web"), {
             recursive: true,
         });
@@ -2616,6 +3415,113 @@ describe("the collector in Pocket", () => {
                     }
                 }
             }, context);
+        }
+    });
+
+    test("with meter in desk.json, a pass reads the provider through METER_IO and counts the answers of every conversation; without it, the meter's memory goes", async () => {
+        const shared = globalThis as unknown as Record<symbol, unknown>;
+        const holder = () => shared[Symbol.for("pi-pocket-team.desk.meter")] as MeterHolder;
+        const calls: string[] = [];
+        const folder = join(root, "dashboard-meter");
+
+        mkdirSync(folder, { recursive: true });
+
+        const conversation = await newSession(app, folder);
+
+        await say(app, conversation, "hello meter");
+        shared[METER_IO] = {
+            token: async () => FAKE_TOKEN,
+            fetch: async (url: string) => {
+                calls.push(url);
+
+                return respond(200, JSON.stringify(R4_BODY));
+            },
+        };
+        writeFileSync(configPath, JSON.stringify({ digest: { minutes: 0 }, cap: 100, meter: {} }));
+
+        try {
+            await stopKind(COLLECTOR_TASK);
+            await app.harness.commit(async (tx) => {
+                await ensureCollector(tx, Number(conversation), Collector, await collectorLive(tx));
+            }, context);
+            await until(
+                async () =>
+                    (await liveTasks(COLLECTOR_TASK)).some(
+                        (task) => task.record.state.status === "sleeping",
+                    ),
+                "the collector's first wait",
+            );
+            // A restart with the clock past the wait: the collector makes its pass.
+            await restartApp(shift + PASS_MS + 60_000);
+            await until(
+                async () => holder().state?.coverage.complete === true,
+                "the meter's backfill",
+                20_000,
+            );
+
+            // The oracle: every own answer of every conversation, read here with Pi Durable's scans.
+            const expected = await app.harness.commit(async (tx) => {
+                let answers = 0;
+                let cursor: Parameters<Tx["scanConversations"]>[2];
+
+                do {
+                    const page = await tx.scanConversations({ order: "ascending" }, 100, cursor);
+
+                    for (const each of page.items) {
+                        let entries: Parameters<Tx["scanEntries"]>[2];
+
+                        do {
+                            const list = await tx.scanEntries(
+                                { conversationId: each.id, order: "ascending" },
+                                200,
+                                entries,
+                            );
+
+                            answers += list.items.filter(
+                                (entry) =>
+                                    entry.conversationId === each.id &&
+                                    entry.kind === "pi.assistant",
+                            ).length;
+                            entries = list.next;
+                        } while (entries !== undefined);
+                    }
+
+                    cursor = page.next;
+                } while (cursor !== undefined);
+
+                return answers;
+            }, context);
+            const state = holder().state;
+
+            assert(state !== undefined);
+            assert.ok(expected > 0, "the sessions have answers");
+            assert.equal(
+                Object.values(state.buckets)
+                    .flatMap((byProvider) => Object.values(byProvider))
+                    .flatMap((byModel) => Object.values(byModel))
+                    .reduce((sum, bucket) => sum + bucket.entries, 0),
+                expected,
+            );
+            assert.deepEqual(calls, [ANTHROPIC_USAGE_URL]);
+            assert.equal(state.providers.anthropic?.lastSuccess?.windows[0]?.percent, 95);
+            assert.ok(!JSON.stringify(state).includes(FAKE_TOKEN));
+
+            // No meter key: the next pass drops the meter's memory, and reads nothing.
+            writeFileSync(configPath, JSON.stringify({ digest: { minutes: 0 }, cap: 100 }));
+            await restartApp(shift + PASS_MS + 60_000);
+            await until(
+                async () => holder().state === undefined,
+                "the meter's memory to go",
+                20_000,
+            );
+            assert.equal(holder().ledger, undefined);
+            assert.deepEqual(calls, [ANTHROPIC_USAGE_URL]);
+        } finally {
+            await stopKind(COLLECTOR_TASK);
+            writeFileSync(configPath, JSON.stringify({ digest: { minutes: 0 }, cap: 100 }));
+            delete shared[METER_IO];
+            delete holder().state;
+            delete holder().ledger;
         }
     });
 

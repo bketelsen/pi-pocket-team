@@ -287,6 +287,14 @@ import {
 import createDesk, { linkedSend } from "./desk.ts";
 import type { BoardRow } from "./_desk-board.ts";
 import {
+    emptyMeterState,
+    meterView,
+    parseAnthropicUsage,
+    recordAttempt,
+    type MeterSettings,
+    type MeterState,
+} from "./_desk-meter.ts";
+import {
     defaultBoardSupervisor,
     deskSupervisors,
     liveSupervisors,
@@ -14119,6 +14127,7 @@ before(async () => {
     cpSync(join(import.meta.dirname, "_desk-dashboard.ts"), join(dropIns, "_desk-dashboard.ts"));
     cpSync(join(import.meta.dirname, "_desk-metrics.ts"), join(dropIns, "_desk-metrics.ts"));
     cpSync(join(import.meta.dirname, "_desk-board.ts"), join(dropIns, "_desk-board.ts"));
+    cpSync(join(import.meta.dirname, "_desk-meter.ts"), join(dropIns, "_desk-meter.ts"));
     cpSync(join(import.meta.dirname, "desk-web"), join(dropIns, "desk-web"), { recursive: true });
     cpSync(join(import.meta.dirname, "night-shift.ts"), join(dropIns, "night-shift.ts"));
     cpSync(join(import.meta.dirname, "night-shift-web"), join(dropIns, "night-shift-web"), {
@@ -26120,6 +26129,143 @@ describe("the desk in a Pi Pocket", () => {
                 await stopDigests();
                 await quiet([]);
                 shift = 0;
+                digestOff();
+            }
+        });
+
+        test("the meter's footer: a digest message ends with the meter line at 75%, and has none at 74%", async () => {
+            const holderKey = Symbol.for("pi-pocket-team.desk.meter");
+            const shared = globalThis as unknown as Record<
+                symbol,
+                { version: number; state?: MeterState } | undefined
+            >;
+            const zone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+            const settings: MeterSettings = {
+                providers: ["anthropic"],
+                pollMinutes: 5,
+                digestAt: 75,
+                holdAt: null,
+            };
+
+            /** The meter's memory with 1 fresh reading of the week at `percent`, as a pass would leave it. */
+            const fill = (percent: number, at: number): MeterState => {
+                const state = emptyMeterState();
+                const reading = parseAnthropicUsage(
+                    {
+                        limits: [
+                            {
+                                kind: "weekly_all",
+                                percent,
+                                severity: "normal",
+                                resets_at: new Date(at + 2 * DAY - 30 * 60_000).toISOString(),
+                                is_active: true,
+                            },
+                        ],
+                    },
+                    at,
+                );
+
+                assert(!("error" in reading));
+                recordAttempt(state, "anthropic", at, reading);
+                shared[holderKey] = { version: 1, state };
+
+                return state;
+            };
+
+            /** The digest messages a supervisor got, as their plain text (`modelTexts` gives JSON). */
+            const digests = async (source: ConversationId) =>
+                (await modelTexts(app, source))
+                    .filter((text) => text.includes("[desk] digest:"))
+                    .map((text) => {
+                        const content = JSON.parse(text) as unknown;
+
+                        return typeof content === "string" ? content : text;
+                    });
+
+            // The reports go in the digest at once: the digest is on, and `report` is a kind that goes now.
+            writeFileSync(
+                configPath,
+                JSON.stringify({
+                    digest: { minutes: 15, now: ["report"] },
+                    cap: 100,
+                    meter: {},
+                }),
+            );
+
+            try {
+                const { source, linked, thread } = await delegated("digest-meter");
+
+                await until(
+                    async () =>
+                        typeof (await deskState())?.threads[thread.id]?.run.sweptAt === "number",
+                    "the first sweep",
+                    20_000,
+                );
+                await until(() => !app.isBusy(linked), "the linked session to settle", 20_000);
+                await app.harness.commit(async (tx) => {
+                    delete (await tx.doc(DeskThreads)).digests;
+                }, context);
+
+                const at = Date.now();
+                const state = fill(75, at);
+                const line = meterView(state, settings, at, zone).providers[0]?.line ?? "";
+
+                assert.match(
+                    line,
+                    /^Anthropic: week 75% used, resets \w{3} \d{2}:\d{2} \(in 1d 23h\)$/,
+                );
+                await say(app, linked, "report to supervisor test");
+                await until(
+                    async () => (await digests(source)).length === 1,
+                    "the first digest message",
+                    20_000,
+                );
+
+                const first = (await digests(source))[0] ?? "";
+
+                assert.match(
+                    first,
+                    new RegExp(`\\[desk\\] ${thread.id} frostyard/test · duncan reported`),
+                );
+                assert.ok(
+                    first.endsWith(`\nMeter: ${line}`),
+                    `the footer is the last line: ${first}`,
+                );
+                assert.equal(
+                    first.split("\n").filter((each) => each.startsWith("Meter: ")).length,
+                    1,
+                );
+
+                // Another supervisor and thread, at 74%.
+                const other = await delegated("digest-meter-low");
+
+                await until(
+                    async () =>
+                        typeof (await deskState())?.threads[other.thread.id]?.run.sweptAt ===
+                        "number",
+                    "the other first sweep",
+                    20_000,
+                );
+                await until(() => !app.isBusy(other.linked), "the other session to settle", 20_000);
+                await app.harness.commit(async (tx) => {
+                    delete (await tx.doc(DeskThreads)).digests;
+                }, context);
+                fill(74, Date.now());
+                await say(app, other.linked, "report to supervisor test");
+                await until(
+                    async () => (await digests(other.source)).length === 1,
+                    "the second digest message",
+                    20_000,
+                );
+
+                const second = (await digests(other.source))[0] ?? "";
+
+                assert.match(second, /duncan reported/);
+                assert.doesNotMatch(second, /Meter: /, "74% is below digestAt");
+            } finally {
+                await stopDigests();
+                await quiet([]);
+                delete shared[holderKey];
                 digestOff();
             }
         });

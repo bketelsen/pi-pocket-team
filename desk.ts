@@ -79,6 +79,7 @@ import type * as DashboardModule from "./_desk-dashboard.ts";
 import type * as MetricsModule from "./_desk-metrics.ts";
 import type * as UsageModule from "./_desk-usage.ts";
 import type * as BoardModule from "./_desk-board.ts";
+import type * as MeterModule from "./_desk-meter.ts";
 
 /**
  * A JSON value, the same shape as chord's `JsonValue`. Kept here: chord 1.5.2 (Pi Pocket 0.28.2 and later) no longer
@@ -120,6 +121,13 @@ const usageDocs = (await import(
 const boardRules = (await import(
     new URL(`./_desk-board.ts${new URL(import.meta.url).search}`, import.meta.url).href
 )) as typeof BoardModule;
+/**
+ * The subscription meter's pure rules (`_desk-meter.ts`, plan T1747), loaded the same way. The URL is the one the
+ * dashboard helper imports, so both get the same instance.
+ */
+const meterRules = (await import(
+    new URL(`./_desk-meter.ts${new URL(import.meta.url).search}`, import.meta.url).href
+)) as typeof MeterModule;
 
 /** Where another module finds this one's live API. */
 const API = Symbol.for("pi-pocket-team.desk");
@@ -19958,6 +19966,45 @@ export function queueExport(
 const CONSULT_STARTS = Symbol.for("pi-pocket-team.desk.consult-starts");
 /** The goal board's row ids whose start runs now: shared by every instance of this module in the process. */
 const BOARD_STARTS = Symbol.for("pi-pocket-team.desk.board-starts");
+/** Where the subscription meter keeps its memory, shared by every load of this module (plan T1747, D6). */
+const METER_HOLDER = Symbol.for("pi-pocket-team.desk.meter");
+
+/**
+ * Tests put fake provider reads here (`{ token, fetch }`, as `MeterIo`), as they put a fake model call in
+ * `JOURNAL_COMPLETE`: no test reads Pi's sign-in or calls Anthropic.
+ */
+export const METER_IO = Symbol.for("pi-pocket-team.desk.meter-io");
+/** The holder's shape version: a reload with another version starts the meter's memory again. */
+export const METER_HOLDER_VERSION = 1;
+
+/**
+ * The meter's memory: the provider readings and the ledger (`state`), and where the ledger's reads are (`ledger`).
+ * Both are absent while the meter is off. It is not stored: a restart of the server starts it again.
+ */
+export type MeterHolder = {
+    version: number;
+    state?: MeterModule.MeterState;
+    ledger?: DashboardModule.MeterLedger;
+};
+
+/**
+ * The meter's memory, shared by every load of this module, so an install does not start the backfill again. A holder
+ * of another version is replaced.
+ */
+export function meterHolder(): MeterHolder {
+    const shared = globalThis as unknown as Record<symbol, MeterHolder | undefined>;
+    const held = shared[METER_HOLDER];
+
+    if (held !== undefined && held.version === METER_HOLDER_VERSION) {
+        return held;
+    }
+
+    const fresh: MeterHolder = { version: METER_HOLDER_VERSION };
+
+    shared[METER_HOLDER] = fresh;
+
+    return fresh;
+}
 
 /**
  * The consult start keys whose start runs now, shared by every instance of this module in the process: the call and
@@ -26426,6 +26473,10 @@ export default function createDesk(host: Host, web: Web) {
         /** The goal board's limits (`board`), each in its bounds; `boardWarnings` names each value that fell back. */
         board: BoardModule.BoardSettings;
         boardWarnings: string[];
+        /** The subscription meter's settings (`meter`); absent when the meter is off (no `meter` key). */
+        meter?: MeterModule.MeterSettings;
+        /** 1 warning for each meter value that fell back. */
+        meterWarnings: string[];
     }> {
         try {
             const value = JSON.parse(await readFile(configFile(), "utf8")) as {
@@ -26440,6 +26491,7 @@ export default function createDesk(host: Host, web: Web) {
                 plans?: unknown;
                 archive?: unknown;
                 board?: unknown;
+                meter?: unknown;
             } | null;
             const authors = Array.isArray(value?.authors)
                 ? value.authors.filter(
@@ -26468,6 +26520,8 @@ export default function createDesk(host: Host, web: Web) {
             // The journal is off without a usable `journal` key: a missing one, or one whose `url` is not a notes endpoint.
             const journal = journalConfig(value?.journal);
             const board = boardRules.boardSettings(value?.board);
+            // The meter is off without a `meter` key.
+            const meter = meterRules.meterSettings(value?.meter);
 
             return {
                 authors,
@@ -26481,6 +26535,8 @@ export default function createDesk(host: Host, web: Web) {
                 },
                 board: board.settings,
                 boardWarnings: board.warnings,
+                ...(meter.settings === undefined ? {} : { meter: meter.settings }),
+                meterWarnings: meter.warnings,
                 ...(journal === undefined ? {} : { journal }),
                 ...(exported === undefined ? {} : { export: exported }),
                 ...(exported !== undefined && value?.exportCommit === true
@@ -26498,14 +26554,16 @@ export default function createDesk(host: Host, web: Web) {
                 archive: { auto: true },
                 board: { ...boardRules.BOARD_DEFAULTS },
                 boardWarnings: [],
+                meterWarnings: [],
             };
         }
     }
 
-    // The board's limits in desk.json: each value out of its bounds falls back to its default, with 1 warning here.
+    // The board's limits and the meter in desk.json: each value out of its bounds falls back to its default, with 1
+    // warning here.
     void deskConfig()
         .then((config) => {
-            for (const warning of config.boardWarnings) {
+            for (const warning of [...config.boardWarnings, ...config.meterWarnings]) {
                 try {
                     host.notice("warning", warning);
                 } catch {
@@ -26514,6 +26572,165 @@ export default function createDesk(host: Host, web: Web) {
             }
         })
         .catch(() => undefined);
+
+    // ─── The subscription meter (plan T1747) ─────────────────────────────────
+
+    /** The meter's on state: its settings and its memory. */
+    type MeterOn = {
+        settings: MeterModule.MeterSettings;
+        state: MeterModule.MeterState;
+        ledger: DashboardModule.MeterLedger;
+    };
+
+    /**
+     * The meter now, from desk.json (`config`, or a new read): its settings and its memory, or undefined when it is off.
+     * Only the collector's pass (`drop`) drops the meter's memory when it is off, so a later key starts it again from
+     * nothing. A reader (`desk usage`, the board, the digest, the dashboard) never drops it: a config file that cannot be
+     * read for a moment reads as off, and must not throw away the backfill.
+     */
+    const meterOn = async (
+        config?: { meter?: MeterModule.MeterSettings },
+        drop = false,
+    ): Promise<MeterOn | undefined> => {
+        const settings = (config ?? (await deskConfig())).meter;
+        const holder = meterHolder();
+
+        if (settings === undefined) {
+            if (drop) {
+                delete holder.state;
+                delete holder.ledger;
+            }
+
+            return undefined;
+        }
+
+        holder.state ??= meterRules.emptyMeterState();
+        holder.ledger ??= dashboard.emptyMeterLedger();
+
+        return { settings, state: holder.state, ledger: holder.ledger };
+    };
+
+    /** The meter's view at `now`, in the server's zone (plan S5). */
+    const meterViewOf = (on: MeterOn, now: number): MeterModule.MeterView =>
+        meterRules.meterView(on.state, on.settings, now, serverZone());
+
+    /** Pi's model runtime for the meter's token: made once, and made again after a failure. */
+    let meterModels: Promise<import("@earendil-works/pi-coding-agent").ModelRuntime> | undefined;
+
+    /**
+     * Pi's OAuth token for Anthropic (plan D1), as Pi keeps it: Pi renews it under its own lock. Only a subscription
+     * sign-in (OAuth) has a usage report. The token stays in memory for the 1 read.
+     */
+    const meterToken = async (signal: AbortSignal): Promise<string | { error: string }> => {
+        try {
+            const { ModelRuntime } = await import("@earendil-works/pi-coding-agent");
+
+            meterModels ??= ModelRuntime.create({ refreshOnCreate: false });
+
+            const models = await meterModels;
+
+            if (!models.isUsingOAuth("anthropic")) {
+                return { error: "Pi's Anthropic sign-in is not a subscription (OAuth)" };
+            }
+
+            const key = (await models.getAuth("anthropic", { signal }))?.auth.apiKey;
+
+            return typeof key === "string" && key !== ""
+                ? key
+                : { error: "Pi is not signed in to Anthropic" };
+        } catch (error) {
+            meterModels = undefined;
+
+            throw error;
+        }
+    };
+
+    /** The provider reader: the test's fakes in `METER_IO`, else Pi's sign-in and the global `fetch`. */
+    const meterReader = (): DashboardModule.MeterDeps["readProvider"] => {
+        const fake = (globalThis as unknown as Record<symbol, unknown>)[METER_IO] as
+            Partial<DashboardModule.MeterIo> | undefined;
+
+        return dashboard.anthropicReader(
+            typeof fake?.token === "function" && typeof fake.fetch === "function"
+                ? (fake as DashboardModule.MeterIo)
+                : { token: meterToken, fetch: (input, init) => globalThis.fetch(input, init) },
+        );
+    };
+
+    // The ledger's active conversations (plan D6): a run that starts makes its conversation active; its end lets it
+    // go after its next read. A listener only changes the meter's memory, and only while the meter is on.
+    if (typeof host.on === "function") {
+        web.onDispose(
+            host.on("run.started", (event) => {
+                try {
+                    const holder = meterHolder();
+
+                    if (holder.state !== undefined && holder.ledger !== undefined) {
+                        holder.ledger.active.add(event.conversationId);
+                        holder.ledger.ended.delete(event.conversationId);
+                    }
+                } catch {
+                    // A listener never throws: the next pass reads the conversations with recent answers anyway.
+                }
+            }),
+        );
+    }
+
+    /**
+     * The meter's part of the `run.ended` listener (the desk has 1 listener for it): the conversation leaves the
+     * active set after its first read that starts later. Only while the meter is on; it never throws.
+     */
+    const meterRunEnded = (event: { conversationId: number }): void => {
+        try {
+            const holder = meterHolder();
+
+            if (
+                holder.state !== undefined &&
+                holder.ledger?.active.has(event.conversationId) === true
+            ) {
+                holder.ledger.ended.set(event.conversationId, Date.now());
+            }
+        } catch {
+            // A listener never throws.
+        }
+    };
+
+    /** The off text of `desk usage`. */
+    const METER_OFF = "The meter is off: set meter in desk.json.";
+
+    /**
+     * `desk usage` (plan S1): each provider's line, each provider's ledger at list price, the granted resets, and the
+     * meter's own state. Read only: no commit and no provider read.
+     */
+    const meterUsageText = async (): Promise<string> => {
+        const on = await meterOn();
+
+        if (on === undefined) {
+            return METER_OFF;
+        }
+
+        const now = Date.now();
+        const zone = serverZone();
+        const view = meterViewOf(on, now);
+
+        return [
+            ...view.providers.map((row) => row.line),
+            ...view.providers.map((row) => `${row.label} ${meterRules.ledgerLine(row)}`),
+            ...view.providers.flatMap((row) => {
+                const grants = meterRules.grantsLine(row, now, zone);
+
+                return grants === undefined ? [] : [`${row.label} ${grants}`];
+            }),
+            meterRules.meterStatusLine(view, now, zone),
+        ].join("\n");
+    };
+
+    /** The meter's lines for the board (plan S2): each provider's line; none when the meter is off. */
+    const meterBoardLines = async (): Promise<string[]> => {
+        const on = await meterOn();
+
+        return on === undefined ? [] : meterViewOf(on, Date.now()).providers.map((row) => row.line);
+    };
 
     /** The export speaks at most once an hour: a failed export must not fill the notices. */
     let exportNoticeAt = 0;
@@ -27296,6 +27513,8 @@ export default function createDesk(host: Host, web: Web) {
     if (typeof host.on === "function") {
         web.onDispose(
             host.on("run.ended", (event) => {
+                meterRunEnded(event);
+
                 try {
                     const supervisor = failedRunSupervisor(event, (session) =>
                         failedRunSessions.get(session),
@@ -29498,6 +29717,12 @@ export default function createDesk(host: Host, web: Web) {
     const Collector = dashboard.defineCollector({
         deskDoc: DeskThreads,
         gh: () => process.env.PI_POCKET_DESK_GH ?? "gh",
+        // The meter's step: desk.json is read at each pass, so a change acts at the next pass; off drops its memory.
+        meter: async () => {
+            const on = await meterOn(undefined, true);
+
+            return on === undefined ? undefined : { ...on, readProvider: meterReader() };
+        },
     });
 
     /**
@@ -30370,7 +30595,8 @@ export default function createDesk(host: Host, web: Web) {
                         };
                     }
 
-                    const { digest, journal } = await deskConfig();
+                    const config = await deskConfig();
+                    const { digest, journal } = config;
                     const clerk = clerkOf(state, supervisor);
                     // The Clerk takes the routine kinds; a kind that goes at once always stays with the supervisor.
                     const split = splitDigest(items, clerk !== undefined, digest);
@@ -30424,11 +30650,21 @@ export default function createDesk(host: Host, web: Web) {
 
                     const base = `x.desk.digest:${String(supervisor)}:${String(taken.seq)}`;
                     const messages: DigestMessage[] = [];
+                    // The meter's footer (plan S3): status, not news. It is made here, so the checkpoint keeps it.
+                    const metered = await meterOn(config);
+                    const footer =
+                        metered === undefined
+                            ? []
+                            : meterRules.meterFooter(
+                                  meterViewOf(metered, now.at),
+                                  metered.settings.digestAt,
+                              );
+                    const withFooter = (text: string): string => [text, ...footer].join("\n");
 
                     if (theirs.length > 0 && clerk !== undefined) {
                         messages.push({
                             conversation: clerk.session,
-                            text: digestText(theirs, now),
+                            text: withFooter(digestText(theirs, now)),
                             requestId: `${base}:clerk`,
                         });
                     }
@@ -30436,7 +30672,7 @@ export default function createDesk(host: Host, web: Web) {
                     if (ours.length > 0) {
                         messages.push({
                             conversation: supervisor,
-                            text: digestText(ours, now),
+                            text: withFooter(digestText(ours, now)),
                             requestId: base,
                         });
                     }
@@ -31567,7 +31803,13 @@ export default function createDesk(host: Host, web: Web) {
                 throw web.error(400, answer.error);
             }
 
-            return answer;
+            // The subscription meter's view (plan S4), only when it is on: no field at all when it is off. It holds no
+            // token and no header.
+            const metered = await meterOn();
+
+            return metered === undefined
+                ? answer
+                : { ...answer, meter: meterViewOf(metered, Date.now()) };
         },
         { access: "owner" },
     );
@@ -33564,6 +33806,8 @@ export default function createDesk(host: Host, web: Web) {
 
         return [
             `Board limits: ${(await boardLimits(state, supervisor)).line}.`,
+            // The subscription meter's lines (plan S2), only when it is on.
+            ...(await meterBoardLines()),
             ...(lines.length === 0 ? ["The board has no rows."] : lines),
         ].join("\n");
     };
@@ -34100,7 +34344,7 @@ export default function createDesk(host: Host, web: Web) {
     const tool = defineTool({
         name: "desk",
         description:
-            "The desk of threads for work the team runs in the background. A supervisor session can use every action; a Clerk can use list, read, sync, attach, detach, watch, result, send, issues, and escalate for its supervisor's threads; an agent session can use read, watch, and result on its own thread only. Actions: list (one line per open thread), read (one thread in full), sync (observe the threads now, with linked sessions, Shift, git, and GitHub), seed (import a seed.json file one time), attach (put a PR, a queued issue, or all of another thread's work, on one thread), detach (take a PR off a thread for good: the sweep does not attach or find it again; only attach brings it back), own (mark a found PR thread as Brian's own: it closes, and no sweep finds its PR again), ask (file a question for Brian on a thread, or on a new one; never for a plain merge: Ready to merge on the Desk page lists those), rewrite (give an open ask new words, and new options or none: an agent's ask is filed as it wrote it, so make it clear for Brian), withdraw (end an open ask that Brian need not answer, with words saying why, or with into to merge it into another open ask), answer (record Brian's words for an ask), watch (set a dated check on a thread: it sleeps until that date, or until its optional on event, and does not count toward the cap; a thread closed as done in the last 7 days opens again for it, and sleeps), result (record that check's pass, which closes the thread, or its fail, which opens it again: a pass is refused while the thread has an open ask, or while it delivers a plan task with no PR and no plan nochange), send (send 1 message from the supervisor's session to a thread's agent), issues (read the issues Brian queued on GitHub: read only), escalate (Clerk only: 1 escalation to the supervisor; the desk drops it when the supervisor already acted on the thread or got its news directly, and else puts it in her next digest, or sends it at once with urgent: true), archive (supervisor only: a dry run that lists the idle sessions of threads closed 2 days ago or more that the desk can archive, with the skips and their reasons; with apply: true, archive the sessions of a dry run of the last 60 minutes that still pass every rule; it archives, it never deletes). The goal board (shift rows of 1 supervisor, launched by the desk under the limits): board (anyone, the Clerk too: the rows in launch order with their rev, state, times and thread, and the limits now), board_add (fields: the supervisor adds any row; an agent adds only its own, as proposed, without note or order), board_edit (row, fields) and board_drop (row) (the supervisor on its rows; an agent only on its own proposed rows, not agent, note or order), and supervisor only: board_pick (rows), board_unpick (rows), board_launch (rows, or none for every picked row: they wait, and the desk starts them), board_reopen (row: a failed row back to proposed), board_resolve (row, and thread for an unknown row whose session started, or nothing to fail it). A rev that differs from the row's is refused: read the board again.",
+            "The desk of threads for work the team runs in the background. A supervisor session can use every action; a Clerk can use list, read, sync, attach, detach, watch, result, send, issues, and escalate for its supervisor's threads; an agent session can use read, watch, and result on its own thread only. Actions: list (one line per open thread), read (one thread in full), sync (observe the threads now, with linked sessions, Shift, git, and GitHub), seed (import a seed.json file one time), attach (put a PR, a queued issue, or all of another thread's work, on one thread), detach (take a PR off a thread for good: the sweep does not attach or find it again; only attach brings it back), own (mark a found PR thread as Brian's own: it closes, and no sweep finds its PR again), ask (file a question for Brian on a thread, or on a new one; never for a plain merge: Ready to merge on the Desk page lists those), rewrite (give an open ask new words, and new options or none: an agent's ask is filed as it wrote it, so make it clear for Brian), withdraw (end an open ask that Brian need not answer, with words saying why, or with into to merge it into another open ask), answer (record Brian's words for an ask), watch (set a dated check on a thread: it sleeps until that date, or until its optional on event, and does not count toward the cap; a thread closed as done in the last 7 days opens again for it, and sleeps), result (record that check's pass, which closes the thread, or its fail, which opens it again: a pass is refused while the thread has an open ask, or while it delivers a plan task with no PR and no plan nochange), send (send 1 message from the supervisor's session to a thread's agent), issues (read the issues Brian queued on GitHub: read only), escalate (Clerk only: 1 escalation to the supervisor; the desk drops it when the supervisor already acted on the thread or got its news directly, and else puts it in her next digest, or sends it at once with urgent: true), archive (supervisor only: a dry run that lists the idle sessions of threads closed 2 days ago or more that the desk can archive, with the skips and their reasons; with apply: true, archive the sessions of a dry run of the last 60 minutes that still pass every rule; it archives, it never deletes), usage (anyone with the desk tool: subscription usage (provider percent, reset, burn, projection, grants) and the ledger at list price; read only). The goal board (shift rows of 1 supervisor, launched by the desk under the limits): board (anyone, the Clerk too: the rows in launch order with their rev, state, times and thread, and the limits now), board_add (fields: the supervisor adds any row; an agent adds only its own, as proposed, without note or order), board_edit (row, fields) and board_drop (row) (the supervisor on its rows; an agent only on its own proposed rows, not agent, note or order), and supervisor only: board_pick (rows), board_unpick (rows), board_launch (rows, or none for every picked row: they wait, and the desk starts them), board_reopen (row: a failed row back to proposed), board_resolve (row, and thread for an unknown row whose session started, or nothing to fail it). A rev that differs from the row's is refused: read the board again.",
         parameters: Type.Object({
             action: Type.Union([
                 Type.Literal("list"),
@@ -34129,6 +34373,7 @@ export default function createDesk(host: Host, web: Web) {
                 Type.Literal("board_launch"),
                 Type.Literal("board_reopen"),
                 Type.Literal("board_resolve"),
+                Type.Literal("usage"),
             ]),
             thread: Type.Optional(
                 Type.String({
@@ -34333,6 +34578,7 @@ export default function createDesk(host: Host, web: Web) {
                 agent &&
                 !watching &&
                 args.action !== "read" &&
+                args.action !== "usage" &&
                 !args.action.startsWith("board")
             ) {
                 throw new Error(
@@ -34347,6 +34593,11 @@ export default function createDesk(host: Host, web: Web) {
                 thread.session === session;
 
             const looked = `supervisor:${String(supervisor)}`;
+
+            // The subscription meter (plan S1): read only, for a supervisor, a Clerk and an agent.
+            if (args.action === "usage") {
+                return reply(await meterUsageText());
+            }
 
             if (args.action === "board" || args.action.startsWith("board_")) {
                 const state = await api.snapshot(DeskThreads, context);

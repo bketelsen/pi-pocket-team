@@ -49,10 +49,21 @@ import {
     type BoardRow,
 } from "./_desk-board.ts";
 import { delegatedRequest, localMidnight, nextClockTime, SHIFT_TEXT_LIMIT } from "./night-shift.ts";
+import { emptyMeterLedger } from "./_desk-dashboard.ts";
+import {
+    addLedger,
+    emptyMeterState,
+    meterView,
+    parseAnthropicUsage,
+    recordAttempt,
+    type MeterSettings,
+    type MeterState,
+} from "./_desk-meter.ts";
 import createDesk, {
     BoardReceipts,
     capView,
     DeskThreads,
+    meterHolder,
     type DeskState,
     openThread,
 } from "./desk.ts";
@@ -1437,6 +1448,68 @@ function config(cap: number, board: object = {}): void {
     writeFileSync(configPath, JSON.stringify({ digest: { minutes: 0 }, cap, board }));
 }
 
+/** The desk config with the meter on (`meter`), the cap, and the board's limits. */
+function meterConfig(meter: object, cap = 100, board: object = {}): void {
+    writeFileSync(configPath, JSON.stringify({ digest: { minutes: 0 }, cap, board, meter }));
+}
+
+/** The meter's defaults: what `meter: {}` gives. */
+const METER_SETTINGS: MeterSettings = {
+    providers: ["anthropic"],
+    pollMinutes: 5,
+    digestAt: 75,
+    holdAt: null,
+};
+/** The zone the desk writes the meter's times in: the server's own. */
+const SERVER_ZONE = Intl.DateTimeFormat().resolvedOptions().timeZone;
+
+/**
+ * The meter's memory with 1 reading at `now` (the plan's R4 answer, with grants that are not readable) and $70 of
+ * list price 10 minutes before `now`: put where the desk finds it, as a pass would leave it.
+ */
+function meterFilled(now: number): MeterState {
+    const state = emptyMeterState();
+    const reading = parseAnthropicUsage(
+        {
+            limits: [
+                {
+                    kind: "weekly_all",
+                    percent: 95,
+                    severity: "critical",
+                    resets_at: "2026-11-18T16:00:00Z",
+                    is_active: true,
+                },
+                {
+                    kind: "weekly_scoped",
+                    percent: 19,
+                    severity: "normal",
+                    resets_at: "2026-11-18T16:00:00Z",
+                    scope: { model: { display_name: "Fable" } },
+                    is_active: false,
+                },
+            ],
+            cedar_ember: { eligible: false, ineligible_reason: "surface", grants: [] },
+        },
+        now,
+    );
+
+    assert(!("error" in reading));
+    recordAttempt(state, "anthropic", now, reading);
+    addLedger(state, {
+        provider: "anthropic",
+        model: "claude-opus-5-5",
+        timestamp: now - 10 * 60_000,
+        input: 10,
+        output: 5,
+        cacheRead: 0,
+        cacheWrite: 0,
+        cost: 70,
+    });
+    meterHolder().state = state;
+
+    return state;
+}
+
 const stubWeb = {
     conversationRoute() {},
     route() {},
@@ -1451,8 +1524,23 @@ const notices: string[] = [];
 let toolCalls = 0;
 
 /** The desk module on the app's harness: its tool, with an injected host. Its API takes the global place. */
-function stubDesk(notes: string[] = notices) {
+function stubDesk(
+    notes: string[] = notices,
+    listeners?: Map<string, ((event: { conversationId: number; session: number }) => void)[]>,
+) {
     const stubHost = {
+        ...(listeners === undefined
+            ? {}
+            : {
+                  on: (
+                      event: string,
+                      listener: (data: { conversationId: number; session: number }) => void,
+                  ) => {
+                      listeners.set(event, [...(listeners.get(event) ?? []), listener]);
+
+                      return () => {};
+                  },
+              }),
         requesterOf: () => owner(app).id,
         subagentModels: () => MODELS,
         text: { defang: (value: string) => value, quoted: (value: string) => value },
@@ -1609,6 +1697,7 @@ const launchSuite = (label: string, instant: number, untilAt: number) =>
                 "_desk-dashboard.ts",
                 "_desk-metrics.ts",
                 "_desk-board.ts",
+                "_desk-meter.ts",
             ]) {
                 cpSync(join(import.meta.dirname, file), join(dropIns, file));
             }
@@ -1671,6 +1760,119 @@ const launchSuite = (label: string, instant: number, untilAt: number) =>
                 /rev 1 proposed · teg · goal · max 20 · until 06:45 .*: First$/,
             );
             assert.match(lines[2] ?? "", /: Second$/);
+        });
+
+        test("desk usage: the exact off text with no meter key; on, the provider lines, the ledger, the grants and the meter's state, for a supervisor, a Clerk and an agent", async () => {
+            await closeAll();
+
+            const supervisor = await supervisorSession();
+
+            mkdirSync(join(root, "usage-teg"), { recursive: true });
+            mkdirSync(join(root, "usage-clerk"), { recursive: true });
+
+            const agentSession = Number(await newSession(app, join(root, "usage-teg")));
+            const clerkSession = Number(await newSession(app, join(root, "usage-clerk")));
+
+            personas.set(agentSession, { id: "teg", name: "Teg", role: "agent" });
+            personas.set(clerkSession, { id: "clerk", name: "Clerk", role: "clerk" });
+            await app.harness.commit(async (tx) => {
+                (await tx.doc(DeskThreads)).clerks = {
+                    [String(supervisor)]: {
+                        session: clerkSession,
+                        address: "session-usage-clerk",
+                        agent: "clerk",
+                        at: Date.now(),
+                    },
+                };
+            }, context);
+
+            try {
+                config(100);
+
+                for (const session of [supervisor, clerkSession, agentSession]) {
+                    assert.equal(
+                        await desk.tool(session, { action: "usage" }),
+                        "The meter is off: set meter in desk.json.",
+                    );
+                }
+
+                const now = Date.now();
+                const state = meterFilled(now);
+
+                meterConfig({});
+
+                const expected = [
+                    meterView(state, METER_SETTINGS, now, SERVER_ZONE).providers[0]?.line,
+                    "OpenAI: no provider report (Pi's ChatGPT sign-in has no usage endpoint)",
+                    "Anthropic list price: $70 last hour, $70 today, $70 in 7 days (partial); top: claude-opus-5-5 $70",
+                    "OpenAI list price: $0 last hour, $0 today, $0 in 7 days (partial)",
+                    "Anthropic grants: not readable (surface)",
+                    "Meter: provider read 0 min ago (last attempt ok); ledger filling 0 of 0 conversations; hold off",
+                ].join("\n");
+
+                assert.match(
+                    expected,
+                    /^Anthropic: week 95% used \(critical\), resets \w{3} \d{2}:\d{2} \(in \d+d \d+h\) · week, Fable 19%\n/,
+                );
+
+                for (const session of [supervisor, clerkSession, agentSession]) {
+                    assert.equal(await desk.tool(session, { action: "usage" }), expected);
+                }
+
+                // The meter key goes: a read says off, and keeps the meter's memory. Only the collector's pass drops
+                // it, so a config file that cannot be read for a moment does not throw away the backfill.
+                config(100);
+                assert.equal(
+                    await desk.tool(supervisor, { action: "usage" }),
+                    "The meter is off: set meter in desk.json.",
+                );
+                assert.equal(meterHolder().state, state);
+            } finally {
+                config(100);
+                delete meterHolder().state;
+                delete meterHolder().ledger;
+                await app.harness.commit(async (tx) => {
+                    (await tx.doc(DeskThreads)).clerks = {};
+                }, context);
+            }
+        });
+
+        test("desk board: each provider's meter line comes right after the limits line, only when the meter is on", async () => {
+            await closeAll();
+
+            const supervisor = await supervisorSession();
+
+            try {
+                config(16, { atOnce: 8 });
+
+                const off = (await desk.tool(supervisor, { action: "board" })).split("\n");
+
+                assert.match(off[0] ?? "", /^Board limits: /);
+                assert.equal(off[1], "The board has no rows.");
+
+                const now = Date.now();
+                const state = meterFilled(now);
+
+                meterConfig({}, 16, { atOnce: 8 });
+
+                const on = (await desk.tool(supervisor, { action: "board" })).split("\n");
+
+                assert.match(on[0] ?? "", /^Board limits: 8 at once, 0 running/);
+                assert.equal(
+                    on[1],
+                    meterView(state, METER_SETTINGS, now, SERVER_ZONE).providers[0]?.line,
+                );
+                assert.match(on[1] ?? "", /^Anthropic: week 95% used \(critical\), resets /);
+                assert.equal(
+                    on[2],
+                    "OpenAI: no provider report (Pi's ChatGPT sign-in has no usage endpoint)",
+                );
+                assert.equal(on[3], "The board has no rows.");
+            } finally {
+                config(100);
+                delete meterHolder().state;
+                delete meterHolder().ledger;
+            }
         });
 
         test("a board_add over the shift's text limit is refused with the counted length and the limit; no row is added", async () => {
@@ -2655,6 +2857,64 @@ const launchSuite = (label: string, instant: number, untilAt: number) =>
                 "desk.json board.atOnce must be a whole number from 1 to 16: 99 is not, so the board uses 8.",
             ]);
             config(100);
+        });
+
+        test("a bad meter value falls back with 1 warning at load", async () => {
+            const own: string[] = [];
+
+            meterConfig({ pollMinutes: 2 });
+            stubDesk(own);
+            await waitFor(() => own.length > 0, "the warning");
+            assert.deepEqual(own, [
+                "desk.json meter.pollMinutes must be a whole number from 5 to 60: 2 is not, so the meter uses 5.",
+            ]);
+            config(100);
+            delete meterHolder().state;
+            delete meterHolder().ledger;
+        });
+
+        test("run.started and run.ended mark the ledger's active conversations, only while the meter has memory", () => {
+            const listeners = new Map<
+                string,
+                ((event: { conversationId: number; session: number }) => void)[]
+            >();
+
+            stubDesk([], listeners);
+
+            const started = listeners.get("run.started") ?? [];
+            const ended = listeners.get("run.ended") ?? [];
+
+            assert.equal(started.length, 1);
+            assert.equal(ended.length, 1, "the desk keeps 1 run.ended listener");
+
+            // Off: no memory, nothing marked, and nothing thrown.
+            delete meterHolder().state;
+            delete meterHolder().ledger;
+            started[0]!({ conversationId: 77, session: 70 });
+            ended[0]!({ conversationId: 77, session: 70 });
+            assert.equal(meterHolder().ledger, undefined);
+
+            meterHolder().state = emptyMeterState();
+            meterHolder().ledger = emptyMeterLedger();
+
+            try {
+                started[0]!({ conversationId: 77, session: 70 });
+                assert.deepEqual([...(meterHolder().ledger?.active ?? [])], [77]);
+                ended[0]!({ conversationId: 77, session: 70 });
+                assert.deepEqual(
+                    [...(meterHolder().ledger?.ended ?? new Map())],
+                    [[77, Date.now()]],
+                );
+                // A new run of the same conversation: it stays active.
+                started[0]!({ conversationId: 77, session: 70 });
+                assert.equal(meterHolder().ledger?.ended.size, 0);
+                // The end of a conversation the meter does not hold active marks nothing.
+                ended[0]!({ conversationId: 78, session: 70 });
+                assert.equal(meterHolder().ledger?.ended.size, 0);
+            } finally {
+                delete meterHolder().state;
+                delete meterHolder().ledger;
+            }
         });
     });
 

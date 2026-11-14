@@ -741,6 +741,166 @@ export const HELP = {
     time: "Dates are UTC days. A range starts at 00:00 UTC of its first day (inclusive) and ends at 00:00 UTC after its last day (exclusive); a range that includes today ends at the snapshot time. Outcomes are the latest known: a reopened thread leaves its range until it closes again.",
 };
 
+// ─── The Subscriptions card (plan T1747, S4) ────────────────────────────────
+
+/** Whole US dollars, as the meter's ledger line writes them: "$2,263". */
+const wholeDollars = (usd) => `$${Math.round(usd).toLocaleString("en-US")}`;
+
+/**
+ * The ledger at list price, as the server's `ledgerLine` writes it: "list price: $70 last hour, $228 today, $2,263 in 7
+ * days (partial); top: claude-opus-5-5 $2,263". List price is not money spent on a subscription.
+ */
+export const meterLedgerText = (ledger) => {
+    if (ledger === null || typeof ledger !== "object") {
+        return null;
+    }
+
+    let text = `list price: ${wholeDollars(ledger.lastHour)} last hour, ${wholeDollars(ledger.today)} today, ${wholeDollars(ledger.days7)} in 7 days`;
+
+    if (ledger.partial) {
+        text += " (partial)";
+    }
+
+    if (Array.isArray(ledger.top) && ledger.top.length > 0) {
+        text += `; top: ${ledger.top.map((item) => `${item.model} ${wholeDollars(item.cost)}`).join(", ")}`;
+    }
+
+    if (typeof ledger.unknownCost === "number" && ledger.unknownCost > 0) {
+        text += `; ${ledger.unknownCost} answers with no cost`;
+    }
+
+    return text;
+};
+
+/** A time left as "26d" or "5h" (floored), for the grants' expiry: no zone needed. */
+const leftText = (ms) =>
+    ms >= DAY_MS ? `${Math.floor(ms / DAY_MS)}d` : `${Math.max(0, Math.floor(ms / HOUR_MS))}h`;
+
+/**
+ * The granted resets, by label: "resets granted: Weekly ×2 (first expires in 26d) · Fable ×2 (first expires in
+ * 115d)"; or "grants: not readable (surface)"; or null with neither. Times count from the view's `at`.
+ */
+export const meterGrantsText = (row, at) => {
+    const grants = Array.isArray(row.grants) ? row.grants : [];
+
+    if (grants.length === 0) {
+        return typeof row.grantsNote === "string" ? `grants: ${row.grantsNote}` : null;
+    }
+
+    const groups = [];
+
+    for (const grant of grants) {
+        const group = groups.find((each) => each.label === grant.label);
+
+        if (group === undefined) {
+            groups.push({ label: grant.label, left: grant.resetsLeft, ends: [grant.endsAt] });
+        } else {
+            group.left += grant.resetsLeft;
+            group.ends.push(grant.endsAt);
+        }
+    }
+
+    const parts = groups.map((group) => {
+        const ends = group.ends.filter((end) => typeof end === "number");
+
+        return ends.length === 0
+            ? `${group.label} ×${group.left}`
+            : `${group.label} ×${group.left} (first expires in ${leftText(Math.min(...ends) - at)})`;
+    });
+
+    return `resets granted: ${parts.join(" · ")}`;
+};
+
+/**
+ * The card's rows, from the dashboard's `meter` field: 1 for each provider. `state` is the main window's reading
+ * state, or "none" with no provider report. A fresh reading gets a gauge; the other states get a text in its place.
+ * `line` is the server's line (its times are in the server's zone), the row's main text; it holds the other windows.
+ */
+export const meterRows = (meter) => {
+    if (meter === null || typeof meter !== "object" || !Array.isArray(meter.providers)) {
+        return [];
+    }
+
+    return meter.providers.map((row) => {
+        const windows = Array.isArray(row.windows) ? row.windows : [];
+        const main = windows.find((window) => window.id === row.mainWindowId);
+        const prefix = `${row.label}: `;
+        const base = {
+            provider: row.provider,
+            label: row.label,
+            line: row.line,
+            grants: meterGrantsText(row, meter.at),
+            ledger: meterLedgerText(row.ledger),
+        };
+
+        if (main === undefined) {
+            return {
+                ...base,
+                state: "none",
+                gauge: null,
+                status: row.line.startsWith(prefix) ? row.line.slice(prefix.length) : row.line,
+                line: null,
+            };
+        }
+
+        if (main.state === "awaiting") {
+            return {
+                ...base,
+                state: "awaiting",
+                gauge: null,
+                status: "reset passed, awaiting provider report",
+            };
+        }
+
+        if (main.state === "stale") {
+            const minutes = Math.max(0, Math.floor((meter.at - row.readAt) / 60_000));
+
+            return {
+                ...base,
+                state: "stale",
+                gauge: null,
+                status: `${main.label} ${main.percent}% used, read ${minutes} min ago`,
+            };
+        }
+
+        return {
+            ...base,
+            state: "fresh",
+            gauge: { percent: main.percent, label: `${main.percent}% of the ${main.label} used` },
+            status: null,
+        };
+    });
+};
+
+/** The Subscriptions card, for `html` (Pocket's, or a test's): account-wide, so the dashboard's filters do not apply. */
+export const meterCard = (html, meter) =>
+    html`<article class="dash-card dash-meter" aria-labelledby="dash-meter">
+        <h3 id="dash-meter">Subscriptions</h3>
+        <ul class="dash-meter-rows">
+            ${meterRows(meter).map(
+                (row) =>
+                    html`<li class="dash-meter-row" data-provider=${row.provider} data-state=${row.state}>
+                        <strong class="dash-meter-label">${row.label}</strong>
+                        ${
+                            row.gauge
+                                ? html`<span class="dash-meter-gauge"
+                                      ><meter min="0" max="100" value=${row.gauge.percent} aria-label=${row.gauge.label}>${row.gauge.percent}%</meter
+                                      ><span>${row.gauge.label}</span></span
+                                  >`
+                                : html`<span class="dash-meter-state">${row.status}</span>`
+                        }
+                        ${row.line ? html`<span class="small dash-meter-line">${row.line}</span>` : null}
+                        ${row.grants ? html`<span class="small">${row.grants}</span>` : null}
+                        ${row.ledger ? html`<span class="small muted">${row.ledger}</span>` : null}
+                    </li>`,
+            )}
+        </ul>
+        <p class="small muted dash-note">
+            Account-wide: the filters do not apply. The percent and the reset come from the provider. List price is what
+            the answers would cost at the API's prices, not money spent on a subscription.
+        </p>
+    </article>`;
+
 // ─── The view ────────────────────────────────────────────────────────────────
 
 /** What the module keeps between 2 openings of the view, in memory only: no browser storage. */
@@ -1664,8 +1824,9 @@ export function makeDashboard(pocket, { refreshMs = REFRESH_MS } = {}) {
                         ? null
                         : html`<${Loader} label="Reading the dashboard" />`
                     : notStarted
-                      ? html`<${CoverageSection} snapshot=${snapshot} />`
+                      ? html`${snapshot.meter ? meterCard(html, snapshot.meter) : null}<${CoverageSection} snapshot=${snapshot} />`
                       : html`<div class=${error ? "dash-body stale" : "dash-body"}>
+                            ${snapshot.meter ? meterCard(html, snapshot.meter) : null}
                             <${Cards} snapshot=${snapshot} />
                             <${Trend} snapshot=${snapshot} />
                             <${Table}

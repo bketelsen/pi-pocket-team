@@ -1254,6 +1254,7 @@ before(async () => {
         "_desk-dashboard.ts",
         "_desk-metrics.ts",
         "_desk-board.ts",
+        "_desk-meter.ts",
     ]) {
         cpSync(join(import.meta.dirname, each), join(dropIns, each));
     }

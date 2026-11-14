@@ -4,7 +4,8 @@ The Desk page has 2 views: **Desk**, the operational inbox (the default each tim
 numbers of Desk-tracked work for 1 range and 1 scope. Both are owner-only. The Dashboard only reads: it has no control
 that changes a thread, and opening it starts no collection. It calls 2 routes, `GET /api/x/desk/dashboard` (the numbers)
 and `GET /api/x/desk/dashboard/records` (the drill-down of 1 row). Each reads the same 2 stored documents and nothing
-else (no GitHub call, no transcript read, no commit, no task).
+else (no GitHub call, no transcript read, no commit, no task). When the subscription meter is on, `GET dashboard` also
+gives the meter's view from the desk's memory ([The Subscriptions card](#the-subscriptions-card)).
 
 ![The Dashboard on a desktop](desk-dashboard-shots/desktop.png)
 
@@ -42,6 +43,7 @@ phone one shows the bketelsen owner row with partial tokens, an unknown cost ("�
       session counts follow only the source's availability.
     - The source: a partial usage source, and a failed one after a good read, keep their collected facts, with a notice
       that they can be low.
+- **Subscriptions**, above the other cards, only when the answer has `meter` ([The Subscriptions card](#the-subscriptions-card)).
 - **Cards**, in this order: thread completion rate, successful closures and velocity, thread cycle time, time to solve,
   current workload ("now"), tracked PRs, dated tokens, reported model cost (USD). Each card has "How is this counted?".
 - **Daily trend.** The successful closures by UTC day, as bars (each with its text for screen readers), with a summary
@@ -70,6 +72,23 @@ eligible closure (completion) or no resolved issue (time to solve).
 The view reads once when it opens, then every 60 seconds while it is mounted and the browser tab is visible. A tab that
 comes back to view reads at once when the last read is older than that. Switching to Desk, closing the page, and the
 module's dispose stop the timer and abort a read in flight; an answer that comes after that changes nothing.
+
+## The Subscriptions card
+
+The subscription meter (plan T1747; its settings and rules are in [modules/desk.md](modules/desk.md)) is on when
+`desk.json` has a `meter` key. Then the answer of `GET dashboard` has a field `meter`, the `MeterView` of `_desk-meter.ts`:
+`at`, `providers` (Anthropic, then OpenAI: each with `provider`, `label`, `line`, `lastAttempt`, `readAt`,
+`mainWindowId`, `windows` with their `state`, `percent`, `resetsAt`, burn and projection, `grants` or `grantsNote`, and
+`ledger` at list price), `coverage` of the ledger, and `hold` when `holdAt` is set. With the meter off, the answer has no
+`meter` field at all. The field holds no token and no header. An unknown number is absent, never 0.
+
+The card (`meterCard` and `meterRows` in `desk-web/dashboard.js`) shows 1 row for each provider: its label; for the main
+window a gauge (a `<meter>` from 0 to 100, labelled "95% of the week used") when the reading is fresh, or a text in its
+place: "week 95% used, read 25 min ago" (stale), "reset passed, awaiting provider report" (awaiting), or "no provider
+report (<reason>)" (none). Then the server's `line` (its times are in the server's zone; it holds the reset, the burn, the
+projection and the other windows), the granted resets ("resets granted: Weekly ×2 (first expires in 26d)", or "grants:
+not readable (surface)"), and the ledger ("list price: $70 last hour, $228 today, $2,263 in 7 days (partial); top: …").
+The card is account-wide: the range and scope filters do not apply to it. On a narrow screen the rows stack.
 
 ## The drill-down route
 
@@ -176,9 +195,13 @@ an agent and never sends a message. Each pass:
 1. reads `x.desk.threads` (never writes it) and the stored facts;
 2. runs the usage step: at most 10 pages (`MAX_SESSION_PAGES`), each page at most 200 entries (`ENTRY_PAGE`) or 100 child
    conversations (`CHILD_PAGE`), each page in its own commit, then at most 50 ledger checks (`MAX_LEDGER_CHECKS`);
-3. makes at most 1 GitHub GraphQL call with at most 20 ref reads (`MAX_REF_READS`): PR reads, issue reads, and pages of an
+3. when the meter is on (a `meter` key in `desk.json`), runs the meter's step (`meterPass`): the provider read when it is
+   due, then the ledger's reads, in commits that only read, at most 25 table reads each (`METER_READS`); the sweep of all
+   conversations spends at most 20 seconds a pass (`METER_SWEEP_MS`). It keeps what it learns in the desk's memory, not
+   in a document, and its failure never fails the GitHub part. The rules are in [modules/desk.md](modules/desk.md);
+4. makes at most 1 GitHub GraphQL call with at most 20 ref reads (`MAX_REF_READS`): PR reads, issue reads, and pages of an
    issue's closing references (25 each, at most 4 pages, `MAX_CLOSING_PAGES`) share that budget;
-4. writes what changed in 1 commit, then sleeps 5 minutes (`PASS_MS`). A new collector also waits 5 minutes first.
+5. writes what changed in 1 commit, then sleeps 5 minutes (`PASS_MS`). A new collector also waits 5 minutes first.
 
 - **Recovery boundary.** The first pass fixes it at 90 days before that pass (`BOUNDARY_DAYS`). It never moves. Usage
   before it is kept only for the ledger check; ranges cannot start before its day.
@@ -265,4 +288,7 @@ usage) and checks the exact numbers and words the screen shows, with the page's 
 the page's helpers: formats (unknown versus 0), the query path, the scope choices, sorting, the table rows, the usage
 knowledge of each row (`usageKnowledge`, `usageText`, `usageReadLines`), the residual's own knowledge
 (`residualKnowledge`), the states, the drill-down helpers (`recordsPath`, `prUrl`, the words, and `recordsStep` and
-`useRecords`: an open drill-down reads again for each new snapshot), and the default view.
+`useRecords`: an open drill-down reads again for each new snapshot), the default view, and the Subscriptions card in its
+4 states (`meterRows`, `meterGrantsText`, `meterLedgerText`, `meterCard`). `desk-metrics.test.ts` also checks the `meter`
+field of `GET dashboard` when the meter is on, and its absence when it is off; `desk-dashboard.test.ts` covers the
+meter's step in a pass.

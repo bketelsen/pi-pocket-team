@@ -1290,6 +1290,71 @@ export function ledgerLine(provider: MeterView["providers"][number]): string {
 }
 
 /**
+ * The last line of `desk usage` (plan S1): `Meter: provider read 3 min ago (last attempt ok); ledger complete since
+ * Fri 6 Nov 21:56; hold off`. The provider part names the first provider that the meter reads: `provider read never`
+ * before its first success, `provider reads off` when it reads none; a failed last attempt shows `(last attempt:
+ * <reason> at HH:MM)`. The ledger part is `ledger filling N of M conversations` until the backfill is complete. The hold
+ * part is `hold off` or `hold at 90%`. Times in `zone`.
+ */
+export function meterStatusLine(view: MeterView, now: number, zone: string): string {
+    const row = view.providers.find((item) => item.off === undefined);
+    let read: string;
+
+    if (row === undefined) {
+        read = "provider reads off";
+    } else {
+        if (row.readAt === undefined) {
+            read = "provider read never";
+        } else {
+            const age = Math.max(0, now - row.readAt);
+
+            read = `provider read ${age < HOUR_MS ? `${String(Math.floor(age / MINUTE_MS))} min` : span(age)} ago`;
+        }
+
+        const attempt = row.lastAttempt;
+
+        if (attempt?.ok === true) {
+            read += " (last attempt ok)";
+        } else if (attempt !== undefined) {
+            read += ` (last attempt: ${attempt.error ?? "failed"} at ${hhmm(attempt.at, zone)})`;
+        }
+    }
+
+    const coverage = view.coverage;
+    const ledger = coverage.complete
+        ? coverage.since === undefined
+            ? "ledger complete"
+            : `ledger complete since ${dateTime(coverage.since, zone)}`
+        : `ledger filling ${String(coverage.done)} of ${String(coverage.total)} conversations`;
+    const hold = view.hold === undefined ? "hold off" : `hold at ${String(view.hold)}%`;
+
+    return `Meter: ${read}; ${ledger}; ${hold}`;
+}
+
+/**
+ * The digest's last lines (plan S3): `Meter: <line>` for each provider whose main window is fresh or stale with a
+ * percent of at least `digestAt`. None for an awaiting window, a provider with no report, or a lower percent.
+ */
+export function meterFooter(view: MeterView, digestAt: number): string[] {
+    const lines: string[] = [];
+
+    for (const row of view.providers) {
+        const main = row.windows.find((window) => window.id === row.mainWindowId);
+
+        if (
+            main !== undefined &&
+            (main.state === "fresh" || main.state === "stale") &&
+            main.percent !== undefined &&
+            main.percent >= digestAt
+        ) {
+            lines.push(`Meter: ${row.line}`);
+        }
+    }
+
+    return lines;
+}
+
+/**
  * Why a board launch of these providers waits (plan B2), or undefined. A provider holds only on a fresh reading with
  * a window that is not scoped, at or above `holdAt`, whose reset is still ahead. A stale, awaiting or missing reading
  * never holds.
