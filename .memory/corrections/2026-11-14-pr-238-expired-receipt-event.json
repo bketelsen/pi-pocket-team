@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-14",
+  "scope": "desk.ts",
+  "correction": "a merge receipt whose <op>:<result> key passed its 48 hours was stored again as a new receipt, but addEvent found the old merge:<op>:<result> event and added none, so the thread kept only the old fields; the new receipt now gets its own event keyed merge:<op>:<result>:<time> when the old event is still on the thread",
+  "evidence": "bketelsen/pi-pocket-team#238, cross-review by openai/gpt-6.1-sol at head 3721d27",
+  "promoted_to": "desk.test.ts: merge receipts, a receipt is kept 48 hours: the next write drops an older one (the event of the re-recorded key)"
+}
