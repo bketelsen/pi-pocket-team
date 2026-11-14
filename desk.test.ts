@@ -863,6 +863,36 @@ describe("merge receipts", () => {
             status: 200,
             recorded: true,
         });
+        assert.equal(state.mergeReceipts![`${OP}:merged`]!.method, "merge");
+
+        // The thread still holds the old receipt's event: the new receipt gets its own, with its fields and its time.
+        const events = state.threads.T1!.events.filter((event) =>
+            event.key.startsWith(`merge:${OP}:merged`),
+        );
+
+        assert.deepEqual(events, [
+            {
+                at: NOW - MERGE_RECEIPT_KEEP_MS - 1,
+                key: `merge:${OP}:merged`,
+                text: "Pocket reports: Brian approved and merged frostyard/test#12 at abc1234 (squash).",
+            },
+            {
+                at: NOW,
+                key: `merge:${OP}:merged:${String(NOW)}`,
+                text: "Pocket reports: Brian approved and merged frostyard/test#12 at abc1234 (merge).",
+            },
+        ]);
+
+        // A repeat of the new receipt adds no third event.
+        assert.deepEqual(recordMergeReceipt(state, "T1", merged({ method: "merge" }), NOW + 1), {
+            status: 200,
+            recorded: false,
+        });
+        assert.equal(
+            state.threads.T1!.events.filter((event) => event.key.startsWith(`merge:${OP}:merged`))
+                .length,
+            2,
+        );
     });
 });
 

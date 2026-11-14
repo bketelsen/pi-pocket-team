@@ -1739,8 +1739,9 @@ export function mergeReceiptText(receipt: Omit<MergeReceipt, "at">): string {
 /**
  * Record 1 merge receipt of the Pocket desktop app on a thread. It checks the whole body first: a 400 or a 404 changes
  * nothing. A 200 (a new receipt or a repeat) first drops the receipts older than `MERGE_RECEIPT_KEEP_MS`. A new
- * receipt adds 1 thread event; a repeat with the same fields changes nothing else; the same key with other fields is a
- * 409. It never changes a PR link or the thread's state: a receipt is information only.
+ * receipt adds 1 thread event (`merge:<op>:<result>`, or `merge:<op>:<result>:<now>` when the thread still holds the
+ * event of an older receipt of that key that passed its 48 hours); a repeat with the same fields changes nothing else;
+ * the same key with other fields is a 409. It never changes a PR link or the thread's state: a receipt is information only.
  */
 export function recordMergeReceipt(
     state: DeskState,
@@ -1865,7 +1866,12 @@ export function recordMergeReceipt(
     }
 
     receipts[key] = { ...receipt, at: now };
-    addEvent(thread, `merge:${key}`, mergeReceiptText(receipt), now);
+
+    // A key past its 48 hours comes back as a new receipt, but the thread may still hold the event of the old one:
+    // the new receipt then gets its own event, keyed with its time, so the thread never shows only the old fields.
+    if (!addEvent(thread, `merge:${key}`, mergeReceiptText(receipt), now)) {
+        addEvent(thread, `merge:${key}:${String(now)}`, mergeReceiptText(receipt), now);
+    }
 
     return { status: 200, recorded: true };
 }
