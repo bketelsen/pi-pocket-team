@@ -1000,6 +1000,8 @@ export type TeamApi = {
             role: Role;
             repositories: Record<string, string>;
             home?: string;
+            /** The profile's model (`provider/model`); absent when the profile names none. An older Team has none. */
+            model?: string;
         }[]
     >;
     /**
@@ -2294,6 +2296,7 @@ export default function createTeam(host: Host, web: Web) {
                 role: agent.role,
                 repositories: agent.repositories,
                 ...(agent.home === undefined ? {} : { home: agent.home }),
+                ...(agent.model === "" ? {} : { model: agent.model }),
             })),
         startPlan: async (request) => {
             const supervisor = request.supervisor as ConversationId;

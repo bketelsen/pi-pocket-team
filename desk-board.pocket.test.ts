@@ -4,7 +4,7 @@
 // stop condition, rounds and length; then the Desk page's board routes (`GET board`, `POST board/:conversation`) on a
 // local HTTP server, with the owner's token and a guest's. No test reaches Brian's data or the network.
 import assert from "node:assert/strict";
-import { cpSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { cpSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
@@ -26,6 +26,7 @@ import {
 } from "./_pocket/test/helpers.ts";
 import { createHandler } from "./_pocket/src/server/http.ts";
 import { boardRows } from "./_desk-board.ts";
+import { emptyMeterState, parseAnthropicUsage, recordAttempt } from "./_desk-meter.ts";
 import { BoardReceipts, capView, DeskReports, DeskThreads, type DeskState } from "./desk.ts";
 import { GoalDoc } from "./night-shift.ts";
 import { RUN_END, turnTexts } from "./scripted-turn-fixture.ts";
@@ -943,6 +944,141 @@ describe("the board in Pi Pocket", () => {
             assert.equal((await userTexts(source)).filter((text) => RUN_END.test(text)).length, 0);
         },
     );
+
+    test("the meter's hold: an Anthropic agent's row waits with held at 95% of the week; another provider's row launches; with no holdAt the row launches", async () => {
+        const shared = globalThis as unknown as Record<symbol, unknown>;
+        const holderKey = Symbol.for("pi-pocket-team.desk.meter");
+        const ioKey = Symbol.for("pi-pocket-team.desk.meter-io");
+        const savedHolder = shared[holderKey];
+        const duncanHome = join(root, "duncan-home");
+        const duncanProfile = join(definitions, "duncan.md");
+        /** The usage answer: the week at 95%, reset 2 days from now. */
+        const usage = () => ({
+            limits: [
+                {
+                    kind: "weekly_all",
+                    percent: 95,
+                    severity: "critical",
+                    resets_at: new Date(Date.now() + 2 * 24 * 3600_000).toISOString(),
+                    is_active: true,
+                },
+            ],
+        });
+
+        mkdirSync(duncanHome, { recursive: true });
+        writeFileSync(
+            duncanProfile,
+            `---\nmodel: anthropic/claude-opus-5-5\nhome: ${duncanHome}\n---\n# Duncan\nYou are Duncan.`,
+        );
+        // A collector's pass never reaches a real sign-in or the network: it reads the same 95%.
+        shared[ioKey] = {
+            token: async () => "sk-ant-oat01-FAKE",
+            fetch: async () => new Response(JSON.stringify(usage()), { status: 200 }),
+        };
+
+        const state = emptyMeterState();
+        const reading = parseAnthropicUsage(usage(), Date.now());
+
+        assert(!("error" in reading));
+        recordAttempt(state, "anthropic", Date.now(), reading);
+        shared[holderKey] = { version: 1, state };
+        writeFileSync(
+            configPath,
+            JSON.stringify({ digest: { minutes: 0 }, cap: 100, meter: { holdAt: 90 } }),
+        );
+
+        try {
+            const source = await supervisor();
+            const add = (agent: string, task: string) =>
+                runTool(source, "desk", {
+                    action: "board_add",
+                    fields: {
+                        agent,
+                        title: task,
+                        task,
+                        stopWhen: "done",
+                        max: 1,
+                        until: untilSoon(),
+                    },
+                });
+
+            await add("duncan", "HOLD-ANTHROPIC");
+            await add("teg", "HOLD-OTHER");
+
+            const added = boardRows((await deskState()).board, Number(source));
+            const [anthropicRow, otherRow] = added;
+
+            assert(anthropicRow !== undefined && otherRow !== undefined);
+            await runTool(source, "desk", {
+                action: "board_pick",
+                rows: added.map((row) => ({ row: row.id, rev: row.rev })),
+            });
+            await runTool(source, "desk", { action: "board_launch" });
+
+            const said = (await modelTexts(app, source)).join("\n");
+
+            assert.match(
+                said,
+                new RegExp(
+                    `#${String(anthropicRow.id)} held: Anthropic week 95% ≥ 90%, resets [^"\\\\]+`,
+                ),
+                said.slice(-2000),
+            );
+
+            const after = boardRows((await deskState()).board, Number(source));
+            const held = after.find((row) => row.id === anthropicRow.id)!;
+
+            assert.equal(held.state, "waiting");
+            assert.match(held.held?.reason ?? "", /^Anthropic week 95% ≥ 90%, resets /);
+            assert.equal(held.rev, anthropicRow.rev, "the hold never changes the rev");
+            assert.deepEqual(held.attempts, [], "a held row makes no attempt");
+            assert.equal(
+                after.find((row) => row.id === otherRow.id)?.state,
+                "launched",
+                "a row of another provider launches while the Anthropic row is held",
+            );
+
+            // With no holdAt the meter holds nothing: the next pass (from a new launch) starts the row. Duncan's
+            // profile model is not on the allowed list, so his run takes the supervisor's model: allow it.
+            await app.setSubagentModels(owner(app), ["faux/faux-2", "faux/faux-1"]);
+            writeFileSync(
+                configPath,
+                JSON.stringify({ digest: { minutes: 0 }, cap: 100, meter: {} }),
+            );
+            await add("teg", "HOLD-NEXT");
+
+            const next = boardRows((await deskState()).board, Number(source)).find(
+                (row) => row.task === "HOLD-NEXT",
+            )!;
+
+            await runTool(source, "desk", {
+                action: "board_pick",
+                rows: [{ row: next.id, rev: next.rev }],
+            });
+            await runTool(source, "desk", { action: "board_launch" });
+            await until(
+                async () =>
+                    boardRows((await deskState()).board, Number(source)).every(
+                        (row) => row.state === "launched",
+                    ),
+                "every row launched with no holdAt",
+                20_000,
+            );
+
+            const released = boardRows((await deskState()).board, Number(source)).find(
+                (row) => row.id === anthropicRow.id,
+            )!;
+
+            assert.equal(released.held, undefined, "the start removes held");
+            assert.equal(released.rev, anthropicRow.rev);
+        } finally {
+            await app.setSubagentModels(owner(app), ["faux/faux-2"]);
+            config(100);
+            delete shared[ioKey];
+            shared[holderKey] = savedHolder;
+            rmSync(duncanProfile);
+        }
+    });
 });
 
 /** The desk API's thread open, as the routes' tests use it. */

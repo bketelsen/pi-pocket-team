@@ -159,10 +159,16 @@ export const boardSplit = (rows) => {
     return { active, done };
 };
 
-/** A row's state on 1 line: its state and rev (a launched row says running or finished), then its thread and the next actor, or its error. */
+/**
+ * A row's state on 1 line: its state and rev (a launched row says running or finished), the meter's hold of a waiting
+ * row, then its thread and the next actor, or its error.
+ */
 export const rowStateText = (row) =>
     [
         `${row.state === "launched" ? `launched (${rowStatus(row)})` : row.state} · rev ${String(row.rev)}`,
+        ...(row.state === "waiting" && typeof row.held?.reason === "string"
+            ? [`held: ${row.held.reason}`]
+            : []),
         ...(row.thread ? [`${row.thread}${row.next ? ` (next: ${row.next})` : ""}`] : []),
         ...((row.state === "failed" || row.state === "unknown") && row.error
             ? [`error: ${row.error}`]
