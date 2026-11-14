@@ -78,7 +78,6 @@ import {
     wakeParked,
     reparkRepairWoken,
     closeCheck,
-    copyHint,
     closeOutcome,
     closeoutHold,
     closeoutKey,
@@ -462,24 +461,6 @@ const errorOf = (result: { error: string } | object): string => {
 
 /** A thread id as a literal in a RegExp: the id depends on the tests that ran before. */
 const rx = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-
-describe("copyHint", () => {
-    test("names the thread's file in the export folder, and nothing without one", () => {
-        assert.equal(copyHint("T5", undefined), "");
-        assert.equal(copyHint("T5", "relative/desk"), "");
-        assert.match(copyHint("T5", "/home/x/desk/"), /`\/home\/x\/desk\/T5\.md`/);
-        assert.match(copyHint("F12", "/home/x/desk"), /`\/home\/x\/desk\/F12\.md`/);
-    });
-
-    test("an id in another form names only the folder, never the agent's text", () => {
-        for (const asked of ["../SECRET", "T0", "T5/../X", "X1", ""]) {
-            const hint = copyHint(asked, "/home/x/desk");
-
-            assert.match(hint, /`\/home\/x\/desk\/`, as `<id>\.md`/);
-            assert.ok(asked === "" || !hint.includes(asked), hint);
-        }
-    });
-});
 
 describe("threads", () => {
     test("the same key opens one thread, and a second open reuses it", () => {
@@ -29825,7 +29806,7 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
                             { action: "escalate", thread: thread.id, text: "x" },
                             Number(linked),
                         ),
-                    /Only a session assigned a supervisor identity can use the desk\. An agent can use only read, watch, and result/,
+                    /Only a session assigned a supervisor identity can use the desk\. An agent can use only read \(any thread, read only\), and watch and result on its own thread\./,
                 );
                 await assert.rejects(
                     () =>
@@ -30094,7 +30075,7 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
                                 `call-agent-${action}`,
                             ),
                         new RegExp(
-                            `Only a session assigned a supervisor identity can use the desk\\. An agent can use only read, watch, and result.*For ${action}, ask Odrade with team_message to ${address} \\(the return address of your first message\\); your task is in that message\\.`,
+                            `Only a session assigned a supervisor identity can use the desk\\. An agent can use only read \\(any thread, read only\\), and watch and result on its own thread\\. For ${action}, ask Odrade with team_message to ${address} \\(the return address of your first message\\); your task is in that message\\.`,
                         ),
                     );
                 }
@@ -30143,7 +30124,7 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
             }
         });
 
-        test("an agent reads its own thread, by id and with no thread, and no other thread", async () => {
+        test("an agent reads its own thread, by id and with no thread, and another thread as its read-only copy", async () => {
             const stub = stubDesk();
 
             try {
@@ -30152,16 +30133,6 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
                 const before = JSON.stringify((await deskState())?.seen ?? {});
                 const read = (args: object, session: number, call: string) =>
                     stub.tool(args, session, "task-read", call);
-
-                const messageOf = async (id: string): Promise<string> => {
-                    try {
-                        await read({ action: "read", thread: id }, Number(linked), `call-${id}`);
-                    } catch (error) {
-                        return (error as Error).message;
-                    }
-
-                    return "";
-                };
 
                 // By id: the text holds the thread, and the reports part of its own session comes after it.
                 const byId = JSON.stringify(
@@ -30177,67 +30148,74 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
 
                 assert.match(noThread, new RegExp(`${thread.id} · open · ${thread.title}`));
 
-                // Another thread, and an id that does not exist: the same words, so a read never says that one exists.
-                const another = await messageOf(other.id);
-                const missing = await messageOf("T99");
-
-                // The hint names the exact address to ask: the return address of the agent's first message.
+                // Another thread: its read-only synced copy (the text the export writes), after 1 line that says it
+                // is not this session's thread and where to ask. No refusal, so the agent does not retry or stop.
                 const address = await firstAddress(linked);
+                const copy = (
+                    (await read(
+                        { action: "read", thread: other.id },
+                        Number(linked),
+                        "call-other",
+                    )) as { output: { text: string }[] }
+                ).output
+                    .map((part) => part.text)
+                    .join("");
+                const [first, blank, ...rest] = copy.split("\n");
 
-                assert.ok(
-                    another.endsWith(
-                        `is not this session's thread: an agent can read only its own thread. Ask Odrade with team_message to ${address} (the return address of your first message).`,
+                assert.equal(
+                    first,
+                    `${other.id} is not this session's thread: this is its read-only copy. An agent can watch or record a result only on its own thread. For anything on ${other.id}, ask Odrade with team_message to ${address} (the return address of your first message).`,
+                );
+                assert.equal(blank, "");
+                assert.ok(rest.join("\n").startsWith(`# ${other.id} · `), copy);
+                assert.match(copy, /\n## Events\n/);
+                assert.match(copy, /\n## Reports\n/);
+
+                // The copy holds no session, address or queued wake-up of the other thread: only what the export holds.
+                const otherThread = (await deskState())!.threads[other.id]!;
+
+                assert.ok(otherThread.address !== undefined, "the other thread has an address");
+                assert.ok(!copy.includes(otherThread.address!), copy);
+                assert.doesNotMatch(copy, /^Session: |^Address: |^Supervisor session: /m);
+
+                // The same text as the export file of that thread, after the first line.
+                const exported = exportFiles(
+                    await deskState(),
+                    {
+                        [otherThread.session!]: (
+                            await app.harness.snapshot(
+                                DeskReports,
+                                otherThread.session as ConversationId,
+                                context,
+                            )
+                        )?.reports,
+                    },
+                    Date.now(),
+                )[`${other.id}.md`]!;
+
+                assert.equal(
+                    rest.join("\n").replace(/^- \d{4}-\d\d-\d\dT[^ ]+/gm, ""),
+                    exported.replace(/^- \d{4}-\d\d-\d\dT[^ ]+/gm, ""),
+                );
+
+                // With the "#" and the lower case that a read accepts: the same thread.
+                const hashed = JSON.stringify(
+                    await read(
+                        { action: "read", thread: `#${other.id.toLowerCase()}` },
+                        Number(linked),
+                        "call-other-hash",
                     ),
-                    another,
-                );
-                assert.equal(
-                    another.replace(other.id, "X"),
-                    missing.replace("T99", "X"),
-                    "the same error for another thread and a missing one",
                 );
 
-                // With the "#" and the lower case that a read accepts: still the same words for both.
-                const anotherHash = await messageOf(`#${other.id.toLowerCase()}`);
-                const missingHash = await messageOf("#t99");
+                assert.ok(hashed.includes(`# ${other.id} · `), hashed);
 
-                assert.ok(
-                    anotherHash.startsWith(`${other.id} is not this session's thread`),
-                    anotherHash,
+                // An id that does not exist: an error that says so, with where to ask.
+                await assert.rejects(
+                    () => read({ action: "read", thread: "#t999999" }, Number(linked), "call-T99"),
+                    (error: Error) =>
+                        error.message ===
+                        `There is no thread T999999 on the desk. Ask Odrade with team_message to ${address} (the return address of your first message).`,
                 );
-                assert.equal(
-                    anotherHash.replace(other.id, "X"),
-                    missingHash.replace("T99", "X"),
-                    "the same error for another thread and a missing one, with a #",
-                );
-
-                // With an export folder: the refusal also names the thread's read-only copy there, in the same words for
-                // another thread and a missing one, so the hint never says that a thread exists.
-                const exportFolder = join(root, "agent-read-export");
-
-                writeFileSync(
-                    configPath,
-                    JSON.stringify({ digest: { minutes: 0 }, cap: 100, export: exportFolder }),
-                );
-
-                try {
-                    const anotherCopy = await messageOf(other.id);
-                    const missingCopy = await messageOf("#t99");
-
-                    assert.ok(
-                        anotherCopy.includes(
-                            `(the return address of your first message). Or read its read-only synced copy, \`${join(exportFolder, `${other.id}.md`)}\``,
-                        ),
-                        anotherCopy,
-                    );
-                    assert.ok(missingCopy.includes(join(exportFolder, "T99.md")), missingCopy);
-                    assert.equal(
-                        anotherCopy.replaceAll(other.id, "X"),
-                        missingCopy.replaceAll("T99", "X"),
-                        "the same error and copy hint for another thread and a missing one",
-                    );
-                } finally {
-                    writeFileSync(configPath, JSON.stringify({ digest: { minutes: 0 }, cap: 100 }));
-                }
 
                 // An agent with no thread of its own: the error says so, with the same hint. A session that a person
                 // started has no return address: the hint keeps the general words.
@@ -32102,7 +32080,7 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
                 await command(agent, "team-agent", "duncan");
                 await assert.rejects(
                     () => stub.tool({ action: "archive", apply: true }, Number(agent)),
-                    /An agent can use only read, watch, and result, on its own thread\. For archive, ask Odrade/,
+                    /An agent can use only read \(any thread, read only\), and watch and result on its own thread\. For archive, ask Odrade/,
                 );
                 assert.equal(stub.calls.length, 0);
             } finally {
