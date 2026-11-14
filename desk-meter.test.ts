@@ -291,6 +291,33 @@ test("states: stale after 2 polls, awaiting after the reset", () => {
     assert.equal(stale.windows[0]?.percent, 70);
     assert.ok(stale.line.includes("(read 11 min ago"), stale.line);
 
+    // A stale reading keeps its percent and age, and gets no estimate (plan D2), also with 3 samples that give a burn.
+    const start = Date.parse("2026-11-14T00:00:00Z");
+    const burning = emptyMeterState();
+
+    read(burning, weekly(90, RESET_ISO), start);
+    read(burning, weekly(91, RESET_ISO), start + 60 * MINUTE);
+    read(burning, weekly(92, RESET_ISO), start + 120 * MINUTE);
+
+    const fresh = anthropicRow(burning, start + 120 * MINUTE).windows[0];
+
+    assert.equal(fresh?.burnPerHour, 1);
+
+    const old = anthropicRow(burning, start + 131 * MINUTE);
+    const oldWindow = old.windows[0];
+
+    assert.equal(oldWindow?.state, "stale");
+    assert.equal(oldWindow?.percent, 92);
+    assert.equal(oldWindow?.burnPerHour, undefined);
+    assert.equal(oldWindow?.burnSpanMinutes, undefined);
+    assert.equal(oldWindow?.hoursToFull, undefined);
+    assert.equal(oldWindow?.fullBeforeReset, undefined);
+    assert.equal(oldWindow?.projectedAtReset, undefined);
+    assert.ok(old.line.includes("(read 11 min ago)"), old.line);
+    assert.ok(!old.line.includes("%/h"), old.line);
+    assert.ok(!old.line.includes("full in"), old.line);
+    assert.ok(!old.line.includes("at reset"), old.line);
+
     const passed = emptyMeterState();
 
     read(passed, weekly(70, iso(at + HOUR)), at);
@@ -492,6 +519,80 @@ test("ledger: buckets, no cost, no timestamp, pruning, partial, today in the zon
         ledgerLine(row),
         "list price: $0 last hour, $263 today, $2,263 in 7 days (partial); top: claude-opus-5-5 $2,263",
     );
+});
+
+test("ledger: names such as __proto__, constructor and toString are own keys and never touch Object.prototype", () => {
+    const now = Date.parse("2026-11-20T12:00:00Z");
+    const state = emptyMeterState();
+    const names = ["__proto__", "constructor", "toString"];
+
+    for (const name of names) {
+        addLedger(state, {
+            provider: "anthropic",
+            model: name,
+            timestamp: now - MINUTE,
+            input: 1,
+            output: 1,
+            cacheRead: 1,
+            cacheWrite: 1,
+            cost: 10,
+        });
+        addLedger(state, {
+            provider: name,
+            model: "m",
+            timestamp: now - MINUTE,
+            input: 1,
+            output: 1,
+            cacheRead: 1,
+            cacheWrite: 1,
+            cost: 1,
+        });
+    }
+
+    for (const key of [
+        "entries",
+        "input",
+        "output",
+        "cacheRead",
+        "cacheWrite",
+        "cost",
+        "unknownCost",
+    ]) {
+        assert.equal(Object.hasOwn(Object.prototype, key), false, `Object.prototype.${key}`);
+    }
+
+    const byModel = Object.values(state.buckets)[0]?.anthropic;
+
+    assert.ok(byModel !== undefined);
+
+    for (const name of names) {
+        assert.ok(Object.hasOwn(byModel, name), name);
+        assert.equal(byModel[name]?.entries, 1);
+        assert.equal(byModel[name]?.cost, 10);
+    }
+
+    const row = anthropicRow(state, now);
+
+    assert.equal(row.ledger.days7, 30);
+    assert.equal(row.ledger.lastHour, 30);
+    assert.deepEqual(
+        row.ledger.top.map((item) => [item.model, item.cost]),
+        [
+            ["__proto__", 10],
+            ["constructor", 10],
+            ["toString", 10],
+        ],
+    );
+
+    // A window id from the provider can be such a name too.
+    read(state, { limits: [{ kind: "__proto__", percent: 50, resets_at: RESET_ISO }] }, now);
+    read(
+        state,
+        { limits: [{ kind: "__proto__", percent: 10, resets_at: RESET_ISO }] },
+        now + MINUTE,
+    );
+    assert.equal(state.providers.anthropic?.resetSeenAt.__proto__, now + MINUTE);
+    assert.equal(Object.hasOwn(Object.prototype, "percent"), false);
 });
 
 test("CLAUDE_CLI_VERSION matches pi-ai's claudeCodeVersion", () => {

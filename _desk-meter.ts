@@ -502,10 +502,18 @@ export type MeterState = {
     coverage: { since?: number; complete: boolean; done: number; total: number };
 };
 
+/**
+ * A dictionary with no prototype: its keys come from outside (provider and model names, window ids), so a name such
+ * as `__proto__`, `constructor` or `toString` is an own key like any other, and never reaches `Object.prototype`.
+ */
+function dict<T>(): Record<string, T> {
+    return Object.create(null) as Record<string, T>;
+}
+
 export function emptyMeterState(): MeterState {
     return {
-        providers: {},
-        buckets: {},
+        providers: dict(),
+        buckets: dict(),
         skipped: 0,
         coverage: { complete: false, done: 0, total: 0 },
     };
@@ -515,7 +523,7 @@ function providerMeter(state: MeterState, provider: string): ProviderMeter {
     let meter = state.providers[provider];
 
     if (meter === undefined) {
-        meter = { samples: {}, resetSeenAt: {}, backoff429: 0 };
+        meter = { samples: dict(), resetSeenAt: dict(), backoff429: 0 };
         state.providers[provider] = meter;
     }
 
@@ -635,8 +643,8 @@ export function addLedger(state: MeterState, usage: LedgerUsage): void {
     }
 
     const start = String(Math.floor(timestamp / BUCKET_MS) * BUCKET_MS);
-    const byProvider = (state.buckets[start] ??= {});
-    const byModel = (byProvider[usage.provider] ??= {});
+    const byProvider = (state.buckets[start] ??= dict());
+    const byModel = (byProvider[usage.provider] ??= dict());
     const bucket = (byModel[usage.model] ??= {
         entries: 0,
         input: 0,
@@ -787,7 +795,8 @@ function windowView(
     view.state = now - readAt <= 2 * settings.pollMinutes * MINUTE_MS ? "fresh" : "stale";
     view.percent = window.percent;
 
-    if (window.scoped) {
+    // A stale reading keeps its percent and its age, and gets no estimate (plan D2); a scoped window gets none either.
+    if (window.scoped || view.state === "stale") {
         return view;
     }
 
@@ -834,7 +843,7 @@ function ledgerView(
 ): MeterLedgerView {
     const midnight = localMidnight(now, zone);
     const ledger: MeterLedgerView = { lastHour: 0, today: 0, days7: 0, partial: false, top: [] };
-    const models: Record<string, number> = {};
+    const models = dict<number>();
     let unknownCost = 0;
 
     for (const [key, byProvider] of Object.entries(state.buckets)) {
