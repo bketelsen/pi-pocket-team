@@ -1517,6 +1517,145 @@ test("H3: a headRefOid that matches no commit is head unknown and counts as othe
     assert.deepEqual(metrics.redAtMergePrs, []);
 });
 
+// The contexts of 1 commit: check runs `[conclusion, suite conclusion]` and status contexts `["status", state]`.
+const contexts = (list: [string, string][], totalCount = list.length) => ({
+    totalCount,
+    nodes: list.map(([a, b]) =>
+        a === "status"
+            ? { __typename: "StatusContext", state: b }
+            : { __typename: "CheckRun", conclusion: a, checkSuite: { conclusion: b } },
+    ),
+});
+const commitWith = (oid: string, state: string, list: [string, string][], totalCount?: number) => ({
+    commit: { oid, statusCheckRollup: { state, contexts: contexts(list, totalCount) } },
+});
+const commitsPr = (nodes: ReturnType<typeof commitWith>[], over: Record<string, unknown> = {}) =>
+    pr({ commits: { totalCount: nodes.length, nodes }, ...over });
+// 5 bot PRs: `first` twice (40%, above the 20% line) and 3 green ones.
+const fivePrs = (first: ReturnType<typeof pr>) =>
+    emptyData({
+        github: github({
+            "acme/widgets#1": first,
+            "acme/widgets#2": first,
+            ...Object.fromEntries([3, 4, 5].map((n) => [`acme/widgets#${n}`, rollupPr("SUCCESS")])),
+        }),
+    });
+
+test("H3: a commit with only cancelled runs (a newer push cancelled them) is not a failing commit", () => {
+    const data = fivePrs(
+        commitsPr([
+            commitWith("a", "FAILURE", [
+                ["CANCELLED", "CANCELLED"],
+                ["CANCELLED", "CANCELLED"],
+            ]),
+            commitWith("b", "SUCCESS", [["SUCCESS", "SUCCESS"]]),
+        ]),
+    );
+    const result = checkH3(data, ctx);
+
+    assert.deepEqual(ids(result), []);
+    assert.equal(result.metrics.withAFailingCommit, 0);
+    assert.equal(result.metrics.cancelledOnly, 2);
+});
+
+test("H3: a gate job that failed over cancelled needs, in a cancelled suite, is not a failing commit", () => {
+    // pi-pocket-team#229: `Test` FAILURE ("Pocket matrix: cancelled"), the run concluded cancelled.
+    const data = fivePrs(
+        commitsPr([
+            commitWith("a", "FAILURE", [
+                ["SUCCESS", "CANCELLED"],
+                ["CANCELLED", "CANCELLED"],
+                ["FAILURE", "CANCELLED"],
+            ]),
+        ]),
+    );
+    const result = checkH3(data, ctx);
+
+    assert.deepEqual(ids(result), []);
+    assert.equal(result.metrics.withAFailingCommit, 0);
+    assert.equal(result.metrics.cancelledOnly, 2);
+});
+
+test("H3: a real failure counts: a failed run in a suite that did not cancel, a timeout, or a failed status", () => {
+    for (const list of [
+        [
+            ["FAILURE", "FAILURE"],
+            ["CANCELLED", "CANCELLED"],
+        ],
+        [["TIMED_OUT", "FAILURE"]],
+        [
+            ["SUCCESS", "SUCCESS"],
+            ["status", "ERROR"],
+        ],
+    ] as [string, string][][]) {
+        const result = checkH3(fivePrs(commitsPr([commitWith("a", "FAILURE", list)])), ctx);
+
+        assert.deepEqual(ids(result), ["H3:ci"], JSON.stringify(list));
+        assert.equal(result.metrics.withAFailingCommit, 2);
+        assert.equal(result.metrics.cancelledOnly, 0);
+    }
+});
+
+test("H3: a real failure followed by a fix is red then fixed", () => {
+    const data = fivePrs(
+        commitsPr(
+            [
+                commitWith("red", "FAILURE", [["FAILURE", "FAILURE"]]),
+                commitWith("green", "SUCCESS", [["SUCCESS", "SUCCESS"]]),
+            ],
+            { state: "MERGED", headRefOid: "green" },
+        ),
+    );
+    const result = checkH3(data, ctx);
+
+    assert.deepEqual(ids(result), ["H3:ci"]);
+    assert.equal(result.metrics.withAFailingCommit, 2);
+    assert.equal(result.metrics.redThenFixed, 2);
+    assert.equal(result.metrics.redAtMerge, 0);
+});
+
+test("H3: a merged head with only cancelled runs is not red at merge", () => {
+    const data = fivePrs(
+        commitsPr(
+            [
+                commitWith("red", "FAILURE", [["FAILURE", "FAILURE"]]),
+                commitWith("head", "FAILURE", [["CANCELLED", "CANCELLED"]]),
+            ],
+            { state: "MERGED", headRefOid: "head" },
+        ),
+    );
+    const metrics = checkH3(data, ctx).metrics;
+
+    assert.equal(metrics.redAtMerge, 0);
+    assert.equal(metrics.redOther, 2);
+});
+
+test("H3: a context list that GitHub cut, or a rollup that is not failing, keeps the rollup's word", () => {
+    // 2 contexts read of 150: the rest can hold the failure.
+    const cut = fivePrs(commitsPr([commitWith("a", "FAILURE", [["CANCELLED", "CANCELLED"]], 150)]));
+
+    assert.equal(checkH3(cut, ctx).metrics.withAFailingCommit, 2);
+
+    const pending = fivePrs(commitsPr([commitWith("a", "PENDING", [["FAILURE", "FAILURE"]])]));
+
+    assert.equal(checkH3(pending, ctx).metrics.withAFailingCommit, 0);
+});
+
+test("H3: a failing rollup with an empty context list keeps the rollup's word, also for the merged head", () => {
+    for (const state of ["FAILURE", "ERROR"]) {
+        const result = checkH3(fivePrs(commitsPr([commitWith("a", state, [])])), ctx);
+
+        assert.equal(result.metrics.withAFailingCommit, 2, state);
+        assert.equal(result.metrics.cancelledOnly, 0, state);
+    }
+
+    const merged = fivePrs(
+        commitsPr([commitWith("head", "FAILURE", [])], { state: "MERGED", headRefOid: "head" }),
+    );
+
+    assert.equal(checkH3(merged, ctx).metrics.redAtMerge, 2);
+});
+
 test("H3: an open bot PR with no update for 48 h is idle; 47 h is not", () => {
     const idle = (hours: number) =>
         emptyData({
