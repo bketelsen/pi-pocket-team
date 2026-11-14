@@ -1908,6 +1908,8 @@ export const METER_READS = 25;
 export const METER_SWEEP_MS = 20_000;
 /** A new sweep starts at this pass after the last sweep started (about 1 hour), once the last one ended. */
 export const METER_SWEEP_PASSES = 12;
+/** A gap of the backfill is retried until it failed this many times; a later sweep or an active read can still clear it. */
+export const METER_GAP_TRIES = 3;
 /** A conversation with an own answer this recent is active: each pass reads it. */
 export const METER_RECENT_MS = 60 * 60_000;
 /** How far back the backfill of a conversation reads: 8 days. */
@@ -1974,6 +1976,14 @@ export type MeterLedger = {
     active: Set<number>;
     /** By conversation: when its run ended (`run.ended`). It leaves `active` at its first read that starts later. */
     ended: Map<number, number>;
+    /**
+     * By conversation: the failed reads of a conversation that the backfill sweep could not read (a gap in the
+     * coverage). Each pass retries the lowest one with fewer than `METER_GAP_TRIES` failures. Any read that finishes it
+     * with success removes it.
+     */
+    gaps: Record<string, number>;
+    /** True when the backfill sweep listed and visited every conversation. */
+    backfillDone: boolean;
 };
 
 export function emptyMeterLedger(): MeterLedger {
@@ -1985,6 +1995,8 @@ export function emptyMeterLedger(): MeterLedger {
         passes: 0,
         active: new Set(),
         ended: new Map(),
+        gaps: Object.create(null) as Record<string, number>,
+        backfillDone: false,
     };
 }
 
@@ -2046,6 +2058,8 @@ type MeterPlan = {
     incremental: number[];
     /** By conversation: when this pass started to read it (for the `ended` rule). */
     started: Record<string, number>;
+    /** The gap that this pass retries, until it is finished. */
+    retry?: number;
     sweep?: MeterSweep;
 };
 
@@ -2056,9 +2070,12 @@ type MeterFound = {
     recent: Record<string, number>;
     /** Conversations of `incremental` that this commit finished. */
     finished: number[];
-    /** Conversations that the backfill listed and finished in this commit. */
+    /** The gap that this commit retried and finished. */
+    retried?: number;
+    /** Conversations that the sweep finished in this commit. */
+    swept: number[];
+    /** Conversations that the sweep listed in this commit. */
     listed: number;
-    done: number;
 };
 
 const dictOf = (from: Record<string, number>): Record<string, number> =>
@@ -2068,12 +2085,14 @@ function planOf(
     ledger: MeterLedger,
     incremental: number[],
     started: Record<string, number>,
+    retry: number | undefined,
 ): MeterPlan {
     const plan: MeterPlan = {
         high: dictOf(ledger.high),
         downs: dictOf(ledger.downs),
         incremental: [...incremental],
         started: dictOf(started),
+        ...(retry === undefined ? {} : { retry }),
     };
 
     if (ledger.sweep !== undefined) {
@@ -2182,11 +2201,14 @@ async function readPage(
 
 /**
  * The ledger part of 1 meter pass (plan D6). First the active conversations (each `run.started` conversation, and
- * each with an own answer in the last 60 minutes), each read to its end. Then the sweep of all conversations, at most
+ * each with an own answer in the last 60 minutes), each read to its end. Then at most 1 gap of the backfill (the lowest
+ * id with fewer than `METER_GAP_TRIES` failures), read to its end. Then the sweep of all conversations, at most
  * `METER_SWEEP_MS` by the pass's clock, checked before each page; the next pass goes on from its cursor, and a
- * conversation's backfill keeps its entry cursor in `downs`. A failed read ends the step for this pass: an active
- * conversation is read again in the next pass, and the sweep skips the conversation it was on (the next sweep, or
- * its next run, reads it again; a started backfill keeps its cursor).
+ * conversation's backfill keeps its entry cursor in `downs`. A failed read of an active conversation or of the gap
+ * waits for the next pass, and the others go on. A failed read in the sweep ends the step for this pass, and the sweep
+ * goes on without that conversation: the backfill sweep keeps it as a gap; a later sweep skips it (it has its `high`
+ * or its cursor from the backfill, so its next read catches up with no loss). The coverage is complete only when the
+ * backfill sweep ended and no gap is left.
  */
 async function ledgerStep(deps: MeterDeps, now: number, signal: AbortSignal): Promise<void> {
     const { ledger, state } = deps;
@@ -2229,15 +2251,35 @@ async function ledgerStep(deps: MeterDeps, now: number, signal: AbortSignal): Pr
     let started: Record<string, number> = Object.create(null) as Record<string, number>;
     let deadline: number | undefined;
     let left = incremental;
+    // The gap to retry in this pass: the lowest id with fewer than `METER_GAP_TRIES` failures, and not active (an
+    // active read clears it too).
+    let retry: number | undefined = Object.entries(ledger.gaps)
+        .filter(([key, tries]) => tries < METER_GAP_TRIES && !left.includes(Number(key)))
+        .map(([key]) => Number(key))
+        .sort((a, b) => a - b)[0];
+
+    /** A conversation that a read finished with success: a gap goes, and it counts in the coverage once. */
+    const succeeded = (id: number, backfillSweep: boolean): void => {
+        const key = String(id);
+
+        if (ledger.gaps[key] !== undefined) {
+            delete ledger.gaps[key];
+            state.coverage.done += 1;
+        } else if (backfillSweep) {
+            state.coverage.done += 1;
+        }
+    };
 
     /** Apply what 1 read commit found: its reads are of committed states, also when a later read of it failed. */
     const apply = (found: MeterFound): void => {
         const plan = found.plan;
+        const backfillSweep = ledger.sweep?.backfill === true;
 
         ledger.high = plan.high;
         ledger.downs = plan.downs;
         left = plan.incremental;
         started = plan.started;
+        retry = plan.retry;
 
         if (plan.sweep !== undefined) {
             ledger.sweep = plan.sweep;
@@ -2262,25 +2304,39 @@ async function ledgerStep(deps: MeterDeps, now: number, signal: AbortSignal): Pr
                 ledger.active.delete(id);
                 ledger.ended.delete(id);
             }
+
+            succeeded(id, false);
         }
 
-        if (ledger.sweep?.backfill === true) {
+        if (found.retried !== undefined) {
+            succeeded(found.retried, false);
+        }
+
+        for (const id of found.swept) {
+            succeeded(id, backfillSweep);
+        }
+
+        if (backfillSweep) {
             state.coverage.total += found.listed;
-            state.coverage.done += found.done;
         }
     };
 
-    /** A sweep that listed and read every conversation ends; the backfill's end makes the coverage complete. */
-    const endSweep = (): void => {
+    /**
+     * A sweep that listed and visited every conversation ends. The coverage is complete only when the backfill sweep
+     * ended and no gap is left: it is set again here, so the last gap's success makes it complete.
+     */
+    const settle = (): void => {
         const sweep = ledger.sweep;
 
         if (sweep !== undefined && sweep.listed && sweep.queue.length === 0) {
             if (sweep.backfill) {
-                state.coverage.complete = true;
+                ledger.backfillDone = true;
             }
 
             delete ledger.sweep;
         }
+
+        state.coverage.complete = ledger.backfillDone && Object.keys(ledger.gaps).length === 0;
     };
 
     for (;;) {
@@ -2288,17 +2344,17 @@ async function ledgerStep(deps: MeterDeps, now: number, signal: AbortSignal): Pr
 
         /** What the commit found so far, and what it reads now: a failure keeps the first, and skips the second. */
         let partial: MeterFound | undefined;
-        let reading: { sweep: boolean; id?: number } | undefined;
+        let reading: { kind: "active" | "retry" | "sweep"; id?: number } | undefined;
 
         try {
             const found = await deps.read(async (tx) => {
                 const result: MeterFound = {
-                    plan: planOf(ledger, left, started),
+                    plan: planOf(ledger, left, started, retry),
                     usages: [],
                     recent: Object.create(null) as Record<string, number>,
                     finished: [],
+                    swept: [],
                     listed: 0,
-                    done: 0,
                 };
                 const plan = result.plan;
 
@@ -2311,12 +2367,25 @@ async function ledgerStep(deps: MeterDeps, now: number, signal: AbortSignal): Pr
                     const head = plan.incremental[0];
 
                     if (head !== undefined) {
-                        reading = { sweep: false, id: head };
+                        reading = { kind: "active", id: head };
                         plan.started[String(head)] ??= clock();
 
                         if (await readPage(tx, plan, result, head, now)) {
                             plan.incremental.shift();
                             result.finished.push(head);
+                        }
+
+                        continue;
+                    }
+
+                    if (plan.retry !== undefined) {
+                        const gap = plan.retry;
+
+                        reading = { kind: "retry", id: gap };
+
+                        if (await readPage(tx, plan, result, gap, now)) {
+                            delete plan.retry;
+                            result.retried = gap;
                         }
 
                         continue;
@@ -2337,7 +2406,7 @@ async function ledgerStep(deps: MeterDeps, now: number, signal: AbortSignal): Pr
                     const id = sweep.queue[0];
 
                     if (id === undefined) {
-                        reading = { sweep: true };
+                        reading = { kind: "sweep" };
 
                         const page = await tx.scanConversations(
                             { order: "ascending" },
@@ -2358,11 +2427,11 @@ async function ledgerStep(deps: MeterDeps, now: number, signal: AbortSignal): Pr
                         continue;
                     }
 
-                    reading = { sweep: true, id };
+                    reading = { kind: "sweep", id };
 
                     if (await readPage(tx, plan, result, id, now)) {
                         sweep.queue.shift();
-                        result.done += 1;
+                        result.swept.push(id);
                     }
                 }
 
@@ -2380,7 +2449,8 @@ async function ledgerStep(deps: MeterDeps, now: number, signal: AbortSignal): Pr
                 throw error;
             }
 
-            const failed = reading as { sweep: boolean; id?: number } | undefined;
+            const failed = reading as
+                { kind: "active" | "retry" | "sweep"; id?: number } | undefined;
             const kept = partial as MeterFound | undefined;
 
             if (kept !== undefined) {
@@ -2388,22 +2458,31 @@ async function ledgerStep(deps: MeterDeps, now: number, signal: AbortSignal): Pr
             }
 
             // An active conversation whose read fails waits for the next pass; the others go on.
-            if (failed?.sweep === false && failed.id !== undefined) {
+            if (failed?.kind === "active" && failed.id !== undefined) {
                 const id = failed.id;
 
                 left = left.filter((each) => each !== id);
                 continue;
             }
 
-            // The step ends for this pass. The backfill moves the conversation whose read failed to the end of its queue:
-            // it does not count as done, and the coverage is complete only when every listed conversation was read. A
-            // later sweep skips it: the backfill read every conversation it listed, so this one has its `high` (or a
-            // newer one has a backfill of 8 days ahead of it), and its next read (when it is active, or in the next
-            // sweep, about 1 hour later) goes on from its `high` or its backfill cursor, with no loss.
+            // The retried gap fails once more: it waits for the next pass (until its tries are spent); the sweep goes on.
+            if (failed?.kind === "retry" && failed.id !== undefined) {
+                const key = String(failed.id);
+
+                ledger.gaps[key] = (ledger.gaps[key] ?? 0) + 1;
+                retry = undefined;
+                continue;
+            }
+
+            // A sweep read fails: the step ends for this pass, and the sweep goes on without that conversation, so every
+            // later page is still listed and the sweep can end. Its backfill cursor (`downs`) stays. The backfill sweep
+            // keeps it as a gap (not done, retried, and the coverage stays not complete). A later sweep skips it with no
+            // loss: it has its `high` or its cursor from the backfill, or it is a gap, or it is newer than the backfill
+            // and its next read (when it is active, or in the next sweep, about 1 hour later) reads its 8 days.
             const sweep = ledger.sweep;
 
             if (
-                failed?.sweep === true &&
+                failed?.kind === "sweep" &&
                 failed.id !== undefined &&
                 sweep !== undefined &&
                 sweep.queue[0] === failed.id
@@ -2411,20 +2490,23 @@ async function ledgerStep(deps: MeterDeps, now: number, signal: AbortSignal): Pr
                 sweep.queue.shift();
 
                 if (sweep.backfill) {
-                    sweep.queue.push(failed.id);
+                    const key = String(failed.id);
+
+                    ledger.gaps[key] = (ledger.gaps[key] ?? 0) + 1;
                 }
             }
 
-            endSweep();
+            settle();
 
             return;
         }
 
-        endSweep();
+        settle();
 
         // Done: nothing left to read, or the sweep's time is over.
         if (
             left.length === 0 &&
+            retry === undefined &&
             (ledger.sweep === undefined || (deadline !== undefined && clock() >= deadline))
         ) {
             return;

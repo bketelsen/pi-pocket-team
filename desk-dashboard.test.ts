@@ -2304,6 +2304,20 @@ const R4_BODY = {
     tangelo: null,
 };
 
+/**
+ * The R4 answer with both windows resetting at `at`: for a test on the real clock, which must not compare with the
+ * fixture's dated reset. The fixed-clock tests keep `R4_BODY`.
+ */
+const r4ResettingAt = (at: number) => {
+    const resetsAt = new Date(at).toISOString();
+
+    return {
+        ...R4_BODY,
+        limits: R4_BODY.limits.map((limit) => ({ ...limit, resets_at: resetsAt })),
+        seven_day: { utilization: 95, resets_at: resetsAt },
+    };
+};
+
 /** A fake store: conversations (a fork has a parent), entries in id order. */
 type MeterWorld = {
     conversations: { id: number; parent?: { conversationId: number; at: number } }[];
@@ -2311,6 +2325,8 @@ type MeterWorld = {
     next: number;
     /** The table reads of each read commit that ended. */
     commits: number[];
+    /** Each `scanEntries` call, by conversation id, before a failure: how often a conversation was tried. */
+    scans: number[];
     /** A read of these throws. */
     failing: Set<number>;
     /** Runs after each table read (its page is made): a test adds entries or moves the clock here. */
@@ -2322,6 +2338,7 @@ const meterWorld = (): MeterWorld => ({
     entries: [],
     next: 0,
     commits: [],
+    scans: [],
     failing: new Set(),
 });
 
@@ -2422,6 +2439,7 @@ function meterRead(w: MeterWorld): MeterDeps["read"] {
                 limit: number,
             ) => {
                 reads += 1;
+                w.scans.push(query.conversationId);
 
                 if (w.failing.has(query.conversationId)) {
                     throw new Error("the storage read failed");
@@ -2737,7 +2755,7 @@ describe("the subscription meter's step", () => {
         });
     });
 
-    test("a failed read: the backfill retries that conversation at the end of its queue and is not complete before it is read; a later sweep skips it; an active one waits for the next pass", async () => {
+    test("a failed read: in the backfill the conversation becomes a gap and the sweep goes on; the retry clears it; a later sweep skips a failed one; an active one waits for the next pass", async () => {
         const w = meterWorld();
         const old = { at: METER_NOW - 2 * HOUR };
 
@@ -2758,22 +2776,27 @@ describe("the subscription meter's step", () => {
             done: 1,
             total: 3,
         });
-        assert.deepEqual(deps.ledger.sweep?.queue, [3, 2], "the failed conversation goes last");
+        assert.deepEqual({ ...deps.ledger.gaps }, { 2: 1 });
+        assert.deepEqual(deps.ledger.sweep?.queue, [3], "the sweep goes on without it");
 
-        // It fails again: the backfill stays not complete.
+        // The retry fails again; the sweep reads 3 and ends; a gap keeps the coverage not complete.
         await meterPass(deps, METER_NOW + PASS_MS);
         assert.equal(ledgerSums(deps.state).entries, 2);
+        assert.equal(deps.ledger.sweep, undefined, "the backfill sweep ended");
+        assert.equal(deps.ledger.backfillDone, true);
+        assert.deepEqual({ ...deps.ledger.gaps }, { 2: 2 });
         assert.deepEqual(deps.state.coverage, {
             since: METER_NOW - 8 * DAY,
             complete: false,
             done: 2,
             total: 3,
         });
-        assert.deepEqual(deps.ledger.sweep?.queue, [2]);
 
+        // The retry works: the gap goes, it counts as done, and the coverage is complete.
         w.failing.clear();
         await meterPass(deps, METER_NOW + 2 * PASS_MS);
         assert.equal(ledgerSums(deps.state).entries, 3);
+        assert.deepEqual({ ...deps.ledger.gaps }, {});
         assert.deepEqual(deps.state.coverage, {
             since: METER_NOW - 8 * DAY,
             complete: true,
@@ -2793,6 +2816,7 @@ describe("the subscription meter's step", () => {
         assert.equal(deps.ledger.sweeps, 2);
         assert.equal(deps.ledger.sweep, undefined, "the later sweep ended");
         assert.equal(deps.ledger.high["4"], undefined, "the skipped conversation is not read");
+        assert.deepEqual({ ...deps.ledger.gaps }, {}, "a later sweep makes no gap");
         assert.equal(ledgerSums(deps.state).entries, 3);
         assert.deepEqual(deps.state.coverage, {
             since: METER_NOW - 8 * DAY,
@@ -2817,60 +2841,137 @@ describe("the subscription meter's step", () => {
         assert.equal(ledgerSums(deps.state).entries, 5);
     });
 
-    test("a backfill read that fails once, within a conversation's backfill: the coverage stays not complete, then completes in the next pass, and each answer counts once", async () => {
+    test("a backfill conversation that always fails, of 150: every page is listed and counted, the backfill ends, the coverage stays not complete, the retries stop after 3, and the hourly sweep starts at the 12th pass", async () => {
+        const w = meterWorld();
+        const old = { at: METER_NOW - 2 * HOUR };
+
+        for (let id = 1; id <= 150; id += 1) {
+            meterConversation(w, id);
+            answerIn(w, id, old);
+        }
+
+        w.failing.add(1);
+
+        const deps = meterDeps(w);
+        const triesOf1 = () => w.scans.filter((id) => id === 1).length;
+
+        await meterPass(deps, METER_NOW);
+        assert.equal(ledgerSums(deps.state).entries, 0);
+        assert.deepEqual({ ...deps.ledger.gaps }, { 1: 1 });
+        assert.deepEqual(deps.state.coverage, {
+            since: METER_NOW - 8 * DAY,
+            complete: false,
+            done: 0,
+            total: 100,
+        });
+
+        // The retry fails; the sweep reads 2 to 100, lists the second page, reads 101 to 150, and ends.
+        await meterPass(deps, METER_NOW + PASS_MS);
+        assert.equal(ledgerSums(deps.state).entries, 149);
+        assert.equal(deps.ledger.high["150"], 150);
+        assert.equal(deps.ledger.sweep, undefined, "the backfill sweep ended");
+        assert.equal(deps.ledger.backfillDone, true);
+        assert.deepEqual({ ...deps.ledger.gaps }, { 1: 2 });
+        assert.deepEqual(deps.state.coverage, {
+            since: METER_NOW - 8 * DAY,
+            complete: false,
+            done: 149,
+            total: 150,
+        });
+
+        await meterPass(deps, METER_NOW + 2 * PASS_MS);
+        assert.deepEqual({ ...deps.ledger.gaps }, { 1: 3 });
+        assert.equal(triesOf1(), 3, "the backfill's read and 2 retries");
+
+        // No more retries after 3 failures, and no sweep before the 12th pass after the backfill started.
+        for (let pass = 4; pass <= 12; pass += 1) {
+            await meterPass(deps, METER_NOW + (pass - 1) * PASS_MS);
+        }
+
+        assert.equal(triesOf1(), 3);
+        assert.equal(deps.ledger.sweeps, 1);
+        assert.equal(deps.state.coverage.complete, false);
+
+        // The 12th pass after the backfill started: the hourly sweep starts, and tries conversation 1 again.
+        await meterPass(deps, METER_NOW + 12 * PASS_MS);
+        assert.equal(deps.ledger.passes, 13);
+        assert.equal(deps.ledger.sweeps, 2);
+        assert.equal(deps.ledger.sweepStartedPass, 13);
+        assert.equal(triesOf1(), 4);
+        assert.deepEqual({ ...deps.ledger.gaps }, { 1: 3 }, "a later sweep adds no try");
+        assert.equal(ledgerSums(deps.state).entries, 149);
+        assert.equal(deps.state.coverage.complete, false);
+
+        // A later read that works (here as an active conversation) clears the gap: the coverage is complete.
+        w.failing.clear();
+        deps.ledger.active.add(1);
+        await meterPass(deps, METER_NOW + 13 * PASS_MS);
+        assert.equal(ledgerSums(deps.state).entries, 150);
+        assert.deepEqual({ ...deps.ledger.gaps }, {});
+        assert.deepEqual(deps.state.coverage, {
+            since: METER_NOW - 8 * DAY,
+            complete: true,
+            done: 150,
+            total: 150,
+        });
+    });
+
+    test("a backfill conversation of 150 that fails once within its backfill: the retry goes on from its cursor, the coverage completes, and each answer counts once", async () => {
         const w = meterWorld();
         const old = { at: METER_NOW - 2 * HOUR };
 
         meterConversation(w, 1);
-        answerIn(w, 1, old);
-        meterConversation(w, 2);
 
         for (let index = 0; index < 250; index += 1) {
-            answerIn(w, 2, old);
+            answerIn(w, 1, old);
         }
 
-        meterConversation(w, 3);
-        answerIn(w, 3, old);
+        for (let id = 2; id <= 150; id += 1) {
+            meterConversation(w, id);
+            answerIn(w, id, old);
+        }
 
         let armed = false;
 
-        // After the first page of conversation 2, its next read fails.
+        // After the first page of conversation 1, its next read fails.
         w.onRead = (kind, id) => {
-            if (kind === "entries" && id === 2 && !armed) {
+            if (kind === "entries" && id === 1 && !armed) {
                 armed = true;
-                w.failing.add(2);
+                w.failing.add(1);
             }
         };
 
         const deps = meterDeps(w);
 
         await meterPass(deps, METER_NOW);
-        assert.equal(ledgerSums(deps.state).entries, 201, "conversation 1, and 2's first page");
+        assert.equal(ledgerSums(deps.state).entries, 200, "conversation 1's first page");
         assert.deepEqual(
             { ...deps.ledger.downs },
-            { 2: 51 },
+            { 1: 50 },
             "the backfill keeps its entry cursor",
         );
+        assert.deepEqual({ ...deps.ledger.gaps }, { 1: 1 });
         assert.deepEqual(deps.state.coverage, {
             since: METER_NOW - 8 * DAY,
             complete: false,
-            done: 1,
-            total: 3,
+            done: 0,
+            total: 100,
         });
 
         w.failing.clear();
         await meterPass(deps, METER_NOW + PASS_MS);
-        assert.equal(ledgerSums(deps.state).entries, 252);
+        assert.equal(ledgerSums(deps.state).entries, 399, "250 + 149, each once");
         assert.deepEqual({ ...deps.ledger.downs }, {});
+        assert.deepEqual({ ...deps.ledger.gaps }, {});
         assert.deepEqual(deps.state.coverage, {
             since: METER_NOW - 8 * DAY,
             complete: true,
-            done: 3,
-            total: 3,
+            done: 150,
+            total: 150,
         });
 
         await meterPass(deps, METER_NOW + 2 * PASS_MS);
-        assert.equal(ledgerSums(deps.state).entries, 252);
+        assert.equal(ledgerSums(deps.state).entries, 399);
     });
 
     test("an abort during a ledger read throws, counts nothing, and the pass's GitHub part does not run", async () => {
@@ -3620,7 +3721,8 @@ describe("the collector in Pocket", () => {
             fetch: async (url: string) => {
                 calls.push(url);
 
-                return respond(200, JSON.stringify(R4_BODY));
+                // The real clock: the reset is 4 days after the app's clock, never the fixture's date.
+                return respond(200, JSON.stringify(r4ResettingAt(Date.now() + shift + 4 * DAY)));
             },
         };
         writeFileSync(configPath, JSON.stringify({ digest: { minutes: 0 }, cap: 100, meter: {} }));
@@ -3845,12 +3947,14 @@ describe("the collector in Pocket", () => {
                 "network error",
                 /Anthropic: no provider report \(network error\)/,
             );
-            // (c) The R4 answer.
-            answerNow = async () => respond(200, JSON.stringify(R4_BODY));
+            // (c) The R4 answer, with its resets 4 days after the app's clock at the read: this test runs on the real
+            // clock, so a dated reset would pass and turn the line into "awaiting".
+            answerNow = async () =>
+                respond(200, JSON.stringify(r4ResettingAt(Date.now() + shift + 4 * DAY)));
             await step(
                 PASS_MS + 60_000,
                 true,
-                /Anthropic: week 95% used \(critical\), resets \w{3} \d{2}:\d{2} \(in \d+d \d+h\) · week, Fable 19%/,
+                /Anthropic: week 95% used \(critical\), resets \w{3} \d{2}:\d{2} \(in [34]d \d+h\) · week, Fable 19%/,
             );
             assert.ok(
                 !JSON.stringify(holder().state).includes(FAKE_TOKEN),
