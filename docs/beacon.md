@@ -100,7 +100,7 @@ What exists today:
   with no PR), and every blocking
   point of a reviewer answer with its PR, its reviewed head, the PR's state and its guard: a test or an `AGENTS.md`
   file of the PR's own diff that is new or changed at the final head against the reviewed head, and the lines added to
-  `.memory/corrections.jsonl` between them plus the new record files under `.memory/corrections/` (a record moved out
+  the old single corrections file (`CORRECTIONS_FILE` in `audit/sources.mjs`) between them plus the new record files under `.memory/corrections/` (a record moved out
   of the old file after the reviewed head is not new). `rate` is guarded points over evaluated points, null at 0.
   GitHub calls, inside the cap of 40 and with no compare: at most 8 PR queries of 40 PRs, then at most 4 blob queries
   of at most 150 object lookups a run, newest first; the rest stay pending for the next run.
@@ -138,8 +138,8 @@ What exists today:
 - The audit writes at most 5 proposals. Each cites finding ids. Code, not the model, gives the owner and the size
   (`ownerOf` in `audit/report.mjs`).
 - Odrade reads the report for the 07:30 brief (README.md, "Daily audit").
-- A blocking review point gets a guard: a test or an `AGENTS.md` rule, and 1 record file in `.memory/corrections/`,
-  or 1 line in `.memory/corrections.jsonl` in a repository that still has it.
+- A blocking review point gets a guard: a test or an `AGENTS.md` rule, and 1 record file in `.memory/corrections/`
+  (name `<date>-pr-<N>-<words>.json`, core ADR-0081).
 
 The loop:
 

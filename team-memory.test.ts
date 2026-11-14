@@ -348,7 +348,7 @@ test("agent memory: identity gate, pending vs approved in the prompt, across fol
         assert.match(refused, /Put a lesson about this repository in the repository by a PR/);
         assert.match(
             refused,
-            /a record file in \.memory\/corrections\/ \(a line in \.memory\/corrections\.jsonl while the repository still has that file\)/,
+            /a record file in \.memory\/corrections\/ \(name <date>-pr-<N>-<words>\.json, core ADR-0081\)/,
         );
         assert.doesNotMatch(refused, /Use the memory tool for this project's lessons/);
         assert.deepEqual((await call("memory")).data, {
@@ -380,7 +380,7 @@ test("agent memory: identity gate, pending vs approved in the prompt, across fol
         // Repository lessons go in the repository, plan T801 t11.
         assert.match(
             section(),
-            /A lesson about one repository \(how to build or test it, a gotcha in its code, a review finding\) goes in that repository by a PR: a test that fails without the fix, an AGENTS\.md rule, or a record file in its \.memory\/corrections\/ \(a line in its \.memory\/corrections\.jsonl while the repository still has that file\)\./,
+            /A lesson about one repository \(how to build or test it, a gotcha in its code, a review finding\) goes in that repository by a PR: a test that fails without the fix, an AGENTS\.md rule, or a record file in its \.memory\/corrections\/ \(name <date>-pr-<N>-<words>\.json, core ADR-0081\)\./,
         );
         assert.match(
             section(),
