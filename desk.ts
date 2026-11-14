@@ -849,6 +849,36 @@ export type DeskState = {
      * next row id; `keys` the last calls' replay keys. Absent until the first row.
      */
     board?: BoardModule.Board;
+    /**
+     * The merge receipts that the Pocket desktop app posts (`POST threads/:id/merges`), keyed `<op>:<result>`. Stored
+     * data: never rename a field or change what it means. Information only: the desk never checks a receipt on GitHub,
+     * and a receipt never authorizes anything. Each receipt is kept `MERGE_RECEIPT_KEEP_MS` (48 hours), whatever the
+     * count. Absent until the first receipt.
+     */
+    mergeReceipts?: Record<string, MergeReceipt>;
+};
+
+/** What the Pocket desktop app reports about 1 approve-and-merge of a PR. */
+export type MergeResult = "approved" | "merged" | "queued" | "refused" | "failed" | "unknown";
+
+/** How a merge ran, as the Pocket desktop app reports it. */
+export type MergeMethod = "merge" | "squash" | "rebase" | "queue";
+
+/** 1 merge receipt. Stored data: never rename a field. Information only, never an authorization. */
+export type MergeReceipt = {
+    /** The thread id the receipt came for. */
+    thread: string;
+    /** "owner/name#N": a PR link of that thread when it came. */
+    ref: string;
+    /** The PR head the app acted on: 40 lowercase hex characters. */
+    head: string;
+    result: MergeResult;
+    method?: MergeMethod;
+    /** 1 to 300 characters. */
+    reason?: string;
+    /** When the desk stored it. */
+    at: number;
+    via: "pocket";
 };
 
 /** One plan's state: the shape of its thread's work. Stored data: never rename a field. */
@@ -1657,6 +1687,187 @@ function addEvent(thread: Thread, key: string, text: string, at: number): boolea
     thread.lastEventAt = at;
 
     return true;
+}
+
+// ─── Merge receipts ─────────────────────────────────────────────────────────
+
+/** How long a merge receipt is kept, whatever the count. */
+export const MERGE_RECEIPT_KEEP_MS = 48 * 3600_000;
+
+const MERGE_OP = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const MERGE_REF = /^[A-Za-z0-9-]+\/[A-Za-z0-9._-]+#[0-9]+$/;
+const MERGE_HEAD = /^[0-9a-f]{40}$/;
+const MERGE_RESULTS: readonly MergeResult[] = [
+    "approved",
+    "merged",
+    "queued",
+    "refused",
+    "failed",
+    "unknown",
+];
+const MERGE_METHODS: readonly MergeMethod[] = ["merge", "squash", "rebase", "queue"];
+const MERGE_FIELDS = new Set(["op", "ref", "head", "result", "method", "reason", "via"]);
+
+/** The event text of a merge receipt: 1 line, with a 7-character head. */
+export function mergeReceiptText(receipt: Omit<MergeReceipt, "at">): string {
+    const at = `${receipt.ref} at ${receipt.head.slice(0, 7)}`;
+    const reason = receipt.reason === undefined ? "" : oneLine(receipt.reason);
+
+    // The reason ends the line: no second period when it has one; a blank reason leaves only the label.
+    const said = (label: string) => {
+        const text = reason === "" ? label : `${label}: ${reason}`;
+
+        return `Pocket reports: ${at}: ${text.endsWith(".") ? text : `${text}.`}`;
+    };
+
+    switch (receipt.result) {
+        case "merged":
+            return `Pocket reports: Brian approved and merged ${at} (${receipt.method ?? "merge"}).`;
+        case "queued":
+            return `Pocket reports: ${at}: queued.`;
+        case "approved":
+            return said("approved, not merged");
+        case "refused":
+            return said("refused");
+        case "failed":
+            return said("failed");
+        case "unknown":
+            return said("outcome unknown");
+    }
+}
+
+/**
+ * Record 1 merge receipt of the Pocket desktop app on a thread. It checks the whole body first: a 400 or a 404 changes
+ * nothing. A 200 (a new receipt or a repeat) first drops the receipts older than `MERGE_RECEIPT_KEEP_MS`. A new
+ * receipt adds 1 thread event; a repeat with the same fields changes nothing else; the same key with other fields is a
+ * 409. It never changes a PR link or the thread's state: a receipt is information only.
+ */
+export function recordMergeReceipt(
+    state: DeskState,
+    id: string,
+    body: Readonly<Record<string, unknown>>,
+    now: number,
+): { status: 200; recorded: boolean } | { status: 400 | 404 | 409; error: string } {
+    const bad = (error: string) => ({ status: 400 as const, error: `merges: ${error}` });
+
+    for (const field of Object.keys(body)) {
+        if (!MERGE_FIELDS.has(field)) {
+            return bad(`unknown field "${field}"`);
+        }
+
+        if (typeof body[field] !== "string") {
+            return bad(`${field} must be a string`);
+        }
+    }
+
+    const { op, ref, head, result, method, reason, via } = body as Record<
+        string,
+        string | undefined
+    >;
+
+    if (op === undefined || !MERGE_OP.test(op)) {
+        return bad("op must be a lowercase UUID v4");
+    }
+
+    if (ref === undefined || !MERGE_REF.test(ref)) {
+        return bad("ref must be owner/name#N");
+    }
+
+    if (head === undefined || !MERGE_HEAD.test(head)) {
+        return bad("head must be 40 lowercase hex characters");
+    }
+
+    if (result === undefined || !(MERGE_RESULTS as readonly string[]).includes(result)) {
+        return bad(`result must be one of ${MERGE_RESULTS.join(", ")}`);
+    }
+
+    if (method !== undefined && !(MERGE_METHODS as readonly string[]).includes(method)) {
+        return bad(`method must be one of ${MERGE_METHODS.join(", ")}`);
+    }
+
+    if (reason !== undefined && ([...reason].length < 1 || [...reason].length > 300)) {
+        return bad("reason must be 1 to 300 characters");
+    }
+
+    if (via !== "pocket") {
+        return bad('via must be "pocket"');
+    }
+
+    if (result === "merged" && method === undefined) {
+        return bad("merged needs method");
+    }
+
+    if (result === "merged" && method === "queue") {
+        return bad("merged must not have method queue");
+    }
+
+    if (result === "queued" && method !== "queue") {
+        return bad("queued needs method queue");
+    }
+
+    if (
+        (result === "refused" || result === "failed" || result === "unknown") &&
+        reason === undefined
+    ) {
+        return bad(`${result} needs reason`);
+    }
+
+    const thread = threadById(state, id);
+
+    if (thread === undefined) {
+        return { status: 404, error: `There is no thread ${id}.` };
+    }
+
+    if (!Object.hasOwn(thread.prs, ref)) {
+        return bad(`${ref} is not a PR of thread ${thread.id}`);
+    }
+
+    const receipt: Omit<MergeReceipt, "at"> = {
+        thread: thread.id,
+        ref,
+        head,
+        result: result as MergeResult,
+        ...(method === undefined ? {} : { method: method as MergeMethod }),
+        ...(reason === undefined ? {} : { reason }),
+        via: "pocket",
+    };
+    const key = `${op}:${result}`;
+    const kept = state.mergeReceipts?.[key];
+
+    if (kept !== undefined && kept.at >= now - MERGE_RECEIPT_KEEP_MS) {
+        const same =
+            kept.thread === receipt.thread &&
+            kept.ref === receipt.ref &&
+            kept.head === receipt.head &&
+            kept.result === receipt.result &&
+            kept.method === receipt.method &&
+            kept.reason === receipt.reason &&
+            kept.via === receipt.via;
+
+        if (!same) {
+            return { status: 409, error: "receipt conflict" };
+        }
+    }
+
+    // A 200 from here: drop the receipts past their time first.
+    // Read it back after the assignment: a document's tracked object is the stored one, not the literal.
+    state.mergeReceipts ??= {};
+    const receipts = state.mergeReceipts;
+
+    for (const [each, stored] of Object.entries(receipts)) {
+        if (stored.at < now - MERGE_RECEIPT_KEEP_MS) {
+            delete receipts[each];
+        }
+    }
+
+    if (Object.hasOwn(receipts, key)) {
+        return { status: 200, recorded: false };
+    }
+
+    receipts[key] = { ...receipt, at: now };
+    addEvent(thread, `merge:${key}`, mergeReceiptText(receipt), now);
+
+    return { status: 200, recorded: true };
 }
 
 // ─── Opening, binding, failing ───────────────────────────────────────────────
@@ -32125,6 +32336,35 @@ export default function createDesk(host: Host, web: Web) {
                 thread.keptAt = now;
                 addEvent(thread, `kept:${String(now)}`, "kept by Brian", now);
             });
+        },
+        { access: "owner" },
+    );
+
+    // The Pocket desktop app's merge receipts: information only. It answers `{ recorded }`, not the view: it changes no
+    // PR link and no thread state, lapses no grant, and starts no sweep or GitHub read.
+    web.route(
+        "POST",
+        "threads/:id/merges",
+        async (request) => {
+            const id = threadIdOf(request);
+            const recorded = await request.commit(async (tx) => {
+                const state = await tx.doc(DeskThreads);
+                const done = recordMergeReceipt(state, id, request.body, Date.now());
+
+                if (done.status !== 200) {
+                    // A throw discards the commit: a refusal changes nothing.
+                    throw web.error(done.status, done.error);
+                }
+
+                return done.recorded;
+            });
+
+            if (recorded) {
+                web.send("changed", {});
+                await exportNow({ snapshot: request.snapshot }, request.context);
+            }
+
+            return { recorded };
         },
         { access: "owner" },
     );
