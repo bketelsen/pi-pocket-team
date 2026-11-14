@@ -3043,6 +3043,80 @@ describe("the subscription meter's step", () => {
         assert.equal(nextReadAt(deps.state, "anthropic", METER_ON), METER_NOW + 9.5 * MINUTE);
     });
 
+    test("a 200 answer that reflects the token in any string the reading copies is refused with fixed words, and the meter keeps nothing of it", async () => {
+        const signal = new AbortController().signal;
+        const read = (body: unknown) =>
+            anthropicReader({
+                token: async () => FAKE_TOKEN,
+                fetch: (async () => respond(200, JSON.stringify(body))) as unknown as typeof fetch,
+                now: () => METER_NOW,
+            })("anthropic", signal);
+        const limit = R4_BODY.limits[0]!;
+        const grant = { type: "reset", label: "granted", resets_left: 1 };
+        const reflecting: Record<string, unknown> = {
+            severity: { ...R4_BODY, limits: [{ ...limit, severity: `critical ${FAKE_TOKEN}` }] },
+            "scoped name": {
+                ...R4_BODY,
+                limits: [
+                    limit,
+                    { ...R4_BODY.limits[1]!, scope: { model: { display_name: FAKE_TOKEN } } },
+                ],
+            },
+            "unknown kind": { ...R4_BODY, limits: [{ ...limit, kind: `x_${FAKE_TOKEN}` }] },
+            "grant label": {
+                ...R4_BODY,
+                cedar_ember: { eligible: true, grants: [{ ...grant, label: FAKE_TOKEN }] },
+            },
+            "grant type": {
+                ...R4_BODY,
+                cedar_ember: {
+                    eligible: true,
+                    grants: [{ type: FAKE_TOKEN, resets_left: 1 }],
+                },
+            },
+            "ineligible reason": {
+                ...R4_BODY,
+                cedar_ember: { eligible: false, ineligible_reason: `no ${FAKE_TOKEN}` },
+            },
+        };
+
+        for (const [where, body] of Object.entries(reflecting)) {
+            assert.deepEqual(await read(body), { error: "request failed" }, where);
+        }
+
+        // The same answer without the token is a reading.
+        assert.equal(
+            (
+                (await read({
+                    ...R4_BODY,
+                    cedar_ember: { eligible: true, grants: [grant] },
+                })) as { provider?: string }
+            ).provider,
+            "anthropic",
+        );
+
+        // Through the pass: no reading is kept, and nothing the meter keeps or shows holds the token.
+        const deps = meterDeps(meterWorld(), {
+            settings: METER_ON,
+            readProvider: anthropicReader({
+                token: async () => FAKE_TOKEN,
+                fetch: (async () =>
+                    respond(200, JSON.stringify(reflecting.severity))) as unknown as typeof fetch,
+                now: () => METER_NOW,
+            }),
+        });
+
+        await meterPass(deps, METER_NOW);
+
+        const view = meterView(deps.state, METER_ON, METER_NOW, METER_ZONE);
+
+        assert.equal(deps.state.providers.anthropic?.lastSuccess, undefined);
+        assert.equal(deps.state.providers.anthropic?.lastAttempt?.error, "request failed");
+        assert.equal(view.providers[0]?.line, "Anthropic: no provider report (request failed)");
+        assert.ok(!JSON.stringify(deps.state).includes(FAKE_TOKEN));
+        assert.ok(!JSON.stringify(view).includes(FAKE_TOKEN));
+    });
+
     test("failures give fixed words: HTTP status, no JSON, network, timeout, no sign-in; the token is in no answer, view, state or log", async () => {
         const logged: string[] = [];
         const methods = ["log", "info", "warn", "error", "debug"] as const;
@@ -3947,6 +4021,37 @@ describe("the collector in Pocket", () => {
                 "network error",
                 /Anthropic: no provider report \(network error\)/,
             );
+
+            // (d) A 200 answer that reflects the token in the strings a reading copies: the severity, the scoped name
+            // and a grant's label. The read is refused with fixed words, and no reading is kept.
+            answerNow = async () => {
+                const body = r4ResettingAt(Date.now() + shift + 4 * DAY);
+
+                return respond(
+                    200,
+                    JSON.stringify({
+                        ...body,
+                        limits: [
+                            { ...body.limits[0], severity: `critical ${FAKE_TOKEN}` },
+                            {
+                                ...body.limits[1],
+                                scope: { model: { display_name: FAKE_TOKEN } },
+                            },
+                        ],
+                        cedar_ember: {
+                            eligible: true,
+                            grants: [{ type: "reset", label: FAKE_TOKEN, resets_left: 1 }],
+                        },
+                    }),
+                );
+            };
+
+            await step(
+                PASS_MS + 60_000,
+                "request failed",
+                /Anthropic: no provider report \(request failed\)/,
+            );
+            assert.equal(holder().state?.providers.anthropic?.lastSuccess, undefined);
             // (c) The R4 answer, with its resets 4 days after the app's clock at the read: this test runs on the real
             // clock, so a dated reset would pass and turn the line into "awaiting".
             answerNow = async () =>

@@ -2573,6 +2573,7 @@ export type MeterIo = {
  * The provider reader for Anthropic (plan D1, D8): `GET /api/oauth/usage` with Pi's token and Claude Code's identity
  * headers, no redirect, 15 seconds at most, aborted with the pass. Its error texts are fixed words: never the
  * answer's body, never an exception's message, and never the token (a text that holds it becomes "request failed").
+ * A 200 reading whose copied strings hold the token is refused the same way, and nothing of it is kept.
  */
 export function anthropicReader(io: MeterIo): MeterDeps["readProvider"] {
     return async (_provider, signal) => {
@@ -2643,8 +2644,37 @@ export function anthropicReader(io: MeterIo): MeterDeps["readProvider"] {
 
         const reading = meterRules.parseAnthropicUsage(body, io.now?.() ?? Date.now());
 
-        return "error" in reading ? safe(reading) : reading;
+        if ("error" in reading) {
+            return safe(reading);
+        }
+
+        // A reading copies the answer's strings (a severity, a scoped name, a kind, a grant's label or type): one that
+        // holds the token is refused with fixed words, and the meter keeps nothing of it (plan D1).
+        return holdsText(reading, token) ? { error: "request failed" } : reading;
     };
+}
+
+/** Whether a string, a key or a value anywhere in `value` (arrays and objects, at any depth) holds `text`. */
+function holdsText(value: unknown, text: string): boolean {
+    if (text === "") {
+        return false;
+    }
+
+    if (typeof value === "string") {
+        return value.includes(text);
+    }
+
+    if (Array.isArray(value)) {
+        return value.some((item) => holdsText(item, text));
+    }
+
+    if (typeof value === "object" && value !== null) {
+        return Object.entries(value).some(
+            ([key, item]) => key.includes(text) || holdsText(item, text),
+        );
+    }
+
+    return false;
 }
 
 // ─── The pass ────────────────────────────────────────────────────────────────
