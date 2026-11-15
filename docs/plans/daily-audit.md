@@ -197,11 +197,23 @@ Q1's limits:
 2. **Writing the proposals.** Code ranks the findings (below) and gives the top 12, with their
    metrics (Q1's day record, review-round thread list and stop list left out: they can be long), to the LLM. The LLM groups them into
    at most 5 proposals and writes each one. It never sees a transcript.
-3. **Code checks the LLM's text** before anyone sees it: at most 5 proposals; each cites 1 or more
-   finding ids that exist (a cited pair id counts as its pair's finding when that finding is a
-   top finding); each number in its text appears in a cited finding or metric; the owner
-   and the size come from the fixed table below, not from the model. A text that fails goes out as
-   the plain ranked list, with no LLM text.
+3. **Code checks the LLM's text** before anyone sees it (`validateAnswer` in `audit/llm.mjs`).
+    - **Each proposal alone:** it has a title and a text; it cites 1 or more ids of the top
+      findings (a cited pair id counts as its pair's finding when that finding is a top finding);
+      its title and text match no secret filter and hold no word `rank`, `ranked`, `ranking` or
+      `score`; and each number in its title and text is a number of its cited findings (their id,
+      text, evidence, cases and waste), the rounded form of one, or 1 to 5. The metrics give a
+      proposal no numbers.
+    - **The summary alone:** at most 3 sentences, no secret, none of those 4 words, and each
+      number is a number of a top finding or of the metrics of a top finding's check, the rounded
+      form of one, or 1 to 5. The metrics are allowed only here.
+    - The owner and the size come from the fixed table below, not from the model.
+    - A proposal or a summary that fails is dropped alone, and the report names it under "Dropped
+      by the checks"; the rest of the answer stays.
+    - The whole answer fails only when it is not valid JSON, is not a JSON object, has a
+      `proposals` that is not a list or that holds more than 5, or has no proposal that passes
+      (an answer with no proposals too). Then the report gives the plain ranked list (the top 5
+      findings by rank) with no LLM text, as it does when the model is not called.
 
 **Rank** (deterministic): `weight(severity) × (1 + log2(cases)) + days it repeats + waste in $ / 5`,
 with weight high 3, medium 2, low 1. A finding marked "maybe fixed" (rule 4) gets no rank.
