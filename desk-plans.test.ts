@@ -12976,6 +12976,40 @@ describe("with the Pi Pocket app", () => {
             /is not a supervisor's/,
         );
 
+        // A private lead is refused: no thread and no planning session, so it never gets the planning identity.
+        const privateHome = join(root, "chani-home");
+        const privateProfile = join(definitions, "chani.md");
+
+        mkdirSync(privateHome, { recursive: true });
+        writeFileSync(
+            privateProfile,
+            `---\nmodel: faux/faux-2\nhome: ${privateHome}\nprivate: true\n---\n# Chani\nYou are Chani. You work for Brian alone.`,
+        );
+
+        try {
+            const before = app.sessions().length;
+            const threads = Object.keys((await deskSnapshot())?.threads ?? {}).length;
+            const refused = await routes(`plans/new/${String(source)}`, {
+                ...body,
+                lead: "chani",
+                key: "new-plan-key-private",
+            });
+
+            assert.equal(refused.status, 400);
+            assert.match(
+                String(refused.data.error ?? refused.data.message ?? ""),
+                /Chani is a private agent: Brian talks to Chani directly/,
+            );
+            assert.equal(app.sessions().length, before, "no planning session started");
+            assert.equal(
+                Object.keys((await deskSnapshot())?.threads ?? {}).length,
+                threads,
+                "no plan thread opened",
+            );
+        } finally {
+            rmSync(privateProfile, { force: true });
+        }
+
         const sessions = app.sessions().length;
         const started = await routes(`plans/new/${String(source)}`, body);
 

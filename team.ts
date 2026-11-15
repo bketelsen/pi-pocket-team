@@ -3581,6 +3581,11 @@ export default function createTeam(host: Host, web: Web) {
             );
         }
 
+        // A private agent is Brian's: no plan starts in its name, from the tool or from the page's New plan.
+        if (await isPrivateAgent(directory, persona.id)) {
+            throw new Error(privateRefusal(persona));
+        }
+
         // An older desk would drop the issue or the source without a word: it refuses here instead.
         if ((input.issue !== undefined || input.source === "page") && desk.planSources !== true) {
             throw new Error(
