@@ -14,6 +14,8 @@
  * keeps every fact it had, and never counts as an empty answer.
  */
 import { execFile } from "node:child_process";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import {
     AssistantEntry,
@@ -2620,11 +2622,46 @@ export async function meterPass(deps: MeterDeps, now: number): Promise<void> {
     }
 }
 
+/** The Claude Code version read from pi-ai, once: `undefined` until the first read of it. */
+let claudeCliVersionCache: string | undefined;
+
+/**
+ * The Claude Code version the meter sends as `user-agent: claude-cli/<version>`. pi-ai sends its own version on each
+ * Claude request and does not export it, and each Pi Pocket release bundles a different pi-ai version, so a constant
+ * cannot match them all: the version is read from pi-ai's own source. `CLAUDE_CLI_VERSION` applies when that file
+ * cannot be read, or when it holds no version of the accepted form.
+ */
+export function claudeCliVersion(): string {
+    if (claudeCliVersionCache === undefined) {
+        let text: string | undefined;
+
+        try {
+            const entry = import.meta.resolve("@earendil-works/pi-ai");
+
+            text = readFileSync(
+                fileURLToPath(new URL("./api/anthropic-messages.js", entry)),
+                "utf8",
+            );
+        } catch {
+            text = undefined;
+        }
+
+        claudeCliVersionCache = meterRules.claudeCliVersionIn(text);
+    }
+
+    return claudeCliVersionCache;
+}
+
 /** What the Anthropic reader needs: Pi's token, and `fetch`. Tests give fakes. */
 export type MeterIo = {
     /** Pi's OAuth token for Anthropic, or why there is none. */
     token: (signal: AbortSignal) => Promise<string | { error: string }>;
     fetch: typeof fetch;
+    /**
+     * The Claude Code version of the `user-agent` header; a test gives a fixed value. `claudeCliVersion()` when
+     * absent.
+     */
+    claudeCliVersion?: string;
     /** The read's own time limit; `AbortSignal.timeout(METER_READ_MS)` when absent. */
     timeout?: () => AbortSignal;
     /** The reading's time; the wall clock when absent (the pass records its own time). */
@@ -2679,7 +2716,7 @@ export function anthropicReader(io: MeterIo): MeterDeps["readProvider"] {
                 headers: {
                     authorization: `Bearer ${token}`,
                     "anthropic-beta": "oauth-2025-04-20",
-                    "user-agent": `claude-cli/${meterRules.CLAUDE_CLI_VERSION}`,
+                    "user-agent": `claude-cli/${io.claudeCliVersion ?? claudeCliVersion()}`,
                     "x-app": "cli",
                 },
                 redirect: "error",

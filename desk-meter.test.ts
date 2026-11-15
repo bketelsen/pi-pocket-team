@@ -16,6 +16,7 @@ import {
     type AgentResolver,
     type SessionAgent,
     CLAUDE_CLI_VERSION,
+    claudeCliVersionIn,
     emptyMeterState,
     grantsLine,
     holdReason,
@@ -608,7 +609,30 @@ test("ledger: names such as __proto__, constructor and toString are own keys and
     assert.equal(Object.hasOwn(Object.prototype, "percent"), false);
 });
 
-test("CLAUDE_CLI_VERSION matches pi-ai's claudeCodeVersion", () => {
+test("claudeCliVersionIn reads pi-ai's claudeCodeVersion from a text", () => {
+    assert.equal(
+        claudeCliVersionIn(
+            ['const something = "x";', 'const claudeCodeVersion = "9.8.7";', "export {}"].join(
+                "\n",
+            ),
+        ),
+        "9.8.7",
+    );
+});
+
+test("claudeCliVersionIn falls back to CLAUDE_CLI_VERSION for a text with no usable version", () => {
+    assert.equal(claudeCliVersionIn(undefined), CLAUDE_CLI_VERSION);
+    assert.equal(claudeCliVersionIn(""), CLAUDE_CLI_VERSION);
+    assert.equal(claudeCliVersionIn('export const other = "1.2.3";'), CLAUDE_CLI_VERSION);
+    // A value goes into an HTTP header: no newline, no colon, no letters.
+    assert.equal(
+        claudeCliVersionIn('const claudeCodeVersion = "1.2.3\r\nx-evil: 1";'),
+        CLAUDE_CLI_VERSION,
+    );
+    assert.equal(claudeCliVersionIn('const claudeCodeVersion = "abc";'), CLAUDE_CLI_VERSION);
+});
+
+test("pi-ai's real file still holds a claudeCodeVersion of the accepted form", () => {
     const file = readFileSync(
         join(
             import.meta.dirname,
@@ -618,8 +642,10 @@ test("CLAUDE_CLI_VERSION matches pi-ai's claudeCodeVersion", () => {
     );
     const match = /const claudeCodeVersion = "([^"]+)"/.exec(file);
 
+    // When this fails, pi-ai renamed or moved the constant: `claudeCliVersionIn` no longer finds it.
     assert.ok(match !== null, "pi-ai has no claudeCodeVersion");
-    assert.equal(CLAUDE_CLI_VERSION, match[1]);
+    assert.match(match[1] ?? "", /^\d+(\.\d+){1,3}$/);
+    assert.equal(claudeCliVersionIn(file), match[1]);
 });
 
 test("meterSettings: off, defaults, bad values", () => {

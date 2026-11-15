@@ -827,7 +827,8 @@ export type DeskState = {
     };
     /**
      * By supervisor id: the supervisor's session takes no run-end answers of the linked sessions it started
-     * (`host.linkedSessions.reports` with `take: false`, since Pi Pocket 0.28.0-bk.1). `at`: the time of the call
+     * (`host.linkedSessions.reports` with `take: false`, since Pi Pocket 0.29.0, and in the fork's tags from
+     * 0.28.0-bk.1). `at`: the time of the call
      * that worked; `pocket`: `host.pocketVersion` then. A supervisor with an entry is never called again. Absent until
      * the first call that worked.
      */
@@ -24741,7 +24742,8 @@ export default function createDesk(host: Host, web: Web) {
 
     // ─── Run-end answers: the supervisor's switch ───────────────────────────────
 
-    /** Pocket's switch (`reports`, since 0.28.0-bk.1), or undefined on a release that has none. */
+    /** Pocket's switch (`reports`, since 0.29.0, and in the fork's tags from 0.28.0-bk.1), or undefined on a release
+     * that has none. */
     type ReportsSwitch = (
         source: ConversationId,
         request: { take: boolean },
