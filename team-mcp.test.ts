@@ -7,9 +7,9 @@ import {
     cleanUp,
     context,
     lastText,
+    loadTools,
     modelTexts,
     newSession,
-    offerSubagents,
     openApp,
     owner,
     root,
@@ -583,6 +583,22 @@ const model = scriptedModel((ctx) => {
 
     return fauxAssistantMessage([fauxText(`echo: ${text.slice(0, 40)}`)]);
 });
+
+/**
+ * Offer `subagent` in each session that `app` starts from now on, as if Pi had loaded it (it waits for tool search).
+ * Pi Pocket's own helper of that name came after v0.27.0, a release the CI matrix still tests: this is its copy.
+ */
+function offerSubagents(app: App): void {
+    const create = app.commands.createSession.bind(app.commands);
+
+    app.commands.createSession = async (...args: Parameters<typeof create>) => {
+        const created = await create(...args);
+
+        await loadTools(app, created.id, "subagent");
+
+        return created;
+    };
+}
 
 describe("the MCP guard in Pocket", () => {
     let app: App;
