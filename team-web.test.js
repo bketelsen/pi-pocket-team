@@ -5,6 +5,8 @@ import {
     expectedOf,
     identityStatus,
     newTaskKey,
+    startHelp,
+    startLabel,
     SUPERVISOR_ICON,
     SUPERVISOR_NAME,
     supervisorAction,
@@ -69,6 +71,27 @@ test("the supervisor button: its name, its badge of open asks, and a tap that op
 
     assert.deepEqual(none, { notice: ["info", "No session is bound."] });
     assert.equal("open" in none, false);
+});
+
+test("a private agent's button starts a plain session, not a linked task", () => {
+    const chan = { id: "chani", name: "Chani", private: true, home: "/home/team/chani" };
+    const duncan = { id: "duncan", name: "Duncan Idaho" };
+
+    assert.equal(startLabel(chan), "Start session");
+    assert.equal(startLabel(duncan), "Start linked task");
+    assert.match(startHelp(chan, false), /as a plain session of yours, linked to no other session/);
+    assert.match(startHelp(chan, false), /\/home\/team\/chani/);
+    assert.doesNotMatch(startHelp(chan, false), /linked task cannot start another/);
+    // A private agent with no home: the panel says what the profile needs.
+    assert.match(
+        startHelp({ ...chan, home: undefined }, false),
+        /has no home: a session for it opens in its home, so add home to chani\.md first/,
+    );
+    // An ordinary agent keeps the linked task text.
+    assert.match(
+        startHelp(duncan, true),
+        /The task opens in the folder shown above with the preferred model, plus the agent's identity and your brief\. Start linked tasks from the original conversation; a linked task cannot start another\./,
+    );
 });
 
 test("the supervisor icon is 1 stroked path in the 24 by 24 box", () => {

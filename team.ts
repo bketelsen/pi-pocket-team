@@ -58,6 +58,11 @@ type Persona = {
      * reads it from the current roster by id, never from that copy.
      */
     mcp?: string[];
+    /**
+     * A personal agent (`private: true` in the profile): Brian starts and talks to it himself. Its sessions are linked
+     * to no other session, nobody delegates to it, and the desk makes no found thread of its work. Absent means no.
+     */
+    private?: true;
 };
 
 /** Where another module finds this one's live API. */
@@ -693,6 +698,51 @@ export function mcpServers(value: unknown, file: string): string[] {
     return [...new Set(value as string[])];
 }
 
+/**
+ * A profile's `private:` field: `true` for a personal agent, and nothing for `false` or absent (the agent keeps the
+ * team behavior). Any other value makes the profile invalid, as a bad `mcp` does.
+ */
+export function privateFlag(value: unknown, file: string): true | undefined {
+    if (value === undefined || value === false) {
+        return undefined;
+    }
+
+    if (value === true) {
+        return true;
+    }
+
+    throw new Error(`${file}: private must be true or false, or absent.`);
+}
+
+/** A profile id: lowercase, letters, digits, `_` and `-`, as the roster takes them. */
+const PROFILE_ID = /^[a-z0-9][a-z0-9_-]*$/;
+
+/**
+ * Whether the CURRENT profile of `id` is a private agent: 1 read of that 1 profile, never the persona copy in an
+ * Identity doc, which can be old, so a profile that gains or loses `private` takes effect at once. No profile, or a
+ * profile that cannot be read, answers false: a broken profile blocks no session and refuses no other agent.
+ */
+export async function isPrivateAgent(directory: string, id: string): Promise<boolean> {
+    if (!PROFILE_ID.test(id)) {
+        return false;
+    }
+
+    const file = `${id}.md`;
+    const text = await readFile(join(directory, file), "utf8").catch(() => undefined);
+
+    if (text === undefined) {
+        return false;
+    }
+
+    try {
+        const { frontmatter } = parseFrontmatter(text);
+
+        return privateFlag(frontmatter.private, file) === true;
+    } catch {
+        return false;
+    }
+}
+
 export async function roster(directory: string): Promise<Persona[]> {
     const names = await readdir(directory).catch((error: NodeJS.ErrnoException) => {
         if (error.code === "ENOENT") {
@@ -732,6 +782,7 @@ export async function roster(directory: string): Promise<Persona[]> {
                 : { workspace: localFolder(frontmatter.workspace) }),
             ...(frontmatter.home === undefined ? {} : { home: localFolder(frontmatter.home) }),
             mcp: mcpServers(frontmatter.mcp, file),
+            ...(privateFlag(frontmatter.private, file) === true ? { private: true as const } : {}),
         });
     }
 
@@ -1166,8 +1217,15 @@ export function mcpText(scope: McpScope): string | undefined {
 /** What a home session must do before it touches a repository: paths only, never a file's contents. */
 const HOME_RULES = `You are in your home: plans, notes and reports for all your repositories live here. Read a repository's AGENTS.md before you answer about it. Never change a repository from your home: start the work with team_work, which opens a session in a fresh worktree of that repository with its own AGENTS.md, skills and memory. In a linked session, team_work is refused: report the plan to the session that started you.`;
 
+/** The home rules of a private agent: it starts no session and so reports to no one. */
+const PRIVATE_HOME_RULES = `You are in your home: plans, notes and reports for all your repositories live here. Read a repository's AGENTS.md before you answer about it. Never change a repository from your home: Brian starts a session in the repository when he wants that work.`;
+
 /** An identity's home and repositories, with the path of each repository's AGENTS.md when the file is there. */
-export async function placesText(persona: Persona, cwd?: string): Promise<string> {
+export async function placesText(
+    persona: Persona,
+    cwd?: string,
+    personal = false,
+): Promise<string> {
     const names = Object.entries(persona.repositories);
 
     if (persona.home === undefined && names.length === 0) {
@@ -1203,24 +1261,41 @@ export async function placesText(persona: Persona, cwd?: string): Promise<string
         cwd !== undefined &&
         within(await realPathOr(cwd), await realPathOr(persona.home))
     ) {
-        lines.push(HOME_RULES);
+        lines.push(personal ? PRIVATE_HOME_RULES : HOME_RULES);
     }
 
     return lines.join("\n");
 }
 
-const identityText = (persona: Persona) => `Named identity for this Pi Pocket session:
-${persona.instructions}
+/**
+ * The refusal for work that would reach a private agent: Brian starts and talks to it himself. It names the agent and
+ * where its sessions live.
+ */
+const privateRefusal = (persona: Persona): string =>
+    `${persona.name} is a private agent: Brian talks to ${persona.name} directly, in a session in ${persona.home ?? "a folder of its own"}. Nobody delegates to ${persona.name}.`;
 
-Work on the person's current request in this session's folder. Keep task history in its session.
-Your name and responsibilities do not change the tools, permissions, or model selected in Pi Pocket.
-${
+/**
+ * The role paragraph of an identity: a private agent works for Brian alone, so it is told to report to nobody and to
+ * send nothing to another session. `personal` comes from the current roster, by id.
+ */
+const roleText = (persona: Persona, personal: boolean): string =>
     persona.role === "supervisor"
         ? "You own the team, not this conversation's repository. Do work directly when helpful. Use team_delegate for a specialist; select their repository by its roster name and give a self-contained task. Their task starts in that repository regardless of your folder. A greeting needs no audit of old work."
         : persona.role === "clerk"
           ? "You are the desk clerk of your supervisor. Desk digests arrive as messages whose lines start with [desk]. Escalate to your supervisor with desk escalate: thread (the thread it is about), text, and urgent: true only for what must go at once. The desk drops an escalation when the supervisor acted on the thread, or got its news directly, after the news that caused it, and records the drop on the thread. Use team_message to your supervisor only to answer a task that it sent you. A thread that desk read shows as Handled needs no escalation for its reports, because the supervisor acted after them."
-          : "Do your assigned work directly. For a linked task, report the result once with team_message to the return address in its initial message. Set its status. Put each decision you need from Brian in its asks, 1 question each, with options when it is a pick-one: a decision written only in the text can be missed. A done or blocked report with no decision sends asks: []. A plain merge or install request is no ask: the PR's label brings it to Brian. In a linked task, never call the built-in `ask` tool: its card waits only in this session, and the desk does not see it. Put the decision in the asks of team_message. List in its prs each PR you created, changed, reviewed or labelled in the task, as { repo, number }, or send prs: [] when there is none."
-}`;
+          : personal
+            ? "You work for Brian directly, in sessions he starts. You have no supervisor and no desk: never send team_message, never start or message another session, and never report your work to another agent."
+            : "Do your assigned work directly. For a linked task, report the result once with team_message to the return address in its initial message. Set its status. Put each decision you need from Brian in its asks, 1 question each, with options when it is a pick-one: a decision written only in the text can be missed. A done or blocked report with no decision sends asks: []. A plain merge or install request is no ask: the PR's label brings it to Brian. In a linked task, never call the built-in `ask` tool: its card waits only in this session, and the desk does not see it. Put the decision in the asks of team_message. List in its prs each PR you created, changed, reviewed or labelled in the task, as { repo, number }, or send prs: [] when there is none.";
+
+const identityText = (
+    persona: Persona,
+    personal = false,
+) => `Named identity for this Pi Pocket session:
+${persona.instructions}
+
+Work on the person's current request in this session's folder. Keep task history in its session.
+Your name and responsibilities do not change the tools, permissions, or model selected in Pi Pocket.
+${roleText(persona, personal)}`;
 
 const reply = (text: string) => ({ output: [{ type: "text" as const, text }] });
 
@@ -1345,6 +1420,8 @@ export type TeamApi = {
             home?: string;
             /** The profile's model (`provider/model`); absent when the profile names none. An older Team has none. */
             model?: string;
+            /** A personal agent (`private: true`): the desk makes no found thread of its work. */
+            private?: true;
         }[]
     >;
     /**
@@ -2007,6 +2084,23 @@ export default function createTeam(host: Host, web: Web) {
         return agent;
     };
 
+    /** Ordinary sessions, since Pi Pocket 0.28.0: an older Pocket has none, and a private start says so. */
+    type PlainSessions = {
+        start: (
+            source: ConversationId,
+            request: { title?: string; cwd?: string; model?: string; message?: string },
+            key: string,
+        ) => Promise<{ session: ConversationId }>;
+    };
+
+    const plainSessions = (): PlainSessions | undefined => {
+        const sessions = (host as unknown as { sessions?: unknown }).sessions;
+
+        return typeof (sessions as PlainSessions | undefined)?.start === "function"
+            ? (sessions as PlainSessions)
+            : undefined;
+    };
+
     /** Every repository name on the roster, for the router's features: none when the roster cannot be read. */
     const rosterRepositories = async (): Promise<string[]> => {
         try {
@@ -2640,6 +2734,7 @@ export default function createTeam(host: Host, web: Web) {
                 repositories: agent.repositories,
                 ...(agent.home === undefined ? {} : { home: agent.home }),
                 ...(agent.model === "" ? {} : { model: agent.model }),
+                ...(agent.private === true ? { private: true as const } : {}),
             })),
         startPlan: async (request) => {
             const supervisor = request.supervisor as ConversationId;
@@ -2847,6 +2942,11 @@ export default function createTeam(host: Host, web: Web) {
                 throw new Error(
                     `${persona.name} has no home in its profile: a consult runs in the agent's home, so Brian adds home to ${persona.id}.md.`,
                 );
+            }
+
+            // A private agent is Brian's: no consult starts in its name.
+            if (persona.private === true) {
+                throw new Error(privateRefusal(persona));
             }
 
             const model = allowedModel(persona);
@@ -3079,12 +3179,15 @@ export default function createTeam(host: Host, web: Web) {
         "session/:source/start",
         async (req) => {
             const persona = await find(req.body.agent);
+            const personal = persona.private === true;
             let cwd: string | undefined;
 
-            try {
-                cwd = taskTarget(persona, req.body.repository).folder;
-            } catch (error) {
-                throw web.error(400, (error as Error).message);
+            if (!personal) {
+                try {
+                    cwd = taskTarget(persona, req.body.repository).folder;
+                } catch (error) {
+                    throw web.error(400, (error as Error).message);
+                }
             }
 
             const message = typeof req.body.message === "string" ? req.body.message.trim() : "";
@@ -3094,14 +3197,56 @@ export default function createTeam(host: Host, web: Web) {
                 throw web.error(400, "Enter a task of up to 6000 characters.");
             }
 
+            const model =
+                req.body.usePreferredModel === true && persona.model
+                    ? { model: persona.model }
+                    : {};
+
+            // A private agent's session is Brian's own: it opens in the agent's home, linked to no other session, and
+            // its first message is his words only, with no identity preface and no task from a source session.
+            if (personal) {
+                if (persona.home === undefined) {
+                    throw web.error(
+                        400,
+                        `${persona.name} is a private agent, and its profile has no home: a session for it opens in its home, so Brian adds home to ${persona.id}.md.`,
+                    );
+                }
+
+                const sessions = plainSessions();
+
+                if (sessions === undefined) {
+                    throw web.error(
+                        400,
+                        `Start ${persona.name} with New session in ${persona.home}: this Pi Pocket cannot start a plain session from the Team panel.`,
+                    );
+                }
+
+                const plain = await sessions.start(
+                    req.conversation.id,
+                    {
+                        title: `${persona.name}: ${message.split("\n")[0]}`.slice(0, 120),
+                        cwd: persona.home,
+                        message,
+                        ...model,
+                    },
+                    `x.team.human:${key}`,
+                );
+
+                // The same durable step as a linked start: the document keeps the identity for later turns.
+                await req.commit(async (tx) => {
+                    (await tx.doc(Identity, plain.session)).persona ??= persona;
+                });
+
+                // No `address`: nothing links to this session, so there is nothing to answer.
+                return { session: plain.session };
+            }
+
             const started = await req.linkedSessions.start(
                 {
                     title: `${persona.name}: ${message.split("\n")[0]}`.slice(0, 120),
                     message: taskText(persona, message),
                     ...(cwd === undefined ? {} : { cwd }),
-                    ...(req.body.usePreferredModel === true && persona.model
-                        ? { model: persona.model }
-                        : {}),
+                    ...model,
                 },
                 `x.team.human:${key}`,
             );
@@ -3630,6 +3775,11 @@ export default function createTeam(host: Host, web: Web) {
         }
 
         const persona = await find(agent);
+
+        // A private agent is Brian's: no delegation reaches it, from a tool, a shift, a plan task, or the board.
+        if (persona.private === true) {
+            throw new Error(privateRefusal(persona));
+        }
 
         if (verifying) {
             if (persona.home === undefined) {
@@ -4383,6 +4533,11 @@ export default function createTeam(host: Host, web: Web) {
                 );
             }
 
+            // A private agent starts nothing: Brian opens the work in the repository himself.
+            if (await isPrivateAgent(directory, persona.id)) {
+                throw new Error(privateRefusal(persona));
+            }
+
             if (persona.home === undefined) {
                 throw new Error(
                     `${persona.name} has no home in its profile: Brian adds home to ${persona.id}.md.`,
@@ -4994,10 +5149,47 @@ export default function createTeam(host: Host, web: Web) {
         },
     });
 
+    /**
+     * A private agent's session sends nothing out: no report, no delegation, no linked start, no desk. The session's own
+     * identity gives the agent; a session with none (a subagent, or a linked session stored before its identity) is
+     * walked up its chain, as the MCP guard does. A failed read, or no named agent on the way, blocks nothing: only a
+     * private agent that the walk finds does.
+     */
+    const PRIVATE_BLOCKED_TOOLS = ["team_message", "team_delegate", "team_work", "team", "desk"];
+    const privateGuard = hook(ToolTask, {
+        beforeTool: async (call, api, context) => {
+            if (!PRIVATE_BLOCKED_TOOLS.includes(call.name)) {
+                return undefined;
+            }
+
+            // The session's own identity first: 1 document, and the walk only for a session that has none (a
+            // subagent, or a linked session started before its identity was stored).
+            const own = (await api.snapshot(Identity, api.conversationId, context))?.persona;
+
+            if (own !== undefined) {
+                return (await isPrivateAgent(directory, own.id))
+                    ? {
+                          block: `${own.name} is a private agent: it sends nothing to other sessions or the desk.`,
+                      }
+                    : undefined;
+            }
+
+            const scope = await scopeOf(api, api.conversationId, context);
+
+            if (scope.kind !== "agent" || !(await isPrivateAgent(directory, scope.id))) {
+                return undefined;
+            }
+
+            return {
+                block: `${scope.name} is a private agent: it sends nothing to other sessions or the desk.`,
+            };
+        },
+    });
+
     return defineExtension({
         name: "named-team",
         tools: [delegateTool, work, message, list, teamMemory],
-        hooks: [homeGuard, mcpGuard],
+        hooks: [homeGuard, mcpGuard, privateGuard],
         sections: [
             section("named_team", async (input, context) => {
                 const identity = await resolveIdentity(
@@ -5032,10 +5224,13 @@ export default function createTeam(host: Host, web: Web) {
                     await input.read.snapshot(AgentMemory, context),
                     persona.id,
                 );
-                const places = await placesText(persona, identity.cwd);
+                // Privacy comes from the current roster by id, so an old Identity copy without the flag still gets the
+                // private text, and a profile that drops the flag gets the team text back.
+                const personal = await isPrivateAgent(directory, persona.id);
+                const places = await placesText(persona, identity.cwd, personal);
 
                 return (
-                    identityText(persona) +
+                    identityText(persona, personal) +
                     (places === "" ? "" : `\n\n${places}`) +
                     (members.length
                         ? `\n\nNamed teammates:\n${members.join("\n")}\nDelegation runs each agent on its profile model when the owner allows that model for subagents, otherwise on your model.`

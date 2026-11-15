@@ -7,6 +7,17 @@ export function newTaskKey(random = globalThis.crypto) {
     return [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
+/** What the panel's start button says: a private agent's session is Brian's own, not a linked task. */
+export const startLabel = (agent) => (agent?.private ? "Start session" : "Start linked task");
+
+/** What the panel says the start makes: a linked task of this session, or a plain session in the agent's home. */
+export const startHelp = (agent, preferred) =>
+    agent?.private
+        ? agent.home
+            ? `The session opens in ${agent.home} as a plain session of yours, linked to no other session, with ${preferred ? "the preferred model" : "the default model of a new session"}. Your message is its first message, and the folder gives it ${agent.name}'s identity.`
+            : `${agent.name} is a private agent and its profile has no home: a session for it opens in its home, so add home to ${agent.id}.md first.`
+        : `The task opens in the folder shown above with ${preferred ? "the preferred model" : "this session's model"}, plus the agent's identity and your brief. Start linked tasks from the original conversation; a linked task cannot start another.`;
+
 /** The status item for a session: the identity's name, which opens the Team page; null when it has none. */
 export const identityStatus = (session) => {
     const name = session?.identity?.name;
@@ -289,14 +300,18 @@ export default function setup(pocket) {
         const agent = agents.find((a) => a.id === selected);
         const repositories = Object.entries(agent?.repositories ?? {});
         // The home is 1 more place a task can start in: studies, triage and plans across the agent's repositories.
-        const choices = [...repositories.map(([name]) => name), ...(agent?.home ? ["home"] : [])];
+        // A private agent's session opens in its home only, so it chooses no repository.
+        const choices = agent?.private
+            ? []
+            : [...repositories.map(([name]) => name), ...(agent?.home ? ["home"] : [])];
         const chosenRepository = choices.includes(repository) ? repository : (choices[0] ?? "");
-        const taskCwd =
-            chosenRepository === "home"
-                ? agent?.home
-                : (agent?.repositories?.[chosenRepository] ??
-                  agent?.workspace ??
-                  session?.conversation.cwd);
+        const taskCwd = agent?.private
+            ? agent?.home
+            : chosenRepository === "home"
+              ? agent?.home
+              : (agent?.repositories?.[chosenRepository] ??
+                agent?.workspace ??
+                session?.conversation.cwd);
 
         const perform = async (action) => {
             setBusy(true);
@@ -478,14 +493,12 @@ export default function setup(pocket) {
                     </label>
                     <button
                         class="button"
-                        disabled=${busy || !source || !task.trim()}
+                        disabled=${busy || !source || !task.trim() || (agent.private === true && !agent.home)}
                         onClick=${start}
                     >
-                        ${busy ? "Working…" : "Start linked task"}
+                        ${busy ? "Working…" : startLabel(agent)}
                     </button>
-                    <p class="small muted">
-                        The task opens in the folder shown above with ${preferred ? "the preferred model" : "this session's model"}, plus the agent's identity and your brief. Start linked tasks from the original conversation; a linked task cannot start another.
-                    </p>
+                    <p class="small muted">${startHelp(agent, preferred)}</p>
                     ${
                         memory &&
                         html`<${Lessons}
