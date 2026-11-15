@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-14",
+  "scope": "_desk-dashboard.ts",
+  "correction": "readPage's tx.conversation point read did not count in the meter commit's 25-read budget, so 1 commit could make up to 50 table reads; the point read now counts in METER_READS and happens only when the budget has room for it and for the page after it",
+  "evidence": "bketelsen/pi-pocket-team#245, cross-review by openai/gpt-6.1-sol at 064ec26211c9bf55bea8675acedf042468bf98e3",
+  "promoted_to": "desk-dashboard.test.ts: 30 newly active conversations and no listing: each commit stays within 25 reads, and each gets its creator and its answers"
+}

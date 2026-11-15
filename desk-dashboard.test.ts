@@ -2318,15 +2318,21 @@ const r4ResettingAt = (at: number) => {
     };
 };
 
-/** A fake store: conversations (a fork has a parent), entries in id order. */
+/** A fake store: conversations (a fork has a parent, a subagent an owner), entries in id order. */
 type MeterWorld = {
-    conversations: { id: number; parent?: { conversationId: number; at: number } }[];
+    conversations: {
+        id: number;
+        parent?: { conversationId: number; at: number };
+        owner?: { conversationId: number; taskId: string };
+    }[];
     entries: EntryRecord[];
     next: number;
     /** The table reads of each read commit that ended. */
     commits: number[];
     /** Each `scanEntries` call, by conversation id, before a failure: how often a conversation was tried. */
     scans: number[];
+    /** Each conversation that a commit's point read (`tx.conversation`) asked for. */
+    points: number[];
     /** A read of these throws. */
     failing: Set<number>;
     /** Runs after each table read (its page is made): a test adds entries or moves the clock here. */
@@ -2339,6 +2345,7 @@ const meterWorld = (): MeterWorld => ({
     next: 0,
     commits: [],
     scans: [],
+    points: [],
     failing: new Set(),
 });
 
@@ -2347,6 +2354,11 @@ function meterConversation(w: MeterWorld, id: number, parentId?: number, at?: nu
         id,
         ...(parentId === undefined ? {} : { parent: { conversationId: parentId, at: at ?? 0 } }),
     });
+}
+
+/** A conversation that a task of `owner` created: a subagent. */
+function subagentOf(w: MeterWorld, id: number, owner: number): void {
+    w.conversations.push({ id, owner: { conversationId: owner, taskId: `task-${String(id)}` } });
 }
 
 /** 1 answer in conversation `id`, as generation writes it. `cost: null` leaves the cost out. */
@@ -2461,6 +2473,15 @@ function meterRead(w: MeterWorld): MeterDeps["read"] {
 
                 return list.length > limit ? { items, next: { more: true } } : { items };
             },
+            conversation: async (id: number) => {
+                // A point read: 1 table read of the commit, counted with its pages.
+                reads += 1;
+                w.points.push(id);
+
+                const record = w.conversations.find((each) => each.id === id);
+
+                return record === undefined ? undefined : copy(record);
+            },
             scanConversations: async (
                 _query: unknown,
                 limit: number,
@@ -2517,6 +2538,29 @@ function ledgerSums(state: MeterState): { entries: number; cost: number; unknown
     return sums;
 }
 
+/** The ledger's sums over every conversation quarter hour. */
+function conversationSums(state: MeterState): {
+    entries: number;
+    cost: number;
+    unknownCost: number;
+} {
+    const sums = { entries: 0, cost: 0, unknownCost: 0 };
+
+    for (const byConversation of Object.values(state.conversations)) {
+        for (const byProvider of Object.values(byConversation)) {
+            for (const byModel of Object.values(byProvider)) {
+                for (const bucket of Object.values(byModel)) {
+                    sums.entries += bucket.entries;
+                    sums.cost += bucket.cost;
+                    sums.unknownCost += bucket.unknownCost;
+                }
+            }
+        }
+    }
+
+    return sums;
+}
+
 /** A Response for the fake fetch. */
 const respond = (status: number, body: string): Response => new Response(body, { status });
 
@@ -2564,6 +2608,116 @@ describe("the subscription meter's step", () => {
             w.commits.every((reads) => reads <= METER_READS),
             "no commit reads more than 25 times",
         );
+    });
+
+    test("30 newly active conversations and no listing: each commit stays within 25 reads, and each gets its creator and its answers", async () => {
+        const w = meterWorld();
+
+        for (let id = 1; id <= 30; id += 1) {
+            meterConversation(w, id);
+            answerIn(w, id, { cost: id });
+        }
+
+        const deps = meterDeps(w);
+
+        for (let id = 1; id <= 30; id += 1) {
+            // `run.started`: the desk's listener adds each one.
+            deps.ledger.active.add(id);
+        }
+
+        // The sweeps have listed nothing yet: each creator is 1 point read, in the same budget as the pages.
+        for (let pass = 1; pass <= 4 && deps.ledger.owners.size < 30; pass += 1) {
+            await meterPass(deps, METER_NOW + pass * PASS_MS);
+        }
+
+        assert.equal(deps.ledger.owners.size, 30, "every conversation got its creator edge");
+        assert.deepEqual(
+            ledgerSums(deps.state),
+            { entries: 30, cost: 465, unknownCost: 0 },
+            "every answer counted once",
+        );
+        assert.ok(
+            w.points.length > 0,
+            "the point reads come first; the sweep's listing gives any that the budget left",
+        );
+        assert.ok(
+            w.commits.every((reads) => reads <= METER_READS),
+            `no commit reads more than ${String(METER_READS)} times: ${w.commits.join(", ")}`,
+        );
+    });
+
+    test("each answer carries its conversation: the conversation quarter hours sum to the same counters as the buckets", async () => {
+        const w = meterWorld();
+
+        meterConversation(w, 1);
+        answerIn(w, 1, { cost: 1 });
+        const fork = answerIn(w, 1, { cost: 2 });
+
+        meterConversation(w, 2, 1, fork);
+        answerIn(w, 2, { cost: 4 });
+        answerIn(w, 2, { cost: null });
+
+        const deps = meterDeps(w);
+
+        await meterPass(deps, METER_NOW);
+        assert.deepEqual(conversationSums(deps.state), ledgerSums(deps.state));
+        assert.deepEqual(conversationSums(deps.state), { entries: 4, cost: 7, unknownCost: 1 });
+
+        // Each answer counts in its own conversation, the fork's inherited ones in the parent only.
+        const split = Object.values(deps.state.conversations).map((byConversation) =>
+            Object.fromEntries(
+                Object.entries(byConversation).map(([id, byProvider]) => [
+                    id,
+                    Object.values(byProvider)
+                        .flatMap((byModel) => Object.values(byModel))
+                        .reduce((entries, bucket) => entries + bucket.entries, 0),
+                ]),
+            ),
+        );
+
+        assert.deepEqual(split, [{ 1: 2, 2: 2 }]);
+    });
+
+    test("the ledger learns each conversation's creator: the sweep's listing, then 1 point read for an active one", async () => {
+        const w = meterWorld();
+
+        meterConversation(w, 1);
+        answerIn(w, 1, { cost: 1 });
+        meterConversation(w, 2);
+        answerIn(w, 2, { cost: 1 });
+
+        const deps = meterDeps(w);
+
+        await meterPass(deps, METER_NOW);
+        assert.deepEqual(
+            [...deps.ledger.owners],
+            [
+                [1, null],
+                [2, null],
+            ],
+            "the listing gave both creator edges",
+        );
+        assert.deepEqual(w.points, [], "no point read after a listing");
+
+        // A subagent that starts now is active, and no sweep runs: its creator comes from 1 point read.
+        subagentOf(w, 3, 1);
+        answerIn(w, 3, { cost: 1 });
+        deps.ledger.active.add(3);
+        await meterPass(deps, METER_NOW + PASS_MS);
+
+        assert.deepEqual(w.points, [3]);
+        assert.equal(deps.ledger.owners.get(3), 1);
+        assert.equal(deps.ledger.owners.get(1), null, "a known edge is not read again");
+        assert.equal(
+            w.commits.at(-1),
+            4,
+            "1 page for each of the 3 active conversations, and 1 point read for the new one",
+        );
+
+        // The edge is known now: a later read of the same conversation makes no point read.
+        answerIn(w, 3, { cost: 1 });
+        await meterPass(deps, METER_NOW + 2 * PASS_MS);
+        assert.deepEqual(w.points, [3]);
     });
 
     test("the backfill stops at the first answer older than 8 days; no cost is unknown; other kinds and bad answers count nothing", async () => {

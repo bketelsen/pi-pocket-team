@@ -901,6 +901,133 @@ export const meterCard = (html, meter) =>
         </p>
     </article>`;
 
+// ─── The Cost by agent card (the meter's ledger by agent) ───────────────────
+
+/** US dollars as the card writes them: "$3.10" below $100, else whole dollars with thousands: "$1,234". */
+const agentMoney = (usd) => {
+    const value = Number.isFinite(usd) ? usd : 0;
+
+    return Math.abs(value) < 100
+        ? `$${value.toFixed(2)}`
+        : `$${Math.round(value).toLocaleString("en-US")}`;
+};
+
+/** A count in compact words: "1.2M", "34k", "0". */
+const compactCount = (value) => {
+    const count = Number.isFinite(value) ? Math.max(0, value) : 0;
+
+    if (count >= 1_000_000) {
+        return `${oneDecimal(count / 1_000_000)}M`;
+    }
+
+    if (count >= 1_000) {
+        return `${Math.round(count / 1_000)}k`;
+    }
+
+    return String(Math.round(count));
+};
+
+const AGENT_KINDS = new Set(["agent", "unattributed", "pending"]);
+
+/**
+ * The card's rows, from the answer's `agents` field: 1 for each agent, then the unattributed and the pending ones, in
+ * the server's order. `tokens` is the 7-day input and cached input over the output, and the providers' title holds each
+ * provider's models. A missing or bad value gives no rows.
+ */
+export const agentCostRows = (agents) => {
+    if (agents === null || typeof agents !== "object" || !Array.isArray(agents.rows)) {
+        return [];
+    }
+
+    return agents.rows
+        .filter((row) => row !== null && typeof row === "object")
+        .map((row) => {
+            const days7 = row.days7 ?? {};
+            const money = (value) => (Number.isFinite(value) ? value : 0);
+            const providers = (Array.isArray(row.providers) ? row.providers : [])
+                .filter((each) => each !== null && typeof each === "object")
+                .map((each) => ({
+                    provider: String(each.provider ?? "?"),
+                    cost: agentMoney(each.days7?.cost),
+                    models: (Array.isArray(each.models) ? each.models : [])
+                        .map(
+                            (model) =>
+                                `${String(model.model ?? "?")} ${agentMoney(model.days7?.cost)}`,
+                        )
+                        .join(", "),
+                }));
+
+            return {
+                kind: AGENT_KINDS.has(row.kind) ? row.kind : "unattributed",
+                label: typeof row.label === "string" ? row.label : "?",
+                today: agentMoney(row.today?.cost),
+                days7: agentMoney(days7.cost),
+                tokens: `${compactCount(
+                    money(days7.input) + money(days7.cacheRead) + money(days7.cacheWrite),
+                )} / ${compactCount(days7.output)}`,
+                providers: providers.map((each) => `${each.provider} ${each.cost}`).join(" · "),
+                providersTitle: providers
+                    .map((each) => `${each.provider}: ${each.models}`)
+                    .join(" · "),
+            };
+        });
+};
+
+const AGENT_NOTE =
+    "List price of each agent's answers, from the meter's ledger. Subagents and linked sessions count to the agent of the session that started them. Today: since midnight in the server's zone; 7 days: the last 7 days.";
+
+/** The card's note, with the ledger's coverage and the conversations that wait for an agent. */
+export const agentCostNote = (agents) => {
+    let text = AGENT_NOTE;
+
+    if (agents?.partial === true) {
+        text += " (partial)";
+    }
+
+    const pending = Number.isFinite(agents?.pending) ? agents.pending : 0;
+
+    if (pending > 0) {
+        text += ` ${pending} ${pending === 1 ? "conversation" : "conversations"} not attributed yet.`;
+    }
+
+    return text;
+};
+
+/** The Cost by agent card, for `html` (Pocket's, or a test's): the meter's ledger, by agent, at list price. */
+export const agentCostCard = (html, agents) => {
+    const rows = agentCostRows(agents);
+
+    return html`<article class="dash-card dash-agent-cost" aria-labelledby="dash-agents">
+        <h3 id="dash-agents">Cost by agent</h3>
+        <table class="dash-table dash-agents">
+            <thead>
+                <tr>
+                    <th scope="col">Agent</th>
+                    <th scope="col">Today</th>
+                    <th scope="col">7 days</th>
+                    <th scope="col">Tokens in / out</th>
+                    <th scope="col">Providers</th>
+                </tr>
+            </thead>
+            <tbody>
+                ${rows.map(
+                    (row) =>
+                        html`<tr data-kind=${row.kind}>
+                            <td class="dash-name" data-label="Agent">${row.label}</td>
+                            <td data-label="Today">${row.today}</td>
+                            <td data-label="7 days">${row.days7}</td>
+                            <td data-label="Tokens in / out">${row.tokens}</td>
+                            <td data-label="Providers" title=${row.providersTitle || undefined}>
+                                ${row.providers}
+                            </td>
+                        </tr>`,
+                )}
+            </tbody>
+        </table>
+        <p class="small muted dash-note">${agentCostNote(agents)}</p>
+    </article>`;
+};
+
 // ─── The view ────────────────────────────────────────────────────────────────
 
 /** What the module keeps between 2 openings of the view, in memory only: no browser storage. */
@@ -1824,9 +1951,12 @@ export function makeDashboard(pocket, { refreshMs = REFRESH_MS } = {}) {
                         ? null
                         : html`<${Loader} label="Reading the dashboard" />`
                     : notStarted
-                      ? html`${snapshot.meter ? meterCard(html, snapshot.meter) : null}<${CoverageSection} snapshot=${snapshot} />`
+                      ? html`${snapshot.meter ? meterCard(html, snapshot.meter) : null}${
+                            snapshot.agents ? agentCostCard(html, snapshot.agents) : null
+                        }<${CoverageSection} snapshot=${snapshot} />`
                       : html`<div class=${error ? "dash-body stale" : "dash-body"}>
                             ${snapshot.meter ? meterCard(html, snapshot.meter) : null}
+                            ${snapshot.agents ? agentCostCard(html, snapshot.agents) : null}
                             <${Cards} snapshot=${snapshot} />
                             <${Trend} snapshot=${snapshot} />
                             <${Table}

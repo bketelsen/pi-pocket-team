@@ -1929,8 +1929,8 @@ export const METER_ABORTED = "the meter's read was aborted";
 
 const meterAborted = (): Error => new Error(METER_ABORTED);
 
-/** The table reads of the meter's ledger: only scans, in a commit that writes nothing. */
-export type MeterTx = Pick<Tx, "scanConversations" | "scanEntries">;
+/** The table reads of the meter's ledger: scans and 1 point read of a conversation, in a commit that writes nothing. */
+export type MeterTx = Pick<Tx, "conversation" | "scanConversations" | "scanEntries">;
 
 /** What 1 provider read gives: a reading, or why it failed (`status`: the HTTP status, when there was one). */
 export type MeterReadResult = MeterModule.ProviderReading | { error: string; status?: number };
@@ -1949,7 +1949,8 @@ export type MeterSweep = {
 
 /**
  * Where the ledger's reads are, in memory (plan D6). Its dictionaries have no prototype: their keys are conversation
- * ids. Only `meterPass` and the desk's `run.started` and `run.ended` listeners change it.
+ * ids. Only `meterPass` and the desk's `run.started` and `run.ended` listeners change it. `owners` is the only Map: a
+ * conversation id and its creator, or null for a session.
  */
 export type MeterLedger = {
     /**
@@ -1984,6 +1985,11 @@ export type MeterLedger = {
     gaps: Record<string, number>;
     /** True when the backfill sweep listed and visited every conversation. */
     backfillDone: boolean;
+    /**
+     * By conversation: the conversation that created it (a subagent's parent), or null for a session. An owner edge
+     * never changes, so it is kept and never pruned; absent: the conversation's creator is not read yet.
+     */
+    owners: Map<number, number | null>;
 };
 
 export function emptyMeterLedger(): MeterLedger {
@@ -1997,6 +2003,7 @@ export function emptyMeterLedger(): MeterLedger {
         ended: new Map(),
         gaps: Object.create(null) as Record<string, number>,
         backfillDone: false,
+        owners: new Map(),
     };
 }
 
@@ -2037,6 +2044,7 @@ function ledgerUsage(
         output: reading.output,
         cacheRead: reading.cacheRead,
         cacheWrite: reading.cacheWrite,
+        conversation: id,
     };
 
     if (reading.at !== undefined) {
@@ -2076,6 +2084,8 @@ type MeterFound = {
     swept: number[];
     /** Conversations that the sweep listed in this commit. */
     listed: number;
+    /** The creator edges this commit read: the listed conversations' and the point reads'. */
+    owners: [number, number | null][];
 };
 
 const dictOf = (from: Record<string, number>): Record<string, number> =>
@@ -2107,6 +2117,11 @@ function planOf(
  * `high` starts its backfill (descending, from its newest entry); else it reads upwards from `high + 1`. The backfill
  * counts own answers until the first inherited entry or the first own answer older than 8 days. True when the
  * conversation is finished for this visit.
+ *
+ * Before the page, a conversation whose creator is not known yet gets 1 point read of its record: the creator edge of
+ * a subagent, which the sweep's listing also gives. That read and the page are both table reads of the commit's
+ * `METER_READS` budget (`used`), so the point read happens only when the budget has room for it and for the page after
+ * it; without room this read skips it, and a later read or the sweep's listing gives the edge.
  */
 async function readPage(
     tx: MeterTx,
@@ -2114,8 +2129,37 @@ async function readPage(
     found: MeterFound,
     id: number,
     now: number,
+    owners: ReadonlyMap<number, number | null>,
+    used: { count: number },
 ): Promise<boolean> {
     const key = String(id);
+
+    if (
+        !owners.has(id) &&
+        !found.owners.some(([each]) => each === id) &&
+        used.count + 2 <= METER_READS
+    ) {
+        used.count += 1;
+
+        const record = await tx.conversation(id as ConversationId);
+
+        if (record !== undefined) {
+            found.owners.push([
+                id,
+                record.owner === undefined ? null : Number(record.owner.conversationId),
+            ]);
+        }
+    }
+
+    /** 1 page of entries, counted in the commit's read budget. */
+    const page = async (
+        query: Parameters<MeterTx["scanEntries"]>[0],
+        limit: number,
+    ): ReturnType<MeterTx["scanEntries"]> => {
+        used.count += 1;
+
+        return tx.scanEntries(query, limit);
+    };
 
     const count = (own: MeterModule.LedgerUsage | undefined): void => {
         if (own === undefined) {
@@ -2132,7 +2176,7 @@ async function readPage(
     const down = plan.downs[key];
 
     if (down !== undefined || plan.high[key] === undefined) {
-        const page = await tx.scanEntries(
+        const first = await page(
             {
                 conversationId: id as ConversationId,
                 order: "descending",
@@ -2142,12 +2186,12 @@ async function readPage(
         );
 
         if (down === undefined) {
-            plan.high[key] = page.items[0]?.id ?? 0;
+            plan.high[key] = first.items[0]?.id ?? 0;
         }
 
         let stop = false;
 
-        for (const entry of page.items) {
+        for (const entry of first.items) {
             // An inherited entry: the parent counts it. Older entries are inherited too.
             if (entry.conversationId !== id) {
                 stop = true;
@@ -2164,9 +2208,9 @@ async function readPage(
             count(own);
         }
 
-        const last = page.items[page.items.length - 1];
+        const last = first.items[first.items.length - 1];
 
-        if (!stop && page.next !== undefined && last !== undefined && last.id > 1) {
+        if (!stop && first.next !== undefined && last !== undefined && last.id > 1) {
             plan.downs[key] = last.id - 1;
 
             return false;
@@ -2177,7 +2221,7 @@ async function readPage(
         return true;
     }
 
-    const page = await tx.scanEntries(
+    const more = await page(
         {
             conversationId: id as ConversationId,
             minEntryId: ((plan.high[key] ?? 0) + 1) as EntryId,
@@ -2186,17 +2230,17 @@ async function readPage(
         METER_ENTRY_PAGE,
     );
 
-    for (const entry of page.items) {
+    for (const entry of more.items) {
         count(ledgerUsage(entry, id));
     }
 
-    const last = page.items[page.items.length - 1];
+    const last = more.items[more.items.length - 1];
 
     if (last !== undefined) {
         plan.high[key] = Math.max(plan.high[key] ?? 0, last.id);
     }
 
-    return page.next === undefined || last === undefined;
+    return more.next === undefined || last === undefined;
 }
 
 /**
@@ -2289,6 +2333,10 @@ async function ledgerStep(deps: MeterDeps, now: number, signal: AbortSignal): Pr
             meterRules.addLedger(state, own);
         }
 
+        for (const [id, owner] of found.owners) {
+            ledger.owners.set(id, owner);
+        }
+
         for (const [key, at] of Object.entries(found.recent)) {
             if (at >= now - METER_RECENT_MS) {
                 ledger.recentAt[key] = Math.max(ledger.recentAt[key] ?? 0, at);
@@ -2355,13 +2403,17 @@ async function ledgerStep(deps: MeterDeps, now: number, signal: AbortSignal): Pr
                     finished: [],
                     swept: [],
                     listed: 0,
+                    owners: [],
                 };
                 const plan = result.plan;
 
                 partial = result;
                 reading = undefined;
 
-                for (let reads = 0; reads < METER_READS; reads += 1) {
+                // The commit's table-read budget: the pages and the point reads together, `METER_READS` at most.
+                const used = { count: 0 };
+
+                while (used.count < METER_READS) {
                     signal.throwIfAborted();
 
                     const head = plan.incremental[0];
@@ -2370,7 +2422,7 @@ async function ledgerStep(deps: MeterDeps, now: number, signal: AbortSignal): Pr
                         reading = { kind: "active", id: head };
                         plan.started[String(head)] ??= clock();
 
-                        if (await readPage(tx, plan, result, head, now)) {
+                        if (await readPage(tx, plan, result, head, now, ledger.owners, used)) {
                             plan.incremental.shift();
                             result.finished.push(head);
                         }
@@ -2383,7 +2435,7 @@ async function ledgerStep(deps: MeterDeps, now: number, signal: AbortSignal): Pr
 
                         reading = { kind: "retry", id: gap };
 
-                        if (await readPage(tx, plan, result, gap, now)) {
+                        if (await readPage(tx, plan, result, gap, now, ledger.owners, used)) {
                             delete plan.retry;
                             result.retried = gap;
                         }
@@ -2408,28 +2460,38 @@ async function ledgerStep(deps: MeterDeps, now: number, signal: AbortSignal): Pr
                     if (id === undefined) {
                         reading = { kind: "sweep" };
 
-                        const page = await tx.scanConversations(
+                        used.count += 1;
+
+                        const listed = await tx.scanConversations(
                             { order: "ascending" },
                             METER_CONVERSATION_PAGE,
                             sweep.cursor,
                         );
 
-                        sweep.queue.push(...page.items.map((item) => Number(item.id)));
-                        sweep.listed = page.next === undefined;
+                        sweep.queue.push(...listed.items.map((item) => Number(item.id)));
 
-                        if (page.next === undefined) {
-                            delete sweep.cursor;
-                        } else {
-                            sweep.cursor = page.next;
+                        for (const item of listed.items) {
+                            result.owners.push([
+                                Number(item.id),
+                                item.owner === undefined ? null : Number(item.owner.conversationId),
+                            ]);
                         }
 
-                        result.listed += page.items.length;
+                        sweep.listed = listed.next === undefined;
+
+                        if (listed.next === undefined) {
+                            delete sweep.cursor;
+                        } else {
+                            sweep.cursor = listed.next;
+                        }
+
+                        result.listed += listed.items.length;
                         continue;
                     }
 
                     reading = { kind: "sweep", id };
 
-                    if (await readPage(tx, plan, result, id, now)) {
+                    if (await readPage(tx, plan, result, id, now, ledger.owners, used)) {
                         sweep.queue.shift();
                         result.swept.push(id);
                     }

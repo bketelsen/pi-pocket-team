@@ -5,6 +5,7 @@ import {
     type App,
     cleanUp,
     context,
+    newSession,
     openApp,
     owner,
     root,
@@ -15,10 +16,12 @@ import { cpSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
+import { SessionsDoc } from "./_pocket/src/server/docs.ts";
 import { createHandler } from "./_pocket/src/server/http.ts";
 import {
     CHECK_HEARTBEAT_MS,
     DeskDashboard,
+    emptyMeterLedger,
     OPEN_REFRESH_MS,
     PASS_MS,
     type DashboardState,
@@ -45,9 +48,12 @@ import {
     type Snapshot,
     type Window,
 } from "./_desk-metrics.ts";
-import { DeskThreads } from "./desk.ts";
+import { DeskThreads, METER_HOLDER_VERSION } from "./desk.ts";
 import {
+    addLedger,
+    type AgentCostView,
     emptyMeterState,
+    localMidnight,
     meterView,
     parseAnthropicUsage,
     recordAttempt,
@@ -59,6 +65,8 @@ import {
 
 const HOUR = 3600_000;
 const DAY = 24 * HOUR;
+/** The meter's conversation buckets: 15 minutes. */
+const QUARTER = 15 * 60_000;
 /** 2026-10-30T00:00:00Z: "today" of the fixtures. */
 const T0 = Date.UTC(2026, 9, 30);
 /** The snapshot time: noon of today. */
@@ -2552,7 +2560,7 @@ describe("GET dashboard in Pocket", () => {
         assert.equal(off.status, 200);
         assert.equal("meter" in off.data, false, "no meter key: no field");
 
-        shared[holderKey] = { version: 1, state };
+        shared[holderKey] = { version: METER_HOLDER_VERSION, state };
         writeFileSync(
             configPath,
             JSON.stringify({ digest: { minutes: 0 }, cap: 100, meter: { holdAt: 90 } }),
@@ -2587,6 +2595,172 @@ describe("GET dashboard in Pocket", () => {
         const again = await get("dashboard");
 
         assert.equal("meter" in again.data, false);
+    });
+
+    test("GET dashboard: the cost by agent, from real sessions; no field at all when the meter is off", async () => {
+        const shared = globalThis as unknown as Record<symbol, unknown>;
+        const holderKey = Symbol.for("pi-pocket-team.desk.meter");
+        const teamKey = Symbol.for("pi-pocket-team.team");
+        const at = Date.now();
+
+        /** 1 real session in a folder of its own. */
+        const session = async (name: string): Promise<number> => {
+            const folder = join(dataDir, `agent-cost-${name}`);
+
+            mkdirSync(folder, { recursive: true });
+
+            return Number(await newSession(app, folder));
+        };
+
+        const odrade = await session("odrade");
+        const linked = await session("linked");
+        const subagent = await session("subagent");
+        const duncan = await session("duncan");
+        const alone = await session("alone");
+
+        // Pi Pocket's own catalogue: the linked session was started by Odrade's session.
+        await app.harness.commit(async (tx) => {
+            const items = (await tx.doc(SessionsDoc)).items;
+            const record = items[String(linked)];
+
+            assert.ok(record !== undefined, "Pi Pocket lists each session");
+            record.linkedFrom = { id: odrade };
+        }, context);
+
+        // A Desk thread with exactly 1 agent: its session is that agent's.
+        await app.harness.commit(async (tx) => {
+            const doc = await tx.doc(DeskThreads);
+
+            doc.threads.T9 = {
+                id: "T9",
+                key: "test:agent-cost",
+                origin: "seed",
+                title: "The cost by agent",
+                agents: ["duncan"],
+                session: duncan,
+                state: "open",
+                startedAt: at - HOUR,
+                lastEventAt: at - HOUR,
+                prs: {},
+                branches: [],
+                asks: [],
+                run: {},
+                events: [],
+            };
+        }, context);
+
+        // The answers' time, taken just before the read: nothing here depends on the time of day.
+        const t = Date.now();
+
+        // The meter's memory: 1 answer in each conversation, and the subagent's creator edge in the ledger.
+        const state = emptyMeterState();
+        const ledger = emptyMeterLedger();
+
+        // The creator edges that the ledger's sweep reads: a session has none, and the subagent has its parent.
+        for (const each of [odrade, linked, duncan, alone]) {
+            ledger.owners.set(each, null);
+        }
+
+        ledger.owners.set(subagent, odrade);
+
+        for (const [conversation, cost] of [
+            [odrade, 1],
+            [linked, 2],
+            [subagent, 4],
+            [duncan, 8],
+            [alone, 16],
+        ] as [number, number][]) {
+            addLedger(state, {
+                provider: "anthropic",
+                model: "claude-opus-5-5",
+                timestamp: t,
+                input: 10,
+                output: 5,
+                cacheRead: 0,
+                cacheWrite: 0,
+                cost,
+                conversation,
+            });
+        }
+
+        state.coverage = { since: t - 8 * DAY, complete: true, done: 5, total: 5 };
+        shared[holderKey] = { version: METER_HOLDER_VERSION, state, ledger };
+        shared[teamKey] = {
+            version: 1,
+            persona: async (_read: unknown, id: number) =>
+                Number(id) === odrade
+                    ? { id: "odrade", name: "Odrade", role: "supervisor" }
+                    : undefined,
+            roster: async () => [
+                { id: "odrade", name: "Odrade", role: "supervisor" },
+                { id: "duncan", name: "Duncan", role: "agent" },
+            ],
+        };
+        writeFileSync(
+            configPath,
+            JSON.stringify({ digest: { minutes: 0 }, cap: 100, meter: { holdAt: 90 } }),
+        );
+
+        try {
+            const answer = await get("dashboard");
+
+            assert.equal(answer.status, 200, JSON.stringify(answer.data));
+
+            const agents = (answer.data as unknown as { agents: AgentCostView }).agents;
+
+            assert.ok(agents !== undefined, "the meter is on: the field is there");
+
+            // Today's part, from the answer's own time: it is the answers at or after local midnight, and nothing here
+            // depends on the time of day.
+            const zone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+            const today = (value: number): number =>
+                Math.floor(t / QUARTER) * QUARTER >= localMidnight(agents.at, zone) ? value : 0;
+
+            assert.equal(agents.partial, false);
+            assert.equal(agents.pending, 0);
+            assert.deepEqual(
+                agents.rows.map((row) => [row.kind, row.label, row.sessions, row.days7.cost]),
+                [
+                    ["unattributed", "Unattributed", 1, 16],
+                    ["agent", "Duncan", 1, 8],
+                    ["agent", "Odrade", 2, 7],
+                ],
+            );
+
+            // The persona's session, the linked session and the subagent count to Odrade: 2 root sessions, because a
+            // linked session is a root of its own whose agent is the session that started it.
+            const row = agents.rows.find((each) => each.agent === "odrade");
+
+            assert.equal(row?.today.cost, today(7));
+            assert.equal(row?.days7.entries, 3);
+            assert.equal(row?.providers[0]?.provider, "anthropic");
+            assert.equal(row?.providers[0]?.models[0]?.model, "claude-opus-5-5");
+
+            // The thread's session is Duncan's, by the Desk's link.
+            const duncanRow = agents.rows.find((each) => each.agent === "duncan");
+
+            assert.equal(duncanRow?.days7.cost, 8);
+            assert.equal(duncanRow?.today.cost, today(8));
+            assert.equal(
+                agents.rows.find((each) => each.kind === "unattributed")?.today.cost,
+                today(16),
+            );
+            assert.ok(!/authorization|bearer|token/i.test(JSON.stringify(agents)));
+
+            // The answer's other parts stay.
+            assert.equal("meter" in answer.data, true);
+            assert.equal(answer.data.totals.completion.success, 2);
+        } finally {
+            writeFileSync(configPath, JSON.stringify({ digest: { minutes: 0 }, cap: 100 }));
+            delete shared[holderKey];
+            delete shared[teamKey];
+        }
+
+        const off = await get("dashboard");
+
+        assert.equal(off.status, 200);
+        assert.equal("meter" in off.data, false);
+        assert.equal("agents" in off.data, false, "no meter: no cost by agent");
     });
 
     test("a bad range or scope is a 400 with its reason", async () => {

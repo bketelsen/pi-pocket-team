@@ -27,7 +27,14 @@ import {
 import { createHandler } from "./_pocket/src/server/http.ts";
 import { boardRows } from "./_desk-board.ts";
 import { emptyMeterState, parseAnthropicUsage, recordAttempt } from "./_desk-meter.ts";
-import { BoardReceipts, capView, DeskReports, DeskThreads, type DeskState } from "./desk.ts";
+import {
+    BoardReceipts,
+    capView,
+    DeskReports,
+    DeskThreads,
+    type DeskState,
+    METER_HOLDER_VERSION,
+} from "./desk.ts";
 import { GoalDoc } from "./night-shift.ts";
 import { RUN_END, turnTexts } from "./scripted-turn-fixture.ts";
 import type { TeamApi, TeamStartShiftRequest } from "./team.ts";
@@ -981,7 +988,7 @@ describe("the board in Pi Pocket", () => {
 
         assert(!("error" in reading));
         recordAttempt(state, "anthropic", Date.now(), reading);
-        shared[holderKey] = { version: 1, state };
+        shared[holderKey] = { version: METER_HOLDER_VERSION, state };
         writeFileSync(
             configPath,
             JSON.stringify({ digest: { minutes: 0 }, cap: 100, meter: { holdAt: 90 } }),

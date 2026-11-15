@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-14",
+  "scope": "_desk-meter.ts",
+  "correction": "attributeConversations cached nothing for a session whose linkedFrom source was pending, so each call spent its persona reads on the same first sessions again and a chain of linked sessions could stay pending forever; a session now caches its source before the source is read, and a fresh entry with a source goes straight to it with no read spent",
+  "evidence": "bketelsen/pi-pocket-team#245, cross-review by openai/gpt-6.1-sol at 064ec26211c9bf55bea8675acedf042468bf98e3",
+  "promoted_to": "desk-meter.test.ts: attributeConversations: a chain of 3 linked sessions resolves in 3 calls, 1 persona read each"
+}

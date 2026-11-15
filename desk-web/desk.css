@@ -755,6 +755,16 @@
     margin-bottom: 10px;
 }
 
+/* The Cost by agent card: the meter's ledger by agent, 5 columns, above the other cards. */
+.dash-agent-cost {
+    margin-bottom: 10px;
+}
+
+.dash-agents th:first-child,
+.dash-agents .dash-name {
+    width: 18%;
+}
+
 .dash-meter-rows {
     display: grid;
     grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
