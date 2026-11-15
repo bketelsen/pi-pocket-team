@@ -45,7 +45,7 @@ import {
     writeFile,
 } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join, sep } from "node:path";
+import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import type { Context } from "@earendil-works/chord/context";
 import { Type } from "typebox";
@@ -1388,6 +1388,18 @@ function nextThreadId(state: DeskState): string {
 
 /** One line, no double spaces, at most `MAX_TITLE` characters. */
 const oneLine = (text: string) => text.replace(/\s+/g, " ").trim().slice(0, MAX_TITLE).trimEnd();
+
+/** A folder as the file system has it when it exists: a symlinked home and its target are 1 folder. */
+const realPathOr = (folder: string): Promise<string> =>
+    realpath(folder).catch(() => resolve(folder));
+
+/** Whether `folder` is `parent` or below it, by real paths. */
+async function inFolder(folder: string, parent: string): Promise<boolean> {
+    const path = await realPathOr(folder);
+    const root = await realPathOr(parent);
+
+    return path === root || path.startsWith(root.endsWith(sep) ? root : `${root}${sep}`);
+}
 
 const iso = (at: number) => new Date(at).toISOString();
 
@@ -15954,11 +15966,17 @@ export function askMarksText(ask: Ask, quote: (text: string) => string): string 
 }
 
 /** A roster entry, as Team's `roster()` gives it: enough to check a graph's agents and repositories. */
-export type PlanRoster = { id: string; role: string; repositories?: Record<string, string> };
+export type PlanRoster = {
+    id: string;
+    role: string;
+    repositories?: Record<string, string>;
+    /** A private agent is never offered to a planner: nobody delegates to it. */
+    private?: true;
+};
 
 /**
  * The lines of `plan read` for the planning session: each agent with role `agent` and its repository names. Names only:
- * never a folder path or a home.
+ * never a folder path or a home. A private agent is left out: nobody delegates to it, so a planner must not pick it.
  */
 export function planRosterText(members: readonly PlanRoster[] | undefined): string[] {
     if (members === undefined) {
@@ -15968,7 +15986,7 @@ export function planRosterText(members: readonly PlanRoster[] | undefined): stri
     return [
         "Agents (role agent) and their repositories:",
         ...members
-            .filter((member) => member.role === "agent")
+            .filter((member) => member.role === "agent" && member.private !== true)
             .map((member) => {
                 const repos = Object.keys(member.repositories ?? {});
 
@@ -23527,6 +23545,11 @@ type TeamMember = {
     home?: string;
     /** The profile's model (`provider/model`): the board's hold reads its provider. An older Team gives none. */
     model?: string;
+    /**
+     * A personal agent (`private: true`): a linked session in its home is Brian's own work, so it never becomes a found
+     * thread, and a planner is never offered it.
+     */
+    private?: true;
 };
 
 type TeamApi = {
@@ -25586,6 +25609,11 @@ export default function createDesk(host: Host, web: Web) {
         title?: string;
         /** Why the session's last run gave up (`failedLine`): absent when it did not fail. */
         failed?: string;
+        /**
+         * The session's folder is inside a private agent's home: it is Brian's own work, so it never becomes a found
+         * thread.
+         */
+        private?: true;
     };
     type FolderFact = {
         dirty: number;
@@ -27968,18 +27996,28 @@ export default function createDesk(host: Host, web: Web) {
         failedRunPrompted.delete(Number(supervisor));
 
         let sessions: SessionFact[] | undefined;
+        /** Each session's folder, as the list gave it: the private agent's check below reads it. */
+        const sessionFolders: { fact: SessionFact; cwd?: string }[] = [];
 
         try {
-            sessions = (await host.linkedSessions.list(supervisor)).map((each) => {
-                const failed = failedLine(each);
+            const listed = await host.linkedSessions.list(supervisor);
 
-                return {
+            sessions = listed.map((each) => {
+                const failed = failedLine(each);
+                const fact: SessionFact = {
                     address: each.address,
                     busy: each.busy === true,
                     archived: each.archived === true,
                     ...(each.title === undefined ? {} : { title: each.title }),
                     ...(failed === undefined ? {} : { failed }),
                 };
+
+                sessionFolders.push({
+                    fact,
+                    ...(each.cwd === undefined ? {} : { cwd: each.cwd }),
+                });
+
+                return fact;
             });
         } catch {
             // The list is not readable now: no facts, and no found session threads.
@@ -28065,6 +28103,27 @@ export default function createDesk(host: Host, web: Web) {
                 }
             } catch {
                 // No roster now: the threads' folders are enough.
+            }
+        }
+
+        // A private agent's home: a linked session there is Brian's own work, so it never becomes a found thread. The
+        // roster read above gives the homes, and with no private agent nothing is read again.
+        const privateHomes = members
+            .filter((member) => member.private === true && member.home !== undefined)
+            .map((member) => member.home!);
+
+        if (privateHomes.length > 0) {
+            for (const each of sessionFolders) {
+                const cwd = each.cwd;
+
+                if (
+                    cwd !== undefined &&
+                    (await Promise.all(privateHomes.map((home) => inFolder(cwd, home)))).some(
+                        (inside) => inside,
+                    )
+                ) {
+                    each.fact.private = true;
+                }
             }
         }
 
@@ -29248,6 +29307,8 @@ export default function createDesk(host: Host, web: Web) {
                 inFlight ||
                 baseline.sessions.includes(session.address) ||
                 session.archived ||
+                // A private agent's session is Brian's own work: it never becomes a found thread.
+                session.private === true ||
                 addresses.has(session.address) ||
                 consultTitled(state, session.title)
             ) {

@@ -30513,7 +30513,14 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
         const archiveDesk = (options: { archive?: boolean; on?: boolean } = {}) => {
             const listed = new Map<
                 string,
-                { address: string; busy: boolean; archived: boolean; failed?: string }
+                {
+                    address: string;
+                    busy: boolean;
+                    archived: boolean;
+                    failed?: string;
+                    /** The session's folder, as Pi Pocket gives it when everyone who sees the session sees it. */
+                    cwd?: string;
+                }
             >();
             /** The `run.ended` listeners the desk added, when `on` is true. */
             const runEnded: ((event: object) => unknown)[] = [];
@@ -30981,6 +30988,63 @@ process.stdout.write(JSON.stringify({ data: { viewer: { login: "github-viewer" }
                 );
             } finally {
                 stub.restore();
+            }
+        });
+
+        test("a sync finds no thread in a private agent's home, and still finds a normal session", async () => {
+            const stub = archiveDesk();
+            const profileFile = join(definitions, "chani-private.md");
+            const privateHome = join(root, "private-home");
+
+            mkdirSync(join(privateHome, "notes"), { recursive: true });
+            writeFileSync(
+                profileFile,
+                `---\nmodel: faux/faux-2\nprivate: true\nhome: ${privateHome}\n---\n# Chani\nYou are Chani.`,
+            );
+
+            try {
+                const source = await supervisor("private-found");
+
+                // The first sweep records the baseline: only the sessions after it can be found work.
+                await stub.sync(source);
+                made += 1;
+
+                const personal = `session-private-${String(made)}`;
+                const normal = `session-normal-${String(made)}`;
+
+                stub.listed.set(personal, {
+                    address: personal,
+                    busy: false,
+                    archived: false,
+                    cwd: join(privateHome, "notes"),
+                });
+                stub.listed.set(normal, {
+                    address: normal,
+                    busy: false,
+                    archived: false,
+                    cwd: join(root, "work"),
+                });
+
+                await stub.sync(source);
+
+                const keys = Object.values((await deskState())?.threads ?? {}).map(
+                    (each) => each.key,
+                );
+
+                assert.equal(
+                    keys.includes(`found:session:${personal}`),
+                    false,
+                    "a session in a private agent's home is Brian's own work: no found thread",
+                );
+                assert.equal(
+                    keys.includes(`found:session:${normal}`),
+                    true,
+                    "a session in another folder is found work, as before",
+                );
+            } finally {
+                stub.restore();
+                rmSync(profileFile, { force: true });
+                rmSync(privateHome, { recursive: true, force: true });
             }
         });
 

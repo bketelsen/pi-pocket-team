@@ -26,6 +26,9 @@ Profiles are Markdown files in `~/.config/pi-pocket-team/agents/`; `PI_POCKET_TE
 | `workspace`    | One folder, for non-repository work.                    |
 | `home`         | The agent's home folder: absolute or `~/`.              |
 | `mcp`          | The MCP servers the agent may use, such as `[truenas]`. |
+| `private`      | `true` for a personal agent: nobody delegates to it.    |
+
+A private agent (`private: true`) is your own person. In the panel, **Open a session in <home>** opens an empty session of yours in its home, linked to no other session; you type the first message there. Nobody delegates to it, the desk makes no found thread of its work, and its session sends nothing to another session or the desk. The panel needs Pi Pocket 0.28.0 or later.
 
 An agent with several repositories gets its lessons split between them. Repository mappings are read fresh for each delegation, so an existing conversation sees an edit without reselecting the identity.
 
@@ -68,6 +71,6 @@ Pi Pocket's memory has 2 scopes: a project, and everywhere. Team adds a third la
 
 ## Read more
 
-The full detail is in the reference page: [Team](https://github.com/bketelsen/pi-pocket-team/blob/main/docs/modules/team.md), [writing an agent profile](https://github.com/bketelsen/pi-pocket-team/blob/main/docs/modules/team.md#writing-an-agent-profile), [repository ownership](https://github.com/bketelsen/pi-pocket-team/blob/main/docs/modules/team.md#repository-ownership), [agent homes](https://github.com/bketelsen/pi-pocket-team/blob/main/docs/modules/team.md#agent-homes), [MCP servers](https://github.com/bketelsen/pi-pocket-team/blob/main/docs/modules/team.md#mcp-servers), [agent memory](https://github.com/bketelsen/pi-pocket-team/blob/main/docs/modules/team.md#agent-memory) and [prototype boundaries](https://github.com/bketelsen/pi-pocket-team/blob/main/docs/modules/team.md#prototype-boundaries).
+The full detail is in the reference page: [Team](https://github.com/bketelsen/pi-pocket-team/blob/main/docs/modules/team.md), [writing an agent profile](https://github.com/bketelsen/pi-pocket-team/blob/main/docs/modules/team.md#writing-an-agent-profile), [repository ownership](https://github.com/bketelsen/pi-pocket-team/blob/main/docs/modules/team.md#repository-ownership), [agent homes](https://github.com/bketelsen/pi-pocket-team/blob/main/docs/modules/team.md#agent-homes), [MCP servers](https://github.com/bketelsen/pi-pocket-team/blob/main/docs/modules/team.md#mcp-servers), [private agents](https://github.com/bketelsen/pi-pocket-team/blob/main/docs/modules/team.md#private-agents), [agent memory](https://github.com/bketelsen/pi-pocket-team/blob/main/docs/modules/team.md#agent-memory) and [prototype boundaries](https://github.com/bketelsen/pi-pocket-team/blob/main/docs/modules/team.md#prototype-boundaries).
 
 The Desk is where a delegation's thread lives: see [Desk](desk.md).

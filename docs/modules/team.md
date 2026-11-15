@@ -24,6 +24,7 @@ Frontmatter fields:
 | `workspace`    | One folder, for non-repository work.                                         |
 | `home`         | The agent's home folder: absolute or `~/`. See [Agent homes](#agent-homes).  |
 | `mcp`          | The MCP servers the agent may use, by name. See [MCP servers](#mcp-servers). |
+| `private`      | `true` for a personal agent. See [Private agents](#private-agents).          |
 
 A supervisor, `lead.md`, named "Lead", with no repositories:
 
@@ -146,6 +147,17 @@ The hook keeps no last good roster (the edit guard does): a profile folder that 
 **The prompt section.** The section `team_mcp` says, in a named agent's session and in its subagents and linked sessions: "Of the MCP servers above, you may use only: truenas. Give server in each call of mcp_tools, mcp_call and mcp_call_read_only.", or "No MCP server is given to you: do not call mcp_tools or mcp_call." When the walk blocks, it says why. Brian's own session gets no such section. The `mcp` module's own section still lists every server that is on.
 
 **A scope guard, not a wall.** Every agent's `bash` runs as the same Unix user as Pocket, so it can read the secrets that `mcp.json` reads and the tokens under `~/.pi-pocket/mcp/`. The hook stops wrong or injected MCP tool calls; it does not keep a server's data from another agent.
+
+## Private agents
+
+A personal agent has `private: true` in its profile. It is Brian's own agent: he starts its sessions and talks to it himself. `false`, or no field, leaves an agent with the team behavior, and any other value makes the profile invalid.
+
+- **Its sessions are its own.** In the Team panel, **Open a session in <home>** opens an empty session of Brian's in the agent's home, for the person who clicks it, and no other session is linked to it. The panel sends no message and no key: Brian types the first message in the new session, and the folder gives it the agent's identity. Each click is a new session, as **New session** is. The panel's card hides the task box and the model option, because there is nothing to send. This starting point needs Pi Pocket 0.28.0 or later (the route request's `createSession`). An older release says to use **New session** in the agent's home. A private agent needs a `home` in its profile.
+- **Nobody delegates to it.** `team_delegate`, a shift, a plan task, a board row, and a plan consult refuse it, each with the same words: `<Name> is a private agent: Brian talks to <Name> directly, in a session in <home>. Nobody delegates to <Name>.` The roster lines of `plan read` leave it out, so a planner does not pick it.
+- **The desk leaves its work alone.** A linked session in the agent's home never becomes a found thread.
+- **It sends nothing out.** In its session, a `beforeTool` hook blocks `team_message`, `team_delegate`, `team_work`, Pi Pocket's own `team` tool and `desk`, with `<Name> is a private agent: it sends nothing to other sessions or the desk.` The hook walks the session, its subagents and the session that started it, as the MCP guard does. A failed read, or a session with no named agent, blocks nothing: only a private agent that the walk finds blocks. Its prompt says: you work for Brian directly, in sessions he starts; you have no supervisor and no desk; never send `team_message`, never start or message another session, and never report your work to another agent. Its home rules leave out `team_work`.
+
+The roster is read at each call, so a profile that gains or loses `private` takes effect at once, also in a session whose stored identity is older.
 
 ## Brian's team (an example)
 

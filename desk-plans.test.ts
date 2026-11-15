@@ -1200,6 +1200,19 @@ describe("a task graph", () => {
             "- teg: frostyard/nsl",
             "- irulan: no repository (home only)",
         ]);
+        // A private agent is never offered to a planner: nobody delegates to it.
+        const chani = {
+            id: "chani",
+            role: "agent",
+            repositories: { "frostyard/notes": "/tmp/notes" },
+            private: true as const,
+        };
+
+        assert.deepEqual(planRosterText([...ROSTER, chani]), [
+            "Agents (role agent) and their repositories:",
+            "- lucilla: frostyard/snow",
+            "- teg: frostyard/nsl",
+        ]);
         assert.deepEqual(planRosterText(undefined), ["Agents: the roster is not available now."]);
     });
 
