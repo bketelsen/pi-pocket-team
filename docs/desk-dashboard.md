@@ -108,9 +108,9 @@ agent": the label, today's cost, the 7-day cost, the 7-day tokens in (input plus
 out, in compact words ("1.2M / 34k"), and the 7-day cost of each provider ("anthropic $12.34 · openai $3.10"), with each
 provider's models in the cell's title. Money has 2 decimals below $100 and whole dollars with thousands above that
 ("$3.10", "$1,234"). Under the table a note says that these are list prices from the meter's ledger, that subagents and
-linked sessions count to the agent of the session that started them, and that today runs from local midnight in the
-server's zone while 7 days run to the hour; it adds "(partial)" while the ledger does not cover 7 days, and the count of
-conversations not attributed yet. Like the Subscriptions card, it is account-wide: the range and scope filters do not
+linked sessions count to the agent of the session that started them, that today runs from local midnight in the
+server's zone, and that the 7 days are the last 7 days; it adds "(partial)" while the ledger does not cover 7 days, and
+the count of conversations not attributed yet. Like the Subscriptions card, it is account-wide: the range and scope filters do not
 apply to it. On a phone each row is a small card.
 
 ## The drill-down route

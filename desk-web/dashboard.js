@@ -974,7 +974,7 @@ export const agentCostRows = (agents) => {
 };
 
 const AGENT_NOTE =
-    "List price of each agent's answers, from the meter's ledger. Subagents and linked sessions count to the agent of the session that started them. Today: since midnight in the server's zone; 7 days: the last 7 days, to the hour.";
+    "List price of each agent's answers, from the meter's ledger. Subagents and linked sessions count to the agent of the session that started them. Today: since midnight in the server's zone; 7 days: the last 7 days.";
 
 /** The card's note, with the ledger's coverage and the conversations that wait for an agent. */
 export const agentCostNote = (agents) => {

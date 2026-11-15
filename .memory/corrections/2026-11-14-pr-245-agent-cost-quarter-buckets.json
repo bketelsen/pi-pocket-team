@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-14",
+  "scope": "_desk-meter.ts",
+  "correction": "the conversation buckets were whole hours, so in a zone whose local midnight is not on a UTC hour (Asia/Kolkata at 18:30 UTC, Asia/Kathmandu at 18:15 UTC) an answer after midnight stayed in the bucket before it and today's cost was too low; the buckets are 15 minutes, so a local midnight always starts one",
+  "evidence": "bketelsen/pi-pocket-team#245, cross-review by openai/gpt-6.1-sol at 064ec26211c9bf55bea8675acedf042468bf98e3",
+  "promoted_to": "desk-meter.test.ts: agentCostView: in a zone whose midnight is not on a UTC hour, only the answer after it is today"
+}

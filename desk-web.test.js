@@ -4181,10 +4181,13 @@ test("agentCostRows: money below and above $100, compact tokens, the providers a
     // The note names the ledger's coverage and the conversations that wait for an agent.
     assert.match(
         agentCostNote(AGENTS),
-        /to the hour\. \(partial\) 2 conversations not attributed yet\.$/,
+        /; 7 days: the last 7 days\. \(partial\) 2 conversations not attributed yet\.$/,
     );
     assert.match(agentCostNote({ ...AGENTS, pending: 1 }), / 1 conversation not attributed yet\.$/);
-    assert.match(agentCostNote({ ...AGENTS, pending: 0, partial: false }), /to the hour\.$/);
+    assert.match(
+        agentCostNote({ ...AGENTS, pending: 0, partial: false }),
+        /7 days: the last 7 days\.$/,
+    );
 });
 
 test("the Cost by agent card: the table with its columns, the rows and the note", () => {
@@ -4204,5 +4207,5 @@ test("the Cost by agent card: the table with its columns, the rows and the note"
     );
     assert.match(out, /<tr data-kind=unattributed> .*?Unattributed.*?<\/tr>/);
     assert.match(out, /List price of each agent's answers, from the meter's ledger\./);
-    assert.match(out, /to the hour\. \(partial\) 2 conversations not attributed yet\./);
+    assert.match(out, /7 days: the last 7 days\. \(partial\) 2 conversations not attributed yet\./);
 });

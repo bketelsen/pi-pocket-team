@@ -53,6 +53,7 @@ import {
     addLedger,
     type AgentCostView,
     emptyMeterState,
+    localMidnight,
     meterView,
     parseAnthropicUsage,
     recordAttempt,
@@ -64,6 +65,8 @@ import {
 
 const HOUR = 3600_000;
 const DAY = 24 * HOUR;
+/** The meter's conversation buckets: 15 minutes. */
+const QUARTER = 15 * 60_000;
 /** 2026-10-30T00:00:00Z: "today" of the fixtures. */
 const T0 = Date.UTC(2026, 9, 30);
 /** The snapshot time: noon of today. */
@@ -2646,6 +2649,9 @@ describe("GET dashboard in Pocket", () => {
             };
         }, context);
 
+        // The answers' time, taken just before the read: nothing here depends on the time of day.
+        const t = Date.now();
+
         // The meter's memory: 1 answer in each conversation, and the subagent's creator edge in the ledger.
         const state = emptyMeterState();
         const ledger = emptyMeterLedger();
@@ -2667,7 +2673,7 @@ describe("GET dashboard in Pocket", () => {
             addLedger(state, {
                 provider: "anthropic",
                 model: "claude-opus-5-5",
-                timestamp: at - HOUR,
+                timestamp: t,
                 input: 10,
                 output: 5,
                 cacheRead: 0,
@@ -2677,7 +2683,7 @@ describe("GET dashboard in Pocket", () => {
             });
         }
 
-        state.coverage = { since: at - 8 * DAY, complete: true, done: 5, total: 5 };
+        state.coverage = { since: t - 8 * DAY, complete: true, done: 5, total: 5 };
         shared[holderKey] = { version: METER_HOLDER_VERSION, state, ledger };
         shared[teamKey] = {
             version: 1,
@@ -2703,6 +2709,13 @@ describe("GET dashboard in Pocket", () => {
             const agents = (answer.data as unknown as { agents: AgentCostView }).agents;
 
             assert.ok(agents !== undefined, "the meter is on: the field is there");
+
+            // Today's part, from the answer's own time: it is the answers at or after local midnight, and nothing here
+            // depends on the time of day.
+            const zone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+            const today = (value: number): number =>
+                Math.floor(t / QUARTER) * QUARTER >= localMidnight(agents.at, zone) ? value : 0;
+
             assert.equal(agents.partial, false);
             assert.equal(agents.pending, 0);
             assert.deepEqual(
@@ -2718,13 +2731,20 @@ describe("GET dashboard in Pocket", () => {
             // linked session is a root of its own whose agent is the session that started it.
             const row = agents.rows.find((each) => each.agent === "odrade");
 
-            assert.equal(row?.today.cost, 7);
+            assert.equal(row?.today.cost, today(7));
             assert.equal(row?.days7.entries, 3);
             assert.equal(row?.providers[0]?.provider, "anthropic");
             assert.equal(row?.providers[0]?.models[0]?.model, "claude-opus-5-5");
 
             // The thread's session is Duncan's, by the Desk's link.
-            assert.equal(agents.rows.find((each) => each.agent === "duncan")?.days7.cost, 8);
+            const duncanRow = agents.rows.find((each) => each.agent === "duncan");
+
+            assert.equal(duncanRow?.days7.cost, 8);
+            assert.equal(duncanRow?.today.cost, today(8));
+            assert.equal(
+                agents.rows.find((each) => each.kind === "unattributed")?.today.cost,
+                today(16),
+            );
             assert.ok(!/authorization|bearer|token/i.test(JSON.stringify(agents)));
 
             // The answer's other parts stay.

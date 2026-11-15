@@ -14,12 +14,14 @@ import {
     type AgentAttribution,
     type AgentLinks,
     type AgentResolver,
+    type SessionAgent,
     CLAUDE_CLI_VERSION,
     emptyMeterState,
     grantsLine,
     holdReason,
     ledgerLine,
     type LedgerUsage,
+    localMidnight,
     mainWindow,
     type MeterSettings,
     type MeterState,
@@ -815,17 +817,17 @@ const entryOf = (
     ...(conversation === undefined ? {} : { conversation }),
 });
 
-test("addLedger: each answer counts in its conversation's hour, and only with a valid conversation", () => {
+test("addLedger: each answer counts in its conversation's quarter hour, and only with a valid conversation", () => {
     const state = emptyMeterState();
-    const hour = String(Date.parse("2026-11-20T12:00:00Z"));
-    const next = String(Date.parse("2026-11-20T13:00:00Z"));
+    const quarter = String(Date.parse("2026-11-20T12:00:00Z"));
+    const next = String(Date.parse("2026-11-20T12:15:00Z"));
 
     addLedger(state, entryOf(7, Date.parse("2026-11-20T12:01:00Z"), 2));
-    addLedger(state, entryOf(7, Date.parse("2026-11-20T12:59:00Z"), 3));
-    addLedger(state, entryOf(7, Date.parse("2026-11-20T13:00:00Z"), 5));
+    addLedger(state, entryOf(7, Date.parse("2026-11-20T12:14:00Z"), 3));
+    addLedger(state, entryOf(7, Date.parse("2026-11-20T12:15:00Z"), 5));
     addLedger(state, entryOf(8, Date.parse("2026-11-20T12:02:00Z"), 9));
 
-    assert.deepEqual(state.conversations[hour]?.["7"]?.anthropic?.["claude-opus-5-5"], {
+    assert.deepEqual(state.conversations[quarter]?.["7"]?.anthropic?.["claude-opus-5-5"], {
         entries: 2,
         input: 200,
         output: 20,
@@ -834,39 +836,42 @@ test("addLedger: each answer counts in its conversation's hour, and only with a 
         cost: 5,
         unknownCost: 0,
     });
-    assert.equal(state.conversations[hour]?.["8"]?.anthropic?.["claude-opus-5-5"]?.cost, 9);
+    assert.equal(state.conversations[quarter]?.["8"]?.anthropic?.["claude-opus-5-5"]?.cost, 9);
     assert.equal(state.conversations[next]?.["7"]?.anthropic?.["claude-opus-5-5"]?.cost, 5);
 
     // The 5-minute buckets sum the same answers, whatever their conversation.
     assert.equal(ledgerTotal(state, "entries"), 4);
 
     // A cost the answer did not give counts in `unknownCost` on both sides.
-    addLedger(state, entryOf(7, Date.parse("2026-11-20T12:40:00Z"), undefined));
-    assert.equal(state.conversations[hour]?.["7"]?.anthropic?.["claude-opus-5-5"]?.unknownCost, 1);
+    addLedger(state, entryOf(7, Date.parse("2026-11-20T12:05:00Z"), undefined));
+    assert.equal(
+        state.conversations[quarter]?.["7"]?.anthropic?.["claude-opus-5-5"]?.unknownCost,
+        1,
+    );
     assert.equal(ledgerTotal(state, "unknownCost"), 1);
 
     for (const bad of [0, -1, 1.5, Number.NaN, Number.MAX_SAFE_INTEGER + 1]) {
-        addLedger(state, entryOf(bad, Date.parse("2026-11-20T12:45:00Z"), 1));
+        addLedger(state, entryOf(bad, Date.parse("2026-11-20T12:07:00Z"), 1));
     }
 
-    addLedger(state, entryOf(undefined, Date.parse("2026-11-20T12:45:00Z"), 1));
+    addLedger(state, entryOf(undefined, Date.parse("2026-11-20T12:08:00Z"), 1));
 
     assert.deepEqual(
-        Object.keys(state.conversations[hour] ?? {}).sort(),
+        Object.keys(state.conversations[quarter] ?? {}).sort(),
         ["7", "8"],
         "no other conversation, and no name such as NaN",
     );
     assert.equal(ledgerTotal(state, "entries"), 11);
 
-    // An answer with no timestamp counts nowhere, and no hour is made for it.
-    const hours = Object.keys(state.conversations).length;
+    // An answer with no timestamp counts nowhere, and no quarter hour is made for it.
+    const quarters = Object.keys(state.conversations).length;
 
     addLedger(state, { ...entryOf(9, NOW, 1), timestamp: undefined });
     assert.equal(state.skipped, 1);
-    assert.equal(Object.keys(state.conversations).length, hours);
+    assert.equal(Object.keys(state.conversations).length, quarters);
 });
 
-test("pruneMeter: the conversation hours older than 8 days go", () => {
+test("pruneMeter: the conversation quarter hours older than 8 days go", () => {
     const state = emptyMeterState();
     const old = Date.parse("2026-11-11T12:00:00Z");
 
@@ -1152,6 +1157,67 @@ test("attributeConversations: the cache keeps an agent for good, and reads a ses
     assert.deepEqual(reads, [1, 1]);
 });
 
+test("attributeConversations: a chain of 3 linked sessions resolves in 3 calls, 1 persona read each", async () => {
+    const reads: number[] = [];
+    const cache = new Map<number, SessionAgent>();
+    const resolver: AgentResolver = {
+        persona: async (session) => {
+            reads.push(session);
+
+            return session === 3 ? "duncan" : undefined;
+        },
+        links: {
+            owners: new Map<number, number | null>([
+                [1, null],
+                [2, null],
+                [3, null],
+            ]),
+            desk: new Map(),
+            linkedFrom: new Map([
+                [1, 2],
+                [2, 3],
+            ]),
+        },
+        cache,
+        now: NOW,
+        maxReads: 1,
+    };
+
+    // The first call spends its 1 read on session 1, and keeps its source before it reads the chain.
+    assert.deepEqual((await attributeConversations([1], resolver)).get(1), { kind: "pending" });
+    assert.deepEqual(reads, [1]);
+    assert.deepEqual(cache.get(1), { source: 2, at: NOW });
+
+    // The second call skips session 1's read and spends it on session 2, whose source it keeps too.
+    assert.deepEqual((await attributeConversations([1], resolver)).get(1), { kind: "pending" });
+    assert.deepEqual(reads, [1, 2]);
+    assert.deepEqual(cache.get(2), { source: 3, at: NOW });
+
+    // The third call reaches the identity at the end of the chain.
+    assert.deepEqual((await attributeConversations([1], resolver)).get(1), {
+        kind: "agent",
+        agent: "duncan",
+        via: "linked",
+        session: 1,
+    });
+    assert.deepEqual(reads, [1, 2, 3]);
+    assert.deepEqual(cache.get(1), { agent: "duncan", via: "linked", at: NOW });
+    assert.deepEqual(cache.get(2), { agent: "duncan", via: "linked", at: NOW });
+    assert.deepEqual(cache.get(3), { agent: "duncan", via: "identity", at: NOW });
+
+    // Every session of the chain answers now, and no call reads a persona again.
+    for (const session of [1, 2, 3]) {
+        assert.deepEqual((await attributeConversations([session], resolver)).get(session), {
+            kind: "agent",
+            agent: "duncan",
+            via: session === 3 ? "identity" : "linked",
+            session,
+        });
+    }
+
+    assert.deepEqual(reads, [1, 2, 3]);
+});
+
 test("agentCostView: the providers and their models, today at local midnight, the unattributed and the pending", () => {
     const state = emptyMeterState();
 
@@ -1261,6 +1327,52 @@ test("agentCostView: the providers and their models, today at local midnight, th
         [["pending", "Not attributed yet"]],
     );
     assert.equal(unknown.pending, 1);
+});
+
+test("agentCostView: in a zone whose midnight is not on a UTC hour, only the answer after it is today", () => {
+    const now = Date.parse("2026-11-20T06:30:00Z");
+
+    // Asia/Kolkata is UTC+5:30: its local midnight is 18:30 UTC the day before, on a quarter hour.
+    assert.equal(localMidnight(now, "Asia/Kolkata"), Date.parse("2026-11-19T18:30:00Z"));
+    // Asia/Kathmandu is UTC+5:45: 18:15 UTC, also on a quarter hour.
+    assert.equal(localMidnight(now, "Asia/Kathmandu"), Date.parse("2026-11-19T18:15:00Z"));
+
+    const state = emptyMeterState();
+
+    // 23:55 and 00:05 local in each zone.
+    addLedger(state, entryOf(1, Date.parse("2026-11-19T18:25:00Z"), 10)); // Kolkata 23:55
+    addLedger(state, entryOf(1, Date.parse("2026-11-19T18:35:00Z"), 1)); // Kolkata 00:05
+    addLedger(state, entryOf(2, Date.parse("2026-11-19T18:10:00Z"), 20)); // Kathmandu 23:55
+    addLedger(state, entryOf(2, Date.parse("2026-11-19T18:20:00Z"), 2)); // Kathmandu 00:05
+
+    const attributions = new Map<number, AgentAttribution>([
+        [1, { kind: "agent", agent: "odrade", via: "identity", session: 1 }],
+        [2, { kind: "agent", agent: "duncan", via: "identity", session: 2 }],
+    ]);
+    const today = (zone: string) =>
+        agentCostView(state, attributions, new Map(), now, zone).rows.map((row) => [
+            row.label,
+            row.today.cost,
+            row.days7.cost,
+        ]);
+
+    // In Kolkata's day, only the 00:05 answer of conversation 1 is today; both of conversation 2 are still yesterday.
+    assert.deepEqual(today("Asia/Kolkata"), [
+        ["duncan", 0, 22],
+        ["odrade", 1, 11],
+    ]);
+
+    // In Kathmandu's day, its own 00:05 answer is today, and Kolkata's 23:55 answer is today too: both are after 18:15.
+    assert.deepEqual(today("Asia/Kathmandu"), [
+        ["duncan", 2, 22],
+        ["odrade", 11, 11],
+    ]);
+
+    // In New York's day, both local times are still yesterday.
+    assert.deepEqual(today(ZONE), [
+        ["duncan", 0, 22],
+        ["odrade", 0, 11],
+    ]);
 });
 
 test("agentCostView: rows at the same cost sort by today's cost, then by their label", () => {

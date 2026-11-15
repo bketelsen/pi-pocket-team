@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-14",
+  "scope": "desk-metrics.test.ts",
+  "correction": "the agents route test put its answers 1 hour before Date.now() and asserted that today's cost was 7, which failed in the first hour after local midnight; the answers now carry a time taken just before the read, and the expected today cost comes from the answer's own agents.at and local midnight",
+  "evidence": "bketelsen/pi-pocket-team#245, cross-review by openai/gpt-6.1-sol at 064ec26211c9bf55bea8675acedf042468bf98e3",
+  "promoted_to": "desk-metrics.test.ts: GET dashboard: the cost by agent, from real sessions; no field at all when the meter is off"
+}

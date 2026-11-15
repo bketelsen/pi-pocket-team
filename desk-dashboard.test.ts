@@ -2474,7 +2474,8 @@ function meterRead(w: MeterWorld): MeterDeps["read"] {
                 return list.length > limit ? { items, next: { more: true } } : { items };
             },
             conversation: async (id: number) => {
-                // A point read: it is not 1 of the commit's pages, so it does not count in `reads`.
+                // A point read: 1 table read of the commit, counted with its pages.
+                reads += 1;
                 w.points.push(id);
 
                 const record = w.conversations.find((each) => each.id === id);
@@ -2537,7 +2538,7 @@ function ledgerSums(state: MeterState): { entries: number; cost: number; unknown
     return sums;
 }
 
-/** The ledger's sums over every conversation hour. */
+/** The ledger's sums over every conversation quarter hour. */
 function conversationSums(state: MeterState): {
     entries: number;
     cost: number;
@@ -2609,7 +2610,43 @@ describe("the subscription meter's step", () => {
         );
     });
 
-    test("each answer carries its conversation: the conversation hours sum to the same counters as the buckets", async () => {
+    test("30 newly active conversations and no listing: each commit stays within 25 reads, and each gets its creator and its answers", async () => {
+        const w = meterWorld();
+
+        for (let id = 1; id <= 30; id += 1) {
+            meterConversation(w, id);
+            answerIn(w, id, { cost: id });
+        }
+
+        const deps = meterDeps(w);
+
+        for (let id = 1; id <= 30; id += 1) {
+            // `run.started`: the desk's listener adds each one.
+            deps.ledger.active.add(id);
+        }
+
+        // The sweeps have listed nothing yet: each creator is 1 point read, in the same budget as the pages.
+        for (let pass = 1; pass <= 4 && deps.ledger.owners.size < 30; pass += 1) {
+            await meterPass(deps, METER_NOW + pass * PASS_MS);
+        }
+
+        assert.equal(deps.ledger.owners.size, 30, "every conversation got its creator edge");
+        assert.deepEqual(
+            ledgerSums(deps.state),
+            { entries: 30, cost: 465, unknownCost: 0 },
+            "every answer counted once",
+        );
+        assert.ok(
+            w.points.length > 0,
+            "the point reads come first; the sweep's listing gives any that the budget left",
+        );
+        assert.ok(
+            w.commits.every((reads) => reads <= METER_READS),
+            `no commit reads more than ${String(METER_READS)} times: ${w.commits.join(", ")}`,
+        );
+    });
+
+    test("each answer carries its conversation: the conversation quarter hours sum to the same counters as the buckets", async () => {
         const w = meterWorld();
 
         meterConversation(w, 1);
@@ -2673,8 +2710,8 @@ describe("the subscription meter's step", () => {
         assert.equal(deps.ledger.owners.get(1), null, "a known edge is not read again");
         assert.equal(
             w.commits.at(-1),
-            3,
-            "1 page for each of the 3 active conversations: the point read is not 1 of them",
+            4,
+            "1 page for each of the 3 active conversations, and 1 point read for the new one",
         );
 
         // The edge is known now: a later read of the same conversation makes no point read.

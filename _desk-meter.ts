@@ -32,6 +32,11 @@ const HOUR_MS = 3600_000;
 const DAY_MS = 24 * HOUR_MS;
 /** Ledger buckets: 5 minutes (UTC). */
 const BUCKET_MS = 5 * MINUTE_MS;
+/**
+ * The conversation buckets: 15 minutes (UTC). Every real zone's offset is a multiple of 15 minutes, so a local midnight
+ * always starts a bucket, and "today" can start at the bucket of the answer.
+ */
+const QUARTER_MS = 15 * MINUTE_MS;
 /** How long the ledger keeps a bucket: 8 days. */
 const BUCKET_KEEP_MS = 8 * DAY_MS;
 /** How long samples and "reset seen" marks stay: 24 hours. */
@@ -508,8 +513,8 @@ export type MeterState = {
     /** Bucket start (epoch ms, as a string) → provider → model → bucket. */
     buckets: Record<string, Record<string, Record<string, Bucket>>>;
     /**
-     * Hour start (epoch ms, UTC, as a string) → conversation id → provider → model → bucket: the ledger's counters
-     * again, for each conversation, for the cost by agent.
+     * Quarter-hour start (epoch ms, UTC, as a string) → conversation id → provider → model → bucket: the ledger's
+     * counters again, for each conversation, for the cost by agent.
      */
     conversations: Record<string, Record<string, Record<string, Record<string, Bucket>>>>;
     /** Ledger entries with no timestamp. */
@@ -677,8 +682,8 @@ function addBucket(bucket: Bucket, usage: LedgerUsage): void {
 }
 
 /**
- * Adds 1 ledger entry to its 5-minute bucket, and to its conversation's hour; an entry with no timestamp counts only in
- * `skipped`, and an entry with no valid conversation counts in its bucket only.
+ * Adds 1 ledger entry to its 5-minute bucket, and to its conversation's quarter hour; an entry with no timestamp counts
+ * only in `skipped`, and an entry with no valid conversation counts in its bucket only.
  */
 export function addLedger(state: MeterState, usage: LedgerUsage): void {
     const timestamp = usage.timestamp;
@@ -706,15 +711,15 @@ export function addLedger(state: MeterState, usage: LedgerUsage): void {
         return;
     }
 
-    const hour = String(Math.floor(timestamp / HOUR_MS) * HOUR_MS);
-    const byConversation = (state.conversations[hour] ??= dict());
+    const quarter = String(Math.floor(timestamp / QUARTER_MS) * QUARTER_MS);
+    const byConversation = (state.conversations[quarter] ??= dict());
     const ownProviders = (byConversation[String(conversation)] ??= dict());
     const ownModels = (ownProviders[usage.provider] ??= dict());
 
     addBucket((ownModels[usage.model] ??= emptyBucket()), usage);
 }
 
-/** Drops buckets and conversation hours older than 8 days, and samples and reset marks older than 24 hours. */
+/** Drops buckets and conversation quarter hours older than 8 days, and samples and reset marks older than 24 hours. */
 export function pruneMeter(state: MeterState, now: number): void {
     for (const start of Object.keys(state.buckets)) {
         if (Number(start) < now - BUCKET_KEEP_MS) {
@@ -1072,8 +1077,11 @@ function zoneOffset(ms: number, zone: string): number {
     return Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute, p.second) - whole;
 }
 
-/** Local midnight in `zone` of the day that holds `now`; the offset is checked again at the guess (daylight saving). */
-function localMidnight(now: number, zone: string): number {
+/**
+ * Local midnight in `zone` of the day that holds `now`; the offset is checked again at the guess (daylight saving). A
+ * conversation bucket starts on a 15-minute boundary, so the bucket of an answer at or after it is "today".
+ */
+export function localMidnight(now: number, zone: string): number {
     const p = zonedParts(now, zone);
     const wall = Date.UTC(p.year, p.month - 1, p.day);
     const guess = wall - zoneOffset(now, zone);
@@ -1469,10 +1477,15 @@ export type AgentAttribution =
     | { kind: "unattributed"; session: number }
     | { kind: "pending" };
 
-/** What a session resolved to, cached in the meter's memory by session id. */
+/**
+ * What a session resolved to, cached in the meter's memory by session id. `agent` is its agent; `source` is the session
+ * that started it, kept before the source is read, so a call that spends its persona reads in the chain keeps its
+ * progress; neither means that no agent named it.
+ */
 export type SessionAgent = {
     agent?: string;
     via?: "identity" | "desk" | "linked";
+    source?: number;
     at: number;
 };
 
@@ -1502,7 +1515,7 @@ function codeUnitOrder(a: string, b: string): number {
     return a < b ? -1 : a > b ? 1 : 0;
 }
 
-/** The conversation ids with a bucket whose hour start is >= now - 7 days, sorted ascending. */
+/** The conversation ids with a bucket whose quarter-hour start is >= now - 7 days, sorted ascending. */
 export function rollupConversations(state: MeterState, now: number): number[] {
     const since = now - 7 * DAY_MS;
     const ids = new Set<number>();
@@ -1578,21 +1591,70 @@ export async function attributeConversations(
             return memo;
         }
 
-        const cached = resolver.cache.get(session);
+        const seen = new Set(chain);
 
-        // An agent is kept; a session with none is read again only after AGENT_RETRY_MS.
-        if (
-            cached !== undefined &&
-            (cached.agent !== undefined || resolver.now - cached.at < AGENT_RETRY_MS)
-        ) {
-            const answer: SessionAnswer =
-                cached.agent === undefined
-                    ? {}
-                    : { agent: cached.agent, via: cached.via ?? "identity" };
+        seen.add(session);
 
+        const keep = (value: SessionAgent, answer: SessionAnswer): SessionAnswer => {
+            resolver.cache.set(session, value);
             asked.set(session, answer);
 
             return answer;
+        };
+
+        /** The session that started this one: its agent (the "linked" way), none, or a read that must wait. */
+        const follow = async (source: number): Promise<SessionAnswer> => {
+            if (seen.has(source)) {
+                return keep({ at: resolver.now }, {});
+            }
+
+            const answer = await resolveSession(source, seen);
+
+            // A pending source keeps what the cache has for this session, which is its source.
+            if (answer === "pending") {
+                asked.set(session, "pending");
+
+                return "pending";
+            }
+
+            if (answer.agent !== undefined) {
+                return keep(
+                    { agent: answer.agent, via: "linked", at: resolver.now },
+                    { agent: answer.agent, via: "linked" },
+                );
+            }
+
+            return keep({ at: resolver.now }, {});
+        };
+
+        const cached = resolver.cache.get(session);
+
+        if (cached !== undefined) {
+            // An agent is kept for good.
+            if (cached.agent !== undefined) {
+                const answer: SessionAnswer = {
+                    agent: cached.agent,
+                    via: cached.via ?? "identity",
+                };
+
+                asked.set(session, answer);
+
+                return answer;
+            }
+
+            // A session with an agent or with none is read again only after AGENT_RETRY_MS; a session that knows the
+            // session that started it goes straight there, and spends no persona read on itself.
+            if (resolver.now - cached.at < AGENT_RETRY_MS) {
+                if (cached.source !== undefined) {
+                    return await follow(cached.source);
+                }
+
+                const answer: SessionAnswer = {};
+
+                asked.set(session, answer);
+
+                return answer;
+            }
         }
 
         if (reads >= resolver.maxReads) {
@@ -1603,10 +1665,6 @@ export async function attributeConversations(
 
         reads += 1;
 
-        const seen = new Set(chain);
-
-        seen.add(session);
-
         let identity: string | undefined;
 
         try {
@@ -1616,13 +1674,6 @@ export async function attributeConversations(
 
             return "pending";
         }
-
-        const keep = (value: SessionAgent, answer: SessionAnswer): SessionAnswer => {
-            resolver.cache.set(session, value);
-            asked.set(session, answer);
-
-            return answer;
-        };
 
         if (typeof identity === "string" && identity !== "") {
             return keep(
@@ -1642,22 +1693,12 @@ export async function attributeConversations(
 
         const source = resolver.links.linkedFrom.get(session);
 
-        if (source !== undefined && !seen.has(source)) {
-            const answer = await resolveSession(source, seen);
+        if (source !== undefined) {
+            // The progress is kept before the source is read: a call that spends its persona reads in the chain goes on
+            // from here, and does not read the same first sessions again.
+            resolver.cache.set(session, { source, at: resolver.now });
 
-            // A pending source is not cached: the next call reads the chain again.
-            if (answer === "pending") {
-                asked.set(session, "pending");
-
-                return "pending";
-            }
-
-            if (answer.agent !== undefined) {
-                return keep(
-                    { agent: answer.agent, via: "linked", at: resolver.now },
-                    { agent: answer.agent, via: "linked" },
-                );
-            }
+            return await follow(source);
         }
 
         return keep({ at: resolver.now }, {});
@@ -1777,8 +1818,8 @@ function sumInto(total: AgentCostTotals, bucket: Bucket): void {
 
 /**
  * The meter's ledger at list price, by agent (plan: the cost by agent): today since local midnight in `zone`, and the
- * last 7 days to the hour. A conversation with no attribution in the map is pending. The rows hold only what has usage
- * in the last 7 days, the highest cost first; the providers and their models follow the same order.
+ * last 7 days. A conversation with no attribution in the map is pending. The rows hold only what has usage in the last
+ * 7 days, the highest cost first, and the providers and their models follow the same order.
  */
 export function agentCostView(
     state: MeterState,
