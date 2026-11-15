@@ -1217,6 +1217,56 @@ export function mcpText(scope: McpScope): string | undefined {
 /** What a home session must do before it touches a repository: paths only, never a file's contents. */
 const HOME_RULES = `You are in your home: plans, notes and reports for all your repositories live here. Read a repository's AGENTS.md before you answer about it. Never change a repository from your home: start the work with team_work, which opens a session in a fresh worktree of that repository with its own AGENTS.md, skills and memory. In a linked session, team_work is refused: report the plan to the session that started you.`;
 
+/** The tools a private agent's session must not call: each one reaches another session or the desk. */
+const PRIVATE_BLOCKED_TOOLS = ["team_message", "team_delegate", "team_work", "team", "desk"];
+
+/** The block text of 1 such call in a private agent's session. */
+const privateBlockText = (name: string): string =>
+    `${name} is a private agent: it sends nothing to other sessions or the desk.`;
+
+/**
+ * The block for 1 tool call in a private agent's session, or undefined when the call may go. The session's own identity
+ * gives the agent: 1 document, and a session with none (a subagent, or a linked session stored before its identity) is
+ * walked up its chain, as the MCP guard does. A read that fails blocks nothing: only a private agent that a good read
+ * finds blocks, so a broken profile or a failed read never stops another agent's report or desk call.
+ */
+export async function privateToolBlock(
+    name: string,
+    read: Pick<DocumentReader, "snapshot">,
+    conversationId: ConversationId,
+    context: Context,
+    directory: string,
+    parents?: McpParents,
+): Promise<string | undefined> {
+    if (!PRIVATE_BLOCKED_TOOLS.includes(name)) {
+        return undefined;
+    }
+
+    const own = (await read.snapshot(Identity, conversationId, context).catch(() => undefined))
+        ?.persona;
+
+    if (own !== undefined) {
+        return (await isPrivateAgent(directory, own.id)) ? privateBlockText(own.name) : undefined;
+    }
+
+    const scope = await mcpScope(
+        read,
+        conversationId,
+        context,
+        directory,
+        parents ?? { found: new Map() },
+    ).catch((): McpScope => ({
+        kind: "blocked",
+        reason: "a read failed, so the agent is not known",
+    }));
+
+    if (scope.kind !== "agent" || !(await isPrivateAgent(directory, scope.id))) {
+        return undefined;
+    }
+
+    return privateBlockText(scope.name);
+}
+
 /** The home rules of a private agent: it starts no session and so reports to no one. */
 const PRIVATE_HOME_RULES = `You are in your home: plans, notes and reports for all your repositories live here. Read a repository's AGENTS.md before you answer about it. Never change a repository from your home: Brian starts a session in the repository when he wants that work.`;
 
@@ -3221,6 +3271,24 @@ export default function createTeam(host: Host, web: Web) {
                     );
                 }
 
+                // A plain session acts for the person who wrote last in the source, not for the person who clicked. A
+                // private agent's session is Brian's own, so it starts only when that person is the one who asks now.
+                const by = host.requesterOf(req.conversation.id);
+
+                if (by === undefined) {
+                    throw web.error(
+                        409,
+                        `${persona.name}'s session starts for the person who wrote last in this session, and nobody wrote here yet: send a message here first, or start ${persona.name} with New session in ${persona.home}.`,
+                    );
+                }
+
+                if (by !== req.user.id) {
+                    throw web.error(
+                        409,
+                        `Another person wrote last in this session, so ${persona.name}'s session would start in their name: start ${persona.name} with New session in ${persona.home}.`,
+                    );
+                }
+
                 const plain = await sessions.start(
                     req.conversation.id,
                     {
@@ -5150,39 +5218,21 @@ export default function createTeam(host: Host, web: Web) {
     });
 
     /**
-     * A private agent's session sends nothing out: no report, no delegation, no linked start, no desk. The session's own
-     * identity gives the agent; a session with none (a subagent, or a linked session stored before its identity) is
-     * walked up its chain, as the MCP guard does. A failed read, or no named agent on the way, blocks nothing: only a
-     * private agent that the walk finds does.
+     * A private agent's session sends nothing out: no report, no delegation, no linked start, no desk. The decision is
+     * `privateToolBlock`: the session's own identity, else the walk up its chain, and a failed read blocks nothing.
      */
-    const PRIVATE_BLOCKED_TOOLS = ["team_message", "team_delegate", "team_work", "team", "desk"];
     const privateGuard = hook(ToolTask, {
         beforeTool: async (call, api, context) => {
-            if (!PRIVATE_BLOCKED_TOOLS.includes(call.name)) {
-                return undefined;
-            }
+            const block = await privateToolBlock(
+                call.name,
+                api,
+                api.conversationId,
+                context,
+                directory,
+                mcpParents,
+            );
 
-            // The session's own identity first: 1 document, and the walk only for a session that has none (a
-            // subagent, or a linked session started before its identity was stored).
-            const own = (await api.snapshot(Identity, api.conversationId, context))?.persona;
-
-            if (own !== undefined) {
-                return (await isPrivateAgent(directory, own.id))
-                    ? {
-                          block: `${own.name} is a private agent: it sends nothing to other sessions or the desk.`,
-                      }
-                    : undefined;
-            }
-
-            const scope = await scopeOf(api, api.conversationId, context);
-
-            if (scope.kind !== "agent" || !(await isPrivateAgent(directory, scope.id))) {
-                return undefined;
-            }
-
-            return {
-                block: `${scope.name} is a private agent: it sends nothing to other sessions or the desk.`,
-            };
+            return block === undefined ? undefined : { block };
         },
     });
 

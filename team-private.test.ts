@@ -16,14 +16,14 @@ import {
     until,
 } from "./_pocket/test/helpers.ts";
 import assert from "node:assert/strict";
-import { cpSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
 import type { ConversationId } from "@earendil-works/pi-durable";
 import { fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import { createHandler } from "./_pocket/src/server/http.ts";
-import createTeam, { Identity, roster } from "./team.ts";
+import createTeam, { Identity, privateToolBlock, roster } from "./team.ts";
 
 /**
  * Pi Pocket 0.28.0 adds `host.sessions`, which starts an ordinary session: an older release has none, and the Team panel
@@ -82,6 +82,9 @@ after(async () => {
 const definitions = join(root, "agents");
 const repo = join(root, "notes-repo");
 const chaniHome = join(root, "chani-home");
+/** The desk's config file and fake `gh`, in the test folder: no test reads Brian's desk data or calls GitHub. */
+const deskConfig = join(root, "desk.json");
+const fakeGh = join(root, "fake-gh.sh");
 /** Each model request's context, as text: the prompt a session's turns carry. */
 const prompts: string[] = [];
 
@@ -89,6 +92,22 @@ const model = scriptedModel((ctx) => {
     const { text } = lastText(ctx as never);
 
     prompts.push(JSON.stringify(ctx));
+
+    // The 2 markers that end with a marker of another tool go first: "… tool test" and "… test" both fit the others.
+    if (text.endsWith("delegate tool test")) {
+        return fauxAssistantMessage(
+            [fauxToolCall("team_delegate", { agent: "duncan", task: "x" })],
+            {
+                stopReason: "toolUse",
+            },
+        );
+    }
+
+    if (text.endsWith("desk tool test")) {
+        return fauxAssistantMessage([fauxToolCall("desk", { action: "list" })], {
+            stopReason: "toolUse",
+        });
+    }
 
     if (text.endsWith("delegate to chani test")) {
         return fauxAssistantMessage(
@@ -129,6 +148,10 @@ const promptWith = (marker: string): string => {
     return found;
 };
 
+/** How many private-agent blocks a session's transcript holds. */
+const blocks = async (id: ConversationId): Promise<number> =>
+    (await modelTexts(app, id)).join("\n").split("is a private agent: it sends nothing").length - 1;
+
 process.env.PI_POCKET_TEAM_AGENTS = definitions;
 mkdirSync(definitions);
 mkdirSync(repo);
@@ -156,12 +179,35 @@ before(async () => {
     const dropIns = join(root, "data", "extensions");
 
     mkdirSync(dropIns, { recursive: true });
-    cpSync(join(import.meta.dirname, "team.ts"), join(dropIns, "team.ts"));
-    cpSync(join(import.meta.dirname, "team-web"), join(dropIns, "team-web"), { recursive: true });
+
+    for (const file of [
+        "team.ts",
+        "desk.ts",
+        "_desk-usage.ts",
+        "_desk-dashboard.ts",
+        "_desk-metrics.ts",
+        "_desk-board.ts",
+        "_desk-meter.ts",
+    ]) {
+        cpSync(join(import.meta.dirname, file), join(dropIns, file));
+    }
+
+    for (const folder of ["team-web", "desk-web"]) {
+        cpSync(join(import.meta.dirname, folder), join(dropIns, folder), { recursive: true });
+    }
+
+    // The desk stays in the test folder: its config file, and a fake `gh` that reads no GitHub.
+    writeFileSync(deskConfig, JSON.stringify({ digest: { minutes: 0 }, cap: 100 }));
+    writeFileSync(fakeGh, '#!/bin/sh\nprintf %s \'{"data":{"viewer":{"login":"test-viewer"}}}\'\n');
+    chmodSync(fakeGh, 0o755);
+    process.env.PI_POCKET_DESK_CONFIG = deskConfig;
+    process.env.PI_POCKET_DESK_GH = fakeGh;
     app = await openApp(model);
     await app.setExtensionEnabled(owner(app), "team.ts", true);
     // Pi Pocket's own linked-session tool, so the guard is checked on the real tool.
     await app.setExtensionEnabled(owner(app), "agent-teams.ts", true);
+    // The desk's tool too: a private agent's session must not call it either.
+    await app.setExtensionEnabled(owner(app), "desk.ts", true);
     server = createServer(
         createHandler({ app, listen: { host: "127.0.0.1", port: 0 }, restart: () => {} }),
     );
@@ -243,6 +289,91 @@ test(
     },
 );
 
+test(
+    "a private agent's start refuses a source session where nobody wrote yet, and starts nothing",
+    { skip: !startsPlainSessions && "Pi Pocket before 0.28.0 has no host.sessions" },
+    async () => {
+        // A plain session acts for the person who wrote last there: with no such person, the start has no one to act
+        // for, and it must say so before it starts anything.
+        const fresh = await newSession(app);
+        const sessions = app.sessions().length;
+        const started = await call(`session/${fresh}/start`, {
+            agent: "chani",
+            message: "Sort my notes.",
+            key: "private-no-person-0001",
+        });
+
+        assert.equal(started.status, 409, JSON.stringify(started.data));
+        assert.match(
+            String(started.data.error),
+            /Chani's session starts for the person who wrote last in this session, and nobody wrote here yet: send a message here first, or start Chani with New session in .*\./,
+        );
+        assert.equal(app.sessions().length, sessions, "no session started");
+    },
+);
+
+test(
+    "a private agent's start refuses a source session where another person wrote last, and starts nothing",
+    { skip: !startsPlainSessions && "Pi Pocket before 0.28.0 has no host.sessions" },
+    async () => {
+        const guest = app.config.addUser("Guest", "guest").user;
+        const theirs = await newSession(app);
+        const submitted = await app.commands.submit(theirs, guest, {
+            text: "Please sort the notes.",
+            requestId: crypto.randomUUID(),
+        });
+
+        await (await app.harness.submission(submitted.submissionId, context))!.wait(context);
+
+        const sessions = app.sessions().length;
+        // The owner asks, but the guest wrote last: the session would start in the guest's name.
+        const started = await call(`session/${theirs}/start`, {
+            agent: "chani",
+            message: "Sort my notes.",
+            key: "private-other-person-0001",
+        });
+
+        assert.equal(started.status, 409, JSON.stringify(started.data));
+        assert.match(
+            String(started.data.error),
+            /Another person wrote last in this session, so Chani's session would start in their name: start Chani with New session in .*\./,
+        );
+        assert.equal(app.sessions().length, sessions, "no session started");
+    },
+);
+
+test("a guard whose identity read fails blocks nothing, and a private identity blocks", async () => {
+    const failed = {
+        snapshot: async () => {
+            throw new Error("the read failed");
+        },
+    };
+
+    // A read that fails answers undefined: it never stops another agent's report or desk call.
+    assert.equal(
+        await privateToolBlock("team_message", failed, 7 as ConversationId, context, definitions),
+        undefined,
+    );
+    assert.equal(
+        await privateToolBlock("desk", failed, 7 as ConversationId, context, definitions),
+        undefined,
+    );
+    // A tool this guard does not hold is never read for.
+    assert.equal(
+        await privateToolBlock("bash", failed, 7 as ConversationId, context, definitions),
+        undefined,
+    );
+
+    const chani = {
+        snapshot: async () => ({ persona: { id: "chani", name: "Chani", role: "agent" } }),
+    };
+
+    assert.equal(
+        await privateToolBlock("team_message", chani, 7 as ConversationId, context, definitions),
+        "Chani is a private agent: it sends nothing to other sessions or the desk.",
+    );
+});
+
 test("another agent's start is still a linked task, with the return address in its first message", async () => {
     const sessions = app.sessions().length;
     const started = await call(`session/${source}/start`, {
@@ -302,31 +433,39 @@ test(
 
         await until(() => !app.isBusy(child), "the private session settled");
 
-        for (const words of ["work test", "message test", "team tool test"]) {
+        // Each call's own refusal: the count goes up at each step, so a later step cannot pass on an earlier block.
+        for (const words of [
+            "work test",
+            "message test",
+            "team tool test",
+            "delegate tool test",
+            "desk tool test",
+        ]) {
+            const before = await blocks(child);
+
             await say(app, child, words);
-            assert.match(
-                (await modelTexts(app, child)).join("\n"),
-                /Chani is a private agent: it sends nothing to other sessions or the desk\./,
-                words,
-            );
+            const after = await blocks(child);
+
+            assert(after > before, `${words} is blocked: ${String(before)} → ${String(after)}`);
         }
 
-        // A normal agent's session is not held by this guard.
+        // A normal agent's session is not held by this guard: the same calls add no block.
         const normal = await newSession(app, repo);
 
         assert.equal((await call(`session/${normal}/identity`, { agent: "duncan" })).status, 200);
-        await say(app, normal, "message test");
-        assert.doesNotMatch(
-            (await modelTexts(app, normal)).join("\n"),
-            /is a private agent/,
-            "another agent sends as before",
-        );
-        await say(app, normal, "team tool test");
-        assert.doesNotMatch(
-            (await modelTexts(app, normal)).join("\n"),
-            /is a private agent/,
-            "another agent may list its sessions",
-        );
+
+        for (const words of [
+            "work test",
+            "message test",
+            "team tool test",
+            "delegate tool test",
+            "desk tool test",
+        ]) {
+            const before = await blocks(normal);
+
+            await say(app, normal, words);
+            assert.equal(await blocks(normal), before, `another agent's ${words} is not blocked`);
+        }
     },
 );
 
