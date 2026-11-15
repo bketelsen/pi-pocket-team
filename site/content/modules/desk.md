@@ -33,7 +33,9 @@ A session with a supervisor identity uses `desk`; another session is refused.
 - `board`, `board_add`, `board_edit`, `board_drop`, `board_pick`, `board_unpick`, `board_launch`, `board_reopen`, `board_resolve`: the goal board (below).
 - `usage`: the subscription meter (below), read only. A Clerk and an agent can use it too.
 
-Plans have a tool of their own, `plan`. After Brian approves a plan, 2 of its actions close gaps without a new approval:
+Plans have a tool of their own, `plan`. A planning session starts with the brainstorming skill: it talks with Brian in its chat until he approves the design there, and asks him pick-one questions there with the built-in `ask` tool, the 1 linked session that may use it. Before the approval, it writes only a problem statement, and files a `plan ask` only while Brian is not in the chat. After it, the session writes the plan, consults, drafts the tasks and calls `plan ready`. This order is a rule in its brief, not a desk check.
+
+After Brian approves a plan, 2 of its actions close gaps without a new approval:
 
 - `plan amend`: a text-only correction of an approved plan. The planning session writes it, with a why; the plan keeps its state, its approved graph and its tasks, and the change shows on the Desk page under the changes since the approval. It never changes Decisions, Tasks, the sections, a heading or the title. A supervisor's `plan amend` is only a request: the desk sends it to the planning session, which writes it in its own words.
 - `plan drop`: the supervisor closes a plan that Brian stopped. It names Brian's answered ask that says stop or drop, on the plan thread or on one of its task threads. An open ask on the plan thread still refuses the drop. The open tasks stop, and their sessions get the stop.

@@ -27,8 +27,10 @@ import {
     delegationWorktree,
     FRONT_DOOR_DESK_OFF,
     Identity,
+    identityText,
     MESSAGE_LIMITS,
     pickSupervisor,
+    PLANNING_ASK_EXCEPTION,
     roster,
     teamMessageProblems,
     linkedSend,
@@ -380,6 +382,8 @@ test("drop-in identities, named delegation, HTTP permissions, replay and restart
             requestContext,
             /In a linked task, never call the built-in `ask` tool: its card waits only in this session, and the desk does not see it\. Put the decision in the asks of team_message\./,
         );
+        // A specialist's linked task is no planning session: it gets no exception to that rule.
+        assert.equal(requestContext.includes(PLANNING_ASK_EXCEPTION.slice(0, 60)), false);
         assert.match(
             (await modelTexts(app, child)).join("\n"),
             /Only a session assigned a supervisor/,
@@ -463,6 +467,47 @@ function repository(folder: string): void {
         );
     }
 }
+
+test("identityText: only a planning session gets the exception to the rule on the built-in ask tool", () => {
+    const persona = (role: "agent" | "supervisor" | "clerk") => ({
+        id: "duncan",
+        name: "Duncan Idaho",
+        role,
+        model: "",
+        instructions: "# Duncan Idaho\nOwn the code.",
+        repositories: {},
+    });
+    const rule =
+        "In a linked task, never call the built-in `ask` tool: its card waits only in this session, and the desk does not see it. Put the decision in the asks of team_message.";
+    const planning = identityText(persona("agent"), false, true);
+    const linked = identityText(persona("agent"));
+
+    // A planning session keeps the rule and gets the exception after it.
+    assert(planning.includes(rule));
+    assert(planning.includes(PLANNING_ASK_EXCEPTION));
+    assert(planning.indexOf(rule) < planning.indexOf(PLANNING_ASK_EXCEPTION));
+    assert.match(
+        PLANNING_ASK_EXCEPTION,
+        /planning session \(the session of a desk thread with origin plan\)\. In its chat, use the built-in `ask` tool for a pick-one question to Brian, with the recommended option first\./,
+    );
+
+    // Every other linked task keeps the rule, with no exception.
+    assert(linked.includes(rule));
+    assert.equal(linked.includes(PLANNING_ASK_EXCEPTION), false);
+    assert.equal(identityText(persona("agent"), false, false), linked);
+
+    // The flag adds nothing to a supervisor, a Clerk or a private agent: none of them has the rule.
+    for (const [role, personal] of [
+        ["supervisor", false],
+        ["clerk", false],
+        ["agent", true],
+    ] as const) {
+        assert.equal(
+            identityText(persona(role), personal, true),
+            identityText(persona(role), personal, false),
+        );
+    }
+});
 
 test("a delegation gets a sibling worktree on a new branch, and its key reuses it", async () => {
     const checkout = join(root, "worktree-checkout");
