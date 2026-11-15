@@ -40,6 +40,7 @@ import {
     closedThreadRefusal,
     delegationWorktree,
     discardRefusedWorktree,
+    PLANNING_ASK_EXCEPTION,
     replayDecision,
     replayedStart,
 } from "./team.ts";
@@ -7475,6 +7476,28 @@ describe("the whole-plan check", () => {
 });
 
 describe("the task and verify briefs", () => {
+    test("the planning brief starts with the brainstorming skill, and its plan steps wait for the design approval", () => {
+        const brief = planningBrief("T1", "/plans/T1.md");
+        const lines = brief.split("\n");
+
+        assert.equal(
+            lines[0],
+            "You plan with the desk. This is plan T1, and its file is /plans/T1.md. First follow ~/.pi/agent/skills/brainstorming/SKILL.md: read the code and the ADRs, then talk with Brian in this chat, 1 question at a time, until he approves the design here. Until then, write no plan text except a problem statement. In this chat, ask a pick-one question with the built-in ask tool, the recommended option first.",
+        );
+        assert.match(
+            brief,
+            /^After Brian approves the design in this chat, or while he is not in this chat, file each decision for Brian with plan \{ action: "ask"/m,
+        );
+        assert.match(
+            brief,
+            /^After Brian approves the design in this chat, draft the task graph with plan \{ action: "tasks".*and then call plan \{ action: "ready" \}\./m,
+        );
+        assert.match(
+            brief,
+            /^To hear an expert while the plan drafts, after Brian approves the design in this chat, call plan \{ action: "consult"/m,
+        );
+    });
+
     test("the planning brief files asks after the section, and names the rev of plan tasks", () => {
         const brief = planningBrief("T1", "/plans/T1.md");
 
@@ -9005,9 +9028,29 @@ const call = (name: string, args: object) =>
     fauxAssistantMessage([fauxToolCall(name, args)], { stopReason: "toolUse" });
 const answer = (text: string) => fauxAssistantMessage([fauxText(text)]);
 
+/**
+ * Each model request's newest `named_team` section (Pocket sends the sections on its system messages) and its other
+ * messages, for the identity text of a session.
+ */
+const requests: { system: string; messages: string }[] = [];
+
 /** Pi, scripted: each test's words make the tool call it needs. */
 const model = scriptedModel((request) => {
     const { role, text } = lastText(request as never);
+
+    const messages =
+        (request as { messages?: { role: string; sections?: Record<string, string> }[] })
+            .messages ?? [];
+
+    requests.push({
+        system:
+            messages
+                .filter((each) => each.role === "system")
+                .map((each) => each.sections?.named_team)
+                .filter((each) => each !== undefined)
+                .at(-1) ?? "",
+        messages: JSON.stringify(messages.filter((each) => each.role !== "system")),
+    });
 
     if (role === "toolResult") {
         return answer("ok");
@@ -10824,6 +10867,19 @@ describe("with the Pi Pocket app", () => {
             "the planning brief",
             20_000,
         );
+
+        // Its identity section names the exception to the rule on the built-in ask tool: it is a planning session.
+        await until(
+            async () =>
+                requests.some(
+                    (each) =>
+                        each.messages.includes(`You plan with the desk. This is plan ${planId},`) &&
+                        each.system.includes(PLANNING_ASK_EXCEPTION) &&
+                        each.system.includes("never call the built-in `ask` tool"),
+                ),
+            "the planning session's exception",
+            20_000,
+        );
     });
 
     test("a plan start needs no repository, also for a lead with 2", async () => {
@@ -11646,6 +11702,20 @@ describe("with the Pi Pocket app", () => {
             20_000,
         );
         assert.equal((await planSnapshot())?.state, "building");
+
+        // A task session is no planning session: its identity keeps the rule on the built-in ask tool, with no exception.
+        const taskRequests = requests.filter(
+            (each) =>
+                each.messages.includes("1 PR for this task") &&
+                each.system.includes("Named identity for this Pi Pocket session"),
+        );
+
+        assert(taskRequests.length > 0, "the task session's requests");
+
+        for (const each of taskRequests) {
+            assert.match(each.system, /In a linked task, never call the built-in `ask` tool/);
+            assert.equal(each.system.includes(PLANNING_ASK_EXCEPTION), false);
+        }
 
         // The task session reads its plan, with no roster lines: those are the planning session's.
         await say(app, task.session as ConversationId, "plan read test");
@@ -12905,6 +12975,40 @@ describe("with the Pi Pocket app", () => {
             String(notSupervisor.data.error ?? notSupervisor.data.message ?? ""),
             /is not a supervisor's/,
         );
+
+        // A private lead is refused: no thread and no planning session, so it never gets the planning identity.
+        const privateHome = join(root, "chani-home");
+        const privateProfile = join(definitions, "chani.md");
+
+        mkdirSync(privateHome, { recursive: true });
+        writeFileSync(
+            privateProfile,
+            `---\nmodel: faux/faux-2\nhome: ${privateHome}\nprivate: true\n---\n# Chani\nYou are Chani. You work for Brian alone.`,
+        );
+
+        try {
+            const before = app.sessions().length;
+            const threads = Object.keys((await deskSnapshot())?.threads ?? {}).length;
+            const refused = await routes(`plans/new/${String(source)}`, {
+                ...body,
+                lead: "chani",
+                key: "new-plan-key-private",
+            });
+
+            assert.equal(refused.status, 400);
+            assert.match(
+                String(refused.data.error ?? refused.data.message ?? ""),
+                /Chani is a private agent: Brian talks to Chani directly/,
+            );
+            assert.equal(app.sessions().length, before, "no planning session started");
+            assert.equal(
+                Object.keys((await deskSnapshot())?.threads ?? {}).length,
+                threads,
+                "no plan thread opened",
+            );
+        } finally {
+            rmSync(privateProfile, { force: true });
+        }
 
         const sessions = app.sessions().length;
         const started = await routes(`plans/new/${String(source)}`, body);

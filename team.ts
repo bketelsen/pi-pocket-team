@@ -1325,27 +1325,39 @@ const privateRefusal = (persona: Persona): string =>
     `${persona.name} is a private agent: Brian talks to ${persona.name} directly, in a session in ${persona.home ?? "a folder of its own"}. Nobody delegates to ${persona.name}.`;
 
 /**
- * The role paragraph of an identity: a private agent works for Brian alone, so it is told to report to nobody and to
- * send nothing to another session. `personal` comes from the current roster, by id.
+ * The 1 exception to the rule on the built-in `ask` tool, for a planning session only (the session of a desk thread
+ * with `origin: "plan"`): Brian talks with it in its chat before the plan is written, so a pick-one question there goes
+ * on an ask card. Every other linked task keeps the rule.
  */
-const roleText = (persona: Persona, personal: boolean): string =>
+export const PLANNING_ASK_EXCEPTION =
+    "Exception: this session is a planning session (the session of a desk thread with origin plan). In its chat, use the built-in `ask` tool for a pick-one question to Brian, with the recommended option first.";
+
+/**
+ * The role paragraph of an identity: a private agent works for Brian alone, so it is told to report to nobody and to
+ * send nothing to another session. `personal` comes from the current roster, by id. `planning` says the session is a
+ * planning session: an agent's paragraph then gets the exception to the rule on the built-in `ask` tool.
+ */
+const roleText = (persona: Persona, personal: boolean, planning: boolean): string =>
     persona.role === "supervisor"
         ? "You own the team, not this conversation's repository. Do work directly when helpful. Use team_delegate for a specialist; select their repository by its roster name and give a self-contained task. Their task starts in that repository regardless of your folder. A greeting needs no audit of old work."
         : persona.role === "clerk"
           ? "You are the desk clerk of your supervisor. Desk digests arrive as messages whose lines start with [desk]. Escalate to your supervisor with desk escalate: thread (the thread it is about), text, and urgent: true only for what must go at once. The desk drops an escalation when the supervisor acted on the thread, or got its news directly, after the news that caused it, and records the drop on the thread. Use team_message to your supervisor only to answer a task that it sent you. A thread that desk read shows as Handled needs no escalation for its reports, because the supervisor acted after them."
           : personal
             ? "You work for Brian directly, in sessions he starts. You have no supervisor and no desk: never send team_message, never start or message another session, and never report your work to another agent."
-            : "Do your assigned work directly. For a linked task, report the result once with team_message to the return address in its initial message. Set its status. Put each decision you need from Brian in its asks, 1 question each, with options when it is a pick-one: a decision written only in the text can be missed. A done or blocked report with no decision sends asks: []. A plain merge or install request is no ask: the PR's label brings it to Brian. In a linked task, never call the built-in `ask` tool: its card waits only in this session, and the desk does not see it. Put the decision in the asks of team_message. List in its prs each PR you created, changed, reviewed or labelled in the task, as { repo, number }, or send prs: [] when there is none.";
+            : "Do your assigned work directly. For a linked task, report the result once with team_message to the return address in its initial message. Set its status. Put each decision you need from Brian in its asks, 1 question each, with options when it is a pick-one: a decision written only in the text can be missed. A done or blocked report with no decision sends asks: []. A plain merge or install request is no ask: the PR's label brings it to Brian. In a linked task, never call the built-in `ask` tool: its card waits only in this session, and the desk does not see it. Put the decision in the asks of team_message. List in its prs each PR you created, changed, reviewed or labelled in the task, as { repo, number }, or send prs: [] when there is none." +
+              (planning ? ` ${PLANNING_ASK_EXCEPTION}` : "");
 
-const identityText = (
+/** The identity text of a session: its profile, then its role paragraph (see `roleText`). */
+export const identityText = (
     persona: Persona,
     personal = false,
+    planning = false,
 ) => `Named identity for this Pi Pocket session:
 ${persona.instructions}
 
 Work on the person's current request in this session's folder. Keep task history in its session.
 Your name and responsibilities do not change the tools, permissions, or model selected in Pi Pocket.
-${roleText(persona, personal)}`;
+${roleText(persona, personal, planning)}`;
 
 const reply = (text: string) => ({ output: [{ type: "text" as const, text }] });
 
@@ -2172,10 +2184,15 @@ export default function createTeam(host: Host, web: Web) {
             ? `You work in your own git worktree at ${worktree.path} on branch ${worktree.branch}, made for this task; you can rename the branch. The main checkout at ${worktree.checkout} belongs to no task: do not work there.`
             : worktreeFailure(worktree);
 
-    const taskText = (persona: Persona, message: string, worktree?: DelegationWorktree) => {
+    const taskText = (
+        persona: Persona,
+        message: string,
+        worktree?: DelegationWorktree,
+        planning = false,
+    ) => {
         const where = worktree === undefined ? "" : worktreeText(worktree);
 
-        return `${identityText(persona)}\n\n${where === "" ? "" : `${where}\n\n`}Task from the source session:\n${message}`;
+        return `${identityText(persona, false, planning)}\n\n${where === "" ? "" : `${where}\n\n`}Task from the source session:\n${message}`;
     };
 
     /**
@@ -2718,6 +2735,15 @@ export default function createTeam(host: Host, web: Web) {
               }
             | undefined
         >;
+        /**
+         * Whether a session is the session of a plan thread: no write. An older desk has none: no session is a planning
+         * session then.
+         */
+        planning?: (
+            read: Pick<DocumentReader, "snapshot">,
+            context: Context,
+            session: number,
+        ) => Promise<boolean>;
         /** This desk knows plans. An older desk has none. */
         plans?: true;
         /** This desk takes a plan start's source and issue. An older desk has none. */
@@ -2748,6 +2774,22 @@ export default function createTeam(host: Host, web: Web) {
         (globalThis as unknown as Record<symbol, DeskApi | undefined>)[
             Symbol.for("pi-pocket-team.desk")
         ];
+
+    /**
+     * Whether a session is a planning session, by the desk's plan threads. No desk, an older desk, or a read that throws
+     * says no: the session then keeps the rule on the built-in `ask` tool.
+     */
+    const planningSession = async (
+        read: Pick<DocumentReader, "snapshot">,
+        context: Context,
+        session: ConversationId,
+    ): Promise<boolean> => {
+        try {
+            return (await deskApi()?.planning?.(read, context, Number(session))) === true;
+        } catch {
+            return false;
+        }
+    };
 
     /** This module's API, for other modules. */
     const published: TeamApi = {
@@ -3539,6 +3581,11 @@ export default function createTeam(host: Host, web: Web) {
             );
         }
 
+        // A private agent is Brian's: no plan starts in its name, from the tool or from the page's New plan.
+        if (await isPrivateAgent(directory, persona.id)) {
+            throw new Error(privateRefusal(persona));
+        }
+
         // An older desk would drop the issue or the source without a word: it refuses here instead.
         if ((input.issue !== undefined || input.source === "page") && desk.planSources !== true) {
             throw new Error(
@@ -3579,7 +3626,13 @@ export default function createTeam(host: Host, web: Web) {
 
         const request = {
             title: `${persona.name}: plan ${input.title}`.slice(0, 120),
-            message: taskText(persona, `${opened.plan?.brief ?? ""}\n\n${input.idea}`),
+            // A planning session: its identity text gets the exception to the rule on the built-in `ask` tool.
+            message: taskText(
+                persona,
+                `${opened.plan?.brief ?? ""}\n\n${input.idea}`,
+                undefined,
+                true,
+            ),
             cwd: persona.home,
             ...(model === undefined ? {} : { model }),
         };
@@ -5237,9 +5290,13 @@ export default function createTeam(host: Host, web: Web) {
                 // private text, and a profile that drops the flag gets the team text back.
                 const personal = await isPrivateAgent(directory, persona.id);
                 const places = await placesText(persona, identity.cwd, personal);
+                const planning =
+                    persona.role === "agent" &&
+                    !personal &&
+                    (await planningSession(input.read, context, input.conversationId));
 
                 return (
-                    identityText(persona, personal) +
+                    identityText(persona, personal, planning) +
                     (places === "" ? "" : `\n\n${places}`) +
                     (members.length
                         ? `\n\nNamed teammates:\n${members.join("\n")}\nDelegation runs each agent on its profile model when the owner allows that model for subagents, otherwise on your model.`

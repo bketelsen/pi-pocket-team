@@ -1,0 +1,7 @@
+{
+  "date": "2026-11-15",
+  "scope": "team.ts",
+  "correction": "startPlanThread did not refuse a private lead, so the Desk page's New plan could start a planning session in a private agent's name, with the team identity and the planning exception to the ask-tool rule in its first message; startPlanThread now refuses a private lead with privateRefusal, for the tool and the page",
+  "evidence": "bketelsen/pi-pocket-team#249, cross-review by openai/gpt-6.1-sol at b6711382f7853ef86efacb3eb680ad14d20a0097",
+  "promoted_to": "desk-plans.test.ts: New plan on the page refuses a private lead with 400, and opens no plan thread and no planning session"
+}
